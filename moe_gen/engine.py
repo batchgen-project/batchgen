@@ -38,6 +38,8 @@ from .config import EngineConfig
 from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 from .scheduler.host_mem import get_physical_memory_info
 
+from moe_gen.parameter_server_client import ParameterServerClient
+
 logging.basicConfig(
     level=logging.INFO,  # Set to the lowest level to capture all messages
     format="%(asctime)s - %(levelname)s - %(message)s",  # Include timestamp
@@ -129,12 +131,13 @@ def _config_torch_module_initializer():
             )
 
 
+
 def run_moe_gen(moe_gen):
     moe_gen.Init()
     return moe_gen.generate()
 
 
-def moe_gen(
+def moe_gen_dep(
     huggingface_ckpt_name: str,
     queries: List[str],
     max_input_length: int,
@@ -157,29 +160,31 @@ def moe_gen(
     if hf_cache_dir is None:
         # Use huggingface default dir.
         from huggingface_hub import constants
-
         hf_cache_dir = constants.HF_HUB_CACHE
-    try:
-        logging.info("entering snapshot_download")
-        from huggingface_hub import snapshot_download
+    
+    if cache_dir is None:
+        try:
+            logging.info("entering snapshot_download")
+            from huggingface_hub import snapshot_download
 
-        model_path = snapshot_download(
-            huggingface_ckpt_name,
-            cache_dir=hf_cache_dir,
-            ignore_patterns=["flax*", "tf*"],
-        )
-        logging.info("exiting snapshot_download")
-    except Exception as e:
-        logging.info(f"Error downloading model: {e}")
-        model_path = None
+            model_path = snapshot_download(
+                huggingface_ckpt_name,
+                cache_dir=hf_cache_dir,
+                ignore_patterns=["flax*", "tf*"],
+            )
+            logging.info("exiting snapshot_download")
+        except Exception as e:
+            logging.info(f"Error downloading model: {e}")
+            model_path = None
 
-    if model_path is None:
-        raise RuntimeError(
-            f"The `snapshot_download` function could not find the checkpoint {huggingface_ckpt_name}. "
-            f"Please provide a valid checkpoint."
-        )
-    else:
-        cache_dir = model_path
+        if model_path is None:
+            raise RuntimeError(
+                f"The `snapshot_download` function could not find the checkpoint {huggingface_ckpt_name}. "
+                f"Please provide a valid checkpoint."
+            )
+        else:
+            if cache_dir is None:
+                cache_dir = model_path
 
     if pt_ckpt_dir is None:
         pt_ckpt_dir = os.path.join(
@@ -270,6 +275,159 @@ def moe_gen(
             all_results.extend(future.result())
     end_time = time.perf_counter()
     # logging.info(f"Prefill + Decoding time: {end_time - start_time}")
+    return all_results
+
+
+# Entry point
+def moe_gen(
+    huggingface_ckpt_name: str,
+    queries: List[str],
+    max_input_length: int,
+    max_decoding_length: int,
+    device: List[int],
+    engine_config=EngineConfig(),  # EngineConfig object
+    hf_cache_dir: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    pt_ckpt_dir: Optional[str] = None,
+    host_kv_cache_size: Optional[int] = None,  # If not set, use all host memory
+    parameter_server_host: str = 'localhost',
+    parameter_server_port: int = 9090,
+):
+    """
+    Run MoE_Gen using the standalone parameter server.
+    
+    Args:
+        huggingface_ckpt_name: Model name on HuggingFace
+        queries: List of queries to process
+        max_input_length: Maximum input length
+        max_decoding_length: Maximum decoding length
+        device: List of GPU device IDs to use
+        engine_config: Engine configuration
+        hf_cache_dir: HuggingFace cache directory
+        cache_dir: Model cache directory
+        pt_ckpt_dir: Directory for PyTorch checkpoints
+        host_kv_cache_size: Host KV cache size in bytes
+        parameter_server_host: Host of the parameter server
+        parameter_server_port: Port of the parameter server
+    
+    Returns:
+        List of results with generated text
+    """
+    # Setup multiprocessing
+    mp.set_start_method("spawn", force=True)
+    mp.set_sharing_strategy("file_system")
+    # from moe_gen.utils import _config_torch_module_initializer
+    _config_torch_module_initializer()
+    
+    # Get model info from the parameter server - just retrieve existing info
+    logging.info(f"Connecting to parameter server at {parameter_server_host}:{parameter_server_port}")
+    try:
+        with ParameterServerClient(host=parameter_server_host, port=parameter_server_port) as client:
+            # First check if the server has a model loaded
+            model_info = client.get_model_info()
+            
+            # If the expected model isn't loaded, we need to request it
+            if model_info.get('huggingface_ckpt_name') != huggingface_ckpt_name:
+                logging.info(f"Parameter server has a different model loaded. Requesting {huggingface_ckpt_name}")
+                # model_info = client.load_model(
+                #     huggingface_ckpt_name=huggingface_ckpt_name,
+                #     hf_cache_dir=hf_cache_dir,
+                #     cache_dir=cache_dir,
+                #     pt_ckpt_dir=pt_ckpt_dir
+                # )
+
+                # Terminate directly
+                logging.info(f"Terminating process as the model is not loaded in the parameter server.")
+                sys.exit(1)
+            else:
+                logging.info(f"Model {huggingface_ckpt_name} already loaded in parameter server")
+    except Exception as e:
+        raise RuntimeError(f"Failed to connect to parameter server: {e}")
+    
+    # Extract necessary data from model_info
+    shm_name = model_info.get('shm_name')
+    tensor_meta_shm_name = model_info.get('tensor_meta_shm_name')
+    skeleton_state_dict = model_info.get('skeleton_state_dict')  # This now comes from shared memory
+    parameter_server_size = model_info.get('parameter_server_size')
+    pt_ckpt_dir = model_info.get('pt_ckpt_dir')
+    
+    if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, pt_ckpt_dir]):
+        missing = []
+        if not shm_name: missing.append('shm_name')
+        if not tensor_meta_shm_name: missing.append('tensor_meta_shm_name')
+        if not skeleton_state_dict: missing.append('skeleton_state_dict')
+        if not parameter_server_size: missing.append('parameter_server_size')
+        if not pt_ckpt_dir: missing.append('pt_ckpt_dir')
+        raise RuntimeError(f"Missing required information from parameter server: {', '.join(missing)}")
+    
+    # Calculate host KV cache size if not provided
+    if host_kv_cache_size is None:
+        from moe_gen.utils import get_physical_memory_info
+        mem_info = get_physical_memory_info()
+        free_mem = mem_info["actually_free"]
+        # We don't need to subtract parameter_server_size since it's in a separate process
+        host_kv_cache_size = math.floor(free_mem)
+        logging.info(f"Host KV Cache Size: {host_kv_cache_size}")
+    
+    # Distribute queries among devices
+    moe_gens = []
+    num_queries = len(queries)
+    num_devices = len(device)
+    logging.info(f"Number of devices: {num_devices}")
+    logging.info(f"Total number of queries: {num_queries}")
+    queries_per_device = math.ceil(num_queries / num_devices)
+    per_device_host_kv_cache_size = host_kv_cache_size // num_devices
+    
+    # For each device, create a MoE_Gen instance
+    for device_idx in range(num_devices):
+        start_query_idx = device_idx * queries_per_device
+        end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
+        
+        # Copy engine config and set device
+        import copy
+        device_engine_config = copy.deepcopy(engine_config)
+        device_engine_config.Basic_Config.device = device[device_idx]
+        device_engine_config.Basic_Config.device_torch = torch.device(
+            f"cuda:{device[device_idx]}"
+        )
+        
+        # Create MoE_Gen instance with the shared memory info
+        from moe_gen.engine import MoE_Gen
+        moe_gen_instance = MoE_Gen(
+            huggingface_ckpt_name=huggingface_ckpt_name,
+            hf_cache_dir=hf_cache_dir,
+            cache_dir=cache_dir,
+            queries=queries[start_query_idx:end_query_idx],
+            max_input_length=max_input_length,
+            max_decoding_length=max_decoding_length,
+            device=device[device_idx],
+            engine_config=device_engine_config,
+            skeleton_state_dict=skeleton_state_dict,
+            shm_name=shm_name,
+            tensor_meta_shm_name=tensor_meta_shm_name,
+            pt_ckpt_dir=pt_ckpt_dir,
+            host_kv_cache_size=per_device_host_kv_cache_size,
+        )
+        moe_gens.append(moe_gen_instance)
+    
+    logging.info(f"Number of MoE_Gen instances: {len(moe_gens)}")
+    
+    # Run inference with worker processes
+    start_time = time.perf_counter()
+    all_results = []
+    
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        # Submit each worker and collect the future objects
+        futures = [
+            executor.submit(run_moe_gen, moe_gen_instance) for moe_gen_instance in moe_gens
+        ]
+        # Retrieve results in the same order as the futures were submitted
+        for future in futures:
+            all_results.extend(future.result())
+    
+    end_time = time.perf_counter()
+    logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
+    
     return all_results
 
 
@@ -618,9 +776,6 @@ class MoE_Gen:
         logging.debug("Initial batching done.")
 
     def generate(self):
-        # torch.cuda.reset_peak_memory_stats(self.device)
-        # print(self.engine_config, flush=True)
-        # print(self.model_config, flush=True)
         prefill_time = 0
         decoding_time = 0
         for model_batch_idx in tqdm(
@@ -631,26 +786,22 @@ class MoE_Gen:
                 new_token = self.prefill(self.model_batches[model_batch_idx])
             prefill_time += time.perf_counter() - prefill_start_time
             self.core_engine.prefill_complete_sync()
+
+            # Random create new token.
+            # new_token = torch.randint(
+            #     0,
+            #     self.model_config.vocab_size,
+            #     (len(self.model_batches[model_batch_idx]), 1),
+            #     device=self.torch_device,
+            # )
+            # self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
+            
             decoding_start_time = time.perf_counter()
-            # logging.info(
-            #     f"Peak memory allocated in prefill: {torch.cuda.max_memory_allocated(self.torch_device)}"
-            # )
-            # logging.info(
-            #     f"Peak memory cached in prefill: {torch.cuda.max_memory_cached(self.torch_device)}"
-            # )
-            # torch.cuda.reset_peak_memory_stats(self.device)
             with torch.no_grad():
                 logging.info(
                     f"decoding batch size: {len(self.model_batches[model_batch_idx])}"
                 )
                 self.decoding(new_token, self.model_batches[model_batch_idx])
-            # logging.info(
-            #     f"Peak memory allocated in decoding: {torch.cuda.max_memory_allocated(self.torch_device)}"
-            # )
-            # logging.info(
-            #     f"Peak memory cached in decoding: {torch.cuda.max_memory_cached(self.torch_device)}"
-            # )
-            # torch.cuda.reset_peak_memory_stats(self.device)
             decoding_time += time.perf_counter() - decoding_start_time
             self.core_engine.clear_kv_storage()
         logging.info(f"Prefill total time: {prefill_time}")

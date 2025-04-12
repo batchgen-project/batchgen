@@ -496,6 +496,155 @@ def prefill_attn(
 
 
 @torch.no_grad()
+def chunked_prefill_attn(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    chunk_size: int = 2048,  # Added chunk_size parameter with default None
+):
+    bsz, q_len, _ = hidden_states.size()
+    
+    if self.q_lora_rank is None:
+        q = self.q_proj(hidden_states)
+    else:
+        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    
+    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+    q_nope, q_pe = torch.split(
+        q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+    )
+    
+    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+    
+    kv_len = compressed_kv.size(1)
+    assert kv_len == attention_mask.size(-1)
+    
+    compressed_kv_ref, k_pe = torch.split(
+        compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+    )
+    
+    k_pe = k_pe.view(bsz, kv_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+    
+    kv = (
+        self.kv_b_proj(self.kv_a_layernorm(compressed_kv_ref))
+        .view(
+            bsz, kv_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        .transpose(1, 2)
+    )
+    
+    k_nope, value_states = torch.split(
+        kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+    )
+    
+    kv_seq_len = attention_mask.shape[-1]
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+    
+    query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+    query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+    query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+    
+    key_states = k_pe.new_empty(
+        bsz, self.num_heads, kv_seq_len, self.q_head_dim
+    )
+    key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+    key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+    
+    # Initialize the final attention output tensor
+    attn_output = torch.zeros(
+        bsz, self.num_heads, q_len, self.v_head_dim, 
+        dtype=query_states.dtype, 
+        device=query_states.device
+    )
+    
+    # Implement chunked query attention computation
+    if chunk_size is None or q_len <= chunk_size:
+        # If chunk_size is None or smaller than q_len, compute attention as before
+        attn_weights = (
+            torch.matmul(query_states, key_states.transpose(2, 3))
+            * self.softmax_scale
+        )
+        
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+            
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+        
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        
+        attn_weights = nn.functional.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training
+        )
+        
+        attn_output = torch.matmul(attn_weights, value_states)
+    else:
+        # Process queries in chunks
+        num_chunks = (q_len + chunk_size - 1) // chunk_size  # Ceiling division
+        
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(chunk_start + chunk_size, q_len)
+            
+            # Extract query chunk
+            query_chunk = query_states[:, :, chunk_start:chunk_end, :]
+            
+            # Compute attention weights for this query chunk
+            chunk_attn_weights = (
+                torch.matmul(query_chunk, key_states.transpose(2, 3))
+                * self.softmax_scale
+            )
+            
+            # Apply attention mask for this chunk if provided
+            if attention_mask is not None:
+                attention_mask_chunk = attention_mask[:, :, chunk_start:chunk_end, :]
+                chunk_attn_weights = chunk_attn_weights + attention_mask_chunk
+            
+            # Apply softmax to get normalized attention weights
+            chunk_attn_weights = nn.functional.softmax(
+                chunk_attn_weights, dim=-1, dtype=torch.float32
+            ).to(query_states.dtype)
+            
+            # Apply dropout
+            chunk_attn_weights = nn.functional.dropout(
+                chunk_attn_weights, p=self.attention_dropout, training=self.training
+            )
+            
+            # Compute attention output for this chunk
+            chunk_output = torch.matmul(chunk_attn_weights, value_states)
+            
+            # Store the output for this chunk
+            attn_output[:, :, chunk_start:chunk_end, :] = chunk_output
+    
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+    
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    
+    attn_output = attn_output.reshape(
+        bsz, q_len, self.num_heads * self.v_head_dim
+    )
+    
+    attn_output = self.o_proj(attn_output)
+    return attn_output, compressed_kv
+
+
+@torch.no_grad()
 def decoding_attn(
     self,
     hidden_states: torch.Tensor,
@@ -869,27 +1018,29 @@ class DeepSeek_Initializer:
             self.engine_config.Basic_Config.max_decoding_length
             + self.engine_config.Basic_Config.padding_length
         )
-        if context_length > 544:
-            self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = math.floor(
-                10 * 544 / context_length
+        if context_length > 768:
+            self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = max(1, math.floor(
+                10 * 768 / context_length)
             )
-            self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = math.floor(
-                20 * 544 / context_length
+            self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = max(1, math.floor(
+                20 * 768 / context_length)
             )
         else:
             self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = 10
             self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 20
-        # logging.info(
-        #     f"attn_prefill_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size}"
-        # )
-        # logging.info(
-        #     f"MoE_prefill_micro_batch_size: {self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size}"
-        # )
+        
+        self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 5
+        logging.info(
+            f"attn_prefill_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size}"
+        )
+        logging.info(
+            f"MoE_prefill_micro_batch_size: {self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size}"
+        )
         self.engine_config.Module_Batching_Config.expert_prefill_batch_size_upper_bound = 2048
 
-        if context_length > 544:
-            self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = math.floor(
-                120 * 544 / context_length
+        if context_length > 768:
+            self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = max(1, math.floor(
+                120 * 768 / context_length)
             )
         else:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
@@ -900,14 +1051,14 @@ class DeepSeek_Initializer:
         self.engine_config.Module_Batching_Config.expert_decoding_batch_size_upper_bound = 2048
 
         # L40
-        if total_memory >= 47 and total_memory < 49:
-            self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size *= 2
-            self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size *= 2
-            self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size *= 2
-        if total_memory >= 78:
-            self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size *= 3
-            self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size *= 3
-            self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size *= 3
+        # if total_memory >= 47 and total_memory < 49:
+        #     self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size *= 2
+        #     self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size *= 2
+        #     self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size *= 2
+        # if total_memory >= 78:
+        #     self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size *= 3
+        #     self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size *= 3
+        #     self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size *= 3
 
         self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer = {
             "attn": 1,
@@ -1187,7 +1338,7 @@ class DeepSeek_Initializer:
             setattr(
                 attn_module,
                 "prefill_attn",
-                types.MethodType(prefill_attn, attn_module),
+                types.MethodType(chunked_prefill_attn, attn_module),
             )
             setattr(
                 attn_module,

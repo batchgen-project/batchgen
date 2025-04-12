@@ -512,7 +512,9 @@ class DeepSeek_Initializer:
         logging.info(f"Current device total memory: {total_memory} GB")
         if (
             self.hf_model_config._name_or_path
-            == "deepseek-ai/DeepSeek-V2-Lite-Chat"
+            == "deepseek-ai/DeepSeek-V2-Lite-Chat" or
+            self.hf_model_config._name_or_path
+            == "deepseek-ai/DeepSeek-V2-Lite"
         ):
             self.engine_config.Basic_Config.log_level = "info"
             self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
@@ -762,7 +764,9 @@ class DeepSeek_Initializer:
         if "DeepSeek-V2" in self.hf_model_config._name_or_path:
             if (
                 self.hf_model_config._name_or_path
-                == "deepseek-ai/DeepSeek-V2-Lite-Chat"
+                == "deepseek-ai/DeepSeek-V2-Lite-Chat" or 
+                self.hf_model_config._name_or_path
+                == "deepseek-ai/DeepSeek-V2-Lite"
             ):
                 model_config.model_type = "deepseek_v2"
                 model_config.num_hidden_layers = 27
@@ -866,7 +870,9 @@ class DeepSeek_Initializer:
             logging.info("Core engine created")
             if (
                 self.hf_model_config._name_or_path
-                == "deepseek-ai/DeepSeek-V2-Lite-Chat"
+                == "deepseek-ai/DeepSeek-V2-Lite-Chat" or 
+                self.hf_model_config._name_or_path
+                == "deepseek-ai/DeepSeek-V2-Lite"
             ):
                 param_byte_size = 32 * 1024 * 1024 * 1024
             else:
