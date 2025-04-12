@@ -62,7 +62,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("reset_weight_copy_queue", &MoE_Gen::reset_weight_copy_queue)
         .def("clear_kv_buffer", &MoE_Gen::clear_kv_buffer)
         .def("clear_weight_copy_queue", &MoE_Gen::clear_weight_copy_queue)
-        .def("reset_prefill_buffer", &MoE_Gen::reset_prefill_buffer);
+        .def("reset_prefill_buffer", &MoE_Gen::reset_prefill_buffer)
+        .def("create_fake_kv_storage", &MoE_Gen::create_fake_kv_storage);
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<>())

@@ -31,6 +31,46 @@
 #include "../utils.h"
 #include "KV_Storage.h"
 #include "tqdm.hpp"
+#include <random>
+#include <cstdint>
+#include <cstring>
+
+typedef uint16_t bf16;
+
+bf16 float_to_bf16(float f) {
+    uint32_t float_bits;
+    std::memcpy(&float_bits, &f, sizeof(float));
+    return static_cast<bf16>(float_bits >> 16);
+}
+
+void fill_with_random_bf16_uniform(void* k_ptr, size_t per_layer_storage_size, 
+                                   float min_val = -1.0f, float max_val = 1.0f) {
+    size_t num_elements = per_layer_storage_size / sizeof(bf16);
+    bf16* bf16_ptr = static_cast<bf16*>(k_ptr);
+    
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dist(min_val, max_val);
+    
+    for (size_t i = 0; i < num_elements; ++i) {
+        bf16_ptr[i] = float_to_bf16(dist(gen));
+    }
+}
+
+// Normal distribution variant
+void fill_with_random_bf16_normal(void* k_ptr, size_t per_layer_storage_size, 
+                                 float mean = 0.0f, float stddev = 1.0f) {
+    size_t num_elements = per_layer_storage_size / sizeof(bf16);
+    bf16* bf16_ptr = static_cast<bf16*>(k_ptr);
+    
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::normal_distribution<float> dist(mean, stddev);
+    
+    for (size_t i = 0; i < num_elements; ++i) {
+        bf16_ptr[i] = float_to_bf16(dist(gen));
+    }
+}
 
 KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
                        DtoH_Engine& d2h_engine)
@@ -71,6 +111,9 @@ KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
                 void* k_ptr = nullptr;
                 CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size,
                                          cudaHostAllocDefault));
+                // memset random generated number to k_ptr
+                // fill_with_random_bf16_uniform(k_ptr, per_layer_storage_size, -0.5f, 0.5f);
+                memset(k_ptr, 0, per_layer_storage_size);
                 this->k_pinned_memory.push_back(k_ptr);
             }
         }
@@ -682,5 +725,37 @@ void KV_Storage::clear_kv_storage() {
             e.what());
         throw std::runtime_error(
             "KV_Storage clear_kv_storage(): Failed to clear K and V storage.");
+    }
+}
+
+
+// Function to create a fake kv storage for test.
+// Fill the storage with random data.
+// Fill the query_idx_to_slot_idx_map with one-to-one mapping.
+// There is no empty slots.
+// We only care deepseek models.
+void KV_Storage::create_fake_kv_storage() {
+    try {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        // Set query_idx_to_slot_idx_map
+        for (int64_t slot_idx = 0;
+             slot_idx < this->engine_config_.kv_storage_config.num_host_slots;
+             slot_idx++) {
+            for (int64_t layer_idx = 0;
+                 layer_idx < this->model_config_.num_hidden_layers;
+                 layer_idx++) {
+                this->k_storage[slot_idx][layer_idx].used_byte_size = 14000 * 576 * 2;
+                this->k_storage[slot_idx][layer_idx].num_tokens = 13000;
+                this->query_idx_to_slot_idx_map[slot_idx] = slot_idx;
+            }
+        }
+    } catch (const std::exception& e) {
+        this->logger_->debug(
+            "KV_Storage create_fake_kv_storage(): Failed to create "
+            "fake kv storage. Error: {}",
+            e.what());
+        throw std::runtime_error(
+            "KV_Storage create_fake_kv_storage(): Failed to create fake kv "
+            "storage.");
     }
 }

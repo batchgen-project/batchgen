@@ -66,8 +66,60 @@ class ParameterServer:
 		# Setup signal handlers for graceful shutdown
 		signal.signal(signal.SIGINT, self.handle_shutdown)
 		signal.signal(signal.SIGTERM, self.handle_shutdown)
-	
+
 	def create_skeleton_state_dict_shared_memory(self, skeleton_state_dict):
+		"""
+		Create file-based storage for large skeleton state dict with PyTorch compatibility
+		
+		Args:
+			skeleton_state_dict: The skeleton state dict to put in shared memory
+			
+		Returns:
+			Name of the file identifier
+		"""
+		try:
+			logging.info("Starting serialization of skeleton state dict...")
+			
+			# Use torch.save instead of pickle for PyTorch tensors
+			import io
+			buffer = io.BytesIO()
+			torch.save(skeleton_state_dict, buffer)
+			serialized_dict = buffer.getvalue()
+			serialized_size = len(serialized_dict)
+			logging.info(f"Serialized skeleton state dict size: {serialized_size} bytes")
+			
+			# Create a backup directory
+			backup_dir = os.path.join(os.getcwd(), "shared_memory_backup")
+			os.makedirs(backup_dir, exist_ok=True)
+			
+			# Create a unique filename
+			import random
+			import string
+			timestamp = int(time.time()) % 10000
+			random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+			file_name = f"skel_{timestamp}_{random_suffix}.pt"  # Use .pt extension for PyTorch files
+			file_path = os.path.join(backup_dir, file_name)
+			
+			# Write the file directly with torch.save
+			logging.info(f"Writing large state dict to file: {file_path}")
+			torch.save(skeleton_state_dict, file_path)
+			
+			# Verify the file was written correctly
+			actual_size = os.path.getsize(file_path)
+			logging.info(f"Successfully wrote state dict to file, size: {actual_size} bytes")
+			
+			# Store the file path for cleanup later
+			self.skeleton_state_dict_file = file_path
+			
+			# No need for shared memory name anymore, just use the file name as identifier
+			self.skeleton_state_dict_shm_name = file_name
+			
+			return file_name
+		except Exception as e:
+			logging.error(f"Error creating shared memory: {e}")
+			return None
+	
+	def create_skeleton_state_dict_shared_memory_dep(self, skeleton_state_dict):
 		"""
 		Create shared memory for skeleton state dict with file backup for reliability
 		
@@ -169,6 +221,7 @@ class ParameterServer:
 		except Exception as e:
 			logging.error(f"Error creating shared memory: {e}")
 			return None
+
 	def start(self):
 		"""Start the parameter server"""
 		# Preload model if specified - BEFORE starting the server socket
@@ -378,8 +431,42 @@ class ParameterServer:
 			except:
 				pass
 			logging.info(f"Client disconnected: {address}")
-	
+
 	def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+		"""Process a client request and return a response"""
+		command = request.get('command')
+		
+		if command == 'ping':
+			return {'status': 'success', 'message': 'pong'}
+		
+		elif command == 'load_model':
+			return self.handle_load_model(request)
+		
+		elif command == 'get_model_info':
+			if not self.current_model:
+				return {'status': 'error', 'message': 'No model currently loaded'}
+			
+			# Return the file path instead of shared memory
+			return {
+				'status': 'success',
+				'shm_name': self.model_info.get('shm_name'),
+				'tensor_meta_shm_name': self.model_info.get('tensor_meta_shm_name'),
+				'parameter_server_size': self.model_info.get('parameter_server_size'),
+				'huggingface_ckpt_name': self.model_info.get('huggingface_ckpt_name'),
+				'pt_ckpt_dir': self.model_info.get('pt_ckpt_dir'),
+				'skeleton_state_dict_file': getattr(self, 'skeleton_state_dict_file', None),
+				# Keep for backward compatibility, but it's just the file name now
+				'skeleton_state_dict_shm_name': self.skeleton_state_dict_shm_name
+			}
+		
+		elif command == 'exit':
+			# Request to disconnect this client, not shut down the server
+			return {'status': 'success', 'message': 'Disconnecting client'}
+		
+		else:
+			return {'status': 'error', 'message': f'Unknown command: {command}'}
+	
+	def process_request_dep(self, request: Dict[str, Any]) -> Dict[str, Any]:
 		"""Process a client request and return a response"""
 		command = request.get('command')
 		

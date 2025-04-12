@@ -103,6 +103,7 @@ class MoE_Gen {
     void clear_weight_copy_queue();
     void reset_weight_copy_queue();
     void reset_prefill_buffer();
+    void create_fake_kv_storage();
 
    private:
     EngineConfig engine_config_;

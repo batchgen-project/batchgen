@@ -44,8 +44,8 @@ Weights_Storage::Weights_Storage(const EngineConfig& engine_config,
 };
 
 Weights_Storage::~Weights_Storage() {
-    free_shared_pinned_memory(this->shm_name, this->weight_ptr_,
-                              this->byte_size_, true);
+    // free_shared_pinned_memory(this->shm_name, this->weight_ptr_,
+    //                           this->byte_size_, true);
     this->logger->info("Weights_Storage Destroyed.");
 };
 

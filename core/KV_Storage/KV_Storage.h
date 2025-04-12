@@ -68,6 +68,7 @@ class KV_Storage {
                                            std::vector<int64_t> batch);
 
     void clear_kv_storage();
+    void create_fake_kv_storage();
 
    private:
     /* Template */

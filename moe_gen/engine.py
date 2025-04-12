@@ -782,19 +782,22 @@ class MoE_Gen:
             range(len(self.model_batches)), desc="Model Batch"
         ):
             prefill_start_time = time.perf_counter()
-            with torch.no_grad():
-                new_token = self.prefill(self.model_batches[model_batch_idx])
-            prefill_time += time.perf_counter() - prefill_start_time
-            self.core_engine.prefill_complete_sync()
+            # with torch.no_grad():
+            #     new_token = self.prefill(self.model_batches[model_batch_idx])
+            # prefill_time += time.perf_counter() - prefill_start_time
+            # self.core_engine.prefill_complete_sync()
 
             # Random create new token.
-            # new_token = torch.randint(
-            #     0,
-            #     self.model_config.vocab_size,
-            #     (len(self.model_batches[model_batch_idx]), 1),
-            #     device=self.torch_device,
-            # )
-            # self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
+            new_token = torch.randint(
+                0,
+                1000,
+                # 129280, # self.model_config.vocab_size,
+                (len(self.model_batches[model_batch_idx]), 1),
+                device=self.torch_device,
+            )
+            self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
+            logging.info("Entering kv_storage creation...")
+            self.core_engine.create_fake_kv_storage()
             
             decoding_start_time = time.perf_counter()
             with torch.no_grad():

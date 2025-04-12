@@ -215,6 +215,9 @@ void MoE_Gen::reset_prefill_buffer() {
 };
 
 void MoE_Gen::clear_kv_buffer() { this->gpu_kv_buffer_.clear_kv_buffer(); };
+void MoE_Gen::create_fake_kv_storage() {
+    this->kv_storage_.create_fake_kv_storage();
+};
 
 #include <signal.h>
 static MoE_Gen* engine_instance = nullptr;
