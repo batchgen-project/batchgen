@@ -407,6 +407,8 @@ def moe_gen(
             tensor_meta_shm_name=tensor_meta_shm_name,
             pt_ckpt_dir=pt_ckpt_dir,
             host_kv_cache_size=per_device_host_kv_cache_size,
+            rank = device_idx,
+            world_size = num_devices
         )
         moe_gens.append(moe_gen_instance)
     
@@ -447,6 +449,8 @@ class MoE_Gen:
         tensor_meta_shm_name,
         engine_config=EngineConfig(),
         host_kv_cache_size: Optional[int] = None,
+        rank: Optional[int] = 0,
+        world_size: Optional[int] = 1,
     ):
         self.model = None
         self.hf_cache_dir = hf_cache_dir
@@ -459,6 +463,8 @@ class MoE_Gen:
         self.max_decoding_length = max_decoding_length
         self.engine_config = engine_config
         self.skeleton_state_dict = skeleton_state_dict
+        self.rank = rank
+        self.world_size = world_size
 
         self.engine_config.Basic_Config.device = device
         self.engine_config.Basic_Config.device_torch = torch.device(
@@ -546,6 +552,8 @@ class MoE_Gen:
                 self.tensor_meta_shm_name,
                 self.pt_ckpt_dir,
                 self.host_kv_cache_size,
+                self.rank,
+                self.world_size
             )
 
         elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":

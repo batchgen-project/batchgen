@@ -51,6 +51,7 @@ class HtoD_Engine {
     // void Init(const py::dict& py_weight_copy_tasks);
     void Init(std::unordered_map<std::string, std::vector<std::string>>&
                   weights_copy_tasks);
+    void Start();
     void Terminate();
 
     torch::Tensor tensor_on_demand_copy(torch::Tensor src_tensor);
@@ -60,6 +61,9 @@ class HtoD_Engine {
     void clear_kv_copy_queue();
     void clear_weight_copy_queue();
     void reset_weight_copy_queue();
+    void set_global_routed_experts_data_ptr(const py::dict& experts_IPC_handles);
+    void cuda_enable_peer_access(int rank, int world_size);
+    
 
    private:
     /* Template */
@@ -70,6 +74,9 @@ class HtoD_Engine {
     std::shared_ptr<spdlog::logger> logger_;
     std::mutex mutex_;
     std::condition_variable cv_;
+    py::module p2p_tensor_copy_module;
+    std::unordered_map<std::string, std::unordered_map<std::string, void*>>
+                       global_device_experts_ptrs_;
 
     /* Need to query kv storage and weights storage. */
     GPU_Weight_Buffer& gpu_weight_buffer_;

@@ -75,17 +75,15 @@ MoE_Gen::MoE_Gen(py::object engine_config, py::object model_config)
 MoE_Gen::~MoE_Gen() { this->Terminate(); }
 
 void MoE_Gen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-                   int64_t byte_size,
-                   std::unordered_map<std::string, std::vector<std::string>>&
-                       weights_copy_tasks) {
+                    int64_t byte_size,
+                    std::unordered_map<std::string, std::vector<std::string>>&
+                       weights_copy_tasks
+    ) 
+{
     this->logger->info("MoE-Gen Init.");
     this->logger->info("model type: {}", this->model_config_.model_type);
-    // this->parameter_server_ = parameter_server;
-    // auto byte_size =
-    // this->parameter_server_.attr("byte_size")().cast<int64_t>(); auto
-    // weights_map = this->parameter_server_.attr("module_weights_shm")()
-    // 	.cast<std::unordered_map<std::string, std::unordered_map<std::string,
-    // tensor_meta>>>();
+
+
     this->shm_name_ = shm_name;
     this->tensor_meta_shm_name_ = tensor_meta_shm_name;
     auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
@@ -218,6 +216,26 @@ void MoE_Gen::clear_kv_buffer() { this->gpu_kv_buffer_.clear_kv_buffer(); };
 void MoE_Gen::create_fake_kv_storage() {
     this->kv_storage_.create_fake_kv_storage();
 };
+
+std::unordered_map<std::string, torch::Tensor> MoE_Gen::get_tensor(
+    std::string module_key)
+{
+    return this->weights_storage_.get_tensor(module_key);
+}
+
+void MoE_Gen::start_h2d_worker() {
+    this->h2d_engine_.Start();
+}
+
+
+void MoE_Gen::set_global_routed_experts_data_ptr(const py::dict& experts_IPC_handles)
+{
+    this->h2d_engine_.set_global_routed_experts_data_ptr(experts_IPC_handles);
+}
+
+void MoE_Gen::cuda_enable_peer_access(int rank, int world_size){
+    this->h2d_engine_.cuda_enable_peer_access(rank, world_size);
+}
 
 #include <signal.h>
 static MoE_Gen* engine_instance = nullptr;

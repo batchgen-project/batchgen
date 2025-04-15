@@ -88,3 +88,24 @@ Weights_Storage::get_module_weights_storage(std::string module_key) {
 
     return this->module_weights_storage_[module_key];
 };
+
+std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(std::string module_key){
+    /* Get the tensor from the weights storage. */
+    if (this->module_weights_storage_.find(module_key) ==
+        this->module_weights_storage_.end()) {
+        this->logger->error("Module key not found in storage.");
+        throw std::runtime_error("Module key not found in storage.");
+    };
+    auto module_weights = this->module_weights_storage_[module_key];
+    std::unordered_map<std::string, torch::Tensor> tensors;
+    for (auto& [tensor_key, tensor_buffer] : module_weights) {
+        auto tensor = torch::from_blob(
+            tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
+            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
+                .device(torch::kCPU)
+                .requires_grad(false)
+                .memory_format(torch::MemoryFormat::Contiguous));
+        tensors[tensor_key] = tensor;
+    }
+    return tensors;
+}

@@ -49,9 +49,10 @@ class MoE_Gen {
     ~MoE_Gen();
 
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-              int64_t byte_size,
-              std::unordered_map<std::string, std::vector<std::string>>&
-                  weights_copy_tasks);
+            int64_t byte_size,
+            std::unordered_map<std::string, std::vector<std::string>>&
+                  weights_copy_tasks
+    );
     void Terminate();
 
     /*
@@ -104,6 +105,11 @@ class MoE_Gen {
     void reset_weight_copy_queue();
     void reset_prefill_buffer();
     void create_fake_kv_storage();
+    std::unordered_map<std::string, torch::Tensor> get_tensor(
+        std::string module_key);
+    void start_h2d_worker();
+    void set_global_routed_experts_data_ptr(const py::dict& experts_IPC_handles);
+    void cuda_enable_peer_access(int rank, int world_size);
 
    private:
     EngineConfig engine_config_;

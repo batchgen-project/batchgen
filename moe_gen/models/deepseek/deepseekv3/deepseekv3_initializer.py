@@ -22,7 +22,7 @@ import os
 import time
 import types
 from multiprocessing import Process
-from typing import Optional
+from typing import Optional, Union, List
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,7 @@ import triton.language as tl
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
 from transformers import AutoConfig
+import torch.distributed as dist
 
 from moe_gen.config import EngineConfig, ModelConfig
 
@@ -64,7 +65,6 @@ from .modeling_deepseek_v3 import (
     apply_rotary_pos_emb,
     rotate_half,
 )
-
 
 def rotary_pos_emb(t, cos, sin, position_ids, unsqueeze_dim=1):
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
@@ -946,6 +946,8 @@ class DeepSeek_Initializer:
         tensor_meta_shm_name: str,
         pt_ckpt_dir,
         host_kv_cache_size: Optional[int] = None,
+        rank: Optional[int] = 0,
+        world_size: Optional[int] = 1,
     ):
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.cache_dir = cache_dir
@@ -960,6 +962,10 @@ class DeepSeek_Initializer:
         )
         self.host_kv_cache_size = host_kv_cache_size
         self.host_kv_cache_byte_size = host_kv_cache_size * (1024**3)
+        self.rank = rank
+        self.world_size = world_size    
+
+        self.fp8_weights_IPC_handle = {}
 
         # TODO:
         self.model_config = self._parse_model_config()
@@ -1201,15 +1207,25 @@ class DeepSeek_Initializer:
                 self.weight_copy_task,
             )
             logging.info("Core engine initialized")
+            
             self._extract_dequantize_scale()
             self._load_model_skeleton()
+            self._load_local_routed_experts()
             self._config_attn_module()
             self._config_expert_module()
             self._config_lm_head_hook()
-
+            self._synchronize_expert_pointers()
+            # self._initialize_p2p_access()
             self.model.eval()
             self.model.to(self.engine_config.Basic_Config.device_torch)
             print(self.model, flush=True)
+            
+            self.core_engine.cuda_enable_peer_access(self.rank, self.world_size)
+            logging.info("Peer access enabled")
+            self.core_engine.set_global_routed_experts_data_ptr(self.global_routed_experts_data_ptr)
+            logging.info("Global Expert IPC Handle Set")
+            self.core_engine.start_h2d_worker()
+            logging.info("Host to Device worker started")
         except Exception as e:
             logging.error(f"Error: {e}")
             raise e
@@ -1228,7 +1244,7 @@ class DeepSeek_Initializer:
             self._lm_head_forward_pre_hook
         )
 
-    def _parse_state_dict(self):
+    def _parse_state_dict_dep(self):
         model_init_start_time = time.perf_counter()
         self.hf_model_config._attn_implementation = "eager"
         self.model = DeepseekV3ForCausalLM._from_config(
@@ -1301,6 +1317,154 @@ class DeepSeek_Initializer:
                         + "_"
                         + str(expert_idx)
                     )
+
+
+    def _parse_state_dict(self):
+        model_init_start_time = time.perf_counter()
+        self.hf_model_config._attn_implementation = "eager"
+        self.model = DeepseekV3ForCausalLM._from_config(
+            self.hf_model_config
+        ).to(self.engine_config.Basic_Config.device_torch)
+        self.model.eval()
+        logging.info(
+            f"torch module init time: {time.perf_counter() - model_init_start_time} s"
+        )
+
+        self.weight_copy_task["attn"] = []
+        self.weight_copy_task["routed_expert"] = []
+        self.weight_copy_task["shared_expert"] = []
+
+        # Each worker stores 20 experts per layer.
+        # i.e. worker 0 stores experts 0-19, worker 1 stores experts 20-39, etc.
+        # Thus the weight copy task for worker rank 0 would be: routed_expert 20 ~ the last one since the first 20 is local.
+        self.local_routed_experts = []
+        
+        NUM_LOCAL_EXPERT_PER_LAYER = 15
+        
+        for layer_idx in range(
+            self.hf_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            for expert_idx in range(
+                self.model_config.num_local_experts
+            ):
+                if expert_idx >= self.rank * NUM_LOCAL_EXPERT_PER_LAYER and expert_idx < (
+                    self.rank + 1
+                ) * NUM_LOCAL_EXPERT_PER_LAYER:
+                    self.local_routed_experts.append(
+                        "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+                    )
+
+        # Build the bookkeeping of routed_expert location. routed_expert id -> device rank
+        # i.e. 0-19 -> 0, 20-49 -> 1, etc.
+        self.expert_location = {}
+        for layer_idx in range(
+            self.hf_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            for rank_id in range(self.world_size):
+                for expert_idx in range(
+                    rank_id * NUM_LOCAL_EXPERT_PER_LAYER,
+                    (rank_id + 1) * NUM_LOCAL_EXPERT_PER_LAYER,
+                ):
+                    if expert_idx < self.model_config.num_local_experts:
+                        self.expert_location[
+                            "routed_expert_"
+                            + str(layer_idx)
+                            + "_"
+                            + str(expert_idx)
+                        ] = rank_id
+                
+                
+
+        for layer_idx in trange(self.model_config.num_hidden_layers):
+            for name, _ in self.model.model.layers[
+                layer_idx
+            ].self_attn.named_parameters():
+                tensor_full_name = (
+                    "model.layers." + str(layer_idx) + ".self_attn." + name
+                )
+                self.state_dict_name_map[tensor_full_name] = {
+                    "module_key": "attn_" + str(layer_idx),
+                    "tensor_key": name,
+                }
+            self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
+
+            if layer_idx >= self.hf_model_config.first_k_dense_replace:
+                for name, _ in self.model.model.layers[
+                    layer_idx
+                ].mlp.shared_experts.named_parameters():
+                    tensor_full_name = (
+                        "model.layers."
+                        + str(layer_idx)
+                        + ".mlp.shared_experts."
+                        + name
+                    )
+                    self.state_dict_name_map[tensor_full_name] = {
+                        "module_key": "shared_expert_" + str(layer_idx),
+                        "tensor_key": name,
+                    }
+                self.weight_copy_task["shared_expert"].append(
+                    "shared_expert_" + str(layer_idx)
+                )
+
+                for expert_idx in range(self.model_config.num_local_experts):
+                    for name, _ in (
+                        self.model.model.layers[layer_idx]
+                        .mlp.experts[expert_idx]
+                        .named_parameters()
+                    ):
+                        tensor_full_name = (
+                            "model.layers."
+                            + str(layer_idx)
+                            + ".mlp.experts."
+                            + str(expert_idx)
+                            + "."
+                            + name
+                        )
+                        self.state_dict_name_map[tensor_full_name] = {
+                            "module_key": "routed_expert_"
+                            + str(layer_idx)
+                            + "_"
+                            + str(expert_idx),
+                            "tensor_key": name,
+                        }
+                    
+                    if "routed_expert_" + str(layer_idx) + "_" + str(expert_idx) not in self.local_routed_experts:
+                        self.weight_copy_task["routed_expert"].append(
+                            "routed_expert_"
+                            + str(layer_idx)
+                            + "_"
+                            + str(expert_idx)
+                        )
+                    
+                    # self.weight_copy_task["routed_expert"].append(
+                    #     "routed_expert_"
+                    #     + str(layer_idx)
+                    #     + "_"
+                    #     + str(expert_idx)
+                    # )
+
+    def _load_local_routed_experts(self):
+        for routed_expert_idx in self.local_routed_experts:
+            tensors = self.core_engine.get_tensor(routed_expert_idx)
+            layer_idx = int(routed_expert_idx.split("_")[2])
+            expert_idx = int(routed_expert_idx.split("_")[3])
+            # logging.info(tensors.keys())
+            self.model.model.layers[layer_idx].mlp.experts[expert_idx].gate_proj.weight.data = tensors["gate_proj.weight"].to(
+                self.engine_config.Basic_Config.device_torch
+            )
+            self.model.model.layers[layer_idx].mlp.experts[expert_idx].up_proj.weight.data = tensors["up_proj.weight"].to(
+                self.engine_config.Basic_Config.device_torch
+            )
+            self.model.model.layers[layer_idx].mlp.experts[expert_idx].down_proj.weight.data = tensors["down_proj.weight"].to(
+                self.engine_config.Basic_Config.device_torch
+            )
+            
+            
+
+            
+
 
     def _config_attn_module(self):
         """
@@ -1441,3 +1605,90 @@ class DeepSeek_Initializer:
                     get_weights,
                     weight_dequant_scales,
                 )
+                if get_weights == False:
+                    layer.mlp.experts[expert_idx]._register_fp8_weights()
+                    for key, value in layer.mlp.experts[expert_idx].weight_dequant_scale.items():
+                        value = value.to(
+                            self.engine_config.Basic_Config.device_torch
+                        )
+                    routed_expert_name = "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+                    self.fp8_weights_IPC_handle[routed_expert_name] = {}
+                    # device, handle, size, offset, view_size
+                    # tmp_metas = layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()
+                    # logging.info(tmp_metas)
+                    self.fp8_weights_IPC_handle[routed_expert_name]['gate_proj.weight'] = (
+                        layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()[0],
+                        layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()[1]
+                    )
+                    
+                    self.fp8_weights_IPC_handle[routed_expert_name]['up_proj.weight'] = (
+                        layer.mlp.experts[expert_idx].fp8_up.storage()._share_cuda_()[0],
+                        layer.mlp.experts[expert_idx].fp8_up.storage()._share_cuda_()[1]
+                    )
+
+                    self.fp8_weights_IPC_handle[routed_expert_name]['down_proj.weight'] = (
+                        layer.mlp.experts[expert_idx].fp8_down.storage()._share_cuda_()[0],
+                        layer.mlp.experts[expert_idx].fp8_down.storage()._share_cuda_()[1]
+                    )
+                    
+                    # _, self.fp8_weights_IPC_handle[routed_expert_name]['gate_proj.weight'],_,_,_ = layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()
+                    # _, self.fp8_weights_IPC_handle[routed_expert_name]['up_proj.weight'],_,_,_ = layer.mlp.experts[expert_idx].storage()._share_cuda_()
+                    # _, self.fp8_weights_IPC_handle[routed_expert_name]['down_proj.weight'],_,_,_ = layer.mlp.experts[expert_idx].storage()._share_cuda_()
+
+                    
+
+    # def _initialize_p2p_access(self) -> List[List[bool]]:
+    #     """Initialize P2P access for this process's device and return access matrix."""
+    #     # Create a shared matrix for all processes
+    #     p2p_matrix = [[False for _ in range(self.world_size)] for _ in range(self.world_size)]
+        
+    #     # Each process only handles its own device (rank)
+    #     i = self.rank  # Use the process rank as the device index
+    #     p2p_matrix[i][i] = True  # Device can access itself
+        
+    #     for j in range(self.world_size):
+    #         if i == j:
+    #             continue
+                
+    #         # Check if device i can access device j
+    #         if torch.cuda.can_device_access_peer(i, j):
+    #             try:
+    #                 # Set the current device
+    #                 torch.cuda.set_device(i)
+    #                 # Enable peer access
+    #                 torch.cuda.device_enable_peer_access(j)
+    #                 p2p_matrix[i][j] = True
+    #                 logging.info(f"Process {self.rank}: Enabled P2P access from device {i} to device {j}")
+    #             except RuntimeError as e:
+    #                 if "peer access already enabled" in str(e):
+    #                     p2p_matrix[i][j] = True
+    #                     logging.info(f"Process {self.rank}: P2P access already enabled from device {i} to device {j}")
+    #                 else:
+    #                     logging.error(f"Process {self.rank}: Failed to enable P2P access from device {i} to device {j}: {e}")
+    #         else:
+    #             logging.info(f"Process {self.rank}: P2P access not possible from device {i} to device {j}")
+        
+
+
+
+    def _synchronize_expert_pointers(self):
+        # Let each worker have global data_ptr of experts.
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="NCCL", 
+                init_method="tcp://localhost:12355",
+                world_size=self.world_size, 
+                rank=self.rank)
+        gathered_dicts = [None] * self.world_size
+        gathered_dicts[self.rank] = self.fp8_weights_IPC_handle
+        dist.all_gather_object(gathered_dicts, gathered_dicts[self.rank])
+        self.global_routed_experts_data_ptr = {}
+        for process_dict in gathered_dicts:
+            self.global_routed_experts_data_ptr.update(process_dict)
+        
+        dist.barrier()
+
+
+        
+        
+                

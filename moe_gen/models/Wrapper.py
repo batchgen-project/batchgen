@@ -117,6 +117,10 @@ def deepseek_v3_dequantization(
     n_block_cols = math.ceil(cols / block_size[1])
     assert n_block_cols == weight_scale_inv_fp32.size(1)
     assert n_block_rows == weight_scale_inv_fp32.size(0)
+    # Check input are on the same device
+    # logging.info(
+    #     f"weight_data_fp8 device: {weight_data_fp8.device}, weight_scale_inv_fp32 device: {weight_scale_inv_fp32.device}"
+    # )
 
     dequantized_weight = weight_data_fp8.to(torch.float32)
     expanded_scales = weight_scale_inv_fp32.repeat_interleave(
@@ -483,12 +487,30 @@ class Expert_Wrapper(torch.nn.Module):
                     self.weight_dequant_scale is not None
                     and name + "_scale_inv" in self.weight_dequant_scale
                 ):
+                    
                     param.data = deepseek_v3_dequantization(
                         weights_dict[name],
-                        self.weight_dequant_scale[name + "_scale_inv"],
+                        self.weight_dequant_scale[name + "_scale_inv"].to(
+                            self.engine_config.Basic_Config.device_torch #TODO:
+                        ),
                     )
                 else:
                     param.data = weights_dict[name]
+        else:
+            self.module.gate_proj.weight.data = deepseek_v3_dequantization(
+                self.fp8_gate.clone(),
+                self.weight_dequant_scale[
+                    "gate_proj.weight_scale_inv"
+                ],
+            )
+            self.module.down_proj.weight.data = deepseek_v3_dequantization(
+                self.fp8_down.clone(),
+                self.weight_dequant_scale["down_proj.weight_scale_inv"],
+            )
+            self.module.up_proj.weight.data = deepseek_v3_dequantization(
+                self.fp8_up.clone(),
+                self.weight_dequant_scale["up_proj.weight_scale_inv"],
+            )
 
         # Step 2: Forward pass, micro-batching in case of OOM.
         hidden_states = args[0]
@@ -519,6 +541,10 @@ class Expert_Wrapper(torch.nn.Module):
                 param.data = torch.tensor(
                     0.0, dtype=param.data.dtype, device=param.data.device
                 )
+        else:
+            self.module.gate_proj.weight.data = self.fp8_gate
+            self.module.down_proj.weight.data = self.fp8_down
+            self.module.up_proj.weight.data = self.fp8_up
 
         logging.debug(
             f"[Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"
@@ -528,3 +554,8 @@ class Expert_Wrapper(torch.nn.Module):
                 self.layer_idx, self.expert_idx
             )
         return result
+
+    def _register_fp8_weights(self):
+        self.fp8_gate = self.module.gate_proj.weight.data
+        self.fp8_down = self.module.down_proj.weight.data
+        self.fp8_up = self.module.up_proj.weight.data

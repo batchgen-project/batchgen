@@ -63,7 +63,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("clear_kv_buffer", &MoE_Gen::clear_kv_buffer)
         .def("clear_weight_copy_queue", &MoE_Gen::clear_weight_copy_queue)
         .def("reset_prefill_buffer", &MoE_Gen::reset_prefill_buffer)
-        .def("create_fake_kv_storage", &MoE_Gen::create_fake_kv_storage);
+        .def("create_fake_kv_storage", &MoE_Gen::create_fake_kv_storage)
+        .def("get_tensor", &MoE_Gen::get_tensor)
+        .def("start_h2d_worker", &MoE_Gen::start_h2d_worker)
+        .def("set_global_routed_experts_data_ptr",
+             &MoE_Gen::set_global_routed_experts_data_ptr)
+        .def("cuda_enable_peer_access", &MoE_Gen::cuda_enable_peer_access);
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<>())

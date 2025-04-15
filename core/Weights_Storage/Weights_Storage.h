@@ -59,6 +59,9 @@ class Weights_Storage {
     std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
         std::string module_key);
 
+    std::unordered_map<std::string, torch::Tensor> get_tensor(
+        std::string module_key);
+
    private:
     /* Template */
     const EngineConfig& engine_config_;
