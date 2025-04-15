@@ -1222,7 +1222,7 @@ class DeepSeek_Initializer:
             
             self.core_engine.cuda_enable_peer_access(self.rank, self.world_size)
             logging.info("Peer access enabled")
-            self.core_engine.set_global_routed_experts_data_ptr(self.global_routed_experts_data_ptr)
+            self.core_engine.set_global_routed_experts_data_ptr(self.global_routed_experts_data_ptr, self.expert_location_map)
             logging.info("Global Expert IPC Handle Set")
             self.core_engine.start_h2d_worker()
             logging.info("Host to Device worker started")
@@ -1337,43 +1337,96 @@ class DeepSeek_Initializer:
         # Each worker stores 20 experts per layer.
         # i.e. worker 0 stores experts 0-19, worker 1 stores experts 20-39, etc.
         # Thus the weight copy task for worker rank 0 would be: routed_expert 20 ~ the last one since the first 20 is local.
+# Alternative Expert Placement with Round-Robin Logic
+
+    # def distribute_experts_round_robin(self):
         self.local_routed_experts = []
+        self.expert_location_map = {}
+
+        NUM_LOCAL_EXPERT_PER_LAYER = 15  # Per requirements: 15 experts per GPU per layer
+        NUM_TOTAL_EXPERTS = 256          # Total experts per layer
+        NUM_RANKS = self.world_size      # Assuming this is 8 as mentioned
         
-        NUM_LOCAL_EXPERT_PER_LAYER = 15
+        # Calculate how many experts should be on GPUs vs host
+        NUM_LOCAL_EXPERTS_TOTAL = NUM_LOCAL_EXPERT_PER_LAYER * NUM_RANKS
+        NUM_HOST_EXPERTS = NUM_TOTAL_EXPERTS - NUM_LOCAL_EXPERTS_TOTAL
         
+        # Sanity check
+        assert NUM_HOST_EXPERTS > 0, "Configuration error: Not enough experts for host placement"
+        
+        # Process each layer
         for layer_idx in range(
             self.hf_model_config.first_k_dense_replace,
             self.model_config.num_hidden_layers,
         ):
-            for expert_idx in range(
-                self.model_config.num_local_experts
-            ):
-                if expert_idx >= self.rank * NUM_LOCAL_EXPERT_PER_LAYER and expert_idx < (
-                    self.rank + 1
-                ) * NUM_LOCAL_EXPERT_PER_LAYER:
-                    self.local_routed_experts.append(
-                        "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+            # Reset counters for each layer
+            expert_count_per_rank = [0] * NUM_RANKS
+            host_expert_count = 0
+            
+            # Initialize placement target index
+            next_target_idx = 0
+            targets = list(range(NUM_RANKS)) + ['host']
+            
+            # Distribute experts in this layer
+            for expert_idx in range(NUM_TOTAL_EXPERTS):
+                expert_name = f"routed_expert_{layer_idx}_{expert_idx}"
+                
+                # Find a valid target for this expert
+                assigned = False
+                tried_targets = 0
+                
+                while not assigned and tried_targets < len(targets):
+                    target = targets[next_target_idx]
+                    next_target_idx = (next_target_idx + 1) % len(targets)
+                    tried_targets += 1
+                    
+                    if target == 'host':
+                        # Check if host has capacity
+                        if host_expert_count < NUM_HOST_EXPERTS:
+                            self.expert_location_map[expert_name] = -1  # -1 represents host
+                            host_expert_count += 1
+                            assigned = True
+                    else:
+                        # Check if this rank has capacity
+                        if expert_count_per_rank[target] < NUM_LOCAL_EXPERT_PER_LAYER:
+                            self.expert_location_map[expert_name] = target
+                            if target == self.rank:
+                                self.local_routed_experts.append(expert_name)
+                            expert_count_per_rank[target] += 1
+                            assigned = True
+                
+                # If we've tried all targets and couldn't assign, we have a problem
+                if not assigned:
+                    raise RuntimeError(
+                        f"Could not assign expert {expert_name}. "
+                        f"GPU capacity: {expert_count_per_rank}, Host capacity: {host_expert_count}/{NUM_HOST_EXPERTS}"
                     )
+            
+            # Verify distribution for this layer
+            assert sum(expert_count_per_rank) + host_expert_count == NUM_TOTAL_EXPERTS, \
+                f"Layer {layer_idx} has incorrect expert count: {sum(expert_count_per_rank)} on GPUs, {host_expert_count} on host"
+
 
         # Build the bookkeeping of routed_expert location. routed_expert id -> device rank
         # i.e. 0-19 -> 0, 20-49 -> 1, etc.
-        self.expert_location = {}
-        for layer_idx in range(
-            self.hf_model_config.first_k_dense_replace,
-            self.model_config.num_hidden_layers,
-        ):
-            for rank_id in range(self.world_size):
-                for expert_idx in range(
-                    rank_id * NUM_LOCAL_EXPERT_PER_LAYER,
-                    (rank_id + 1) * NUM_LOCAL_EXPERT_PER_LAYER,
-                ):
-                    if expert_idx < self.model_config.num_local_experts:
-                        self.expert_location[
-                            "routed_expert_"
-                            + str(layer_idx)
-                            + "_"
-                            + str(expert_idx)
-                        ] = rank_id
+        
+        # self.expert_location = {}
+        # for layer_idx in range(
+        #     self.hf_model_config.first_k_dense_replace,
+        #     self.model_config.num_hidden_layers,
+        # ):
+        #     for rank_id in range(self.world_size):
+        #         for expert_idx in range(
+        #             rank_id * NUM_LOCAL_EXPERT_PER_LAYER,
+        #             (rank_id + 1) * NUM_LOCAL_EXPERT_PER_LAYER,
+        #         ):
+        #             if expert_idx < self.model_config.num_local_experts:
+        #                 self.expert_location[
+        #                     "routed_expert_"
+        #                     + str(layer_idx)
+        #                     + "_"
+        #                     + str(expert_idx)
+        #                 ] = rank_id
                 
                 
 

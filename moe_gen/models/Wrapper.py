@@ -498,17 +498,17 @@ class Expert_Wrapper(torch.nn.Module):
                     param.data = weights_dict[name]
         else:
             self.module.gate_proj.weight.data = deepseek_v3_dequantization(
-                self.fp8_gate.clone(),
+                self.fp8_gate,
                 self.weight_dequant_scale[
                     "gate_proj.weight_scale_inv"
                 ],
             )
             self.module.down_proj.weight.data = deepseek_v3_dequantization(
-                self.fp8_down.clone(),
+                self.fp8_down,
                 self.weight_dequant_scale["down_proj.weight_scale_inv"],
             )
             self.module.up_proj.weight.data = deepseek_v3_dequantization(
-                self.fp8_up.clone(),
+                self.fp8_up,
                 self.weight_dequant_scale["up_proj.weight_scale_inv"],
             )
 

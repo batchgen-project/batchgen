@@ -228,9 +228,14 @@ void MoE_Gen::start_h2d_worker() {
 }
 
 
-void MoE_Gen::set_global_routed_experts_data_ptr(const py::dict& experts_IPC_handles)
+void MoE_Gen::set_global_routed_experts_data_ptr(
+    const py::dict& experts_IPC_handles,
+    const py::dict& expert_location_map)
 {
-    this->h2d_engine_.set_global_routed_experts_data_ptr(experts_IPC_handles);
+    this->h2d_engine_.set_global_routed_experts_data_ptr(
+        experts_IPC_handles,
+        expert_location_map
+    );
 }
 
 void MoE_Gen::cuda_enable_peer_access(int rank, int world_size){

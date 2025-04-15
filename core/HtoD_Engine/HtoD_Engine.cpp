@@ -68,9 +68,44 @@ void HtoD_Engine::cuda_enable_peer_access(int rank, int world_size){
     }
 }
 
+// void HtoD_Engine::setup_torch_dist_nccl_p2p(){
+//     // TODO:
+//     auto options = torch::distributed::ProcessGroupNCCL::Options();
+//     options.set_rank(this->engine_config_.basic_config.device);
+//     options.set_world_size(8);
+//     options.set_init_method("tcp://localhost:12355");
 
-void HtoD_Engine::set_global_routed_experts_data_ptr(const py::dict& experts_IPC_handles)
+//     torch::distributed::init_process_group(options);
+
+//     at::cuda::set_device(this->engine_config_.basic_config.device);
+
+//     // Enable peer access for all devices
+//     int world_size = torch::distributed::get_world_size();
+//     for(int i = 0; i < world_size; ++i) {
+//         if (i != this->engine_config_.basic_config.device) {
+//             int can_access = 0;
+//             cudaDeviceCanAccessPeer(&can_access, this->engine_config_.basic_config.device, i);
+//             if (can_access) {
+//                 cudaSetDevice(this->engine_config_.basic_config.device);
+//                 cudaDeviceEnablePeerAccess(i, 0);
+//             }
+//         }
+//     }
+//     this->logger_->info("Peer access enabled for all devices.");
+// }
+
+
+void HtoD_Engine::set_global_routed_experts_data_ptr(
+    const py::dict& experts_IPC_handles,
+    const py::dict& expert_location_map)
 {
+    // Set std::unordered_set<std::string> for local_expert_names
+    for (const auto& item : expert_location_map) {
+        std::string module_name = item.first.cast<std::string>();
+        int64_t location = item.second.cast<int64_t>();
+        this->expert_location_map_[module_name] = location;
+    }
+
     // reinterpret_cast ptrs to void* 
     for(auto& item : experts_IPC_handles) {
         std::string module_name = item.first.cast<std::string>();
@@ -466,90 +501,76 @@ void HtoD_Engine::HtoD_Worker() {
                 // Then we copy this through p2p NVLINK from another device. 
                 // Otherwise we copy it from this->weights_storage_
 
-                if (module_name.substr(0, 13) == "routed_expert") {
-                    // Find the last two underscores
-                    size_t last_underscore = module_name.rfind('_');
-                    size_t second_last_underscore =
-                        module_name.rfind('_', last_underscore - 1);
-
-                    if (last_underscore != std::string::npos &&
-                        second_last_underscore != std::string::npos) {
-                        // Extract indices using the underscore positions
-                        std::string layer_str = module_name.substr(
-                            second_last_underscore + 1,
-                            last_underscore - second_last_underscore - 1);
-                        std::string expert_str =
-                            module_name.substr(last_underscore + 1);
-
-                        int64_t layer_idx = std::stoi(layer_str);
-                        int64_t expert_idx = std::stoi(expert_str);
-                        if (expert_idx < 120) {
-                            int64_t src_device_rank = expert_idx / 15;
-                            // int canAccess;
-                            // cudaDeviceCanAccessPeer(&canAccess, this->engine_config_.basic_config.device, src_device_rank);
-                            // if (!canAccess) {
-                            //     this->logger_->error("Device {} cannot access device {}", 
-                            //                         this->engine_config_.basic_config.device, src_device_rank);
-                            //     // Handle this case - either skip or use alternative transfer method
-                            // } else {
-                            //     // Check if peer access is already enabled
-                            //     cudaError_t peerAccessStatus = cudaDeviceEnablePeerAccess(src_device_rank, 0);
-                            //     if (peerAccessStatus == cudaErrorPeerAccessAlreadyEnabled) {
-                            //         // Peer access already enabled, ignore the error
-                            //         cudaGetLastError(); // Clear the error state
-                            //         this->logger_->info("Peer access already enabled between device {} and {}", 
-                            //                         this->engine_config_.basic_config.device, src_device_rank);
-                            //     } else if (peerAccessStatus != cudaSuccess) {
-                            //         // Handle other errors
-                            //         this->logger_->error("Failed to enable peer access from device {} to {}: {}",
-                            //                             this->engine_config_.basic_config.device, src_device_rank,
-                            //                             cudaGetErrorString(peerAccessStatus));
-                            //     }
-                            // }
+                if (this->expert_location_map_.find(module_name) ==
+                    this->expert_location_map_.end()) {
+                    // int canAccess;
+                    // cudaDeviceCanAccessPeer(&canAccess, this->engine_config_.basic_config.device, src_device_rank);
+                    // if (!canAccess) {
+                    //     this->logger_->error("Device {} cannot access device {}", 
+                    //                         this->engine_config_.basic_config.device, src_device_rank);
+                    //     // Handle this case - either skip or use alternative transfer method
+                    // } else {
+                    //     // Check if peer access is already enabled
+                    //     cudaError_t peerAccessStatus = cudaDeviceEnablePeerAccess(src_device_rank, 0);
+                    //     if (peerAccessStatus == cudaErrorPeerAccessAlreadyEnabled) {
+                    //         // Peer access already enabled, ignore the error
+                    //         cudaGetLastError(); // Clear the error state
+                    //         this->logger_->info("Peer access already enabled between device {} and {}", 
+                    //                         this->engine_config_.basic_config.device, src_device_rank);
+                    //     } else if (peerAccessStatus != cudaSuccess) {
+                    //         // Handle other errors
+                    //         this->logger_->error("Failed to enable peer access from device {} to {}: {}",
+                    //                             this->engine_config_.basic_config.device, src_device_rank,
+                    //                             cudaGetErrorString(peerAccessStatus));
+                    //     }
+                    // }
+                    int64_t& location = this->expert_location_map_[module_name];
+                    if(location != -1){
+                        auto src = this->global_device_experts_ptrs_[module_name];
+                        for(auto & [tensor_name, src_ptr] : src) {
+                            this->logger_->debug(
+                                "Copying module {} from device {} to device {}, srt ptr {}, dst ptr{}",
+                                    module_name, location,
+                                    this->engine_config_.basic_config.device,
+                                    src_ptr, dst[tensor_name].data_ptr());
+                            cudaError_t copyStatus = cudaMemcpyPeerAsync(
+                                dst[tensor_name].data_ptr(), this->engine_config_.basic_config.device,
+                                src_ptr, location,
+                                7168 * 2048,
+                                this->HtoD_stream
+                            );
                             
-                            auto src = this->global_device_experts_ptrs_[module_name];
-                            for(auto & [tensor_name, src_ptr] : src) {
-                                this->logger_->debug(
-                                    "Copying module {} from device {} to device {}, srt ptr {}, dst ptr{}",
-                                        module_name, src_device_rank,
-                                        this->engine_config_.basic_config.device,
-                                        src_ptr, dst[tensor_name].data_ptr());
-                                cudaError_t copyStatus = cudaMemcpyPeer(
-                                    dst[tensor_name].data_ptr(), this->engine_config_.basic_config.device,
-                                    src_ptr, src_device_rank,
-                                    7168 * 2048);  // 7168 * 2048 is the size of the tensor
-                                
-                                if (copyStatus != cudaSuccess) {
-                                    this->logger_->error("Failed to copy tensor {} from device {} to {}: {}",
-                                                    tensor_name, src_device_rank, this->engine_config_.basic_config.device,
-                                                    cudaGetErrorString(copyStatus));
-                                }
+                            if (copyStatus != cudaSuccess) {
+                                this->logger_->error("Failed to copy tensor {} from device {} to {}: {}",
+                                                tensor_name, location, this->engine_config_.basic_config.device,
+                                                cudaGetErrorString(copyStatus));
                             }
                         }
+                        CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
                     }
-                }
-                else{
-                    auto src = this->weights_storage_.get_module_weights_storage(
-                        module_name);
-                    torch::Tensor tmp_src;
-                    void* src_ptr;
-                    int64_t src_byte_size;
-                    for (auto& [tensor_name, host_tensor_storage] : src) {
-                        src_ptr = host_tensor_storage.data_ptr;
-                        src_byte_size = host_tensor_storage.byte_size;
-                        if (dst[tensor_name].defined() &&
-                            dst[tensor_name].has_storage()) {
-                            this->blocking_copy_(dst[tensor_name].data_ptr(),
-                                                src_ptr, src_byte_size);
-                        } else {
-                            this->logger_->error(
-                                "Tensor {} doesn't have valid storage",
-                                tensor_name);
-                            std::runtime_error("Tensor doesn't have valid storage");
+                    else{ // in this host
+                        auto src = this->weights_storage_.get_module_weights_storage(
+                            module_name);
+                        torch::Tensor tmp_src;
+                        void* src_ptr;
+                        int64_t src_byte_size;
+                        for (auto& [tensor_name, host_tensor_storage] : src) {
+                            src_ptr = host_tensor_storage.data_ptr;
+                            src_byte_size = host_tensor_storage.byte_size;
+                            if (dst[tensor_name].defined() &&
+                                dst[tensor_name].has_storage()) {
+                                this->blocking_copy_(dst[tensor_name].data_ptr(),
+                                                    src_ptr, src_byte_size);
+                            } else {
+                                this->logger_->error(
+                                    "Tensor {} doesn't have valid storage",
+                                    tensor_name);
+                                std::runtime_error("Tensor doesn't have valid storage");
+                            }
                         }
+                        this->logger_->debug("Copied module: {} to buffer: {}",
+                                            module_name, buffer_idx);
                     }
-                    this->logger_->debug("Copied module: {} to buffer: {}",
-                                        module_name, buffer_idx);
                 }
                 
                 this->gpu_weight_buffer_.weights_copy_complete(
@@ -564,3 +585,18 @@ void HtoD_Engine::HtoD_Worker() {
         }
     }
 };
+
+
+// void nccl_p2p_tensor_copy(
+//     const std::string& module_name,
+//     std::unordered_map<std::string, torch::Tensor> & dst,
+
+// ){
+//     int src_device = this->expert_location_map_[module_name];
+
+//     for(auto& [tensor_name, tensor_meta] : dst) {
+//         CUDA_CHECK(cudaSetDevice(src_device));
+//         auto src_tensor = 
+        
+
+// }
