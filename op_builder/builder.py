@@ -96,6 +96,9 @@ def get_default_compute_capabilities():
             compute_caps += ";8.0"
         else:
             compute_caps += ";8.0;8.6"
+        
+        if installed_cuda_version()[0] >= 12:
+            compute_caps += ";9.0"
     return compute_caps
 
 
@@ -118,7 +121,7 @@ cuda_minor_mismatch_ok = {
         "11.7",
         "11.8",
     ],
-    12: ["12.0", "12.1"],
+    12: ["12.0", "12.1", "12.2", "12.3", "12.4", "12.5", "12.6"],
 }
 
 
@@ -699,7 +702,10 @@ class CUDAOpBuilder(OpBuilder):
         version_ge_1_5 = []
         if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR > 4):
             version_ge_1_5 = ["-DVERSION_GE_1_5"]
-        return version_ge_1_1 + version_ge_1_3 + version_ge_1_5
+        version_ge_2_0 = []
+        if TORCH_MAJOR >= 2:
+            version_ge_2_0 = ["-DVERSION_GE_2_0"]
+        return version_ge_1_1 + version_ge_1_3 + version_ge_1_5 + version_ge_2_0
 
     def is_compatible(self, verbose=True):
         return super().is_compatible(verbose)

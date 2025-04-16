@@ -495,84 +495,28 @@ void HtoD_Engine::HtoD_Worker() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
                 auto dst = buffer.get();
-                // If the module is routed_expert and the expert id is less tna 200
-                // Which means it is located in another device.
-                // The device rank would be expert id // 25.
-                // Then we copy this through p2p NVLINK from another device. 
-                // Otherwise we copy it from this->weights_storage_
-
-                if (this->expert_location_map_.find(module_name) ==
-                    this->expert_location_map_.end()) {
-                    // int canAccess;
-                    // cudaDeviceCanAccessPeer(&canAccess, this->engine_config_.basic_config.device, src_device_rank);
-                    // if (!canAccess) {
-                    //     this->logger_->error("Device {} cannot access device {}", 
-                    //                         this->engine_config_.basic_config.device, src_device_rank);
-                    //     // Handle this case - either skip or use alternative transfer method
-                    // } else {
-                    //     // Check if peer access is already enabled
-                    //     cudaError_t peerAccessStatus = cudaDeviceEnablePeerAccess(src_device_rank, 0);
-                    //     if (peerAccessStatus == cudaErrorPeerAccessAlreadyEnabled) {
-                    //         // Peer access already enabled, ignore the error
-                    //         cudaGetLastError(); // Clear the error state
-                    //         this->logger_->info("Peer access already enabled between device {} and {}", 
-                    //                         this->engine_config_.basic_config.device, src_device_rank);
-                    //     } else if (peerAccessStatus != cudaSuccess) {
-                    //         // Handle other errors
-                    //         this->logger_->error("Failed to enable peer access from device {} to {}: {}",
-                    //                             this->engine_config_.basic_config.device, src_device_rank,
-                    //                             cudaGetErrorString(peerAccessStatus));
-                    //     }
-                    // }
-                    int64_t& location = this->expert_location_map_[module_name];
-                    if(location != -1){
-                        auto src = this->global_device_experts_ptrs_[module_name];
-                        for(auto & [tensor_name, src_ptr] : src) {
-                            this->logger_->debug(
-                                "Copying module {} from device {} to device {}, srt ptr {}, dst ptr{}",
-                                    module_name, location,
-                                    this->engine_config_.basic_config.device,
-                                    src_ptr, dst[tensor_name].data_ptr());
-                            cudaError_t copyStatus = cudaMemcpyPeerAsync(
-                                dst[tensor_name].data_ptr(), this->engine_config_.basic_config.device,
-                                src_ptr, location,
-                                7168 * 2048,
-                                this->HtoD_stream
-                            );
-                            
-                            if (copyStatus != cudaSuccess) {
-                                this->logger_->error("Failed to copy tensor {} from device {} to {}: {}",
-                                                tensor_name, location, this->engine_config_.basic_config.device,
-                                                cudaGetErrorString(copyStatus));
-                            }
-                        }
-                        CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
-                    }
-                    else{ // in this host
-                        auto src = this->weights_storage_.get_module_weights_storage(
-                            module_name);
-                        torch::Tensor tmp_src;
-                        void* src_ptr;
-                        int64_t src_byte_size;
-                        for (auto& [tensor_name, host_tensor_storage] : src) {
-                            src_ptr = host_tensor_storage.data_ptr;
-                            src_byte_size = host_tensor_storage.byte_size;
-                            if (dst[tensor_name].defined() &&
-                                dst[tensor_name].has_storage()) {
-                                this->blocking_copy_(dst[tensor_name].data_ptr(),
-                                                    src_ptr, src_byte_size);
-                            } else {
-                                this->logger_->error(
-                                    "Tensor {} doesn't have valid storage",
-                                    tensor_name);
-                                std::runtime_error("Tensor doesn't have valid storage");
-                            }
-                        }
-                        this->logger_->debug("Copied module: {} to buffer: {}",
-                                            module_name, buffer_idx);
+                auto src = this->weights_storage_.get_module_weights_storage(
+                    module_name);
+                torch::Tensor tmp_src;
+                void* src_ptr;
+                int64_t src_byte_size;
+                for (auto& [tensor_name, host_tensor_storage] : src) {
+                    src_ptr = host_tensor_storage.data_ptr;
+                    src_byte_size = host_tensor_storage.byte_size;
+                    if (dst[tensor_name].defined() &&
+                        dst[tensor_name].has_storage()) {
+                        this->blocking_copy_(dst[tensor_name].data_ptr(),
+                                            src_ptr, src_byte_size);
+                    } else {
+                        this->logger_->error(
+                            "Tensor {} doesn't have valid storage",
+                            tensor_name);
+                        std::runtime_error("Tensor doesn't have valid storage");
                     }
                 }
-                
+                this->logger_->debug("Copied module: {} to buffer: {}",
+                                    module_name, buffer_idx);
+                    
                 this->gpu_weight_buffer_.weights_copy_complete(
                     module_type, module_name, buffer_idx);
                 /* PUSH THE TASK BACK */

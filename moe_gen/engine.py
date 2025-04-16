@@ -41,7 +41,7 @@ from .scheduler.host_mem import get_physical_memory_info
 from moe_gen.parameter_server_client import ParameterServerClient
 
 logging.basicConfig(
-    level=logging.INFO,  # Set to the lowest level to capture all messages
+    level=logging.DEBUG,  # Set to the lowest level to capture all messages
     format="%(asctime)s - %(levelname)s - %(message)s",  # Include timestamp
     datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
 )
@@ -806,6 +806,7 @@ class MoE_Gen:
             self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
             logging.info("Entering kv_storage creation...")
             self.core_engine.create_fake_kv_storage()
+            self.core_engine.start_h2d_worker()
             
             decoding_start_time = time.perf_counter()
             with torch.no_grad():
@@ -843,6 +844,8 @@ class MoE_Gen:
         self.core_engine.clear_weight_copy_queue()
         self.core_engine.reset_prefill_buffer()
         self.core_engine.reset_weight_copy_queue()
+        self.core_engine.start_h2d_worker()
+
 
         logging.info("Weight buffer cleared.")
         if "deepseek" in self.model_config.model_type:

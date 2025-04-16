@@ -113,7 +113,7 @@ KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
                                          cudaHostAllocDefault));
                 // memset random generated number to k_ptr
                 // fill_with_random_bf16_uniform(k_ptr, per_layer_storage_size, -0.5f, 0.5f);
-                memset(k_ptr, 0, per_layer_storage_size);
+                // memset(k_ptr, 0, per_layer_storage_size);
                 this->k_pinned_memory.push_back(k_ptr);
             }
         }

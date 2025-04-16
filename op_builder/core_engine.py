@@ -91,7 +91,7 @@ class CoreEngineBuilder(OpBuilder):
             SIMD_WIDTH,
             "-I/usr/local/cuda/include",
             "-L/usr/local/cuda/lib64",
-            "-D_GLIBCXX_USE_CXX11_ABI=0",
+            "-D_GLIBCXX_USE_CXX11_ABI=1",
             "-lcuda",
             "-lcudart",
             "-lcublas",

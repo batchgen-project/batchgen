@@ -1073,13 +1073,13 @@ class DeepSeek_Initializer:
         }
         self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
             "attn": 1,
-            "routed_expert": 128,
+            # "routed_expert": 128,
             "shared_expert": 1,
         }
         if total_memory > 32:
             self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
                 "attn": 1,
-                "routed_expert": 256,
+                "routed_expert": 16,
                 "shared_expert": 1,
             }
 
@@ -1186,7 +1186,8 @@ class DeepSeek_Initializer:
 
     def Init(self):
         try:
-            self._parse_state_dict()
+            self._init_torch_dist_nccl()
+            self._parse_state_dict_ep()
             logging.info("State dict parsed")
             self.core_engine = core_engine(
                 self.engine_config, self.model_config
@@ -1214,17 +1215,21 @@ class DeepSeek_Initializer:
             self._config_attn_module()
             self._config_expert_module()
             self._config_lm_head_hook()
-            self._synchronize_expert_pointers()
+            # self._synchronize_expert_pointers()
             # self._initialize_p2p_access()
             self.model.eval()
             self.model.to(self.engine_config.Basic_Config.device_torch)
             print(self.model, flush=True)
             
-            self.core_engine.cuda_enable_peer_access(self.rank, self.world_size)
-            logging.info("Peer access enabled")
-            self.core_engine.set_global_routed_experts_data_ptr(self.global_routed_experts_data_ptr, self.expert_location_map)
-            logging.info("Global Expert IPC Handle Set")
-            self.core_engine.start_h2d_worker()
+            if len(self.weight_copy_task["routed_expert"]) == 0:
+                self.weight_copy_task.pop("routed_expert")
+                
+            
+            # self.core_engine.cuda_enable_peer_access(self.rank, self.world_size)
+            # logging.info("Peer access enabled")
+            # self.core_engine.set_global_routed_experts_data_ptr(self.global_routed_experts_data_ptr, self.expert_location_map)
+            # logging.info("Global Expert IPC Handle Set")
+            # self.core_engine.start_h2d_worker()
             logging.info("Host to Device worker started")
         except Exception as e:
             logging.error(f"Error: {e}")
@@ -1319,7 +1324,7 @@ class DeepSeek_Initializer:
                     )
 
 
-    def _parse_state_dict(self):
+    def _parse_state_dict_round_robin(self):
         model_init_start_time = time.perf_counter()
         self.hf_model_config._attn_implementation = "eager"
         self.model = DeepseekV3ForCausalLM._from_config(
@@ -1337,9 +1342,9 @@ class DeepSeek_Initializer:
         # Each worker stores 20 experts per layer.
         # i.e. worker 0 stores experts 0-19, worker 1 stores experts 20-39, etc.
         # Thus the weight copy task for worker rank 0 would be: routed_expert 20 ~ the last one since the first 20 is local.
-# Alternative Expert Placement with Round-Robin Logic
+        # Alternative Expert Placement with Round-Robin Logic
 
-    # def distribute_experts_round_robin(self):
+        # def distribute_experts_round_robin(self):
         self.local_routed_experts = []
         self.expert_location_map = {}
 
@@ -1498,6 +1503,132 @@ class DeepSeek_Initializer:
                     #     + str(expert_idx)
                     # )
 
+
+    def _parse_state_dict_ep(self):
+        model_init_start_time = time.perf_counter()
+        self.hf_model_config._attn_implementation = "eager"
+        self.model = DeepseekV3ForCausalLM._from_config(
+            self.hf_model_config
+        ).to(self.engine_config.Basic_Config.device_torch)
+        self.model.eval()
+        logging.info(
+            f"torch module init time: {time.perf_counter() - model_init_start_time} s"
+        )
+
+        self.weight_copy_task["attn"] = []
+        self.weight_copy_task["routed_expert"] = []
+        self.weight_copy_task["shared_expert"] = []
+
+        # We have 8 devices and 256 experts per layer.
+        # Each devices is responsible for 32 experts. However, the device may not be able to hold all experts.
+        # In this case, we hold NUM_LOCAL_EXPERT_PER_LAYER in the GPU and the 32 - NUM_LOCAL_EXPERT_PER_LAYER in the host memory.
+        # So the self.local_routed_experts in just the names of experts in each rank's GPU.
+
+        self.local_routed_experts = []
+        self.host_routed_experts = []
+        # self.expert_location_map = {}
+
+        NUM_LOCAL_EXPERT_PER_LAYER = 30  # Per requirements: 15 experts per GPU per layer
+        NUM_TOTAL_EXPERTS = 256          # Total experts per layer
+
+
+        routed_expert_gpu_start_idx = self.rank * 32
+        routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
+        routed_expert_host_start_idx = routed_expert_gpu_end_idx
+        routed_expert_host_end_idx = (self.rank + 1) * 32
+        for layer_idx in range(
+            self.hf_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            # We split the 256 into 8 parts, each part is 32 experts.
+            # The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
+            # The rest of the experts in the part are stored in the host memory.
+            for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
+                self.local_routed_experts.append(
+                    "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+                )
+            for expert_idx in range(routed_expert_host_start_idx, routed_expert_host_end_idx):
+                self.host_routed_experts.append(
+                    "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+                )
+
+        self.weight_copy_task["routed_expert"] = self.host_routed_experts
+        # assert len(self.weight_copy_task["routed_expert"]) == 0
+
+
+        for layer_idx in trange(self.model_config.num_hidden_layers):
+            for name, _ in self.model.model.layers[
+                layer_idx
+            ].self_attn.named_parameters():
+                tensor_full_name = (
+                    "model.layers." + str(layer_idx) + ".self_attn." + name
+                )
+                self.state_dict_name_map[tensor_full_name] = {
+                    "module_key": "attn_" + str(layer_idx),
+                    "tensor_key": name,
+                }
+            self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
+
+            if layer_idx >= self.hf_model_config.first_k_dense_replace:
+                for name, _ in self.model.model.layers[
+                    layer_idx
+                ].mlp.shared_experts.named_parameters():
+                    tensor_full_name = (
+                        "model.layers."
+                        + str(layer_idx)
+                        + ".mlp.shared_experts."
+                        + name
+                    )
+                    self.state_dict_name_map[tensor_full_name] = {
+                        "module_key": "shared_expert_" + str(layer_idx),
+                        "tensor_key": name,
+                    }
+                self.weight_copy_task["shared_expert"].append(
+                    "shared_expert_" + str(layer_idx)
+                )
+
+                for expert_idx in range(self.model_config.num_local_experts):
+                    for name, _ in (
+                        self.model.model.layers[layer_idx]
+                        .mlp.experts[expert_idx]
+                        .named_parameters()
+                    ):
+                        tensor_full_name = (
+                            "model.layers."
+                            + str(layer_idx)
+                            + ".mlp.experts."
+                            + str(expert_idx)
+                            + "."
+                            + name
+                        )
+                        self.state_dict_name_map[tensor_full_name] = {
+                            "module_key": "routed_expert_"
+                            + str(layer_idx)
+                            + "_"
+                            + str(expert_idx),
+                            "tensor_key": name,
+                        }
+                    
+                    # if "routed_expert_" + str(layer_idx) + "_" + str(expert_idx) not in self.local_routed_experts:
+                    #     self.weight_copy_task["routed_expert"].append(
+                    #         "routed_expert_"
+                    #         + str(layer_idx)
+                    #         + "_"
+                    #         + str(expert_idx)
+                    #     )
+                    
+                    # self.weight_copy_task["routed_expert"].append(
+                    #     "routed_expert_"
+                    #     + str(layer_idx)
+                    #     + "_"
+                    #     + str(expert_idx)
+                    # )
+        # if len(self.weight_copy_task["routed_expert"]) == 0:
+        #     self.weight_copy_task.pop("routed_expert")
+
+    
+    
+    
     def _load_local_routed_experts(self):
         for routed_expert_idx in self.local_routed_experts:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
@@ -1513,6 +1644,7 @@ class DeepSeek_Initializer:
             self.model.model.layers[layer_idx].mlp.experts[expert_idx].down_proj.weight.data = tensors["down_proj.weight"].to(
                 self.engine_config.Basic_Config.device_torch
             )
+        logging.debug(f"Local routed experts loaded")
             
             
 
@@ -1669,20 +1801,21 @@ class DeepSeek_Initializer:
                     # device, handle, size, offset, view_size
                     # tmp_metas = layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()
                     # logging.info(tmp_metas)
-                    self.fp8_weights_IPC_handle[routed_expert_name]['gate_proj.weight'] = (
-                        layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()[0],
-                        layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()[1]
-                    )
-                    
-                    self.fp8_weights_IPC_handle[routed_expert_name]['up_proj.weight'] = (
-                        layer.mlp.experts[expert_idx].fp8_up.storage()._share_cuda_()[0],
-                        layer.mlp.experts[expert_idx].fp8_up.storage()._share_cuda_()[1]
-                    )
 
-                    self.fp8_weights_IPC_handle[routed_expert_name]['down_proj.weight'] = (
-                        layer.mlp.experts[expert_idx].fp8_down.storage()._share_cuda_()[0],
-                        layer.mlp.experts[expert_idx].fp8_down.storage()._share_cuda_()[1]
-                    )
+                    # self.fp8_weights_IPC_handle[routed_expert_name]['gate_proj.weight'] = (
+                    #     layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()[0],
+                    #     layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()[1]
+                    # )
+                    
+                    # self.fp8_weights_IPC_handle[routed_expert_name]['up_proj.weight'] = (
+                    #     layer.mlp.experts[expert_idx].fp8_up.storage()._share_cuda_()[0],
+                    #     layer.mlp.experts[expert_idx].fp8_up.storage()._share_cuda_()[1]
+                    # )
+
+                    # self.fp8_weights_IPC_handle[routed_expert_name]['down_proj.weight'] = (
+                    #     layer.mlp.experts[expert_idx].fp8_down.storage()._share_cuda_()[0],
+                    #     layer.mlp.experts[expert_idx].fp8_down.storage()._share_cuda_()[1]
+                    # )
                     
                     # _, self.fp8_weights_IPC_handle[routed_expert_name]['gate_proj.weight'],_,_,_ = layer.mlp.experts[expert_idx].fp8_gate.storage()._share_cuda_()
                     # _, self.fp8_weights_IPC_handle[routed_expert_name]['up_proj.weight'],_,_,_ = layer.mlp.experts[expert_idx].storage()._share_cuda_()
@@ -1740,6 +1873,15 @@ class DeepSeek_Initializer:
             self.global_routed_experts_data_ptr.update(process_dict)
         
         dist.barrier()
+
+    def _init_torch_dist_nccl(self):
+        dist.init_process_group(
+            backend="NCCL",
+            init_method="tcp://localhost:12355",
+            world_size=self.world_size,
+            rank = self.rank
+        )
+        torch.cuda.set_device(self.rank)
 
 
         
