@@ -68,7 +68,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("start_h2d_worker", &MoE_Gen::start_h2d_worker)
         .def("set_global_routed_experts_data_ptr",
              &MoE_Gen::set_global_routed_experts_data_ptr)
-        .def("cuda_enable_peer_access", &MoE_Gen::cuda_enable_peer_access);
+        .def("cuda_enable_peer_access", &MoE_Gen::cuda_enable_peer_access)
+        .def("save_compressed_kv", &MoE_Gen::save_compressed_kv);
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<>())

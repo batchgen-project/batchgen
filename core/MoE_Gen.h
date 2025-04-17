@@ -113,6 +113,7 @@ class MoE_Gen {
         const py::dict& expert_location_map
     );
     void cuda_enable_peer_access(int rank, int world_size);
+    void save_compressed_kv();
 
    private:
     EngineConfig engine_config_;

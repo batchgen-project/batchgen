@@ -759,3 +759,38 @@ void KV_Storage::create_fake_kv_storage() {
             "storage.");
     }
 }
+
+
+void KV_Storage::save_compressed_kv(){
+    // Save all the k in k_storage in a .pt file.
+    this->logger_->info("KV_Storage save_compressed_kv(): Saving compressed kv.");
+    std::vector<torch::Tensor> compressed_kv;
+    for (int64_t slot_idx = 0;
+         slot_idx < this->engine_config_.kv_storage_config.num_host_slots;
+         slot_idx++) {
+        for (int64_t layer_idx = 0;
+             layer_idx < this->model_config_.num_hidden_layers;
+             layer_idx++) {
+            auto k_ptr = this->k_storage[slot_idx][layer_idx].start_ptr;
+            auto k_size = this->k_storage[slot_idx][layer_idx].used_byte_size;
+            auto k_tensor = torch::from_blob(
+                k_ptr,                                     // pointer to data
+                {1, k_size},                               // shape
+                torch::TensorOptions()
+                    .dtype(torch::kBFloat16)               // move dtype into TensorOptions
+                    .device(torch::kCPU)                   // device
+            ).clone();
+            // Fill the tensor with random data
+            // compressed_kv = torch::cat({compressed_kv, k_tensor}, 1);
+            compressed_kv.push_back(k_tensor);
+        }
+    }
+    // Concatenate all tensors in compressed_kv
+    auto t = torch::cat(compressed_kv, 0);
+    // Save the tensor with name compressed_kv_{device_id}.pt
+    std::string device_id = std::to_string(this->engine_config_.basic_config.device);
+    std::string file_name = "./compressed_kv_" + device_id + ".pt";
+    this->logger_->info("Saving to file: {}", file_name);
+    torch::save(t, file_name);
+    this->logger_->info("KV_Storage save_compressed_kv(): Compressed kv saved.");  
+}

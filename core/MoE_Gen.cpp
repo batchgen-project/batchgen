@@ -242,6 +242,10 @@ void MoE_Gen::cuda_enable_peer_access(int rank, int world_size){
     this->h2d_engine_.cuda_enable_peer_access(rank, world_size);
 }
 
+void MoE_Gen::save_compressed_kv(){
+    this->kv_storage_.save_compressed_kv();
+}
+
 #include <signal.h>
 static MoE_Gen* engine_instance = nullptr;
 void signalHandler(int signum) {

@@ -39,9 +39,11 @@ from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 from .scheduler.host_mem import get_physical_memory_info
 
 from moe_gen.parameter_server_client import ParameterServerClient
+from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+from tqdm import trange
 
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to the lowest level to capture all messages
+    level=logging.INFO,  # Set to the lowest level to capture all messages
     format="%(asctime)s - %(levelname)s - %(message)s",  # Include timestamp
     datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
 )
@@ -794,6 +796,8 @@ class MoE_Gen:
             #     new_token = self.prefill(self.model_batches[model_batch_idx])
             # prefill_time += time.perf_counter() - prefill_start_time
             # self.core_engine.prefill_complete_sync()
+            # self.core_engine.save_compressed_kv()
+            # exit()
 
             # Random create new token.
             new_token = torch.randint(
@@ -836,18 +840,96 @@ class MoE_Gen:
         # logging.info(f"Peak memory allocated: {peak_memory}")
         return res
 
-    def prefill(self, batch: list[int]):
-        """
-        Handle the prefill for a full model batch.
-        """
+    def _parse_state_dict_dp(self):
+        model_init_start_time = time.perf_counter()
+        self.hf_model_config._attn_implementation = "eager"
+        self.model = DeepseekV3ForCausalLM._from_config(
+            self.hf_model_config
+        ).to(self.engine_config.Basic_Config.device_torch)
+        self.model.eval()
+        logging.info(
+            f"torch module init time: {time.perf_counter() - model_init_start_time} s"
+        )
+
+        self.weight_copy_task["attn"] = []
+        self.weight_copy_task["routed_expert"] = []
+        self.weight_copy_task["shared_expert"] = []
+
+        for layer_idx in trange(self.model_config.num_hidden_layers):
+            for name, _ in self.model.model.layers[
+                layer_idx
+            ].self_attn.named_parameters():
+                tensor_full_name = (
+                    "model.layers." + str(layer_idx) + ".self_attn." + name
+                )
+                self.state_dict_name_map[tensor_full_name] = {
+                    "module_key": "attn_" + str(layer_idx),
+                    "tensor_key": name,
+                }
+            self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
+
+            if layer_idx >= self.hf_model_config.first_k_dense_replace:
+                for name, _ in self.model.model.layers[
+                    layer_idx
+                ].mlp.shared_experts.named_parameters():
+                    tensor_full_name = (
+                        "model.layers."
+                        + str(layer_idx)
+                        + ".mlp.shared_experts."
+                        + name
+                    )
+                    self.state_dict_name_map[tensor_full_name] = {
+                        "module_key": "shared_expert_" + str(layer_idx),
+                        "tensor_key": name,
+                    }
+                self.weight_copy_task["shared_expert"].append(
+                    "shared_expert_" + str(layer_idx)
+                )
+
+                for expert_idx in range(self.model_config.num_local_experts):
+                    for name, _ in (
+                        self.model.model.layers[layer_idx]
+                        .mlp.experts[expert_idx]
+                        .named_parameters()
+                    ):
+                        tensor_full_name = (
+                            "model.layers."
+                            + str(layer_idx)
+                            + ".mlp.experts."
+                            + str(expert_idx)
+                            + "."
+                            + name
+                        )
+                        self.state_dict_name_map[tensor_full_name] = {
+                            "module_key": "routed_expert_"
+                            + str(layer_idx)
+                            + "_"
+                            + str(expert_idx),
+                            "tensor_key": name,
+                        }
+                    self.weight_copy_task["routed_expert"].append(
+                        "routed_expert_"
+                        + str(layer_idx)
+                        + "_"
+                        + str(expert_idx)
+                    )
+
+    def _config_prefill_dp(self):
         self.set_phase("prefill")
+        # # Step 1: Config Weight Copy Task.
+        # self._parse_state_dict_dp()
+        # # Step 2: Load Model Skeleton
         self.core_engine.clear_weight_copy_queue()
         self.core_engine.reset_prefill_buffer()
         self.core_engine.reset_weight_copy_queue()
         self.core_engine.start_h2d_worker()
 
+    def prefill(self, batch: list[int]):
+        """
+        Handle the prefill for a full model batch.
+        """
+        self._config_prefill_dp()
 
-        logging.info("Weight buffer cleared.")
         if "deepseek" in self.model_config.model_type:
             self.model.model._use_flash_attention_2 = False
 

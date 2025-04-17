@@ -69,6 +69,7 @@ class KV_Storage {
 
     void clear_kv_storage();
     void create_fake_kv_storage();
+    void save_compressed_kv();
 
    private:
     /* Template */
