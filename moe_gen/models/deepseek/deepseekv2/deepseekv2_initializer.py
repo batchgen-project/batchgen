@@ -38,6 +38,7 @@ except ImportError:
     # jit compile
     from core_engine import MoE_Gen as core_engine
 from moe_gen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+import torch.nn.functional as F
 
 # current_dir = os.path.dirname(os.path.abspath(__file__))
 # sys.append(current_dir)
@@ -45,6 +46,13 @@ from .modeling_deepseek_v2 import (
     DeepseekV2ForCausalLM,
     apply_rotary_pos_emb,
     rotate_half,
+)
+from moe_gen.models.utils import (
+    get_valid_token_mask_from_causal_mask,
+    flash_attn_varlen_func,
+    index_first_axis,
+    pad_input,
+    _get_unpad_data
 )
 
 
@@ -164,6 +172,95 @@ def _Post_Attn(self, attn_output):
     return attn_output
 
 
+
+
+def prefill_attn_fa(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+):
+    indices, cu_seqlens, max_seqlen_in_batch = _get_unpad_data(
+        get_valid_token_mask_from_causal_mask(attention_mask)
+    )
+    bsz, q_len, _ = hidden_states.size()
+    if self.q_lora_rank is None:
+        q = self.q_proj(hidden_states)
+    else:
+        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+    q_nope, q_pe = torch.split(
+        q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+    )
+
+    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+
+    kv_len = compressed_kv.size(1)
+    assert kv_len == attention_mask.size(-1)
+    compressed_kv_ref, k_pe = torch.split(
+        compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+    )
+    k_pe = k_pe.view(bsz, kv_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+    kv = (
+        self.kv_b_proj(self.kv_a_layernorm(compressed_kv_ref))
+        .view(
+            bsz, kv_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        .transpose(1, 2)
+    )
+
+    k_nope, value_states = torch.split(
+        kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+    )
+    kv_seq_len = attention_mask.shape[-1]
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+
+    query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+    query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+    query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+    key_states = k_pe.new_empty(
+        bsz, self.num_heads, kv_seq_len, self.q_head_dim
+    )
+    key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+    key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+
+    query_states = query_states.transpose(1, 2) # [bsz, num_heads, q_len, q_head_dim] -> [bsz, q_len, num_heads, q_head_dim]
+    key_states = key_states.transpose(1, 2) # [bsz, num_heads, kv_len, k_head_dim] -> [bsz, kv_len, num_heads, k_head_dim]
+    value_states = value_states.transpose(1, 2) # [bsz, num_heads, kv_len, v_head_dim] -> [bsz, kv_len, num_heads, v_head_dim]
+
+    query_states = query_states.reshape(bsz * q_len, self.num_heads, self.q_head_dim)
+    query_states = index_first_axis(query_states, indices)
+
+    key_states = key_states.reshape(bsz * q_len, self.num_heads, self.q_head_dim)
+    key_states = index_first_axis(key_states, indices)
+
+    value_states = value_states.reshape(bsz * q_len, self.num_heads, self.v_head_dim)
+    value_states = index_first_axis(value_states, indices)
+
+    attn_output = flash_attn_varlen_func(
+        q=query_states,
+        k=key_states,
+        v=value_states,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen_in_batch,
+        max_seqlen_k=max_seqlen_in_batch,
+        softmax_scale=self.softmax_scale,
+        causal=True
+    )
+    attn_output = pad_input(
+        attn_output, indices, bsz, q_len
+    )
+    attn_output = attn_output.view(bsz, q_len, self.num_heads * self.v_head_dim)
+
+    print(f"{attn_output.shape=}")
+    print(f"{attn_output=}")
+
+    attn_output = self.o_proj(attn_output)
+    return attn_output, compressed_kv
+
 def prefill_attn(
     self,
     hidden_states: torch.Tensor,
@@ -251,6 +348,8 @@ def prefill_attn(
     attn_output = attn_output.reshape(
         bsz, q_len, self.num_heads * self.v_head_dim
     )
+    print(f"{attn_output.shape=}")
+    print(f"{attn_output=}")
 
     attn_output = self.o_proj(attn_output)
     return attn_output, compressed_kv
@@ -1021,7 +1120,8 @@ class DeepSeek_Initializer:
             setattr(
                 attn_module,
                 "prefill_attn",
-                types.MethodType(prefill_attn, attn_module),
+                # types.MethodType(prefill_attn, attn_module),
+                types.MethodType(prefill_attn_fa, attn_module),
             )
             setattr(
                 attn_module,

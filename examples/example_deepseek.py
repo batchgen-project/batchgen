@@ -47,7 +47,10 @@ if __name__ == "__main__":
         We recommend using the DeepSeek-V2-Lite-Chat model to get started.
         Feel free to experiment with other models by changing the hugging_face_checkpoint variable with above supported models.
     """
+    # hugging_face_checkpoint = "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1"
+    # hugging_face_checkpoint = "deepseek-ai/DeepSeek-R1"
     hugging_face_checkpoint = "deepseek-ai/DeepSeek-V2-Lite-Chat"
+
 
     """
         Step 2: Load dataset and apply chat template(prompt engineering).
@@ -56,7 +59,7 @@ if __name__ == "__main__":
     benchmark_name = "Muennighoff/flan"
     dataset = datasets.load_dataset(benchmark_name, split="train")
 
-    max_prompts = 1000
+    max_prompts = 1
     queries = dataset["inputs"][:max_prompts]
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -80,9 +83,9 @@ if __name__ == "__main__":
         huggingface_ckpt_name=hugging_face_checkpoint,
         queries=queries,
         max_input_length=512,
-        max_decoding_length=256,
+        max_decoding_length=10,
         device=[0],
-        host_kv_cache_size=50,
+        host_kv_cache_size=10,
     )
 
     """
