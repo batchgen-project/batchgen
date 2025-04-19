@@ -501,11 +501,11 @@ void KV_Storage::update_helper_(int64_t layer_idx,
             }
             CUDA_CHECK(cudaStreamSynchronize(this->d2h_engine_.DtoH_stream));
         } else {
-            if ((k.dtype() != torch::kBFloat16)) {
-                throw std::runtime_error(
-                    "KV_Storage update_helper_(): k.dtype and "
-                    "v.dtype should be torch::kBFloat16.");
-            }
+            // if ((k.dtype() != torch::kBFloat16)) {
+            //     throw std::runtime_error(
+            //         "KV_Storage update_helper_(): k.dtype and "
+            //         "v.dtype should be torch::kBFloat16.");
+            // }
             k = k.contiguous();
             // int64_t token_byte_size = this->model_config_.head_dim *
             // this->model_config_.num_key_value_heads * k.element_size();
@@ -573,6 +573,7 @@ std::vector<c10::BFloat16*> KV_Storage::get_k_ptrs(int64_t layer_idx,
                                                    std::vector<int64_t> batch) {
     try {
         std::vector<c10::BFloat16*> k_ptrs;
+        // std::vector<c10::Float8_e4m3fn*> k_ptrs;
         for (int64_t i = 0; i < static_cast<int64_t>(batch.size()); i++) {
             auto query_idx = batch[i];
             int64_t slot_idx = -1;
@@ -618,6 +619,65 @@ std::vector<c10::BFloat16*> KV_Storage::get_k_ptrs(int64_t layer_idx,
     catch (...) {
         this->logger_->debug(
             "KV_Storage get_k_ptrs(): Failed to update K and V to the "
+            "storage.");
+        throw std::runtime_error(
+            "KV_Storage: Failed to update K and V to the storage.");
+    }
+};
+
+
+std::vector<c10::Float8_e4m3fn*> KV_Storage::get_k_ptrs_fp8(
+    int64_t layer_idx,
+    std::vector<int64_t> batch) 
+{
+    try{
+        std::vector<c10::Float8_e4m3fn*> k_ptrs;
+        for (int64_t i = 0; i < static_cast<int64_t>(batch.size()); i++) {
+            auto query_idx = batch[i];
+            int64_t slot_idx = -1;
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+            }
+            c10::Float8_e4m3fn* k_ptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(
+                    this->per_element_mutex_[slot_idx *
+                                                this->model_config_
+                                                    .num_hidden_layers +
+                                            layer_idx]);
+                k_ptr = static_cast<c10::Float8_e4m3fn*>(
+                    this->k_storage[slot_idx][layer_idx].start_ptr);
+            }
+            k_ptrs.push_back(k_ptr);
+        }
+        return k_ptrs;
+    }
+    // Catch PyTorch/CUDA specific exceptions
+    catch (const c10::Error& e) {
+        this->logger_->debug("KV_Storage get_k_ptrs_fp8(): CUDA/PyTorch error: {}",
+                             e.what());
+        throw;
+    }
+    // Catch CUDA runtime errors
+    catch (const cudaError_t& err) {
+        this->logger_->debug("KV_Storage get_k_ptrs_fp8(): CUDA runtime error: {}",
+                             cudaGetErrorString(err));
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    // Catch standard C++ exceptions
+    catch (const std::exception& e) {
+        this->logger_->debug(
+            "KV_Storage get_k_ptrs_fp8(): Failed to update K and V to "
+            "the storage. Error: {}",
+            e.what());
+        throw std::runtime_error(
+            "KV_Storage: Failed to update K and V to the storage.");
+    }
+    // Catch any other unexpected errors
+    catch (...) {
+        this->logger_->debug(
+            "KV_Storage get_k_ptrs_fp8(): Failed to update K and V to the "
             "storage.");
         throw std::runtime_error(
             "KV_Storage: Failed to update K and V to the storage.");
@@ -744,7 +804,7 @@ void KV_Storage::create_fake_kv_storage() {
             for (int64_t layer_idx = 0;
                  layer_idx < this->model_config_.num_hidden_layers;
                  layer_idx++) {
-                this->k_storage[slot_idx][layer_idx].used_byte_size = 14000 * 576 * 2;
+                this->k_storage[slot_idx][layer_idx].used_byte_size = 14000 * 576;
                 this->k_storage[slot_idx][layer_idx].num_tokens = 13000;
                 this->query_idx_to_slot_idx_map[slot_idx] = slot_idx;
             }

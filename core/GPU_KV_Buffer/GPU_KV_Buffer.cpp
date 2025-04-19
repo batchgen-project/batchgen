@@ -145,17 +145,14 @@ void GPU_KV_Buffer::kv_copy_complete(int64_t layer_idx, int64_t micro_batch_idx,
     this->cv_.notify_all();
 };
 
+
+
 torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
                                    std::vector<int64_t> tensor_shape) {
     cudaSetDevice(this->engine_config_.basic_config.device);
     /* Sync */
     std::string key =
         std::to_string(layer_idx) + "_" + std::to_string(micro_batch_idx);
-    // Log kv_buffer_map_
-    // for(auto const& [key, val] : this->kv_buffer_map_){
-    // 	std::cout << "KV_buffer_map_: Key: " << key << " Val: " << val <<
-    // std::endl;
-    // }
     std::unique_lock<std::mutex> lock(this->mutex_);
     this->cv_.wait(lock, [this, key] {
         return this->kv_buffer_map_.find(key) != this->kv_buffer_map_.end();
@@ -164,7 +161,8 @@ torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
     // Note: kv buffer is always in bfloat16.
     auto option =
         torch::TensorOptions()
-            .dtype(torch::kBFloat16)
+            // .dtype(torch::kBFloat16)
+            .dtype(c10::kFloat8_e4m3fn)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);

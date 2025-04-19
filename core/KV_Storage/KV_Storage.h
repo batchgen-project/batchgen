@@ -66,6 +66,10 @@ class KV_Storage {
                                            std::vector<int64_t> batch);
     std::vector<c10::BFloat16*> get_v_ptrs(int64_t layer_idx,
                                            std::vector<int64_t> batch);
+    std::vector<c10::Float8_e4m3fn*> get_k_ptrs_fp8(
+        int64_t layer_idx,
+        std::vector<int64_t> batch
+    );
 
     void clear_kv_storage();
     void create_fake_kv_storage();

@@ -455,18 +455,18 @@ void HtoD_Engine::HtoD_Worker() {
                     this->kv_copy_task_queue_.wait_and_pop(task);
                     auto& [cur_batch, micro_batch_idx, layer_idx, byte_size] =
                         task;
-                    this->logger_->debug(
-                        "copying micro_batch_idx: {}, layer_idx: {}, "
-                        "byte_size: {}",
-                        micro_batch_idx, layer_idx, byte_size);
                     auto host_k_ptrs =
-                        this->kv_storage_.get_k_ptrs(layer_idx, cur_batch);
+                        this->kv_storage_.get_k_ptrs_fp8(layer_idx, cur_batch);
                     // auto host_v_ptrs =
                     // this->kv_storage_.get_v_ptrs(layer_idx, cur_batch);
                     int64_t k_offset = 0;
                     // int64_t v_offset = 0;
-                    int64_t k_byte_size = byte_size;
+                    int64_t k_byte_size = byte_size / 2; // TODO:
                     // int64_t v_byte_size = byte_size;
+                    this->logger_->debug(
+                        "copying micro_batch_idx: {}, layer_idx: {}, "
+                        "byte_size: {}",
+                        micro_batch_idx, layer_idx, k_byte_size);
                     for (int64_t i = 0; i < cur_batch.size(); i++) {
                         CUDA_CHECK(cudaMemcpyAsync(
                             dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,

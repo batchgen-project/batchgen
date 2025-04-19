@@ -762,6 +762,22 @@ def decoding_attn(
     )
 
 
+def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """
+    Dequantize the output of bf16_to_fp8_per_token back to BF16.
+    Inputs:
+      q     [bsz, seq, 576]  dtype=float8_e4m3fn
+      scale [bsz, seq]       dtype=float32
+    Returns:
+      x_bf16 [bsz, seq, 576] dtype=bfloat16
+    """
+    bsz, seq_len, dim = q.shape
+    M = bsz * seq_len
+    # flatten
+    q_flat = q.view(M, dim).float()               # upcast FP8→FP32
+    x_rec = q_flat * s.view(M, 1)             # rescale
+    return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)	
+
 @torch.no_grad()
 def cus_absorbed_mla_decoding_forward(
     self,
@@ -771,6 +787,19 @@ def cus_absorbed_mla_decoding_forward(
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
 ):
+    if past_key_states.dtype == torch.float8_e4m3fn:
+        # Dequantize past_key_states
+        # Random generate the scale
+        weight_scale_inv = torch.empty(
+            (past_key_states.size(0), past_key_states.size(1)),
+            device=past_key_states.device,
+            dtype=torch.float,
+        )
+        # past_key_states = past_key_states.to(torch.bfloat16)
+        past_key_states = compressed_kv_fp8_to_bf16_per_token(
+            past_key_states, weight_scale_inv
+        )
+
     bsz, q_len, _ = hidden_states.size()
 
     if self.q_lora_rank is None:
@@ -1014,8 +1043,7 @@ class DeepSeek_Initializer:
         self.engine_config.KV_Storage_Config.slot_byte_size = (
             self.engine_config.KV_Storage_Config.reserved_length
             * self.model_config.compressed_kv_dim
-            * 2
-        )  # KV saved in BFloat16. TODO.
+        )  # KV saved in FP8
         self.engine_config.KV_Storage_Config.num_host_slots = (
             self.host_kv_cache_byte_size
             // self.engine_config.KV_Storage_Config.slot_byte_size
@@ -1027,6 +1055,9 @@ class DeepSeek_Initializer:
         # logging.info(
         #     f"KV storage byte size: {self.engine_config.KV_Storage_Config.storage_byte_size}"
         # )
+        logging.info(
+            f"Number of host kv slots: {self.engine_config.KV_Storage_Config.num_host_slots}"
+        )
 
         self.engine_config.Module_Batching_Config.global_batch_size = min(
             self.engine_config.KV_Storage_Config.num_host_slots,
@@ -1062,9 +1093,10 @@ class DeepSeek_Initializer:
             )
         else:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
-        # logging.info(
-        #     f"attn_decoding_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size}"
-        # )
+        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 50
+        logging.info(
+            f"attn_decoding_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size}"
+        )
         self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size = self.engine_config.Module_Batching_Config.global_batch_size
         self.engine_config.Module_Batching_Config.expert_decoding_batch_size_upper_bound = 2048
 
@@ -1095,7 +1127,7 @@ class DeepSeek_Initializer:
                 "shared_expert": 1,
             }
 
-        self.engine_config.GPU_Buffer_Config.num_k_buffer = 2
+        self.engine_config.GPU_Buffer_Config.num_k_buffer = 1
         self.engine_config.GPU_Buffer_Config.num_v_buffer = 0
         self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens = (
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size

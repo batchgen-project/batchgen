@@ -20,6 +20,7 @@ from multiprocessing import shared_memory
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import torch
+import torch.distributed as dist
 from .engine import _config_torch_module_initializer
 _config_torch_module_initializer()
 # Configure logging
@@ -28,6 +29,15 @@ logging.basicConfig(
 	level=logging.INFO,
 	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+def _init_dist_process_group(rank, world_size):
+	if not dist.is_initialized():
+		dist.init_process_group(
+			backend="NCCL",
+			init_method="tcp://localhost:12355",
+			world_size=world_size,
+			rank = rank
+		)
 
 class ParameterServer:
 	def __init__(self, host='localhost', port=9090, model_name=None,
@@ -48,7 +58,8 @@ class ParameterServer:
 		self.server_socket = None
 		self.clients = []
 		self.running = False
-		
+
+		# _init_dist_process_group(0,1)
 		# Initial model parameters
 		self.initial_model_name = model_name
 		self.hf_cache_dir = hf_cache_dir

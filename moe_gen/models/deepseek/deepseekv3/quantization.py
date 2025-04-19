@@ -38,5 +38,5 @@ def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> tor
     M = bsz * seq_len
     # flatten
     q_flat = q.view(M, dim).float()               # upcast FP8→FP32
-    x_rec = q_flat * scale.view(M, 1)             # rescale
+    x_rec = q_flat * s.view(M, 1)             # rescale
     return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)	
