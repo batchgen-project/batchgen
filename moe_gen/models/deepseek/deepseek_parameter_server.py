@@ -54,7 +54,7 @@ class DeepSeek_Parameter_Server:
             huggingface_ckpt_name, trust_remote_code=True
         )
 
-        logging.info("Have we reached here?")
+
 
 
 
@@ -63,7 +63,6 @@ class DeepSeek_Parameter_Server:
     def Init(self):
         self._save_safetensors_to_pt()
         self._parse_state_dict()
-        logging.info("Have we reached here 2 ?")
         self.parameter_server = Parameter_Server()
         if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
             if "DeepSeek-V2-Lite" in self.huggingface_ckpt_name:
@@ -102,7 +101,6 @@ class DeepSeek_Parameter_Server:
         return self.shm_name, self.tensor_meta_shm_name
 
     def _parse_state_dict(self):
-        logging.info("Have we reached here 3?")
         self.hf_model_config._attn_implementation = "eager"
         if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
             model = DeepseekV2ForCausalLM._from_config(self.hf_model_config)
@@ -111,7 +109,6 @@ class DeepSeek_Parameter_Server:
         else:
             raise ValueError("Unknown model architecture")
         model.eval()
-        logging.info("Have we reached here 4?")
 
         self.weight_copy_task["attn"] = []
         self.weight_copy_task["routed_expert"] = []

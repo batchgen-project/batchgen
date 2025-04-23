@@ -57,6 +57,7 @@ except ImportError:
     pass
 
 from moe_gen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+from flash_mla import get_mla_metadata, flash_mla_with_kvcache
 
 # current_dir = os.path.dirname(os.path.abspath(__file__))
 # sys.append(current_dir)
@@ -778,6 +779,521 @@ def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> tor
     x_rec = q_flat * s.view(M, 1)             # rescale
     return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)	
 
+@torch.inference_mode()
+def FlashMLA_DeepSeekR1(
+    self,
+    hidden_states: torch.Tensor,
+    past_key_states: torch.Tensor,
+    past_value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+):
+    # logging.info(f"past_key_states shape: {past_key_states.shape}")
+    # logging.info(f"attention_mask shape: {attention_mask.shape}")
+    # logging.info(f"attention_mask{attention_mask[0]}")
+
+    attention_mask = attention_mask.squeeze(1).squeeze(1)  # [bsz,seq_len]
+    attention_mask = (attention_mask == 0).to(hidden_states.dtype)
+    # logging.info(f"attention_mask{attention_mask[0]}")
+    bsz, q_len, _ = hidden_states.size()
+    if past_key_states.dtype == torch.float8_e4m3fn:
+        # Dequantize past_key_states
+        # Random generate the scale
+        weight_scale_inv = torch.empty(
+            (past_key_states.size(0), past_key_states.size(1)),
+            device=past_key_states.device,
+            dtype=torch.float,
+        )
+        # past_key_states = past_key_states.to(torch.bfloat16)
+        past_key_states = compressed_kv_fp8_to_bf16_per_token(
+            past_key_states, weight_scale_inv
+        )
+    
+    
+    q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+    q_nope, q_pe = torch.split(
+        q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+    )
+
+    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+    compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
+    kv_len = compressed_kv_ref.size(1)
+    assert kv_len == attention_mask.size(-1)
+    compressed_kv_ref, k_pe = torch.split(
+        compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+    )
+    compressed_kv_ref = self.kv_a_layernorm(compressed_kv_ref)
+
+    k_pe = k_pe.view(bsz, 1, kv_len, self.qk_rope_head_dim)
+    cos, sin = self.rotary_emb(k_pe, seq_len=kv_len)
+    k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids)
+    
+    compressed_kv_ref = compressed_kv_ref.view(
+        bsz, 1, kv_len, self.kv_lora_rank
+    )
+    # Concat k_pe back to compressed_kv_ref
+    compressed_kv_ref = torch.cat(
+        [compressed_kv_ref, k_pe], dim=-1
+    ).view(bsz, kv_len, 1, 576)
+
+    
+
+    kv_b_proj = self.kv_b_proj.weight.view(
+        self.num_heads, -1, self.kv_lora_rank
+    )
+    q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+    out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+    q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids[:, -1].unsqueeze(-1))
+    
+
+    qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+    query_states = torch.empty(
+        bsz, self.num_heads, q_len, qk_head_dim,
+        dtype=compressed_kv_ref.dtype,
+        device=compressed_kv_ref.device,
+    )
+
+    # query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+    query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+    query_states[:, :, :, self.kv_lora_rank :] = q_pe
+    query_states = query_states.view(
+        bsz, q_len, self.num_heads, qk_head_dim
+    )
+
+    # key_states = k_pe.new_empty(bsz, self.num_heads, kv_len, qk_head_dim)
+    # key_states[:, :, :, : self.kv_lora_rank] = compressed_kv.unsqueeze(1)
+    # key_states[:, :, :, self.kv_lora_rank :] = k_pe
+
+
+    # start = torch.cuda.Event(enable_timing=True)
+    # end = torch.cuda.Event(enable_timing=True)
+    # start.record()
+    # Create a block table for the key states
+    block_size = 64
+    cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+    
+    # max_seqlen = cache_seqlens.max().item()
+    cache_seqlens = torch.full(
+        (bsz,), kv_len, dtype=torch.int32, device=compressed_kv_ref.device
+    )
+    max_seqlen = kv_len
+    max_seqlen_pad = ((max_seqlen + block_size - 1) // block_size) * block_size
+    # logging.info(f"max_seqlen_pad: {max_seqlen_pad}")
+
+    # Pad the compressed_kv_ref tensor to the maximum sequence length
+    compressed_kv_ref = torch.cat(
+        [
+            compressed_kv_ref,
+            torch.full(
+                (bsz, max_seqlen_pad - kv_len, 1, compressed_kv_ref.size(-1)),
+                float("nan"),
+                dtype=compressed_kv_ref.dtype,
+                device=compressed_kv_ref.device,
+            ),
+        ],
+        dim=1,
+    )
+
+    block_table = torch.arange(
+        bsz * max_seqlen_pad // block_size, dtype=torch.int32
+    ).view(bsz, max_seqlen_pad // block_size).to(compressed_kv_ref.device)
+
+    blocked_k = compressed_kv_ref.view(
+        bsz * max_seqlen_pad // block_size, block_size, 1, compressed_kv_ref.size(-1)
+    )
+
+    # for i in range(bsz):
+    #     blocked_k.view(
+    #         bsz, max_seqlen_pad // block_size, block_size, 1, compressed_kv_ref.size(-1)
+    #     )[i, cache_seqlens[i].item():] = (
+    #         float("nan")
+    #     )
+
+    # block_table = torch.arange(
+    #     bsz * max_seqlen_pad // block_size, dtype=torch.int32
+    # ).view(bsz, max_seqlen_pad // block_size).to(compressed_kv_ref.device)
+
+    # num_blocks = block_table.numel()  # Total number of blocks
+
+    # # Create the blocked_k tensor
+    # blocked_k = torch.full(
+    #     (num_blocks, block_size, 1, compressed_kv_ref.size(-1)),
+    #     float('nan'),  # Pre-fill with NaN
+    #     dtype=compressed_kv_ref.dtype,
+    #     device=compressed_kv_ref.device
+    # )
+
+    # # Create a mask for valid tokens
+    # valid_mask = torch.zeros(bsz, max_seqlen_pad, dtype=torch.bool, device=compressed_kv_ref.device)
+    # for i in range(bsz):
+    #     valid_mask[i, :cache_seqlens[i]] = True
+
+    # # Reshape compressed_kv_ref to match padded dimensions
+    # padded_kv = torch.full(
+    #     (bsz, max_seqlen_pad, 1, compressed_kv_ref.size(-1)), 
+    #     float('nan'),
+    #     dtype=compressed_kv_ref.dtype,
+    #     device=compressed_kv_ref.device
+    # )
+
+    # # Only copy valid parts
+    # for i in range(bsz):
+    #     seq_len_i = cache_seqlens[i].item()
+    #     padded_kv[i, :seq_len_i] = compressed_kv_ref[i, :seq_len_i]
+
+    # # Convert to blocked format more efficiently
+    # block_indices = block_table.view(-1)
+    # for b_idx in range(num_blocks):
+    #     batch_idx = b_idx // (max_seqlen_pad // block_size)
+    #     block_in_batch_idx = b_idx % (max_seqlen_pad // block_size)
+    #     start_idx = block_in_batch_idx * block_size
+        
+    #     # Copy the whole block at once
+    #     blocked_k[block_indices[b_idx]] = padded_kv[batch_idx, start_idx:start_idx+block_size]
+
+
+
+
+
+     
+    
+
+    tile_scheduler_metadata, num_splits = get_mla_metadata(
+        cache_seqlens, 128, 1
+    )
+
+    """
+    flash_mla_with_kvcache
+    Arguments:
+        q: (batch_size, seq_len_q, num_heads_q, head_dim).
+        k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
+        block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
+        cache_seqlens: (batch_size), torch.int32.
+        head_dim_v: Head dimension of v.
+        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32, returned by get_mla_metadata.
+        num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
+        softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
+        causal: bool. Whether to apply causal attention mask.
+
+    Returns:
+        out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
+        softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
+    """
+    # logging.info(f"query_states shape: {query_states.shape}")
+    # logging.info(f"blocked_k shape: {blocked_k.shape}")
+    # cuda event record
+    # start = torch.cuda.Event(enable_timing=True)
+    # end = torch.cuda.Event(enable_timing=True)
+    # start.record()
+    try:
+        attn_out, attention_weights = flash_mla_with_kvcache(
+            query_states,
+            blocked_k,
+            block_table,
+            cache_seqlens,
+            512,
+            tile_scheduler_metadata,
+            num_splits,
+            self.softmax_scale,
+            False
+        )
+    except Exception as e:
+        logging.error(f"Error in flash_mla_with_kvcache: {e}")
+        raise
+    # end.record()
+    # torch.cuda.synchronize(dist.get_rank())
+    # elapsed_time = start.elapsed_time(end)
+    # logging.info(f"FlashMLA Elapsed time: {elapsed_time} ms")
+    # logging.info(f"attn_out shape: {attn_out.shape}")
+    # logging.info(f"out_absorb shape: {out_absorb.shape}")
+    # attn_output = torch.matmul(
+    #     attn_out, out_absorb.mT
+    # )  # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+    attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(
+        bsz, q_len, self.num_heads * self.v_head_dim
+    )
+    attn_output = self.o_proj(attn_output)
+
+    return (
+        attn_output,
+        compressed_kv,
+        torch.tensor([], device=hidden_states.device),
+    )
+
+@torch.inference_mode()
+def FlashMLA_DeepSeekR1_dep(
+    self,
+    hidden_states: torch.Tensor,
+    past_key_states: torch.Tensor,
+    past_value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+):
+    attention_mask = attention_mask.squeeze(1).squeeze(1)  # [bsz,seq_len]
+    attention_mask = (attention_mask == 0).to(hidden_states.dtype)
+    from flash_mla import get_mla_metadata, flash_mla_with_kvcache
+    bsz, q_len, _ = hidden_states.size()
+    if past_key_states.dtype == torch.float8_e4m3fn:
+        # Dequantize past_key_states
+        # Random generate the scale
+        weight_scale_inv = torch.empty(
+            (past_key_states.size(0), past_key_states.size(1)),
+            device=past_key_states.device,
+            dtype=torch.float,
+        )
+        # past_key_states = past_key_states.to(torch.bfloat16)
+        past_key_states = compressed_kv_fp8_to_bf16_per_token(
+            past_key_states, weight_scale_inv
+        )
+    
+    
+    q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+    q_nope, q_pe = torch.split(
+        q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+    )
+    # logging.info(f"q shape: {q.shape}")
+
+    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+    compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
+    kv_len = compressed_kv_ref.size(1)
+    assert kv_len == attention_mask.size(-1)
+    # compressed_kv_ref, k_pe = torch.split(
+    #     compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+    # )
+    # compressed_kv_ref = self.kv_a_layernorm(compressed_kv_ref)
+
+    # k_pe = k_pe.view(bsz, 1, kv_len, self.qk_rope_head_dim)
+    # cos, sin = self.rotary_emb(k_pe, seq_len=kv_len)
+    # k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids)
+    
+    # compressed_kv_ref = compressed_kv_ref.view(
+    #     bsz, 1, kv_len, self.kv_lora_rank
+    # )
+    # # Concat k_pe back to compressed_kv_ref
+    # compressed_kv_ref = torch.cat(
+    #     [compressed_kv_ref, k_pe], dim=-1
+    # ).view(bsz, kv_len, 1, 576)
+    compressed_kv_ref = compressed_kv_ref.view(
+        bsz, kv_len, 1, 576
+    )
+    
+
+    kv_b_proj = self.kv_b_proj.weight.view(
+        self.num_heads, -1, self.kv_lora_rank
+    )
+    q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+    out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+    # q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids[:, -1].unsqueeze(-1))
+    
+
+    qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+    query_states = torch.empty(
+        bsz, self.num_heads, q_len, qk_head_dim,
+        dtype=compressed_kv_ref.dtype,
+        device=compressed_kv_ref.device,
+    )
+
+    # query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+    query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+    query_states[:, :, :, self.kv_lora_rank :] = q_pe
+    query_states = query_states.view(
+        bsz, q_len, self.num_heads, qk_head_dim
+    )
+
+    # key_states = k_pe.new_empty(bsz, self.num_heads, kv_len, qk_head_dim)
+    # key_states[:, :, :, : self.kv_lora_rank] = compressed_kv.unsqueeze(1)
+    # key_states[:, :, :, self.kv_lora_rank :] = k_pe
+
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    # Create a block table for the key states
+    block_size = 64
+    cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+    
+    max_seqlen = cache_seqlens.max().item()
+    max_seqlen_pad = ((max_seqlen + block_size - 1) // block_size) * block_size
+
+    block_table = torch.arange(
+        bsz * max_seqlen_pad // block_size, dtype=torch.int32
+    ).view(bsz, max_seqlen_pad // block_size).to(compressed_kv_ref.device)
+
+    num_blocks = block_table.numel()  # Total number of blocks
+
+
+    # #Create the blocked_k tensor
+    # blocked_k = torch.zeros(
+    #     num_blocks, block_size, 1, compressed_kv_ref.size(-1), 
+    #     dtype=compressed_kv_ref.dtype, 
+    #     device=compressed_kv_ref.device
+    # )
+
+    # # Fill the blocked_k tensor
+    # for i in range(bsz):
+    #     # Get actual sequence length for this batch
+    #     seq_len_i = cache_seqlens[i].item()
+        
+    #     # Number of blocks for this sequence
+    #     num_blocks_i = (seq_len_i + block_size - 1) // block_size
+        
+    #     # For each block in this sequence
+    #     for j in range(num_blocks_i):
+    #         # Calculate start and end indices in the original sequence
+    #         start_idx = j * block_size
+    #         end_idx = min(start_idx + block_size, seq_len_i)
+            
+    #         # Calculate how many valid elements are in this block
+    #         valid_elements = end_idx - start_idx
+            
+    #         # Get the block index from block_table
+    #         block_idx = block_table[i, j].item()
+            
+    #         # Copy data to the block - ensure dimensions match
+    #         blocked_k[block_idx, :valid_elements] = compressed_kv_ref[i, start_idx:end_idx].view(valid_elements, 1, compressed_kv_ref.size(-1))
+            
+    #         # Fill the rest of the block with NaNs or zeros if needed
+    #         if valid_elements < block_size:
+    #             blocked_k[block_idx, valid_elements:] = float('nan')  # or 0.0
+    
+    end.record()
+    torch.cuda.synchronize(dist.get_rank())
+    elapsed_time = start.elapsed_time(end)
+    logging.info(f"Block creation Elapsed time: {elapsed_time} ms")
+    
+
+
+    # block_table = torch.arange(
+    #     bsz * max_seqlen_pad // block_size, dtype=torch.int32
+    # ).view(bsz, max_seqlen_pad // block_size).to(compressed_kv_ref.device)
+
+    # num_blocks = block_table.numel()  # Total number of blocks
+
+    # # Create the blocked_k tensor
+    # blocked_k = torch.full(
+    #     (num_blocks, block_size, 1, compressed_kv_ref.size(-1)),
+    #     float('nan'),  # Pre-fill with NaN
+    #     dtype=compressed_kv_ref.dtype,
+    #     device=compressed_kv_ref.device
+    # )
+
+    # # Create a mask for valid tokens
+    # valid_mask = torch.zeros(bsz, max_seqlen_pad, dtype=torch.bool, device=compressed_kv_ref.device)
+    # for i in range(bsz):
+    #     valid_mask[i, :cache_seqlens[i]] = True
+
+    # # Reshape compressed_kv_ref to match padded dimensions
+    # padded_kv = torch.full(
+    #     (bsz, max_seqlen_pad, 1, compressed_kv_ref.size(-1)), 
+    #     float('nan'),
+    #     dtype=compressed_kv_ref.dtype,
+    #     device=compressed_kv_ref.device
+    # )
+
+    # # Only copy valid parts
+    # for i in range(bsz):
+    #     seq_len_i = cache_seqlens[i].item()
+    #     padded_kv[i, :seq_len_i] = compressed_kv_ref[i, :seq_len_i]
+
+    # # Convert to blocked format more efficiently
+    # block_indices = block_table.view(-1)
+    # for b_idx in range(num_blocks):
+    #     batch_idx = b_idx // (max_seqlen_pad // block_size)
+    #     block_in_batch_idx = b_idx % (max_seqlen_pad // block_size)
+    #     start_idx = block_in_batch_idx * block_size
+        
+    #     # Copy the whole block at once
+    #     blocked_k[block_indices[b_idx]] = padded_kv[batch_idx, start_idx:start_idx+block_size]
+
+
+
+
+
+     
+    
+
+    tile_scheduler_metadata, num_splits = get_mla_metadata(
+        cache_seqlens, 128, 1
+    )
+
+    """
+    flash_mla_with_kvcache
+    Arguments:
+        q: (batch_size, seq_len_q, num_heads_q, head_dim).
+        k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
+        block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
+        cache_seqlens: (batch_size), torch.int32.
+        head_dim_v: Head dimension of v.
+        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32, returned by get_mla_metadata.
+        num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
+        softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
+        causal: bool. Whether to apply causal attention mask.
+
+    Returns:
+        out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
+        softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
+    """
+    # logging.info(f"query_states shape: {query_states.shape}")
+    # logging.info(f"blocked_k shape: {blocked_k.shape}")
+    # cuda event record
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    attn_out, attention_weights = flash_mla_with_kvcache(
+        query_states,
+        blocked_k,
+        block_table,
+        cache_seqlens,
+        512,
+        tile_scheduler_metadata,
+        num_splits,
+        self.softmax_scale,
+        False
+    )
+    end.record()
+    torch.cuda.synchronize(dist.get_rank())
+    elapsed_time = start.elapsed_time(end)
+    logging.info(f"FlashMLA Elapsed time: {elapsed_time} ms")
+    # logging.info(f"attn_out shape: {attn_out.shape}")
+    # logging.info(f"out_absorb shape: {out_absorb.shape}")
+    # attn_output = torch.matmul(
+    #     attn_out, out_absorb.mT
+    # )  # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+    attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(
+        bsz, q_len, self.num_heads * self.v_head_dim
+    )
+    attn_output = self.o_proj(attn_output)
+
+    return (
+        attn_output,
+        compressed_kv,
+        torch.tensor([], device=hidden_states.device),
+    )
+
+
+
 @torch.no_grad()
 def cus_absorbed_mla_decoding_forward(
     self,
@@ -1093,7 +1609,7 @@ class DeepSeek_Initializer:
             )
         else:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
-        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 50
+        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
         logging.info(
             f"attn_decoding_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size}"
         )
@@ -1117,13 +1633,13 @@ class DeepSeek_Initializer:
         }
         self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
             "attn": 1,
-            # "routed_expert": 128,
+            "routed_expert": 128,
             "shared_expert": 1,
         }
         if total_memory > 32:
             self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
                 "attn": 1,
-                "routed_expert": 16,
+                "routed_expert": 10,
                 "shared_expert": 1,
             }
 
@@ -1572,7 +2088,7 @@ class DeepSeek_Initializer:
         self.host_routed_experts = []
         # self.expert_location_map = {}
 
-        NUM_LOCAL_EXPERT_PER_LAYER = 30  # Per requirements: 15 experts per GPU per layer
+        NUM_LOCAL_EXPERT_PER_LAYER = 24  # Per requirements: 15 experts per GPU per layer
         NUM_TOTAL_EXPERTS = 256          # Total experts per layer
 
 
@@ -1721,11 +2237,18 @@ class DeepSeek_Initializer:
             #     "decoding_attn",
             #     types.MethodType(decoding_attn, attn_module),
             # )
+            # setattr(
+            #     attn_module,
+            #     "decoding_attn",
+            #     types.MethodType(
+            #         cus_absorbed_mla_decoding_forward, attn_module
+            #     ),
+            # )
             setattr(
                 attn_module,
                 "decoding_attn",
                 types.MethodType(
-                    cus_absorbed_mla_decoding_forward, attn_module
+                    FlashMLA_DeepSeekR1, attn_module
                 ),
             )
             setattr(
