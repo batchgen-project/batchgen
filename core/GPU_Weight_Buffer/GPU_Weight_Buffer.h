@@ -67,6 +67,7 @@ class GPU_Weight_Buffer {
 
     void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx);
     void reset_prefill_buffer();
+    void reset_decoding_buffer();
 
    private:
     EngineConfig& engine_config_;

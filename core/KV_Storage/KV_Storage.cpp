@@ -35,42 +35,53 @@
 #include <cstdint>
 #include <cstring>
 
-typedef uint16_t bf16;
-
-bf16 float_to_bf16(float f) {
-    uint32_t float_bits;
-    std::memcpy(&float_bits, &f, sizeof(float));
-    return static_cast<bf16>(float_bits >> 16);
+constexpr float FP8_MAX = 448.0f;
+std::tuple<at::Tensor, at::Tensor> per_token_quant(torch::Tensor x) {
+    /* 
+     * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per-token.
+     * Args:
+     *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
+     * Returns:
+     *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+     *   s: Scale factors [bsz, seq] with dtype float32
+     */
+    // TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, 
+    //             "Input tensor must be of dtype BFloat16");
+    // TORCH_CHECK(x.size(-1) == 576, 
+    //             "Last dimension of input tensor must be 576");
+    // TORCH_CHECK(x.is_contiguous(), 
+    //             "Input tensor must be contiguous");
+    // TORCH_CHECK(x.dim() == 3, 
+    //             "Input tensor must have 3 dimensions");
+    
+    const auto device = x.device();
+    const auto bsz = x.size(0);
+    const auto seq_len = x.size(1);
+    const auto dim = x.size(2);
+    const auto M = bsz * seq_len;
+    
+    // Cast to float32 and reshape for reduction
+    auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+    
+    // Compute max absolute value per token
+    auto amax = at::amax(at::abs(x_flat), /*dim=*/1);
+    amax = at::clamp(amax, /*min=*/1e-6f);
+    
+    // Compute scales
+    auto scale = amax / FP8_MAX;
+    
+    // Scale and cast to fp8
+    auto y = x_flat / scale.unsqueeze(1);
+    auto q = y.to(at::ScalarType::Float8_e4m3fn);
+    
+    // Reshape output tensors
+    q = q.view({bsz, seq_len, dim});
+    scale = scale.view({bsz, seq_len});
+    
+    return std::make_tuple(q, scale);
 }
 
-void fill_with_random_bf16_uniform(void* k_ptr, size_t per_layer_storage_size, 
-                                   float min_val = -1.0f, float max_val = 1.0f) {
-    size_t num_elements = per_layer_storage_size / sizeof(bf16);
-    bf16* bf16_ptr = static_cast<bf16*>(k_ptr);
-    
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> dist(min_val, max_val);
-    
-    for (size_t i = 0; i < num_elements; ++i) {
-        bf16_ptr[i] = float_to_bf16(dist(gen));
-    }
-}
 
-// Normal distribution variant
-void fill_with_random_bf16_normal(void* k_ptr, size_t per_layer_storage_size, 
-                                 float mean = 0.0f, float stddev = 1.0f) {
-    size_t num_elements = per_layer_storage_size / sizeof(bf16);
-    bf16* bf16_ptr = static_cast<bf16*>(k_ptr);
-    
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::normal_distribution<float> dist(mean, stddev);
-    
-    for (size_t i = 0; i < num_elements; ++i) {
-        bf16_ptr[i] = float_to_bf16(dist(gen));
-    }
-}
 
 KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
                        DtoH_Engine& d2h_engine)
@@ -110,10 +121,7 @@ KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
             for (auto layer_idx : bar) {
                 void* k_ptr = nullptr;
                 CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size,
-                                         cudaHostAllocDefault));
-                // memset random generated number to k_ptr
-                // fill_with_random_bf16_uniform(k_ptr, per_layer_storage_size, -0.5f, 0.5f);
-                // memset(k_ptr, 0, per_layer_storage_size);
+                                         cudaHostAllocDefault)); 
                 this->k_pinned_memory.push_back(k_ptr);
             }
         }
@@ -218,8 +226,10 @@ void KV_Storage::Init() {
 };
 
 void KV_Storage::offload(int64_t layer_idx,
-                         std::vector<int64_t> query_global_idx, torch::Tensor k,
-                         torch::Tensor v) {
+                         std::vector<int64_t> query_global_idx, 
+                         torch::Tensor k,
+                         torch::Tensor v) 
+{
     SAFE_CALL(
         [&]() {
             auto worker = std::thread(&KV_Storage::offload_helper_, this,
@@ -231,12 +241,13 @@ void KV_Storage::offload(int64_t layer_idx,
 
 void KV_Storage::offload_helper_(int64_t layer_idx,
                                  std::vector<int64_t> query_global_idx,
-                                 torch::Tensor k, torch::Tensor v) {
+                                 torch::Tensor bf16_k, torch::Tensor v) {
     this->logger_->debug("Offloading layer_idx: {}", layer_idx);
     try {
         if (this->model_config_.model_type.find("deepseek") ==
             std::string::npos) {
             /* Step 1: Permute k and v in the device. */
+            auto k = bf16_k;
             int64_t bsz = k.size(0);
             int64_t seq_len = k.size(2);
             int64_t k_seq_byte_size =
@@ -328,6 +339,15 @@ void KV_Storage::offload_helper_(int64_t layer_idx,
             this->logger_->debug("Offloading layer_idx: {} completed.",
                                  layer_idx);
         } else {
+            auto [k, k_quantize_scale] = per_token_quant(bf16_k);
+            // If k_quantize_scale[layer_idx] is torch.empty({0,0}), assign it to k_quantize_scale
+            // other wise concatenate it.
+            if (this->k_quantize_scale[layer_idx].numel() == 0) {
+                this->k_quantize_scale[layer_idx] = k_quantize_scale;
+            } else {
+                this->k_quantize_scale[layer_idx] = torch::cat(
+                    {this->k_quantize_scale[layer_idx], k_quantize_scale}, 0);
+            }
             /* Step 1: Permute k and v in the device. */
             int64_t bsz = k.size(0);
             int64_t seq_len = k.size(1);
@@ -422,10 +442,10 @@ void KV_Storage::offload_helper_(int64_t layer_idx,
 
 void KV_Storage::update(int64_t layer_idx,
                         std::vector<int64_t> query_global_indices,
-                        torch::Tensor k, torch::Tensor v) {
+                        torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale) {
     try {
         auto worker = std::thread(&KV_Storage::update_helper_, this, layer_idx,
-                                  query_global_indices, k, v);
+                                  query_global_indices, k, v, k_quantize_scale);
         worker.detach();
     } catch (const std::exception& e) {
         this->logger_->debug(
@@ -439,7 +459,7 @@ void KV_Storage::update(int64_t layer_idx,
 
 void KV_Storage::update_helper_(int64_t layer_idx,
                                 std::vector<int64_t> query_global_indices,
-                                torch::Tensor k, torch::Tensor v) {
+                                torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale) {
     try {
         CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
         if (this->model_config_.model_type.find("deepseek") ==
@@ -501,14 +521,9 @@ void KV_Storage::update_helper_(int64_t layer_idx,
             }
             CUDA_CHECK(cudaStreamSynchronize(this->d2h_engine_.DtoH_stream));
         } else {
-            // if ((k.dtype() != torch::kBFloat16)) {
-            //     throw std::runtime_error(
-            //         "KV_Storage update_helper_(): k.dtype and "
-            //         "v.dtype should be torch::kBFloat16.");
-            // }
+            this->k_quantize_scale[layer_idx] = torch::cat(
+                {this->k_quantize_scale[layer_idx], k_quantize_scale}, 1);
             k = k.contiguous();
-            // int64_t token_byte_size = this->model_config_.head_dim *
-            // this->model_config_.num_key_value_heads * k.element_size();
             int64_t k_token_byte_size =
                 k.size(1) * k.size(2) * k.element_size();
             this->logger_->debug("k_token_byte_size: {}", k_token_byte_size);
@@ -774,6 +789,15 @@ void KV_Storage::clear_kv_storage() {
                     this->k_storage[slot_idx][layer_idx].num_tokens = 0;
                     this->empty_slots.insert(slot_idx);
                 }
+            }
+            // Init empty tensors for quantization scale
+            for(auto layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
+                auto options = torch::TensorOptions()
+                    .dtype(torch::kFloat32)
+                    .device(this->engine_config_.basic_config.device_torch)
+                    .requires_grad(false);
+                torch::Tensor k_quantize_scale = torch::empty({0,0}, options);
+                this->k_quantize_scale.push_back(k_quantize_scale);
             }
         }
         this->logger_->debug(

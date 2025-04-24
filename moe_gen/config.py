@@ -53,6 +53,7 @@ class EngineConfig:
                 "padding_length": None,
                 "max_decoding_length": None,
                 "num_queries": None,
+                "kv_dtype": None,
             }
         )
 

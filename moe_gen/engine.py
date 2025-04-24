@@ -28,6 +28,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 import torch.multiprocessing as mp
+import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
@@ -51,7 +52,6 @@ logging.basicConfig(
 # nvtx = False
 # if nvtx:
 # 	nvidia_dlprof_pytorch_nvtx.init()
-
 
 class query:
     def __init__(
@@ -137,147 +137,6 @@ def _config_torch_module_initializer():
 def run_moe_gen(moe_gen):
     moe_gen.Init()
     return moe_gen.generate()
-
-
-def moe_gen_dep(
-    huggingface_ckpt_name: str,
-    queries: List[str],
-    max_input_length: int,
-    max_decoding_length: int,
-    device: List[int],
-    engine_config=EngineConfig(),
-    hf_cache_dir: Optional[str] = None,
-    cache_dir: Optional[str] = None,
-    pt_ckpt_dir: Optional[str] = None,
-    host_kv_cache_size: Optional[
-        int
-    ] = None,  # If not set, use all host memory.
-):
-    """
-    Launch multiple MoE_Gen instances on multiple GPUs.
-    """
-    mp.set_start_method("spawn", force=True)
-    mp.set_sharing_strategy("file_system")
-    _config_torch_module_initializer()
-    if hf_cache_dir is None:
-        # Use huggingface default dir.
-        from huggingface_hub import constants
-        hf_cache_dir = constants.HF_HUB_CACHE
-    
-    if cache_dir is None:
-        try:
-            logging.info("entering snapshot_download")
-            from huggingface_hub import snapshot_download
-
-            model_path = snapshot_download(
-                huggingface_ckpt_name,
-                cache_dir=hf_cache_dir,
-                ignore_patterns=["flax*", "tf*"],
-            )
-            logging.info("exiting snapshot_download")
-        except Exception as e:
-            logging.info(f"Error downloading model: {e}")
-            model_path = None
-
-        if model_path is None:
-            raise RuntimeError(
-                f"The `snapshot_download` function could not find the checkpoint {huggingface_ckpt_name}. "
-                f"Please provide a valid checkpoint."
-            )
-        else:
-            if cache_dir is None:
-                cache_dir = model_path
-
-    if pt_ckpt_dir is None:
-        pt_ckpt_dir = os.path.join(
-            hf_cache_dir, "pt_ckpt", huggingface_ckpt_name
-        )
-        if not os.path.exists(pt_ckpt_dir):
-            os.makedirs(pt_ckpt_dir)
-    else:
-        pt_ckpt_dir = os.path.join(pt_ckpt_dir, huggingface_ckpt_name)
-        if not os.path.exists(pt_ckpt_dir):
-            os.makedirs(pt_ckpt_dir)
-    logging.info(f"Will dump model parameters to: {pt_ckpt_dir}")
-
-    # Step 0: Start Parameter Server.
-    if "deepseek" in huggingface_ckpt_name:
-        parameter_server = DeepSeek_Parameter_Server(
-            huggingface_ckpt_name, cache_dir, pt_ckpt_dir
-        )
-    elif "Mixtral" in huggingface_ckpt_name:
-        from moe_gen.models.mixtral.mixtral_parameter_server import (
-            Mixtral_Parameter_Server,
-        )
-
-        parameter_server = Mixtral_Parameter_Server(
-            huggingface_ckpt_name, cache_dir, pt_ckpt_dir
-        )
-    else:
-        raise ValueError(
-            f"Model architecture {huggingface_ckpt_name} not supported yet."
-        )
-    shm_name, tensor_meta_shm_name = parameter_server.Init()
-    skeleton_state_dict = (
-        parameter_server.parameter_server.get_skeleton_state_dict()
-    )
-    parameter_server_size = parameter_server.parameter_server.byte_size()
-    logging.info(f"Parameter Server Size: {parameter_server_size}")
-
-    if host_kv_cache_size is None:
-        mem_info = get_physical_memory_info()
-        free_mem = mem_info["actually_free"]
-        host_kv_cache_size = math.floor(free_mem - parameter_server_size)
-        logging.info(f"Host KV Cache Size: {host_kv_cache_size}")
-
-    # Step 1: Create MoE_Gen instances. Each instance responsible for part of the queries.
-    moe_gens = []
-    num_queries = len(queries)
-    num_devices = len(device)
-    logging.info(f"Number of devices: {num_devices}")
-    logging.info(f"Toal number of queries: {num_queries}")
-    queries_per_device = math.ceil(num_queries / num_devices)
-    per_device_host_kv_cache_size = host_kv_cache_size // num_devices
-    for device_idx in range(num_devices):
-        start_query_idx = device_idx * queries_per_device
-        end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
-        device_engine_config = copy.deepcopy(engine_config)
-        device_engine_config.Basic_Config.device = device[device_idx]
-        device_engine_config.Basic_Config.device_torch = torch.device(
-            f"cuda:{device[device_idx]}"
-        )
-        moe_gen = MoE_Gen(
-            huggingface_ckpt_name=huggingface_ckpt_name,
-            hf_cache_dir=hf_cache_dir,
-            cache_dir=cache_dir,
-            queries=queries[start_query_idx:end_query_idx],
-            max_input_length=max_input_length,
-            max_decoding_length=max_decoding_length,
-            device=device[device_idx],
-            engine_config=device_engine_config,
-            skeleton_state_dict=skeleton_state_dict,
-            shm_name=shm_name,
-            tensor_meta_shm_name=tensor_meta_shm_name,
-            pt_ckpt_dir=pt_ckpt_dir,
-            host_kv_cache_size=per_device_host_kv_cache_size,
-        )
-        moe_gens.append(moe_gen)
-
-    logging.info(f"Number of MoE_Gen instances: {len(moe_gens)}")
-    # Step 2: Launch the MoE_Gen instances in parallel and preserve the input order.
-    start_time = time.perf_counter()
-    all_results = []
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        # Submit each worker and collect the future objects in a list.
-        futures = [
-            executor.submit(run_moe_gen, moe_gen) for moe_gen in moe_gens
-        ]
-        # Retrieve results in the same order as the futures were submitted.
-        for future in futures:
-            all_results.extend(future.result())
-    end_time = time.perf_counter()
-    # logging.info(f"Prefill + Decoding time: {end_time - start_time}")
-    return all_results
 
 
 # Entry point
@@ -494,6 +353,8 @@ class MoE_Gen:
         self.shm_name = shm_name
         self.tensor_meta_shm_name = tensor_meta_shm_name
 
+
+
     def Init(self):
         logging.info("Running with PID: %d", os.getpid())
         logging.info("Running with device: %s", self.device)
@@ -580,10 +441,26 @@ class MoE_Gen:
                 f"Model architecture {self.model_config.architectures[0]} not supported yet."
             )
 
-        self.core_engine, self.model, self.engine_config, self.model_config = (
+        self.core_engine, self.model, self.engine_config, self.model_config, self.hf_model_config = (
             self.initializer.Init()
         )
         self.vanilla_batching()
+        
+        
+        #TODO:
+        from .models.deepseek.deepseekv3.Parallel_Strategy_Manager import(  
+            Parallel_Strategy_Manager,
+        )
+        self.parallel_manager = Parallel_Strategy_Manager(
+            self.hf_model_config,
+            self.engine_config,
+            self.model_config,
+            self.core_engine,
+            self.skeleton_state_dict
+        )        
+        
+        
+        
         logging.info(f"Engine on device {self.device} initialized.")
 
     def _config_torch_module_initializer(self):
@@ -791,27 +668,27 @@ class MoE_Gen:
         for model_batch_idx in tqdm(
             range(len(self.model_batches)), desc="Model Batch"
         ):
+            self._config_prefill()
             prefill_start_time = time.perf_counter()
-            # with torch.no_grad():
-            #     new_token = self.prefill(self.model_batches[model_batch_idx])
-            # prefill_time += time.perf_counter() - prefill_start_time
-            # self.core_engine.prefill_complete_sync()
-            # self.core_engine.save_compressed_kv()
-            # exit()
+            with torch.no_grad():
+                new_token = self.prefill(self.model_batches[model_batch_idx])
+            prefill_time += time.perf_counter() - prefill_start_time
+            self.core_engine.prefill_complete_sync()
 
             # Random create new token.
-            new_token = torch.randint(
-                0,
-                1000,
-                # 129280, # self.model_config.vocab_size,
-                (len(self.model_batches[model_batch_idx]), 1),
-                device=self.torch_device,
-            )
-            self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
-            logging.info("Entering kv_storage creation...")
-            self.core_engine.create_fake_kv_storage()
-            self.core_engine.start_h2d_worker()
+            # new_token = torch.randint(
+            #     0,
+            #     1000,
+            #     # 129280, # self.model_config.vocab_size,
+            #     (len(self.model_batches[model_batch_idx]), 1),
+            #     device=self.torch_device,
+            # )
+            # self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
+            # logging.info("Entering kv_storage creation...")
+            # self.core_engine.create_fake_kv_storage()
+            # self.core_engine.start_h2d_worker()
             
+            self._config_decoding()
             decoding_start_time = time.perf_counter()
             with torch.no_grad():
                 logging.info(
@@ -820,6 +697,12 @@ class MoE_Gen:
                 self.decoding(new_token, self.model_batches[model_batch_idx])
             decoding_time += time.perf_counter() - decoding_start_time
             self.core_engine.clear_kv_storage()
+        
+        dist.barrier()
+        self.model = None 
+        torch.cuda.empty_cache()
+        dist.destroy_process_group()
+
         logging.info(f"Prefill total time: {prefill_time}")
         logging.info(f"Decoding total time: {decoding_time}")
         logging.info(f"Waiting for process clean up...")
@@ -914,22 +797,31 @@ class MoE_Gen:
                         + str(expert_idx)
                     )
 
-    def _config_prefill_dp(self):
+    def _config_prefill(self):
+        self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
         self.set_phase("prefill")
-        # # Step 1: Config Weight Copy Task.
-        # self._parse_state_dict_dp()
-        # # Step 2: Load Model Skeleton
+        self.core_engine.stop_h2d_worker()
         self.core_engine.clear_weight_copy_queue()
         self.core_engine.reset_prefill_buffer()
-        self.core_engine.reset_weight_copy_queue()
+        self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+        self.core_engine.clear_kv_storage()
+        self.core_engine.start_h2d_worker()
+    
+    def _config_decoding(self):
+        self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+        self.set_phase("decoding")
+        self.core_engine.stop_h2d_worker()
+        self.core_engine.clear_kv_copy_queue()
+        self.core_engine.clear_kv_buffer()
+        self.core_engine.clear_weight_copy_queue()
+        self.core_engine.reset_decoding_buffer()
+        self.core_engine.set_weight_copy_queue(self.weight_copy_task)
         self.core_engine.start_h2d_worker()
 
     def prefill(self, batch: list[int]):
         """
         Handle the prefill for a full model batch.
         """
-        self._config_prefill_dp()
-
         if "deepseek" in self.model_config.model_type:
             self.model.model._use_flash_attention_2 = False
 
@@ -1026,11 +918,6 @@ class MoE_Gen:
         return
                 - answer_set: dict[query_idx, decoded_tokens]
         """
-        self.set_phase("decoding")
-        self.core_engine.clear_kv_copy_queue()
-        logging.debug("KV copy queue cleared.")
-        self.core_engine.clear_kv_buffer()
-        logging.debug("KV buffer cleared.")
         if "deepseek" in self.model_config.model_type:
             self.model.model._use_flash_attention_2 = True
         new_token_idx = 1
@@ -1039,6 +926,10 @@ class MoE_Gen:
         #  	attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         # 	attention_mask = torch.where(attention_mask == 0, torch.finfo(torch.bfloat16).min, torch.tensor(0.0, dtype=torch.bfloat16, device=attention_mask.device))
         # Attn_Wrapper.attention_mask = attention_mask
+
+        # Log device memory usage
+        logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
+
         while new_token_idx < self.max_decoding_length and len(batch) > 0:
             logging.info(f"Decoding new token idx: {new_token_idx}")
             # Step 1: Before each round of decoding, review the attention mode and batching plan.

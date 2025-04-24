@@ -1,0 +1,450 @@
+from .modeling_deepseek_v3 import (
+	DeepseekV3ForCausalLM
+)
+from ...Wrapper import (
+	Attn_Wrapper,
+	Expert_Wrapper
+)
+import logging
+from .quantization import (
+	deepseek_v3_dequantization
+)
+from .utils import (
+	chunked_prefill_attn,
+	prefill_attn,
+	cus_absorbed_mla_decoding_forward,
+	FlashMLA_DeepSeekR1
+)
+import types
+import torch.distributed as dist	
+import time
+import torch 
+	
+
+
+class Parallel_Strategy_Manager:
+	def __init__(
+		self, 
+		hf_model_config, 
+		engine_config, 
+		model_config,
+		core_engine,
+		skeleton_state_dict
+	):
+		self.hf_model_config = hf_model_config
+		self.engine_config = engine_config
+		self.model_config = model_config
+		self.core_engine = core_engine
+		self.skeleton_state_dict = skeleton_state_dict
+		self.weight_copy_task = {}
+
+		self.rank = dist.get_rank()
+		self.world_size = dist.get_world_size()
+		
+	def configure_prefill(self):
+		"""
+			Configure a model skeletion for prefill pure dp 
+			and the corresponding weight copy task.
+		"""
+		self.hf_model_config.phase = "prefill"
+		self.model = DeepseekV3ForCausalLM._from_config(
+			self.hf_model_config
+		)
+		self.state_dict_name_map = {}
+		self.weight_copy_task = {}
+		self.weight_copy_task["attn"] = []
+		self.weight_copy_task["routed_expert"] = []
+		self.weight_copy_task["shared_expert"] = []
+
+		for layer_idx in range(self.model_config.num_hidden_layers):
+			for name, _ in self.model.model.layers[
+				layer_idx
+			].self_attn.named_parameters():
+				tensor_full_name = (
+					"model.layers." + str(layer_idx) + ".self_attn." + name
+				)
+				self.state_dict_name_map[tensor_full_name] = {
+					"module_key": "attn_" + str(layer_idx),
+					"tensor_key": name,
+				}
+			self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
+
+			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+				for name, _ in self.model.model.layers[
+					layer_idx
+				].mlp.shared_experts.named_parameters():
+					tensor_full_name = (
+						"model.layers."
+						+ str(layer_idx)
+						+ ".mlp.shared_experts."
+						+ name
+					)
+					self.state_dict_name_map[tensor_full_name] = {
+						"module_key": "shared_expert_" + str(layer_idx),
+						"tensor_key": name,
+					}
+				self.weight_copy_task["shared_expert"].append(
+					"shared_expert_" + str(layer_idx)
+				)
+
+				for expert_idx in range(self.model_config.num_local_experts):
+					for name, _ in (
+						self.model.model.layers[layer_idx]
+						.mlp.experts[expert_idx]
+						.named_parameters()
+					):
+						tensor_full_name = (
+							"model.layers."
+							+ str(layer_idx)
+							+ ".mlp.experts."
+							+ str(expert_idx)
+							+ "."
+							+ name
+						)
+						self.state_dict_name_map[tensor_full_name] = {
+							"module_key": "routed_expert_"
+							+ str(layer_idx)
+							+ "_"
+							+ str(expert_idx),
+							"tensor_key": name,
+						}
+					self.weight_copy_task["routed_expert"].append(
+						"routed_expert_"
+						+ str(layer_idx)
+						+ "_"
+						+ str(expert_idx)
+					)
+
+		# Load Model Skeleton
+		self._extract_dequantize_scale()
+		self._load_model_skeleton()
+		self._config_attn_module()
+		self._config_expert_module()
+		self._config_lm_head_hook()
+		self.model.eval()
+		self.model.to(self.engine_config.Basic_Config.device_torch)
+		return self.model, self.weight_copy_task
+
+
+	def configure_decoding(self):
+		"""
+			Configure a model skeletion for decoding, 
+			DP + EP 
+		"""
+		self.hf_model_config.phase = "decoding"
+		self.hf_model_config._attn_implementation = "eager"
+		self.model = DeepseekV3ForCausalLM._from_config(
+			self.hf_model_config
+		)
+		self.weight_copy_task = {}
+		self.state_dict_name_map = {}
+		self.weight_copy_task["attn"] = []
+		self.weight_copy_task["routed_expert"] = []
+		self.weight_copy_task["shared_expert"] = []
+
+		# We have 8 devices and 256 experts per layer.
+		# Each devices is responsible for 32 experts. However, the device may not be able to hold all experts.
+		# In this case, we hold NUM_LOCAL_EXPERT_PER_LAYER in the GPU and the 32 - NUM_LOCAL_EXPERT_PER_LAYER in the host memory.
+		# So the self.local_routed_experts in just the names of experts in each rank's GPU.
+
+		self.local_routed_experts = []
+		self.host_routed_experts = []
+		# self.expert_location_map = {}
+
+		NUM_LOCAL_EXPERT_PER_LAYER = 26  # Per requirements: 15 experts per GPU per layer
+		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
+
+
+		routed_expert_gpu_start_idx = self.rank * 32
+		routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
+		routed_expert_host_start_idx = routed_expert_gpu_end_idx
+		routed_expert_host_end_idx = (self.rank + 1) * 32
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			self.model_config.num_hidden_layers,
+		):
+			# We split the 256 into 8 parts, each part is 32 experts.
+			# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
+			# The rest of the experts in the part are stored in the host memory.
+			for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
+				self.local_routed_experts.append(
+					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+				)
+			for expert_idx in range(routed_expert_host_start_idx, routed_expert_host_end_idx):
+				self.host_routed_experts.append(
+					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+				)
+
+		self.weight_copy_task["routed_expert"] = self.host_routed_experts
+		# assert len(self.weight_copy_task["routed_expert"]) == 0
+
+
+		for layer_idx in range(self.model_config.num_hidden_layers):
+			for name, _ in self.model.model.layers[
+				layer_idx
+			].self_attn.named_parameters():
+				tensor_full_name = (
+					"model.layers." + str(layer_idx) + ".self_attn." + name
+				)
+				self.state_dict_name_map[tensor_full_name] = {
+					"module_key": "attn_" + str(layer_idx),
+					"tensor_key": name,
+				}
+			self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
+
+			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+				for name, _ in self.model.model.layers[
+					layer_idx
+				].mlp.shared_experts.named_parameters():
+					tensor_full_name = (
+						"model.layers."
+						+ str(layer_idx)
+						+ ".mlp.shared_experts."
+						+ name
+					)
+					self.state_dict_name_map[tensor_full_name] = {
+						"module_key": "shared_expert_" + str(layer_idx),
+						"tensor_key": name,
+					}
+				self.weight_copy_task["shared_expert"].append(
+					"shared_expert_" + str(layer_idx)
+				)
+
+				for expert_idx in range(self.model_config.num_local_experts):
+					for name, _ in (
+						self.model.model.layers[layer_idx]
+						.mlp.experts[expert_idx]
+						.named_parameters()
+					):
+						tensor_full_name = (
+							"model.layers."
+							+ str(layer_idx)
+							+ ".mlp.experts."
+							+ str(expert_idx)
+							+ "."
+							+ name
+						)
+						self.state_dict_name_map[tensor_full_name] = {
+							"module_key": "routed_expert_"
+							+ str(layer_idx)
+							+ "_"
+							+ str(expert_idx),
+							"tensor_key": name,
+						}
+		# Load Model Skeleton and Local Routed Experts
+		self._extract_dequantize_scale()
+		self._load_model_skeleton()
+		self._load_local_routed_experts()
+		self._config_attn_module()
+		self._config_expert_module()
+		self._config_lm_head_hook()
+		self.model.eval()
+		self.model.to(self.engine_config.Basic_Config.device_torch)
+		return self.model, self.weight_copy_task
+
+	
+	def _config_attn_module(self):
+		"""
+		- Configure the wrapper.
+		"""
+		start_time = time.perf_counter()
+		for layer_idx in range(len(self.model.model.layers)):
+			attn_module = self.model.model.layers[layer_idx].self_attn
+			# setattr(
+			#     attn_module,
+			#     "decoding_attn",
+			#     types.MethodType(decoding_attn, attn_module),
+			# )
+			# setattr(
+			# 	attn_module,
+			# 	"decoding_attn",
+			# 	types.MethodType(
+			# 		cus_absorbed_mla_decoding_forward, attn_module
+			# 	),
+			# )
+
+			setattr(
+				attn_module,
+				"decoding_attn",
+				types.MethodType(
+					FlashMLA_DeepSeekR1, attn_module
+				),
+			)
+			setattr(
+				attn_module,
+				"prefill_attn",
+				types.MethodType(chunked_prefill_attn, attn_module),
+			)
+			# setattr(
+			# 	attn_module,
+			# 	"prefill_attn_fp8",
+			# 	types.MethodType(prefill_attn_fp8, attn_module),
+			# )
+			if "attn_" + str(layer_idx) in self.weight_copy_task["attn"]:
+				get_weights = True
+			else:
+				get_weights = False
+			weight_dequant_scales = {}
+			prefix = "model.layers." + str(layer_idx) + ".self_attn."
+			postfix = ".weight_scale_inv"
+			for name, param in self.skeleton_state_dict.items():
+				if name.startswith(prefix) and name.endswith(postfix):
+					# Use simplified key: e.g: "q_a_proj.weight_scale_inv"
+					key = name[len(prefix) :]
+					weight_dequant_scales[key] = param.to(
+						self.engine_config.Basic_Config.device_torch
+					)
+			attn_wrapper_instance = Attn_Wrapper(
+				attn_module,
+				layer_idx,
+				self.core_engine,
+				self.engine_config,
+				self.model_config,
+				get_weights,
+				weight_dequant_scales,
+			)
+			self.model.model.layers[layer_idx].self_attn = attn_wrapper_instance
+		
+		end_time = time.perf_counter()
+		logging.info(
+			f"Attn module configuration time: {end_time - start_time:.2f} seconds"
+		)
+
+
+
+	def _load_local_routed_experts(self):
+		for routed_expert_idx in self.local_routed_experts:
+			tensors = self.core_engine.get_tensor(routed_expert_idx)
+			layer_idx = int(routed_expert_idx.split("_")[2])
+			expert_idx = int(routed_expert_idx.split("_")[3])
+			# logging.info(tensors.keys())
+			self.model.model.layers[layer_idx].mlp.experts[expert_idx].gate_proj.weight.data = tensors["gate_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			self.model.model.layers[layer_idx].mlp.experts[expert_idx].up_proj.weight.data = tensors["up_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			self.model.model.layers[layer_idx].mlp.experts[expert_idx].down_proj.weight.data = tensors["down_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+		logging.debug(f"Local routed experts loaded")
+
+	def _load_model_skeleton(self):
+		for key, param in self.model.named_parameters():
+			if key in self.skeleton_state_dict:
+				dequant_key = key + "_scale_inv"
+				if dequant_key in self.dequant_scale:
+					param.data = deepseek_v3_dequantization(
+						self.skeleton_state_dict[key],
+						self.dequant_scale[dequant_key],
+					)
+				else:
+					param.data = self.skeleton_state_dict[key]
+
+		model_skeletion_byte_size = (
+			sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+			* 2
+			/ (1024**3)
+		)
+		logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
+
+
+	def _config_expert_module(self):
+		"""
+		Replace expert module with the wrapper.
+		"""
+		start_time = time.perf_counter()
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			len(self.model.model.layers),
+		):
+			layer = self.model.model.layers[layer_idx]
+			if (
+				"shared_expert_" + str(layer_idx)
+				in self.weight_copy_task["shared_expert"]
+			):
+				get_weights = True
+			else:
+				get_weights = False
+
+			prefix = "model.layers." + str(layer_idx) + ".mlp.shared_experts."
+			postfix = ".weight_scale_inv"
+			weight_dequant_scales = {}
+			for name, param in self.skeleton_state_dict.items():
+				if name.startswith(prefix) and name.endswith(postfix):
+					key = name[len(prefix) :]
+					weight_dequant_scales[key] = param.to(
+						self.engine_config.Basic_Config.device_torch
+					)
+
+			layer.mlp.shared_experts = Expert_Wrapper(
+				layer.mlp.shared_experts,
+				layer_idx,
+				-1,
+				self.core_engine,
+				self.engine_config,
+				self.model_config,
+				get_weights,
+				weight_dequant_scales,
+			)
+			for expert_idx in range(len(layer.mlp.experts)):
+				if (
+					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+					in self.weight_copy_task["routed_expert"]
+				):
+					get_weights = True
+				else:
+					get_weights = False
+
+				prefix = (
+					"model.layers."
+					+ str(layer_idx)
+					+ ".mlp.experts."
+					+ str(expert_idx)
+					+ "."
+				)
+				postfix = ".weight_scale_inv"
+				weight_dequant_scales = {}
+				for name, param in self.skeleton_state_dict.items():
+					if name.startswith(prefix) and name.endswith(postfix):
+						key = name[len(prefix) :]
+						weight_dequant_scales[key] = param.to(
+							self.engine_config.Basic_Config.device_torch
+						)
+				layer.mlp.experts[expert_idx] = Expert_Wrapper(
+					layer.mlp.experts[expert_idx],
+					layer_idx,
+					expert_idx,
+					self.core_engine,
+					self.engine_config,
+					self.model_config,
+					get_weights,
+					weight_dequant_scales,
+				)
+				if get_weights == False:
+					layer.mlp.experts[expert_idx]._register_fp8_weights()
+					for key, value in layer.mlp.experts[expert_idx].weight_dequant_scale.items():
+						value = value.to(
+							self.engine_config.Basic_Config.device_torch
+						)
+					routed_expert_name = "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+					# self.fp8_weights_IPC_handle[routed_expert_name] = {}
+		end_time = time.perf_counter()
+		logging.info(
+			f"Expert module configuration time: {end_time - start_time:.2f} seconds"
+		)
+		
+
+	def _lm_head_forward_pre_hook(self, module, input):
+		return input[0][:, -1, :].unsqueeze(1)
+
+	def _config_lm_head_hook(self):
+		self.model.lm_head.register_forward_pre_hook(
+			self._lm_head_forward_pre_hook
+		)	
+
+	def _extract_dequantize_scale(self):
+		self.dequant_scale = {}
+		for key, param in self.skeleton_state_dict.items():
+			if "weight_scale_inv" in key:
+				self.dequant_scale[key] = param				

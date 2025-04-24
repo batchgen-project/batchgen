@@ -114,6 +114,12 @@ class MoE_Gen {
     );
     void cuda_enable_peer_access(int rank, int world_size);
     void save_compressed_kv();
+    void set_weight_copy_queue(
+        std::unordered_map<std::string, std::vector<std::string>>&
+            weight_copy_tasks);
+
+    void reset_decoding_buffer();
+    void stop_h2d_worker();
 
    private:
     EngineConfig engine_config_;

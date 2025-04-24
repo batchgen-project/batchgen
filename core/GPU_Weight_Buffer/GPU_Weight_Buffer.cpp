@@ -308,19 +308,6 @@ void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx,
 }
 
 void GPU_Weight_Buffer::reset_prefill_buffer() {
-    // // Clear and reset the number of buffer to prefill phase.
-    // this->Init();
-    // // Check size of the buffer
-    // this->logger_->debug("Number of routed expert buffer: {}",
-    // this->buffers_["routed_expert"].size());
-    // this->module_in_buffers_.clear(); this->logger_->debug("Number of
-    // module_in_buffers: {}", this->module_in_buffers_.size());
-    // // Print attn buffer status:
-    // for(int64_t buffer_idx = 0; buffer_idx <
-    // this->buffer_status_["routed_expert"].size(); buffer_idx++){
-    // 	this->logger_->debug("Buffer status: {}",
-    // this->buffer_status_["routed_expert"][buffer_idx]);
-    // }
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers =
         this->engine_config_.gpu_buffer_config
@@ -375,5 +362,65 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                     this->buffer_status_[module_type][buffer_idx]);
             }
         }
+    }
+}
+
+
+void GPU_Weight_Buffer::reset_decoding_buffer() {
+    auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
+    auto& num_buffers =
+        this->engine_config_.gpu_buffer_config
+            .num_decoding_module_buffer;  // {"attn": 1, "routed_expert": 160,
+                                          // "shared_expert": 1}
+    auto options =
+        torch::TensorOptions()
+            .dtype(this->engine_config_.basic_config.dtype_torch)
+            .device(torch::kCUDA, this->engine_config_.basic_config.device)
+            .requires_grad(false)
+            .memory_format(torch::MemoryFormat::Contiguous);
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        // reset the buffer size as the prefill buffer size.
+        this->buffers_["routed_expert"].clear();
+        this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
+        for (auto& [buffer_name, buffer_shape] :
+             buffer_shapes["routed_expert"]) {
+            for (int64_t buffer_idx = 0;
+                 buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
+                if (buffer_name.find("norm") == std::string::npos) {
+                    this->buffers_["routed_expert"][buffer_idx][buffer_name] =
+                        torch::zeros(buffer_shape, options);
+                } else {
+                    auto bf16_options =
+                        torch::TensorOptions()
+                            .dtype(torch::kBFloat16)
+                            .device(torch::kCUDA,
+                                    this->engine_config_.basic_config.device)
+                            .requires_grad(false)
+                            .memory_format(torch::MemoryFormat::Contiguous);
+                    this->buffers_["routed_expert"][buffer_idx][buffer_name] =
+                        torch::ones(buffer_shape, bf16_options);
+                }
+            }
+        }
+        this->module_in_buffers_.clear();
+
+        // Set all buffer status to 0.
+        for (auto& [module_type, num_buffer] : num_buffers) {
+            this->buffer_status_[module_type].clear();
+            this->buffer_status_[module_type].resize(num_buffer, 0);
+        }
+        // Log the buffer status and size of each buffer.
+        for (auto& [module_type, num_buffer] : num_buffers) {
+            this->logger_->debug("Module type: {}, Number of buffer: {}",
+                                 module_type, num_buffer);
+            for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
+                 buffer_idx++) {
+                this->logger_->debug(
+                    "Buffer_idx: {}, Buffer status: {}", buffer_idx,
+                    this->buffer_status_[module_type][buffer_idx]);
+            }
+        }
+        this->logger_->debug("Decoding buffer reset complete.");
     }
 }

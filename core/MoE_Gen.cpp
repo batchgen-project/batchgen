@@ -246,6 +246,21 @@ void MoE_Gen::save_compressed_kv(){
     this->kv_storage_.save_compressed_kv();
 }
 
+
+void MoE_Gen::set_weight_copy_queue(
+    std::unordered_map<std::string, std::vector<std::string>>&
+        weight_copy_tasks) {
+    this->h2d_engine_.set_weight_copy_queue(weight_copy_tasks);
+}
+
+void MoE_Gen::reset_decoding_buffer() {
+    this->gpu_weight_buffer_.reset_decoding_buffer();
+}
+
+void MoE_Gen::stop_h2d_worker() {
+    this->h2d_engine_.stop_h2d_worker();
+}
+
 #include <signal.h>
 static MoE_Gen* engine_instance = nullptr;
 void signalHandler(int signum) {

@@ -133,6 +133,8 @@ class DeepseekV3Config(PretrainedConfig):
 
     model_type = "deepseek_v3"
     keys_to_ignore_at_inference = ["past_key_values"]
+    phase = None
+    _name_or_path = "deepseek-ai/DeepSeek-R1"
 
     def __init__(
         self,
@@ -220,6 +222,10 @@ class DeepseekV3Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+
+        self.phase = None
+        self._name_or_path = "deepseek-ai/DeepSeek-R1"
+        self.architectures = ["DeepseekV3ForCausalLM"]
 
         super().__init__(
             pad_token_id=pad_token_id,

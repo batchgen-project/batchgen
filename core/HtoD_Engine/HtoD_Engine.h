@@ -65,6 +65,10 @@ class HtoD_Engine {
         const py::dict& experts_IPC_handles,
         const py::dict& expert_location_map);
     void cuda_enable_peer_access(int rank, int world_size);
+    void set_weight_copy_queue(
+        std::unordered_map<std::string, std::vector<std::string>>&
+            weight_copy_tasks);
+    void stop_h2d_worker();
     
 
    private:

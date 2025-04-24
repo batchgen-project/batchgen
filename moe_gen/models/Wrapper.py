@@ -24,6 +24,11 @@ import triton
 import triton.language as tl
 from transformers.cache_utils import DynamicCache
 import torch.distributed as dist
+from ..models.deepseek.deepseekv3.quantization import (
+    compressed_kv_bf16_to_fp8_per_token,
+    compressed_kv_fp8_to_bf16_per_token
+)
+
 
 
 
@@ -240,6 +245,7 @@ class Attn_Wrapper(torch.nn.Module):
     phase = "prefill"
     attn_mode = 0
     cur_batch = None
+    kv_quantization_factor = None
 
     def __init__(
         self,
@@ -260,6 +266,7 @@ class Attn_Wrapper(torch.nn.Module):
         self.get_weights = get_weights
         self.attn_module_id = "attn" + "_" + str(self.layer_idx)
         self.weight_dequant_scale = weight_dequant_scale
+
 
     def forward(self, *args, **kwargs):
         logging.debug(
@@ -385,6 +392,17 @@ class Attn_Wrapper(torch.nn.Module):
                     torch.cuda.current_stream().synchronize()
                     attn_output[cur_batch_start:cur_batch_end] = output[0]
 
+                # Quantization
+                # q_key, factor = compressed_kv_bf16_to_fp8_per_token(key_cache)
+                # if Attn_Wrapper.kv_quantization_factor is None:
+                #     Attn_Wrapper.kv_quantization_factor = [None for _ in range(self.model_config.num_hidden_layers)]
+                # if Attn_Wrapper.kv_quantization_factor[self.layer_idx] is None:
+                #     Attn_Wrapper.kv_quantization_factor[self.layer_idx] = factor
+                # else:
+                #     Attn_Wrapper.kv_quantization_factor[self.layer_idx] = torch.cat(
+                #         (Attn_Wrapper.kv_quantization_factor[self.layer_idx], factor),
+                #         dim=0,
+                #     )
                 self.core_engine.kv_offload(
                     self.layer_idx, cur_attn_batch, key_cache, value_cache
                 )
@@ -404,8 +422,8 @@ class Attn_Wrapper(torch.nn.Module):
             return attn_output, None, None
 
         elif Attn_Wrapper.phase == "decoding":
+            # logging.info(f"[Layer {self.layer_idx} - Attn_Wrapper] Decoding phase.")
             self.core_engine.clear_expert_buffer(self.layer_idx, 0)
-
             hidden_states = kwargs["hidden_states"]
             attention_mask = Attn_Wrapper.attention_mask
             position_ids = Attn_Wrapper.position_ids

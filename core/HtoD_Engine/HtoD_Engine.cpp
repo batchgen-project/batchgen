@@ -181,9 +181,13 @@ void HtoD_Engine::Init(
 };
 
 void HtoD_Engine::Start(){
-    this->terminate_flag_ = false;
-    this->HtoD_worker_ = std::thread(&HtoD_Engine::HtoD_Worker, this);
+    if (!this->HtoD_worker_.joinable()) {
+        this->terminate_flag_ = false;
+        this->HtoD_worker_ = std::thread(&HtoD_Engine::HtoD_Worker, this);
+    }
 }
+
+
 void HtoD_Engine::Terminate() {
     this->terminate_flag_ = true;
     if (this->HtoD_worker_.joinable()) {
@@ -228,135 +232,6 @@ void HtoD_Engine::blocking_copy_(void* dst, void* src, int64_t size) {
     // CUDA_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
 };
-
-// void HtoD_Engine::HtoD_Worker() {
-//     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-//     while (!terminate_flag_) {
-//         std::packaged_task<void()> task;
-//         while (on_demand_task_queue_.try_pop(task)) {
-//             task();
-//         }
-//         if (!this->kv_copy_task_queue_.empty()) {
-//             auto optional_buffer = this->gpu_kv_buffer_.acquireEmptyBuffer();
-//             if (optional_buffer.has_value()) {
-//                 if (this->model_config_.model_type.find("deepseek") ==
-//                     std::string::npos) {
-//                     // this->logger_->debug("DeepSeek model detected. Copying
-//                     // both K to GPU.");
-//                     auto [dst_k_ptr, dst_v_ptr, buffer_idx] =
-//                         optional_buffer.value();
-//                     std::tuple<std::vector<int64_t>, int64_t, int64_t, int64_t>
-//                         task;
-//                     this->kv_copy_task_queue_.wait_and_pop(task);
-//                     auto& [cur_batch, micro_batch_idx, layer_idx, byte_size] =
-//                         task;
-//                     this->logger_->debug(
-//                         "copying micro_batch_idx: {}, layer_idx: {}, "
-//                         "byte_size: {}",
-//                         micro_batch_idx, layer_idx, byte_size);
-//                     auto host_k_ptrs =
-//                         this->kv_storage_.get_k_ptrs(layer_idx, cur_batch);
-//                     auto host_v_ptrs =
-//                         this->kv_storage_.get_v_ptrs(layer_idx, cur_batch);
-//                     int64_t k_offset = 0;
-//                     int64_t v_offset = 0;
-//                     int64_t k_byte_size = byte_size;
-//                     int64_t v_byte_size = byte_size;
-//                     for (int64_t i = 0; i < cur_batch.size(); i++) {
-//                         CUDA_CHECK(cudaMemcpyAsync(
-//                             dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,
-//                             cudaMemcpyHostToDevice, this->HtoD_stream));
-//                         CUDA_CHECK(cudaMemcpyAsync(
-//                             dst_v_ptr + v_offset, host_v_ptrs[i], v_byte_size,
-//                             cudaMemcpyHostToDevice, this->HtoD_stream));
-//                         k_offset += k_byte_size;
-//                         v_offset += v_byte_size;
-//                     }
-//                     CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
-//                     this->gpu_kv_buffer_.kv_copy_complete(
-//                         layer_idx, micro_batch_idx, buffer_idx);
-//                     this->logger_->debug("Copied KV to buffer: {}", buffer_idx);
-//                 } else {
-//                     auto [dst_k_ptr, dst_v_ptr, buffer_idx] =
-//                         optional_buffer.value();
-//                     std::tuple<std::vector<int64_t>, int64_t, int64_t, int64_t>
-//                         task;
-//                     this->kv_copy_task_queue_.wait_and_pop(task);
-//                     auto& [cur_batch, micro_batch_idx, layer_idx, byte_size] =
-//                         task;
-//                     this->logger_->debug(
-//                         "copying micro_batch_idx: {}, layer_idx: {}, "
-//                         "byte_size: {}",
-//                         micro_batch_idx, layer_idx, byte_size);
-//                     auto host_k_ptrs =
-//                         this->kv_storage_.get_k_ptrs(layer_idx, cur_batch);
-//                     // auto host_v_ptrs =
-//                     // this->kv_storage_.get_v_ptrs(layer_idx, cur_batch);
-//                     int64_t k_offset = 0;
-//                     // int64_t v_offset = 0;
-//                     int64_t k_byte_size = byte_size;
-//                     // int64_t v_byte_size = byte_size;
-//                     for (int64_t i = 0; i < cur_batch.size(); i++) {
-//                         CUDA_CHECK(cudaMemcpyAsync(
-//                             dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,
-//                             cudaMemcpyHostToDevice, this->HtoD_stream));
-//                         k_offset += k_byte_size;
-//                     }
-//                     CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
-//                     this->gpu_kv_buffer_.kv_copy_complete(
-//                         layer_idx, micro_batch_idx, buffer_idx);
-//                     this->logger_->debug("Copied KV to buffer: {}", buffer_idx);
-//                 }
-//             }
-//         };
-
-//         for (auto& module_type :
-//              this->engine_config_.basic_config.module_types) {
-//             auto optional_buffer =
-//                 this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
-//             if (optional_buffer.has_value()) {
-//                 this->logger_->debug("Acquired buffer for module type: {}",
-//                                      module_type);
-//                 auto [buffer, buffer_idx] = optional_buffer.value();
-//                 std::string module_name;
-//                 while (this->weights_copy_task_queue_[module_type].try_pop(
-//                            module_name) == false) {
-//                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-//                 }
-//                 auto dst = buffer.get();
-//                 auto src = this->weights_storage_.get_module_weights_storage(
-//                     module_name);
-//                 torch::Tensor tmp_src;
-//                 void* src_ptr;
-//                 int64_t src_byte_size;
-//                 for (auto& [tensor_name, host_tensor_storage] : src) {
-//                     src_ptr = host_tensor_storage.data_ptr;
-//                     src_byte_size = host_tensor_storage.byte_size;
-//                     if (dst[tensor_name].defined() &&
-//                         dst[tensor_name].has_storage()) {
-//                         this->blocking_copy_(dst[tensor_name].data_ptr(),
-//                                              src_ptr, src_byte_size);
-//                     } else {
-//                         this->logger_->error(
-//                             "Tensor {} doesn't have valid storage",
-//                             tensor_name);
-//                         std::runtime_error("Tensor doesn't have valid storage");
-//                     }
-//                 }
-//                 this->logger_->debug("Copied module: {} to buffer: {}",
-//                                      module_name, buffer_idx);
-//                 this->gpu_weight_buffer_.weights_copy_complete(
-//                     module_type, module_name, buffer_idx);
-//                 /* PUSH THE TASK BACK */
-//                 {
-//                     std::lock_guard<std::mutex> lock(this->mutex_);
-//                     this->weights_copy_task_queue_[module_type].push(
-//                         module_name);
-//                 }
-//             }
-//         }
-//     }
-// };
 
 void HtoD_Engine::clear_kv_copy_queue() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
@@ -531,16 +406,24 @@ void HtoD_Engine::HtoD_Worker() {
 };
 
 
-// void nccl_p2p_tensor_copy(
-//     const std::string& module_name,
-//     std::unordered_map<std::string, torch::Tensor> & dst,
+void HtoD_Engine::set_weight_copy_queue(
+    std::unordered_map<std::string, std::vector<std::string>>&
+        weight_copy_tasks) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->weight_copy_tasks_ = weight_copy_tasks;
+    for (auto& item : weight_copy_tasks) {
+        auto module_type = item.first;
+        auto module_names = item.second;
+        this->weights_copy_task_queue_[module_type].clear();
+        for (auto& module_name : module_names) {
+            this->weights_copy_task_queue_[module_type].push(module_name);
+        }
+    }
+}
 
-// ){
-//     int src_device = this->expert_location_map_[module_name];
-
-//     for(auto& [tensor_name, tensor_meta] : dst) {
-//         CUDA_CHECK(cudaSetDevice(src_device));
-//         auto src_tensor = 
-        
-
-// }
+void HtoD_Engine::stop_h2d_worker() {
+    this->terminate_flag_ = true;
+    if (this->HtoD_worker_.joinable()) {
+        this->HtoD_worker_.join();
+    }
+}

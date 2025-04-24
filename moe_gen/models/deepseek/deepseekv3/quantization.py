@@ -40,3 +40,38 @@ def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> tor
     q_flat = q.view(M, dim).float()               # upcast FP8→FP32
     x_rec = q_flat * s.view(M, 1)             # rescale
     return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)	
+
+
+def deepseek_v3_dequantization(
+    weight_data_fp8: torch.Tensor,
+    weight_scale_inv_fp32: torch.Tensor,
+    block_size=(128, 128),
+) -> torch.Tensor:
+    """
+    Vectorized dequantization that removes Python-level loops
+    and leverages PyTorch's parallelism.
+    """
+    rows, cols = weight_data_fp8.shape
+    block_rows, block_cols = block_size
+
+    # Number of blocks in each dimension
+    n_block_rows = rows // block_rows
+    n_block_cols = cols // block_cols
+
+    # 1) Reshape weight data into 4D block form and cast to float32
+    #    shape becomes [n_block_rows, block_rows, n_block_cols, block_cols].
+    weight_4d = weight_data_fp8.reshape(
+        n_block_rows, block_rows, n_block_cols, block_cols
+    ).to(torch.float32)
+
+    # 2) Broadcast scale into 4D by unsqueezing along the second and fourth dimensions.
+    #    shape becomes [n_block_rows, 1, n_block_cols, 1].
+    scale_4d = weight_scale_inv_fp32.unsqueeze(1).unsqueeze(-1)
+
+    # 3) Multiply once using broadcasting
+    dequantized_4d = weight_4d * scale_4d
+
+    # 4) Reshape back to [rows, cols] and cast to bfloat16
+    dequantized_weight = dequantized_4d.reshape(rows, cols).to(torch.bfloat16)
+
+    return dequantized_weight

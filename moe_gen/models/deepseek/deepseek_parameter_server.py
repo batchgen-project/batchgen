@@ -53,6 +53,8 @@ class DeepSeek_Parameter_Server:
         self.hf_model_config = config_cls.from_pretrained(
             huggingface_ckpt_name, trust_remote_code=True
         )
+        self.hf_model_config._name_or_path = huggingface_ckpt_name
+        self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
 
 
 
@@ -64,6 +66,7 @@ class DeepSeek_Parameter_Server:
         self._save_safetensors_to_pt()
         self._parse_state_dict()
         self.parameter_server = Parameter_Server()
+        logging.info(f"architectures: {self.hf_model_config.architectures[0]}")
         if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
             if "DeepSeek-V2-Lite" in self.huggingface_ckpt_name:
                 byte_size = 32 * 1024 * 1024 * 1024

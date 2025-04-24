@@ -47,6 +47,82 @@
 #include "CPU_Kernels/cpu_kernels.h"
 #include "Hetero_Attn.h"
 
+constexpr float FP8_MAX = 448.0f;
+std::tuple<at::Tensor, at::Tensor> compressed_kv_bf16_to_fp8_per_token(torch::Tensor x) {
+    /* 
+     * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per-token.
+     * Args:
+     *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
+     * Returns:
+     *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+     *   s: Scale factors [bsz, seq] with dtype float32
+     */
+    // TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, 
+    //             "Input tensor must be of dtype BFloat16");
+    // TORCH_CHECK(x.size(-1) == 576, 
+    //             "Last dimension of input tensor must be 576");
+    // TORCH_CHECK(x.is_contiguous(), 
+    //             "Input tensor must be contiguous");
+    // TORCH_CHECK(x.dim() == 3, 
+    //             "Input tensor must have 3 dimensions");
+    
+    const auto device = x.device();
+    const auto bsz = x.size(0);
+    const auto seq_len = x.size(1);
+    const auto dim = x.size(2);
+    const auto M = bsz * seq_len;
+    
+    // Cast to float32 and reshape for reduction
+    auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+    
+    // Compute max absolute value per token
+    auto amax = at::amax(at::abs(x_flat), /*dim=*/1);
+    amax = at::clamp(amax, /*min=*/1e-6f);
+    
+    // Compute scales
+    auto scale = amax / FP8_MAX;
+    
+    // Scale and cast to fp8
+    auto y = x_flat / scale.unsqueeze(1);
+    auto q = y.to(at::ScalarType::Float8_e4m3fn);
+    
+    // Reshape output tensors
+    q = q.view({bsz, seq_len, dim});
+    scale = scale.view({bsz, seq_len});
+    
+    return std::make_tuple(q, scale);
+}
+
+torch::Tensor compressed_kv_fp8_to_bf16_per_token(torch::Tensor q, torch::Tensor scale) {
+    /*
+     * Dequantize the output of bf16_to_fp8_per_token back to BF16.
+     * Args:
+     *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+     *   scale: Scale factors [bsz, seq] with dtype float32
+     * Returns:
+     *   x_bf16: Dequantized tensor [bsz, seq, 576] with dtype bfloat16
+     */
+    // TORCH_CHECK(q.scalar_type() == at::ScalarType::Float8_e4m3fn, 
+    //             "Quantized tensor must be of dtype Float8_e4m3fn");
+    // TORCH_CHECK(scale.scalar_type() == at::ScalarType::Float, 
+    //             "Scale tensor must be of dtype Float");
+    
+    const auto bsz = q.size(0);
+    const auto seq_len = q.size(1);
+    const auto dim = q.size(2);
+    const auto M = bsz * seq_len;
+    
+    // Flatten tensors
+    auto q_flat = q.view({M, dim}).to(at::ScalarType::Float);  // upcast FP8→FP32
+    auto scale_flat = scale.view({M, 1});
+    
+    // Rescale
+    auto x_rec = q_flat * scale_flat;
+    
+    // Cast back to BF16 and reshape
+    return x_rec.to(at::ScalarType::BFloat16).view({bsz, seq_len, dim});
+}
+
 Hetero_Attn::Hetero_Attn(const EngineConfig& engine_config,
                          const ModelConfig& model_config,
                          KV_Storage& kv_storage, GPU_KV_Buffer& gpu_kv_buffer,
@@ -91,6 +167,7 @@ torch::Tensor Hetero_Attn::attn(
                                       position_ids, cur_batching_plan);
         default:
             throw std::runtime_error("Unsupported attn_mode_");
+            
     };
 };
 
@@ -136,7 +213,10 @@ torch::Tensor Hetero_Attn::_attn_mode_0(py::object& PyTorch_attn_module,
                          get_tensor_shape(attention_mask));
     // query_states = this->d2h_engine_.tensor_on_demand_copy(query_states);
     query_states = query_states.to(torch::kCPU);
-    this->kv_storage_.update(layer_idx, batch, key_states, value_states);
+
+    // TODO: revise for other models.
+    // this->kv_storage_.update(layer_idx, batch, key_states, value_states,
+    //                          this->kv_storage_.get_k_quantize_scale(layer_idx));
     this->logger_->debug("K and V updated to the storage.");
 
     auto k_ptrs = this->kv_storage_.get_k_ptrs(layer_idx, batch);
@@ -188,7 +268,9 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
     py::object& PyTorch_attn_module, int64_t layer_idx,
     torch::Tensor& hidden_states, torch::Tensor& attention_mask,
     torch::Tensor& position_ids,
-    std::vector<std::vector<int64_t>> micro_batches) {
+    std::vector<std::vector<int64_t>> micro_batches)
+{
+    // this->logger_->info("Hetero_Attn::_attn_mode_1");
     /*
             FULL GPU MODE.
     */
@@ -220,8 +302,6 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             auto cur_hidden_states = hidden_states.index(
                 {torch::indexing::Slice(cur_batch_start_idx,
                                         cur_batch_start_idx + cur_batch_size)});
-            // CUDA_CHECK(cudaStreamSynchronize(0));
-            // CUDA_CHECK(cudaDeviceSynchronize());
             auto module_output =
                 PyTorch_attn_module
                     .attr("decoding_attn")(
@@ -238,8 +318,9 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
 
             auto [attn_result, new_k, new_v] = module_output;
             this->gpu_kv_buffer_.releaseBuffer(layer_idx, micro_batch_idx);
-            this->kv_storage_.update(layer_idx, cur_batch, new_k,
-                                     new_v);  // Todo.
+            
+            // this->kv_storage_.update(layer_idx, cur_batch, new_k,
+            //                          new_v, );  // Todo.
             final_output.index_put_(
                 {torch::indexing::Slice(cur_batch_start_idx,
                                         cur_batch_start_idx + cur_batch_size)},
@@ -247,6 +328,9 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             // py::gil_scoped_release release;
         }
     } else {
+        // this->logger_->info("Hetero_Attn::_attn_mode_1 deepseek");
+        auto dequantize_factor = this->kv_storage_.get_k_quantize_scale(layer_idx);
+        // this->logger_->info("dequantize_factor got");
         for (int64_t micro_batch_idx = 0;
              micro_batch_idx < micro_batches.size(); micro_batch_idx++) {
             auto cur_batch = micro_batches[micro_batch_idx];
@@ -262,6 +346,11 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             auto cur_k = torch::empty_like(external_tensor);
             cur_k.copy_(external_tensor);
             CUDA_CHECK(cudaStreamSynchronize(0));
+            // dequantize cur_k
+            // auto cur_factor = dequantize_factor.index(
+            //     {torch::indexing::Slice(micro_batch_idx, micro_batch_idx + 1)});
+            // cur_k = compressed_kv_fp8_to_bf16_per_token(cur_k, cur_factor);
+            
 
             this->gpu_kv_buffer_.releaseBuffer(layer_idx, micro_batch_idx);
 
@@ -283,11 +372,17 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                          .memory_format(torch::MemoryFormat::Contiguous));
             std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
                 module_output;
+            
+            // this->logger_->info("start dequantization");
+            auto cur_factor = dequantize_factor.index(
+                {torch::indexing::Slice(cur_batch_start_idx,
+                                        cur_batch_start_idx + cur_batch_size)});
+            auto dequant_k = compressed_kv_fp8_to_bf16_per_token(cur_k, cur_factor);
 
             module_output =
                 PyTorch_attn_module
                     .attr("decoding_attn")(
-                        cur_hidden_states, cur_k, cur_v,
+                        cur_hidden_states, dequant_k, cur_v,
                         attention_mask.index({torch::indexing::Slice(
                             cur_batch_start_idx,
                             cur_batch_start_idx + cur_batch_size)}),
@@ -300,7 +395,9 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             CUDA_CHECK(cudaStreamSynchronize(0));
 
             auto [attn_result, new_k, new_v] = module_output;
-            this->kv_storage_.update(layer_idx, cur_batch, new_k, new_v);
+            auto [quant_k, factor] = 
+                compressed_kv_bf16_to_fp8_per_token(new_k);
+            this->kv_storage_.update(layer_idx, cur_batch, quant_k, new_v, factor);
             // CUDA_CHECK(cudaStreamSynchronize(0));
             // CUDA_CHECK(cudaDeviceSynchronize());
             // result.push_back(attn_result);
@@ -423,7 +520,7 @@ torch::Tensor Hetero_Attn::_attn_mode_2(
                           .cast<torch::Tensor>();
 
         this->gpu_kv_buffer_.releaseBuffer(layer_idx, GPU_micro_batch_idx);
-        this->kv_storage_.update(layer_idx, cur_batch, new_k, new_v);
+        // this->kv_storage_.update(layer_idx, cur_batch, new_k, new_v); //TODO
         GPU_result.push_back(attn_output);
     };
     auto GPU_end = std::chrono::high_resolution_clock::now();
@@ -465,8 +562,8 @@ std::future<torch::Tensor> Hetero_Attn::CPU_attn_mechanism(
         try {
             // auto start = std::chrono::high_resolution_clock::now();
             CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-            this->kv_storage_.update(layer_idx, batch, key_states,
-                                     value_states);
+            // this->kv_storage_.update(layer_idx, batch, key_states,
+            //                          value_states); // TODO
             this->logger_->debug("num threads: {}",
                                  this->engine_config_.basic_config.num_threads);
             auto k_ptrs = this->kv_storage_.get_k_ptrs(layer_idx, batch);

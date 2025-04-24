@@ -34,6 +34,7 @@ from transformers import AutoConfig
 import torch.distributed as dist
 
 from moe_gen.config import EngineConfig, ModelConfig
+from .configuration_deepseek_v3 import DeepseekV3Config
 
 # from transformers.models.qwen2_moe.modeling_qwen2_moe import repeat_kv
 
@@ -43,11 +44,6 @@ except ImportError:
     # jit compile
     from core_engine import MoE_Gen as core_engine
 
-try:
-    from moe_gen.core_engine import Parameter_Server
-except ImportError:
-    # jit compile
-    from core_engine import Parameter_Server
 from typing import Tuple
 
 try:
@@ -779,7 +775,7 @@ def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> tor
     x_rec = q_flat * s.view(M, 1)             # rescale
     return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)	
 
-@torch.inference_mode()
+@torch.no_grad()
 def FlashMLA_DeepSeekR1(
     self,
     hidden_states: torch.Tensor,
@@ -788,10 +784,6 @@ def FlashMLA_DeepSeekR1(
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
 ):
-    # logging.info(f"past_key_states shape: {past_key_states.shape}")
-    # logging.info(f"attention_mask shape: {attention_mask.shape}")
-    # logging.info(f"attention_mask{attention_mask[0]}")
-
     attention_mask = attention_mask.squeeze(1).squeeze(1)  # [bsz,seq_len]
     attention_mask = (attention_mask == 0).to(hidden_states.dtype)
     # logging.info(f"attention_mask{attention_mask[0]}")
@@ -862,14 +854,6 @@ def FlashMLA_DeepSeekR1(
         bsz, q_len, self.num_heads, qk_head_dim
     )
 
-    # key_states = k_pe.new_empty(bsz, self.num_heads, kv_len, qk_head_dim)
-    # key_states[:, :, :, : self.kv_lora_rank] = compressed_kv.unsqueeze(1)
-    # key_states[:, :, :, self.kv_lora_rank :] = k_pe
-
-
-    # start = torch.cuda.Event(enable_timing=True)
-    # end = torch.cuda.Event(enable_timing=True)
-    # start.record()
     # Create a block table for the key states
     block_size = 64
     cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
@@ -904,62 +888,6 @@ def FlashMLA_DeepSeekR1(
         bsz * max_seqlen_pad // block_size, block_size, 1, compressed_kv_ref.size(-1)
     )
 
-    # for i in range(bsz):
-    #     blocked_k.view(
-    #         bsz, max_seqlen_pad // block_size, block_size, 1, compressed_kv_ref.size(-1)
-    #     )[i, cache_seqlens[i].item():] = (
-    #         float("nan")
-    #     )
-
-    # block_table = torch.arange(
-    #     bsz * max_seqlen_pad // block_size, dtype=torch.int32
-    # ).view(bsz, max_seqlen_pad // block_size).to(compressed_kv_ref.device)
-
-    # num_blocks = block_table.numel()  # Total number of blocks
-
-    # # Create the blocked_k tensor
-    # blocked_k = torch.full(
-    #     (num_blocks, block_size, 1, compressed_kv_ref.size(-1)),
-    #     float('nan'),  # Pre-fill with NaN
-    #     dtype=compressed_kv_ref.dtype,
-    #     device=compressed_kv_ref.device
-    # )
-
-    # # Create a mask for valid tokens
-    # valid_mask = torch.zeros(bsz, max_seqlen_pad, dtype=torch.bool, device=compressed_kv_ref.device)
-    # for i in range(bsz):
-    #     valid_mask[i, :cache_seqlens[i]] = True
-
-    # # Reshape compressed_kv_ref to match padded dimensions
-    # padded_kv = torch.full(
-    #     (bsz, max_seqlen_pad, 1, compressed_kv_ref.size(-1)), 
-    #     float('nan'),
-    #     dtype=compressed_kv_ref.dtype,
-    #     device=compressed_kv_ref.device
-    # )
-
-    # # Only copy valid parts
-    # for i in range(bsz):
-    #     seq_len_i = cache_seqlens[i].item()
-    #     padded_kv[i, :seq_len_i] = compressed_kv_ref[i, :seq_len_i]
-
-    # # Convert to blocked format more efficiently
-    # block_indices = block_table.view(-1)
-    # for b_idx in range(num_blocks):
-    #     batch_idx = b_idx // (max_seqlen_pad // block_size)
-    #     block_in_batch_idx = b_idx % (max_seqlen_pad // block_size)
-    #     start_idx = block_in_batch_idx * block_size
-        
-    #     # Copy the whole block at once
-    #     blocked_k[block_indices[b_idx]] = padded_kv[batch_idx, start_idx:start_idx+block_size]
-
-
-
-
-
-     
-    
-
     tile_scheduler_metadata, num_splits = get_mla_metadata(
         cache_seqlens, 128, 1
     )
@@ -981,12 +909,6 @@ def FlashMLA_DeepSeekR1(
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
         softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
     """
-    # logging.info(f"query_states shape: {query_states.shape}")
-    # logging.info(f"blocked_k shape: {blocked_k.shape}")
-    # cuda event record
-    # start = torch.cuda.Event(enable_timing=True)
-    # end = torch.cuda.Event(enable_timing=True)
-    # start.record()
     try:
         attn_out, attention_weights = flash_mla_with_kvcache(
             query_states,
@@ -1002,15 +924,6 @@ def FlashMLA_DeepSeekR1(
     except Exception as e:
         logging.error(f"Error in flash_mla_with_kvcache: {e}")
         raise
-    # end.record()
-    # torch.cuda.synchronize(dist.get_rank())
-    # elapsed_time = start.elapsed_time(end)
-    # logging.info(f"FlashMLA Elapsed time: {elapsed_time} ms")
-    # logging.info(f"attn_out shape: {attn_out.shape}")
-    # logging.info(f"out_absorb shape: {out_absorb.shape}")
-    # attn_output = torch.matmul(
-    #     attn_out, out_absorb.mT
-    # )  # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
     attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
 
     if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
@@ -1512,11 +1425,14 @@ class DeepSeek_Initializer:
         self.engine_config = engine_config
         self.skeleton_state_dict = skeleton_state_dict
         self.model = None
-        self.hf_model_config = AutoConfig.from_pretrained(
+        self.hf_model_config = DeepseekV3Config.from_pretrained(
             huggingface_ckpt_name,
-            cache_dir=hf_cache_dir,
-            trust_remote_code=True,
+            # cache_dir=hf_cache_dir,
+            # trust_remote_code=True,
         )
+        self.hf_model_config._name_or_path = huggingface_ckpt_name
+        self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
+
         self.host_kv_cache_size = host_kv_cache_size
         self.host_kv_cache_byte_size = host_kv_cache_size * (1024**3)
         self.rank = rank
@@ -1609,7 +1525,7 @@ class DeepSeek_Initializer:
             )
         else:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
-        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
+        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 25
         logging.info(
             f"attn_decoding_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size}"
         )
@@ -1753,6 +1669,7 @@ class DeepSeek_Initializer:
                 self.engine_config, self.model_config
             )
             logging.info("Core engine created")
+            logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
             if (
                 "deepseek-ai/DeepSeek-V3" in self.hf_model_config._name_or_path
                 or "deepseek-ai/DeepSeek-R1"
@@ -1769,17 +1686,19 @@ class DeepSeek_Initializer:
             )
             logging.info("Core engine initialized")
             
-            self._extract_dequantize_scale()
-            self._load_model_skeleton()
-            self._load_local_routed_experts()
-            self._config_attn_module()
-            self._config_expert_module()
-            self._config_lm_head_hook()
-            # self._synchronize_expert_pointers()
-            # self._initialize_p2p_access()
+            # self._extract_dequantize_scale()
+            # self._load_model_skeleton()
+            # self._load_local_routed_experts()
+            # self._config_attn_module()
+            # self._config_expert_module()
+            # self._config_lm_head_hook()
+            
+            
+
             self.model.eval()
             self.model.to(self.engine_config.Basic_Config.device_torch)
-            print(self.model, flush=True)
+            if dist.get_rank() == 0:    
+                print(self.model, flush=True)
             
             if len(self.weight_copy_task["routed_expert"]) == 0:
                 self.weight_copy_task.pop("routed_expert")
@@ -1799,6 +1718,7 @@ class DeepSeek_Initializer:
             self.model,
             self.engine_config,
             self.model_config,
+            self.hf_model_config
         )
 
     def _lm_head_forward_pre_hook(self, module, input):
