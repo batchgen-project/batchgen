@@ -737,9 +737,9 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		else:
 			self.rank = dist.get_rank()
 			self.world_size = dist.get_world_size()
-		assert self.world_size == 8
+		# assert self.world_size == 8
 
-		self.experts_per_rank = 32
+		self.experts_per_rank = 256 // self.world_size
 		self.total_experts = self.world_size * self.experts_per_rank
 		self.routed_expert_start_idx = self.rank * self.experts_per_rank
 		self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank

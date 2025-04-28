@@ -153,12 +153,13 @@ class Parallel_Strategy_Manager:
 
 		NUM_LOCAL_EXPERT_PER_LAYER = 26  # Per requirements: 15 experts per GPU per layer
 		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
+		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
 
-		routed_expert_gpu_start_idx = self.rank * 32
+		routed_expert_gpu_start_idx = self.rank * NUM_EXPERT_PER_RANK
 		routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
 		routed_expert_host_start_idx = routed_expert_gpu_end_idx
-		routed_expert_host_end_idx = (self.rank + 1) * 32
+		routed_expert_host_end_idx = (self.rank + 1) * NUM_EXPERT_PER_RANK
 		for layer_idx in range(
 			self.hf_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
