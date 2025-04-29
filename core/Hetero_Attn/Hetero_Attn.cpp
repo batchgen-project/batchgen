@@ -275,8 +275,8 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             FULL GPU MODE.
     */
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-    // py::gil_scoped_acquire acquire;
-
+    std::vector<torch::Tensor> full_new_k;
+    std::vector<torch::Tensor> full_factor;
     torch::Tensor final_output = torch::zeros_like(hidden_states);
     if (this->model_config_.model_type.find("deepseek") == std::string::npos) {
         for (int64_t micro_batch_idx = 0;
@@ -346,11 +346,6 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             auto cur_k = torch::empty_like(external_tensor);
             cur_k.copy_(external_tensor);
             CUDA_CHECK(cudaStreamSynchronize(0));
-            // dequantize cur_k
-            // auto cur_factor = dequantize_factor.index(
-            //     {torch::indexing::Slice(micro_batch_idx, micro_batch_idx + 1)});
-            // cur_k = compressed_kv_fp8_to_bf16_per_token(cur_k, cur_factor);
-            
 
             this->gpu_kv_buffer_.releaseBuffer(layer_idx, micro_batch_idx);
 
@@ -397,18 +392,39 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             auto [attn_result, new_k, new_v] = module_output;
             auto [quant_k, factor] = 
                 compressed_kv_bf16_to_fp8_per_token(new_k);
-            this->kv_storage_.update(layer_idx, cur_batch, quant_k, new_v, factor);
+            // this->kv_storage_.update(layer_idx, cur_batch, quant_k, new_v, factor);
+            full_new_k.push_back(quant_k);
+            full_factor.push_back(factor);
             // CUDA_CHECK(cudaStreamSynchronize(0));
-            // CUDA_CHECK(cudaDeviceSynchronize());
-            // result.push_back(attn_result);
             final_output.index_put_(
                 {torch::indexing::Slice(cur_batch_start_idx,
                                         cur_batch_start_idx + cur_batch_size)},
                 attn_result);
-            // py::gil_scoped_release release;
+            CUDA_CHECK(cudaStreamSynchronize(0));    
         }
     }
-    // auto final_output = torch::cat(result, 0);
+    torch::Tensor quant_k = torch::cat(full_new_k, 0);
+    torch::Tensor factor = torch::cat(full_factor, 0);
+    // Merge all micro batches into one vector.
+    std::vector<int64_t> idx = {};
+    for (int64_t i = 0; i < micro_batches.size(); i++) {
+        auto cur_batch = micro_batches[i];
+        for (int64_t j = 0; j < cur_batch.size(); j++) {
+            idx.push_back(cur_batch[j]);
+        }
+    }
+    // new_v is a place holder
+    torch::Tensor new_v = torch::empty(
+        {0}, torch::TensorOptions()
+                 .dtype(this->engine_config_.basic_config.dtype_torch)
+                 .device(torch::kCUDA,
+                         this->engine_config_.basic_config.device)
+                 .requires_grad(false)
+                 .memory_format(torch::MemoryFormat::Contiguous));
+
+    this->kv_storage_.update(layer_idx, idx, quant_k, new_v, factor);
+    // CUDA_CHECK(cudaStreamSynchronize(0));
+    // CUDA_CHECK(cudaDeviceSynchronize());
     return final_output;
 };
 

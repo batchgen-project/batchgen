@@ -208,7 +208,7 @@ class ParameterServerClient:
                 
                 # Load the file using torch.load
                 import torch
-                logging.info("Loading state dict using torch.load...")
+                logging.info("Loading state dict...")
                 skeleton_state_dict = torch.load(skeleton_state_dict_file)
                 logging.info(f"Successfully loaded skeleton state dict with {len(skeleton_state_dict)} keys")
                 

@@ -235,6 +235,7 @@ void KV_Storage::offload(int64_t layer_idx,
             auto worker = std::thread(&KV_Storage::offload_helper_, this,
                                       layer_idx, query_global_idx, k, v);
             worker.detach();
+            // worker.join();
         },
         this->logger_);
 };
@@ -446,7 +447,8 @@ void KV_Storage::update(int64_t layer_idx,
     try {
         auto worker = std::thread(&KV_Storage::update_helper_, this, layer_idx,
                                   query_global_indices, k, v, k_quantize_scale);
-        worker.detach();
+        //worker.detach();
+        worker.join();
     } catch (const std::exception& e) {
         this->logger_->debug(
             "KV_Storage update(): Failed to update K and V to the "
@@ -521,6 +523,7 @@ void KV_Storage::update_helper_(int64_t layer_idx,
             }
             CUDA_CHECK(cudaStreamSynchronize(this->d2h_engine_.DtoH_stream));
         } else {
+            // logging 
             this->k_quantize_scale[layer_idx] = torch::cat(
                 {this->k_quantize_scale[layer_idx], k_quantize_scale}, 1);
             k = k.contiguous();

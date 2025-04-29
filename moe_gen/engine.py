@@ -970,8 +970,9 @@ class MoE_Gen:
                         position_ids = create_position_ids_from_attention_mask(
                             attention_mask
                         )
+                    # DeepSeek use flash-attn by default
                     if attention_mask.dim() == 2 and (
-                        self.model_config.model_type not in ["Qwen2"]
+                        self.model_config.model_type not in ["Qwen2", "deepseek"]
                     ):
                         attention_mask = attention_mask.unsqueeze(1).unsqueeze(
                             2

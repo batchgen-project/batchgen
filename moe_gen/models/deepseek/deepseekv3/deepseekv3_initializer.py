@@ -1509,8 +1509,8 @@ class DeepSeek_Initializer:
         else:
             self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = 10
             self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 20
-        
-        self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 5
+        self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = 50
+        self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 300
         logging.info(
             f"attn_prefill_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size}"
         )
@@ -1525,7 +1525,7 @@ class DeepSeek_Initializer:
             )
         else:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
-        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 25
+        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 50
         logging.info(
             f"attn_decoding_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size}"
         )

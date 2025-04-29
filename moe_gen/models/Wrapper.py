@@ -341,7 +341,10 @@ class Attn_Wrapper(torch.nn.Module):
                     cur_batch_start:cur_batch_end
                 ]
                 if "deepseek" in self.model_config.model_type:
-                    cur_attention_mask = arg_dict["attention_mask"][
+                    # cur_attention_mask = arg_dict["attention_mask"][
+                    #     cur_batch_start:cur_batch_end
+                    # ]
+                    cur_attention_mask = Attn_Wrapper.attention_mask[
                         cur_batch_start:cur_batch_end
                     ]
                 else:
@@ -360,10 +363,13 @@ class Attn_Wrapper(torch.nn.Module):
                         #     cur_hidden_states, cur_attention_mask, position_ids,
                         #     self.weight_dequant_scale
                         # )
+                        # logging.info(f"cur_attention_mask_shape: {cur_attention_mask.shape}")
+                        # logging.info(f"cur_attention_mask: {cur_attention_mask}")
+                        # exit()
                         output = self.module.prefill_attn(
                             cur_hidden_states,
-                            cur_attention_mask,
-                            position_ids,
+                            cur_attention_mask.to(cur_hidden_states.device),
+                            position_ids.to(cur_hidden_states.device),
                         )
                         key_cache = output[1]
                         value_cache = torch.ones(
@@ -389,8 +395,10 @@ class Attn_Wrapper(torch.nn.Module):
                         key_cache = output[2].key_cache[self.layer_idx]
                         value_cache = output[2].value_cache[self.layer_idx]
 
-                    torch.cuda.current_stream().synchronize()
+                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
                     attn_output[cur_batch_start:cur_batch_end] = output[0]
+                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+
 
                 # Quantization
                 # q_key, factor = compressed_kv_bf16_to_fp8_per_token(key_cache)
@@ -435,7 +443,7 @@ class Attn_Wrapper(torch.nn.Module):
                 position_ids.to(self.engine_config.Basic_Config.device_torch),
                 Attn_Wrapper.cur_batch,
             )
-            torch.cuda.current_stream().synchronize()
+            torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
             # Step 4: Clean up
             if self.get_weights:
                 self.core_engine.free_weights_buffer(self.attn_module_id)
@@ -551,7 +559,7 @@ class Expert_Wrapper(torch.nn.Module):
             # self.module.eval()
             with torch.no_grad():
                 result[start:end].copy_(self.module(micro_batch))
-            torch.cuda.current_stream().synchronize()
+            torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 
         # Step 3: Clean up
         if self.get_weights:
