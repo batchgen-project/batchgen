@@ -395,9 +395,9 @@ class Attn_Wrapper(torch.nn.Module):
                         key_cache = output[2].key_cache[self.layer_idx]
                         value_cache = output[2].value_cache[self.layer_idx]
 
-                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
                     attn_output[cur_batch_start:cur_batch_end] = output[0]
-                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 
 
                 # Quantization
@@ -411,9 +411,13 @@ class Attn_Wrapper(torch.nn.Module):
                 #         (Attn_Wrapper.kv_quantization_factor[self.layer_idx], factor),
                 #         dim=0,
                 #     )
+                # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
                 self.core_engine.kv_offload(
                     self.layer_idx, cur_attn_batch, key_cache, value_cache
                 )
+                # Sync
+                # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
 
             # Step 4: Clean up
             if self.get_weights:
@@ -435,6 +439,11 @@ class Attn_Wrapper(torch.nn.Module):
             hidden_states = kwargs["hidden_states"]
             attention_mask = Attn_Wrapper.attention_mask
             position_ids = Attn_Wrapper.position_ids
+            # logging.info(f"rank: {dist.get_rank()} attention_mask: {attention_mask}")
+            # logging.info(f"rank: {dist.get_rank()} position_ids: {position_ids}")
+            # if self.layer_idx == 0:
+            #     logging.info(f"cur_hideden_states seq 0 : {hidden_states[0][0]}")
+            #     logging.info(f"cur_hideden_states seq 1 : {hidden_states[0][0]}")
             final_attn_result = self.core_engine.attn(
                 self.module,
                 self.layer_idx,
@@ -443,7 +452,7 @@ class Attn_Wrapper(torch.nn.Module):
                 position_ids.to(self.engine_config.Basic_Config.device_torch),
                 Attn_Wrapper.cur_batch,
             )
-            torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+            # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
             # Step 4: Clean up
             if self.get_weights:
                 self.core_engine.free_weights_buffer(self.attn_module_id)
@@ -455,6 +464,13 @@ class Attn_Wrapper(torch.nn.Module):
             logging.debug(
                 f"[Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
             )
+            # logging the first token
+            # if self.layer_idx == 0:
+            #     logging.info(f"Final attn result layer 0, 0: {final_attn_result[0][0]}")
+            #     logging.info(f"Final attn result layer 0 1: {final_attn_result[1][0]}")
+            # if self.layer_idx == 60:
+            #     logging.info(f"Final attn result layer 60, 0: {final_attn_result[0][0]}")
+            #     logging.info(f"Final attn result layer 60 1: {final_attn_result[1][0]}")
             return final_attn_result, None, None
 
 
@@ -558,8 +574,10 @@ class Expert_Wrapper(torch.nn.Module):
             micro_batch = hidden_states[start:end]
             # self.module.eval()
             with torch.no_grad():
-                result[start:end].copy_(self.module(micro_batch))
+                # result[start:end].copy_(self.module(micro_batch))
+                result[start:end] = self.module(micro_batch)
             torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+            torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
 
         # Step 3: Clean up
         if self.get_weights:

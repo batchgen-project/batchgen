@@ -778,12 +778,12 @@ class CUDAOpBuilder(OpBuilder):
         if sys.platform == "win32":
             return ["-O2"]
         else:
-            return ["-O3", "-std=c++14", "-g", "-Wno-reorder"]
+            return ["-O2", "-std=c++14", "-g", "-Wno-reorder"]
 
     def nvcc_args(self):
         if self.build_for_cpu:
             return []
-        args = ["-O3"]
+        args = ["-O2"]
         if self.is_rocm_pytorch():
             ROCM_MAJOR, ROCM_MINOR = self.installed_rocm_version()
             args += [

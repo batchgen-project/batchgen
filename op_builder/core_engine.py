@@ -75,7 +75,7 @@ class CoreEngineBuilder(OpBuilder):
         SIMD_WIDTH = self.simd_width()
         return [
             "-Wall",
-            "-Ofast",
+            "-O2",
             "-std=c++17",
             "-fipa-pta",
             "-ffast-math",

@@ -384,7 +384,7 @@ def chunked_prefill_attn(
 	return attn_output, compressed_kv
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def FlashMLA_DeepSeekR1(
 	self,
 	hidden_states: torch.Tensor,
@@ -393,22 +393,22 @@ def FlashMLA_DeepSeekR1(
 	attention_mask: torch.Tensor,
 	position_ids: torch.Tensor,
 ):
-	attention_mask = attention_mask.squeeze(1).squeeze(1)  # [bsz,seq_len]
-	attention_mask = (attention_mask == 0).to(hidden_states.dtype)
+	# attention_mask = attention_mask.squeeze(1).squeeze(1)  # [bsz,seq_len]
+	# attention_mask = (attention_mask == 0).to(hidden_states.dtype)
 	# logging.info(f"attention_mask{attention_mask[0]}")
 	bsz, q_len, _ = hidden_states.size()
-	if past_key_states.dtype == torch.float8_e4m3fn:
-		# Dequantize past_key_states
-		# Random generate the scale
-		weight_scale_inv = torch.empty(
-			(past_key_states.size(0), past_key_states.size(1)),
-			device=past_key_states.device,
-			dtype=torch.float,
-		)
-		# past_key_states = past_key_states.to(torch.bfloat16)
-		past_key_states = compressed_kv_fp8_to_bf16_per_token(
-			past_key_states, weight_scale_inv
-		)
+	# if past_key_states.dtype == torch.float8_e4m3fn:
+	# 	# Dequantize past_key_states
+	# 	# Random generate the scale
+	# 	weight_scale_inv = torch.empty(
+	# 		(past_key_states.size(0), past_key_states.size(1)),
+	# 		device=past_key_states.device,
+	# 		dtype=torch.float,
+	# 	)
+	# 	# past_key_states = past_key_states.to(torch.bfloat16)
+	# 	past_key_states = compressed_kv_fp8_to_bf16_per_token(
+	# 		past_key_states, weight_scale_inv
+	# 	)
 	
 	
 	q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
@@ -552,7 +552,7 @@ def FlashMLA_DeepSeekR1(
 		torch.tensor([], device=hidden_states.device),
 	)
 
-
+@torch.inference_mode()
 def hopper_prefill_mla(
 	self,
 	hidden_states: torch.Tensor,

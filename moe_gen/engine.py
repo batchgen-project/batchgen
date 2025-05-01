@@ -276,17 +276,37 @@ def moe_gen(
     logging.info(f"Number of MoE_Gen instances: {len(moe_gens)}")
     
     # Run inference with worker processes
-    start_time = time.perf_counter()
-    all_results = []
     
+    def safe_collect_results(futures):
+        all_results = []
+        for future in futures:
+            try:
+                result = future.result()
+                all_results.extend(result)
+            except torch.distributed.DistBackendError as e:
+                # Check if it's an out of memory error during cleanup
+                if "out of memory" in str(e) and "destroy_process_group" in str(e):
+                    print("Ignoring CUDA out of memory error during process cleanup")
+                    # Try to extract results if they were generated before the error
+                    # This assumes your function might have returned partial results
+                else:
+                    # Re-raise if it's a different type of DistBackendError
+                    raise
+            except Exception as e:
+                # Handle other exceptions according to your needs
+                print(f"Error in worker process: {e}")
+                raise
+        
+        return all_results
+
+    start_time = time.perf_counter()
     with concurrent.futures.ProcessPoolExecutor() as executor:
         # Submit each worker and collect the future objects
         futures = [
             executor.submit(run_moe_gen, moe_gen_instance) for moe_gen_instance in moe_gens
         ]
         # Retrieve results in the same order as the futures were submitted
-        for future in futures:
-            all_results.extend(future.result())
+        all_results = safe_collect_results(futures)
     
     end_time = time.perf_counter()
     logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
@@ -371,6 +391,10 @@ class MoE_Gen:
             cache_dir=self.hf_cache_dir,
             trust_remote_code=True,
         )
+        # Use flash_attn by default thus right padding.
+        self.tokenizer.padding_side = "right"
+
+
         if self.model_config.architectures[0] == "MixtralForCausalLM":
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -687,7 +711,7 @@ class MoE_Gen:
             # logging.info("Entering kv_storage creation...")
             # self.core_engine.create_fake_kv_storage()
             # self.core_engine.start_h2d_worker()
-            
+            # time.sleep(2)
             self._config_decoding()
             decoding_start_time = time.perf_counter()
             with torch.no_grad():
@@ -971,21 +995,22 @@ class MoE_Gen:
                             attention_mask
                         )
                     # DeepSeek use flash-attn by default
-                    if attention_mask.dim() == 2 and (
-                        self.model_config.model_type not in ["Qwen2", "deepseek"]
-                    ):
-                        attention_mask = attention_mask.unsqueeze(1).unsqueeze(
-                            2
-                        )
-                        attention_mask = torch.where(
-                            attention_mask == 0,
-                            torch.finfo(torch.bfloat16).min,
-                            torch.tensor(
-                                0.0,
-                                dtype=torch.bfloat16,
-                                device=attention_mask.device,
-                            ),
-                        )
+                    
+                    # if attention_mask.dim() == 2 and (
+                    #     self.model_config.model_type not in ["Qwen2", "deepseek"]
+                    # ):
+                    #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(
+                    #         2
+                    #     )
+                    #     attention_mask = torch.where(
+                    #         attention_mask == 0,
+                    #         torch.finfo(torch.bfloat16).min,
+                    #         torch.tensor(
+                    #             0.0,
+                    #             dtype=torch.bfloat16,
+                    #             device=attention_mask.device,
+                    #         ),
+                    #     )
 
                     Attn_Wrapper.attention_mask = attention_mask
                     Attn_Wrapper.position_ids = position_ids
@@ -1035,12 +1060,16 @@ class MoE_Gen:
                 # Resub every 32 new tokens.
                 if (new_token_idx - 1) % 32 == 0:
                     for idx in range(new_token_idx - 1, new_token_idx + 31):
-                        # Note: KV are always in bfloat16.
+                        # Note: DeepSeek use fp8 kv.
                         if "deepseek" in self.model_config.model_type:
+                            # past_kv_byte_size = (
+                            #     (self.max_input_length + idx)
+                            #     * self.model_config.compressed_kv_dim
+                            #     * 2
+                            # )
                             past_kv_byte_size = (
                                 (self.max_input_length + idx)
                                 * self.model_config.compressed_kv_dim
-                                * 2
                             )
                         elif "mixtral" in self.model_config.model_type:
                             past_kv_byte_size = (
@@ -1077,6 +1106,7 @@ class MoE_Gen:
                         ],
                         dim=0,
                     ).to(self.torch_device)
+                    # logging.info(f"engine.py attention_mask: {attention_mask}")   
                     if "deepseek" in self.model_config.model_type:
                         position_ids = create_position_ids_from_attention_mask(
                             attention_mask
@@ -1086,34 +1116,41 @@ class MoE_Gen:
                             attention_mask
                         )[:, -1].unsqueeze(-1)
 
-                    if attention_mask.dim() == 2 and (
-                        self.model_config.model_type not in ["Qwen2"]
-                    ):
-                        attention_mask = attention_mask.unsqueeze(1).unsqueeze(
-                            2
-                        )
-                        attention_mask = torch.where(
-                            attention_mask == 0,
-                            torch.finfo(torch.bfloat16).min,
-                            torch.tensor(
-                                0.0,
-                                dtype=torch.bfloat16,
-                                device=attention_mask.device,
-                            ),
-                        )
+                    # if attention_mask.dim() == 2 and (
+                    #     self.model_config.model_type not in ["Qwen2", "deepseek"]
+                    # ):
+                    #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(
+                    #         2
+                    #     )
+                    #     attention_mask = torch.where(
+                    #         attention_mask == 0,
+                    #         torch.finfo(torch.bfloat16).min,
+                    #         torch.tensor(
+                    #             0.0,
+                    #             dtype=torch.bfloat16,
+                    #             device=attention_mask.device,
+                    #         ),
+                    #     )
 
                     Attn_Wrapper.attention_mask = attention_mask
                     Attn_Wrapper.position_ids = position_ids
+                    # logging.info(f"rank: {self.rank} attention_mask: {attention_mask}")
+                    # logging.info(f"rank: {self.rank} position_ids: {position_ids}")
                     new_tokens = self.model(
                         new_tokens.to(self.torch_device),
                         attention_mask=attention_mask.to(self.torch_device),
                         # position_ids=position_ids.to(self.torch_device),
                         use_cache=False,
                     )
+                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
                     new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
                         -1, 1
                     )
                     self.update_new_token(new_tokens, batch, new_token_idx)
+                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                    # logging.info(f"New tokens: {new_tokens}")
                 new_token_idx += 1
 
                 # Step 1.1 Config new micro_batch size. Magic Number change every 32 new tokens.
@@ -1228,11 +1265,16 @@ class MoE_Gen:
                         # position_ids=position_ids,
                         use_cache=False,
                     )
+                    torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
                     new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
                         -1, 1
                     )
                     # start = time.perf_counter()
                     self.update_new_token(new_tokens, batch, new_token_idx)
+                    torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                    print(f"New tokens: {new_tokens}")
                     # logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
                 new_token_idx += 1
 

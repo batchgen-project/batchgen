@@ -121,7 +121,8 @@ KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
             for (auto layer_idx : bar) {
                 void* k_ptr = nullptr;
                 CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size,
-                                         cudaHostAllocDefault)); 
+                                         cudaHostAllocDefault));
+                memset(k_ptr, 999, per_layer_storage_size); 
                 this->k_pinned_memory.push_back(k_ptr);
             }
         }
@@ -230,14 +231,34 @@ void KV_Storage::offload(int64_t layer_idx,
                          torch::Tensor k,
                          torch::Tensor v) 
 {
-    SAFE_CALL(
-        [&]() {
-            auto worker = std::thread(&KV_Storage::offload_helper_, this,
-                                      layer_idx, query_global_idx, k, v);
-            worker.detach();
-            // worker.join();
-        },
-        this->logger_);
+    // SAFE_CALL(
+    //     [&]() {
+    //         auto worker = std::thread(&KV_Storage::offload_helper_, this,
+    //                                   layer_idx, query_global_idx, k, v);
+    //         // worker.detach();
+    //         worker.join();
+    //     },
+    //     this->logger_);
+    // Check if k has nan values
+    if (torch::any(torch::isnan(k)).item<bool>()){
+        for (int64_t i = 0; i < k.size(0); i++) {
+            if(torch::any(torch::isnan(k[i])).item<bool>()) {
+                this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
+                                     i, this->engine_config_.basic_config.device,
+                                     layer_idx);
+            }
+        }
+        throw std::runtime_error("k has nan values");
+    }
+    // SAFE_CALL(
+    //     [&]() {
+    //         auto worker = std::thread(&KV_Storage::offload_helper_, this,
+    //                                   layer_idx, query_global_idx, k, v);
+    //         // worker.detach();
+    //         worker.join();
+    //     },
+    //     this->logger_);
+    this->offload_helper_(layer_idx, query_global_idx, k, v);
 };
 
 void KV_Storage::offload_helper_(int64_t layer_idx,
@@ -340,7 +361,32 @@ void KV_Storage::offload_helper_(int64_t layer_idx,
             this->logger_->debug("Offloading layer_idx: {} completed.",
                                  layer_idx);
         } else {
+            CUDA_CHECK(cudaSetDevice(
+                this->engine_config_.basic_config.device));
             auto [k, k_quantize_scale] = per_token_quant(bf16_k);
+            // Check k or k_quantize_scale has nan values
+            if (torch::any(torch::isnan(k)).item<bool>()){
+                for (int64_t i = 0; i < k.size(0); i++) {
+                    if(torch::any(torch::isnan(k[i])).item<bool>()) {
+                        this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
+                                             i, this->engine_config_.basic_config.device,
+                                             layer_idx);
+                    }
+                }
+                throw std::runtime_error("k has nan values");
+            }
+            if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
+                for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
+                    if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
+                        this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
+                                             i, this->engine_config_.basic_config.device,
+                                             layer_idx);
+                    }
+                }
+                throw std::runtime_error("k_quantize_scale has nan values");
+            }
+
+
             // If k_quantize_scale[layer_idx] is torch.empty({0,0}), assign it to k_quantize_scale
             // other wise concatenate it.
             if (this->k_quantize_scale[layer_idx].numel() == 0) {
@@ -405,6 +451,12 @@ void KV_Storage::offload_helper_(int64_t layer_idx,
                     this->query_idx_to_slot_idx_map[query_idx] = slot_idx;
                 }
             }
+            CUDA_CHECK(cudaStreamSynchronize(
+                this->d2h_engine_.DtoH_stream));
+            CUDA_CHECK(cudaStreamSynchronize(
+                    0));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
             this->logger_->debug("Offloading layer_idx: {} completed.",
                                  layer_idx);
         }
@@ -445,10 +497,12 @@ void KV_Storage::update(int64_t layer_idx,
                         std::vector<int64_t> query_global_indices,
                         torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale) {
     try {
-        auto worker = std::thread(&KV_Storage::update_helper_, this, layer_idx,
-                                  query_global_indices, k, v, k_quantize_scale);
-        //worker.detach();
-        worker.join();
+        // auto worker = std::thread(&KV_Storage::update_helper_, this, layer_idx,
+        //                           query_global_indices, k, v, k_quantize_scale);
+        // //worker.detach();
+        // worker.join();
+        this->update_helper_(layer_idx, query_global_indices, k, v,
+                             k_quantize_scale);
     } catch (const std::exception& e) {
         this->logger_->debug(
             "KV_Storage update(): Failed to update K and V to the "

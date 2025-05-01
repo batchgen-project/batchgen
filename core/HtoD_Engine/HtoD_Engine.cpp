@@ -323,6 +323,7 @@ void HtoD_Engine::HtoD_Worker() {
                         layer_idx, micro_batch_idx, buffer_idx);
                     this->logger_->debug("Copied KV to buffer: {}", buffer_idx);
                 } else {
+                    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
                     auto [dst_k_ptr, dst_v_ptr, buffer_idx] =
                         optional_buffer.value();
                     std::tuple<std::vector<int64_t>, int64_t, int64_t, int64_t>
@@ -336,7 +337,7 @@ void HtoD_Engine::HtoD_Worker() {
                     // this->kv_storage_.get_v_ptrs(layer_idx, cur_batch);
                     int64_t k_offset = 0;
                     // int64_t v_offset = 0;
-                    int64_t k_byte_size = byte_size / 2; // TODO:
+                    int64_t k_byte_size = byte_size; // TODO:
                     // int64_t v_byte_size = byte_size;
                     this->logger_->debug(
                         "copying micro_batch_idx: {}, layer_idx: {}, "
@@ -349,9 +350,11 @@ void HtoD_Engine::HtoD_Worker() {
                         k_offset += k_byte_size;
                     }
                     CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                    CUDA_CHECK(cudaDeviceSynchronize());
                     this->gpu_kv_buffer_.kv_copy_complete(
                         layer_idx, micro_batch_idx, buffer_idx);
                     this->logger_->debug("Copied KV to buffer: {}", buffer_idx);
+                    CUDA_CHECK(cudaStreamSynchronize(0));
                 }
             }
         };
@@ -367,7 +370,7 @@ void HtoD_Engine::HtoD_Worker() {
                 std::string module_name;
                 while (this->weights_copy_task_queue_[module_type].try_pop(
                            module_name) == false) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
                 auto dst = buffer.get();
                 auto src = this->weights_storage_.get_module_weights_storage(

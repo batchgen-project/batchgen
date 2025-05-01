@@ -103,7 +103,7 @@ void DtoH_Engine::submit_to_queue_B(void* dst, void* src, int64_t size) {
         CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
                                    this->DtoH_stream));
         CUDA_CHECK(cudaStreamSynchronize(this->DtoH_stream));
-        // CUDA_CHECK(cudaStreamSynchronize(0));
+        CUDA_CHECK(cudaStreamSynchronize(0));
     } catch (const c10::Error& e) {
         this->logger_->debug("KV_Storage: CUDA/PyTorch error: {}", e.what());
         throw std::runtime_error(e.what());

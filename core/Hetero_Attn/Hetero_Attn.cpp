@@ -328,9 +328,16 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             // py::gil_scoped_release release;
         }
     } else {
+        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
         // this->logger_->info("Hetero_Attn::_attn_mode_1 deepseek");
         auto dequantize_factor = this->kv_storage_.get_k_quantize_scale(layer_idx);
         // this->logger_->info("dequantize_factor got");
+        // Check if the dequantize_factor contains nan
+        if (torch::any(torch::isnan(dequantize_factor)).item<bool>()) {
+            this->logger_->error("Dequantize factor contains NaN values, rank: {}",
+                                 this->engine_config_.basic_config.device);
+            throw std::runtime_error("Dequantize factor contains NaN values.");
+        }
         for (int64_t micro_batch_idx = 0;
              micro_batch_idx < micro_batches.size(); micro_batch_idx++) {
             auto cur_batch = micro_batches[micro_batch_idx];
@@ -340,12 +347,45 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             int64_t kv_seq_len = attention_mask.size(-1) - 1;
             std::vector<int64_t> tensor_shape = {
                 bsz, kv_seq_len, this->model_config_.compressed_kv_dim};
-
+            
+            CUDA_CHECK(cudaDeviceSynchronize());
             auto external_tensor = this->gpu_kv_buffer_.get_k(
                 layer_idx, micro_batch_idx, tensor_shape);
-            auto cur_k = torch::empty_like(external_tensor);
+            // Check if the external_tensor contains nan
+            if (torch::any(torch::isnan(external_tensor)).item<bool>()) {
+                for(int i = 0; i < external_tensor.size(0); i++) {
+                    if (torch::any(torch::isnan(external_tensor[i])).item<bool>()) {
+                        this->logger_->error("external_tensor contains NaN values, rank: {}, i",
+                                                this->engine_config_.basic_config.device, i);
+                    }
+                
+                }
+                this->logger_->error("external_tensor contains NaN values, rank: {}",
+                                     this->engine_config_.basic_config.device);
+                throw std::runtime_error("external_tensor contains NaN values.");
+            }
+
+
+            auto cur_k = torch::zeros_like(external_tensor);
             cur_k.copy_(external_tensor);
+            // auto cur_k = external_tensor.clone();
             CUDA_CHECK(cudaStreamSynchronize(0));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            // Check if cur_k contains nan
+            if (torch::any(torch::isnan(cur_k)).item<bool>()) {
+                this->logger_->error("cur_k contains NaN values, rank: {}",
+                                     this->engine_config_.basic_config.device);
+                throw std::runtime_error("cur_k contains NaN values.");
+            }
+
+            // file name: rank_0_layer_0_micro_batch_0_k.pt
+            // std::string file_name = "/workspace/rank_" +
+            //     std::to_string(this->engine_config_.basic_config.device) +
+            //     "_layer_" + std::to_string(layer_idx) + "_micro_batch_" +
+            //     std::to_string(micro_batch_idx) + "_k.pt";
+            // torch::save(cur_k, file_name);
+            // exit(0);
+            
 
             this->gpu_kv_buffer_.releaseBuffer(layer_idx, micro_batch_idx);
 
@@ -356,8 +396,8 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             auto cur_hidden_states = hidden_states.index(
                 {torch::indexing::Slice(cur_batch_start_idx,
                                         cur_batch_start_idx + cur_batch_size)});
-            // CUDA_CHECK(cudaStreamSynchronize(0));
-            // CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaStreamSynchronize(0));
+            CUDA_CHECK(cudaDeviceSynchronize());
             torch::Tensor cur_v = torch::empty(
                 {0}, torch::TensorOptions()
                          .dtype(this->engine_config_.basic_config.dtype_torch)
@@ -373,6 +413,12 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                 {torch::indexing::Slice(cur_batch_start_idx,
                                         cur_batch_start_idx + cur_batch_size)});
             auto dequant_k = compressed_kv_fp8_to_bf16_per_token(cur_k, cur_factor);
+            // Check if the dequant_k contains nan
+            if (torch::any(torch::isnan(dequant_k)).item<bool>()) {
+                this->logger_->error("dequant_k contains NaN values, rank: {}",
+                                     this->engine_config_.basic_config.device);
+                throw std::runtime_error("dequant_k contains NaN values.");
+            }
 
             module_output =
                 PyTorch_attn_module
@@ -388,8 +434,19 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                                      torch::Tensor>>();
 
             CUDA_CHECK(cudaStreamSynchronize(0));
-
+            CUDA_CHECK(cudaDeviceSynchronize());    
             auto [attn_result, new_k, new_v] = module_output;
+            // Check if the attn_result and new_k contain nan
+            if (torch::any(torch::isnan(attn_result)).item<bool>()) {
+                this->logger_->error("attn_result contains NaN values, rank: {}",
+                                     this->engine_config_.basic_config.device);
+                throw std::runtime_error("attn_result contains NaN values.");
+            }
+            if (torch::any(torch::isnan(new_k)).item<bool>()) {
+                this->logger_->error("new_k contains NaN values, rank: {}",
+                                     this->engine_config_.basic_config.device);
+                throw std::runtime_error("new_k contains NaN values.");
+            }
             auto [quant_k, factor] = 
                 compressed_kv_bf16_to_fp8_per_token(new_k);
             // this->kv_storage_.update(layer_idx, cur_batch, quant_k, new_v, factor);
@@ -400,7 +457,9 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                 {torch::indexing::Slice(cur_batch_start_idx,
                                         cur_batch_start_idx + cur_batch_size)},
                 attn_result);
-            CUDA_CHECK(cudaStreamSynchronize(0));    
+
+            CUDA_CHECK(cudaStreamSynchronize(0)); 
+            CUDA_CHECK(cudaDeviceSynchronize());   
         }
     }
     torch::Tensor quant_k = torch::cat(full_new_k, 0);
@@ -423,8 +482,8 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                  .memory_format(torch::MemoryFormat::Contiguous));
 
     this->kv_storage_.update(layer_idx, idx, quant_k, new_v, factor);
-    // CUDA_CHECK(cudaStreamSynchronize(0));
-    // CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    CUDA_CHECK(cudaDeviceSynchronize());
     return final_output;
 };
 

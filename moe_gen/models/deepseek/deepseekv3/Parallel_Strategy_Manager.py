@@ -152,7 +152,7 @@ class Parallel_Strategy_Manager:
 		self.host_routed_experts = []
 		# self.expert_location_map = {}
 
-		NUM_LOCAL_EXPERT_PER_LAYER = 26  # Per requirements: 15 experts per GPU per layer
+		NUM_LOCAL_EXPERT_PER_LAYER = 24  # Per requirements: 15 experts per GPU per layer
 		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
 		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
@@ -367,7 +367,7 @@ class Parallel_Strategy_Manager:
 		logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
 
 
-	def _config_expert_module(self):
+	def _config_expert_module_(self):
 		"""
 		Replace expert module with the wrapper.
 		"""
@@ -451,6 +451,100 @@ class Parallel_Strategy_Manager:
 		logging.info(
 			f"Expert module configuration time: {end_time - start_time:.2f} seconds"
 		)
+
+	def _config_expert_module(self):
+		"""
+		Replace expert module with the wrapper.
+		"""
+		start_time = time.perf_counter()
+		mlp_names = ["gate_proj", "up_proj", "down_proj"]
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			len(self.model.model.layers),
+		):
+			layer = self.model.model.layers[layer_idx]
+			if (
+				"shared_expert_" + str(layer_idx)
+				in self.weight_copy_task["shared_expert"]
+			):
+				get_weights = True
+			else:
+				get_weights = False
+
+			prefix = "model.layers." + str(layer_idx) + ".mlp.shared_experts."
+			postfix = ".weight_scale_inv"
+			weight_dequant_scales = {}
+			for name in mlp_names:
+				key = prefix + name + postfix
+				if key in self.skeleton_state_dict:
+					weight_dequant_scales[name + postfix] = self.skeleton_state_dict[key].to(
+						self.engine_config.Basic_Config.device_torch
+					)
+				
+
+
+			layer.mlp.shared_experts = Expert_Wrapper(
+				layer.mlp.shared_experts,
+				layer_idx,
+				-1,
+				self.core_engine,
+				self.engine_config,
+				self.model_config,
+				get_weights,
+				weight_dequant_scales,
+			)
+			for expert_idx in range(len(layer.mlp.experts)):
+				if (
+					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+					in self.weight_copy_task["routed_expert"]
+				):
+					get_weights = True
+				else:
+					get_weights = False
+
+				prefix = (
+					"model.layers."
+					+ str(layer_idx)
+					+ ".mlp.experts."
+					+ str(expert_idx)
+					+ "."
+				)
+				postfix = ".weight_scale_inv"
+				weight_dequant_scales = {}
+				# for name, param in self.skeleton_state_dict.items():
+				# 	if name.startswith(prefix) and name.endswith(postfix):
+				# 		key = name[len(prefix) :]
+				# 		weight_dequant_scales[key] = param.to(
+				# 			self.engine_config.Basic_Config.device_torch
+				# 		)
+				for name in mlp_names:
+					key = prefix + name + postfix
+					if key in self.skeleton_state_dict:
+						weight_dequant_scales[name + postfix] = self.skeleton_state_dict[key].to(
+							self.engine_config.Basic_Config.device_torch
+						)
+				layer.mlp.experts[expert_idx] = Expert_Wrapper(
+					layer.mlp.experts[expert_idx],
+					layer_idx,
+					expert_idx,
+					self.core_engine,
+					self.engine_config,
+					self.model_config,
+					get_weights,
+					weight_dequant_scales,
+				)
+				if get_weights == False:
+					layer.mlp.experts[expert_idx]._register_fp8_weights()
+					for key, value in layer.mlp.experts[expert_idx].weight_dequant_scale.items():
+						value = value.to(
+							self.engine_config.Basic_Config.device_torch
+						)
+					routed_expert_name = "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+					# self.fp8_weights_IPC_handle[routed_expert_name] = {}
+		end_time = time.perf_counter()
+		logging.info(
+			f"Expert module configuration time: {end_time - start_time:.2f} seconds"
+		)
 		
 
 	def _lm_head_forward_pre_hook(self, module, input):
@@ -467,94 +561,3 @@ class Parallel_Strategy_Manager:
 			if "weight_scale_inv" in key:
 				self.dequant_scale[key] = param				
 
-	def _config_expert_module_(self):
-		"""
-		Replace expert module with the wrapper.
-		Optimized version with reduced redundancy.
-		"""
-		start_time = time.perf_counter()
-		
-		# Pre-process skeleton_state_dict to avoid repeated iterations
-		weight_dequant_scales_by_prefix = {}
-		for name, param in self.skeleton_state_dict.items():
-			if name.endswith(".weight_scale_inv"):
-				# Extract layer and expert information from the parameter name
-				parts = name.split(".")
-				if "shared_experts" in name:
-					# Format: model.layers.{layer_idx}.mlp.shared_experts.{remainder}
-					if len(parts) >= 5:
-						layer_idx = int(parts[2])
-						prefix = f"model.layers.{layer_idx}.mlp.shared_experts."
-						key = name[len(prefix):]
-						if prefix not in weight_dequant_scales_by_prefix:
-							weight_dequant_scales_by_prefix[prefix] = {}
-						weight_dequant_scales_by_prefix[prefix][key] = param.to(
-							self.engine_config.Basic_Config.device_torch
-						)
-				elif "experts" in name:
-					# Format: model.layers.{layer_idx}.mlp.experts.{expert_idx}.{remainder}
-					if len(parts) >= 6:
-						layer_idx = int(parts[2])
-						expert_idx = int(parts[4])
-						prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
-						key = name[len(prefix):]
-						if prefix not in weight_dequant_scales_by_prefix:
-							weight_dequant_scales_by_prefix[prefix] = {}
-						weight_dequant_scales_by_prefix[prefix][key] = param.to(
-							self.engine_config.Basic_Config.device_torch
-						)
-		
-		# Main loop - configure expert modules
-		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
-			len(self.model.model.layers),
-		):
-			layer = self.model.model.layers[layer_idx]
-			
-			# Process shared experts
-			shared_expert_key = f"shared_expert_{layer_idx}"
-			get_weights = shared_expert_key in self.weight_copy_task["shared_expert"]
-			
-			prefix = f"model.layers.{layer_idx}.mlp.shared_experts."
-			weight_dequant_scales = weight_dequant_scales_by_prefix.get(prefix, {})
-			
-			layer.mlp.shared_experts = Expert_Wrapper(
-				layer.mlp.shared_experts,
-				layer_idx,
-				-1,
-				self.core_engine,
-				self.engine_config,
-				self.model_config,
-				get_weights,
-				weight_dequant_scales,
-			)
-			
-			# Process routed experts
-			for expert_idx in range(len(layer.mlp.experts)):
-				routed_expert_key = f"routed_expert_{layer_idx}_{expert_idx}"
-				get_weights = routed_expert_key in self.weight_copy_task["routed_expert"]
-				
-				prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
-				weight_dequant_scales = weight_dequant_scales_by_prefix.get(prefix, {})
-				
-				layer.mlp.experts[expert_idx] = Expert_Wrapper(
-					layer.mlp.experts[expert_idx],
-					layer_idx,
-					expert_idx,
-					self.core_engine,
-					self.engine_config,
-					self.model_config,
-					get_weights,
-					weight_dequant_scales,
-				)
-				
-				if not get_weights:
-					layer.mlp.experts[expert_idx]._register_fp8_weights()
-					for key, value in layer.mlp.experts[expert_idx].weight_dequant_scale.items():
-						value = value.to(self.engine_config.Basic_Config.device_torch)
-					# Note: Removed commented code from original implementation
-		
-		end_time = time.perf_counter()
-		logging.info(
-			f"Expert module configuration time: {end_time - start_time:.2f} seconds"
-		)
