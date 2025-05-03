@@ -96,8 +96,14 @@ EngineConfig parse_engine_config(const py::object& engine_config);
 ModelConfig parse_model_config(const py::object& model_config);
 std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
                                             const std::string& logger_name);
+std::string get_tensor_shape(
+    const torch::Tensor& t,
+    bool include_dtype = true,
+    bool include_device = true);
 
 template <typename T>
 constexpr T ceil_div(T numerator, T denominator) {
     return (numerator + denominator - 1) / denominator;
 }
+
+

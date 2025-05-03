@@ -413,7 +413,7 @@ class Attn_Wrapper(torch.nn.Module):
                 #     )
                 # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
                 self.core_engine.kv_offload(
-                    self.layer_idx, cur_attn_batch, key_cache, value_cache
+                    self.layer_idx, cur_attn_batch, key_cache, value_cache, cur_attention_mask
                 )
                 # Sync
                 # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
@@ -439,11 +439,12 @@ class Attn_Wrapper(torch.nn.Module):
             hidden_states = kwargs["hidden_states"]
             attention_mask = Attn_Wrapper.attention_mask
             position_ids = Attn_Wrapper.position_ids
-            # logging.info(f"rank: {dist.get_rank()} attention_mask: {attention_mask}")
-            # logging.info(f"rank: {dist.get_rank()} position_ids: {position_ids}")
-            # if self.layer_idx == 0:
-            #     logging.info(f"cur_hideden_states seq 0 : {hidden_states[0][0]}")
-            #     logging.info(f"cur_hideden_states seq 1 : {hidden_states[0][0]}")
+            # position_ids = torch.arange(
+            #     attention_mask.size(-1),
+            #     dtype=torch.long,
+            #     device=attention_mask.device,
+            # ).unsqueeze(0)
+            attention_mask = attention_mask.to(torch.int64)
             final_attn_result = self.core_engine.attn(
                 self.module,
                 self.layer_idx,

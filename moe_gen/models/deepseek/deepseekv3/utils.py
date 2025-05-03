@@ -12,8 +12,11 @@ from flash_mla import (
 from .flash_attn_utils import (
 	_upad_input,
 	pad_input,
+	pad_input_cus
 )
 from flash_attn_interface import flash_attn_varlen_func 
+import triton
+import torch.distributed as dist
 	
 
 def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -41,7 +44,44 @@ def rotary_pos_emb(t, cos, sin, position_ids, unsqueeze_dim=1):
 	t_embed = (t * cos) + (rotate_half(t) * sin)
 	return t_embed
 
-@torch.no_grad()
+
+
+def convert_to_causal_attention_mask(attention_mask):
+    """
+    Convert a 2D attention mask (batch_size, seq_len) to a 4D causal attention mask (batch_size, 1, 1, seq_len).
+    Uses 0 for padding tokens and the minimum value of bfloat16 for non-padding tokens.
+    
+    Args:
+        attention_mask: torch.Tensor of shape (batch_size, seq_len) with 0 for padding and 1 for non-padding
+    
+    Returns:
+        causal_mask: torch.Tensor of shape (batch_size, 1, 1, seq_len) with 0 for padding and min of bfloat16 for non-padding
+    """
+    # Get batch size and sequence length
+    batch_size, seq_len = attention_mask.shape
+    
+    # Create causal mask (lower triangular matrix)
+    # This ensures each token can only attend to itself and previous tokens
+    causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=attention_mask.device))
+    
+    # Expand attention_mask to match the causal mask shape for broadcasting
+    expanded_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+    
+    # Combine the attention mask with the causal mask
+    # This ensures we mask both padding tokens and future tokens
+    combined_mask = causal_mask.unsqueeze(0) * expanded_attention_mask
+    
+    # Convert 0s to min of bfloat16 (approximately -3.4e+38) and keep 0s as 0s
+    min_bfloat16 = torch.finfo(torch.bfloat16).min
+    
+    # Where the combined mask is 0, keep it as 0 (for padding tokens)
+    # Where the combined mask is 1, replace with min of bfloat16 (for non-padding tokens that can be attended to)
+    final_mask = torch.zeros_like(combined_mask)
+    final_mask = torch.where(combined_mask > 0, min_bfloat16 * torch.ones_like(combined_mask), final_mask)
+    
+    return final_mask
+
+@torch.inference_mode()
 def cus_absorbed_mla_decoding_forward(
 	self,
 	hidden_states: torch.Tensor,
@@ -50,19 +90,21 @@ def cus_absorbed_mla_decoding_forward(
 	attention_mask: torch.Tensor,
 	position_ids: torch.Tensor,
 ):
-	# if past_key_states.dtype == torch.float8_e4m3fn:
-	#     # Dequantize past_key_states
-	#     # Random generate the scale
-	#     weight_scale_inv = torch.empty(
-	#         (past_key_states.size(0), past_key_states.size(1)),
-	#         device=past_key_states.device,
-	#         dtype=torch.float,
-	#     )
-	#     # past_key_states = past_key_states.to(torch.bfloat16)
-	#     past_key_states = compressed_kv_fp8_to_bf16_per_token(
-	#         past_key_states, weight_scale_inv
-	#     )
-	# logging.info(f"Entered mla decoding forward")
+	assert attention_mask.dim() == 2
+	# position_ids of q_pe is the sum of the attention mask minus one 
+	q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+	# logging.info(f"q_position_id shape: {q_position_id.shape}")
+	# logging.info(f"q_position_id: {q_position_id}")
+	
+	# logging.info(f"Rank: {dist.get_rank()}, attention_mask sum: {attention_mask[0].sum()}")
+	# attention_mask = convert_to_causal_attention_mask(attention_mask)
+	attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+	attention_mask = torch.where(
+		attention_mask == 0,
+		torch.finfo(torch.bfloat16).min,
+		0).to(hidden_states.dtype)
+	# logging.info(f"attention_mask 0 :{attention_mask[0]}")
+
 	bsz, q_len, _ = hidden_states.size()
 
 	if self.q_lora_rank is None:
@@ -77,7 +119,17 @@ def cus_absorbed_mla_decoding_forward(
 	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
 	# past_key_states = past_key_states.to(torch.bfloat16)
-	compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
+	# compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
+	# Copy the new compressed_kv to the corresponding position in the past_key_states
+	# The position is given by q_position_id.
+	# We first concat the past_key_states with a padding of 0
+	compressed_kv_ref = torch.cat(
+		[past_key_states, torch.zeros_like(compressed_kv)], dim=1
+	)
+	for idx in range(bsz):
+		compressed_kv_ref[idx, q_position_id[idx], :] = compressed_kv[idx,0,:]
+
+
 	kv_len = compressed_kv_ref.size(1)
 	assert kv_len == attention_mask.size(-1)
 	compressed_kv_ref, k_pe = torch.split(
@@ -98,7 +150,10 @@ def cus_absorbed_mla_decoding_forward(
 
 	# cos, sin = self.rotary_emb(q_pe, seq_len=q_len)
 	# q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids)
-	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids[:, -1].unsqueeze(-1))
+	# q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids[:, -1].unsqueeze(-1))
+	
+
+	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_id)
 
 	q_nope = torch.matmul(q_nope, q_absorb)
 	# attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
@@ -393,24 +448,9 @@ def FlashMLA_DeepSeekR1(
 	attention_mask: torch.Tensor,
 	position_ids: torch.Tensor,
 ):
-	# attention_mask = attention_mask.squeeze(1).squeeze(1)  # [bsz,seq_len]
-	# attention_mask = (attention_mask == 0).to(hidden_states.dtype)
-	# logging.info(f"attention_mask{attention_mask[0]}")
+	assert attention_mask.dim() == 2
 	bsz, q_len, _ = hidden_states.size()
-	# if past_key_states.dtype == torch.float8_e4m3fn:
-	# 	# Dequantize past_key_states
-	# 	# Random generate the scale
-	# 	weight_scale_inv = torch.empty(
-	# 		(past_key_states.size(0), past_key_states.size(1)),
-	# 		device=past_key_states.device,
-	# 		dtype=torch.float,
-	# 	)
-	# 	# past_key_states = past_key_states.to(torch.bfloat16)
-	# 	past_key_states = compressed_kv_fp8_to_bf16_per_token(
-	# 		past_key_states, weight_scale_inv
-	# 	)
-	
-	
+
 	q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(
@@ -418,7 +458,15 @@ def FlashMLA_DeepSeekR1(
 	)
 
 	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-	compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
+	# compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
+	compressed_kv_ref = torch.cat(
+		[past_key_states, torch.zeros_like(compressed_kv)], dim=1
+	)
+	q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+	for idx in range(bsz):
+		compressed_kv_ref[idx, q_position_id[idx], :] = compressed_kv[idx,0,:]
+	
+	
 	kv_len = compressed_kv_ref.size(1)
 	assert kv_len == attention_mask.size(-1)
 	compressed_kv_ref, k_pe = torch.split(
@@ -445,7 +493,7 @@ def FlashMLA_DeepSeekR1(
 	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
 	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
 
-	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids[:, -1].unsqueeze(-1))
+	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_id)
 	
 
 	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
@@ -467,11 +515,13 @@ def FlashMLA_DeepSeekR1(
 	cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
 	
 	# max_seqlen = cache_seqlens.max().item()
-	cache_seqlens = torch.full(
-		(bsz,), kv_len, dtype=torch.int32, device=compressed_kv_ref.device
-	)
+	# cache_seqlens = torch.full(
+	# 	(bsz,), kv_len, dtype=torch.int32, device=compressed_kv_ref.device
+	# )
 	max_seqlen = kv_len
 	max_seqlen_pad = ((max_seqlen + block_size - 1) // block_size) * block_size
+	# max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
+
 	# logging.info(f"max_seqlen_pad: {max_seqlen_pad}")
 
 	# Pad the compressed_kv_ref tensor to the maximum sequence length
@@ -480,7 +530,8 @@ def FlashMLA_DeepSeekR1(
 			compressed_kv_ref,
 			torch.full(
 				(bsz, max_seqlen_pad - kv_len, 1, compressed_kv_ref.size(-1)),
-				float("nan"),
+				# float("nan"),
+				0,
 				dtype=compressed_kv_ref.dtype,
 				device=compressed_kv_ref.device,
 			),
@@ -527,7 +578,7 @@ def FlashMLA_DeepSeekR1(
 			tile_scheduler_metadata,
 			num_splits,
 			self.softmax_scale,
-			False
+			True
 		)
 	except Exception as e:
 		logging.error(f"Error in flash_mla_with_kvcache: {e}")
@@ -626,17 +677,10 @@ def hopper_prefill_mla(
 		softmax_scale=self.softmax_scale,
 		causal=True
 	)		
-	attn_output= pad_input(
-		attn_output_unpad, indices_q, bsz, seq_len
-	).view(
-		bsz, seq_len, self.num_heads, self.v_head_dim
-	).transpose(1, 2)	
 
-
-	attn_output = attn_output.transpose(1, 2).contiguous()
-	attn_output = attn_output.reshape(
+	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
 		bsz, seq_len, self.num_heads * self.v_head_dim
-	)
+	).contiguous()
 
 	attn_output = self.o_proj(attn_output)
 

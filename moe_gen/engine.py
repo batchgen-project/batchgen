@@ -80,7 +80,7 @@ def create_position_ids_from_attention_mask(
     position_ids = torch.clamp(cumsum - 1, min=0)
     # Zero out positions where mask=0, then replace those with 1
     position_ids = position_ids * attention_mask
-    position_ids = position_ids + (attention_mask.eq(0) * 1)
+    position_ids = position_ids + (attention_mask.eq(0) * (-1))
     return position_ids
 
 
@@ -955,7 +955,8 @@ class MoE_Gen:
         logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
         while new_token_idx < self.max_decoding_length and len(batch) > 0:
-            logging.info(f"Decoding new token idx: {new_token_idx}")
+            if self.rank == 0:
+                logging.info(f"Decoding new token idx: {new_token_idx}")
             # Step 1: Before each round of decoding, review the attention mode and batching plan.
             # TODO: review attention mode. Current fixing attention mode.
             RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
@@ -1293,21 +1294,45 @@ class MoE_Gen:
         """
         pass
 
+    # def update_new_token(
+    #     self, new_tokens: torch.Tensor, query_idx: List[int], new_token_idx: int
+    # ):
+    #     new_tokens = new_tokens.to("cpu")
+    #     for idx, q_idx in enumerate(query_idx):
+    #         self.query_book[q_idx].decoded_tokens[:, new_token_idx] = (
+    #             new_tokens[idx]
+    #         )
+    #         self.query_book[q_idx].encoded["input_ids"][
+    #             0, new_token_idx + self.max_input_length
+    #         ] = new_tokens[idx]
+    #         self.query_book[q_idx].encoded["attention_mask"][
+    #             0, new_token_idx + self.max_input_length
+    #         ] = torch.tensor(1, dtype=torch.int64)
+
+
     def update_new_token(
         self, new_tokens: torch.Tensor, query_idx: List[int], new_token_idx: int
     ):
         new_tokens = new_tokens.to("cpu")
         for idx, q_idx in enumerate(query_idx):
-            self.query_book[q_idx].decoded_tokens[:, new_token_idx] = (
-                new_tokens[idx]
-            )
-            # self.query_book[query_idx].encoded["input_ids"] = torch.cat(
-            # 	[self.query_book[query_idx].encoded["input_ids"], new_tokens[idx].view(1,1)], dim=1)
-            # self.query_book[query_idx].encoded["attention_mask"] = torch.cat(
-            # 	[self.query_book[query_idx].encoded["attention_mask"], torch.ones(1,1,dtype=torch.int64)], dim=1)
-            self.query_book[q_idx].encoded["input_ids"][
-                0, new_token_idx + self.max_input_length
-            ] = new_tokens[idx]
-            self.query_book[q_idx].encoded["attention_mask"][
-                0, new_token_idx + self.max_input_length
-            ] = torch.tensor(1, dtype=torch.int64)
+            # Update decoded tokens
+            self.query_book[q_idx].decoded_tokens[:, new_token_idx] = new_tokens[idx]
+            
+            # Update encoded input_ids
+            # self.query_book[q_idx].encoded["input_ids"][
+            #     0, new_token_idx + self.max_input_length
+            # ] = new_tokens[idx]
+            
+            # Get the current attention mask
+            attention_mask = self.query_book[q_idx].encoded["attention_mask"][0]
+            
+            # Find the first 0 in the attention mask
+            zeros_positions = (attention_mask == 0).nonzero(as_tuple=True)[0]
+            # logging.info(f"zeros_positions: {zeros_positions}")
+            if len(zeros_positions) > 0:
+                # If a 0 is found, change the first one to 1
+                first_zero_pos = zeros_positions[0].item()
+                self.query_book[q_idx].encoded["attention_mask"][0, first_zero_pos] = torch.tensor(1, dtype=attention_mask.dtype)
+                # self.query_book[q_idx].encoded["input_ids"][0, first_zero_pos] = new_tokens[idx]
+            else:
+                raise ValueError("No 0 found in the attention mask.")

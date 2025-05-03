@@ -776,7 +776,7 @@ def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> tor
     return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)	
 
 @torch.no_grad()
-def FlashMLA_DeepSeekR1(
+def FlashMLA_DeepSeekR1_(
     self,
     hidden_states: torch.Tensor,
     past_key_states: torch.Tensor,

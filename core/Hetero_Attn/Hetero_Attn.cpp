@@ -36,6 +36,8 @@
 #include <torch/torch.h>
 #include <unordered_map>
 #include <vector>
+#include <sstream>
+#include <string>
 
 #include "../DtoH_Engine/DtoH_Engine.h"
 #include "../GPU_Weight_Buffer/GPU_Weight_Buffer.h"
@@ -171,16 +173,16 @@ torch::Tensor Hetero_Attn::attn(
     };
 };
 
-std::string get_tensor_shape(const torch::Tensor& t) {
-    std::stringstream ss;
-    ss << "[";
-    for (int i = 0; i < t.dim(); ++i) {
-        ss << t.size(i);
-        if (i < t.dim() - 1) ss << ", ";
-    }
-    ss << "]";
-    return ss.str();
-}
+// std::string get_tensor_shape(const torch::Tensor& t) {
+//     std::stringstream ss;
+//     ss << "[";
+//     for (int i = 0; i < t.dim(); ++i) {
+//         ss << t.size(i);
+//         if (i < t.dim() - 1) ss << ", ";
+//     }
+//     ss << "]";
+//     return ss.str();
+// }
 
 torch::Tensor Hetero_Attn::_attn_mode_0(py::object& PyTorch_attn_module,
                                         int64_t layer_idx,
@@ -330,14 +332,14 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
     } else {
         CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
         // this->logger_->info("Hetero_Attn::_attn_mode_1 deepseek");
-        auto dequantize_factor = this->kv_storage_.get_k_quantize_scale(layer_idx);
+        // auto dequantize_factor = this->kv_storage_.get_k_quantize_scale(layer_idx);
         // this->logger_->info("dequantize_factor got");
         // Check if the dequantize_factor contains nan
-        if (torch::any(torch::isnan(dequantize_factor)).item<bool>()) {
-            this->logger_->error("Dequantize factor contains NaN values, rank: {}",
-                                 this->engine_config_.basic_config.device);
-            throw std::runtime_error("Dequantize factor contains NaN values.");
-        }
+        // if (torch::any(torch::isnan(dequantize_factor)).item<bool>()) {
+        //     this->logger_->error("Dequantize factor contains NaN values, rank: {}",
+        //                          this->engine_config_.basic_config.device);
+        //     throw std::runtime_error("Dequantize factor contains NaN values.");
+        // }
         for (int64_t micro_batch_idx = 0;
              micro_batch_idx < micro_batches.size(); micro_batch_idx++) {
             auto cur_batch = micro_batches[micro_batch_idx];
@@ -409,9 +411,14 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                 module_output;
             
             // this->logger_->info("start dequantization");
-            auto cur_factor = dequantize_factor.index(
-                {torch::indexing::Slice(cur_batch_start_idx,
-                                        cur_batch_start_idx + cur_batch_size)});
+            // auto cur_factor = dequantize_factor.index(
+            //     {torch::indexing::Slice(cur_batch_start_idx,
+            //                             cur_batch_start_idx + cur_batch_size)});
+            int64_t padding_length = cur_k.size(1);
+            auto cur_factor = this->kv_storage_.get_k_quantize_scale(layer_idx, cur_batch, padding_length);
+            // log cur_factor shape
+            // this->logger_->info("cur_factor shape: {}",
+            //                  get_tensor_shape(cur_factor));
             auto dequant_k = compressed_kv_fp8_to_bf16_per_token(cur_k, cur_factor);
             // Check if the dequant_k contains nan
             if (torch::any(torch::isnan(dequant_k)).item<bool>()) {

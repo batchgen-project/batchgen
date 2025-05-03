@@ -97,11 +97,11 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
 	)
 
 
-def pad_input(hidden_states, indices, batch, seqlen):
+def pad_input_cus(hidden_states, cu_seqlens_q, batch, seqlen):
 	"""
 	Arguments:
 		hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
-		indices: (total_nnz), the indices that represent the non-masked tokens of the original padded input sequence.
+		cu_seqlens_q: (total_nnz),
 		batch: int, batch size for the padded sequence.
 		seqlen: int, maximum sequence length for the padded sequence.
 	Return:
@@ -109,7 +109,26 @@ def pad_input(hidden_states, indices, batch, seqlen):
 	"""
 	dim = hidden_states.shape[1:]
 	output = torch.zeros((batch * seqlen), *dim, device=hidden_states.device, dtype=hidden_states.dtype)
-	output[indices] = hidden_states
+	for i in range(batch):
+		start = cu_seqlens_q[i]
+		end = cu_seqlens_q[i + 1]
+		output[i * seqlen : i * seqlen + end - start] = hidden_states[start:end]
+	
+	return rearrange(output, "(b s) ... -> b s ...", b=batch)
+
+def pad_input(hidden_states, indices_q, batch, seqlen):
+	"""
+	Arguments:
+		hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+		indices_q: (total_nnz),
+		batch: int, batch size for the padded sequence.
+		seqlen: int, maximum sequence length for the padded sequence.
+	Return:
+		hidden_states: (batch, seqlen, ...)
+	"""
+	dim = hidden_states.shape[1:]
+	output = torch.zeros((batch * seqlen), *dim, device=hidden_states.device, dtype=hidden_states.dtype)
+	output[indices_q] = hidden_states
 	return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 

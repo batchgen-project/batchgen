@@ -44,6 +44,8 @@ struct sequence_storage {
     void* start_ptr;
     int64_t used_byte_size;
     int64_t num_tokens;
+    torch::Tensor quantize_scale;
+    sequence_storage() : start_ptr(nullptr), used_byte_size(0), num_tokens(0) {}
 };
 
 class DtoH_Engine;
@@ -56,7 +58,7 @@ class KV_Storage {
     void Init();
 
     void offload(int64_t layer_idx, std::vector<int64_t> query_global_idx,
-                 torch::Tensor k, torch::Tensor v);
+                 torch::Tensor k, torch::Tensor v, torch::Tensor attention_mask);
     void update(int64_t layer_idx, std::vector<int64_t> query_global_idx,
                 torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale);
 
@@ -75,17 +77,7 @@ class KV_Storage {
     void create_fake_kv_storage();
     void save_compressed_kv();
 
-    torch::Tensor get_k_quantize_scale(int64_t layer_idx) {
-        std::stringstream ss;
-        ss << "[";
-        const auto& shape = this->k_quantize_scale[layer_idx].sizes().vec();
-        for (size_t i = 0; i < shape.size(); ++i) {
-            ss << shape[i] << (i < shape.size() - 1 ? "×" : "");
-        }
-        ss << "]";
-        this->logger_->debug("k_quantize_scale shape: {}", ss.str());
-        return this->k_quantize_scale[layer_idx];
-    }
+    torch::Tensor get_k_quantize_scale(int64_t layer_idx, std::vector<int64_t> cur_batch, int64_t padding_lentgh);
 
    private:
     /* Template */
@@ -99,7 +91,7 @@ class KV_Storage {
     std::vector<std::vector<sequence_storage>> k_storage;
     std::vector<std::vector<sequence_storage>> v_storage;
     std::vector<std::mutex> per_element_mutex_;
-    std::vector<torch::Tensor> k_quantize_scale;
+    // std::vector<torch::Tensor> k_quantize_scale;
 
     std::mutex mutex_;  // protect query_idx_to_slot_idx_map and empty_slots.
     std::unordered_map<int64_t, int64_t> query_idx_to_slot_idx_map;
@@ -108,7 +100,8 @@ class KV_Storage {
     void offload_helper_(int64_t layer_idx,
                          std::vector<int64_t> query_global_idx, 
                          torch::Tensor k,
-                         torch::Tensor v);
+                         torch::Tensor v,
+                         torch::Tensor attention_mask);
     void update_helper_(int64_t layer_idx,
                         std::vector<int64_t> query_global_idx, 
                         torch::Tensor k,

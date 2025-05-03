@@ -226,10 +226,68 @@ void KV_Storage::Init() {
     }
 };
 
-void KV_Storage::offload(int64_t layer_idx,
-                         std::vector<int64_t> query_global_idx, 
-                         torch::Tensor k,
-                         torch::Tensor v) 
+torch::Tensor KV_Storage::get_k_quantize_scale(
+    int64_t layer_idx, std::vector<int64_t> cur_batch, int64_t padding_length) 
+{
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    torch::Device device(torch::kCUDA, this->engine_config_.basic_config.device);
+    auto opt = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(device)  // Use the device object instead of a raw integer
+        .requires_grad(false);
+    auto k_quantize_scale = torch::ones({cur_batch.size(), padding_length}, opt);
+                                            
+    for (int64_t i = 0; i < static_cast<int64_t>(cur_batch.size()); i++) {
+        auto query_idx = cur_batch[i];
+        int64_t slot_idx = -1;
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+        }
+        auto scale = this->k_storage[slot_idx][layer_idx].quantize_scale;
+        // log scale shape
+        // this->logger_->info("scale shape: {}",
+        //                      get_tensor_shape(scale));
+        int64_t scale_size = scale.size(1);
+        // copy scale to k_quantize_scale[i]'s first scale's size
+        if(scale_size > padding_length) {
+            this->logger_->info("scale_size: {}, padding_length: {}",
+                                 scale_size, padding_length);
+            throw std::runtime_error("scale_size > padding_length");
+        }
+        k_quantize_scale.index({i, torch::indexing::Slice(0, scale_size)}) = scale.index({0, torch::indexing::Slice(0, scale_size)}); 
+        // Log padding_length, and the first 5 elements of k_quantize_scale[i]
+        // this->logger_->info("padding_length: {}, k_quantize_scale[{}]: {}{}{}{}{}",
+        //                      padding_length, i,
+        //                      k_quantize_scale[i][-1].item<float>(),
+        //                      k_quantize_scale[i][-2].item<float>(),
+        //                      k_quantize_scale[i][-3].item<float>(),
+        //                      k_quantize_scale[i][-4].item<float>(),
+        //                      k_quantize_scale[i][-5].item<float>());
+    }
+    // Check k_quantize_scale has nan values
+    if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
+        for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
+            if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
+                this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
+                                     i, this->engine_config_.basic_config.device,
+                                     layer_idx);
+            }
+        }
+        throw std::runtime_error("k_quantize_scale has nan values");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return k_quantize_scale;
+}
+            
+            
+void KV_Storage::offload(
+    int64_t layer_idx,
+    std::vector<int64_t> query_global_idx, 
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor attention_mask)
 {
     // SAFE_CALL(
     //     [&]() {
@@ -250,20 +308,16 @@ void KV_Storage::offload(int64_t layer_idx,
         }
         throw std::runtime_error("k has nan values");
     }
-    // SAFE_CALL(
-    //     [&]() {
-    //         auto worker = std::thread(&KV_Storage::offload_helper_, this,
-    //                                   layer_idx, query_global_idx, k, v);
-    //         // worker.detach();
-    //         worker.join();
-    //     },
-    //     this->logger_);
-    this->offload_helper_(layer_idx, query_global_idx, k, v);
+    this->offload_helper_(layer_idx, query_global_idx, k, v, attention_mask);
 };
 
-void KV_Storage::offload_helper_(int64_t layer_idx,
-                                 std::vector<int64_t> query_global_idx,
-                                 torch::Tensor bf16_k, torch::Tensor v) {
+void KV_Storage::offload_helper_(
+    int64_t layer_idx,
+    std::vector<int64_t> query_global_idx,
+    torch::Tensor bf16_k, 
+    torch::Tensor v,
+    torch::Tensor attention_mask) 
+{
     this->logger_->debug("Offloading layer_idx: {}", layer_idx);
     try {
         if (this->model_config_.model_type.find("deepseek") ==
@@ -389,16 +443,17 @@ void KV_Storage::offload_helper_(int64_t layer_idx,
 
             // If k_quantize_scale[layer_idx] is torch.empty({0,0}), assign it to k_quantize_scale
             // other wise concatenate it.
-            if (this->k_quantize_scale[layer_idx].numel() == 0) {
-                this->k_quantize_scale[layer_idx] = k_quantize_scale;
-            } else {
-                this->k_quantize_scale[layer_idx] = torch::cat(
-                    {this->k_quantize_scale[layer_idx], k_quantize_scale}, 0);
-            }
+            // if (this->k_quantize_scale[layer_idx].numel() == 0) {
+            //     this->k_quantize_scale[layer_idx] = k_quantize_scale;
+            // } else {
+            //     this->k_quantize_scale[layer_idx] = torch::cat(
+            //         {this->k_quantize_scale[layer_idx], k_quantize_scale}, 0);
+            // }
             /* Step 1: Permute k and v in the device. */
             int64_t bsz = k.size(0);
             int64_t seq_len = k.size(1);
             int64_t k_seq_byte_size = k.size(1) * k.size(2) * k.element_size();
+            int64_t token_byte_size = k.size(2) * k.element_size();
             k = k.contiguous();
 
             /* Launch DMA per sequence. */
@@ -441,10 +496,21 @@ void KV_Storage::offload_helper_(int64_t layer_idx,
                                                         host_k_ptr,
                                                         device_k_ptr,
                                                         k_seq_byte_size);
-                    // torch::cuda::synchronize(this->engine_config_.basic_config.device);
+                    // Only note non-padding token.
+                    // num_tokens = attention_mask.sum(1).item<int64_t>();
+                    // used_byte_size = num_tokens * token_byte_size;
+                    this->k_storage[slot_idx][layer_idx].num_tokens = attention_mask[i].sum().item<int64_t>();
                     this->k_storage[slot_idx][layer_idx].used_byte_size =
-                        k_seq_byte_size;
-                    this->k_storage[slot_idx][layer_idx].num_tokens = seq_len;
+                        attention_mask[i].sum().item<int64_t>() * token_byte_size;
+                    this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)}).clone().unsqueeze(0);                     
+                        
+                    // this->logger_->info("k_storage[{}][{}].num_tokens: {}, used_byte_size: {}",
+                    //                     slot_idx, layer_idx,
+                    //                     this->k_storage[slot_idx][layer_idx].num_tokens,
+                    //                     this->k_storage[slot_idx][layer_idx].used_byte_size);
+                    // this->k_storage[slot_idx][layer_idx].used_byte_size =
+                    //     k_seq_byte_size;
+                    // this->k_storage[slot_idx][layer_idx].num_tokens = seq_len;
                 }
                 {
                     std::lock_guard<std::mutex> lock(this->mutex_);
@@ -577,9 +643,8 @@ void KV_Storage::update_helper_(int64_t layer_idx,
             }
             CUDA_CHECK(cudaStreamSynchronize(this->d2h_engine_.DtoH_stream));
         } else {
-            // logging 
-            this->k_quantize_scale[layer_idx] = torch::cat(
-                {this->k_quantize_scale[layer_idx], k_quantize_scale}, 1);
+            // this->k_quantize_scale[layer_idx] = torch::cat(
+            //     {this->k_quantize_scale[layer_idx], k_quantize_scale}, 1);
             k = k.contiguous();
             int64_t k_token_byte_size =
                 k.size(1) * k.size(2) * k.element_size();
@@ -605,6 +670,10 @@ void KV_Storage::update_helper_(int64_t layer_idx,
                     this->k_storage[slot_idx][layer_idx].used_byte_size +=
                         k_token_byte_size;
                     this->k_storage[slot_idx][layer_idx].num_tokens += 1;
+                    this->k_storage[slot_idx][layer_idx].quantize_scale = torch::cat(
+                        {this->k_storage[slot_idx][layer_idx].quantize_scale,
+                            k_quantize_scale.index({i}).unsqueeze(0)}, 1);
+                    // this->k_quantize_scale[layer_idx]
                 }
             }
         }
@@ -848,14 +917,14 @@ void KV_Storage::clear_kv_storage() {
                 }
             }
             // Init empty tensors for quantization scale
-            for(auto layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
-                auto options = torch::TensorOptions()
-                    .dtype(torch::kFloat32)
-                    .device(this->engine_config_.basic_config.device_torch)
-                    .requires_grad(false);
-                torch::Tensor k_quantize_scale = torch::empty({0,0}, options);
-                this->k_quantize_scale.push_back(k_quantize_scale);
-            }
+            // for(auto layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
+            //     auto options = torch::TensorOptions()
+            //         .dtype(torch::kFloat32)
+            //         .device(this->engine_config_.basic_config.device_torch)
+            //         .requires_grad(false);
+            //     torch::Tensor k_quantize_scale = torch::empty({0,0}, options);
+            //     this->k_quantize_scale.push_back(k_quantize_scale);
+            // }
         }
         this->logger_->debug(
             "KV_Storage clear_kv_storage(): K and V storage cleared.");

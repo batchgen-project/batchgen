@@ -203,3 +203,38 @@ std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
     logger->flush_on(spdlog::level::trace);
     return std::shared_ptr<spdlog::logger>(logger);
 };
+std::string get_tensor_shape(const torch::Tensor& tensor, 
+                             bool include_dtype,
+                             bool include_device) {
+    std::ostringstream shape_str;
+    
+    // Get the dimensions
+    auto sizes = tensor.sizes();
+    shape_str << "[";
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        shape_str << sizes[i];
+        if (i < sizes.size() - 1) {
+            shape_str << ", ";
+        }
+    }
+    shape_str << "]";
+    
+    // Add dtype if requested
+    if (include_dtype) {
+        shape_str << ", dtype=" << torch::toString(tensor.scalar_type());
+    }
+    
+    // Add device if requested
+    if (include_device) {
+        shape_str << ", device=";
+        if (tensor.device().is_cuda()) {
+            shape_str << "cuda:" << tensor.device().index();
+        } else if (tensor.device().is_cpu()) {
+            shape_str << "cpu";
+        } else {
+            shape_str << torch::toString(tensor.device().type());
+        }
+    }
+    
+    return shape_str.str();
+}

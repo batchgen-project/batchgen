@@ -70,7 +70,7 @@ class MoE_Gen {
 
     /* KV */
     void kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
-                    torch::Tensor key_states, torch::Tensor value_states);
+                    torch::Tensor key_states, torch::Tensor value_states,torch::Tensor attention_mask);
 
     /* Weights */
     // void add_weight_storage(
