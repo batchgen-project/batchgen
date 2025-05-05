@@ -1068,10 +1068,17 @@ class MoE_Gen:
                             #     * self.model_config.compressed_kv_dim
                             #     * 2
                             # )
+                            # past_kv_byte_size = (
+                            #     (self.max_input_length + idx)
+                            #     * self.model_config.compressed_kv_dim
+                            # )
+
+                            # Copy one more token to avoid torch::cat in attention forward.
                             past_kv_byte_size = (
-                                (self.max_input_length + idx)
+                                (self.max_input_length + idx + 1)
                                 * self.model_config.compressed_kv_dim
                             )
+
                         elif "mixtral" in self.model_config.model_type:
                             past_kv_byte_size = (
                                 (self.max_input_length + idx)
@@ -1266,15 +1273,15 @@ class MoE_Gen:
                         # position_ids=position_ids,
                         use_cache=False,
                     )
-                    torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
                     new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
                         -1, 1
                     )
                     # start = time.perf_counter()
                     self.update_new_token(new_tokens, batch, new_token_idx)
-                    torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
                     print(f"New tokens: {new_tokens}")
                     # logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
                 new_token_idx += 1

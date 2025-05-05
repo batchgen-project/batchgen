@@ -119,7 +119,7 @@ def cus_absorbed_mla_decoding_forward(
 	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
 	# past_key_states = past_key_states.to(torch.bfloat16)
-	# compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
+	# compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1) # 1.9ms
 	# Copy the new compressed_kv to the corresponding position in the past_key_states
 	# The position is given by q_position_id.
 	# We first concat the past_key_states with a padding of 0
@@ -135,7 +135,7 @@ def cus_absorbed_mla_decoding_forward(
 	compressed_kv_ref, k_pe = torch.split(
 		compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
-	compressed_kv_ref = self.kv_a_layernorm(compressed_kv_ref)
+	compressed_kv_ref = self.kv_a_layernorm(compressed_kv_ref) # 4.8 ms
 
 	k_pe = k_pe.view(bsz, 1, kv_len, self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(k_pe, seq_len=kv_len)
@@ -155,11 +155,11 @@ def cus_absorbed_mla_decoding_forward(
 
 	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_id)
 
-	q_nope = torch.matmul(q_nope, q_absorb)
+	q_nope = torch.matmul(q_nope, q_absorb) # 0.4ms
 	# attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
-	attn_weights = torch.einsum("bhqd,bhcd->bhqc", q_pe, k_pe)
+	attn_weights = torch.einsum("bhqd,bhcd->bhqc", q_pe, k_pe) # 0.3 ms
 	attn_weights = attn_weights + torch.einsum(
-		"bhqd,bhcd->bhqc", q_nope, compressed_kv_ref.unsqueeze(-3)
+		"bhqd,bhcd->bhqc", q_nope, compressed_kv_ref.unsqueeze(-3) # einsum 2.3ms
 	)
 	attn_weights = attn_weights * self.softmax_scale
 	if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
@@ -457,34 +457,57 @@ def FlashMLA_DeepSeekR1(
 		q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
 	)
 
-	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+	new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 	# compressed_kv_ref = torch.cat([past_key_states, compressed_kv], dim=1)
-	compressed_kv_ref = torch.cat(
-		[past_key_states, torch.zeros_like(compressed_kv)], dim=1
-	)
+	compressed_kv_ref = past_key_states
+	# compressed_kv_ref = torch.cat(
+	# 	[past_key_states, torch.zeros_like(new_compressed_kv)], dim=1
+	# )
+
+	# We get the past_key_states padded one from the buffer. This avoids one torch::cat.
+	# compressed_kv_ref = past_key_states
 	q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+	# lof compressed_kv_ref shape and q_position_id
+	# logging.info(f"compressed_kv_ref shape: {compressed_kv_ref.shape}")
+	# logging.info(f"q_position_id: {q_position_id}")
+	# set last position of compressed_kv_ref to 0
+	# compressed_kv_ref[:, -1, :] = 0
+	# logging.info(f"compressed_kv_ref shape: {compressed_kv_ref.shape}")
 	for idx in range(bsz):
-		compressed_kv_ref[idx, q_position_id[idx], :] = compressed_kv[idx,0,:]
-	
-	
+		compressed_kv_ref[idx, q_position_id[idx, 0], :] = new_compressed_kv[idx,0,:]
+	# compressed_kv_ref[:, -1, :] = 0
+	# logging.info(f"compressed_kv_ref shape: {compressed_kv_ref.shape}")
+	# logging.info(f"q_position_id: {q_position_id}")
+	# torch.cuda.current_stream(hidden_states.device).synchronize()
+
 	kv_len = compressed_kv_ref.size(1)
+	# logging.info(f"kv_len: {kv_len}, attention_mask size: {attention_mask.size()}, compressed_kv_ref size: {compressed_kv_ref.size()}")
 	assert kv_len == attention_mask.size(-1)
-	compressed_kv_ref, k_pe = torch.split(
+	compressed_kv, k_pe = torch.split(
 		compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
-	compressed_kv_ref = self.kv_a_layernorm(compressed_kv_ref)
+	compressed_kv = self.kv_a_layernorm(compressed_kv)
 
 	k_pe = k_pe.view(bsz, 1, kv_len, self.qk_rope_head_dim)
+	# logging.info(f"k_pe shape: {k_pe.shape}")
+	# logging.info(f"seq_len: {kv_len}")
 	cos, sin = self.rotary_emb(k_pe, seq_len=kv_len)
 	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids)
 	
-	compressed_kv_ref = compressed_kv_ref.view(
+	compressed_kv = compressed_kv.view(
 		bsz, 1, kv_len, self.kv_lora_rank
 	)
-	# Concat k_pe back to compressed_kv_ref
-	compressed_kv_ref = torch.cat(
-		[compressed_kv_ref, k_pe], dim=-1
-	).view(bsz, kv_len, 1, 576)
+	# # Concat k_pe back to compressed_kv_ref
+	# compressed_kv_ref = torch.cat(
+	# 	[compressed_kv, k_pe], dim=-1
+	# ).view(bsz, kv_len, 1, 576)
+	
+	
+	compressed_kv_ref = compressed_kv_ref.view(bsz, 1, kv_len, 576)
+	compressed_kv_ref[:, :, :, :self.kv_lora_rank] = compressed_kv
+	compressed_kv_ref[:, :, :, self.kv_lora_rank:] = k_pe
+	compressed_kv_ref = compressed_kv_ref.view(bsz, kv_len, 1, 576)
+	
 
 	
 	kv_b_proj = self.kv_b_proj.weight.view(
@@ -514,30 +537,33 @@ def FlashMLA_DeepSeekR1(
 	block_size = 64
 	cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
 	
-	# max_seqlen = cache_seqlens.max().item()
+	max_seqlen = cache_seqlens.max().item()
 	# cache_seqlens = torch.full(
 	# 	(bsz,), kv_len, dtype=torch.int32, device=compressed_kv_ref.device
 	# )
-	max_seqlen = kv_len
+	# max_seqlen = kv_len
 	max_seqlen_pad = ((max_seqlen + block_size - 1) // block_size) * block_size
 	# max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
 
 	# logging.info(f"max_seqlen_pad: {max_seqlen_pad}")
 
 	# Pad the compressed_kv_ref tensor to the maximum sequence length
-	compressed_kv_ref = torch.cat(
-		[
-			compressed_kv_ref,
-			torch.full(
-				(bsz, max_seqlen_pad - kv_len, 1, compressed_kv_ref.size(-1)),
-				# float("nan"),
-				0,
-				dtype=compressed_kv_ref.dtype,
-				device=compressed_kv_ref.device,
-			),
-		],
-		dim=1,
-	)
+	if max_seqlen_pad > kv_len:
+		compressed_kv_ref = torch.cat(
+			[
+				compressed_kv_ref,
+				torch.full(
+					(bsz, max_seqlen_pad - kv_len, 1, compressed_kv_ref.size(-1)),
+					# float("nan"),
+					0,
+					dtype=compressed_kv_ref.dtype,
+					device=compressed_kv_ref.device,
+				),
+			],
+			dim=1,
+		)
+	else:
+		compressed_kv_ref = compressed_kv_ref[:, :max_seqlen_pad, :, :]
 
 	block_table = torch.arange(
 		bsz * max_seqlen_pad // block_size, dtype=torch.int32
@@ -585,21 +611,29 @@ def FlashMLA_DeepSeekR1(
 		raise
 	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
 
-	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
-		raise ValueError(
-			f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
-			f" {attn_output.size()}"
-		)
+	# if attn_output.size() != (bsz, q_len, self.num_heads, self.v_head_dim):
+	# 	raise ValueError(
+	# 		f"`attn_output` should be of size {(bsz, q_len, self.num_heads, self.v_head_dim)}, but is"
+	# 		f" {attn_output.size()}"
+	# 	)
+	# if attn_output.size() != (bsz, q_len, self.num_heads * self.v_head_dim):
+	# 	raise ValueError(
+	# 		f"`attn_output` should be of size {(bsz, q_len, self.num_heads * self.v_head_dim)}, but is"
+	# 		f" {attn_output.size()}"
+	# 	)
 
 	attn_output = attn_output.transpose(1, 2).contiguous()
-	attn_output = attn_output.reshape(
+	attn_output = attn_output.view(
 		bsz, q_len, self.num_heads * self.v_head_dim
 	)
+	# attn_output = attn_output.reshape(
+	# 	bsz, q_len, self.num_heads * self.v_head_dim
+	# )
 	attn_output = self.o_proj(attn_output)
 
 	return (
 		attn_output,
-		compressed_kv,
+		new_compressed_kv,
 		torch.tensor([], device=hidden_states.device),
 	)
 
@@ -687,4 +721,5 @@ def hopper_prefill_mla(
 	return attn_output, compressed_kv
 
 
-
+# import torch.nn.functional as F
+# F.rms_norm()

@@ -58,8 +58,10 @@ class GPU_Weight_Buffer {
 
     void releaseBuffer(const std::string& module_name);
 
-    std::shared_ptr<module_weight_tensor_map> get_weights(
-        const std::string& module_name);
+    // std::shared_ptr<module_weight_tensor_map> get_weights(
+    //     const std::string& module_name);
+    module_weight_tensor_map get_weights(
+            const std::string& module_name);
 
     void weights_copy_complete(const std::string& module_type,
                                const std::string& module_name,

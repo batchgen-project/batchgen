@@ -346,33 +346,34 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             auto cur_batch_size = cur_batch.size();
 
             int64_t bsz = cur_batch_size;
-            int64_t kv_seq_len = attention_mask.size(-1) - 1;
+            // int64_t kv_seq_len = attention_mask.size(-1) - 1;
+            int64_t kv_seq_len = attention_mask.size(-1); // We copy one more token which is the place holder for new Q.
             std::vector<int64_t> tensor_shape = {
                 bsz, kv_seq_len, this->model_config_.compressed_kv_dim};
             
-            CUDA_CHECK(cudaDeviceSynchronize());
-            auto external_tensor = this->gpu_kv_buffer_.get_k(
+            // CUDA_CHECK(cudaDeviceSynchronize());
+            auto cur_k = this->gpu_kv_buffer_.get_k(
                 layer_idx, micro_batch_idx, tensor_shape);
             // Check if the external_tensor contains nan
-            if (torch::any(torch::isnan(external_tensor)).item<bool>()) {
-                for(int i = 0; i < external_tensor.size(0); i++) {
-                    if (torch::any(torch::isnan(external_tensor[i])).item<bool>()) {
-                        this->logger_->error("external_tensor contains NaN values, rank: {}, i",
+            if (torch::any(torch::isnan(cur_k)).item<bool>()) {
+                for(int i = 0; i < cur_k.size(0); i++) {
+                    if (torch::any(torch::isnan(cur_k[i])).item<bool>()) {
+                        this->logger_->error("cur_k contains NaN values, rank: {}, i",
                                                 this->engine_config_.basic_config.device, i);
                     }
                 
                 }
-                this->logger_->error("external_tensor contains NaN values, rank: {}",
+                this->logger_->error("cur_k contains NaN values, rank: {}",
                                      this->engine_config_.basic_config.device);
-                throw std::runtime_error("external_tensor contains NaN values.");
+                throw std::runtime_error("cur_k contains NaN values.");
             }
 
 
-            auto cur_k = torch::zeros_like(external_tensor);
-            cur_k.copy_(external_tensor);
+            // auto cur_k = torch::zeros_like(external_tensor);
+            // cur_k.copy_(external_tensor);
             // auto cur_k = external_tensor.clone();
-            CUDA_CHECK(cudaStreamSynchronize(0));
-            CUDA_CHECK(cudaDeviceSynchronize());
+            // CUDA_CHECK(cudaStreamSynchronize(0));
+            // CUDA_CHECK(cudaDeviceSynchronize());
             // Check if cur_k contains nan
             if (torch::any(torch::isnan(cur_k)).item<bool>()) {
                 this->logger_->error("cur_k contains NaN values, rank: {}",
@@ -398,8 +399,8 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             auto cur_hidden_states = hidden_states.index(
                 {torch::indexing::Slice(cur_batch_start_idx,
                                         cur_batch_start_idx + cur_batch_size)});
-            CUDA_CHECK(cudaStreamSynchronize(0));
-            CUDA_CHECK(cudaDeviceSynchronize());
+            // CUDA_CHECK(cudaStreamSynchronize(0));
+            // CUDA_CHECK(cudaDeviceSynchronize());
             torch::Tensor cur_v = torch::empty(
                 {0}, torch::TensorOptions()
                          .dtype(this->engine_config_.basic_config.dtype_torch)
@@ -465,8 +466,8 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                                         cur_batch_start_idx + cur_batch_size)},
                 attn_result);
 
-            CUDA_CHECK(cudaStreamSynchronize(0)); 
-            CUDA_CHECK(cudaDeviceSynchronize());   
+            // CUDA_CHECK(cudaStreamSynchronize(0)); 
+            // CUDA_CHECK(cudaDeviceSynchronize());   
         }
     }
     torch::Tensor quant_k = torch::cat(full_new_k, 0);
@@ -489,8 +490,8 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                  .memory_format(torch::MemoryFormat::Contiguous));
 
     this->kv_storage_.update(layer_idx, idx, quant_k, new_v, factor);
-    CUDA_CHECK(cudaStreamSynchronize(0));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // CUDA_CHECK(cudaStreamSynchronize(0));
+    // CUDA_CHECK(cudaDeviceSynchronize());
     return final_output;
 };
 

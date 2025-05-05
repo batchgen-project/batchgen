@@ -350,11 +350,11 @@ void HtoD_Engine::HtoD_Worker() {
                         k_offset += k_byte_size;
                     }
                     CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
-                    CUDA_CHECK(cudaDeviceSynchronize());
+                    // CUDA_CHECK(cudaDeviceSynchronize());
                     this->gpu_kv_buffer_.kv_copy_complete(
                         layer_idx, micro_batch_idx, buffer_idx);
                     this->logger_->debug("Copied KV to buffer: {}", buffer_idx);
-                    CUDA_CHECK(cudaStreamSynchronize(0));
+                    // CUDA_CHECK(cudaStreamSynchronize(0));
                 }
             }
         };
@@ -366,6 +366,8 @@ void HtoD_Engine::HtoD_Worker() {
             if (optional_buffer.has_value()) {
                 this->logger_->debug("Acquired buffer for module type: {}",
                                      module_type);
+                CUDA_CHECK(
+                    cudaSetDevice(this->engine_config_.basic_config.device));
                 auto [buffer, buffer_idx] = optional_buffer.value();
                 std::string module_name;
                 while (this->weights_copy_task_queue_[module_type].try_pop(
@@ -394,7 +396,8 @@ void HtoD_Engine::HtoD_Worker() {
                 }
                 this->logger_->debug("Copied module: {} to buffer: {}",
                                     module_name, buffer_idx);
-                    
+                // CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                // CUDA_CHECK(cudaStreamSynchronize(0));
                 this->gpu_weight_buffer_.weights_copy_complete(
                     module_type, module_name, buffer_idx);
                 /* PUSH THE TASK BACK */

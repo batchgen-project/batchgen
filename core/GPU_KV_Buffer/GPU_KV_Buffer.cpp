@@ -164,9 +164,8 @@ torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
     });
     int64_t buffer_idx = this->kv_buffer_map_[key];
     // Note: kv buffer is always in bfloat16.
-    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-    CUDA_CHECK(cudaStreamSynchronize(0));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // CUDA_CHECK(cudaStreamSynchronize(0));
+    // CUDA_CHECK(cudaDeviceSynchronize());
     auto option =
         torch::TensorOptions()
             // .dtype(torch::kBFloat16)
@@ -176,6 +175,9 @@ torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
             // .memory_format(torch::MemoryFormat::Contiguous); 
     // auto [bsz, kv_seq_len, num_kv_heads, head_dim] = tensor_shape;
 
+    // Add one to sequence length to account for padding
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    // tensor_shape[1] += 1;
     torch::Tensor k_tensor =
         torch::from_blob(this->k_buffers_[buffer_idx], tensor_shape,
                          // [](void*){},

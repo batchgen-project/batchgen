@@ -276,8 +276,8 @@ torch::Tensor KV_Storage::get_k_quantize_scale(
         }
         throw std::runtime_error("k_quantize_scale has nan values");
     }
-    CUDA_CHECK(cudaStreamSynchronize(0));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // CUDA_CHECK(cudaStreamSynchronize(0));
+    // CUDA_CHECK(cudaDeviceSynchronize());
     return k_quantize_scale;
 }
             
@@ -565,10 +565,10 @@ void KV_Storage::update(int64_t layer_idx,
     try {
         // auto worker = std::thread(&KV_Storage::update_helper_, this, layer_idx,
         //                           query_global_indices, k, v, k_quantize_scale);
-        // //worker.detach();
+        // worker.detach();
         // worker.join();
         this->update_helper_(layer_idx, query_global_indices, k, v,
-                             k_quantize_scale);
+                              k_quantize_scale);
     } catch (const std::exception& e) {
         this->logger_->debug(
             "KV_Storage update(): Failed to update K and V to the "

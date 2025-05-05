@@ -170,10 +170,18 @@ void MoE_Gen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
 // 	);
 // };
 
+// std::unordered_map<std::string, torch::Tensor> MoE_Gen::get_weights(
+//     std::string module_key) {
+//     /* Get the weights from the weights storage. */
+//     return *this->gpu_weight_buffer_.get_weights(module_key);  // blocking.
+// };
+
 std::unordered_map<std::string, torch::Tensor> MoE_Gen::get_weights(
     std::string module_key) {
     /* Get the weights from the weights storage. */
-    return *this->gpu_weight_buffer_.get_weights(module_key);  // blocking.
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    return this->gpu_weight_buffer_.get_weights(module_key);  // blocking.
 };
 
 void MoE_Gen::free_weights_buffer(const std::string& module_name) {

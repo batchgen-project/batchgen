@@ -1525,7 +1525,7 @@ class DeepSeek_Initializer:
             )
         else:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 100
-        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 50
+        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 32
         logging.info(
             f"attn_decoding_micro_batch_size: {self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size}"
         )
@@ -1555,7 +1555,7 @@ class DeepSeek_Initializer:
         if total_memory > 32:
             self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
                 "attn": 1,
-                "routed_expert": 10,
+                "routed_expert": 12,
                 "shared_expert": 1,
             }
 

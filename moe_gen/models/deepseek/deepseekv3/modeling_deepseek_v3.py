@@ -91,6 +91,22 @@ def _get_unpad_data(attention_mask):
 	)
 
 
+# class DeepseekV3RMSNorm(nn.Module):
+# 	def __init__(self, hidden_size, eps=1e-6):
+# 		"""
+# 		DeepseekV3RMSNorm is equivalent to T5LayerNorm
+# 		"""
+# 		super().__init__()
+# 		self.weight = nn.Parameter(torch.ones(hidden_size))
+# 		self.variance_epsilon = eps
+
+# 	def forward(self, hidden_states):
+# 		input_dtype = hidden_states.dtype
+# 		hidden_states = hidden_states.to(torch.float32)
+# 		variance = hidden_states.pow(2).mean(-1, keepdim=True)
+# 		hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+# 		return self.weight * hidden_states.to(input_dtype)
+
 class DeepseekV3RMSNorm(nn.Module):
 	def __init__(self, hidden_size, eps=1e-6):
 		"""
@@ -99,13 +115,10 @@ class DeepseekV3RMSNorm(nn.Module):
 		super().__init__()
 		self.weight = nn.Parameter(torch.ones(hidden_size))
 		self.variance_epsilon = eps
+		self.dim = hidden_size
 
 	def forward(self, hidden_states):
-		input_dtype = hidden_states.dtype
-		hidden_states = hidden_states.to(torch.float32)
-		variance = hidden_states.pow(2).mean(-1, keepdim=True)
-		hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-		return self.weight * hidden_states.to(input_dtype)
+		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
 
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
@@ -385,6 +398,7 @@ class DeepseekV3MLP(nn.Module):
 		self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 		self.act_fn = ACT2FN[config.hidden_act]
 
+	@torch.inference_mode()
 	def forward(self, x):
 		down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 		return down_proj
@@ -823,6 +837,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		dist.all_to_all_single(recv_expert_ids, send_expert_ids, recv_counts.tolist(), send_counts.tolist())
 
 		# Process received data
+		# torch.cuda.current_stream(self.rank).synchronize()
 		for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
 			expert_mask = (recv_expert_ids == expert_idx)
 			indices = torch.nonzero(expert_mask, as_tuple=True)[0]
@@ -830,7 +845,12 @@ class DeepseekV3MoE_Decoding(nn.Module):
 				continue
 			expert_input = recv_tensor[indices]
 			expert_output = self.experts[expert_idx](expert_input)
+			# torch.cuda.current_stream(self.rank).synchronize()
+			# torch.cuda.synchronize(self.rank)
 			recv_tensor[indices] = expert_output
+		
+		# torch.cuda.current_stream(self.rank).synchronize()
+		# torch.cuda.synchronize(self.rank)
 
 			
 

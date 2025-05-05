@@ -152,7 +152,7 @@ class Parallel_Strategy_Manager:
 		self.host_routed_experts = []
 		# self.expert_location_map = {}
 
-		NUM_LOCAL_EXPERT_PER_LAYER = 24  # Per requirements: 15 experts per GPU per layer
+		NUM_LOCAL_EXPERT_PER_LAYER = 22  # Per requirements: 15 experts per GPU per layer
 		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
 		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
@@ -329,7 +329,6 @@ class Parallel_Strategy_Manager:
 		)
 
 
-
 	def _load_local_routed_experts(self):
 		for routed_expert_idx in self.local_routed_experts:
 			tensors = self.core_engine.get_tensor(routed_expert_idx)
@@ -365,7 +364,6 @@ class Parallel_Strategy_Manager:
 			/ (1024**3)
 		)
 		logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
-
 
 	def _config_expert_module_(self):
 		"""
@@ -445,7 +443,7 @@ class Parallel_Strategy_Manager:
 						value = value.to(
 							self.engine_config.Basic_Config.device_torch
 						)
-					routed_expert_name = "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+					# routed_expert_name = "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 					# self.fp8_weights_IPC_handle[routed_expert_name] = {}
 		end_time = time.perf_counter()
 		logging.info(

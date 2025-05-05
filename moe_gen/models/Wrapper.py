@@ -526,6 +526,7 @@ class Expert_Wrapper(torch.nn.Module):
             )
         if self.get_weights:
             weights_dict = self.core_engine.get_weights(self.expert_weights_idx)
+            # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
             for name, param in self.module.named_parameters():
                 if (
                     self.weight_dequant_scale is not None
@@ -574,11 +575,19 @@ class Expert_Wrapper(torch.nn.Module):
             )
             micro_batch = hidden_states[start:end]
             # self.module.eval()
-            with torch.no_grad():
-                # result[start:end].copy_(self.module(micro_batch))
-                result[start:end] = self.module(micro_batch)
-            torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-            torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+            # with torch.no_grad():
+            #     # result[start:end].copy_(self.module(micro_batch))
+            #     output = self.module(micro_batch)
+            #     result[start:end] = output
+            # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+
+            output = self.module(micro_batch)
+            # output.record_stream(torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch))
+            result[start:end] = output
+            # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+            # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+        # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+        # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 
         # Step 3: Clean up
         if self.get_weights:
@@ -607,247 +616,4 @@ class Expert_Wrapper(torch.nn.Module):
         self.fp8_up = self.module.up_proj.weight.data
 
 
-
-from collections import defaultdict
-class DeepseekV3MoE(torch.nn.Module):
-    """
-        For DeepSeekV3 MoE and EP
-        1. Pass the Gate and distribute the activations to the dst rank.
-        2. Do the MLPs that each worker only call its own experts.
-        3. Gather the activations back to the src rank.        
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.num_experts_per_tok = config.num_experts_per_tok
-        
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
-        assert self.world_size == 8 
-
-        self.routed_expert_start_idx = 32 * self.rank
-        self.routed_expert_end_idx = 32 * (self.rank + 1)
-
-        # Full init
-        self.experts = nn.ModuleList(
-                [
-                    DeepseekV3MLP(
-                        config, intermediate_size=config.moe_intermediate_size
-                    )
-                    for i in range(config.n_routed_experts)
-                ]
-            )
-        self.gate = MoEGate(config)
-        if config.n_shared_experts is not None:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV3MLP(
-                config=config, intermediate_size=intermediate_size
-            )
-
-    def forward(self, hidden_states):
-        identity = hidden_states
-        orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
-        y = y + self.shared_experts(identity)
-        return y
-
-    @torch.no_grad()
-    def moe_infer(self, x, topk_ids, topk_weight): 
-        """
-        x: [B, E]
-        topk_ids: [B,K]
-        topk_weight: [B,K]
-        
-        Each rank will process only experts with indices between 
-        self.routed_expert_start_idx and self.routed_expert_end_idx
-        """
-        # 1. Send the activations and its weights to the dst rank
-        # 2. Do the MLPs that each worker only call its own experts.
-        # 3. Get the result activations back to the src rank.
-        
-        batch_size, hidden_dim = x.shape
-        num_experts = 256  # Total experts across all devices
-        experts_per_device = 32  # Experts per device
-        num_k = self.num_experts_per_tok  # Number of experts per token
-        
-        # Create a structure to hold information about which tokens need processing by which experts
-        # Key: destination rank, Value: [token_indices, expert_indices, weights]
-        token_dispatch_map = defaultdict(lambda: [[], [], []])
-        
-        # For each token, determine which experts are needed and where they live
-        for token_idx in range(batch_size):
-            for k_idx in range(num_k):
-                expert_idx = topk_ids[token_idx, k_idx].item()
-                weight = topk_weight[token_idx, k_idx].item()
-                
-                # Calculate which rank owns this expert
-                dst_rank = expert_idx // experts_per_device
-                
-                # Store information for this token-expert pair
-                token_dispatch_map[dst_rank][0].append(token_idx)
-                token_dispatch_map[dst_rank][1].append(expert_idx)  # Global expert index
-                token_dispatch_map[dst_rank][2].append(weight)
-        
-        # Prepare tensors for all-to-all communication
-        send_token_counts = torch.zeros(self.world_size, dtype=torch.int64, device=x.device)
-        for dst_rank, (token_indices, _, _) in token_dispatch_map.items():
-            send_token_counts[dst_rank] = len(token_indices)
-        
-        # All-to-all to exchange token counts
-        recv_token_counts = torch.zeros_like(send_token_counts)
-        dist.all_to_all_single(recv_token_counts, send_token_counts)
-        
-        # Prepare data to send: [token_data, expert_indices, weights]
-        # For each destination rank, pack the data
-        send_data = []
-        send_expert_indices = []
-        send_weights = []
-        send_token_indices = []  # Original indices for later reconstruction
-        
-        for dst_rank in range(self.world_size):
-            if dst_rank in token_dispatch_map:
-                token_indices, expert_indices, weights = token_dispatch_map[dst_rank]
-                # Get tokens that need to be sent
-                send_token_data = x[token_indices]
-                send_data.append(send_token_data)
-                send_expert_indices.append(torch.tensor(expert_indices, device=x.device))
-                send_weights.append(torch.tensor(weights, device=x.device))
-                send_token_indices.append(torch.tensor(token_indices, device=x.device))
-            else:
-                # Empty tensors for ranks with no tokens to send
-                send_data.append(torch.zeros((0, hidden_dim), device=x.device))
-                send_expert_indices.append(torch.zeros((0,), dtype=torch.int64, device=x.device))
-                send_weights.append(torch.zeros((0,), device=x.device))
-                send_token_indices.append(torch.zeros((0,), dtype=torch.int64, device=x.device))
-        
-        # Concatenate send data for all-to-all
-        send_data_cat = torch.cat(send_data, dim=0)
-        send_expert_indices_cat = torch.cat(send_expert_indices, dim=0)
-        send_weights_cat = torch.cat(send_weights, dim=0)
-        send_token_indices_cat = torch.cat(send_token_indices, dim=0)
-        
-        # Calculate send/recv splits for all-to-all
-        send_splits = [t.size(0) for t in send_data]
-        recv_splits = recv_token_counts.tolist()
-        
-        # Prepare receive buffers
-        total_recv_tokens = recv_token_counts.sum().item()
-        recv_data = torch.zeros((total_recv_tokens, hidden_dim), device=x.device)
-        recv_expert_indices = torch.zeros((total_recv_tokens,), dtype=torch.int64, device=x.device)
-        recv_weights = torch.zeros((total_recv_tokens,), device=x.device)
-        recv_src_ranks = torch.zeros((total_recv_tokens,), dtype=torch.int64, device=x.device)
-        recv_token_indices = torch.zeros((total_recv_tokens,), dtype=torch.int64, device=x.device)
-        
-        # All-to-all for token data
-        if total_recv_tokens > 0:
-            # Exchange token data
-            dist.all_to_all(recv_data, send_data_cat, recv_splits, send_splits)
-            
-            # Exchange expert indices
-            dist.all_to_all_single(
-                recv_expert_indices, 
-                send_expert_indices_cat, 
-                recv_splits, 
-                send_splits
-            )
-            
-            # Exchange weights
-            dist.all_to_all_single(
-                recv_weights,
-                send_weights_cat,
-                recv_splits,
-                send_splits
-            )
-            
-            # Exchange original token indices
-            dist.all_to_all_single(
-                recv_token_indices,
-                send_token_indices_cat,
-                recv_splits,
-                send_splits
-            )
-            
-            # Create source rank information
-            offset = 0
-            for src_rank, count in enumerate(recv_splits):
-                if count > 0:
-                    recv_src_ranks[offset:offset+count] = src_rank
-                    offset += count
-        
-        # Compute expert outputs for tokens received by this rank
-        expert_outputs = torch.zeros_like(recv_data)
-        
-        if total_recv_tokens > 0:
-            # Group by local expert - using only experts in our assigned range
-            for local_expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-                # The expert indices received are global indices, so we need to match directly
-                expert_mask = (recv_expert_indices == local_expert_idx)
-                if not expert_mask.any():
-                    continue
-                
-                # Get tokens that need this expert
-                expert_tokens = recv_data[expert_mask]
-                
-                # Run the expert - use the global expert index directly
-                expert_out = self.experts[local_expert_idx](expert_tokens)
-                
-                # Store results
-                expert_outputs[expert_mask] = expert_out
-        
-        # Apply weights
-        expert_outputs = expert_outputs * recv_weights.unsqueeze(1)
-        
-        # Prepare data to send back to source
-        send_back_splits = []
-        send_back_data = []
-        
-        for src_rank in range(self.world_size):
-            mask = (recv_src_ranks == src_rank)
-            if mask.any():
-                count = mask.sum().item()
-                send_back_splits.append(count)
-                # Pack [output, original_token_index]
-                send_back_data.append(expert_outputs[mask])
-            else:
-                send_back_splits.append(0)
-                send_back_data.append(torch.zeros((0, hidden_dim), device=x.device))
-        
-        # Concatenate for all-to-all
-        send_back_data_cat = torch.cat(send_back_data, dim=0)
-        
-        # Prepare receive buffer for final results
-        # Each token may have selected multiple experts, so we need to aggregate
-        final_output = torch.zeros_like(x)
-        
-        # All-to-all to send results back to source ranks
-        if send_back_data_cat.size(0) > 0:
-            # Exchange results
-            recv_back_data = torch.zeros((sum(send_splits), hidden_dim), device=x.device)
-            dist.all_to_all(
-                recv_back_data,
-                send_back_data_cat,
-                send_splits,
-                send_back_splits
-            )
-            
-            # Process received data and reconstruct output
-            offset = 0
-            for dst_rank in range(self.world_size):
-                if dst_rank in token_dispatch_map:
-                    token_indices = token_dispatch_map[dst_rank][0]
-                    count = len(token_indices)
-                    if count > 0:
-                        # Get results for these tokens
-                        token_results = recv_back_data[offset:offset+count]
-                        
-                        # Add to final output (accumulating results from multiple experts)
-                        for i, token_idx in enumerate(token_indices):
-                            final_output[token_idx] += token_results[i]
-                        
-                        offset += count
-        
-        return final_output
     
