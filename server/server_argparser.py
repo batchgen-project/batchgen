@@ -28,11 +28,11 @@ def validate_server_host(value):
 			return value	
 
 def validate_server_port(value):
-    """Validate that the port is in a valid range."""
-    ivalue = int(value)
-    if ivalue < 1024 or ivalue > 65535:
-        raise argparse.ArgumentTypeError(f"Port should be between 1024 and 65535, got {ivalue}")
-    return ivalue
+	"""Validate that the port is in a valid range."""
+	ivalue = int(value)
+	if ivalue < 1024 or ivalue > 65535:
+		raise argparse.ArgumentTypeError(f"Port should be between 1024 and 65535, got {ivalue}")
+	return ivalue
 
 
 
@@ -55,8 +55,8 @@ def server_argparser():
 
 	parser.add_argument(
 		'--ep',
-		type=bool,
-		help='Whether expert parallelism is turned on. Currently only supports 2, 4, or 8 devices within a node.'
+		action='store_true',
+		help='Enable expert parallelism. When enabled, must specify --ep_num_devices.'
 	)
 
 	parser.add_argument(

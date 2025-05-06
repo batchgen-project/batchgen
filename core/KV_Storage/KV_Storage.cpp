@@ -298,16 +298,17 @@ void KV_Storage::offload(
     //     },
     //     this->logger_);
     // Check if k has nan values
-    if (torch::any(torch::isnan(k)).item<bool>()){
-        for (int64_t i = 0; i < k.size(0); i++) {
-            if(torch::any(torch::isnan(k[i])).item<bool>()) {
-                this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
-                                     i, this->engine_config_.basic_config.device,
-                                     layer_idx);
-            }
-        }
-        throw std::runtime_error("k has nan values");
-    }
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    // if (torch::any(torch::isnan(k)).item<bool>()){
+    //     for (int64_t i = 0; i < k.size(0); i++) {
+    //         if(torch::any(torch::isnan(k[i])).item<bool>()) {
+    //             this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
+    //                                  i, this->engine_config_.basic_config.device,
+    //                                  layer_idx);
+    //         }
+    //     }
+    //     throw std::runtime_error("k has nan values");
+    // }
     this->offload_helper_(layer_idx, query_global_idx, k, v, attention_mask);
 };
 
@@ -517,11 +518,10 @@ void KV_Storage::offload_helper_(
                     this->query_idx_to_slot_idx_map[query_idx] = slot_idx;
                 }
             }
-            CUDA_CHECK(cudaStreamSynchronize(
-                this->d2h_engine_.DtoH_stream));
-            CUDA_CHECK(cudaStreamSynchronize(
-                    0));
-            CUDA_CHECK(cudaDeviceSynchronize());
+            // CUDA_CHECK(cudaStreamSynchronize(
+            //     this->d2h_engine_.DtoH_stream));
+            CUDA_CHECK(cudaStreamSynchronize(0));
+            // CUDA_CHECK(cudaDeviceSynchronize());
             
             this->logger_->debug("Offloading layer_idx: {} completed.",
                                  layer_idx);
