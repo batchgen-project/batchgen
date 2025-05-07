@@ -24,7 +24,7 @@ import triton
 import triton.language as tl
 from transformers.cache_utils import DynamicCache
 import torch.distributed as dist
-from ..models.deepseek.deepseekv3.quantization import (
+from ..quantization.fp8e4m3 import (
     compressed_kv_bf16_to_fp8_per_token,
     compressed_kv_fp8_to_bf16_per_token
 )
@@ -584,7 +584,7 @@ class Expert_Wrapper(torch.nn.Module):
             output = self.module(micro_batch)
             # output.record_stream(torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch))
             result[start:end] = output
-            # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+            torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
             # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
         # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
         # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()

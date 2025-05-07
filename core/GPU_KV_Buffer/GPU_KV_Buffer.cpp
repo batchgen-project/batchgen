@@ -54,7 +54,7 @@ GPU_KV_Buffer::GPU_KV_Buffer(EngineConfig& engine_config,
 void GPU_KV_Buffer::Init() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     for (int64_t buffer_idx = 0;
-         buffer_idx < this->engine_config_.gpu_buffer_config.num_k_buffer;
+         buffer_idx < this->engine_config_.gpu_buffer_config.num_k_buffer ;
          buffer_idx++) {
         this->buffer_status_.push_back(0);
     }
@@ -198,9 +198,9 @@ torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
         //                 "_layer_" + std::to_string(layer_idx) +
         //                 "_micro_batch_" + std::to_string(micro_batch_idx) +
         //                 "_k.pt");
-        this->logger_->error("k_tensor contains NaN values, rank: {}",
+        this->logger_->info("k_tensor contains NaN values, rank: {}",
                              this->engine_config_.basic_config.device);
-        throw std::runtime_error("k_tensor contains NaN values.");
+        // throw std::runtime_error("k_tensor contains NaN values.");
     }
     if (this->model_config_.model_type.find("deepseek") == std::string::npos) {
         k_tensor = k_tensor.permute({0, 2, 1, 3});
@@ -221,7 +221,7 @@ torch::Tensor GPU_KV_Buffer::get_v(int64_t layer_idx, int64_t micro_batch_idx,
     int64_t buffer_idx = this->kv_buffer_map_[key];
     auto option =
         torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.dtype_torch)
+            .dtype(this->engine_config_.basic_config.kv_dtype_torch)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);

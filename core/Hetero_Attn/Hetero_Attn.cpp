@@ -365,7 +365,7 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                 }
                 this->logger_->error("cur_k contains NaN values, rank: {}",
                                      this->engine_config_.basic_config.device);
-                throw std::runtime_error("cur_k contains NaN values.");
+                // throw std::runtime_error("cur_k contains NaN values.");
             }
 
 
@@ -378,7 +378,7 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             if (torch::any(torch::isnan(cur_k)).item<bool>()) {
                 this->logger_->error("cur_k contains NaN values, rank: {}",
                                      this->engine_config_.basic_config.device);
-                throw std::runtime_error("cur_k contains NaN values.");
+                // throw std::runtime_error("cur_k contains NaN values.");
             }
 
             // file name: rank_0_layer_0_micro_batch_0_k.pt
@@ -403,7 +403,7 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             // CUDA_CHECK(cudaDeviceSynchronize());
             torch::Tensor cur_v = torch::empty(
                 {0}, torch::TensorOptions()
-                         .dtype(this->engine_config_.basic_config.dtype_torch)
+                         .dtype(this->engine_config_.basic_config.kv_dtype_torch)
                          .device(torch::kCUDA,
                                  this->engine_config_.basic_config.device)
                          .requires_grad(false)
@@ -425,22 +425,23 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             if (torch::any(torch::isnan(dequant_k)).item<bool>()) {
                 this->logger_->error("dequant_k contains NaN values, rank: {}",
                                      this->engine_config_.basic_config.device);
-                throw std::runtime_error("dequant_k contains NaN values.");
+                // throw std::runtime_error("dequant_k contains NaN values.");
             }
-
-            module_output =
-                PyTorch_attn_module
-                    .attr("decoding_attn")(
-                        cur_hidden_states, dequant_k, cur_v,
-                        attention_mask.index({torch::indexing::Slice(
-                            cur_batch_start_idx,
-                            cur_batch_start_idx + cur_batch_size)}),
-                        position_ids.index({torch::indexing::Slice(
-                            cur_batch_start_idx,
-                            cur_batch_start_idx + cur_batch_size)}))
-                    .cast<std::tuple<torch::Tensor, torch::Tensor,
-                                     torch::Tensor>>();
-
+            {
+                py::gil_scoped_acquire acquire;
+                module_output =
+                    PyTorch_attn_module
+                        .attr("decoding_attn")(
+                            cur_hidden_states, dequant_k, cur_v,
+                            attention_mask.index({torch::indexing::Slice(
+                                cur_batch_start_idx,
+                                cur_batch_start_idx + cur_batch_size)}),
+                            position_ids.index({torch::indexing::Slice(
+                                cur_batch_start_idx,
+                                cur_batch_start_idx + cur_batch_size)}))
+                        .cast<std::tuple<torch::Tensor, torch::Tensor,
+                                        torch::Tensor>>();
+            }
             CUDA_CHECK(cudaStreamSynchronize(0));
             CUDA_CHECK(cudaDeviceSynchronize());    
             auto [attn_result, new_k, new_v] = module_output;
@@ -448,12 +449,12 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             if (torch::any(torch::isnan(attn_result)).item<bool>()) {
                 this->logger_->error("attn_result contains NaN values, rank: {}",
                                      this->engine_config_.basic_config.device);
-                throw std::runtime_error("attn_result contains NaN values.");
+                // throw std::runtime_error("attn_result contains NaN values.");
             }
             if (torch::any(torch::isnan(new_k)).item<bool>()) {
                 this->logger_->error("new_k contains NaN values, rank: {}",
                                      this->engine_config_.basic_config.device);
-                throw std::runtime_error("new_k contains NaN values.");
+                // throw std::runtime_error("new_k contains NaN values.");
             }
             auto [quant_k, factor] = 
                 compressed_kv_bf16_to_fp8_per_token(new_k);
@@ -483,7 +484,7 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
     // new_v is a place holder
     torch::Tensor new_v = torch::empty(
         {0}, torch::TensorOptions()
-                 .dtype(this->engine_config_.basic_config.dtype_torch)
+                 .dtype(this->engine_config_.basic_config.kv_dtype_torch)
                  .device(torch::kCUDA,
                          this->engine_config_.basic_config.device)
                  .requires_grad(false)

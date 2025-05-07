@@ -69,7 +69,7 @@ void GPU_Weight_Buffer::Init() {
                                          // 160, "shared_expert": 1}
     auto options =
         torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.dtype_torch)
+            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);
@@ -108,7 +108,7 @@ void GPU_Weight_Buffer::resize_buffer() {
                                           // "shared_expert": 1}
     auto options =
         torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.dtype_torch)
+            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);
@@ -391,7 +391,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                                          // "shared_expert": 1}
     auto options =
         torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.dtype_torch)
+            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);
@@ -450,7 +450,7 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                                           // "shared_expert": 1}
     auto options =
         torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.dtype_torch)
+            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);
@@ -467,15 +467,15 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::zeros(buffer_shape, options);
                 } else {
-                    auto bf16_options =
+                    auto options =
                         torch::TensorOptions()
-                            .dtype(torch::kBFloat16)
+                            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
                             .device(torch::kCUDA,
                                     this->engine_config_.basic_config.device)
                             .requires_grad(false)
                             .memory_format(torch::MemoryFormat::Contiguous);
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                        torch::ones(buffer_shape, bf16_options);
+                        torch::ones(buffer_shape, options);
                 }
             }
         }

@@ -1,12 +1,7 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import math
 from einops import rearrange, repeat
 
-"""
-	Test Performance and Correctness of BF16 MLA implementation using FA3 as backend.
-"""
 class IndexFirstAxis(torch.autograd.Function):
 	@staticmethod
 	def forward(ctx, input, indices):
@@ -97,25 +92,6 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
 	)
 
 
-def pad_input_cus(hidden_states, cu_seqlens_q, batch, seqlen):
-	"""
-	Arguments:
-		hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
-		cu_seqlens_q: (total_nnz),
-		batch: int, batch size for the padded sequence.
-		seqlen: int, maximum sequence length for the padded sequence.
-	Return:
-		hidden_states: (batch, seqlen, ...)
-	"""
-	dim = hidden_states.shape[1:]
-	output = torch.zeros((batch * seqlen), *dim, device=hidden_states.device, dtype=hidden_states.dtype)
-	for i in range(batch):
-		start = cu_seqlens_q[i]
-		end = cu_seqlens_q[i + 1]
-		output[i * seqlen : i * seqlen + end - start] = hidden_states[start:end]
-	
-	return rearrange(output, "(b s) ... -> b s ...", b=batch)
-
 def pad_input(hidden_states, indices_q, batch, seqlen):
 	"""
 	Arguments:
@@ -179,23 +155,20 @@ def _upad_input(
 		cu_seqlens_q = cu_seqlens_k
 		max_seqlen_in_batch_q = max_seqlen_in_batch_k
 		indices_q = indices_k
+
+	elif query_length == 1:
+		max_seqlen_in_batch_q = 1
+		cu_seqlens_q = torch.arange(
+			batch_size + 1, dtype=torch.int32, device=query_layer.device
+		)  # There is a memcpy here, that is very bad.
+		indices_q = cu_seqlens_q[:-1]
+		query_layer = query_layer.squeeze(1)
 	else:
-		raise ValueError(
-			"Query length must be equal to key value length for MLA prefill."
+		# The -q_len: slice assumes left padding.
+		attention_mask = attention_mask[:, -query_length:]
+		query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(
+			query_layer, attention_mask
 		)
-	# elif query_length == 1:
-	# 	max_seqlen_in_batch_q = 1
-	# 	cu_seqlens_q = torch.arange(
-	# 		batch_size + 1, dtype=torch.int32, device=query_layer.device
-	# 	)  # There is a memcpy here, that is very bad.
-	# 	indices_q = cu_seqlens_q[:-1]
-	# 	query_layer = query_layer.squeeze(1)
-	# else:
-	# 	# The -q_len: slice assumes left padding.
-	# 	attention_mask = attention_mask[:, -query_length:]
-	# 	query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(
-	# 		query_layer, attention_mask
-	# 	)
 
 	return (
 		query_layer,

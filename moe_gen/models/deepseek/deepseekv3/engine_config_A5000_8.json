@@ -1,0 +1,40 @@
+{
+	"Basic_Config": {
+	  "log_level": "info",
+	  "weight_dtype": "float8_e4m3fn",
+	  "kv_dtype": "float8_e4m3fn",
+	  "activation_dtype": "bfloat16",
+	  "module_types": ["attn", "routed_expert", "shared_expert"],
+	  "gpu_arch": "ampere"
+	},
+
+	"Module_Batching_Config": {
+		"attn_prefill_micro_batch_size": 1,
+		"MoE_prefill_micro_batch_size": 2,
+		"expert_prefill_batch_size_upper_bound": 2048,
+		"attn_decoding_micro_batch_size": 4,
+		"MoE_decoding_micro_batch_size": null,
+		"expert_decoding_batch_size_upper_bound": 2048
+	},
+
+	"GPU_Buffer_Config": {
+		"num_prefill_module_buffer": {
+		  "attn": 1,
+		  "routed_expert": 8,
+		  "shared_expert": 1
+		},
+		"num_decoding_module_buffer": {
+		  "attn": 1,
+		  "routed_expert": 32,
+		  "shared_expert": 1
+		},
+		"num_k_buffer": 1,
+		"num_v_buffer": 0,
+		"kv_buffer_num_tokens": null
+	},
+
+	"EP_Config":{
+		"enable": true,
+		"num_local_expert_per_layer": 0
+	}
+}

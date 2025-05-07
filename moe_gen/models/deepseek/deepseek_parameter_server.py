@@ -73,7 +73,7 @@ class DeepSeek_Parameter_Server:
             else:
                 byte_size = 236 * 1024 * 1024 * 1024 * 2
         elif self.hf_model_config.architectures[0] == "DeepseekV3ForCausalLM":
-            byte_size = 690 * 1024 * 1024 * 1024
+            byte_size = 675 * 1024 * 1024 * 1024
         else:
             raise ValueError("Unknown huggingface model card")
 
@@ -106,9 +106,9 @@ class DeepSeek_Parameter_Server:
     def _parse_state_dict(self):
         self.hf_model_config._attn_implementation = "eager"
         if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
-            model = DeepseekV2ForCausalLM._from_config(self.hf_model_config)
+            model = DeepseekV2ForCausalLM._from_config(self.hf_model_config).to('cpu')
         elif self.hf_model_config.architectures[0] == "DeepseekV3ForCausalLM":
-            model = DeepseekV3ForCausalLM._from_config(self.hf_model_config)
+            model = DeepseekV3ForCausalLM._from_config(self.hf_model_config).to('cpu')
         else:
             raise ValueError("Unknown model architecture")
         model.eval()

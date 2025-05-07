@@ -43,6 +43,24 @@
 
 namespace py = pybind11;
 
+torch::ScalarType str_to_torch_dtype(const std::string& dtype_str) {
+    static const std::unordered_map<std::string, torch::ScalarType> dtype_map = {
+        {"float16", torch::kFloat16},
+        {"float32", torch::kFloat32},
+        {"bfloat16", torch::kBFloat16},
+        {"float8_e4m3fn", torch::kFloat8_e4m3fn},
+        {"float8_e5m2", torch::kFloat8_e5m2}
+    };
+
+    auto it = dtype_map.find(dtype_str);
+    if (it != dtype_map.end()) {
+        return it->second;
+    }
+    
+    // Default to float32 if not found
+    return torch::kFloat32;
+}
+
 Basic_Config parse_basic_config(const py::object& engine_config) {
     Basic_Config basic_config;
     py::object basic_config_obj = engine_config.attr("Basic_Config");
@@ -51,15 +69,21 @@ Basic_Config parse_basic_config(const py::object& engine_config) {
     basic_config.device = basic_config_obj.attr("device").cast<int64_t>();
     basic_config.device_torch =
         torch::Device(torch::kCUDA, basic_config.device);
-    basic_config.dtype_str =
-        basic_config_obj.attr("dtype_str").cast<std::string>();
-    if (basic_config.dtype_str == "bfloat16") {
-        basic_config.dtype_torch = torch::kBFloat16;
-    } else if (basic_config.dtype_str == "float8_e4m3fn") {
-        basic_config.dtype_torch = torch::kFloat8_e4m3fn;
-    } else {
-        basic_config.dtype_torch = torch::kFloat32;
-    }
+    // basic_config.dtype_str =
+    //     basic_config_obj.attr("dtype_str").cast<std::string>();
+    basic_config.weight_dtype =
+        basic_config_obj.attr("weight_dtype").cast<std::string>();
+    basic_config.weight_dtype_torch =
+        str_to_torch_dtype(basic_config.weight_dtype);
+    basic_config.kv_dtype = 
+        basic_config_obj.attr("kv_dtype").cast<std::string>();
+    basic_config.kv_dtype_torch =
+        str_to_torch_dtype(basic_config.kv_dtype);
+    basic_config.activation_dtype =
+        basic_config_obj.attr("activation_dtype").cast<std::string>();
+    basic_config.activation_dtype_torch =
+        str_to_torch_dtype(basic_config.activation_dtype);
+
     basic_config.attn_mode = basic_config_obj.attr("attn_mode").cast<int64_t>();
     basic_config.num_threads =
         basic_config_obj.attr("num_threads").cast<int64_t>();
@@ -138,10 +162,13 @@ EngineConfig parse_engine_config(const py::object& engine_config) {
     // std::cerr << "Parsing EngineConfig" << std::endl;
     EngineConfig config;
     config.basic_config = parse_basic_config(engine_config);
+    std::cerr << "Basic Config Done" << std::endl;
     config.kv_storage_config = parse_kv_storage_config(engine_config);
+    std::cerr << "KV Storage Config Done" << std::endl;
     config.gpu_buffer_config = parse_gpu_buffer_config(engine_config);
+    std::cerr << "GPU Buffer Config Done" << std::endl;
     config.module_batching_config = parse_module_batching_config(engine_config);
-    // std::cerr << "Parsing EngineConfig Done" << std::endl;
+    std::cerr << "Module Batching Config Done" << std::endl;
     return config;
 };
 

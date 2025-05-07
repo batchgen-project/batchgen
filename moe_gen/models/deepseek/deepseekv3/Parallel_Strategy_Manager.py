@@ -6,20 +6,14 @@ from ...Wrapper import (
 	Expert_Wrapper
 )
 import logging
-from .quantization import (
+from ....quantization.fp8e4m3 import (
 	deepseek_v3_dequantization
-)
-from .utils import (
-	chunked_prefill_attn,
-	prefill_attn,
-	cus_absorbed_mla_decoding_forward,
-	FlashMLA_DeepSeekR1,
-	hopper_prefill_mla,
 )
 import types
 import torch.distributed as dist	
 import time
 import torch 
+import gc
 	
 
 
@@ -134,6 +128,8 @@ class Parallel_Strategy_Manager:
 		"""
 		self.hf_model_config.phase = "decoding"
 		self.hf_model_config._attn_implementation = "eager"
+		self.model = None
+		torch.cuda.empty_cache()
 		self.model = DeepseekV3ForCausalLM._from_config(
 			self.hf_model_config
 		)
@@ -152,7 +148,7 @@ class Parallel_Strategy_Manager:
 		self.host_routed_experts = []
 		# self.expert_location_map = {}
 
-		NUM_LOCAL_EXPERT_PER_LAYER = 22  # Per requirements: 15 experts per GPU per layer
+		NUM_LOCAL_EXPERT_PER_LAYER = self.engine_config.EP_Config.num_local_expert_per_layer  
 		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
 		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
@@ -234,12 +230,18 @@ class Parallel_Strategy_Manager:
 							"tensor_key": name,
 						}
 		# Load Model Skeleton and Local Routed Experts
+		# Clear torch cache
+		torch.cuda.empty_cache()
 		self._extract_dequantize_scale()
 		self._load_model_skeleton()
 		self._load_local_routed_experts()
 		self._config_attn_module()
 		self._config_expert_module()
 		self._config_lm_head_hook()
+		# Log used GPU memory
+		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
+		used_memory_gb = used_memory / (1024**3)
+		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
 		self.model.eval()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
 		return self.model, self.weight_copy_task
@@ -252,52 +254,47 @@ class Parallel_Strategy_Manager:
 		start_time = time.perf_counter()
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
-			# setattr(
-			#     attn_module,
-			#     "decoding_attn",
-			#     types.MethodType(decoding_attn, attn_module),
-			# )
-			# setattr(
-			# 	attn_module,
-			# 	"decoding_attn",
-			# 	types.MethodType(
-			# 		cus_absorbed_mla_decoding_forward, attn_module
-			# 	),
-			# )
-			setattr(
-				attn_module,
-				"decoding_attn",
-				types.MethodType(
-					FlashMLA_DeepSeekR1, attn_module
-				),
-			)
-			# setattr(
-			# 	attn_module,
-			# 	"decoding_attn",
-			# 	types.MethodType(
-			# 		hopper_prefill_mla, attn_module
-			# 	),
-			# )
-			# setattr(
-			# 	attn_module,
-			# 	"prefill_attn",
-			# 	types.MethodType(chunked_prefill_attn, attn_module),
-			# )
-			# setattr(
-			# 	attn_module,
-			# 	"prefill_attn",
-			# 	types.MethodType(chunked_prefill_attn, attn_module),
-			# )
-			setattr(
-				attn_module,
-				"prefill_attn",
-				types.MethodType(hopper_prefill_mla, attn_module),
-			)
-			# setattr(
-			# 	attn_module,
-			# 	"prefill_attn_fp8",
-			# 	types.MethodType(prefill_attn_fp8, attn_module),
-			# )
+			if self.engine_config.Basic_Config.gpu_arch == "hooper":
+				from ....attention.mla.fa3_backend import mla_prefill_flashattention3
+				from ....attention.mla.flashmla_backend import mla_decoding_flashmla
+				setattr(
+					attn_module,
+					"prefill_attn",
+					types.MethodType(
+						mla_prefill_flashattention3, attn_module
+					),
+				)
+				setattr(
+					attn_module,
+					"decoding_attn",
+					types.MethodType(
+						mla_decoding_flashmla, attn_module
+					),
+				)
+			elif self.engine_config.Basic_Config.gpu_arch == "ampere":
+				from ....attention.mla.fa2_backend import mla_prefill_flashattention2, mla_chunked_prefill_flashattention2
+				from ....attention.mla.torch_backend import mla_decoding_torch, mla_chunked_prefill_torch
+				setattr(
+					attn_module,
+					"prefill_attn",
+					types.MethodType(
+						mla_chunked_prefill_flashattention2, attn_module
+					),
+				)
+				setattr(
+					attn_module,
+					"decoding_attn",
+					types.MethodType(
+						mla_decoding_torch, attn_module
+					),
+				)
+			else:
+				raise ValueError(
+					"Unsupported GPU architecture: "
+					+ self.engine_config.Basic_Config.gpu_arch
+				)
+
+
 			if "attn_" + str(layer_idx) in self.weight_copy_task["attn"]:
 				get_weights = True
 			else:
@@ -557,5 +554,5 @@ class Parallel_Strategy_Manager:
 		self.dequant_scale = {}
 		for key, param in self.skeleton_state_dict.items():
 			if "weight_scale_inv" in key:
-				self.dequant_scale[key] = param				
+				self.dequant_scale[key] = param			
 

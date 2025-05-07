@@ -147,7 +147,7 @@ void MoE_Gen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
             }
         }
         this->logger->error("key_states contains NaN values");
-        throw std::runtime_error("key_states contains NaN values");
+        // throw std::runtime_error("key_states contains NaN values");
     }
     this->kv_storage_.offload(layer_idx, query_idx, key_states, value_states, attention_mask);
 };

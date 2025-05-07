@@ -35,7 +35,7 @@ from transformers import AutoConfig, AutoTokenizer
 # import nvidia_dlprof_pytorch_nvtx
 from moe_gen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
 
-from .config import EngineConfig
+from .config.config import EngineConfig
 from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 from .scheduler.host_mem import get_physical_memory_info
 
@@ -49,6 +49,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
 )
 
+from .config.engine_config_parser import parse_config_from_json
 # nvtx = False
 # if nvtx:
 # 	nvidia_dlprof_pytorch_nvtx.init()
@@ -146,7 +147,7 @@ def moe_gen(
     max_input_length: int,
     max_decoding_length: int,
     device: List[int],
-    engine_config=EngineConfig(),  # EngineConfig object
+    engine_config_json_dir: str,
     hf_cache_dir: Optional[str] = None,
     cache_dir: Optional[str] = None,
     pt_ckpt_dir: Optional[str] = None,
@@ -245,12 +246,12 @@ def moe_gen(
         end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
         
         # Copy engine config and set device
-        import copy
-        device_engine_config = copy.deepcopy(engine_config)
-        device_engine_config.Basic_Config.device = device[device_idx]
-        device_engine_config.Basic_Config.device_torch = torch.device(
-            f"cuda:{device[device_idx]}"
-        )
+        # import copy
+        # device_engine_config = copy.deepcopy(engine_config)
+        # device_engine_config.Basic_Config.device = device[device_idx]
+        # device_engine_config.Basic_Config.device_torch = torch.device(
+        #     f"cuda:{device[device_idx]}"
+        # )
         
         # Create MoE_Gen instance with the shared memory info
         from moe_gen.engine import MoE_Gen
@@ -262,7 +263,7 @@ def moe_gen(
             max_input_length=max_input_length,
             max_decoding_length=max_decoding_length,
             device=device[device_idx],
-            engine_config=device_engine_config,
+            engine_config_json_dir=engine_config_json_dir,
             skeleton_state_dict=skeleton_state_dict,
             shm_name=shm_name,
             tensor_meta_shm_name=tensor_meta_shm_name,
@@ -328,7 +329,7 @@ class MoE_Gen:
         skeleton_state_dict,
         shm_name,
         tensor_meta_shm_name,
-        engine_config=EngineConfig(),
+        engine_config_json_dir,
         host_kv_cache_size: Optional[int] = None,
         rank: Optional[int] = 0,
         world_size: Optional[int] = 1,
@@ -342,7 +343,7 @@ class MoE_Gen:
         self.num_queries = len(queries)
         self.max_input_length = max_input_length
         self.max_decoding_length = max_decoding_length
-        self.engine_config = engine_config
+        self.engine_config = parse_config_from_json(engine_config_json_dir)
         self.skeleton_state_dict = skeleton_state_dict
         self.rank = rank
         self.world_size = world_size
@@ -356,7 +357,12 @@ class MoE_Gen:
         )
         self.engine_config.Basic_Config.padding_length = max_input_length
         self.engine_config.Basic_Config.num_queries = self.num_queries
-        # self.engine_config.KV_Storage_Config.num_host_slots = self.num_queries
+        self.engine_config.Basic_Config.rank = rank
+        self.engine_config.Basic_Config.world_size = world_size
+        
+        
+        
+        
         self.device = device
         self.torch_device = torch.device(f"cuda:{device}")
         self.host_kv_cache_size = host_kv_cache_size
@@ -426,10 +432,10 @@ class MoE_Gen:
             )
         elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
             from moe_gen.models.deepseek.deepseekv3.deepseekv3_initializer import (
-                DeepSeek_Initializer,
+                DeepSeekV3_Initializer,
             )
 
-            self.initializer = DeepSeek_Initializer(
+            self.initializer = DeepSeekV3_Initializer(
                 self.huggingface_ckpt_name,
                 self.hf_cache_dir,
                 self.cache_dir,
@@ -712,6 +718,8 @@ class MoE_Gen:
             # self.core_engine.create_fake_kv_storage()
             # self.core_engine.start_h2d_worker()
             # time.sleep(2)
+            
+            dist.barrier()
             self._config_decoding()
             decoding_start_time = time.perf_counter()
             with torch.no_grad():
@@ -832,6 +840,14 @@ class MoE_Gen:
         self.core_engine.start_h2d_worker()
     
     def _config_decoding(self):
+        self.model = self.model.to("cpu")
+        # Set all model parameters to None
+        for param in self.model.parameters():
+            param.data = torch.zeros(
+                1, dtype=torch.bfloat16, device=param.device)
+        self.model = None
+        torch.cuda.empty_cache()
+
         self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
         self.set_phase("decoding")
         self.core_engine.stop_h2d_worker()

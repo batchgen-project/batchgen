@@ -110,8 +110,14 @@ struct GPU_Buffer_Config {
 struct Basic_Config {
     std::string log_level;
     int64_t device;
-    torch::Dtype dtype_torch;
-    std::string dtype_str;
+    // torch::Dtype dtype_torch;
+    // std::string dtype_str;
+    std::string weight_dtype;
+    torch::Dtype weight_dtype_torch;
+    std::string kv_dtype;
+    torch::Dtype kv_dtype_torch;
+    std::string activation_dtype;
+    torch::Dtype activation_dtype_torch;
     torch::Device device_torch = torch::Device(torch::kCPU);
     int64_t attn_mode;  // 0: kv disaggreated. 1. kv cpu. 2. kv gpu.
     int64_t num_threads = 16;

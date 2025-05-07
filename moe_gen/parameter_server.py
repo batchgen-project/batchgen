@@ -343,6 +343,63 @@ class ParameterServer:
 		
 		logging.info("Parameter server shutdown complete")
 	
+	# def cleanup(self):
+	# 	"""Clean up resources when shutting down"""
+	# 	logging.info("Cleaning up parameter server...")
+		
+	# 	# Close all client connections
+	# 	for client_socket, _ in self.clients:
+	# 		try:
+	# 			client_socket.close()
+	# 		except:
+	# 			pass
+		
+	# 	# Close the server socket
+	# 	if self.server_socket:
+	# 		try:
+	# 			self.server_socket.close()
+	# 		except:
+	# 			pass
+		
+	# 	# Clean up model resources
+	# 	if self.parameter_server_instance:
+	# 		logging.info("Cleaning up model resources...")
+	# 		# Any specific cleanup needed for your parameter server
+		
+	# 	# Clean up skeleton_state_dict temporary file if it exists
+	# 	if hasattr(self, 'skeleton_state_dict_file') and self.skeleton_state_dict_file:
+	# 		try:
+	# 			if os.path.exists(self.skeleton_state_dict_file):
+	# 				logging.info(f"Removing skeleton state dict temporary file: {self.skeleton_state_dict_file}")
+	# 				os.remove(self.skeleton_state_dict_file)
+	# 				self.skeleton_state_dict_file = None
+	# 		except Exception as e:
+	# 			logging.error(f"Error removing skeleton state dict temporary file: {e}")
+		
+	# 	# Clean up shared memory - ONLY during server shutdown
+	# 	if hasattr(self, '_current_shm') and self._current_shm:
+	# 		try:
+	# 			logging.info(f"Cleaning up current shared memory {self.skeleton_state_dict_shm_name}")
+	# 			self._current_shm.close()
+	# 			self._current_shm.unlink()
+	# 			self._current_shm = None
+	# 			self.skeleton_state_dict_shm_name = None
+	# 		except Exception as e:
+	# 			logging.error(f"Error cleaning up current shared memory: {e}")
+		
+	# 	# Clean up any old shared memory segments we've kept around
+	# 	if hasattr(self, '_old_shm_segments'):
+	# 		for i, old_shm in enumerate(self._old_shm_segments):
+	# 			try:
+	# 				logging.info(f"Cleaning up old shared memory segment {i+1}/{len(self._old_shm_segments)}")
+	# 				old_shm.close()
+	# 				old_shm.unlink()
+	# 			except Exception as e:
+	# 				logging.error(f"Error cleaning up old shared memory segment: {e}")
+	# 		self._old_shm_segments = []
+		
+	# 	logging.info("Parameter server shutdown complete")
+		
 	def handle_shutdown(self, signum, frame):
 		"""Handle shutdown signals"""
 		logging.info(f"Received signal {signum}, shutting down...")
