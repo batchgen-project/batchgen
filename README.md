@@ -58,7 +58,7 @@ conda create --name moe_gen python=3.11
 conda activate moe_gen
 ```
 
-### Flash-attention dependencies installation
+### Dependencies installation
 ```bash
 pip install flash-attn --no-build-isolation
 ```
@@ -66,6 +66,12 @@ For Hooper user, please install flash-attention 3 beta release refer to https://
 ```bash
 git clone git@github.com:Dao-AILab/flash-attention.git
 cd ./flash-attention/hopper/
+python setup.py install
+```
+For Hooper user, please install FlashMLA refer to https://github.com/deepseek-ai/FlashMLA/tree/main
+```bash
+git clone git@github.com:deepseek-ai/FlashMLA.git
+cd FlashMLA
 python setup.py install
 ```
 
@@ -122,40 +128,13 @@ if __name__ == "__main__":
     num_requests = 2400
 
     task_names = [
-        "2wikimqa",
-        "2wikimqa_e",
-        "dureader",
-        "gov_report",
-        "gov_report_e",
-        "hotpotqa",
-        "hotpotqa_e",
-        "lcc",
-        "lcc_e",
-        "lsht",
-        "multi_news",
-        "multi_news_e",
-        "multifieldqa_en",
-        "multifieldqa_en_e",
-        "multifieldqa_zh",
-        "musique",
-        "narrativeqa",
-        "passage_count",
-        "passage_count_e",
-        "passage_retrieval_en",
-        "passage_retrieval_en_e",
-        "passage_retrieval_zh",
-        "qasper",
-        "qasper_e",
-        "qmsum",
-        "repobench-p",
-        "repobench-p_e",
-        "samsum",
-        "samsum_e",
-        "trec",
-        "trec_e",
-        "triviaqa",
-        "triviaqa_e",
-        "vcsum"
+        "2wikimqa", "2wikimqa_e", "dureader", "gov_report", "gov_report_e",
+        "hotpotqa", "hotpotqa_e", "lcc", "lcc_e", "lsht",
+        "multi_news", "multi_news_e", "multifieldqa_en", "multifieldqa_en_e", "multifieldqa_zh",
+        "musique", "narrativeqa", "passage_count", "passage_count_e", "passage_retrieval_en",
+        "passage_retrieval_en_e", "passage_retrieval_zh", "qasper", "qasper_e", "qmsum",
+        "repobench-p", "repobench-p_e", "samsum", "samsum_e", "trec",
+        "trec_e", "triviaqa", "triviaqa_e", "vcsum"
     ]
     queries = []
     for task_name in task_names:
