@@ -25,7 +25,7 @@
 		},
 		"num_decoding_module_buffer": {
 		  "attn": 1,
-		  "routed_expert": 12,
+		  "routed_expert": 10,
 		  "shared_expert": 1
 		},
 		"num_k_buffer": 1,
@@ -35,6 +35,6 @@
 
 	"EP_Config":{
 		"enable": true,
-		"num_local_expert_per_layer": 22
+		"num_local_expert_per_layer": 24
 	}
 }

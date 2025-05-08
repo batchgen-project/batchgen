@@ -7,13 +7,10 @@
 
 
 <div align="center">
- <h3>Extreme Throughput for Bulk Offline Inference for MoE Models with Limited GPU Resources</h3>
+ <h3> High-throughput Offline Inference for MoE Models with Limited GPU Memory</h3>
   <strong><a href="#Performance">Performance</a> | <a href="#Installation"> Installation</a> | <a href="#Quick-Start">Quick Start </a> </strong>
 </div>
 
-# Latest News
-- [2025-03-21] Integrated mat absorption for DeepSeek MLA. On single A5000-24GB + 1TB host memory, **DeepSeek-R1-671B BF16 decoding: 27 token/s**. DeepSeek-V2-236B decoding: 49 tokens/s. On 4xA5000 , DeepSeek-V2-236B Prefill/Decoding: 3150/196 tokens/s.
-- [2025-03] MoE-Gen V0.1 release. Empower **DeepSeek-R1-671B NO-Quantization** inference on **a single** NVIDIA A5000 with prefill throughput **204 tokens/s**, decoding throughput **17 tokens/s**. Data parallel on multiple devices supported.
 
 # About
 MoE-Gen is an efficient serving engine optimized specifically for **Mixture-of-Expert(MoE)** based large language models. It is tailored for bulk **offline inference** tasks and **limited GPU resources**. It enables low cost serving for latency-insensitive applications.
@@ -22,12 +19,8 @@ MoE-Gen is an efficient serving engine optimized specifically for **Mixture-of-E
 
 - **Module-Based Batching**: A fine-grained batching strategy ensures consistently high GPU utilization throughout every forward pass.
 - **Efficient Data Swapping Engine**: Supports inference of large-scale models (e.g., DeepSeek-R1) on constrained hardware setups such as single NVIDIA A5000 or RTX 4090 GPUs, aggressively maximizing overlap between computation and memory transfers to achieve optimal efficiency.
-- **Heterogeneous Computing**: Leverages under-utilized CPU resources and optimizes host data locality to significantly boost overall throughput.
+- **Tailored Offloading and Parallel Strategy**: Different parallel strategies, model weights offloaidng and KV-Cache offloading are applied to different models and hardware settings. 
 
-# Supported Models
-- **DeepSeek-R1/V3-671B. FULL Precision.**
-- DeepSeek-V2 Family: V2, V2.5, V2-Lite, V2-Coder.
-- Mixtral: Mixtral 8x7B, Mixtral 8x22B.
 
 # Application Scenarios
 - MoE model evaluation.
@@ -35,27 +28,16 @@ MoE-Gen is an efficient serving engine optimized specifically for **Mixture-of-E
 - Latency-insensitive bulk inference tasks. Such as large batch inference launched in valley period.
 - Deep-research applications. Deliver high-quality results overnight.
 
-## Performance
-
-**Single GPU A5000 (24GB Memory).** Prompt length 512 tokens, decoding length 256 tokens. Prefill/decoding throughput in tokens/s.
 
 
-<div align="center">
+# Supported Models
+- **DeepSeek-R1/V3-671B. FULL Precision.**
 
-|               | DeepSeek-R1/V3 (671B-W8A16)| DeekSeek-V2 (236B-W16A16)|Mixtral-8x22B (141B-W16A16)|Mixtral-8x7B (48B-W16A16)|
-|:-------------:|:--------------------------:|:-----------------------:|:-----------------------:|:-----------------------:|
-| **SGLang**    | Not Supported              | Not Supported           |Not Supported           |Not Supported           |
-| **vLLM**      | Not Supported              | 97 / 0.9                |147/2                   |1347/31|
-| **Llama.cpp** | 5.7/0.9                  | 23/1                    |110/2                   |328/4|
-| **MoE-Gen**   | **204/27**                 | **787/49**              |**907/91**              |**2790/469**|
-</div>
+# Supported Hardware
+Hooper and Ampere archtecture are supported. 
 
+Recommended configurations for 8xH20, 8xA100 and 8xA5000 node are included in ./moe_gen/configurations/
 
-## Release Plan
-
-* Integrate speculative decoding for DeepSeek-R1.
-* Optimization on Ada and Hopper architecture.
-* Support moonshotai/Moonlight MoE.
 
 ## Installation
 
@@ -76,18 +58,40 @@ conda create --name moe_gen python=3.11
 conda activate moe_gen
 ```
 
-### Install from PyPI
-
+### Flash-attention dependencies installation
 ```bash
-# install nightly release
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ moe-gen
-pip install flash-attn==2.7.4.post1
+pip install flash-attn --no-build-isolation
+```
+For Hooper user, please install flash-attention 3 beta release refer to https://github.com/Dao-AILab/flash-attention
+```bash
+git clone git@github.com:Dao-AILab/flash-attention.git
+cd ./flash-attention/hopper/
+python setup.py install
+```
+
+### Install MoE-Gen from codebase
+```bash
+git clone git@github.com:EfficientMoE/MoE-Gen.git
+cd MoE-Gen
+pip install -e .
 ```
 
 ## Quick Start
 MoE-Gen seamlessly integrates with Huggingface environment. Start inference with Huggingface checkpoint name.
+### Example usage of serving DeepSeek-R1 on 8*H20 node
+#### Start Server
+```bash
+python -m moe_gen.parameter_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --cache-dir "..." 
+```
+Please provide --cache-dir as your model checkpoint if you are not using hugging face default model checkpoint directory.
+
+#### Submit Batch
+Please prepare the batch in python and call the client.
 ```python
 import logging
+import os
 from transformers import AutoTokenizer
 from moe_gen.engine import moe_gen
 import numpy as np
@@ -95,60 +99,115 @@ import datasets
 
 if __name__ == "__main__":
     """
-        Supported Models:
-        1. DeepSeek-V2 Architecture:
-            * deepseek-ai/DeepSeek-V2-Lite-Chat
-            * deepseek-ai/DeepSeek-V2
-            * deepseek-ai/DeepSeek-V2.5
-            * deepseek-ai/DeepSeek-V2.5-1210
-            * deepseek-ai/DeepSeek-Coder-V2-Instruct
-        2. DeepSeek-V3 Architecture:
-            * deepseek-ai/DeepSeek-R1
-            * deepseek-ai/DeepSeek-V3
-        3. Mixtral:
-            * mistralai/Mixtral-8x7B-Instruct-v0.1
-            * mistralai/Mixtral-8x22B-Instruct-v0.1
+        Step 1: Task Configs
     """
+    hugging_face_checkpoint_name = "deepseek-ai/DeepSeek-R1"
+    
+    # The host memory reserved for KV-Cache. Adjust based on your hardware platform.
+    host_kv_cache_size = 100 
+    
+    max_input_length = 13000
+    max_decoding_length = 100
+    engine_config_json_dir = "/MoE-Gen/configurations/DeepSeek-R1/engine_config_H20_8.json"
+    # Change if there is port conflict.
+    server_host = "localhost"
+    server_port = "9090" 
 
-
-    """
-        Step 1: Select Model.
-    """
-    hugging_face_checkpoint = "deepseek-ai/DeepSeek-V2-Lite-Chat"
 
     """
-        Step 2: Load dataset and apply chat template(prompt engineering).
+        Step 2: Prepare the input requests(list of string).
+                Here we use huggingface dataset as an example.
     """
+    benchmark_name = "THUDM/LongBench"
+    num_requests = 2400
 
-    benchmark_name = "Muennighoff/flan"
-    dataset = datasets.load_dataset(benchmark_name, split="train")
+    task_names = [
+        "2wikimqa",
+        "2wikimqa_e",
+        "dureader",
+        "gov_report",
+        "gov_report_e",
+        "hotpotqa",
+        "hotpotqa_e",
+        "lcc",
+        "lcc_e",
+        "lsht",
+        "multi_news",
+        "multi_news_e",
+        "multifieldqa_en",
+        "multifieldqa_en_e",
+        "multifieldqa_zh",
+        "musique",
+        "narrativeqa",
+        "passage_count",
+        "passage_count_e",
+        "passage_retrieval_en",
+        "passage_retrieval_en_e",
+        "passage_retrieval_zh",
+        "qasper",
+        "qasper_e",
+        "qmsum",
+        "repobench-p",
+        "repobench-p_e",
+        "samsum",
+        "samsum_e",
+        "trec",
+        "trec_e",
+        "triviaqa",
+        "triviaqa_e",
+        "vcsum"
+    ]
+    queries = []
+    for task_name in task_names:
+        dataset = datasets.load_dataset(benchmark_name, task_name, split="test")
+        for q in dataset["context"]:
+            if len(q.split(" ")) >= max_input_length:
+            # if len(q.split(" ")) >= 9000:
+                queries.append(q)
+                if len(queries) == num_requests:
+                    break
+        if len(queries) == num_requests:
+            break
 
-    max_prompts = 500
-    queries = dataset['inputs'][:max_prompts]
 
-    tokenizer = AutoTokenizer.from_pretrained(hugging_face_checkpoint, trust_remote_code=True)
+    # If number of queries is less than max_prompts, fill the rest by duplicating
+    if len(queries) < num_requests:
+        queries = queries * (num_requests // len(queries)) + queries[: num_requests % len(queries)]
+    
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        hugging_face_checkpoint, trust_remote_code=True
+    )
     for prompt_idx in range(len(queries)):
         messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": queries[prompt_idx]},
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": queries[prompt_idx]},
         ]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         queries[prompt_idx] = text
-    logging.info(f"Number of prompts: {len(queries)}")
-
 
     """
-        Step 3: Launch MoE-Gen.
-    """
+        Step 3: Launch MoE-Gen
+    """    
+    logging.info(f"Connecting to parameter server at {server_host}:{server_port}")
+    logging.info(f"Using model {hugging_face_checkpoint}")
+    
+    # Run inference with our standalone parameter server
     answer_set = moe_gen(
-        huggingface_ckpt_name = hugging_face_checkpoint,
+        huggingface_ckpt_name=hugging_face_checkpoint,
         queries=queries,
-        max_input_length=512,
-        max_decoding_length=32,
-        device=[0], # Can also use multiple devices to enable data parallel, e.g.[0,1,2,3]
-        host_kv_cache_size=10 #in GB, reserved CPU memory for KV-cache
-    )
+        max_input_length=max_input_length,
+        max_decoding_length=max_decoding_length,
+        device=[0,1,2,3,4,5,6,7],
+        engine_config_json_dir = engine_config_json_dir,
+        host_kv_cache_size=host_kv_cache_size,
 
+        # Connect to our standalone parameter server
+        parameter_server_host=server_host,
+        parameter_server_port=server_port,
+    )
 
     """
         Step 4: Print responses to the prompts.
@@ -163,17 +222,15 @@ if __name__ == "__main__":
     if print_result:
         for idx in range(len(answer_set)):
             tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist()[0])
-            print(f"Prompt {idx}: {queries[idx]}")
             print(f"Answer {idx}: {tmp_answer}")
             print("\n\n")
 
-
-
 ```
-### Running Inference
+#### Running Inference
 
 This command runs the script on selected GPUs.
 ```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \ 
 python example.py
 ```
 
