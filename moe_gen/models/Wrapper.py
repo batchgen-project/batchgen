@@ -112,7 +112,7 @@ def create_position_ids_from_attention_mask(
 # 	return dequantized_weight
 
 
-def deepseek_v3_dequantization(
+def deepseek_v3_dequantization_(
     weight_data_fp8, weight_scale_inv_fp32, block_size=[128, 128]
 ) -> torch.Tensor:
     # start_time = torch.cuda.Event(enable_timing=True)
@@ -146,6 +146,28 @@ def deepseek_v3_dequantization(
     # # logging dequantize time in ms
     # logging.info(f"Dequantization time: {start_time.elapsed_time(end_time)} ms")
     return dequantized_weight
+
+def deepseek_v3_dequantization(weight_data_fp8, weight_scale_inv_fp32, block_size=[128, 128]):
+    rows, cols = weight_data_fp8.shape
+    
+    # Convert block_size to constants or GPU tensors
+    block_h, block_w = block_size
+    
+    dequantized_weight = weight_data_fp8.to(torch.float32)
+    
+    # Use torch operations that avoid HtoD transfers
+    expanded_scales = weight_scale_inv_fp32.repeat_interleave(
+        block_h, dim=0
+    ).repeat_interleave(block_w, dim=1)
+    
+    # Use narrow instead of slicing with variables
+    if expanded_scales.shape[0] > rows:
+        expanded_scales = expanded_scales.narrow(0, 0, rows)
+    if expanded_scales.shape[1] > cols:
+        expanded_scales = expanded_scales.narrow(1, 0, cols)
+    
+    dequantized_weight *= expanded_scales
+    return dequantized_weight.to(torch.bfloat16)
 
 
 # def deepseek_v3_dequantization(
@@ -535,12 +557,19 @@ class Expert_Wrapper(torch.nn.Module):
                     
                     param.data = deepseek_v3_dequantization(
                         weights_dict[name],
-                        self.weight_dequant_scale[name + "_scale_inv"].to(
-                            self.engine_config.Basic_Config.device_torch #TODO:
-                        ),
+                        self.weight_dequant_scale[name + "_scale_inv"]
                     )
+                    # param.data.set_(
+                    #     deepseek_v3_dequantization(
+                    #         weights_dict[name],
+                    #         self.weight_dequant_scale[name + "_scale_inv"].to(
+                    #             self.engine_config.Basic_Config.device_torch
+                    #         ),
+                    #     )
+                    # )
                 else:
                     param.data = weights_dict[name]
+                    # param.data.set_(weights_dict[name])
         else:
             self.module.gate_proj.weight.data = deepseek_v3_dequantization(
                 self.fp8_gate,
@@ -592,14 +621,23 @@ class Expert_Wrapper(torch.nn.Module):
         # Step 3: Clean up
         if self.get_weights:
             self.core_engine.free_weights_buffer(self.expert_weights_idx)
+            # with torch.no_grad():
             for name, param in self.module.named_parameters():
-                param.data = torch.tensor(
-                    0.0, dtype=param.data.dtype, device=param.data.device
+                # param.data = torch.tensor(
+                #     0.0, dtype=param.data.dtype, device=param.data.device
+                # )
+                # param.data.zero_()
+                param.data = torch.empty(
+                    0,
+                    device=param.data.device,
                 )
         else:
             self.module.gate_proj.weight.data = self.fp8_gate
             self.module.down_proj.weight.data = self.fp8_down
             self.module.up_proj.weight.data = self.fp8_up
+            # self.module.gate_proj.weight.data.set_(self.fp8_gate)
+            # self.module.down_proj.weight.data.set_(self.fp8_down)
+            # self.module.up_proj.weight.data.set_(self.fp8_up)
 
         logging.debug(
             f"[Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"

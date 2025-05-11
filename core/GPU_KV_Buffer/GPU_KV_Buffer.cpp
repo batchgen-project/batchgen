@@ -176,32 +176,33 @@ torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
     // auto [bsz, kv_seq_len, num_kv_heads, head_dim] = tensor_shape;
 
     // Add one to sequence length to account for padding
-    CUDA_CHECK(cudaStreamSynchronize(0));
+    // CUDA_CHECK(cudaStreamSynchronize(0));
     // tensor_shape[1] += 1;
     torch::Tensor k_tensor =
         torch::from_blob(this->k_buffers_[buffer_idx], tensor_shape,
                          // [](void*){},
                          option).clone();
+    CUDA_CHECK(cudaStreamSynchronize(0));
     // Check if k_tensor contains nan
-    if (torch::any(torch::isnan(k_tensor)).item<bool>()) {
-        for (int i = 0; i < k_tensor.size(0); i++) {
-            if (torch::any(torch::isnan(k_tensor[i])).item<bool>()) {
-                this->logger_->error(
-                    "k_tensor contains NaN values, rank: {}, i: {}, layer_idx: {}",
-                    this->engine_config_.basic_config.device, i, layer_idx
-                );
-            }
-        }
-        // torch::save(k_tensor,
-        //             "/workspace/rank_" +
-        //                 std::to_string(this->engine_config_.basic_config.device) +
-        //                 "_layer_" + std::to_string(layer_idx) +
-        //                 "_micro_batch_" + std::to_string(micro_batch_idx) +
-        //                 "_k.pt");
-        this->logger_->info("k_tensor contains NaN values, rank: {}",
-                             this->engine_config_.basic_config.device);
-        // throw std::runtime_error("k_tensor contains NaN values.");
-    }
+    // if (torch::any(torch::isnan(k_tensor)).item<bool>()) {
+    //     for (int i = 0; i < k_tensor.size(0); i++) {
+    //         if (torch::any(torch::isnan(k_tensor[i])).item<bool>()) {
+    //             this->logger_->error(
+    //                 "k_tensor contains NaN values, rank: {}, i: {}, layer_idx: {}",
+    //                 this->engine_config_.basic_config.device, i, layer_idx
+    //             );
+    //         }
+    //     }
+    //     // torch::save(k_tensor,
+    //     //             "/workspace/rank_" +
+    //     //                 std::to_string(this->engine_config_.basic_config.device) +
+    //     //                 "_layer_" + std::to_string(layer_idx) +
+    //     //                 "_micro_batch_" + std::to_string(micro_batch_idx) +
+    //     //                 "_k.pt");
+    //     this->logger_->info("k_tensor contains NaN values, rank: {}",
+    //                          this->engine_config_.basic_config.device);
+    //     // throw std::runtime_error("k_tensor contains NaN values.");
+    // }
     if (this->model_config_.model_type.find("deepseek") == std::string::npos) {
         k_tensor = k_tensor.permute({0, 2, 1, 3});
     }

@@ -266,16 +266,16 @@ torch::Tensor KV_Storage::get_k_quantize_scale(
         //                      k_quantize_scale[i][-5].item<float>());
     }
     // Check k_quantize_scale has nan values
-    if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
-        for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
-            if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
-                this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
-                                     i, this->engine_config_.basic_config.device,
-                                     layer_idx);
-            }
-        }
-        // throw std::runtime_error("k_quantize_scale has nan values");
-    }
+    // if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
+    //     for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
+    //         if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
+    //             this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
+    //                                  i, this->engine_config_.basic_config.device,
+    //                                  layer_idx);
+    //         }
+    //     }
+    //     // throw std::runtime_error("k_quantize_scale has nan values");
+    // }
     // CUDA_CHECK(cudaStreamSynchronize(0));
     // CUDA_CHECK(cudaDeviceSynchronize());
     return k_quantize_scale;
@@ -299,7 +299,7 @@ void KV_Storage::offload(
     //     this->logger_);
     // Check if k has nan values
     CUDA_CHECK(cudaStreamSynchronize(0));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // CUDA_CHECK(cudaDeviceSynchronize());
     if (torch::any(torch::isnan(k)).item<bool>()){
         for (int64_t i = 0; i < k.size(0); i++) {
             if(torch::any(torch::isnan(k[i])).item<bool>()) {
@@ -564,12 +564,12 @@ void KV_Storage::update(int64_t layer_idx,
                         std::vector<int64_t> query_global_indices,
                         torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale) {
     try {
-        // auto worker = std::thread(&KV_Storage::update_helper_, this, layer_idx,
-        //                           query_global_indices, k, v, k_quantize_scale);
-        // worker.detach();
+        auto worker = std::thread(&KV_Storage::update_helper_, this, layer_idx,
+                                  query_global_indices, k, v, k_quantize_scale);
+        worker.detach();
         // worker.join();
-        this->update_helper_(layer_idx, query_global_indices, k, v,
-                              k_quantize_scale);
+        // this->update_helper_(layer_idx, query_global_indices, k, v,
+        //                       k_quantize_scale);
     } catch (const std::exception& e) {
         this->logger_->debug(
             "KV_Storage update(): Failed to update K and V to the "

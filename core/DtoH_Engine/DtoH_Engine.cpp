@@ -91,19 +91,19 @@ torch::Tensor DtoH_Engine::tensor_on_demand_copy(torch::Tensor& src_tensor) {
 
 void DtoH_Engine::submit_to_queue_B(void* dst, void* src, int64_t size) {
     try {
-        // std::packaged_task<void()> task([this, dst, src, size](){
-        // 	this->blocking_copy_(dst, src, size);
-        // });
-        // std::future<void> completion_future = task.get_future();
-        // this->queue_B_.push(std::move(task));
-        // completion_future.wait();
+        std::packaged_task<void()> task([this, dst, src, size](){
+        	this->blocking_copy_(dst, src, size);
+        });
+        std::future<void> completion_future = task.get_future();
+        this->queue_B_.push(std::move(task));
+        completion_future.wait();
 
-        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-        // CUDA_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
-                                   this->DtoH_stream));
-        CUDA_CHECK(cudaStreamSynchronize(this->DtoH_stream));
-        CUDA_CHECK(cudaStreamSynchronize(0));
+        // CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+        // // CUDA_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost));
+        // CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
+        //                            this->DtoH_stream));
+        // CUDA_CHECK(cudaStreamSynchronize(this->DtoH_stream));
+        // CUDA_CHECK(cudaStreamSynchronize(0));
     } catch (const c10::Error& e) {
         this->logger_->debug("KV_Storage: CUDA/PyTorch error: {}", e.what());
         throw std::runtime_error(e.what());
@@ -187,7 +187,7 @@ void DtoH_Engine::blocking_copy_(void* dst, void* src, int64_t size) {
 
 void DtoH_Engine::d2h_copy_worker_thread_func_() {
     // This worker terminated.
-    while (false) {
+    while (!this->terminate_flag_) {
         std::packaged_task<void()> task;
         while (on_demand_task_queue_.try_pop(task)) {
             try {

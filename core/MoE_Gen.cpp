@@ -180,7 +180,7 @@ std::unordered_map<std::string, torch::Tensor> MoE_Gen::get_weights(
     std::string module_key) {
     /* Get the weights from the weights storage. */
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-    CUDA_CHECK(cudaStreamSynchronize(0));
+    // CUDA_CHECK(cudaStreamSynchronize(0));
     return this->gpu_weight_buffer_.get_weights(module_key);  // blocking.
 };
 

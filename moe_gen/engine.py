@@ -54,6 +54,36 @@ from .config.engine_config_parser import parse_config_from_json
 # if nvtx:
 # 	nvidia_dlprof_pytorch_nvtx.init()
 
+import signal
+import traceback
+import sys
+import faulthandler
+
+def signal_handler(signum, frame):
+    print(f"\n{'='*50}")
+    print(f"Process {os.getpid()} (Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 'N/A'}) received signal {signum}")
+    print(f"{'='*50}")
+    
+    # Print current stack trace
+    traceback.print_stack(frame)
+    
+    # For all threads
+    import threading
+    for thread_id, frame in sys._current_frames().items():
+        print(f"\nThread {thread_id} stack:")
+        traceback.print_stack(frame)
+    
+    # Force flush output
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    # Exit after some delay to allow other processes to print
+    import time
+    time.sleep(0.5)
+    sys.exit(1)
+
+
+
 class query:
     def __init__(
         self,
@@ -180,6 +210,12 @@ def moe_gen(
     mp.set_sharing_strategy("file_system")
     # from moe_gen.utils import _config_torch_module_initializer
     _config_torch_module_initializer()
+    # Register the handler
+    signal.signal(signal.SIGINT, signal_handler)  # For Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # For kill command
+
+    # Enable faulthandler to get stack traces on segfault
+    faulthandler.enable()
     
     # Get model info from the parameter server - just retrieve existing info
     logging.info(f"Connecting to parameter server at {parameter_server_host}:{parameter_server_port}")
@@ -313,6 +349,7 @@ def moe_gen(
     logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
     
     return all_results
+
 
 
 class MoE_Gen:

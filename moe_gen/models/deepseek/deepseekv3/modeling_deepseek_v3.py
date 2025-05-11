@@ -809,6 +809,115 @@ class DeepseekV3MoE_Decoding(nn.Module):
 			for r in range(self.world_size)
 		], device=x.device, dtype=torch.int64)
 
+		# Create tensors for all-to-all operations
+		recv_counts = torch.empty(self.world_size, dtype=torch.int64, device=x.device)
+		dist.all_to_all_single(recv_counts, send_counts)
+		
+		# All-to-all send for input tensors
+		send_tensor = sorted_inputs.contiguous()
+		recv_total = recv_counts.sum().item()
+		
+		# *** KEY FIX 1: Handle empty tensors properly ***
+		# Create properly sized tensors even when recv_total is 0
+		if recv_total == 0:
+			recv_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		else:
+			recv_tensor = torch.empty(recv_total, hidden_size, device=x.device, dtype=x.dtype)
+		
+		# Convert counts to lists for all_to_all_single
+		send_counts_list = send_counts.tolist()
+		recv_counts_list = recv_counts.tolist()
+		
+		# *** KEY FIX 2: Handle case where some counts are zero ***
+		# Ensure all_to_all_single works even with empty tensors
+		if send_tensor.size(0) == 0:
+			# If we have nothing to send, create a dummy tensor that won't be used
+			# but allows the collective to proceed
+			send_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		
+		dist.all_to_all_single(recv_tensor, send_tensor, recv_counts_list, send_counts_list)
+
+		# All-to-all comm for expert ids
+		send_expert_ids = sorted_expert_ids.contiguous()
+		
+		# *** KEY FIX 3: Handle empty expert_ids tensor ***
+		if recv_total == 0:
+			recv_expert_ids = torch.empty(0, device=x.device, dtype=send_expert_ids.dtype)
+		else:
+			recv_expert_ids = torch.empty(recv_total, device=x.device, dtype=send_expert_ids.dtype)
+		
+		# *** KEY FIX 4: Handle case where no expert ids to send ***
+		if send_expert_ids.size(0) == 0:
+			# Create a dummy tensor that won't be used but allows the collective to proceed
+			send_expert_ids = torch.empty(0, device=x.device, dtype=send_expert_ids.dtype)
+		
+		dist.all_to_all_single(recv_expert_ids, send_expert_ids, recv_counts_list, send_counts_list)
+
+		# Process received data if there's any
+		if recv_total > 0:
+			for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+				expert_mask = (recv_expert_ids == expert_idx)
+				indices = torch.nonzero(expert_mask, as_tuple=True)[0]
+				if len(indices) == 0:
+					continue
+				expert_input = recv_tensor[indices]
+				expert_output = self.experts[expert_idx](expert_input)
+				recv_tensor[indices] = expert_output
+
+		# All-to-all return, send back output
+		output_recv = torch.empty_like(sorted_inputs)
+		
+		# *** KEY FIX 5: Handle corner case for return communication ***
+		if recv_tensor.size(0) == 0:
+			# Create a dummy tensor that won't be used but allows the collective to proceed
+			recv_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		
+		dist.all_to_all_single(output_recv, recv_tensor, send_counts_list, recv_counts_list)
+
+		# Unsort and accumulate outputs
+		unsort_idx = sort_idx.argsort()
+		unsorted_output = output_recv[unsort_idx]
+		unsorted_token_ids = sorted_token_ids[unsort_idx]
+		unsorted_weights = sorted_weights[unsort_idx]
+
+		# Create accumulators for output
+		output_accumulator = torch.zeros_like(x, dtype=torch.float32)
+		weight_accumulator = torch.zeros(num_tokens, 1, device=x.device)
+
+		# Accumulate outputs and weights
+		output_accumulator.index_add_(0, unsorted_token_ids, unsorted_output.to(torch.float32) * unsorted_weights.unsqueeze(-1))
+		weight_accumulator.index_add_(0, unsorted_token_ids, unsorted_weights.unsqueeze(-1))
+
+		# Produce final normalized output
+		final_output = output_accumulator / weight_accumulator.clamp(min=1e-9)
+
+		return final_output.to(x.dtype)
+
+	@torch.no_grad()
+	def moe_infer_dep(self, x, topk_idx, topk_weight):
+		num_tokens, hidden_size = x.shape
+
+		# Flatten top-k expert routing
+		flat_expert_ids = topk_idx.view(-1)
+		flat_weights = topk_weight.view(-1)
+		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
+		token_ids = torch.arange(num_tokens, device=x.device).repeat_interleave(self.num_experts_per_tok)
+
+		# Sort by expert
+		sorted_expert_ids, sort_idx = flat_expert_ids.sort()
+		sorted_inputs = expanded_x[sort_idx]
+		sorted_token_ids = token_ids[sort_idx]
+		sorted_weights = flat_weights[sort_idx]
+
+		# Count how many tokens per expert
+		expert_token_counts = torch.bincount(sorted_expert_ids, minlength=self.total_experts)
+
+		# Split input to send to each rank
+		send_counts = torch.tensor([
+			expert_token_counts[r * self.experts_per_rank:(r + 1) * self.experts_per_rank].sum().item()
+			for r in range(self.world_size)
+		], device=x.device, dtype=torch.int64)
+
 		recv_counts = torch.empty(self.world_size, dtype=torch.int64, device=x.device)
 		# logger.info(f"Rank {self.rank} First ALL-to-ALL")
 		dist.all_to_all_single(recv_counts, send_counts)
