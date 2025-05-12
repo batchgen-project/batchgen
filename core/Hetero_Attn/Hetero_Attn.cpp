@@ -50,50 +50,69 @@
 #include "Hetero_Attn.h"
 
 constexpr float FP8_MAX = 448.0f;
-std::tuple<at::Tensor, at::Tensor> compressed_kv_bf16_to_fp8_per_token(torch::Tensor x) {
-    /* 
-     * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per-token.
-     * Args:
-     *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
-     * Returns:
-     *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
-     *   s: Scale factors [bsz, seq] with dtype float32
-     */
-    // TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, 
-    //             "Input tensor must be of dtype BFloat16");
-    // TORCH_CHECK(x.size(-1) == 576, 
-    //             "Last dimension of input tensor must be 576");
-    // TORCH_CHECK(x.is_contiguous(), 
-    //             "Input tensor must be contiguous");
-    // TORCH_CHECK(x.dim() == 3, 
-    //             "Input tensor must have 3 dimensions");
-    
-    const auto device = x.device();
-    const auto bsz = x.size(0);
-    const auto seq_len = x.size(1);
-    const auto dim = x.size(2);
-    const auto M = bsz * seq_len;
-    
-    // Cast to float32 and reshape for reduction
+std::tuple<torch::Tensor, torch::Tensor> compressed_kv_bf16_to_fp8_per_token(torch::Tensor x) {
+    /*
+        * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
+        * Args:
+        *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
+        * Returns:
+        *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+        *   s: Scale factors [bsz, seq, num_blocks] with dtype float32
+        */
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
+                "Input tensor must be of dtype BFloat16");
+    TORCH_CHECK(x.size(-1) == 576,
+                "Last dimension of input tensor must be 576");
+    TORCH_CHECK(x.is_contiguous(),
+                "Input tensor must be contiguous");
+    TORCH_CHECK(x.dim() == 3,
+                "Input tensor must have 3 dimensions");
+
+    const int64_t bsz = x.size(0);
+    const int64_t seq_len = x.size(1);
+    const int64_t dim = x.size(2);
+    const int64_t M = bsz * seq_len;
+
+    const int64_t block_size = 128;
+    const int64_t num_full_blocks = dim / block_size; // 576 / 128 = 4
+    const bool has_last_block = (dim % block_size != 0);
+    const int64_t last_block_size = dim % block_size; // 64
+    const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0); // 5
+
+    // Flatten and cast to float32
     auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
-    
-    // Compute max absolute value per token
-    auto amax = at::amax(at::abs(x_flat), /*dim=*/1);
-    amax = at::clamp(amax, /*min=*/1e-6f);
-    
-    // Compute scales
-    auto scale = amax / FP8_MAX;
-    
-    // Scale and cast to fp8
-    auto y = x_flat / scale.unsqueeze(1);
-    auto q = y.to(at::ScalarType::Float8_e4m3fn);
-    
-    // Reshape output tensors
-    q = q.view({bsz, seq_len, dim});
-    scale = scale.view({bsz, seq_len});
-    
+
+    // Prepare output tensors
+    auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
+    auto q_flat     = at::empty({M, dim},   x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
+
+    // Process each block independently
+    for (int64_t b = 0; b < num_blocks; ++b) {
+        const int64_t start  = b * block_size;
+        const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+
+        auto x_block = x_flat.narrow(1, start, length);
+        auto amax    = at::amax(at::abs(x_block), /*dim=*/1);
+        amax = at::clamp(amax, /*min=*/1e-6f);
+
+        // Compute scale for this block
+        auto scale = amax / FP8_MAX;
+        scale_flat.select(1, b).copy_(scale);
+
+        // Quantize block
+        auto y       = x_block / scale.unsqueeze(1);
+        auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
+        q_flat.narrow(1, start, length).copy_(q_block);
+    }
+
+    // Reshape back to [bsz, seq_len, dim] and [bsz, seq_len, num_blocks]
+    auto q     = q_flat.view({bsz, seq_len, dim});
+    auto scale = scale_flat.view({bsz, seq_len, num_blocks});
+
     return std::make_tuple(q, scale);
 }
+    
+
 
 torch::Tensor compressed_kv_fp8_to_bf16_per_token(torch::Tensor q, torch::Tensor scale) {
     /*
@@ -124,6 +143,69 @@ torch::Tensor compressed_kv_fp8_to_bf16_per_token(torch::Tensor q, torch::Tensor
     // Cast back to BF16 and reshape
     return x_rec.to(at::ScalarType::BFloat16).view({bsz, seq_len, dim});
 }
+
+at::Tensor dequant_per_token(const at::Tensor& q, const at::Tensor& scale) {
+    /*
+     * Dequantize a [bsz, seq, 576] FP8 tensor back to BF16 per 128-element block.
+     * Args:
+     *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+     *   scale: Scale factors [bsz, seq, num_blocks] with dtype float32
+     * Returns:
+     *   x_bf16: Dequantized tensor [bsz, seq, 576] with dtype bfloat16
+     */
+    TORCH_CHECK(q.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                "Quantized tensor must be of dtype Float8_e4m3fn");
+    TORCH_CHECK(scale.scalar_type() == at::ScalarType::Float,
+                "Scale tensor must be of dtype Float");
+    TORCH_CHECK(q.dim() == 3 && scale.dim() == 3,
+                "Input tensors must be 3D");
+    TORCH_CHECK(q.size(0) == scale.size(0) && q.size(1) == scale.size(1),
+                "Batch and sequence dimensions must match between q and scale");
+
+    const int64_t bsz = q.size(0);
+    const int64_t seq_len = q.size(1);
+    const int64_t dim = q.size(2);
+    const int64_t M = bsz * seq_len;
+
+    const int64_t block_size = 128;
+    const int64_t num_full_blocks = dim / block_size;
+    const bool has_last_block = (dim % block_size != 0);
+    const int64_t last_block_size = dim % block_size;
+    const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0);
+
+    TORCH_CHECK(scale.size(2) == num_blocks,
+                "Scale tensor last dimension must match number of blocks");
+
+    // Flatten
+    auto q_flat     = q.view({M, dim});
+    auto scale_flat = scale.view({M, num_blocks});
+
+    // Prepare output buffer in float32
+    auto x_flat = at::empty({M, dim}, q_flat.options().dtype(at::ScalarType::Float));
+
+    // Process each block
+    for (int64_t b = 0; b < num_blocks; ++b) {
+        const int64_t start  = b * block_size;
+        const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+
+        // Extract block of q, upcast to float
+        auto q_block = q_flat.narrow(1, start, length).to(at::ScalarType::Float);
+
+        // Get scale for this block [M]
+        auto s_block = scale_flat.select(1, b).unsqueeze(1);
+
+        // Reconstruct
+        auto x_block = q_block * s_block;
+
+        // Store
+        x_flat.narrow(1, start, length).copy_(x_block);
+    }
+
+    // Cast back to BF16 and reshape
+    auto x_bf16 = x_flat.to(at::ScalarType::BFloat16).view({bsz, seq_len, dim});
+    return x_bf16;
+}
+
 
 Hetero_Attn::Hetero_Attn(const EngineConfig& engine_config,
                          const ModelConfig& model_config,
@@ -420,7 +502,11 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             // log cur_factor shape
             // this->logger_->info("cur_factor shape: {}",
             //                  get_tensor_shape(cur_factor));
-            auto dequant_k = compressed_kv_fp8_to_bf16_per_token(cur_k, cur_factor);
+            // this->logger_->info("cur_factor shape: {}",
+            //              get_tensor_shape(cur_factor));
+            // this->logger_->info("cur_k shape: {}",
+            //              get_tensor_shape(cur_k));
+            auto dequant_k = dequant_per_token(cur_k, cur_factor);
             // Check if the dequant_k contains nan
 
             // if (torch::any(torch::isnan(dequant_k)).item<bool>()) {
@@ -458,8 +544,7 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             //                          this->engine_config_.basic_config.device);
             //     // throw std::runtime_error("new_k contains NaN values.");
             // }
-            auto [quant_k, factor] = 
-                compressed_kv_bf16_to_fp8_per_token(new_k);
+            auto [quant_k, factor] = compressed_kv_bf16_to_fp8_per_token(new_k);
             // this->kv_storage_.update(layer_idx, cur_batch, quant_k, new_v, factor);
             full_new_k.push_back(quant_k);
             full_factor.push_back(factor);

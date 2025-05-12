@@ -36,48 +36,110 @@
 #include <cstring>
 
 constexpr float FP8_MAX = 448.0f;
-std::tuple<at::Tensor, at::Tensor> per_token_quant(torch::Tensor x) {
-    /* 
-     * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per-token.
+// std::tuple<at::Tensor, at::Tensor> per_token_quant(torch::Tensor x) {
+//     /* 
+//      * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per-token.
+//      * Args:
+//      *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
+//      * Returns:
+//      *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+//      *   s: Scale factors [bsz, seq] with dtype float32
+//      */
+//     // TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, 
+//     //             "Input tensor must be of dtype BFloat16");
+//     // TORCH_CHECK(x.size(-1) == 576, 
+//     //             "Last dimension of input tensor must be 576");
+//     // TORCH_CHECK(x.is_contiguous(), 
+//     //             "Input tensor must be contiguous");
+//     // TORCH_CHECK(x.dim() == 3, 
+//     //             "Input tensor must have 3 dimensions");
+    
+//     const auto device = x.device();
+//     const auto bsz = x.size(0);
+//     const auto seq_len = x.size(1);
+//     const auto dim = x.size(2);
+//     const auto M = bsz * seq_len;
+    
+//     // Cast to float32 and reshape for reduction
+//     auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+    
+//     // Compute max absolute value per token
+//     auto amax = at::amax(at::abs(x_flat), /*dim=*/1);
+//     amax = at::clamp(amax, /*min=*/1e-6f);
+    
+//     // Compute scales
+//     auto scale = amax / FP8_MAX;
+    
+//     // Scale and cast to fp8
+//     auto y = x_flat / scale.unsqueeze(1);
+//     auto q = y.to(at::ScalarType::Float8_e4m3fn);
+    
+//     // Reshape output tensors
+//     q = q.view({bsz, seq_len, dim});
+//     scale = scale.view({bsz, seq_len});
+    
+//     return std::make_tuple(q, scale);
+// }
+
+std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
+    /*
+     * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
      * Args:
      *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
      * Returns:
      *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
-     *   s: Scale factors [bsz, seq] with dtype float32
+     *   s: Scale factors [bsz, seq, num_blocks] with dtype float32
      */
-    // TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, 
-    //             "Input tensor must be of dtype BFloat16");
-    // TORCH_CHECK(x.size(-1) == 576, 
-    //             "Last dimension of input tensor must be 576");
-    // TORCH_CHECK(x.is_contiguous(), 
-    //             "Input tensor must be contiguous");
-    // TORCH_CHECK(x.dim() == 3, 
-    //             "Input tensor must have 3 dimensions");
-    
-    const auto device = x.device();
-    const auto bsz = x.size(0);
-    const auto seq_len = x.size(1);
-    const auto dim = x.size(2);
-    const auto M = bsz * seq_len;
-    
-    // Cast to float32 and reshape for reduction
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
+                "Input tensor must be of dtype BFloat16");
+    TORCH_CHECK(x.size(-1) == 576,
+                "Last dimension of input tensor must be 576");
+    TORCH_CHECK(x.is_contiguous(),
+                "Input tensor must be contiguous");
+    TORCH_CHECK(x.dim() == 3,
+                "Input tensor must have 3 dimensions");
+
+    const int64_t bsz = x.size(0);
+    const int64_t seq_len = x.size(1);
+    const int64_t dim = x.size(2);
+    const int64_t M = bsz * seq_len;
+
+    const int64_t block_size = 128;
+    const int64_t num_full_blocks = dim / block_size; // 576 / 128 = 4
+    const bool has_last_block = (dim % block_size != 0);
+    const int64_t last_block_size = dim % block_size; // 64
+    const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0); // 5
+
+    // Flatten and cast to float32
     auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
-    
-    // Compute max absolute value per token
-    auto amax = at::amax(at::abs(x_flat), /*dim=*/1);
-    amax = at::clamp(amax, /*min=*/1e-6f);
-    
-    // Compute scales
-    auto scale = amax / FP8_MAX;
-    
-    // Scale and cast to fp8
-    auto y = x_flat / scale.unsqueeze(1);
-    auto q = y.to(at::ScalarType::Float8_e4m3fn);
-    
-    // Reshape output tensors
-    q = q.view({bsz, seq_len, dim});
-    scale = scale.view({bsz, seq_len});
-    
+
+    // Prepare output tensors
+    auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
+    auto q_flat     = at::empty({M, dim},   x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
+
+    // Process each block independently
+    for (int64_t b = 0; b < num_blocks; ++b) {
+        const int64_t start  = b * block_size;
+        const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+
+        auto x_block = x_flat.narrow(1, start, length);
+        auto amax    = at::amax(at::abs(x_block), /*dim=*/1);
+        amax = at::clamp(amax, /*min=*/1e-6f);
+
+        // Compute scale for this block
+        auto scale = amax / FP8_MAX;
+        scale_flat.select(1, b).copy_(scale);
+
+        // Quantize block
+        auto y       = x_block / scale.unsqueeze(1);
+        auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
+        q_flat.narrow(1, start, length).copy_(q_block);
+    }
+
+    // Reshape back to [bsz, seq_len, dim] and [bsz, seq_len, num_blocks]
+    auto q     = q_flat.view({bsz, seq_len, dim});
+    auto scale = scale_flat.view({bsz, seq_len, num_blocks});
+
     return std::make_tuple(q, scale);
 }
 
@@ -235,7 +297,8 @@ torch::Tensor KV_Storage::get_k_quantize_scale(
         .dtype(torch::kFloat32)
         .device(device)  // Use the device object instead of a raw integer
         .requires_grad(false);
-    auto k_quantize_scale = torch::ones({cur_batch.size(), padding_length}, opt);
+    auto k_quantize_scale = torch::ones({cur_batch.size(), padding_length, 5}, opt); // TODO:
+    // std::vector<torch::Tensor> k_quantize_scale_vec;
                                             
     for (int64_t i = 0; i < static_cast<int64_t>(cur_batch.size()); i++) {
         auto query_idx = cur_batch[i];
@@ -256,14 +319,7 @@ torch::Tensor KV_Storage::get_k_quantize_scale(
             throw std::runtime_error("scale_size > padding_length");
         }
         k_quantize_scale.index({i, torch::indexing::Slice(0, scale_size)}) = scale.index({0, torch::indexing::Slice(0, scale_size)}); 
-        // Log padding_length, and the first 5 elements of k_quantize_scale[i]
-        // this->logger_->info("padding_length: {}, k_quantize_scale[{}]: {}{}{}{}{}",
-        //                      padding_length, i,
-        //                      k_quantize_scale[i][-1].item<float>(),
-        //                      k_quantize_scale[i][-2].item<float>(),
-        //                      k_quantize_scale[i][-3].item<float>(),
-        //                      k_quantize_scale[i][-4].item<float>(),
-        //                      k_quantize_scale[i][-5].item<float>());
+        // k_quantize_scale_vec.push_back(scale.index({0, torch::indexing::Slice(0, scale_size)}).unsqueeze(0));
     }
     // Check k_quantize_scale has nan values
     // if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
@@ -278,6 +334,14 @@ torch::Tensor KV_Storage::get_k_quantize_scale(
     // }
     // CUDA_CHECK(cudaStreamSynchronize(0));
     // CUDA_CHECK(cudaDeviceSynchronize());
+    // torch::Tensor k_quantize_scale = torch::cat(k_quantize_scale_vec, 0);
+    // Concat to padding_length
+    // if(k_quantize_scale.size(1) < padding_length) {
+    //     auto padding = torch::ones({k_quantize_scale.size(0), padding_length - k_quantize_scale.size(1),k_quantize_scale.size(2)}, opt);
+    //     k_quantize_scale = torch::cat({k_quantize_scale, padding}, 1);
+    // }
+    // this->logger_->info("k_quantize_scale shape: {}",
+    //                              get_tensor_shape(k_quantize_scale));
     return k_quantize_scale;
 }
             
@@ -419,7 +483,10 @@ void KV_Storage::offload_helper_(
         } else {
             CUDA_CHECK(cudaSetDevice(
                 this->engine_config_.basic_config.device));
-            auto [k, k_quantize_scale] = per_token_quant(bf16_k);
+            auto [k, k_quantize_scale] = quant_per_token(bf16_k);
+            // log k_quantize_scale shape
+            // this->logger_->info("k_quantize_scale shape: {}",
+            //                      get_tensor_shape(k_quantize_scale));
             // Check k or k_quantize_scale has nan values
             if (torch::any(torch::isnan(k)).item<bool>()){
                 for (int64_t i = 0; i < k.size(0); i++) {
@@ -504,7 +571,10 @@ void KV_Storage::offload_helper_(
                     this->k_storage[slot_idx][layer_idx].num_tokens = attention_mask[i].sum().item<int64_t>();
                     this->k_storage[slot_idx][layer_idx].used_byte_size =
                         attention_mask[i].sum().item<int64_t>() * token_byte_size;
-                    this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)}).clone().unsqueeze(0);                     
+                    this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)}).clone().unsqueeze(0);       
+                    // log quantize_scale shape
+                    // this->logger_->info("quantize_scale shape: {}",
+                    //                      get_tensor_shape(this->k_storage[slot_idx][layer_idx].quantize_scale));              
                         
                     // this->logger_->info("k_storage[{}][{}].num_tokens: {}, used_byte_size: {}",
                     //                     slot_idx, layer_idx,
