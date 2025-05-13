@@ -29,6 +29,58 @@ from ..quantization.fp8e4m3 import (
     compressed_kv_fp8_to_bf16_per_token
 )
 
+@triton.jit
+def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    """
+    Dequantizes weights using the provided scaling factors and stores the result.
+
+    Args:
+        x_ptr (tl.pointer): Pointer to the quantized weights.
+        s_ptr (tl.pointer): Pointer to the scaling factors.
+        y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+        M (int): Number of rows in the weight matrix.
+        N (int): Number of columns in the weight matrix.
+        BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+    Returns:
+        None
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n = tl.cdiv(N, BLOCK_SIZE)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    s = tl.load(s_ptr + pid_m * n + pid_n)
+    y = x * s
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale tensor.
+
+    Args:
+        x (torch.Tensor): The quantized weight tensor of shape (M, N).
+        s (torch.Tensor): The scale tensor of shape (M//block_size, N//block_size).
+        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+    Returns:
+        torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+    Raises:
+        AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+    """
+    assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
+    assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
+    M, N = x.size()
+    y = torch.empty_like(x, dtype=torch.bfloat16)
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
+    weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+    return y
+
 
 
 
@@ -86,68 +138,8 @@ def create_position_ids_from_attention_mask(
     return position_ids
 
 
-# def deepseek_v3_dequantization(
-# 		weight_data_fp8,
-# 		weight_scale_inv_fp32,
-# 		block_size = [128,128]) -> torch.Tensor:
-# 	start_time = torch.cuda.Event(enable_timing=True)
-# 	end_time = torch.cuda.Event(enable_timing=True)
-# 	start_time.record()
-# 	rows, cols = weight_data_fp8.size()
-# 	n_block_rows = math.ceil(rows / block_size[0])
-# 	n_block_cols = math.ceil(cols / block_size[1])
-# 	assert n_block_cols == weight_scale_inv_fp32.size(1)
-# 	assert n_block_rows == weight_scale_inv_fp32.size(0)
 
-# 	dequantized_weight = weight_data_fp8.to(torch.float32)
-# 	for i in range(n_block_rows):
-# 		for j in range(n_block_cols):
-# 			dequantized_weight[i*block_size[0]:(i+1)*block_size[0], j*block_size[1]:(j+1)*block_size[1]] *= weight_scale_inv_fp32[i, j]
-
-# 	dequantized_weight = dequantized_weight.to(torch.bfloat16)
-# 	end_time.record()
-# 	torch.cuda.synchronize(7)
-# 	# logging dequantize time in ms
-# 	logging.info(f"Dequantization time: {start_time.elapsed_time(end_time)} ms")
-# 	return dequantized_weight
-
-
-def deepseek_v3_dequantization_(
-    weight_data_fp8, weight_scale_inv_fp32, block_size=[128, 128]
-) -> torch.Tensor:
-    # start_time = torch.cuda.Event(enable_timing=True)
-    # end_time = torch.cuda.Event(enable_timing=True)
-    # start_time.record()
-    rows, cols = weight_data_fp8.size()
-    n_block_rows = math.ceil(rows / block_size[0])
-    n_block_cols = math.ceil(cols / block_size[1])
-    assert n_block_cols == weight_scale_inv_fp32.size(1)
-    assert n_block_rows == weight_scale_inv_fp32.size(0)
-    # Check input are on the same device
-    # logging.info(
-    #     f"weight_data_fp8 device: {weight_data_fp8.device}, weight_scale_inv_fp32 device: {weight_scale_inv_fp32.device}"
-    # )
-
-    dequantized_weight = weight_data_fp8.to(torch.float32)
-    expanded_scales = weight_scale_inv_fp32.repeat_interleave(
-        block_size[0], dim=0
-    ).repeat_interleave(block_size[1], dim=1)
-    expanded_scales = expanded_scales[
-        :rows, :cols
-    ]  # trim if block doesn't perfectly divide
-    dequantized_weight *= expanded_scales
-    # for i in range(n_block_rows):
-    # 	for j in range(n_block_cols):
-    # 		dequantized_weight[i*block_size[0]:(i+1)*block_size[0], j*block_size[1]:(j+1)*block_size[1]] *= weight_scale_inv_fp32[i, j]
-
-    dequantized_weight = dequantized_weight.to(torch.bfloat16)
-    # end_time.record()
-    # torch.cuda.synchronize(7)
-    # # logging dequantize time in ms
-    # logging.info(f"Dequantization time: {start_time.elapsed_time(end_time)} ms")
-    return dequantized_weight
-
-def deepseek_v3_dequantization(weight_data_fp8, weight_scale_inv_fp32, block_size=[128, 128]):
+def deepseek_v3_dequantization_(weight_data_fp8, weight_scale_inv_fp32, block_size=[128, 128]):
     rows, cols = weight_data_fp8.shape
     
     # Convert block_size to constants or GPU tensors
@@ -202,67 +194,6 @@ def deepseek_v3_dequantization(weight_data_fp8, weight_scale_inv_fp32, block_siz
 
 #     return dequantized_weight
 
-
-@triton.jit
-def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
-    """
-    Dequantizes weights using the provided scaling factors and stores the result.
-
-    Args:
-            x_ptr (tl.pointer): Pointer to the quantized weights.
-            s_ptr (tl.pointer): Pointer to the scaling factors.
-            y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
-            M (int): Number of rows in the weight matrix.
-            N (int): Number of columns in the weight matrix.
-            BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
-
-    Returns:
-            None
-    """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    n = tl.cdiv(N, BLOCK_SIZE)
-    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs = offs_m[:, None] * N + offs_n[None, :]
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-    s = tl.load(s_ptr + pid_m * n + pid_n)
-    y = x * s
-    tl.store(y_ptr + offs, y, mask=mask)
-
-
-def weight_dequant(
-    x: torch.Tensor, s: torch.Tensor, block_size: int = 128
-) -> torch.Tensor:
-    """
-    Dequantizes the given weight tensor using the provided scale tensor.
-
-    Args:
-            x (torch.Tensor): The quantized weight tensor of shape (M, N).
-            s (torch.Tensor): The scale tensor of shape (M, N).
-            block_size (int, optional): The block size to use for dequantization. Defaults to 128.
-
-    Returns:
-            torch.Tensor: The dequantized weight tensor of the same shape as `x`.
-
-    Raises:
-            AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
-    """
-    assert (
-        x.is_contiguous() and s.is_contiguous()
-    ), "Input tensors must be contiguous"
-    assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
-    M, N = x.size()
-    y = torch.empty_like(x, dtype=torch.bfloat16)
-    grid = lambda meta: (  # noqa E731
-        triton.cdiv(M, meta["BLOCK_SIZE"]),
-        triton.cdiv(N, meta["BLOCK_SIZE"]),
-    )
-    weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
-    return y
-
-
 class Attn_Wrapper(torch.nn.Module):
     phase = "prefill"
     attn_mode = 0
@@ -296,32 +227,27 @@ class Attn_Wrapper(torch.nn.Module):
         )
         self.core_engine.clear_expert_buffer(self.layer_idx, 0)
         # Step 1: Synchronize Attn Weights.
-        if self.get_weights:
-            weights_dict = self.core_engine.get_weights(self.attn_module_id)
-            for name, param in self.module.named_parameters():
-                if (
-                    self.weight_dequant_scale is not None
-                    and name + "_scale_inv" in self.weight_dequant_scale
-                ):
-                    param.data = deepseek_v3_dequantization(
-                        weights_dict[name],
-                        self.weight_dequant_scale[name + "_scale_inv"],
-                    )
-                else:
-                    param.data = weights_dict[name]
+        # if self.get_weights:
+        #     weights_dict = self.core_engine.get_weights(self.attn_module_id)
+        #     for name, param in self.module.named_parameters():
+        #         if (
+        #             self.weight_dequant_scale is not None
+        #             and name + "_scale_inv" in self.weight_dequant_scale
+        #         ):
+        #             param.data = deepseek_v3_dequantization(
+        #                 weights_dict[name],
+        #                 self.weight_dequant_scale[name + "_scale_inv"],
+        #             )
+        #         else:
+        #             param.data = weights_dict[name]
         if Attn_Wrapper.phase == "prefill":
             """
 				All attn Mode has the same prefill logic.
 			"""
-            # Get all tensor objects currently alive
-            # for obj in gc.get_objects():
-            # 	try:
-            # 		if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-            # 			if obj.numel() * obj.element_size() * 2 > 1e8:
-            # 				if obj.device.type == "cuda":
-            # 					logging.debug(f"Tensor object id: {id(obj)},size: {obj.numel() * obj.element_size() * 2}, shape: {obj.shape}")
-            # 	except:
-            # 		pass
+            if self.get_weights:
+                weights_dict = self.core_engine.get_weights(self.attn_module_id)
+                for name, param in self.module.named_parameters():
+                        param.data = weights_dict[name]
             # Step 2: Prepare input
             arg_dict = {
                 "hidden_states": kwargs["hidden_states"],
@@ -381,17 +307,16 @@ class Attn_Wrapper(torch.nn.Module):
                         position_ids = Attn_Wrapper.position_ids[
                             cur_batch_start:cur_batch_end
                         ]
-                        # output = self.module.prefill_attn_fp8(
-                        #     cur_hidden_states, cur_attention_mask, position_ids,
-                        #     self.weight_dequant_scale
+                        # output = self.module.prefill_attn(
+                        #     cur_hidden_states,
+                        #     cur_attention_mask.to(cur_hidden_states.device),
+                        #     position_ids.to(cur_hidden_states.device),
                         # )
-                        # logging.info(f"cur_attention_mask_shape: {cur_attention_mask.shape}")
-                        # logging.info(f"cur_attention_mask: {cur_attention_mask}")
-                        # exit()
-                        output = self.module.prefill_attn(
+                        output = self.module.prefill_attn_w8a16(
                             cur_hidden_states,
                             cur_attention_mask.to(cur_hidden_states.device),
                             position_ids.to(cur_hidden_states.device),
+                            self.weight_dequant_scale
                         )
                         key_cache = output[1]
                         value_cache = torch.ones(
@@ -456,6 +381,19 @@ class Attn_Wrapper(torch.nn.Module):
             return attn_output, None, None
 
         elif Attn_Wrapper.phase == "decoding":
+            if self.get_weights:
+                weights_dict = self.core_engine.get_weights(self.attn_module_id)
+                for name, param in self.module.named_parameters():
+                    if (
+                        self.weight_dequant_scale is not None
+                        and name + "_scale_inv" in self.weight_dequant_scale
+                    ):
+                        param.data = deepseek_v3_dequantization(
+                            weights_dict[name],
+                            self.weight_dequant_scale[name + "_scale_inv"],
+                        )
+                    else:
+                        param.data = weights_dict[name]
             # logging.info(f"[Layer {self.layer_idx} - Attn_Wrapper] Decoding phase.")
             self.core_engine.clear_expert_buffer(self.layer_idx, 0)
             hidden_states = kwargs["hidden_states"]
@@ -549,42 +487,38 @@ class Expert_Wrapper(torch.nn.Module):
         if self.get_weights:
             weights_dict = self.core_engine.get_weights(self.expert_weights_idx)
             # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-            for name, param in self.module.named_parameters():
-                if (
-                    self.weight_dequant_scale is not None
-                    and name + "_scale_inv" in self.weight_dequant_scale
-                ):
+            # for name, param in self.module.named_parameters():
+            #     if (
+            #         self.weight_dequant_scale is not None
+            #         and name + "_scale_inv" in self.weight_dequant_scale
+            #     ):
                     
-                    param.data = deepseek_v3_dequantization(
-                        weights_dict[name],
-                        self.weight_dequant_scale[name + "_scale_inv"]
-                    )
-                    # param.data.set_(
-                    #     deepseek_v3_dequantization(
-                    #         weights_dict[name],
-                    #         self.weight_dequant_scale[name + "_scale_inv"].to(
-                    #             self.engine_config.Basic_Config.device_torch
-                    #         ),
-                    #     )
-                    # )
-                else:
-                    param.data = weights_dict[name]
-                    # param.data.set_(weights_dict[name])
+            #         param.data = deepseek_v3_dequantization(
+            #             weights_dict[name],
+            #             self.weight_dequant_scale[name + "_scale_inv"]
+            #         )
+            #     else:
+            #         param.data = weights_dict[name]
+            for name, param in self.module.named_parameters():
+                param.data = weights_dict[name]
         else:
-            self.module.gate_proj.weight.data = deepseek_v3_dequantization(
-                self.fp8_gate,
-                self.weight_dequant_scale[
-                    "gate_proj.weight_scale_inv"
-                ],
-            )
-            self.module.down_proj.weight.data = deepseek_v3_dequantization(
-                self.fp8_down,
-                self.weight_dequant_scale["down_proj.weight_scale_inv"],
-            )
-            self.module.up_proj.weight.data = deepseek_v3_dequantization(
-                self.fp8_up,
-                self.weight_dequant_scale["up_proj.weight_scale_inv"],
-            )
+            # self.module.gate_proj.weight.data = deepseek_v3_dequantization(
+            #     self.fp8_gate,
+            #     self.weight_dequant_scale[
+            #         "gate_proj.weight_scale_inv"
+            #     ],
+            # )
+            # self.module.down_proj.weight.data = deepseek_v3_dequantization(
+            #     self.fp8_down,
+            #     self.weight_dequant_scale["down_proj.weight_scale_inv"],
+            # )
+            # self.module.up_proj.weight.data = deepseek_v3_dequantization(
+            #     self.fp8_up,
+            #     self.weight_dequant_scale["up_proj.weight_scale_inv"],
+            # )
+            self.module.gate_proj.weight.data = self.fp8_gate
+            self.module.down_proj.weight.data = self.fp8_down
+            self.module.up_proj.weight.data = self.fp8_up
 
         # Step 2: Forward pass, micro-batching in case of OOM.
         hidden_states = args[0]
@@ -603,15 +537,9 @@ class Expert_Wrapper(torch.nn.Module):
                 else (i + 1) * token_num_upper_bound
             )
             micro_batch = hidden_states[start:end]
-            # self.module.eval()
-            # with torch.no_grad():
-            #     # result[start:end].copy_(self.module(micro_batch))
-            #     output = self.module(micro_batch)
-            #     result[start:end] = output
-            # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-
-            output = self.module(micro_batch)
-            # output.record_stream(torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch))
+            # output = self.module(micro_batch)
+            output = self.module.fused_fp8_forward(micro_batch, self.weight_dequant_scale)
+            
             result[start:end] = output
             torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
             # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)

@@ -255,7 +255,10 @@ class Parallel_Strategy_Manager:
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			if self.engine_config.Basic_Config.gpu_arch == "hooper":
-				from ....attention.mla.fa3_backend import mla_prefill_flashattention3
+				from ....attention.mla.fa3_backend import (
+					mla_prefill_flashattention3, 
+					mla_prefill_flashattention3_w8a16_deepgemm
+				)
 				from ....attention.mla.flashmla_backend import mla_decoding_flashmla
 				setattr(
 					attn_module,
@@ -264,6 +267,14 @@ class Parallel_Strategy_Manager:
 						mla_prefill_flashattention3, attn_module
 					),
 				)
+				setattr(
+					attn_module,
+					"prefill_attn_w8a16",
+					types.MethodType(
+						mla_prefill_flashattention3_w8a16_deepgemm, attn_module
+					),
+				)
+
 				setattr(
 					attn_module,
 					"decoding_attn",

@@ -9,7 +9,7 @@
 	},
 
 	"Module_Batching_Config": {
-		"attn_prefill_micro_batch_size": 4,
+		"attn_prefill_micro_batch_size": 8,
 		"MoE_prefill_micro_batch_size": 8,
 		"expert_prefill_batch_size_upper_bound": 2048,
 		"attn_decoding_micro_batch_size": 32,
@@ -20,12 +20,12 @@
 	"GPU_Buffer_Config": {
 		"num_prefill_module_buffer": {
 		  "attn": 1,
-		  "routed_expert": 20,
+		  "routed_expert": 10,
 		  "shared_expert": 1
 		},
 		"num_decoding_module_buffer": {
 		  "attn": 1,
-		  "routed_expert": 10,
+		  "routed_expert": 8,
 		  "shared_expert": 1
 		},
 		"num_k_buffer": 1,

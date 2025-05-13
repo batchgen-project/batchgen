@@ -383,7 +383,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 	k_embed = (k * cos) + (rotate_half(k) * sin)
 	return q_embed, k_embed
 
-
+from ....moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 class DeepseekV3MLP(nn.Module):
 	def __init__(self, config, hidden_size=None, intermediate_size=None):
 		super().__init__()
@@ -402,6 +402,13 @@ class DeepseekV3MLP(nn.Module):
 	def forward(self, x):
 		down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 		return down_proj
+
+	@torch.inference_mode
+	def fused_fp8_forward(self, x, scale):
+		up = fused_fp8_bf16_gemm(x, self.up_proj.weight.data, scale['up_proj.weight_scale_inv'])
+		gate = fused_fp8_bf16_gemm(x, self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'])
+		intermediate = self.act_fn(gate) * up
+		return fused_fp8_bf16_gemm(intermediate, self.down_proj.weight.data, scale['down_proj.weight_scale_inv']) 
 
 
 class MoEGate(nn.Module):
@@ -811,7 +818,10 @@ class DeepseekV3MoE_Decoding(nn.Module):
 
 		# Create tensors for all-to-all operations
 		recv_counts = torch.empty(self.world_size, dtype=torch.int64, device=x.device)
+		# Log rank reached first all-to-all
+		# logger.info(f"Rank {self.rank} reached first all-to-all")
 		dist.all_to_all_single(recv_counts, send_counts)
+
 		
 		# All-to-all send for input tensors
 		send_tensor = sorted_inputs.contiguous()
@@ -835,6 +845,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 			# but allows the collective to proceed
 			send_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
 		
+		# logger.info(f"Rank {self.rank} Send: Recv tensor dim 0: {recv_tensor.size(0)}, recv count sum: {recv_counts.sum()}")
 		dist.all_to_all_single(recv_tensor, send_tensor, recv_counts_list, send_counts_list)
 
 		# All-to-all comm for expert ids
@@ -851,7 +862,9 @@ class DeepseekV3MoE_Decoding(nn.Module):
 			# Create a dummy tensor that won't be used but allows the collective to proceed
 			send_expert_ids = torch.empty(0, device=x.device, dtype=send_expert_ids.dtype)
 		
+		# logger.info(f"Rank {self.rank} reached third all-to-all")
 		dist.all_to_all_single(recv_expert_ids, send_expert_ids, recv_counts_list, send_counts_list)
+		# logger.info(f"Rank {self.rank} passed third all-to-all")
 
 		# Process received data if there's any
 		if recv_total > 0:
@@ -863,6 +876,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 				expert_input = recv_tensor[indices]
 				expert_output = self.experts[expert_idx](expert_input)
 				recv_tensor[indices] = expert_output
+				# logger.info(f"Rank {self.rank} processed expert {expert_idx} with {len(indices)} tokens")
 
 		# All-to-all return, send back output
 		output_recv = torch.empty_like(sorted_inputs)
@@ -872,6 +886,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 			# Create a dummy tensor that won't be used but allows the collective to proceed
 			recv_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
 		
+		# logger.info(f"Rank {self.rank} Return recv tensor dim 0: {output_recv.size(0)}, recv count sum: {send_counts.sum()}")
 		dist.all_to_all_single(output_recv, recv_tensor, send_counts_list, recv_counts_list)
 
 		# Unsort and accumulate outputs
@@ -891,6 +906,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		# Produce final normalized output
 		final_output = output_accumulator / weight_accumulator.clamp(min=1e-9)
 
+		# logger.info(f"Rank {self.rank} completed all-to-all and processing")
 		return final_output.to(x.dtype)
 
 	@torch.no_grad()
