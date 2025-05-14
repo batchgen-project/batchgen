@@ -89,6 +89,10 @@ Basic_Config parse_basic_config(const py::object& engine_config) {
         basic_config_obj.attr("num_threads").cast<int64_t>();
     basic_config.module_types =
         basic_config_obj.attr("module_types").cast<std::vector<std::string>>();
+    basic_config.rank = 
+        basic_config_obj.attr("rank").cast<int64_t>();
+    basic_config.world_size = 
+        basic_config_obj.attr("world_size").cast<int64_t>();    
     return basic_config;
 };
 

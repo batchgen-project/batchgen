@@ -122,6 +122,8 @@ struct Basic_Config {
     int64_t attn_mode;  // 0: kv disaggreated. 1. kv cpu. 2. kv gpu.
     int64_t num_threads = 16;
     std::vector<std::string> module_types;  // {"attn", "expert", "dense"}
+    int64_t rank;
+    int64_t world_size;
 };
 
 struct Module_Batching_Config {

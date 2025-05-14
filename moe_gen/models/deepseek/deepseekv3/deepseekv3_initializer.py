@@ -674,6 +674,7 @@ class DeepSeekV3_Initializer:
     def Init(self):
         try:
             self._init_torch_dist_nccl()
+            torch.cuda.set_device(self.rank)
             self._parse_state_dict_ep()
             logging.info("State dict parsed")
             self.core_engine = core_engine(
@@ -1377,7 +1378,8 @@ class DeepSeekV3_Initializer:
             backend="NCCL",
             init_method="tcp://localhost:12355",
             world_size=self.world_size,
-            rank = self.rank
+            rank = self.rank,
+            device_id=torch.device(f"cuda:{self.rank}")
         )
         torch.cuda.set_device(self.rank)
 

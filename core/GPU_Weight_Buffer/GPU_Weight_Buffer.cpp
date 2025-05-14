@@ -245,14 +245,16 @@ void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
 //     }
 // };
 module_weight_tensor_map GPU_Weight_Buffer::get_weights(
-    const std::string& module_name) {
+    const std::string& module_name,
+    std::string& phase) 
+{
     this->logger_->debug("Get weights: {}", module_name);
     try {
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(this->mutex_);
                 if (this->cv_.wait_for(
-                        lock, std::chrono::milliseconds(1),
+                        lock, std::chrono::milliseconds(2),
                         [this, module_name] {
                             return this->module_in_buffers_.find(module_name) !=
                                    this->module_in_buffers_.end();
@@ -285,7 +287,7 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                     this->logger_->debug(
                         "Clearing expert buffer: layer_idx: {}, expert_idx: {}",
                         layer_idx, expert_idx);
-                    this->clear_expert_buffer(layer_idx, expert_idx);
+                    this->clear_expert_buffer(layer_idx, expert_idx, phase);
                 } else {
                     this->logger_->error(
                         "Invalid format in module name: '{}', expected "
@@ -334,14 +336,9 @@ void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
     
 };
 
+
 // void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx,
 //                                             int64_t expert_idx) {
-//     // clear expert in the buffer that is in previous of current expert.
-//     // this->logger_->debug("Clearing expert buffer prev of: layer_idx: {},
-//     // expert_idx: {}", layer_idx, expert_idx); for(auto const& [key, val] :
-//     // this->module_in_buffers_){ 	this->logger_->debug("Before Clearing
-//     // Module_in_buffers_: Key: {}", key);
-//     // }
 //     // Step 1: clear current layer.
 //     for (int64_t idx = 0; idx < expert_idx; idx++) {
 //         std::string module_name = "routed_expert_" + std::to_string(layer_idx) +
@@ -351,105 +348,188 @@ void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
 //             this->releaseBuffer(module_name);
 //         }
 //     };
-//     // Step 2: clear previous layer.
-//     int64_t prev_layer_idx;
+//     // Step 2: Clear expert not belongs the current layer and the next layer.
+//     int64_t next_layer_idx;
 //     if (this->model_config_.model_type == "deepseek_v2") {
-//         if ((layer_idx == 0) || (layer_idx == 1)) {
-//             prev_layer_idx = this->model_config_.num_hidden_layers - 1;
+//         if ((layer_idx == 0) || (layer_idx == (this->model_config_.num_hidden_layers - 1))) {
+//             next_layer_idx = 1;
 //         } else {
-//             prev_layer_idx = layer_idx - 1;
+//             next_layer_idx = layer_idx + 1;
 //         }
 //     } else if (this->model_config_.model_type == "deepseek_v3") {
-//         if ((layer_idx >= 0) && (layer_idx <= 3)) {
-//             prev_layer_idx = this->model_config_.num_hidden_layers - 1;
+//         if (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || 
+//             layer_idx == this->model_config_.num_hidden_layers - 1) {
+//             next_layer_idx = 3;
 //         } else {
-//             prev_layer_idx = layer_idx - 1;
+//             next_layer_idx = layer_idx + 1;
 //         }
-//     } else {
-//         prev_layer_idx = layer_idx - 1;
 //     }
-
-//     for (int64_t idx = 0; idx < this->model_config_.num_local_experts; idx++) {
-//         std::string module_name = "routed_expert_" +
-//                                   std::to_string(prev_layer_idx) + "_" +
-//                                   std::to_string(idx);
-//         if (this->module_in_buffers_.find(module_name) !=
-//             this->module_in_buffers_.end()) {
-//             this->releaseBuffer(module_name);
+//     std::vector<std::string> keys_to_remove;
+//     for (const auto& [key, value] : this->module_in_buffers_) {
+//         // Skip if key doesn't match the routed_expert pattern
+//         if (key.find("routed_expert_") != 0) {
+//             continue;
 //         }
-//     };
-//     // for(auto const& [key, val] : this->module_in_buffers_){
-//     // 	this->logger_->debug("After Clearing Module_in_buffers_: Key: {}", key);
-//     // }
+        
+//         // Parse layer_id from the key
+//         // Format: routed_expert_{layer_id}_{expert_id}
+//         size_t first_underscore = key.find('_', 13); // "routed_expert_" is 13 chars
+//         size_t second_underscore = key.find('_', first_underscore + 1);
+        
+//         if (first_underscore == std::string::npos || second_underscore == std::string::npos) {
+//             // Malformed key, skip it
+//             continue;
+//         }
+        
+//         std::string layer_id_str = key.substr(first_underscore + 1, second_underscore - first_underscore - 1);
+//         int64_t layer_id;
+        
+//         try {
+//             layer_id = std::stoll(layer_id_str);
+//         } catch (const std::exception& e) {
+//             // Invalid layer_id, skip it
+//             continue;
+//         }
+        
+//         // Keep if it's current layer or next layer, otherwise mark for removal
+//         if (layer_id != layer_idx && layer_id != next_layer_idx) {
+//             // this->logger_->info(
+//             //     "Current layer: {}, current expert: {}, clearing expert buffer: {}",
+//             //     layer_idx, expert_idx, key);
+//             keys_to_remove.push_back(key);
+//         }
+//     }
+//     for (const auto& key : keys_to_remove) {
+//         this->releaseBuffer(key);
+//     }
 // }
 
-// TODO:
-void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx,
-                                            int64_t expert_idx) {
-    // Step 1: clear current layer.
-    for (int64_t idx = 0; idx < expert_idx; idx++) {
-        std::string module_name = "routed_expert_" + std::to_string(layer_idx) +
-                                  "_" + std::to_string(idx);
-        if (this->module_in_buffers_.find(module_name) !=
-            this->module_in_buffers_.end()) {
-            this->releaseBuffer(module_name);
-        }
-    };
-    // Step 2: Clear expert not belongs the current layer and the next layer.
-    int64_t next_layer_idx;
-    if (this->model_config_.model_type == "deepseek_v2") {
-        if ((layer_idx == 0) || (layer_idx == (this->model_config_.num_hidden_layers - 1))) {
-            next_layer_idx = 1;
-        } else {
-            next_layer_idx = layer_idx + 1;
-        }
-    } else if (this->model_config_.model_type == "deepseek_v3") {
-        if (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || 
-            layer_idx == this->model_config_.num_hidden_layers - 1) {
-            next_layer_idx = 3;
-        } else {
-            next_layer_idx = layer_idx + 1;
-        }
+// void GPU_Weight_Buffer::clear_expert_buffer(
+//     int64_t layer_idx,
+//     int64_t expert_idx,
+//     std::string phase) 
+// {
+//     // Step 1: Prepare a hashset contains the routed expert name that is allowed.
+//     // Allowded expert name is from current expert to current expert + engine_config num expert buffer.
+//     // Find the current expert name of the weight_copy_tasks_. The insert the names to the hashset.
+//     // If we reach the end of the task list, append start from the beginning.
+//     std::unordered_set<std::string> allowed_expert_names;
+//     int64_t num_expert_buffer;
+//     if(phase == "prefill"){
+//         num_expert_buffer = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer["routed_expert"];
+//     } else if(phase == "decoding"){
+//         num_expert_buffer = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer["routed_expert"];
+//     } else {
+//         throw std::runtime_error("Invalid phase: " + phase);
+//     }
+//     // Find the index for the current expert in the weight_copy_tasks_.
+//     int64_t idx = 0;
+//     std::string current_expert_name = "routed_expert_" + std::to_string(layer_idx) + "_" + std::to_string(expert_idx);
+//     for (const auto& module_name : this->weight_copy_tasks_["routed_expert"]) {
+//         if (module_name == current_expert_name) {
+//             break;
+//         }
+//         idx++;
+//     }
+//     // Insert the current expert name to the hashset.
+//     allowed_expert_names.insert(current_expert_name);
+//     // Insert the next num_expert_buffer - 1 expert names to the hashset.
+//     // If we reach the end of the task list, append start from the beginning.
+//     for (int64_t i = 1; i < num_expert_buffer; i++) {
+//         idx++;
+//         if (idx >= this->weight_copy_tasks_["routed_expert"].size()) {
+//             idx = 0;
+//         }
+//         allowed_expert_names.insert(this->weight_copy_tasks_["routed_expert"][idx]);
+//     }
+
+//     // Step 2: Clear the expert buffer that is not in the hashset.
+//     std::vector<std::string> keys_to_remove;
+//     for (const auto& [key, value] : this->module_in_buffers_) {
+//         // Skip if key doesn't match the routed_expert pattern
+//         if (key.find("routed_expert_") != 0) {
+//             continue;
+//         }
+//         else if (allowed_expert_names.find(key) == allowed_expert_names.end()) {
+//             // Add to key_to_remove if the key is not in the hashset.
+//             keys_to_remove.push_back(key);
+//         }
+//     }
+//     for (const auto& key : keys_to_remove) {
+//         this->releaseBuffer(key);
+//     }
+// }
+
+void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase) {
+    // Log the keys of the module_in_buffers_ in the same log msg
+    // std::ostringstream oss;
+    // oss << "Map keys: ";
+    
+    // size_t count = 0;
+    // for (const auto& [key, value] : this->module_in_buffers_) {
+    //     oss << key;
+    //     if (++count < this->module_in_buffers_.size()) {
+    //         oss << ", ";
+    //     }
+    // }
+    // this->logger_->debug("clearing expert buffer: layer_idx: {}, expert_idx: {}, existing keys: {}", layer_idx, expert_idx, oss.str());
+
+    // Get the number of expert buffers based on phase
+    int64_t num_expert_buffer;
+    if (phase == "prefill") {
+        num_expert_buffer = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer["routed_expert"];
+    } else if (phase == "decoding") {
+        num_expert_buffer = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer["routed_expert"];
+    } else {
+        throw std::runtime_error("Invalid phase: " + std::string(phase));
     }
-    std::vector<std::string> keys_to_remove;
-    for (const auto& [key, value] : this->module_in_buffers_) {
-        // Skip if key doesn't match the routed_expert pattern
-        if (key.find("routed_expert_") != 0) {
-            continue;
-        }
-        
-        // Parse layer_id from the key
-        // Format: routed_expert_{layer_id}_{expert_id}
-        size_t first_underscore = key.find('_', 13); // "routed_expert_" is 13 chars
-        size_t second_underscore = key.find('_', first_underscore + 1);
-        
-        if (first_underscore == std::string::npos || second_underscore == std::string::npos) {
-            // Malformed key, skip it
-            continue;
-        }
-        
-        std::string layer_id_str = key.substr(first_underscore + 1, second_underscore - first_underscore - 1);
-        int64_t layer_id;
-        
-        try {
-            layer_id = std::stoll(layer_id_str);
-        } catch (const std::exception& e) {
-            // Invalid layer_id, skip it
-            continue;
-        }
-        
-        // Keep if it's current layer or next layer, otherwise mark for removal
-        if (layer_id != layer_idx && layer_id != next_layer_idx) {
-            // this->logger_->info(
-            //     "Current layer: {}, current expert: {}, clearing expert buffer: {}",
-            //     layer_idx, expert_idx, key);
-            keys_to_remove.push_back(key);
-        }
+    
+    // Create the current expert name once
+    std::string current_expert_name = "routed_expert_" + std::to_string(layer_idx) + "_" + std::to_string(expert_idx);
+    
+    // Find index of current expert in weight_copy_tasks_ in one pass
+    const auto& expert_tasks = this->weight_copy_tasks_["routed_expert"];
+    auto task_it = std::find(expert_tasks.begin(), expert_tasks.end(), current_expert_name);
+    if (task_it == expert_tasks.end()) {
+        return; // Expert name not found, nothing to clear
     }
-    for (const auto& key : keys_to_remove) {
-        this->releaseBuffer(key);
+    
+    // Build the set of allowed expert names efficiently
+    std::unordered_set<std::string> allowed_expert_names;
+    allowed_expert_names.reserve(num_expert_buffer); // Preallocate for performance
+    allowed_expert_names.insert(current_expert_name);
+    
+    size_t task_size = expert_tasks.size();
+    size_t idx = std::distance(expert_tasks.begin(), task_it);
+    
+    // Add the next (num_expert_buffer - 1) expert names
+    for (int64_t i = 1; i < num_expert_buffer; i++) {
+        idx = (idx + 1) % task_size; // Wrap around more efficiently
+        allowed_expert_names.insert(expert_tasks[idx]);
+    }
+    
+    // Remove buffers in one pass, avoiding temporary storage vector
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        for (auto it = this->module_in_buffers_.begin(); it != this->module_in_buffers_.end();) {
+            const auto& key = it->first;
+            // Check if this is a routed expert buffer not in our allowed list
+            if (key.compare(0, 13, "routed_expert") == 0 && 
+                allowed_expert_names.find(key) == allowed_expert_names.end()) {
+                this->logger_->debug(
+                    "Clearing expert buffer: layer_idx: {}, expert_idx: {}, {} cleared",
+                    layer_idx, expert_idx, key);
+                auto module_type = it->second.first;  // Access through iterator
+                auto buffer_idx = it->second.second;  // Access through iterator
+                it = this->module_in_buffers_.erase(it); // Erase and get next iterator
+                this->buffer_status_[module_type][buffer_idx] = 0; // Release buffer
+            } else {
+                ++it; // Move to next element
+            }
+        }
     }
 }
+
 
 void GPU_Weight_Buffer::reset_prefill_buffer() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;

@@ -25,7 +25,7 @@
 		},
 		"num_decoding_module_buffer": {
 		  "attn": 1,
-		  "routed_expert": 8,
+		  "routed_expert": 20,
 		  "shared_expert": 1
 		},
 		"num_k_buffer": 1,

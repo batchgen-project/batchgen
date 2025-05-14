@@ -177,11 +177,13 @@ void MoE_Gen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
 // };
 
 std::unordered_map<std::string, torch::Tensor> MoE_Gen::get_weights(
-    std::string module_key) {
+    std::string module_key,
+    std::string& phase) 
+{
     /* Get the weights from the weights storage. */
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     // CUDA_CHECK(cudaStreamSynchronize(0));
-    return this->gpu_weight_buffer_.get_weights(module_key);  // blocking.
+    return this->gpu_weight_buffer_.get_weights(module_key, phase);  // blocking.
 };
 
 void MoE_Gen::free_weights_buffer(const std::string& module_name) {
@@ -205,8 +207,8 @@ void MoE_Gen::submit_to_KV_queue(std::vector<int64_t> micro_batch,
                                          layer_idx, byte_size);
 };
 
-void MoE_Gen::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx) {
-    this->gpu_weight_buffer_.clear_expert_buffer(layer_idx, expert_idx);
+void MoE_Gen::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase) {
+    this->gpu_weight_buffer_.clear_expert_buffer(layer_idx, expert_idx, phase);
 };
 
 void MoE_Gen::prefill_complete_sync() {
@@ -270,6 +272,7 @@ void MoE_Gen::set_weight_copy_queue(
     std::unordered_map<std::string, std::vector<std::string>>&
         weight_copy_tasks) {
     this->h2d_engine_.set_weight_copy_queue(weight_copy_tasks);
+    this->gpu_weight_buffer_.set_weight_copy_task(weight_copy_tasks);
 }
 
 void MoE_Gen::reset_decoding_buffer() {

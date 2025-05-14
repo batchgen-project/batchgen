@@ -225,7 +225,7 @@ class Attn_Wrapper(torch.nn.Module):
         logging.debug(
             f"[Layer {self.layer_idx} - Attn_Wrapper] Forward pass. Phase: {Attn_Wrapper.phase}"
         )
-        self.core_engine.clear_expert_buffer(self.layer_idx, 0)
+        # self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)
         # Step 1: Synchronize Attn Weights.
         # if self.get_weights:
         #     weights_dict = self.core_engine.get_weights(self.attn_module_id)
@@ -245,7 +245,7 @@ class Attn_Wrapper(torch.nn.Module):
 				All attn Mode has the same prefill logic.
 			"""
             if self.get_weights:
-                weights_dict = self.core_engine.get_weights(self.attn_module_id)
+                weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
                 for name, param in self.module.named_parameters():
                         param.data = weights_dict[name]
             # Step 2: Prepare input
@@ -382,7 +382,7 @@ class Attn_Wrapper(torch.nn.Module):
 
         elif Attn_Wrapper.phase == "decoding":
             if self.get_weights:
-                weights_dict = self.core_engine.get_weights(self.attn_module_id)
+                weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
                 for name, param in self.module.named_parameters():
                     if (
                         self.weight_dequant_scale is not None
@@ -395,7 +395,7 @@ class Attn_Wrapper(torch.nn.Module):
                     else:
                         param.data = weights_dict[name]
             # logging.info(f"[Layer {self.layer_idx} - Attn_Wrapper] Decoding phase.")
-            self.core_engine.clear_expert_buffer(self.layer_idx, 0)
+            # self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)
             hidden_states = kwargs["hidden_states"]
             attention_mask = Attn_Wrapper.attention_mask
             position_ids = Attn_Wrapper.position_ids
@@ -481,11 +481,10 @@ class Expert_Wrapper(torch.nn.Module):
         )
         # Step 1: Synchronize Expert Weights.
         if self.expert_idx != -1:
-            self.core_engine.clear_expert_buffer(
-                self.layer_idx, self.expert_idx
-            )
+            # self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)
+            pass
         if self.get_weights:
-            weights_dict = self.core_engine.get_weights(self.expert_weights_idx)
+            weights_dict = self.core_engine.get_weights(self.expert_weights_idx, Attn_Wrapper.phase)
             # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
             # for name, param in self.module.named_parameters():
             #     if (
@@ -571,9 +570,8 @@ class Expert_Wrapper(torch.nn.Module):
             f"[Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"
         )
         if self.expert_idx != -1:
-            self.core_engine.clear_expert_buffer(
-                self.layer_idx, self.expert_idx
-            )
+            # self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)
+            pass
         return result
 
     def _register_fp8_weights(self):

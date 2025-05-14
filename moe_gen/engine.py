@@ -740,7 +740,8 @@ class MoE_Gen:
             with torch.no_grad():
                 new_token = self.prefill(self.model_batches[model_batch_idx])
             prefill_time += time.perf_counter() - prefill_start_time
-            self.core_engine.prefill_complete_sync()
+            # self.core_engine.prefill_complete_sync()
+            logging.info(f"Rank: {self.rank} prefill complete.")
 
             # Random create new token.
             # new_token = torch.randint(
@@ -756,7 +757,7 @@ class MoE_Gen:
             # self.core_engine.start_h2d_worker()
             # time.sleep(2)
             
-            dist.barrier()
+            # dist.barrier()
             self._config_decoding()
             decoding_start_time = time.perf_counter()
             with torch.no_grad():
@@ -877,6 +878,7 @@ class MoE_Gen:
         self.core_engine.start_h2d_worker()
     
     def _config_decoding(self):
+        logging.info(f"Start Config Decoding")
         self.model = self.model.to("cpu")
         # Set all model parameters to None
         for param in self.model.parameters():
@@ -894,6 +896,7 @@ class MoE_Gen:
         self.core_engine.reset_decoding_buffer()
         self.core_engine.set_weight_copy_queue(self.weight_copy_task)
         self.core_engine.start_h2d_worker()
+        logging.info(f"End Config Decoding")
 
     def prefill(self, batch: list[int]):
         """

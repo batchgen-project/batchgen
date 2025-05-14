@@ -82,7 +82,7 @@ class MoE_Gen {
     // );
 
     std::unordered_map<std::string, torch::Tensor> get_weights(
-        std::string module_key);
+        std::string module_key, std::string& phase);
     void free_weights_buffer(const std::string& module_name);
 
     /* Attn */
@@ -92,7 +92,7 @@ class MoE_Gen {
                        torch::Tensor& position_ids,
                        std::vector<std::vector<int64_t>> cur_batching_plan);
 
-    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx);
+    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
 
     void set_phase(std::string phase);
 
