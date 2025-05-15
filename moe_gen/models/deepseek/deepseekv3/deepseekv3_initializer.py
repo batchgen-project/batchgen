@@ -1376,7 +1376,7 @@ class DeepSeekV3_Initializer:
     def _init_torch_dist_nccl(self):
         dist.init_process_group(
             backend="NCCL",
-            init_method="tcp://localhost:12355",
+            init_method="tcp://localhost:12345",
             world_size=self.world_size,
             rank = self.rank,
             device_id=torch.device(f"cuda:{self.rank}")

@@ -170,6 +170,45 @@ def run_moe_gen(moe_gen):
     return moe_gen.generate()
 
 
+def distribute_sequences(num_sequences, num_devices):
+    """
+    Distributes sequences across devices ensuring each device gets at least one sequence when possible,
+    and the distribution is as even as possible.
+    
+    Args:
+        num_sequences: Number of sequences to distribute
+        num_devices: Number of available devices
+    
+    Returns:
+        List of (start_idx, end_idx) tuples for each device
+    """
+    # If we have fewer sequences than devices, only use as many devices as we have sequences
+    active_devices = min(num_sequences, num_devices)
+    
+    # Calculate base sequences per device and remainder
+    base_per_device = num_sequences // active_devices
+    remainder = num_sequences % active_devices
+    
+    distribution = []
+    current_idx = 0
+    
+    for device_idx in range(num_devices):
+        if device_idx < active_devices:
+            # This device gets work
+            # Add one extra sequence for the first 'remainder' devices
+            device_sequences = base_per_device + (1 if device_idx < remainder else 0)
+            
+            start_idx = current_idx
+            end_idx = start_idx + device_sequences
+            current_idx = end_idx
+            
+            distribution.append((start_idx, end_idx))
+        else:
+            # This device gets no work
+            distribution.append((0, 0))  # Empty range
+    
+    return distribution
+
 # Entry point
 def moe_gen(
     huggingface_ckpt_name: str,
@@ -273,22 +312,17 @@ def moe_gen(
     num_devices = len(device)
     logging.info(f"Number of devices: {num_devices}")
     logging.info(f"Total number of queries: {num_queries}")
-    queries_per_device = math.ceil(num_queries / num_devices)
+    # queries_per_device = math.ceil(num_queries / num_devices)
+    distribution = distribute_sequences(num_queries, num_devices)
     per_device_host_kv_cache_size = host_kv_cache_size // num_devices
     
     # For each device, create a MoE_Gen instance
     for device_idx in range(num_devices):
-        start_query_idx = device_idx * queries_per_device
-        end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
-        
-        # Copy engine config and set device
-        # import copy
-        # device_engine_config = copy.deepcopy(engine_config)
-        # device_engine_config.Basic_Config.device = device[device_idx]
-        # device_engine_config.Basic_Config.device_torch = torch.device(
-        #     f"cuda:{device[device_idx]}"
-        # )
-        
+        # start_query_idx = device_idx * queries_per_device
+        # end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
+        start_query_idx, end_query_idx = distribution[device_idx]
+        logging.info(f"Device {device_idx}: Processing queries from {start_query_idx} to {end_query_idx}")
+                
         # Create MoE_Gen instance with the shared memory info
         from moe_gen.engine import MoE_Gen
         moe_gen_instance = MoE_Gen(
@@ -732,41 +766,54 @@ class MoE_Gen:
     def generate(self):
         prefill_time = 0
         decoding_time = 0
-        for model_batch_idx in tqdm(
-            range(len(self.model_batches)), desc="Model Batch"
-        ):
-            self._config_prefill()
-            prefill_start_time = time.perf_counter()
-            with torch.no_grad():
-                new_token = self.prefill(self.model_batches[model_batch_idx])
-            prefill_time += time.perf_counter() - prefill_start_time
-            # self.core_engine.prefill_complete_sync()
-            logging.info(f"Rank: {self.rank} prefill complete.")
+        if len(self.model_batches) > 0:
+            for model_batch_idx in tqdm(
+                range(len(self.model_batches)), desc="Model Batch"
+            ):
+                self._config_prefill()
+                prefill_start_time = time.perf_counter()
+                with torch.no_grad():
+                    new_token = self.prefill(self.model_batches[model_batch_idx])
+                prefill_time += time.perf_counter() - prefill_start_time
+                # self.core_engine.prefill_complete_sync()
+                logging.info(f"Rank: {self.rank} prefill complete.")
 
-            # Random create new token.
-            # new_token = torch.randint(
-            #     0,
-            #     1000,
-            #     # 129280, # self.model_config.vocab_size,
-            #     (len(self.model_batches[model_batch_idx]), 1),
-            #     device=self.torch_device,
-            # )
-            # self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
-            # logging.info("Entering kv_storage creation...")
-            # self.core_engine.create_fake_kv_storage()
-            # self.core_engine.start_h2d_worker()
-            # time.sleep(2)
-            
-            # dist.barrier()
+                # Random create new token.
+                # new_token = torch.randint(
+                #     0,
+                #     1000,
+                #     # 129280, # self.model_config.vocab_size,
+                #     (len(self.model_batches[model_batch_idx]), 1),
+                #     device=self.torch_device,
+                # )
+                # self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
+                # logging.info("Entering kv_storage creation...")
+                # self.core_engine.create_fake_kv_storage()
+                # self.core_engine.start_h2d_worker()
+                # time.sleep(2)
+                
+                # dist.barrier()
+                self._config_decoding()
+                decoding_start_time = time.perf_counter()
+                with torch.no_grad():
+                    logging.info(
+                        f"decoding batch size: {len(self.model_batches[model_batch_idx])}"
+                    )
+                    self.decoding(new_token, self.model_batches[model_batch_idx])
+                decoding_time += time.perf_counter() - decoding_start_time
+                self.core_engine.clear_kv_storage()
+        else:
+            # For small input batch, some worker might do not have any input.
+            # In this case, it only participate in the decoding phase.
+            # Todo: 
             self._config_decoding()
             decoding_start_time = time.perf_counter()
             with torch.no_grad():
-                logging.info(
-                    f"decoding batch size: {len(self.model_batches[model_batch_idx])}"
-                )
-                self.decoding(new_token, self.model_batches[model_batch_idx])
+                self.decoding(None, None)
             decoding_time += time.perf_counter() - decoding_start_time
             self.core_engine.clear_kv_storage()
+
+
         
         dist.barrier()
         self.model = None 
