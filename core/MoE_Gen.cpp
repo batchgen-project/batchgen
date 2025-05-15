@@ -139,16 +139,16 @@ void MoE_Gen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
                          torch::Tensor key_states, torch::Tensor value_states,torch::Tensor attention_mask) {
     /* Offload the kv to the kv storage. */
     // check if key_states contains any NaN values
-    if (key_states.isnan().any().item<bool>()) {
-        // check which sequence contains NaN values
-        for(int i = 0; i < key_states.size(0); i++){
-            if(key_states[i].isnan().any().item<bool>()){
-                this->logger->error("key_states contains NaN values at index {}", i);
-            }
-        }
-        this->logger->error("key_states contains NaN values");
-        // throw std::runtime_error("key_states contains NaN values");
-    }
+    // if (key_states.isnan().any().item<bool>()) {
+    //     // check which sequence contains NaN values
+    //     for(int i = 0; i < key_states.size(0); i++){
+    //         if(key_states[i].isnan().any().item<bool>()){
+    //             this->logger->error("key_states contains NaN values at index {}", i);
+    //         }
+    //     }
+    //     this->logger->error("key_states contains NaN values");
+    //     // throw std::runtime_error("key_states contains NaN values");
+    // }
     this->kv_storage_.offload(layer_idx, query_idx, key_states, value_states, attention_mask);
 };
 

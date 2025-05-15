@@ -254,7 +254,7 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
             {
                 std::unique_lock<std::mutex> lock(this->mutex_);
                 if (this->cv_.wait_for(
-                        lock, std::chrono::milliseconds(2),
+                        lock, std::chrono::milliseconds(1),
                         [this, module_name] {
                             return this->module_in_buffers_.find(module_name) !=
                                    this->module_in_buffers_.end();

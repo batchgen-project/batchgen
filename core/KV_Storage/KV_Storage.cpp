@@ -364,16 +364,16 @@ void KV_Storage::offload(
     // Check if k has nan values
     CUDA_CHECK(cudaStreamSynchronize(0));
     // CUDA_CHECK(cudaDeviceSynchronize());
-    if (torch::any(torch::isnan(k)).item<bool>()){
-        for (int64_t i = 0; i < k.size(0); i++) {
-            if(torch::any(torch::isnan(k[i])).item<bool>()) {
-                this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
-                                     i, this->engine_config_.basic_config.device,
-                                     layer_idx);
-            }
-        }
-        // throw std::runtime_error("k has nan values");
-    }
+    // if (torch::any(torch::isnan(k)).item<bool>()){
+    //     for (int64_t i = 0; i < k.size(0); i++) {
+    //         if(torch::any(torch::isnan(k[i])).item<bool>()) {
+    //             this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
+    //                                  i, this->engine_config_.basic_config.device,
+    //                                  layer_idx);
+    //         }
+    //     }
+    //     // throw std::runtime_error("k has nan values");
+    // }
     this->offload_helper_(layer_idx, query_global_idx, k, v, attention_mask);
 };
 
@@ -488,26 +488,27 @@ void KV_Storage::offload_helper_(
             // this->logger_->info("k_quantize_scale shape: {}",
             //                      get_tensor_shape(k_quantize_scale));
             // Check k or k_quantize_scale has nan values
-            if (torch::any(torch::isnan(k)).item<bool>()){
-                for (int64_t i = 0; i < k.size(0); i++) {
-                    if(torch::any(torch::isnan(k[i])).item<bool>()) {
-                        this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
-                                             i, this->engine_config_.basic_config.device,
-                                             layer_idx);
-                    }
-                }
-                // throw std::runtime_error("k has nan values");
-            }
-            if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
-                for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
-                    if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
-                        this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
-                                             i, this->engine_config_.basic_config.device,
-                                             layer_idx);
-                    }
-                }
-                // throw std::runtime_error("k_quantize_scale has nan values");
-            }
+            CUDA_CHECK(cudaStreamSynchronize(0));
+            // if (torch::any(torch::isnan(k)).item<bool>()){
+            //     for (int64_t i = 0; i < k.size(0); i++) {
+            //         if(torch::any(torch::isnan(k[i])).item<bool>()) {
+            //             this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
+            //                                  i, this->engine_config_.basic_config.device,
+            //                                  layer_idx);
+            //         }
+            //     }
+            //     // throw std::runtime_error("k has nan values");
+            // }
+            // if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
+            //     for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
+            //         if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
+            //             this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
+            //                                  i, this->engine_config_.basic_config.device,
+            //                                  layer_idx);
+            //         }
+            //     }
+            //     // throw std::runtime_error("k_quantize_scale has nan values");
+            // }
 
 
             // If k_quantize_scale[layer_idx] is torch.empty({0,0}), assign it to k_quantize_scale

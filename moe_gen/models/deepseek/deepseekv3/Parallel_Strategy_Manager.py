@@ -257,7 +257,7 @@ class Parallel_Strategy_Manager:
 			if self.engine_config.Basic_Config.gpu_arch == "hooper":
 				from ....attention.mla.fa3_backend import (
 					mla_prefill_flashattention3, 
-					mla_prefill_flashattention3_w8a16_deepgemm
+					mla_prefill_flashattention3_w8a16_deepgemm,
 				)
 				from ....attention.mla.flashmla_backend import mla_decoding_flashmla
 				setattr(

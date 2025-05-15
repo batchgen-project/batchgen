@@ -124,47 +124,109 @@ class DeepseekV3RMSNorm(nn.Module):
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
 
+# class DeepseekV3RotaryEmbedding(nn.Module):
+# 	def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+# 		super().__init__()
+
+# 		self.dim = dim
+# 		self.max_position_embeddings = max_position_embeddings
+# 		self.base = base
+# 		inv_freq = 1.0 / (
+# 			self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+# 		)
+# 		self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+# 		# Build here to make `torch.jit.trace` work.
+# 		self._set_cos_sin_cache(
+# 			seq_len=max_position_embeddings,
+# 			device=self.inv_freq.device,
+# 			dtype=torch.get_default_dtype(),
+# 		)
+# 		self.max_seq_len_cached = None
+
+# 	def _set_cos_sin_cache(self, seq_len, device, dtype):
+# 		self.max_seq_len_cached = seq_len
+# 		t = torch.arange(
+# 			self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+# 		)
+
+# 		freqs = torch.outer(t, self.inv_freq.to(t.device))
+# 		# Different from paper, but it uses a different permutation in order to obtain the same calculation
+# 		emb = torch.cat((freqs, freqs), dim=-1)
+# 		self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+# 		self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+# 	def forward(self, x, seq_len=None):
+# 		# x: [bs, num_attention_heads, seq_len, head_size]
+# 		if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+# 			self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+# 		return (
+# 			self.cos_cached[:seq_len].to(dtype=x.dtype),
+# 			self.sin_cached[:seq_len].to(dtype=x.dtype),
+# 		)
+
 class DeepseekV3RotaryEmbedding(nn.Module):
-	def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-		super().__init__()
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
 
-		self.dim = dim
-		self.max_position_embeddings = max_position_embeddings
-		self.base = base
-		inv_freq = 1.0 / (
-			self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
-		)
-		self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        
+        # Store the original device
+        self.init_device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Calculate on specified device and don't move it around
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2, device=self.init_device).float() / self.dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-		# Build here to make `torch.jit.trace` work.
-		self._set_cos_sin_cache(
-			seq_len=max_position_embeddings,
-			device=self.inv_freq.device,
-			dtype=torch.get_default_dtype(),
-		)
-		self.max_seq_len_cached = None
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings,
+            device=self.init_device,
+            dtype=torch.get_default_dtype(),
+        )
+        self.max_seq_len_cached = None
 
-	def _set_cos_sin_cache(self, seq_len, device, dtype):
-		self.max_seq_len_cached = seq_len
-		t = torch.arange(
-			self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
-		)
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        
+        # Ensure we're creating on the requested device
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.float32)
+        
+        # Move inv_freq to match t's device
+        inv_freq_on_device = self.inv_freq.to(device)
+        
+        # Compute freqs
+        freqs = torch.outer(t, inv_freq_on_device)
+        
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # Register buffers with correct dtype
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
-		freqs = torch.outer(t, self.inv_freq.to(t.device))
-		# Different from paper, but it uses a different permutation in order to obtain the same calculation
-		emb = torch.cat((freqs, freqs), dim=-1)
-		self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-		self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-	def forward(self, x, seq_len=None):
-		# x: [bs, num_attention_heads, seq_len, head_size]
-		if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
-			self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
-		return (
-			self.cos_cached[:seq_len].to(dtype=x.dtype),
-			self.sin_cached[:seq_len].to(dtype=x.dtype),
-		)
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        
+        # Default seq_len if not provided
+        if seq_len is None:
+            seq_len = x.size(-2)  # Assuming seq_len dimension is -2
+            
+        # Check if we need to recompute the cache
+        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+            # Make sure to set cache on the same device as x
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        
+        # Return cached values, ensuring they're on the right device and dtype
+        return (
+            self.cos_cached[:seq_len].to(device=x.device, dtype=x.dtype),
+            self.sin_cached[:seq_len].to(device=x.device, dtype=x.dtype),
+        )
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->DeepseekV3
@@ -792,7 +854,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		return out
 
 	@torch.no_grad()
-	def moe_infer(self, x, topk_idx, topk_weight):
+	def moe_infer_(self, x, topk_idx, topk_weight):
 		num_tokens, hidden_size = x.shape
 
 		# Flatten top-k expert routing
@@ -867,16 +929,29 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		# logger.info(f"Rank {self.rank} passed third all-to-all")
 
 		# Process received data if there's any
+		# if recv_total > 0:
+		# 	for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+		# 		expert_mask = (recv_expert_ids == expert_idx)
+		# 		indices = torch.nonzero(expert_mask, as_tuple=True)[0]
+		# 		if len(indices) == 0:
+		# 			continue
+		# 		expert_input = recv_tensor[indices]
+		# 		expert_output = self.experts[expert_idx](expert_input)
+		# 		recv_tensor[indices] = expert_output
 		if recv_total > 0:
+			# Pre-calculate all expert masks and indices at once
+			expert_indices = {}
 			for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
 				expert_mask = (recv_expert_ids == expert_idx)
-				indices = torch.nonzero(expert_mask, as_tuple=True)[0]
-				if len(indices) == 0:
-					continue
+				# Use a method that keeps computation on the device
+				if expert_mask.any():  # This might still cause DtoH but fewer times
+					expert_indices[expert_idx] = torch.nonzero(expert_mask, as_tuple=True)[0]
+			
+			# Process all experts with non-empty inputs
+			for expert_idx, indices in expert_indices.items():
 				expert_input = recv_tensor[indices]
 				expert_output = self.experts[expert_idx](expert_input)
 				recv_tensor[indices] = expert_output
-				# logger.info(f"Rank {self.rank} processed expert {expert_idx} with {len(indices)} tokens")
 
 		# All-to-all return, send back output
 		output_recv = torch.empty_like(sorted_inputs)
@@ -910,526 +985,100 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		return final_output.to(x.dtype)
 
 	@torch.no_grad()
-	def moe_infer_dep(self, x, topk_idx, topk_weight):
+	def moe_infer(self, x, topk_idx, topk_weight):
 		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
 
-		# Flatten top-k expert routing
-		flat_expert_ids = topk_idx.view(-1)
-		flat_weights = topk_weight.view(-1)
-		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
-		token_ids = torch.arange(num_tokens, device=x.device).repeat_interleave(self.num_experts_per_tok)
+		# ── 1) Flatten & sort by expert ─────────────────────────────────────────
+		flat_eids = topk_idx.view(-1)                 # [N*K]
+		flat_wts  = topk_weight.view(-1)              # [N*K]
+		expanded_x = x.repeat_interleave(K, dim=0)    # [N*K, H]
+		token_idx  = torch.arange(num_tokens,
+								device=x.device).repeat_interleave(K)
 
-		# Sort by expert
-		sorted_expert_ids, sort_idx = flat_expert_ids.sort()
-		sorted_inputs = expanded_x[sort_idx]
-		sorted_token_ids = token_ids[sort_idx]
-		sorted_weights = flat_weights[sort_idx]
+		sorted_eids, sort_idx = flat_eids.sort()      # ascending expert-ID
+		sorted_x   = expanded_x[sort_idx]
+		sorted_tok = token_idx[sort_idx]
+		sorted_wt  = flat_wts[sort_idx]
 
-		# Count how many tokens per expert
-		expert_token_counts = torch.bincount(sorted_expert_ids, minlength=self.total_experts)
-
-		# Split input to send to each rank
+		# ── 2) Count locally, build per-rank counts ────────────────────────────
+		# how many of your flattened tokens went to each of the TOTAL_EXPERTS?
+		local_counts_all = torch.bincount(sorted_eids,
+										minlength=self.total_experts)
+		# now sum each rank's block of experts
 		send_counts = torch.tensor([
-			expert_token_counts[r * self.experts_per_rank:(r + 1) * self.experts_per_rank].sum().item()
+			int(local_counts_all[r*self.experts_per_rank:
+								(r+1)*self.experts_per_rank].sum().item())
 			for r in range(self.world_size)
 		], device=x.device, dtype=torch.int64)
 
-		recv_counts = torch.empty(self.world_size, dtype=torch.int64, device=x.device)
-		# logger.info(f"Rank {self.rank} First ALL-to-ALL")
+		# exchange to find out how many YOU will receive from each peer
+		recv_counts = torch.empty_like(send_counts)
 		dist.all_to_all_single(recv_counts, send_counts)
+
+		# ── 3) All-to-all for inputs & expert-IDs ──────────────────────────────
+		send_x = sorted_x.contiguous()
+		send_eid = sorted_eids.contiguous()
+		recv_total = int(recv_counts.sum().item())
+
+		# Handle empty tensor cases properly
+		if send_x.size(0) == 0:
+			# Create dummy tensors for all-to-all to proceed
+			send_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+			send_eid = torch.empty(0, device=x.device, dtype=sorted_eids.dtype)
 		
-		# # Each rank contributes its send_counts vector -> we receive the list
-		# gathered = [torch.empty_like(send_counts) for _ in range(self.world_size)]
-		# dist.all_gather(gathered, send_counts)
+		# Prepare receive buffers with proper handling for empty case
+		if recv_total == 0:
+			recv_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+			recv_eid = torch.empty(0, device=x.device, dtype=send_eid.dtype)
+		else:
+			recv_x = torch.empty((recv_total, hidden_size), device=x.device, dtype=x.dtype)
+			recv_eid = torch.empty((recv_total,), device=x.device, dtype=send_eid.dtype)
 
-		# my_rank = dist.get_rank()
-		# # recv_counts[j] == how many tokens *we* will receive from rank j
-		# recv_counts = torch.stack([gathered[r][my_rank] for r in range(self.world_size)])        
+		sc, rc = send_counts.tolist(), recv_counts.tolist()
+		# note: we use two _single calls rather than the list‐based all_to_all
+		dist.all_to_all_single(recv_x, send_x, rc, sc)
+		dist.all_to_all_single(recv_eid, send_eid, rc, sc)
 
-		# All-to-all send
-		send_tensor = sorted_inputs.contiguous()
-		recv_total = recv_counts.sum().item()
-		recv_tensor = torch.empty(recv_total, hidden_size, device=x.device, dtype = x.dtype)
-		# logger.info(f"Send: Recv tensor dim 0: {recv_tensor.size(0)}, recv count sum: {recv_counts.sum()}")
-		# logger.info(f"Send: Send tensor dim 0: {send_tensor.size(0)}, send count sum: {send_counts.sum()}")
-		# logger.info(f"Rank {self.rank} Second ALL-to-ALL")
-		dist.all_to_all_single(recv_tensor, send_tensor, recv_counts.tolist(), send_counts.tolist())
-
-		# All-to-all comm for expert ids associated with send_tensor
-		send_expert_ids = sorted_expert_ids.contiguous()
-		recv_expert_ids = torch.empty(recv_total, device=x.device, dtype=send_expert_ids.dtype)
-		# logger.info(f"Rank {self.rank} Third ALL-to-ALL")
-		dist.all_to_all_single(recv_expert_ids, send_expert_ids, recv_counts.tolist(), send_counts.tolist())
-
-		# Process received data
-		# torch.cuda.current_stream(self.rank).synchronize()
-		for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-			expert_mask = (recv_expert_ids == expert_idx)
-			indices = torch.nonzero(expert_mask, as_tuple=True)[0]
-			if len(indices) == 0:
-				continue
-			expert_input = recv_tensor[indices]
-			expert_output = self.experts[expert_idx](expert_input)
-			# torch.cuda.current_stream(self.rank).synchronize()
-			# torch.cuda.synchronize(self.rank)
-			recv_tensor[indices] = expert_output
-		
-		# torch.cuda.current_stream(self.rank).synchronize()
-		# torch.cuda.synchronize(self.rank)
-
+		# ── 4) Process received data if there's any ──────────────────────────────
+		if recv_total > 0:
+			# Use same approach as original: create masks for each expert
+			expert_indices = {}
+			for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+				expert_mask = (recv_eid == expert_idx)
+				if expert_mask.any():  # Only process if there are any tokens for this expert
+					expert_indices[expert_idx] = torch.nonzero(expert_mask, as_tuple=True)[0]
 			
+			# Process all experts with non-empty inputs
+			for expert_idx, indices in expert_indices.items():
+				expert_input = recv_x[indices]
+				expert_output = self.experts[expert_idx](expert_input)
+				recv_x[indices] = expert_output
+		
+		# ── 5) All-to-all return & unsort/accumulate ───────────────────────────
+		# Handle empty tensor case for return communication
+		out_sorted = torch.empty_like(sorted_x)
+		if recv_x.size(0) == 0:
+			# Create a dummy tensor for all-to-all to proceed
+			recv_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		
+		dist.all_to_all_single(out_sorted, recv_x, sc, rc)
 
-		# All-to-all return, send back output
-		# send_output = torch.cat(output_chunks, dim=0) if output_chunks else torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
-		output_recv = torch.empty_like(sorted_inputs)
-		# logger dim 0 of the tensors and the sum of the lists
-		# logger.info(f"Return recv tensor dim 0: {output_recv.size(0)}, recv count sum: {send_counts.sum()}")
-		# logger.info(f"Send output tensor dim 0: {send_output.size(0)}, send count sum: {recv_counts.sum()}")
-		# logger.info(f"Rank {self.rank} Forth ALL-to-ALL")
-		dist.all_to_all_single(output_recv, recv_tensor, send_counts.tolist(), recv_counts.tolist())
-
-		# Unsort and accumulate outputs
 		unsort_idx = sort_idx.argsort()
-		unsorted_output = output_recv[unsort_idx]
-		unsorted_token_ids = sorted_token_ids[unsort_idx]
-		unsorted_weights = sorted_weights[unsort_idx]
+		final_x   = out_sorted[unsort_idx]
+		final_tok = sorted_tok[unsort_idx]
+		final_wt  = sorted_wt[unsort_idx]
 
-		output_accumulator = torch.zeros_like(x, dtype=torch.float32)
-		weight_accumulator = torch.zeros(num_tokens, 1, device=x.device)
+		# accumulate
+		out_acc    = torch.zeros_like(x, dtype=torch.float32)
+		weight_acc = torch.zeros((num_tokens, 1), device=x.device, dtype=torch.float32)
+		out_acc.index_add_(0, final_tok, final_x.to(torch.float32) * final_wt.unsqueeze(-1))
+		weight_acc.index_add_(0, final_tok, final_wt.unsqueeze(-1))
 
-		output_accumulator.index_add_(0, unsorted_token_ids, unsorted_output.to(torch.float32) * unsorted_weights.unsqueeze(-1))
-		weight_accumulator.index_add_(0, unsorted_token_ids, unsorted_weights.unsqueeze(-1))
-
-		final_output = output_accumulator / weight_accumulator.clamp(min=1e-9)
-
-		return final_output.to(x.dtype)
-
-# class DeepseekV3MoE_dep(torch.nn.Module):
-#     """
-#         For DeepSeekV3 MoE and EP
-#         1. Pass the Gate and distribute the activations to the dst rank.
-#         2. Do the MLPs that each worker only call its own experts.
-#         3. Gather the activations back to the src rank.        
-#     """
-
-#     def __init__(self, config):
-#         super().__init__()
-#         self.config = config
-#         self.num_experts_per_tok = config.num_experts_per_tok
-		
-#         self.rank = dist.get_rank()
-#         self.world_size = dist.get_world_size()
-#         assert self.world_size == 8 
-
-#         self.experts_per_rank = 32
-#         self.routed_expert_start_idx = self.experts_per_rank * self.rank
-#         self.routed_expert_end_idx = self.experts_per_rank * (self.rank + 1)
-
-#         # Full init
-#         self.experts = nn.ModuleList(
-#                 [
-#                     DeepseekV3MLP(
-#                         config, intermediate_size=config.moe_intermediate_size
-#                     )
-#                     for i in range(config.n_routed_experts)
-#                 ]
-#             )
-#         self.gate = MoEGate(config)
-#         if config.n_shared_experts is not None:
-#             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-#             self.shared_experts = DeepseekV3MLP(
-#                 config=config, intermediate_size=intermediate_size
-#             )
-
-#     def forward(self, hidden_states):
-#         identity = hidden_states
-#         orig_shape = hidden_states.shape
-#         topk_idx, topk_weight = self.gate(hidden_states)
-#         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-#         start_time = torch.cuda.Event(enable_timing=True)
-#         end_time = torch.cuda.Event(enable_timing=True)
-#         start_time.record()
-#         logger.info(f"rank {self.rank} entering moe_infer")
-#         y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
-#         end_time.record()
-#         torch.cuda.synchronize(self.rank)
-#         elapsed_time = start_time.elapsed_time(end_time)
-#         if self.rank == 0:
-#             print(f"Elapsed time for inference: {elapsed_time} ms")
-#         # torch.cuda.synchronize(self.rank)
-#         # dist.barrier()
-#         y = y + self.shared_experts(identity)
-#         return y
-
-#     @torch.no_grad()
-#     def moe_infer(self, x, topk_ids, topk_weight):
-#         self.ep_size = self.world_size
-
-#         cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
-#         cnts.scatter_(1, topk_ids, 1)
-#         tokens_per_expert = cnts.sum(dim=0)
-#         idxs = topk_ids.view(-1).argsort()
-#         sorted_tokens = x[idxs // topk_ids.shape[1]]
-#         sorted_tokens_shape = sorted_tokens.shape
-#         if self.ep_size > 1:
-#             tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-#             tokens_per_expert_group = tokens_per_expert.new_empty(
-#                 tokens_per_expert.shape[0]
-#             )
-#             dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
-#             output_splits = (
-#                 tokens_per_expert_group.view(self.ep_size, -1)
-#                 .sum(1)
-#                 .cpu()
-#                 .numpy()
-#                 .tolist()
-#             )
-#             gathered_tokens = sorted_tokens.new_empty(
-#                 tokens_per_expert_group.sum(dim=0).cpu().item(), sorted_tokens.shape[1]
-#             )
-#             input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
-#             dist.all_to_all(
-#                 list(gathered_tokens.split(output_splits)),
-#                 list(sorted_tokens.split(input_split_sizes)),
-#             )
-#             tokens_per_expert_post_gather = tokens_per_expert_group.view(
-#                 self.ep_size, self.experts_per_rank
-#             ).sum(dim=0)
-#             gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
-#             s = 0
-#             for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-#                 gatherd_idxs[s : s + k] = i % self.experts_per_rank
-#                 s += k
-#             gatherd_idxs = gatherd_idxs.argsort()
-#             sorted_tokens = gathered_tokens[gatherd_idxs]
-#             tokens_per_expert = tokens_per_expert_post_gather
-#         tokens_per_expert = tokens_per_expert.cpu().numpy()
-
-#         outputs = []
-#         start_idx = 0
-#         for i, num_tokens in enumerate(tokens_per_expert):
-#             end_idx = start_idx + num_tokens
-#             if num_tokens == 0:
-#                 continue
-#             expert = self.experts[i + self.routed_expert_start_idx]
-#             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-#             expert_out = expert(tokens_for_this_expert)
-#             outputs.append(expert_out)
-#             start_idx = end_idx
-
-#         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-#         if self.ep_size > 1:
-#             new_x = torch.empty_like(outs)
-#             new_x[gatherd_idxs] = outs
-#             gathered_tokens = new_x.new_empty(*sorted_tokens_shape)
-#             dist.all_to_all(
-#                 list(gathered_tokens.split(input_split_sizes)),
-#                 list(new_x.split(output_splits)),
-#             )
-#             outs = gathered_tokens
-
-#         new_x = torch.empty_like(outs)
-#         new_x[idxs] = outs
-#         final_out = (
-#             new_x.view(*topk_ids.shape, -1)
-#             .type(topk_weight.dtype)
-#             .mul_(topk_weight.unsqueeze(dim=-1))
-#             .sum(dim=1)
-#             .type(new_x.dtype)
-#         )
-#         return final_out
-	
-	# def moe_infer(self, x, topk_ids, topk_weight):
-	#     cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
-	#     cnts.scatter_(1, topk_ids, 1)
-	#     tokens_per_expert = cnts.sum(dim=0)
-	#     idxs = topk_ids.view(-1).argsort()
-	#     sorted_tokens = x[idxs // topk_ids.shape[1]]
-	#     sorted_tokens_shape = sorted_tokens.shape
-
-	#     logger.info(f"rank {self.rank} get sorted tokens")
+		# normalize & cast back
+		return (out_acc / weight_acc.clamp(min=1e-9)).to(x.dtype)
 
 
-	#     # tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-	#     tokens_per_ep_rank = tokens_per_expert.view(self.world_size, -1).sum(dim=1)
-	#     tokens_per_expert_group = tokens_per_expert.new_empty(
-	#         tokens_per_expert.shape[0]
-	#     )
-
-	#     logger.info(f"rank {self.rank} start first all to all")
-	#     dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
-	#     logger.info(f"rank {self.rank} complete first all to all")
-		
-	#     output_splits = (
-	#         tokens_per_expert_group.view(self.world_size, -1)
-	#         .sum(1)
-	#         .cpu()
-	#         .numpy()
-	#         .tolist()
-	#     )
-	#     gathered_tokens = sorted_tokens.new_empty(
-	#         tokens_per_expert_group.sum(dim=0).cpu().item(), sorted_tokens.shape[1]
-	#     )
-	#     input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
-
-	#     logger.info(f"rank {self.rank} start second all to all")
-	#     dist.all_to_all(
-	#         list(gathered_tokens.split(output_splits)),
-	#         list(sorted_tokens.split(input_split_sizes)),
-	#     )
-	#     logger.info(f"rank {self.rank} complete second all to all")
-
-	#     tokens_per_expert_post_gather = tokens_per_expert_group.view(
-	#         self.world_size, self.experts_per_rank
-	#     ).sum(dim=0)
-	#     gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
-	#     s = 0
-	#     for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-	#         gatherd_idxs[s : s + k] = i % self.experts_per_rank
-	#         s += k
-	#     gatherd_idxs = gatherd_idxs.argsort()
-	#     sorted_tokens = gathered_tokens[gatherd_idxs]
-	#     tokens_per_expert = tokens_per_expert_post_gather
-		
-	#     tokens_per_expert = tokens_per_expert.cpu().numpy()
-
-	#     outputs = []
-	#     start_idx = 0
-	#     for i, num_tokens in enumerate(tokens_per_expert):
-	#         end_idx = start_idx + num_tokens
-	#         if num_tokens == 0:
-	#             continue
-	#         expert = self.experts[self.routed_expert_start_idx + i]
-	#         tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-	#         expert_out = expert(tokens_for_this_expert)
-	#         outputs.append(expert_out)
-	#         start_idx = end_idx
-
-	#     outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-
-	#     new_x = torch.empty_like(outs)
-	#     new_x[gatherd_idxs] = outs
-	#     gathered_tokens = new_x.new_empty(*sorted_tokens_shape)
-
-	#     logger.info(f"rank {self.rank} start third all to all")
-	#     dist.all_to_all(
-	#         list(gathered_tokens.split(input_split_sizes)),
-	#         list(new_x.split(output_splits)),
-	#     )
-	#     logger.info(f"rank {self.rank} complete third all to all")
-
-	#     outs = gathered_tokens
-
-	#     new_x = torch.empty_like(outs)
-	#     new_x[idxs] = outs
-	#     final_out = (
-	#         new_x.view(*topk_ids.shape, -1)
-	#         .type(topk_weight.dtype)
-	#         .mul_(topk_weight.unsqueeze(dim=-1))
-	#         .sum(dim=1)
-	#         .type(new_x.dtype)
-	#     )
-	#     return final_out
-
-
-	# @torch.no_grad()
-	# def moe_infer(self, x, topk_ids, topk_weight):
-	#     """
-	#     x: [B, E] - batch of tokens with hidden dimension E (BF16)
-	#     topk_ids: [B, K] - top-k expert indices for each token
-	#     topk_weight: [B, K] - weights for the top-k experts (Float32)
-		
-	#     Each rank will process only experts with indices between 
-	#     self.routed_expert_start_idx and self.routed_expert_end_idx
-	#     """
-	#     batch_size, hidden_dim = x.shape
-	#     num_k = self.num_experts_per_tok
-
-
-
-		
-	#     # Step 1: Find tokens that need experts on each rank
-	#     # Each token needs to know which of its experts should be sent to which rank
-	#     tokens_to_send = [[] for _ in range(self.world_size)]
-	#     token_source_indices = [[] for _ in range(self.world_size)]
-	#     token_expert_indices = [[] for _ in range(self.world_size)]
-		
-	#     # Store weights for final combination (keep on source rank)
-	#     token_expert_weights = {}  # (token_idx, expert_idx) -> weight
-
-	#     for token_idx in range(batch_size):
-	#         # Store weights for all experts this token uses
-	#         for k in range(num_k):
-	#             expert_id = topk_ids[token_idx, k].item()
-	#             weight = topk_weight[token_idx, k].item()
-	#             token_expert_weights[(token_idx, expert_id)] = weight
-				
-	#             # Determine which rank owns this expert
-	#             rank_for_expert = expert_id // 32
-				
-	#             # If this token should be sent to this rank
-	#             if rank_for_expert != self.rank:
-	#                 # Only add the token once to each destination rank
-	#                 if token_idx not in token_source_indices[rank_for_expert]:
-	#                     tokens_to_send[rank_for_expert].append(x[token_idx])
-	#                     token_source_indices[rank_for_expert].append(token_idx)
-	#                     token_expert_indices[rank_for_expert].append([])
-					
-	#                 # Find the position in the list where we added this token
-	#                 pos = token_source_indices[rank_for_expert].index(token_idx)
-					
-	#                 # Add the global expert index
-	#                 token_expert_indices[rank_for_expert][pos].append(expert_id)
-		
-	#     # Step 2: Prepare data for all-to-all communication
-	#     send_tokens = []
-	#     send_indices = []
-	#     send_expert_indices = []
-		
-	#     # For each destination rank
-	#     for r in range(self.world_size):
-	#         if tokens_to_send[r]:
-	#             # Convert tokens to tensor
-	#             send_tokens.append(torch.stack(tokens_to_send[r]))
-				
-	#             # Create tensor with (token_idx, src_rank) pairs
-	#             indices_with_src = [(idx, self.rank) for idx in token_source_indices[r]]
-	#             send_indices.append(torch.tensor(indices_with_src, device=x.device, dtype=torch.long))
-				
-	#             # Convert expert indices to tensor format (pad to max length)
-	#             max_experts = max(len(experts) for experts in token_expert_indices[r])
-				
-	#             # Pad and convert expert indices
-	#             expert_tensors = []
-	#             for experts in token_expert_indices[r]:
-	#                 padded = experts + [-1] * (max_experts - len(experts))
-	#                 expert_tensors.append(torch.tensor(padded, device=x.device, dtype=torch.long))
-	#             send_expert_indices.append(torch.stack(expert_tensors))
-	#         else:
-	#             # Empty placeholder tensors
-	#             send_tokens.append(torch.zeros((0, hidden_dim), device=x.device, dtype=torch.bfloat16))
-	#             send_indices.append(torch.zeros((0, 2), device=x.device, dtype=torch.long))
-	#             send_expert_indices.append(torch.zeros((0, 1), device=x.device, dtype=torch.long))
-		
-	#     # Step 3: All-to-all communication to send tokens to ranks that own the needed experts
-	#     recv_tokens = [torch.zeros_like(t) for t in send_tokens]
-	#     recv_indices = [torch.zeros_like(t) for t in send_indices]
-	#     recv_expert_indices = [torch.zeros_like(t) for t in send_expert_indices]
-		
-	#     dist.all_to_all(recv_tokens, send_tokens)
-	#     dist.all_to_all(recv_indices, send_indices)
-	#     dist.all_to_all(recv_expert_indices, send_expert_indices)
-		
-	#     # Step 4: Process tokens with local experts
-	#     # Results to send back to source ranks
-	#     send_results = [[] for _ in range(self.world_size)]
-	#     send_token_indices = [[] for _ in range(self.world_size)]
-	#     send_expert_ids = [[] for _ in range(self.world_size)]
-		
-	#     # Process received tokens
-	#     for r in range(self.world_size):
-	#         batch = recv_tokens[r]
-	#         if batch.size(0) > 0:
-	#             for i in range(batch.size(0)):
-	#                 token = batch[i]
-	#                 orig_token_idx, src_rank = recv_indices[r][i]
-	#                 expert_ids = recv_expert_indices[r][i]
-					
-	#                 # Process with all required experts (that are not padding -1)
-	#                 for expert_id in expert_ids:
-	#                     if expert_id.item() == -1:
-	#                         continue
-						
-	#                     # Only process experts that this rank is responsible for
-	#                     if self.routed_expert_start_idx <= expert_id.item() < self.routed_expert_end_idx:
-	#                         # Use the expert to process the token
-	#                         # Note: We call the expert using its global index
-	#                         expert = self.experts[expert_id.item()]
-	#                         result = expert(token.unsqueeze(0)).squeeze(0)
-							
-	#                         # Save the result for sending back to source
-	#                         send_results[src_rank].append(result)
-	#                         send_token_indices[src_rank].append(orig_token_idx.item())
-	#                         send_expert_ids[src_rank].append(expert_id.item())
-		
-	#     # Step 5: Prepare tensors to send results back
-	#     send_result_tensors = []
-	#     send_result_indices = []
-	#     send_result_expert_ids = []
-		
-	#     for r in range(self.world_size):
-	#         if send_results[r]:
-	#             send_result_tensors.append(torch.stack(send_results[r]))
-	#             send_result_indices.append(torch.tensor(send_token_indices[r], device=x.device, dtype=torch.long))
-	#             send_result_expert_ids.append(torch.tensor(send_expert_ids[r], device=x.device, dtype=torch.long))
-	#         else:
-	#             # Empty placeholder tensors
-	#             send_result_tensors.append(torch.zeros((0, hidden_dim), device=x.device, dtype=torch.bfloat16))
-	#             send_result_indices.append(torch.zeros(0, device=x.device, dtype=torch.long))
-	#             send_result_expert_ids.append(torch.zeros(0, device=x.device, dtype=torch.long))
-		
-	#     # Step 6: All-to-all to send results back to source ranks
-	#     recv_result_tensors = [torch.zeros_like(t) for t in send_result_tensors]
-	#     recv_result_indices = [torch.zeros_like(t) for t in send_result_indices]
-	#     recv_result_expert_ids = [torch.zeros_like(t) for t in send_result_expert_ids]
-		
-	#     dist.all_to_all(recv_result_tensors, send_result_tensors)
-	#     dist.all_to_all(recv_result_indices, send_result_indices)
-	#     dist.all_to_all(recv_result_expert_ids, send_result_expert_ids)
-		
-	#     # Step 7: Process local experts (those owned by this rank)
-	#     # For each token, we need to also process the experts assigned to this rank
-	#     local_results = []
-	#     local_token_indices = []
-	#     local_expert_ids = []
-		
-	#     # Process tokens with experts owned by this rank
-	#     for token_idx in range(batch_size):
-	#         for k in range(num_k):
-	#             expert_id = topk_ids[token_idx, k].item()
-				
-	#             # Check if this expert belongs to this rank
-	#             if self.routed_expert_start_idx <= expert_id < self.routed_expert_end_idx:
-	#                 # Process token with expert (using global expert ID)
-	#                 token_data = x[token_idx]
-	#                 expert = self.experts[expert_id]
-	#                 result = expert(token_data.unsqueeze(0)).squeeze(0)
-					
-	#                 # Store result
-	#                 local_results.append(result)
-	#                 local_token_indices.append(token_idx)
-	#                 local_expert_ids.append(expert_id)
-		
-	#     # Step 8: Combine all results (from remote ranks and local processing)
-	#     # Initialize output tensor
-	#     output = torch.zeros_like(x)
-		
-	#     # Process results received from other ranks
-	#     for r in range(self.world_size):
-	#         results = recv_result_tensors[r]
-	#         token_indices = recv_result_indices[r]
-	#         expert_ids = recv_result_expert_ids[r]
-			
-	#         for i in range(results.size(0)):
-	#             token_idx = token_indices[i].item()
-	#             expert_id = expert_ids[i].item()
-	#             result = results[i]
-				
-	#             # Get weight for this token-expert pair
-	#             weight = token_expert_weights.get((token_idx, expert_id), 0.0)
-				
-	#             # Apply weight and accumulate (with correct dtype conversion)
-	#             output[token_idx] += (result.to(torch.float32) * weight).to(result.dtype)
-		
-	#     # Process local results
-	#     for result, token_idx, expert_id in zip(local_results, local_token_indices, local_expert_ids):
-	#         # Get weight for this token-expert pair
-	#         weight = token_expert_weights.get((token_idx, expert_id), 0.0)
-			
-	#         # Apply weight and accumulate (with correct dtype conversion)
-	#         output[token_idx] += (result.to(torch.float32) * weight).to(result.dtype)
-		
-	#     return output
 	
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
