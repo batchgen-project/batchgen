@@ -102,7 +102,7 @@ class CoreEngineBuilder(OpBuilder):
         ]
 
     def extra_ldflags(self):
-        return []
+        return ['-lnuma']
 
     def is_compatible(self, verbose=True):
         return super().is_compatible(verbose)

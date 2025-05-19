@@ -498,15 +498,10 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
             //     {torch::indexing::Slice(cur_batch_start_idx,
             //                             cur_batch_start_idx + cur_batch_size)});
             int64_t padding_length = cur_k.size(1);
-            auto cur_factor = this->kv_storage_.get_k_quantize_scale(layer_idx, cur_batch, padding_length);
-            // log cur_factor shape
-            // this->logger_->info("cur_factor shape: {}",
-            //                  get_tensor_shape(cur_factor));
-            // this->logger_->info("cur_factor shape: {}",
-            //              get_tensor_shape(cur_factor));
-            // this->logger_->info("cur_k shape: {}",
-            //              get_tensor_shape(cur_k));
-            auto dequant_k = dequant_per_token(cur_k, cur_factor);
+            auto cur_factor = this->kv_storage_.get_k_quantize_scale(layer_idx, cur_batch, padding_length);            
+            
+            // auto dequant_k = dequant_per_token(cur_k, cur_factor);
+
             // Check if the dequant_k contains nan
 
             // if (torch::any(torch::isnan(dequant_k)).item<bool>()) {
@@ -520,13 +515,14 @@ torch::Tensor Hetero_Attn::_attn_mode_1(
                 module_output =
                     PyTorch_attn_module
                         .attr("decoding_attn")(
-                            cur_hidden_states, dequant_k, cur_v,
+                            cur_hidden_states, cur_k, cur_v,
                             attention_mask.index({torch::indexing::Slice(
                                 cur_batch_start_idx,
                                 cur_batch_start_idx + cur_batch_size)}),
                             position_ids.index({torch::indexing::Slice(
                                 cur_batch_start_idx,
-                                cur_batch_start_idx + cur_batch_size)}))
+                                cur_batch_start_idx + cur_batch_size)}),
+                            cur_factor)
                         .cast<std::tuple<torch::Tensor, torch::Tensor,
                                         torch::Tensor>>();
             }

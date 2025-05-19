@@ -456,7 +456,7 @@ void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
 //         }
 //     }
 //     for (const auto& key : keys_to_remove) {
-//         this->releaseBuffer(key);
+//         this->(key);
 //     }
 // }
 

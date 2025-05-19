@@ -34,6 +34,8 @@
 #include <random>
 #include <cstdint>
 #include <cstring>
+#include <numa.h>
+#include <numaif.h>
 
 constexpr float FP8_MAX = 448.0f;
 // std::tuple<at::Tensor, at::Tensor> per_token_quant(torch::Tensor x) {
@@ -145,6 +147,58 @@ std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
 
 
 
+// KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
+//                        DtoH_Engine& d2h_engine)
+//     : engine_config_(engine_config),
+//       model_config_(model_config),
+//       d2h_engine_(d2h_engine),
+//       per_element_mutex_(model_config.num_hidden_layers *
+//                          engine_config.kv_storage_config.num_host_slots) {
+//     try {
+//         this->logger_ = init_logger(
+//             this->engine_config_.basic_config.log_level,
+//             "KV_Storage" +
+//                 std::to_string(this->engine_config_.basic_config.device));
+//         CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+//         this->logger_->info("Starting KV_Storage Initialization.");
+//         /* Reserve Pinned Memory for K and V. */
+//         const auto& storage_size =
+//             this->engine_config_.kv_storage_config.storage_byte_size;
+//         auto per_layer_storage_size =
+//             storage_size / this->model_config_.num_hidden_layers;
+
+//         auto bar = tq::trange(this->model_config_.num_hidden_layers);
+//         bar.set_prefix("Allocating Pinned Memory for KV cache");
+//         if (this->model_config_.model_type.find("deepseek") ==
+//             std::string::npos) {
+//             for (auto layer_idx : bar) {
+//                 void* k_ptr = nullptr;
+//                 void* v_ptr = nullptr;
+//                 CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size,
+//                                          cudaHostAllocDefault));
+//                 CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size,
+//                                          cudaHostAllocDefault));
+//                 this->k_pinned_memory.push_back(k_ptr);
+//                 this->v_pinned_memory.push_back(v_ptr);
+//             }
+//         } else {
+//             for (auto layer_idx : bar) {
+//                 void* k_ptr = nullptr;
+//                 CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size,
+//                                          cudaHostAllocDefault));
+//                 // memset(k_ptr, 999, per_layer_storage_size); 
+//                 this->k_pinned_memory.push_back(k_ptr);
+//             }
+//         }
+//         this->logger_->info("KV Storage Pinned Memory Allocated.");
+//     } catch (...) {
+//         this->logger_->debug(
+//             "KV_Storage: Failed to update K and V to the storage.");
+//         throw std::runtime_error(
+//             "KV_Storage: Failed to update K and V to the storage.");
+//     }
+// };
+
 KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
                        DtoH_Engine& d2h_engine)
     : engine_config_(engine_config),
@@ -157,8 +211,22 @@ KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
             this->engine_config_.basic_config.log_level,
             "KV_Storage" +
                 std::to_string(this->engine_config_.basic_config.device));
-        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-        this->logger_->info("Starting KV_Storage Initialization.");
+        
+        int device_id = this->engine_config_.basic_config.device;
+        CUDA_CHECK(cudaSetDevice(device_id));
+        
+        // Determine which NUMA node to use based on device ID
+        int numa_node = (device_id < 4) ? 0 : 1;
+        
+        this->logger_->info("Starting KV_Storage Initialization on device {} using NUMA node {}.", 
+                           device_id, numa_node);
+        
+        // Check if NUMA is available
+        if (numa_available() < 0) {
+            this->logger_->warn("NUMA is not available. Falling back to default memory allocation.");
+            numa_node = -1; // Disable NUMA binding
+        }
+        
         /* Reserve Pinned Memory for K and V. */
         const auto& storage_size =
             this->engine_config_.kv_storage_config.storage_byte_size;
@@ -167,35 +235,73 @@ KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
 
         auto bar = tq::trange(this->model_config_.num_hidden_layers);
         bar.set_prefix("Allocating Pinned Memory for KV cache");
-        if (this->model_config_.model_type.find("deepseek") ==
-            std::string::npos) {
-            for (auto layer_idx : bar) {
-                void* k_ptr = nullptr;
+        
+        // Check if it's a deepseek model which only uses K
+        bool is_deepseek = (this->model_config_.model_type.find("deepseek") != std::string::npos);
+        
+        for (auto layer_idx : bar) {
+            // Allocate K memory
+            void* k_ptr = nullptr;
+            
+            if (numa_node >= 0) {
+                // Use NUMA-aware allocation
+                k_ptr = numa_alloc_onnode(per_layer_storage_size, numa_node);
+                if (k_ptr == nullptr) {
+                    this->logger_->warn("NUMA allocation failed for K cache. Falling back to cudaHostAlloc.");
+                    CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size, cudaHostAllocDefault));
+                } else {
+                    // Register the NUMA memory with CUDA for pinned access
+                    CUDA_CHECK(cudaHostRegister(k_ptr, per_layer_storage_size, 
+                                               cudaHostRegisterDefault));
+                }
+            } else {
+                // Use regular pinned memory
+                CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size, cudaHostAllocDefault));
+            }
+            
+            this->k_pinned_memory.push_back(k_ptr);
+            
+            // Allocate V memory if not deepseek model
+            if (!is_deepseek) {
                 void* v_ptr = nullptr;
-                CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size,
-                                         cudaHostAllocDefault));
-                CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size,
-                                         cudaHostAllocDefault));
-                this->k_pinned_memory.push_back(k_ptr);
+                
+                if (numa_node >= 0) {
+                    // Use NUMA-aware allocation
+                    v_ptr = numa_alloc_onnode(per_layer_storage_size, numa_node);
+                    if (v_ptr == nullptr) {
+                        this->logger_->warn("NUMA allocation failed for V cache. Falling back to cudaHostAlloc.");
+                        CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size, cudaHostAllocDefault));
+                    } else {
+                        // Register the NUMA memory with CUDA for pinned access
+                        CUDA_CHECK(cudaHostRegister(v_ptr, per_layer_storage_size, 
+                                                   cudaHostRegisterDefault));
+                    }
+                } else {
+                    // Use regular pinned memory
+                    CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size, cudaHostAllocDefault));
+                }
+                
                 this->v_pinned_memory.push_back(v_ptr);
             }
-        } else {
-            for (auto layer_idx : bar) {
-                void* k_ptr = nullptr;
-                CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size,
-                                         cudaHostAllocDefault));
-                memset(k_ptr, 999, per_layer_storage_size); 
-                this->k_pinned_memory.push_back(k_ptr);
-            }
         }
-        this->logger_->info("KV Storage Pinned Memory Allocated.");
+        
+        this->logger_->info("KV Storage Pinned Memory Allocated on NUMA node {}.", numa_node);
+    } catch (const std::exception& e) {
+        this->logger_->error("KV_Storage: Exception during initialization: {}", e.what());
+        throw;
     } catch (...) {
-        this->logger_->debug(
-            "KV_Storage: Failed to update K and V to the storage.");
-        throw std::runtime_error(
-            "KV_Storage: Failed to update K and V to the storage.");
+        this->logger_->error("KV_Storage: Unknown exception during initialization");
+        throw std::runtime_error("KV_Storage: Failed to update K and V to the storage.");
+    }
+    
+    // Add memory allocation verification (optional)
+    if (!this->k_pinned_memory.empty()) {
+        int node;
+        get_mempolicy(&node, NULL, 0, this->k_pinned_memory[0], MPOL_F_NODE | MPOL_F_ADDR);
+        this->logger_->info("Verified K memory is on NUMA node: {}", node);
     }
 };
+
 
 void KV_Storage::Init() {
     try {

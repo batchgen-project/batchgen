@@ -32,7 +32,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-# import nvidia_dlprof_pytorch_nvtx
+# import nvidia_dlprof_pytorch_nvtx as nvtx
 from moe_gen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
 
 from .config.config import EngineConfig
@@ -457,16 +457,19 @@ class MoE_Gen:
         logging.info("Running with device: %s", self.device)
         torch.cuda.set_device(self.device)
         torch.cuda.reset_peak_memory_stats()
+        logging.info(self.hf_cache_dir)
         self.model_config = AutoConfig.from_pretrained(
-            self.huggingface_ckpt_name,
-            cache_dir=self.hf_cache_dir,
+            self.hf_cache_dir,
             trust_remote_code=True,
+            local_files_only=True,
         )
         self._config_torch_module_initializer()
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.huggingface_ckpt_name,
-            cache_dir=self.hf_cache_dir,
+            # self.huggingface_ckpt_name,
+            self.hf_cache_dir,
+            # cache_dir=self.hf_cache_dir,
             trust_remote_code=True,
+            local_files_only=True,
         )
         # Use flash_attn by default thus right padding.
         self.tokenizer.padding_side = "right"
@@ -794,6 +797,7 @@ class MoE_Gen:
                 
                 # dist.barrier()
                 self._config_decoding()
+                # nvtx.init()
                 decoding_start_time = time.perf_counter()
                 with torch.no_grad():
                     logging.info(

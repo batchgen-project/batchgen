@@ -258,6 +258,7 @@ class Parallel_Strategy_Manager:
 				from ....attention.mla.fa3_backend import (
 					mla_prefill_flashattention3, 
 					mla_prefill_flashattention3_w8a16_deepgemm,
+					mla_prefill_flashattention3_fused_dequant
 				)
 				from ....attention.mla.flashmla_backend import mla_decoding_flashmla
 				setattr(

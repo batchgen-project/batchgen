@@ -2,7 +2,10 @@ import torch
 import triton
 import triton.language as tl
 import os
-os.environ["TRITON_CACHE_SIZE"] = "2048"
+# os.environ["TRITON_CACHE_SIZE"] = "2048"
+import torch.distributed as dist
+import math
+import time
 
 @triton.jit
 def fgemm_fp8_e4m3_bf16_kernel(

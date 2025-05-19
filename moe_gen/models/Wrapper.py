@@ -344,7 +344,7 @@ class Attn_Wrapper(torch.nn.Module):
 
                     # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
                     attn_output[cur_batch_start:cur_batch_end] = output[0]
-                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                    torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 
 
                 # Quantization

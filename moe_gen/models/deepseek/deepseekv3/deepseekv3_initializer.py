@@ -437,7 +437,8 @@ class DeepSeekV3_Initializer:
         self.skeleton_state_dict = skeleton_state_dict
         self.model = None
         self.hf_model_config = DeepseekV3Config.from_pretrained(
-            huggingface_ckpt_name,
+            self.cache_dir,
+            # huggingface_ckpt_name,
             # cache_dir=hf_cache_dir,
             # trust_remote_code=True,
         )

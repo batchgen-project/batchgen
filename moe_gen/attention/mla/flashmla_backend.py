@@ -8,6 +8,7 @@ from flash_mla import (
 from .rotary_embedding import rotary_pos_emb
 import logging
 import torch.distributed as dist
+from ..quantization import dequant_per_token_triton
 
 @torch.inference_mode()
 def mla_decoding_flashmla(
@@ -17,7 +18,9 @@ def mla_decoding_flashmla(
 	past_value_states: torch.Tensor,
 	attention_mask: torch.Tensor,
 	position_ids: torch.Tensor,
+	scale
 ):
+	compressed_kv = dequant_per_token_triton(past_key_states, scale)
 	assert attention_mask.dim() == 2
 	bsz, q_len, _ = hidden_states.size()
 	q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
@@ -39,7 +42,7 @@ def mla_decoding_flashmla(
 	k_pe = k_pe.view(bsz, q_len, self.qk_rope_head_dim)
 	offload_kv = torch.cat([kv, k_pe], dim=-1)
 
-	compressed_kv = past_key_states
+	# compressed_kv = past_key_states
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
 	compressed_kv[batch_indices, q_position_id[:, 0], :self.kv_lora_rank] = kv[:, 0, :]
 	compressed_kv[batch_indices, q_position_id[:, 0], self.kv_lora_rank:] = k_pe[:, 0, :]

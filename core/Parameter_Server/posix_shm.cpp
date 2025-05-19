@@ -32,62 +32,116 @@
 #include <vector>
 
 #include "posix_shm.h"
+#include <numa.h>
+#include <numaif.h>
 
-void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
+void* allocate_shared_pinned_memory(const std::string& shm_name,
+                                    int64_t size,
                                     bool create) {
     int flags = O_RDWR | (create ? O_CREAT : 0);
-    // Open (or create) the shared memory object
     int fd = shm_open(shm_name.c_str(), flags, 0666);
-    // int fd = memfd_create(shm_name.c_str(), 0);
-
-    // int fd = shm_open(shm_name.c_str(), flags, 0666);
     if (fd < 0) {
         throw std::runtime_error("shm_open failed for " + shm_name);
     }
 
     if (create) {
-        // Set the shared memory object size
         if (ftruncate64(fd, size) == -1) {
             close(fd);
             throw std::runtime_error("ftruncate failed for " + shm_name);
         }
     }
 
-    // First map the shared memory into the process address space
-    // void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED |
-    // MAP_LOCKED, fd, 0);
-    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);  // fd no longer needed after mapping
-
+    void* ptr = mmap(nullptr, size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED,
+                     fd, 0);
+    close(fd);
     if (ptr == MAP_FAILED) {
         throw std::runtime_error("mmap failed for " + shm_name);
     }
 
-    // Now register the mapped memory with CUDA to pin it
-    // std::cerr << "Registering shared memory with CUDA" << std::endl;
-    // std::cerr << "Size: " << size << std::endl;
-    // std::cerr << "Pointer: " << ptr << std::endl;
-    // int64_t block_size = 32LL * 1024 * 1024 * 1024;
-    // // Register the memory in blocks of 32GB
-    // for (int64_t i = 0; i < size; i += block_size) {
-    //     cudaError_t err = cudaHostRegister((char*)ptr + i,
-    //     std::min(block_size, size - i), cudaHostRegisterDefault); if (err !=
-    //     cudaSuccess) {
-    //         munmap(ptr, size);
-    //         throw std::runtime_error("cudaHostRegister failed: " +
-    //         std::string(cudaGetErrorString(err)));
-    //     }
-    // }
+#if defined(__linux__)
+    // If NUMA is available, interleave pages between node 0 and node 1
+    if (numa_available() >= 0) {
+        unsigned long nodemask = (1UL << 0) | (1UL << 1);
+        int ret = mbind(ptr, size,
+                        MPOL_INTERLEAVE,
+                        &nodemask,
+                        /* maxnode = */ 8 * sizeof(nodemask),
+                        /* flags = */ 0);
+        if (ret != 0) {
+            // non-fatal: we'll still fall back to default if interleave fails
+            perror("mbind(MPOL_INTERLEAVE)");
+        }
+    }
+#endif
 
     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
     if (err != cudaSuccess) {
         munmap(ptr, size);
-        throw std::runtime_error("cudaHostRegister failed: " +
-                                 std::string(cudaGetErrorString(err)));
+        throw std::runtime_error(
+            std::string("cudaHostRegister failed: ") +
+            cudaGetErrorString(err));
     }
 
     return ptr;
 }
+
+// void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
+//                                     bool create) {
+//     int flags = O_RDWR | (create ? O_CREAT : 0);
+//     // Open (or create) the shared memory object
+//     int fd = shm_open(shm_name.c_str(), flags, 0666);
+//     // int fd = memfd_create(shm_name.c_str(), 0);
+
+//     // int fd = shm_open(shm_name.c_str(), flags, 0666);
+//     if (fd < 0) {
+//         throw std::runtime_error("shm_open failed for " + shm_name);
+//     }
+
+//     if (create) {
+//         // Set the shared memory object size
+//         if (ftruncate64(fd, size) == -1) {
+//             close(fd);
+//             throw std::runtime_error("ftruncate failed for " + shm_name);
+//         }
+//     }
+
+//     // First map the shared memory into the process address space
+//     // void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED |
+//     // MAP_LOCKED, fd, 0);
+//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+//     close(fd);  // fd no longer needed after mapping
+
+//     if (ptr == MAP_FAILED) {
+//         throw std::runtime_error("mmap failed for " + shm_name);
+//     }
+
+//     // Now register the mapped memory with CUDA to pin it
+//     // std::cerr << "Registering shared memory with CUDA" << std::endl;
+//     // std::cerr << "Size: " << size << std::endl;
+//     // std::cerr << "Pointer: " << ptr << std::endl;
+//     // int64_t block_size = 32LL * 1024 * 1024 * 1024;
+//     // // Register the memory in blocks of 32GB
+//     // for (int64_t i = 0; i < size; i += block_size) {
+//     //     cudaError_t err = cudaHostRegister((char*)ptr + i,
+//     //     std::min(block_size, size - i), cudaHostRegisterDefault); if (err !=
+//     //     cudaSuccess) {
+//     //         munmap(ptr, size);
+//     //         throw std::runtime_error("cudaHostRegister failed: " +
+//     //         std::string(cudaGetErrorString(err)));
+//     //     }
+//     // }
+
+//     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+//     if (err != cudaSuccess) {
+//         munmap(ptr, size);
+//         throw std::runtime_error("cudaHostRegister failed: " +
+//                                  std::string(cudaGetErrorString(err)));
+//     }
+
+//     return ptr;
+// }
 
 // void* allocate_shared_pinned_memory(const std::string& shm_name, size_t size,
 // bool create) {
