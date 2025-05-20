@@ -158,7 +158,7 @@ class ParameterServerClient:
             huggingface_ckpt_name: Model name on HuggingFace
             hf_cache_dir: HuggingFace cache directory
             cache_dir: Model cache directory
-            pt_ckpt_dir: Directory for PyTorch checkpoints
+            pt_ckpt_dir: Directory for checkpoints in .pt format.
             
         Returns:
             Dict containing model information including shared memory names

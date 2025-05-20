@@ -25,6 +25,7 @@ import torch
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
 from transformers import AutoConfig
+import gc
 
 from .deepseekv2.configuration_deepseek_v2 import DeepseekV2Config
 from .deepseekv2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
@@ -55,7 +56,10 @@ class DeepSeek_Parameter_Server:
         )
         self.hf_model_config._name_or_path = huggingface_ckpt_name
         self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
-
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        gpu0_memory = free_memory / 1024 / 1024 / 1024
+        total_memory = total_memory / 1024 / 1024 / 1024
+        logging.info(f"Python PM instantiation: GPU 0 free memory: {gpu0_memory} GB / {total_memory} GB")
 
 
 
@@ -63,8 +67,24 @@ class DeepSeek_Parameter_Server:
         # self.hf_model_config = AutoConfig.from_pretrained(huggingface_ckpt_name, cache_dir=cache_dir, trust_remote_code=True)
 
     def Init(self):
+        # log gpu 0 memory usage before init
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        gpu0_memory = free_memory / 1024 / 1024 / 1024
+        total_memory = total_memory / 1024 / 1024 / 1024
+        logging.info(f"GPU 0 free mem pm start Init: {gpu0_memory} GB / {total_memory} GB")
+        
         self._save_safetensors_to_pt()
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        gpu0_memory = free_memory / 1024 / 1024 / 1024
+        total_memory = total_memory / 1024 / 1024 / 1024
+        logging.info(f"GPU 0 free mem after save safetensors to pt: {gpu0_memory} GB / {total_memory} GB")
+
         self._parse_state_dict()
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        gpu0_memory = free_memory / 1024 / 1024 / 1024
+        total_memory = total_memory / 1024 / 1024 / 1024
+        logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory} GB / {total_memory} GB")
+
         self.parameter_server = Parameter_Server()
         logging.info(f"architectures: {self.hf_model_config.architectures[0]}")
         if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
@@ -94,6 +114,11 @@ class DeepSeek_Parameter_Server:
             f"Tensor meta shared memory name: {self.tensor_meta_shm_name}"
         )
         logging.info(f"Byte size: {byte_size}")
+        # logging gpu 0 free memory
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        gpu0_memory = free_memory / 1024 / 1024 / 1024
+        total_memory = total_memory / 1024 / 1024 / 1024
+        logging.info(f"GPU 0 free memory before cpp pm Init: {gpu0_memory} GB / {total_memory} GB")
         self.parameter_server.Init(
             self.shm_name,
             self.tensor_meta_shm_name,
@@ -179,6 +204,11 @@ class DeepSeek_Parameter_Server:
                         + "_"
                         + str(expert_idx)
                     )
+        del model
+        gc.collect()  
+        torch.cuda.empty_cache() 
+
+
 
     def save_and_load(self, file_path, save_dir):
         tensor_dict = load_file(file_path)

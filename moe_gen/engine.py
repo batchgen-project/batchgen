@@ -450,6 +450,11 @@ class MoE_Gen:
         self.shm_name = shm_name
         self.tensor_meta_shm_name = tensor_meta_shm_name
 
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        gpu0_memory = free_memory / 1024 / 1024 / 1024
+        total_memory = total_memory / 1024 / 1024 / 1024
+        logging.info(f"GPU 0 free memory moegen instantiate: {gpu0_memory} GB / {total_memory} GB")
+
 
 
     def Init(self):
@@ -562,9 +567,7 @@ class MoE_Gen:
             self.core_engine,
             self.skeleton_state_dict
         )        
-        
-        
-        
+                
         logging.info(f"Engine on device {self.device} initialized.")
 
     def _config_torch_module_initializer(self):

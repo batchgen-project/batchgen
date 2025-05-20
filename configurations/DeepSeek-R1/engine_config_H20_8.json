@@ -12,7 +12,7 @@
 		"attn_prefill_micro_batch_size": 8,
 		"MoE_prefill_micro_batch_size": 8,
 		"expert_prefill_batch_size_upper_bound": 2048,
-		"attn_decoding_micro_batch_size": 32,
+		"attn_decoding_micro_batch_size": 16,
 		"MoE_decoding_micro_batch_size": null,
 		"expert_decoding_batch_size_upper_bound": 2048
 	},
@@ -25,7 +25,7 @@
 		},
 		"num_decoding_module_buffer": {
 		  "attn": 1,
-		  "routed_expert": 20,
+		  "routed_expert": 6,
 		  "shared_expert": 1
 		},
 		"num_k_buffer": 1,
@@ -35,6 +35,6 @@
 
 	"EP_Config":{
 		"enable": true,
-		"num_local_expert_per_layer": 24
+		"num_local_expert_per_layer": 26
 	}
 }

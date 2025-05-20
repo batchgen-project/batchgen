@@ -244,11 +244,94 @@ void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
 //         throw std::runtime_error("GPU_Weight_Buffer get_weights()");
 //     }
 // };
+// module_weight_tensor_map GPU_Weight_Buffer::get_weights(
+//     const std::string& module_name,
+//     std::string& phase) 
+// {
+//     this->logger_->debug("Get weights: {}", module_name);
+//     try {
+//         while (true) {
+//             {
+//                 std::unique_lock<std::mutex> lock(this->mutex_);
+//                 if (this->cv_.wait_for(
+//                         lock, std::chrono::milliseconds(1),
+//                         [this, module_name] {
+//                             return this->module_in_buffers_.find(module_name) !=
+//                                    this->module_in_buffers_.end();
+//                         })) {
+//                     auto [module_type, buffer_idx] =
+//                         this->module_in_buffers_[module_name];
+//                     return this->buffers_[module_type][buffer_idx];
+//                 }
+//                 this->logger_->debug("Waiting for module: {}", module_name);
+//             }
+//             // Check if module_name starts with "routed_expert" and has enough
+//             // length
+//             if (module_name.substr(0, 13) == "routed_expert") {
+//                 // Find the last two underscores
+//                 size_t last_underscore = module_name.rfind('_');
+//                 size_t second_last_underscore =
+//                     module_name.rfind('_', last_underscore - 1);
+
+//                 if (last_underscore != std::string::npos &&
+//                     second_last_underscore != std::string::npos) {
+//                     // Extract indices using the underscore positions
+//                     std::string layer_str = module_name.substr(
+//                         second_last_underscore + 1,
+//                         last_underscore - second_last_underscore - 1);
+//                     std::string expert_str =
+//                         module_name.substr(last_underscore + 1);
+
+//                     int64_t layer_idx = std::stoi(layer_str);
+//                     int64_t expert_idx = std::stoi(expert_str);
+//                     this->logger_->debug(
+//                         "Clearing expert buffer: layer_idx: {}, expert_idx: {}",
+//                         layer_idx, expert_idx);
+//                     this->clear_expert_buffer(layer_idx, expert_idx, phase);
+//                 } else {
+//                     this->logger_->error(
+//                         "Invalid format in module name: '{}', expected "
+//                         "format: routed_expert_X_Y",
+//                         module_name);
+//                 }
+//             }
+//         }
+//     } catch (const c10::Error& e) {
+//         this->logger_->debug(
+//             "GPU_Weight_Buffer get_weights(): CUDA/PyTorch error: {}",
+//             e.what());
+//         throw std::runtime_error(e.what());
+//     }
+//     // Catch CUDA runtime errors
+//     catch (const cudaError_t& err) {
+//         this->logger_->debug(
+//             "GPU_Weight_Buffer get_weights(): CUDA runtime error: {}",
+//             cudaGetErrorString(err));
+//         throw std::runtime_error(cudaGetErrorString(err));
+//     }
+//     // Catch standard C++ exceptions
+//     catch (const std::exception& e) {
+//         this->logger_->debug("GPU_Weight_Buffer get_weights() Error: {}",
+//                              e.what());
+//         throw std::runtime_error("GPU_Weight_Buffer get_weights()");
+//     }
+//     // Catch any other unexpected errors
+//     catch (...) {
+//         this->logger_->debug("GPU_Weight_Buffer get_weights()");
+//         throw std::runtime_error("GPU_Weight_Buffer get_weights()");
+//     }
+// };
+
 module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     const std::string& module_name,
     std::string& phase) 
 {
     this->logger_->debug("Get weights: {}", module_name);
+    
+    // Start timer for timeout tracking
+    auto start_time = std::chrono::steady_clock::now();
+    constexpr auto timeout_duration = std::chrono::seconds(2);
+    
     try {
         while (true) {
             {
@@ -265,6 +348,28 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                 }
                 this->logger_->debug("Waiting for module: {}", module_name);
             }
+            
+            // Check for timeout
+            auto current_time = std::chrono::steady_clock::now();
+            auto elapsed = current_time - start_time;
+            if (elapsed >= timeout_duration) {
+                // Log timeout error with buffer contents
+                std::ostringstream oss;
+                oss << "Map keys: ";
+                
+                size_t count = 0;
+                for (const auto& [key, value] : this->module_in_buffers_) {
+                    oss << key;
+                    if (++count < this->module_in_buffers_.size()) {
+                        oss << ", ";
+                    }
+                }
+                
+                this->logger_->error("Timeout reached while waiting for module: {}. Buffer contents: {}", 
+                                    module_name, oss.str());
+                throw std::runtime_error("Timeout reached while waiting for module: " + module_name);
+            }
+            
             // Check if module_name starts with "routed_expert" and has enough
             // length
             if (module_name.substr(0, 13) == "routed_expert") {

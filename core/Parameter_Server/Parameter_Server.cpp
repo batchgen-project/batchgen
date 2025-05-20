@@ -122,12 +122,27 @@ void Parameter_Server::Init(
     this->logger->info("Parameter Server Initializing...");
     this->shm_name = weight_shm_name;
     this->tensor_meta_shm_name = tensor_meta_shm_name;
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaMemGetInfo(&free_memory, &total_memory));
+    this->logger->info("Before pinned memory setting, GPU Memory Usage: {} GB / {} GB",
+                       (total_memory - free_memory) / (1024 * 1024 * 1024),
+                       total_memory / (1024 * 1024 * 1024));
+    
+
     void* weight_ptr = nullptr;
     weight_ptr =
         allocate_shared_pinned_memory(weight_shm_name, byte_size, true);
     this->byte_size_ = byte_size;
     this->weight_ptr_ = weight_ptr;
+    // Log gpu memory usage on device 0
 
+    
+    CUDA_CHECK(cudaMemGetInfo(&free_memory, &total_memory));
+    this->logger->info("After pinned memory setting, GPU Memory Usage: {} GB / {} GB",
+                       (total_memory - free_memory) / (1024 * 1024 * 1024),
+                       total_memory / (1024 * 1024 * 1024));
     int64_t offset = 0;
     // std::vector<fs::path> paths;
     // std::copy(fs::directory_iterator(model_weights_path),

@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#include "../utils.h"
 
 #include "posix_shm.h"
 #include <numa.h>
@@ -60,22 +61,28 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         throw std::runtime_error("mmap failed for " + shm_name);
     }
 
-#if defined(__linux__)
-    // If NUMA is available, interleave pages between node 0 and node 1
-    if (numa_available() >= 0) {
-        unsigned long nodemask = (1UL << 0) | (1UL << 1);
-        int ret = mbind(ptr, size,
-                        MPOL_INTERLEAVE,
-                        &nodemask,
-                        /* maxnode = */ 8 * sizeof(nodemask),
-                        /* flags = */ 0);
-        if (ret != 0) {
-            // non-fatal: we'll still fall back to default if interleave fails
-            perror("mbind(MPOL_INTERLEAVE)");
+// #if defined(__linux__)
+    if(create){
+        // Log the number of NUMA nodes
+        int num_nodes = numa_num_configured_nodes();
+        std::cout << "Number of NUMA nodes: " << num_nodes << std::endl;
+        // If NUMA is available, interleave pages between node 0 and node 1
+        if (numa_available() >= 0) {
+            std::cout << "Interleaving memory across NUMA nodes." << std::endl;
+            unsigned long nodemask = (1UL << 0) | (1UL << 1);
+            int ret = mbind(ptr, size,
+                            MPOL_INTERLEAVE,
+                            &nodemask,
+                            /* maxnode = */ 8 * sizeof(nodemask),
+                            /* flags = */ 0);
+            if (ret != 0) {
+                // non-fatal: we'll still fall back to default if interleave fails
+                perror("mbind(MPOL_INTERLEAVE)");
+            }
         }
     }
-#endif
-
+// #endif
+    
     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
     if (err != cudaSuccess) {
         munmap(ptr, size);
