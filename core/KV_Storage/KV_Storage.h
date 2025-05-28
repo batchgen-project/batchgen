@@ -77,7 +77,7 @@ class KV_Storage {
     void create_fake_kv_storage();
     void save_compressed_kv();
 
-    torch::Tensor get_k_quantize_scale(int64_t layer_idx, std::vector<int64_t> cur_batch, int64_t padding_lentgh);
+    torch::Tensor get_k_quantize_scale(int64_t layer_idx, const std::vector<int64_t>& cur_batch, int64_t padding_lentgh);
 
    private:
     /* Template */
@@ -107,4 +107,6 @@ class KV_Storage {
                         torch::Tensor k,
                         torch::Tensor v,
                         torch::Tensor k_quantize_scale);
+    
+    void verify_numa_placement(void* ptr, size_t size, int expected_node);
 };

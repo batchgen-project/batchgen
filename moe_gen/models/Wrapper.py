@@ -381,6 +381,14 @@ class Attn_Wrapper(torch.nn.Module):
             return attn_output, None, None
 
         elif Attn_Wrapper.phase == "decoding":
+            # TODO: FIX
+            rank = dist.get_rank() 
+            current_rank_offloaded_expert_idx = (
+                rank * 32 + self.engine_config.EP_Config.num_local_expert_per_layer
+            )
+            self.core_engine.clear_expert_buffer(self.layer_idx, 
+                                                 current_rank_offloaded_expert_idx,
+                                                 Attn_Wrapper.phase)
             if self.get_weights:
                 weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
                 for name, param in self.module.named_parameters():
@@ -423,15 +431,8 @@ class Attn_Wrapper(torch.nn.Module):
                     )
 
             logging.debug(
-                f"[Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
+                f"[Rank: {dist.get_rank()} Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
             )
-            # logging the first token
-            # if self.layer_idx == 0:
-            #     logging.info(f"Final attn result layer 0, 0: {final_attn_result[0][0]}")
-            #     logging.info(f"Final attn result layer 0 1: {final_attn_result[1][0]}")
-            # if self.layer_idx == 60:
-            #     logging.info(f"Final attn result layer 60, 0: {final_attn_result[0][0]}")
-            #     logging.info(f"Final attn result layer 60 1: {final_attn_result[1][0]}")
             return final_attn_result, None, None
 
 
@@ -567,7 +568,7 @@ class Expert_Wrapper(torch.nn.Module):
             # self.module.up_proj.weight.data.set_(self.fp8_up)
 
         logging.debug(
-            f"[Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"
+            f"[Rank {dist.get_rank()} Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"
         )
         if self.expert_idx != -1:
             # self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)

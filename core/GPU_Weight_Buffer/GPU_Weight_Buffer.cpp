@@ -290,17 +290,17 @@ void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
 
 void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase) {
     // Log the keys of the module_in_buffers_ in the same log msg
-    // std::ostringstream oss;
-    // oss << "Map keys: ";
+    std::ostringstream oss;
+    oss << "Map keys: ";
     
-    // size_t count = 0;
-    // for (const auto& [key, value] : this->module_in_buffers_) {
-    //     oss << key;
-    //     if (++count < this->module_in_buffers_.size()) {
-    //         oss << ", ";
-    //     }
-    // }
-    // this->logger_->debug("clearing expert buffer: layer_idx: {}, expert_idx: {}, existing keys: {}", layer_idx, expert_idx, oss.str());
+    size_t count = 0;
+    for (const auto& [key, value] : this->module_in_buffers_) {
+        oss << key;
+        if (++count < this->module_in_buffers_.size()) {
+            oss << ", ";
+        }
+    }
+    this->logger_->debug("clearing expert buffer: layer_idx: {}, expert_idx: {}, existing keys: {}", layer_idx, expert_idx, oss.str());
 
     // Get the number of expert buffers based on phase
     int64_t num_expert_buffer;

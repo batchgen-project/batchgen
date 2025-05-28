@@ -143,6 +143,7 @@ void Parameter_Server::Init(
     this->logger->info("After pinned memory setting, GPU Memory Usage: {} GB / {} GB",
                        (total_memory - free_memory) / (1024 * 1024 * 1024),
                        total_memory / (1024 * 1024 * 1024));
+    // exit();
     int64_t offset = 0;
     // std::vector<fs::path> paths;
     // std::copy(fs::directory_iterator(model_weights_path),

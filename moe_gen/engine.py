@@ -798,7 +798,7 @@ class MoE_Gen:
                 # self.core_engine.start_h2d_worker()
                 # time.sleep(2)
                 
-                # dist.barrier()
+                dist.barrier()
                 self._config_decoding()
                 # nvtx.init()
                 decoding_start_time = time.perf_counter()

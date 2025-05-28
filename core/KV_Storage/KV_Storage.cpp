@@ -36,6 +36,10 @@
 #include <cstring>
 #include <numa.h>
 #include <numaif.h>
+#include <cstdlib>       // posix_memalign      
+#include <cuda_runtime.h>
+#include <unistd.h>      // getpagesize
+
 
 constexpr float FP8_MAX = 448.0f;
 // std::tuple<at::Tensor, at::Tensor> per_token_quant(torch::Tensor x) {
@@ -199,7 +203,96 @@ std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
 //     }
 // };
 
-KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
+// KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
+//                        DtoH_Engine& d2h_engine)
+//     : engine_config_(engine_config),
+//       model_config_(model_config),
+//       d2h_engine_(d2h_engine),
+//       per_element_mutex_(model_config.num_hidden_layers *
+//                          engine_config.kv_storage_config.num_host_slots) {
+//     try {
+//         this->logger_ = init_logger(
+//             this->engine_config_.basic_config.log_level,
+//             "KV_Storage" + std::to_string(this->engine_config_.basic_config.device));
+        
+//         int device_id = this->engine_config_.basic_config.device;
+//         CUDA_CHECK(cudaSetDevice(device_id));
+
+//         int numa_node = -1;
+
+//         if (numa_available() >= 0) {
+//             numa_node = (device_id < 4) ? 0 : 1;
+//             numa_set_preferred(numa_node);
+//             numa_run_on_node(numa_node);  // Apply thread binding after check
+//         } else {
+//             this->logger_->warn("NUMA is not available. Falling back to default memory allocation.");
+//         }
+
+//         this->logger_->info("Starting KV_Storage Initialization on device {} using NUMA node {}.",
+//                             device_id, numa_node);
+
+//         const auto& storage_size = this->engine_config_.kv_storage_config.storage_byte_size;
+//         auto per_layer_storage_size = storage_size / this->model_config_.num_hidden_layers;
+
+//         auto bar = tq::trange(this->model_config_.num_hidden_layers);
+//         bar.set_prefix("Allocating Pinned Memory for KV cache");
+
+//         bool is_deepseek = (this->model_config_.model_type.find("deepseek") != std::string::npos);
+
+//         for (auto layer_idx : bar) {
+//             auto allocate = [&](void** ptr) {
+//                 if (numa_node >= 0) {
+//                     *ptr = numa_alloc_onnode(per_layer_storage_size, numa_node);
+//                     if (*ptr != nullptr) {
+//                         // Touch the pages to commit allocation
+//                         volatile char* p = static_cast<volatile char*>(*ptr);
+//                         for (size_t i = 0; i < per_layer_storage_size; i += 4096)
+//                             p[i] = 0;
+
+//                         if (cudaHostRegister(*ptr, per_layer_storage_size, cudaHostRegisterDefault) != cudaSuccess) {
+//                             this->logger_->warn("cudaHostRegister failed on NUMA memory, falling back to cudaHostAlloc.");
+//                             numa_free(*ptr, per_layer_storage_size);
+//                             *ptr = nullptr;
+//                         }
+//                     }
+//                 }
+
+//                 if (*ptr == nullptr) {
+//                     CUDA_CHECK(cudaHostAlloc(ptr, per_layer_storage_size, cudaHostAllocDefault));
+//                 }
+//             };
+
+//             void* k_ptr = nullptr;
+//             allocate(&k_ptr);
+//             this->k_pinned_memory.push_back(k_ptr);
+
+//             if (!is_deepseek) {
+//                 void* v_ptr = nullptr;
+//                 allocate(&v_ptr);
+//                 this->v_pinned_memory.push_back(v_ptr);
+//             }
+//         }
+
+//         this->logger_->info("KV Storage Pinned Memory Allocated on NUMA node {}.", numa_node);
+//     } catch (const std::exception& e) {
+//         this->logger_->error("KV_Storage: Exception during initialization: {}", e.what());
+//         throw;
+//     } catch (...) {
+//         this->logger_->error("KV_Storage: Unknown exception during initialization");
+//         throw std::runtime_error("KV_Storage: Failed to initialize storage.");
+//     }
+
+//     // NUMA verification (optional)
+//     if (!this->k_pinned_memory.empty()) {
+//         int node = -1;
+//         get_mempolicy(&node, nullptr, 0, this->k_pinned_memory[0], MPOL_F_NODE | MPOL_F_ADDR);
+//         this->logger_->info("Verify device {} memory allocation on NUMA node {}.",
+//                             this->engine_config_.basic_config.device, node);
+//     }
+// }
+
+KV_Storage::KV_Storage(EngineConfig& engine_config,
+                       ModelConfig& model_config,
                        DtoH_Engine& d2h_engine)
     : engine_config_(engine_config),
       model_config_(model_config),
@@ -209,98 +302,303 @@ KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
     try {
         this->logger_ = init_logger(
             this->engine_config_.basic_config.log_level,
-            "KV_Storage" +
-                std::to_string(this->engine_config_.basic_config.device));
-        
+            "KV_Storage" + std::to_string(this->engine_config_.basic_config.device));
+
         int device_id = this->engine_config_.basic_config.device;
         CUDA_CHECK(cudaSetDevice(device_id));
-        
-        // Determine which NUMA node to use based on device ID
-        int numa_node = (device_id < 4) ? 0 : 1;
-        
-        this->logger_->info("Starting KV_Storage Initialization on device {} using NUMA node {}.", 
-                           device_id, numa_node);
-        
-        // Check if NUMA is available
-        if (numa_available() < 0) {
-            this->logger_->warn("NUMA is not available. Falling back to default memory allocation.");
-            numa_node = -1; // Disable NUMA binding
-        }
-        
-        /* Reserve Pinned Memory for K and V. */
-        const auto& storage_size =
-            this->engine_config_.kv_storage_config.storage_byte_size;
-        auto per_layer_storage_size =
-            storage_size / this->model_config_.num_hidden_layers;
 
-        auto bar = tq::trange(this->model_config_.num_hidden_layers);
-        bar.set_prefix("Allocating Pinned Memory for KV cache");
-        
-        // Check if it's a deepseek model which only uses K
-        bool is_deepseek = (this->model_config_.model_type.find("deepseek") != std::string::npos);
-        
-        for (auto layer_idx : bar) {
-            // Allocate K memory
-            void* k_ptr = nullptr;
-            
-            if (numa_node >= 0) {
-                // Use NUMA-aware allocation
-                k_ptr = numa_alloc_onnode(per_layer_storage_size, numa_node);
-                if (k_ptr == nullptr) {
-                    this->logger_->warn("NUMA allocation failed for K cache. Falling back to cudaHostAlloc.");
-                    CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size, cudaHostAllocDefault));
-                } else {
-                    // Register the NUMA memory with CUDA for pinned access
-                    CUDA_CHECK(cudaHostRegister(k_ptr, per_layer_storage_size, 
-                                               cudaHostRegisterDefault));
+        // Determine target NUMA node based on device ID
+        int numa_node = -1;
+        bool numa_avail = (numa_available() >= 0);
+        if (numa_avail) {
+            numa_node = (device_id < 4) ? 0 : 1;
+        }
+
+        this->logger_->info("Starting KV_Storage Initialization on device {} targeting NUMA node {}.",
+                            device_id, numa_node);
+
+        const size_t storage_size       = this->engine_config_.kv_storage_config.storage_byte_size;
+        const size_t per_layer_size     = storage_size / this->model_config_.num_hidden_layers;
+        const size_t alignment          = 2 * 1024 * 1024;  // 2 MiB
+
+        bool is_deepseek =
+            (this->model_config_.model_type.find("deepseek") != std::string::npos);
+
+        // -------------------------------------------------
+        // NUMA-aware allocation function
+        // -------------------------------------------------
+        auto allocate_numa_wc = [&](void** out_ptr) -> bool {
+            if (!numa_avail || numa_node < 0) {
+                // Fallback to regular cudaHostAlloc if NUMA not available
+                cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
+                if (err == cudaSuccess) {
+                    this->logger_->info("Allocated {} bytes using cudaHostAlloc (no NUMA)", per_layer_size);
+                    return true;
                 }
-            } else {
-                // Use regular pinned memory
-                CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size, cudaHostAllocDefault));
+                return false;
             }
+
+            // Set NUMA policy to bind to target node before allocation
+            struct bitmask *old_mask = numa_get_membind();
+            struct bitmask *target_mask = numa_allocate_nodemask();
+            numa_bitmask_setbit(target_mask, numa_node);
             
+            // Set binding policy - use MPOL_BIND for strict placement
+            numa_set_bind_policy(1);
+            numa_set_membind(target_mask);
+
+            // Allocate write-combined memory
+            cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
+            
+            if (err == cudaSuccess) {
+                // Verify the allocation is on correct NUMA node
+                int actual_node = -1;
+                if (get_mempolicy(&actual_node, nullptr, 0, *out_ptr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+                    if (actual_node == numa_node) {
+                        this->logger_->info("Successfully allocated {} bytes on NUMA node {}", 
+                                          per_layer_size, actual_node);
+                    } else {
+                        this->logger_->warn("Allocated on NUMA node {} instead of target node {}", 
+                                          actual_node, numa_node);
+                        
+                        // Attempt to migrate the memory to correct NUMA node
+                        unsigned long nodemask = 1UL << numa_node;
+                        if (mbind(*out_ptr, per_layer_size, MPOL_BIND, &nodemask, 
+                                sizeof(nodemask) * 8, MPOL_MF_MOVE | MPOL_MF_STRICT) == 0) {
+                            this->logger_->info("Successfully migrated memory to NUMA node {}", numa_node);
+                        } else {
+                            this->logger_->warn("Failed to migrate memory to NUMA node {}", numa_node);
+                        }
+                    }
+                }
+
+                // Touch pages to ensure physical allocation and proper NUMA placement
+                // Use first-touch with proper alignment
+                volatile char* ptr = static_cast<volatile char*>(*out_ptr);
+                size_t page_size = getpagesize();
+                
+                #pragma omp parallel for if(per_layer_size > 1024*1024)
+                for (size_t offset = 0; offset < per_layer_size; offset += page_size) {
+                    ptr[offset] = 0;
+                }
+                
+                // Check alignment
+                if (reinterpret_cast<uintptr_t>(*out_ptr) % alignment == 0) {
+                    this->logger_->debug("Memory is properly aligned to {} bytes", alignment);
+                } else {
+                    this->logger_->warn("Memory alignment is not optimal (requested {} bytes)", alignment);
+                }
+            }
+
+            // Restore original NUMA policy
+            numa_set_membind(old_mask);
+            numa_set_bind_policy(0);
+            numa_free_nodemask(target_mask);
+            numa_free_nodemask(old_mask);
+
+            return (err == cudaSuccess);
+        };
+
+        // -------------------------------------------------
+        // Allocate per-layer KV buffers
+        // -------------------------------------------------
+        auto bar = tq::trange(this->model_config_.num_hidden_layers);
+        bar.set_prefix("Allocating NUMA-aware Pinned Memory for KV cache");
+
+        for (auto layer_idx : bar) {
+            void* k_ptr = nullptr;
+            if (!allocate_numa_wc(&k_ptr)) {
+                throw std::runtime_error("Failed to allocate K cache memory for layer " + std::to_string(layer_idx));
+            }
             this->k_pinned_memory.push_back(k_ptr);
-            
-            // Allocate V memory if not deepseek model
+
             if (!is_deepseek) {
                 void* v_ptr = nullptr;
-                
-                if (numa_node >= 0) {
-                    // Use NUMA-aware allocation
-                    v_ptr = numa_alloc_onnode(per_layer_storage_size, numa_node);
-                    if (v_ptr == nullptr) {
-                        this->logger_->warn("NUMA allocation failed for V cache. Falling back to cudaHostAlloc.");
-                        CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size, cudaHostAllocDefault));
-                    } else {
-                        // Register the NUMA memory with CUDA for pinned access
-                        CUDA_CHECK(cudaHostRegister(v_ptr, per_layer_storage_size, 
-                                                   cudaHostRegisterDefault));
-                    }
-                } else {
-                    // Use regular pinned memory
-                    CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size, cudaHostAllocDefault));
+                if (!allocate_numa_wc(&v_ptr)) {
+                    throw std::runtime_error("Failed to allocate V cache memory for layer " + std::to_string(layer_idx));
                 }
-                
                 this->v_pinned_memory.push_back(v_ptr);
             }
         }
-        
-        this->logger_->info("KV Storage Pinned Memory Allocated on NUMA node {}.", numa_node);
+
+        this->logger_->info("KV Storage Pinned Memory Allocated successfully.");
+
+        // Final NUMA verification for first allocation
+        if (!this->k_pinned_memory.empty() && numa_available) {
+            int actual_node = -1;
+            if (get_mempolicy(&actual_node, nullptr, 0,
+                            this->k_pinned_memory[0],
+                            MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+                this->logger_->info("Final verification: Device {} memory allocated on NUMA node {} (target was {}).",
+                                  device_id, actual_node, numa_node);
+            }
+            
+            // Optional: Verify multiple pages for large allocations
+            this->verify_numa_placement(this->k_pinned_memory[0], per_layer_size, numa_node);
+        }
+
     } catch (const std::exception& e) {
         this->logger_->error("KV_Storage: Exception during initialization: {}", e.what());
         throw;
     } catch (...) {
         this->logger_->error("KV_Storage: Unknown exception during initialization");
-        throw std::runtime_error("KV_Storage: Failed to update K and V to the storage.");
+        throw std::runtime_error("KV_Storage: Failed to initialize storage.");
+    }
+}
+
+// Helper method to verify NUMA placement across pages
+void KV_Storage::verify_numa_placement(void* ptr, size_t size, int expected_node) {
+    if (!ptr || size == 0) return;
+    
+    size_t page_size = getpagesize();
+    size_t num_pages = (size + page_size - 1) / page_size;
+    
+    // Only check first few and last few pages for large allocations
+    size_t pages_to_check = std::min(num_pages, static_cast<size_t>(10));
+    
+    std::vector<void*> pages(pages_to_check);
+    std::vector<int> status(pages_to_check);
+    
+    // Check first few pages
+    for (size_t i = 0; i < pages_to_check / 2 && i < num_pages; i++) {
+        pages[i] = static_cast<char*>(ptr) + i * page_size;
     }
     
-    // Add memory allocation verification (optional)
-    if (!this->k_pinned_memory.empty()) {
-        int node;
-        get_mempolicy(&node, NULL, 0, this->k_pinned_memory[0], MPOL_F_NODE | MPOL_F_ADDR);
-        this->logger_->info("Verified K memory is on NUMA node: {}", node);
+    // Check last few pages
+    size_t start_idx = pages_to_check / 2;
+    for (size_t i = 0; i < pages_to_check - start_idx && (num_pages - pages_to_check + start_idx + i) < num_pages; i++) {
+        pages[start_idx + i] = static_cast<char*>(ptr) + (num_pages - pages_to_check + start_idx + i) * page_size;
     }
-};
+    
+    if (move_pages(0, pages_to_check, pages.data(), nullptr, status.data(), 0) == 0) {
+        int correct_placement = 0;
+        for (size_t i = 0; i < pages_to_check; i++) {
+            if (status[i] == expected_node) {
+                correct_placement++;
+            } else if (status[i] >= 0) {
+                this->logger_->debug("Page {} on NUMA node {} (expected {})", i, status[i], expected_node);
+            }
+        }
+        
+        double placement_ratio = static_cast<double>(correct_placement) / pages_to_check;
+        if (placement_ratio >= 0.9) {
+            this->logger_->info("NUMA placement verification: {:.1f}% pages on correct node", placement_ratio * 100);
+        } else {
+            this->logger_->warn("NUMA placement verification: Only {:.1f}% pages on correct node {}", 
+                              placement_ratio * 100, expected_node);
+        }
+    }
+}
+
+
+
+
+
+// KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
+//                        DtoH_Engine& d2h_engine)
+//     : engine_config_(engine_config),
+//       model_config_(model_config),
+//       d2h_engine_(d2h_engine),
+//       per_element_mutex_(model_config.num_hidden_layers *
+//                          engine_config.kv_storage_config.num_host_slots) {
+//     try {
+//         this->logger_ = init_logger(
+//             this->engine_config_.basic_config.log_level,
+//             "KV_Storage" +
+//                 std::to_string(this->engine_config_.basic_config.device));
+        
+//         int device_id = this->engine_config_.basic_config.device;
+//         CUDA_CHECK(cudaSetDevice(device_id));
+        
+//         // Determine which NUMA node to use based on device ID
+//         int numa_node = (device_id < 4) ? 0 : 1;
+//         numa_run_on_node(numa_node);
+//         numa_set_preferred(numa_node);
+        
+//         this->logger_->info("Starting KV_Storage Initialization on device {} using NUMA node {}.", 
+//                            device_id, numa_node);
+        
+//         // Check if NUMA is available
+//         if (numa_available() < 0) {
+//             this->logger_->warn("NUMA is not available. Falling back to default memory allocation.");
+//             numa_node = -1; // Disable NUMA binding
+//         }
+        
+//         /* Reserve Pinned Memory for K and V. */
+//         const auto& storage_size =
+//             this->engine_config_.kv_storage_config.storage_byte_size;
+//         auto per_layer_storage_size =
+//             storage_size / this->model_config_.num_hidden_layers;
+
+//         auto bar = tq::trange(this->model_config_.num_hidden_layers);
+//         bar.set_prefix("Allocating Pinned Memory for KV cache");
+        
+//         // Check if it's a deepseek model which only uses K
+//         bool is_deepseek = (this->model_config_.model_type.find("deepseek") != std::string::npos);
+        
+//         for (auto layer_idx : bar) {
+//             // Allocate K memory
+//             void* k_ptr = nullptr;
+            
+//             if (numa_node >= 0) {
+//                 // Use NUMA-aware allocation
+//                 k_ptr = numa_alloc_onnode(per_layer_storage_size, numa_node);
+//                 if (k_ptr == nullptr) {
+//                     this->logger_->warn("NUMA allocation failed for K cache. Falling back to cudaHostAlloc.");
+//                     CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size, cudaHostAllocDefault));
+//                 } else {
+//                     // Register the NUMA memory with CUDA for pinned access
+//                     CUDA_CHECK(cudaHostRegister(k_ptr, per_layer_storage_size, 
+//                                                cudaHostRegisterDefault));
+//                 }
+//             } else {
+//                 // Use regular pinned memory
+//                 CUDA_CHECK(cudaHostAlloc(&k_ptr, per_layer_storage_size, cudaHostAllocDefault));
+//             }
+            
+//             this->k_pinned_memory.push_back(k_ptr);
+            
+//             // Allocate V memory if not deepseek model
+//             if (!is_deepseek) {
+//                 void* v_ptr = nullptr;
+                
+//                 if (numa_node >= 0) {
+//                     // Use NUMA-aware allocation
+//                     v_ptr = numa_alloc_onnode(per_layer_storage_size, numa_node);
+//                     if (v_ptr == nullptr) {
+//                         this->logger_->warn("NUMA allocation failed for V cache. Falling back to cudaHostAlloc.");
+//                         CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size, cudaHostAllocDefault));
+//                     } else {
+//                         // Register the NUMA memory with CUDA for pinned access
+//                         CUDA_CHECK(cudaHostRegister(v_ptr, per_layer_storage_size, 
+//                                                    cudaHostRegisterDefault));
+//                     }
+//                 } else {
+//                     // Use regular pinned memory
+//                     CUDA_CHECK(cudaHostAlloc(&v_ptr, per_layer_storage_size, cudaHostAllocDefault));
+//                 }
+                
+//                 this->v_pinned_memory.push_back(v_ptr);
+//             }
+//         }
+        
+//         this->logger_->info("KV Storage Pinned Memory Allocated on NUMA node {}.", numa_node);
+//     } catch (const std::exception& e) {
+//         this->logger_->error("KV_Storage: Exception during initialization: {}", e.what());
+//         throw;
+//     } catch (...) {
+//         this->logger_->error("KV_Storage: Unknown exception during initialization");
+//         throw std::runtime_error("KV_Storage: Failed to update K and V to the storage.");
+//     }
+    
+//     // Add memory allocation verification (optional)
+//     if (!this->k_pinned_memory.empty()) {
+//         int node;
+//         get_mempolicy(&node, NULL, 0, this->k_pinned_memory[0], MPOL_F_NODE | MPOL_F_ADDR);
+//         this->logger_->info("Verify device {} memory allocation on NUMA node {}.", 
+//                            this->engine_config_.basic_config.device, node);
+//     }
+// };
 
 
 void KV_Storage::Init() {
@@ -394,61 +692,143 @@ void KV_Storage::Init() {
     }
 };
 
+// torch::Tensor KV_Storage::get_k_quantize_scale(
+//     int64_t layer_idx, std::vector<int64_t> cur_batch, int64_t padding_length) 
+// {
+//     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+//     torch::Device device(torch::kCUDA, this->engine_config_.basic_config.device);
+//     auto opt = torch::TensorOptions()
+//         .dtype(torch::kFloat32)
+//         .device(device)  // Use the device object instead of a raw integer
+//         .requires_grad(false);
+//     auto k_quantize_scale = torch::ones({cur_batch.size(), padding_length, 5}, opt); // TODO:
+//     // std::vector<torch::Tensor> k_quantize_scale_vec;
+                                            
+//     for (int64_t i = 0; i < static_cast<int64_t>(cur_batch.size()); i++) {
+//         auto query_idx = cur_batch[i];
+//         int64_t slot_idx = -1;
+//         {
+//             std::lock_guard<std::mutex> lock(this->mutex_);
+//             slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+//         }
+//         auto scale = this->k_storage[slot_idx][layer_idx].quantize_scale;
+//         // log scale shape
+//         // this->logger_->info("scale shape: {}",
+//         //                      get_tensor_shape(scale));
+//         int64_t scale_size = scale.size(1);
+//         // copy scale to k_quantize_scale[i]'s first scale's size
+//         if(scale_size > padding_length) {
+//             this->logger_->info("scale_size: {}, padding_length: {}",
+//                                  scale_size, padding_length);
+//             throw std::runtime_error("scale_size > padding_length");
+//         }
+//         k_quantize_scale.index({i, torch::indexing::Slice(0, scale_size)}) = scale.index({0, torch::indexing::Slice(0, scale_size)}); 
+//         // k_quantize_scale_vec.push_back(scale.index({0, torch::indexing::Slice(0, scale_size)}).unsqueeze(0));
+//     }
+//     // Check k_quantize_scale has nan values
+//     // if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
+//     //     for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
+//     //         if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
+//     //             this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
+//     //                                  i, this->engine_config_.basic_config.device,
+//     //                                  layer_idx);
+//     //         }
+//     //     }
+//     //     // throw std::runtime_error("k_quantize_scale has nan values");
+//     // }
+//     // CUDA_CHECK(cudaStreamSynchronize(0));
+//     // CUDA_CHECK(cudaDeviceSynchronize());
+//     // torch::Tensor k_quantize_scale = torch::cat(k_quantize_scale_vec, 0);
+//     // Concat to padding_length
+//     // if(k_quantize_scale.size(1) < padding_length) {
+//     //     auto padding = torch::ones({k_quantize_scale.size(0), padding_length - k_quantize_scale.size(1),k_quantize_scale.size(2)}, opt);
+//     //     k_quantize_scale = torch::cat({k_quantize_scale, padding}, 1);
+//     // }
+//     // this->logger_->info("k_quantize_scale shape: {}",
+//     //                              get_tensor_shape(k_quantize_scale));
+//     return k_quantize_scale;
+// }
+
 torch::Tensor KV_Storage::get_k_quantize_scale(
-    int64_t layer_idx, std::vector<int64_t> cur_batch, int64_t padding_length) 
-{
+    int64_t layer_idx, 
+    const std::vector<int64_t>& cur_batch, 
+    int64_t padding_length) {
+    
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     torch::Device device(torch::kCUDA, this->engine_config_.basic_config.device);
+    
     auto opt = torch::TensorOptions()
         .dtype(torch::kFloat32)
-        .device(device)  // Use the device object instead of a raw integer
+        .device(device)
         .requires_grad(false);
-    auto k_quantize_scale = torch::ones({cur_batch.size(), padding_length, 5}, opt); // TODO:
-    // std::vector<torch::Tensor> k_quantize_scale_vec;
-                                            
-    for (int64_t i = 0; i < static_cast<int64_t>(cur_batch.size()); i++) {
-        auto query_idx = cur_batch[i];
-        int64_t slot_idx = -1;
-        {
-            std::lock_guard<std::mutex> lock(this->mutex_);
-            slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+    
+    // Check if all scales have the same size for potential optimization
+    std::vector<std::pair<torch::Tensor, int64_t>> tensor_info;
+    tensor_info.reserve(cur_batch.size());
+    
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        for (const auto& query_idx : cur_batch) {
+            int64_t slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+            auto& scale = this->k_storage[slot_idx][layer_idx].quantize_scale;
+            int64_t scale_size = scale.size(1);
+            
+            if (scale_size > padding_length) {
+                this->logger_->info("scale_size: {}, padding_length: {}", 
+                                   scale_size, padding_length);
+                throw std::runtime_error("scale_size > padding_length");
+            }
+            
+            tensor_info.emplace_back(scale, scale_size);
         }
-        auto scale = this->k_storage[slot_idx][layer_idx].quantize_scale;
-        // log scale shape
-        // this->logger_->info("scale shape: {}",
-        //                      get_tensor_shape(scale));
-        int64_t scale_size = scale.size(1);
-        // copy scale to k_quantize_scale[i]'s first scale's size
-        if(scale_size > padding_length) {
-            this->logger_->info("scale_size: {}, padding_length: {}",
-                                 scale_size, padding_length);
-            throw std::runtime_error("scale_size > padding_length");
-        }
-        k_quantize_scale.index({i, torch::indexing::Slice(0, scale_size)}) = scale.index({0, torch::indexing::Slice(0, scale_size)}); 
-        // k_quantize_scale_vec.push_back(scale.index({0, torch::indexing::Slice(0, scale_size)}).unsqueeze(0));
     }
-    // Check k_quantize_scale has nan values
-    // if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
-    //     for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
-    //         if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
-    //             this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
-    //                                  i, this->engine_config_.basic_config.device,
-    //                                  layer_idx);
-    //         }
-    //     }
-    //     // throw std::runtime_error("k_quantize_scale has nan values");
-    // }
-    // CUDA_CHECK(cudaStreamSynchronize(0));
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // torch::Tensor k_quantize_scale = torch::cat(k_quantize_scale_vec, 0);
-    // Concat to padding_length
-    // if(k_quantize_scale.size(1) < padding_length) {
-    //     auto padding = torch::ones({k_quantize_scale.size(0), padding_length - k_quantize_scale.size(1),k_quantize_scale.size(2)}, opt);
-    //     k_quantize_scale = torch::cat({k_quantize_scale, padding}, 1);
-    // }
-    // this->logger_->info("k_quantize_scale shape: {}",
-    //                              get_tensor_shape(k_quantize_scale));
-    return k_quantize_scale;
+    
+    // Check if we can use torch::stack for uniform sizes
+    bool uniform_sizes = true;
+    int64_t first_size = tensor_info.empty() ? 0 : tensor_info[0].second;
+    for (const auto& info : tensor_info) {
+        if (info.second != first_size) {
+            uniform_sizes = false;
+            break;
+        }
+    }
+    
+    if (uniform_sizes && first_size > 0 && first_size <= padding_length) {
+        // All tensors have the same size - use efficient stack operation
+        std::vector<torch::Tensor> uniform_tensors;
+        uniform_tensors.reserve(tensor_info.size());
+        
+        for (const auto& info : tensor_info) {
+            uniform_tensors.push_back(
+                info.first.index({0, torch::indexing::Slice(0, first_size)})
+            );
+        }
+        
+        auto stacked = torch::stack(uniform_tensors, 0);
+        
+        // If we need padding, create result tensor and copy
+        if (first_size < padding_length) {
+            auto result = torch::ones({static_cast<int64_t>(cur_batch.size()), padding_length, 5}, opt);
+            result.index({torch::indexing::Slice(), torch::indexing::Slice(0, first_size)}) = stacked;
+            return result;
+        } else {
+            return stacked;
+        }
+    } else {
+        // Fall back to individual copies (but still more efficient than original)
+        auto k_quantize_scale = torch::ones({static_cast<int64_t>(cur_batch.size()), padding_length, 5}, opt);
+        
+        for (int64_t i = 0; i < static_cast<int64_t>(tensor_info.size()); i++) {
+            const auto& [scale, scale_size] = tensor_info[i];
+            if (scale_size > 0) {
+                k_quantize_scale.index({i, torch::indexing::Slice(0, scale_size)}).copy_(
+                    scale.index({0, torch::indexing::Slice(0, scale_size)})
+                );
+            }
+        }
+        
+        return k_quantize_scale;
+    }
 }
             
             

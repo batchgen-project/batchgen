@@ -808,278 +808,280 @@ class DeepseekV3MoE_Prefill(nn.Module):
 # 		return final_output.to(x.dtype)
 
 # H20-VERSION
-# class DeepseekV3MoE_Decoding(nn.Module):
-# 	def __init__(self, config):
-# 		super().__init__()
-# 		# logger.info("Initializing DeepseekV3MoE_Decoding")
-# 		self.config = config
-# 		self.num_experts_per_tok = config.num_experts_per_tok
+class DeepseekV3MoE_Decoding_(nn.Module):
+	def __init__(self, config):
+		super().__init__()
+		# logger.info("Initializing DeepseekV3MoE_Decoding")
+		self.config = config
+		self.num_experts_per_tok = config.num_experts_per_tok
 
-# 		if not dist.is_initialized():
-# 			self.rank = 0
-# 			self.world_size = 1
-# 		else:
-# 			self.rank = dist.get_rank()
-# 			self.world_size = dist.get_world_size()
-# 		# assert self.world_size == 8
+		if not dist.is_initialized():
+			self.rank = 0
+			self.world_size = 1
+		else:
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+		# assert self.world_size == 8
 
-# 		self.experts_per_rank = 256 // self.world_size
-# 		self.total_experts = self.world_size * self.experts_per_rank
-# 		self.routed_expert_start_idx = self.rank * self.experts_per_rank
-# 		self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
+		self.experts_per_rank = 256 // self.world_size
+		self.total_experts = self.world_size * self.experts_per_rank
+		self.routed_expert_start_idx = self.rank * self.experts_per_rank
+		self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
 
-# 		self.experts = nn.ModuleList([
-# 			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
-# 			for _ in range(self.total_experts)
-# 		])
+		self.experts = nn.ModuleList([
+			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
+			for _ in range(self.total_experts)
+		])
 
-# 		self.gate = MoEGate(config)
-# 		if config.n_shared_experts:
-# 			self.shared_experts = DeepseekV3MLP(
-# 				config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
-# 			)
+		self.gate = MoEGate(config)
+		if config.n_shared_experts:
+			self.shared_experts = DeepseekV3MLP(
+				config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+			)
 		
-# 		# logger.info("DeepseekV3MoE_Decoding initialized")
+		# logger.info("DeepseekV3MoE_Decoding initialized")
 
 
-# 	def forward(self, hidden_states):
-# 		# logger.info("DeepseekV3MoE_Decoding forward")
-# 		identity = hidden_states
-# 		orig_shape = hidden_states.shape
-# 		topk_idx, topk_weight = self.gate(hidden_states)
-# 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-# 		out = self.moe_infer(hidden_states, topk_idx, topk_weight)
-# 		out = out.view(*orig_shape)
-# 		out = out + self.shared_experts(identity)
-# 		return out
+	def forward(self, hidden_states):
+		# logger.info("DeepseekV3MoE_Decoding forward")
+		identity = hidden_states
+		orig_shape = hidden_states.shape
+		topk_idx, topk_weight = self.gate(hidden_states)
+		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+		logger.info(f"Rank {self.rank} passed gate.")
+		out = self.moe_infer(hidden_states, topk_idx, topk_weight)
+		logger.info(f"Rank {self.rank} passed moe_infer.")
+		out = out.view(*orig_shape)
+		out = out + self.shared_experts(identity)
+		return out
 
-# 	@torch.no_grad()
-# 	def moe_infer(self, x, topk_idx, topk_weight):
-# 		num_tokens, hidden_size = x.shape
+	@torch.no_grad()
+	def moe_infer(self, x, topk_idx, topk_weight):
+		num_tokens, hidden_size = x.shape
 
-# 		# Flatten top-k expert routing
-# 		flat_expert_ids = topk_idx.view(-1)
-# 		flat_weights = topk_weight.view(-1)
-# 		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
-# 		token_ids = torch.arange(num_tokens, device=x.device).repeat_interleave(self.num_experts_per_tok)
+		# Flatten top-k expert routing
+		flat_expert_ids = topk_idx.view(-1)
+		flat_weights = topk_weight.view(-1)
+		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
+		token_ids = torch.arange(num_tokens, device=x.device).repeat_interleave(self.num_experts_per_tok)
 
-# 		# Sort by expert
-# 		sorted_expert_ids, sort_idx = flat_expert_ids.sort()
-# 		sorted_inputs = expanded_x[sort_idx]
-# 		sorted_token_ids = token_ids[sort_idx]
-# 		sorted_weights = flat_weights[sort_idx]
+		# Sort by expert
+		sorted_expert_ids, sort_idx = flat_expert_ids.sort()
+		sorted_inputs = expanded_x[sort_idx]
+		sorted_token_ids = token_ids[sort_idx]
+		sorted_weights = flat_weights[sort_idx]
 
-# 		# Count how many tokens per expert
-# 		expert_token_counts = torch.bincount(sorted_expert_ids, minlength=self.total_experts)
+		# Count how many tokens per expert
+		expert_token_counts = torch.bincount(sorted_expert_ids, minlength=self.total_experts)
 
-# 		# Split input to send to each rank
-# 		send_counts = torch.tensor([
-# 			expert_token_counts[r * self.experts_per_rank:(r + 1) * self.experts_per_rank].sum().item()
-# 			for r in range(self.world_size)
-# 		], device=x.device, dtype=torch.int64)
+		# Split input to send to each rank
+		send_counts = torch.tensor([
+			expert_token_counts[r * self.experts_per_rank:(r + 1) * self.experts_per_rank].sum().item()
+			for r in range(self.world_size)
+		], device=x.device, dtype=torch.int64)
 
-# 		# Create tensors for all-to-all operations
-# 		recv_counts = torch.empty(self.world_size, dtype=torch.int64, device=x.device)
-# 		# Log rank reached first all-to-all
-# 		# logger.info(f"Rank {self.rank} reached first all-to-all")
-# 		dist.all_to_all_single(recv_counts, send_counts)
+		# Create tensors for all-to-all operations
+		recv_counts = torch.empty(self.world_size, dtype=torch.int64, device=x.device)
+		# Log rank reached first all-to-all
+		# logger.info(f"Rank {self.rank} reached first all-to-all")
+		dist.all_to_all_single(recv_counts, send_counts)
 
 		
-# 		# All-to-all send for input tensors
-# 		send_tensor = sorted_inputs.contiguous()
-# 		recv_total = recv_counts.sum().item()
+		# All-to-all send for input tensors
+		send_tensor = sorted_inputs.contiguous()
+		recv_total = recv_counts.sum().item()
 		
-# 		# *** KEY FIX 1: Handle empty tensors properly ***
-# 		# Create properly sized tensors even when recv_total is 0
-# 		if recv_total == 0:
-# 			recv_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
-# 		else:
-# 			recv_tensor = torch.empty(recv_total, hidden_size, device=x.device, dtype=x.dtype)
+		# *** KEY FIX 1: Handle empty tensors properly ***
+		# Create properly sized tensors even when recv_total is 0
+		if recv_total == 0:
+			recv_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		else:
+			recv_tensor = torch.empty(recv_total, hidden_size, device=x.device, dtype=x.dtype)
 		
-# 		# Convert counts to lists for all_to_all_single
-# 		send_counts_list = send_counts.tolist()
-# 		recv_counts_list = recv_counts.tolist()
+		# Convert counts to lists for all_to_all_single
+		send_counts_list = send_counts.tolist()
+		recv_counts_list = recv_counts.tolist()
 		
-# 		# *** KEY FIX 2: Handle case where some counts are zero ***
-# 		# Ensure all_to_all_single works even with empty tensors
-# 		if send_tensor.size(0) == 0:
-# 			# If we have nothing to send, create a dummy tensor that won't be used
-# 			# but allows the collective to proceed
-# 			send_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		# *** KEY FIX 2: Handle case where some counts are zero ***
+		# Ensure all_to_all_single works even with empty tensors
+		if send_tensor.size(0) == 0:
+			# If we have nothing to send, create a dummy tensor that won't be used
+			# but allows the collective to proceed
+			send_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
 		
-# 		# logger.info(f"Rank {self.rank} Send: Recv tensor dim 0: {recv_tensor.size(0)}, recv count sum: {recv_counts.sum()}")
-# 		dist.all_to_all_single(recv_tensor, send_tensor, recv_counts_list, send_counts_list)
+		# logger.info(f"Rank {self.rank} Send: Recv tensor dim 0: {recv_tensor.size(0)}, recv count sum: {recv_counts.sum()}")
+		dist.all_to_all_single(recv_tensor, send_tensor, recv_counts_list, send_counts_list)
 
-# 		# All-to-all comm for expert ids
-# 		send_expert_ids = sorted_expert_ids.contiguous()
+		# All-to-all comm for expert ids
+		send_expert_ids = sorted_expert_ids.contiguous()
 		
-# 		# *** KEY FIX 3: Handle empty expert_ids tensor ***
-# 		if recv_total == 0:
-# 			recv_expert_ids = torch.empty(0, device=x.device, dtype=send_expert_ids.dtype)
-# 		else:
-# 			recv_expert_ids = torch.empty(recv_total, device=x.device, dtype=send_expert_ids.dtype)
+		# *** KEY FIX 3: Handle empty expert_ids tensor ***
+		if recv_total == 0:
+			recv_expert_ids = torch.empty(0, device=x.device, dtype=send_expert_ids.dtype)
+		else:
+			recv_expert_ids = torch.empty(recv_total, device=x.device, dtype=send_expert_ids.dtype)
 		
-# 		# *** KEY FIX 4: Handle case where no expert ids to send ***
-# 		if send_expert_ids.size(0) == 0:
-# 			# Create a dummy tensor that won't be used but allows the collective to proceed
-# 			send_expert_ids = torch.empty(0, device=x.device, dtype=send_expert_ids.dtype)
+		# *** KEY FIX 4: Handle case where no expert ids to send ***
+		if send_expert_ids.size(0) == 0:
+			# Create a dummy tensor that won't be used but allows the collective to proceed
+			send_expert_ids = torch.empty(0, device=x.device, dtype=send_expert_ids.dtype)
 		
-# 		# logger.info(f"Rank {self.rank} reached third all-to-all")
-# 		dist.all_to_all_single(recv_expert_ids, send_expert_ids, recv_counts_list, send_counts_list)
-# 		# logger.info(f"Rank {self.rank} passed third all-to-all")
+		# logger.info(f"Rank {self.rank} reached third all-to-all")
+		dist.all_to_all_single(recv_expert_ids, send_expert_ids, recv_counts_list, send_counts_list)
+		# logger.info(f"Rank {self.rank} passed third all-to-all")
 
-# 		# Process received data if there's any
-# 		# if recv_total > 0:
-# 		# 	for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-# 		# 		expert_mask = (recv_expert_ids == expert_idx)
-# 		# 		indices = torch.nonzero(expert_mask, as_tuple=True)[0]
-# 		# 		if len(indices) == 0:
-# 		# 			continue
-# 		# 		expert_input = recv_tensor[indices]
-# 		# 		expert_output = self.experts[expert_idx](expert_input)
-# 		# 		recv_tensor[indices] = expert_output
-# 		if recv_total > 0:
-# 			# Pre-calculate all expert masks and indices at once
-# 			expert_indices = {}
-# 			for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-# 				expert_mask = (recv_expert_ids == expert_idx)
-# 				# Use a method that keeps computation on the device
-# 				if expert_mask.any():  # This might still cause DtoH but fewer times
-# 					expert_indices[expert_idx] = torch.nonzero(expert_mask, as_tuple=True)[0]
+		# Process received data if there's any
+		# if recv_total > 0:
+		# 	for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+		# 		expert_mask = (recv_expert_ids == expert_idx)
+		# 		indices = torch.nonzero(expert_mask, as_tuple=True)[0]
+		# 		if len(indices) == 0:
+		# 			continue
+		# 		expert_input = recv_tensor[indices]
+		# 		expert_output = self.experts[expert_idx](expert_input)
+		# 		recv_tensor[indices] = expert_output
+		if recv_total > 0:
+			# Pre-calculate all expert masks and indices at once
+			expert_indices = {}
+			for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+				expert_mask = (recv_expert_ids == expert_idx)
+				# Use a method that keeps computation on the device
+				if expert_mask.any():  # This might still cause DtoH but fewer times
+					expert_indices[expert_idx] = torch.nonzero(expert_mask, as_tuple=True)[0]
 			
-# 			# Process all experts with non-empty inputs
-# 			for expert_idx, indices in expert_indices.items():
-# 				expert_input = recv_tensor[indices]
-# 				expert_output = self.experts[expert_idx](expert_input)
-# 				recv_tensor[indices] = expert_output
+			# Process all experts with non-empty inputs
+			for expert_idx, indices in expert_indices.items():
+				expert_input = recv_tensor[indices]
+				expert_output = self.experts[expert_idx](expert_input)
+				recv_tensor[indices] = expert_output
 
-# 		# All-to-all return, send back output
-# 		output_recv = torch.empty_like(sorted_inputs)
+		# All-to-all return, send back output
+		output_recv = torch.empty_like(sorted_inputs)
 		
-# 		# *** KEY FIX 5: Handle corner case for return communication ***
-# 		if recv_tensor.size(0) == 0:
-# 			# Create a dummy tensor that won't be used but allows the collective to proceed
-# 			recv_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		# *** KEY FIX 5: Handle corner case for return communication ***
+		if recv_tensor.size(0) == 0:
+			# Create a dummy tensor that won't be used but allows the collective to proceed
+			recv_tensor = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
 		
-# 		# logger.info(f"Rank {self.rank} Return recv tensor dim 0: {output_recv.size(0)}, recv count sum: {send_counts.sum()}")
-# 		dist.all_to_all_single(output_recv, recv_tensor, send_counts_list, recv_counts_list)
+		# logger.info(f"Rank {self.rank} Return recv tensor dim 0: {output_recv.size(0)}, recv count sum: {send_counts.sum()}")
+		dist.all_to_all_single(output_recv, recv_tensor, send_counts_list, recv_counts_list)
 
-# 		# Unsort and accumulate outputs
-# 		unsort_idx = sort_idx.argsort()
-# 		unsorted_output = output_recv[unsort_idx]
-# 		unsorted_token_ids = sorted_token_ids[unsort_idx]
-# 		unsorted_weights = sorted_weights[unsort_idx]
+		# Unsort and accumulate outputs
+		unsort_idx = sort_idx.argsort()
+		unsorted_output = output_recv[unsort_idx]
+		unsorted_token_ids = sorted_token_ids[unsort_idx]
+		unsorted_weights = sorted_weights[unsort_idx]
 
-# 		# Create accumulators for output
-# 		output_accumulator = torch.zeros_like(x, dtype=torch.float32)
-# 		weight_accumulator = torch.zeros(num_tokens, 1, device=x.device)
+		# Create accumulators for output
+		output_accumulator = torch.zeros_like(x, dtype=torch.float32)
+		weight_accumulator = torch.zeros(num_tokens, 1, device=x.device)
 
-# 		# Accumulate outputs and weights
-# 		output_accumulator.index_add_(0, unsorted_token_ids, unsorted_output.to(torch.float32) * unsorted_weights.unsqueeze(-1))
-# 		weight_accumulator.index_add_(0, unsorted_token_ids, unsorted_weights.unsqueeze(-1))
+		# Accumulate outputs and weights
+		output_accumulator.index_add_(0, unsorted_token_ids, unsorted_output.to(torch.float32) * unsorted_weights.unsqueeze(-1))
+		weight_accumulator.index_add_(0, unsorted_token_ids, unsorted_weights.unsqueeze(-1))
 
-# 		# Produce final normalized output
-# 		final_output = output_accumulator / weight_accumulator.clamp(min=1e-9)
+		# Produce final normalized output
+		final_output = output_accumulator / weight_accumulator.clamp(min=1e-9)
 
-# 		# logger.info(f"Rank {self.rank} completed all-to-all and processing")
-# 		return final_output.to(x.dtype)
+		# logger.info(f"Rank {self.rank} completed all-to-all and processing")
+		return final_output.to(x.dtype)
 
-# 	@torch.no_grad()
-# 	def moe_infer_(self, x, topk_idx, topk_weight):
-# 		num_tokens, hidden_size = x.shape
-# 		K = self.num_experts_per_tok
+	@torch.no_grad()
+	def moe_infer_(self, x, topk_idx, topk_weight):
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
 
-# 		# ── 1) Flatten & sort by expert ─────────────────────────────────────────
-# 		flat_eids = topk_idx.view(-1)                 # [N*K]
-# 		flat_wts  = topk_weight.view(-1)              # [N*K]
-# 		expanded_x = x.repeat_interleave(K, dim=0)    # [N*K, H]
-# 		token_idx  = torch.arange(num_tokens,
-# 								device=x.device).repeat_interleave(K)
+		# ── 1) Flatten & sort by expert ─────────────────────────────────────────
+		flat_eids = topk_idx.view(-1)                 # [N*K]
+		flat_wts  = topk_weight.view(-1)              # [N*K]
+		expanded_x = x.repeat_interleave(K, dim=0)    # [N*K, H]
+		token_idx  = torch.arange(num_tokens,
+								device=x.device).repeat_interleave(K)
 
-# 		sorted_eids, sort_idx = flat_eids.sort()      # ascending expert-ID
-# 		sorted_x   = expanded_x[sort_idx]
-# 		sorted_tok = token_idx[sort_idx]
-# 		sorted_wt  = flat_wts[sort_idx]
+		sorted_eids, sort_idx = flat_eids.sort()      # ascending expert-ID
+		sorted_x   = expanded_x[sort_idx]
+		sorted_tok = token_idx[sort_idx]
+		sorted_wt  = flat_wts[sort_idx]
 
-# 		# ── 2) Count locally, build per-rank counts ────────────────────────────
-# 		# how many of your flattened tokens went to each of the TOTAL_EXPERTS?
-# 		local_counts_all = torch.bincount(sorted_eids,
-# 										minlength=self.total_experts)
-# 		# now sum each rank's block of experts
-# 		send_counts = torch.tensor([
-# 			int(local_counts_all[r*self.experts_per_rank:
-# 								(r+1)*self.experts_per_rank].sum().item())
-# 			for r in range(self.world_size)
-# 		], device=x.device, dtype=torch.int64)
+		# ── 2) Count locally, build per-rank counts ────────────────────────────
+		# how many of your flattened tokens went to each of the TOTAL_EXPERTS?
+		local_counts_all = torch.bincount(sorted_eids,
+										minlength=self.total_experts)
+		# now sum each rank's block of experts
+		send_counts = torch.tensor([
+			int(local_counts_all[r*self.experts_per_rank:
+								(r+1)*self.experts_per_rank].sum().item())
+			for r in range(self.world_size)
+		], device=x.device, dtype=torch.int64)
 
-# 		# exchange to find out how many YOU will receive from each peer
-# 		recv_counts = torch.empty_like(send_counts)
-# 		torch.cuda.synchronize(self.rank)
-# 		dist.all_to_all_single(recv_counts, send_counts)
+		# exchange to find out how many YOU will receive from each peer
+		recv_counts = torch.empty_like(send_counts)
+		torch.cuda.synchronize(self.rank)
+		dist.all_to_all_single(recv_counts, send_counts)
 
-# 		# ── 3) All-to-all for inputs & expert-IDs ──────────────────────────────
-# 		send_x = sorted_x.contiguous()
-# 		send_eid = sorted_eids.contiguous()
-# 		recv_total = int(recv_counts.sum().item())
+		# ── 3) All-to-all for inputs & expert-IDs ──────────────────────────────
+		send_x = sorted_x.contiguous()
+		send_eid = sorted_eids.contiguous()
+		recv_total = int(recv_counts.sum().item())
 
-# 		# Handle empty tensor cases properly
-# 		if send_x.size(0) == 0:
-# 			# Create dummy tensors for all-to-all to proceed
-# 			send_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
-# 			send_eid = torch.empty(0, device=x.device, dtype=sorted_eids.dtype)
+		# Handle empty tensor cases properly
+		if send_x.size(0) == 0:
+			# Create dummy tensors for all-to-all to proceed
+			send_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+			send_eid = torch.empty(0, device=x.device, dtype=sorted_eids.dtype)
 		
-# 		# Prepare receive buffers with proper handling for empty case
-# 		if recv_total == 0:
-# 			recv_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
-# 			recv_eid = torch.empty(0, device=x.device, dtype=send_eid.dtype)
-# 		else:
-# 			recv_x = torch.empty((recv_total, hidden_size), device=x.device, dtype=x.dtype)
-# 			recv_eid = torch.empty((recv_total,), device=x.device, dtype=send_eid.dtype)
+		# Prepare receive buffers with proper handling for empty case
+		if recv_total == 0:
+			recv_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+			recv_eid = torch.empty(0, device=x.device, dtype=send_eid.dtype)
+		else:
+			recv_x = torch.empty((recv_total, hidden_size), device=x.device, dtype=x.dtype)
+			recv_eid = torch.empty((recv_total,), device=x.device, dtype=send_eid.dtype)
 
-# 		sc, rc = send_counts.tolist(), recv_counts.tolist()
-# 		# note: we use two _single calls rather than the list‐based all_to_all
-# 		dist.all_to_all_single(recv_x, send_x, rc, sc)
-# 		dist.all_to_all_single(recv_eid, send_eid, rc, sc)
+		sc, rc = send_counts.tolist(), recv_counts.tolist()
+		# note: we use two _single calls rather than the list‐based all_to_all
+		dist.all_to_all_single(recv_x, send_x, rc, sc)
+		dist.all_to_all_single(recv_eid, send_eid, rc, sc)
 
-# 		# ── 4) Process received data if there's any ──────────────────────────────
-# 		if recv_total > 0:
-# 			# Use same approach as original: create masks for each expert
-# 			expert_indices = {}
-# 			for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-# 				expert_mask = (recv_eid == expert_idx)
-# 				if expert_mask.any():  # Only process if there are any tokens for this expert
-# 					expert_indices[expert_idx] = torch.nonzero(expert_mask, as_tuple=True)[0]
+		# ── 4) Process received data if there's any ──────────────────────────────
+		if recv_total > 0:
+			# Use same approach as original: create masks for each expert
+			expert_indices = {}
+			for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+				expert_mask = (recv_eid == expert_idx)
+				if expert_mask.any():  # Only process if there are any tokens for this expert
+					expert_indices[expert_idx] = torch.nonzero(expert_mask, as_tuple=True)[0]
 			
-# 			# Process all experts with non-empty inputs
-# 			for expert_idx, indices in expert_indices.items():
-# 				expert_input = recv_x[indices]
-# 				expert_output = self.experts[expert_idx](expert_input)
-# 				recv_x[indices] = expert_output
+			# Process all experts with non-empty inputs
+			for expert_idx, indices in expert_indices.items():
+				expert_input = recv_x[indices]
+				expert_output = self.experts[expert_idx](expert_input)
+				recv_x[indices] = expert_output
 		
-# 		# ── 5) All-to-all return & unsort/accumulate ───────────────────────────
-# 		# Handle empty tensor case for return communication
-# 		out_sorted = torch.empty_like(sorted_x)
-# 		if recv_x.size(0) == 0:
-# 			# Create a dummy tensor for all-to-all to proceed
-# 			recv_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
+		# ── 5) All-to-all return & unsort/accumulate ───────────────────────────
+		# Handle empty tensor case for return communication
+		out_sorted = torch.empty_like(sorted_x)
+		if recv_x.size(0) == 0:
+			# Create a dummy tensor for all-to-all to proceed
+			recv_x = torch.empty(0, hidden_size, device=x.device, dtype=x.dtype)
 		
-# 		dist.all_to_all_single(out_sorted, recv_x, sc, rc)
+		dist.all_to_all_single(out_sorted, recv_x, sc, rc)
 
-# 		unsort_idx = sort_idx.argsort()
-# 		final_x   = out_sorted[unsort_idx]
-# 		final_tok = sorted_tok[unsort_idx]
-# 		final_wt  = sorted_wt[unsort_idx]
+		unsort_idx = sort_idx.argsort()
+		final_x   = out_sorted[unsort_idx]
+		final_tok = sorted_tok[unsort_idx]
+		final_wt  = sorted_wt[unsort_idx]
 
-# 		# accumulate
-# 		out_acc    = torch.zeros_like(x, dtype=torch.float32)
-# 		weight_acc = torch.zeros((num_tokens, 1), device=x.device, dtype=torch.float32)
-# 		out_acc.index_add_(0, final_tok, final_x.to(torch.float32) * final_wt.unsqueeze(-1))
-# 		weight_acc.index_add_(0, final_tok, final_wt.unsqueeze(-1))
+		# accumulate
+		out_acc    = torch.zeros_like(x, dtype=torch.float32)
+		weight_acc = torch.zeros((num_tokens, 1), device=x.device, dtype=torch.float32)
+		out_acc.index_add_(0, final_tok, final_x.to(torch.float32) * final_wt.unsqueeze(-1))
+		weight_acc.index_add_(0, final_tok, final_wt.unsqueeze(-1))
 
-# 		# normalize & cast back
-# 		return (out_acc / weight_acc.clamp(min=1e-9)).to(x.dtype)
+		# normalize & cast back
+		return (out_acc / weight_acc.clamp(min=1e-9)).to(x.dtype)
 
-class DeepseekV3MoE_Decoding(nn.Module):
+class DeepseekV3MoE_Decoding_(nn.Module):
 	def __init__(self, config):
 		super().__init__()
 		self.config = config
@@ -1121,10 +1123,6 @@ class DeepseekV3MoE_Decoding(nn.Module):
 
 		# optional: a dedicated CUDA stream for collectives
 		self.comm_stream = torch.cuda.Stream()
-
-	# --------------------------------------------------------------------- #
-	#               ∙∙∙ all the rest of the class stays the same ∙∙∙        #
-	# --------------------------------------------------------------------- #
 
 	def forward(self, hidden_states):
 		# logger.info("DeepseekV3MoE_Decoding forward")
@@ -1236,8 +1234,158 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		return (out_acc / weight_acc.clamp(min=1e-9)).to(x.dtype)
 
 
+class DeepseekV3MoE_Decoding(nn.Module):
+	def __init__(self, config):
+		super().__init__()
+		self.config = config
+		self.num_experts_per_tok = config.num_experts_per_tok
 
-	
+		# --- distributed/world metadata -------------------------------------
+		if not dist.is_initialized():
+			self.rank, self.world_size = 0, 1
+		else:
+			self.rank        = dist.get_rank()
+			self.world_size  = dist.get_world_size()
+
+		self.experts_per_rank   = 256 // self.world_size
+		self.total_experts      = self.world_size * self.experts_per_rank
+		self.routed_expert_start_idx = self.rank * self.experts_per_rank
+		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
+
+		# --- experts, gate, shared MLP --------------------------------------
+		self.experts = nn.ModuleList([
+			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
+			for _ in range(self.total_experts)
+		])
+		self.gate = MoEGate(config)
+		if config.n_shared_experts:
+			self.shared_experts = DeepseekV3MLP(
+				config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+			)
+
+		# --- 🔑  pre-allocate the tiny communication buffers ---------------
+		# They are the same size every call, so we keep them as buffers
+		self.register_buffer(
+			"send_counts_buf",
+			torch.zeros(self.world_size, dtype=torch.int64)
+		)
+		self.register_buffer(
+			"recv_counts_buf",
+			torch.zeros(self.world_size, dtype=torch.int64)
+		)
+
+		# optional: a dedicated CUDA stream for collectives
+		self.comm_stream = torch.cuda.Stream()
+
+	def forward(self, hidden_states):
+		identity = hidden_states
+		orig_shape = hidden_states.shape
+		topk_idx, topk_weight = self.gate(hidden_states)
+		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+		out = self.moe_infer(hidden_states, topk_idx, topk_weight)
+		out = out.view(*orig_shape)
+		out = out + self.shared_experts(identity)
+		return out
+
+	@torch.no_grad()
+	def moe_infer(self, x, topk_idx, topk_weight):
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids   = topk_idx.flatten()
+		flat_wts    = topk_weight.flatten()
+		expanded_x  = x.repeat_interleave(K, dim=0)
+		token_idx   = torch.arange(num_tokens, device=device).repeat_interleave(K)
+
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x   = expanded_x[sort_idx]
+		sorted_tok = token_idx[sort_idx]
+		sorted_wt  = flat_wts[sort_idx]
+
+		# ---- 2) fill the pre-allocated send_counts tensor ------------------
+		local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
+		sc = self.send_counts_buf               # alias for readability
+		rc = self.recv_counts_buf
+
+		for r in range(self.world_size):
+			start = r * self.experts_per_rank
+			sc[r] = int(local_counts[start:start + self.experts_per_rank].sum())
+
+		# local_counts_for_gather = sc.clone()
+		gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
+		# ---- 3) first all-to-all (counts) on its own stream ---------------
+		# torch.cuda.synchronize(self.rank)  # make sure all ranks are ready
+		# with torch.cuda.stream(self.comm_stream):
+		# 	# dist.group_start()
+		# 	# work_cnts = dist.all_to_all_single(rc, sc, async_op=True)
+		# 	work_cnts = dist.all_gather(gathered_counts, sc, async_op=True)
+		# 	# dist.group_end()
+		dist.all_gather(gathered_counts, sc)
+		# at this point both sc & rc live on the comm_stream, so:
+		# work_cnts.wait()   # light-weight; returns when kernel is enqueued
+		# logger.info(f"Rank {self.rank} finished all-to-all for counts")
+		for r in range(self.world_size):
+			rc[r] = gathered_counts[r][self.rank]
+		recv_total = int(rc.sum().item())
+
+		# ---- 4) allocate data buffers (variable size) ----------------------
+		send_x   = sorted_x
+		send_eid = sorted_eids
+		recv_x   = torch.empty(recv_total, hidden_size, device=device, dtype=x.dtype)
+		recv_eid = torch.empty(recv_total, device=device, dtype=sorted_eids.dtype)
+
+		# convert counts to python lists once – NCCL needs that
+		sc_list, rc_list = sc.tolist(), rc.tolist()
+
+		# ---- 5) main all-to-alls, still on comm_stream --------------------
+		with torch.cuda.stream(self.comm_stream):
+			work_in  = dist.all_to_all_single(recv_x,  send_x,
+											  rc_list, sc_list,
+											  async_op=True)
+			work_eid = dist.all_to_all_single(recv_eid, send_eid,
+											  rc_list, sc_list,
+											  async_op=True)
+
+		# ---- 6) keep computing experts on the *default* stream ------------
+		# while comm_stream is moving data in the background
+		torch.cuda.current_stream().wait_stream(self.comm_stream)  # sync before read
+		work_in.wait(); work_eid.wait()                            # make sure data arrived
+
+		if recv_total:
+			idx_map = {}
+			for e in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+				mask = (recv_eid == e)
+				if mask.any():
+					idx_map[e] = torch.nonzero(mask, as_tuple=True)[0]
+					
+			for e, ids in idx_map.items():
+				recv_x[ids] = self.experts[e](recv_x[ids])
+
+		# ---- 7) all-to-all (return) ---------------------------------------
+		out_sorted = torch.empty_like(sorted_x)
+		# with torch.cuda.stream(self.comm_stream):
+		# 	work_ret = dist.all_to_all_single(out_sorted, recv_x,
+		# 									  sc_list, rc_list,
+		# 									  async_op=True)
+		# torch.cuda.current_stream().wait_stream(self.comm_stream)
+		# work_ret.wait()
+		dist.all_to_all_single(out_sorted, recv_x, sc_list, rc_list)
+
+		# ---- 8) unsort, accumulate, normalise -----------------------------
+		unsort_idx = sort_idx.argsort()
+		final_x   = out_sorted[unsort_idx]
+		final_tok = sorted_tok[unsort_idx]
+		final_wt  = sorted_wt[unsort_idx]
+
+		out_acc    = torch.zeros_like(x, dtype=torch.float32)
+		weight_acc = torch.zeros((num_tokens, 1), device=device, dtype=torch.float32)
+		out_acc.index_add_(0, final_tok, final_x.float() * final_wt.unsqueeze(-1))
+		weight_acc.index_add_(0, final_tok, final_wt.unsqueeze(-1))
+
+		return (out_acc / weight_acc.clamp(min=1e-9)).to(x.dtype)
+
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

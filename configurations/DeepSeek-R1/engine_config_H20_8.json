@@ -25,10 +25,10 @@
 		},
 		"num_decoding_module_buffer": {
 		  "attn": 1,
-		  "routed_expert": 6,
+		  "routed_expert": 8,
 		  "shared_expert": 1
 		},
-		"num_k_buffer": 1,
+		"num_k_buffer": 6,
 		"num_v_buffer": 0,
 		"kv_buffer_num_tokens": null
 	},

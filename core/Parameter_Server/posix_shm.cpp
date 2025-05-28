@@ -52,37 +52,69 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         }
     }
 
-    void* ptr = mmap(nullptr, size,
-                     PROT_READ | PROT_WRITE,
-                     MAP_SHARED,
-                     fd, 0);
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (ptr == MAP_FAILED) {
         throw std::runtime_error("mmap failed for " + shm_name);
     }
 
-// #if defined(__linux__)
-    if(create){
-        // Log the number of NUMA nodes
-        int num_nodes = numa_num_configured_nodes();
-        std::cout << "Number of NUMA nodes: " << num_nodes << std::endl;
-        // If NUMA is available, interleave pages between node 0 and node 1
+    if (create) {
         if (numa_available() >= 0) {
-            std::cout << "Interleaving memory across NUMA nodes." << std::endl;
-            unsigned long nodemask = (1UL << 0) | (1UL << 1);
-            int ret = mbind(ptr, size,
-                            MPOL_INTERLEAVE,
-                            &nodemask,
-                            /* maxnode = */ 8 * sizeof(nodemask),
-                            /* flags = */ 0);
-            if (ret != 0) {
-                // non-fatal: we'll still fall back to default if interleave fails
-                perror("mbind(MPOL_INTERLEAVE)");
+            int num_nodes = numa_num_configured_nodes();
+            std::cout << "NUMA available with " << num_nodes << " nodes." << std::endl;
+            
+            if (num_nodes >= 2) {
+                std::cout << "Interleaving memory across NUMA nodes 0 and 1." << std::endl;
+
+                // Create proper nodemask using numa library functions
+                struct bitmask* nodemask = numa_allocate_nodemask();
+                if (!nodemask) {
+                    std::cerr << "Failed to allocate nodemask" << std::endl;
+                } else {
+                    // Clear all bits first
+                    numa_bitmask_clearall(nodemask);
+                    // Set bits for nodes 0 and 1
+                    numa_bitmask_setbit(nodemask, 0);
+                    numa_bitmask_setbit(nodemask, 1);
+
+                    // Use set_mempolicy for the current process/thread
+                    int ret = set_mempolicy(MPOL_INTERLEAVE, 
+                                          nodemask->maskp, 
+                                          nodemask->size + 1);
+                    if (ret != 0) {
+                        perror("set_mempolicy(MPOL_INTERLEAVE)");
+                    }
+
+                    // Alternative: use mbind with correct parameters
+                    // int ret = mbind(ptr, size, MPOL_INTERLEAVE, 
+                    //                nodemask->maskp, nodemask->size + 1, 0);
+                    // if (ret != 0) {
+                    //     perror("mbind(MPOL_INTERLEAVE)");
+                    // }
+
+                    numa_free_nodemask(nodemask);
+                }
+            } else {
+                std::cout << "Only " << num_nodes << " NUMA node(s) available, skipping interleaving." << std::endl;
             }
+
+            // Touch pages to enforce actual allocation
+            // Use proper page size and ensure we don't go out of bounds
+            long page_size = sysconf(_SC_PAGESIZE);
+            volatile char* p = reinterpret_cast<volatile char*>(ptr);
+            for (int64_t i = 0; i < size; i += page_size) {
+                p[i] = 0;
+            }
+            
+            // Touch the last page if size is not page-aligned
+            if (size > 0) {
+                p[size - 1] = 0;
+            }
+        } else {
+            std::cout << "NUMA not available on this system." << std::endl;
         }
     }
-// #endif
-    
+
     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
     if (err != cudaSuccess) {
         munmap(ptr, size);
@@ -93,6 +125,148 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
     return ptr;
 }
+
+// Helper function to verify NUMA allocation
+void verify_numa_allocation(void* ptr, size_t size) {
+    if (numa_available() < 0) {
+        std::cout << "NUMA not available for verification" << std::endl;
+        return;
+    }
+
+    // Check a few sample pages
+    long page_size = sysconf(_SC_PAGESIZE);
+    int num_samples = std::min(10L, (long)(size / page_size));
+    
+    std::cout << "Verifying NUMA allocation for " << num_samples << " sample pages:" << std::endl;
+    
+    for (int i = 0; i < num_samples; i++) {
+        void* page_addr = (char*)ptr + (i * size / num_samples);
+        int node = -1;
+        
+        if (get_mempolicy(&node, nullptr, 0, page_addr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+            std::cout << "Page at offset " << (i * size / num_samples) 
+                      << " is on NUMA node " << node << std::endl;
+        } else {
+            perror("get_mempolicy failed");
+        }
+    }
+}
+
+// void* allocate_shared_pinned_memory(const std::string& shm_name,
+//                                     int64_t size,
+//                                     bool create) {
+//     int flags = O_RDWR | (create ? O_CREAT : 0);
+//     int fd = shm_open(shm_name.c_str(), flags, 0666);
+//     if (fd < 0) {
+//         throw std::runtime_error("shm_open failed for " + shm_name);
+//     }
+
+//     if (create) {
+//         if (ftruncate64(fd, size) == -1) {
+//             close(fd);
+//             throw std::runtime_error("ftruncate failed for " + shm_name);
+//         }
+//     }
+
+//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+//     close(fd);
+//     if (ptr == MAP_FAILED) {
+//         throw std::runtime_error("mmap failed for " + shm_name);
+//     }
+
+//     if (create) {
+//         if (numa_available() >= 0) {
+//             std::cout << "Interleaving memory across NUMA nodes." << std::endl;
+
+//             // Allocate nodemask and get maxnode
+//             unsigned long nodemask = (1UL << 0) | (1UL << 1);
+//             long maxnode = numa_num_configured_nodes();  // Correct maxnode
+
+//             int ret = mbind(ptr, size,
+//                             MPOL_INTERLEAVE,
+//                             &nodemask,
+//                             maxnode,  // Should be 2, not 64
+//                             0);
+//             if (ret != 0) {
+//                 perror("mbind(MPOL_INTERLEAVE)");
+//             }
+
+//             // Touch pages to enforce actual allocation
+//             volatile char* p = reinterpret_cast<volatile char*>(ptr);
+//             for (int64_t i = 0; i < size; i += 4096) {
+//                 p[i] = 0;
+//             }
+//         }
+//     }
+
+//     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+//     if (err != cudaSuccess) {
+//         munmap(ptr, size);
+//         throw std::runtime_error(
+//             std::string("cudaHostRegister failed: ") +
+//             cudaGetErrorString(err));
+//     }
+
+//     return ptr;
+// }
+
+// void* allocate_shared_pinned_memory(const std::string& shm_name,
+//                                     int64_t size,
+//                                     bool create) {
+//     int flags = O_RDWR | (create ? O_CREAT : 0);
+//     int fd = shm_open(shm_name.c_str(), flags, 0666);
+//     if (fd < 0) {
+//         throw std::runtime_error("shm_open failed for " + shm_name);
+//     }
+
+//     if (create) {
+//         if (ftruncate64(fd, size) == -1) {
+//             close(fd);
+//             throw std::runtime_error("ftruncate failed for " + shm_name);
+//         }
+//     }
+
+//     void* ptr = mmap(nullptr, size,
+//                      PROT_READ | PROT_WRITE,
+//                      MAP_SHARED,
+//                      fd, 0);
+//     close(fd);
+//     if (ptr == MAP_FAILED) {
+//         throw std::runtime_error("mmap failed for " + shm_name);
+//     }
+
+// // #if defined(__linux__)
+//     if(create){
+//         // Log the number of NUMA nodes
+//         int num_nodes = numa_num_configured_nodes();
+//         std::cout << "Number of NUMA nodes: " << num_nodes << std::endl;
+//         // If NUMA is available, interleave pages between node 0 and node 1
+//         if (numa_available() >= 0) {
+//             std::cout << "Interleaving memory across NUMA nodes." << std::endl;
+//             unsigned long nodemask = (1UL << 0) | (1UL << 1);
+//             int ret = mbind(ptr, size,
+//                             MPOL_INTERLEAVE,
+//                             &nodemask,
+//                             /* maxnode = */ 8 * sizeof(nodemask),
+//                             /* flags = */ 0);
+//             if (ret != 0) {
+//                 // non-fatal: we'll still fall back to default if interleave fails
+//                 perror("mbind(MPOL_INTERLEAVE)");
+//             }
+//         }
+//     }
+// // #endif
+    
+//     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+//     if (err != cudaSuccess) {
+//         munmap(ptr, size);
+//         throw std::runtime_error(
+//             std::string("cudaHostRegister failed: ") +
+//             cudaGetErrorString(err));
+//     }
+
+//     return ptr;
+// }
 
 // void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
 //                                     bool create) {
