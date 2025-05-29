@@ -143,6 +143,25 @@ class BasicConfig:
             "float8_e5m2": torch.float8_e5m2,
         }
         return dtype_map.get(dtype_str, None)
+    
+    def __str__(self):
+        return (
+            f"BasicConfig:\n"
+            f"  log_level: {self.log_level}\n"
+            f"  weight_dtype: {self.weight_dtype}\n"
+            f"  kv_dtype: {self.kv_dtype}\n"
+            f"  activation_dtype: {self.activation_dtype}\n"
+            f"  device: {self.device}\n"
+            f"  attn_mode: {self.attn_mode}\n"
+            f"  module_types: {self.module_types}\n"
+            f"  num_threads: {self.num_threads}\n"
+            f"  padding_length: {self.padding_length}\n"
+            f"  max_decoding_length: {self.max_decoding_length}\n"
+            f"  num_queries: {self.num_queries}\n"
+            f"  rank: {self.rank}\n"
+            f"  world_size: {self.world_size}\n"
+            f"  gpu_arch: {self.gpu_arch}"
+        )
 
 
 # Module batching configuration section
@@ -155,6 +174,18 @@ class ModuleBatchingConfig:
     attn_decoding_micro_batch_size: Optional[int] = 0
     MoE_decoding_micro_batch_size: Optional[int] = 0
     expert_decoding_batch_size_upper_bound: Optional[int] = 0
+    
+    def __str__(self):
+        return (
+            f"ModuleBatchingConfig:\n"
+            f"  global_batch_size: {self.global_batch_size}\n"
+            f"  attn_prefill_micro_batch_size: {self.attn_prefill_micro_batch_size}\n"
+            f"  MoE_prefill_micro_batch_size: {self.MoE_prefill_micro_batch_size}\n"
+            f"  expert_prefill_batch_size_upper_bound: {self.expert_prefill_batch_size_upper_bound}\n"
+            f"  attn_decoding_micro_batch_size: {self.attn_decoding_micro_batch_size}\n"
+            f"  MoE_decoding_micro_batch_size: {self.MoE_decoding_micro_batch_size}\n"
+            f"  expert_decoding_batch_size_upper_bound: {self.expert_decoding_batch_size_upper_bound}"
+        )
 
 
 # GPU buffer configuration section
@@ -166,6 +197,17 @@ class GPUBufferConfig:
     num_v_buffer: int = 0
     kv_buffer_num_tokens: int = 0
     module_shapes: Dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self):
+        return (
+            f"GPUBufferConfig:\n"
+            f"  num_prefill_module_buffer: {self.num_prefill_module_buffer}\n"
+            f"  num_decoding_module_buffer: {self.num_decoding_module_buffer}\n"
+            f"  num_k_buffer: {self.num_k_buffer}\n"
+            f"  num_v_buffer: {self.num_v_buffer}\n"
+            f"  kv_buffer_num_tokens: {self.kv_buffer_num_tokens}\n"
+            f"  module_shapes: {self.module_shapes}"
+        )
 
 
 # KV storage configuration section
@@ -182,6 +224,13 @@ class KVStorageConfig:
 class EPConfig:
     enable: bool = False
     num_local_expert_per_layer: int = 0
+
+    def __str__(self):
+        return (
+            f"EPConfig:\n"
+            f"  enable: {self.enable}\n"
+            f"  num_local_expert_per_layer: {self.num_local_expert_per_layer}"
+        )
 
 
 # Main engine configuration class
@@ -262,15 +311,15 @@ class EngineConfig:
         
 #         return result
 
-#     def __str__(self) -> str:
-#         sections = [
-#             f"Module_Batching_Config:\n{self.Module_Batching_Config}",
-#             f"Basic_Config:\n{self.Basic_Config}",
-#             f"GPU_Buffer_Config:\n{self.GPU_Buffer_Config}",
-#             f"KV_Storage_Config:\n{self.KV_Storage_Config}",
-#             f"EP_Config:\n{self.EP_Config}"
-#         ]
-#         return "EngineConfig:\n  " + "\n  ".join(sections)
+    def __str__(self) -> str:
+        sections = [
+            f"Module_Batching_Config:\n{self.Module_Batching_Config}",
+            f"Basic_Config:\n{self.Basic_Config}",
+            f"GPU_Buffer_Config:\n{self.GPU_Buffer_Config}",
+            # f"KV_Storage_Config:\n{self.KV_Storage_Config}",
+            f"EP_Config:\n{self.EP_Config}"
+        ]
+        return "EngineConfig:\n  " + "\n  ".join(sections)
 
 
 class ModelConfig:

@@ -368,11 +368,29 @@ class Parallel_Strategy_Manager:
 					param.data = self.skeleton_state_dict[key]
 
 		model_skeletion_byte_size = (
-			sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-			* 2
+			sum(p.numel() * p.element_size() for p in self.model.parameters())
 			/ (1024**3)
 		)
 		logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
+
+		# Rank 0 print out all the tensors in the model with tensor size in MB
+		# if dist.get_rank() == 0:
+		# 	logging.info("Model skeleton tensors:")
+		# 	for name, param in self.model.named_parameters():
+		# 		tensor_size_mb = (
+		# 			param.numel() * param.element_size() / (1024**2)
+		# 		)
+		# 		logging.info(
+		# 			f"{name}: {tensor_size_mb:.2f} MB, dtype: {param.dtype}"
+		# 		)
+		# 	for name, buffer in self.model.named_buffers():
+		# 		tensor_size_mb = (
+		# 			buffer.numel() * buffer.element_size() / (1024**2)
+		# 		)
+		# 		logging.info(
+		# 			f"{name}: {tensor_size_mb:.2f} MB, dtype: {buffer.dtype}"
+		# 		)
+		# dist.barrier()
 
 	def _config_expert_module_(self):
 		"""

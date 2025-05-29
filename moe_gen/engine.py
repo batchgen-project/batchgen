@@ -42,6 +42,7 @@ from .scheduler.host_mem import get_physical_memory_info
 from moe_gen.parameter_server_client import ParameterServerClient
 from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from tqdm import trange
+import gc
 
 logging.basicConfig(
     level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -50,6 +51,7 @@ logging.basicConfig(
 )
 
 from .config.engine_config_parser import parse_config_from_json
+from .scheduler.scheduler import Scheduler
 # nvtx = False
 # if nvtx:
 # 	nvidia_dlprof_pytorch_nvtx.init()
@@ -414,11 +416,14 @@ class MoE_Gen:
         self.num_queries = len(queries)
         self.max_input_length = max_input_length
         self.max_decoding_length = max_decoding_length
-        self.engine_config = parse_config_from_json(engine_config_json_dir)
         self.skeleton_state_dict = skeleton_state_dict
         self.rank = rank
         self.world_size = world_size
 
+
+        config_scheduler = Scheduler(max_input_length, max_decoding_length)
+        self.engine_config = config_scheduler.generate_config()
+        # self.engine_config = parse_config_from_json(engine_config_json_dir)
         self.engine_config.Basic_Config.device = device
         self.engine_config.Basic_Config.device_torch = torch.device(
             f"cuda:{device}"
@@ -430,6 +435,9 @@ class MoE_Gen:
         self.engine_config.Basic_Config.num_queries = self.num_queries
         self.engine_config.Basic_Config.rank = rank
         self.engine_config.Basic_Config.world_size = world_size
+
+        if(self.rank == 0):
+            print(self.engine_config)
         
         
         
@@ -799,8 +807,40 @@ class MoE_Gen:
                 # time.sleep(2)
                 
                 dist.barrier()
+
+                torch.cuda.empty_cache()
+                # Log allocated memory after prefill
+                if self.rank == 0:
+                    allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+                    logging.info(
+                        f"Rank: {self.rank} Prefill complete. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
+                    )
+                    tensor_mem = []
+                    torch_total_mem = 0
+                    for name, param in self.model.named_parameters():   
+                        tensor_mem.append(
+                            f"{name}: {param.numel() * param.element_size() / 1024 / 1024:.2f} MB"
+                        )
+                        torch_total_mem += (
+                            param.numel() * param.element_size() / 1024 / 1024
+                        )
+                    # tensor_mem = tensor_mem.sort(
+                    #     key=lambda x: float(x.split(": ")[1].split(" ")[0]),
+                    #     reverse=True,
+                    # )
+                    logging.info(f"Torch total memory: {torch_total_mem:.2f} MB")
+                    # for mem in tensor_mem:
+                    #     logging.info(mem)
+
+                    
                 self._config_decoding()
-                # nvtx.init()
+                
+                if self.rank == 0:
+                    allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+                    logging.info(
+                        f"Rank: {self.rank} Decoding configuration done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
+                    )
+                    
                 decoding_start_time = time.perf_counter()
                 with torch.no_grad():
                     logging.info(
@@ -938,8 +978,13 @@ class MoE_Gen:
         for param in self.model.parameters():
             param.data = torch.zeros(
                 1, dtype=torch.bfloat16, device=param.device)
+        # del self.model
         self.model = None
+        gc.collect()  
         torch.cuda.empty_cache()
+
+        # Log device memory usage before configure decoding
+        logging.info(f"{self.rank} Device memory usage before configure decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
         self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
         self.set_phase("decoding")
@@ -950,7 +995,7 @@ class MoE_Gen:
         self.core_engine.reset_decoding_buffer()
         self.core_engine.set_weight_copy_queue(self.weight_copy_task)
         self.core_engine.start_h2d_worker()
-        logging.info(f"End Config Decoding")
+        logging.info(f"{self.rank} End Config Decoding")
 
     def prefill(self, batch: list[int]):
         """

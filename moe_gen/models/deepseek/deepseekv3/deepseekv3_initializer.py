@@ -36,6 +36,7 @@ import torch.distributed as dist
 # from moe_gen.config import EngineConfig, ModelConfig
 from ....config.config import EngineConfig, ModelConfig
 from .configuration_deepseek_v3 import DeepseekV3Config
+from datetime import timedelta
 
 # from transformers.models.qwen2_moe.modeling_qwen2_moe import repeat_kv
 
@@ -666,11 +667,29 @@ class DeepSeekV3_Initializer:
                     param.data = self.skeleton_state_dict[key]
 
         model_skeletion_byte_size = (
-            sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            * 2
+            sum(p.numel() * p.element_size() for p in self.model.parameters())
             / (1024**3)
         )
         logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
+
+        # Rank 0 print out all the tensors in the model with tensor size in MB
+        # if dist.get_rank() == 0:
+        #     logging.info("Model skeleton tensors:")
+        #     for name, param in self.model.named_parameters():
+        #         tensor_size_mb = (
+        #             param.numel() * param.element_size() / (1024**2)
+        #         )
+        #         logging.info(
+        #             f"{name}: {tensor_size_mb:.2f} MB, dtype: {param.dtype}"
+        #         )
+        #     for name, buffer in self.model.named_buffers():
+        #         tensor_size_mb = (
+        #             buffer.numel() * buffer.element_size() / (1024**2)
+        #         )
+        #         logging.info(
+        #             f"{name}: {tensor_size_mb:.2f} MB, dtype: {buffer.dtype}"
+        #         )
+        # dist.barrier()
 
     def Init(self):
         try:
@@ -1375,13 +1394,18 @@ class DeepSeekV3_Initializer:
         dist.barrier()
 
     def _init_torch_dist_nccl(self):
-        dist.init_process_group(
-            backend="NCCL",
-            init_method="tcp://localhost:12345",
-            world_size=self.world_size,
-            rank = self.rank,
-            device_id=torch.device(f"cuda:{self.rank}")
-        )
+        timeout = timedelta(minutes=10)
+        try:
+            dist.init_process_group(
+                backend="NCCL",
+                init_method="tcp://localhost:12233",
+                world_size=self.world_size,
+                rank = self.rank,
+                device_id=torch.device(f"cuda:{self.rank}"),
+                timeout=timeout,
+            )
+        except RuntimeError as e:
+            raise
         torch.cuda.set_device(self.rank)
 
 

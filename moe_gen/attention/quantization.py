@@ -122,8 +122,8 @@ def dequant_per_token_return_with_max_seqlen_pad(
         The rest of the tensor is padded with zeros.
     """
     assert q.is_cuda and scale.is_cuda
-    assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
-    assert max_seqlen_pad >= q.size(1), "max_seqlen_pad must be >= seq_len"
+    assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32, f"Expected q to be float8_e4m3fn and scale to be float32, got {q.dtype} and {scale.dtype}"
+    assert max_seqlen_pad >= q.size(1), f"max_seqlen_pad must be >= seq_len, got {max_seqlen_pad} < {q.size(1)}"
 
     bsz, seq_len, dim = q.shape
     M = bsz * seq_len

@@ -1,4 +1,5 @@
 from ..config.config import EngineConfig
+import logging
 class Scheduler:
 	def __version__(self):
 		""" 
@@ -6,7 +7,7 @@ class Scheduler:
 		"""
 		return "0.1.0"
 	
-	def __init__(self, Max_Prompt_Length, Max_Response_Length, ):
+	def __init__(self, Max_Prompt_Length, Max_Response_Length):
 		self.config = EngineConfig()
 		self.Max_Prompt_Length = Max_Prompt_Length
 		self.Max_Response_Length = Max_Response_Length
@@ -17,21 +18,24 @@ class Scheduler:
 		"""
 			Configure the rest.
 		"""
-		DEFAULT_MEM_FRAC = 0.9
+		DEFAULT_MEM_FRAC = 0.80
 		# MAGIC_NUM = self.compute_profiler.profile(attn_decoding_module)
-		MAGIC_NUM =  224000
+		MAGIC_NUM = 224000
 		
 		attn_decoding_micro_batch_size = MAGIC_NUM // self.Max_Prompt_Length
+		# Down round attn_decoding_micro_batch_size to nearest expon of 2
+		attn_decoding_micro_batch_size = 2 ** (attn_decoding_micro_batch_size.bit_length() - 1)
 		est_kv_cp_t_per_micro_batch = attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) / 52 * 1000 # in ms
 		# num_k_buffer = self.compute_profiler.profile(MoE_module) // est_kv_cp_t_per_micro_batch + 2
-		num_k_buffer = 8
+		num_k_buffer = 6
 		k_buffer_size = num_k_buffer * attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) # in GB
 
 
 		available_gpu_mem = 96 * DEFAULT_MEM_FRAC  # Assuming 96GB GPU memory
-		non_static_memory_usage = 6 + max(self.mem_profiler.profile(attn_decoding_module), self.mem_profiler.profile(MoE_module)) + k_buffer_size 
+		# non_static_memory_usage = 6 + max(self.mem_profiler.profile(attn_decoding_module), self.mem_profiler.profile(MoE_module)) + k_buffer_size 
+		non_static_memory_usage = 16 + k_buffer_size
 		available_memory_for_expert_cache = available_gpu_mem - non_static_memory_usage
-		num_local_expert_per_layer = int(available_memory_for_expert_cache // 2.4) # Each expert cache is around 2.4GB
+		num_local_expert_per_layer = min(32, int(available_memory_for_expert_cache // 2.4)) # Each expert cache is around 2.4GB
 		num_decoding_module_buffer_routed_expert = 32 - num_local_expert_per_layer + 2
 
 		# Update the config with the computed values
@@ -40,48 +44,60 @@ class Scheduler:
 		self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = num_decoding_module_buffer_routed_expert
 		self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
 
+		if self.Max_Prompt_Length > 14000:
+			# For longer context, shink prefill attention micro batch size and MoE prefill micro batch size accordingly
+			factor = self.Max_Prompt_Length / 14000
+			logging.info(f"Reducing prefill micro batch sizes by a factor of {factor} due to long response length.")
+			self.config.Module_Batching_Config.attn_prefill_micro_batch_size = int(self.config.Module_Batching_Config.attn_prefill_micro_batch_size / factor)
+			self.config.Module_Batching_Config.MoE_prefill_micro_batch_size = int(self.config.Module_Batching_Config.MoE_prefill_micro_batch_size / factor)
+		
+		else:
+			# For shorter context, increse prefill attention micro batch size and MoE prefill micro batch size accordingly
+			factor = self.Max_Prompt_Length / 14000
+			logging.info(f"Increasing prefill micro batch sizes by a factor of {factor} due to short response length.")
+			self.config.Module_Batching_Config.attn_prefill_micro_batch_size = min(32, int(self.config.Module_Batching_Config.attn_prefill_micro_batch_size / factor))
+			self.config.Module_Batching_Config.MoE_prefill_micro_batch_size = min(32, int(self.config.Module_Batching_Config.MoE_prefill_micro_batch_size / factor))
+
+		return self.config
+
 
 	def _set_default_configs(self):
 		""" Default Basic Config """
-		self.config.Basic_Config = {
-			"log_level": "info",
-			"weight_dtype": "float8_e4m3fn",
-			"kv_dtype": "float8_e4m3fn",
-			"activation_dtype": "bfloat16",
-			"module_types": ["attn", "routed_expert", "shared_expert"],
-			"gpu_arch": "hooper"
-		}
-
+		self.config.Basic_Config.log_level = "info"
+		self.config.Basic_Config.weight_dtype = "float8_e4m3fn"
+		self.config.Basic_Config.kv_dtype = "float8_e4m3fn"
+		self.config.Basic_Config.activation_dtype = "bfloat16"
+		self.config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
+		self.config.Basic_Config.gpu_arch = "hooper"
+		
+		
 		""" Default Module Batching Config """
-		self.config.Module_Batching_Config = {
-			"attn_prefill_micro_batch_size": 8,
-			"MoE_prefill_micro_batch_size": 8,
-			"expert_prefill_batch_size_upper_bound": 2048,
-			"attn_decoding_micro_batch_size": None,
-			"MoE_decoding_micro_batch_size": None,
-			"expert_decoding_batch_size_upper_bound": 2048
-		}
+		self.config.Module_Batching_Config.attn_prefill_micro_batch_size = 8
+		self.config.Module_Batching_Config.MoE_prefill_micro_batch_size = 8	
+		self.config.Module_Batching_Config.expert_prefill_batch_size_upper_bound = 2048
+
+		self.config.Module_Batching_Config.attn_decoding_micro_batch_size = None
+		self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = None
+		self.config.Module_Batching_Config.expert_decoding_batch_size_upper_bound = 2048
+				
 
 		""" Default GPU Buffer Config """
-		self.config.GPU_Buffer_Config = {
-			"num_prefill_module_buffer": {
-				"attn": 1,
-				"routed_expert": 8,
-				"shared_expert": 1
-			},
-			"num_decoding_module_buffer": {
-				"attn": 1,
-				"routed_expert": None,
-				"shared_expert": 1
-			},
-			"num_k_buffer": None,
-			"num_v_buffer": 0,
-			"kv_buffer_num_tokens": None
+		self.config.GPU_Buffer_Config.num_prefill_module_buffer = {
+			"attn": 1,
+			"routed_expert": 8,
+			"shared_expert": 1
 		}
+		self.config.GPU_Buffer_Config.num_decoding_module_buffer = {
+			"attn": 1,
+			"routed_expert": None,  # This will be set later based on available memory
+			"shared_expert": 1
+		}
+		self.config.GPU_Buffer_Config.num_k_buffer = None  # This will be set later based on available memory
+		self.config.GPU_Buffer_Config.num_v_buffer = 0  # No value buffer for now
+		self.config.GPU_Buffer_Config.kv_buffer_num_tokens = None  # This will be set later based on available memory
+		
 
 		""" Default EP Config """
-		self.config.EP_Config = {
-			"enable": True,
-			"num_local_expert_per_layer": None
-		}
+		self.config.EP_Config.enable = True
+		self.config.EP_Config.num_local_expert_per_layer = None
 

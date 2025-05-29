@@ -235,6 +235,7 @@ class ParameterServer:
 
 	def start(self):
 		"""Start the parameter server"""
+		start_time = time.time()
 		# Preload model if specified - BEFORE starting the server socket
 		if self.initial_model_name:
 			logging.info(f"Preloading model: {self.initial_model_name}")
@@ -269,6 +270,8 @@ class ParameterServer:
 		
 		self.running = True
 		logging.info(f"Parameter server is now listening on {self.host}:{self.port}")
+		end_time = time.time()
+		logging.info(f"Server started in {end_time - start_time:.2f} seconds")
 		
 		try:
 			while self.running:
