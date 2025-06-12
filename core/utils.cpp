@@ -166,13 +166,13 @@ EngineConfig parse_engine_config(const py::object& engine_config) {
     // std::cerr << "Parsing EngineConfig" << std::endl;
     EngineConfig config;
     config.basic_config = parse_basic_config(engine_config);
-    std::cerr << "Basic Config Done" << std::endl;
+    // std::cerr << "Basic Config Done" << std::endl;
     config.kv_storage_config = parse_kv_storage_config(engine_config);
-    std::cerr << "KV Storage Config Done" << std::endl;
+    // std::cerr << "KV Storage Config Done" << std::endl;
     config.gpu_buffer_config = parse_gpu_buffer_config(engine_config);
-    std::cerr << "GPU Buffer Config Done" << std::endl;
+    // std::cerr << "GPU Buffer Config Done" << std::endl;
     config.module_batching_config = parse_module_batching_config(engine_config);
-    std::cerr << "Module Batching Config Done" << std::endl;
+    // std::cerr << "Module Batching Config Done" << std::endl;
     return config;
 };
 

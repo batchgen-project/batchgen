@@ -59,8 +59,9 @@ def mla_decoding_flashmla(
 	offload_kv = torch.cat([kv, k_pe], dim=-1)
 
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
-	compressed_kv[batch_indices, q_position_id[:, 0], :self.kv_lora_rank] = kv[:, 0, :]
-	compressed_kv[batch_indices, q_position_id[:, 0], self.kv_lora_rank:] = k_pe[:, 0, :]
+	# compressed_kv[batch_indices, q_position_id[:, 0], :self.kv_lora_rank] = kv[:, 0, :]
+	# compressed_kv[batch_indices, q_position_id[:, 0], self.kv_lora_rank:] = k_pe[:, 0, :]
+	compressed_kv[batch_indices, q_position_id[:, 0], :] = offload_kv[:, 0, :]
 	compressed_kv = compressed_kv.view(bsz, max_seqlen_pad, 1, 576)
 	
 	kv_b_proj = self.kv_b_proj.weight.view(
@@ -103,9 +104,12 @@ def mla_decoding_flashmla(
 	# else:
 	# 	compressed_kv = compressed_kv[:, :max_seqlen_pad, :, :]
 
+	# block_table = torch.arange(
+	# 	bsz * max_seqlen_pad // block_size, dtype=torch.int32
+	# ).view(bsz, max_seqlen_pad // block_size).to(compressed_kv.device)
 	block_table = torch.arange(
-		bsz * max_seqlen_pad // block_size, dtype=torch.int32
-	).view(bsz, max_seqlen_pad // block_size).to(compressed_kv.device)
+		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv.device
+	).view(bsz, max_seqlen_pad // block_size)
 
 	blocked_k = compressed_kv.view(
 		bsz * max_seqlen_pad // block_size, block_size, 1, compressed_kv.size(-1)

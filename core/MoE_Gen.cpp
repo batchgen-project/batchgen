@@ -74,11 +74,41 @@ MoE_Gen::MoE_Gen(py::object engine_config, py::object model_config)
 
 MoE_Gen::~MoE_Gen() { this->Terminate(); }
 
+// void MoE_Gen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
+//                     int64_t byte_size,
+//                     std::unordered_map<std::string, std::vector<std::string>>&
+//                        weights_copy_tasks
+//     ) 
+// {
+//     this->logger->info("MoE-Gen Init.");
+//     this->logger->info("model type: {}", this->model_config_.model_type);
+
+
+//     this->shm_name_ = shm_name;
+//     this->tensor_meta_shm_name_ = tensor_meta_shm_name;
+//     auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
+
+//     this->logger->info("weights_map deserialized.");
+//     this->logger->info("shm_name: {}", shm_name);
+//     this->logger->info("byte_size: {}", byte_size);
+//     this->weights_storage_.Init(shm_name, byte_size, weights_map);
+//     this->logger->info("weights_storage initialized.");
+//     // this->weights_storage_.Init(this->parameter_server_.attr("byte_size").cast<int64_t>(),
+//     // this->parameter_server_.attr("module_weights_shm").cast<std::unordered_map<std::string,
+//     // std::unordered_map<std::string, tensor_meta>>());
+//     this->gpu_kv_buffer_.Init();
+//     this->gpu_weight_buffer_.Init();
+//     this->kv_storage_.Init();
+//     this->h2d_engine_.Init(weights_copy_tasks);
+//     this->d2h_engine_.Init();
+
+//     // this->hetero_attn_.Init();
+//     this->register_signal_handler();
+//     this->logger->info("MoE-Gen Initialized.");
+// };
+
 void MoE_Gen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-                    int64_t byte_size,
-                    std::unordered_map<std::string, std::vector<std::string>>&
-                       weights_copy_tasks
-    ) 
+                    int64_t byte_size) 
 {
     this->logger->info("MoE-Gen Init.");
     this->logger->info("model type: {}", this->model_config_.model_type);
@@ -99,7 +129,7 @@ void MoE_Gen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
     this->gpu_kv_buffer_.Init();
     this->gpu_weight_buffer_.Init();
     this->kv_storage_.Init();
-    this->h2d_engine_.Init(weights_copy_tasks);
+    this->h2d_engine_.Init();
     this->d2h_engine_.Init();
 
     // this->hetero_attn_.Init();

@@ -74,7 +74,7 @@ def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int
         AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
     """
     assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
-    assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
+    assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions but got {} and {}'.format(x.shape, s.shape)
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.bfloat16)
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
@@ -383,14 +383,21 @@ class Attn_Wrapper(torch.nn.Module):
         elif Attn_Wrapper.phase == "decoding":
             # TODO: FIX
             rank = dist.get_rank() 
+            world_size = dist.get_world_size()
+            EXPERT_PER_RANK = self.model_config.num_local_experts // world_size
             current_rank_offloaded_expert_idx = (
-                rank * 32 + self.engine_config.EP_Config.num_local_expert_per_layer
+                rank * EXPERT_PER_RANK + self.engine_config.EP_Config.num_local_expert_per_layer
             )
-            self.core_engine.clear_expert_buffer(self.layer_idx, 
-                                                 current_rank_offloaded_expert_idx,
-                                                 Attn_Wrapper.phase)
+            if self.engine_config.EP_Config.num_local_expert_per_layer < EXPERT_PER_RANK:
+                #TODO
+                logging.info("Clearning which shoudl not happen")
+                self.core_engine.clear_expert_buffer(self.layer_idx, 
+                                                    current_rank_offloaded_expert_idx,
+                                                    Attn_Wrapper.phase)
             if self.get_weights:
                 weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
+                logging.info(f"{self.weight_dequant_scale.keys()}")
+                logging.info(f"weights_dict: {weights_dict.keys()}")
                 for name, param in self.module.named_parameters():
                     if (
                         self.weight_dequant_scale is not None
@@ -402,6 +409,27 @@ class Attn_Wrapper(torch.nn.Module):
                         )
                     else:
                         param.data = weights_dict[name]
+            else:
+                # Weights are already set in the module
+                # Dequant them
+                for name, param in self.module.named_parameters():
+                    if (
+                        self.weight_dequant_scale is not None
+                        and name + "_scale_inv" in self.weight_dequant_scale
+                    ):
+                        param.data = deepseek_v3_dequantization(
+                            param.data,
+                            self.weight_dequant_scale[name + "_scale_inv"],
+                        )
+                    # else:
+                    #     param.data = param.data
+            # logging.info(f"get_weights: {self.get_weights}")
+            # if self.module.q_a_layernorm.weight.dtype != torch.bfloat16:
+            #     logging.info(f"{self.weight_dequant_scale.keys()}")
+            # assert self.module.q_a_layernorm.weight.dtype == torch.bfloat16, "q_a_layernorm weight dtype should be bfloat16 but got {}".format(self.module.q_a_layernorm.weight.dtype)
+
+
+
             # logging.info(f"[Layer {self.layer_idx} - Attn_Wrapper] Decoding phase.")
             # self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)
             hidden_states = kwargs["hidden_states"]
@@ -528,44 +556,44 @@ class Expert_Wrapper(torch.nn.Module):
             if Expert_Wrapper.phase == "prefill"
             else self.engine_config.Module_Batching_Config.expert_decoding_batch_size_upper_bound
         )
-        num_micro_batch = math.ceil(len(hidden_states) / token_num_upper_bound)
+        num_micro_batch = math.ceil(hidden_states.size(0) / token_num_upper_bound)
         for i in range(num_micro_batch):
             start = i * token_num_upper_bound
             end = (
-                len(hidden_states)
-                if (i + 1) * token_num_upper_bound > len(hidden_states)
+                hidden_states.size(0)
+                if (i + 1) * token_num_upper_bound > hidden_states.size(0)
                 else (i + 1) * token_num_upper_bound
             )
             micro_batch = hidden_states[start:end]
             # output = self.module(micro_batch)
-            output = self.module.fused_fp8_forward(micro_batch, self.weight_dequant_scale)
-            
-            result[start:end] = output
-            torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+            # output = self.module.fused_fp8_forward(micro_batch, self.weight_dequant_scale)
+
+            # offset 
+            offset = start * result.shape[-1] if hidden_states.dim() == 2 else start * result.shape[-1] * result.shape[-2]
+            self.module.fused_fp8_forward(micro_batch, self.weight_dequant_scale, result, offset)
+            # result[start:end] = output
+            # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
             # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
         # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
         # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+        
 
         # Step 3: Clean up
         if self.get_weights:
+            torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize() 
             self.core_engine.free_weights_buffer(self.expert_weights_idx)
             # with torch.no_grad():
             for name, param in self.module.named_parameters():
-                # param.data = torch.tensor(
-                #     0.0, dtype=param.data.dtype, device=param.data.device
-                # )
-                # param.data.zero_()
                 param.data = torch.empty(
                     0,
                     device=param.data.device,
                 )
         else:
-            self.module.gate_proj.weight.data = self.fp8_gate
-            self.module.down_proj.weight.data = self.fp8_down
-            self.module.up_proj.weight.data = self.fp8_up
-            # self.module.gate_proj.weight.data.set_(self.fp8_gate)
-            # self.module.down_proj.weight.data.set_(self.fp8_down)
-            # self.module.up_proj.weight.data.set_(self.fp8_up)
+            # self.module.gate_proj.weight.data = self.fp8_gate
+            # self.module.down_proj.weight.data = self.fp8_down
+            # self.module.up_proj.weight.data = self.fp8_up
+            # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize() 
+            pass
 
         logging.debug(
             f"[Rank {dist.get_rank()} Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"

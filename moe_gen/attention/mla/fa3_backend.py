@@ -13,6 +13,7 @@ from deep_gemm import get_col_major_tma_aligned_tensor
 import logging
 from typing import Tuple
 import torch.distributed as dist
+from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 
 @torch.inference_mode()
 def mla_prefill_flashattention3(
@@ -200,7 +201,8 @@ def w8a16_gemm(
 	out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
 	y_fp8 = (weight_data_fp8, weight_scale_inv_fp32)
 	
-	x_fp8 = per_token_cast_to_fp8(x)
+	# x_fp8 = per_token_cast_to_fp8(x)
+	x_fp8 = act_quant(x)
 	x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 	deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 	return out.view(activation_bf16.size(0), -1, n)
@@ -225,12 +227,16 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		weight_scale["q_a_proj.weight_scale_inv"],
 		hidden_states
 	)
+	# query_states = fused_fp8_bf16_gemm(hidden_states, self.q_a_proj.weight.data, weight_scale["q_a_proj.weight_scale_inv"])
+	# torch.cuda.current_stream().synchronize()
 	query_states = self.q_a_layernorm(query_states)
 	query_states = w8a16_gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
 		query_states
 	)
+	# query_states = fused_fp8_bf16_gemm(query_states, self.q_b_proj.weight.data, weight_scale["q_b_proj.weight_scale_inv"])
+	# torch.cuda.current_stream().synchronize()
 
 	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -242,6 +248,9 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
 		hidden_states
 	)
+	# compressed_kv = fused_fp8_bf16_gemm(hidden_states, self.kv_a_proj_with_mqa.weight.data, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"])
+	# torch.cuda.current_stream().synchronize()
+	
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)	
@@ -322,7 +331,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	# logging.info(f"offload_kv: {offload_kv.shape}")
 	return attn_output, offload_kv
 
-from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
+
 @torch.inference_mode()
 def mla_prefill_flashattention3_fused_dequant(
 	self,

@@ -49,8 +49,10 @@ class HtoD_Engine {
                 GPU_KV_Buffer& gpu_kv_buffer);
     ~HtoD_Engine();
     // void Init(const py::dict& py_weight_copy_tasks);
-    void Init(std::unordered_map<std::string, std::vector<std::string>>&
-                  weights_copy_tasks);
+    // void Init(std::unordered_map<std::string, std::vector<std::string>>&
+    //               weights_copy_tasks);
+    void Init();
+
     void Start();
     void Terminate();
 

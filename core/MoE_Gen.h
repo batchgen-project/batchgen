@@ -49,10 +49,7 @@ class MoE_Gen {
     ~MoE_Gen();
 
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-            int64_t byte_size,
-            std::unordered_map<std::string, std::vector<std::string>>&
-                  weights_copy_tasks
-    );
+            int64_t byte_size);
     void Terminate();
 
     /*
@@ -120,6 +117,14 @@ class MoE_Gen {
 
     void reset_decoding_buffer();
     void stop_h2d_worker();
+
+    void copy_kv_to_worker(std::vector<int64_t> query_global_idx, int64_t context_length) {
+        this->kv_storage_.copy_kv_to_worker(query_global_idx, context_length);
+    }
+    void clear_gpu_kv_storage(){
+        this->kv_storage_.clear_kv_gpu_storage();
+    }
+        
 
    private:
     EngineConfig engine_config_;

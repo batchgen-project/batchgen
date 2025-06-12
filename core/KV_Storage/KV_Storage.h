@@ -78,6 +78,13 @@ class KV_Storage {
     void save_compressed_kv();
 
     torch::Tensor get_k_quantize_scale(int64_t layer_idx, const std::vector<int64_t>& cur_batch, int64_t padding_lentgh);
+    void copy_kv_to_worker(std::vector<int64_t> query_global_idx, int64_t context_length);
+    torch::Tensor get_k(int64_t layer_idx, std::vector<int64_t> cur_batch, std::vector<int64_t> tensor_shape);
+    void gpu_kv_update(
+        int64_t layer_idx,
+        std::vector<int64_t> query_global_indices,
+        torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale);
+    void clear_kv_gpu_storage();
 
    private:
     /* Template */
@@ -85,16 +92,21 @@ class KV_Storage {
     const EngineConfig& engine_config_;
     const ModelConfig& model_config_;
     DtoH_Engine& d2h_engine_;
+    cudaStream_t stream_;
 
     std::vector<void*> k_pinned_memory;
     std::vector<void*> v_pinned_memory;
     std::vector<std::vector<sequence_storage>> k_storage;
     std::vector<std::vector<sequence_storage>> v_storage;
     std::vector<std::mutex> per_element_mutex_;
-    // std::vector<torch::Tensor> k_quantize_scale;
+    
+    std::vector<void*> k_gpu_memory;
+    std::vector<std::vector<sequence_storage>> k_gpu_storage;
+
 
     std::mutex mutex_;  // protect query_idx_to_slot_idx_map and empty_slots.
     std::unordered_map<int64_t, int64_t> query_idx_to_slot_idx_map;
+    std::unordered_map<int64_t, int64_t> gpu_query_idx_to_slot_idx_map;
     std::unordered_set<int64_t> empty_slots;
 
     void offload_helper_(int64_t layer_idx,

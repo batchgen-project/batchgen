@@ -43,6 +43,7 @@ from moe_gen.parameter_server_client import ParameterServerClient
 from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from tqdm import trange
 import gc
+from datetime import timedelta
 
 logging.basicConfig(
     level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -83,7 +84,6 @@ def signal_handler(signum, frame):
     import time
     time.sleep(0.5)
     sys.exit(1)
-
 
 
 class query:
@@ -225,6 +225,10 @@ def moe_gen(
     host_kv_cache_size: Optional[int] = None,  # If not set, use all host memory
     parameter_server_host: str = 'localhost',
     parameter_server_port: int = 9090,
+    dist_init_addr: Optional[str] = "localhost:12355",
+    nnodes: Optional[int] = 1,
+    node_rank: Optional[int] = 0,
+    device_per_node: Optional[int] = 8,
 ):
     """
     Run MoE_Gen using the standalone parameter server.
@@ -246,10 +250,9 @@ def moe_gen(
     Returns:
         List of results with generated text
     """
-    # Setup multiprocessing
+    # Setups
     mp.set_start_method("spawn", force=True)
     mp.set_sharing_strategy("file_system")
-    # from moe_gen.utils import _config_torch_module_initializer
     _config_torch_module_initializer()
     # Register the handler
     signal.signal(signal.SIGINT, signal_handler)  # For Ctrl+C
@@ -268,13 +271,6 @@ def moe_gen(
             # If the expected model isn't loaded, we need to request it
             if model_info.get('huggingface_ckpt_name') != huggingface_ckpt_name:
                 logging.info(f"Parameter server has a different model loaded. Requesting {huggingface_ckpt_name}")
-                # model_info = client.load_model(
-                #     huggingface_ckpt_name=huggingface_ckpt_name,
-                #     hf_cache_dir=hf_cache_dir,
-                #     cache_dir=cache_dir,
-                #     pt_ckpt_dir=pt_ckpt_dir
-                # )
-
                 # Terminate directly
                 logging.info(f"Terminating process as the model is not loaded in the parameter server.")
                 sys.exit(1)
@@ -288,7 +284,8 @@ def moe_gen(
     tensor_meta_shm_name = model_info.get('tensor_meta_shm_name')
     skeleton_state_dict = model_info.get('skeleton_state_dict')  # This now comes from shared memory
     parameter_server_size = model_info.get('parameter_server_size')
-    pt_ckpt_dir = model_info.get('pt_ckpt_dir')
+    if pt_ckpt_dir == None:
+        pt_ckpt_dir = model_info.get('pt_ckpt_dir')
     
     if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, pt_ckpt_dir]):
         missing = []
@@ -308,22 +305,41 @@ def moe_gen(
         host_kv_cache_size = math.floor(free_mem)
         logging.info(f"Host KV Cache Size: {host_kv_cache_size}")
     
+
+    if torch.cuda.is_available():
+        num_devices = torch.cuda.device_count()
+        logging.info(f"Node {node_rank} has {num_devices} local devices visible.")
+
+        # TODO: Handle cases where number of devices is not eight.
+        assert num_devices == 8, "Current version requires exactly 8 devices per node. Will be fixed in the future version."
+
+    else:
+        raise RuntimeError("No CUDA devices available. Please check your setup.")
+    
     # Distribute queries among devices
     moe_gens = []
     num_queries = len(queries)
-    num_devices = len(device)
-    logging.info(f"Number of devices: {num_devices}")
+    # num_devices = len(device)
+    world_size = nnodes * device_per_node
+    logging.info(f"World size: {world_size}")
     logging.info(f"Total number of queries: {num_queries}")
-    # queries_per_device = math.ceil(num_queries / num_devices)
-    distribution = distribute_sequences(num_queries, num_devices)
+
+    assert num_queries >= world_size, "Current version requires at least as many queries as devices. Will be fixed in the future version."
+
+    distribution = distribute_sequences(num_queries, world_size)
     per_device_host_kv_cache_size = host_kv_cache_size // num_devices
+
+    # indices: List of tuples (local_rank, global_rank)
+    # E.g. node 1: [(0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14), (7, 15)]
+    indices = [(local_rank, local_rank + node_rank * device_per_node) for local_rank in range(device_per_node)]
+    logging.info(f"Distributing queries across devices: {indices}")
     
     # For each device, create a MoE_Gen instance
-    for device_idx in range(num_devices):
+    for local_rank, global_rank in indices:
         # start_query_idx = device_idx * queries_per_device
         # end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
-        start_query_idx, end_query_idx = distribution[device_idx]
-        logging.info(f"Device {device_idx}: Processing queries from {start_query_idx} to {end_query_idx}")
+        start_query_idx, end_query_idx = distribution[global_rank]
+        logging.info(f"Global rank {global_rank}: Processing queries from {start_query_idx} to {end_query_idx}")
                 
         # Create MoE_Gen instance with the shared memory info
         from moe_gen.engine import MoE_Gen
@@ -334,15 +350,17 @@ def moe_gen(
             queries=queries[start_query_idx:end_query_idx],
             max_input_length=max_input_length,
             max_decoding_length=max_decoding_length,
-            device=device[device_idx],
+            device=device[local_rank],
             engine_config_json_dir=engine_config_json_dir,
             skeleton_state_dict=skeleton_state_dict,
             shm_name=shm_name,
             tensor_meta_shm_name=tensor_meta_shm_name,
             pt_ckpt_dir=pt_ckpt_dir,
             host_kv_cache_size=per_device_host_kv_cache_size,
-            rank = device_idx,
-            world_size = num_devices
+            dist_init_addr = dist_init_addr,
+            local_rank = local_rank,
+            global_rank = global_rank,
+            world_size = nnodes * device_per_node,
         )
         moe_gens.append(moe_gen_instance)
     
@@ -404,7 +422,9 @@ class MoE_Gen:
         tensor_meta_shm_name,
         engine_config_json_dir,
         host_kv_cache_size: Optional[int] = None,
-        rank: Optional[int] = 0,
+        dist_init_addr: str = "localhost:12355",
+        local_rank: Optional[int] = 0,
+        global_rank: Optional[int] = 0,
         world_size: Optional[int] = 1,
     ):
         self.model = None
@@ -417,11 +437,15 @@ class MoE_Gen:
         self.max_input_length = max_input_length
         self.max_decoding_length = max_decoding_length
         self.skeleton_state_dict = skeleton_state_dict
-        self.rank = rank
+        # self.rank = rank
+        self.dist_init_addr = dist_init_addr
+        self.local_rank = local_rank
+        self.global_rank = global_rank
+        self.rank = global_rank
         self.world_size = world_size
 
 
-        config_scheduler = Scheduler(max_input_length, max_decoding_length)
+        config_scheduler = Scheduler(max_input_length, max_decoding_length, world_size)
         self.engine_config = config_scheduler.generate_config()
         # self.engine_config = parse_config_from_json(engine_config_json_dir)
         self.engine_config.Basic_Config.device = device
@@ -433,7 +457,7 @@ class MoE_Gen:
         )
         self.engine_config.Basic_Config.padding_length = max_input_length
         self.engine_config.Basic_Config.num_queries = self.num_queries
-        self.engine_config.Basic_Config.rank = rank
+        self.engine_config.Basic_Config.rank = self.global_rank
         self.engine_config.Basic_Config.world_size = world_size
 
         if(self.rank == 0):
@@ -458,17 +482,18 @@ class MoE_Gen:
         self.shm_name = shm_name
         self.tensor_meta_shm_name = tensor_meta_shm_name
 
-        free_memory, total_memory = torch.cuda.mem_get_info()
-        gpu0_memory = free_memory / 1024 / 1024 / 1024
-        total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(f"GPU 0 free memory moegen instantiate: {gpu0_memory} GB / {total_memory} GB")
+        # free_memory, total_memory = torch.cuda.mem_get_info()
+        # gpu0_memory = free_memory / 1024 / 1024 / 1024
+        # total_memory = total_memory / 1024 / 1024 / 1024
+        # logging.info(f"GPU 0 free memory moegen instantiate: {gpu0_memory} GB / {total_memory} GB")
 
 
 
     def Init(self):
-        logging.info("Running with PID: %d", os.getpid())
-        logging.info("Running with device: %s", self.device)
+        logging.info(f"Initializing MoE_Gen with global rank {self.global_rank} and world size {self.world_size} with PID: {os.getpid()}")
         torch.cuda.set_device(self.device)
+        self._init_torch_dist_nccl()
+
         torch.cuda.reset_peak_memory_stats()
         logging.info(self.hf_cache_dir)
         self.model_config = AutoConfig.from_pretrained(
@@ -532,7 +557,8 @@ class MoE_Gen:
                 self.tensor_meta_shm_name,
                 self.pt_ckpt_dir,
                 self.host_kv_cache_size,
-                self.rank,
+                self.local_rank,
+                self.global_rank,
                 self.world_size
             )
 
@@ -573,7 +599,10 @@ class MoE_Gen:
             self.engine_config,
             self.model_config,
             self.core_engine,
-            self.skeleton_state_dict
+            self.skeleton_state_dict,
+            self.local_rank,
+            self.global_rank,
+            self.world_size
         )        
                 
         logging.info(f"Engine on device {self.device} initialized.")
@@ -834,6 +863,7 @@ class MoE_Gen:
 
                     
                 self._config_decoding()
+                self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
                 
                 if self.rank == 0:
                     allocated_memory = torch.cuda.memory_allocated(self.torch_device)
@@ -986,15 +1016,28 @@ class MoE_Gen:
         # Log device memory usage before configure decoding
         logging.info(f"{self.rank} Device memory usage before configure decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
-        self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-        self.set_phase("decoding")
-        self.core_engine.stop_h2d_worker()
-        self.core_engine.clear_kv_copy_queue()
-        self.core_engine.clear_kv_buffer()
-        self.core_engine.clear_weight_copy_queue()
-        self.core_engine.reset_decoding_buffer()
-        self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-        self.core_engine.start_h2d_worker()
+        # TODO:
+        if self.world_size <= 8:
+            self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+            self.set_phase("decoding")
+            self.core_engine.stop_h2d_worker()
+            self.core_engine.clear_kv_copy_queue()
+            self.core_engine.clear_kv_buffer()
+            self.core_engine.clear_weight_copy_queue()
+            self.core_engine.reset_decoding_buffer()
+            self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+            self.core_engine.start_h2d_worker()
+        else:
+            self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding()
+            self.set_phase("decoding")
+            self.core_engine.stop_h2d_worker()
+            self.core_engine.clear_kv_copy_queue()
+            self.core_engine.clear_kv_buffer()
+            self.core_engine.clear_weight_copy_queue()
+            # self.core_engine.reset_decoding_buffer()
+            # self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+            # self.core_engine.start_h2d_worker()
+
         logging.info(f"{self.rank} End Config Decoding")
 
     def prefill(self, batch: list[int]):
@@ -1115,14 +1158,7 @@ class MoE_Gen:
             # Step 1: Before each round of decoding, review the attention mode and batching plan.
             # TODO: review attention mode. Current fixing attention mode.
             RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
-            if RUNTIME_ATTN_MODE == 2:
-                w = float(os.getenv("SPLIT_RATIO_W", None))
-                if w is None:
-                    logging.info(
-                        f"CPU compute ratio not set. Default setting applied."
-                    )
-                    w = 0.6
-                logging.info(f"Split ratio: {w}")
+            # logging.info(f"RUNTIME_ATTN_MODE: {RUNTIME_ATTN_MODE}")
 
             if RUNTIME_ATTN_MODE == 0:
                 """
@@ -1321,8 +1357,16 @@ class MoE_Gen:
                 # ATTN_DECODING_MICRO_BATCH_SIZE = self.engine_config.GPU_Buffer_Config.k_buffer_num_tokens // seq_len
             elif RUNTIME_ATTN_MODE == 2:
                 """
-					CPU-GPU Parallel ATTN
+					CPU-GPU Parallel ATTN.
+                    Deprecated.
 				"""
+                w = float(os.getenv("SPLIT_RATIO_W", None))
+                if w is None:
+                    logging.info(
+                        f"CPU compute ratio not set. Default setting applied."
+                    )
+                    w = 0.6
+                logging.info(f"Split ratio: {w}")
                 # TODO: wordload partitioning.
                 CPU_batch = batch[: math.ceil(len(batch) * w)]
                 GPU_batch = batch[math.ceil(len(batch) * w) :]
@@ -1441,6 +1485,60 @@ class MoE_Gen:
                     # logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
                 new_token_idx += 1
 
+            elif RUNTIME_ATTN_MODE == 3:
+                """
+                    KV ACCUMULATION IN GPU.
+                """
+                # Submit KV copy task to the core engine.
+                micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
+                num_micro_batches = math.ceil(len(batch) / micro_batch_size)
+                micro_batches = [
+                    batch[
+                        micro_batch_idx * micro_batch_size : (
+                            micro_batch_idx + 1
+                        )
+                        * micro_batch_size
+                    ]
+                    for micro_batch_idx in range(num_micro_batches)
+                ]
+                Attn_Wrapper.cur_batch = micro_batches
+                with torch.no_grad():
+                    attention_mask = torch.cat(
+                        [
+                            self.query_book[query_idx].encoded[
+                                "attention_mask"
+                            ][:, : self.max_input_length + new_token_idx]
+                            for query_idx in batch
+                        ],
+                        dim=0,
+                    ).to(self.torch_device)
+                    # logging.info(f"engine.py attention_mask: {attention_mask}")   
+                    if "deepseek" in self.model_config.model_type:
+                        position_ids = create_position_ids_from_attention_mask(
+                            attention_mask
+                        )
+                    else:
+                        position_ids = create_position_ids_from_attention_mask(
+                            attention_mask
+                        )[:, -1].unsqueeze(-1)
+
+                    Attn_Wrapper.attention_mask = attention_mask
+                    Attn_Wrapper.position_ids = position_ids
+                    new_tokens = self.model(
+                        new_tokens.to(self.torch_device),
+                        attention_mask=attention_mask.to(self.torch_device),
+                        # position_ids=position_ids.to(self.torch_device),
+                        use_cache=False,
+                    )
+                    new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
+                        -1, 1
+                    )
+                    self.update_new_token(new_tokens, batch, new_token_idx)
+                new_token_idx += 1
+        
+        if RUNTIME_ATTN_MODE == 3:
+            self.core_engine.clear_kv_gpu_storage()    
+    
     def set_phase(self, phase: str):
         """
         Control different behavior of the engine in different phases.
@@ -1498,3 +1596,19 @@ class MoE_Gen:
                 # self.query_book[q_idx].encoded["input_ids"][0, first_zero_pos] = new_tokens[idx]
             else:
                 raise ValueError("No 0 found in the attention mask.")
+
+    def _init_torch_dist_nccl(self):
+        timeout = timedelta(minutes=10)
+        try:
+            dist.init_process_group(
+                backend="NCCL",
+                init_method="tcp://" + self.dist_init_addr,
+                world_size=self.world_size,
+                rank = self.global_rank,
+                device_id=torch.device(f"cuda:{self.local_rank}"),
+                timeout=timeout,
+            )
+        except RuntimeError as e:
+            raise
+    
+    

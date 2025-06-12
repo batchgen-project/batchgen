@@ -72,8 +72,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("save_compressed_kv", &MoE_Gen::save_compressed_kv)
         .def("set_weight_copy_queue", &MoE_Gen::set_weight_copy_queue)
         .def("reset_decoding_buffer", &MoE_Gen::reset_decoding_buffer)
-        .def("stop_h2d_worker", &MoE_Gen::stop_h2d_worker);
+        .def("stop_h2d_worker", &MoE_Gen::stop_h2d_worker)
+        .def("copy_kv_to_worker",
+             &MoE_Gen::copy_kv_to_worker,
+             "Copy KV to worker for the given query global index and context length.")
+        .def("clear_kv_gpu_storage",
+             &MoE_Gen::clear_gpu_kv_storage,
+             "Clear the GPU KV storage.");
 
+             
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<>())
         .def("Init", &Parameter_Server::Init)

@@ -20,7 +20,8 @@ def fgemm_fp8_e4m3_bf16_kernel(
 	# Meta-parameters
 	BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 	SCALE_BLOCK_M: tl.constexpr, SCALE_BLOCK_K: tl.constexpr,
-	GROUP_SIZE_M: tl.constexpr
+	GROUP_SIZE_M: tl.constexpr,
+	c_ptr_offset=0,
 ):
 	"""
 	Compute the matrix multiplication C = A @ B.T.
@@ -41,6 +42,7 @@ def fgemm_fp8_e4m3_bf16_kernel(
 	pid_m = first_pid_m + (pid % group_size_m)
 	pid_n = (pid % num_pid_in_group) // group_size_m
 
+	c_ptr += c_ptr_offset
 	# ----------------------------------------------------------
 	# Create offset pointers and masks for A, B, and C
 	offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -109,7 +111,7 @@ def fgemm_fp8_e4m3_bf16_kernel(
 	tl.store(c_ptrs, c, mask=c_mask)
 
 
-def fused_fp8_bf16_gemm(A, B_fp8, B_scale, block_size=(64, 64, 32), scale_block_size=(128, 128), group_size_m=8):
+def fused_fp8_bf16_gemm(A, B_fp8, B_scale, block_size=(64, 64, 32), scale_block_size=(128, 128), group_size_m=8, out=None, offset=None):
 	"""
 	Performs a fused dequantization and matrix multiplication: A @ B_dequantized.T
 	
@@ -148,7 +150,10 @@ def fused_fp8_bf16_gemm(A, B_fp8, B_scale, block_size=(64, 64, 32), scale_block_
 	A = A.to(torch.bfloat16).contiguous()
 	B_fp8 = B_fp8.contiguous()
 	B_scale = B_scale.reshape(expected_scale_shape).contiguous()
-	C = torch.empty((M, N), dtype=torch.bfloat16, device=A.device)
+	if out is None:
+		C = torch.empty((M, N), dtype=torch.bfloat16, device=A.device)
+
+	
 	
 	# Calculate grid size with improved work distribution
 	grid = lambda META: (
@@ -157,18 +162,22 @@ def fused_fp8_bf16_gemm(A, B_fp8, B_scale, block_size=(64, 64, 32), scale_block_
 	
 	# Launch kernel with auto-tuning
 	fgemm_fp8_e4m3_bf16_kernel[grid](
-		A, B_fp8, C, B_scale,
+		A, B_fp8, out if out is not None else C, B_scale,
 		M, N, K,
 		A.stride(0), A.stride(1),
 		B_fp8.stride(1), B_fp8.stride(0),  # Note the swap for transposition
-		C.stride(0), C.stride(1),
+		# C.stride(0), C.stride(1),
+		N, 1,
 		BLOCK_SIZE_M=block_size[0], 
 		BLOCK_SIZE_N=block_size[1], 
 		BLOCK_SIZE_K=block_size[2],
 		SCALE_BLOCK_M=scale_block_size[0], 
 		SCALE_BLOCK_K=scale_block_size[1],
 		GROUP_SIZE_M=group_size_m,
+		c_ptr_offset=offset if out is not None else 0,
 	)
 	
 	# Reshape output if necessary
-	return C.reshape(original_shape[0], original_shape[1], -1) if len(original_shape) == 3 else C
+	if out is None:
+		return C.reshape(original_shape[0], original_shape[1], -1) if len(original_shape) == 3 else C
+	

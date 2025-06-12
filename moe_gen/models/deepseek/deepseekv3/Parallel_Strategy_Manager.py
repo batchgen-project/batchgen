@@ -24,7 +24,10 @@ class Parallel_Strategy_Manager:
 		engine_config, 
 		model_config,
 		core_engine,
-		skeleton_state_dict
+		skeleton_state_dict,
+		local_rank,
+		global_rank,
+		world_size
 	):
 		self.hf_model_config = hf_model_config
 		self.engine_config = engine_config
@@ -33,8 +36,9 @@ class Parallel_Strategy_Manager:
 		self.skeleton_state_dict = skeleton_state_dict
 		self.weight_copy_task = {}
 
-		self.rank = dist.get_rank()
-		self.world_size = dist.get_world_size()
+		self.local_rank = local_rank
+		self.global_rank = global_rank
+		self.world_size = world_size
 		
 	def configure_prefill(self):
 		"""
@@ -118,6 +122,11 @@ class Parallel_Strategy_Manager:
 		self._config_lm_head_hook()
 		self.model.eval()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
+		# log attn_1 q_a_layernorm weight dtype
+		# if self.local_rank == 0:
+		# 	logging.info(
+		# 		f"Attn_1 q_a_layernorm weight dtype: {self.model.model.layers[1].self_attn.module.q_a_layernorm.weight.dtype}"
+		# 	)
 		return self.model, self.weight_copy_task
 
 
@@ -140,7 +149,6 @@ class Parallel_Strategy_Manager:
 		self.weight_copy_task["shared_expert"] = []
 
 		# We have 8 devices and 256 experts per layer.
-		# Each devices is responsible for 32 experts. However, the device may not be able to hold all experts.
 		# In this case, we hold NUM_LOCAL_EXPERT_PER_LAYER in the GPU and the 32 - NUM_LOCAL_EXPERT_PER_LAYER in the host memory.
 		# So the self.local_routed_experts in just the names of experts in each rank's GPU.
 
@@ -153,15 +161,14 @@ class Parallel_Strategy_Manager:
 		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
 
-		routed_expert_gpu_start_idx = self.rank * NUM_EXPERT_PER_RANK
+		routed_expert_gpu_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
 		routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
 		routed_expert_host_start_idx = routed_expert_gpu_end_idx
-		routed_expert_host_end_idx = (self.rank + 1) * NUM_EXPERT_PER_RANK
+		routed_expert_host_end_idx = (self.global_rank + 1) * NUM_EXPERT_PER_RANK
 		for layer_idx in range(
 			self.hf_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
-			# We split the 256 into 8 parts, each part is 32 experts.
 			# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
 			# The rest of the experts in the part are stored in the host memory.
 			for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
@@ -243,10 +250,130 @@ class Parallel_Strategy_Manager:
 		used_memory_gb = used_memory / (1024**3)
 		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
 		self.model.eval()
-		self.model.to(self.engine_config.Basic_Config.device_torch)
+		self.model.to(self.engine_config.Basic_Config.device_torch)			
 		return self.model, self.weight_copy_task
 
+
+	def pure_gpu_decoding(self):
+		"""
+			Beta 1: Load full mode into GPU.
+			Duplicate attention modules and shared experts in each dp worker.
+			Split routed experts.
+		"""
+		self.hf_model_config.phase = "decoding"
+		self.hf_model_config._attn_implementation = "eager"
+		self.model = None
+		torch.cuda.empty_cache()
+		self.model = DeepseekV3ForCausalLM._from_config(
+			self.hf_model_config
+		)
+		""" In this case, empty copy task. """
+		self.weight_copy_task = {}
+		self.state_dict_name_map = {}
+		self.weight_copy_task["attn"] = []
+		self.weight_copy_task["routed_expert"] = []
+		self.weight_copy_task["shared_expert"] = []
+
+		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
+		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
+
+		routed_expert_gpu_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
+		routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_EXPERT_PER_RANK
+
+		self.local_routed_experts = []
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			self.model_config.num_hidden_layers,
+		):
+			# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
+			# The rest of the experts in the part are stored in the host memory.
+			for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
+				self.local_routed_experts.append(
+					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+				)
+
+
+		self._extract_dequantize_scale()
+		self._load_model_skeleton()
+		self._load_local_routed_experts()
+		logging.info(
+				f"local routed_experts loaded Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}"
+			)
+		self._load_attn_module()
+		logging.info(
+				f"attn module loaded loaded Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}"
+			)
+		self._load_shared_expert_module()
+		logging.info(
+				f"shared expert module loaded loaded Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}"
+			)
+		self._config_attn_module()
+		logging.info(
+				f"attn wrapper added Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.module.q_a_layernorm.weight.dtype}"
+			)
+		self._config_expert_module()
+		logging.info(
+				f"expert wrapper added Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.module.q_a_layernorm.weight.dtype}"
+			)
+		self._config_lm_head_hook()
+		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
+		used_memory_gb = used_memory / (1024**3)
+		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
+		self.model.eval()
+		self.model.to(self.engine_config.Basic_Config.device_torch)
+		if self.local_rank == 0:
+			logging.info(
+				f"Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.module.q_a_layernorm.weight.dtype}"
+			)
+			# assert self.model.model.layers[1].self_attn.module.q_a_layernorm.weight.dtype == torch.bfloat16, "Attn_1 q_a_layernorm weight dtype should be bfloat16"
+		return self.model, self.weight_copy_task
+
+	def _load_attn_module(self):
+		for layer_idx in range(len(self.model.model.layers)):
+			attn_module = self.model.model.layers[layer_idx].self_attn
+			attn_module_name = "attn_" + str(layer_idx)
+			tensors = self.core_engine.get_tensor(attn_module_name)
+			# for name, param in attn_module.named_parameters():
+			# 	if name in tensors:
+			# 		if self.local_rank == 0:
+			# 			logging.info(f"Loading {name} for attn module {attn_module_name}")
+			# 		param.data = tensors[name].to(
+			# 			self.engine_config.Basic_Config.device_torch
+			# 		)
+			attn_module.q_a_proj.weight.data = tensors["q_a_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			attn_module.q_b_proj.weight.data = tensors["q_b_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			attn_module.kv_a_proj_with_mqa.weight.data = tensors["kv_a_proj_with_mqa.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			attn_module.kv_b_proj.weight.data = tensors["kv_b_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			attn_module.o_proj.weight.data = tensors["o_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+
 	
+
+	def _load_shared_expert_module(self):
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			len(self.model.model.layers),
+		):
+			layer = self.model.model.layers[layer_idx]
+			shared_expert_name = "shared_expert_" + str(layer_idx)
+			tensors = self.core_engine.get_tensor(shared_expert_name)
+			for name, param in layer.mlp.shared_experts.named_parameters():
+				if name in tensors:
+					if self.local_rank == 0:
+						logging.debug(f"Loading {name} for shared expert module {shared_expert_name}")
+					param.data = tensors[name].to(
+						self.engine_config.Basic_Config.device_torch
+					)
+
 	def _config_attn_module(self):
 		"""
 		- Configure the wrapper.
@@ -372,6 +499,7 @@ class Parallel_Strategy_Manager:
 			/ (1024**3)
 		)
 		logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
+		logging.info(f"model skeleton loaded, attn 0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}")
 
 		# Rank 0 print out all the tensors in the model with tensor size in MB
 		# if dist.get_rank() == 0:
@@ -518,6 +646,13 @@ class Parallel_Strategy_Manager:
 				get_weights,
 				weight_dequant_scales,
 			)
+			if get_weights == False:
+					layer.mlp.shared_experts._register_fp8_weights()
+					for key, value in layer.mlp.shared_experts.weight_dequant_scale.items():
+						value = value.to(
+							self.engine_config.Basic_Config.device_torch
+						)
+			
 			for expert_idx in range(len(layer.mlp.experts)):
 				if (
 					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)

@@ -30,15 +30,6 @@ logging.basicConfig(
 	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-def _init_dist_process_group(rank, world_size):
-	if not dist.is_initialized():
-		dist.init_process_group(
-			backend="NCCL",
-			init_method="tcp://localhost:12355",
-			world_size=world_size,
-			rank = rank
-		)
-
 class ParameterServer:
 	def __init__(self, host='localhost', port=9090, model_name=None,
 				 hf_cache_dir=None, cache_dir=None, pt_ckpt_dir=None):
@@ -623,7 +614,7 @@ class ParameterServer:
 		# Handle pt_ckpt_dir - exactly as in original implementation
 		if pt_ckpt_dir is None:
 			pt_ckpt_dir = os.path.join(
-				hf_cache_dir, "pt_ckpt", huggingface_ckpt_name
+				cache_dir, "pt_ckpt", huggingface_ckpt_name
 			)
 			if not os.path.exists(pt_ckpt_dir):
 				os.makedirs(pt_ckpt_dir)

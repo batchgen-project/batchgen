@@ -162,21 +162,25 @@ void HtoD_Engine::set_global_routed_experts_data_ptr(
     }                    
 }
 
-void HtoD_Engine::Init(
-    std::unordered_map<std::string, std::vector<std::string>>&
-        weight_copy_tasks) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    this->weight_copy_tasks_ = weight_copy_tasks;
-    for (auto& item : weight_copy_tasks) {
-        auto module_type = item.first;
-        auto module_names = item.second;
-        this->weights_copy_task_queue_.emplace(module_type,
-                                               threadsafe_queue<std::string>());
-        for (auto& module_name : module_names) {
-            this->weights_copy_task_queue_[module_type].push(module_name);
-        }
-    }
+// void HtoD_Engine::Init(
+//     std::unordered_map<std::string, std::vector<std::string>>&
+//         weight_copy_tasks) {
+//     std::lock_guard<std::mutex> lock(this->mutex_);
+//     this->weight_copy_tasks_ = weight_copy_tasks;
+//     for (auto& item : weight_copy_tasks) {
+//         auto module_type = item.first;
+//         auto module_names = item.second;
+//         this->weights_copy_task_queue_.emplace(module_type,
+//                                                threadsafe_queue<std::string>());
+//         for (auto& module_name : module_names) {
+//             this->weights_copy_task_queue_[module_type].push(module_name);
+//         }
+//     }
     
+//     // this->p2p_tensor_copy_module = py::module::import("p2p_tensor_copy");
+// };
+
+void HtoD_Engine::Init() {    
     // this->p2p_tensor_copy_module = py::module::import("p2p_tensor_copy");
 };
 

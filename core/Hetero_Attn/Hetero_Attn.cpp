@@ -249,6 +249,10 @@ torch::Tensor Hetero_Attn::attn(
             return this->_attn_mode_2(PyTorch_attn_module, layer_idx,
                                       hidden_states, attention_mask,
                                       position_ids, cur_batching_plan);
+        case 3:
+            return this->_attn_mode_3(PyTorch_attn_module, layer_idx,
+                                      hidden_states, attention_mask,
+                                      position_ids, cur_batching_plan);
         default:
             throw std::runtime_error("Unsupported attn_mode_");
             
@@ -770,4 +774,164 @@ std::future<torch::Tensor> Hetero_Attn::CPU_attn_mechanism(
     }).detach();
 
     return future;
+};
+
+
+torch::Tensor Hetero_Attn::_attn_mode_3(
+    py::object& PyTorch_attn_module, int64_t layer_idx,
+    torch::Tensor& hidden_states, torch::Tensor& attention_mask,
+    torch::Tensor& position_ids,
+    std::vector<std::vector<int64_t>> micro_batches)
+{
+    /*
+        Decoding. KV Managed in GPU with DP pattern.
+    */
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    std::vector<torch::Tensor> full_new_k;
+    std::vector<torch::Tensor> full_factor;
+    torch::Tensor final_output = torch::zeros_like(hidden_states);
+    if (this->model_config_.model_type.find("deepseek") == std::string::npos) {
+        for (int64_t micro_batch_idx = 0;
+             micro_batch_idx < micro_batches.size(); micro_batch_idx++) {
+            auto cur_batch = micro_batches[micro_batch_idx];
+            auto cur_batch_size = cur_batch.size();
+
+            int64_t bsz = cur_batch_size;
+            int64_t kv_seq_len = attention_mask.size(-1) - 1;
+            std::vector<int64_t> tensor_shape = {
+                bsz, kv_seq_len, this->model_config_.num_key_value_heads,
+                this->model_config_.head_dim};
+
+            auto cur_k = this->gpu_kv_buffer_.get_k(layer_idx, micro_batch_idx,
+                                                    tensor_shape);
+            auto cur_v = this->gpu_kv_buffer_.get_v(layer_idx, micro_batch_idx,
+                                                    tensor_shape);
+
+            int64_t cur_batch_start_idx = 0;
+            for (int64_t i = 0; i < micro_batch_idx; i++) {
+                cur_batch_start_idx += micro_batches[i].size();
+            };
+            auto cur_hidden_states = hidden_states.index(
+                {torch::indexing::Slice(cur_batch_start_idx,
+                                        cur_batch_start_idx + cur_batch_size)});
+            auto module_output =
+                PyTorch_attn_module
+                    .attr("decoding_attn")(
+                        cur_hidden_states, cur_k, cur_v,
+                        attention_mask.index({torch::indexing::Slice(
+                            cur_batch_start_idx,
+                            cur_batch_start_idx + cur_batch_size)}),
+                        position_ids.index({torch::indexing::Slice(
+                            cur_batch_start_idx,
+                            cur_batch_start_idx + cur_batch_size)}))
+                    .cast<std::tuple<torch::Tensor, torch::Tensor,
+                                     torch::Tensor>>();
+            CUDA_CHECK(cudaStreamSynchronize(0));
+
+            auto [attn_result, new_k, new_v] = module_output;
+            this->gpu_kv_buffer_.releaseBuffer(layer_idx, micro_batch_idx);
+            
+            // this->kv_storage_.update(layer_idx, cur_batch, new_k,
+            //                          new_v, );  // Todo.
+            final_output.index_put_(
+                {torch::indexing::Slice(cur_batch_start_idx,
+                                        cur_batch_start_idx + cur_batch_size)},
+                attn_result);
+            // py::gil_scoped_release release;
+        }
+    } else {
+        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+        for (int64_t micro_batch_idx = 0;
+             micro_batch_idx < micro_batches.size(); micro_batch_idx++) {
+            auto cur_batch = micro_batches[micro_batch_idx];
+            auto cur_batch_size = cur_batch.size();
+
+            int64_t bsz = cur_batch_size;
+            // int64_t kv_seq_len = attention_mask.size(-1) - 1;
+            int64_t kv_seq_len = attention_mask.size(-1); // We copy one more token which is the place holder for new Q.
+            std::vector<int64_t> tensor_shape = {
+                bsz, kv_seq_len, this->model_config_.compressed_kv_dim};
+            
+            // auto cur_k = this->gpu_kv_buffer_.get_gpu_k(
+            //     layer_idx, micro_batch_idx, tensor_shape);
+
+            // this->gpu_kv_buffer_.releaseBuffer(layer_idx, micro_batch_idx);
+            auto cur_k = this->kv_storage_.get_k(layer_idx, cur_batch, tensor_shape);
+
+            int64_t cur_batch_start_idx = 0;
+            for (int64_t i = 0; i < micro_batch_idx; i++) {
+                cur_batch_start_idx += micro_batches[i].size();
+            };
+            auto cur_hidden_states = hidden_states.index(
+                {torch::indexing::Slice(cur_batch_start_idx,
+                                        cur_batch_start_idx + cur_batch_size)});
+            // CUDA_CHECK(cudaStreamSynchronize(0));
+            // CUDA_CHECK(cudaDeviceSynchronize());
+            torch::Tensor cur_v = torch::empty(
+                {0}, torch::TensorOptions()
+                         .dtype(this->engine_config_.basic_config.kv_dtype_torch)
+                         .device(torch::kCUDA,
+                                 this->engine_config_.basic_config.device)
+                         .requires_grad(false)
+                         .memory_format(torch::MemoryFormat::Contiguous));
+            std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+                module_output;
+            
+
+            int64_t padding_length = cur_k.size(1);
+            auto cur_factor = this->kv_storage_.get_k_quantize_scale(layer_idx, cur_batch, padding_length);            
+
+            {
+                py::gil_scoped_acquire acquire;
+                module_output =
+                    PyTorch_attn_module
+                        .attr("decoding_attn")(
+                            cur_hidden_states, cur_k, cur_v,
+                            attention_mask.index({torch::indexing::Slice(
+                                cur_batch_start_idx,
+                                cur_batch_start_idx + cur_batch_size)}),
+                            position_ids.index({torch::indexing::Slice(
+                                cur_batch_start_idx,
+                                cur_batch_start_idx + cur_batch_size)}),
+                            cur_factor)
+                        .cast<std::tuple<torch::Tensor, torch::Tensor,
+                                        torch::Tensor>>();
+            }
+            CUDA_CHECK(cudaStreamSynchronize(0));   
+            auto [attn_result, new_k, new_v] = module_output;
+            auto [quant_k, factor] = compressed_kv_bf16_to_fp8_per_token(new_k);
+            // this->kv_storage_.update(layer_idx, cur_batch, quant_k, new_v, factor);
+            full_new_k.push_back(quant_k);
+            full_factor.push_back(factor);
+            // CUDA_CHECK(cudaStreamSynchronize(0));
+            final_output.index_put_(
+                {torch::indexing::Slice(cur_batch_start_idx,
+                                        cur_batch_start_idx + cur_batch_size)},
+                attn_result);
+
+            // CUDA_CHECK(cudaStreamSynchronize(0)); 
+            // CUDA_CHECK(cudaDeviceSynchronize());   
+        }
+    }
+    torch::Tensor quant_k = torch::cat(full_new_k, 0);
+    torch::Tensor factor = torch::cat(full_factor, 0);
+    // Merge all micro batches into one vector.
+    std::vector<int64_t> idx = {};
+    for (int64_t i = 0; i < micro_batches.size(); i++) {
+        auto cur_batch = micro_batches[i];
+        for (int64_t j = 0; j < cur_batch.size(); j++) {
+            idx.push_back(cur_batch[j]);
+        }
+    }
+    // new_v is a place holder
+    torch::Tensor new_v = torch::empty(
+        {0}, torch::TensorOptions()
+                 .dtype(this->engine_config_.basic_config.kv_dtype_torch)
+                 .device(torch::kCUDA,
+                         this->engine_config_.basic_config.device)
+                 .requires_grad(false)
+                 .memory_format(torch::MemoryFormat::Contiguous));
+
+    this->kv_storage_.gpu_kv_update(layer_idx, idx, quant_k, new_v, factor);
+    return final_output;
 };

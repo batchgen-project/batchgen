@@ -664,6 +664,8 @@ void KV_Storage::Init() {
                 }
             }
         }
+        CUDA_CHECK(
+            cudaStreamCreateWithFlags(&this->stream_, cudaStreamNonBlocking));
         this->logger_->debug("KV_Storage Initialized.");
     } catch (const c10::Error& e) {
         this->logger_->debug("KV_Storage: CUDA/PyTorch error: {}", e.what());
@@ -832,6 +834,38 @@ torch::Tensor KV_Storage::get_k_quantize_scale(
 }
             
             
+// void KV_Storage::offload(
+//     int64_t layer_idx,
+//     std::vector<int64_t> query_global_idx, 
+//     torch::Tensor k,
+//     torch::Tensor v,
+//     torch::Tensor attention_mask)
+// {
+//     // SAFE_CALL(
+//     //     [&]() {
+//     //         auto worker = std::thread(&KV_Storage::offload_helper_, this,
+//     //                                   layer_idx, query_global_idx, k, v);
+//     //         // worker.detach();
+//     //         worker.join();
+//     //     },
+//     //     this->logger_);
+//     // Check if k has nan values
+//     CUDA_CHECK(cudaStreamSynchronize(0));
+//     // CUDA_CHECK(cudaDeviceSynchronize());
+//     // if (torch::any(torch::isnan(k)).item<bool>()){
+//     //     for (int64_t i = 0; i < k.size(0); i++) {
+//     //         if(torch::any(torch::isnan(k[i])).item<bool>()) {
+//     //             this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
+//     //                                  i, this->engine_config_.basic_config.device,
+//     //                                  layer_idx);
+//     //         }
+//     //     }
+//     //     // throw std::runtime_error("k has nan values");
+//     // }
+//     this->offload_helper_(layer_idx, query_global_idx, k, v, attention_mask);
+// };
+
+
 void KV_Storage::offload(
     int64_t layer_idx,
     std::vector<int64_t> query_global_idx, 
@@ -839,28 +873,17 @@ void KV_Storage::offload(
     torch::Tensor v,
     torch::Tensor attention_mask)
 {
-    // SAFE_CALL(
-    //     [&]() {
-    //         auto worker = std::thread(&KV_Storage::offload_helper_, this,
-    //                                   layer_idx, query_global_idx, k, v);
-    //         // worker.detach();
-    //         worker.join();
-    //     },
-    //     this->logger_);
-    // Check if k has nan values
     CUDA_CHECK(cudaStreamSynchronize(0));
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // if (torch::any(torch::isnan(k)).item<bool>()){
-    //     for (int64_t i = 0; i < k.size(0); i++) {
-    //         if(torch::any(torch::isnan(k[i])).item<bool>()) {
-    //             this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
-    //                                  i, this->engine_config_.basic_config.device,
-    //                                  layer_idx);
-    //         }
-    //     }
-    //     // throw std::runtime_error("k has nan values");
-    // }
-    this->offload_helper_(layer_idx, query_global_idx, k, v, attention_mask);
+    SAFE_CALL(
+        [&]() {
+            auto worker = std::thread(&KV_Storage::offload_helper_, this,
+                                      layer_idx, query_global_idx, k, v, attention_mask);
+            worker.detach();
+            // worker.join();
+        },
+        this->logger_);
+
+    // this->offload_helper_(layer_idx, query_global_idx, k, v, attention_mask);
 };
 
 void KV_Storage::offload_helper_(
@@ -1562,3 +1585,270 @@ void KV_Storage::save_compressed_kv(){
     torch::save(t, file_name);
     this->logger_->info("KV_Storage save_compressed_kv(): Compressed kv saved.");  
 }
+
+void KV_Storage::copy_kv_to_worker(std::vector<int64_t> query_global_idx, int64_t max_length) {
+    /*
+        Copy the prefilled KV to the worker. 
+        Here we copy the k storage to k_gpu_storage
+    */
+    this->logger_->info("KV_Storage copy_kv_to_worker(): Copying KV to worker.");
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    try{
+        // Init the k_gpu_storage and v_gpu_storage
+        int64_t num_slots = query_global_idx.size();
+        // int64_t max_length = this->engine_config_.basic_config.padding_length + this->engine_config_.basic_config.max_decoding_length;
+        // TODO:
+        this->k_gpu_memory.resize(this->model_config_.num_hidden_layers);
+        int64_t per_layer_size = num_slots * max_length * 576;
+        for(int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++){
+            void* k_ptr = nullptr;
+            CUDA_CHECK(cudaMalloc(&k_ptr, per_layer_size));
+            this->k_gpu_memory[layer_idx] = k_ptr;
+        };
+        this->logger_->info("KV_Storage copy_kv_to_worker(): num_slots: {}, per_layer_size: {}", num_slots, per_layer_size);
+
+        this->k_gpu_storage.resize(num_slots);
+        for(int64_t slot_idx = 0; slot_idx < num_slots; slot_idx++){
+            this->k_gpu_storage[slot_idx].resize(this->model_config_.num_hidden_layers);
+            for(int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++){
+                void* slot_ptr = nullptr;
+                slot_ptr = static_cast<void*>(
+                    static_cast<char*>(this->k_gpu_memory[layer_idx]) +
+                    slot_idx * max_length * 576);
+                this->k_gpu_storage[slot_idx][layer_idx].start_ptr = slot_ptr;
+                this->k_gpu_storage[slot_idx][layer_idx].used_byte_size = 0;
+                this->k_gpu_storage[slot_idx][layer_idx].num_tokens = 0;
+
+            }
+        };
+
+        // Update gpu_query_idx_to_slot_idx_map
+        this->gpu_query_idx_to_slot_idx_map.clear();
+        for(int64_t i = 0; i < query_global_idx.size(); i++){
+            int64_t query_idx = query_global_idx[i];
+            this->gpu_query_idx_to_slot_idx_map[query_idx] = i;
+        };
+            
+        this->logger_->info("KV_Storage copy_kv_to_worker(): GPU storage initialized.");
+
+                         
+        for(int64_t idx = 0; idx < query_global_idx.size(); idx++){
+            int64_t cpu_slot_idx = -1;
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                cpu_slot_idx = this->query_idx_to_slot_idx_map[query_global_idx[idx]];
+            }
+            for(int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++){
+                auto host_k_ptr = this->k_storage[cpu_slot_idx][layer_idx].start_ptr;
+                // auto host_v_ptr = this->v_storage[slot_idx][layer_idx].start_ptr;
+                auto k_size = this->k_storage[cpu_slot_idx][layer_idx].used_byte_size;
+                // auto v_size = this->v_storage[slot_idx][layer_idx].used_byte_size;
+                // Copy the k and v to the worker
+                CUDA_CHECK(cudaMemcpyAsync(
+                    this->k_gpu_storage[idx][layer_idx].start_ptr,
+                    host_k_ptr, k_size, cudaMemcpyHostToDevice, this->stream_));
+                // CUDA_CHECK(cudaMemcpyAsync(
+                //     this->v_gpu_storage[slot_idx][layer_idx].start_ptr,
+                //     host_v_ptr, v_size, cudaMemcpyHostToDevice, this->stream_));
+                // Update the used byte size and num tokens in the gpu storage
+                this->k_gpu_storage[idx][layer_idx].used_byte_size = k_size;
+                this->k_gpu_storage[idx][layer_idx].num_tokens = this->k_storage[cpu_slot_idx][layer_idx].num_tokens;
+                this->k_gpu_storage[idx][layer_idx].quantize_scale = this->k_storage[cpu_slot_idx][layer_idx].quantize_scale.clone();
+                // this->v_gpu_storage[slot_idx][layer_idx].used_byte_size = v_size;
+                // this->v_gpu_storage[slot_idx][layer_idx].num_tokens = this->v_storage[slot_idx][layer_idx].num_tokens;
+            }
+        }
+        // Synchronize the stream
+        CUDA_CHECK(cudaStreamSynchronize(this->stream_));
+        this->logger_->info("KV_Storage copy_kv_to_worker(): KV copied to worker.");
+    }
+    // Catch PyTorch/CUDA specific exceptions
+    catch (const c10::Error& e) {
+        this->logger_->debug("KV_Storage get_v_ptrs(): CUDA/PyTorch error: {}",
+                             e.what());
+        throw std::runtime_error(
+            "KV_Storage: Failed to copy KV to worker.");
+    }
+    // Catch CUDA runtime errors
+    catch (const cudaError_t& err) {
+        this->logger_->debug("KV_Storage get_v_ptrs(): CUDA runtime error: {}",
+                             cudaGetErrorString(err));
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    // Catch standard C++ exceptions
+    catch (const std::exception& e) {
+        this->logger_->debug(
+            "KV_Storage get_v_ptrs(): Failed to update K and V to "
+            "the storage. Error: {}",
+            e.what());
+        throw std::runtime_error(
+            "KV_Storage: Failed to update K and V to the storage.");
+    }
+    // Catch any other unexpected errors
+    catch (...) {
+        this->logger_->debug(
+            "KV_Storage get_v_ptrs(): Failed to update K and V to the "
+            "storage.");
+        throw std::runtime_error(
+            "KV_Storage: Failed to update K and V to the storage.");
+    }
+};
+
+
+
+// get_k(layer_idx, cur_batch, tensor_shape)
+torch::Tensor KV_Storage::get_k(int64_t layer_idx, std::vector<int64_t> cur_batch, std::vector<int64_t> tensor_shape) {
+    try {
+        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+        // Check if the layer_idx is valid
+        if (layer_idx < 0 || layer_idx >= this->model_config_.num_hidden_layers) {
+            throw std::runtime_error("Invalid layer index: " + std::to_string(layer_idx));
+        }
+        // Check if the batch is empty
+        if (cur_batch.empty()) {
+            throw std::runtime_error("Batch is empty.");
+        }
+        
+        // Get the tensor from k_gpu_storage
+        auto k_tensor = torch::empty(tensor_shape, torch::TensorOptions()
+            .dtype(this->engine_config_.basic_config.kv_dtype_torch)
+            .device(this->engine_config_.basic_config.device_torch)
+            .requires_grad(false));
+        
+        int64_t seq_byte_size = tensor_shape[1] * tensor_shape[2] * k_tensor.element_size();
+        // Fill the tensor with data from k_gpu_storage
+        for (int64_t i = 0; i < static_cast<int64_t>(cur_batch.size()); i++) {
+            auto query_idx = cur_batch[i];
+            int64_t slot_idx = -1;
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                slot_idx = this->gpu_query_idx_to_slot_idx_map[query_idx];
+            }
+            // this->engine_config_.basic_config.kv_dtype_torch* k_ptr = nullptr;
+            void* src_ptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(
+                    this->per_element_mutex_[slot_idx * this->model_config_.num_hidden_layers + layer_idx]);
+                    src_ptr = this->k_gpu_storage[slot_idx][layer_idx].start_ptr;
+            }
+            // Copy the data from k_ptr to k_tensor
+            auto dst_ptr = k_tensor.data_ptr() + i * seq_byte_size;
+            CUDA_CHECK(cudaMemcpyAsync(
+                dst_ptr, src_ptr, seq_byte_size, cudaMemcpyDeviceToDevice, this->stream_));
+        }
+        // Synchronize the stream
+        CUDA_CHECK(cudaStreamSynchronize(this->stream_));
+        return k_tensor;
+    }     // Catch PyTorch/CUDA specific exceptions
+    catch (const c10::Error& e) {
+        this->logger_->debug("KV_Storage get_v_ptrs(): CUDA/PyTorch error: {}",
+                             e.what());
+        throw std::runtime_error(
+            "KV_Storage: Failed to copy KV to worker.");
+    }
+    // Catch CUDA runtime errors
+    catch (const cudaError_t& err) {
+        this->logger_->debug("KV_Storage get_v_ptrs(): CUDA runtime error: {}",
+                             cudaGetErrorString(err));
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    // Catch standard C++ exceptions
+    catch (const std::exception& e) {
+        this->logger_->debug(
+            "KV_Storage get_v_ptrs(): Failed to update K and V to "
+            "the storage. Error: {}",
+            e.what());
+        throw std::runtime_error(
+            "KV_Storage: Failed to update K and V to the storage.");
+    }
+    // Catch any other unexpected errors
+    catch (...) {
+        this->logger_->debug(
+            "KV_Storage get_v_ptrs(): Failed to update K and V to the "
+            "storage.");
+        throw std::runtime_error(
+            "KV_Storage: Failed to update K and V to the storage.");
+    }
+};
+
+
+void KV_Storage::gpu_kv_update(
+        int64_t layer_idx,
+        std::vector<int64_t> query_global_indices,
+        torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale) 
+{
+    try{
+        CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+        k = k.contiguous();
+        int64_t k_token_byte_size =
+            k.size(1) * k.size(2) * k.element_size();
+        this->logger_->debug("k_token_byte_size: {}", k_token_byte_size);
+        for (int64_t i = 0; i < query_global_indices.size(); i++) {
+            auto query_idx = query_global_indices[i];
+            auto src_ptr = k.data_ptr() + i * k_token_byte_size;
+            int64_t slot_idx;
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                slot_idx = this->gpu_query_idx_to_slot_idx_map[query_idx];
+            }
+            auto dst_k_ptr =
+                this->k_gpu_storage[slot_idx][layer_idx].start_ptr +
+                this->k_gpu_storage[slot_idx][layer_idx].used_byte_size;
+            {
+                std::lock_guard<std::mutex> lock(
+                    this->per_element_mutex_
+                        [slot_idx * this->model_config_.num_hidden_layers +
+                        layer_idx]);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    dst_k_ptr, src_ptr, k_token_byte_size,
+                    cudaMemcpyDeviceToDevice, this->stream_));
+                this->k_gpu_storage[slot_idx][layer_idx].used_byte_size +=
+                    k_token_byte_size;
+                this->k_gpu_storage[slot_idx][layer_idx].num_tokens += 1;
+                this->k_gpu_storage[slot_idx][layer_idx].quantize_scale = torch::cat(
+                    {this->k_gpu_storage[slot_idx][layer_idx].quantize_scale,
+                        k_quantize_scale.index({i}).unsqueeze(0)}, 1);
+            }
+        }
+        // Synchronize the stream
+        CUDA_CHECK(cudaStreamSynchronize(this->stream_));
+    }
+    // Catch CUDA runtime errors
+    catch (const cudaError_t& err) {
+        this->logger_->debug(
+            "KV_Storage gpu_kv_update(): CUDA runtime error: {}",
+            cudaGetErrorString(err));
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    // Catch standard C++ exceptions
+    catch (const std::exception& e) {
+        this->logger_->debug(
+            "KV_Storage gpu_kv_update(): Failed to update K and "
+            "V to the storage. Error: {}",
+            e.what());
+        throw std::runtime_error(
+            "KV_Storage gpu_kv_update(): Failed to update K and V to the storage.");
+    }
+    // Catch any other unexpected errors
+    catch (...) {
+        this->logger_->debug(
+            "KV_Storage gpu_kv_update(): Failed to update K and "
+            "V to the storage.");
+        throw std::runtime_error(
+            "KV_Storage gpu_kv_update(): Failed to update K and V to the storage.");
+    }
+};
+
+void KV_Storage::clear_kv_gpu_storage(){
+    // Deallocate the k_gpu_storage and v_gpu_storage
+    this->logger_->debug("KV_Storage clear_kv_gpu_storage(): Clearing KV GPU storage.");
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    for(int64_t layer_idx = 0; layer_idx < this->k_gpu_memory.size(); layer_idx++){
+        CUDA_CHECK(cudaFree(this->k_gpu_memory[layer_idx]));
+    };
+    this->logger_->info("KV_Storage clear_kv_gpu_storage(): KV GPU storage cleared.");
+}
+
+
+
+
