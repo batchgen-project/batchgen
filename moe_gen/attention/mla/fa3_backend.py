@@ -188,13 +188,15 @@ def w8a16_gemm(
 	activation_bf16: torch.Tensor,
 ) -> torch.Tensor:
 	"""
-	activation_bf16: [n_group, m, k]
-	weight_data_fp8: [m, n]
-	weight_scale_inv_fp32: [m, n]
+		activation_bf16: [n_group, m, k]
+		weight_data_fp8: [m, n]
+		weight_scale_inv_fp32: [m, n]
 	"""
 	assert weight_data_fp8.dim() == 2
-	assert activation_bf16.dim() == 3
-	# n_group, m, k = activation_bf16.size()
+	assert activation_bf16.dim() == 3 or activation_bf16.dim() == 2
+	if activation_bf16.dim() == 3:
+		n_group, l, _ = activation_bf16.size()
+
 	x = activation_bf16.view(-1, activation_bf16.size(-1))
 	m, k = x.size()
 	n, _ = weight_data_fp8.size()
@@ -205,7 +207,11 @@ def w8a16_gemm(
 	x_fp8 = act_quant(x)
 	x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 	deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-	return out.view(activation_bf16.size(0), -1, n)
+	if activation_bf16.dim() == 3:
+		out = out.view(n_group, l, n)
+	else:
+		out = out.view(m, n)
+	return out
 
 @torch.inference_mode()
 def mla_prefill_flashattention3_w8a16_deepgemm(

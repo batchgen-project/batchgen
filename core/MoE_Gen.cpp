@@ -313,6 +313,8 @@ void MoE_Gen::stop_h2d_worker() {
     this->h2d_engine_.stop_h2d_worker();
 }
 
+
+
 #include <signal.h>
 static MoE_Gen* engine_instance = nullptr;
 void signalHandler(int signum) {

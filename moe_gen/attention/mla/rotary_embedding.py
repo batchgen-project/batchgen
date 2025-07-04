@@ -1,4 +1,5 @@
 import torch
+import logging
 def rotate_half(x):
 	"""Rotates half the hidden dims of the input."""
 	x1 = x[..., : x.shape[-1] // 2]
@@ -26,6 +27,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 	Returns:
 		`tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 	"""
+	
 	cos = cos[position_ids].unsqueeze(unsqueeze_dim)
 	sin = sin[position_ids].unsqueeze(unsqueeze_dim)
 
@@ -40,8 +42,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 	return q_embed, k_embed
 
 def rotary_pos_emb(t, cos, sin, position_ids, unsqueeze_dim=1):
+	# logging.info(f"Applying rotary position embedding t shape: {t.shape}, cos shape: {cos.shape}, sin shape: {sin.shape}, position_ids shape: {position_ids.shape}, unsqueeze_dim: {unsqueeze_dim}")
 	cos = cos[position_ids].unsqueeze(unsqueeze_dim)
 	sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+	# logging.info(f"cos shape after unsqueeze: {cos.shape}, sin shape after unsqueeze: {sin.shape}")
 
 	b, h, s, d = t.shape
 	t = t.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)

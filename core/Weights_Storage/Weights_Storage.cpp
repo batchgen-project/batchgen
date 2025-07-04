@@ -97,15 +97,31 @@ std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(std::
         throw std::runtime_error("Module key not found in storage.");
     };
     auto module_weights = this->module_weights_storage_[module_key];
+    auto bf16_option = torch::TensorOptions()
+        .dtype(torch::kBFloat16)
+        .device(torch::kCPU)
+        .requires_grad(false)
+        .memory_format(torch::MemoryFormat::Contiguous);
+    auto fp8_option = torch::TensorOptions()
+        .dtype(torch::kFloat8_e4m3fn)
+        .device(torch::kCPU)
+        .requires_grad(false)
+        .memory_format(torch::MemoryFormat::Contiguous);
     std::unordered_map<std::string, torch::Tensor> tensors;
     for (auto& [tensor_key, tensor_buffer] : module_weights) {
-        auto tensor = torch::from_blob(
-            tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
-            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
-                .device(torch::kCPU)
-                .requires_grad(false)
-                .memory_format(torch::MemoryFormat::Contiguous));
-        tensors[tensor_key] = tensor;
+        // If "norm" in module_key, use bf16 dtype.
+        if (tensor_key.find("norm") != std::string::npos) {
+            auto tensor = torch::from_blob(
+                tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
+                bf16_option);
+            tensors[tensor_key] = tensor;
+        }
+        else{
+            auto tensor = torch::from_blob(
+                tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
+                fp8_option);
+            tensors[tensor_key] = tensor;
+        }
     }
     return tensors;
 }

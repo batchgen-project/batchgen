@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple
 
 @triton.jit
 def _dequant_kernel(
@@ -148,3 +149,12 @@ def dequant_per_token_return_with_max_seqlen_pad(
         raise
     return x_flat.view(bsz, max_seqlen_pad, dim)
 
+
+def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+	assert x.dim() == 2 and x.size(1) % 128 == 0
+	m, n = x.shape
+	x_view = x.view(m, -1, 128)
+	x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+	return (x_view * (448.0 / x_amax.unsqueeze(2))).to(
+		torch.float8_e4m3fn
+	).view(m, n), (x_amax / 448.0).view(m, -1)

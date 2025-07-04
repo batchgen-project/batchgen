@@ -57,6 +57,17 @@ class Scheduler:
 		self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = num_decoding_module_buffer_routed_expert
 		self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
 
+			
+		if self.config.Basic_Config.attn_mode == 3:
+			# decoding module buffer are zero.
+			self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
+			self.config.GPU_Buffer_Config.num_decoding_module_buffer["attn"] = 0
+			self.config.GPU_Buffer_Config.num_decoding_module_buffer["shared_expert"] = 0
+			
+			self.config.GPU_Buffer_Config.num_k_buffer = 0
+
+
+
 		if self.Max_Prompt_Length > 14000:
 			# For longer context, shink prefill attention micro batch size and MoE prefill micro batch size accordingly
 			factor = self.Max_Prompt_Length / 14000

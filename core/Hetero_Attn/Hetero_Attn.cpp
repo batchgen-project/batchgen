@@ -932,6 +932,6 @@ torch::Tensor Hetero_Attn::_attn_mode_3(
                  .requires_grad(false)
                  .memory_format(torch::MemoryFormat::Contiguous));
 
-    this->kv_storage_.gpu_kv_update(layer_idx, idx, quant_k, new_v, factor);
+    this->kv_storage_.gpu_kv_update_func(layer_idx, idx, quant_k, new_v, factor);
     return final_output;
 };

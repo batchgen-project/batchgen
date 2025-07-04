@@ -124,6 +124,13 @@ class MoE_Gen {
     void clear_gpu_kv_storage(){
         this->kv_storage_.clear_kv_gpu_storage();
     }
+
+    std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+        return this->kv_storage_.get_past_key_states(query_global_indices, max_seq_len);
+    }
+    std::vector<torch::Tensor> get_kv_scale(std::vector<int64_t> query_global_indices, int64_t seq_len){
+        return this->kv_storage_.get_kv_scale(query_global_indices, seq_len);
+    }
         
 
    private:

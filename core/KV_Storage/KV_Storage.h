@@ -84,7 +84,13 @@ class KV_Storage {
         int64_t layer_idx,
         std::vector<int64_t> query_global_indices,
         torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale);
+    void gpu_kv_update_func(
+        int64_t layer_idx,
+        std::vector<int64_t> query_global_indices,
+        torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale);
     void clear_kv_gpu_storage();
+    std::vector<torch::Tensor> get_kv_scale(std::vector<int64_t> query_global_indices, int64_t seq_len);
+    std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len);
 
    private:
     /* Template */

@@ -296,25 +296,10 @@ class Parallel_Strategy_Manager:
 		self._extract_dequantize_scale()
 		self._load_model_skeleton()
 		self._load_local_routed_experts()
-		logging.info(
-				f"local routed_experts loaded Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}"
-			)
 		self._load_attn_module()
-		logging.info(
-				f"attn module loaded loaded Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}"
-			)
 		self._load_shared_expert_module()
-		logging.info(
-				f"shared expert module loaded loaded Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}"
-			)
 		self._config_attn_module()
-		logging.info(
-				f"attn wrapper added Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.module.q_a_layernorm.weight.dtype}"
-			)
 		self._config_expert_module()
-		logging.info(
-				f"expert wrapper added Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.module.q_a_layernorm.weight.dtype}"
-			)
 		self._config_lm_head_hook()
 		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
 		used_memory_gb = used_memory / (1024**3)
@@ -333,13 +318,6 @@ class Parallel_Strategy_Manager:
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			attn_module_name = "attn_" + str(layer_idx)
 			tensors = self.core_engine.get_tensor(attn_module_name)
-			# for name, param in attn_module.named_parameters():
-			# 	if name in tensors:
-			# 		if self.local_rank == 0:
-			# 			logging.info(f"Loading {name} for attn module {attn_module_name}")
-			# 		param.data = tensors[name].to(
-			# 			self.engine_config.Basic_Config.device_torch
-			# 		)
 			attn_module.q_a_proj.weight.data = tensors["q_a_proj.weight"].to(
 				self.engine_config.Basic_Config.device_torch
 			)
@@ -355,6 +333,15 @@ class Parallel_Strategy_Manager:
 			attn_module.o_proj.weight.data = tensors["o_proj.weight"].to(
 				self.engine_config.Basic_Config.device_torch
 			)
+			
+			attn_module.q_a_layernorm.weight.data = tensors["q_a_layernorm.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			attn_module.kv_a_layernorm.weight.data = tensors["kv_a_layernorm.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+
+			# attn_module.initialize()
 
 	
 
@@ -366,13 +353,25 @@ class Parallel_Strategy_Manager:
 			layer = self.model.model.layers[layer_idx]
 			shared_expert_name = "shared_expert_" + str(layer_idx)
 			tensors = self.core_engine.get_tensor(shared_expert_name)
-			for name, param in layer.mlp.shared_experts.named_parameters():
-				if name in tensors:
-					if self.local_rank == 0:
-						logging.debug(f"Loading {name} for shared expert module {shared_expert_name}")
-					param.data = tensors[name].to(
-						self.engine_config.Basic_Config.device_torch
-					)
+			shared_expert = layer.mlp.shared_experts
+			shared_expert.gate_proj.weight.data = tensors["gate_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			shared_expert.up_proj.weight.data = tensors["up_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+			shared_expert.down_proj.weight.data = tensors["down_proj.weight"].to(
+				self.engine_config.Basic_Config.device_torch
+			)
+
+			# for name, param in layer.mlp.shared_experts.named_parameters():
+			# 	if name in tensors:
+			# 		if self.local_rank == 0:
+			# 			logging.debug(f"Loading {name} for shared expert module {shared_expert_name}")
+					
+					# param.data = tensors[name].to(
+					# 	self.engine_config.Basic_Config.device_torch
+					# )
 
 	def _config_attn_module(self):
 		"""
@@ -387,7 +386,13 @@ class Parallel_Strategy_Manager:
 					mla_prefill_flashattention3_w8a16_deepgemm,
 					mla_prefill_flashattention3_fused_dequant
 				)
-				from ....attention.mla.flashmla_backend import mla_decoding_flashmla
+				from ....attention.mla.flashmla_backend import (
+					mla_decoding_flashmla,
+					mla_decoding_flashmla_v2,
+					fused_get_query_states_triton,
+					mla_decoding_flashmla_attn_mode_3,
+					mla_decoding_flashmla_attn_mode_3_dequant_fusion
+				)
 				setattr(
 					attn_module,
 					"prefill_attn",
@@ -408,6 +413,31 @@ class Parallel_Strategy_Manager:
 					"decoding_attn",
 					types.MethodType(
 						mla_decoding_flashmla, attn_module
+					),
+				)
+
+				setattr(
+					attn_module,
+					"decoding_attn_mode_3",
+					types.MethodType(
+						mla_decoding_flashmla_attn_mode_3, attn_module
+					),
+				)
+
+				setattr(
+					attn_module,
+					"decoding_attn_mode_3_dequant_fusion",
+					types.MethodType(
+						mla_decoding_flashmla_attn_mode_3_dequant_fusion, attn_module
+					),
+				)
+
+
+				setattr(
+					attn_module,
+					"fused_get_query_states_triton",
+					types.MethodType(
+						fused_get_query_states_triton, attn_module
 					),
 				)
 			elif self.engine_config.Basic_Config.gpu_arch == "ampere":
@@ -458,6 +488,13 @@ class Parallel_Strategy_Manager:
 				weight_dequant_scales,
 			)
 			self.model.model.layers[layer_idx].self_attn = attn_wrapper_instance
+			if get_weights == False:
+				attn_wrapper_instance._register_fp8_weights()
+				for key, value in attn_wrapper_instance.weight_dequant_scale.items():
+					value = value.to(
+						self.engine_config.Basic_Config.device_torch
+					)
+				
 		
 		end_time = time.perf_counter()
 		logging.info(
@@ -499,8 +536,6 @@ class Parallel_Strategy_Manager:
 			/ (1024**3)
 		)
 		logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
-		logging.info(f"model skeleton loaded, attn 0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.q_a_layernorm.weight.dtype}")
-
 		# Rank 0 print out all the tensors in the model with tensor size in MB
 		# if dist.get_rank() == 0:
 		# 	logging.info("Model skeleton tensors:")

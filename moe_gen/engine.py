@@ -835,9 +835,7 @@ class MoE_Gen:
                 # self.core_engine.start_h2d_worker()
                 # time.sleep(2)
                 
-                dist.barrier()
 
-                torch.cuda.empty_cache()
                 # Log allocated memory after prefill
                 if self.rank == 0:
                     allocated_memory = torch.cuda.memory_allocated(self.torch_device)
@@ -863,20 +861,47 @@ class MoE_Gen:
 
                     
                 self._config_decoding()
-                self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+                # self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+                if self.engine_config.Basic_Config.attn_mode == 3:
+                    # FULL GPU DECODING MODE.
+                    if self.model_config.model_type == "deepseek_v3":
+                        past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+                        past_value_states = None
+                        # scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
+                        scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+                        # Compute the byte size of past_key_states
+                        past_key_states_byte_size = 0
+                        for value in past_key_states:
+                            past_key_states_byte_size += value.numel() * value.element_size()
+                        logging.info(
+                            f"Rank: {self.rank} past_key_states byte size: {past_key_states_byte_size / 1024 / 1024 / 1024:.2f} GB"
+                        )
+                        # Compute the byte size of scale_dict
+                        scale_dict_byte_size = 0
+                        for value in scale_dict:
+                            scale_dict_byte_size += value.numel() * value.element_size()
+                        logging.info(
+                            f"Rank: {self.rank} scale_dict byte size: {scale_dict_byte_size / 1024 / 1024:.2f} MB"
+                        )
+        
+                    else:
+                        # TODO:
+                        pass
                 
                 if self.rank == 0:
                     allocated_memory = torch.cuda.memory_allocated(self.torch_device)
                     logging.info(
                         f"Rank: {self.rank} Decoding configuration done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
                     )
-                    
+                
+                dist.barrier()
+                torch.cuda.empty_cache()
                 decoding_start_time = time.perf_counter()
                 with torch.no_grad():
                     logging.info(
                         f"decoding batch size: {len(self.model_batches[model_batch_idx])}"
                     )
-                    self.decoding(new_token, self.model_batches[model_batch_idx])
+                    self.decoding(new_token, self.model_batches[model_batch_idx], past_key_states, past_value_states, scale_dict)
                 decoding_time += time.perf_counter() - decoding_start_time
                 self.core_engine.clear_kv_storage()
         else:
@@ -884,6 +909,19 @@ class MoE_Gen:
             # In this case, it only participate in the decoding phase.
             # Todo: 
             self._config_decoding()
+
+            # Log used memory before decoding
+            if self.rank == 0:
+                free_memory, total_memory = torch.cuda.mem_get_info()
+                free_memory = free_memory / 1024 / 1024 / 1024
+                total_memory = total_memory / 1024 / 1024 / 1024
+                logging.info(
+                    f"Rank: {self.rank} Device torch memory usage before decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+                )
+                logging.info(
+                    f"Rank: {self.rank} Device torch free memory before decoding: {free_memory} GB / {total_memory} GB"
+                )
+
             decoding_start_time = time.perf_counter()
             with torch.no_grad():
                 self.decoding(None, None)
@@ -896,6 +934,8 @@ class MoE_Gen:
         self.model = None 
         torch.cuda.empty_cache()
         dist.destroy_process_group()
+
+        # 
 
         logging.info(f"Prefill total time: {prefill_time}")
         logging.info(f"Decoding total time: {decoding_time}")
@@ -911,10 +951,6 @@ class MoE_Gen:
         #     logging.info(
         #         f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
         #     )
-
-        # Show peak memory allocated
-        # peak_memory = torch.cuda.max_memory_allocated(self.torch_device)
-        # logging.info(f"Peak memory allocated: {peak_memory}")
         return res
 
     def _parse_state_dict_dp(self):
@@ -1034,7 +1070,7 @@ class MoE_Gen:
             self.core_engine.clear_kv_copy_queue()
             self.core_engine.clear_kv_buffer()
             self.core_engine.clear_weight_copy_queue()
-            # self.core_engine.reset_decoding_buffer()
+            self.core_engine.reset_decoding_buffer()
             # self.core_engine.set_weight_copy_queue(self.weight_copy_task)
             # self.core_engine.start_h2d_worker()
 
@@ -1132,7 +1168,14 @@ class MoE_Gen:
         self.update_new_token(new_tokens, batch, 0)
         return new_tokens
 
-    def decoding(self, new_tokens: torch.Tensor, batch: list[int]):
+    def decoding(
+        self, 
+        new_tokens: torch.Tensor, 
+        batch: list[int],
+        past_key_states: Optional[torch.Tensor] = None,
+        past_value_states: Optional[torch.Tensor] = None,
+        scale_dict: Optional[dict] = None,
+    ):
         """
         Handle the decoding for a full model batch.
         All the queries reach <EOS> or the max decoding length.
@@ -1149,152 +1192,33 @@ class MoE_Gen:
         # 	attention_mask = torch.where(attention_mask == 0, torch.finfo(torch.bfloat16).min, torch.tensor(0.0, dtype=torch.bfloat16, device=attention_mask.device))
         # Attn_Wrapper.attention_mask = attention_mask
 
+        RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
         # Log device memory usage
         logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
-        while new_token_idx < self.max_decoding_length and len(batch) > 0:
-            if self.rank == 0:
-                logging.info(f"Decoding new token idx: {new_token_idx}")
-            # Step 1: Before each round of decoding, review the attention mode and batching plan.
-            # TODO: review attention mode. Current fixing attention mode.
-            RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
-            # logging.info(f"RUNTIME_ATTN_MODE: {RUNTIME_ATTN_MODE}")
-
-            if RUNTIME_ATTN_MODE == 0:
-                """
-					CPU ATTN MODE
-						- NO ATTN MICRO BATCH
-				"""
-                # self.set_attn_mode(0)
-                # self.core_engine.set_attn_mode(0)
-                with torch.no_grad():
-                    Attn_Wrapper.cur_batch = [batch]
-                    attention_mask = torch.cat(
-                        [
-                            self.query_book[query_idx].encoded[
-                                "attention_mask"
-                            ][:, : self.max_input_length + new_token_idx]
-                            for query_idx in batch
-                        ],
-                        dim=0,
-                    )
-                    if "deepseek" not in self.model_config.model_type:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )[:, -1].unsqueeze(-1)
-                    else:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )
-                    # DeepSeek use flash-attn by default
-                    
-                    # if attention_mask.dim() == 2 and (
-                    #     self.model_config.model_type not in ["Qwen2", "deepseek"]
-                    # ):
-                    #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(
-                    #         2
-                    #     )
-                    #     attention_mask = torch.where(
-                    #         attention_mask == 0,
-                    #         torch.finfo(torch.bfloat16).min,
-                    #         torch.tensor(
-                    #             0.0,
-                    #             dtype=torch.bfloat16,
-                    #             device=attention_mask.device,
-                    #         ),
-                    #     )
-
-                    Attn_Wrapper.attention_mask = attention_mask
-                    Attn_Wrapper.position_ids = position_ids
-                    new_tokens = self.model(
-                        new_tokens.to(self.torch_device),
-                        attention_mask=attention_mask.to(self.torch_device),
-                        # position_ids=position_ids.to(self.torch_device),
-                        use_cache=False,
-                    )
-                    new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-                        -1, 1
-                    )
-                    # logging.info(f"New tokens: {new_tokens}")
-                    # start = time.perf_counter()
-                    self.update_new_token(new_tokens, batch, new_token_idx)
-                    # logging.info(
-                    #     f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms"
-                    # )
-
-                # TODO: Temporally remove.
-                # Check <EOS>, if <EOS>, remove from batch.
-                # for idx, query_idx in enumerate(batch):
-                # 	if new_tokens[idx] == self.tokenizer.eos_token_id:
-                # 		batch.remove(query_idx)
-                new_token_idx += 1
-
-            elif RUNTIME_ATTN_MODE == 1:
-                """
-					GPU ATTN MODE
-						- ATTN MICRO BATCH
-				"""
-                # Submit KV copy task to the core engine.
-                micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
-                num_micro_batches = math.ceil(len(batch) / micro_batch_size)
-                # logging.info(f"num_micro_batches: {num_micro_batches}")
-                micro_batches = [
-                    batch[
-                        micro_batch_idx * micro_batch_size : (
-                            micro_batch_idx + 1
-                        )
-                        * micro_batch_size
-                    ]
-                    for micro_batch_idx in range(num_micro_batches)
-                ]
-                Attn_Wrapper.cur_batch = micro_batches
-                # TODO: init ModelConfig in the initializer.
-                # Resub every 32 new tokens.
-                if (new_token_idx - 1) % 32 == 0:
-                    for idx in range(new_token_idx - 1, new_token_idx + 31):
-                        # Note: DeepSeek use fp8 kv.
-                        if "deepseek" in self.model_config.model_type:
-                            # past_kv_byte_size = (
-                            #     (self.max_input_length + idx)
-                            #     * self.model_config.compressed_kv_dim
-                            #     * 2
-                            # )
-                            # past_kv_byte_size = (
-                            #     (self.max_input_length + idx)
-                            #     * self.model_config.compressed_kv_dim
-                            # )
-
-                            # Copy one more token to avoid torch::cat in attention forward.
-                            past_kv_byte_size = (
-                                (self.max_input_length + idx + 1)
-                                * self.model_config.compressed_kv_dim
-                            )
-
-                        elif "mixtral" in self.model_config.model_type:
-                            past_kv_byte_size = (
-                                (self.max_input_length + idx)
-                                * self.model_config.num_key_value_heads
-                                * self.model_config.head_dim
-                                * 2
-                            )
-                        else:
-                            raise ValueError(
-                                f"Model architecture {self.model_config.model_type} not supported yet."
-                            )
-
-                        for layer_idx in range(
-                            self.model_config.num_hidden_layers
-                        ):
-                            for micro_batch_idx in range(num_micro_batches):
-                                cur_batch = micro_batches[micro_batch_idx]
-                                # logging.info(f"token idx: {idx}, layer idx: {layer_idx}, micro_batch_idx: {micro_batch_idx} current batch: {cur_batch}")
-                                self.core_engine.submit_to_KV_queue(
-                                    cur_batch,
-                                    micro_batch_idx,
-                                    layer_idx,
-                                    past_kv_byte_size,
-                                )
-
+        if RUNTIME_ATTN_MODE == 3:
+            """
+                KV ACCUMULATION IN GPU.
+            """
+            Attn_Wrapper.scale = scale_dict
+            Attn_Wrapper.past_key_states = past_key_states
+            Attn_Wrapper.past_value_states = past_value_states
+            while new_token_idx < self.max_decoding_length and len(batch) > 0:
+                if self.rank == 0:
+                    logging.info(f"Decoding new token idx: {new_token_idx}")
+                
+                # micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
+                # num_micro_batches = math.ceil(len(batch) / micro_batch_size)
+                # micro_batches = [
+                #     batch[
+                #         micro_batch_idx * micro_batch_size : (
+                #             micro_batch_idx + 1
+                #         )
+                #         * micro_batch_size
+                #     ]
+                #     for micro_batch_idx in range(num_micro_batches)
+                # ]
+                # Attn_Wrapper.cur_batch = micro_batches
                 with torch.no_grad():
                     attention_mask = torch.cat(
                         [
@@ -1305,225 +1229,18 @@ class MoE_Gen:
                         ],
                         dim=0,
                     ).to(self.torch_device)
-                    # logging.info(f"engine.py attention_mask: {attention_mask}")   
-                    if "deepseek" in self.model_config.model_type:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )
-                    else:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )[:, -1].unsqueeze(-1)
-
-                    # if attention_mask.dim() == 2 and (
-                    #     self.model_config.model_type not in ["Qwen2", "deepseek"]
-                    # ):
-                    #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(
-                    #         2
+                    # if "deepseek" in self.model_config.model_type:
+                    #     position_ids = create_position_ids_from_attention_mask(
+                    #         attention_mask
                     #     )
-                    #     attention_mask = torch.where(
-                    #         attention_mask == 0,
-                    #         torch.finfo(torch.bfloat16).min,
-                    #         torch.tensor(
-                    #             0.0,
-                    #             dtype=torch.bfloat16,
-                    #             device=attention_mask.device,
-                    #         ),
-                    #     )
+                    # else:
+                    #     position_ids = create_position_ids_from_attention_mask(
+                    #         attention_mask
+                    #     )[:, -1].unsqueeze(-1)
 
                     Attn_Wrapper.attention_mask = attention_mask
-                    Attn_Wrapper.position_ids = position_ids
-                    # logging.info(f"rank: {self.rank} attention_mask: {attention_mask}")
-                    # logging.info(f"rank: {self.rank} position_ids: {position_ids}")
-                    new_tokens = self.model(
-                        new_tokens.to(self.torch_device),
-                        attention_mask=attention_mask.to(self.torch_device),
-                        # position_ids=position_ids.to(self.torch_device),
-                        use_cache=False,
-                    )
-                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-                    new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-                        -1, 1
-                    )
-                    self.update_new_token(new_tokens, batch, new_token_idx)
-                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-                    # logging.info(f"New tokens: {new_tokens}")
-                new_token_idx += 1
+                    Attn_Wrapper.position_ids = None
 
-                # Step 1.1 Config new micro_batch size. Magic Number change every 32 new tokens.
-                # seq_len = self.query_book[batch[0]].encoded["input_ids"].shape[1] + self.query_book[batch[0]].num_decoded_tokens
-                # ATTN_DECODING_MICRO_BATCH_SIZE = self.engine_config.GPU_Buffer_Config.k_buffer_num_tokens // seq_len
-            elif RUNTIME_ATTN_MODE == 2:
-                """
-					CPU-GPU Parallel ATTN.
-                    Deprecated.
-				"""
-                w = float(os.getenv("SPLIT_RATIO_W", None))
-                if w is None:
-                    logging.info(
-                        f"CPU compute ratio not set. Default setting applied."
-                    )
-                    w = 0.6
-                logging.info(f"Split ratio: {w}")
-                # TODO: wordload partitioning.
-                CPU_batch = batch[: math.ceil(len(batch) * w)]
-                GPU_batch = batch[math.ceil(len(batch) * w) :]
-                logging.info(
-                    f"CPU batch size: {len(CPU_batch)}, GPU batch size: {len(GPU_batch)}"
-                )
-
-                GPU_micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
-                num_GPU_micro_batches = math.ceil(
-                    len(GPU_batch) / GPU_micro_batch_size
-                )
-                GPU_micro_batches = [
-                    GPU_batch[
-                        micro_batch_idx * GPU_micro_batch_size : (
-                            micro_batch_idx + 1
-                        )
-                        * GPU_micro_batch_size
-                    ]
-                    for micro_batch_idx in range(num_GPU_micro_batches)
-                ]
-                Attn_Wrapper.cur_batch = [CPU_batch] + GPU_micro_batches
-                # TODO:
-                if (new_token_idx - 1) % 32 == 0:
-                    for idx in range(new_token_idx - 1, new_token_idx + 31):
-                        if "deepseek" in self.model_config.model_type:
-                            past_kv_byte_size = (
-                                (self.max_input_length + idx)
-                                * self.model_config.compressed_kv_dim
-                                * self.engine_config.Basic_Config.torch_dtype.itemsize
-                            )
-                        else:
-                            past_kv_byte_size = (
-                                (self.max_input_length + idx)
-                                * self.model_config.num_key_value_heads
-                                * self.model_config.head_dim
-                                * self.engine_config.Basic_Config.torch_dtype.itemsize
-                            )
-
-                        if "deepseek" in self.model_config.model_type:
-                            for layer_idx in range(
-                                self.model_config.num_hidden_layers
-                            ):
-                                self.core_engine.submit_to_KV_queue(
-                                    cur_batch, 0, layer_idx, past_kv_byte_size
-                                )
-
-                        else:
-                            for layer_idx in range(
-                                self.model_config.num_hidden_layers
-                            ):
-                                for micro_batch_idx in range(
-                                    num_GPU_micro_batches
-                                ):
-                                    cur_batch = GPU_micro_batches[
-                                        micro_batch_idx
-                                    ]
-                                    self.core_engine.submit_to_KV_queue(
-                                        cur_batch,
-                                        micro_batch_idx,
-                                        layer_idx,
-                                        past_kv_byte_size,
-                                    )
-
-                with torch.no_grad():
-                    attention_mask = torch.cat(
-                        [
-                            self.query_book[query_idx].encoded[
-                                "attention_mask"
-                            ][:, : self.max_input_length + new_token_idx]
-                            for query_idx in batch
-                        ],
-                        dim=0,
-                    )
-                    if "deepseek" not in self.model_config.model_type:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )[:, -1].unsqueeze(-1)
-                    else:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )
-                    if attention_mask.dim() == 2 and (
-                        self.model_config.model_type not in ["Qwen2"]
-                    ):
-                        attention_mask = attention_mask.unsqueeze(1).unsqueeze(
-                            2
-                        )
-                        attention_mask = torch.where(
-                            attention_mask == 0,
-                            torch.finfo(torch.bfloat16).min,
-                            torch.tensor(
-                                0.0,
-                                dtype=torch.bfloat16,
-                                device=attention_mask.device,
-                            ),
-                        )
-
-                    Attn_Wrapper.attention_mask = attention_mask
-                    Attn_Wrapper.position_ids = position_ids
-                    new_tokens = self.model(
-                        new_tokens.to(self.torch_device),
-                        attention_mask=attention_mask.to(self.torch_device),
-                        # position_ids=position_ids,
-                        use_cache=False,
-                    )
-                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-                    new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-                        -1, 1
-                    )
-                    # start = time.perf_counter()
-                    self.update_new_token(new_tokens, batch, new_token_idx)
-                    # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-                    # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-                    print(f"New tokens: {new_tokens}")
-                    # logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
-                new_token_idx += 1
-
-            elif RUNTIME_ATTN_MODE == 3:
-                """
-                    KV ACCUMULATION IN GPU.
-                """
-                # Submit KV copy task to the core engine.
-                micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
-                num_micro_batches = math.ceil(len(batch) / micro_batch_size)
-                micro_batches = [
-                    batch[
-                        micro_batch_idx * micro_batch_size : (
-                            micro_batch_idx + 1
-                        )
-                        * micro_batch_size
-                    ]
-                    for micro_batch_idx in range(num_micro_batches)
-                ]
-                Attn_Wrapper.cur_batch = micro_batches
-                with torch.no_grad():
-                    attention_mask = torch.cat(
-                        [
-                            self.query_book[query_idx].encoded[
-                                "attention_mask"
-                            ][:, : self.max_input_length + new_token_idx]
-                            for query_idx in batch
-                        ],
-                        dim=0,
-                    ).to(self.torch_device)
-                    # logging.info(f"engine.py attention_mask: {attention_mask}")   
-                    if "deepseek" in self.model_config.model_type:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )
-                    else:
-                        position_ids = create_position_ids_from_attention_mask(
-                            attention_mask
-                        )[:, -1].unsqueeze(-1)
-
-                    Attn_Wrapper.attention_mask = attention_mask
-                    Attn_Wrapper.position_ids = position_ids
                     new_tokens = self.model(
                         new_tokens.to(self.torch_device),
                         attention_mask=attention_mask.to(self.torch_device),
@@ -1536,8 +1253,343 @@ class MoE_Gen:
                     self.update_new_token(new_tokens, batch, new_token_idx)
                 new_token_idx += 1
         
-        if RUNTIME_ATTN_MODE == 3:
-            self.core_engine.clear_kv_gpu_storage()    
+        
+        else:
+            while new_token_idx < self.max_decoding_length and len(batch) > 0:
+                if self.rank == 0:
+                    logging.info(f"Decoding new token idx: {new_token_idx}")
+                # Step 1: Before each round of decoding, review the attention mode and batching plan.
+                # TODO: review attention mode. Current fixing attention mode.
+                RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
+                # logging.info(f"RUNTIME_ATTN_MODE: {RUNTIME_ATTN_MODE}")
+
+                if RUNTIME_ATTN_MODE == 0:
+                    """
+                        CPU ATTN MODE
+                            - NO ATTN MICRO BATCH
+                    """
+                    # self.set_attn_mode(0)
+                    # self.core_engine.set_attn_mode(0)
+                    with torch.no_grad():
+                        Attn_Wrapper.cur_batch = [batch]
+                        attention_mask = torch.cat(
+                            [
+                                self.query_book[query_idx].encoded[
+                                    "attention_mask"
+                                ][:, : self.max_input_length + new_token_idx]
+                                for query_idx in batch
+                            ],
+                            dim=0,
+                        )
+                        if "deepseek" not in self.model_config.model_type:
+                            position_ids = create_position_ids_from_attention_mask(
+                                attention_mask
+                            )[:, -1].unsqueeze(-1)
+                        else:
+                            position_ids = create_position_ids_from_attention_mask(
+                                attention_mask
+                            )
+                        # DeepSeek use flash-attn by default
+                        
+                        # if attention_mask.dim() == 2 and (
+                        #     self.model_config.model_type not in ["Qwen2", "deepseek"]
+                        # ):
+                        #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(
+                        #         2
+                        #     )
+                        #     attention_mask = torch.where(
+                        #         attention_mask == 0,
+                        #         torch.finfo(torch.bfloat16).min,
+                        #         torch.tensor(
+                        #             0.0,
+                        #             dtype=torch.bfloat16,
+                        #             device=attention_mask.device,
+                        #         ),
+                        #     )
+
+                        Attn_Wrapper.attention_mask = attention_mask
+                        Attn_Wrapper.position_ids = position_ids
+                        new_tokens = self.model(
+                            new_tokens.to(self.torch_device),
+                            attention_mask=attention_mask.to(self.torch_device),
+                            # position_ids=position_ids.to(self.torch_device),
+                            use_cache=False,
+                        )
+                        new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
+                            -1, 1
+                        )
+                        # logging.info(f"New tokens: {new_tokens}")
+                        # start = time.perf_counter()
+                        self.update_new_token(new_tokens, batch, new_token_idx)
+                        # logging.info(
+                        #     f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms"
+                        # )
+
+                    # TODO: Temporally remove.
+                    # Check <EOS>, if <EOS>, remove from batch.
+                    # for idx, query_idx in enumerate(batch):
+                    # 	if new_tokens[idx] == self.tokenizer.eos_token_id:
+                    # 		batch.remove(query_idx)
+                    new_token_idx += 1
+
+                elif RUNTIME_ATTN_MODE == 1:
+                    """
+                        GPU ATTN MODE
+                            - ATTN MICRO BATCH
+                    """
+                    # Submit KV copy task to the core engine.
+                    micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
+                    num_micro_batches = math.ceil(len(batch) / micro_batch_size)
+                    # logging.info(f"num_micro_batches: {num_micro_batches}")
+                    micro_batches = [
+                        batch[
+                            micro_batch_idx * micro_batch_size : (
+                                micro_batch_idx + 1
+                            )
+                            * micro_batch_size
+                        ]
+                        for micro_batch_idx in range(num_micro_batches)
+                    ]
+                    Attn_Wrapper.cur_batch = micro_batches
+                    # TODO: init ModelConfig in the initializer.
+                    # Resub every 32 new tokens.
+                    if (new_token_idx - 1) % 32 == 0:
+                        for idx in range(new_token_idx - 1, new_token_idx + 31):
+                            # Note: DeepSeek use fp8 kv.
+                            if "deepseek" in self.model_config.model_type:
+                                # past_kv_byte_size = (
+                                #     (self.max_input_length + idx)
+                                #     * self.model_config.compressed_kv_dim
+                                #     * 2
+                                # )
+                                # past_kv_byte_size = (
+                                #     (self.max_input_length + idx)
+                                #     * self.model_config.compressed_kv_dim
+                                # )
+
+                                # Copy one more token to avoid torch::cat in attention forward.
+                                past_kv_byte_size = (
+                                    (self.max_input_length + idx + 1)
+                                    * self.model_config.compressed_kv_dim
+                                )
+
+                            elif "mixtral" in self.model_config.model_type:
+                                past_kv_byte_size = (
+                                    (self.max_input_length + idx)
+                                    * self.model_config.num_key_value_heads
+                                    * self.model_config.head_dim
+                                    * 2
+                                )
+                            else:
+                                raise ValueError(
+                                    f"Model architecture {self.model_config.model_type} not supported yet."
+                                )
+
+                            for layer_idx in range(
+                                self.model_config.num_hidden_layers
+                            ):
+                                for micro_batch_idx in range(num_micro_batches):
+                                    cur_batch = micro_batches[micro_batch_idx]
+                                    # logging.info(f"token idx: {idx}, layer idx: {layer_idx}, micro_batch_idx: {micro_batch_idx} current batch: {cur_batch}")
+                                    self.core_engine.submit_to_KV_queue(
+                                        cur_batch,
+                                        micro_batch_idx,
+                                        layer_idx,
+                                        past_kv_byte_size,
+                                    )
+
+                    with torch.no_grad():
+                        attention_mask = torch.cat(
+                            [
+                                self.query_book[query_idx].encoded[
+                                    "attention_mask"
+                                ][:, : self.max_input_length + new_token_idx]
+                                for query_idx in batch
+                            ],
+                            dim=0,
+                        ).to(self.torch_device)
+                        if "deepseek" in self.model_config.model_type:
+                            position_ids = create_position_ids_from_attention_mask(
+                                attention_mask
+                            )
+                        else:
+                            position_ids = create_position_ids_from_attention_mask(
+                                attention_mask
+                            )[:, -1].unsqueeze(-1)
+
+                        # if attention_mask.dim() == 2 and (
+                        #     self.model_config.model_type not in ["Qwen2", "deepseek"]
+                        # ):
+                        #     attention_mask = attention_mask.unsqueeze(1).unsqueeze(
+                        #         2
+                        #     )
+                        #     attention_mask = torch.where(
+                        #         attention_mask == 0,
+                        #         torch.finfo(torch.bfloat16).min,
+                        #         torch.tensor(
+                        #             0.0,
+                        #             dtype=torch.bfloat16,
+                        #             device=attention_mask.device,
+                        #         ),
+                        #     )
+
+                        Attn_Wrapper.attention_mask = attention_mask
+                        Attn_Wrapper.position_ids = position_ids
+                        # logging.info(f"rank: {self.rank} attention_mask: {attention_mask}")
+                        # logging.info(f"rank: {self.rank} position_ids: {position_ids}")
+                        new_tokens = self.model(
+                            new_tokens.to(self.torch_device),
+                            attention_mask=attention_mask.to(self.torch_device),
+                            # position_ids=position_ids.to(self.torch_device),
+                            use_cache=False,
+                        )
+                        # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                        # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                        new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
+                            -1, 1
+                        )
+                        self.update_new_token(new_tokens, batch, new_token_idx)
+                        # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                        # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                        # logging.info(f"New tokens: {new_tokens}")
+                    new_token_idx += 1
+
+                    # Step 1.1 Config new micro_batch size. Magic Number change every 32 new tokens.
+                    # seq_len = self.query_book[batch[0]].encoded["input_ids"].shape[1] + self.query_book[batch[0]].num_decoded_tokens
+                    # ATTN_DECODING_MICRO_BATCH_SIZE = self.engine_config.GPU_Buffer_Config.k_buffer_num_tokens // seq_len
+                elif RUNTIME_ATTN_MODE == 2:
+                    """
+                        CPU-GPU Parallel ATTN.
+                        Deprecated.
+                    """
+                    w = float(os.getenv("SPLIT_RATIO_W", None))
+                    if w is None:
+                        logging.info(
+                            f"CPU compute ratio not set. Default setting applied."
+                        )
+                        w = 0.6
+                    logging.info(f"Split ratio: {w}")
+                    # TODO: wordload partitioning.
+                    CPU_batch = batch[: math.ceil(len(batch) * w)]
+                    GPU_batch = batch[math.ceil(len(batch) * w) :]
+                    logging.info(
+                        f"CPU batch size: {len(CPU_batch)}, GPU batch size: {len(GPU_batch)}"
+                    )
+
+                    GPU_micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
+                    num_GPU_micro_batches = math.ceil(
+                        len(GPU_batch) / GPU_micro_batch_size
+                    )
+                    GPU_micro_batches = [
+                        GPU_batch[
+                            micro_batch_idx * GPU_micro_batch_size : (
+                                micro_batch_idx + 1
+                            )
+                            * GPU_micro_batch_size
+                        ]
+                        for micro_batch_idx in range(num_GPU_micro_batches)
+                    ]
+                    Attn_Wrapper.cur_batch = [CPU_batch] + GPU_micro_batches
+                    # TODO:
+                    if (new_token_idx - 1) % 32 == 0:
+                        for idx in range(new_token_idx - 1, new_token_idx + 31):
+                            if "deepseek" in self.model_config.model_type:
+                                past_kv_byte_size = (
+                                    (self.max_input_length + idx)
+                                    * self.model_config.compressed_kv_dim
+                                    * self.engine_config.Basic_Config.torch_dtype.itemsize
+                                )
+                            else:
+                                past_kv_byte_size = (
+                                    (self.max_input_length + idx)
+                                    * self.model_config.num_key_value_heads
+                                    * self.model_config.head_dim
+                                    * self.engine_config.Basic_Config.torch_dtype.itemsize
+                                )
+
+                            if "deepseek" in self.model_config.model_type:
+                                for layer_idx in range(
+                                    self.model_config.num_hidden_layers
+                                ):
+                                    self.core_engine.submit_to_KV_queue(
+                                        cur_batch, 0, layer_idx, past_kv_byte_size
+                                    )
+
+                            else:
+                                for layer_idx in range(
+                                    self.model_config.num_hidden_layers
+                                ):
+                                    for micro_batch_idx in range(
+                                        num_GPU_micro_batches
+                                    ):
+                                        cur_batch = GPU_micro_batches[
+                                            micro_batch_idx
+                                        ]
+                                        self.core_engine.submit_to_KV_queue(
+                                            cur_batch,
+                                            micro_batch_idx,
+                                            layer_idx,
+                                            past_kv_byte_size,
+                                        )
+
+                    with torch.no_grad():
+                        attention_mask = torch.cat(
+                            [
+                                self.query_book[query_idx].encoded[
+                                    "attention_mask"
+                                ][:, : self.max_input_length + new_token_idx]
+                                for query_idx in batch
+                            ],
+                            dim=0,
+                        )
+                        if "deepseek" not in self.model_config.model_type:
+                            position_ids = create_position_ids_from_attention_mask(
+                                attention_mask
+                            )[:, -1].unsqueeze(-1)
+                        else:
+                            position_ids = create_position_ids_from_attention_mask(
+                                attention_mask
+                            )
+                        if attention_mask.dim() == 2 and (
+                            self.model_config.model_type not in ["Qwen2"]
+                        ):
+                            attention_mask = attention_mask.unsqueeze(1).unsqueeze(
+                                2
+                            )
+                            attention_mask = torch.where(
+                                attention_mask == 0,
+                                torch.finfo(torch.bfloat16).min,
+                                torch.tensor(
+                                    0.0,
+                                    dtype=torch.bfloat16,
+                                    device=attention_mask.device,
+                                ),
+                            )
+
+                        Attn_Wrapper.attention_mask = attention_mask
+                        Attn_Wrapper.position_ids = position_ids
+                        new_tokens = self.model(
+                            new_tokens.to(self.torch_device),
+                            attention_mask=attention_mask.to(self.torch_device),
+                            # position_ids=position_ids,
+                            use_cache=False,
+                        )
+                        # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                        # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                        new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
+                            -1, 1
+                        )
+                        # start = time.perf_counter()
+                        self.update_new_token(new_tokens, batch, new_token_idx)
+                        # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+                        # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+                        print(f"New tokens: {new_tokens}")
+                        # logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
+                    new_token_idx += 1
+
+        
+        # if RUNTIME_ATTN_MODE == 3:
+        #     self.core_engine.clear_kv_gpu_storage()    
     
     def set_phase(self, phase: str):
         """
@@ -1598,7 +1650,7 @@ class MoE_Gen:
                 raise ValueError("No 0 found in the attention mask.")
 
     def _init_torch_dist_nccl(self):
-        timeout = timedelta(minutes=10)
+        timeout = timedelta(minutes=5)
         try:
             dist.init_process_group(
                 backend="NCCL",

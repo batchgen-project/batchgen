@@ -78,7 +78,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Copy KV to worker for the given query global index and context length.")
         .def("clear_kv_gpu_storage",
              &MoE_Gen::clear_gpu_kv_storage,
-             "Clear the GPU KV storage.");
+             "Clear the GPU KV storage.")
+        .def("get_kv_scale",
+             &MoE_Gen::get_kv_scale,
+             "Get the quantization scale for KV storage.")
+        .def("get_past_key_states",
+                &MoE_Gen::get_past_key_states,
+                "Get the past key states for the given query global indices and max sequence length.");
 
              
     py::class_<Parameter_Server>(m, "Parameter_Server")
