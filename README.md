@@ -83,6 +83,9 @@ pip install -e .
 ```
 
 ## Quick Start
+For 2-8*H20 Serving, please refer to ```./docs/Serving_with_two_nodes.```
+
+Following is an example for one node or within one node.
 MoE-Gen seamlessly integrates with Huggingface environment. Start inference with Huggingface checkpoint name.
 ### Example usage of serving DeepSeek-R1 on 8*H20 node
 #### Start Server

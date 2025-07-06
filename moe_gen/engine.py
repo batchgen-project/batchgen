@@ -218,7 +218,7 @@ def moe_gen(
     max_input_length: int,
     max_decoding_length: int,
     device: List[int],
-    engine_config_json_dir: str,
+    engine_config_json_dir: Optional[str] = None,
     hf_cache_dir: Optional[str] = None,
     cache_dir: Optional[str] = None,
     pt_ckpt_dir: Optional[str] = None,
@@ -420,7 +420,7 @@ class MoE_Gen:
         skeleton_state_dict,
         shm_name,
         tensor_meta_shm_name,
-        engine_config_json_dir,
+        engine_config_json_dir = None, # Will be deprecated in the future
         host_kv_cache_size: Optional[int] = None,
         dist_init_addr: str = "localhost:12355",
         local_rank: Optional[int] = 0,
@@ -428,7 +428,10 @@ class MoE_Gen:
         world_size: Optional[int] = 1,
     ):
         self.model = None
-        self.hf_cache_dir = hf_cache_dir
+        # self.hf_cache_dir = hf_cache_dir
+        # hf_cache_dir will be deprecated in the future.
+        if (hf_cache_dir is None) and (cache_dir is not None):
+            self.hf_cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.cache_dir = cache_dir
         self.pt_ckpt_dir = pt_ckpt_dir
