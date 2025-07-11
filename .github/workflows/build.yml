@@ -28,7 +28,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout Source Code
@@ -41,7 +41,7 @@ jobs:
 
       - name: Install CUDA 12.1
         run: |
-          bash -x .github/workflows/scripts/cuda-install.sh 12.1 ubuntu-20.04
+          bash -x .github/workflows/scripts/cuda-install.sh 12.1 ubuntu-22.04
 
       - name: Install Dependencies
         run: |
