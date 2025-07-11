@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-          os: ['ubuntu-20.04']
+          os: ['ubuntu-22.04']
           python-version: ['3.11']
           cuda-version: ['12.1']
 
