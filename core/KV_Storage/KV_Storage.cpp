@@ -39,6 +39,12 @@
 #include <cstdlib>       // posix_memalign      
 #include <cuda_runtime.h>
 #include <unistd.h>      // getpagesize
+#include <linux/mman.h>  // For MAP_HUGE_2MB
+
+// Fallback calculation if MAP_HUGE_2MB is not directly available
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
 
 
 constexpr float FP8_MAX = 448.0f;
@@ -304,140 +310,139 @@ KV_Storage::KV_Storage(EngineConfig& engine_config,
             this->engine_config_.basic_config.log_level,
             "KV_Storage" + std::to_string(this->engine_config_.basic_config.device));
 
-        int device_id = this->engine_config_.basic_config.device;
-        CUDA_CHECK(cudaSetDevice(device_id));
+        // int device_id = this->engine_config_.basic_config.device;
+        // CUDA_CHECK(cudaSetDevice(device_id));
 
-        // Determine target NUMA node based on device ID
-        int numa_node = -1;
-        bool numa_avail = (numa_available() >= 0);
-        if (numa_avail) {
-            numa_node = (device_id < 4) ? 0 : 1;
-        }
+        // // Determine target NUMA node based on device ID
+        // int numa_node = -1;
+        // bool numa_avail = (numa_available() >= 0);
+        // if (numa_avail) {
+        //     numa_node = (device_id < 4) ? 0 : 1;
+        // }
 
-        this->logger_->info("Starting KV_Storage Initialization on device {} targeting NUMA node {}.",
-                            device_id, numa_node);
+        // this->logger_->info("Starting KV_Storage Initialization on device {} targeting NUMA node {}.",
+        //                     device_id, numa_node);
 
-        const size_t storage_size       = this->engine_config_.kv_storage_config.storage_byte_size;
-        const size_t per_layer_size     = storage_size / this->model_config_.num_hidden_layers;
-        const size_t alignment          = 2 * 1024 * 1024;  // 2 MiB
+        // const size_t storage_size       = this->engine_config_.kv_storage_config.storage_byte_size;
+        // const size_t per_layer_size     = storage_size / this->model_config_.num_hidden_layers;
+        // const size_t alignment          = 2 * 1024 * 1024;  // 2 MiB
 
-        bool is_deepseek =
-            (this->model_config_.model_type.find("deepseek") != std::string::npos);
+        // bool is_deepseek =
+        //     (this->model_config_.model_type.find("deepseek") != std::string::npos);
 
-        // -------------------------------------------------
-        // NUMA-aware allocation function
-        // -------------------------------------------------
-        auto allocate_numa_wc = [&](void** out_ptr) -> bool {
-            if (!numa_avail || numa_node < 0) {
-                // Fallback to regular cudaHostAlloc if NUMA not available
-                cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
-                if (err == cudaSuccess) {
-                    this->logger_->info("Allocated {} bytes using cudaHostAlloc (no NUMA)", per_layer_size);
-                    return true;
-                }
-                // memset
-                CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
-                return false;
-            }
+        // auto allocate_numa_wc = [&](void** out_ptr) -> bool {
+        //     if (!numa_avail || numa_node < 0) {
+        //         // Fallback to regular cudaHostAlloc if NUMA not available
+        //         cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
+        //         if (err == cudaSuccess) {
+        //             this->logger_->info("Allocated {} bytes using cudaHostAlloc (no NUMA)", per_layer_size);
+        //             return true;
+        //         }
+        //         // memset
+        //         // CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
+        //         return false;
+        //     }
 
-            // Set NUMA policy to bind to target node before allocation
-            struct bitmask *old_mask = numa_get_membind();
-            struct bitmask *target_mask = numa_allocate_nodemask();
-            numa_bitmask_setbit(target_mask, numa_node);
+        //     // Set NUMA policy to bind to target node before allocation
+        //     struct bitmask *old_mask = numa_get_membind();
+        //     struct bitmask *target_mask = numa_allocate_nodemask();
+        //     numa_bitmask_setbit(target_mask, numa_node);
             
-            // Set binding policy - use MPOL_BIND for strict placement
-            numa_set_bind_policy(1);
-            numa_set_membind(target_mask);
+        //     // Set binding policy - use MPOL_BIND for strict placement
+        //     numa_set_bind_policy(1);
+        //     numa_set_membind(target_mask);
 
-            // Allocate write-combined memory
-            cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
+        //     // Allocate write-combined memory
+        //     cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
             
-            if (err == cudaSuccess) {
-                // Verify the allocation is on correct NUMA node
-                int actual_node = -1;
-                if (get_mempolicy(&actual_node, nullptr, 0, *out_ptr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
-                    if (actual_node == numa_node) {
-                        this->logger_->info("Successfully allocated {} bytes on NUMA node {}", 
-                                          per_layer_size, actual_node);
-                    } else {
-                        this->logger_->warn("Allocated on NUMA node {} instead of target node {}", 
-                                          actual_node, numa_node);
+        //     if (err == cudaSuccess) {
+        //         // Verify the allocation is on correct NUMA node
+        //         int actual_node = -1;
+        //         if (get_mempolicy(&actual_node, nullptr, 0, *out_ptr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+        //             if (actual_node == numa_node) {
+        //                 this->logger_->info("Successfully allocated {} bytes on NUMA node {}", 
+        //                                   per_layer_size, actual_node);
+        //             } else {
+        //                 this->logger_->warn("Allocated on NUMA node {} instead of target node {}", 
+        //                                   actual_node, numa_node);
                         
-                        // Attempt to migrate the memory to correct NUMA node
-                        unsigned long nodemask = 1UL << numa_node;
-                        if (mbind(*out_ptr, per_layer_size, MPOL_BIND, &nodemask, 
-                                sizeof(nodemask) * 8, MPOL_MF_MOVE | MPOL_MF_STRICT) == 0) {
-                            this->logger_->info("Successfully migrated memory to NUMA node {}", numa_node);
-                        } else {
-                            this->logger_->warn("Failed to migrate memory to NUMA node {}", numa_node);
-                        }
-                    }
-                }
+        //                 // Attempt to migrate the memory to correct NUMA node
+        //                 unsigned long nodemask = 1UL << numa_node;
+        //                 if (mbind(*out_ptr, per_layer_size, MPOL_BIND, &nodemask, 
+        //                         sizeof(nodemask) * 8, MPOL_MF_MOVE | MPOL_MF_STRICT) == 0) {
+        //                     this->logger_->info("Successfully migrated memory to NUMA node {}", numa_node);
+        //                 } else {
+        //                     this->logger_->warn("Failed to migrate memory to NUMA node {}", numa_node);
+        //                 }
+        //             }
+        //         }
 
-                // Touch pages to ensure physical allocation and proper NUMA placement
-                // Use first-touch with proper alignment
-                volatile char* ptr = static_cast<volatile char*>(*out_ptr);
-                size_t page_size = getpagesize();
+        //         // Touch pages to ensure physical allocation and proper NUMA placement
+        //         // Use first-touch with proper alignment
+        //         volatile char* ptr = static_cast<volatile char*>(*out_ptr);
+        //         size_t page_size = getpagesize();
                 
-                #pragma omp parallel for if(per_layer_size > 1024*1024)
-                for (size_t offset = 0; offset < per_layer_size; offset += page_size) {
-                    ptr[offset] = 0;
-                }
+        //         #pragma omp parallel for if(per_layer_size > 1024*1024)
+        //         for (size_t offset = 0; offset < per_layer_size; offset += page_size) {
+        //             ptr[offset] = 0;
+        //         }
                 
-                // Check alignment
-                if (reinterpret_cast<uintptr_t>(*out_ptr) % alignment == 0) {
-                    this->logger_->debug("Memory is properly aligned to {} bytes", alignment);
-                } else {
-                    this->logger_->warn("Memory alignment is not optimal (requested {} bytes)", alignment);
-                }
-            }
+        //         // Check alignment
+        //         if (reinterpret_cast<uintptr_t>(*out_ptr) % alignment == 0) {
+        //             this->logger_->debug("Memory is properly aligned to {} bytes", alignment);
+        //         } else {
+        //             this->logger_->warn("Memory alignment is not optimal (requested {} bytes)", alignment);
+        //         }
+        //     }
 
-            // Restore original NUMA policy
-            numa_set_membind(old_mask);
-            numa_set_bind_policy(0);
-            numa_free_nodemask(target_mask);
-            numa_free_nodemask(old_mask);
+        //     // Restore original NUMA policy
+        //     numa_set_membind(old_mask);
+        //     numa_set_bind_policy(0);
+        //     numa_free_nodemask(target_mask);
+        //     numa_free_nodemask(old_mask);
 
-            return (err == cudaSuccess);
-        };
+        //     return (err == cudaSuccess);
+        // };
 
-        // -------------------------------------------------
-        // Allocate per-layer KV buffers
-        // -------------------------------------------------
-        auto bar = tq::trange(this->model_config_.num_hidden_layers);
-        bar.set_prefix("Allocating NUMA-aware Pinned Memory for KV cache");
+        // // -------------------------------------------------
+        // // Allocate per-layer KV buffers
+        // // -------------------------------------------------
+        // auto start_time = std::chrono::high_resolution_clock::now();
+        // auto bar = tq::trange(this->model_config_.num_hidden_layers);
+        // bar.set_prefix("Allocating NUMA-aware Pinned Memory for KV cache");
+        // for (auto layer_idx : bar) {
+        //     void* k_ptr = nullptr;
+        //     if (!allocate_numa_wc(&k_ptr)) {
+        //         throw std::runtime_error("Failed to allocate K cache memory for layer " + std::to_string(layer_idx));
+        //     }
+        //     this->k_pinned_memory.push_back(k_ptr);
 
-        for (auto layer_idx : bar) {
-            void* k_ptr = nullptr;
-            if (!allocate_numa_wc(&k_ptr)) {
-                throw std::runtime_error("Failed to allocate K cache memory for layer " + std::to_string(layer_idx));
-            }
-            this->k_pinned_memory.push_back(k_ptr);
+        //     if (!is_deepseek) {
+        //         void* v_ptr = nullptr;
+        //         if (!allocate_numa_wc(&v_ptr)) {
+        //             throw std::runtime_error("Failed to allocate V cache memory for layer " + std::to_string(layer_idx));
+        //         }
+        //         this->v_pinned_memory.push_back(v_ptr);
+        //     }
+        // }
+        // auto end_time = std::chrono::high_resolution_clock::now();
+        // auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+        // this->logger_->info("KV Storage Pinned Memory Allocated in {} seconds on NUMA node {}.",
+        //                     duration, numa_node);
 
-            if (!is_deepseek) {
-                void* v_ptr = nullptr;
-                if (!allocate_numa_wc(&v_ptr)) {
-                    throw std::runtime_error("Failed to allocate V cache memory for layer " + std::to_string(layer_idx));
-                }
-                this->v_pinned_memory.push_back(v_ptr);
-            }
-        }
-
-        this->logger_->info("KV Storage Pinned Memory Allocated successfully.");
-
-        // Final NUMA verification for first allocation
-        if (!this->k_pinned_memory.empty() && numa_available) {
-            int actual_node = -1;
-            if (get_mempolicy(&actual_node, nullptr, 0,
-                            this->k_pinned_memory[0],
-                            MPOL_F_NODE | MPOL_F_ADDR) == 0) {
-                this->logger_->info("Final verification: Device {} memory allocated on NUMA node {} (target was {}).",
-                                  device_id, actual_node, numa_node);
-            }
+        // // Final NUMA verification for first allocation
+        // if (!this->k_pinned_memory.empty() && numa_available) {
+        //     int actual_node = -1;
+        //     if (get_mempolicy(&actual_node, nullptr, 0,
+        //                     this->k_pinned_memory[0],
+        //                     MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+        //         this->logger_->info("Final verification: Device {} memory allocated on NUMA node {} (target was {}).",
+        //                           device_id, actual_node, numa_node);
+        //     }
             
-            // Optional: Verify multiple pages for large allocations
-            this->verify_numa_placement(this->k_pinned_memory[0], per_layer_size, numa_node);
-        }
+        //     // Optional: Verify multiple pages for large allocations
+        //     this->verify_numa_placement(this->k_pinned_memory[0], per_layer_size, numa_node);
+        // }
 
     } catch (const std::exception& e) {
         this->logger_->error("KV_Storage: Exception during initialization: {}", e.what());
@@ -605,6 +610,141 @@ void KV_Storage::verify_numa_placement(void* ptr, size_t size, int expected_node
 
 void KV_Storage::Init() {
     try {
+        int device_id = this->engine_config_.basic_config.device;
+        CUDA_CHECK(cudaSetDevice(device_id));
+
+        // Determine target NUMA node based on device ID
+        int numa_node = -1;
+        bool numa_avail = (numa_available() >= 0);
+        if (numa_avail) {
+            numa_node = (device_id < 4) ? 0 : 1;
+        }
+
+        this->logger_->info("Starting KV_Storage Initialization on device {} targeting NUMA node {}.",
+                            device_id, numa_node);
+
+        const size_t storage_size       = this->engine_config_.kv_storage_config.storage_byte_size;
+        const size_t per_layer_size     = storage_size / this->model_config_.num_hidden_layers;
+        const size_t alignment          = 2 * 1024 * 1024;  // 2 MiB
+
+        bool is_deepseek =
+            (this->model_config_.model_type.find("deepseek") != std::string::npos);
+
+        auto allocate_numa_wc = [&](void** out_ptr) -> bool {
+            if (!numa_avail || numa_node < 0) {
+                // Fallback to regular cudaHostAlloc if NUMA not available
+                cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
+                if (err == cudaSuccess) {
+                    this->logger_->info("Allocated {} bytes using cudaHostAlloc (no NUMA)", per_layer_size);
+                    return true;
+                }
+                // memset
+                // CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
+                return false;
+            }
+
+            // Set NUMA policy to bind to target node before allocation
+            struct bitmask *old_mask = numa_get_membind();
+            struct bitmask *target_mask = numa_allocate_nodemask();
+            numa_bitmask_setbit(target_mask, numa_node);
+            
+            // Set binding policy - use MPOL_BIND for strict placement
+            numa_set_bind_policy(1);
+            numa_set_membind(target_mask);
+
+            // Allocate write-combined memory
+            cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
+            
+            if (err == cudaSuccess) {
+                // Verify the allocation is on correct NUMA node
+                int actual_node = -1;
+                if (get_mempolicy(&actual_node, nullptr, 0, *out_ptr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+                    if (actual_node == numa_node) {
+                        this->logger_->info("Successfully allocated {} bytes on NUMA node {}", 
+                                          per_layer_size, actual_node);
+                    } else {
+                        this->logger_->warn("Allocated on NUMA node {} instead of target node {}", 
+                                          actual_node, numa_node);
+                        
+                        // Attempt to migrate the memory to correct NUMA node
+                        unsigned long nodemask = 1UL << numa_node;
+                        if (mbind(*out_ptr, per_layer_size, MPOL_BIND, &nodemask, 
+                                sizeof(nodemask) * 8, MPOL_MF_MOVE | MPOL_MF_STRICT) == 0) {
+                            this->logger_->info("Successfully migrated memory to NUMA node {}", numa_node);
+                        } else {
+                            this->logger_->warn("Failed to migrate memory to NUMA node {}", numa_node);
+                        }
+                    }
+                }
+
+                // Touch pages to ensure physical allocation and proper NUMA placement
+                // Use first-touch with proper alignment
+                volatile char* ptr = static_cast<volatile char*>(*out_ptr);
+                size_t page_size = getpagesize();
+                
+                #pragma omp parallel for if(per_layer_size > 1024*1024)
+                for (size_t offset = 0; offset < per_layer_size; offset += page_size) {
+                    ptr[offset] = 0;
+                }
+                
+                // Check alignment
+                if (reinterpret_cast<uintptr_t>(*out_ptr) % alignment == 0) {
+                    this->logger_->debug("Memory is properly aligned to {} bytes", alignment);
+                } else {
+                    this->logger_->warn("Memory alignment is not optimal (requested {} bytes)", alignment);
+                }
+            }
+
+            // Restore original NUMA policy
+            numa_set_membind(old_mask);
+            numa_set_bind_policy(0);
+            numa_free_nodemask(target_mask);
+            numa_free_nodemask(old_mask);
+
+            return (err == cudaSuccess);
+        };
+
+        // -------------------------------------------------
+        // Allocate per-layer KV buffers
+        // -------------------------------------------------
+        auto start_time = std::chrono::high_resolution_clock::now();
+        auto bar = tq::trange(this->model_config_.num_hidden_layers);
+        bar.set_prefix("Allocating NUMA-aware Pinned Memory for KV cache");
+        for (auto layer_idx : bar) {
+            void* k_ptr = nullptr;
+            if (!allocate_numa_wc(&k_ptr)) {
+                throw std::runtime_error("Failed to allocate K cache memory for layer " + std::to_string(layer_idx));
+            }
+            this->k_pinned_memory.push_back(k_ptr);
+
+            if (!is_deepseek) {
+                void* v_ptr = nullptr;
+                if (!allocate_numa_wc(&v_ptr)) {
+                    throw std::runtime_error("Failed to allocate V cache memory for layer " + std::to_string(layer_idx));
+                }
+                this->v_pinned_memory.push_back(v_ptr);
+            }
+        }
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+        this->logger_->info("KV Storage Pinned Memory Allocated in {} seconds on NUMA node {}.",
+                            duration, numa_node);
+
+        // Final NUMA verification for first allocation
+        if (!this->k_pinned_memory.empty() && numa_available) {
+            int actual_node = -1;
+            if (get_mempolicy(&actual_node, nullptr, 0,
+                            this->k_pinned_memory[0],
+                            MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+                this->logger_->info("Final verification: Device {} memory allocated on NUMA node {} (target was {}).",
+                                  device_id, actual_node, numa_node);
+            }
+            
+            // Optional: Verify multiple pages for large allocations
+            this->verify_numa_placement(this->k_pinned_memory[0], per_layer_size, numa_node);
+        }
+
+        // Bookkeeping init
         if (this->model_config_.model_type.find("deepseek") ==
             std::string::npos) {
             /* Slicing reserved K and V to slots. */

@@ -56,6 +56,8 @@ class ParameterServer:
 		self.hf_cache_dir = hf_cache_dir
 		self.cache_dir = cache_dir
 		self.pt_ckpt_dir = pt_ckpt_dir
+		# if self.pt_ckpt_dir is None:
+		# 	self.pt_ckpt_dir = os.path.join(cache_dir, "converted_ckpt")
 		
 		# State tracking
 		self.current_model = None
@@ -397,6 +399,10 @@ class ParameterServer:
 	def handle_shutdown(self, signum, frame):
 		"""Handle shutdown signals"""
 		logging.info(f"Received signal {signum}, shutting down...")
+		# clean-up /dev/shm or /dev/hugepages
+		logging.info("unlink /dev/hugepages/{self.model_info.get('shm_name')}")
+		os.unlink(os.path.join("/dev/hugepages", self.model_info.get('shm_name')))
+
 		self.running = False
 	
 	def handle_client(self, client_socket, address):

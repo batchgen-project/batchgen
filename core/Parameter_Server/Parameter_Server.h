@@ -86,4 +86,9 @@ class Parameter_Server {
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_storage_;
     std::unordered_map<std::string, torch::Tensor> skeleton_state_dict_;
+
+    void _load_cus_format_file_to_host_mem(
+        const std::string& model_weights_path,
+        void* weight_ptr,
+        std::unordered_map<std::string,std::unordered_map<std::string, std::string>>& state_dict_name_map);
 };

@@ -54,11 +54,21 @@ void Weights_Storage::Init(
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_shm) {
+    CUDA_CHECK(cudaSetDevice(
+        this->engine_config_.basic_config.device));
     this->shm_name = shm_name;
     auto start_time = std::chrono::high_resolution_clock::now();
     this->byte_size_ = byte_size;
+    this->logger->info(
+        "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
+        shm_name, byte_size);
     void* weight_ptr =
         allocate_shared_pinned_memory(shm_name, byte_size, false);
+    // Check if weight_ptr is null
+    if (weight_ptr == nullptr) {
+        this->logger->error("Failed to allocate shared pinned memory.");
+        throw std::runtime_error("Failed to allocate shared pinned memory.");
+    }
     this->weight_ptr_ = weight_ptr;
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration =
