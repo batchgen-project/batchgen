@@ -21,6 +21,9 @@
 # changing the environment variable `SGLANG_NCCL_SO_PATH`, or the `so_file`
 # variable in the code.
 
+"""
+    Adapted from SGLang project and vLLM project.
+"""
 import ctypes
 import logging
 import os
@@ -30,25 +33,23 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.distributed import ReduceOp
-
 logger = logging.getLogger(__name__)
 
 
 def find_nccl_library() -> str:
     """
-    We either use the library file specified by the `SGLANG_NCCL_SO_PATH`
-    environment variable, or we find the library file brought by PyTorch.
+    We either use the library file specified by the environment variable, 
+    or we find the library file brought by PyTorch.
     After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
     found by `ctypes` automatically.
     """
 
-    # so_file can be set to None in sglang
-    so_file = os.environ.get("SGLANG_NCCL_SO_PATH", None)
+    so_file = os.environ.get("MOEGEN_NCCL_SO_PATH", None)
 
     # manually load the nccl library
     if so_file:
         logger.info(
-            "Found nccl from environment variable SGLANG_NCCL_SO_PATH=%s", so_file
+            "Found nccl from environment variable %s", so_file
         )
     else:
         if torch.version.cuda is not None:
@@ -303,7 +304,7 @@ class NCCLLibrary:
                 "Otherwise, the nccl library might not exist, be corrupted "
                 "or it does not support the current platform %s."
                 "If you already have the library, please set the "
-                "environment variable SGLANG_NCCL_SO_PATH"
+                "environment variable MOEGEN_NCCL_SO_PATH"
                 " to point to the correct nccl library path.",
                 so_file,
                 platform.platform(),

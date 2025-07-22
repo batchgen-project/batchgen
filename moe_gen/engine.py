@@ -19,6 +19,7 @@
 import concurrent.futures
 import copy
 import functools
+import psutil
 import logging
 import math
 import os
@@ -167,9 +168,42 @@ def _config_torch_module_initializer():
 
 
 
-def run_moe_gen(moe_gen):
-    moe_gen.Init()
-    return moe_gen.generate()
+def run_moe_gen(args):
+    moe_gen_instance, numa_node = args
+    try:
+        current_process = psutil.Process()
+        # Get CPUs for this NUMA node
+        numa_cpus = psutil.cpu_count(logical=False) // 2  # Assuming 2 NUMA nodes
+        if numa_node == 0:
+            cpu_list = list(range(0, numa_cpus))
+        else:
+            cpu_list = list(range(numa_cpus, numa_cpus * 2))
+
+        current_process.cpu_affinity(cpu_list)
+        if hasattr(os, 'sched_setaffinity'):
+            os.sched_setaffinity(0, cpu_list)
+    except Exception as e:
+        print(f"Warning: Could not set NUMA affinity: {e}")
+
+    moe_gen_instance.Init()
+    res = moe_gen_instance.generate()
+    return res
+
+class FastProcessPoolExecutor(concurrent.futures.ProcessPoolExecutor):
+    def shutdown(self, wait=True):
+        # Get all worker processes
+        if hasattr(self, '_processes'):
+            for p in self._processes.values():
+                if p.is_alive():
+                    p.terminate()  # Force termination
+            # Give a brief moment for termination
+            import time
+            time.sleep(0.1)
+            # Kill any remaining processes
+            for p in self._processes.values():
+                if p.is_alive():
+                    p.kill()
+        super().shutdown(wait=False)
 
 
 def distribute_sequences(num_sequences, num_devices):
@@ -390,15 +424,13 @@ def moe_gen(
         
         return all_results
 
+    # TODO:
+    device_to_numa = {0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 1}  
+    worker_args = [(moe_gen, device_to_numa[i]) for i, moe_gen in enumerate(moe_gens)]
     start_time = time.perf_counter()
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        # Submit each worker and collect the future objects
-        futures = [
-            executor.submit(run_moe_gen, moe_gen_instance) for moe_gen_instance in moe_gens
-        ]
-        # Retrieve results in the same order as the futures were submitted
+    with FastProcessPoolExecutor() as executor:
+        futures = [executor.submit(run_moe_gen, args) for args in worker_args]
         all_results = safe_collect_results(futures)
-    
     end_time = time.perf_counter()
     logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
     
@@ -495,7 +527,7 @@ class MoE_Gen:
     def Init(self):
         logging.info(f"Initializing MoE_Gen with global rank {self.global_rank} and world size {self.world_size} with PID: {os.getpid()}")
         torch.cuda.set_device(self.device)
-        self._init_torch_dist_nccl()
+        self._init_torch_dist()
 
         torch.cuda.reset_peak_memory_stats()
         logging.info(self.hf_cache_dir)
@@ -703,19 +735,24 @@ class MoE_Gen:
 
         # Step 2: Create model batches. Batch size = self.engine_config.KV_Storage_Config.num_host_slots
         self.model_batches = []
+        if self.engine_config.Basic_Config.attn_mode != 3:
+            model_batch_size = self.engine_config.KV_Storage_Config.num_host_slots
+        else:
+            model_batch_size = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
+        
         num_model_batch = math.ceil(
             self.num_queries
-            / self.engine_config.KV_Storage_Config.num_host_slots
+            / model_batch_size
         )
         for model_batch_idx in range(num_model_batch):
             self.model_batches.append(
                 list(
                     range(
                         model_batch_idx
-                        * self.engine_config.KV_Storage_Config.num_host_slots,
+                        * model_batch_size,
                         min(
                             (model_batch_idx + 1)
-                            * self.engine_config.KV_Storage_Config.num_host_slots,
+                            * model_batch_size,
                             self.num_queries,
                         ),
                     )
@@ -726,7 +763,7 @@ class MoE_Gen:
             f"Number of model level batches: {len(self.model_batches)}"
         )
         logging.info(
-            f"Model level batch size: {self.engine_config.KV_Storage_Config.num_host_slots}"
+            f"Model level batch size: {model_batch_size}"
         )
 
     def initial_batching(self):
@@ -816,9 +853,10 @@ class MoE_Gen:
             for model_batch_idx in tqdm(
                 range(len(self.model_batches)), desc="Model Batch"
             ):
+                dist.barrier()
                 self._config_prefill()
                 prefill_start_time = time.perf_counter()
-                with torch.no_grad():
+                with torch.inference_mode():
                     new_token = self.prefill(self.model_batches[model_batch_idx])
                 prefill_time += time.perf_counter() - prefill_start_time
                 # self.core_engine.prefill_complete_sync()
@@ -840,27 +878,22 @@ class MoE_Gen:
                 
 
                 # Log allocated memory after prefill
-                if self.rank == 0:
-                    allocated_memory = torch.cuda.memory_allocated(self.torch_device)
-                    logging.info(
-                        f"Rank: {self.rank} Prefill complete. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
-                    )
-                    tensor_mem = []
-                    torch_total_mem = 0
-                    for name, param in self.model.named_parameters():   
-                        tensor_mem.append(
-                            f"{name}: {param.numel() * param.element_size() / 1024 / 1024:.2f} MB"
-                        )
-                        torch_total_mem += (
-                            param.numel() * param.element_size() / 1024 / 1024
-                        )
-                    # tensor_mem = tensor_mem.sort(
-                    #     key=lambda x: float(x.split(": ")[1].split(" ")[0]),
-                    #     reverse=True,
-                    # )
-                    logging.info(f"Torch total memory: {torch_total_mem:.2f} MB")
-                    # for mem in tensor_mem:
-                    #     logging.info(mem)
+                # if self.rank == 0:
+                #     allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+                #     logging.info(
+                #         f"Rank: {self.rank} Prefill complete. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
+                #     )
+                #     tensor_mem = []
+                #     torch_total_mem = 0
+                #     for name, param in self.model.named_parameters():   
+                #         tensor_mem.append(
+                #             f"{name}: {param.numel() * param.element_size() / 1024 / 1024:.2f} MB"
+                #         )
+                #         torch_total_mem += (
+                #             param.numel() * param.element_size() / 1024 / 1024
+                #         )
+                #     logging.info(f"Torch total memory: {torch_total_mem:.2f} MB")
+
 
                     
                 self._config_decoding()
@@ -872,20 +905,22 @@ class MoE_Gen:
                         past_value_states = None
                         # scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
                         scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+                        
+                        
                         # Compute the byte size of past_key_states
-                        past_key_states_byte_size = 0
-                        for value in past_key_states:
-                            past_key_states_byte_size += value.numel() * value.element_size()
-                        logging.info(
-                            f"Rank: {self.rank} past_key_states byte size: {past_key_states_byte_size / 1024 / 1024 / 1024:.2f} GB"
-                        )
-                        # Compute the byte size of scale_dict
-                        scale_dict_byte_size = 0
-                        for value in scale_dict:
-                            scale_dict_byte_size += value.numel() * value.element_size()
-                        logging.info(
-                            f"Rank: {self.rank} scale_dict byte size: {scale_dict_byte_size / 1024 / 1024:.2f} MB"
-                        )
+                        # past_key_states_byte_size = 0
+                        # for value in past_key_states:
+                        #     past_key_states_byte_size += value.numel() * value.element_size()
+                        # logging.info(
+                        #     f"Rank: {self.rank} past_key_states byte size: {past_key_states_byte_size / 1024 / 1024 / 1024:.2f} GB"
+                        # )
+                        # # Compute the byte size of scale_dict
+                        # scale_dict_byte_size = 0
+                        # for value in scale_dict:
+                        #     scale_dict_byte_size += value.numel() * value.element_size()
+                        # logging.info(
+                        #     f"Rank: {self.rank} scale_dict byte size: {scale_dict_byte_size / 1024 / 1024:.2f} MB"
+                        # )
         
                     else:
                         # TODO:
@@ -900,7 +935,7 @@ class MoE_Gen:
                 dist.barrier()
                 torch.cuda.empty_cache()
                 decoding_start_time = time.perf_counter()
-                with torch.no_grad():
+                with torch.inference_mode():
                     logging.info(
                         f"decoding batch size: {len(self.model_batches[model_batch_idx])}"
                     )
@@ -924,9 +959,10 @@ class MoE_Gen:
                 logging.info(
                     f"Rank: {self.rank} Device torch free memory before decoding: {free_memory} GB / {total_memory} GB"
                 )
-
+            dist.barrier()
+            torch.cuda.empty_cache()
             decoding_start_time = time.perf_counter()
-            with torch.no_grad():
+            with torch.inference_mode():
                 self.decoding(None, None)
             decoding_time += time.perf_counter() - decoding_start_time
             self.core_engine.clear_kv_storage()
@@ -938,11 +974,11 @@ class MoE_Gen:
         torch.cuda.empty_cache()
         dist.destroy_process_group()
 
-        # 
-
-        logging.info(f"Prefill total time: {prefill_time}")
-        logging.info(f"Decoding total time: {decoding_time}")
-        logging.info(f"Waiting for process clean up...")
+        logging.info(
+            f"Rank {self.rank} Prefill total time: {prefill_time:.1f} seconds,\n"
+            f"Decoding total time: {decoding_time:.1f} seconds,\n"
+            f"Waiting for process clean up..."
+        )
 
         res = [
             self.query_book[query_idx].decoded_tokens
@@ -1125,7 +1161,8 @@ class MoE_Gen:
         for micro_batch_idx in tqdm(
             range(num_prefill_micro_batches), desc="Prefill Micro Batch"
         ):
-            with torch.no_grad():
+            print("\n")
+            with torch.inference_mode():
                 Attn_Wrapper.attention_mask = (
                     Prefill_micro_batch_attention_masks[micro_batch_idx]
                 )
@@ -1222,7 +1259,7 @@ class MoE_Gen:
                 #     for micro_batch_idx in range(num_micro_batches)
                 # ]
                 # Attn_Wrapper.cur_batch = micro_batches
-                with torch.no_grad():
+                with torch.inference_mode():
                     attention_mask = torch.cat(
                         [
                             self.query_book[query_idx].encoded[
@@ -1242,7 +1279,9 @@ class MoE_Gen:
                     #     )[:, -1].unsqueeze(-1)
 
                     Attn_Wrapper.attention_mask = attention_mask
-                    Attn_Wrapper.position_ids = None
+                    Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+                    Attn_Wrapper.cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+                    Attn_Wrapper.max_seqlen = Attn_Wrapper.cache_seqlens.max().item()
 
                     new_tokens = self.model(
                         new_tokens.to(self.torch_device),
@@ -1273,7 +1312,7 @@ class MoE_Gen:
                     """
                     # self.set_attn_mode(0)
                     # self.core_engine.set_attn_mode(0)
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         Attn_Wrapper.cur_batch = [batch]
                         attention_mask = torch.cat(
                             [
@@ -1401,7 +1440,7 @@ class MoE_Gen:
                                         past_kv_byte_size,
                                     )
 
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         attention_mask = torch.cat(
                             [
                                 self.query_book[query_idx].encoded[
@@ -1535,7 +1574,7 @@ class MoE_Gen:
                                             past_kv_byte_size,
                                         )
 
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         attention_mask = torch.cat(
                             [
                                 self.query_book[query_idx].encoded[
@@ -1652,11 +1691,13 @@ class MoE_Gen:
             else:
                 raise ValueError("No 0 found in the attention mask.")
 
-    def _init_torch_dist_nccl(self):
+    def _init_torch_dist(self):
         timeout = timedelta(minutes=5)
+        os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
         try:
             dist.init_process_group(
                 backend="NCCL",
+                # backend="gloo",
                 init_method="tcp://" + self.dist_init_addr,
                 world_size=self.world_size,
                 rank = self.global_rank,

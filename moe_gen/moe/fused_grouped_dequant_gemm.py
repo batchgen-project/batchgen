@@ -418,7 +418,9 @@ def fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
 		group_sizes: tuple[int, int],
 		group_start_indices: torch.Tensor,
 		gemm_block_size=(64, 64, 128), 
-		scale_block_size=(128, 128)
+		scale_block_size=(128, 128),
+		num_stages=2,
+		num_warps=4
 ):
 	"""
 		Performs a fused dequantization and grouped_gemm. We dequantize the fp8 rhs to bf16 on the fly.
@@ -476,13 +478,14 @@ def fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
 			rhs_ptrs_ptr.stride(0), rhs_scale_ptrs_ptr.stride(0),
 			GEMM_BLOCK_SIZE_M=gemm_block_size[0], GEMM_BLOCK_SIZE_N=gemm_block_size[1], GEMM_BLOCK_SIZE_K=gemm_block_size[2],
 			SCALE_BLOCK_SIZE_N=scale_block_size[0], SCALE_BLOCK_SIZE_K=scale_block_size[1],
-			# num_warps=4,
-    		# num_stages=4
+			num_warps=num_warps,
+			num_stages=num_stages
 		)
 	except Exception as e:
 		print(f"Error launching fused_dequant_grouped_gemm_bf16_fp8_kernel: {e}")
 		raise
 	return output
+
 
 
 
@@ -494,6 +497,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_kernel(
 	output_ptr,
 	M, N:tl.constexpr, K:tl.constexpr, num_groups,
 	stride_lhs_m, stride_lhs_k,
+	stride_lhs_scale_m, stride_lhs_scale_k,
 	stride_rhs_n, stride_rhs_k,
 	stride_output_m, stride_output_n,
 	stride_group_idx, stride_group_sizes, stride_group_start_indices, stride_rhs_ptrs, stride_rhs_scale_ptrs,
@@ -502,7 +506,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_kernel(
 	SCALE_BLOCK_SIZE_N: tl.constexpr, SCALE_BLOCK_SIZE_K: tl.constexpr
 ):
 	"""
-		Fused grouped GEMM kernel for fp8 lhs and fp8 rhs matrices.
+		Fused dequantization and grouped GEMM kernel for bf16 lhs and fp8 rhs matrices.
 		Args:
 			- lhs_ptr: Pointer to the lhs matrix (M, K) in bf16 dtype.
 			- rhs_ptrs_ptr: Pointer to a tensor of pointers to rhs matrices (N, K) in fp8 dtype.
@@ -563,7 +567,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_kernel(
 				scale_k = k_idx * GEMM_BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
 				scale_ptr = rhs_scale_base_ptr + (scale_n * num_scale_k + scale_k)
 				# Load the scale for this tile
-				scale = tl.load(scale_ptr)
+				rhs_scale = tl.load(scale_ptr)
 
 				# Create masks for lhs and rhs
 				# lhs_mask = (offsets_m[:, None] < valid_rows_this_block) & (offsets_k[None, :] < K)
@@ -573,15 +577,19 @@ def fused_dequant_grouped_gemm_fp8_fp8_kernel(
 				# Load rhs tile:
 				rhs_fp8 = tl.load(rhs_ptrs, mask=rhs_mask, other=0.0, cache_modifier='.cg')
 				# Dequantize rhs from fp8 to bf16
-				rhs_fp32 = tl.cast(rhs_fp8, tl.float32)
-				rhs_scaled = rhs_fp32 * scale
-				rhs_bf16 = tl.cast(rhs_scaled, lhs_dtype)
+				# rhs_fp32 = tl.cast(rhs_fp8, tl.float32)
+				# rhs_scaled = rhs_fp32 * scale
+				# rhs_bf16 = tl.cast(rhs_scaled, lhs_dtype)
 
 				# Load lhs tile:
 				lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
-				# , cache_modifier='.cg'
+				lhs_scale_k = k_idx * GEMM_BLOCK_SIZE_K // 128
+				l_scale_ptr = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + lhs_scale_k * stride_lhs_scale_k)
+				lhs_scale = tl.load(l_scale_ptr, mask=(abs_row_indices[:, None] < M), other=1.0, cache_modifier='.cg')
+				
+
 				# Product
-				acc += tl.dot(lhs, tl.trans(rhs_bf16))
+				acc += tl.dot(lhs, tl.trans(rhs_fp8)) * lhs_scale * rhs_scale
 			# Store the result
 			offs_output_m = sub_group_start_idx + tl.arange(0, GEMM_BLOCK_SIZE_M)
 			offs_output_n = pid * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
@@ -593,3 +601,81 @@ def fused_dequant_grouped_gemm_fp8_fp8_kernel(
 			# Convert to bf16 before storing
 			output = tl.cast(acc, lhs_dtype)
 			tl.store(output_ptrs, output, mask=output_mask)
+
+
+@torch.inference_mode()
+def fused_dequant_grouped_gemm_fp8_fp8_triton(
+		lhs: torch.Tensor,
+		lhs_scale: torch.Tensor,
+		rhs_list: list[torch.Tensor],
+		rhs_ptrs_ptr: torch.Tensor,
+		rhs_scale_list: list[torch.Tensor],
+		rhs_scale_ptrs_ptr: torch.Tensor,
+		# group_sizes: tuple[int, int],
+		group_size: torch.Tensor,
+		activated_group_idx: torch.Tensor,
+		group_start_indices: torch.Tensor,
+		gemm_block_size=(64, 32, 128), 
+		scale_block_size=(128, 128),
+		num_stages=2,
+		num_warps=4
+):
+	"""
+		Performs a fused dequantization and grouped_gemm. We dequantize the fp8 rhs to bf16 on the fly.
+		Args:
+			lhs: torch.Tensor of shape (M, K) in bf16 dtype.
+			lhs_scale: torch.Tensor of shape (M, lhs_dim // lhs_scale_block_size) in fp32 dtype.
+			rhs_list: List of torch.Tensor, each of shape (N, K) in fp8 dtype.
+			rhs_scale_list: List of torch.Tensor, each of shape (ceil(N / scale_block_size[0]), ceil(K / scale_block_size[1])) in fp32 dtype.
+			group_sizes: Tuple of (group ID, group size) for each group.
+			gemm_block_size: Tuple of (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+			scale_block_size: Tuple of (SCALE_BLOCK_M, SCALE_BLOCK_K)
+		
+		Returns:
+			C: torch.Tensor of shape (M, N) in bf16 dtype.
+
+	"""
+	assert lhs.dtype == torch.float8_e4m3fn, "lhs must be of dtype float8_e4m3fn"
+	assert lhs_scale.dtype == torch.float32, "lhs_scale must be of dtype float32"
+	assert all(r.dtype == torch.float8_e4m3fn for r in rhs_list), "All rhs matrices must be of dtype float8_e4m3fn"
+	assert all(s.dtype == torch.float32 for s in rhs_scale_list), "All scale tensors must be of dtype float32"
+	assert len(rhs_list) == len(rhs_scale_list), "rhs_list and rhs_scale_list must have the same length"
+
+	device = lhs.device
+	N = rhs_list[0].shape[0]
+	K = lhs.shape[1]
+	# rhs_ptrs_ptr = torch.tensor([r.data_ptr() for r in rhs_list], dtype=torch.int64, device=device)
+	# rhs_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in rhs_scale_list], dtype=torch.int64, device=device)
+	# group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=device)
+	# activated_group_idx = torch.tensor([idx for idx, _ in group_sizes], dtype=torch.int32, device=device)
+	num_groups = group_size.shape[0]
+
+	output = torch.zeros((lhs.shape[0], N), dtype=torch.bfloat16, device=device)
+	# num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+	grid = lambda META: (triton.cdiv(N, META['GEMM_BLOCK_SIZE_N']), )
+	# logging.info(f"Rank {dist.get_rank()} launching fused_dequant_grouped_gemm_bf16_fp8_kernel with input shapes: lhs: {lhs.shape}, rhs_list: {[r.shape for r in rhs_list]}, rhs_scale_list: {[s.shape for s in rhs_scale_list]}, group_sizes: {group_size.tolist()}, group_start_indices: {group_start_indices.tolist()}, selected groups: {activated_group_idx.tolist()}")
+	# # Launch the kernel
+	try:
+		fused_dequant_grouped_gemm_fp8_fp8_kernel[grid](
+			lhs, lhs_scale,
+			rhs_ptrs_ptr, rhs_scale_ptrs_ptr,
+			activated_group_idx, group_size, group_start_indices,
+			output,
+			lhs.shape[0], N, K, num_groups,
+			lhs.stride(0), lhs.stride(1),
+			lhs_scale.stride(0), lhs_scale.stride(1),
+			rhs_list[0].stride(0), rhs_list[0].stride(1),
+			output.stride(0), output.stride(1),
+			activated_group_idx.stride(0), 
+			group_size.stride(0), group_start_indices.stride(0),
+			rhs_ptrs_ptr.stride(0), rhs_scale_ptrs_ptr.stride(0),
+			GEMM_BLOCK_SIZE_M=gemm_block_size[0], GEMM_BLOCK_SIZE_N=gemm_block_size[1], GEMM_BLOCK_SIZE_K=gemm_block_size[2],
+			SCALE_BLOCK_SIZE_N=scale_block_size[0], SCALE_BLOCK_SIZE_K=scale_block_size[1],
+			num_warps=num_warps,
+			num_stages=num_stages
+		)
+	except Exception as e:
+		print(f"Error launching fused_dequant_grouped_gemm_bf16_fp8_kernel: {e}")
+		raise
+	return output
+

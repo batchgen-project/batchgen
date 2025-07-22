@@ -302,7 +302,7 @@ class Attn_Wrapper(torch.nn.Module):
 
 				key_cache = None
 				value_cache = None
-				with torch.no_grad():
+				with torch.inference_mode():
 					if "deepseek" in self.model_config.model_type:
 						position_ids = Attn_Wrapper.position_ids[
 							cur_batch_start:cur_batch_end
@@ -474,8 +474,10 @@ class Attn_Wrapper(torch.nn.Module):
 						past_key_states[start_ids:end_ids],
 						past_value_states[start_ids:end_ids] if past_value_states is not None else None,
 						attention_mask[start_ids:end_ids],
-						None,
-						kv_scale[start_ids:end_ids]
+						position_ids[start_ids:end_ids],
+						kv_scale[start_ids:end_ids],
+						Attn_Wrapper.cache_seqlens[start_ids:end_ids],
+						Attn_Wrapper.max_seqlen,
 					)
 					# attn_result, kv, scale = self.module.decoding_attn_mode_3_dequant_fusion(
 					# 	hidden_states[start_ids:end_ids],
@@ -644,7 +646,7 @@ class Expert_Wrapper(torch.nn.Module):
 		if self.get_weights:
 			torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize() 
 			self.core_engine.free_weights_buffer(self.expert_weights_idx)
-			# with torch.no_grad():
+			# with torch.inference_mode():
 			for name, param in self.module.named_parameters():
 				param.data = torch.empty(
 					0,

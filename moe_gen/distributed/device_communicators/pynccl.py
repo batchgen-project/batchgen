@@ -44,9 +44,9 @@ class PyNcclCommunicator:
         """
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
-            assert (
-                dist.get_backend(group) != dist.Backend.NCCL
-            ), "PyNcclCommunicator should be attached to a non-NCCL group."
+            # assert (
+            #     dist.get_backend(group) != dist.Backend.NCCL
+            # ), "PyNcclCommunicator should be attached to a non-NCCL group."
             # note: this rank is the rank in the group
             self.rank = dist.get_rank(group)
             self.world_size = dist.get_world_size(group)
@@ -76,7 +76,7 @@ class PyNcclCommunicator:
         self.disabled = False
 
         if self.rank == 0:
-            logger.info("sglang is using nccl==%s", self.nccl.ncclGetVersion())
+            logger.info("MoE-Gen is using nccl==%s", self.nccl.ncclGetVersion())
 
         if self.rank == 0:
             # get the unique id from NCCL
@@ -86,7 +86,7 @@ class PyNcclCommunicator:
             self.unique_id = ncclUniqueId()
 
         if not isinstance(group, StatelessProcessGroup):
-            tensor = torch.ByteTensor(list(self.unique_id.internal))
+            tensor = torch.ByteTensor(list(self.unique_id.internal)).to(device)
             ranks = dist.get_process_group_ranks(group)
             # arg `src` in `broadcast` is the global rank
             dist.broadcast(tensor, src=ranks[0], group=group)

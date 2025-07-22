@@ -660,7 +660,7 @@ void KV_Storage::Init() {
                 int actual_node = -1;
                 if (get_mempolicy(&actual_node, nullptr, 0, *out_ptr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
                     if (actual_node == numa_node) {
-                        this->logger_->info("Successfully allocated {} bytes on NUMA node {}", 
+                        this->logger_->debug("Successfully allocated {} bytes on NUMA node {}", 
                                           per_layer_size, actual_node);
                     } else {
                         this->logger_->warn("Allocated on NUMA node {} instead of target node {}", 
@@ -2101,7 +2101,7 @@ std::vector<torch::Tensor> KV_Storage::get_past_key_states(std::vector<int64_t> 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time -
         start_time);
-    this->logger_->info("KV_Storage get_past_key_states(): Time taken to get past key states: {} seconds", duration.count());
+    this->logger_->debug("KV_Storage get_past_key_states(): Time taken to get past key states: {} seconds", duration.count());
     return past_key_states;
 }
 
@@ -2146,7 +2146,7 @@ std::vector<torch::Tensor> KV_Storage::get_kv_scale(std::vector<int64_t> query_g
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time -
         start_time);
-    this->logger_->info("KV_Storage get_kv_scale(): Time taken to get kv scale: {} seconds", duration.count());
+    this->logger_->debug("KV_Storage get_kv_scale(): Time taken to get kv scale: {} seconds", duration.count());
     return kv_scale;
 }
 

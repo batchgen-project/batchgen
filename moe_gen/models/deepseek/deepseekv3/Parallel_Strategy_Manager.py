@@ -122,12 +122,36 @@ class Parallel_Strategy_Manager:
 		self._config_lm_head_hook()
 		self.model.eval()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
-		# log attn_1 q_a_layernorm weight dtype
-		# if self.local_rank == 0:
-		# 	logging.info(
-		# 		f"Attn_1 q_a_layernorm weight dtype: {self.model.model.layers[1].self_attn.module.q_a_layernorm.weight.dtype}"
-		# 	)
+		# self._warmup()
 		return self.model, self.weight_copy_task
+	
+	def _warmup(self):
+		# Currently only need to warmup the MoEGate
+		torch._dynamo.config.inline_inbuilt_nn_modules = True
+		logging.info("Start torch compile warmup")
+		# from .modeling_deepseek_v3 import warmup_compiled_moe_gate
+		# device = self.engine_config.Basic_Config.device_torch
+		# with torch.inference_mode():
+		# 	warmup_compiled_moe_gate(device)
+		for layer_idx in range(self.hf_model_config.first_k_dense_replace, self.model_config.num_hidden_layers):
+			layer = self.model.model.layers[layer_idx].mlp.gate
+			if hasattr(layer, "warmup"):
+				if self.global_rank == 0:
+					logging.debug(f"Warming up layer {layer_idx}")
+					dummy_hidden_states = torch.randn(128, 1, 7168, dtype=torch.bfloat16, device=self.engine_config.Basic_Config.device_torch)
+					_ = layer.decoding_forward(dummy_hidden_states)
+					torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
+				# layer.warmup()
+			# with torch.inference_mode():
+			# 	for t in range(5):
+			# 		dummy_hidden_states = torch.randn(128, 1, 7168, dtype=torch.bfloat16, device=self.engine_config.Basic_Config.device_torch)
+			# 		_ = layer.decoding_forward(dummy_hidden_states)
+
+		
+		# for layer_idx in range(self.hf_model_config.first_k_dense_replace, self.hf_model_config.first_k_dense_replace + 1):
+		# 	layer = self.model.model.layers[layer_idx].mlp.gate
+		# 	if hasattr(layer, "warmup"):
+		# 		layer.warmup()
 
 
 	def configure_decoding(self):
@@ -301,17 +325,24 @@ class Parallel_Strategy_Manager:
 		self._config_attn_module()
 		self._config_expert_module()
 		self._config_lm_head_hook()
+		self._init_mode_decoding()
 		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
 		used_memory_gb = used_memory / (1024**3)
 		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
 		self.model.eval()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
-		if self.local_rank == 0:
-			logging.info(
-				f"Attn_0 q_a_layernorm weight dtype: {self.model.model.layers[0].self_attn.module.q_a_layernorm.weight.dtype}"
-			)
-			# assert self.model.model.layers[1].self_attn.module.q_a_layernorm.weight.dtype == torch.bfloat16, "Attn_1 q_a_layernorm weight dtype should be bfloat16"
+		self._warmup()
 		return self.model, self.weight_copy_task
+
+	def _init_mode_decoding(self):
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			self.model_config.num_hidden_layers,
+		):
+			layer = self.model.model.layers[layer_idx].mlp
+			if hasattr(layer, "init"):
+				layer.init(self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size)
+			
 
 	def _load_attn_module(self):
 		for layer_idx in range(len(self.model.model.layers)):
@@ -497,7 +528,7 @@ class Parallel_Strategy_Manager:
 				
 		
 		end_time = time.perf_counter()
-		logging.info(
+		logging.debug(
 			f"Attn module configuration time: {end_time - start_time:.2f} seconds"
 		)
 
@@ -535,7 +566,8 @@ class Parallel_Strategy_Manager:
 			sum(p.numel() * p.element_size() for p in self.model.parameters())
 			/ (1024**3)
 		)
-		logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
+		if dist.get_rank() == 0:
+			logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
 		# Rank 0 print out all the tensors in the model with tensor size in MB
 		# if dist.get_rank() == 0:
 		# 	logging.info("Model skeleton tensors:")
@@ -636,7 +668,7 @@ class Parallel_Strategy_Manager:
 					# routed_expert_name = "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 					# self.fp8_weights_IPC_handle[routed_expert_name] = {}
 		end_time = time.perf_counter()
-		logging.info(
+		logging.debug(
 			f"Expert module configuration time: {end_time - start_time:.2f} seconds"
 		)
 
@@ -737,7 +769,7 @@ class Parallel_Strategy_Manager:
 					routed_expert_name = "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 					# self.fp8_weights_IPC_handle[routed_expert_name] = {}
 		end_time = time.perf_counter()
-		logging.info(
+		logging.debug(
 			f"Expert module configuration time: {end_time - start_time:.2f} seconds"
 		)
 		

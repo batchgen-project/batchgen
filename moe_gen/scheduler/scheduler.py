@@ -3,9 +3,9 @@ import logging
 class Scheduler:
 	def __version__(self):
 		""" 
-			Exclusively for H20 Single Node and DeepSeek-R1
+			Exclusively for H20 and DeepSeek-R1
 		"""
-		return "0.1.0"
+		return "0.1.4"
 	
 	def __init__(self, Max_Prompt_Length, Max_Response_Length, world_size):
 		self.config = EngineConfig()
@@ -41,13 +41,20 @@ class Scheduler:
 		# non_static_memory_usage = 6 + max(self.mem_profiler.profile(attn_decoding_module), self.mem_profiler.profile(MoE_module)) + k_buffer_size 
 		model_skeleton_size = 6
 		cuda_page_table_default_size = 5
+		NCCL_default_buffer_usage = 2.5 # in GB
 		non_static_memory_usage = k_buffer_size + model_skeleton_size + cuda_page_table_default_size
 		available_memory_for_expert_cache = available_gpu_mem - non_static_memory_usage
 		num_local_expert_per_layer = min(EXPERT_PER_RANK, int(available_memory_for_expert_cache // 2.4)) # Each expert cache is around 2.4GB
 		num_decoding_module_buffer_routed_expert = EXPERT_PER_RANK - num_local_expert_per_layer + 2
 		if self.config.Basic_Config.attn_mode == 3:
 			num_local_expert_per_layer = EXPERT_PER_RANK
-		
+			expert_size = num_local_expert_per_layer * 2.4
+			# Fix 
+			self.per_seq_size = self.Max_Context_Length * 61 * 576 / (1024 ** 3) # in GB
+			self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = (
+				int((available_gpu_mem - model_skeleton_size - cuda_page_table_default_size - expert_size - NCCL_default_buffer_usage) / self.per_seq_size)
+			)
+			logging.info(f"Max Available MoE decoding micro batch size: {self.config.Module_Batching_Config.MoE_decoding_micro_batch_size}")
 		if num_local_expert_per_layer == EXPERT_PER_RANK:
 			num_decoding_module_buffer_routed_expert = 0
 

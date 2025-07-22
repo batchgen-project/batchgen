@@ -14,7 +14,12 @@ import triton.language as tl
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 from .fused_bhd_hdc_kernel import fused_bhd_hdc, fused_bhd_hdc_inplace
 from .fused_rotary_embedding import fused_rotary_embedding, fused_rotary_embedding_inplace
-from ...quantization.fp8e4m3 import per_token_blocked_quantize_bf16_to_fp8, dequant_compressed_kv_per_token_with_length
+from ...quantization.fp8e4m3 import (
+	per_token_blocked_quantize_bf16_to_fp8, 
+	dequant_compressed_kv_per_token_with_length, 
+	dequant_compressed_kv_per_token_with_length_v2,
+	dequant_compressed_kv_per_token
+)
 
 from typing import Tuple
 
@@ -591,6 +596,151 @@ def mla_decoding_flashmla_attn_mode_3(
 	past_key_states: torch.Tensor,
 	past_value_states: torch.Tensor,
 	attention_mask: torch.Tensor,
+	q_position_ids: torch.Tensor,
+	scale: torch.Tensor,
+	cache_seqlens: torch.Tensor,
+	max_seqlen: int
+):
+	"""
+		MLA decoding function using FlashMLA as the attention mechanism backend.
+		Args:
+			hidden_states (torch.Tensor): The input hidden states of shape (batch_size, 1, hidden_size).
+			past_key_states (torch.Tensor): The past key states of shape (batch_size, max_seqlen, kv_dim)
+			past_value_states (torch.Tensor): None. Placeholder.
+			attention_mask (torch.Tensor): The attention mask of shape (batch_size, seq_len).
+			position_ids (torch.Tensor): The position ids of shape (batch_size, 1)
+			scale (torch.Tensor): The scale tensor for kv per token quantization. [batch_size, max_seqlen, ceil(kv_dim // 128)]
+	
+		Note:
+			- The past_key_states has the shape of (batch_size, max_seqlen, kv_dim).
+			Where max_seqlen is the nearest multiple of 64(kv block size) that is greater than or equal to the full context length.
+			- attention_mask has the shape of (batch_size, seq_len).
+			Where seq_len is the length of the processed tokens(input prompt(padded) + generated tokens).
+			- position_ids record the position of the new kv should be placed in the past compressed kv cache.
+			- max_seq_len is reserved for scale. 
+			
+	"""
+	assert attention_mask.dim() == 2
+	# Create a block table for the key states
+	block_size = 64
+	# cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+	
+	bsz, seq_len = attention_mask.size()
+	# max_seqlen = cache_seqlens.max().item()
+	
+	# _,max_seq_len, _ = past_key_states.size()
+	# compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
+	compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
+	max_seqlen_pad = compressed_kv.size(1)
+
+	# q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+	# kv_len = attention_mask.size(-1)
+	# q_position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+	# self.q_a_proj.weight.data = deepseek_v3_dequantization(
+	# 	self.q_a_proj.weight.data, weight_scale["q_a_proj.weight_scale_inv"]
+	# )
+	# self.q_b_proj.weight.data = deepseek_v3_dequantization(
+	# 	self.q_b_proj.weight.data, weight_scale["q_b_proj.weight_scale_inv"]
+	# )
+	q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+	q = q.view(bsz, 1, self.num_heads, self.q_head_dim).transpose(1, 2)
+	q_nope, q_pe = torch.split(
+		q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)
+
+	# self.kv_a_proj_with_mqa.weight.data = deepseek_v3_dequantization(
+	# 	self.kv_a_proj_with_mqa.weight.data, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]
+	# )
+	new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+	kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+	k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
+	cos, sin = self.rotary_emb(k_pe, seq_len=max_seqlen_pad)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+	kv = self.kv_a_layernorm(kv)
+	k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
+	offload_kv = torch.cat([kv, k_pe], dim=-1)
+	
+	batch_indices = torch.arange(bsz, device=hidden_states.device)
+	compressed_kv[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
+	compressed_kv = compressed_kv.view(bsz, max_seqlen_pad, 1, 576)
+
+	# Quantize and write to past_key_states
+	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+	
+	kv_b_proj = self.kv_b_proj.weight.view(
+		self.num_heads, -1, self.kv_lora_rank
+	)
+	# kv_b_proj = deepseek_v3_dequantization(
+	# 	self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+	# ).view(self.num_heads, -1, self.kv_lora_rank)
+	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+	query_states = torch.empty(
+		bsz, self.num_heads, 1, qk_head_dim,
+		dtype=compressed_kv.dtype,
+		device=compressed_kv.device,
+	)
+
+	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+	query_states[:, :, :, self.kv_lora_rank :] = q_pe
+	query_states = query_states.view(
+		bsz, 1, self.num_heads, qk_head_dim
+	)
+
+
+	block_table = torch.arange(
+		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv.device
+	).view(bsz, max_seqlen_pad // block_size)
+
+	blocked_k = compressed_kv.view(
+		bsz * max_seqlen_pad // block_size, block_size, 1, compressed_kv.size(-1)
+	)
+
+	tile_scheduler_metadata, num_splits = get_mla_metadata(
+		cache_seqlens, 128, 1
+	)
+
+	try:
+		attn_out, _ = flash_mla_with_kvcache(
+			query_states,
+			blocked_k,
+			block_table,
+			cache_seqlens,
+			512,
+			tile_scheduler_metadata,
+			num_splits,
+			self.softmax_scale,
+			True
+		)
+	except Exception as e:
+		logging.error(f"Error in flash_mla_with_kvcache: {e}")
+		raise
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+
+
+	attn_output = attn_output.transpose(1, 2).contiguous()
+	attn_output = attn_output.view(
+		bsz, 1, self.num_heads * self.v_head_dim
+	)
+	# self.o_proj.weight.data = deepseek_v3_dequantization(
+	# 	self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
+	# )
+	attn_output = self.o_proj(attn_output)
+
+	return attn_output, past_key_states, scale
+
+@torch.inference_mode()
+def mla_decoding_flashmla_attn_mode_3_bak(
+	self,
+	hidden_states: torch.Tensor,
+	past_key_states: torch.Tensor,
+	past_value_states: torch.Tensor,
+	attention_mask: torch.Tensor,
 	position_ids: torch.Tensor,
 	scale: torch.Tensor
 ):
@@ -622,7 +772,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	max_seqlen = cache_seqlens.max().item()
 	
 	# _,max_seq_len, _ = past_key_states.size()
-	compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
+	# compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
+	compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
 	max_seqlen_pad = compressed_kv.size(1)
 
 	# q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)

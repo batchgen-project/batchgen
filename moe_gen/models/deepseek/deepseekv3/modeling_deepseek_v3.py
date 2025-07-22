@@ -58,6 +58,7 @@ from .configuration_deepseek_v3 import DeepseekV3Config
 import torch.distributed as dist
 import numpy as np
 import os
+import triton
 
 if is_flash_attn_2_available():
 	from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -490,6 +491,96 @@ class DeepseekV3MLP(nn.Module):
 		return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
 
 
+torch.set_float32_matmul_precision('high')
+# import torch._dynamo.config as dynamo_config
+# import os
+
+# # Set up persistent disk cache
+# cache_dir = "./torch_compile_cache"
+# os.makedirs(cache_dir, exist_ok=True)
+
+# # Configure disk caching
+# dynamo_config.cache_dir = cache_dir
+# dynamo_config.accumulated_cache_size_limit = 1024  # MB
+# dynamo_config.cache_size_limit = 1024
+
+# Enable FX graph caching  
+# torch._dynamo.config.fx_graph_cache = True
+
+
+@torch.inference_mode()
+@torch.compile(mode="max-autotune", fullgraph=True, disable=True, backend="inductor")
+def compiled_moe_gate_forward(hidden_states, weight, e_score_correction_bias, 
+							 n_group, topk_group, n_routed_experts, top_k, 
+							 routed_scaling_factor):
+	bsz, seq_len, h = hidden_states.shape
+	### compute gating score
+	hidden_states = hidden_states.view(-1, h)
+	logits = F.linear(
+		hidden_states.type(torch.float32), weight.type(torch.float32), None
+	)
+	scores = logits.sigmoid()
+
+	### select top-k experts
+	scores_for_choice = scores.view(bsz * seq_len, -1) + e_score_correction_bias.unsqueeze(0)
+	group_scores = (
+		scores_for_choice.view(bsz * seq_len, n_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
+	)  # [n, n_group]
+	group_idx = torch.topk(
+		group_scores, k=topk_group, dim=-1, sorted=False
+	)[
+		1
+	]  # [n, top_k_group]
+	group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+	group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+	score_mask = (
+		group_mask.unsqueeze(-1)
+		.expand(
+			bsz * seq_len, n_group, n_routed_experts // n_group
+		)
+		.reshape(bsz * seq_len, -1)
+	)  # [n, e]
+	tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
+	_, topk_idx = torch.topk(
+		tmp_scores, k=top_k, dim=-1, sorted=False
+	)
+	topk_weight = scores.gather(1, topk_idx)
+
+	denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+	topk_weight = topk_weight / denominator
+	topk_weight = topk_weight * routed_scaling_factor # must multiply the scaling factor
+
+	return topk_idx, topk_weight.to(hidden_states.dtype)
+
+from torch._inductor import config as ind_config
+# ind_config.triton.force_cudagraphs_warmup = True
+# ind_config.triton.cudagraphs = True
+# ind_config.triton.cudagraphs
+def warmup_compiled_moe_gate(device):
+	
+	dummy_weight = nn.Parameter(
+		torch.zeros(256, 7168, dtype=torch.bfloat16, device=device)
+	)
+	dummy_e_score_correction_bias = torch.nn.Parameter(
+		torch.zeros(256, dtype=torch.float32, device=device)
+	)
+	
+	with torch.inference_mode(): 
+		for t in range(5):
+			dummy_hidden_states = torch.randn(128, 1, 7168, dtype=torch.bfloat16, device=device)
+			_ = compiled_moe_gate_forward(
+				dummy_hidden_states, 
+				dummy_weight,
+				dummy_e_score_correction_bias,
+				8, 
+				4, 
+				256, 
+				8, 
+				2.5
+			)
+			torch.cuda.synchronize(device=device)
+
+
 
 class MoEGate(nn.Module):
 	def __init__(self, config):
@@ -514,6 +605,29 @@ class MoEGate(nn.Module):
 				torch.empty((self.n_routed_experts))
 			)
 		self.reset_parameters()
+		self.device = torch.device("cuda", dist.get_rank() % torch.cuda.device_count())
+		# self.decoding_forward = torch.compile(
+		# 	self._decoding_forward, 
+		# 	mode="max-autotune-no-cudagraphs", 
+		# 	# mode="reduce-overhead",
+		# 	backend="inductor",
+		# 	disable=False)
+		self.input_buf = torch.empty(128,1,7168, dtype=torch.bfloat16, device=self.device)
+
+	@torch.inference_mode()
+	def warmup(self):	
+		with torch.inference_mode():
+			for t in range(5):
+				_ = compiled_moe_gate_forward(
+					self.input_buf, 
+					self.weight,
+					self.e_score_correction_bias,
+					self.n_group, 
+					self.topk_group, 
+					self.n_routed_experts, 
+					self.top_k, 
+					self.routed_scaling_factor
+				)
 
 	def reset_parameters(self) -> None:
 		import torch.nn.init as init
@@ -521,6 +635,7 @@ class MoEGate(nn.Module):
 		init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
 	def forward(self, hidden_states):
+		# log self.weight and self.e_score_correction_bias shape and dtype
 		bsz, seq_len, h = hidden_states.shape
 		### compute gating score
 		hidden_states = hidden_states.view(-1, h)
@@ -571,14 +686,121 @@ class MoEGate(nn.Module):
 			topk_weight = topk_weight / denominator
 		topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
 
-		return topk_idx, topk_weight
+		return topk_idx, topk_weight.to(hidden_states.dtype)
+	
+	# @torch.compile(fullgraph=True, mode="reduce-overhead")
+	# @torch.compile(mode="reduce-overhead", backend="inductor")
+	@torch.inference_mode()
+	@torch.compile(mode="max-autotune", backend="inductor")
+	def _decoding_forward_compiled(self, hidden_states, weight, e_score_correction_bias, 
+							  n_group, topk_group, n_routed_experts, top_k, 
+							  routed_scaling_factor):
+		bsz, seq_len, h = hidden_states.shape
+		### compute gating score
+		hidden_states = hidden_states.view(-1, h)
+		logits = F.linear(
+			hidden_states.type(torch.float32), weight.type(torch.float32), None
+		)
+		scores = logits.sigmoid()
+
+		### select top-k experts
+		scores_for_choice = scores.view(bsz * seq_len, -1) + e_score_correction_bias.unsqueeze(0)
+		group_scores = (
+			scores_for_choice.view(bsz * seq_len, n_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
+		)  # [n, n_group]
+		group_idx = torch.topk(
+			group_scores, k=topk_group, dim=-1, sorted=False
+		)[
+			1
+		]  # [n, top_k_group]
+		group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+		group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+		score_mask = (
+			group_mask.unsqueeze(-1)
+			.expand(
+				bsz * seq_len, n_group, n_routed_experts // n_group
+			)
+			.reshape(bsz * seq_len, -1)
+		)  # [n, e]
+		tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
+		_, topk_idx = torch.topk(
+			tmp_scores, k=top_k, dim=-1, sorted=False
+		)
+		topk_weight = scores.gather(1, topk_idx)
+
+		denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+		topk_weight = topk_weight / denominator
+		topk_weight = topk_weight * routed_scaling_factor # must multiply the scaling factor
+
+		return topk_idx, topk_weight.to(hidden_states.dtype)
+
+	@torch.inference_mode()
+	def _decoding_forward(self, hidden_states):
+		bsz, seq_len, h = hidden_states.shape
+		### compute gating score
+		hidden_states = hidden_states.view(-1, h)
+		logits = F.linear(
+			hidden_states.type(torch.float32), self.weight.type(torch.float32), None
+		)
+		scores = logits.sigmoid()
+
+		### select top-k experts
+		scores_for_choice = scores.view(bsz * seq_len, -1) + self.e_score_correction_bias.unsqueeze(0)
+		group_scores = (
+			scores_for_choice.view(bsz * seq_len, self.n_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
+		)  # [n, n_group]
+		group_idx = torch.topk(
+			group_scores, k=self.topk_group, dim=-1, sorted=False
+		)[
+			1
+		]  # [n, top_k_group]
+		group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+		group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+		score_mask = (
+			group_mask.unsqueeze(-1)
+			.expand(
+				bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group
+			)
+			.reshape(bsz * seq_len, -1)
+		)  # [n, e]
+		tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
+		_, topk_idx = torch.topk(
+			tmp_scores, k=self.top_k, dim=-1, sorted=False
+		)
+		topk_weight = scores.gather(1, topk_idx)
+
+		denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+		topk_weight = topk_weight / denominator
+		topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
+
+		return topk_idx, topk_weight.to(hidden_states.dtype)
+	
+	@torch.inference_mode()
+	def decoding_forward(self, hidden_states):
+		# out = self._decoding_forward_compiled(
+		# 	hidden_states, self.weight, self.e_score_correction_bias,
+		# 	self.n_group, self.topk_group, self.n_routed_experts, 
+		# 	self.top_k, self.routed_scaling_factor
+		# )
+		# return out
+
+		# logger.warning_once(f"MoE Gate weight shape: {self.weight.shape}, dtype: {self.weight.dtype}")
+		# if hasattr(self, 'e_score_correction_bias'):
+		# 	logger.warning_once(f"MoE Gate e_score_correction_bias shape: {self.e_score_correction_bias.shape}, dtype: {self.e_score_correction_bias.dtype}")
+	
+		# self.input_buf.copy_(hidden_states)
+		return compiled_moe_gate_forward(
+			hidden_states, self.weight, self.e_score_correction_bias,
+			self.n_group, self.topk_group, self.n_routed_experts, 
+			self.top_k, self.routed_scaling_factor
+		)
 
 class DeepseekV3MoE_Prefill(nn.Module):
 	"""
 	A mixed expert module containing shared experts.
 	"""
 
-	def __init__(self, config):
+	def __init__(self, config, comm=None):
 		super().__init__()
 		# logger.info("Initializing DeepseekV3MoE_Prefill")
 		self.config = config
@@ -711,9 +933,15 @@ class DeepseekV3MoE_Prefill(nn.Module):
 
 from ....moe.fused_grouped_dequant_gemm import (
 	fused_dequant_grouped_gemm_bf16_fp8_triton,
-	fused_dequant_grouped_gemm_bf16_fp8_triton_v2
+	fused_dequant_grouped_gemm_bf16_fp8_triton_v2,
+	fused_dequant_grouped_gemm_fp8_fp8_triton
 )
-from ....moe.fused_dequant_moe import fused_dequant_weighted_moe_stage_1
+from ....moe.fused_dequant_moe import (
+	fused_dequant_weighted_moe_stage_1, 
+	fused_fp8_moe_stage_1,
+	fused_fp8_moe_stage_1_optimized
+)
+from ....attention.mla.fa3_backend import act_quant
 class DeepseekV3MoE_Decoding(nn.Module):
 	def __init__(self, config):
 		super().__init__()
@@ -868,6 +1096,924 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		)
 		return res
 
+class DeepseekV3MoE_Decoding_FP8(nn.Module): 
+	"""
+		EP with two ALL-to-ALLs.
+	"""
+	def __init__(self, config, comm):
+		super().__init__()
+		self.config = config
+		self.num_experts_per_tok = config.num_experts_per_tok
+		self.comm = comm
+		
+
+		# --- distributed/world metadata -------------------------------------
+		if not dist.is_initialized():
+			self.rank, self.world_size = 0, 1
+		else:
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+
+		self.experts_per_rank   = 256 // self.world_size
+		self.total_experts      = self.world_size * self.experts_per_rank
+		self.routed_expert_start_idx = self.rank * self.experts_per_rank
+		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
+
+		# --- experts, gate, shared MLP --------------------------------------
+		self.experts = nn.ModuleList([
+			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
+			for _ in range(self.total_experts)
+		])
+		self.gate = MoEGate(config)
+		if config.n_shared_experts:
+			self.shared_experts = DeepseekV3MLP(
+				config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+			)
+		self.act_fn = ACT2FN[config.hidden_act]
+		self.register_buffer(
+			"send_counts_buf",
+			torch.zeros(self.world_size, dtype=torch.int32)
+		)
+		self.register_buffer(
+			"recv_counts_buf",
+			torch.zeros(self.world_size, dtype=torch.int32)
+		)
+
+		# --- communication setup -------------------------------------------
+		self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		self.comm_stream = torch.cuda.Stream(device=self.device)
+
+		# --- Pre-allocate Buffers. --------------------------------
+		self.num_tokens_per_rank = 8		# This is a placeholder, adjust as needed
+		# global_num_tokens = self.num_tokens_per_rank * self.world_size
+		# K = self.num_experts_per_tok
+		# self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
+		# self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
+	
+	def init(self, num_tokens_per_rank):
+		# self.num_tokens_per_rank = num_tokens_per_rank
+		
+		self.gate_list = []
+		self.up_list = []
+		self.down_list = []
+		self.gate_scale_list = []
+		self.up_scale_list = []
+		self.down_scale_list = []
+		for e in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+			self.gate_list.append(self.experts[e].fp8_gate)
+			self.up_list.append(self.experts[e].fp8_up)
+			self.down_list.append(self.experts[e].fp8_down)
+			self.gate_scale_list.append(self.experts[e].weight_dequant_scale['gate_proj.weight_scale_inv'])
+			self.up_scale_list.append(self.experts[e].weight_dequant_scale['up_proj.weight_scale_inv'])
+			self.down_scale_list.append(self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv'])
+		
+			self.gate_ptrs_ptr = torch.tensor([r.data_ptr() for r in self.gate_list], dtype=torch.int64, device=self.device)
+			self.up_ptrs_ptr = torch.tensor([r.data_ptr() for r in self.up_list], dtype=torch.int64, device=self.device)
+			self.down_ptrs_ptr = torch.tensor([r.data_ptr() for r in self.down_list], dtype=torch.int64, device=self.device)
+			self.gate_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.gate_scale_list], dtype=torch.int64, device=self.device)
+			self.up_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.up_scale_list], dtype=torch.int64, device=self.device)
+			self.down_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.down_scale_list], dtype=torch.int64, device=self.device)
+
+
+	def forward(self, hidden_states):
+		orig_shape = hidden_states.shape
+		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+		identity = hidden_states
+		
+		out = self.moe_infer_alltoall(hidden_states)
+		out = out + self.shared_experts(identity)
+		return out.view(*orig_shape)
+	
+	@torch.inference_mode()
+	def moe_infer_alltoall(self, x):
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+		topk_idx, topk_weight = self.gate.decoding_forward(x.view(num_tokens, 1, hidden_size)) #API Comp
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids   = topk_idx.flatten()
+		flat_wts    = topk_weight.flatten()
+		expanded_x  = x.repeat_interleave(K, dim=0)
+		# token_idx   = torch.arange(num_tokens, device=device).repeat_interleave(K)
+
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x   = expanded_x[sort_idx]
+		# sorted_tok = token_idx[sort_idx]
+		sorted_wt  = flat_wts[sort_idx]
+
+		# ---- 2) fill the pre-allocated send_counts tensor ------------------
+		local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
+		sc = self.send_counts_buf               # alias for readability
+		rc = self.recv_counts_buf
+
+		reshaped_counts = local_counts.view(self.world_size, -1)
+		sc = reshaped_counts.sum(dim=1)
+
+		gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
+		# ---- 3) first all-to-all (counts) on its own stream ---------------
+		dist.all_gather(gathered_counts, sc)
+		gathered_tensor = torch.stack(gathered_counts)  # Shape: [world_size, world_size]
+		rc = gathered_tensor[:, self.rank]  # Extract column for this rank
+		recv_total = rc.sum()  # Keep as tensor until final use		
+		# sc_cpu = sc.to("cpu", non_blocking=True)
+		# rc_cpu = rc.to("cpu", non_blocking=True)
+
+		# ---- 4) allocate data buffers (variable size) ----------------------
+		send_x   = sorted_x
+		send_eid = sorted_eids
+		recv_x   = torch.empty(recv_total, hidden_size, device=device, dtype=x.dtype)
+		recv_eid = torch.empty(recv_total, device=device, dtype=sorted_eids.dtype)
+
+		# convert counts to python lists once – NCCL needs that
+		sc_list, rc_list = sc.tolist(), rc.tolist()
+		# torch.cuda.current_stream(device).synchronize()
+		# sc_list, rc_list = sc_cpu.tolist(), rc_cpu.tolist()
+
+		# ---- 5) main all-to-alls --------------------
+		dist.all_to_all_single(recv_x, send_x, rc_list, sc_list)
+		dist.all_to_all_single(recv_eid, send_eid, rc_list, sc_list)
+
+		if recv_total:
+			recv_eid_sorted, local_sort_idx = recv_eid.sort()
+			res = self.grouped_dequant_moe_fp8(recv_x[local_sort_idx], recv_eid_sorted)
+			recv_x[local_sort_idx] = res
+
+		# ---- 7) all-to-all (return) ---------------------------------------
+		out_sorted = torch.empty_like(sorted_x)
+		dist.all_to_all_single(out_sorted, recv_x, sc_list, rc_list)
+
+		# ---- 8) unsort, accumulate, normalise -----------------------------
+		unsort_idx = sort_idx.argsort()
+		final_x   = out_sorted[unsort_idx]
+		# final_tok = sorted_tok[unsort_idx]
+		final_wt  = sorted_wt[unsort_idx]
+
+		# out_acc = torch.zeros_like(x, dtype=torch.float32)
+		# out_acc.index_add_(0, final_tok, final_x.float() * final_wt.unsqueeze(-1))
+		final_x = final_x * final_wt.unsqueeze(-1)
+		final_x = final_x.view(num_tokens, K, -1)
+		final_x = final_x.sum(dim=1)  # sum over experts
+		return final_x.to(x.dtype)
+
+	@torch.inference_mode()
+	def moe_infer_allgather_allreduce(self, x):
+		num_tokens, hidden_size = x.shape
+		# Fix
+		self.num_tokens_per_rank = 64
+		self.num_tokens_per_rank = min(self.num_tokens_per_rank, triton.next_power_of_2(num_tokens))
+		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
+		global_num_tokens = self.num_tokens_per_rank * self.world_size
+		K = self.num_experts_per_tok
+		self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
+		self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
+		
+
+		device = x.device
+		# ---- 1) First all-gather: collect all tokens on all workers -------
+		# Prepare buffers for all-gather
+		all_tokens = torch.zeros((self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
+		 							  device=self.device, dtype=torch.bfloat16)
+		# all_tokens[self.rank * self.num_tokens_per_rank: self.rank * self.num_tokens_per_rank + num_tokens] = x
+		# with self.comm.change_state(enable=True):
+		# 	self.comm.all_reduce(all_tokens, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(all_tokens, x, stream=torch.cuda.default_stream(self.device))
+		# self.comm.stream.synchronize()  # Ensure all-gather is complete
+		# dist.all_gather_into_tensor(all_tokens, x, async_op=False)
+		# ---- 2) Gate computation on global tokens --------------------------
+		global_x = all_tokens
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
+		topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		global_x = global_x.squeeze(1)  # Remove the dummy dimension
+
+
+		# ---- 3) Process tokens assigned to local experts ------------------
+		# Find out which tokens are assigned to which local experts.
+		# ---- 3.1) flatten, sort by expert ------------------------------------
+		flat_eids   = topk_idx.flatten()
+		expanded_x  = global_x.repeat_interleave(K, dim=0)
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x   = expanded_x[sort_idx]
+		sorted_tok = self.token_idx[sort_idx]
+		sorted_pos = self.topk_pos[sort_idx]
+
+		# ---- 3.2) Build tensor for local expert input sorted by expert id ----
+		"""
+			We need a tensor x that contains tokens assigned to local expert sorted by expert id.
+			We need a tensor eids that contains expert ids for each token in x.
+		"""
+		local_token_expanded_x_indices = (sorted_eids >= self.routed_expert_start_idx) & (sorted_eids < self.routed_expert_end_idx)
+		input_x = sorted_x[local_token_expanded_x_indices]
+		input_eids = sorted_eids[local_token_expanded_x_indices]
+		global_indices = sorted_tok[local_token_expanded_x_indices]
+		token_topk_pos = sorted_pos[local_token_expanded_x_indices]
+		# ---- 3) Process tokens assigned to local experts ------------------
+		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		# self.local_expert_results.zero_()  # Reset results buffer
+		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
+		 									 device=self.device, dtype=torch.bfloat16)
+		global_results[global_indices, token_topk_pos, :] = res
+		weighted_output = global_results * topk_weight.unsqueeze(-1)
+		global_results = weighted_output.sum(dim=1)
+
+		# ---- 3.3) All-reduce to combine results from all workers ------------
+		with self.comm.change_state(enable=True):
+			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
+		# self.comm.stream.synchronize()  # Ensure all-reduce is complete
+		# dist.all_reduce(global_results, op=dist.ReduceOp.SUM, async_op=False)
+		# ---- 3.4) Extract results for local tokens and aggregate ------------
+		start_token_ids = self.rank * num_tokens
+		end_token_ids = start_token_ids + num_tokens
+
+		final_output = global_results[start_token_ids:end_token_ids]
+		return final_output
+	
+	def expert_bincount(self, eids, routed_expert_start_idx, experts_per_rank, device):
+		# # Adjust expert IDs and compute bincount
+		# eids_adjusted = eids - routed_expert_start_idx  
+		# counts = torch.bincount(eids_adjusted, minlength=experts_per_rank)
+		
+		# nonzero_mask = counts > 0
+		# activated_group_idx = torch.arange(experts_per_rank, device=device, dtype=torch.int32)[nonzero_mask]
+		# group_size = counts[nonzero_mask].to(torch.int32)  # Convert to int32 for consistency
+		
+		# # Compute start indices using cumsum
+		# if len(group_size) > 0:
+		# 	group_start_indices = torch.zeros(len(group_size), dtype=torch.int32, device=device)
+		# 	if len(group_size) > 1:
+		# 		group_start_indices[1:] = torch.cumsum(group_size[:-1], dim=0)
+		# else:
+		# 	group_start_indices = torch.empty(0, dtype=torch.int32, device=device)
+		
+		# return group_size, activated_group_idx, group_start_indices
+		eids_adjusted = eids - routed_expert_start_idx  
+		counts = torch.bincount(eids_adjusted, minlength=experts_per_rank)
+		
+		nonzero_mask = counts > 0
+		activated_group_idx = torch.nonzero(nonzero_mask, as_tuple=True)[0].to(torch.int32)
+		group_size = counts[nonzero_mask].to(torch.int32)
+		
+		group_start_indices = torch.zeros_like(group_size)
+		if group_size.numel() > 1:
+			group_start_indices[1:] = torch.cumsum(group_size[:-1], dim=0)
+		
+		return group_size, activated_group_idx, group_start_indices
+
+	def grouped_dequant_moe_fp8(self, x, eids):
+		# This function assumes that recv_x and recv_eid are already sorted by expert id
+		# eids = eids - self.routed_expert_start_idx
+		# counts = torch.bincount(eids, minlength=self.experts_per_rank)
+		# group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)	
+		# group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=self.device)
+		# activated_group_idx = torch.tensor([idx for idx, _ in group_sizes], dtype=torch.int32, device=self.device)
+		# group_start_indices = torch.roll(torch.cumsum(group_size, dim=0), 1)
+		# group_start_indices[0] = 0  # The first group starts at index 0
+		group_size, activated_group_idx, group_start_indices = self.expert_bincount(
+			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+		)
+
+		# Quantize the recv_x tensor to fp8_e4m3
+		x, x_scale = act_quant(x)
+		intermediate = fused_fp8_moe_stage_1(
+			x, x_scale, 
+			self.gate_list, self.gate_ptrs_ptr,
+			self.up_list, self.up_ptrs_ptr,
+			self.gate_scale_list, self.gate_scale_ptrs_ptr,
+			self.up_scale_list, self.up_scale_ptrs_ptr,
+			group_size, activated_group_idx, group_start_indices
+		)	
+		
+		intermediate, intermediate_scale = act_quant(intermediate)
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+			intermediate, intermediate_scale, 
+			self.down_list, self.down_ptrs_ptr,
+			self.down_scale_list, self.down_scale_ptrs_ptr,
+			group_size, activated_group_idx, group_start_indices
+		)
+		return res
+
+	
+
+class DeepseekV3MoE_Decoding_v2_bak2(nn.Module): 
+	"""
+		EP with two ALL-to-ALLs.
+	"""
+	def __init__(self, config, comm):
+		super().__init__()
+		self.config = config
+		self.num_experts_per_tok = config.num_experts_per_tok
+		self.comm = comm
+		
+
+		# --- distributed/world metadata -------------------------------------
+		if not dist.is_initialized():
+			self.rank, self.world_size = 0, 1
+		else:
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+
+		self.experts_per_rank   = 256 // self.world_size
+		self.total_experts      = self.world_size * self.experts_per_rank
+		self.routed_expert_start_idx = self.rank * self.experts_per_rank
+		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
+
+		# --- experts, gate, shared MLP --------------------------------------
+		self.experts = nn.ModuleList([
+			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
+			for _ in range(self.total_experts)
+		])
+		self.gate = MoEGate(config)
+		if config.n_shared_experts:
+			self.shared_experts = DeepseekV3MLP(
+				config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+			)
+
+		# --- communication setup -------------------------------------------
+		self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		self.comm_stream = torch.cuda.Stream(device=self.device)
+
+		# --- Pre-allocate Buffers. --------------------------------
+		self.num_tokens_per_rank = 48		# This is a placeholder, adjust as needed
+		global_num_tokens = self.num_tokens_per_rank * self.world_size
+		K = self.num_experts_per_tok
+		# self.all_tokens = torch.zeros((self.world_size * num_tokens_per_rank, config.hidden_size),
+		# 							  device=self.device, dtype=torch.bfloat16)
+		# self.local_expert_results = torch.zeros((num_tokens_per_rank * self.world_size, self.num_experts_per_tok, config.hidden_size),
+		# 									 device=self.device, dtype=torch.bfloat16)
+
+		self.act_fn = ACT2FN[config.hidden_act]
+		self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
+		self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
+
+
+	
+	def forward(self, hidden_states):
+		orig_shape = hidden_states.shape
+		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+		identity = hidden_states
+		
+		out = self.moe_infer(hidden_states)
+		out = out + self.shared_experts(identity)
+		return out.view(*orig_shape)
+
+	@torch.inference_mode()
+	def moe_infer(self, x):
+		# self.local_expert_results.zero_()  # Reset results buffer
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+		# ---- 1) First all-gather: collect all tokens on all workers -------
+		# Prepare buffers for all-gather
+		# logger.info(f"Rank {self.rank} starting all-gather for tokens.")
+		# dist.all_gather(self.all_tokens, x, async_op=False)
+		# torch.cuda.synchronize(self.device)  # Ensure all-gather is complete
+		# self.all_tokens.zero_()  # Reset the all_tokens buffer
+		all_tokens = torch.zeros((self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
+		 							  device=self.device, dtype=torch.bfloat16)
+		# dist.all_gather_into_tensor(all_tokens, x, async_op=False)
+		# self.comm.all_gather(all_tokens, x, self.comm_stream)
+		# self.comm_stream.synchronize()  # Ensure all-gather is complete
+		# torch.cuda.current_stream(self.device).wait_stream(self.comm_stream)  # Ensure
+		# torch.cuda.synchronize(self.device)  # Ensure all-gather is complete
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(all_tokens, x, stream=torch.cuda.default_stream(self.device))
+		# self.comm.stream.synchronize()  # Ensure all-gather is complete
+		# dist.barrier()  # Ensure all-gather is complete before proceeding
+
+		# logger.info(f"Rank {self.rank} gathered {len(self.all_tokens)} tokens from all workers.")
+
+		# Concatenate all tokens from all workers
+		# global_x = torch.cat(self.all_tokens, dim=0)  # Shape: [num_tokens * world_size, hidden_size]
+		# global_num_tokens = global_x.shape[0]
+
+		# ---- 2) Gate computation on global tokens --------------------------
+		# logger.info(f"all_tokens.shape: {all_tokens.shape}, dtype: {all_tokens.dtype}, device: {all_tokens.device}")
+		# if self.rank == 0:
+		# 	logger.info(f"{all_tokens[0]}")  # Log the first token for debugging
+		global_x = all_tokens
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
+		topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		global_x = global_x.squeeze(1)  # Remove the dummy dimension
+
+
+		# ---- 3) Process tokens assigned to local experts ------------------
+		"""
+		if recv_total:
+			recv_eid_sorted, local_sort_idx = recv_eid.sort()
+			res = self.grouped_dequant_moe(recv_x[local_sort_idx], recv_eid_sorted)
+			recv_x[local_sort_idx] = res
+
+		"""	
+
+		# Find out which tokens are assigned to which local experts.
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids   = topk_idx.flatten()
+		expanded_x  = global_x.repeat_interleave(K, dim=0)
+		# token_idx   = torch.arange(global_num_tokens, device=device).repeat_interleave(K)
+		# topk_pos    = torch.arange(K, device=device).repeat(global_num_tokens)
+
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x   = expanded_x[sort_idx]
+		sorted_tok = self.token_idx[sort_idx]
+		sorted_pos = self.topk_pos[sort_idx]
+
+		# ---- 2) Build tensor for local expert input sorted by expert id ----
+		"""
+			We need a tensor x that contains tokens assigned to local expert sorted by expert id.
+			We need a tensor eids that contains expert ids for each token in x.
+		"""
+		local_token_expanded_x_indices = (sorted_eids >= self.routed_expert_start_idx) & (sorted_eids < self.routed_expert_end_idx)
+		input_x = sorted_x[local_token_expanded_x_indices]
+		input_eids = sorted_eids[local_token_expanded_x_indices]
+		global_indices = sorted_tok[local_token_expanded_x_indices]
+		token_topk_pos = sorted_pos[local_token_expanded_x_indices]
+		# torch.cuda.synchronize(self.device)  # Ensure all operations are complete
+		# ---- 3) Process tokens assigned to local experts ------------------
+		res = self.grouped_dequant_moe(input_x, input_eids)
+		# self.local_expert_results.zero_()  # Reset results buffer
+		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
+		 									 device=self.device, dtype=torch.bfloat16)
+		global_results[global_indices, token_topk_pos, :] = res
+		# Compute the weighted sum
+		# weighted_output = global_results.to(torch.float32) * topk_weight.unsqueeze(-1)
+		# assert topk_weight.dtype == torch.bfloat16, f"Expected topk_weight to be bfloat16, got {topk_weight.dtype}"
+		weighted_output = global_results * topk_weight.unsqueeze(-1)
+		global_results = weighted_output.sum(dim=1)
+
+
+				
+		# ---- 4) All-reduce to combine results from all workers ------------
+		with self.comm.change_state(enable=True):
+			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
+		# self.comm.stream.synchronize()  # Ensure all-reduce is complete
+		# ---- 5) Extract results for local tokens and aggregate ------------
+		start_token_ids = self.rank * num_tokens
+		end_token_ids = start_token_ids + num_tokens
+
+		# local_results = local_expert_results[start_token_ids:end_token_ids]
+		# local_token_weights = topk_weight[start_token_ids:end_token_ids]
+
+		# weighted_output = local_results.to(torch.float32) * local_token_weights.unsqueeze(-1)
+		# final_output = weighted_output.sum(dim=1).to(x.dtype)
+		final_output = global_results[start_token_ids:end_token_ids]
+		return final_output
+
+	def grouped_dequant_moe(self, recv_x, recv_eid):
+		# This function assumes that recv_x and recv_eid are already sorted by expert id
+		gate_list = []
+		up_list = []
+		down_list = []
+		gate_scale_list = []
+		up_scale_list = []
+		down_scale_list = []
+		for e in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+			gate_list.append(self.experts[e].fp8_gate)
+			up_list.append(self.experts[e].fp8_up)
+			down_list.append(self.experts[e].fp8_down)
+			gate_scale_list.append(self.experts[e].weight_dequant_scale['gate_proj.weight_scale_inv'])
+			up_scale_list.append(self.experts[e].weight_dequant_scale['up_proj.weight_scale_inv'])
+			down_scale_list.append(self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv'])
+		eids = recv_eid - self.routed_expert_start_idx
+		counts = torch.bincount(eids, minlength=self.experts_per_rank)
+		group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)	
+		group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=self.device)
+		group_start_indices = torch.roll(torch.cumsum(group_size, dim=0), 1)
+		group_start_indices[0] = 0  # The first group starts at index 0	
+
+		intermediate = fused_dequant_weighted_moe_stage_1(
+			recv_x, gate_list, up_list, gate_scale_list, up_scale_list, group_sizes, group_start_indices
+		)	
+		
+		res = fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
+			intermediate, down_list, down_scale_list, group_sizes, group_start_indices, gemm_block_size = [64, 16, 64]
+		)
+		return res
+
+
+
+
+class DeepseekV3MoE_Decoding_v2_bak(nn.Module): 
+	"""
+		EP with two ALL-to-ALLs.
+	"""
+	def __init__(self, config, comm):
+		super().__init__()
+		self.config = config
+		self.num_experts_per_tok = config.num_experts_per_tok
+		self.comm = comm
+		
+
+		# --- distributed/world metadata -------------------------------------
+		if not dist.is_initialized():
+			self.rank, self.world_size = 0, 1
+		else:
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+
+		self.experts_per_rank   = 256 // self.world_size
+		self.total_experts      = self.world_size * self.experts_per_rank
+		self.routed_expert_start_idx = self.rank * self.experts_per_rank
+		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
+
+		# --- experts, gate, shared MLP --------------------------------------
+		self.experts = nn.ModuleList([
+			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
+			for _ in range(self.total_experts)
+		])
+		self.gate = MoEGate(config)
+		if config.n_shared_experts:
+			self.shared_experts = DeepseekV3MLP(
+				config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+			)
+
+		# --- communication setup -------------------------------------------
+		self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		self.comm_stream = torch.cuda.Stream(device=self.device)
+
+		# --- Pre-allocate Buffers. --------------------------------
+		self.num_tokens_per_rank = 48		# This is a placeholder, adjust as needed
+		global_num_tokens = self.num_tokens_per_rank * self.world_size
+		K = self.num_experts_per_tok
+		# self.all_tokens = torch.zeros((self.world_size * num_tokens_per_rank, config.hidden_size),
+		# 							  device=self.device, dtype=torch.bfloat16)
+		# self.local_expert_results = torch.zeros((num_tokens_per_rank * self.world_size, self.num_experts_per_tok, config.hidden_size),
+		# 									 device=self.device, dtype=torch.bfloat16)
+
+		self.act_fn = ACT2FN[config.hidden_act]
+		self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
+		self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
+
+
+	
+	def forward(self, hidden_states):
+		orig_shape = hidden_states.shape
+		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+		identity = hidden_states
+		
+		out = self.moe_infer(hidden_states)
+		out = out + self.shared_experts(identity)
+		return out.view(*orig_shape)
+
+	@torch.inference_mode()
+	def moe_infer(self, x):
+		# self.local_expert_results.zero_()  # Reset results buffer
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+		# ---- 1) First all-gather: collect all tokens on all workers -------
+		# Prepare buffers for all-gather
+		# logger.info(f"Rank {self.rank} starting all-gather for tokens.")
+		# dist.all_gather(self.all_tokens, x, async_op=False)
+		# torch.cuda.synchronize(self.device)  # Ensure all-gather is complete
+		# self.all_tokens.zero_()  # Reset the all_tokens buffer
+		all_tokens = torch.zeros((self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
+		 							  device=self.device, dtype=torch.bfloat16)
+		# dist.all_gather_into_tensor(all_tokens, x, async_op=False)
+		# self.comm.all_gather(all_tokens, x, self.comm_stream)
+		# self.comm_stream.synchronize()  # Ensure all-gather is complete
+		# torch.cuda.current_stream(self.device).wait_stream(self.comm_stream)  # Ensure
+		# torch.cuda.synchronize(self.device)  # Ensure all-gather is complete
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(all_tokens, x, stream=torch.cuda.default_stream(self.device))
+		self.comm.stream.synchronize()  # Ensure all-gather is complete
+		# dist.barrier()  # Ensure all-gather is complete before proceeding
+
+		# logger.info(f"Rank {self.rank} gathered {len(self.all_tokens)} tokens from all workers.")
+
+		# Concatenate all tokens from all workers
+		# global_x = torch.cat(self.all_tokens, dim=0)  # Shape: [num_tokens * world_size, hidden_size]
+		# global_num_tokens = global_x.shape[0]
+
+		# ---- 2) Gate computation on global tokens --------------------------
+		# logger.info(f"all_tokens.shape: {all_tokens.shape}, dtype: {all_tokens.dtype}, device: {all_tokens.device}")
+		# if self.rank == 0:
+		# 	logger.info(f"{all_tokens[0]}")  # Log the first token for debugging
+		global_x = all_tokens
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
+		topk_idx, topk_weight = self.gate(global_x)
+		global_x = global_x.squeeze(1)  # Remove the dummy dimension
+
+
+		# ---- 3) Process tokens assigned to local experts ------------------
+		"""
+		if recv_total:
+			recv_eid_sorted, local_sort_idx = recv_eid.sort()
+			res = self.grouped_dequant_moe(recv_x[local_sort_idx], recv_eid_sorted)
+			recv_x[local_sort_idx] = res
+
+		"""	
+
+		# Find out which tokens are assigned to which local experts.
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids   = topk_idx.flatten()
+		expanded_x  = global_x.repeat_interleave(K, dim=0)
+		# token_idx   = torch.arange(global_num_tokens, device=device).repeat_interleave(K)
+		# topk_pos    = torch.arange(K, device=device).repeat(global_num_tokens)
+
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x   = expanded_x[sort_idx]
+		sorted_tok = self.token_idx[sort_idx]
+		sorted_pos = self.topk_pos[sort_idx]
+
+		# ---- 2) Build tensor for local expert input sorted by expert id ----
+		"""
+			We need a tensor x that contains tokens assigned to local expert sorted by expert id.
+			We need a tensor eids that contains expert ids for each token in x.
+		"""
+		local_token_expanded_x_indices = (sorted_eids >= self.routed_expert_start_idx) & (sorted_eids < self.routed_expert_end_idx)
+		input_x = sorted_x[local_token_expanded_x_indices]
+		input_eids = sorted_eids[local_token_expanded_x_indices]
+		global_indices = sorted_tok[local_token_expanded_x_indices]
+		token_topk_pos = sorted_pos[local_token_expanded_x_indices]
+		# torch.cuda.synchronize(self.device)  # Ensure all operations are complete
+		# ---- 3) Process tokens assigned to local experts ------------------
+		res = self.grouped_dequant_moe(input_x, input_eids)
+		# self.local_expert_results.zero_()  # Reset results buffer
+		local_expert_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
+		 									 device=self.device, dtype=torch.bfloat16)
+		local_expert_results[global_indices, token_topk_pos, :] = res
+		# torch.cuda.default_stream(self.device).synchronize()  # Ensure all operations are complete
+		# torch.cuda.synchronize(self.device)  # Ensure all operations are complete	
+				
+		# ---- 4) All-reduce to combine results from all workers ------------
+		# logger.info(f"Rank {self.rank} starting all-reduce for expert results.")
+		# dist.all_reduce(local_expert_results, op=dist.ReduceOp.SUM, async_op=False)
+		# self.comm.all_reduce(local_expert_results, stream=self.comm_stream)
+		# self.comm_stream.synchronize()  # Ensure all-reduce is complete
+		# torch.cuda.current_stream(self.device).wait_stream(self.comm_stream)  # Ensure all
+		# torch.cuda.synchronize(self.device)
+		with self.comm.change_state(enable=True):
+			self.comm.all_reduce(local_expert_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
+		self.comm.stream.synchronize()  # Ensure all-reduce is complete
+		# ---- 5) Extract results for local tokens and aggregate ------------
+		start_token_ids = self.rank * num_tokens
+		end_token_ids = start_token_ids + num_tokens
+
+		local_results = local_expert_results[start_token_ids:end_token_ids]
+		local_token_weights = topk_weight[start_token_ids:end_token_ids]
+
+		weighted_output = local_results.to(torch.float32) * local_token_weights.unsqueeze(-1)
+		final_output = weighted_output.sum(dim=1).to(x.dtype)
+
+		return final_output
+
+	def grouped_dequant_moe(self, recv_x, recv_eid):
+		# This function assumes that recv_x and recv_eid are already sorted by expert id
+		gate_list = []
+		up_list = []
+		down_list = []
+		gate_scale_list = []
+		up_scale_list = []
+		down_scale_list = []
+		for e in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+			gate_list.append(self.experts[e].fp8_gate)
+			up_list.append(self.experts[e].fp8_up)
+			down_list.append(self.experts[e].fp8_down)
+			gate_scale_list.append(self.experts[e].weight_dequant_scale['gate_proj.weight_scale_inv'])
+			up_scale_list.append(self.experts[e].weight_dequant_scale['up_proj.weight_scale_inv'])
+			down_scale_list.append(self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv'])
+		eids = recv_eid - self.routed_expert_start_idx
+		counts = torch.bincount(eids, minlength=self.experts_per_rank)
+		group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)	
+		group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=self.device)
+		group_start_indices = torch.roll(torch.cumsum(group_size, dim=0), 1)
+		group_start_indices[0] = 0  # The first group starts at index 0	
+
+		intermediate = fused_dequant_weighted_moe_stage_1(
+			recv_x, gate_list, up_list, gate_scale_list, up_scale_list, group_sizes, group_start_indices
+		)	
+		
+		res = fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
+			intermediate, down_list, down_scale_list, group_sizes, group_start_indices, gemm_block_size = [64, 16, 64]
+		)
+		return res
+
+class DeepseekV3MoE_Decoding_v2_(nn.Module):
+	"""
+		EP with two ALL-to-ALLs.
+	"""
+	def __init__(self, config, comm):
+		super().__init__()
+		self.config = config
+		self.num_experts_per_tok = config.num_experts_per_tok
+		self.comm = comm
+		
+
+		# --- distributed/world metadata -------------------------------------
+		if not dist.is_initialized():
+			self.rank, self.world_size = 0, 1
+		else:
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+
+		self.experts_per_rank   = 256 // self.world_size
+		self.total_experts      = self.world_size * self.experts_per_rank
+		self.routed_expert_start_idx = self.rank * self.experts_per_rank
+		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
+
+		# --- experts, gate, shared MLP --------------------------------------
+		self.experts = nn.ModuleList([
+			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
+			for _ in range(self.total_experts)
+		])
+		self.gate = MoEGate(config)
+		if config.n_shared_experts:
+			self.shared_experts = DeepseekV3MLP(
+				config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+			)
+
+		# --- communication setup -------------------------------------------
+		self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		# self.comm_stream = torch.cuda.Stream()
+
+		# --- Pre-allocate Buffers. --------------------------------
+		num_tokens_per_rank = 8		# This is a placeholder, adjust as needed
+		global_num_tokens = num_tokens_per_rank * self.world_size
+		K = self.num_experts_per_tok
+		self.all_tokens = torch.zeros((self.world_size * num_tokens_per_rank, config.hidden_size),
+									  device=self.device, dtype=torch.bfloat16)
+		self.local_expert_results = torch.zeros((num_tokens_per_rank * self.world_size, self.num_experts_per_tok, config.hidden_size),
+											 device=self.device, dtype=torch.bfloat16)
+
+		self.act_fn = ACT2FN[config.hidden_act]
+		self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
+		self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
+
+	
+	def forward(self, hidden_states):
+		orig_shape = hidden_states.shape
+		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+		identity = hidden_states
+		
+		out = self.moe_infer(hidden_states)
+		out = out + self.shared_experts(identity)
+		return out.view(*orig_shape)
+
+	@torch.inference_mode()
+	def moe_infer(self, x):
+		# self.local_expert_results.zero_()  # Reset results buffer
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+		# ---- 1) First all-gather: collect all tokens on all workers -------
+		# Prepare buffers for all-gather
+		# logger.info(f"Rank {self.rank} starting all-gather for tokens.")
+		# dist.all_gather(self.all_tokens, x, async_op=False)
+		# torch.cuda.synchronize(self.device)  # Ensure all-gather is complete
+		self.all_tokens.zero_()  # Reset the all_tokens buffer
+		dist.all_gather_into_tensor(self.all_tokens, x, async_op=False)
+		# torch.cuda.synchronize(self.device)  # Ensure all-gather is complete
+		# dist.barrier()  # Ensure all-gather is complete before proceeding
+
+		# logger.info(f"Rank {self.rank} gathered {len(self.all_tokens)} tokens from all workers.")
+
+		# Concatenate all tokens from all workers
+		# global_x = torch.cat(self.all_tokens, dim=0)  # Shape: [num_tokens * world_size, hidden_size]
+		# global_num_tokens = global_x.shape[0]
+
+		# ---- 2) Gate computation on global tokens --------------------------
+		global_x = self.all_tokens
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
+		topk_idx, topk_weight = self.gate(global_x)
+		global_x = global_x.squeeze(1)  # Remove the dummy dimension
+
+
+		# ---- 3) Process tokens assigned to local experts ------------------
+		"""
+		if recv_total:
+			recv_eid_sorted, local_sort_idx = recv_eid.sort()
+			res = self.grouped_dequant_moe(recv_x[local_sort_idx], recv_eid_sorted)
+			recv_x[local_sort_idx] = res
+
+		"""	
+
+		# Find out which tokens are assigned to which local experts.
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids   = topk_idx.flatten()
+		expanded_x  = global_x.repeat_interleave(K, dim=0)
+		# token_idx   = torch.arange(global_num_tokens, device=device).repeat_interleave(K)
+		# topk_pos    = torch.arange(K, device=device).repeat(global_num_tokens)
+
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x   = expanded_x[sort_idx]
+		sorted_tok = self.token_idx[sort_idx]
+		sorted_pos = self.topk_pos[sort_idx]
+
+		# ---- 2) Build tensor for local expert input sorted by expert id ----
+		"""
+			We need a tensor x that contains tokens assigned to local expert sorted by expert id.
+			We need a tensor eids that contains expert ids for each token in x.
+		"""
+		local_token_expanded_x_indices = (sorted_eids >= self.routed_expert_start_idx) & (sorted_eids < self.routed_expert_end_idx)
+		input_x = sorted_x[local_token_expanded_x_indices]
+		input_eids = sorted_eids[local_token_expanded_x_indices]
+		global_indices = sorted_tok[local_token_expanded_x_indices]
+		token_topk_pos = sorted_pos[local_token_expanded_x_indices]
+		# torch.cuda.synchronize(self.device)  # Ensure all operations are complete
+		# ---- 3) Process tokens assigned to local experts ------------------
+		res = self.grouped_dequant_moe(input_x, input_eids)
+		self.local_expert_results.zero_()  # Reset results buffer
+		self.local_expert_results[global_indices, token_topk_pos, :] = res
+		# torch.cuda.default_stream(self.device).synchronize()  # Ensure all operations are complete
+		
+
+
+		# for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+		# 	# Get the mask for tokens assigned to this expert
+		# 	mask = (topk_idx == expert_idx)
+		# 	if mask.any():
+		# 		# Process only tokens assigned to this expert
+		# 		token_indices, topk_pos = torch.where(mask)
+
+		# 		if len(token_indices) > 0:
+		# 			# Get the corresponding tokens and weights
+		# 			input_tokens = global_x[token_indices]
+
+		# 			# Apply the expert to these tokens
+		# 			expert_output = self.experts[expert_idx](input_tokens)
+
+		# 			self.local_expert_results[token_indices, topk_pos, :] = expert_output
+		
+		# ---- 4) All-reduce to combine results from all workers ------------
+		# logger.info(f"Rank {self.rank} starting all-reduce for expert results.")
+		dist.all_reduce(self.local_expert_results, op=dist.ReduceOp.SUM, async_op=False)
+		# ---- 5) Extract results for local tokens and aggregate ------------
+		start_token_ids = self.rank * num_tokens
+		end_token_ids = start_token_ids + num_tokens
+
+		local_results = self.local_expert_results[start_token_ids:end_token_ids]
+		local_token_weights = topk_weight[start_token_ids:end_token_ids]
+
+		weighted_output = local_results.to(torch.float32) * local_token_weights.unsqueeze(-1)
+		final_output = weighted_output.sum(dim=1).to(x.dtype)
+
+		return final_output
+
+
+	# def grouped_dequant_moe(self, recv_x, recv_eid):
+	# 	from ....moe.fused_grouped_dequant_gemm import (
+	# 		fused_dequant_grouped_gemm_bf16_fp8_triton,
+	# 		fused_dequant_grouped_gemm_bf16_fp8_triton_v2
+	# 	)
+
+	# 	# This function assumes that recv_x and recv_eid are already sorted by expert id
+	# 	gate_list = []
+	# 	up_list = []
+	# 	down_list = []
+	# 	gate_scale_list = []
+	# 	up_scale_list = []
+	# 	down_scale_list = []
+	# 	for e in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+	# 		gate_list.append(self.experts[e].fp8_gate)
+	# 		up_list.append(self.experts[e].fp8_up)
+	# 		down_list.append(self.experts[e].fp8_down)
+	# 		gate_scale_list.append(self.experts[e].weight_dequant_scale['gate_proj.weight_scale_inv'])
+	# 		up_scale_list.append(self.experts[e].weight_dequant_scale['up_proj.weight_scale_inv'])
+	# 		down_scale_list.append(self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv'])
+	# 	eids = recv_eid - self.routed_expert_start_idx
+	# 	counts = torch.bincount(eids, minlength=self.experts_per_rank)
+	# 	group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)		
+	# 	up = fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
+	# 		recv_x, up_list, up_scale_list, group_sizes, gemm_block_size = [64, 16, 128]
+	# 	)
+	# 	gate = fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
+	# 		recv_x, gate_list, gate_scale_list, group_sizes, gemm_block_size = [64, 16, 128]
+	# 	)
+	# 	intermediate = self.act_fn(gate) * up
+	# 	res = fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
+	# 		intermediate, down_list, down_scale_list, group_sizes, gemm_block_size = [64, 16, 64]
+	# 	)
+	# 	return res
+	def grouped_dequant_moe(self, recv_x, recv_eid):
+		# This function assumes that recv_x and recv_eid are already sorted by expert id
+		gate_list = []
+		up_list = []
+		down_list = []
+		gate_scale_list = []
+		up_scale_list = []
+		down_scale_list = []
+		for e in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+			gate_list.append(self.experts[e].fp8_gate)
+			up_list.append(self.experts[e].fp8_up)
+			down_list.append(self.experts[e].fp8_down)
+			gate_scale_list.append(self.experts[e].weight_dequant_scale['gate_proj.weight_scale_inv'])
+			up_scale_list.append(self.experts[e].weight_dequant_scale['up_proj.weight_scale_inv'])
+			down_scale_list.append(self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv'])
+		eids = recv_eid - self.routed_expert_start_idx
+		counts = torch.bincount(eids, minlength=self.experts_per_rank)
+		group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)	
+		group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=self.device)
+		group_start_indices = torch.roll(torch.cumsum(group_size, dim=0), 1)
+		group_start_indices[0] = 0  # The first group starts at index 0	
+
+		intermediate = fused_dequant_weighted_moe_stage_1(
+			recv_x, gate_list, up_list, gate_scale_list, up_scale_list, group_sizes, group_start_indices
+		)	
+		
+		res = fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
+			intermediate, down_list, down_scale_list, group_sizes, group_start_indices, gemm_block_size = [64, 16, 64]
+		)
+		return res
 
 				
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -1205,7 +2351,7 @@ class DeepseekV3Attention_FlashMLA_Decoding_CUDAGraph(nn.Module):
 		stream = torch.cuda.Stream()
 		with torch.cuda.stream(stream):
 			for i in range(10):
-				with torch.no_grad():
+				with torch.inference_mode():
 					try:
 						outputs = self.base_model.mla_decoding_flashmla_attn_mode_3(**self.static_inputs)
 						if i == 0:
@@ -1557,22 +2703,23 @@ ATTENTION_CLASSES = {
 
 
 class DeepseekV3DecoderLayer(nn.Module):
-	def __init__(self, config: DeepseekV3Config, layer_idx: int):
+	def __init__(self, config: DeepseekV3Config, layer_idx: int, comm):
 		super().__init__()
 		self.hidden_size = config.hidden_size
 
 		self.self_attn = ATTENTION_CLASSES[config._attn_implementation](
 			config=config, layer_idx=layer_idx
 		)
+		self.comm = comm
 		if config.phase == "prefill":
 			cls = DeepseekV3MoE_Prefill
 		elif config.phase == "decoding":
-			cls = DeepseekV3MoE_Decoding
+			cls = DeepseekV3MoE_Decoding_FP8
 		else:
 			cls = DeepseekV3MoE_Prefill
 		
 		self.mlp = (
-			cls(config)
+			cls(config, self.comm)
 			if (
 				config.n_routed_experts is not None
 				and layer_idx >= config.first_k_dense_replace
@@ -1784,9 +2931,75 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 		self.embed_tokens = nn.Embedding(
 			config.vocab_size, config.hidden_size, self.padding_idx
 		)
+		self.comm = None
+		if self.config.phase == "decoding":
+			# from moe_gen.distributed.utils import StatelessProcessGroup
+			# from moe_gen.distributed.device_communicators.pynccl import PyNcclCommunicator
+			# self.rank = dist.get_rank()
+			# self.world_size = dist.get_world_size()
+			# device = torch.device("cuda", self.rank % torch.cuda.device_count())
+			# group = StatelessProcessGroup.create(
+			# 	host="29.194.13.154",
+			# 	port=20001,
+			# 	rank=self.rank,
+			# 	world_size=self.world_size,
+			# 	data_expiration_seconds=6000,
+			# )
+			# self.comm = PyNcclCommunicator(
+			# 	group=group,
+			# 	device=device
+			# )		
+			# 
+			pass		
+	
+		# if self.config.phase == "decoding":
+		# 	self.rank = dist.get_rank()
+		# 	cus_group = dist.new_group(backend="nccl")
+		# 	device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		# 	from ....distributed.device_communicators.pynccl import PyNcclCommunicator
+		# 	self.comm = PyNcclCommunicator(group=cus_group, device=device)
+		# 	# Check if the group size matches expected number of processes
+		# 	expected_size = dist.get_world_size()
+		# 	actual_size = dist.get_world_size(group=cus_group)
+
+		# 	if actual_size == expected_size:
+		# 		# print(f"Rank {self.rank}: All {actual_size} processes are in the group")
+		# 		logger.info(f"Rank {self.rank}: All {actual_size} processes are in the group")
+		# 	else:
+		# 		# print(f"Rank {self.rank}: Only {actual_size}/{expected_size} processes in group")
+		# 		logger.warning(f"Rank {self.rank}: Only {actual_size}/{expected_size} processes in group")
+		# 	# Test custom communicator
+		# 	try:
+		# 		# Assuming your PyNcclCommunicator has similar methods
+		# 		if hasattr(self.comm, 'all_reduce'):
+		# 			test_tensor = torch.tensor([1.0], device=device, dtype=torch.bfloat16)
+		# 			with self.comm.change_state(enable=True):
+		# 				self.comm.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+		# 			self.comm.stream.synchronize()  # Ensure all-reduce is complete
+		# 			expected_result = torch.tensor([dist.get_world_size()], device=device, dtype=torch.bfloat16)
+					
+		# 			if abs(test_tensor.item() - expected_result.item()) < 1e-2:
+		# 				# print(f"Rank {self.rank}: PyNccl communicator healthy")
+		# 				logger.info(f"Rank {self.rank}: PyNccl communicator healthy")
+		# 			else:
+		# 				# print(f"Rank {self.rank}: PyNccl communicator test failed")
+		# 				logger.error(f"Rank {self.rank}: PyNccl communicator test failed - expected {expected_result}, got {test_tensor.item()}")
+		# 				raise RuntimeError(
+		# 					f"PyNccl communicator test failed - expected {expected_result}, got {test_tensor.item()}"
+		# 				)
+				
+		# 		# Test barrier if available
+		# 		if hasattr(self.comm, 'barrier'):
+		# 			self.comm.barrier()
+		# 			# print(f"Rank {self.rank}: PyNccl barrier successful")
+		# 			logger.info(f"Rank {self.rank}: PyNccl barrier successful")
+					
+		# 	except Exception as e:
+		# 		# print(f"Rank {self.rank}: PyNccl communicator test failed - {e}")
+		# 		logger.error(f"Rank {self.rank}: PyNccl communicator test failed - {e}")
 		self.layers = nn.ModuleList(
 			[
-				DeepseekV3DecoderLayer(config, layer_idx)
+				DeepseekV3DecoderLayer(config, layer_idx, self.comm)
 				for layer_idx in range(config.num_hidden_layers)
 			]
 		)
