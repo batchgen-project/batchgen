@@ -535,15 +535,22 @@ class MoE_Gen:
                 self.pt_ckpt_dir,
                 self.host_kv_cache_size,
             )
-        elif self.model_config.architectures[0] == "Qwen2MoeForCausalLM":
-            from moe_gen.models.Qwen_Initializer import Qwen_Initializer
+        elif self.model_config.architectures[0] == "Qwen3MoeForCausalLM":
+            from moe_gen.models.qwen.Qwen_Initializer import Qwen3Moe_Initializer
 
-            self.initializer = Qwen_Initializer(
+            self.initializer = Qwen3Moe_Initializer(
                 self.huggingface_ckpt_name,
                 self.hf_cache_dir,
                 self.cache_dir,
                 self.engine_config,
+                self.skeleton_state_dict,
+                self.shm_name,
+                self.tensor_meta_shm_name,
                 self.pt_ckpt_dir,
+                self.host_kv_cache_size,
+                self.local_rank,
+                self.global_rank,
+                self.world_size
             )
         elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
             from moe_gen.models.deepseek.deepseekv3.deepseekv3_initializer import (
