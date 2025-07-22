@@ -169,15 +169,13 @@ void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
 };
 
 module_weight_tensor_map GPU_Weight_Buffer::get_weights(
-    const std::string& module_name,
-    std::string& phase) 
-{
+    const std::string& module_name, std::string& phase) {
     this->logger_->debug("Get weights: {}", module_name);
-    
+
     // Start timer for timeout tracking
     auto start_time = std::chrono::steady_clock::now();
     constexpr auto timeout_duration = std::chrono::seconds(2);
-    
+
     try {
         while (true) {
             {
@@ -194,7 +192,7 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                 }
                 this->logger_->debug("Waiting for module: {}", module_name);
             }
-            
+
             // Check for timeout
             auto current_time = std::chrono::steady_clock::now();
             auto elapsed = current_time - start_time;
@@ -202,7 +200,7 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                 // Log timeout error with buffer contents
                 std::ostringstream oss;
                 oss << "Map keys: ";
-                
+
                 size_t count = 0;
                 for (const auto& [key, value] : this->module_in_buffers_) {
                     oss << key;
@@ -210,12 +208,15 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                         oss << ", ";
                     }
                 }
-                
-                this->logger_->error("Timeout reached while waiting for module: {}. Buffer contents: {}", 
-                                    module_name, oss.str());
-                throw std::runtime_error("Timeout reached while waiting for module: " + module_name);
+
+                this->logger_->error(
+                    "Timeout reached while waiting for module: {}. Buffer "
+                    "contents: {}",
+                    module_name, oss.str());
+                throw std::runtime_error(
+                    "Timeout reached while waiting for module: " + module_name);
             }
-            
+
             // Check if module_name starts with "routed_expert" and has enough
             // length
             if (module_name.substr(0, 13) == "routed_expert") {
@@ -275,24 +276,22 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
 
 void GPU_Weight_Buffer::weights_copy_complete(const std::string& module_type,
                                               const std::string& module_name,
-                                              int64_t buffer_idx) {
-    {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        this->module_in_buffers_[module_name] =
-            std::make_pair(module_type, buffer_idx);
-        this->logger_->debug("Module: {} is in buffer: {}", module_name,
-                             buffer_idx);
-        this->cv_.notify_all();
-    }
-    
-};
+                                              int64_t buffer_idx){
+    {std::lock_guard<std::mutex> lock(this -> mutex_);
+this->module_in_buffers_[module_name] = std::make_pair(module_type, buffer_idx);
+this->logger_->debug("Module: {} is in buffer: {}", module_name, buffer_idx);
+this->cv_.notify_all();
+}
+}
+;
 
-
-void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase) {
+void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx,
+                                            int64_t expert_idx,
+                                            std::string phase) {
     // Log the keys of the module_in_buffers_ in the same log msg
     std::ostringstream oss;
     oss << "Map keys: ";
-    
+
     size_t count = 0;
     for (const auto& [key, value] : this->module_in_buffers_) {
         oss << key;
@@ -300,64 +299,76 @@ void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_id
             oss << ", ";
         }
     }
-    this->logger_->debug("clearing expert buffer: layer_idx: {}, expert_idx: {}, existing keys: {}", layer_idx, expert_idx, oss.str());
+    this->logger_->debug(
+        "clearing expert buffer: layer_idx: {}, expert_idx: {}, existing keys: "
+        "{}",
+        layer_idx, expert_idx, oss.str());
 
     // Get the number of expert buffers based on phase
     int64_t num_expert_buffer;
     if (phase == "prefill") {
-        num_expert_buffer = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer["routed_expert"];
+        num_expert_buffer = this->engine_config_.gpu_buffer_config
+                                .num_prefill_module_buffer["routed_expert"];
     } else if (phase == "decoding") {
-        num_expert_buffer = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer["routed_expert"];
+        num_expert_buffer = this->engine_config_.gpu_buffer_config
+                                .num_decoding_module_buffer["routed_expert"];
     } else {
         throw std::runtime_error("Invalid phase: " + std::string(phase));
     }
-    
+
     // Create the current expert name once
-    std::string current_expert_name = "routed_expert_" + std::to_string(layer_idx) + "_" + std::to_string(expert_idx);
-    
+    std::string current_expert_name = "routed_expert_" +
+                                      std::to_string(layer_idx) + "_" +
+                                      std::to_string(expert_idx);
+
     // Find index of current expert in weight_copy_tasks_ in one pass
     const auto& expert_tasks = this->weight_copy_tasks_["routed_expert"];
-    auto task_it = std::find(expert_tasks.begin(), expert_tasks.end(), current_expert_name);
+    auto task_it = std::find(expert_tasks.begin(), expert_tasks.end(),
+                             current_expert_name);
     if (task_it == expert_tasks.end()) {
-        return; // Expert name not found, nothing to clear
+        return;  // Expert name not found, nothing to clear
     }
-    
+
     // Build the set of allowed expert names efficiently
     std::unordered_set<std::string> allowed_expert_names;
-    allowed_expert_names.reserve(num_expert_buffer); // Preallocate for performance
+    allowed_expert_names.reserve(
+        num_expert_buffer);  // Preallocate for performance
     allowed_expert_names.insert(current_expert_name);
-    
+
     size_t task_size = expert_tasks.size();
     size_t idx = std::distance(expert_tasks.begin(), task_it);
-    
+
     // Add the next (num_expert_buffer - 1) expert names
     for (int64_t i = 1; i < num_expert_buffer; i++) {
-        idx = (idx + 1) % task_size; // Wrap around more efficiently
+        idx = (idx + 1) % task_size;  // Wrap around more efficiently
         allowed_expert_names.insert(expert_tasks[idx]);
     }
-    
+
     // Remove buffers in one pass, avoiding temporary storage vector
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        for (auto it = this->module_in_buffers_.begin(); it != this->module_in_buffers_.end();) {
+        for (auto it = this->module_in_buffers_.begin();
+             it != this->module_in_buffers_.end();) {
             const auto& key = it->first;
             // Check if this is a routed expert buffer not in our allowed list
-            if (key.compare(0, 13, "routed_expert") == 0 && 
+            if (key.compare(0, 13, "routed_expert") == 0 &&
                 allowed_expert_names.find(key) == allowed_expert_names.end()) {
                 this->logger_->debug(
-                    "Clearing expert buffer: layer_idx: {}, expert_idx: {}, {} cleared",
+                    "Clearing expert buffer: layer_idx: {}, expert_idx: {}, {} "
+                    "cleared",
                     layer_idx, expert_idx, key);
                 auto module_type = it->second.first;  // Access through iterator
                 auto buffer_idx = it->second.second;  // Access through iterator
-                it = this->module_in_buffers_.erase(it); // Erase and get next iterator
-                this->buffer_status_[module_type][buffer_idx] = 0; // Release buffer
+                it = this->module_in_buffers_.erase(
+                    it);  // Erase and get next iterator
+                this->buffer_status_[module_type][buffer_idx] =
+                    0;  // Release buffer
             } else {
-                ++it; // Move to next element
+                ++it;  // Move to next element
             }
         }
     }
 }
-
 
 void GPU_Weight_Buffer::reset_prefill_buffer() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
@@ -417,7 +428,6 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
     }
 }
 
-
 void GPU_Weight_Buffer::reset_decoding_buffer() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers =
@@ -445,7 +455,8 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                 } else {
                     auto options =
                         torch::TensorOptions()
-                            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+                            .dtype(this->engine_config_.basic_config
+                                       .weight_dtype_torch)
                             .device(torch::kCUDA,
                                     this->engine_config_.basic_config.device)
                             .requires_grad(false)

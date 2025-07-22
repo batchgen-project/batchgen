@@ -16,6 +16,7 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
+import gc
 import logging
 import os
 import shutil
@@ -25,13 +26,12 @@ import torch
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
 from transformers import AutoConfig
-import gc
 
+from ...ckpt_converter.ckpt_converter import ckpt_converter
 from .deepseekv2.configuration_deepseek_v2 import DeepseekV2Config
 from .deepseekv2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
 from .deepseekv3.configuration_deepseek_v3 import DeepseekV3Config
 from .deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-from ...ckpt_converter.ckpt_converter import ckpt_converter
 
 try:
     from moe_gen.core_engine import Parameter_Server
@@ -60,10 +60,9 @@ class DeepSeek_Parameter_Server:
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(f"Python PM instantiation: GPU 0 free memory: {gpu0_memory} GB / {total_memory} GB")
-
-
-
+        logging.info(
+            f"Python PM instantiation: GPU 0 free memory: {gpu0_memory} GB / {total_memory} GB"
+        )
 
         # self.hf_model_config = AutoConfig.from_pretrained(huggingface_ckpt_name, cache_dir=cache_dir, trust_remote_code=True)
 
@@ -72,19 +71,25 @@ class DeepSeek_Parameter_Server:
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(f"GPU 0 free mem pm start Init: {gpu0_memory} GB / {total_memory} GB")
-        
+        logging.info(
+            f"GPU 0 free mem pm start Init: {gpu0_memory} GB / {total_memory} GB"
+        )
+
         self._save_safetensors_to_pt()
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(f"GPU 0 free mem after save safetensors to pt: {gpu0_memory} GB / {total_memory} GB")
+        logging.info(
+            f"GPU 0 free mem after save safetensors to pt: {gpu0_memory} GB / {total_memory} GB"
+        )
 
         self._parse_state_dict()
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory} GB / {total_memory} GB")
+        logging.info(
+            f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory} GB / {total_memory} GB"
+        )
 
         self.parameter_server = Parameter_Server()
         logging.info(f"architectures: {self.hf_model_config.architectures[0]}")
@@ -119,7 +124,9 @@ class DeepSeek_Parameter_Server:
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(f"GPU 0 free memory before cpp pm Init: {gpu0_memory} GB / {total_memory} GB")
+        logging.info(
+            f"GPU 0 free memory before cpp pm Init: {gpu0_memory} GB / {total_memory} GB"
+        )
         # Todo: Fix this
         self.pt_ckpt_dir = os.path.join(self.cache_dir, "converted_ckpt")
         file_list = []
@@ -128,20 +135,26 @@ class DeepSeek_Parameter_Server:
                 file_list.append(os.path.join(self.cache_dir, file_name))
         if not os.path.exists(self.pt_ckpt_dir):
             os.makedirs(self.pt_ckpt_dir, exist_ok=True)
-            logging.info(f"First time run this model, converting the checkpoint files to MoE-Gen compatible format.")
+            logging.info(
+                f"First time run this model, converting the checkpoint files to MoE-Gen compatible format."
+            )
             converter = ckpt_converter()
-            for file_path in tqdm(file_list, desc="Converting checkpoint files", smoothing=0):
+            for file_path in tqdm(
+                file_list, desc="Converting checkpoint files", smoothing=0
+            ):
                 logging.debug(f"Converting {file_path} to {self.pt_ckpt_dir}")
                 converter.convert(file_path, self.pt_ckpt_dir)
         else:
             # Check if files are corrupted
             # Num of metadata(.json) and bin(.bin) files should be the same as file_list
-            # Also they should be in the same name exclusing the extension
+            # Also they should be in the same name excluding the extension
             metadata_files = []
             bin_files = []
             for file_name in os.listdir(self.pt_ckpt_dir):
                 if file_name.endswith(".json"):
-                    metadata_files.append(os.path.join(self.pt_ckpt_dir, file_name))
+                    metadata_files.append(
+                        os.path.join(self.pt_ckpt_dir, file_name)
+                    )
                 elif file_name.endswith(".bin"):
                     bin_files.append(os.path.join(self.pt_ckpt_dir, file_name))
             if len(metadata_files) != len(bin_files):
@@ -157,18 +170,23 @@ class DeepSeek_Parameter_Server:
             for files in file_list:
                 file_name = os.path.basename(files)
                 metadata_file = os.path.join(
-                    self.pt_ckpt_dir, file_name.replace(".safetensors", ".json").replace(".pt", ".json")
+                    self.pt_ckpt_dir,
+                    file_name.replace(".safetensors", ".json").replace(
+                        ".pt", ".json"
+                    ),
                 )
                 bin_file = os.path.join(
-                    self.pt_ckpt_dir, file_name.replace(".safetensors", ".bin").replace(".pt", ".bin")
+                    self.pt_ckpt_dir,
+                    file_name.replace(".safetensors", ".bin").replace(
+                        ".pt", ".bin"
+                    ),
                 )
                 if not os.path.exists(metadata_file):
                     raise FileNotFoundError(f"Metadata file {metadata_file} does not exist. \
-                    Please clean the converted_ckpt dir in {self.cache_dir} and run again.")    
+                    Please clean the converted_ckpt dir in {self.cache_dir} and run again.")
                 if not os.path.exists(bin_file):
                     raise FileNotFoundError(f"Bin file {bin_file} does not exist. \
                     Please clean the converted_ckpt dir in {self.cache_dir} and run again.")
-         
 
         self.parameter_server.Init(
             self.shm_name,
@@ -182,9 +200,13 @@ class DeepSeek_Parameter_Server:
     def _parse_state_dict(self):
         self.hf_model_config._attn_implementation = "eager"
         if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
-            model = DeepseekV2ForCausalLM._from_config(self.hf_model_config).to('cpu')
+            model = DeepseekV2ForCausalLM._from_config(self.hf_model_config).to(
+                "cpu"
+            )
         elif self.hf_model_config.architectures[0] == "DeepseekV3ForCausalLM":
-            model = DeepseekV3ForCausalLM._from_config(self.hf_model_config).to('cpu')
+            model = DeepseekV3ForCausalLM._from_config(self.hf_model_config).to(
+                "cpu"
+            )
         else:
             raise ValueError("Unknown model architecture")
         model.eval()
@@ -256,10 +278,8 @@ class DeepSeek_Parameter_Server:
                         + str(expert_idx)
                     )
         del model
-        gc.collect()  
-        torch.cuda.empty_cache() 
-
-
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def save_and_load(self, file_path, save_dir):
         tensor_dict = load_file(file_path)

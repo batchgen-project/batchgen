@@ -58,9 +58,9 @@ def _test_nccl_worker(rank, world_size, return_dict):
             expected = torch.arange(
                 world_size, dtype=torch.float32, device=device
             )
-            assert torch.allclose(output_tensor, expected), (
-                f"Rank {rank} all_gather failed"
-            )
+            assert torch.allclose(
+                output_tensor, expected
+            ), f"Rank {rank} all_gather failed"
 
             # reduce_scatter
             input_tensor = torch.tensor([1.0] * world_size, device=device)
@@ -70,9 +70,9 @@ def _test_nccl_worker(rank, world_size, return_dict):
             expected = torch.tensor(
                 [world_size], dtype=torch.float32, device=device
             )
-            assert torch.allclose(output_tensor, expected), (
-                f"Rank {rank} reduce_scatter failed"
-            )
+            assert torch.allclose(
+                output_tensor, expected
+            ), f"Rank {rank} reduce_scatter failed"
 
             # broadcast
             bcast_tensor = torch.tensor(
@@ -115,6 +115,6 @@ def test_nccl_communicator(world_size):
     )
 
     for rank in range(world_size):
-        assert return_dict[rank] == "pass", (
-            f"Rank {rank} failed: {return_dict[rank]}"
-        )
+        assert (
+            return_dict[rank] == "pass"
+        ), f"Rank {rank} failed: {return_dict[rank]}"

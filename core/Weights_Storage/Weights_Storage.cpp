@@ -54,13 +54,13 @@ void Weights_Storage::Init(
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_shm) {
-    CUDA_CHECK(cudaSetDevice(
-        this->engine_config_.basic_config.device));
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     this->shm_name = shm_name;
     auto start_time = std::chrono::high_resolution_clock::now();
     this->byte_size_ = byte_size;
     this->logger->info(
-        "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
+        "Initializing Weights_Storage with shared memory name: {} and byte "
+        "size: {}",
         shm_name, byte_size);
     void* weight_ptr =
         allocate_shared_pinned_memory(shm_name, byte_size, false);
@@ -99,7 +99,8 @@ Weights_Storage::get_module_weights_storage(std::string module_key) {
     return this->module_weights_storage_[module_key];
 };
 
-std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(std::string module_key){
+std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(
+    std::string module_key) {
     /* Get the tensor from the weights storage. */
     if (this->module_weights_storage_.find(module_key) ==
         this->module_weights_storage_.end()) {
@@ -108,28 +109,26 @@ std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(std::
     };
     auto module_weights = this->module_weights_storage_[module_key];
     auto bf16_option = torch::TensorOptions()
-        .dtype(torch::kBFloat16)
-        .device(torch::kCPU)
-        .requires_grad(false)
-        .memory_format(torch::MemoryFormat::Contiguous);
+                           .dtype(torch::kBFloat16)
+                           .device(torch::kCPU)
+                           .requires_grad(false)
+                           .memory_format(torch::MemoryFormat::Contiguous);
     auto fp8_option = torch::TensorOptions()
-        .dtype(torch::kFloat8_e4m3fn)
-        .device(torch::kCPU)
-        .requires_grad(false)
-        .memory_format(torch::MemoryFormat::Contiguous);
+                          .dtype(torch::kFloat8_e4m3fn)
+                          .device(torch::kCPU)
+                          .requires_grad(false)
+                          .memory_format(torch::MemoryFormat::Contiguous);
     std::unordered_map<std::string, torch::Tensor> tensors;
     for (auto& [tensor_key, tensor_buffer] : module_weights) {
         // If "norm" in module_key, use bf16 dtype.
         if (tensor_key.find("norm") != std::string::npos) {
-            auto tensor = torch::from_blob(
-                tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
-                bf16_option);
+            auto tensor =
+                torch::from_blob(tensor_buffer.data_ptr,
+                                 tensor_buffer.tensor_shape, bf16_option);
             tensors[tensor_key] = tensor;
-        }
-        else{
+        } else {
             auto tensor = torch::from_blob(
-                tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
-                fp8_option);
+                tensor_buffer.data_ptr, tensor_buffer.tensor_shape, fp8_option);
             tensors[tensor_key] = tensor;
         }
     }

@@ -51,7 +51,7 @@
 #include "../utils.h"
 
 class Hetero_Attn {
-public:
+   public:
     Hetero_Attn(const EngineConfig& engine_config,
                 const ModelConfig& model_config, KV_Storage& kv_storage,
                 GPU_KV_Buffer& gpu_kv_buffer, HtoD_Engine& h2d_engine,
@@ -91,7 +91,7 @@ public:
                                torch::Tensor& attention_mask,
                                torch::Tensor& position_ids,
                                std::vector<std::vector<int64_t>> micro_batches);
-        torch::Tensor _attn_mode_3(py::object& PyTorch_attn_module,
+    torch::Tensor _attn_mode_3(py::object& PyTorch_attn_module,
                                int64_t layer_idx, torch::Tensor& hidden_states,
                                torch::Tensor& attention_mask,
                                torch::Tensor& position_ids,

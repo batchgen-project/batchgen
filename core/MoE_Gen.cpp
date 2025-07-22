@@ -76,13 +76,13 @@ MoE_Gen::~MoE_Gen() { this->Terminate(); }
 
 // void MoE_Gen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
 //                     int64_t byte_size,
-//                     std::unordered_map<std::string, std::vector<std::string>>&
+//                     std::unordered_map<std::string,
+//                     std::vector<std::string>>&
 //                        weights_copy_tasks
-//     ) 
+//     )
 // {
 //     this->logger->info("MoE-Gen Init.");
 //     this->logger->info("model type: {}", this->model_config_.model_type);
-
 
 //     this->shm_name_ = shm_name;
 //     this->tensor_meta_shm_name_ = tensor_meta_shm_name;
@@ -93,8 +93,10 @@ MoE_Gen::~MoE_Gen() { this->Terminate(); }
 //     this->logger->info("byte_size: {}", byte_size);
 //     this->weights_storage_.Init(shm_name, byte_size, weights_map);
 //     this->logger->info("weights_storage initialized.");
-//     // this->weights_storage_.Init(this->parameter_server_.attr("byte_size").cast<int64_t>(),
-//     // this->parameter_server_.attr("module_weights_shm").cast<std::unordered_map<std::string,
+//     //
+//     this->weights_storage_.Init(this->parameter_server_.attr("byte_size").cast<int64_t>(),
+//     //
+//     this->parameter_server_.attr("module_weights_shm").cast<std::unordered_map<std::string,
 //     // std::unordered_map<std::string, tensor_meta>>());
 //     this->gpu_kv_buffer_.Init();
 //     this->gpu_weight_buffer_.Init();
@@ -108,11 +110,9 @@ MoE_Gen::~MoE_Gen() { this->Terminate(); }
 // };
 
 void MoE_Gen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-                    int64_t byte_size) 
-{
+                   int64_t byte_size) {
     this->logger->info("MoE-Gen Init.");
     this->logger->info("model type: {}", this->model_config_.model_type);
-
 
     this->shm_name_ = shm_name;
     this->tensor_meta_shm_name_ = tensor_meta_shm_name;
@@ -140,7 +140,7 @@ void MoE_Gen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
 void MoE_Gen::Terminate() {
     this->h2d_engine_.Terminate();
     this->d2h_engine_.Terminate();
-    
+
     // Now managed by the parameter server.
     // shm_unlink(this->shm_name_.c_str());
     // shm_unlink(this->tensor_meta_shm_name_.c_str());
@@ -166,20 +166,23 @@ void MoE_Gen::set_phase(std::string phase) {
 }
 
 void MoE_Gen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
-                         torch::Tensor key_states, torch::Tensor value_states,torch::Tensor attention_mask) {
+                         torch::Tensor key_states, torch::Tensor value_states,
+                         torch::Tensor attention_mask) {
     /* Offload the kv to the kv storage. */
     // check if key_states contains any NaN values
     // if (key_states.isnan().any().item<bool>()) {
     //     // check which sequence contains NaN values
     //     for(int i = 0; i < key_states.size(0); i++){
     //         if(key_states[i].isnan().any().item<bool>()){
-    //             this->logger->error("key_states contains NaN values at index {}", i);
+    //             this->logger->error("key_states contains NaN values at index
+    //             {}", i);
     //         }
     //     }
     //     this->logger->error("key_states contains NaN values");
     //     // throw std::runtime_error("key_states contains NaN values");
     // }
-    this->kv_storage_.offload(layer_idx, query_idx, key_states, value_states, attention_mask);
+    this->kv_storage_.offload(layer_idx, query_idx, key_states, value_states,
+                              attention_mask);
 };
 
 // void MoE_Gen::add_weight_storage(
@@ -207,13 +210,12 @@ void MoE_Gen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
 // };
 
 std::unordered_map<std::string, torch::Tensor> MoE_Gen::get_weights(
-    std::string module_key,
-    std::string& phase) 
-{
+    std::string module_key, std::string& phase) {
     /* Get the weights from the weights storage. */
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     // CUDA_CHECK(cudaStreamSynchronize(0));
-    return this->gpu_weight_buffer_.get_weights(module_key, phase);  // blocking.
+    return this->gpu_weight_buffer_.get_weights(module_key,
+                                                phase);  // blocking.
 };
 
 void MoE_Gen::free_weights_buffer(const std::string& module_name) {
@@ -237,7 +239,8 @@ void MoE_Gen::submit_to_KV_queue(std::vector<int64_t> micro_batch,
                                          layer_idx, byte_size);
 };
 
-void MoE_Gen::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase) {
+void MoE_Gen::clear_expert_buffer(int64_t layer_idx, int64_t expert_idx,
+                                  std::string phase) {
     this->gpu_weight_buffer_.clear_expert_buffer(layer_idx, expert_idx, phase);
 };
 
@@ -269,34 +272,23 @@ void MoE_Gen::create_fake_kv_storage() {
 };
 
 std::unordered_map<std::string, torch::Tensor> MoE_Gen::get_tensor(
-    std::string module_key)
-{
+    std::string module_key) {
     return this->weights_storage_.get_tensor(module_key);
 }
 
-void MoE_Gen::start_h2d_worker() {
-    this->h2d_engine_.Start();
-}
-
+void MoE_Gen::start_h2d_worker() { this->h2d_engine_.Start(); }
 
 void MoE_Gen::set_global_routed_experts_data_ptr(
-    const py::dict& experts_IPC_handles,
-    const py::dict& expert_location_map)
-{
-    this->h2d_engine_.set_global_routed_experts_data_ptr(
-        experts_IPC_handles,
-        expert_location_map
-    );
+    const py::dict& experts_IPC_handles, const py::dict& expert_location_map) {
+    this->h2d_engine_.set_global_routed_experts_data_ptr(experts_IPC_handles,
+                                                         expert_location_map);
 }
 
-void MoE_Gen::cuda_enable_peer_access(int rank, int world_size){
+void MoE_Gen::cuda_enable_peer_access(int rank, int world_size) {
     this->h2d_engine_.cuda_enable_peer_access(rank, world_size);
 }
 
-void MoE_Gen::save_compressed_kv(){
-    this->kv_storage_.save_compressed_kv();
-}
-
+void MoE_Gen::save_compressed_kv() { this->kv_storage_.save_compressed_kv(); }
 
 void MoE_Gen::set_weight_copy_queue(
     std::unordered_map<std::string, std::vector<std::string>>&
@@ -309,11 +301,7 @@ void MoE_Gen::reset_decoding_buffer() {
     this->gpu_weight_buffer_.reset_decoding_buffer();
 }
 
-void MoE_Gen::stop_h2d_worker() {
-    this->h2d_engine_.stop_h2d_worker();
-}
-
-
+void MoE_Gen::stop_h2d_worker() { this->h2d_engine_.stop_h2d_worker(); }
 
 #include <signal.h>
 static MoE_Gen* engine_instance = nullptr;

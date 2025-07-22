@@ -49,7 +49,7 @@ class MoE_Gen {
     ~MoE_Gen();
 
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-            int64_t byte_size);
+              int64_t byte_size);
     void Terminate();
 
     /*
@@ -67,7 +67,8 @@ class MoE_Gen {
 
     /* KV */
     void kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
-                    torch::Tensor key_states, torch::Tensor value_states,torch::Tensor attention_mask);
+                    torch::Tensor key_states, torch::Tensor value_states,
+                    torch::Tensor attention_mask);
 
     /* Weights */
     // void add_weight_storage(
@@ -89,7 +90,8 @@ class MoE_Gen {
                        torch::Tensor& position_ids,
                        std::vector<std::vector<int64_t>> cur_batching_plan);
 
-    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
+    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx,
+                             std::string phase);
 
     void set_phase(std::string phase);
 
@@ -107,8 +109,7 @@ class MoE_Gen {
     void start_h2d_worker();
     void set_global_routed_experts_data_ptr(
         const py::dict& experts_IPC_handles,
-        const py::dict& expert_location_map
-    );
+        const py::dict& expert_location_map);
     void cuda_enable_peer_access(int rank, int world_size);
     void save_compressed_kv();
     void set_weight_copy_queue(
@@ -118,20 +119,21 @@ class MoE_Gen {
     void reset_decoding_buffer();
     void stop_h2d_worker();
 
-    void copy_kv_to_worker(std::vector<int64_t> query_global_idx, int64_t context_length) {
+    void copy_kv_to_worker(std::vector<int64_t> query_global_idx,
+                           int64_t context_length) {
         this->kv_storage_.copy_kv_to_worker(query_global_idx, context_length);
     }
-    void clear_gpu_kv_storage(){
-        this->kv_storage_.clear_kv_gpu_storage();
-    }
+    void clear_gpu_kv_storage() { this->kv_storage_.clear_kv_gpu_storage(); }
 
-    std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
-        return this->kv_storage_.get_past_key_states(query_global_indices, max_seq_len);
+    std::vector<torch::Tensor> get_past_key_states(
+        std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+        return this->kv_storage_.get_past_key_states(query_global_indices,
+                                                     max_seq_len);
     }
-    std::vector<torch::Tensor> get_kv_scale(std::vector<int64_t> query_global_indices, int64_t seq_len){
+    std::vector<torch::Tensor> get_kv_scale(
+        std::vector<int64_t> query_global_indices, int64_t seq_len) {
         return this->kv_storage_.get_kv_scale(query_global_indices, seq_len);
     }
-        
 
    private:
     EngineConfig engine_config_;

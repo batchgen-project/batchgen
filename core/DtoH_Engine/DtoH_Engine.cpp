@@ -91,9 +91,8 @@ torch::Tensor DtoH_Engine::tensor_on_demand_copy(torch::Tensor& src_tensor) {
 
 void DtoH_Engine::submit_to_queue_B(void* dst, void* src, int64_t size) {
     try {
-        std::packaged_task<void()> task([this, dst, src, size](){
-        	this->blocking_copy_(dst, src, size);
-        });
+        std::packaged_task<void()> task(
+            [this, dst, src, size]() { this->blocking_copy_(dst, src, size); });
         std::future<void> completion_future = task.get_future();
         this->queue_B_.push(std::move(task));
         completion_future.wait();

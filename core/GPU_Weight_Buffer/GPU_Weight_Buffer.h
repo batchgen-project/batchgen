@@ -60,18 +60,19 @@ class GPU_Weight_Buffer {
 
     // std::shared_ptr<module_weight_tensor_map> get_weights(
     //     const std::string& module_name);
-    module_weight_tensor_map get_weights(
-            const std::string& module_name,
-            std::string& phase);
+    module_weight_tensor_map get_weights(const std::string& module_name,
+                                         std::string& phase);
 
     void weights_copy_complete(const std::string& module_type,
                                const std::string& module_name,
                                int64_t buffer_idx);
 
-    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx, std::string phase);
+    void clear_expert_buffer(int64_t layer_idx, int64_t expert_idx,
+                             std::string phase);
     void reset_prefill_buffer();
     void reset_decoding_buffer();
-    void set_weight_copy_task(std::unordered_map<std::string, std::vector<std::string>> task){
+    void set_weight_copy_task(
+        std::unordered_map<std::string, std::vector<std::string>> task) {
         this->weight_copy_tasks_ = task;
     }
 

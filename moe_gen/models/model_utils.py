@@ -1,19 +1,16 @@
-
-
 import logging
-from multiprocessing import Process
 import os
+from multiprocessing import Process
 from typing import Optional
 
 import torch
-from tqdm import tqdm
-
+from deepseek.deepseekv3.configuration_deepseek_v3 import DeepseekV3Config
+from qwen.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from safetensors.torch import load_file
+from tqdm import tqdm
 
 from ..config.config import EngineConfig, ModelConfig
 from ..config.hf_config_parser import HuggingFaceModelConfig
-from qwen.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from deepseek.deepseekv3.configuration_deepseek_v3 import DeepseekV3Config
 
 SUPPORTED_MODELS = {
     "deepseek-ai/DeepSeek-V3": DeepseekV3Config,
@@ -21,6 +18,7 @@ SUPPORTED_MODELS = {
     "Qwen/Qwen3-235B-A22B": Qwen3MoeConfig,
     "Qwen/Qwen3-30B-A3B": Qwen3MoeConfig,
 }
+
 
 class ModelInitializer:
     def __init__(
@@ -49,19 +47,17 @@ class ModelInitializer:
         self.local_rank = local_rank
         self.global_rank = global_rank
         self.world_size = world_size
-        
+
         self.host_kv_cache_byte_size = host_kv_cache_size * (1024**3)
-        
+
         assert self.huggingface_ckpt_name in SUPPORTED_MODELS, (
             f"Unsupported model: {self.huggingface_ckpt_name}. "
             f"Supported models are: {list(SUPPORTED_MODELS.keys())}"
         )
-        
-        self.hf_model_config = SUPPORTED_MODELS[self.huggingface_ckpt_name].from_pretrained(
-            self.cache_dir, 
-            trust_remote_code=True
-        )
-        
+
+        self.hf_model_config = SUPPORTED_MODELS[
+            self.huggingface_ckpt_name
+        ].from_pretrained(self.cache_dir, trust_remote_code=True)
 
     def _save_safetensors_to_pt(self):
         ckpt_files = os.listdir(self.cache_dir)
@@ -95,18 +91,19 @@ class ModelInitializer:
             p.join()
             p.close()
         logging.info("All safetensor loader processes joined")
-        
-        
+
     def _parse_model_config(self):
         model_config = ModelConfig()
-        
+
         self.hf_config = HuggingFaceModelConfig(self.hf_model_config)
 
         model_config.model_type = self.hf_config.model_type
         model_config.num_hidden_layers = self.hf_config.num_layers
         model_config.num_local_experts = self.hf_config.moe_config.num_experts
         model_config.num_attention_heads = self.hf_config.attn_config.num_heads
-        model_config.num_key_value_heads = self.hf_config.attn_config.num_key_value_heads
+        model_config.num_key_value_heads = (
+            self.hf_config.attn_config.num_key_value_heads
+        )
         model_config.head_dim = self.hf_config.attn_config.head_dim
         model_config.compressed_kv_dim = (
             self.hf_config.attn_config.compressed_kv_dim

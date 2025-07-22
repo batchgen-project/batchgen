@@ -21,22 +21,22 @@ import math
 import os
 import time
 import types
+from datetime import timedelta
 from multiprocessing import Process
-from typing import Optional, Union, List
+from typing import List, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import triton
 import triton.language as tl
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
 from transformers import AutoConfig
-import torch.distributed as dist
 
 # from moe_gen.config import EngineConfig, ModelConfig
 from ....config.config import EngineConfig, ModelConfig
 from .configuration_deepseek_v3 import DeepseekV3Config
-from datetime import timedelta
 
 # from transformers.models.qwen2_moe.modeling_qwen2_moe import repeat_kv
 
@@ -55,8 +55,10 @@ except ImportError:
     pass
 
 from moe_gen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
-# from flash_mla import get_mla_metadata, flash_mla_with_kvcache
 
+from ....config.engine_config_parser import parse_config_from_json
+
+# from flash_mla import get_mla_metadata, flash_mla_with_kvcache
 # current_dir = os.path.dirname(os.path.abspath(__file__))
 # sys.append(current_dir)
 from .modeling_deepseek_v3 import (
@@ -65,7 +67,6 @@ from .modeling_deepseek_v3 import (
     rotate_half,
 )
 
-from ....config.engine_config_parser import parse_config_from_json
 
 def ceil_div(x: int, y: int) -> int:
     """
@@ -79,6 +80,7 @@ def ceil_div(x: int, y: int) -> int:
         The result of the ceiling division.
     """
     return (x + y - 1) // y
+
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
@@ -305,7 +307,9 @@ def prefill_attn_fp8(
     return attn_output, new_compressed_kv
 
 
-def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+def compressed_kv_fp8_to_bf16_per_token(
+    q: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
     """
     Dequantize the output of bf16_to_fp8_per_token back to BF16.
     Inputs:
@@ -317,9 +321,10 @@ def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> tor
     bsz, seq_len, dim = q.shape
     M = bsz * seq_len
     # flatten
-    q_flat = q.view(M, dim).float()               # upcast FP8→FP32
-    x_rec = q_flat * s.view(M, 1)             # rescale
-    return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)	
+    q_flat = q.view(M, dim).float()  # upcast FP8→FP32
+    x_rec = q_flat * s.view(M, 1)  # rescale
+    return x_rec.to(torch.bfloat16).view(bsz, seq_len, dim)
+
 
 def deepseek_v3_dequantization(
     weight_data_fp8: torch.Tensor,
@@ -452,7 +457,7 @@ class DeepSeekV3_Initializer:
 
         self.local_rank = local_rank
         self.global_rank = global_rank
-        self.world_size = world_size    
+        self.world_size = world_size
 
         self.fp8_weights_IPC_handle = {}
 
@@ -669,10 +674,9 @@ class DeepSeekV3_Initializer:
                 else:
                     param.data = self.skeleton_state_dict[key]
 
-        model_skeletion_byte_size = (
-            sum(p.numel() * p.element_size() for p in self.model.parameters())
-            / (1024**3)
-        )
+        model_skeletion_byte_size = sum(
+            p.numel() * p.element_size() for p in self.model.parameters()
+        ) / (1024**3)
         logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
 
         # Rank 0 print out all the tensors in the model with tensor size in MB
@@ -720,30 +724,25 @@ class DeepSeekV3_Initializer:
             #     self.weight_copy_task,
             # )
             self.core_engine.Init(
-                self.shm_name,
-                self.tensor_meta_shm_name,
-                param_byte_size
+                self.shm_name, self.tensor_meta_shm_name, param_byte_size
             )
             logging.info("Core engine initialized")
-            
+
             # self._extract_dequantize_scale()
             # self._load_model_skeleton()
             # self._load_local_routed_experts()
             # self._config_attn_module()
             # self._config_expert_module()
             # self._config_lm_head_hook()
-            
-            
 
             # self.model.eval()
             # self.model.to(self.engine_config.Basic_Config.device_torch)
-            # if dist.get_rank() == 0:    
+            # if dist.get_rank() == 0:
             #     print(self.model, flush=True)
-            
+
             # if len(self.weight_copy_task["routed_expert"]) == 0:
             #     self.weight_copy_task.pop("routed_expert")
-                
-            
+
             # self.core_engine.cuda_enable_peer_access(self.rank, self.world_size)
             # logging.info("Peer access enabled")
             # self.core_engine.set_global_routed_experts_data_ptr(self.global_routed_experts_data_ptr, self.expert_location_map)
@@ -758,7 +757,7 @@ class DeepSeekV3_Initializer:
             self.model,
             self.engine_config,
             self.model_config,
-            self.hf_model_config
+            self.hf_model_config,
         )
 
     def _parse_state_dict_ep(self):
@@ -785,13 +784,15 @@ class DeepSeekV3_Initializer:
         self.host_routed_experts = []
         # self.expert_location_map = {}
 
-        NUM_LOCAL_EXPERT_PER_LAYER = 24  # Per requirements: 15 experts per GPU per layer
-        NUM_TOTAL_EXPERTS = 256          # Total experts per layer
-        
-
+        NUM_LOCAL_EXPERT_PER_LAYER = (
+            24  # Per requirements: 15 experts per GPU per layer
+        )
+        NUM_TOTAL_EXPERTS = 256  # Total experts per layer
 
         routed_expert_gpu_start_idx = self.rank * 32
-        routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
+        routed_expert_gpu_end_idx = (
+            routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
+        )
         routed_expert_host_start_idx = routed_expert_gpu_end_idx
         routed_expert_host_end_idx = (self.rank + 1) * 32
         for layer_idx in range(
@@ -801,18 +802,21 @@ class DeepSeekV3_Initializer:
             # We split the 256 into 8 parts, each part is 32 experts.
             # The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
             # The rest of the experts in the part are stored in the host memory.
-            for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
+            for expert_idx in range(
+                routed_expert_gpu_start_idx, routed_expert_gpu_end_idx
+            ):
                 self.local_routed_experts.append(
                     "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
                 )
-            for expert_idx in range(routed_expert_host_start_idx, routed_expert_host_end_idx):
+            for expert_idx in range(
+                routed_expert_host_start_idx, routed_expert_host_end_idx
+            ):
                 self.host_routed_experts.append(
                     "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
                 )
 
         self.weight_copy_task["routed_expert"] = self.host_routed_experts
         # assert len(self.weight_copy_task["routed_expert"]) == 0
-
 
         for layer_idx in trange(self.model_config.num_hidden_layers):
             for name, _ in self.model.model.layers[
@@ -866,7 +870,7 @@ class DeepSeekV3_Initializer:
                             + str(expert_idx),
                             "tensor_key": name,
                         }
-                    
+
                     # if "routed_expert_" + str(layer_idx) + "_" + str(expert_idx) not in self.local_routed_experts:
                     #     self.weight_copy_task["routed_expert"].append(
                     #         "routed_expert_"
@@ -874,7 +878,7 @@ class DeepSeekV3_Initializer:
                     #         + "_"
                     #         + str(expert_idx)
                     #     )
-                    
+
                     # self.weight_copy_task["routed_expert"].append(
                     #     "routed_expert_"
                     #     + str(layer_idx)
@@ -883,8 +887,3 @@ class DeepSeekV3_Initializer:
                     # )
         # if len(self.weight_copy_task["routed_expert"]) == 0:
         #     self.weight_copy_task.pop("routed_expert")
-
-
-        
-        
-                

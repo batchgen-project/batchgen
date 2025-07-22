@@ -19,7 +19,7 @@ MoE-Gen is an efficient serving engine optimized specifically for **Mixture-of-E
 
 - **Module-Based Batching**: A fine-grained batching strategy ensures consistently high GPU utilization throughout every forward pass.
 - **Efficient Data Swapping Engine**: Supports inference of large-scale models (e.g., DeepSeek-R1) on constrained hardware setups such as single NVIDIA A5000 or RTX 4090 GPUs, aggressively maximizing overlap between computation and memory transfers to achieve optimal efficiency.
-- **Tailored Offloading and Parallel Strategy**: Different parallel strategies, model weights offloaidng and KV-Cache offloading are applied to different models and hardware settings. 
+- **Tailored Offloading and Parallel Strategy**: Different parallel strategies, model weights offloaidng and KV-Cache offloading are applied to different models and hardware settings.
 
 
 # Application Scenarios
@@ -34,7 +34,7 @@ MoE-Gen is an efficient serving engine optimized specifically for **Mixture-of-E
 - **DeepSeek-R1/V3-671B. FULL Precision.**
 
 # Supported Hardware
-Hooper and Ampere archtecture are supported. 
+Hooper and Ampere architecture are supported.
 
 Recommended configurations for 8xH20, 8xA100 and 8xA5000 node are included in ./moe_gen/configurations/
 
@@ -92,7 +92,7 @@ MoE-Gen seamlessly integrates with Huggingface environment. Start inference with
 ```bash
 python -m moe_gen.parameter_server \
     --model deepseek-ai/DeepSeek-R1 \
-    --cache-dir "..." 
+    --cache-dir "..."
 ```
 Please provide --cache-dir as your model checkpoint if you are not using hugging face default model checkpoint directory.
 
@@ -111,16 +111,16 @@ if __name__ == "__main__":
         Step 1: Task Configs
     """
     hugging_face_checkpoint_name = "deepseek-ai/DeepSeek-R1"
-    
+
     # The host memory reserved for KV-Cache. Adjust based on your hardware platform.
-    host_kv_cache_size = 100 
-    
+    host_kv_cache_size = 100
+
     max_input_length = 13000
     max_decoding_length = 100
     engine_config_json_dir = "/MoE-Gen/configurations/DeepSeek-R1/engine_config_H20_8.json"
     # Change if there is port conflict.
     server_host = "localhost"
-    server_port = "9090" 
+    server_port = "9090"
 
 
     """
@@ -155,7 +155,7 @@ if __name__ == "__main__":
     # If number of queries is less than max_prompts, fill the rest by duplicating
     if len(queries) < num_requests:
         queries = queries * (num_requests // len(queries)) + queries[: num_requests % len(queries)]
-    
+
 
     tokenizer = AutoTokenizer.from_pretrained(
         hugging_face_checkpoint, trust_remote_code=True
@@ -172,10 +172,10 @@ if __name__ == "__main__":
 
     """
         Step 3: Launch MoE-Gen
-    """    
+    """
     logging.info(f"Connecting to parameter server at {server_host}:{server_port}")
     logging.info(f"Using model {hugging_face_checkpoint}")
-    
+
     # Run inference with our standalone parameter server
     answer_set = moe_gen(
         huggingface_ckpt_name=hugging_face_checkpoint,
@@ -212,7 +212,7 @@ if __name__ == "__main__":
 
 This command runs the script on selected GPUs.
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \ 
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python example.py
 ```
 

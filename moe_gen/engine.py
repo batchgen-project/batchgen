@@ -19,31 +19,31 @@
 import concurrent.futures
 import copy
 import functools
+import gc
 import logging
 import math
 import os
 import sys
 import time
+from datetime import timedelta
 from typing import Callable, Dict, List, Optional
 
 import torch
-import torch.multiprocessing as mp
 import torch.distributed as dist
-from tqdm import tqdm
+import torch.multiprocessing as mp
+from tqdm import tqdm, trange
 from transformers import AutoConfig, AutoTokenizer
 
 # import nvidia_dlprof_pytorch_nvtx as nvtx
 from moe_gen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+from moe_gen.parameter_server_client import ParameterServerClient
 
 from .config.config import EngineConfig
 from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
+from .models.deepseek.deepseekv3.modeling_deepseek_v3 import (
+    DeepseekV3ForCausalLM,
+)
 from .scheduler.host_mem import get_physical_memory_info
-
-from moe_gen.parameter_server_client import ParameterServerClient
-from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-from tqdm import trange
-import gc
-from datetime import timedelta
 
 logging.basicConfig(
     level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -51,37 +51,43 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
 )
 
-from .config.engine_config_parser import parse_config_from_json
-from .scheduler.scheduler import Scheduler
+import faulthandler
+
 # nvtx = False
 # if nvtx:
 # 	nvidia_dlprof_pytorch_nvtx.init()
-
 import signal
-import traceback
 import sys
-import faulthandler
+import traceback
+
+from .config.engine_config_parser import parse_config_from_json
+from .scheduler.scheduler import Scheduler
+
 
 def signal_handler(signum, frame):
     print(f"\n{'='*50}")
-    print(f"Process {os.getpid()} (Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 'N/A'}) received signal {signum}")
+    print(
+        f"Process {os.getpid()} (Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 'N/A'}) received signal {signum}"
+    )
     print(f"{'='*50}")
-    
+
     # Print current stack trace
     traceback.print_stack(frame)
-    
+
     # For all threads
     import threading
+
     for thread_id, frame in sys._current_frames().items():
         print(f"\nThread {thread_id} stack:")
         traceback.print_stack(frame)
-    
+
     # Force flush output
     sys.stdout.flush()
     sys.stderr.flush()
-    
+
     # Exit after some delay to allow other processes to print
     import time
+
     time.sleep(0.5)
     sys.exit(1)
 
@@ -166,7 +172,6 @@ def _config_torch_module_initializer():
             )
 
 
-
 def run_moe_gen(moe_gen):
     moe_gen.Init()
     return moe_gen.generate()
@@ -176,40 +181,43 @@ def distribute_sequences(num_sequences, num_devices):
     """
     Distributes sequences across devices ensuring each device gets at least one sequence when possible,
     and the distribution is as even as possible.
-    
+
     Args:
         num_sequences: Number of sequences to distribute
         num_devices: Number of available devices
-    
+
     Returns:
         List of (start_idx, end_idx) tuples for each device
     """
     # If we have fewer sequences than devices, only use as many devices as we have sequences
     active_devices = min(num_sequences, num_devices)
-    
+
     # Calculate base sequences per device and remainder
     base_per_device = num_sequences // active_devices
     remainder = num_sequences % active_devices
-    
+
     distribution = []
     current_idx = 0
-    
+
     for device_idx in range(num_devices):
         if device_idx < active_devices:
             # This device gets work
             # Add one extra sequence for the first 'remainder' devices
-            device_sequences = base_per_device + (1 if device_idx < remainder else 0)
-            
+            device_sequences = base_per_device + (
+                1 if device_idx < remainder else 0
+            )
+
             start_idx = current_idx
             end_idx = start_idx + device_sequences
             current_idx = end_idx
-            
+
             distribution.append((start_idx, end_idx))
         else:
             # This device gets no work
             distribution.append((0, 0))  # Empty range
-    
+
     return distribution
+
 
 # Entry point
 def moe_gen(
@@ -223,7 +231,7 @@ def moe_gen(
     cache_dir: Optional[str] = None,
     pt_ckpt_dir: Optional[str] = None,
     host_kv_cache_size: Optional[int] = None,  # If not set, use all host memory
-    parameter_server_host: str = 'localhost',
+    parameter_server_host: str = "localhost",
     parameter_server_port: int = 9090,
     dist_init_addr: Optional[str] = "localhost:12355",
     nnodes: Optional[int] = 1,
@@ -232,7 +240,7 @@ def moe_gen(
 ):
     """
     Run MoE_Gen using the standalone parameter server.
-    
+
     Args:
         huggingface_ckpt_name: Model name on HuggingFace
         queries: List of queries to process
@@ -246,7 +254,7 @@ def moe_gen(
         host_kv_cache_size: Host KV cache size in bytes
         parameter_server_host: Host of the parameter server
         parameter_server_port: Port of the parameter server
-    
+
     Returns:
         List of results with generated text
     """
@@ -260,62 +268,95 @@ def moe_gen(
 
     # Enable faulthandler to get stack traces on segfault
     faulthandler.enable()
-    
+
     # Get model info from the parameter server - just retrieve existing info
-    logging.info(f"Connecting to parameter server at {parameter_server_host}:{parameter_server_port}")
+    logging.info(
+        f"Connecting to parameter server at {parameter_server_host}:{parameter_server_port}"
+    )
     try:
-        with ParameterServerClient(host=parameter_server_host, port=parameter_server_port) as client:
+        with ParameterServerClient(
+            host=parameter_server_host, port=parameter_server_port
+        ) as client:
             # First check if the server has a model loaded
             model_info = client.get_model_info()
-            
+
             # If the expected model isn't loaded, we need to request it
-            if model_info.get('huggingface_ckpt_name') != huggingface_ckpt_name:
-                logging.info(f"Parameter server has a different model loaded. Requesting {huggingface_ckpt_name}")
+            if model_info.get("huggingface_ckpt_name") != huggingface_ckpt_name:
+                logging.info(
+                    f"Parameter server has a different model loaded. Requesting {huggingface_ckpt_name}"
+                )
                 # Terminate directly
-                logging.info(f"Terminating process as the model is not loaded in the parameter server.")
+                logging.info(
+                    f"Terminating process as the model is not loaded in the parameter server."
+                )
                 sys.exit(1)
             else:
-                logging.info(f"Model {huggingface_ckpt_name} already loaded in parameter server")
+                logging.info(
+                    f"Model {huggingface_ckpt_name} already loaded in parameter server"
+                )
     except Exception as e:
         raise RuntimeError(f"Failed to connect to parameter server: {e}")
-    
+
     # Extract necessary data from model_info
-    shm_name = model_info.get('shm_name')
-    tensor_meta_shm_name = model_info.get('tensor_meta_shm_name')
-    skeleton_state_dict = model_info.get('skeleton_state_dict')  # This now comes from shared memory
-    parameter_server_size = model_info.get('parameter_server_size')
+    shm_name = model_info.get("shm_name")
+    tensor_meta_shm_name = model_info.get("tensor_meta_shm_name")
+    skeleton_state_dict = model_info.get(
+        "skeleton_state_dict"
+    )  # This now comes from shared memory
+    parameter_server_size = model_info.get("parameter_server_size")
     if pt_ckpt_dir == None:
-        pt_ckpt_dir = model_info.get('pt_ckpt_dir')
-    
-    if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, pt_ckpt_dir]):
+        pt_ckpt_dir = model_info.get("pt_ckpt_dir")
+
+    if not all(
+        [
+            shm_name,
+            tensor_meta_shm_name,
+            skeleton_state_dict,
+            parameter_server_size,
+            pt_ckpt_dir,
+        ]
+    ):
         missing = []
-        if not shm_name: missing.append('shm_name')
-        if not tensor_meta_shm_name: missing.append('tensor_meta_shm_name')
-        if not skeleton_state_dict: missing.append('skeleton_state_dict')
-        if not parameter_server_size: missing.append('parameter_server_size')
-        if not pt_ckpt_dir: missing.append('pt_ckpt_dir')
-        raise RuntimeError(f"Missing required information from parameter server: {', '.join(missing)}")
-    
+        if not shm_name:
+            missing.append("shm_name")
+        if not tensor_meta_shm_name:
+            missing.append("tensor_meta_shm_name")
+        if not skeleton_state_dict:
+            missing.append("skeleton_state_dict")
+        if not parameter_server_size:
+            missing.append("parameter_server_size")
+        if not pt_ckpt_dir:
+            missing.append("pt_ckpt_dir")
+        raise RuntimeError(
+            f"Missing required information from parameter server: {', '.join(missing)}"
+        )
+
     # Calculate host KV cache size if not provided
     if host_kv_cache_size is None:
         from moe_gen.utils import get_physical_memory_info
+
         mem_info = get_physical_memory_info()
         free_mem = mem_info["actually_free"]
         # We don't need to subtract parameter_server_size since it's in a separate process
         host_kv_cache_size = math.floor(free_mem)
         logging.info(f"Host KV Cache Size: {host_kv_cache_size}")
-    
 
     if torch.cuda.is_available():
         num_devices = torch.cuda.device_count()
-        logging.info(f"Node {node_rank} has {num_devices} local devices visible.")
+        logging.info(
+            f"Node {node_rank} has {num_devices} local devices visible."
+        )
 
         # TODO: Handle cases where number of devices is not eight.
-        assert num_devices == 8, "Current version requires exactly 8 devices per node. Will be fixed in the future version."
+        assert (
+            num_devices == 8
+        ), "Current version requires exactly 8 devices per node. Will be fixed in the future version."
 
     else:
-        raise RuntimeError("No CUDA devices available. Please check your setup.")
-    
+        raise RuntimeError(
+            "No CUDA devices available. Please check your setup."
+        )
+
     # Distribute queries among devices
     moe_gens = []
     num_queries = len(queries)
@@ -324,25 +365,33 @@ def moe_gen(
     logging.info(f"World size: {world_size}")
     logging.info(f"Total number of queries: {num_queries}")
 
-    assert num_queries >= world_size, "Current version requires at least as many queries as devices. Will be fixed in the future version."
+    assert (
+        num_queries >= world_size
+    ), "Current version requires at least as many queries as devices. Will be fixed in the future version."
 
     distribution = distribute_sequences(num_queries, world_size)
     per_device_host_kv_cache_size = host_kv_cache_size // num_devices
 
     # indices: List of tuples (local_rank, global_rank)
     # E.g. node 1: [(0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14), (7, 15)]
-    indices = [(local_rank, local_rank + node_rank * device_per_node) for local_rank in range(device_per_node)]
+    indices = [
+        (local_rank, local_rank + node_rank * device_per_node)
+        for local_rank in range(device_per_node)
+    ]
     logging.info(f"Distributing queries across devices: {indices}")
-    
+
     # For each device, create a MoE_Gen instance
     for local_rank, global_rank in indices:
         # start_query_idx = device_idx * queries_per_device
         # end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
         start_query_idx, end_query_idx = distribution[global_rank]
-        logging.info(f"Global rank {global_rank}: Processing queries from {start_query_idx} to {end_query_idx}")
-                
+        logging.info(
+            f"Global rank {global_rank}: Processing queries from {start_query_idx} to {end_query_idx}"
+        )
+
         # Create MoE_Gen instance with the shared memory info
         from moe_gen.engine import MoE_Gen
+
         moe_gen_instance = MoE_Gen(
             huggingface_ckpt_name=huggingface_ckpt_name,
             hf_cache_dir=hf_cache_dir,
@@ -357,17 +406,17 @@ def moe_gen(
             tensor_meta_shm_name=tensor_meta_shm_name,
             pt_ckpt_dir=pt_ckpt_dir,
             host_kv_cache_size=per_device_host_kv_cache_size,
-            dist_init_addr = dist_init_addr,
-            local_rank = local_rank,
-            global_rank = global_rank,
-            world_size = nnodes * device_per_node,
+            dist_init_addr=dist_init_addr,
+            local_rank=local_rank,
+            global_rank=global_rank,
+            world_size=nnodes * device_per_node,
         )
         moe_gens.append(moe_gen_instance)
-    
+
     logging.info(f"Number of MoE_Gen instances: {len(moe_gens)}")
-    
+
     # Run inference with worker processes
-    
+
     def safe_collect_results(futures):
         all_results = []
         for future in futures:
@@ -376,8 +425,12 @@ def moe_gen(
                 all_results.extend(result)
             except torch.distributed.DistBackendError as e:
                 # Check if it's an out of memory error during cleanup
-                if "out of memory" in str(e) and "destroy_process_group" in str(e):
-                    print("Ignoring CUDA out of memory error during process cleanup")
+                if "out of memory" in str(e) and "destroy_process_group" in str(
+                    e
+                ):
+                    print(
+                        "Ignoring CUDA out of memory error during process cleanup"
+                    )
                     # Try to extract results if they were generated before the error
                     # This assumes your function might have returned partial results
                 else:
@@ -387,23 +440,25 @@ def moe_gen(
                 # Handle other exceptions according to your needs
                 print(f"Error in worker process: {e}")
                 raise
-        
+
         return all_results
 
     start_time = time.perf_counter()
     with concurrent.futures.ProcessPoolExecutor() as executor:
         # Submit each worker and collect the future objects
         futures = [
-            executor.submit(run_moe_gen, moe_gen_instance) for moe_gen_instance in moe_gens
+            executor.submit(run_moe_gen, moe_gen_instance)
+            for moe_gen_instance in moe_gens
         ]
         # Retrieve results in the same order as the futures were submitted
         all_results = safe_collect_results(futures)
-    
-    end_time = time.perf_counter()
-    logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
-    
-    return all_results
 
+    end_time = time.perf_counter()
+    logging.info(
+        f"Inference complete. Total time: {end_time - start_time:.2f}s"
+    )
+
+    return all_results
 
 
 class MoE_Gen:
@@ -420,7 +475,7 @@ class MoE_Gen:
         skeleton_state_dict,
         shm_name,
         tensor_meta_shm_name,
-        engine_config_json_dir = None, # Will be deprecated in the future
+        engine_config_json_dir=None,  # Will be deprecated in the future
         host_kv_cache_size: Optional[int] = None,
         dist_init_addr: str = "localhost:12355",
         local_rank: Optional[int] = 0,
@@ -447,8 +502,9 @@ class MoE_Gen:
         self.rank = global_rank
         self.world_size = world_size
 
-
-        config_scheduler = Scheduler(max_input_length, max_decoding_length, world_size)
+        config_scheduler = Scheduler(
+            max_input_length, max_decoding_length, world_size
+        )
         self.engine_config = config_scheduler.generate_config()
         # self.engine_config = parse_config_from_json(engine_config_json_dir)
         self.engine_config.Basic_Config.device = device
@@ -463,12 +519,9 @@ class MoE_Gen:
         self.engine_config.Basic_Config.rank = self.global_rank
         self.engine_config.Basic_Config.world_size = world_size
 
-        if(self.rank == 0):
+        if self.rank == 0:
             print(self.engine_config)
-        
-        
-        
-        
+
         self.device = device
         self.torch_device = torch.device(f"cuda:{device}")
         self.host_kv_cache_size = host_kv_cache_size
@@ -490,10 +543,10 @@ class MoE_Gen:
         # total_memory = total_memory / 1024 / 1024 / 1024
         # logging.info(f"GPU 0 free memory moegen instantiate: {gpu0_memory} GB / {total_memory} GB")
 
-
-
     def Init(self):
-        logging.info(f"Initializing MoE_Gen with global rank {self.global_rank} and world size {self.world_size} with PID: {os.getpid()}")
+        logging.info(
+            f"Initializing MoE_Gen with global rank {self.global_rank} and world size {self.world_size} with PID: {os.getpid()}"
+        )
         torch.cuda.set_device(self.device)
         self._init_torch_dist_nccl()
 
@@ -515,7 +568,6 @@ class MoE_Gen:
         # Use flash_attn by default thus right padding.
         self.tokenizer.padding_side = "right"
 
-
         if self.model_config.architectures[0] == "MixtralForCausalLM":
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -536,7 +588,9 @@ class MoE_Gen:
                 self.host_kv_cache_size,
             )
         elif self.model_config.architectures[0] == "Qwen3MoeForCausalLM":
-            from moe_gen.models.qwen.Qwen_Initializer import Qwen3Moe_Initializer
+            from moe_gen.models.qwen.Qwen_Initializer import (
+                Qwen3Moe_Initializer,
+            )
 
             self.initializer = Qwen3Moe_Initializer(
                 self.huggingface_ckpt_name,
@@ -550,7 +604,7 @@ class MoE_Gen:
                 self.host_kv_cache_size,
                 self.local_rank,
                 self.global_rank,
-                self.world_size
+                self.world_size,
             )
         elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
             from moe_gen.models.deepseek.deepseekv3.deepseekv3_initializer import (
@@ -569,7 +623,7 @@ class MoE_Gen:
                 self.host_kv_cache_size,
                 self.local_rank,
                 self.global_rank,
-                self.world_size
+                self.world_size,
             )
 
         elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
@@ -594,16 +648,20 @@ class MoE_Gen:
                 f"Model architecture {self.model_config.architectures[0]} not supported yet."
             )
 
-        self.core_engine, self.model, self.engine_config, self.model_config, self.hf_model_config = (
-            self.initializer.Init()
-        )
+        (
+            self.core_engine,
+            self.model,
+            self.engine_config,
+            self.model_config,
+            self.hf_model_config,
+        ) = self.initializer.Init()
         self.vanilla_batching()
-        
-        
-        #TODO:
-        from .models.deepseek.deepseekv3.Parallel_Strategy_Manager import(  
+
+        # TODO:
+        from .models.deepseek.deepseekv3.Parallel_Strategy_Manager import (
             Parallel_Strategy_Manager,
         )
+
         self.parallel_manager = Parallel_Strategy_Manager(
             self.hf_model_config,
             self.engine_config,
@@ -612,9 +670,9 @@ class MoE_Gen:
             self.skeleton_state_dict,
             self.local_rank,
             self.global_rank,
-            self.world_size
-        )        
-                
+            self.world_size,
+        )
+
         logging.info(f"Engine on device {self.device} initialized.")
 
     def _config_torch_module_initializer(self):
@@ -826,7 +884,9 @@ class MoE_Gen:
                 self._config_prefill()
                 prefill_start_time = time.perf_counter()
                 with torch.no_grad():
-                    new_token = self.prefill(self.model_batches[model_batch_idx])
+                    new_token = self.prefill(
+                        self.model_batches[model_batch_idx]
+                    )
                 prefill_time += time.perf_counter() - prefill_start_time
                 # self.core_engine.prefill_complete_sync()
                 logging.info(f"Rank: {self.rank} prefill complete.")
@@ -844,17 +904,18 @@ class MoE_Gen:
                 # self.core_engine.create_fake_kv_storage()
                 # self.core_engine.start_h2d_worker()
                 # time.sleep(2)
-                
 
                 # Log allocated memory after prefill
                 if self.rank == 0:
-                    allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+                    allocated_memory = torch.cuda.memory_allocated(
+                        self.torch_device
+                    )
                     logging.info(
                         f"Rank: {self.rank} Prefill complete. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
                     )
                     tensor_mem = []
                     torch_total_mem = 0
-                    for name, param in self.model.named_parameters():   
+                    for name, param in self.model.named_parameters():
                         tensor_mem.append(
                             f"{name}: {param.numel() * param.element_size() / 1024 / 1024:.2f} MB"
                         )
@@ -865,45 +926,58 @@ class MoE_Gen:
                     #     key=lambda x: float(x.split(": ")[1].split(" ")[0]),
                     #     reverse=True,
                     # )
-                    logging.info(f"Torch total memory: {torch_total_mem:.2f} MB")
+                    logging.info(
+                        f"Torch total memory: {torch_total_mem:.2f} MB"
+                    )
                     # for mem in tensor_mem:
                     #     logging.info(mem)
 
-                    
                 self._config_decoding()
                 # self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
                 if self.engine_config.Basic_Config.attn_mode == 3:
                     # FULL GPU DECODING MODE.
                     if self.model_config.model_type == "deepseek_v3":
-                        past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+                        past_key_states = self.core_engine.get_past_key_states(
+                            self.model_batches[model_batch_idx],
+                            self.max_input_length + self.max_decoding_length,
+                        )
                         past_value_states = None
                         # scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
-                        scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+                        scale_dict = self.core_engine.get_kv_scale(
+                            self.model_batches[model_batch_idx],
+                            self.max_input_length + self.max_decoding_length,
+                        )
                         # Compute the byte size of past_key_states
                         past_key_states_byte_size = 0
                         for value in past_key_states:
-                            past_key_states_byte_size += value.numel() * value.element_size()
+                            past_key_states_byte_size += (
+                                value.numel() * value.element_size()
+                            )
                         logging.info(
                             f"Rank: {self.rank} past_key_states byte size: {past_key_states_byte_size / 1024 / 1024 / 1024:.2f} GB"
                         )
                         # Compute the byte size of scale_dict
                         scale_dict_byte_size = 0
                         for value in scale_dict:
-                            scale_dict_byte_size += value.numel() * value.element_size()
+                            scale_dict_byte_size += (
+                                value.numel() * value.element_size()
+                            )
                         logging.info(
                             f"Rank: {self.rank} scale_dict byte size: {scale_dict_byte_size / 1024 / 1024:.2f} MB"
                         )
-        
+
                     else:
                         # TODO:
                         pass
-                
+
                 if self.rank == 0:
-                    allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+                    allocated_memory = torch.cuda.memory_allocated(
+                        self.torch_device
+                    )
                     logging.info(
                         f"Rank: {self.rank} Decoding configuration done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
                     )
-                
+
                 dist.barrier()
                 torch.cuda.empty_cache()
                 decoding_start_time = time.perf_counter()
@@ -911,13 +985,19 @@ class MoE_Gen:
                     logging.info(
                         f"decoding batch size: {len(self.model_batches[model_batch_idx])}"
                     )
-                    self.decoding(new_token, self.model_batches[model_batch_idx], past_key_states, past_value_states, scale_dict)
+                    self.decoding(
+                        new_token,
+                        self.model_batches[model_batch_idx],
+                        past_key_states,
+                        past_value_states,
+                        scale_dict,
+                    )
                 decoding_time += time.perf_counter() - decoding_start_time
                 self.core_engine.clear_kv_storage()
         else:
             # For small input batch, some worker might do not have any input.
             # In this case, it only participate in the decoding phase.
-            # Todo: 
+            # Todo:
             self._config_decoding()
 
             # Log used memory before decoding
@@ -938,14 +1018,12 @@ class MoE_Gen:
             decoding_time += time.perf_counter() - decoding_start_time
             self.core_engine.clear_kv_storage()
 
-
-        
         dist.barrier()
-        self.model = None 
+        self.model = None
         torch.cuda.empty_cache()
         dist.destroy_process_group()
 
-        # 
+        #
 
         logging.info(f"Prefill total time: {prefill_time}")
         logging.info(f"Decoding total time: {decoding_time}")
@@ -1038,7 +1116,9 @@ class MoE_Gen:
                     )
 
     def _config_prefill(self):
-        self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+        self.model, self.weight_copy_task = (
+            self.parallel_manager.configure_prefill()
+        )
         self.set_phase("prefill")
         self.core_engine.stop_h2d_worker()
         self.core_engine.clear_weight_copy_queue()
@@ -1046,25 +1126,30 @@ class MoE_Gen:
         self.core_engine.set_weight_copy_queue(self.weight_copy_task)
         self.core_engine.clear_kv_storage()
         self.core_engine.start_h2d_worker()
-    
+
     def _config_decoding(self):
         logging.info(f"Start Config Decoding")
         self.model = self.model.to("cpu")
         # Set all model parameters to None
         for param in self.model.parameters():
             param.data = torch.zeros(
-                1, dtype=torch.bfloat16, device=param.device)
+                1, dtype=torch.bfloat16, device=param.device
+            )
         # del self.model
         self.model = None
-        gc.collect()  
+        gc.collect()
         torch.cuda.empty_cache()
 
         # Log device memory usage before configure decoding
-        logging.info(f"{self.rank} Device memory usage before configure decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
+        logging.info(
+            f"{self.rank} Device memory usage before configure decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB"
+        )
 
         # TODO:
         if self.world_size <= 8:
-            self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+            self.model, self.weight_copy_task = (
+                self.parallel_manager.configure_decoding()
+            )
             self.set_phase("decoding")
             self.core_engine.stop_h2d_worker()
             self.core_engine.clear_kv_copy_queue()
@@ -1074,7 +1159,9 @@ class MoE_Gen:
             self.core_engine.set_weight_copy_queue(self.weight_copy_task)
             self.core_engine.start_h2d_worker()
         else:
-            self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding()
+            self.model, self.weight_copy_task = (
+                self.parallel_manager.pure_gpu_decoding()
+            )
             self.set_phase("decoding")
             self.core_engine.stop_h2d_worker()
             self.core_engine.clear_kv_copy_queue()
@@ -1179,8 +1266,8 @@ class MoE_Gen:
         return new_tokens
 
     def decoding(
-        self, 
-        new_tokens: torch.Tensor, 
+        self,
+        new_tokens: torch.Tensor,
         batch: list[int],
         past_key_states: Optional[torch.Tensor] = None,
         past_value_states: Optional[torch.Tensor] = None,
@@ -1204,7 +1291,9 @@ class MoE_Gen:
 
         RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
         # Log device memory usage
-        logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
+        logging.info(
+            f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB"
+        )
 
         if RUNTIME_ATTN_MODE == 3:
             """
@@ -1216,7 +1305,7 @@ class MoE_Gen:
             while new_token_idx < self.max_decoding_length and len(batch) > 0:
                 if self.rank == 0:
                     logging.info(f"Decoding new token idx: {new_token_idx}")
-                
+
                 # micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
                 # num_micro_batches = math.ceil(len(batch) / micro_batch_size)
                 # micro_batches = [
@@ -1262,8 +1351,7 @@ class MoE_Gen:
                     )
                     self.update_new_token(new_tokens, batch, new_token_idx)
                 new_token_idx += 1
-        
-        
+
         else:
             while new_token_idx < self.max_decoding_length and len(batch) > 0:
                 if self.rank == 0:
@@ -1292,15 +1380,19 @@ class MoE_Gen:
                             dim=0,
                         )
                         if "deepseek" not in self.model_config.model_type:
-                            position_ids = create_position_ids_from_attention_mask(
-                                attention_mask
-                            )[:, -1].unsqueeze(-1)
+                            position_ids = (
+                                create_position_ids_from_attention_mask(
+                                    attention_mask
+                                )[:, -1].unsqueeze(-1)
+                            )
                         else:
-                            position_ids = create_position_ids_from_attention_mask(
-                                attention_mask
+                            position_ids = (
+                                create_position_ids_from_attention_mask(
+                                    attention_mask
+                                )
                             )
                         # DeepSeek use flash-attn by default
-                        
+
                         # if attention_mask.dim() == 2 and (
                         #     self.model_config.model_type not in ["Qwen2", "deepseek"]
                         # ):
@@ -1325,9 +1417,9 @@ class MoE_Gen:
                             # position_ids=position_ids.to(self.torch_device),
                             use_cache=False,
                         )
-                        new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-                            -1, 1
-                        )
+                        new_tokens = torch.argmax(
+                            new_tokens.logits, dim=-1
+                        ).view(-1, 1)
                         # logging.info(f"New tokens: {new_tokens}")
                         # start = time.perf_counter()
                         self.update_new_token(new_tokens, batch, new_token_idx)
@@ -1379,9 +1471,8 @@ class MoE_Gen:
 
                                 # Copy one more token to avoid torch::cat in attention forward.
                                 past_kv_byte_size = (
-                                    (self.max_input_length + idx + 1)
-                                    * self.model_config.compressed_kv_dim
-                                )
+                                    self.max_input_length + idx + 1
+                                ) * self.model_config.compressed_kv_dim
 
                             elif "mixtral" in self.model_config.model_type:
                                 past_kv_byte_size = (
@@ -1419,13 +1510,17 @@ class MoE_Gen:
                             dim=0,
                         ).to(self.torch_device)
                         if "deepseek" in self.model_config.model_type:
-                            position_ids = create_position_ids_from_attention_mask(
-                                attention_mask
+                            position_ids = (
+                                create_position_ids_from_attention_mask(
+                                    attention_mask
+                                )
                             )
                         else:
-                            position_ids = create_position_ids_from_attention_mask(
-                                attention_mask
-                            )[:, -1].unsqueeze(-1)
+                            position_ids = (
+                                create_position_ids_from_attention_mask(
+                                    attention_mask
+                                )[:, -1].unsqueeze(-1)
+                            )
 
                         # if attention_mask.dim() == 2 and (
                         #     self.model_config.model_type not in ["Qwen2", "deepseek"]
@@ -1455,9 +1550,9 @@ class MoE_Gen:
                         )
                         # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
                         # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-                        new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-                            -1, 1
-                        )
+                        new_tokens = torch.argmax(
+                            new_tokens.logits, dim=-1
+                        ).view(-1, 1)
                         self.update_new_token(new_tokens, batch, new_token_idx)
                         # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
                         # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
@@ -1522,7 +1617,10 @@ class MoE_Gen:
                                     self.model_config.num_hidden_layers
                                 ):
                                     self.core_engine.submit_to_KV_queue(
-                                        cur_batch, 0, layer_idx, past_kv_byte_size
+                                        cur_batch,
+                                        0,
+                                        layer_idx,
+                                        past_kv_byte_size,
                                     )
 
                             else:
@@ -1553,19 +1651,23 @@ class MoE_Gen:
                             dim=0,
                         )
                         if "deepseek" not in self.model_config.model_type:
-                            position_ids = create_position_ids_from_attention_mask(
-                                attention_mask
-                            )[:, -1].unsqueeze(-1)
+                            position_ids = (
+                                create_position_ids_from_attention_mask(
+                                    attention_mask
+                                )[:, -1].unsqueeze(-1)
+                            )
                         else:
-                            position_ids = create_position_ids_from_attention_mask(
-                                attention_mask
+                            position_ids = (
+                                create_position_ids_from_attention_mask(
+                                    attention_mask
+                                )
                             )
                         if attention_mask.dim() == 2 and (
                             self.model_config.model_type not in ["Qwen2"]
                         ):
-                            attention_mask = attention_mask.unsqueeze(1).unsqueeze(
-                                2
-                            )
+                            attention_mask = attention_mask.unsqueeze(
+                                1
+                            ).unsqueeze(2)
                             attention_mask = torch.where(
                                 attention_mask == 0,
                                 torch.finfo(torch.bfloat16).min,
@@ -1586,9 +1688,9 @@ class MoE_Gen:
                         )
                         # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
                         # torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-                        new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-                            -1, 1
-                        )
+                        new_tokens = torch.argmax(
+                            new_tokens.logits, dim=-1
+                        ).view(-1, 1)
                         # start = time.perf_counter()
                         self.update_new_token(new_tokens, batch, new_token_idx)
                         # torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
@@ -1597,10 +1699,9 @@ class MoE_Gen:
                         # logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
                     new_token_idx += 1
 
-        
         # if RUNTIME_ATTN_MODE == 3:
-        #     self.core_engine.clear_kv_gpu_storage()    
-    
+        #     self.core_engine.clear_kv_gpu_storage()
+
     def set_phase(self, phase: str):
         """
         Control different behavior of the engine in different phases.
@@ -1631,30 +1732,33 @@ class MoE_Gen:
     #             0, new_token_idx + self.max_input_length
     #         ] = torch.tensor(1, dtype=torch.int64)
 
-
     def update_new_token(
         self, new_tokens: torch.Tensor, query_idx: List[int], new_token_idx: int
     ):
         new_tokens = new_tokens.to("cpu")
         for idx, q_idx in enumerate(query_idx):
             # Update decoded tokens
-            self.query_book[q_idx].decoded_tokens[:, new_token_idx] = new_tokens[idx]
-            
+            self.query_book[q_idx].decoded_tokens[:, new_token_idx] = (
+                new_tokens[idx]
+            )
+
             # Update encoded input_ids
             # self.query_book[q_idx].encoded["input_ids"][
             #     0, new_token_idx + self.max_input_length
             # ] = new_tokens[idx]
-            
+
             # Get the current attention mask
             attention_mask = self.query_book[q_idx].encoded["attention_mask"][0]
-            
+
             # Find the first 0 in the attention mask
             zeros_positions = (attention_mask == 0).nonzero(as_tuple=True)[0]
             # logging.info(f"zeros_positions: {zeros_positions}")
             if len(zeros_positions) > 0:
                 # If a 0 is found, change the first one to 1
                 first_zero_pos = zeros_positions[0].item()
-                self.query_book[q_idx].encoded["attention_mask"][0, first_zero_pos] = torch.tensor(1, dtype=attention_mask.dtype)
+                self.query_book[q_idx].encoded["attention_mask"][
+                    0, first_zero_pos
+                ] = torch.tensor(1, dtype=attention_mask.dtype)
                 # self.query_book[q_idx].encoded["input_ids"][0, first_zero_pos] = new_tokens[idx]
             else:
                 raise ValueError("No 0 found in the attention mask.")
@@ -1666,11 +1770,9 @@ class MoE_Gen:
                 backend="NCCL",
                 init_method="tcp://" + self.dist_init_addr,
                 world_size=self.world_size,
-                rank = self.global_rank,
+                rank=self.global_rank,
                 device_id=torch.device(f"cuda:{self.local_rank}"),
                 timeout=timeout,
             )
         except RuntimeError as e:
             raise
-    
-    

@@ -55,7 +55,7 @@ HtoD_Engine::HtoD_Engine(const EngineConfig& engine_config,
 };
 
 // Enable peer access for all devices
-void HtoD_Engine::cuda_enable_peer_access(int rank, int world_size){
+void HtoD_Engine::cuda_enable_peer_access(int rank, int world_size) {
     for (int i = 0; i < world_size; ++i) {
         if (i != rank) {
             int can_access = 0;
@@ -84,8 +84,8 @@ void HtoD_Engine::cuda_enable_peer_access(int rank, int world_size){
 //     for(int i = 0; i < world_size; ++i) {
 //         if (i != this->engine_config_.basic_config.device) {
 //             int can_access = 0;
-//             cudaDeviceCanAccessPeer(&can_access, this->engine_config_.basic_config.device, i);
-//             if (can_access) {
+//             cudaDeviceCanAccessPeer(&can_access,
+//             this->engine_config_.basic_config.device, i); if (can_access) {
 //                 cudaSetDevice(this->engine_config_.basic_config.device);
 //                 cudaDeviceEnablePeerAccess(i, 0);
 //             }
@@ -94,11 +94,8 @@ void HtoD_Engine::cuda_enable_peer_access(int rank, int world_size){
 //     this->logger_->info("Peer access enabled for all devices.");
 // }
 
-
 void HtoD_Engine::set_global_routed_experts_data_ptr(
-    const py::dict& experts_IPC_handles,
-    const py::dict& expert_location_map)
-{
+    const py::dict& experts_IPC_handles, const py::dict& expert_location_map) {
     // Set std::unordered_set<std::string> for local_expert_names
     for (const auto& item : expert_location_map) {
         std::string module_name = item.first.cast<std::string>();
@@ -106,60 +103,73 @@ void HtoD_Engine::set_global_routed_experts_data_ptr(
         this->expert_location_map_[module_name] = location;
     }
 
-    // reinterpret_cast ptrs to void* 
-    for(auto& item : experts_IPC_handles) {
+    // reinterpret_cast ptrs to void*
+    for (auto& item : experts_IPC_handles) {
         std::string module_name = item.first.cast<std::string>();
         py::dict tensor_ptrs_dict = item.second.cast<py::dict>();
-        for(const auto& tensor_item : tensor_ptrs_dict) {
+        for (const auto& tensor_item : tensor_ptrs_dict) {
             auto start_time = std::chrono::high_resolution_clock::now();
             std::string tensor_name = tensor_item.first.cast<std::string>();
-            std::tuple<py::object, py::object> IPC_context = tensor_item.second.cast<std::tuple<py::object, py::object>>();
+            std::tuple<py::object, py::object> IPC_context =
+                tensor_item.second.cast<std::tuple<py::object, py::object>>();
             int rank_id = std::get<0>(IPC_context).cast<int>();
             py::bytes handle_bytes = std::get<1>(IPC_context).cast<py::bytes>();
-            if(rank_id == this->engine_config_.basic_config.device) {
-                this->global_device_experts_ptrs_[module_name][tensor_name] = nullptr;
+            if (rank_id == this->engine_config_.basic_config.device) {
+                this->global_device_experts_ptrs_[module_name][tensor_name] =
+                    nullptr;
                 continue;
             }
             // Get raw bytes from Python bytes object
             std::string handle_str = handle_bytes;
             // Verify the size matches cudaIpcMemHandle_t
             if (handle_str.size() != sizeof(cudaIpcMemHandle_t)) {
-                throw std::runtime_error("Invalid IPC handle size: " + 
-                    std::to_string(handle_str.size()) + " != " + 
-                    std::to_string(sizeof(cudaIpcMemHandle_t)));
-            }            
+                throw std::runtime_error(
+                    "Invalid IPC handle size: " +
+                    std::to_string(handle_str.size()) +
+                    " != " + std::to_string(sizeof(cudaIpcMemHandle_t)));
+            }
 
             // Cast the bytes to cudaIpcMemHandle_t
             cudaIpcMemHandle_t handle;
             std::memcpy(&handle, handle_str.data(), sizeof(cudaIpcMemHandle_t));
             auto end_time = std::chrono::high_resolution_clock::now();
-            this->logger_->info("IPC handle cast time: {} ms", 
-                std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count());
+            this->logger_->info(
+                "IPC handle cast time: {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end_time - start_time)
+                    .count());
 
             start_time = std::chrono::high_resolution_clock::now();
             // Print used cuda memory
             size_t free_mem = 0;
             size_t total_mem = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-            this->logger_->info("Free memory: {} MB, Total memory: {} MB", 
-                free_mem / (1024 * 1024), total_mem / (1024 * 1024));
+            this->logger_->info("Free memory: {} MB, Total memory: {} MB",
+                                free_mem / (1024 * 1024),
+                                total_mem / (1024 * 1024));
             // Open the handle to get a device pointer
             CUDA_CHECK(cudaSetDevice(rank_id));
             void* dev_ptr = nullptr;
-            cudaError_t err = cudaIpcOpenMemHandle(&dev_ptr, handle, cudaIpcMemLazyEnablePeerAccess);
+            cudaError_t err = cudaIpcOpenMemHandle(
+                &dev_ptr, handle, cudaIpcMemLazyEnablePeerAccess);
             if (err != cudaSuccess) {
-                throw std::runtime_error("Failed to open IPC handle for expert '" + 
-                    module_name + "': " + cudaGetErrorString(err));
+                throw std::runtime_error(
+                    "Failed to open IPC handle for expert '" + module_name +
+                    "': " + cudaGetErrorString(err));
             }
             // Close IPC
             // CUDA_CHECK(cudaIpcCloseMemHandle(dev_ptr));
             end_time = std::chrono::high_resolution_clock::now();
-            this->logger_->info("IPC handle open time: {} ms", 
-                std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count());
+            this->logger_->info(
+                "IPC handle open time: {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end_time - start_time)
+                    .count());
 
-            this->global_device_experts_ptrs_[module_name][tensor_name] = dev_ptr;
+            this->global_device_experts_ptrs_[module_name][tensor_name] =
+                dev_ptr;
         }
-    }                    
+    }
 }
 
 // void HtoD_Engine::Init(
@@ -176,21 +186,20 @@ void HtoD_Engine::set_global_routed_experts_data_ptr(
 //             this->weights_copy_task_queue_[module_type].push(module_name);
 //         }
 //     }
-    
+
 //     // this->p2p_tensor_copy_module = py::module::import("p2p_tensor_copy");
 // };
 
-void HtoD_Engine::Init() {    
+void HtoD_Engine::Init() {
     // this->p2p_tensor_copy_module = py::module::import("p2p_tensor_copy");
 };
 
-void HtoD_Engine::Start(){
+void HtoD_Engine::Start() {
     if (!this->HtoD_worker_.joinable()) {
         this->terminate_flag_ = false;
         this->HtoD_worker_ = std::thread(&HtoD_Engine::HtoD_Worker, this);
     }
 }
-
 
 void HtoD_Engine::Terminate() {
     this->terminate_flag_ = true;
@@ -327,7 +336,8 @@ void HtoD_Engine::HtoD_Worker() {
                         layer_idx, micro_batch_idx, buffer_idx);
                     this->logger_->debug("Copied KV to buffer: {}", buffer_idx);
                 } else {
-                    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+                    CUDA_CHECK(cudaSetDevice(
+                        this->engine_config_.basic_config.device));
                     auto [dst_k_ptr, dst_v_ptr, buffer_idx] =
                         optional_buffer.value();
                     std::tuple<std::vector<int64_t>, int64_t, int64_t, int64_t>
@@ -341,7 +351,7 @@ void HtoD_Engine::HtoD_Worker() {
                     // this->kv_storage_.get_v_ptrs(layer_idx, cur_batch);
                     int64_t k_offset = 0;
                     // int64_t v_offset = 0;
-                    int64_t k_byte_size = byte_size; // TODO:
+                    int64_t k_byte_size = byte_size;  // TODO:
                     // int64_t v_byte_size = byte_size;
                     this->logger_->debug(
                         "copying micro_batch_idx: {}, layer_idx: {}, "
@@ -390,7 +400,7 @@ void HtoD_Engine::HtoD_Worker() {
                     if (dst[tensor_name].defined() &&
                         dst[tensor_name].has_storage()) {
                         this->blocking_copy_(dst[tensor_name].data_ptr(),
-                                            src_ptr, src_byte_size);
+                                             src_ptr, src_byte_size);
                     } else {
                         this->logger_->error(
                             "Tensor {} doesn't have valid storage",
@@ -399,7 +409,7 @@ void HtoD_Engine::HtoD_Worker() {
                     }
                 }
                 this->logger_->debug("Copied module: {} to buffer: {}",
-                                    module_name, buffer_idx);
+                                     module_name, buffer_idx);
                 // CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
                 // CUDA_CHECK(cudaStreamSynchronize(0));
                 this->gpu_weight_buffer_.weights_copy_complete(
@@ -414,7 +424,6 @@ void HtoD_Engine::HtoD_Worker() {
         }
     }
 };
-
 
 void HtoD_Engine::set_weight_copy_queue(
     std::unordered_map<std::string, std::vector<std::string>>&

@@ -2,14 +2,14 @@
 ## Start server on two nodes respectively:
 ```python
 #Add the following line if you have problem in accessing Huggingface.co
-export HF_ENDPOINT=https://hf-mirror.com 
+export HF_ENDPOINT=https://hf-mirror.com
 python -m moe_gen.parameter_server --model deepseek-ai/DeepSeek-R1 --cache-dir "<dir-to-your-model-checkpoint>"
 ```
 
 ## Run tasks on two nodes
 Please first copy the ```two_nodes_H20_benchmark.py``` to your working dir (outside /MoE-Gen directory) on two nodes respectively.
 
-To have better cold-start performance, please first configure hugepages in terminal. This will reserve enough host memmory pages for DeepSeek-R1.
+To have better cold-start performance, please first configure hugepages in terminal. This will reserve enough host memory pages for DeepSeek-R1.
 ```bash
 # Please first check if the default hugepage size is 2048 (2MB) by:
 cat /proc/meminfo | grep -i huge
@@ -66,4 +66,4 @@ If the program terminated or killed without proper clean-up, you may need to man
 ```bash
 rm -f /dev/hugepages/*
 ```
-By ```sudo sysctl -w vm.nr_hugepages=0```, we can revert to default page configurations. 
+By ```sudo sysctl -w vm.nr_hugepages=0```, we can revert to default page configurations.

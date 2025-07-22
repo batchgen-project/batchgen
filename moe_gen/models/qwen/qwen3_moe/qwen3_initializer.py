@@ -21,22 +21,22 @@ import math
 import os
 import time
 import types
+from datetime import timedelta
 from multiprocessing import Process
-from typing import Optional, Union, List
+from typing import List, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import triton.language as tl
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
-import torch.distributed as dist
 
 # from moe_gen.config import EngineConfig, ModelConfig
 from ....config.config import EngineConfig, ModelConfig
-from .configuration_qwen3_moe import Qwen3MoeConfig
 from ....config.hf_config_parser import HuggingFaceModelConfig
 from ...model_utils import ModelInitializer
-from datetime import timedelta
+from .configuration_qwen3_moe import Qwen3MoeConfig
 
 # from transformers.models.qwen2_moe.modeling_qwen2_moe import repeat_kv
 
@@ -55,6 +55,7 @@ from .modeling_qwen3_moe import (
     apply_rotary_pos_emb,
     rotate_half,
 )
+
 
 class Qwen3Moe_Initializer(ModelInitializer):
     def __init__(
@@ -92,7 +93,7 @@ class Qwen3Moe_Initializer(ModelInitializer):
 
         self.local_rank = local_rank
         self.global_rank = global_rank
-        self.world_size = world_size    
+        self.world_size = world_size
 
         # self.fp8_weights_IPC_handle = {}
 
@@ -122,7 +123,7 @@ class Qwen3Moe_Initializer(ModelInitializer):
         self.engine_config.KV_Storage_Config.slot_byte_size = (
             self.engine_config.KV_Storage_Config.reserved_length
             * self.model_config.compressed_kv_dim
-        ) 
+        )
         self.engine_config.KV_Storage_Config.num_host_slots = (
             self.host_kv_cache_byte_size
             // self.engine_config.KV_Storage_Config.slot_byte_size
@@ -137,7 +138,7 @@ class Qwen3Moe_Initializer(ModelInitializer):
         logging.info(
             f"Number of host kv slots: {self.engine_config.KV_Storage_Config.num_host_slots}"
         )
-        
+
         self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens = (
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
             * (
@@ -145,35 +146,66 @@ class Qwen3Moe_Initializer(ModelInitializer):
                 + self.engine_config.Basic_Config.padding_length
             )
         )
-        
+
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             "attn": {
-                "q_proj.weight": [self.hf_config.attn_config.hidden_size, self.hf_config.attn_config.num_heads * self.hf_config.attn_config.head_dim],
+                "q_proj.weight": [
+                    self.hf_config.attn_config.hidden_size,
+                    self.hf_config.attn_config.num_heads
+                    * self.hf_config.attn_config.head_dim,
+                ],
                 "q_norm.weight": [self.hf_config.attn_config.hidden_size],
-                "k_proj.weight": [self.hf_config.attn_config.hidden_size, self.hf_config.attn_config.num_key_value_heads * self.hf_config.attn_config.head_dim],
-                "v_proj.weight": [self.hf_config.attn_config.hidden_size, self.hf_config.attn_config.num_key_value_heads * self.hf_config.attn_config.head_dim],
+                "k_proj.weight": [
+                    self.hf_config.attn_config.hidden_size,
+                    self.hf_config.attn_config.num_key_value_heads
+                    * self.hf_config.attn_config.head_dim,
+                ],
+                "v_proj.weight": [
+                    self.hf_config.attn_config.hidden_size,
+                    self.hf_config.attn_config.num_key_value_heads
+                    * self.hf_config.attn_config.head_dim,
+                ],
                 "k_norm.weight": [self.hf_config.attn_config.hidden_size],
-                "o_proj.weight": [self.hf_config.attn_config.num_heads * self.hf_config.attn_config.head_dim, self.hf_config.attn_config.hidden_size],
-                "post_attention_layernorm.weight": [self.hf_config.attn_config.hidden_size],
-                "input_layernorm.weight": [self.hf_config.attn_config.hidden_size],
+                "o_proj.weight": [
+                    self.hf_config.attn_config.num_heads
+                    * self.hf_config.attn_config.head_dim,
+                    self.hf_config.attn_config.hidden_size,
+                ],
+                "post_attention_layernorm.weight": [
+                    self.hf_config.attn_config.hidden_size
+                ],
+                "input_layernorm.weight": [
+                    self.hf_config.attn_config.hidden_size
+                ],
             },
             "routed_expert": {
-                "gate_proj.weight": [self.hf_config.moe_config.hidden_size, self.hf_config.moe_config.intermediate_size],
-                "up_proj.weight": [self.hf_config.moe_config.hidden_size, self.hf_config.moe_config.intermediate_size],
-                "down_proj.weight": [self.hf_config.moe_config.intermediate_size, self.hf_config.moe_config.hidden_size],
+                "gate_proj.weight": [
+                    self.hf_config.moe_config.hidden_size,
+                    self.hf_config.moe_config.intermediate_size,
+                ],
+                "up_proj.weight": [
+                    self.hf_config.moe_config.hidden_size,
+                    self.hf_config.moe_config.intermediate_size,
+                ],
+                "down_proj.weight": [
+                    self.hf_config.moe_config.intermediate_size,
+                    self.hf_config.moe_config.hidden_size,
+                ],
             },
         }
 
     def _parse_model_config(self):
         model_config = ModelConfig()
-        
+
         self.hf_config = HuggingFaceModelConfig(self.hf_model_config)
 
         model_config.model_type = self.hf_config.model_type
         model_config.num_hidden_layers = self.hf_config.num_layers
         model_config.num_local_experts = self.hf_config.moe_config.num_experts
         model_config.num_attention_heads = self.hf_config.attn_config.num_heads
-        model_config.num_key_value_heads = self.hf_config.attn_config.num_key_value_heads
+        model_config.num_key_value_heads = (
+            self.hf_config.attn_config.num_key_value_heads
+        )
         model_config.head_dim = self.hf_config.attn_config.head_dim
         return model_config
 
@@ -182,10 +214,9 @@ class Qwen3Moe_Initializer(ModelInitializer):
             if key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
 
-        model_skeletion_byte_size = (
-            sum(p.numel() * p.element_size() for p in self.model.parameters())
-            / (1024**3)
-        )
+        model_skeletion_byte_size = sum(
+            p.numel() * p.element_size() for p in self.model.parameters()
+        ) / (1024**3)
         logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
 
     def Init(self):
@@ -209,12 +240,10 @@ class Qwen3Moe_Initializer(ModelInitializer):
                 raise ValueError("Unknown huggingface model card")
 
             self.core_engine.Init(
-                self.shm_name,
-                self.tensor_meta_shm_name,
-                param_byte_size
+                self.shm_name, self.tensor_meta_shm_name, param_byte_size
             )
             logging.info("Core engine initialized")
-            
+
             logging.info("Host to Device worker started")
         except Exception as e:
             logging.error(f"Error: {e}")
@@ -224,15 +253,15 @@ class Qwen3Moe_Initializer(ModelInitializer):
             self.model,
             self.engine_config,
             self.model_config,
-            self.hf_model_config
+            self.hf_model_config,
         )
 
     def _parse_state_dict_ep(self):
         model_init_start_time = time.perf_counter()
         self.hf_model_config._attn_implementation = "eager"
-        self.model = Qwen3MoeForCausalLM._from_config(
-            self.hf_model_config
-        ).to(self.engine_config.Basic_Config.device_torch)
+        self.model = Qwen3MoeForCausalLM._from_config(self.hf_model_config).to(
+            self.engine_config.Basic_Config.device_torch
+        )
         self.model.eval()
         logging.info(
             f"torch module init time: {time.perf_counter() - model_init_start_time} s"
@@ -254,7 +283,9 @@ class Qwen3Moe_Initializer(ModelInitializer):
         NUM_LOCAL_EXPERT_PER_LAYER = 24
 
         routed_expert_gpu_start_idx = self.rank * 32
-        routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
+        routed_expert_gpu_end_idx = (
+            routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
+        )
         routed_expert_host_start_idx = routed_expert_gpu_end_idx
         routed_expert_host_end_idx = (self.rank + 1) * 32
         for layer_idx in range(
@@ -264,18 +295,21 @@ class Qwen3Moe_Initializer(ModelInitializer):
             # We split the 256 into 8 parts, each part is 32 experts.
             # The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
             # The rest of the experts in the part are stored in the host memory.
-            for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
+            for expert_idx in range(
+                routed_expert_gpu_start_idx, routed_expert_gpu_end_idx
+            ):
                 self.local_routed_experts.append(
                     "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
                 )
-            for expert_idx in range(routed_expert_host_start_idx, routed_expert_host_end_idx):
+            for expert_idx in range(
+                routed_expert_host_start_idx, routed_expert_host_end_idx
+            ):
                 self.host_routed_experts.append(
                     "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
                 )
 
         self.weight_copy_task["routed_expert"] = self.host_routed_experts
         # assert len(self.weight_copy_task["routed_expert"]) == 0
-
 
         for layer_idx in trange(self.model_config.num_hidden_layers):
             for name, _ in self.model.model.layers[
@@ -294,16 +328,16 @@ class Qwen3Moe_Initializer(ModelInitializer):
             # for name, _ in self.model.model.layers[
             #     layer_idx
             # ].mlp.shared_experts.named_parameters():
-                # tensor_full_name = (
-                #     "model.layers."
-                #     + str(layer_idx)
-                #     + ".mlp.shared_experts."
-                #     + name
-                # )
-                # self.state_dict_name_map[tensor_full_name] = {
-                #     "module_key": "shared_expert_" + str(layer_idx),
-                #     "tensor_key": name,
-                # }
+            # tensor_full_name = (
+            #     "model.layers."
+            #     + str(layer_idx)
+            #     + ".mlp.shared_experts."
+            #     + name
+            # )
+            # self.state_dict_name_map[tensor_full_name] = {
+            #     "module_key": "shared_expert_" + str(layer_idx),
+            #     "tensor_key": name,
+            # }
             # self.weight_copy_task["shared_expert"].append(
             #     "shared_expert_" + str(layer_idx)
             # )
@@ -329,6 +363,3 @@ class Qwen3Moe_Initializer(ModelInitializer):
                         + str(expert_idx),
                         "tensor_key": name,
                     }
-    
-        
-                

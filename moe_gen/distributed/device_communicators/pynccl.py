@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 class PyNcclCommunicator:
-
     def __init__(
         self,
         group: Union[ProcessGroup, StatelessProcessGroup],
@@ -147,7 +146,10 @@ class PyNcclCommunicator:
         )
 
     def all_gather(
-        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, stream=None
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        stream=None,
     ):
         if self.disabled:
             return
@@ -261,7 +263,9 @@ class PyNcclCommunicator:
 
     @contextmanager
     def change_state(
-        self, enable: Optional[bool] = None, stream: Optional[torch.cuda.Stream] = None
+        self,
+        enable: Optional[bool] = None,
+        stream: Optional[torch.cuda.Stream] = None,
     ):
         """
         A context manager to change the state of the communicator.

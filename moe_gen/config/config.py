@@ -99,13 +99,14 @@
 #             f"  KV_Storage_Config:\n{self.KV_Storage_Config}"
 #         )
 
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Any, Union
 import json
-import yaml
-from pathlib import Path
-import torch
 import logging
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import torch
+import yaml
 
 
 # Basic configuration section
@@ -143,7 +144,7 @@ class BasicConfig:
             "float8_e5m2": torch.float8_e5m2,
         }
         return dtype_map.get(dtype_str, None)
-    
+
     def __str__(self):
         return (
             f"BasicConfig:\n"
@@ -174,7 +175,7 @@ class ModuleBatchingConfig:
     attn_decoding_micro_batch_size: Optional[int] = 0
     MoE_decoding_micro_batch_size: Optional[int] = 0
     expert_decoding_batch_size_upper_bound: Optional[int] = 0
-    
+
     def __str__(self):
         return (
             f"ModuleBatchingConfig:\n"
@@ -237,79 +238,81 @@ class EPConfig:
 @dataclass
 class EngineConfig:
     Basic_Config: BasicConfig = field(default_factory=BasicConfig)
-    Module_Batching_Config: ModuleBatchingConfig = field(default_factory=ModuleBatchingConfig)
+    Module_Batching_Config: ModuleBatchingConfig = field(
+        default_factory=ModuleBatchingConfig
+    )
     GPU_Buffer_Config: GPUBufferConfig = field(default_factory=GPUBufferConfig)
     KV_Storage_Config: KVStorageConfig = field(default_factory=KVStorageConfig)
     EP_Config: EPConfig = field(default_factory=EPConfig)
 
-#     @classmethod
-#     def from_dict(cls, config_dict: Dict[str, Any]) -> 'EngineConfig':
-#         """Create EngineConfig from a dictionary"""
-#         return cls(
-#             Basic_Config=BasicConfig(**config_dict.get('Basic_Config', {})),
-#             Module_Batching_Config=ModuleBatchingConfig(**config_dict.get('Module_Batching_Config', {})),
-#             GPU_Buffer_Config=GPUBufferConfig(**config_dict.get('GPU_Buffer_Config', {})),
-#             KV_Storage_Config=KVStorageConfig(**config_dict.get('KV_Storage_Config', {})),
-#             EP_Config=EPConfig(**config_dict.get('EP_Config', {}))
-#         )
+    #     @classmethod
+    #     def from_dict(cls, config_dict: Dict[str, Any]) -> 'EngineConfig':
+    #         """Create EngineConfig from a dictionary"""
+    #         return cls(
+    #             Basic_Config=BasicConfig(**config_dict.get('Basic_Config', {})),
+    #             Module_Batching_Config=ModuleBatchingConfig(**config_dict.get('Module_Batching_Config', {})),
+    #             GPU_Buffer_Config=GPUBufferConfig(**config_dict.get('GPU_Buffer_Config', {})),
+    #             KV_Storage_Config=KVStorageConfig(**config_dict.get('KV_Storage_Config', {})),
+    #             EP_Config=EPConfig(**config_dict.get('EP_Config', {}))
+    #         )
 
-#     @classmethod
-#     def from_json(cls, json_path: Union[str, Path]) -> 'EngineConfig':
-#         """Load configuration from JSON file"""
-#         with open(json_path, 'r') as f:
-#             config_dict = json.load(f)
-#         return cls.from_dict(config_dict)
+    #     @classmethod
+    #     def from_json(cls, json_path: Union[str, Path]) -> 'EngineConfig':
+    #         """Load configuration from JSON file"""
+    #         with open(json_path, 'r') as f:
+    #             config_dict = json.load(f)
+    #         return cls.from_dict(config_dict)
 
-#     @classmethod
-#     def from_yaml(cls, yaml_path: Union[str, Path]) -> 'EngineConfig':
-#         """Load configuration from YAML file"""
-#         with open(yaml_path, 'r') as f:
-#             config_dict = yaml.safe_load(f)
-#         return cls.from_dict(config_dict)
+    #     @classmethod
+    #     def from_yaml(cls, yaml_path: Union[str, Path]) -> 'EngineConfig':
+    #         """Load configuration from YAML file"""
+    #         with open(yaml_path, 'r') as f:
+    #             config_dict = yaml.safe_load(f)
+    #         return cls.from_dict(config_dict)
 
-#     def to_dict(self) -> Dict[str, Any]:
-#         """Convert config to dictionary for serialization"""
-#         # Use asdict but handle torch dtypes which aren't serializable
-#         config_dict = asdict(self)
-        
-#         # Handle torch dtypes
-#         if self.Basic_Config.torch_dtype is not None:
-#             if isinstance(self.Basic_Config.torch_dtype, torch.dtype):
-#                 for torch_type_name in ["float16", "float32", "bfloat16", "float8_e4m3fn", "float8_e5m2"]:
-#                     if getattr(torch, torch_type_name, None) == self.Basic_Config.torch_dtype:
-#                         config_dict["Basic_Config"]["torch_dtype"] = torch_type_name
-#                         break
-#                 else:
-#                     config_dict["Basic_Config"]["torch_dtype"] = str(self.Basic_Config.torch_dtype)
-        
-#         return config_dict
+    #     def to_dict(self) -> Dict[str, Any]:
+    #         """Convert config to dictionary for serialization"""
+    #         # Use asdict but handle torch dtypes which aren't serializable
+    #         config_dict = asdict(self)
 
-#     def to_json(self, json_path: Union[str, Path], indent: int = 2) -> None:
-#         """Save configuration to JSON file"""
-#         with open(json_path, 'w') as f:
-#             json.dump(self.to_dict(), f, indent=indent)
-#         logging.info(f"Configuration saved to {json_path}")
+    #         # Handle torch dtypes
+    #         if self.Basic_Config.torch_dtype is not None:
+    #             if isinstance(self.Basic_Config.torch_dtype, torch.dtype):
+    #                 for torch_type_name in ["float16", "float32", "bfloat16", "float8_e4m3fn", "float8_e5m2"]:
+    #                     if getattr(torch, torch_type_name, None) == self.Basic_Config.torch_dtype:
+    #                         config_dict["Basic_Config"]["torch_dtype"] = torch_type_name
+    #                         break
+    #                 else:
+    #                     config_dict["Basic_Config"]["torch_dtype"] = str(self.Basic_Config.torch_dtype)
 
-#     def to_yaml(self, yaml_path: Union[str, Path]) -> None:
-#         """Save configuration to YAML file"""
-#         with open(yaml_path, 'w') as f:
-#             yaml.dump(self.to_dict(), f, default_flow_style=False)
-#         logging.info(f"Configuration saved to {yaml_path}")
+    #         return config_dict
 
-#     def merge_with(self, other: 'EngineConfig') -> 'EngineConfig':
-#         """Merge with another config, with other taking precedence"""
-#         result = deepcopy(self)
-#         other_dict = other.to_dict()
-        
-#         # Merge each section
-#         for section in ['Basic_Config', 'Module_Batching_Config', 'GPU_Buffer_Config', 
-#                        'KV_Storage_Config', 'EP_Config']:
-#             if section in other_dict:
-#                 for key, value in other_dict[section].items():
-#                     if value is not None:  # Only overwrite if value is not None
-#                         getattr(result, section).__dict__[key] = value
-        
-#         return result
+    #     def to_json(self, json_path: Union[str, Path], indent: int = 2) -> None:
+    #         """Save configuration to JSON file"""
+    #         with open(json_path, 'w') as f:
+    #             json.dump(self.to_dict(), f, indent=indent)
+    #         logging.info(f"Configuration saved to {json_path}")
+
+    #     def to_yaml(self, yaml_path: Union[str, Path]) -> None:
+    #         """Save configuration to YAML file"""
+    #         with open(yaml_path, 'w') as f:
+    #             yaml.dump(self.to_dict(), f, default_flow_style=False)
+    #         logging.info(f"Configuration saved to {yaml_path}")
+
+    #     def merge_with(self, other: 'EngineConfig') -> 'EngineConfig':
+    #         """Merge with another config, with other taking precedence"""
+    #         result = deepcopy(self)
+    #         other_dict = other.to_dict()
+
+    #         # Merge each section
+    #         for section in ['Basic_Config', 'Module_Batching_Config', 'GPU_Buffer_Config',
+    #                        'KV_Storage_Config', 'EP_Config']:
+    #             if section in other_dict:
+    #                 for key, value in other_dict[section].items():
+    #                     if value is not None:  # Only overwrite if value is not None
+    #                         getattr(result, section).__dict__[key] = value
+
+    #         return result
 
     def __str__(self) -> str:
         sections = [
@@ -317,7 +320,7 @@ class EngineConfig:
             f"Basic_Config:\n{self.Basic_Config}",
             f"GPU_Buffer_Config:\n{self.GPU_Buffer_Config}",
             # f"KV_Storage_Config:\n{self.KV_Storage_Config}",
-            f"EP_Config:\n{self.EP_Config}"
+            f"EP_Config:\n{self.EP_Config}",
         ]
         return "EngineConfig:\n  " + "\n  ".join(sections)
 

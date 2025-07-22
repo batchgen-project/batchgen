@@ -44,19 +44,18 @@
 namespace py = pybind11;
 
 torch::ScalarType str_to_torch_dtype(const std::string& dtype_str) {
-    static const std::unordered_map<std::string, torch::ScalarType> dtype_map = {
-        {"float16", torch::kFloat16},
-        {"float32", torch::kFloat32},
-        {"bfloat16", torch::kBFloat16},
-        {"float8_e4m3fn", torch::kFloat8_e4m3fn},
-        {"float8_e5m2", torch::kFloat8_e5m2}
-    };
+    static const std::unordered_map<std::string, torch::ScalarType> dtype_map =
+        {{"float16", torch::kFloat16},
+         {"float32", torch::kFloat32},
+         {"bfloat16", torch::kBFloat16},
+         {"float8_e4m3fn", torch::kFloat8_e4m3fn},
+         {"float8_e5m2", torch::kFloat8_e5m2}};
 
     auto it = dtype_map.find(dtype_str);
     if (it != dtype_map.end()) {
         return it->second;
     }
-    
+
     // Default to float32 if not found
     return torch::kFloat32;
 }
@@ -75,10 +74,9 @@ Basic_Config parse_basic_config(const py::object& engine_config) {
         basic_config_obj.attr("weight_dtype").cast<std::string>();
     basic_config.weight_dtype_torch =
         str_to_torch_dtype(basic_config.weight_dtype);
-    basic_config.kv_dtype = 
+    basic_config.kv_dtype =
         basic_config_obj.attr("kv_dtype").cast<std::string>();
-    basic_config.kv_dtype_torch =
-        str_to_torch_dtype(basic_config.kv_dtype);
+    basic_config.kv_dtype_torch = str_to_torch_dtype(basic_config.kv_dtype);
     basic_config.activation_dtype =
         basic_config_obj.attr("activation_dtype").cast<std::string>();
     basic_config.activation_dtype_torch =
@@ -89,10 +87,9 @@ Basic_Config parse_basic_config(const py::object& engine_config) {
         basic_config_obj.attr("num_threads").cast<int64_t>();
     basic_config.module_types =
         basic_config_obj.attr("module_types").cast<std::vector<std::string>>();
-    basic_config.rank = 
-        basic_config_obj.attr("rank").cast<int64_t>();
-    basic_config.world_size = 
-        basic_config_obj.attr("world_size").cast<int64_t>();    
+    basic_config.rank = basic_config_obj.attr("rank").cast<int64_t>();
+    basic_config.world_size =
+        basic_config_obj.attr("world_size").cast<int64_t>();
     return basic_config;
 };
 
@@ -234,11 +231,10 @@ std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
     logger->flush_on(spdlog::level::trace);
     return std::shared_ptr<spdlog::logger>(logger);
 };
-std::string get_tensor_shape(const torch::Tensor& tensor, 
-                             bool include_dtype,
+std::string get_tensor_shape(const torch::Tensor& tensor, bool include_dtype,
                              bool include_device) {
     std::ostringstream shape_str;
-    
+
     // Get the dimensions
     auto sizes = tensor.sizes();
     shape_str << "[";
@@ -249,12 +245,12 @@ std::string get_tensor_shape(const torch::Tensor& tensor,
         }
     }
     shape_str << "]";
-    
+
     // Add dtype if requested
     if (include_dtype) {
         shape_str << ", dtype=" << torch::toString(tensor.scalar_type());
     }
-    
+
     // Add device if requested
     if (include_device) {
         shape_str << ", device=";
@@ -266,6 +262,6 @@ std::string get_tensor_shape(const torch::Tensor& tensor,
             shape_str << torch::toString(tensor.device().type());
         }
     }
-    
+
     return shape_str.str();
 }

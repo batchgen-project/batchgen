@@ -48,7 +48,8 @@ def find_nccl_library() -> str:
     # manually load the nccl library
     if so_file:
         logger.info(
-            "Found nccl from environment variable SGLANG_NCCL_SO_PATH=%s", so_file
+            "Found nccl from environment variable SGLANG_NCCL_SO_PATH=%s",
+            so_file,
         )
     else:
         if torch.version.cuda is not None:
@@ -156,9 +157,13 @@ class NCCLLibrary:
         # const char* ncclGetErrorString(ncclResult_t result)
         Function("ncclGetErrorString", ctypes.c_char_p, [ncclResult_t]),
         # ncclResult_t  ncclGetVersion(int *version);
-        Function("ncclGetVersion", ncclResult_t, [ctypes.POINTER(ctypes.c_int)]),
+        Function(
+            "ncclGetVersion", ncclResult_t, [ctypes.POINTER(ctypes.c_int)]
+        ),
         # ncclResult_t ncclGetUniqueId(ncclUniqueId* uniqueId);
-        Function("ncclGetUniqueId", ncclResult_t, [ctypes.POINTER(ncclUniqueId)]),
+        Function(
+            "ncclGetUniqueId", ncclResult_t, [ctypes.POINTER(ncclUniqueId)]
+        ),
         # ncclResult_t  ncclCommInitRank(
         #   ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank);
         # note that ncclComm_t is a pointer type, so the first argument
@@ -166,7 +171,12 @@ class NCCLLibrary:
         Function(
             "ncclCommInitRank",
             ncclResult_t,
-            [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int],
+            [
+                ctypes.POINTER(ncclComm_t),
+                ctypes.c_int,
+                ncclUniqueId,
+                ctypes.c_int,
+            ],
         ),
         # ncclResult_t  ncclAllReduce(
         #   const void* sendbuff, void* recvbuff, size_t count,
@@ -288,7 +298,6 @@ class NCCLLibrary:
     path_to_dict_mapping: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self, so_file: Optional[str] = None):
-
         so_file = so_file or find_nccl_library()
 
         try:
@@ -425,7 +434,9 @@ class NCCLLibrary:
         stream: cudaStream_t,
     ) -> None:
         self.NCCL_CHECK(
-            self._funcs["ncclSend"](sendbuff, count, datatype, dest, comm, stream)
+            self._funcs["ncclSend"](
+                sendbuff, count, datatype, dest, comm, stream
+            )
         )
 
     def ncclRecv(
@@ -438,7 +449,9 @@ class NCCLLibrary:
         stream: cudaStream_t,
     ) -> None:
         self.NCCL_CHECK(
-            self._funcs["ncclRecv"](recvbuff, count, datatype, src, comm, stream)
+            self._funcs["ncclRecv"](
+                recvbuff, count, datatype, src, comm, stream
+            )
         )
 
     def ncclBroadcast(

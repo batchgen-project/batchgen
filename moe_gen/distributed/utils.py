@@ -79,7 +79,9 @@ def get_pp_indices(
         if len(partitions) != pp_size:
             raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
         if sum(partitions) != num_hidden_layers:
-            raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
+            raise ValueError(
+                f"{sum(partitions)=} does not match {num_hidden_layers=}."
+            )
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
     else:
@@ -110,7 +112,9 @@ class StatelessProcessGroup:
     # src rank -> counter
     recv_src_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
     broadcast_send_counter: int = 0
-    broadcast_recv_src_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
+    broadcast_recv_src_counter: Dict[int, int] = dataclasses.field(
+        default_factory=dict
+    )
 
     # A deque to store the data entries, with key and timestamp.
     entries: Deque[Tuple[str, float]] = dataclasses.field(default_factory=deque)
@@ -161,7 +165,10 @@ class StatelessProcessGroup:
             self.entries.append((key, time.perf_counter()))
             return obj
         else:
-            key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
+            key = (
+                f"broadcast_from/{src}/"
+                f"{self.broadcast_recv_src_counter[src]}"
+            )
             recv_obj = pickle.loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj

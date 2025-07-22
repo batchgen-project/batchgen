@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +14,9 @@
 """Qwen3MoE model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
-from ...modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
+from ...modeling_rope_utils import rope_config_validation
 
 logger = logging.get_logger(__name__)
 
@@ -124,7 +123,7 @@ class Qwen3MoeConfig(PretrainedConfig):
         norm_topk_prob (`bool`, *optional*, defaults to `False`):
             Whether to normalize the topk probabilities.
         output_router_logits (`bool`, *optional*, defaults to `False`):
-            Whether or not the router logits should be returned by the model. Enabeling this will also
+            Whether or not the router logits should be returned by the model. Enabling this will also
             allow the model to output the auxiliary loss, including load balancing loss and router z-loss.
         router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
             The aux loss factor for the total loss.
@@ -229,7 +228,9 @@ class Qwen3MoeConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
-        self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
+        self.mlp_only_layers = (
+            [] if mlp_only_layers is None else mlp_only_layers
+        )
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

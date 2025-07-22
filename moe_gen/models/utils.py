@@ -1,9 +1,8 @@
-
-
-
 from functools import wraps
-import torch
 from typing import Any, Optional, TypedDict
+
+import torch
+
 
 class LossKwargs(TypedDict, total=False):
     """
@@ -16,6 +15,7 @@ class LossKwargs(TypedDict, total=False):
     """
 
     num_items_in_batch: Optional[int]
+
 
 def set_attribute_for_modules(module: "torch.nn.Module", key: str, value: Any):
     """
@@ -37,6 +37,7 @@ def del_attribute_from_modules(module: "torch.nn.Module", key: str):
     for submodule in module.children():
         del_attribute_from_modules(submodule, key)
 
+
 def can_return_tuple(func):
     """
     Decorator to wrap model method, to call output.to_tuple() if return_dict=False passed as a kwarg or
@@ -49,7 +50,11 @@ def can_return_tuple(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
         is_requested_to_return_tuple = kwargs.pop("return_dict", True) is False
-        is_configured_to_return_tuple = self.config.use_return_dict is False if hasattr(self, "config") else False
+        is_configured_to_return_tuple = (
+            self.config.use_return_dict is False
+            if hasattr(self, "config")
+            else False
+        )
 
         # The following allows to convert output to tuple ONLY on top level forward call,
         # while internal modules of the model will return Output objects
@@ -63,7 +68,9 @@ def can_return_tuple(func):
 
         try:
             output = func(self, *args, **kwargs)
-            if is_requested_to_return_tuple or (is_configured_to_return_tuple and is_top_level_module):
+            if is_requested_to_return_tuple or (
+                is_configured_to_return_tuple and is_top_level_module
+            ):
                 output = output.to_tuple()
         finally:
             # Remove the flag after the model forward call is finished.

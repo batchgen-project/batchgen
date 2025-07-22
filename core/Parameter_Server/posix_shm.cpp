@@ -39,41 +39,45 @@
 
 // Fallback calculation if MAP_HUGE_2MB is not directly available
 #ifndef MAP_HUGE_2MB
-#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+    #define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
 #endif
-void* allocate_shared_pinned_memory(const std::string& shm_name,
-                                    int64_t size,
+void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
                                     bool create) {
     void* ptr = nullptr;
     bool using_huge_pages = false;
-    
+
     // Validate input parameters
     if (size <= 0) {
         throw std::runtime_error("Invalid size: " + std::to_string(size));
     }
-    
+
     // CUDA alignment requirements: memory must be aligned to page boundaries
     // For best performance, align to 64KB (or larger for huge pages)
-    const size_t cuda_alignment = using_huge_pages ? (2 * 1024 * 1024) : (64 * 1024); // 2MB for huge pages, 64KB for regular
+    const size_t cuda_alignment =
+        using_huge_pages ? (2 * 1024 * 1024)
+                         : (64 * 1024);  // 2MB for huge pages, 64KB for regular
     const size_t page_size = sysconf(_SC_PAGESIZE);
-    
+
     // Round up size to page boundary to ensure proper alignment
     int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
-    
-    std::cout << "Original size: " << size / (1024*1024) << "MB, "
-              << "Aligned size: " << aligned_size / (1024*1024) << "MB" << std::endl;
-    
+
+    std::cout << "Original size: " << size / (1024 * 1024) << "MB, "
+              << "Aligned size: " << aligned_size / (1024 * 1024) << "MB"
+              << std::endl;
+
     // Method 1: Try hugetlbfs first (most reliable for huge pages)
     std::string hugepage_path = "/dev/hugepages/" + shm_name;
     int flags = O_RDWR | (create ? O_CREAT : 0);
     int fd = open(hugepage_path.c_str(), flags, 0666);
-    
+
     if (fd >= 0) {
         std::cout << "Trying hugetlbfs allocation..." << std::endl;
-        
+
         if (create) {
             if (ftruncate64(fd, aligned_size) == -1) {
-                std::cout << "ftruncate failed for hugetlbfs, trying fallback..." << std::endl;
+                std::cout
+                    << "ftruncate failed for hugetlbfs, trying fallback..."
+                    << std::endl;
                 perror("ftruncate64 on hugetlbfs");
                 close(fd);
                 unlink(hugepage_path.c_str());
@@ -82,32 +86,40 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         }
 
         // mmap the huge page file (no MAP_HUGETLB needed with hugetlbfs!)
-        ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fd, 0);
         close(fd);
-        
+
         if (ptr != MAP_FAILED) {
-            std::cout << "✓ Successfully allocated " << aligned_size/(1024*1024*1024) 
+            std::cout << "✓ Successfully allocated "
+                      << aligned_size / (1024 * 1024 * 1024)
                       << "GB using hugetlbfs (2MB pages)!" << std::endl;
             using_huge_pages = true;
-            
+
             // Verify alignment for huge pages (should be 2MB aligned)
             if ((uintptr_t)ptr % (2 * 1024 * 1024) != 0) {
-                std::cout << "Warning: Huge page memory not 2MB aligned: " << ptr << std::endl;
+                std::cout << "Warning: Huge page memory not 2MB aligned: "
+                          << ptr << std::endl;
             } else {
-                std::cout << "✓ Memory is properly 2MB aligned: " << ptr << std::endl;
+                std::cout << "✓ Memory is properly 2MB aligned: " << ptr
+                          << std::endl;
             }
             goto success;
         } else {
-            std::cout << "mmap failed on hugetlbfs, trying fallback..." << std::endl;
+            std::cout << "mmap failed on hugetlbfs, trying fallback..."
+                      << std::endl;
             perror("mmap on hugetlbfs");
             if (create) unlink(hugepage_path.c_str());
         }
     } else {
-        std::cout << "Cannot open hugetlbfs file (normal if not mounted), trying fallback..." << std::endl;
+        std::cout << "Cannot open hugetlbfs file (normal if not mounted), "
+                     "trying fallback..."
+                  << std::endl;
     }
 
 fallback_to_shm:
-    // Method 2: Try shm_open with MAP_HUGETLB (will likely fail but worth trying)
+    // Method 2: Try shm_open with MAP_HUGETLB (will likely fail but worth
+    // trying)
     std::cout << "Trying shm_open with MAP_HUGETLB..." << std::endl;
     fd = shm_open(shm_name.c_str(), flags, 0666);
     if (fd < 0) {
@@ -122,87 +134,105 @@ fallback_to_shm:
     }
 
     // Try MAP_HUGETLB with shm_open (will probably fail)
-    ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, 
+    ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
                MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd, 0);
-    
+
     if (ptr != MAP_FAILED) {
-        std::cout << "✓ Successfully allocated " << aligned_size/(1024*1024*1024) 
+        std::cout << "✓ Successfully allocated "
+                  << aligned_size / (1024 * 1024 * 1024)
                   << "GB using shm_open + MAP_HUGETLB!" << std::endl;
         using_huge_pages = true;
         close(fd);
-        
+
         // Verify 2MB alignment
         if ((uintptr_t)ptr % (2 * 1024 * 1024) != 0) {
-            std::cout << "Warning: Huge page memory not 2MB aligned: " << ptr << std::endl;
+            std::cout << "Warning: Huge page memory not 2MB aligned: " << ptr
+                      << std::endl;
         } else {
-            std::cout << "✓ Memory is properly 2MB aligned: " << ptr << std::endl;
+            std::cout << "✓ Memory is properly 2MB aligned: " << ptr
+                      << std::endl;
         }
         goto success;
     } else {
-        std::cout << "shm_open + MAP_HUGETLB failed (expected), trying regular pages..." << std::endl;
+        std::cout << "shm_open + MAP_HUGETLB failed (expected), trying regular "
+                     "pages..."
+                  << std::endl;
         perror("mmap with MAP_HUGETLB on shm_open");
-        
-        // Method 3: Fallback to regular pages - allocate extra space for manual alignment
+
+        // Method 3: Fallback to regular pages - allocate extra space for manual
+        // alignment
         size_t extra_size = aligned_size + cuda_alignment;
-        ptr = mmap(nullptr, extra_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        ptr = mmap(nullptr, extra_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                   0);
         close(fd);
-        
+
         if (ptr == MAP_FAILED) {
             throw std::runtime_error("All mmap methods failed for " + shm_name);
         }
-        
+
         // Manually align the pointer to cuda_alignment boundary
-        uintptr_t aligned_addr = ((uintptr_t)ptr + cuda_alignment - 1) & ~(cuda_alignment - 1);
+        uintptr_t aligned_addr =
+            ((uintptr_t)ptr + cuda_alignment - 1) & ~(cuda_alignment - 1);
         void* aligned_ptr = (void*)aligned_addr;
-        
+
         // Check if we have enough space after alignment
         size_t offset = aligned_addr - (uintptr_t)ptr;
         if (offset + aligned_size > extra_size) {
             munmap(ptr, extra_size);
-            throw std::runtime_error("Cannot align memory within allocated space");
+            throw std::runtime_error(
+                "Cannot align memory within allocated space");
         }
-        
-        std::cout << "✓ Memory aligned from " << ptr << " to " << aligned_ptr 
+
+        std::cout << "✓ Memory aligned from " << ptr << " to " << aligned_ptr
                   << " (offset: " << offset << " bytes)" << std::endl;
-        
+
         // We need to keep track of the original ptr for munmap later
-        // For simplicity, let's try a different approach: use posix_memalign instead
+        // For simplicity, let's try a different approach: use posix_memalign
+        // instead
         munmap(ptr, extra_size);
-        
+
         // Use a simpler approach with proper alignment from the start
         void* temp_ptr = nullptr;
         if (posix_memalign(&temp_ptr, cuda_alignment, aligned_size) != 0) {
             throw std::runtime_error("posix_memalign failed for alignment");
         }
-        
+
         // Copy to shared memory with proper alignment
-        ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         if (ptr == MAP_FAILED) {
             free(temp_ptr);
             throw std::runtime_error("mmap for aligned memory failed");
         }
-        
+
         // Verify alignment
         if ((uintptr_t)ptr % cuda_alignment != 0) {
-            std::cout << "Warning: Regular memory not " << cuda_alignment/1024 << "KB aligned" << std::endl;
+            std::cout << "Warning: Regular memory not " << cuda_alignment / 1024
+                      << "KB aligned" << std::endl;
             // If still not aligned, we need to handle this case
             munmap(ptr, aligned_size);
-            
-            // Last resort: use the properly aligned temp_ptr and convert to shared
+
+            // Last resort: use the properly aligned temp_ptr and convert to
+            // shared
             ptr = temp_ptr;
             std::cout << "Using posix_memaligned memory: " << ptr << std::endl;
         } else {
-            std::cout << "✓ Memory is properly " << cuda_alignment/1024 << "KB aligned: " << ptr << std::endl;
+            std::cout << "✓ Memory is properly " << cuda_alignment / 1024
+                      << "KB aligned: " << ptr << std::endl;
             free(temp_ptr);
         }
-        
+
         if (create) {
             // Use madvise hint for transparent huge pages
             int ret = madvise(ptr, aligned_size, MADV_HUGEPAGE);
             if (ret == 0) {
-                std::cout << "✓ Successfully hinted for transparent huge pages (may use 2MB pages)" << std::endl;
+                std::cout << "✓ Successfully hinted for transparent huge pages "
+                             "(may use 2MB pages)"
+                          << std::endl;
             } else {
-                std::cout << "madvise(MADV_HUGEPAGE) failed, using regular 4KB pages" << std::endl;
+                std::cout
+                    << "madvise(MADV_HUGEPAGE) failed, using regular 4KB pages"
+                    << std::endl;
                 perror("madvise");
             }
         }
@@ -213,30 +243,37 @@ success:
     if (ptr == nullptr) {
         throw std::runtime_error("Memory allocation returned null pointer");
     }
-    
+
     // Check final alignment
-    size_t final_alignment = using_huge_pages ? (2 * 1024 * 1024) : cuda_alignment;
+    size_t final_alignment =
+        using_huge_pages ? (2 * 1024 * 1024) : cuda_alignment;
     if ((uintptr_t)ptr % final_alignment != 0) {
         std::cout << "ERROR: Final memory alignment check failed!" << std::endl;
-        std::cout << "Pointer: " << ptr << ", Required alignment: " << final_alignment << std::endl;
-        std::cout << "Pointer modulo: " << ((uintptr_t)ptr % final_alignment) << std::endl;
-        
+        std::cout << "Pointer: " << ptr
+                  << ", Required alignment: " << final_alignment << std::endl;
+        std::cout << "Pointer modulo: " << ((uintptr_t)ptr % final_alignment)
+                  << std::endl;
+
         // For CUDA, we need at least page alignment, so let's check that
         if ((uintptr_t)ptr % page_size != 0) {
             munmap(ptr, aligned_size);
-            throw std::runtime_error("Memory is not page-aligned, cudaHostRegister will fail");
+            throw std::runtime_error(
+                "Memory is not page-aligned, cudaHostRegister will fail");
         } else {
-            std::cout << "Memory is at least page-aligned, proceeding..." << std::endl;
+            std::cout << "Memory is at least page-aligned, proceeding..."
+                      << std::endl;
         }
     }
-    
+
     if (create) {
         if (numa_available() >= 0) {
             int num_nodes = numa_num_configured_nodes();
-            std::cout << "NUMA available with " << num_nodes << " nodes." << std::endl;
-            
+            std::cout << "NUMA available with " << num_nodes << " nodes."
+                      << std::endl;
+
             if (num_nodes >= 2) {
-                std::cout << "Interleaving memory across NUMA nodes 0 and 1." << std::endl;
+                std::cout << "Interleaving memory across NUMA nodes 0 and 1."
+                          << std::endl;
 
                 // Create proper nodemask using numa library functions
                 struct bitmask* nodemask = numa_allocate_nodemask();
@@ -250,109 +287,131 @@ success:
                     numa_bitmask_setbit(nodemask, 1);
 
                     // Use set_mempolicy for the current process/thread
-                    int ret = set_mempolicy(MPOL_INTERLEAVE, 
-                                          nodemask->maskp, 
-                                          nodemask->size + 1);
+                    int ret = set_mempolicy(MPOL_INTERLEAVE, nodemask->maskp,
+                                            nodemask->size + 1);
                     if (ret != 0) {
                         perror("set_mempolicy(MPOL_INTERLEAVE)");
                     } else {
-                        std::cout << "✓ NUMA memory policy set successfully" << std::endl;
+                        std::cout << "✓ NUMA memory policy set successfully"
+                                  << std::endl;
                     }
 
                     numa_free_nodemask(nodemask);
                 }
             } else {
-                std::cout << "Only " << num_nodes << " NUMA node(s) available, skipping interleaving." << std::endl;
+                std::cout << "Only " << num_nodes
+                          << " NUMA node(s) available, skipping interleaving."
+                          << std::endl;
             }
 
             // Multi-threaded page touching
-            std::cout << "Starting multi-threaded page touching..." << std::endl;
+            std::cout << "Starting multi-threaded page touching..."
+                      << std::endl;
             auto touch_start = std::chrono::high_resolution_clock::now();
-            
+
             // Use appropriate page size based on allocation method
-            long touch_page_size = using_huge_pages ? (2 * 1024 * 1024) : sysconf(_SC_PAGESIZE);
-            std::cout << "Using page size: " << touch_page_size / 1024 << " KB" << std::endl;
-            
+            long touch_page_size =
+                using_huge_pages ? (2 * 1024 * 1024) : sysconf(_SC_PAGESIZE);
+            std::cout << "Using page size: " << touch_page_size / 1024 << " KB"
+                      << std::endl;
+
             // Determine optimal number of threads
-            int num_threads = std::min(16, std::max(2, (int)std::thread::hardware_concurrency() / 2));
-            std::cout << "Using " << num_threads << " threads for page touching" << std::endl;
-            
-            // Calculate work distribution - use original size for touching, not aligned_size
-            int64_t total_pages = (size + touch_page_size - 1) / touch_page_size;
+            int num_threads = std::min(
+                16, std::max(2, (int)std::thread::hardware_concurrency() / 2));
+            std::cout << "Using " << num_threads << " threads for page touching"
+                      << std::endl;
+
+            // Calculate work distribution - use original size for touching, not
+            // aligned_size
+            int64_t total_pages =
+                (size + touch_page_size - 1) / touch_page_size;
             int64_t chunk_size = size / num_threads;
-            
+
             std::vector<std::thread> threads;
             std::atomic<int64_t> completed_pages{0};
             std::atomic<bool> progress_active{true};
-            
+
             // Progress reporting thread
             std::thread progress_thread([&]() {
                 while (progress_active.load()) {
                     int64_t current = completed_pages.load();
                     double progress = (double)current / total_pages * 100.0;
-                    std::cout << "Page touching progress: " << std::fixed << std::setprecision(1) 
-                              << progress << "% (" << current << "/" << total_pages << " pages)" << std::endl;
+                    std::cout << "Page touching progress: " << std::fixed
+                              << std::setprecision(1) << progress << "% ("
+                              << current << "/" << total_pages << " pages)"
+                              << std::endl;
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                 }
             });
-            
+
             // Worker function for each thread
             auto touch_worker = [&](int thread_id) {
                 int64_t start_offset = thread_id * chunk_size;
-                int64_t end_offset = (thread_id == num_threads - 1) ? size : start_offset + chunk_size;
-                
+                int64_t end_offset = (thread_id == num_threads - 1)
+                                         ? size
+                                         : start_offset + chunk_size;
+
                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
                 int64_t local_pages_touched = 0;
-                
+
                 // Touch pages in this thread's range
-                for (int64_t offset = start_offset; offset < end_offset; offset += touch_page_size) {
+                for (int64_t offset = start_offset; offset < end_offset;
+                     offset += touch_page_size) {
                     p[offset] = 0;
                     local_pages_touched++;
-                    
-                    // Update global counter every 1000 pages to reduce contention
+
+                    // Update global counter every 1000 pages to reduce
+                    // contention
                     if (local_pages_touched % 1000 == 0) {
                         completed_pages.fetch_add(1000);
                     }
                 }
-                
+
                 // Add remaining pages to counter
                 completed_pages.fetch_add(local_pages_touched % 1000);
-                
-                // std::cout << "Thread " << thread_id << " completed " << local_pages_touched << " pages" << std::endl;
+
+                // std::cout << "Thread " << thread_id << " completed " <<
+                // local_pages_touched << " pages" << std::endl;
             };
-            
+
             // Launch worker threads
             for (int i = 0; i < num_threads; i++) {
                 threads.emplace_back(touch_worker, i);
             }
-            
+
             // Wait for all threads to complete
             for (auto& t : threads) {
                 t.join();
             }
-            
+
             // Stop progress thread
             progress_active.store(false);
             progress_thread.join();
-            
+
             // Touch the last page if size is not page-aligned
             if (size > 0) {
                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
                 p[size - 1] = 0;
             }
-            
+
             auto touch_end = std::chrono::high_resolution_clock::now();
-            auto touch_duration = std::chrono::duration_cast<std::chrono::milliseconds>(touch_end - touch_start);
-            
+            auto touch_duration =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    touch_end - touch_start);
+
             int64_t final_pages = completed_pages.load();
-            double throughput = (double)size / (1024.0 * 1024.0 * 1024.0) / (touch_duration.count() / 1000.0);
-            
-            std::cout << "✓ Multi-threaded page touching completed:" << std::endl;
+            double throughput = (double)size / (1024.0 * 1024.0 * 1024.0) /
+                                (touch_duration.count() / 1000.0);
+
+            std::cout << "✓ Multi-threaded page touching completed:"
+                      << std::endl;
             std::cout << "  - Pages touched: " << final_pages << std::endl;
-            std::cout << "  - Time: " << touch_duration.count() << " ms (" 
-                      << touch_duration.count() / 1000.0 << " seconds)" << std::endl;
-            std::cout << "  - Throughput: " << std::fixed << std::setprecision(2) 
-                      << throughput << " GB/s" << std::endl;
+            std::cout << "  - Time: " << touch_duration.count() << " ms ("
+                      << touch_duration.count() / 1000.0 << " seconds)"
+                      << std::endl;
+            std::cout << "  - Throughput: " << std::fixed
+                      << std::setprecision(2) << throughput << " GB/s"
+                      << std::endl;
         } else {
             std::cout << "NUMA not available on this system." << std::endl;
         }
@@ -361,10 +420,12 @@ success:
     // Additional validation before CUDA registration
     std::cout << "Pre-CUDA validation:" << std::endl;
     std::cout << "  - Pointer: " << ptr << std::endl;
-    std::cout << "  - Size: " << size << " bytes (" << size/(1024*1024*1024) << " GB)" << std::endl;
+    std::cout << "  - Size: " << size << " bytes ("
+              << size / (1024 * 1024 * 1024) << " GB)" << std::endl;
     std::cout << "  - Aligned size: " << aligned_size << " bytes" << std::endl;
-    std::cout << "  - Page alignment: " << ((uintptr_t)ptr % page_size == 0 ? "✓" : "✗") << std::endl;
-    
+    std::cout << "  - Page alignment: "
+              << ((uintptr_t)ptr % page_size == 0 ? "✓" : "✗") << std::endl;
+
     // Check if the memory range is valid by trying to read/write
     try {
         volatile char* test_ptr = reinterpret_cast<volatile char*>(ptr);
@@ -374,54 +435,63 @@ success:
             throw std::runtime_error("Memory test failed - cannot write");
         }
         test_ptr[0] = original;
-        
+
         // Test last byte
         original = test_ptr[size - 1];
         test_ptr[size - 1] = 0x43;
         if (test_ptr[size - 1] != 0x43) {
-            throw std::runtime_error("Memory test failed - cannot write to end");
+            throw std::runtime_error(
+                "Memory test failed - cannot write to end");
         }
         test_ptr[size - 1] = original;
-        
+
         std::cout << "  - Memory accessibility: ✓" << std::endl;
     } catch (const std::exception& e) {
-        std::cout << "  - Memory accessibility: ✗ (" << e.what() << ")" << std::endl;
+        std::cout << "  - Memory accessibility: ✗ (" << e.what() << ")"
+                  << std::endl;
         munmap(ptr, aligned_size);
-        throw std::runtime_error("Memory accessibility test failed: " + std::string(e.what()));
+        throw std::runtime_error("Memory accessibility test failed: " +
+                                 std::string(e.what()));
     }
 
     // Register with CUDA - use original size, not aligned_size
-    std::cout << "Starting cudaHostRegister for " << size/(1024*1024*1024) << "GB..." << std::endl;
+    std::cout << "Starting cudaHostRegister for " << size / (1024 * 1024 * 1024)
+              << "GB..." << std::endl;
     auto cuda_start = std::chrono::high_resolution_clock::now();
-    
+
     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
-    
+
     auto cuda_end = std::chrono::high_resolution_clock::now();
-    auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cuda_end - cuda_start);
-    
+    auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cuda_end - cuda_start);
+
     if (err != cudaSuccess) {
-        std::cout << "cudaHostRegister failed with error: " << cudaGetErrorString(err) << std::endl;
+        std::cout << "cudaHostRegister failed with error: "
+                  << cudaGetErrorString(err) << std::endl;
         std::cout << "Error details:" << std::endl;
         std::cout << "  - Pointer: " << ptr << std::endl;
         std::cout << "  - Size: " << size << std::endl;
-        std::cout << "  - Alignment: " << ((uintptr_t)ptr % page_size) << std::endl;
-        
+        std::cout << "  - Alignment: " << ((uintptr_t)ptr % page_size)
+                  << std::endl;
+
         munmap(ptr, aligned_size);
         // Clean up hugetlbfs file if we created it
         if (using_huge_pages && create) {
             unlink(hugepage_path.c_str());
         }
-        throw std::runtime_error(
-            std::string("cudaHostRegister failed: ") + cudaGetErrorString(err));
+        throw std::runtime_error(std::string("cudaHostRegister failed: ") +
+                                 cudaGetErrorString(err));
     }
-    
-    std::cout << "✓ cudaHostRegister completed in " << cuda_duration.count() 
-              << " milliseconds (" << cuda_duration.count()/1000.0 << " seconds)" << std::endl;
-    
+
+    std::cout << "✓ cudaHostRegister completed in " << cuda_duration.count()
+              << " milliseconds (" << cuda_duration.count() / 1000.0
+              << " seconds)" << std::endl;
+
     // Verify huge page usage
     if (create && using_huge_pages) {
         std::cout << "\nChecking huge page consumption..." << std::endl;
-        system("cat /proc/meminfo | grep -i 'HugePages_Free\\|HugePages_Total'");
+        system(
+            "cat /proc/meminfo | grep -i 'HugePages_Free\\|HugePages_Total'");
     }
 
     return ptr;
@@ -432,46 +502,46 @@ success:
 //                                     bool create) {
 //     void* ptr = nullptr;
 //     bool using_huge_pages = false;
-    
+
 //     // Method 1: Try hugetlbfs first (most reliable for huge pages)
 //     std::string hugepage_path = "/dev/hugepages/" + shm_name;
 //     int flags = O_RDWR | (create ? O_CREAT : 0);
 //     int fd = open(hugepage_path.c_str(), flags, 0666);
-    
+
 //     if (fd >= 0) {
 //         std::cout << "Trying hugetlbfs allocation..." << std::endl;
-        
+
 //         if (create) {
 //             if (ftruncate64(fd, size) == -1) {
-//                 std::cout << "ftruncate failed for hugetlbfs, trying fallback..." << std::endl;
-//                 perror("ftruncate64 on hugetlbfs");
-//                 close(fd);
-//                 unlink(hugepage_path.c_str());
-//                 goto fallback_to_shm;
+//                 std::cout << "ftruncate failed for hugetlbfs, trying
+//                 fallback..." << std::endl; perror("ftruncate64 on
+//                 hugetlbfs"); close(fd); unlink(hugepage_path.c_str()); goto
+//                 fallback_to_shm;
 //             }
 //         }
 
 //         // mmap the huge page file (no MAP_HUGETLB needed with hugetlbfs!)
 //         ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 //         close(fd);
-        
+
 //         if (ptr != MAP_FAILED) {
-//             std::cout << "✓ Successfully allocated " << size/(1024*1024*1024) 
+//             std::cout << "✓ Successfully allocated " << size/(1024*1024*1024)
 //                       << "GB using hugetlbfs (2MB pages)!" << std::endl;
 //             using_huge_pages = true;
 //             goto success;
 //         } else {
-//             std::cout << "mmap failed on hugetlbfs, trying fallback..." << std::endl;
-//             perror("mmap on hugetlbfs");
-//             if (create) unlink(hugepage_path.c_str());
+//             std::cout << "mmap failed on hugetlbfs, trying fallback..." <<
+//             std::endl; perror("mmap on hugetlbfs"); if (create)
+//             unlink(hugepage_path.c_str());
 //         }
 //     } else {
-//         std::cout << "Cannot open hugetlbfs file (normal if not mounted), trying fallback..." << std::endl;
+//         std::cout << "Cannot open hugetlbfs file (normal if not mounted),
+//         trying fallback..." << std::endl;
 //     }
 
 // fallback_to_shm:
-//     // Method 2: Try shm_open with MAP_HUGETLB (will likely fail but worth trying)
-//     std::cout << "Trying shm_open with MAP_HUGETLB..." << std::endl;
+//     // Method 2: Try shm_open with MAP_HUGETLB (will likely fail but worth
+//     trying) std::cout << "Trying shm_open with MAP_HUGETLB..." << std::endl;
 //     fd = shm_open(shm_name.c_str(), flags, 0666);
 //     if (fd < 0) {
 //         throw std::runtime_error("shm_open failed for " + shm_name);
@@ -485,35 +555,38 @@ success:
 //     }
 
 //     // Try MAP_HUGETLB with shm_open (will probably fail)
-//     ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, 
+//     ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
 //                MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd, 0);
-    
+
 //     if (ptr != MAP_FAILED) {
-//         std::cout << "✓ Successfully allocated " << size/(1024*1024*1024) 
+//         std::cout << "✓ Successfully allocated " << size/(1024*1024*1024)
 //                   << "GB using shm_open + MAP_HUGETLB!" << std::endl;
 //         using_huge_pages = true;
 //         close(fd);
 //         goto success;
 //     } else {
-//         std::cout << "shm_open + MAP_HUGETLB failed (expected), trying regular pages..." << std::endl;
-//         perror("mmap with MAP_HUGETLB on shm_open");
-        
+//         std::cout << "shm_open + MAP_HUGETLB failed (expected), trying
+//         regular pages..." << std::endl; perror("mmap with MAP_HUGETLB on
+//         shm_open");
+
 //         // Method 3: Fallback to regular pages with huge page hints
 //         ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 //         close(fd);
-        
+
 //         if (ptr == MAP_FAILED) {
-//             throw std::runtime_error("All mmap methods failed for " + shm_name);
+//             throw std::runtime_error("All mmap methods failed for " +
+//             shm_name);
 //         }
-        
+
 //         if (create) {
 //             // Use madvise hint for transparent huge pages
 //             int ret = madvise(ptr, size, MADV_HUGEPAGE);
 //             if (ret == 0) {
-//                 std::cout << "✓ Successfully hinted for transparent huge pages (may use 2MB pages)" << std::endl;
+//                 std::cout << "✓ Successfully hinted for transparent huge
+//                 pages (may use 2MB pages)" << std::endl;
 //             } else {
-//                 std::cout << "madvise(MADV_HUGEPAGE) failed, using regular 4KB pages" << std::endl;
-//                 perror("madvise");
+//                 std::cout << "madvise(MADV_HUGEPAGE) failed, using regular
+//                 4KB pages" << std::endl; perror("madvise");
 //             }
 //         }
 //     }
@@ -522,10 +595,12 @@ success:
 //     if (create) {
 //         if (numa_available() >= 0) {
 //             int num_nodes = numa_num_configured_nodes();
-//             std::cout << "NUMA available with " << num_nodes << " nodes." << std::endl;
-            
+//             std::cout << "NUMA available with " << num_nodes << " nodes." <<
+//             std::endl;
+
 //             if (num_nodes >= 2) {
-//                 std::cout << "Interleaving memory across NUMA nodes 0 and 1." << std::endl;
+//                 std::cout << "Interleaving memory across NUMA nodes 0 and 1."
+//                 << std::endl;
 
 //                 // Create proper nodemask using numa library functions
 //                 struct bitmask* nodemask = numa_allocate_nodemask();
@@ -539,108 +614,125 @@ success:
 //                     numa_bitmask_setbit(nodemask, 1);
 
 //                     // Use set_mempolicy for the current process/thread
-//                     int ret = set_mempolicy(MPOL_INTERLEAVE, 
-//                                           nodemask->maskp, 
+//                     int ret = set_mempolicy(MPOL_INTERLEAVE,
+//                                           nodemask->maskp,
 //                                           nodemask->size + 1);
 //                     if (ret != 0) {
 //                         perror("set_mempolicy(MPOL_INTERLEAVE)");
 //                     } else {
-//                         std::cout << "✓ NUMA memory policy set successfully" << std::endl;
+//                         std::cout << "✓ NUMA memory policy set successfully"
+//                         << std::endl;
 //                     }
 
 //                     numa_free_nodemask(nodemask);
 //                 }
 //             } else {
-//                 std::cout << "Only " << num_nodes << " NUMA node(s) available, skipping interleaving." << std::endl;
+//                 std::cout << "Only " << num_nodes << " NUMA node(s)
+//                 available, skipping interleaving." << std::endl;
 //             }
 
 //             // Multi-threaded page touching
-//             std::cout << "Starting multi-threaded page touching..." << std::endl;
-//             auto touch_start = std::chrono::high_resolution_clock::now();
-            
+//             std::cout << "Starting multi-threaded page touching..." <<
+//             std::endl; auto touch_start =
+//             std::chrono::high_resolution_clock::now();
+
 //             // Use appropriate page size based on allocation method
-//             long page_size = using_huge_pages ? (2 * 1024 * 1024) : sysconf(_SC_PAGESIZE);
-//             std::cout << "Using page size: " << page_size / 1024 << " KB" << std::endl;
-            
+//             long page_size = using_huge_pages ? (2 * 1024 * 1024) :
+//             sysconf(_SC_PAGESIZE); std::cout << "Using page size: " <<
+//             page_size / 1024 << " KB" << std::endl;
+
 //             // Determine optimal number of threads
-//             int num_threads = std::min(16, std::max(2, (int)std::thread::hardware_concurrency() / 2));
-//             std::cout << "Using " << num_threads << " threads for page touching" << std::endl;
-            
+//             int num_threads = std::min(16, std::max(2,
+//             (int)std::thread::hardware_concurrency() / 2)); std::cout <<
+//             "Using " << num_threads << " threads for page touching" <<
+//             std::endl;
+
 //             // Calculate work distribution
 //             int64_t total_pages = (size + page_size - 1) / page_size;
 //             int64_t chunk_size = size / num_threads;
-            
+
 //             std::vector<std::thread> threads;
 //             std::atomic<int64_t> completed_pages{0};
 //             std::atomic<bool> progress_active{true};
-            
+
 //             // Progress reporting thread
 //             std::thread progress_thread([&]() {
 //                 while (progress_active.load()) {
 //                     int64_t current = completed_pages.load();
 //                     double progress = (double)current / total_pages * 100.0;
-//                     std::cout << "Page touching progress: " << std::fixed << std::setprecision(1) 
-//                               << progress << "% (" << current << "/" << total_pages << " pages)" << std::endl;
+//                     std::cout << "Page touching progress: " << std::fixed <<
+//                     std::setprecision(1)
+//                               << progress << "% (" << current << "/" <<
+//                               total_pages << " pages)" << std::endl;
 //                     std::this_thread::sleep_for(std::chrono::seconds(2));
 //                 }
 //             });
-            
+
 //             // Worker function for each thread
 //             auto touch_worker = [&](int thread_id) {
 //                 int64_t start_offset = thread_id * chunk_size;
-//                 int64_t end_offset = (thread_id == num_threads - 1) ? size : start_offset + chunk_size;
-                
+//                 int64_t end_offset = (thread_id == num_threads - 1) ? size :
+//                 start_offset + chunk_size;
+
 //                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
 //                 int64_t local_pages_touched = 0;
-                
+
 //                 // Touch pages in this thread's range
-//                 for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
+//                 for (int64_t offset = start_offset; offset < end_offset;
+//                 offset += page_size) {
 //                     p[offset] = 0;
 //                     local_pages_touched++;
-                    
-//                     // Update global counter every 1000 pages to reduce contention
-//                     if (local_pages_touched % 1000 == 0) {
+
+//                     // Update global counter every 1000 pages to reduce
+//                     contention if (local_pages_touched % 1000 == 0) {
 //                         completed_pages.fetch_add(1000);
 //                     }
 //                 }
-                
+
 //                 // Add remaining pages to counter
 //                 completed_pages.fetch_add(local_pages_touched % 1000);
-                
-//                 std::cout << "Thread " << thread_id << " completed " << local_pages_touched << " pages" << std::endl;
+
+//                 std::cout << "Thread " << thread_id << " completed " <<
+//                 local_pages_touched << " pages" << std::endl;
 //             };
-            
+
 //             // Launch worker threads
 //             for (int i = 0; i < num_threads; i++) {
 //                 threads.emplace_back(touch_worker, i);
 //             }
-            
+
 //             // Wait for all threads to complete
 //             for (auto& t : threads) {
 //                 t.join();
 //             }
-            
+
 //             // Stop progress thread
 //             progress_active.store(false);
 //             progress_thread.join();
-            
+
 //             // Touch the last page if size is not page-aligned
 //             if (size > 0) {
 //                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
 //                 p[size - 1] = 0;
 //             }
-            
+
 //             auto touch_end = std::chrono::high_resolution_clock::now();
-//             auto touch_duration = std::chrono::duration_cast<std::chrono::milliseconds>(touch_end - touch_start);
-            
+//             auto touch_duration =
+//             std::chrono::duration_cast<std::chrono::milliseconds>(touch_end -
+//             touch_start);
+
 //             int64_t final_pages = completed_pages.load();
-//             double throughput = (double)size / (1024.0 * 1024.0 * 1024.0) / (touch_duration.count() / 1000.0);
-            
-//             std::cout << "✓ Multi-threaded page touching completed:" << std::endl;
-//             std::cout << "  - Pages touched: " << final_pages << std::endl;
-//             std::cout << "  - Time: " << touch_duration.count() << " ms (" 
-//                       << touch_duration.count() / 1000.0 << " seconds)" << std::endl;
-//             std::cout << "  - Throughput: " << std::fixed << std::setprecision(2) 
+//             double throughput = (double)size / (1024.0 * 1024.0 * 1024.0) /
+//             (touch_duration.count() / 1000.0);
+
+//             std::cout << "✓ Multi-threaded page touching completed:" <<
+//             std::endl; std::cout << "  - Pages touched: " << final_pages <<
+//             std::endl; std::cout << "  - Time: " << touch_duration.count() <<
+//             " ms ("
+//                       << touch_duration.count() / 1000.0 << " seconds)" <<
+//                       std::endl;
+//             std::cout << "  - Throughput: " << std::fixed <<
+//             std::setprecision(2)
 //                       << throughput << " GB/s" << std::endl;
 //         } else {
 //             std::cout << "NUMA not available on this system." << std::endl;
@@ -648,7 +740,8 @@ success:
 //     }
 
 //     // Register with CUDA - measure performance
-//     std::cout << "Starting cudaHostRegister for " << size/(1024*1024*1024) << "GB..." << std::endl;
+//     std::cout << "Starting cudaHostRegister for " << size/(1024*1024*1024) <<
+//     "GB..." << std::endl;
 //     // Check if ptr is null and log the size
 //     if (ptr == nullptr) {
 //         std::cerr << "Error: ptr is null after mmap, size requested: "
@@ -656,15 +749,17 @@ success:
 //         throw std::runtime_error("mmap failed, ptr is null");
 //     }
 //     std::cout << "Allocated memory at: " << ptr << std::endl;
-//     std::cout << "Size of allocated memory: " << size / (1024 * 1024 * 1024) 
+//     std::cout << "Size of allocated memory: " << size / (1024 * 1024 * 1024)
 //               << " GB" << std::endl;
 //     auto cuda_start = std::chrono::high_resolution_clock::now();
-    
+
 //     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
-    
+
 //     auto cuda_end = std::chrono::high_resolution_clock::now();
-//     auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cuda_end - cuda_start);
-    
+//     auto cuda_duration =
+//     std::chrono::duration_cast<std::chrono::milliseconds>(cuda_end -
+//     cuda_start);
+
 //     if (err != cudaSuccess) {
 //         munmap(ptr, size);
 //         // Clean up hugetlbfs file if we created it
@@ -672,16 +767,19 @@ success:
 //             unlink(hugepage_path.c_str());
 //         }
 //         throw std::runtime_error(
-//             std::string("cudaHostRegister failed: ") + cudaGetErrorString(err));
+//             std::string("cudaHostRegister failed: ") +
+//             cudaGetErrorString(err));
 //     }
-    
-//     std::cout << "✓ cudaHostRegister completed in " << cuda_duration.count() 
-//               << " milliseconds (" << cuda_duration.count()/1000.0 << " seconds)" << std::endl;
-    
+
+//     std::cout << "✓ cudaHostRegister completed in " << cuda_duration.count()
+//               << " milliseconds (" << cuda_duration.count()/1000.0 << "
+//               seconds)" << std::endl;
+
 //     // Verify huge page usage
 //     if (create && using_huge_pages) {
 //         std::cout << "\nChecking huge page consumption..." << std::endl;
-//         system("cat /proc/meminfo | grep -i 'HugePages_Free\\|HugePages_Total'");
+//         system("cat /proc/meminfo | grep -i
+//         'HugePages_Free\\|HugePages_Total'");
 //     }
 
 //     return ptr;
@@ -692,46 +790,46 @@ success:
 //                                     bool create) {
 //     void* ptr = nullptr;
 //     bool using_huge_pages = false;
-    
+
 //     // Method 1: Try hugetlbfs first (most reliable for huge pages)
 //     std::string hugepage_path = "/dev/hugepages/" + shm_name;
 //     int flags = O_RDWR | (create ? O_CREAT : 0);
 //     int fd = open(hugepage_path.c_str(), flags, 0666);
-    
+
 //     if (fd >= 0) {
 //         std::cout << "Trying hugetlbfs allocation..." << std::endl;
-        
+
 //         if (create) {
 //             if (ftruncate64(fd, size) == -1) {
-//                 std::cout << "ftruncate failed for hugetlbfs, trying fallback..." << std::endl;
-//                 perror("ftruncate64 on hugetlbfs");
-//                 close(fd);
-//                 unlink(hugepage_path.c_str());
-//                 goto fallback_to_shm;
+//                 std::cout << "ftruncate failed for hugetlbfs, trying
+//                 fallback..." << std::endl; perror("ftruncate64 on
+//                 hugetlbfs"); close(fd); unlink(hugepage_path.c_str()); goto
+//                 fallback_to_shm;
 //             }
 //         }
 
 //         // mmap the huge page file (no MAP_HUGETLB needed with hugetlbfs!)
 //         ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 //         close(fd);
-        
+
 //         if (ptr != MAP_FAILED) {
-//             std::cout << "✓ Successfully allocated " << size/(1024*1024*1024) 
+//             std::cout << "✓ Successfully allocated " << size/(1024*1024*1024)
 //                       << "GB using hugetlbfs (2MB pages)!" << std::endl;
 //             using_huge_pages = true;
 //             goto success;
 //         } else {
-//             std::cout << "mmap failed on hugetlbfs, trying fallback..." << std::endl;
-//             perror("mmap on hugetlbfs");
-//             if (create) unlink(hugepage_path.c_str());
+//             std::cout << "mmap failed on hugetlbfs, trying fallback..." <<
+//             std::endl; perror("mmap on hugetlbfs"); if (create)
+//             unlink(hugepage_path.c_str());
 //         }
 //     } else {
-//         std::cout << "Cannot open hugetlbfs file (normal if not mounted), trying fallback..." << std::endl;
+//         std::cout << "Cannot open hugetlbfs file (normal if not mounted),
+//         trying fallback..." << std::endl;
 //     }
 
 // fallback_to_shm:
-//     // Method 2: Try shm_open with MAP_HUGETLB (will likely fail but worth trying)
-//     std::cout << "Trying shm_open with MAP_HUGETLB..." << std::endl;
+//     // Method 2: Try shm_open with MAP_HUGETLB (will likely fail but worth
+//     trying) std::cout << "Trying shm_open with MAP_HUGETLB..." << std::endl;
 //     fd = shm_open(shm_name.c_str(), flags, 0666);
 //     if (fd < 0) {
 //         throw std::runtime_error("shm_open failed for " + shm_name);
@@ -745,35 +843,38 @@ success:
 //     }
 
 //     // Try MAP_HUGETLB with shm_open (will probably fail)
-//     ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, 
+//     ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
 //                MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd, 0);
-    
+
 //     if (ptr != MAP_FAILED) {
-//         std::cout << "✓ Successfully allocated " << size/(1024*1024*1024) 
+//         std::cout << "✓ Successfully allocated " << size/(1024*1024*1024)
 //                   << "GB using shm_open + MAP_HUGETLB!" << std::endl;
 //         using_huge_pages = true;
 //         close(fd);
 //         goto success;
 //     } else {
-//         std::cout << "shm_open + MAP_HUGETLB failed (expected), trying regular pages..." << std::endl;
-//         perror("mmap with MAP_HUGETLB on shm_open");
-        
+//         std::cout << "shm_open + MAP_HUGETLB failed (expected), trying
+//         regular pages..." << std::endl; perror("mmap with MAP_HUGETLB on
+//         shm_open");
+
 //         // Method 3: Fallback to regular pages with huge page hints
 //         ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 //         close(fd);
-        
+
 //         if (ptr == MAP_FAILED) {
-//             throw std::runtime_error("All mmap methods failed for " + shm_name);
+//             throw std::runtime_error("All mmap methods failed for " +
+//             shm_name);
 //         }
-        
+
 //         if (create) {
 //             // Use madvise hint for transparent huge pages
 //             int ret = madvise(ptr, size, MADV_HUGEPAGE);
 //             if (ret == 0) {
-//                 std::cout << "✓ Successfully hinted for transparent huge pages (may use 2MB pages)" << std::endl;
+//                 std::cout << "✓ Successfully hinted for transparent huge
+//                 pages (may use 2MB pages)" << std::endl;
 //             } else {
-//                 std::cout << "madvise(MADV_HUGEPAGE) failed, using regular 4KB pages" << std::endl;
-//                 perror("madvise");
+//                 std::cout << "madvise(MADV_HUGEPAGE) failed, using regular
+//                 4KB pages" << std::endl; perror("madvise");
 //             }
 //         }
 //     }
@@ -782,10 +883,12 @@ success:
 //     if (create) {
 //         if (numa_available() >= 0) {
 //             int num_nodes = numa_num_configured_nodes();
-//             std::cout << "NUMA available with " << num_nodes << " nodes." << std::endl;
-            
+//             std::cout << "NUMA available with " << num_nodes << " nodes." <<
+//             std::endl;
+
 //             if (num_nodes >= 2) {
-//                 std::cout << "Interleaving memory across NUMA nodes 0 and 1." << std::endl;
+//                 std::cout << "Interleaving memory across NUMA nodes 0 and 1."
+//                 << std::endl;
 
 //                 // Create proper nodemask using numa library functions
 //                 struct bitmask* nodemask = numa_allocate_nodemask();
@@ -799,54 +902,61 @@ success:
 //                     numa_bitmask_setbit(nodemask, 1);
 
 //                     // Use set_mempolicy for the current process/thread
-//                     int ret = set_mempolicy(MPOL_INTERLEAVE, 
-//                                           nodemask->maskp, 
+//                     int ret = set_mempolicy(MPOL_INTERLEAVE,
+//                                           nodemask->maskp,
 //                                           nodemask->size + 1);
 //                     if (ret != 0) {
 //                         perror("set_mempolicy(MPOL_INTERLEAVE)");
 //                     } else {
-//                         std::cout << "✓ NUMA memory policy set successfully" << std::endl;
+//                         std::cout << "✓ NUMA memory policy set successfully"
+//                         << std::endl;
 //                     }
 
 //                     numa_free_nodemask(nodemask);
 //                 }
 //             } else {
-//                 std::cout << "Only " << num_nodes << " NUMA node(s) available, skipping interleaving." << std::endl;
+//                 std::cout << "Only " << num_nodes << " NUMA node(s)
+//                 available, skipping interleaving." << std::endl;
 //             }
 
 //             // Touch pages to enforce actual allocation
-//             std::cout << "Touching pages to enforce allocation..." << std::endl;
-//             auto touch_start = std::chrono::high_resolution_clock::now();
-            
+//             std::cout << "Touching pages to enforce allocation..." <<
+//             std::endl; auto touch_start =
+//             std::chrono::high_resolution_clock::now();
+
 //             // Use appropriate page size based on allocation method
-//             long page_size = using_huge_pages ? (2 * 1024 * 1024) : sysconf(_SC_PAGESIZE);
-//             std::cout << "Using page size: " << page_size / 1024 << " KB" << std::endl;
-            
+//             long page_size = using_huge_pages ? (2 * 1024 * 1024) :
+//             sysconf(_SC_PAGESIZE); std::cout << "Using page size: " <<
+//             page_size / 1024 << " KB" << std::endl;
+
 //             volatile char* p = reinterpret_cast<volatile char*>(ptr);
 //             int64_t pages_touched = 0;
-            
+
 //             for (int64_t i = 0; i < size; i += page_size) {
 //                 p[i] = 0;
 //                 pages_touched++;
-                
+
 //                 // Progress indicator for large allocations
 //                 if (pages_touched % 10000 == 0) {
 //                     double progress = (double)i / size * 100.0;
-//                     std::cout << "Page touching progress: " << std::fixed << std::setprecision(1) 
+//                     std::cout << "Page touching progress: " << std::fixed <<
+//                     std::setprecision(1)
 //                               << progress << "%" << std::endl;
 //                 }
 //             }
-            
+
 //             // Touch the last page if size is not page-aligned
 //             if (size > 0) {
 //                 p[size - 1] = 0;
 //                 pages_touched++;
 //             }
-            
+
 //             auto touch_end = std::chrono::high_resolution_clock::now();
-//             auto touch_duration = std::chrono::duration_cast<std::chrono::seconds>(touch_end - touch_start);
-            
-//             std::cout << "✓ Touched " << pages_touched << " pages in " 
+//             auto touch_duration =
+//             std::chrono::duration_cast<std::chrono::seconds>(touch_end -
+//             touch_start);
+
+//             std::cout << "✓ Touched " << pages_touched << " pages in "
 //                       << touch_duration.count() << " seconds" << std::endl;
 //         } else {
 //             std::cout << "NUMA not available on this system." << std::endl;
@@ -854,14 +964,17 @@ success:
 //     }
 
 //     // Register with CUDA - measure performance
-//     std::cout << "Starting cudaHostRegister for " << size/(1024*1024*1024) << "GB..." << std::endl;
-//     auto cuda_start = std::chrono::high_resolution_clock::now();
-    
+//     std::cout << "Starting cudaHostRegister for " << size/(1024*1024*1024) <<
+//     "GB..." << std::endl; auto cuda_start =
+//     std::chrono::high_resolution_clock::now();
+
 //     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
-    
+
 //     auto cuda_end = std::chrono::high_resolution_clock::now();
-//     auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cuda_end - cuda_start);
-    
+//     auto cuda_duration =
+//     std::chrono::duration_cast<std::chrono::milliseconds>(cuda_end -
+//     cuda_start);
+
 //     if (err != cudaSuccess) {
 //         munmap(ptr, size);
 //         // Clean up hugetlbfs file if we created it
@@ -869,16 +982,19 @@ success:
 //             unlink(hugepage_path.c_str());
 //         }
 //         throw std::runtime_error(
-//             std::string("cudaHostRegister failed: ") + cudaGetErrorString(err));
+//             std::string("cudaHostRegister failed: ") +
+//             cudaGetErrorString(err));
 //     }
-    
-//     std::cout << "✓ cudaHostRegister completed in " << cuda_duration.count() 
-//               << " milliseconds (" << cuda_duration.count()/1000.0 << " seconds)" << std::endl;
-    
+
+//     std::cout << "✓ cudaHostRegister completed in " << cuda_duration.count()
+//               << " milliseconds (" << cuda_duration.count()/1000.0 << "
+//               seconds)" << std::endl;
+
 //     // Verify huge page usage
 //     if (create && using_huge_pages) {
 //         std::cout << "\nChecking huge page consumption..." << std::endl;
-//         system("cat /proc/meminfo | grep -i 'HugePages_Free\\|HugePages_Total'");
+//         system("cat /proc/meminfo | grep -i
+//         'HugePages_Free\\|HugePages_Total'");
 //     }
 
 //     return ptr;
@@ -900,31 +1016,34 @@ success:
 //         }
 //     }
 
-//     // void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-//     // void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, 
-//     //     MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd, 0);   
+//     // void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+//     fd, 0);
+//     // void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+//     //     MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd, 0);
 //     // Try huge pages first
-//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, 
+//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
 //                      MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd, 0);
-    
+
 //     if (ptr == MAP_FAILED) {
-//         std::cout << "Huge page allocation failed, trying regular pages..." << std::endl;
-//         perror("mmap with huge pages");
-        
+//         std::cout << "Huge page allocation failed, trying regular pages..."
+//         << std::endl; perror("mmap with huge pages");
+
 //         // Fallback to regular pages
 //         ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        
+
 //         if (ptr != MAP_FAILED && create) {
 //             // Use madvise hint for regular pages
 //             int ret = madvise(ptr, size, MADV_HUGEPAGE);
 //             if (ret == 0) {
-//                 std::cout << "Successfully hinted for huge pages" << std::endl;
+//                 std::cout << "Successfully hinted for huge pages" <<
+//                 std::endl;
 //             } else {
-//                 perror("madvise(MADV_HUGEPAGE) failed, continuing with regular pages");
+//                 perror("madvise(MADV_HUGEPAGE) failed, continuing with
+//                 regular pages");
 //             }
 //         }
 //     } else {
-//         std::cout << "Successfully allocated " << size/(1024*1024*1024) 
+//         std::cout << "Successfully allocated " << size/(1024*1024*1024)
 //                   << "GB using 2MB huge pages!" << std::endl;
 //     }
 //     close(fd);
@@ -935,10 +1054,12 @@ success:
 //     if (create) {
 //         if (numa_available() >= 0) {
 //             int num_nodes = numa_num_configured_nodes();
-//             std::cout << "NUMA available with " << num_nodes << " nodes." << std::endl;
-            
+//             std::cout << "NUMA available with " << num_nodes << " nodes." <<
+//             std::endl;
+
 //             if (num_nodes >= 2) {
-//                 std::cout << "Interleaving memory across NUMA nodes 0 and 1." << std::endl;
+//                 std::cout << "Interleaving memory across NUMA nodes 0 and 1."
+//                 << std::endl;
 
 //                 // Create proper nodemask using numa library functions
 //                 struct bitmask* nodemask = numa_allocate_nodemask();
@@ -952,16 +1073,17 @@ success:
 //                     numa_bitmask_setbit(nodemask, 1);
 
 //                     // Use set_mempolicy for the current process/thread
-//                     int ret = set_mempolicy(MPOL_INTERLEAVE, 
-//                                           nodemask->maskp, 
+//                     int ret = set_mempolicy(MPOL_INTERLEAVE,
+//                                           nodemask->maskp,
 //                                           nodemask->size + 1);
 //                     if (ret != 0) {
 //                         perror("set_mempolicy(MPOL_INTERLEAVE)");
 //                     }
 
 //                     // Alternative: use mbind with correct parameters
-//                     // int ret = mbind(ptr, size, MPOL_INTERLEAVE, 
-//                     //                nodemask->maskp, nodemask->size + 1, 0);
+//                     // int ret = mbind(ptr, size, MPOL_INTERLEAVE,
+//                     //                nodemask->maskp, nodemask->size + 1,
+//                     0);
 //                     // if (ret != 0) {
 //                     //     perror("mbind(MPOL_INTERLEAVE)");
 //                     // }
@@ -969,7 +1091,8 @@ success:
 //                     numa_free_nodemask(nodemask);
 //                 }
 //             } else {
-//                 std::cout << "Only " << num_nodes << " NUMA node(s) available, skipping interleaving." << std::endl;
+//                 std::cout << "Only " << num_nodes << " NUMA node(s)
+//                 available, skipping interleaving." << std::endl;
 //             }
 
 //             // Touch pages to enforce actual allocation
@@ -980,7 +1103,7 @@ success:
 //             for (int64_t i = 0; i < size; i += page_size) {
 //                 p[i] = 0;
 //             }
-            
+
 //             // Touch the last page if size is not page-aligned
 //             if (size > 0) {
 //                 p[size - 1] = 0;
@@ -1011,15 +1134,17 @@ void verify_numa_allocation(void* ptr, size_t size) {
     // Check a few sample pages
     long page_size = sysconf(_SC_PAGESIZE);
     int num_samples = std::min(10L, (long)(size / page_size));
-    
-    std::cout << "Verifying NUMA allocation for " << num_samples << " sample pages:" << std::endl;
-    
+
+    std::cout << "Verifying NUMA allocation for " << num_samples
+              << " sample pages:" << std::endl;
+
     for (int i = 0; i < num_samples; i++) {
         void* page_addr = (char*)ptr + (i * size / num_samples);
         int node = -1;
-        
-        if (get_mempolicy(&node, nullptr, 0, page_addr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
-            std::cout << "Page at offset " << (i * size / num_samples) 
+
+        if (get_mempolicy(&node, nullptr, 0, page_addr,
+                          MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+            std::cout << "Page at offset " << (i * size / num_samples)
                       << " is on NUMA node " << node << std::endl;
         } else {
             perror("get_mempolicy failed");
@@ -1043,15 +1168,15 @@ void verify_numa_allocation(void* ptr, size_t size) {
 //         }
 //     }
 
-//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-//     close(fd);
-//     if (ptr == MAP_FAILED) {
+//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+//     0); close(fd); if (ptr == MAP_FAILED) {
 //         throw std::runtime_error("mmap failed for " + shm_name);
 //     }
 
 //     if (create) {
 //         if (numa_available() >= 0) {
-//             std::cout << "Interleaving memory across NUMA nodes." << std::endl;
+//             std::cout << "Interleaving memory across NUMA nodes." <<
+//             std::endl;
 
 //             // Allocate nodemask and get maxnode
 //             unsigned long nodemask = (1UL << 0) | (1UL << 1);
@@ -1117,21 +1242,21 @@ void verify_numa_allocation(void* ptr, size_t size) {
 //         std::cout << "Number of NUMA nodes: " << num_nodes << std::endl;
 //         // If NUMA is available, interleave pages between node 0 and node 1
 //         if (numa_available() >= 0) {
-//             std::cout << "Interleaving memory across NUMA nodes." << std::endl;
-//             unsigned long nodemask = (1UL << 0) | (1UL << 1);
-//             int ret = mbind(ptr, size,
+//             std::cout << "Interleaving memory across NUMA nodes." <<
+//             std::endl; unsigned long nodemask = (1UL << 0) | (1UL << 1); int
+//             ret = mbind(ptr, size,
 //                             MPOL_INTERLEAVE,
 //                             &nodemask,
 //                             /* maxnode = */ 8 * sizeof(nodemask),
 //                             /* flags = */ 0);
 //             if (ret != 0) {
-//                 // non-fatal: we'll still fall back to default if interleave fails
-//                 perror("mbind(MPOL_INTERLEAVE)");
+//                 // non-fatal: we'll still fall back to default if interleave
+//                 fails perror("mbind(MPOL_INTERLEAVE)");
 //             }
 //         }
 //     }
 // // #endif
-    
+
 //     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
 //     if (err != cudaSuccess) {
 //         munmap(ptr, size);
@@ -1143,7 +1268,8 @@ void verify_numa_allocation(void* ptr, size_t size) {
 //     return ptr;
 // }
 
-// void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
+// void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t
+// size,
 //                                     bool create) {
 //     int flags = O_RDWR | (create ? O_CREAT : 0);
 //     // Open (or create) the shared memory object
@@ -1166,8 +1292,8 @@ void verify_numa_allocation(void* ptr, size_t size) {
 //     // First map the shared memory into the process address space
 //     // void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED |
 //     // MAP_LOCKED, fd, 0);
-//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-//     close(fd);  // fd no longer needed after mapping
+//     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+//     0); close(fd);  // fd no longer needed after mapping
 
 //     if (ptr == MAP_FAILED) {
 //         throw std::runtime_error("mmap failed for " + shm_name);
@@ -1181,7 +1307,8 @@ void verify_numa_allocation(void* ptr, size_t size) {
 //     // // Register the memory in blocks of 32GB
 //     // for (int64_t i = 0; i < size; i += block_size) {
 //     //     cudaError_t err = cudaHostRegister((char*)ptr + i,
-//     //     std::min(block_size, size - i), cudaHostRegisterDefault); if (err !=
+//     //     std::min(block_size, size - i), cudaHostRegisterDefault); if (err
+//     !=
 //     //     cudaSuccess) {
 //     //         munmap(ptr, size);
 //     //         throw std::runtime_error("cudaHostRegister failed: " +

@@ -71,7 +71,6 @@ class HtoD_Engine {
         std::unordered_map<std::string, std::vector<std::string>>&
             weight_copy_tasks);
     void stop_h2d_worker();
-    
 
    private:
     /* Template */
@@ -84,7 +83,7 @@ class HtoD_Engine {
     std::condition_variable cv_;
     py::module p2p_tensor_copy_module;
     std::unordered_map<std::string, std::unordered_map<std::string, void*>>
-                       global_device_experts_ptrs_;
+        global_device_experts_ptrs_;
     std::unordered_map<std::string, int64_t> expert_location_map_;
 
     /* Need to query kv storage and weights storage. */
