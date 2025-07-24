@@ -75,6 +75,21 @@ cd FlashMLA
 python setup.py install
 ```
 
+For Hooper user, please install DeepGEMM refer to https://github.com/deepseek-ai/DeepGEMM
+```bash
+git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
+cd DeepGEMM
+cat develop.sh
+./develop.sh
+cat install.sh
+./install.sh
+```
+
+Currently, MoE-Gen depends on torch==2.70+cu128
+```bash
+pip install torch==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+```
+
 ### Install MoE-Gen from codebase
 ```bash
 git clone git@github.com:EfficientMoE/MoE-Gen.git
