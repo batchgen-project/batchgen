@@ -853,7 +853,7 @@ class MoE_Gen:
             for model_batch_idx in tqdm(
                 range(len(self.model_batches)), desc="Model Batch"
             ):
-                # dist.barrier()
+                dist.barrier()
                 self._config_prefill()
                 prefill_start_time = time.perf_counter()
                 with torch.inference_mode():
