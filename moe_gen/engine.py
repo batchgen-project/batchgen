@@ -1696,8 +1696,8 @@ class MoE_Gen:
         os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
         try:
             dist.init_process_group(
-                # backend="NCCL",
-                backend="gloo",
+                backend="nccl",
+                # backend="gloo",
                 init_method="tcp://" + self.dist_init_addr,
                 world_size=self.world_size,
                 rank = self.global_rank,
