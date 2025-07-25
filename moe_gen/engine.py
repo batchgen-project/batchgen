@@ -853,7 +853,7 @@ class MoE_Gen:
             for model_batch_idx in tqdm(
                 range(len(self.model_batches)), desc="Model Batch"
             ):
-                # dist.barrier()
+                dist.barrier()
                 self._config_prefill()
                 prefill_start_time = time.perf_counter()
                 with torch.inference_mode():
@@ -932,7 +932,7 @@ class MoE_Gen:
                         f"Rank: {self.rank} Decoding configuration done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
                     )
                 
-                # dist.barrier()
+                dist.barrier()
                 torch.cuda.empty_cache()
                 decoding_start_time = time.perf_counter()
                 with torch.inference_mode():
@@ -959,7 +959,7 @@ class MoE_Gen:
                 logging.info(
                     f"Rank: {self.rank} Device torch free memory before decoding: {free_memory} GB / {total_memory} GB"
                 )
-            # dist.barrier()
+            dist.barrier()
             torch.cuda.empty_cache()
             decoding_start_time = time.perf_counter()
             with torch.inference_mode():
@@ -969,7 +969,7 @@ class MoE_Gen:
 
 
         
-        # dist.barrier()
+        dist.barrier()
         self.model = None 
         torch.cuda.empty_cache()
         dist.destroy_process_group()
@@ -1705,6 +1705,7 @@ class MoE_Gen:
                 timeout=timeout,
             )
         except RuntimeError as e:
+            logging.error(f"Failed to initialize torch distributed: {e}")
             raise
     
     
