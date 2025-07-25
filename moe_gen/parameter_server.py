@@ -400,8 +400,34 @@ class ParameterServer:
 		"""Handle shutdown signals"""
 		logging.info(f"Received signal {signum}, shutting down...")
 		# clean-up /dev/shm or /dev/hugepages
-		logging.info("unlink /dev/hugepages/{self.model_info.get('shm_name')}")
-		os.unlink(os.path.join("/dev/hugepages", self.model_info.get('shm_name')))
+		# if self.model_info['shm_name'] is not None, unlink it.
+		if self.model_info.get('shm_name'):
+			try:
+				shm_name = self.model_info.get('shm_name')
+				# Remove leading slash if present to avoid double slash in path
+				clean_name = shm_name.lstrip('/')
+				shm_path = os.path.join("/dev/hugepages", clean_name)
+				
+				logging.info(f"Removing shared memory file {shm_path}")
+				
+				if os.path.exists(shm_path):
+					os.remove(shm_path)
+					logging.info(f"Successfully removed {shm_path}")
+				else:
+					logging.info(f"Shared memory file {shm_path} already cleaned up")
+			except Exception as e:
+				logging.warning(f"Shared memory cleanup not properly, you may need to manually clear by `rm -f /dev/hugepages/{shm_path}`: {e}")
+
+		# rm -rf Writing large state dict to file:
+		if hasattr(self, 'skeleton_state_dict_file') and self.skeleton_state_dict_file:
+			try:
+				if os.path.exists(self.skeleton_state_dict_file):
+					logging.info(f"Removing skeleton state dict temporary file: {self.skeleton_state_dict_file}")
+					os.remove(self.skeleton_state_dict_file)
+					self.skeleton_state_dict_file = None
+			except Exception as e:
+				logging.warning(f"Deleting emoving skeleton state dict temporary file not properly, please manually clean ./shared_memory_backup/: {e}")
+
 
 		self.running = False
 	

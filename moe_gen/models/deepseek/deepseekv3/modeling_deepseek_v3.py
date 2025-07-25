@@ -605,29 +605,24 @@ class MoEGate(nn.Module):
 				torch.empty((self.n_routed_experts))
 			)
 		self.reset_parameters()
-		self.device = torch.device("cuda", dist.get_rank() % torch.cuda.device_count())
-		# self.decoding_forward = torch.compile(
-		# 	self._decoding_forward, 
-		# 	mode="max-autotune-no-cudagraphs", 
-		# 	# mode="reduce-overhead",
-		# 	backend="inductor",
-		# 	disable=False)
-		self.input_buf = torch.empty(128,1,7168, dtype=torch.bfloat16, device=self.device)
+		# self.device = torch.device("cuda", dist.get_rank() % torch.cuda.device_count())
+		# self.input_buf = torch.empty(128,1,7168, dtype=torch.bfloat16, device=self.device)
 
 	@torch.inference_mode()
 	def warmup(self):	
-		with torch.inference_mode():
-			for t in range(5):
-				_ = compiled_moe_gate_forward(
-					self.input_buf, 
-					self.weight,
-					self.e_score_correction_bias,
-					self.n_group, 
-					self.topk_group, 
-					self.n_routed_experts, 
-					self.top_k, 
-					self.routed_scaling_factor
-				)
+		# with torch.inference_mode():
+		# 	for t in range(5):
+		# 		_ = compiled_moe_gate_forward(
+		# 			self.input_buf, 
+		# 			self.weight,
+		# 			self.e_score_correction_bias,
+		# 			self.n_group, 
+		# 			self.topk_group, 
+		# 			self.n_routed_experts, 
+		# 			self.top_k, 
+		# 			self.routed_scaling_factor
+		# 		)
+		pass
 
 	def reset_parameters(self) -> None:
 		import torch.nn.init as init
