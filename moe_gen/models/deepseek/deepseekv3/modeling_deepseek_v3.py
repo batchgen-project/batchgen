@@ -1141,12 +1141,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.comm_stream = torch.cuda.Stream(device=self.device)
 
 		# --- Pre-allocate Buffers. --------------------------------
-		self.num_tokens_per_rank = 8		# This is a placeholder, adjust as needed
-		# global_num_tokens = self.num_tokens_per_rank * self.world_size
-		# K = self.num_experts_per_tok
-		# self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
-		# self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
-	
+		self.num_tokens_per_rank = 48		# This is a placeholder, adjust as needed
+		global_num_tokens = self.num_tokens_per_rank * self.world_size
+		K = self.num_experts_per_tok
+		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
+		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
+
 	def init(self, num_tokens_per_rank):
 		# self.num_tokens_per_rank = num_tokens_per_rank
 		
@@ -1329,13 +1329,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	def moe_infer_allgather_allreduce_opt(self, x):
 		num_tokens, hidden_size = x.shape
 		# Fix
-		self.num_tokens_per_rank = 48
-		self.num_tokens_per_rank = min(self.num_tokens_per_rank, triton.next_power_of_2(num_tokens))
-		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
-		global_num_tokens = self.num_tokens_per_rank * self.world_size
-		K = self.num_experts_per_tok
-		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
-		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
+		# self.num_tokens_per_rank = 48
+		# self.num_tokens_per_rank = min(self.num_tokens_per_rank, triton.next_power_of_2(num_tokens))
+		# # logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
+		# global_num_tokens = self.num_tokens_per_rank * self.world_size
+		# K = self.num_experts_per_tok
+		# self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
+		# self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
 		
 
 		device = x.device
