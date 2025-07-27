@@ -1332,7 +1332,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
-		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, vice=self.device).repeat_interleave(K)
+		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
 		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
 		
 
