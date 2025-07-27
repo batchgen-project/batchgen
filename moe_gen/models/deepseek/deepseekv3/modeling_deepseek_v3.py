@@ -1360,6 +1360,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			global_x, topk_idx, self.token_idx, self.topk_pos,
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
+		logger.warning_once(f"input_x shape is {input_x.shape}, input_eids shape is {input_eids.shape}, "
+							f"global_indices shape is {global_indices.shape}, token_topk_pos shape is {token_topk_pos.shape}")
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
