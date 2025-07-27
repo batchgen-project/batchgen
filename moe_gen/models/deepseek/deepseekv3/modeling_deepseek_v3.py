@@ -1092,6 +1092,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		return res
 
 from moe_gen.moe.token_dispatcher.benchmark import FusedMoETokenDispatch
+from moe_gen.moe.expert_bincount.benchmark import FusedExpertBincount
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1328,7 +1329,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	def moe_infer_allgather_allreduce_opt(self, x):
 		num_tokens, hidden_size = x.shape
 		# Fix
-		self.num_tokens_per_rank = 48
+		self.num_tokens_per_rank = 8
 		self.num_tokens_per_rank = min(self.num_tokens_per_rank, triton.next_power_of_2(num_tokens))
 		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
@@ -1379,23 +1380,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return final_output
 	
 	def expert_bincount(self, eids, routed_expert_start_idx, experts_per_rank, device):
-		# # Adjust expert IDs and compute bincount
-		# eids_adjusted = eids - routed_expert_start_idx  
-		# counts = torch.bincount(eids_adjusted, minlength=experts_per_rank)
-		
-		# nonzero_mask = counts > 0
-		# activated_group_idx = torch.arange(experts_per_rank, device=device, dtype=torch.int32)[nonzero_mask]
-		# group_size = counts[nonzero_mask].to(torch.int32)  # Convert to int32 for consistency
-		
-		# # Compute start indices using cumsum
-		# if len(group_size) > 0:
-		# 	group_start_indices = torch.zeros(len(group_size), dtype=torch.int32, device=device)
-		# 	if len(group_size) > 1:
-		# 		group_start_indices[1:] = torch.cumsum(group_size[:-1], dim=0)
-		# else:
-		# 	group_start_indices = torch.empty(0, dtype=torch.int32, device=device)
-		
-		# return group_size, activated_group_idx, group_start_indices
 		eids_adjusted = eids - routed_expert_start_idx  
 		counts = torch.bincount(eids_adjusted, minlength=experts_per_rank)
 		
@@ -1410,15 +1394,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return group_size, activated_group_idx, group_start_indices
 
 	def grouped_dequant_moe_fp8(self, x, eids):
-		# This function assumes that recv_x and recv_eid are already sorted by expert id
-		# eids = eids - self.routed_expert_start_idx
-		# counts = torch.bincount(eids, minlength=self.experts_per_rank)
-		# group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)	
-		# group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=self.device)
-		# activated_group_idx = torch.tensor([idx for idx, _ in group_sizes], dtype=torch.int32, device=self.device)
-		# group_start_indices = torch.roll(torch.cumsum(group_size, dim=0), 1)
-		# group_start_indices[0] = 0  # The first group starts at index 0
-		group_size, activated_group_idx, group_start_indices = self.expert_bincount(
+		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
+		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+		# )
+		bincounter = FusedExpertBincount(use_cuda_if_available=True)
+		group_size, activated_group_idx, group_start_indices = bincounter(
 			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		)
 
