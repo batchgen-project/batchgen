@@ -1175,7 +1175,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
 		
-		out = self.moe_infer_allgather_allreduce_opt(hidden_states)
+		out = self.moe_infer_allgather_allreduce(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
@@ -1254,7 +1254,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	def moe_infer_allgather_allreduce(self, x):
 		num_tokens, hidden_size = x.shape
 		# Fix
-		self.num_tokens_per_rank = 64
+		self.num_tokens_per_rank = 8
 		self.num_tokens_per_rank = min(self.num_tokens_per_rank, triton.next_power_of_2(num_tokens))
 		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
