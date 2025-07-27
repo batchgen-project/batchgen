@@ -175,7 +175,7 @@ def benchmark_dispatch(num_tokens=8192, hidden_size=4096, K=2, num_experts=64, n
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Create test data
-    global_x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.float16)
+    global_x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
     topk_idx = torch.randint(0, num_experts, (num_tokens, K), device=device, dtype=torch.int32)
     
     # Create token_idx and topk_pos (as in original implementation)

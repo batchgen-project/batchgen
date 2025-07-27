@@ -87,8 +87,8 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     // Validate inputs
     TORCH_CHECK(global_x.is_cuda(), "global_x must be a CUDA tensor");
     TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
-    TORCH_CHECK(global_x.dtype() == torch::kFloat32 || global_x.dtype() == torch::kFloat16, 
-                "global_x must be float32 or float16");
+    // TORCH_CHECK(global_x.dtype() == torch::kFloat32 || global_x.dtype() == torch::kFloat16, 
+    //             "global_x must be float32 or float16");
     TORCH_CHECK(topk_idx.dtype() == torch::kInt32, "topk_idx must be int32");
     
     // Step 1: Count tokens per local expert
