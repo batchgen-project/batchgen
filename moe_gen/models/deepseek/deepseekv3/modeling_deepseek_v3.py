@@ -1365,12 +1365,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
-		# self.local_expert_results.zero_()  # Reset results buffer
+		logger.warning_once(f"res shape is {res.shape}, dtype is {res.dtype}")
 		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		 									 device=self.device, dtype=torch.bfloat16)
 		global_results[global_indices, token_topk_pos, :] = res
 		weighted_output = global_results * topk_weight.unsqueeze(-1)
 		global_results = weighted_output.sum(dim=1)
+		
+		logger.warning_once(f"global_results shape is {global_results.shape}, dtype is {global_results.dtype}")
 
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
