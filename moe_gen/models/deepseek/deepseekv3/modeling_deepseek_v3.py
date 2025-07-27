@@ -2982,24 +2982,24 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 		)
 		self.comm = None
 		if self.config.phase == "decoding":
-			# from moe_gen.distributed.utils import StatelessProcessGroup
-			# from moe_gen.distributed.device_communicators.pynccl import PyNcclCommunicator
-			# self.rank = dist.get_rank()
-			# self.world_size = dist.get_world_size()
-			# device = torch.device("cuda", self.rank % torch.cuda.device_count())
-			# group = StatelessProcessGroup.create(
-			# 	host="29.194.13.154",
-			# 	port=20001,
-			# 	rank=self.rank,
-			# 	world_size=self.world_size,
-			# 	data_expiration_seconds=6000,
-			# )
-			# self.comm = PyNcclCommunicator(
-			# 	group=group,
-			# 	device=device
-			# )		
-			# 
-			pass		
+			from moe_gen.distributed.utils import StatelessProcessGroup
+			from moe_gen.distributed.device_communicators.pynccl import PyNcclCommunicator
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+			device = torch.device("cuda", self.rank % torch.cuda.device_count())
+			group = StatelessProcessGroup.create(
+				host="29.194.13.154",
+				port=20001,
+				rank=self.rank,
+				world_size=self.world_size,
+				data_expiration_seconds=6000,
+			)
+			self.comm = PyNcclCommunicator(
+				group=group,
+				device=device
+			)		
+			
+				
 	
 		# if self.config.phase == "decoding":
 		# 	self.rank = dist.get_rank()
