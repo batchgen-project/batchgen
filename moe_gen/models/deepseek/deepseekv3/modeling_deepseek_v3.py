@@ -1328,7 +1328,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	def moe_infer_allgather_allreduce_opt(self, x):
 		num_tokens, hidden_size = x.shape
 		# Fix
-		self.num_tokens_per_rank = 8
+		self.num_tokens_per_rank = 48
 		self.num_tokens_per_rank = min(self.num_tokens_per_rank, triton.next_power_of_2(num_tokens))
 		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
