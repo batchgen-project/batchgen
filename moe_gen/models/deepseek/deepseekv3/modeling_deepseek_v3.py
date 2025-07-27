@@ -1348,11 +1348,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
 		topk_idx, topk_weight = self.gate.decoding_forward(global_x)
 		global_x = global_x.squeeze(1)  # Remove the dummy dimension
+		
 
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		from moe_gen.moe.token_dispatcher.benchmark import FusedMoETokenDispatch
 		dispatcher = FusedMoETokenDispatch(use_cuda_if_available=True)
+		logger.warning_once(f"topk_idx dtype is {topk_idx.dtype}, topk_weight dtype is {topk_weight.dtype}")
+		topk_idx = topk_idx.to(torch.int32)
 		input_x, input_eids, global_indices, token_topk_pos = dispatcher(
 			global_x, topk_idx, self.token_idx, self.topk_pos,
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
