@@ -109,6 +109,22 @@ def _get_unpad_data(attention_mask):
 # 		hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 # 		return self.weight * hidden_states.to(input_dtype)
 
+# class DeepseekV3RMSNorm(nn.Module):
+# 	def __init__(self, hidden_size, eps=1e-6):
+# 		"""
+# 		DeepseekV3RMSNorm is equivalent to T5LayerNorm
+# 		"""
+# 		super().__init__()
+# 		self.weight = nn.Parameter(torch.ones(hidden_size))
+# 		self.variance_epsilon = eps
+# 		self.dim = hidden_size
+
+# 	def forward(self, hidden_states):
+# 		# logger.info(f"Hidden states dtype: {hidden_states.dtype}")
+# 		# logger.info(f"Weight dtype: {self.weight.dtype}")
+# 		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
+
+from moe_gen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
 class DeepseekV3RMSNorm(nn.Module):
 	def __init__(self, hidden_size, eps=1e-6):
 		"""
@@ -120,10 +136,8 @@ class DeepseekV3RMSNorm(nn.Module):
 		self.dim = hidden_size
 
 	def forward(self, hidden_states):
-		# logger.info(f"Hidden states dtype: {hidden_states.dtype}")
-		# logger.info(f"Weight dtype: {self.weight.dtype}")
-		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
-
+		# return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
+		return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
@@ -1141,7 +1155,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.comm_stream = torch.cuda.Stream(device=self.device)
 
 		# --- Pre-allocate Buffers. --------------------------------
-		self.num_tokens_per_rank = 48		# This is a placeholder, adjust as needed
+		self.num_tokens_per_rank = 8		# This is a placeholder, adjust as needed
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
 		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
