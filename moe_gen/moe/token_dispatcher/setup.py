@@ -18,6 +18,7 @@ if torch.cuda.is_available():
                     '-Xptxas=-O3',
                     '-Xcompiler=-O3',
                     '--expt-relaxed-constexpr',
+                    '--expt-extended-lambda',  # For bfloat16 support
                 ]
             }
         )
