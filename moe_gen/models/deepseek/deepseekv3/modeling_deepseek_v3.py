@@ -1091,6 +1091,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		)
 		return res
 
+from moe_gen.moe.token_dispatcher.benchmark import FusedMoETokenDispatch
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1352,28 +1353,21 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		from moe_gen.moe.token_dispatcher.benchmark import FusedMoETokenDispatch
 		dispatcher = FusedMoETokenDispatch(use_cuda_if_available=True)
-		logger.warning_once(f"topk_idx dtype is {topk_idx.dtype}, topk_weight dtype is {topk_weight.dtype}")
 		topk_idx = topk_idx.to(torch.int32)
 		input_x, input_eids, global_indices, token_topk_pos = dispatcher(
 			global_x, topk_idx, self.token_idx, self.topk_pos,
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
-		logger.warning_once(f"input_x shape is {input_x.shape}, input_eids shape is {input_eids.shape}, "
-							f"global_indices shape is {global_indices.shape}, token_topk_pos shape is {token_topk_pos.shape}")
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
-		logger.warning_once(f"res shape is {res.shape}, dtype is {res.dtype}")
 		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		 									 device=self.device, dtype=torch.bfloat16)
 		global_results[global_indices, token_topk_pos, :] = res
 		weighted_output = global_results * topk_weight.unsqueeze(-1)
 		global_results = weighted_output.sum(dim=1)
 		
-		logger.warning_once(f"global_results shape is {global_results.shape}, dtype is {global_results.dtype}")
-
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
@@ -1382,7 +1376,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		end_token_ids = start_token_ids + num_tokens
 
 		final_output = global_results[start_token_ids:end_token_ids]
-		logger.warning_once(f"Final output shape is {final_output.shape}, dtype is {final_output.dtype}")
 		return final_output
 	
 	def expert_bincount(self, eids, routed_expert_start_idx, experts_per_rank, device):
