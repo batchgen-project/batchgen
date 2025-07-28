@@ -1155,7 +1155,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.comm_stream = torch.cuda.Stream(device=self.device)
 
 		# --- Pre-allocate Buffers. --------------------------------
-		self.num_tokens_per_rank = 8		# This is a placeholder, adjust as needed
+		self.num_tokens_per_rank = 48		# This is a placeholder, adjust as needed
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
 		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
