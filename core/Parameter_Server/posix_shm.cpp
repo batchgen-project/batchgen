@@ -114,31 +114,38 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     }
     
     const size_t page_size = sysconf(_SC_PAGESIZE);
-    const int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
+    const size_t huge_page_size = 2 * 1024 * 1024;  // 2MB
     
-    logger->info("Allocating shared memory: name={}, size={}MB, aligned={}MB, mode={}", 
-                shm_name, size / (1024*1024), aligned_size / (1024*1024), 
+    // Initially align to regular page size
+    int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
+    
+    logger->info("Allocating shared memory: name={}, size={}MB, mode={}", 
+                shm_name, size / (1024*1024), 
                 create ? "server" : "worker");
     
     void* ptr = nullptr;
     bool using_huge_pages = false;
     
-    // Try hugetlbfs first (most reliable for huge pages)
+    // Try hugetlbfs first
     std::string hugepage_path = "/dev/hugepages/" + shm_name;
     int flags = O_RDWR | (create ? O_CREAT : 0);
     int fd = open(hugepage_path.c_str(), flags, 0666);
     
     if (fd >= 0) {
-        if (create && ftruncate64(fd, aligned_size) == -1) {
+        // For huge pages, align to huge page size
+        int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
+        
+        if (create && ftruncate64(fd, huge_aligned_size) == -1) {
             logger->debug("hugetlbfs ftruncate failed: {}", strerror(errno));
             close(fd);
             unlink(hugepage_path.c_str());
         } else {
-            ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             close(fd);
             
             if (ptr != MAP_FAILED) {
                 using_huge_pages = true;
+                aligned_size = huge_aligned_size;  // Update aligned_size for later use
                 logger->info("Allocated {}GB using hugetlbfs (2MB pages)", 
                            aligned_size / (1024.0*1024.0*1024.0));
             } else if (create) {
@@ -202,7 +209,7 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         auto start_time = std::chrono::high_resolution_clock::now();
         
         const long touch_page_size = using_huge_pages ? (2 * 1024 * 1024) : page_size;
-        const int num_threads = std::min(8, (int)std::thread::hardware_concurrency());
+        const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
         const int64_t chunk_size = size / num_threads;
         
         std::vector<std::thread> threads;
