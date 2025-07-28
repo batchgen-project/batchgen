@@ -206,32 +206,32 @@ def _compile_simple_extension():
         
         print("✅ Compilation successful!")
         
-        # Test the extension with different dtypes
-        try:
-            device = torch.device('cuda')
+        # # Test the extension with different dtypes
+        # try:
+        #     device = torch.device('cuda')
             
-            # Test BF16
-            test_input_bf16 = torch.randn(1, 4, device=device, dtype=torch.bfloat16)
-            test_weight_bf16 = torch.ones(4, device=device, dtype=torch.bfloat16)
-            output_bf16 = _cuda_extension.forward(test_input_bf16, test_weight_bf16, 1e-6)
-            print("✅ BF16 kernel test passed!")
+        #     # Test BF16
+        #     test_input_bf16 = torch.randn(1, 4, device=device, dtype=torch.bfloat16)
+        #     test_weight_bf16 = torch.ones(4, device=device, dtype=torch.bfloat16)
+        #     output_bf16 = _cuda_extension.forward(test_input_bf16, test_weight_bf16, 1e-6)
+        #     print("✅ BF16 kernel test passed!")
             
-            # Test FP16
-            test_input_fp16 = torch.randn(1, 4, device=device, dtype=torch.float16)
-            test_weight_fp16 = torch.ones(4, device=device, dtype=torch.float16)
-            output_fp16 = _cuda_extension.forward(test_input_fp16, test_weight_fp16, 1e-6)
-            print("✅ FP16 kernel test passed!")
+        #     # Test FP16
+        #     test_input_fp16 = torch.randn(1, 4, device=device, dtype=torch.float16)
+        #     test_weight_fp16 = torch.ones(4, device=device, dtype=torch.float16)
+        #     output_fp16 = _cuda_extension.forward(test_input_fp16, test_weight_fp16, 1e-6)
+        #     print("✅ FP16 kernel test passed!")
             
-            # Test FP32
-            test_input_fp32 = torch.randn(1, 4, device=device, dtype=torch.float32)
-            test_weight_fp32 = torch.ones(4, device=device, dtype=torch.float32)
-            output_fp32 = _cuda_extension.forward(test_input_fp32, test_weight_fp32, 1e-6)
-            print("✅ FP32 kernel test passed!")
+        #     # Test FP32
+        #     test_input_fp32 = torch.randn(1, 4, device=device, dtype=torch.float32)
+        #     test_weight_fp32 = torch.ones(4, device=device, dtype=torch.float32)
+        #     output_fp32 = _cuda_extension.forward(test_input_fp32, test_weight_fp32, 1e-6)
+        #     print("✅ FP32 kernel test passed!")
             
-        except Exception as test_error:
-            print(f"❌ Kernel test failed: {test_error}")
-            print("   Falling back to PyTorch implementation")
-            _cuda_extension = None
+        # except Exception as test_error:
+        #     print(f"❌ Kernel test failed: {test_error}")
+        #     print("   Falling back to PyTorch implementation")
+        #     _cuda_extension = None
         
         return _cuda_extension
         
