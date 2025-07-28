@@ -14,6 +14,7 @@ import json
 import pickle
 import struct
 import threading
+import subprocess
 import signal
 import multiprocessing
 from multiprocessing import shared_memory
@@ -226,6 +227,39 @@ class ParameterServer:
 			logging.error(f"Error creating shared memory: {e}")
 			return None
 
+	def config_hugepages(self):
+		"""
+		Configure hugepages for shared memory usage.
+		Call the following commands in python:
+			sysctl -w vm.nr_hugepages=350000
+			cat /proc/meminfo | grep -i huge
+			mkdir -p /dev/hugepages
+			mount -t hugetlbfs none /dev/hugepages
+		"""
+		# Fix: different size for different models.
+		try:
+			commands = [
+				['sysctl', '-w', 'vm.nr_hugepages=350000'],
+				['mkdir', '-p', '/dev/hugepages'],
+				['mount', '-t', 'hugetlbfs', 'none', '/dev/hugepages']
+			]
+			for cmd in commands:
+				logging.info(f"Running command: {' '.join(cmd)}")
+				result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+				if result.stdout:
+					logging.info(f"Command output: {result.stdout.strip()}")
+				if result.stderr:
+					logging.warning(f"Command error: {result.stderr.strip()}")
+		except subprocess.CalledProcessError as e:
+			logging.warning(f"Error configuring hugepages: {e}")
+			logging.warning(f"Command output: {e.output.strip()}")
+			logging.warning(f"Command error: {e.stderr.strip()}")
+			logging.warning(f"Failed to use hugepages, falling back to regular shared memory")
+			
+			
+
+
+	
 	def start(self):
 		"""Start the parameter server"""
 		start_time = time.time()
@@ -234,6 +268,7 @@ class ParameterServer:
 			logging.info(f"Preloading model: {self.initial_model_name}")
 			try:
 				start_time = time.time()
+				self.config_hugepages()
 				self._preload_model(
 					self.initial_model_name,
 					self.hf_cache_dir,
@@ -336,6 +371,21 @@ class ParameterServer:
 				except Exception as e:
 					logging.error(f"Error cleaning up old shared memory segment: {e}")
 			self._old_shm_segments = []
+
+		# clean up huge pages setting
+		try:
+			command = ['sysctl', '-w', 'vm.nr_hugepages=0']
+			logging.info(f"Running command to clean up hugepages: {' '.join(command)}")
+			result = subprocess.run(command, check=True, capture_output=True, text=True)
+			if result.stdout:
+				logging.info(f"Command output: {result.stdout.strip()}")
+			if result.stderr:
+				logging.warning(f"Command error: {result.stderr.strip()}")
+		except subprocess.CalledProcessError as e:
+			logging.warning(f"Error cleaning up hugepages: {e}")
+			logging.warning(f"Command output: {e.output.strip()}")
+			logging.warning(f"Command error: {e.stderr.strip()}")
+			logging.warning("Failed to clean up hugepages, you may need to manually clear by `sysctl -w vm.nr_hugepages=0`")
 		
 		logging.info("Parameter server shutdown complete")
 	
