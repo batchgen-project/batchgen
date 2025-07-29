@@ -96,7 +96,12 @@ if __name__ == "__main__":
 	]
 	queries = []
 	for task_name in task_names:
-		dataset = datasets.load_dataset("/root/.cache/huggingface/datasets/THUDM___long_bench", split="test")
+		dataset = datasets.load_dataset(
+			"/root/.cache/huggingface/datasets/THUDM___long_bench", 
+			name=task_name,
+			split="test",
+			trust_remote_code=True
+		)
 		for q in dataset["context"]:
 			if len(q.split(" ")) >= args.max_input_length:
 				queries.append(q)
