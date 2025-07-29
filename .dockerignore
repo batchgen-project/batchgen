@@ -1,0 +1,36 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.env
+*.env
+
+# Git
+.git
+.gitignore
+
+# Package build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# Tests and docs
+tests/
+docs/
+examples/
+notebooks/
+
+# Editor junk
+*.swp
+.vscode/
+.idea/
+
+# User-specific files
+docker/
+.dockerignore
