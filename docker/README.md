@@ -22,6 +22,17 @@ docker buildx build --progress=plain -f docker/Dockerfile -t moe-gen:<tag> . 2>&
 
 This will display the output in the terminal and also write it to `build.log` for later review.
 
+### Triggering CI Builds
+
+To initiate a CI build for the Docker image and publish it to a container registry, use the following steps:
+
+```bash
+git tag -a <tag> -m "Release <tag>"
+git push origin <tag>
+```
+
+This process creates an annotated tag and pushes it to the remote repository. Pushing the tag typically triggers the CI/CD pipeline, which will build and deploy the Docker image to the specified registry.
+
 ## Contents
 
 - `Dockerfile`: Instructions for building the `moe-gen` image.
