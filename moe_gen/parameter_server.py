@@ -239,7 +239,7 @@ class ParameterServer:
 		# Fix: different size for different models.
 		try:
 			commands = [
-				['sysctl', '-w', 'vm.nr_hugepages=350000'],
+				# ['sysctl', '-w', 'vm.nr_hugepages=350000'],
 				['mkdir', '-p', '/dev/hugepages'],
 				['mount', '-t', 'hugetlbfs', 'none', '/dev/hugepages']
 			]
