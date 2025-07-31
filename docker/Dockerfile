@@ -43,6 +43,19 @@ RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && uv pip install . --no-build-isolation \
     && uv cache clean
 
+# Download LongBench dataset to /root/.cache
+RUN uv pip install datasets==2.16.1 && python -c "\
+from datasets import load_dataset; \
+task_names = [ \
+    '2wikimqa', '2wikimqa_e', 'dureader', 'gov_report', 'gov_report_e', 'hotpotqa', \
+    'hotpotqa_e', 'lcc', 'lcc_e', 'lsht', 'multi_news', 'multi_news_e', 'multifieldqa_en', \
+    'multifieldqa_en_e', 'multifieldqa_zh', 'musique', 'narrativeqa', 'passage_count', \
+    'passage_count_e', 'passage_retrieval_en', 'passage_retrieval_en_e', 'passage_retrieval_zh', \
+    'qasper', 'qasper_e', 'qmsum', 'repobench-p', 'repobench-p_e', 'samsum', 'samsum_e', \
+    'trec', 'trec_e', 'triviaqa', 'triviaqa_e', 'vcsum' \
+]; \
+[load_dataset('THUDM/LongBench', name, split='test') for name in task_names] \
+"
 
 # Install from moe gen source
 COPY . /root/moegen
@@ -50,12 +63,7 @@ COPY . /root/moegen
 RUN uv pip install -e . -v \
     && uv cache clean
 
-RUN apt-get update && apt-get install -y locales \
-    && locale-gen en_US.UTF-8 \
-    && update-locale LANG=en_US.UTF-8
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
-
+    
+    
 
 CMD ["sleep", "infinity"]
