@@ -97,7 +97,7 @@ if __name__ == "__main__":
 	queries = []
 	for task_name in task_names:
 		dataset = datasets.load_dataset(
-			"/root/.cache/huggingface/datasets/THUDM___long_bench", 
+			benchmark_name, 
 			name=task_name,
 			split="test",
 			trust_remote_code=True
