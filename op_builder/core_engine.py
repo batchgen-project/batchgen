@@ -99,7 +99,6 @@ class CoreEngineBuilder(OpBuilder):
             "-ltcmalloc",
             "-lcufile",
             "-lnuma",
-            "-g", # Enable debugging symbols
         ]
 
     def extra_ldflags(self):
