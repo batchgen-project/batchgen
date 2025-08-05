@@ -172,6 +172,9 @@ string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"     "" CMAKE_CUDA_FLAGS "${CMAKE_
 set(SOURCES
     "csrc/common_extension.cc"
     "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/expert_bin_count.cu"
+    "csrc/moe/fused_moe_token_dispatch.cu"
+    "csrc/elementwise/rmsnorm.cu"
 )
 
 # Create the Python module

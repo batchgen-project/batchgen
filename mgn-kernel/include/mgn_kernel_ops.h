@@ -55,3 +55,25 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk,
     int64_t num_fused_shared_experts,
     double routed_scaling_factor);
+
+std::vector<torch::Tensor> expert_bincount_cuda(
+    torch::Tensor eids,
+    int64_t routed_expert_start_idx,
+    int64_t experts_per_rank,
+    torch::Device device);
+
+std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
+    torch::Tensor global_x,
+    torch::Tensor topk_idx,
+    torch::Tensor token_idx,
+    torch::Tensor topk_pos,
+    int64_t routed_expert_start_idx,
+    int64_t routed_expert_end_idx);
+
+/*
+ * From csrc/elementwise
+ */
+torch::Tensor fused_rmsnorm_forward(
+    torch::Tensor input,
+    torch::Tensor weight,
+    double eps = 1e-6);

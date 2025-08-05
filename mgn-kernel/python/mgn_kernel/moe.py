@@ -1,5 +1,6 @@
 import torch
 
+
 def moe_fused_gate(
     input_tensor,
     bias,
@@ -50,4 +51,52 @@ def moe_fused_gate(
         topk,
         num_fused_shared_experts,
         routed_scaling_factor,
+    )
+
+
+def expert_bincount(
+    eid: torch.Tensor,
+    routed_expert_start_idx: int,
+    experts_per_rank: int,
+    device: torch.device,
+):
+    """
+    Count the number of tokens routed to each expert.
+    Args:
+        eid (torch.Tensor): Tensor of expert IDs for each token.
+        routed_expert_start_idx (int): Starting index for routed experts.
+        experts_per_rank (int): Number of experts per rank.
+        device (torch.device): Device to place the output tensor.
+    """
+    return torch.ops.mgn_kernel.expert_bincount.default(
+        eid, routed_expert_start_idx, experts_per_rank, device
+    )
+
+
+def fused_moe_token_dispatch(
+    global_x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    token_idx: torch.Tensor,
+    topk_pos: torch.Tensor,
+    routed_expert_start_idx: int,
+    routed_expert_end_idx: int,
+):
+    """
+    Dispatch tokens to their respective experts based on top-k indices.
+
+    Args:
+        global_x (torch.Tensor): Global input tensor of shape (num_tokens, hidden_size).
+        topk_idx (torch.Tensor): Indices of the top-k experts for each token.
+        token_idx (torch.Tensor): Indices of the tokens.
+        topk_pos (torch.Tensor): Positions of the top-k experts.
+        routed_expert_start_idx (int): Starting index for routed experts.
+        routed_expert_end_idx (int): Ending index for routed experts.
+    """
+    return torch.ops.mgn_kernel.fused_moe_token_dispatch.default(
+        global_x,
+        topk_idx,
+        token_idx,
+        topk_pos,
+        routed_expert_start_idx,
+        routed_expert_end_idx,
     )
