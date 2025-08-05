@@ -98,54 +98,7 @@ def main():
         print("CUDA not available. Installing without CUDA acceleration")
     
     setup(
-        name='fused-rmsnorm',
-        version='1.0.0',
-        author='AI Assistant',
-        author_email='ai@assistant.com',
-        description='Fused CUDA implementation of RMSNorm for efficient deep learning',
-        long_description=read_long_description(),
-        long_description_content_type='text/markdown',
-        url='https://github.com/yourname/fused-rmsnorm',
-        packages=find_packages(),
-        py_modules=['fused_rmsnorm'],
-        ext_modules=ext_modules,
-        cmdclass=cmdclass,
-        install_requires=[
-            'torch>=1.12.0',
-            'numpy>=1.20.0',
-        ],
-        extras_require={
-            'dev': [
-                'pytest>=6.0',
-                'black>=21.0',
-                'isort>=5.0',
-                'flake8>=3.8',
-            ],
-            'benchmark': [
-                'matplotlib>=3.3.0',
-                'seaborn>=0.11.0',
-                'pandas>=1.3.0',
-            ]
-        },
-        python_requires='>=3.8',
-        classifiers=[
-            'Development Status :: 4 - Beta',
-            'Intended Audience :: Developers',
-            'Intended Audience :: Science/Research',
-            'License :: OSI Approved :: MIT License',
-            'Programming Language :: Python :: 3',
-            'Programming Language :: Python :: 3.8',
-            'Programming Language :: Python :: 3.9',
-            'Programming Language :: Python :: 3.10',
-            'Programming Language :: Python :: 3.11',
-            'Programming Language :: C++',
-            'Programming Language :: CUDA',
-            'Topic :: Scientific/Engineering :: Artificial Intelligence',
-            'Topic :: Software Development :: Libraries :: Python Modules',
-        ],
-        keywords='deep-learning, pytorch, cuda, rmsnorm, transformer, optimization',
-        zip_safe=False,
-        include_package_data=True,
+        name='fused-rmsnorm'
     )
 
 if __name__ == '__main__':

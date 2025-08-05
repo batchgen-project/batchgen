@@ -136,7 +136,6 @@ class DeepseekV3RMSNorm(nn.Module):
 		self.dim = hidden_size
 
 	def forward(self, hidden_states):
-		# return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
 		return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
@@ -1105,8 +1104,8 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		)
 		return res
 
-from moe_gen.moe.token_dispatcher.benchmark import FusedMoETokenDispatch
-from moe_gen.moe.expert_bincount.benchmark import FusedExpertBincount
+from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
+from moe_gen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1368,7 +1367,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		dispatcher = FusedMoETokenDispatch(use_cuda_if_available=True)
+		dispatcher = FusedMoETokenPermutation(use_cuda_if_available=True)
 		topk_idx = topk_idx.to(torch.int32)
 		input_x, input_eids, global_indices, token_topk_pos = dispatcher(
 			global_x, topk_idx, self.token_idx, self.topk_pos,
