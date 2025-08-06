@@ -875,28 +875,8 @@ class MoE_Gen:
                 # self.core_engine.create_fake_kv_storage()
                 # self.core_engine.start_h2d_worker()
                 # time.sleep(2)
-                
-
-                # Log allocated memory after prefill
-                # if self.rank == 0:
-                #     allocated_memory = torch.cuda.memory_allocated(self.torch_device)
-                #     logging.info(
-                #         f"Rank: {self.rank} Prefill complete. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
-                #     )
-                #     tensor_mem = []
-                #     torch_total_mem = 0
-                #     for name, param in self.model.named_parameters():   
-                #         tensor_mem.append(
-                #             f"{name}: {param.numel() * param.element_size() / 1024 / 1024:.2f} MB"
-                #         )
-                #         torch_total_mem += (
-                #             param.numel() * param.element_size() / 1024 / 1024
-                #         )
-                #     logging.info(f"Torch total memory: {torch_total_mem:.2f} MB")
-
-
                     
-                self._config_decoding()
+                self._config_decoding(len(new_token))
                 # self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
                 if self.engine_config.Basic_Config.attn_mode == 3:
                     # FULL GPU DECODING MODE.
@@ -946,7 +926,7 @@ class MoE_Gen:
             # For small input batch, some worker might do not have any input.
             # In this case, it only participate in the decoding phase.
             # Todo: 
-            self._config_decoding()
+            self._config_decoding(0)
 
             # Log used memory before decoding
             if self.rank == 0:
