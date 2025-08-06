@@ -1408,7 +1408,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		end_token_ids = start_token_ids + num_tokens
 
 		final_output = global_results[start_token_ids:end_token_ids]
-		return final_output
+		return final_output.to(x.dtype)
 	
 	# def expert_bincount(self, eids, routed_expert_start_idx, experts_per_rank, device):
 	# 	eids_adjusted = eids - routed_expert_start_idx  
