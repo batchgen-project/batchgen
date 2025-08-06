@@ -278,7 +278,7 @@ class Parallel_Strategy_Manager:
 		return self.model, self.weight_copy_task
 
 
-	def pure_gpu_decoding(self):
+	def pure_gpu_decoding(self, padding_bsz):
 		"""
 			Beta 1: Load full mode into GPU.
 			Duplicate attention modules and shared experts in each dp worker.
@@ -326,6 +326,7 @@ class Parallel_Strategy_Manager:
 		self._config_expert_module()
 		self._config_lm_head_hook()
 		self._init_mode_decoding()
+		self._init_decoding_padding_bsz(padding_bsz)
 		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
 		used_memory_gb = used_memory / (1024**3)
 		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
@@ -333,6 +334,19 @@ class Parallel_Strategy_Manager:
 		self.model.to(self.engine_config.Basic_Config.device_torch)
 		self._warmup()
 		return self.model, self.weight_copy_task
+	
+	def _init_decoding_padding_bsz(self, padding_bsz):
+		"""
+		Initialize the padding batch size for decoding.
+		This is used to set the padding size for the input sequences.
+		"""
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			self.model_config.num_hidden_layers,
+		):
+			layer = self.model.model.layers[layer_idx].mlp.module
+			if hasattr(layer, "init_num_tokens"):
+				layer.init_num_tokens(padding_bsz)
 
 	def _init_mode_decoding(self):
 		for layer_idx in range(

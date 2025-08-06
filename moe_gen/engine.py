@@ -1076,7 +1076,7 @@ class MoE_Gen:
         self.core_engine.clear_kv_storage()
         self.core_engine.start_h2d_worker()
     
-    def _config_decoding(self):
+    def _config_decoding(self, num_seq):
         logging.info(f"Start Config Decoding")
         self.model = self.model.to("cpu")
         # Set all model parameters to None
@@ -1091,6 +1091,14 @@ class MoE_Gen:
         # Log device memory usage before configure decoding
         logging.info(f"{self.rank} Device memory usage before configure decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
+        # Get number of sequences for each rank 
+        num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
+        num_seq_per_rank[self.rank] = num_seq
+        dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
+        # Get the maximum number of sequences across all ranks
+        max_num_seq = int(num_seq_per_rank.max().item())
+
+
         # TODO:
         if self.world_size <= 8:
             self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
@@ -1103,7 +1111,7 @@ class MoE_Gen:
             self.core_engine.set_weight_copy_queue(self.weight_copy_task)
             self.core_engine.start_h2d_worker()
         else:
-            self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding()
+            self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq)
             self.set_phase("decoding")
             self.core_engine.stop_h2d_worker()
             self.core_engine.clear_kv_copy_queue()
