@@ -1369,7 +1369,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		logits = F.linear(
 			global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
 		)
-		topk_idx, topk_weight = fused_moe_gate(
+
+		topk_weight, topk_idx = fused_moe_gate(
 			logits, torch.empty(0, device=device),
 			self.config.n_routed_experts,
 			self.config.topk_group,
