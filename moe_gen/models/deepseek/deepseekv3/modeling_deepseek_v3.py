@@ -125,6 +125,8 @@ def _get_unpad_data(attention_mask):
 # 		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
 
 from moe_gen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
+# from mgn_kernel import fused_rmsnorm
+
 class DeepseekV3RMSNorm(nn.Module):
 	def __init__(self, hidden_size, eps=1e-6):
 		"""
@@ -1104,8 +1106,10 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		)
 		return res
 
-from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
-from moe_gen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
+# from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
+# from moe_gen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
+from mgn_kernel import expert_bincount
+from mgn_kernel import fused_moe_token_dispatch
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1367,9 +1371,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		dispatcher = FusedMoETokenPermutation(use_cuda_if_available=True)
+		# dispatcher = FusedMoETokenPermutation(use_cuda_if_available=True)
 		topk_idx = topk_idx.to(torch.int32)
-		input_x, input_eids, global_indices, token_topk_pos = dispatcher(
+		input_x, input_eids, global_indices, token_topk_pos = fused_moe_token_dispatch(
 			global_x, topk_idx, self.token_idx, self.topk_pos,
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
@@ -1410,8 +1414,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
 		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		# )
-		bincounter = FusedExpertBincount(use_cuda_if_available=True)
-		group_size, activated_group_idx, group_start_indices = bincounter(
+		group_size, activated_group_idx, group_start_indices = expert_bincount(
 			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		)
 
