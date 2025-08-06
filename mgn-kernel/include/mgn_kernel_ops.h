@@ -73,7 +73,7 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
 /*
  * From csrc/elementwise
  */
-torch::Tensor fused_rmsnorm_forward(
+torch::Tensor simple_rmsnorm_forward(
     torch::Tensor input,
     torch::Tensor weight,
-    double eps = 1e-6);
+    double eps);

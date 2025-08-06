@@ -46,7 +46,7 @@ TORCH_LIBRARY_FRAGMENT(mgn_kernel, m) {
     m.def(
         "fused_rmsnorm(Tensor input, Tensor weight, float eps) -> "
         "(Tensor)");
-    m.impl("fused_rmsnorm", torch::kCUDA, &fused_rmsnorm_forward);
+    m.impl("fused_rmsnorm", torch::kCUDA, &simple_rmsnorm_forward);
 }
 
 REGISTER_EXTENSION(common_ops)

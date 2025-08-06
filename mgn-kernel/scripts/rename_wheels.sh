@@ -5,22 +5,14 @@ WHEEL_DIR="dist"
 
 wheel_files=($WHEEL_DIR/*.whl)
 for wheel in "${wheel_files[@]}"; do
-    if [[ "$wheel" == *manylinux2014* && "$wheel" == *+cu128* ]]; then
+    if [[ "$wheel" == *manylinux2014* ]]; then
         echo "Skipping already formatted wheel: $wheel"
         continue
     fi
 
     intermediate_wheel="${wheel/linux/manylinux2014}"
 
-    if ls /usr/local/ | grep -q "12.8"; then
-        if [[ "$intermediate_wheel" != *+cu128* ]]; then
-            new_wheel="${intermediate_wheel/-cp39/+cu128-cp39}"
-        else
-            new_wheel="$intermediate_wheel"
-        fi
-    else
-        new_wheel="$intermediate_wheel"
-    fi
+    new_wheel="${intermediate_wheel}"
 
     if [[ "$wheel" != "$new_wheel" ]]; then
         echo "Renaming $wheel to $new_wheel"
