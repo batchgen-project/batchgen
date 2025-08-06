@@ -1374,7 +1374,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			logits, torch.empty(0, device=device),
 			self.config.n_routed_experts,
 			self.config.topk_group,
-			self.config.topk,
+			self.config.num_experts_per_tok,
 			0,
 			self.config.routed_scaling_factor
 		)
