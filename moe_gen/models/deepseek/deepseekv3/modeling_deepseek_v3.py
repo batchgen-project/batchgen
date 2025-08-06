@@ -1373,7 +1373,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 3) Process tokens assigned to local experts ------------------
 		# dispatcher = FusedMoETokenPermutation(use_cuda_if_available=True)
 		topk_idx = topk_idx.to(torch.int32)
-		input_x, input_eids, global_indices, token_topk_pos = fused_moe_token_dispatch(
+		input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
 			global_x, topk_idx, self.token_idx, self.topk_pos,
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
