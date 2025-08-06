@@ -1163,7 +1163,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		K = self.num_experts_per_tok
 		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
 		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
-		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.float32)
+		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 
 	def init(self, num_tokens_per_rank):
 		# self.num_tokens_per_rank = num_tokens_per_rank
@@ -1369,7 +1369,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
 		logits = F.linear(
 			global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
-		)
+		).to(torch.bfloat16)
 
 		logits = logits.squeeze(1)  
 		topk_weight, topk_idx = moe_fused_gate(
