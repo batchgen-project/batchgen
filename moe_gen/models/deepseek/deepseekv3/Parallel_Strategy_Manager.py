@@ -344,7 +344,7 @@ class Parallel_Strategy_Manager:
 			self.hf_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
-			layer = self.model.model.layers[layer_idx].mlp.module
+			layer = self.model.model.layers[layer_idx].mlp
 			if hasattr(layer, "init_num_tokens"):
 				layer.init_num_tokens(padding_bsz)
 
