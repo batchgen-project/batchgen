@@ -1109,8 +1109,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 
 # from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
 # from moe_gen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
-from mgn_kernel import expert_bincount
-from mgn_kernel import fused_moe_token_dispatch
+from mgn_kernel import expert_bincount, fused_moe_token_dispatch, fused_moe_gate
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1366,7 +1365,19 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 2) Gate computation on global tokens --------------------------
 		global_x = all_tokens
 		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
-		topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		logits = F.linear(
+			global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
+		)
+		topk_idx, topk_weight = fused_moe_gate(
+			logits, torch.empty(0, device=device),
+			self.config.n_routed_experts,
+			self.config.topk_group,
+			self.config.topk,
+			0,
+			self.config.routed_scaling_factor
+		)
+
 		global_x = global_x.squeeze(1)  # Remove the dummy dimension
 		
 
@@ -1397,19 +1408,19 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		final_output = global_results[start_token_ids:end_token_ids]
 		return final_output
 	
-	def expert_bincount(self, eids, routed_expert_start_idx, experts_per_rank, device):
-		eids_adjusted = eids - routed_expert_start_idx  
-		counts = torch.bincount(eids_adjusted, minlength=experts_per_rank)
+	# def expert_bincount(self, eids, routed_expert_start_idx, experts_per_rank, device):
+	# 	eids_adjusted = eids - routed_expert_start_idx  
+	# 	counts = torch.bincount(eids_adjusted, minlength=experts_per_rank)
 		
-		nonzero_mask = counts > 0
-		activated_group_idx = torch.nonzero(nonzero_mask, as_tuple=True)[0].to(torch.int32)
-		group_size = counts[nonzero_mask].to(torch.int32)
+	# 	nonzero_mask = counts > 0
+	# 	activated_group_idx = torch.nonzero(nonzero_mask, as_tuple=True)[0].to(torch.int32)
+	# 	group_size = counts[nonzero_mask].to(torch.int32)
 		
-		group_start_indices = torch.zeros_like(group_size)
-		if group_size.numel() > 1:
-			group_start_indices[1:] = torch.cumsum(group_size[:-1], dim=0)
+	# 	group_start_indices = torch.zeros_like(group_size)
+	# 	if group_size.numel() > 1:
+	# 		group_start_indices[1:] = torch.cumsum(group_size[:-1], dim=0)
 		
-		return group_size, activated_group_idx, group_start_indices
+	# 	return group_size, activated_group_idx, group_start_indices
 
 	def grouped_dequant_moe_fp8(self, x, eids):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
