@@ -124,8 +124,8 @@ def _get_unpad_data(attention_mask):
 # 		# logger.info(f"Weight dtype: {self.weight.dtype}")
 # 		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
 
-from moe_gen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
-# from mgn_kernel import fused_rmsnorm
+# from moe_gen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
+from mgn_kernel import fused_rmsnorm
 
 class DeepseekV3RMSNorm(nn.Module):
 	def __init__(self, hidden_size, eps=1e-6):
@@ -138,7 +138,8 @@ class DeepseekV3RMSNorm(nn.Module):
 		self.dim = hidden_size
 
 	def forward(self, hidden_states):
-		return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
+		# return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
+		return fused_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
