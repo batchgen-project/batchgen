@@ -1370,7 +1370,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
 		)
 
-		topk_weight, topk_idx = moe_fused_gate(
+		logits = logits.squeeze(1)  
+ 		topk_weight, topk_idx = moe_fused_gate(
 			logits, torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.float32),
 			self.config.n_routed_experts,
 			self.config.topk_group,
@@ -1379,7 +1380,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.config.routed_scaling_factor
 		)
 
-		global_x = global_x.squeeze(1)  # Remove the dummy dimension
+		global_x = global_x.squeeze(1) 
 		
 
 
