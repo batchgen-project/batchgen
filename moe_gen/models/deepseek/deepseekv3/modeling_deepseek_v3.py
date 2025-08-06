@@ -1371,7 +1371,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 
 		topk_weight, topk_idx = moe_fused_gate(
-			logits, torch.empty(0, device=device),
+			logits, torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.float32),
 			self.config.n_routed_experts,
 			self.config.topk_group,
 			self.config.num_experts_per_tok,
