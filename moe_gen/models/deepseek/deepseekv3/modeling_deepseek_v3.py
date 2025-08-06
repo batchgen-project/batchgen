@@ -1376,28 +1376,28 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		).to(torch.bfloat16)
 
 		logits = logits.squeeze(1)  
-		# topk_weight, topk_idx = moe_fused_gate(
-		# 	logits, 
-		# 	self.gate_bias,
-		# 	self.config.n_group,
-		# 	self.config.topk_group,
-		# 	self.config.num_experts_per_tok,
-		# 	0,
-		# 	self.config.routed_scaling_factor
-		# )
 		topk_weight, topk_idx = moe_fused_gate(
 			logits, 
 			self.gate_bias,
-			8,
-			4,
-			8,
-			# self.config.n_group,
-			# self.config.topk_group,
-			# self.config.num_experts_per_tok,
+			self.config.n_group,
+			self.config.topk_group,
+			self.config.num_experts_per_tok,
 			0,
-			# self.config.routed_scaling_factor
-			2.5
+			self.config.routed_scaling_factor
 		)
+		# topk_weight, topk_idx = moe_fused_gate(
+		# 	logits, 
+		# 	self.gate_bias,
+		# 	8,
+		# 	4,
+		# 	8,
+		# 	# self.config.n_group,
+		# 	# self.config.topk_group,
+		# 	# self.config.num_experts_per_tok,
+		# 	0,
+		# 	# self.config.routed_scaling_factor
+		# 	2.5
+		# )
 
 		global_x = global_x.squeeze(1) 
 		
