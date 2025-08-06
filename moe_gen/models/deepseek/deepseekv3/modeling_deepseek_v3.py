@@ -1109,7 +1109,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 
 # from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
 # from moe_gen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
-from mgn_kernel import expert_bincount, fused_moe_token_dispatch, fused_moe_gate
+from mgn_kernel import expert_bincount, fused_moe_token_dispatch, moe_fused_gate
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1370,7 +1370,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
 		)
 
-		topk_weight, topk_idx = fused_moe_gate(
+		topk_weight, topk_idx = moe_fused_gate(
 			logits, torch.empty(0, device=device),
 			self.config.n_routed_experts,
 			self.config.topk_group,
