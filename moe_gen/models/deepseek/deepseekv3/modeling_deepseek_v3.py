@@ -1397,7 +1397,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		 									 device=self.device, dtype=torch.bfloat16)
 		global_results[global_indices, token_topk_pos, :] = res
-		weighted_output = global_results * topk_weight.unsqueeze(-1)
+		weighted_output = global_results * topk_weight.to(x.dtype).unsqueeze(-1)
 		global_results = weighted_output.sum(dim=1)
 		
 		# ---- 3.3) All-reduce to combine results from all workers ------------
