@@ -1107,7 +1107,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		)
 		return res
 
-# from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
+from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
 # from moe_gen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
 from mgn_kernel import expert_bincount, fused_moe_token_dispatch, moe_fused_gate
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
@@ -1399,12 +1399,17 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		# dispatcher = FusedMoETokenPermutation(use_cuda_if_available=True)
 		topk_idx = topk_idx.to(torch.int32)
-		input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
+		dispatcher = FusedMoETokenPermutation(use_cuda_if_available=True)
+		input_x, input_eids, global_indices, token_topk_pos = dispatcher(
 			global_x, topk_idx, self.token_idx, self.topk_pos,
-			self.routed_expert_start_idx, self.routed_expert_end_idx,
-		)
+			self.routed_expert_start_idx, self.routed_expert_end_idx
+	)
+		
+		# input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
+		# 	global_x, topk_idx, self.token_idx, self.topk_pos,
+		# 	self.routed_expert_start_idx, self.routed_expert_end_idx,
+		# )
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
