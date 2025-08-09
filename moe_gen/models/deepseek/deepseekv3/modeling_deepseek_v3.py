@@ -1110,6 +1110,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 from moe_gen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
 # from moe_gen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
 from mgn_kernel import expert_bincount, fused_moe_token_dispatch, moe_fused_gate
+from moe_gen.moe.moe_weighted_sum import moe_weighted_sum_triton_v2
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1331,14 +1332,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		 									 device=self.device, dtype=torch.bfloat16)
 		global_results[global_indices, token_topk_pos, :] = res
-		weighted_output = global_results * topk_weight.unsqueeze(-1)
-		global_results = weighted_output.sum(dim=1)
+		# weighted_output = global_results * topk_weight.unsqueeze(-1)
+		# global_results = weighted_output.sum(dim=1)
+		global_results = moe_weighted_sum_triton_v2(global_results, topk_weight)
 
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
-		# self.comm.stream.synchronize()  # Ensure all-reduce is complete
-		# dist.all_reduce(global_results, op=dist.ReduceOp.SUM, async_op=False)
 		# ---- 3.4) Extract results for local tokens and aggregate ------------
 		start_token_ids = self.rank * num_tokens
 		end_token_ids = start_token_ids + num_tokens
@@ -1380,20 +1380,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			0,
 			self.config.routed_scaling_factor
 		)
-		# topk_weight, topk_idx = moe_fused_gate(
-		# 	logits, 
-		# 	self.gate_bias,
-		# 	8,
-		# 	4,
-		# 	8,
-		# 	# self.config.n_group,
-		# 	# self.config.topk_group,
-		# 	# self.config.num_experts_per_tok,
-		# 	0,
-		# 	# self.config.routed_scaling_factor
-		# 	2.5
-		# )
-
 		global_x = global_x.squeeze(1) 
 		
 
@@ -1416,9 +1402,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		 									 device=self.device, dtype=torch.bfloat16)
 		global_results[global_indices, token_topk_pos, :] = res
-		# weighted_output = global_results * topk_weight.to(x.dtype).unsqueeze(-1)
-		topk_weight_expanded = topk_weight.unsqueeze(-1).expand(-1, -1, hidden_size)
-		weighted_output = global_results * topk_weight_expanded
+		weighted_output = global_results * topk_weight.to(x.dtype).unsqueeze(-1)
 		global_results = weighted_output.sum(dim=1)
 		
 		# ---- 3.3) All-reduce to combine results from all workers ------------
