@@ -1349,23 +1349,18 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	@torch.inference_mode()
 	def moe_infer_allgather_allreduce_opt(self, x):
 		num_tokens, hidden_size = x.shape
-		# Fix
-		# self.num_tokens_per_rank = 48
-		# self.num_tokens_per_rank = min(self.num_tokens_per_rank, triton.next_power_of_2(num_tokens))
-		# # logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
-		# global_num_tokens = self.num_tokens_per_rank * self.world_size
-		# K = self.num_experts_per_tok
-		# self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
-		# self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
-		
-
 		device = x.device
 		# ---- 1) First all-gather: collect all tokens on all workers -------
 		# Prepare buffers for all-gather
 		all_tokens = torch.zeros((self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
 		 							  device=self.device, dtype=torch.bfloat16)
+		if x.shape[0] < self.num_tokens_per_rank:
+			padded_hidden_states = torch.zeros((self.num_tokens_per_rank, hidden_size), device=self.device, dtype=x.dtype)
+			padded_hidden_states[:x.shape[0]] = x
+		else:
+			padded_hidden_states = x
 		with self.comm.change_state(enable=True):
-			self.comm.all_gather(all_tokens, x, stream=torch.cuda.default_stream(self.device))
+			self.comm.all_gather(all_tokens, padded_hidden_states, stream=torch.cuda.default_stream(self.device))
 		# ---- 2) Gate computation on global tokens --------------------------
 		global_x = all_tokens
 		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
