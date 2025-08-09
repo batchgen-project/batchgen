@@ -100,6 +100,185 @@ __global__ void count_local_expert_tokens_kernel(
     }
 }
 
+// std::vector<torch::Tensor> fused_moe_token_permutation_cuda(
+//     torch::Tensor global_x,                    // [num_tokens, hidden_size]
+//     torch::Tensor topk_idx,                    // [num_tokens, K]
+//     torch::Tensor token_idx,                   // [num_tokens * K] - original implementation artifact
+//     torch::Tensor topk_pos,                    // [num_tokens * K] - original implementation artifact  
+//     int routed_expert_start_idx,
+//     int routed_expert_end_idx) {
+    
+//     const auto num_tokens = global_x.size(0);
+//     const auto hidden_size = global_x.size(1);
+//     const auto K = topk_idx.size(1);
+//     const auto num_local_experts = routed_expert_end_idx - routed_expert_start_idx;
+    
+//     // Validate inputs
+//     TORCH_CHECK(global_x.is_cuda(), "global_x must be a CUDA tensor");
+//     TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
+//     TORCH_CHECK(global_x.dtype() == torch::kFloat32 || global_x.dtype() == torch::kFloat16 || global_x.dtype() == torch::kBFloat16, 
+//                 "global_x must be float32, float16, or bfloat16");
+//     TORCH_CHECK(topk_idx.dtype() == torch::kInt32, "topk_idx must be int32");
+    
+//     // Step 1: Count tokens per local expert
+//     auto expert_counts = torch::zeros({num_local_experts}, 
+//                                      torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+    
+//     const int threads = 256;
+//     const int blocks = (num_tokens * K + threads - 1) / threads;
+    
+//     DISPATCH_FLOAT_AND_HALF_AND_BF16(global_x, "count_local_expert_tokens", [&] {
+//         count_local_expert_tokens_kernel<scalar_t><<<blocks, threads>>>(
+//             topk_idx.data_ptr<int32_t>(),
+//             expert_counts.data_ptr<int32_t>(),
+//             num_tokens,
+//             K,
+//             routed_expert_start_idx,
+//             routed_expert_end_idx
+//         );
+//     });
+    
+//     // Step 2: Compute prefix sum to get expert offsets
+//     auto expert_offsets = torch::zeros({num_local_experts + 1}, 
+//                                       torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+    
+//     // Copy counts to CPU for prefix sum (could be optimized with GPU scan)
+//     auto expert_counts_cpu = expert_counts.cpu();
+//     auto expert_offsets_cpu = expert_offsets.cpu();
+    
+//     int total_local_tokens = 0;
+//     for (int i = 0; i < num_local_experts; i++) {
+//         expert_offsets_cpu[i] = total_local_tokens;
+//         total_local_tokens += expert_counts_cpu[i].item<int>();
+//     }
+//     expert_offsets_cpu[num_local_experts] = total_local_tokens;
+    
+//     expert_offsets = expert_offsets_cpu.to(global_x.device());
+    
+//     // Step 3: Allocate output tensors
+//     auto output_x = torch::empty({total_local_tokens, hidden_size}, 
+//                                 torch::TensorOptions().dtype(global_x.dtype()).device(global_x.device()));
+//     auto output_eids = torch::empty({total_local_tokens}, 
+//                                    torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+//     auto output_token_idx = torch::empty({total_local_tokens}, 
+//                                         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+//     auto output_topk_pos = torch::empty({total_local_tokens}, 
+//                                        torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+    
+//     // Reset expert counters for the main kernel
+//     expert_counts.zero_();
+    
+//     // Step 4: Launch the main dispatch kernel
+//     DISPATCH_FLOAT_AND_HALF_AND_BF16(global_x, "fused_moe_token_dispatch", [&] {
+//         fused_moe_token_permutation_kernel<scalar_t><<<blocks, threads>>>(
+//             global_x.data_ptr<scalar_t>(),
+//             topk_idx.data_ptr<int32_t>(),
+//             output_x.data_ptr<scalar_t>(),
+//             output_eids.data_ptr<int32_t>(),
+//             output_token_idx.data_ptr<int32_t>(),
+//             output_topk_pos.data_ptr<int32_t>(),
+//             expert_counts.data_ptr<int32_t>(),
+//             expert_offsets.data_ptr<int32_t>(),
+//             num_tokens,
+//             hidden_size,
+//             K,
+//             routed_expert_start_idx,
+//             routed_expert_end_idx
+//         );
+//     });
+    
+//     cudaDeviceSynchronize();
+    
+//     return {output_x, output_eids, output_token_idx, output_topk_pos, expert_counts};
+// }
+// Add this kernel for GPU-based exclusive prefix sum
+template <typename T>
+__global__ void exclusive_scan_kernel(
+    const T* input,
+    T* output,
+    int n) {
+    
+    extern __shared__ T temp[];
+    
+    int tid = threadIdx.x;
+    int offset = 1;
+    
+    // Load input into shared memory
+    if (tid < n) {
+        temp[tid] = (tid > 0) ? input[tid - 1] : 0;
+    } else {
+        temp[tid] = 0;
+    }
+    __syncthreads();
+    
+    // Build sum in place up the tree
+    for (int d = n >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            if (bi < n) {
+                temp[bi] += temp[ai];
+            }
+        }
+        offset *= 2;
+    }
+    
+    // Clear the last element
+    if (tid == 0) {
+        temp[n - 1] = 0;
+    }
+    
+    // Traverse down tree & build scan
+    for (int d = 1; d < n; d *= 2) {
+        offset >>= 1;
+        __syncthreads();
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            if (bi < n) {
+                T t = temp[ai];
+                temp[ai] = temp[bi];
+                temp[bi] += t;
+            }
+        }
+    }
+    
+    __syncthreads();
+    
+    // Write results to output
+    if (tid < n) {
+        output[tid] = temp[tid];
+    }
+    
+    // Also compute and store the total sum in the last position
+    if (tid == 0) {
+        T total = 0;
+        for (int i = 0; i < n; i++) {
+            total += input[i];
+        }
+        output[n] = total;
+    }
+}
+
+// Alternative: Optimized single-pass kernel for small arrays (like expert counts)
+// This is more efficient for small num_local_experts (typically < 64)
+__global__ void small_exclusive_scan_with_total(
+    const int32_t* input,
+    int32_t* output,
+    int n) {
+    
+    // Single thread does the entire scan for small arrays
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int32_t running_sum = 0;
+        for (int i = 0; i < n; i++) {
+            output[i] = running_sum;
+            running_sum += input[i];
+        }
+        output[n] = running_sum;  // Store total at the end
+    }
+}
+
 std::vector<torch::Tensor> fused_moe_token_permutation_cuda(
     torch::Tensor global_x,                    // [num_tokens, hidden_size]
     torch::Tensor topk_idx,                    // [num_tokens, K]
@@ -138,22 +317,37 @@ std::vector<torch::Tensor> fused_moe_token_permutation_cuda(
         );
     });
     
-    // Step 2: Compute prefix sum to get expert offsets
+    // Step 2: Compute prefix sum ON GPU to get expert offsets
     auto expert_offsets = torch::zeros({num_local_experts + 1}, 
                                       torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
     
-    // Copy counts to CPU for prefix sum (could be optimized with GPU scan)
-    auto expert_counts_cpu = expert_counts.cpu();
-    auto expert_offsets_cpu = expert_offsets.cpu();
-    
-    int total_local_tokens = 0;
-    for (int i = 0; i < num_local_experts; i++) {
-        expert_offsets_cpu[i] = total_local_tokens;
-        total_local_tokens += expert_counts_cpu[i].item<int>();
+    // Use the optimized small scan for typical MoE cases (num_experts usually < 64)
+    if (num_local_experts <= 512) {
+        // For small arrays, use single-thread kernel (very efficient for small n)
+        small_exclusive_scan_with_total<<<1, 1>>>(
+            expert_counts.data_ptr<int32_t>(),
+            expert_offsets.data_ptr<int32_t>(),
+            num_local_experts
+        );
+    } else {
+        // For larger arrays, use parallel scan with shared memory
+        int scan_threads = 1;
+        while (scan_threads < num_local_experts + 1) {
+            scan_threads *= 2;
+        }
+        scan_threads = min(scan_threads, 1024);  // Cap at max threads per block
+        
+        size_t shared_mem_size = scan_threads * sizeof(int32_t);
+        exclusive_scan_kernel<int32_t><<<1, scan_threads, shared_mem_size>>>(
+            expert_counts.data_ptr<int32_t>(),
+            expert_offsets.data_ptr<int32_t>(),
+            num_local_experts
+        );
     }
-    expert_offsets_cpu[num_local_experts] = total_local_tokens;
     
-    expert_offsets = expert_offsets_cpu.to(global_x.device());
+    // Get total_local_tokens from the last element of expert_offsets (computed on GPU)
+    auto total_local_tokens_tensor = expert_offsets.index({num_local_experts});
+    int total_local_tokens = total_local_tokens_tensor.item<int32_t>();
     
     // Step 3: Allocate output tensors
     auto output_x = torch::empty({total_local_tokens, hidden_size}, 
