@@ -8,8 +8,8 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "mgn-kernel"
-version = "0.1.0"
+name = "test-kernel-0ab602a9"
+version = "0.1.2"
 description = "Custom CUDA Kernels for MoE-Gen Project"
 readme = "README.md"
 requires-python = ">=3.9"
