@@ -41,14 +41,12 @@ def moe_weighted_sum_kernel(
     token_mask = token_offsets < num_tokens
     hidden_mask = hidden_offsets < hidden_size
     
-    # Initialize output accumulator for all tokens in this block
-    # Shape: [BLOCK_SIZE_TOKENS, BLOCK_SIZE_HIDDEN]
+    # Initialize output accumulator for this block
     output_acc = tl.zeros((BLOCK_SIZE_TOKENS, BLOCK_SIZE_HIDDEN), dtype=tl.float32)
     
     # Sum across all experts
     for expert_idx in range(topk):
         # Load weights for all tokens in this block
-        # Shape: [BLOCK_SIZE_TOKENS]
         weight_indices = token_offsets * topk + expert_idx
         weights = tl.load(
             topk_weight_ptr + weight_indices,
@@ -56,39 +54,36 @@ def moe_weighted_sum_kernel(
             other=0.0
         )
         
-        # Load global_results for all tokens and current expert
-        # We need to load [BLOCK_SIZE_TOKENS, BLOCK_SIZE_HIDDEN]
-        for tok_idx in range(BLOCK_SIZE_TOKENS):
-            token_id = token_start + tok_idx
-            if token_id < num_tokens:
-                # Base index for this token and expert
-                base_idx = token_id * topk * hidden_size + expert_idx * hidden_size
-                
-                # Load values for this token-expert pair
-                values = tl.load(
-                    global_results_ptr + base_idx + hidden_offsets,
-                    mask=hidden_mask,
-                    other=0.0
-                )
-                
-                # Get weight for this token (scalar)
-                weight = weights[tok_idx] if tok_idx < BLOCK_SIZE_TOKENS else 0.0
-                
-                # Multiply by weight and accumulate
-                weighted_values = values * weight
-                output_acc[tok_idx, :] += weighted_values
+        # Load global_results for all tokens and current expert using vectorized operations
+        # Calculate base indices for all tokens
+        token_base_indices = token_offsets * topk * hidden_size + expert_idx * hidden_size
+        
+        # Create 2D indices: [BLOCK_SIZE_TOKENS, BLOCK_SIZE_HIDDEN]
+        load_indices = token_base_indices[:, None] + hidden_offsets[None, :]
+        load_mask = token_mask[:, None] & hidden_mask[None, :]
+        
+        # Load values for all tokens and hidden dims in this block
+        values = tl.load(
+            global_results_ptr + load_indices,
+            mask=load_mask,
+            other=0.0
+        )
+        
+        # Multiply by weights (broadcast weights to match values shape)
+        weighted_values = values * weights[:, None]
+        
+        # Accumulate
+        output_acc += weighted_values
     
-    # Store results for all tokens in this block
-    for tok_idx in range(BLOCK_SIZE_TOKENS):
-        token_id = token_start + tok_idx
-        if token_id < num_tokens:
-            output_base = token_id * hidden_size + hidden_start
-            
-            tl.store(
-                output_ptr + output_base + tl.arange(0, BLOCK_SIZE_HIDDEN),
-                output_acc[tok_idx, :],
-                mask=hidden_mask
-            )
+    # Store results
+    store_indices = token_offsets[:, None] * hidden_size + hidden_offsets[None, :]
+    store_mask = token_mask[:, None] & hidden_mask[None, :]
+    
+    tl.store(
+        output_ptr + store_indices,
+        output_acc,
+        mask=store_mask
+    )
 
 
 @triton.jit
