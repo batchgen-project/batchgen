@@ -1404,7 +1404,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		global_results[global_indices, token_topk_pos, :] = res
 		# weighted_output = global_results * topk_weight.to(x.dtype).unsqueeze(-1)
 		# global_results = weighted_output.sum(dim=1)
-		global_results = moe_weighted_sum_triton(global_results, topk_weight, False)
+		global_results = moe_weighted_sum_triton(global_results, topk_weight, True)
 		
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
