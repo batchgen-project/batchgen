@@ -209,7 +209,7 @@ def moe_weighted_sum_triton(global_results, topk_weight, use_optimized=True, ver
     return output
 
 @triton.jit
-def moe_weighted_sum_kernel_v2(
+def moe_weighted_sum_kernel_v3(
     global_results_ptr,
     topk_weight_ptr, 
     output_ptr,
