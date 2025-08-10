@@ -589,6 +589,15 @@ def mla_decoding_flashmla_(
 	
 # 	return attn_output, past_key_states, scale
 
+@triton.jit
+def w8a8_triton_kernel():
+	pass
+
+def w8a8_triton(a, a_scale, w, w_scale):
+	
+
+	pass
+
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3(
 	self,
