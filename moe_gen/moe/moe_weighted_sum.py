@@ -208,6 +208,139 @@ def moe_weighted_sum_triton(global_results, topk_weight, use_optimized=True, ver
     
     return output
 
+@triton.jit
+def moe_weighted_sum_kernel_v2(
+    global_results_ptr,
+    topk_weight_ptr, 
+    output_ptr,
+    num_tokens,
+    topk,
+    hidden_size,
+    BLOCK_SIZE_TOKENS: tl.constexpr,
+    BLOCK_SIZE_HIDDEN: tl.constexpr,
+):
+    """
+    Truly optimized version with better memory access patterns
+    """
+    pid_token = tl.program_id(0)
+    pid_hidden = tl.program_id(1)
+    
+    token_start = pid_token * BLOCK_SIZE_TOKENS
+    hidden_start = pid_hidden * BLOCK_SIZE_HIDDEN
+    
+    token_offsets = token_start + tl.arange(0, BLOCK_SIZE_TOKENS)
+    hidden_offsets = hidden_start + tl.arange(0, BLOCK_SIZE_HIDDEN)
+    
+    token_mask = token_offsets < num_tokens
+    hidden_mask = hidden_offsets < hidden_size
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_TOKENS, BLOCK_SIZE_HIDDEN), dtype=tl.float32)
+    
+    # Process all experts at once with better memory coalescing
+    for expert_idx in range(topk):
+        # More efficient weight loading
+        weight_ptrs = token_offsets * topk + expert_idx
+        weights = tl.load(topk_weight_ptr + weight_ptrs, mask=token_mask, other=0.0)
+        
+        # More efficient result loading with better stride pattern
+        result_base_ptrs = token_offsets * (topk * hidden_size) + expert_idx * hidden_size
+        result_ptrs = result_base_ptrs[:, None] + hidden_offsets[None, :]
+        
+        mask_2d = token_mask[:, None] & hidden_mask[None, :]
+        values = tl.load(global_results_ptr + result_ptrs, mask=mask_2d, other=0.0)
+        
+        # Fused multiply-add
+        acc = tl.fma(values, weights[:, None], acc)
+    
+    # Single store with optimal stride
+    output_ptrs = token_offsets[:, None] * hidden_size + hidden_offsets[None, :]
+    mask_2d = token_mask[:, None] & hidden_mask[None, :]
+    tl.store(output_ptr + output_ptrs, acc, mask=mask_2d)
+
+
+def moe_weighted_sum_v3(global_results, topk_weight, 
+                        block_size_tokens=None, block_size_hidden=None,
+                        debug=False):
+    """
+    Wrapper function for the V2 optimized kernel.
+    
+    Args:
+        global_results: torch.Tensor of shape [num_tokens, topk, hidden_size]
+        topk_weight: torch.Tensor of shape [num_tokens, topk]
+        block_size_tokens: int, optional. Token block size for tuning
+        block_size_hidden: int, optional. Hidden dimension block size for tuning
+        debug: bool, print debug information
+    
+    Returns:
+        output: torch.Tensor of shape [num_tokens, hidden_size]
+    """
+    num_tokens, topk_val, hidden_size = global_results.shape
+    assert topk_weight.shape == (num_tokens, topk_val), \
+        f"Shape mismatch: topk_weight {topk_weight.shape} vs expected {(num_tokens, topk_val)}"
+    
+    # Validate inputs
+    assert global_results.device == topk_weight.device, "Tensors must be on same device"
+    assert global_results.dtype == topk_weight.dtype, "Tensors must have same dtype"
+    assert global_results.is_contiguous(), "global_results must be contiguous"
+    assert topk_weight.is_contiguous(), "topk_weight must be contiguous"
+    
+    # Create output tensor
+    output = torch.empty(
+        (num_tokens, hidden_size),
+        device=global_results.device,
+        dtype=global_results.dtype
+    )
+    
+    # Auto-tune block sizes if not provided
+    if block_size_tokens is None:
+        # Adaptive token block size based on problem size
+        if num_tokens <= 128:
+            block_size_tokens = min(32, triton.next_power_of_2(num_tokens))
+        elif num_tokens <= 1024:
+            block_size_tokens = 64
+        else:
+            block_size_tokens = 128
+    
+    if block_size_hidden is None:
+        # Adaptive hidden block size
+        if hidden_size <= 512:
+            block_size_hidden = min(256, triton.next_power_of_2(hidden_size))
+        elif hidden_size <= 2048:
+            block_size_hidden = 512
+        else:
+            block_size_hidden = 1024
+    
+    # Ensure minimum efficient block sizes
+    block_size_tokens = max(4, block_size_tokens)
+    block_size_hidden = max(32, block_size_hidden)
+    
+    # Calculate grid dimensions
+    grid_tokens = triton.cdiv(num_tokens, block_size_tokens)
+    grid_hidden = triton.cdiv(hidden_size, block_size_hidden)
+    
+    if debug:
+        print(f"Kernel config:")
+        print(f"  Input shape: global_results={global_results.shape}, topk_weight={topk_weight.shape}")
+        print(f"  Block sizes: tokens={block_size_tokens}, hidden={block_size_hidden}")
+        print(f"  Grid: ({grid_tokens}, {grid_hidden})")
+        print(f"  Total threads: {grid_tokens * grid_hidden}")
+        print(f"  Device: {global_results.device}")
+        print(f"  Dtype: {global_results.dtype}")
+    
+    # Launch kernel
+    moe_weighted_sum_kernel_v3[(grid_tokens, grid_hidden)](
+        global_results,
+        topk_weight,
+        output,
+        num_tokens,
+        topk_val,
+        hidden_size,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+        BLOCK_SIZE_HIDDEN=block_size_hidden,
+    )
+    
+    return output
 
 # @triton.jit
 # def moe_weighted_sum_kernel(
