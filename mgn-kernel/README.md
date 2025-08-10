@@ -22,6 +22,21 @@ The build artifacts will be placed in the `dist/` directory, and the resulting P
 
 If you encounter build errors, you can use the `make rebuild` command to clear all cached files and perform a clean rebuild.
 
+Steps for developing a kernel:
+
+1. Add a CUDA source file (`.cu`) to the csrc directory.
+2. Register the new source file in `CMakeLists.txt` by appending it to the `SOURCES` list:
+    ```cmake
+    set(SOURCES
+        "csrc/xxx.cu"
+    )
+    ```
+3. Extend the C++–Python interface:
+    - Define the corresponding Python bindings in `common_extension.cc`.
+    - Add the function declaration to the header file `include/mgn_kernel_ops.h`.
+4. Integrate the Python-level API by adding the corresponding definitions in the `python/mgn_kernel` directory.
+
+
 ## License
 
 See the LICENSE file for details.
