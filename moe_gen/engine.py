@@ -875,28 +875,8 @@ class MoE_Gen:
                 # self.core_engine.create_fake_kv_storage()
                 # self.core_engine.start_h2d_worker()
                 # time.sleep(2)
-                
-
-                # Log allocated memory after prefill
-                # if self.rank == 0:
-                #     allocated_memory = torch.cuda.memory_allocated(self.torch_device)
-                #     logging.info(
-                #         f"Rank: {self.rank} Prefill complete. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
-                #     )
-                #     tensor_mem = []
-                #     torch_total_mem = 0
-                #     for name, param in self.model.named_parameters():   
-                #         tensor_mem.append(
-                #             f"{name}: {param.numel() * param.element_size() / 1024 / 1024:.2f} MB"
-                #         )
-                #         torch_total_mem += (
-                #             param.numel() * param.element_size() / 1024 / 1024
-                #         )
-                #     logging.info(f"Torch total memory: {torch_total_mem:.2f} MB")
-
-
                     
-                self._config_decoding()
+                self._config_decoding(len(new_token))
                 # self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
                 if self.engine_config.Basic_Config.attn_mode == 3:
                     # FULL GPU DECODING MODE.
@@ -946,7 +926,7 @@ class MoE_Gen:
             # For small input batch, some worker might do not have any input.
             # In this case, it only participate in the decoding phase.
             # Todo: 
-            self._config_decoding()
+            self._config_decoding(0)
 
             # Log used memory before decoding
             if self.rank == 0:
@@ -1076,7 +1056,7 @@ class MoE_Gen:
         self.core_engine.clear_kv_storage()
         self.core_engine.start_h2d_worker()
     
-    def _config_decoding(self):
+    def _config_decoding(self, num_seq):
         logging.info(f"Start Config Decoding")
         self.model = self.model.to("cpu")
         # Set all model parameters to None
@@ -1091,6 +1071,14 @@ class MoE_Gen:
         # Log device memory usage before configure decoding
         logging.info(f"{self.rank} Device memory usage before configure decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
+        # Get number of sequences for each rank 
+        num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
+        num_seq_per_rank[self.rank] = num_seq
+        dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
+        # Get the maximum number of sequences across all ranks
+        max_num_seq = int(num_seq_per_rank.max().item())
+
+
         # TODO:
         if self.world_size <= 8:
             self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
@@ -1103,7 +1091,7 @@ class MoE_Gen:
             self.core_engine.set_weight_copy_queue(self.weight_copy_task)
             self.core_engine.start_h2d_worker()
         else:
-            self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding()
+            self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq)
             self.set_phase("decoding")
             self.core_engine.stop_h2d_worker()
             self.core_engine.clear_kv_copy_queue()
@@ -1696,7 +1684,7 @@ class MoE_Gen:
         os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
         try:
             dist.init_process_group(
-                backend="NCCL",
+                backend="nccl",
                 # backend="gloo",
                 init_method="tcp://" + self.dist_init_addr,
                 world_size=self.world_size,
@@ -1705,6 +1693,7 @@ class MoE_Gen:
                 timeout=timeout,
             )
         except RuntimeError as e:
+            logging.error(f"Failed to initialize torch distributed: {e}")
             raise
     
     
