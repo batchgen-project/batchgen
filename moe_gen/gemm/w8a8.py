@@ -37,7 +37,7 @@ def w8a8_gemm_kernel(
     # Pointers to scales
     a_scale_ptr, w_scale_ptr,
     # Matrix dimensions
-    M, N, K,
+    M, N: tl.constexpr, K: tl.constexpr,
     # Quantization block sizes
     a_block_size, w_block_size_k, w_block_size_n,
     # The stride variables represent how much to increase the ptr by when moving by 1
@@ -204,7 +204,7 @@ def w8a8_gemm(
         c.stride(0), c.stride(1),
         a_scale.stride(0), a_scale.stride(1),
         w_scale.stride(0), w_scale.stride(1),
-        BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=4
+        BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=4
     )
     
     return c
