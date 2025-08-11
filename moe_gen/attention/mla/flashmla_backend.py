@@ -433,6 +433,7 @@ def mla_decoding_flashmla_attn_mode_3(
 			- max_seq_len is reserved for scale. 
 			
 	"""
+	hidden_states = hidden_states.squeeze_(1)
 	assert attention_mask.dim() == 2
 	# Create a block table for the key states
 	block_size = 64	
@@ -550,7 +551,7 @@ def mla_decoding_flashmla_attn_mode_3(
 		attn_output_fp8, attn_out_scale, self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
 	)
 
-	return attn_output, past_key_states, scale
+	return attn_output.unsqueeze_(1), past_key_states, scale
 
 
 
