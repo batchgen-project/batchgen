@@ -562,7 +562,7 @@ def mla_decoding_flashmla_attn_mode_3(
 
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3_(
+def mla_decoding_flashmla_attn_mode_3(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
@@ -571,7 +571,8 @@ def mla_decoding_flashmla_attn_mode_3_(
 	q_position_ids: torch.Tensor,
 	scale: torch.Tensor,
 	cache_seqlens: torch.Tensor,
-	max_seqlen: int
+	max_seqlen: int,
+	weight_scale: dict = None
 ):
 	"""
 		MLA decoding function using FlashMLA as the attention mechanism backend.

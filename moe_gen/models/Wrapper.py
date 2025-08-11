@@ -396,34 +396,34 @@ class Attn_Wrapper(torch.nn.Module):
 													Attn_Wrapper.phase)
 			if self.get_weights:
 				weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
-				# for name, param in self.module.named_parameters():
-				# 	if (
-				# 		self.weight_dequant_scale is not None
-				# 		and name + "_scale_inv" in self.weight_dequant_scale
-				# 	):
-				# 		param.data = deepseek_v3_dequantization(
-				# 			weights_dict[name],
-				# 			self.weight_dequant_scale[name + "_scale_inv"],
-				# 		)
-				# 	else:
-				# 		param.data = weights_dict[name]
 				for name, param in self.module.named_parameters():
-					param.data = weights_dict[name]
-			else:
+					if (
+						self.weight_dequant_scale is not None
+						and name + "_scale_inv" in self.weight_dequant_scale
+					):
+						param.data = deepseek_v3_dequantization(
+							weights_dict[name],
+							self.weight_dequant_scale[name + "_scale_inv"],
+						)
+					else:
+						param.data = weights_dict[name]
 				# for name, param in self.module.named_parameters():
-				# 	if (
-				# 		self.weight_dequant_scale is not None
-				# 		and name + "_scale_inv" in self.weight_dequant_scale
-				# 	):
-				# 		param.data = deepseek_v3_dequantization(
-				# 			param.data,
-				# 			self.weight_dequant_scale[name + "_scale_inv"],
-				# 		)
-				self.module.q_a_proj.weight.data = self.fp8_q_a_proj
-				self.module.q_b_proj.weight.data = self.fp8_q_b_proj
-				self.module.kv_a_proj_with_mqa.weight.data = self.fp8_kv_a_proj_with_mqa
-				self.module.kv_b_proj.weight.data = self.fp8_kv_b_proj
-				self.module.o_proj.weight.data = self.fp8_o_proj
+				# 	param.data = weights_dict[name]
+			else:
+				for name, param in self.module.named_parameters():
+					if (
+						self.weight_dequant_scale is not None
+						and name + "_scale_inv" in self.weight_dequant_scale
+					):
+						param.data = deepseek_v3_dequantization(
+							param.data,
+							self.weight_dequant_scale[name + "_scale_inv"],
+						)
+				# self.module.q_a_proj.weight.data = self.fp8_q_a_proj
+				# self.module.q_b_proj.weight.data = self.fp8_q_b_proj
+				# self.module.kv_a_proj_with_mqa.weight.data = self.fp8_kv_a_proj_with_mqa
+				# self.module.kv_b_proj.weight.data = self.fp8_kv_b_proj
+				# self.module.o_proj.weight.data = self.fp8_o_proj
 				
 				
 			hidden_states = kwargs["hidden_states"]
