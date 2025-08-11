@@ -109,24 +109,6 @@ def _get_unpad_data(attention_mask):
 # 		hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 # 		return self.weight * hidden_states.to(input_dtype)
 
-class DeepseekV3RMSNorm(nn.Module):
-	def __init__(self, hidden_size, eps=1e-6):
-		"""
-		DeepseekV3RMSNorm is equivalent to T5LayerNorm
-		"""
-		super().__init__()
-		self.weight = nn.Parameter(torch.ones(hidden_size))
-		self.variance_epsilon = eps
-		self.dim = hidden_size
-
-	def forward(self, hidden_states):
-		# logger.info(f"Hidden states dtype: {hidden_states.dtype}")
-		# logger.info(f"Weight dtype: {self.weight.dtype}")
-		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
-
-# from moe_gen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
-from mgn_kernel import fused_rmsnorm
-
 # class DeepseekV3RMSNorm(nn.Module):
 # 	def __init__(self, hidden_size, eps=1e-6):
 # 		"""
@@ -138,8 +120,26 @@ from mgn_kernel import fused_rmsnorm
 # 		self.dim = hidden_size
 
 # 	def forward(self, hidden_states):
-# 		# return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
-# 		return fused_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
+# 		# logger.info(f"Hidden states dtype: {hidden_states.dtype}")
+# 		# logger.info(f"Weight dtype: {self.weight.dtype}")
+# 		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
+
+# from moe_gen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
+from mgn_kernel import fused_rmsnorm
+
+class DeepseekV3RMSNorm(nn.Module):
+	def __init__(self, hidden_size, eps=1e-6):
+		"""
+		DeepseekV3RMSNorm is equivalent to T5LayerNorm
+		"""
+		super().__init__()
+		self.weight = nn.Parameter(torch.ones(hidden_size))
+		self.variance_epsilon = eps
+		self.dim = hidden_size
+
+	def forward(self, hidden_states):
+		# return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
+		return fused_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
