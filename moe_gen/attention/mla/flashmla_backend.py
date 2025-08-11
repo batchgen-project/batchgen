@@ -402,7 +402,7 @@ def mla_decoding_flashmla_(
 from moe_gen.gemm.w8a8 import w8a8_gemm
 from moe_gen.attention.mla.fa3_backend import act_quant
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3(
+def mla_decoding_flashmla_attn_mode_3_(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
