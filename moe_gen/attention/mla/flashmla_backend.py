@@ -451,7 +451,12 @@ def mla_decoding_flashmla_attn_mode_3(
 	# )
 	x_fp8, x_scale = act_quant(hidden_states)
 	x = w8a8_gemm(x_fp8, x_scale, self.q_a_proj.weight.data, weight_scale['q_a_proj.weight_scale_inv'])
-	q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+	new_compressed_kv = w8a8_gemm(x_fp8, x_scale, self.kv_a_proj_with_mqa.weight.data, weight_scale['kv_a_proj_with_mqa.weight_scale_inv'])
+	x = self.q_a_layernorm(x)
+	x_fp8, x_scale = act_quant(x)
+	q = w8a8_gemm(x_fp8, x_scale, self.q_b_proj.weight.data, weight_scale['q_b_proj.weight_scale_inv'])
+
+	# q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 	q = q.view(bsz, 1, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(
 		q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -460,7 +465,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	# self.kv_a_proj_with_mqa.weight.data = deepseek_v3_dequantization(
 	# 	self.kv_a_proj_with_mqa.weight.data, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]
 	# )
-	new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+	# new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 	kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 	k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(k_pe, seq_len=max_seqlen_pad)
@@ -479,12 +484,12 @@ def mla_decoding_flashmla_attn_mode_3(
 	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
 	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
 	
-	kv_b_proj = self.kv_b_proj.weight.view(
-		self.num_heads, -1, self.kv_lora_rank
-	)
-	# kv_b_proj = deepseek_v3_dequantization(
-	# 	self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
-	# ).view(self.num_heads, -1, self.kv_lora_rank)
+	# kv_b_proj = self.kv_b_proj.weight.view(
+	# 	self.num_heads, -1, self.kv_lora_rank
+	# )
+	kv_b_proj = deepseek_v3_dequantization(
+		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+	).view(self.num_heads, -1, self.kv_lora_rank)
 	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
 	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
 
@@ -539,7 +544,11 @@ def mla_decoding_flashmla_attn_mode_3(
 	# self.o_proj.weight.data = deepseek_v3_dequantization(
 	# 	self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
 	# )
-	attn_output = self.o_proj(attn_output)
+	# attn_output = self.o_proj(attn_output)
+	attn_output_fp8, attn_out_scale = act_quant(attn_output)
+	attn_output = w8a8_gemm(
+		attn_output_fp8, attn_out_scale, self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
+	)
 
 	return attn_output, past_key_states, scale
 

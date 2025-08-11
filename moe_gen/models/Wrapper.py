@@ -396,17 +396,19 @@ class Attn_Wrapper(torch.nn.Module):
 													Attn_Wrapper.phase)
 			if self.get_weights:
 				weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
+				# for name, param in self.module.named_parameters():
+				# 	if (
+				# 		self.weight_dequant_scale is not None
+				# 		and name + "_scale_inv" in self.weight_dequant_scale
+				# 	):
+				# 		param.data = deepseek_v3_dequantization(
+				# 			weights_dict[name],
+				# 			self.weight_dequant_scale[name + "_scale_inv"],
+				# 		)
+				# 	else:
+				# 		param.data = weights_dict[name]
 				for name, param in self.module.named_parameters():
-					if (
-						self.weight_dequant_scale is not None
-						and name + "_scale_inv" in self.weight_dequant_scale
-					):
-						param.data = deepseek_v3_dequantization(
-							weights_dict[name],
-							self.weight_dequant_scale[name + "_scale_inv"],
-						)
-					else:
-						param.data = weights_dict[name]
+					param.data = weights_dict[name]
 			else:
 				for name, param in self.module.named_parameters():
 					if (
