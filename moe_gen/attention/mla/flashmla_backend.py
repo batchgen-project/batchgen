@@ -540,13 +540,17 @@ def mla_decoding_flashmla_attn_mode_3(
 
 
 	attn_output = attn_output.transpose(1, 2).contiguous()
-	attn_output = attn_output.view(
-		bsz, 1, self.num_heads * self.v_head_dim
-	)
+	# attn_output = attn_output.view(
+	# 	bsz, 1, self.num_heads * self.v_head_dim
+	# )
 	# self.o_proj.weight.data = deepseek_v3_dequantization(
 	# 	self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
 	# )
 	# attn_output = self.o_proj(attn_output)
+
+	attn_output = attn_output.view(
+		bsz, self.num_heads * self.v_head_dim
+	)
 	attn_output_fp8, attn_out_scale = act_quant(attn_output)
 	attn_output = w8a8_gemm(
 		attn_output_fp8, attn_out_scale, self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
