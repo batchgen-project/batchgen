@@ -204,7 +204,7 @@ def w8a8_gemm(
         c.stride(0), c.stride(1),
         a_scale.stride(0), a_scale.stride(1),
         w_scale.stride(0), w_scale.stride(1),
-        BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=4
+        BLOCK_SIZE_M=64, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=4
     )
     
     return c
@@ -222,6 +222,8 @@ def test_w8a8_gemm():
     assert c.dtype == torch.bfloat16
     assert c.shape == (M, N)
     print("Test passed! Output shape:", c.shape)
+
+
 
 if __name__ == "__main__":
     test_w8a8_gemm()
