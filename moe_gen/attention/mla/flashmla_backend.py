@@ -474,6 +474,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 	kv = self.kv_a_layernorm(kv)
 	k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
+	kv = kv.view(bsz, 1, self.kv_lora_rank)
 	offload_kv = torch.cat([kv, k_pe], dim=-1)
 	
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
