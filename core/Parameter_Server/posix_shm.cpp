@@ -389,6 +389,34 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     return ptr;
 }
 
+
+// Helper function to verify NUMA allocation
+void verify_numa_allocation(void* ptr, size_t size) {
+    if (numa_available() < 0) {
+        std::cout << "NUMA not available for verification" << std::endl;
+        return;
+    }
+
+    // Check a few sample pages
+    long page_size = sysconf(_SC_PAGESIZE);
+    int num_samples = std::min(10L, (long)(size / page_size));
+    
+    std::cout << "Verifying NUMA allocation for " << num_samples << " sample pages:" << std::endl;
+    
+    for (int i = 0; i < num_samples; i++) {
+        void* page_addr = (char*)ptr + (i * size / num_samples);
+        int node = -1;
+        
+        if (get_mempolicy(&node, nullptr, 0, page_addr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+            std::cout << "Page at offset " << (i * size / num_samples) 
+                      << " is on NUMA node " << node << std::endl;
+        } else {
+            perror("get_mempolicy failed");
+        }
+    }
+}
+
+
 void free_shared_pinned_memory(std::string& shm_name, void* ptr, int64_t size,
                                bool create) {
     cudaHostUnregister(ptr);
