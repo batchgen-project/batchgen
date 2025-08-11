@@ -478,6 +478,7 @@ class Attn_Wrapper(torch.nn.Module):
 						kv_scale[start_ids:end_ids],
 						Attn_Wrapper.cache_seqlens[start_ids:end_ids],
 						Attn_Wrapper.max_seqlen,
+						self.weight_dequant_scale
 					)
 					# attn_result, kv, scale = self.module.decoding_attn_mode_3_dequant_fusion(
 					# 	hidden_states[start_ids:end_ids],
