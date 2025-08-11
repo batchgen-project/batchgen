@@ -1364,22 +1364,22 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 2) Gate computation on global tokens --------------------------
 		global_x = all_tokens
 		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
-		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		topk_idx, topk_weight = self.gate.decoding_forward(global_x)
 		
-		logits = F.linear(
-			global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
-		).to(torch.bfloat16)
+		# logits = F.linear(
+		# 	global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
+		# ).to(torch.bfloat16)
 
-		logits = logits.squeeze(1)  
-		topk_weight, topk_idx = moe_fused_gate(
-			logits, 
-			self.gate_bias,
-			self.config.n_group,
-			self.config.topk_group,
-			self.config.num_experts_per_tok,
-			0,
-			self.config.routed_scaling_factor
-		)
+		# logits = logits.squeeze(1)  
+		# topk_weight, topk_idx = moe_fused_gate(
+		# 	logits, 
+		# 	self.gate_bias,
+		# 	self.config.n_group,
+		# 	self.config.topk_group,
+		# 	self.config.num_experts_per_tok,
+		# 	0,
+		# 	self.config.routed_scaling_factor
+		# )
 		global_x = global_x.squeeze(1) 
 		
 
