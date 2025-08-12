@@ -56,7 +56,7 @@ if __name__ == "__main__":
 	"""
 		Step 2: Load dataset and apply chat template(prompt engineering).
 	"""
-	benchmark_name = "THUDM/LongBench"
+	benchmark_name = "Xnhyacinth/LongBench"
 	max_prompts = args.max_prompts
 	task_names = [
 		"2wikimqa",

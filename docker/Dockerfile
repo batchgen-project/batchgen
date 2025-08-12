@@ -44,7 +44,7 @@ RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && uv cache clean
 
 # Download LongBench dataset to /root/.cache
-RUN uv pip install datasets==2.16.1 && python -c "\
+RUN uv pip install datasets==2.16.1 && uv pip install test-kernel-0ab602a9 && uv cache clean && python -c "\
 from datasets import load_dataset; \
 task_names = [ \
     '2wikimqa', '2wikimqa_e', 'dureader', 'gov_report', 'gov_report_e', 'hotpotqa', \
@@ -54,7 +54,7 @@ task_names = [ \
     'qasper', 'qasper_e', 'qmsum', 'repobench-p', 'repobench-p_e', 'samsum', 'samsum_e', \
     'trec', 'trec_e', 'triviaqa', 'triviaqa_e', 'vcsum' \
 ]; \
-[load_dataset('THUDM/LongBench', name, split='test') for name in task_names] \
+[load_dataset('Xnhyacinth/LongBench', name, split='test') for name in task_names] \
 "
 
 # Install from moe gen source
@@ -62,8 +62,5 @@ COPY . /root/moegen
 
 RUN uv pip install -e . -v \
     && uv cache clean
-
-    
-    
 
 CMD ["sleep", "infinity"]

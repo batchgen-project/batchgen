@@ -12,6 +12,12 @@ docker buildx build --progress=plain -f docker/Dockerfile -t moe-gen:<tag> .
 
 Replace `<tag>` with your desired image version.
 
+You can also directly build and push the image to a container registry by adding the `--push` flag:
+
+```bash
+docker buildx build --progress=plain -f docker/Dockerfile -t moe-gen:<tag> --push .
+```
+
 ### Viewing Intermediate Output
 
 To check intermediate output during the build process, you can use `tee` to save the logs to a file:
