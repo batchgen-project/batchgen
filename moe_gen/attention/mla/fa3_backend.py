@@ -321,7 +321,10 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		max_seqlen_k=max_seqlen_in_batch_k,
 		softmax_scale=self.softmax_scale,
 		causal=True
-	)		
+	)
+	# if attn_output_unpad is a tuple, we use attn_output_unpad[0]
+	if isinstance(attn_output_unpad, tuple):
+		attn_output_unpad = attn_output_unpad[0]		
 
 	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
 		bsz, seq_len, self.num_heads * self.v_head_dim

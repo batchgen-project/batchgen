@@ -3005,17 +3005,22 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 			self.rank = dist.get_rank()
 			self.world_size = dist.get_world_size()
 			device = torch.device("cuda", self.rank % torch.cuda.device_count())
-			group = StatelessProcessGroup.create(
-				host="29.194.13.154",
-				port=20001,
-				rank=self.rank,
-				world_size=self.world_size,
-				data_expiration_seconds=6000,
-			)
-			self.comm = PyNcclCommunicator(
-				group=group,
-				device=device
-			)		
+			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+			try:
+				group = StatelessProcessGroup.create(
+					host=comm_master_addr,
+					port=20001,
+					rank=self.rank,
+					world_size=self.world_size,
+					data_expiration_seconds=6000,
+				)
+				self.comm = PyNcclCommunicator(
+					group=group,
+					device=device
+				)		
+			except Exception as e:
+				logger.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 			
 				
 	

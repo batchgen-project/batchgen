@@ -527,6 +527,8 @@ class MoE_Gen:
     def Init(self):
         logging.info(f"Initializing MoE_Gen with global rank {self.global_rank} and world size {self.world_size} with PID: {os.getpid()}")
         torch.cuda.set_device(self.device)
+        COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
+        os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
         self._init_torch_dist()
 
         torch.cuda.reset_peak_memory_stats()
