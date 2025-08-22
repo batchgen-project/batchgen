@@ -13,7 +13,7 @@
 
 
 # About
-MoE-Gen is an efficient serving engine optimized specifically for **Mixture-of-Expert(MoE)** based large language models. It is tailored for bulk **offline inference** tasks and **limited GPU resources**. It enables low cost serving for latency-insensitive applications.
+BatchGen is an efficient serving engine optimized specifically for **Mixture-of-Expert(MoE)** based large language models. It is tailored for bulk **offline inference** tasks and **limited GPU resources**. It enables low cost serving for latency-insensitive applications.
 
 **Core Features**
 
@@ -36,12 +36,12 @@ MoE-Gen is an efficient serving engine optimized specifically for **Mixture-of-E
 # Supported Hardware
 Hooper and Ampere archtecture are supported. 
 
-Recommended configurations for 8xH20, 8xA100 and 8xA5000 node are included in ./moe_gen/configurations/
+Recommended configurations for 8xH20, 8xA100 and 8xA5000 node are included in ./batchgen/configurations/
 
 
 ## Installation
 
-We recommend installing MoE-Gen in a virtual environment. To install MoE-Gen, you can either install it from PyPI or build it from source.
+We recommend installing BatchGen in a virtual environment. To install BatchGen, you can either install it from PyPI or build it from source.
 
 ### Hardware Requirements
 ```bash
@@ -54,8 +54,8 @@ For example,  to efficiently serve DeepSeek-R1-6871B-FP8, 1TB Host memory is rec
 ### Create conda environment.
 
 ```bash
-conda create --name moe_gen python=3.11
-conda activate moe_gen
+conda create --name batchgen python=3.11
+conda activate batchgen
 ```
 
 ### Dependencies installation
@@ -85,15 +85,15 @@ cat install.sh
 ./install.sh
 ```
 
-Currently, MoE-Gen depends on torch==2.70+cu128
+Currently, BatchGen depends on torch==2.70+cu128
 ```bash
 pip install torch==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### Install MoE-Gen from codebase
+### Install BatchGen from codebase
 ```bash
-git clone git@github.com:EfficientMoE/MoE-Gen.git
-cd MoE-Gen
+git clone git@github.com:EfficientMoE/BatchGen.git
+cd BatchGen
 pip install -e .
 ```
 
@@ -101,11 +101,11 @@ pip install -e .
 For 2-8*H20 Serving, please refer to ```./docs/Serving_with_two_nodes.```
 
 Following is an example for one node or within one node.
-MoE-Gen seamlessly integrates with Huggingface environment. Start inference with Huggingface checkpoint name.
+BatchGen seamlessly integrates with Huggingface environment. Start inference with Huggingface checkpoint name.
 ### Example usage of serving DeepSeek-R1 on 8*H20 node
 #### Start Server
 ```bash
-python -m moe_gen.parameter_server \
+python -m batchgen.parameter_server \
     --model deepseek-ai/DeepSeek-R1 \
     --cache-dir "..." 
 ```
@@ -117,7 +117,7 @@ Please prepare the batch in python and call the client.
 import logging
 import os
 from transformers import AutoTokenizer
-from moe_gen.engine import moe_gen
+from batchgen.engine import batchgen
 import numpy as np
 import datasets
 
@@ -132,7 +132,7 @@ if __name__ == "__main__":
     
     max_input_length = 13000
     max_decoding_length = 100
-    engine_config_json_dir = "/MoE-Gen/configurations/DeepSeek-R1/engine_config_H20_8.json"
+    engine_config_json_dir = "/BatchGen/configurations/DeepSeek-R1/engine_config_H20_8.json"
     # Change if there is port conflict.
     server_host = "localhost"
     server_port = "9090" 
@@ -186,13 +186,13 @@ if __name__ == "__main__":
         queries[prompt_idx] = text
 
     """
-        Step 3: Launch MoE-Gen
+        Step 3: Launch BatchGen
     """    
     logging.info(f"Connecting to parameter server at {server_host}:{server_port}")
     logging.info(f"Using model {hugging_face_checkpoint}")
     
     # Run inference with our standalone parameter server
-    answer_set = moe_gen(
+    answer_set = batchgen(
         huggingface_ckpt_name=hugging_face_checkpoint,
         queries=queries,
         max_input_length=max_input_length,
@@ -236,7 +236,7 @@ python example.py
 ## Citation
 ```
 @misc{xu2025moegenhighthroughputmoeinference,
-      title={MoE-Gen: High-Throughput MoE Inference on a Single GPU with Module-Based Batching},
+      title={BatchGen: High-Throughput MoE Inference on a Single GPU with Module-Based Batching},
       author={Tairan Xu and Leyang Xue and Zhan Lu and Adrian Jackson and Luo Mai},
       year={2025},
       eprint={2503.09716},

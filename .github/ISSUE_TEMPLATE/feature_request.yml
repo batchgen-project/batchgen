@@ -1,5 +1,5 @@
 name: Feature Request
-description: Suggest an idea for MoE-Gen
+description: Suggest an idea for BatchGen
 title: "[Feature Request] "
 labels: [enhancement]
 assignees: [futurexy]
@@ -57,6 +57,6 @@ body:
     attributes:
       label: Usage Statistics (Optional)
       description: |
-        We'd love to know how you're using MoE-Gen! If you're comfortable, please share details like your affiliation and use case to help us improve the project.
+        We'd love to know how you're using BatchGen! If you're comfortable, please share details like your affiliation and use case to help us improve the project.
     validations:
       required: false

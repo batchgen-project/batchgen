@@ -3,11 +3,11 @@
 ```python
 #Add the following line if you have problem in accessing Huggingface.co
 export HF_ENDPOINT=https://hf-mirror.com 
-python -m moe_gen.parameter_server --model deepseek-ai/DeepSeek-R1 --cache-dir "<dir-to-your-model-checkpoint>"
+python -m batchgen.parameter_server --model deepseek-ai/DeepSeek-R1 --cache-dir "<dir-to-your-model-checkpoint>"
 ```
 
 ## Run tasks on two nodes
-Please first copy the ```two_nodes_H20_benchmark.py``` to your working dir (outside /MoE-Gen directory) on two nodes respectively.
+Please first copy the ```two_nodes_H20_benchmark.py``` to your working dir (outside /BatchGen directory) on two nodes respectively.
 
 Then run following commands.
 Cache-dir can be something like: ```**/modelscope/hub/models/deepseek-ai/DeepSeek-R1```
@@ -50,7 +50,7 @@ python "<dir-to-two_nodes_H20_benchmark.py>" \
 ```
 
 ## Clean-up(Optional)
-If the program terminated or killed without proper clean-up, you may need to manually clean the occupied pages before next start MoE-Gen server.
+If the program terminated or killed without proper clean-up, you may need to manually clean the occupied pages before next start BatchGen server.
 ```bash
 rm -f /dev/hugepages/*
 ```

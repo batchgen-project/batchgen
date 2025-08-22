@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------- #
-#  MoE-Gen                                                                      #
+#  BatchGen                                                                      #
 #  copyright (c) EfficientMoE team 2025                                             #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
@@ -95,20 +95,20 @@ print(f"find_packages: {find_packages()}")
 
 # install all files in the package, rather than just the egg
 setup(
-    name="moe_gen",
+    name="batchgen",
     version=os.getenv("MOEGEN_VERSION", "0.1"),
     packages=find_packages(
         exclude=["op_builder", "op_builder.*", "external/*"],
         include=[
-            "moe_gen",
-            "moe_gen.core_engine",
-            "moe_gen.*",
-            "moe_gen.models",
-            "moe_gen.models.**",
+            "batchgen",
+            "batchgen.core_engine",
+            "batchgen.*",
+            "batchgen.models",
+            "batchgen.models.**",
         ],
     ),
     package_data={
-        "moe_gen": [
+        "batchgen": [
             "**/*.cpp",
             "**/*.h",
             "**/*.cc",
@@ -116,12 +116,12 @@ setup(
             "**/*.py",
             "**/*.so",
         ],
-        "moe_gen.core_engine": ["**/*.so"],
+        "batchgen.core_engine": ["**/*.so"],
     },
     include_package_data=True,
     install_requires=install_requires,
     author="EfficientMoE Team",
-    description="MoE-Gen is a library for High-throughput offline inference for MoE models with limited GPUs",
+    description="BatchGen is a library for High-throughput offline inference for MoE models with limited GPUs",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     classifiers=[
