@@ -455,6 +455,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	# attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
 	# 	bsz, seq_len, self.num_heads * self.v_head_dim
 	# ).contiguous()
+	attention_mask = attention_mask.to(torch.bool)
 	attn_output = F.scaled_dot_product_attention(
 		query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim).transpose(1, 2),
 		key_states.view(bsz, seq_len, self.num_heads, self.q_head_dim).transpose(1, 2),  
