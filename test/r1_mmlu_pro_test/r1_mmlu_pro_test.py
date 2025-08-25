@@ -64,13 +64,23 @@ if __name__ == "__main__":
 			option_str += f'({o}): {opt}' + '\n'
 		return option_str
 	
-	queries = []
-	for row_idx, entry in dataset.iterrows():
-		prompt = 'Q: ' + entry['question'] + '\n' + form_options(entry['options']) + '\n' 
-		queries.append(prompt)
+
 	
 
+	categories = ['computer science', 'math', 'chemistry', 'engineering', 'law', 'biology',
+				  'health', 'physics', 'business', 'philosophy', 'economics', 'other',
+				  'psychology', 'history']
 
+	# load 5-shot prompts for each category
+	prompts = {c: '' for c in categories}
+	for d in dataset['validation']:
+		prompts[d['category']] += 'Q:' + ' ' + d['question'] + '\n' + form_options(d['options']) + '\n' + d['cot_content'] + '\n\n'
+
+	queries = []
+	for row_idx, entry in dataset.iterrows():
+		prefix = prompts[entry['category']]
+		prompt = prefix + 'Q: ' + entry['question'] + '\n' + form_options(entry['options']) + '\n' 
+		queries.append(prompt)
 
 	tokenizer = AutoTokenizer.from_pretrained(
 		hugging_face_checkpoint, trust_remote_code=True
