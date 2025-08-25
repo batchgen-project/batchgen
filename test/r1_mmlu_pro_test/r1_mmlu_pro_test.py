@@ -53,6 +53,9 @@ if __name__ == "__main__":
 
 	## to be removed
 	dataset = dataset.head(128)
+	# print all the questions:
+	# print(dataset['question'].tolist())
+	# exit()
 
 	def form_options(options: list):
 		option_str = 'Options are:\n'
@@ -65,6 +68,8 @@ if __name__ == "__main__":
 	for row_idx, entry in dataset.iterrows():
 		prompt = 'Q: ' + entry['question'] + '\n' + form_options(entry['options']) + '\n' 
 		queries.append(prompt)
+	
+
 
 
 	tokenizer = AutoTokenizer.from_pretrained(
@@ -72,7 +77,7 @@ if __name__ == "__main__":
 	)
 	for prompt_idx in range(len(queries)):
 		messages = [
-			{"role": "system", "content": "You are an knowledge expert, you are supposed to answer the multi-choice question to derive your final answer as `The answer is ...`."},
+			{"role": "system", "content": "You are an knowledge expert, you are supposed to answer the multi-choice question to derive your final answer as `The answer is ...` and select from choices (A) to (J)."},
 			{"role": "user", "content": queries[prompt_idx]},
 		]
 		text = tokenizer.apply_chat_template(
@@ -80,7 +85,14 @@ if __name__ == "__main__":
 		)
 		queries[prompt_idx] = text
 	
+	# print(queries)
+	# exit()
+	
 	logging.info(f"Loaded {len(queries)} samples from the dataset.")
+	# Print first 5 questions:
+	# for i in range(min(5, len(queries))):
+	# 	logging.info(f"Prompt {i}: {queries[i][:args.max_input_length]}")
+	# exit()
 	"""
 		Step 3: Launch BatchGen using the standalone parameter server
 	"""
