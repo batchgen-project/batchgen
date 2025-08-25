@@ -73,7 +73,7 @@ if __name__ == "__main__":
 
 	# load 5-shot prompts for each category
 	prompts = {c: '' for c in categories}
-	for d in validation_set['validation']:
+	for d in validation_set:
 		prompts[d['category']] += 'Q:' + ' ' + d['question'] + '\n' + form_options(d['options']) + '\n' + d['cot_content'] + '\n\n'
 
 	queries = []
