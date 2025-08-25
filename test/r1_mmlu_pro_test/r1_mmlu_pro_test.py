@@ -118,7 +118,7 @@ if __name__ == "__main__":
 		# return tokenizer.decode(tokens[:end_pos], skip_special_tokens=True)
 		return tokenizer.decode(tokens[:end_pos], skip_special_tokens=False)
 
-	print_result = False
+	print_result = True
 	if print_result:
 		for idx in range(len(answer_set)):
 		# for idx in range(4):
