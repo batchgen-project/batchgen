@@ -1685,7 +1685,7 @@ class BatchGen:
 
     def _init_torch_dist(self):
         timeout = timedelta(minutes=5)
-        os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
+        # os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
         try:
             dist.init_process_group(
                 backend="nccl",
