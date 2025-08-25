@@ -227,7 +227,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
 	"""
 	bsz, seq_len, _ = hidden_states.shape
-	position_ids[attention_mask == 0] = 0
+	# position_ids[attention_mask == 0] = 0
 	# query_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 	query_states = w8a16_gemm(
 		self.q_a_proj.weight.data,
