@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+import logging
 
 class IndexFirstAxis(torch.autograd.Function):
 	@staticmethod
@@ -148,6 +149,9 @@ def _upad_input(
 		indices_k,
 	)
 	if query_length == kv_seq_len:
+		logging.info("Using kv_seq_len to unpad query")
+		logging.info(f"kv_seq_len: {kv_seq_len}, query_length: {query_length}")
+		
 		query_layer = index_first_axis(
 			query_layer.reshape(batch_size * kv_seq_len, num_heads, head_dim_k),
 			indices_k,
@@ -166,6 +170,8 @@ def _upad_input(
 	else:
 		# We are using right padding, so we can just take the last query_length tokens.
 		# attention_mask = attention_mask[:, -query_length:]
+		logging.info("Using right padding to unpad query")
+		logging.info(f"kv_seq_len: {kv_seq_len}, query_length: {query_length}")
 		attention_mask = attention_mask[:, :query_length]
 		query_layer = query_layer[:, :query_length, ...]
 		query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(

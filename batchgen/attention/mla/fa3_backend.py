@@ -309,7 +309,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		max_seq_lens,
 	) = _upad_input(
 		query_states, key_states, value_states, attention_mask, seq_len
-	)      	
+	)  
+	exit()    	
 	cu_seqlens_q, cu_seqlens_k = cu_seq_lens
 	max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 	# logging.info(f"attention_mask shape: {attention_mask.shape}")
