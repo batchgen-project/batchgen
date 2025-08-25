@@ -315,6 +315,9 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	logging.info(f"cu_seqlens_k: {cu_seqlens_k}")
 	logging.info(f"max_seqlen_in_batch_q: {max_seqlen_in_batch_q}")
 	logging.info(f"max_seqlen_in_batch_k: {max_seqlen_in_batch_k}")
+	logging.info(f"query_states shape: {query_states.shape}, dtype: {query_states.dtype}")
+	logging.info(f"key_states shape: {key_states.shape}, dtype: {key_states.dtype}")	
+	logging.info(f"value_states shape: {value_states.shape}, dtype: {value_states.dtype}")
 	# exit()
 	attn_output_unpad = flash_attn_varlen_func(
 		query_states,

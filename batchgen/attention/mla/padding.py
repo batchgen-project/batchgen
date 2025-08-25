@@ -167,6 +167,7 @@ def _upad_input(
 		# We are using right padding, so we can just take the last query_length tokens.
 		# attention_mask = attention_mask[:, -query_length:]
 		attention_mask = attention_mask[:, :query_length]
+		query_layer = query_layer[:, :query_length, ...]
 		query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(
 			query_layer, attention_mask
 		)
