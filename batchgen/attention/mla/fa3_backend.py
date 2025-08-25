@@ -214,7 +214,7 @@ def w8a16_gemm(
 	return out
 
 @torch.inference_mode()
-def mla_prefill_flashattention3_w8a16_deepgemm(
+def mla_prefill_flashattention3_w8a16_deepgemm_(
 	self,
 	hidden_states: torch.Tensor,
 	attention_mask: torch.Tensor,
@@ -313,19 +313,6 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	exit()    	
 	cu_seqlens_q, cu_seqlens_k = cu_seq_lens
 	max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-	# logging.info(f"attention_mask shape: {attention_mask.shape}")
-	# logging.info(f"attention_mask sample: {attention_mask[0]}")  # Should show [1,1,1,...,0,0] pattern
-	# logging.info(f"sequence lengths: {attention_mask.sum(dim=-1)}")  # Actual valid lengths per sequence
-	# logging.info(f"position_ids shape: {position_ids.shape}")
-	# logging.info(f"position_ids sample: {position_ids[0]}")  # Should show [0,1,2,...] pattern
-	# logging.info(f"cu_seqlens_q: {cu_seqlens_q}")
-	# logging.info(f"cu_seqlens_k: {cu_seqlens_k}")
-	# logging.info(f"max_seqlen_in_batch_q: {max_seqlen_in_batch_q}")
-	# logging.info(f"max_seqlen_in_batch_k: {max_seqlen_in_batch_k}")
-	# logging.info(f"query_states shape: {query_states.shape}, dtype: {query_states.dtype}")
-	# logging.info(f"key_states shape: {key_states.shape}, dtype: {key_states.dtype}")	
-	# logging.info(f"value_states shape: {value_states.shape}, dtype: {value_states.dtype}")
-	# exit()
 	attn_output_unpad = flash_attn_varlen_func(
 		query_states,
 		key_states,
@@ -344,6 +331,138 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
 		bsz, seq_len, self.num_heads * self.v_head_dim
 	).contiguous()
+
+	# attn_output = self.o_proj(attn_output)
+	attn_output = w8a16_gemm(
+		self.o_proj.weight.data,
+		weight_scale["o_proj.weight_scale_inv"],
+		attn_output
+	)
+
+	# logging.info(f"offload_kv: {offload_kv.shape}")
+	return attn_output, offload_kv
+
+
+@torch.inference_mode()
+def mla_prefill_flashattention3_w8a16_deepgemm(
+	self,
+	hidden_states: torch.Tensor,
+	attention_mask: torch.Tensor,
+	position_ids: torch.Tensor,
+	weight_scale: dict[str, torch.Tensor],
+
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""
+		MLA prefifill on hooper device.
+		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
+	"""
+	bsz, seq_len, _ = hidden_states.shape
+	query_states = w8a16_gemm(
+		self.q_a_proj.weight.data,
+		weight_scale["q_a_proj.weight_scale_inv"],
+		hidden_states
+	)
+
+	query_states = self.q_a_layernorm(query_states)
+	query_states = w8a16_gemm(
+		self.q_b_proj.weight.data,
+		weight_scale["q_b_proj.weight_scale_inv"],
+		query_states
+	)
+
+	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
+	q_nope, q_pe = torch.split(
+		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)	
+	# compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+	compressed_kv = w8a16_gemm(
+		self.kv_a_proj_with_mqa.weight.data,
+		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+		hidden_states
+	)
+	# compressed_kv = fused_fp8_bf16_gemm(hidden_states, self.kv_a_proj_with_mqa.weight.data, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"])
+	# torch.cuda.current_stream().synchronize()
+	
+	compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)	
+	normed_kv = self.kv_a_layernorm(compressed_kv)
+	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
+	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
+	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
+	offload_kv = torch.cat(
+		[normed_kv, k_pe], dim=-1
+	)
+
+	# kv = self.kv_b_proj(normed_kv)
+	kv = w8a16_gemm(
+		self.kv_b_proj.weight.data,
+		weight_scale["kv_b_proj.weight_scale_inv"],
+		normed_kv
+	)
+	kv = kv.view(bsz, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+	k_nope, value_states = torch.split(
+		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+	)		
+
+	
+	query_states = k_pe.new_empty(bsz, seq_len, self.num_heads, self.q_head_dim)
+	query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+	query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+	key_states = k_pe.new_empty(
+		bsz, seq_len, self.num_heads, self.q_head_dim
+	)
+	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
+	key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+	key_states[:, :, :, self.qk_nope_head_dim :] = k_pe	
+
+	query_states = query_states.contiguous()
+	key_states = key_states.contiguous()
+	value_states = value_states.contiguous()
+
+
+	# # Call flash_attn_varlen_func
+	# (
+	# 	query_states,
+	# 	key_states,
+	# 	value_states,
+	# 	indices_q,
+	# 	cu_seq_lens,
+	# 	max_seq_lens,
+	# ) = _upad_input(
+	# 	query_states, key_states, value_states, attention_mask, seq_len
+	# )  	
+	# cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+	# max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+	# attn_output_unpad = flash_attn_varlen_func(
+	# 	query_states,
+	# 	key_states,
+	# 	value_states,
+	# 	cu_seqlens_q=cu_seqlens_q,
+	# 	cu_seqlens_k=cu_seqlens_k,
+	# 	max_seqlen_q=max_seqlen_in_batch_q,
+	# 	max_seqlen_k=max_seqlen_in_batch_k,
+	# 	softmax_scale=self.softmax_scale,
+	# 	causal=True
+	# )
+	# # if attn_output_unpad is a tuple, we use attn_output_unpad[0]
+	# if isinstance(attn_output_unpad, tuple):
+	# 	attn_output_unpad = attn_output_unpad[0]		
+
+	# attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
+	# 	bsz, seq_len, self.num_heads * self.v_head_dim
+	# ).contiguous()
+	attn_output = F.scaled_dot_product_attention(
+		query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim).transpose(1, 2),
+		key_states.view(bsz, seq_len, self.num_heads, self.k_head_dim).transpose(1, 2),  
+		value_states.view(bsz, seq_len, self.num_heads, self.v_head_dim).transpose(1, 2),
+		attn_mask=attention_mask,
+		dropout_p=0.0,
+		is_causal=True,
+	).transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.v_head_dim)
 
 	# attn_output = self.o_proj(attn_output)
 	attn_output = w8a16_gemm(
