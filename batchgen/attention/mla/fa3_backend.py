@@ -311,6 +311,11 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	)      	
 	cu_seqlens_q, cu_seqlens_k = cu_seq_lens
 	max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+	logging.info(f"attention_mask shape: {attention_mask.shape}")
+	logging.info(f"attention_mask sample: {attention_mask[0]}")  # Should show [1,1,1,...,0,0] pattern
+	logging.info(f"sequence lengths: {attention_mask.sum(dim=-1)}")  # Actual valid lengths per sequence
+	logging.info(f"position_ids shape: {position_ids.shape}")
+	logging.info(f"position_ids sample: {position_ids[0]}")  # Should show [0,1,2,...] pattern
 	logging.info(f"cu_seqlens_q: {cu_seqlens_q}")
 	logging.info(f"cu_seqlens_k: {cu_seqlens_k}")
 	logging.info(f"max_seqlen_in_batch_q: {max_seqlen_in_batch_q}")
@@ -318,7 +323,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	logging.info(f"query_states shape: {query_states.shape}, dtype: {query_states.dtype}")
 	logging.info(f"key_states shape: {key_states.shape}, dtype: {key_states.dtype}")	
 	logging.info(f"value_states shape: {value_states.shape}, dtype: {value_states.dtype}")
-	# exit()
+	exit()
 	attn_output_unpad = flash_attn_varlen_func(
 		query_states,
 		key_states,
