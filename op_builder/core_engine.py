@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------- #
-#  MoE-Gen                                                                      #
+#  BatchGen                                                                      #
 #  copyright (c) EfficientMoE team 2025                                             #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
@@ -35,7 +35,7 @@ import os
 
 from .builder import OpBuilder
 
-MOE_GEN_CORE_ROOT = "core/"
+batchgen_CORE_ROOT = "core/"
 
 
 class CoreEngineBuilder(OpBuilder):
@@ -46,24 +46,24 @@ class CoreEngineBuilder(OpBuilder):
         super().__init__(name=self.NAME)
 
     def absolute_name(self):
-        return f"moe_gen.core_engine"
+        return f"batchgen.core_engine"
 
     def sources(self):
         return [
-            f"{MOE_GEN_CORE_ROOT}/utils.cpp",
-            f"{MOE_GEN_CORE_ROOT}/MoE_Gen_Binding.cpp",
-            f"{MOE_GEN_CORE_ROOT}/MoE_Gen.cpp",
-            f"{MOE_GEN_CORE_ROOT}/DtoH_Engine/DtoH_Engine.cpp",
-            f"{MOE_GEN_CORE_ROOT}/Hetero_Attn/Hetero_Attn.cpp",
-            f"{MOE_GEN_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cpp",
-            f"{MOE_GEN_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
-            f"{MOE_GEN_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
-            f"{MOE_GEN_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
-            f"{MOE_GEN_CORE_ROOT}/Parameter_Server/posix_shm.cpp",
-            f"{MOE_GEN_CORE_ROOT}/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp",
-            f"{MOE_GEN_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
-            f"{MOE_GEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
-            f"{MOE_GEN_CORE_ROOT}/allocator.cpp",
+            f"{batchgen_CORE_ROOT}/utils.cpp",
+            f"{batchgen_CORE_ROOT}/batchgen_Binding.cpp",
+            f"{batchgen_CORE_ROOT}/batchgen.cpp",
+            f"{batchgen_CORE_ROOT}/DtoH_Engine/DtoH_Engine.cpp",
+            f"{batchgen_CORE_ROOT}/Hetero_Attn/Hetero_Attn.cpp",
+            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cpp",
+            f"{batchgen_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
+            f"{batchgen_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
+            f"{batchgen_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
+            f"{batchgen_CORE_ROOT}/Parameter_Server/posix_shm.cpp",
+            f"{batchgen_CORE_ROOT}/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp",
+            f"{batchgen_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
+            f"{batchgen_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
+            f"{batchgen_CORE_ROOT}/allocator.cpp",
         ]
 
     def include_paths(self):

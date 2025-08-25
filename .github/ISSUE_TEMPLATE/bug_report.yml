@@ -1,5 +1,5 @@
 name: Bug Report
-description: File an issue about a bug in MoE-Gen.
+description: File an issue about a bug in BatchGen.
 title: "[BUG] "
 labels: [bug]
 assignees: []
@@ -14,9 +14,9 @@ body:
     attributes:
       label: Prerequisites
       options:
-        - label: I have read the [MoE-Gen documentation](https://moe-gen.github.io/).
+        - label: I have read the [BatchGen documentation](https://BatchGen.github.io/).
           required: true
-        - label: I have searched the [Issue Tracker](https://github.com/EfficientMoE/MoE-Gen/issues) to ensure this hasn't been reported before.
+        - label: I have searched the [Issue Tracker](https://github.com/EfficientMoE/BatchGen/issues) to ensure this hasn't been reported before.
           required: true
 
   - type: textarea
@@ -70,6 +70,6 @@ body:
     attributes:
       label: Usage Statistics (Optional)
       description: |
-        We'd love to know how you're using MoE-Gen! If you're comfortable, please share details like your affiliation and use case to help us improve the project.
+        We'd love to know how you're using BatchGen! If you're comfortable, please share details like your affiliation and use case to help us improve the project.
     validations:
       required: false

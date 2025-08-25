@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------- #
-#  MoE-Gen                                                                      #
+#  BatchGen                                                                      #
 #  copyright (c) EfficientMoE team 2025                                             #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #

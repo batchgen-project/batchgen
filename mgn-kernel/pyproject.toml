@@ -10,7 +10,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "test-kernel-0ab602a9"
 version = "0.1.2"
-description = "Custom CUDA Kernels for MoE-Gen Project"
+description = "Custom CUDA Kernels for BatchGen Project"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }

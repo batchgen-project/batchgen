@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------- #
-#  MoE-Gen                                                                      #
+#  BatchGen                                                                      #
 #  copyright (c) FlashMoE team 2025                                             #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
@@ -19,7 +19,7 @@
 import logging
 import os
 from transformers import AutoTokenizer
-from moe_gen.engine import moe_gen
+from batchgen.engine import batchgen
 import numpy as np
 import datasets
 import argparse
@@ -132,16 +132,16 @@ if __name__ == "__main__":
 		logging.warning(f"Number of prompts {len(queries)} is not equal to max_prompts {args.max_prompts}.")
 
 	"""
-		Step 3: Launch MoE-Gen using the standalone parameter server
+		Step 3: Launch BatchGen using the standalone parameter server
 	"""
 	logging.info(f"Connecting to parameter server at {args.server_host}:{args.server_port}")
 	logging.info(f"Using model {hugging_face_checkpoint}")
 	
 	# Log device 0 gpu memory usage
 	gpu0_memory = torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024
-	logging.info(f"GPU 0 memory usage before moe-gen init: {gpu0_memory} GB")
+	logging.info(f"GPU 0 memory usage before BatchGen init: {gpu0_memory} GB")
 	# Run inference with our standalone parameter server
-	answer_set = moe_gen(
+	answer_set = batchgen(
 		huggingface_ckpt_name=hugging_face_checkpoint,
 		queries=queries,
 		max_input_length=args.max_input_length,

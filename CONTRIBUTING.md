@@ -1,6 +1,6 @@
-# Contributing to MoE-Gen
+# Contributing to BatchGen
 
-Thank you for considering contributing to MoE-Gen!
+Thank you for considering contributing to BatchGen!
 We welcome contributions of all kinds from the community.
 Whether you're introducing new features, enhancing the infrastructure, fixing bugs, or writing documentation, we appreciate your enthusiasm and value your efforts.
 
@@ -8,7 +8,7 @@ To help make your contributions as smooth as possible, we've put together this g
 
 ## Table of Contents
 
-- [Contributing to MoE-Gen](#contributing-to-MoE-Gen)
+- [Contributing to BatchGen](#contributing-to-BatchGen)
   - [Table of Contents](#table-of-contents)
   - [Community](#community)
   - [Code of Conduct](#code-of-conduct)
@@ -21,12 +21,12 @@ To help make your contributions as smooth as possible, we've put together this g
 
 ## How to Contribute
 
-- Check the [public development board](https://github.com/orgs/MoE-Gen/projects/2) for tasks (i.e., items with the status `Ready 🟢`) or [issue tracker](https://github.com/MoE-Gen/MoE-Gen/issues) for open issues. You can also create a new one to discuss your idea.
+- Check the [public development board](https://github.com/orgs/BatchGen/projects/2) for tasks (i.e., items with the status `Ready 🟢`) or [issue tracker](https://github.com/BatchGen/BatchGen/issues) for open issues. You can also create a new one to discuss your idea.
 - Follow the [Fork-and-Pull-Request](https://docs.github.com/en/get-started/quickstart/contributing-to-projects) workflow when opening your pull requests.
 - Ensure your code follows our style guidelines and passes all tests (see [Development Environment](#development-environment)).
 - Submit a pull request with a clear description of your changes.
   - The pull request title should follow the [Commit Message Guidelines](#commit-message-guidelines).
-  - The description should follow the [Pull Request Template](https://github.com/MoE-Gen/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
+  - The description should follow the [Pull Request Template](https://github.com/BatchGen/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
   - Make sure to mention any related issues.
 
 Before your pull request can be merged, it must pass the formatting, linting, and testing checks (see [Development Environment](#development-environment)).
@@ -42,7 +42,7 @@ If you add a feature:
 
 ### Roadmap and Tasks
 
-You can find available tasks (i.e., `status=Ready 🟢`) and contribute to planned features by checking our [public development board](https://github.com/orgs/MoE-Gen/projects/2).
+You can find available tasks (i.e., `status=Ready 🟢`) and contribute to planned features by checking our [public development board](https://github.com/orgs/BatchGen/projects/2).
 For beginners, we recommend starting with issues labeled `good first issue` or `help wanted`.
 Feel free to discuss any ideas before getting started!
 

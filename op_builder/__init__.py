@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------- #
-#  MoE-Gen                                                                      #
+#  BatchGen                                                                      #
 #  copyright (c) EfficientMoE team 2025                                             #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
@@ -43,9 +43,9 @@ __deepspeed__ = True
 
 # List of all available op builders from deepspeed op_builder
 try:
-    import moe_gen.op_builder  # noqa: F401
+    import batchgen.op_builder  # noqa: F401
 
-    op_builder_dir = "moe_gen.op_builder"
+    op_builder_dir = "batchgen.op_builder"
 except ImportError:
     op_builder_dir = "op_builder"
 

@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from moe_gen.distributed.device_communicators.pynccl import PyNcclCommunicator
+from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 
 def setup_dist(rank, world_size, backend="gloo"):
