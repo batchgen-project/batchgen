@@ -139,48 +139,48 @@ from triton import Config
 
 @triton.jit
 def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
-    """
-    Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
+	"""
+	Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
 
-    Args:
-        x_ptr (triton.Pointer): Pointer to the input tensor.
-        y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
-        s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
-        BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
+	Args:
+		x_ptr (triton.Pointer): Pointer to the input tensor.
+		y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
+		s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
+		BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
 
-    Returns:
-        None
-    """
-    pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.
-    y = x / s
-    y = y.to(y_ptr.dtype.element_ty)
-    tl.store(y_ptr + offs, y)
-    tl.store(s_ptr + pid, s)
+	Returns:
+		None
+	"""
+	pid = tl.program_id(axis=0)
+	offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+	x = tl.load(x_ptr + offs).to(tl.float32)
+	s = tl.max(tl.abs(x)) / 448.
+	y = x / s
+	y = y.to(y_ptr.dtype.element_ty)
+	tl.store(y_ptr + offs, y)
+	tl.store(s_ptr + pid, s)
 
 
 def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantizes the input tensor `x` using block-wise quantization.
+	"""
+	Quantizes the input tensor `x` using block-wise quantization.
 
-    Args:
-        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
-        block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
+	Args:
+		x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+		block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The quantized tensor with dtype `torch.float8_e4m3fn`.
-            - A tensor of scaling factors with dtype `torch.float32`.
-    """
-    assert x.is_contiguous(), 'Input tensor must be contiguous'
-    assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
-    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
-    act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
-    return y, s
+	Returns:
+		Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+			- The quantized tensor with dtype `torch.float8_e4m3fn`.
+			- A tensor of scaling factors with dtype `torch.float32`.
+	"""
+	assert x.is_contiguous(), 'Input tensor must be contiguous'
+	assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
+	y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+	s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+	grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
+	act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+	return y, s
 
 def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
@@ -456,8 +456,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	# 	bsz, seq_len, self.num_heads * self.v_head_dim
 	# ).contiguous()
 	# attention_mask = attention_mask.to(torch.bool)
-    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-    attention_mask = torch.where(attention_mask == 0, torch.finfo(torch.bfloat16).min, torch.tensor(0.0, dtype=torch.bfloat16, device=attention_mask.device))
+	attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+	attention_mask = torch.where(attention_mask == 0, torch.finfo(torch.bfloat16).min, torch.tensor(0.0, dtype=torch.bfloat16, device=attention_mask.device))
 	attn_output = F.scaled_dot_product_attention(
 		query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim).transpose(1, 2),
 		key_states.view(bsz, seq_len, self.num_heads, self.q_head_dim).transpose(1, 2),  
