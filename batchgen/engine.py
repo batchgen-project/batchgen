@@ -857,6 +857,7 @@ class BatchGen:
                 range(len(self.model_batches)), desc="Model Batch"
             ):
                 dist.barrier()
+                logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
                 self._config_prefill()
                 prefill_start_time = time.perf_counter()
                 with torch.inference_mode():

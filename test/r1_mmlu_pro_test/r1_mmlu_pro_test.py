@@ -52,7 +52,7 @@ if __name__ == "__main__":
 	dataset = pd.read_parquet(os.path.join(os.path.dirname(__file__), 'mmlu_pro_test.parquet'))	
 
 	## to be removed
-	dataset = dataset.head(100)
+	dataset = dataset.head(128)
 
 	def form_options(options: list):
 		option_str = 'Options are:\n'
