@@ -77,6 +77,7 @@ if __name__ == "__main__":
 	for idx, d in validation_set.iterrows():
 		prompts[d['category']] += 'Q:' + ' ' + d['question'] + '\n' + form_options(d['options']) + '\n' + d['cot_content'] + '\n\n'
 
+
 	queries = []
 	for row_idx, entry in dataset.iterrows():
 		prefix = prompts[entry['category']]
@@ -88,7 +89,7 @@ if __name__ == "__main__":
 	)
 	for prompt_idx in range(len(queries)):
 		messages = [
-			{"role": "system", "content": "You are an knowledge expert, you are supposed to answer the multi-choice question to derive your final answer as `The answer is ...` and select from choices (A) to (J)."},
+			{"role": "system", "content": "You are an knowledge expert, you are supposed to answer the multi-choice question to derive your final answer as `The answer is ...`. Please follow the following examples and strictly give the answer with format 'the answer is (A/B/C/D/E/F/G/H/I/J)'."},
 			{"role": "user", "content": queries[prompt_idx]},
 		]
 		text = tokenizer.apply_chat_template(
