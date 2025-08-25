@@ -164,8 +164,9 @@ def _upad_input(
 		indices_q = cu_seqlens_q[:-1]
 		query_layer = query_layer.squeeze(1)
 	else:
-		# The -q_len: slice assumes left padding.
-		attention_mask = attention_mask[:, -query_length:]
+		# We are using right padding, so we can just take the last query_length tokens.
+		# attention_mask = attention_mask[:, -query_length:]
+		attention_mask = attention_mask[:, :query_length]
 		query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(
 			query_layer, attention_mask
 		)
