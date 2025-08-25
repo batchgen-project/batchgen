@@ -66,14 +66,14 @@ if __name__ == "__main__":
 	
 
 	
-
+	validation_set = pd.read_parquet(os.path.join(os.path.dirname(__file__), 'mmlu_pro_validation.parquet'))
 	categories = ['computer science', 'math', 'chemistry', 'engineering', 'law', 'biology',
 				  'health', 'physics', 'business', 'philosophy', 'economics', 'other',
 				  'psychology', 'history']
 
 	# load 5-shot prompts for each category
 	prompts = {c: '' for c in categories}
-	for d in dataset['validation']:
+	for d in validation_set['validation']:
 		prompts[d['category']] += 'Q:' + ' ' + d['question'] + '\n' + form_options(d['options']) + '\n' + d['cot_content'] + '\n\n'
 
 	queries = []
