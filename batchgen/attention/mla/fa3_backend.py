@@ -605,6 +605,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		softmax_scale=self.softmax_scale if hasattr(self, 'softmax_scale') else None,
 		causal=True
 	)
+	if isinstance(attn_output_unpad, tuple):
+		attn_output_unpad = attn_output_unpad[0]
 	
 	# Re-pad the output back to original shape
 	# Create padded output tensor
