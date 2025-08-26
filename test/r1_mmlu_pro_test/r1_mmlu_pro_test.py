@@ -52,7 +52,7 @@ if __name__ == "__main__":
 	dataset = pd.read_parquet(os.path.join(os.path.dirname(__file__), 'mmlu_pro_test.parquet'))	
 
 	## to be removed
-	dataset = dataset.head(128)
+	dataset = dataset.head(768)
 	# print all the questions:
 	# print(dataset['question'].tolist())
 	# exit()
@@ -183,7 +183,7 @@ if __name__ == "__main__":
 	"""
 		Step 5: Calculate the accuracy.
 	"""
-	def get_prediction(output):
+	def get_prediction(output,idx):
 		# Find the end of thinking section
 		think_end = output.find("</think>")
 		
@@ -193,7 +193,8 @@ if __name__ == "__main__":
 		else:
 			# If no </think> tag found, search the entire output
 			search_text = output
-			print("Warning: No </think> tag found, searching entire output")
+			# print("Warning: No </think> tag found, searching entire output")
+			logging.warning(f"No </think> tag found in output for sample {idx}, searching entire output")
 		
 		pattern = r"answer is \(?([ABCDEFGHIJ])\)?"
 		match = re.search(pattern, search_text)
@@ -208,7 +209,7 @@ if __name__ == "__main__":
 	ground_truths = dataset['answer'].tolist()
 	for answer_idx in range(len(answer_set)):
 		pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist()[0])
-		prediction = get_prediction(pred_answer)
+		prediction = get_prediction(pred_answer, answer_idx)
 		answers.append(prediction)
 
 		if prediction == ground_truths[answer_idx]:
