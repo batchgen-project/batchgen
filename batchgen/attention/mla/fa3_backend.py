@@ -603,7 +603,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		max_seqlen_q=max_seqlen,
 		max_seqlen_k=max_seqlen,
 		softmax_scale=self.softmax_scale if hasattr(self, 'softmax_scale') else None,
-		causal=True
+		causal=False
 	)
 	if isinstance(attn_output_unpad, tuple):
 		attn_output_unpad = attn_output_unpad[0]
