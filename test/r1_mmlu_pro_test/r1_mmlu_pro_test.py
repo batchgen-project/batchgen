@@ -152,18 +152,57 @@ if __name__ == "__main__":
 			print("\n\n")	
 	
 
+	# """
+	# 	Step 5: Calculate the accuracy.
+	# """
+	# def get_prediction(output):
+	# 	pattern = r"answer is \(?([ABCDEFGHIJ])\)?"
+	# 	match = re.search(pattern, output)
+	# 	if match:
+	# 		return match.group(1)
+	# 	else:
+	# 		print("extraction failed, do a random guess")
+	# 		return random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
+		
+	# success, fail = 0, 0
+	# answers = []
+	# ground_truths = dataset['answer'].tolist()
+	# for answer_idx in range(len(answer_set)):
+	# 	pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist()[0])
+	# 	prediction = get_prediction(pred_answer)
+	# 	answers.append(prediction)
+	
+	# 	if prediction == ground_truths[answer_idx]:
+	# 		success += 1
+	# 	else:
+	# 		fail += 1
+	
+	# print(f"Total samples: {success + fail}, Success: {success}, Fail: {fail}")
+	# print(f"Accuracy: {success / (success + fail)}")
+
 	"""
 		Step 5: Calculate the accuracy.
 	"""
 	def get_prediction(output):
+		# Find the end of thinking section
+		think_end = output.find("</think>")
+		
+		if think_end != -1:
+			# Search for answer pattern only after </think>
+			search_text = output[think_end + len("</think>"):]
+		else:
+			# If no </think> tag found, search the entire output
+			search_text = output
+			print("Warning: No </think> tag found, searching entire output")
+		
 		pattern = r"answer is \(?([ABCDEFGHIJ])\)?"
-		match = re.search(pattern, output)
+		match = re.search(pattern, search_text)
 		if match:
 			return match.group(1)
 		else:
 			print("extraction failed, do a random guess")
 			return random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
-		
+
 	success, fail = 0, 0
 	answers = []
 	ground_truths = dataset['answer'].tolist()
@@ -171,12 +210,12 @@ if __name__ == "__main__":
 		pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist()[0])
 		prediction = get_prediction(pred_answer)
 		answers.append(prediction)
-	
+
 		if prediction == ground_truths[answer_idx]:
 			success += 1
 		else:
 			fail += 1
-	
+
 	print(f"Total samples: {success + fail}, Success: {success}, Fail: {fail}")
 	print(f"Accuracy: {success / (success + fail)}")
 		
