@@ -52,7 +52,7 @@ if __name__ == "__main__":
 	dataset = pd.read_parquet(os.path.join(os.path.dirname(__file__), 'mmlu_pro_test.parquet'))	
 
 	## to be removed
-	dataset = dataset.head(768)
+	dataset = dataset.head(args.max_prompts)
 	# print all the questions:
 	# print(dataset['question'].tolist())
 	# exit()

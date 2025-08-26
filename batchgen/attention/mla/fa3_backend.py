@@ -344,7 +344,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_(
 
 
 @torch.inference_mode()
-def mla_prefill_flashattention3_w8a16_deepgemm(
+def mla_prefill_w8a16_deepgemm(
 	self,
 	hidden_states: torch.Tensor,
 	attention_mask: torch.Tensor,
@@ -477,6 +477,160 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	# logging.info(f"offload_kv: {offload_kv.shape}")
 	return attn_output, offload_kv
 
+
+@torch.inference_mode()
+def mla_prefill_flashattention3_w8a16_deepgemm(
+	self,
+	hidden_states: torch.Tensor,
+	attention_mask: torch.Tensor,
+	position_ids: torch.Tensor,
+	weight_scale: dict[str, torch.Tensor],
+
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""
+		MLA prefifill on hooper device.
+		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
+	"""
+	bsz, seq_len, _ = hidden_states.shape
+	query_states = w8a16_gemm(
+		self.q_a_proj.weight.data,
+		weight_scale["q_a_proj.weight_scale_inv"],
+		hidden_states
+	)
+
+	query_states = self.q_a_layernorm(query_states)
+	query_states = w8a16_gemm(
+		self.q_b_proj.weight.data,
+		weight_scale["q_b_proj.weight_scale_inv"],
+		query_states
+	)
+
+	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
+	q_nope, q_pe = torch.split(
+		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)	
+	# compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+	compressed_kv = w8a16_gemm(
+		self.kv_a_proj_with_mqa.weight.data,
+		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+		hidden_states
+	)
+	# compressed_kv = fused_fp8_bf16_gemm(hidden_states, self.kv_a_proj_with_mqa.weight.data, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"])
+	# torch.cuda.current_stream().synchronize()
+	
+	compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)	
+	normed_kv = self.kv_a_layernorm(compressed_kv)
+	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
+	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
+	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
+	offload_kv = torch.cat(
+		[normed_kv, k_pe], dim=-1
+	)
+
+	# kv = self.kv_b_proj(normed_kv)
+	kv = w8a16_gemm(
+		self.kv_b_proj.weight.data,
+		weight_scale["kv_b_proj.weight_scale_inv"],
+		normed_kv
+	)
+	kv = kv.view(bsz, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+	k_nope, value_states = torch.split(
+		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+	)		
+
+	
+	query_states = k_pe.new_empty(bsz, seq_len, self.num_heads, self.q_head_dim)
+	query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+	query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+	key_states = k_pe.new_empty(
+		bsz, seq_len, self.num_heads, self.q_head_dim
+	)
+	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
+	key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+	key_states[:, :, :, self.qk_nope_head_dim :] = k_pe	
+
+	query_states = query_states.contiguous()
+	key_states = key_states.contiguous()
+	value_states = value_states.contiguous()
+
+	# ========== Replace vanilla attention with Flash Attention ==========
+	# Since tokens are right-padded, compute actual sequence lengths from attention_mask
+	# attention_mask shape: [bsz, seq_len], where 1 indicates valid tokens, 0 indicates padding
+	
+	# Get actual sequence lengths for each batch element
+	# For right-padded sequences, find the last valid position
+	seqlens = attention_mask.sum(dim=1, dtype=torch.int32)  # [bsz]
+	
+	# Compute cumulative sequence lengths for flash attention
+	cu_seqlens = torch.cat([
+		torch.zeros(1, dtype=torch.int32, device=attention_mask.device),
+		seqlens.cumsum(dim=0, dtype=torch.int32)
+	])
+	
+	# Get max sequence length in the batch
+	max_seqlen = seqlens.max().item()
+	
+	# Unpad the tensors - remove padding tokens and concatenate all valid tokens
+	# First, create indices for valid tokens
+	indices = torch.arange(seq_len, device=attention_mask.device).unsqueeze(0).expand(bsz, -1)
+	valid_mask = indices < seqlens.unsqueeze(1)  # [bsz, seq_len]
+	
+	# Reshape to [bsz * seq_len, num_heads, head_dim] and select valid tokens
+	query_states_flat = query_states.view(bsz * seq_len, self.num_heads, self.q_head_dim)
+	key_states_flat = key_states.view(bsz * seq_len, self.num_heads, self.q_head_dim)
+	value_states_flat = value_states.view(bsz * seq_len, self.num_heads, self.v_head_dim)
+	
+	valid_indices = valid_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)
+	
+	query_states_unpad = query_states_flat[valid_indices]  # [total_valid_tokens, num_heads, head_dim]
+	key_states_unpad = key_states_flat[valid_indices]
+	value_states_unpad = value_states_flat[valid_indices]
+	
+	# Call flash attention with unpadded tensors
+	from flash_attn import flash_attn_varlen_func
+	
+	attn_output_unpad = flash_attn_varlen_func(
+		query_states_unpad,
+		key_states_unpad,
+		value_states_unpad,
+		cu_seqlens_q=cu_seqlens,
+		cu_seqlens_k=cu_seqlens,
+		max_seqlen_q=max_seqlen,
+		max_seqlen_k=max_seqlen,
+		softmax_scale=self.softmax_scale if hasattr(self, 'softmax_scale') else None,
+		causal=True
+	)
+	
+	# Re-pad the output back to original shape
+	# Create padded output tensor
+	attn_output_padded = torch.zeros(
+		bsz * seq_len, self.num_heads, self.v_head_dim,
+		dtype=attn_output_unpad.dtype,
+		device=attn_output_unpad.device
+	)
+	
+	# Place the unpadded output back in the correct positions
+	attn_output_padded[valid_indices] = attn_output_unpad
+	
+	# Reshape back to [bsz, seq_len, num_heads * v_head_dim]
+	attn_output = attn_output_padded.view(bsz, seq_len, self.num_heads * self.v_head_dim)
+	# ========== End Flash Attention replacement ==========
+
+
+	# attn_output = self.o_proj(attn_output)
+	attn_output = w8a16_gemm(
+		self.o_proj.weight.data,
+		weight_scale["o_proj.weight_scale_inv"],
+		attn_output
+	)
+
+	# logging.info(f"offload_kv: {offload_kv.shape}")
+	return attn_output, offload_kv
 
 @torch.inference_mode()
 def mla_prefill_flashattention3_fused_dequant(
