@@ -591,8 +591,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	key_states_unpad = key_states_flat[valid_indices]
 	value_states_unpad = value_states_flat[valid_indices]
 	
-	# Call flash attention with unpadded tensors
-	from flash_attn import flash_attn_varlen_func
+	# # Call flash attention with unpadded tensors
+	# from flash_attn import flash_attn_varlen_func
 	
 	attn_output_unpad = flash_attn_varlen_func(
 		query_states_unpad,
