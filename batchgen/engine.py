@@ -935,12 +935,12 @@ class BatchGen:
 				self._unregister_fp8_weights()
 				# del past_key_states
 				# del scale_dict
-				self.model = self.model.to("cpu")
-				# Set all model parameters to None
-				for param in self.model.parameters():
-					param.data = torch.zeros(
-						1, dtype=torch.bfloat16, device=param.device)
-				# del self.model
+				# self.model = self.model.to("cpu")
+				# # Set all model parameters to None
+				# for param in self.model.parameters():
+				# 	param.data = torch.zeros(
+				# 		1, dtype=torch.bfloat16, device=param.device)
+				del self.model
 				self.model = None
 				gc.collect()  
 				torch.cuda.empty_cache()
@@ -1103,12 +1103,13 @@ class BatchGen:
 	
 	def _config_decoding(self, num_seq):
 		logging.info(f"Start Config Decoding")
-		self.model = self.model.to("cpu")
-		# Set all model parameters to None
-		for param in self.model.parameters():
-			param.data = torch.zeros(
-				1, dtype=torch.bfloat16, device=param.device)
-		# del self.model
+		# self.model = self.model.to("cpu")
+		# # Set all model parameters to None
+		# for param in self.model.parameters():
+		# 	param.data = torch.zeros(
+		# 		1, dtype=torch.bfloat16, device=param.device)
+		# # del self.model
+		del self.model
 		self.model = None
 		gc.collect()  
 		torch.cuda.empty_cache()
