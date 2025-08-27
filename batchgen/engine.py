@@ -962,7 +962,6 @@ class BatchGen:
         dist.barrier()
         self.model = None 
         torch.cuda.empty_cache()
-        dist.destroy_process_group()
 
         logging.info(
             f"Rank {self.rank} Prefill total time: {prefill_time:.1f} seconds,\n"
@@ -984,6 +983,7 @@ class BatchGen:
         # Gather results from all rank to rank 0
         all_results = [None] * self.world_size
         dist.all_gather_object(all_results, res)
+        dist.destroy_process_group()
         all_result = [item for sublist in all_results for item in sublist]
         if self.rank == 0:
             return all_result
