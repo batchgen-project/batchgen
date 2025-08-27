@@ -437,11 +437,11 @@ def batchgen(
 
     # Communicate to let each node get all the results
     # The results should remain the order of node rank.
-    global_results = [None] * nnodes
-    dist.all_gather_object(global_results, all_results)
+    # global_results = [None] * nnodes
+    # dist.all_gather_object(global_results, all_results)
 
 
-    return global_results
+    return all_results
 
 
 
@@ -980,7 +980,15 @@ class BatchGen:
         #     logging.info(
         #         f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
         #     )
-        return res
+
+        # Gather results from all rank to rank 0
+        all_results = [None] * self.world_size
+        dist.all_gather_object(all_results, res)
+        all_result = [item for sublist in all_results for item in sublist]
+        if self.rank == 0:
+            return all_result
+        else:
+            return []
 
     def _parse_state_dict_dp(self):
         model_init_start_time = time.perf_counter()
