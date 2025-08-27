@@ -123,15 +123,15 @@ std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(std::
         if (tensor_key.find("norm") != std::string::npos) {
             auto tensor = torch::from_blob(
                 tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
-                bf16_option,
-                [buffer_copy = tensor_buffer](void* ptr) {});
+                [buffer_copy = tensor_buffer](void* ptr) {},
+                bf16_option);
             tensors[tensor_key] = tensor;
         }
         else{
             auto tensor = torch::from_blob(
                 tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
-                fp8_option,
-                [buffer_copy = tensor_buffer](void* ptr) {});
+                [buffer_copy = tensor_buffer](void* ptr) {},
+                fp8_option);
             tensors[tensor_key] = tensor;
         }
     }
