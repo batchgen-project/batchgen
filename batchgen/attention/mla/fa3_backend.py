@@ -214,7 +214,7 @@ def w8a16_gemm(
 	return out
 
 @torch.inference_mode()
-def mla_prefill_flashattention3_w8a16_deepgemm_(
+def mla_prefill_flashattention3_w8a16_deepgemm(
 	self,
 	hidden_states: torch.Tensor,
 	attention_mask: torch.Tensor,
@@ -309,8 +309,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_(
 		max_seq_lens,
 	) = _upad_input(
 		query_states, key_states, value_states, attention_mask, seq_len
-	)  
-	exit()    	
+	)   	
 	cu_seqlens_q, cu_seqlens_k = cu_seq_lens
 	max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 	attn_output_unpad = flash_attn_varlen_func(
@@ -322,7 +321,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_(
 		max_seqlen_q=max_seqlen_in_batch_q,
 		max_seqlen_k=max_seqlen_in_batch_k,
 		softmax_scale=self.softmax_scale,
-		causal=True
+		causal=False
 	)
 	# if attn_output_unpad is a tuple, we use attn_output_unpad[0]
 	if isinstance(attn_output_unpad, tuple):
