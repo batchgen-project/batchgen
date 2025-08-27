@@ -5,7 +5,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python /data2/tairan/workspace/BatchGen/test/r1_mmlu_pro_test/r1_mmlu_pro_test.py \
     --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
 	--host_kv_cache_size 256 \
-    --max_prompts 768 \
     --max_input_length 4096 \
     --max_decoding_length 4096 \
     --ATTN_MODE 3 \

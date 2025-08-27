@@ -932,6 +932,10 @@ class BatchGen:
                     self.decoding(new_token, self.model_batches[model_batch_idx], past_key_states, past_value_states, scale_dict)
                 decoding_time += time.perf_counter() - decoding_start_time
                 self.core_engine.clear_kv_storage()
+                del past_key_states
+                del scale_dict
+                gc.collect()
+                
         else:
             # For small input batch, some worker might do not have any input.
             # In this case, it only participate in the decoding phase.
@@ -1065,6 +1069,16 @@ class BatchGen:
                     )
 
     def _config_prefill(self):
+        if self.model is not None:
+            self.model = self.model.to("cpu")
+            # Set all model parameters to None
+            for param in self.model.parameters():
+                param.data = torch.zeros(
+                    1, dtype=torch.bfloat16, device=param.device)
+            # del self.model
+            self.model = None
+            gc.collect()  
+            torch.cuda.empty_cache()
         self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
         self.set_phase("prefill")
         self.core_engine.stop_h2d_worker()
