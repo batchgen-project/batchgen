@@ -24,7 +24,7 @@ if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--hugging_face_checkpoint", type=str)
 	parser.add_argument("--host_kv_cache_size", type=int)
-	parser.add_argument("--max_prompts", type=int)
+	parser.add_argument("--max_prompts", type=int, default=0)
 	parser.add_argument("--ATTN_MODE", type=str)
 	parser.add_argument("--SPLIT_RATIO_W", type=str)
 	parser.add_argument("--max_input_length", type=int)
@@ -50,12 +50,8 @@ if __name__ == "__main__":
 	benchmark_name = "TIGER-Lab/MMLU-Pro"
 	logging.info(f"Loading dataset {benchmark_name}")
 	dataset = pd.read_parquet(os.path.join(os.path.dirname(__file__), 'mmlu_pro_test.parquet'))	
-
-	## to be removed
-	dataset = dataset.head(args.max_prompts)
-	# print all the questions:
-	# print(dataset['question'].tolist())
-	# exit()
+	if args.max_prompts != 0:
+		dataset = dataset.head(args.max_prompts)
 
 	def form_options(options: list):
 		option_str = 'Options are:\n'
@@ -97,14 +93,8 @@ if __name__ == "__main__":
 		)
 		queries[prompt_idx] = text
 	
-	# print(queries)
-	# exit()
 	
 	logging.info(f"Loaded {len(queries)} samples from the dataset.")
-	# Print first 5 questions:
-	# for i in range(min(5, len(queries))):
-	# 	logging.info(f"Prompt {i}: {queries[i][:args.max_input_length]}")
-	# exit()
 	"""
 		Step 3: Launch BatchGen using the standalone parameter server
 	"""
@@ -151,34 +141,6 @@ if __name__ == "__main__":
 			print(f"Answer {idx}: {tmp_answer}")
 			print("\n\n")	
 	
-
-	# """
-	# 	Step 5: Calculate the accuracy.
-	# """
-	# def get_prediction(output):
-	# 	pattern = r"answer is \(?([ABCDEFGHIJ])\)?"
-	# 	match = re.search(pattern, output)
-	# 	if match:
-	# 		return match.group(1)
-	# 	else:
-	# 		print("extraction failed, do a random guess")
-	# 		return random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
-		
-	# success, fail = 0, 0
-	# answers = []
-	# ground_truths = dataset['answer'].tolist()
-	# for answer_idx in range(len(answer_set)):
-	# 	pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist()[0])
-	# 	prediction = get_prediction(pred_answer)
-	# 	answers.append(prediction)
-	
-	# 	if prediction == ground_truths[answer_idx]:
-	# 		success += 1
-	# 	else:
-	# 		fail += 1
-	
-	# print(f"Total samples: {success + fail}, Success: {success}, Fail: {fail}")
-	# print(f"Accuracy: {success / (success + fail)}")
 
 	"""
 		Step 5: Calculate the accuracy.
