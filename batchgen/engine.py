@@ -933,8 +933,8 @@ class BatchGen:
 				decoding_time += time.perf_counter() - decoding_start_time
 				self.core_engine.clear_kv_storage()
 				self._unregister_fp8_weights()
-				del past_key_states
-				del scale_dict
+				# del past_key_states
+				# del scale_dict
 				self.model = self.model.to("cpu")
 				# Set all model parameters to None
 				for param in self.model.parameters():
@@ -1327,6 +1327,9 @@ class BatchGen:
 					)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 				new_token_idx += 1
+			Attn_Wrapper.scale = None
+			Attn_Wrapper.past_key_states = None
+			Attn_Wrapper.past_value_states = None
 		
 		
 		else:
