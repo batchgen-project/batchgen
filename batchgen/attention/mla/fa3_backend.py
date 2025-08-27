@@ -214,7 +214,7 @@ def w8a16_gemm(
 	return out
 
 @torch.inference_mode()
-def mla_prefill_flashattention3_w8a16_deepgemm_(
+def mla_prefill_flashattention3_w8a16_deepgemm(
 	self,
 	hidden_states: torch.Tensor,
 	attention_mask: torch.Tensor,
@@ -320,7 +320,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm_(
 		cu_seqlens_k=cu_seqlens_k,
 		max_seqlen_q=max_seqlen_in_batch_q,
 		max_seqlen_k=max_seqlen_in_batch_k,
-		softmax_scale=self.softmax_scale,
+		# softmax_scale=self.softmax_scale,
+		softmax_scale= self.q_head_dim ** (-0.5),
 		causal=False
 	)
 	# if attn_output_unpad is a tuple, we use attn_output_unpad[0]
@@ -343,7 +344,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_(
 
 
 @torch.inference_mode()
-def mla_prefill_flashattention3_w8a16_deepgemm(
+def mla_prefill_flashattention3_w8a16_deepgemm_(
 	self,
 	hidden_states: torch.Tensor,
 	attention_mask: torch.Tensor,
