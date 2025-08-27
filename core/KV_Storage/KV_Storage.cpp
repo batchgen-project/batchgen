@@ -639,7 +639,7 @@ void KV_Storage::Init() {
                     return true;
                 }
                 // memset
-                // CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
+                CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
                 return false;
             }
 
@@ -654,6 +654,7 @@ void KV_Storage::Init() {
 
             // Allocate write-combined memory
             cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
+            CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
             
             if (err == cudaSuccess) {
                 // Verify the allocation is on correct NUMA node

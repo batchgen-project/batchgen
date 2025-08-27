@@ -541,7 +541,9 @@ def dequant_compressed_kv_per_token(
 		bsz, max_seq_len, dim = q.shape
 		padded_seq_len = ceil(seq_len / 64) * 64  # Nearest multiple of 64
 
-		result = torch.empty((bsz * padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+		result = torch.ones((bsz * padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+		# Assign max value to result tensor
+		# result.fill_(1e10)
 
 		# Construct 3D triton grid: bsz, seq_len, num_blocks
 		BLOCK_SIZE_M = 64
@@ -563,6 +565,7 @@ def dequant_compressed_kv_per_token(
 				scale.stride(0), scale.stride(1),
 				result.stride(0), result.stride(1)
 		)
+		# result = torch.ones((bsz * padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
 		return result.view(bsz, padded_seq_len, dim)  # Reshape back to [bsz, padded_seq_len, dim]
 
 

@@ -434,7 +434,13 @@ def batchgen(
         all_results = safe_collect_results(futures)
     end_time = time.perf_counter()
     logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
-    
+
+    # Communicate to let each node get all the results
+    # The results should remain the order of node rank.
+    # global_results = [None] * nnodes
+    # dist.all_gather_object(global_results, all_results)
+
+
     return all_results
 
 
@@ -857,6 +863,7 @@ class BatchGen:
                 range(len(self.model_batches)), desc="Model Batch"
             ):
                 dist.barrier()
+                logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
                 self._config_prefill()
                 prefill_start_time = time.perf_counter()
                 with torch.inference_mode():
@@ -955,7 +962,6 @@ class BatchGen:
         dist.barrier()
         self.model = None 
         torch.cuda.empty_cache()
-        dist.destroy_process_group()
 
         logging.info(
             f"Rank {self.rank} Prefill total time: {prefill_time:.1f} seconds,\n"
@@ -973,7 +979,16 @@ class BatchGen:
         #     logging.info(
         #         f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
         #     )
-        return res
+
+        # Gather results from all rank to rank 0
+        all_results = [None] * self.world_size
+        dist.all_gather_object(all_results, res)
+        dist.destroy_process_group()
+        all_result = [item for sublist in all_results for item in sublist]
+        if self.rank == 0:
+            return all_result
+        else:
+            return []
 
     def _parse_state_dict_dp(self):
         model_init_start_time = time.perf_counter()
@@ -1684,7 +1699,7 @@ class BatchGen:
 
     def _init_torch_dist(self):
         timeout = timedelta(minutes=5)
-        os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
+        # os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
         try:
             dist.init_process_group(
                 backend="nccl",

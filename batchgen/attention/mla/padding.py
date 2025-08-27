@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+import logging
 
 class IndexFirstAxis(torch.autograd.Function):
 	@staticmethod
@@ -122,7 +123,7 @@ def _get_unpad_data(attention_mask):
 	indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
 	max_seqlen_in_batch = seqlens_in_batch.max().item()
 	cu_seqlens = F.pad(
-		torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
+		torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
 	)
 	return (
 		indices,
@@ -147,7 +148,7 @@ def _upad_input(
 		value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim_v),
 		indices_k,
 	)
-	if query_length == kv_seq_len:
+	if query_length == kv_seq_len:		
 		query_layer = index_first_axis(
 			query_layer.reshape(batch_size * kv_seq_len, num_heads, head_dim_k),
 			indices_k,
@@ -164,8 +165,10 @@ def _upad_input(
 		indices_q = cu_seqlens_q[:-1]
 		query_layer = query_layer.squeeze(1)
 	else:
-		# The -q_len: slice assumes left padding.
-		attention_mask = attention_mask[:, -query_length:]
+		# We are using right padding, so we can just take the last query_length tokens.
+		# attention_mask = attention_mask[:, -query_length:]
+		attention_mask = attention_mask[:, :query_length]
+		query_layer = query_layer[:, :query_length, ...]
 		query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(
 			query_layer, attention_mask
 		)

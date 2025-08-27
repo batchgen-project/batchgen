@@ -139,48 +139,48 @@ from triton import Config
 
 @triton.jit
 def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
-    """
-    Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
+	"""
+	Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
 
-    Args:
-        x_ptr (triton.Pointer): Pointer to the input tensor.
-        y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
-        s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
-        BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
+	Args:
+		x_ptr (triton.Pointer): Pointer to the input tensor.
+		y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
+		s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
+		BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
 
-    Returns:
-        None
-    """
-    pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.
-    y = x / s
-    y = y.to(y_ptr.dtype.element_ty)
-    tl.store(y_ptr + offs, y)
-    tl.store(s_ptr + pid, s)
+	Returns:
+		None
+	"""
+	pid = tl.program_id(axis=0)
+	offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+	x = tl.load(x_ptr + offs).to(tl.float32)
+	s = tl.max(tl.abs(x)) / 448.
+	y = x / s
+	y = y.to(y_ptr.dtype.element_ty)
+	tl.store(y_ptr + offs, y)
+	tl.store(s_ptr + pid, s)
 
 
 def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantizes the input tensor `x` using block-wise quantization.
+	"""
+	Quantizes the input tensor `x` using block-wise quantization.
 
-    Args:
-        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
-        block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
+	Args:
+		x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+		block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The quantized tensor with dtype `torch.float8_e4m3fn`.
-            - A tensor of scaling factors with dtype `torch.float32`.
-    """
-    assert x.is_contiguous(), 'Input tensor must be contiguous'
-    assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
-    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
-    act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
-    return y, s
+	Returns:
+		Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+			- The quantized tensor with dtype `torch.float8_e4m3fn`.
+			- A tensor of scaling factors with dtype `torch.float32`.
+	"""
+	assert x.is_contiguous(), 'Input tensor must be contiguous'
+	assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
+	y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+	s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+	grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
+	act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+	return y, s
 
 def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
@@ -227,22 +227,135 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
 	"""
 	bsz, seq_len, _ = hidden_states.shape
-	# query_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 	query_states = w8a16_gemm(
 		self.q_a_proj.weight.data,
 		weight_scale["q_a_proj.weight_scale_inv"],
 		hidden_states
 	)
-	# query_states = fused_fp8_bf16_gemm(hidden_states, self.q_a_proj.weight.data, weight_scale["q_a_proj.weight_scale_inv"])
-	# torch.cuda.current_stream().synchronize()
 	query_states = self.q_a_layernorm(query_states)
 	query_states = w8a16_gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
 		query_states
 	)
-	# query_states = fused_fp8_bf16_gemm(query_states, self.q_b_proj.weight.data, weight_scale["q_b_proj.weight_scale_inv"])
-	# torch.cuda.current_stream().synchronize()
+
+	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
+	q_nope, q_pe = torch.split(
+		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)	
+	compressed_kv = w8a16_gemm(
+		self.kv_a_proj_with_mqa.weight.data,
+		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+		hidden_states
+	)	
+	compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)	
+	normed_kv = self.kv_a_layernorm(compressed_kv)
+	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
+	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
+	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
+	offload_kv = torch.cat(
+		[normed_kv, k_pe], dim=-1
+	)
+
+	kv = w8a16_gemm(
+		self.kv_b_proj.weight.data,
+		weight_scale["kv_b_proj.weight_scale_inv"],
+		normed_kv
+	)
+	kv = kv.view(bsz, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+	k_nope, value_states = torch.split(
+		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+	)		
+
+	
+	query_states = k_pe.new_empty(bsz, seq_len, self.num_heads, self.q_head_dim)
+	query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+	query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+	key_states = k_pe.new_empty(
+		bsz, seq_len, self.num_heads, self.q_head_dim
+	)
+	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
+	key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+	key_states[:, :, :, self.qk_nope_head_dim :] = k_pe	
+
+	query_states = query_states.contiguous()
+	key_states = key_states.contiguous()
+	value_states = value_states.contiguous()
+
+
+	# Call flash_attn_varlen_func
+	(
+		query_states,
+		key_states,
+		value_states,
+		indices_q,
+		cu_seq_lens,
+		max_seq_lens,
+	) = _upad_input(
+		query_states, key_states, value_states, attention_mask, seq_len
+	)   	
+	cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+	max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+	attn_output_unpad = flash_attn_varlen_func(
+		query_states,
+		key_states,
+		value_states,
+		cu_seqlens_q=cu_seqlens_q,
+		cu_seqlens_k=cu_seqlens_k,
+		max_seqlen_q=max_seqlen_in_batch_q,
+		max_seqlen_k=max_seqlen_in_batch_k,
+		# softmax_scale=self.softmax_scale,
+		softmax_scale=self.q_head_dim ** (-0.5),
+		causal=True
+	)
+	# if attn_output_unpad is a tuple, we use attn_output_unpad[0]
+	if isinstance(attn_output_unpad, tuple):
+		attn_output_unpad = attn_output_unpad[0]		
+
+	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
+		bsz, seq_len, self.num_heads * self.v_head_dim
+	).contiguous()
+
+	attn_output = w8a16_gemm(
+		self.o_proj.weight.data,
+		weight_scale["o_proj.weight_scale_inv"],
+		attn_output
+	)
+
+	return attn_output, offload_kv
+
+
+@torch.inference_mode()
+def mla_prefill_w8a16_deepgemm(
+	self,
+	hidden_states: torch.Tensor,
+	attention_mask: torch.Tensor,
+	position_ids: torch.Tensor,
+	weight_scale: dict[str, torch.Tensor],
+
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""
+		MLA prefifill on hooper device.
+		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
+	"""
+	bsz, seq_len, _ = hidden_states.shape
+	query_states = w8a16_gemm(
+		self.q_a_proj.weight.data,
+		weight_scale["q_a_proj.weight_scale_inv"],
+		hidden_states
+	)
+
+	query_states = self.q_a_layernorm(query_states)
+	query_states = w8a16_gemm(
+		self.q_b_proj.weight.data,
+		weight_scale["q_b_proj.weight_scale_inv"],
+		query_states
+	)
 
 	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -297,38 +410,16 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	key_states = key_states.contiguous()
 	value_states = value_states.contiguous()
 
-
-	# Call flash_attn_varlen_func
-	(
-		query_states,
-		key_states,
-		value_states,
-		indices_q,
-		cu_seq_lens,
-		max_seq_lens,
-	) = _upad_input(
-		query_states, key_states, value_states, attention_mask, seq_len
-	)      	
-	cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-	max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-	attn_output_unpad = flash_attn_varlen_func(
-		query_states,
-		key_states,
-		value_states,
-		cu_seqlens_q=cu_seqlens_q,
-		cu_seqlens_k=cu_seqlens_k,
-		max_seqlen_q=max_seqlen_in_batch_q,
-		max_seqlen_k=max_seqlen_in_batch_k,
-		softmax_scale=self.softmax_scale,
-		causal=True
-	)
-	# if attn_output_unpad is a tuple, we use attn_output_unpad[0]
-	if isinstance(attn_output_unpad, tuple):
-		attn_output_unpad = attn_output_unpad[0]		
-
-	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
-		bsz, seq_len, self.num_heads * self.v_head_dim
-	).contiguous()
+	attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+	attention_mask = torch.where(attention_mask == 0, torch.finfo(torch.bfloat16).min, torch.tensor(0.0, dtype=torch.bfloat16, device=attention_mask.device))
+	attn_output = F.scaled_dot_product_attention(
+		query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim).transpose(1, 2),
+		key_states.view(bsz, seq_len, self.num_heads, self.q_head_dim).transpose(1, 2),  
+		value_states.view(bsz, seq_len, self.num_heads, self.v_head_dim).transpose(1, 2),
+		attn_mask=attention_mask,
+		dropout_p=0.0,
+		is_causal=True,
+	).transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.v_head_dim)
 
 	# attn_output = self.o_proj(attn_output)
 	attn_output = w8a16_gemm(
