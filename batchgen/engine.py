@@ -747,7 +747,7 @@ class BatchGen:
 		if self.engine_config.Basic_Config.attn_mode != 3:
 			model_batch_size = self.engine_config.KV_Storage_Config.num_host_slots
 		else:
-			model_batch_size = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
+			model_batch_size = min(self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size, self.engine_config.KV_Storage_Config.num_host_slots)
 		
 		num_model_batch = math.ceil(
 			self.num_queries
