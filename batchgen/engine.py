@@ -434,8 +434,14 @@ def batchgen(
         all_results = safe_collect_results(futures)
     end_time = time.perf_counter()
     logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
-    
-    return all_results
+
+    # Communicate to let each node get all the results
+    # The results should remain the order of node rank.
+    global_results = [None] * nnodes
+    dist.all_gather_object(global_results, all_results)
+
+
+    return global_results
 
 
 
