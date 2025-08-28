@@ -24,7 +24,7 @@ jobs:
         run: |
           echo "Runner: ${{ runner.name }}"
           echo "Labels: ${{ toJson(runner.labels) }}"
-      
+
       - name: Check Docker
         run: |
           docker version
@@ -57,7 +57,7 @@ jobs:
         run: |
           echo "Runner: ${{ runner.name }}"
           echo "Labels: ${{ toJson(runner.labels) }}"
-      
+
       - name: Check Docker
         run: |
           docker version
