@@ -86,61 +86,237 @@ def signal_handler(signum, frame):
 	time.sleep(0.5)
 	sys.exit(1)
 
-# def check_large_tensors(threshold_mb=10):
-#     """Simple function to find and print all tensors larger than threshold"""
+# def check_large_tensors(threshold_mb=10, max_referrers=30):
+#     """Detailed GPU tensor memory analysis with better referrer identification"""
 #     import gc
 #     import torch
+#     import inspect
     
-#     print(f"\nSearching for tensors > {threshold_mb} MB...")
-#     print("-" * 60)
+#     print(f"\nSearching for GPU tensors > {threshold_mb} MB...")
+#     print("=" * 80)
     
-#     found_any = False
-#     total_mb = 0
+#     found_tensors = []
     
 #     for obj in gc.get_objects():
 #         try:
-#             if torch.is_tensor(obj):
+#             if torch.is_tensor(obj) and obj.is_cuda:
 #                 size_bytes = obj.element_size() * obj.numel()
 #                 size_mb = size_bytes / (1024 * 1024)
                 
 #                 if size_mb >= threshold_mb:
-#                     found_any = True
-#                     total_mb += size_mb
-                    
-#                     print(f"\nTensor found:")
-#                     print(f"  Shape: {list(obj.shape)}")
-#                     print(f"  Dtype: {obj.dtype}")
-#                     print(f"  Size: {size_mb:.2f} MB")  # <- This is what should be here
-#                     print(f"  Device: {obj.device}")
-#                     print(f"  Requires grad: {obj.requires_grad}")
-#                     print(f"  Memory address: {hex(obj.data_ptr())}")
-                    
-#                     # Check if it's part of a model
-#                     referrers = gc.get_referrers(obj)
-#                     for ref in referrers:
-#                         if hasattr(ref, '__class__') and 'Module' in str(type(ref)):
-#                             print(f"  Part of module: {type(ref).__name__}")
-#                             break
+#                     found_tensors.append((size_mb, obj))
 #         except:
 #             pass
     
-#     if found_any:
-#         print(f"\nTotal memory in large tensors: {total_mb:.2f} MB")
-#     else:
-#         print(f"No tensors found larger than {threshold_mb} MB")
+#     if not found_tensors:
+#         print(f"No GPU tensors found larger than {threshold_mb} MB")
+#         return
+    
+#     # Sort by size (largest first)
+#     found_tensors.sort(key=lambda x: x[0], reverse=True)
+    
+#     total_mb = sum(size for size, _ in found_tensors)
+#     print(f"Found {len(found_tensors)} GPU tensors using {total_mb:.2f} MB total\n")
+    
+#     for idx, (size_mb, tensor) in enumerate(found_tensors, 1):
+#         print(f"\n{'-'*80}")
+#         print(f"Tensor #{idx}:")
+#         print(f"  Shape: {list(tensor.shape)}")
+#         print(f"  Dtype: {tensor.dtype}")
+#         print(f"  Size: {size_mb:.2f} MB")
+#         print(f"  Device: {tensor.device}")
+#         print(f"  Requires grad: {tensor.requires_grad}")
+#         print(f"  Is leaf: {tensor.is_leaf}")
+#         print(f"  Grad fn: {tensor.grad_fn.__class__.__name__ if tensor.grad_fn else 'None'}")
+#         print(f"  Memory address: {hex(tensor.data_ptr())}")
+        
+#         # Detailed referrer analysis
+#         referrers = gc.get_referrers(tensor)
+#         print(f"\n  Referenced by {len(referrers)} objects:")
+        
+#         # Categorize referrers
+#         ref_categories = {
+#             'modules': [],
+#             'optimizers': [],
+#             'dicts': [],
+#             'lists': [],
+#             'functions': [],
+#             'others': []
+#         }
+        
+#         for ref in referrers:
+#             try:
+#                 ref_type = type(ref).__name__
+#                 ref_info = None
+                
+#                 # Check for PyTorch modules
+#                 if hasattr(ref, '__class__'):
+#                     class_name = ref.__class__.__name__
+#                     module_name = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
+                    
+#                     if 'torch.nn' in module_name or 'Module' in class_name:
+#                         ref_info = f"{module_name}.{class_name}"
+#                         ref_categories['modules'].append(ref_info)
+#                     elif 'optim' in module_name.lower() or 'optimizer' in class_name.lower():
+#                         ref_info = f"{module_name}.{class_name}"
+#                         ref_categories['optimizers'].append(ref_info)
+#                     else:
+#                         ref_info = f"{ref_type} ({module_name}.{class_name})"
+#                         ref_categories['others'].append(ref_info)
+                        
+#                 elif callable(ref):
+#                     # Function or method
+#                     name = getattr(ref, '__name__', '<anonymous>')
+#                     ref_info = f"Function: {name}"
+#                     ref_categories['functions'].append(ref_info)
+                    
+#                 elif isinstance(ref, dict):
+#                     if '__name__' in ref:
+#                         ref_info = f"Module dict: {ref['__name__']}"
+#                     else:
+#                         # Try to identify dict owner
+#                         dict_id = id(ref)
+#                         owner_found = False
+#                         for owner in gc.get_objects():
+#                             try:
+#                                 if hasattr(owner, '__dict__') and id(owner.__dict__) == dict_id:
+#                                     owner_class = owner.__class__.__name__
+#                                     ref_info = f"Dict of {owner_class} instance"
+#                                     owner_found = True
+#                                     break
+#                             except:
+#                                 pass
+#                         if not owner_found:
+#                             ref_info = f"Dict with {len(ref)} keys"
+#                     ref_categories['dicts'].append(ref_info)
+                    
+#                 elif isinstance(ref, (list, tuple)):
+#                     ref_info = f"{ref_type} with {len(ref)} items"
+#                     ref_categories['lists'].append(ref_info)
+                    
+#                 else:
+#                     ref_info = ref_type
+#                     ref_categories['others'].append(ref_info)
+                    
+#             except Exception as e:
+#                 ref_categories['others'].append(f"<Error: {e}>")
+        
+#         # Print categorized referrers
+#         for category, refs in ref_categories.items():
+#             if refs:
+#                 print(f"\n    {category.capitalize()}:")
+#                 for ref in refs[:max_referrers//5]:  # Limit each category
+#                     print(f"      - {ref}")
+#                 if len(refs) > max_referrers//5:
+#                     print(f"      ... and {len(refs) - max_referrers//5} more")
     
 #     # GPU memory summary
+#     print(f"\n{'='*80}")
+#     print("GPU Memory Summary:")
 #     if torch.cuda.is_available():
-#         print(f"\nGPU memory: {torch.cuda.memory_allocated() / 1024**2:.2f} MB allocated")
+#         for i in range(torch.cuda.device_count()):
+#             allocated = torch.cuda.memory_allocated(i) / 1024**2
+#             reserved = torch.cuda.memory_reserved(i) / 1024**2
+#             print(f"  GPU {i}: {allocated:.2f} MB allocated / {reserved:.2f} MB reserved")
 
-def check_large_tensors(threshold_mb=10, max_referrers=30):
-    """Detailed GPU tensor memory analysis with better referrer identification"""
+
+def check_large_tensors_with_names(threshold_mb=10, max_depth=3):
+    """Find large GPU tensors and trace back to find actual variable names"""
     import gc
     import torch
     import inspect
+    import sys
     
     print(f"\nSearching for GPU tensors > {threshold_mb} MB...")
     print("=" * 80)
+    
+    def find_name_in_namespace(obj, namespace, namespace_name=""):
+        """Find variable name of an object in a namespace"""
+        names = []
+        for name, value in namespace.items():
+            if value is obj:
+                names.append(f"{namespace_name}.{name}" if namespace_name else name)
+            elif isinstance(value, (list, tuple)) and obj in value:
+                idx = value.index(obj) if isinstance(value, list) else list(value).index(obj)
+                names.append(f"{namespace_name}.{name}[{idx}]" if namespace_name else f"{name}[{idx}]")
+            elif isinstance(value, dict):
+                for k, v in value.items():
+                    if v is obj:
+                        names.append(f"{namespace_name}.{name}['{k}']" if namespace_name else f"{name}['{k}']")
+        return names
+    
+    def find_container_owners(container, max_depth=3, current_depth=0):
+        """Recursively find what owns a container"""
+        if current_depth >= max_depth:
+            return []
+        
+        owners = []
+        container_refs = gc.get_referrers(container)
+        
+        for ref in container_refs:
+            try:
+                # Skip frames and internal references
+                if type(ref).__name__ in ['frame', 'cell', 'method', 'function']:
+                    continue
+                
+                ref_type = type(ref).__name__
+                ref_module = type(ref).__module__ if hasattr(type(ref), '__module__') else ''
+                
+                # Check if it's an object with attributes
+                if hasattr(ref, '__dict__'):
+                    # Find which attribute holds our container
+                    for attr_name, attr_value in ref.__dict__.items():
+                        if attr_value is container:
+                            class_name = ref.__class__.__name__
+                            module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
+                            owners.append(f"{module}.{class_name}.{attr_name}")
+                            break
+                
+                # Check if it's another container
+                elif isinstance(ref, (list, tuple)):
+                    # Recursively find what owns this container
+                    parent_owners = find_container_owners(ref, max_depth, current_depth + 1)
+                    if parent_owners:
+                        idx = ref.index(container) if isinstance(ref, list) else list(ref).index(container)
+                        for po in parent_owners:
+                            owners.append(f"{po}[{idx}]")
+                    else:
+                        owners.append(f"{ref_type} (depth {current_depth + 1})")
+                
+                # Check if it's a dict
+                elif isinstance(ref, dict):
+                    # Find which key holds our container
+                    for key, value in ref.items():
+                        if value is container:
+                            # Check if this dict belongs to a module or object
+                            dict_owners = find_container_owners(ref, max_depth, current_depth + 1)
+                            if dict_owners:
+                                for do in dict_owners:
+                                    owners.append(f"{do}['{key}']")
+                            else:
+                                owners.append(f"Dict key: '{key}'")
+                            break
+                
+                # Check globals and locals
+                if not owners:
+                    # Check main module
+                    import __main__
+                    names = find_name_in_namespace(container, vars(__main__), "__main__")
+                    owners.extend(names)
+                    
+                    # Check all modules
+                    for module_name, module in sys.modules.items():
+                        if module and hasattr(module, '__dict__'):
+                            try:
+                                names = find_name_in_namespace(container, module.__dict__, module_name)
+                                owners.extend(names)
+                            except:
+                                pass
+                
+            except Exception as e:
+                pass
+        
+        return owners
     
     found_tensors = []
     
@@ -172,90 +348,69 @@ def check_large_tensors(threshold_mb=10, max_referrers=30):
         print(f"  Dtype: {tensor.dtype}")
         print(f"  Size: {size_mb:.2f} MB")
         print(f"  Device: {tensor.device}")
-        print(f"  Requires grad: {tensor.requires_grad}")
-        print(f"  Is leaf: {tensor.is_leaf}")
-        print(f"  Grad fn: {tensor.grad_fn.__class__.__name__ if tensor.grad_fn else 'None'}")
         print(f"  Memory address: {hex(tensor.data_ptr())}")
         
-        # Detailed referrer analysis
+        # Find direct referrers
         referrers = gc.get_referrers(tensor)
-        print(f"\n  Referenced by {len(referrers)} objects:")
+        print(f"\n  Direct references: {len(referrers)}")
         
-        # Categorize referrers
-        ref_categories = {
-            'modules': [],
-            'optimizers': [],
-            'dicts': [],
-            'lists': [],
-            'functions': [],
-            'others': []
-        }
+        # Check global namespace for direct tensor references
+        import __main__
+        direct_names = find_name_in_namespace(tensor, vars(__main__), "__main__")
+        if direct_names:
+            print(f"  Found in global namespace: {direct_names}")
         
-        for ref in referrers:
+        # Analyze each referrer
+        for ref_idx, ref in enumerate(referrers):
             try:
                 ref_type = type(ref).__name__
-                ref_info = None
                 
-                # Check for PyTorch modules
-                if hasattr(ref, '__class__'):
-                    class_name = ref.__class__.__name__
-                    module_name = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
+                if isinstance(ref, (list, tuple)):
+                    print(f"\n  Referrer #{ref_idx + 1}: {ref_type} with {len(ref)} items")
                     
-                    if 'torch.nn' in module_name or 'Module' in class_name:
-                        ref_info = f"{module_name}.{class_name}"
-                        ref_categories['modules'].append(ref_info)
-                    elif 'optim' in module_name.lower() or 'optimizer' in class_name.lower():
-                        ref_info = f"{module_name}.{class_name}"
-                        ref_categories['optimizers'].append(ref_info)
+                    # Find what owns this container
+                    owners = find_container_owners(ref, max_depth)
+                    if owners:
+                        print(f"    Container owned by:")
+                        for owner in owners[:10]:
+                            print(f"      - {owner}")
                     else:
-                        ref_info = f"{ref_type} ({module_name}.{class_name})"
-                        ref_categories['others'].append(ref_info)
-                        
-                elif callable(ref):
-                    # Function or method
-                    name = getattr(ref, '__name__', '<anonymous>')
-                    ref_info = f"Function: {name}"
-                    ref_categories['functions'].append(ref_info)
+                        print(f"    Container owner: NOT FOUND (orphaned or temporary)")
                     
                 elif isinstance(ref, dict):
-                    if '__name__' in ref:
-                        ref_info = f"Module dict: {ref['__name__']}"
+                    # Find which key holds the tensor
+                    tensor_key = None
+                    for k, v in ref.items():
+                        if v is tensor:
+                            tensor_key = k
+                            break
+                    
+                    print(f"\n  Referrer #{ref_idx + 1}: Dict with key '{tensor_key}'")
+                    owners = find_container_owners(ref, max_depth)
+                    if owners:
+                        print(f"    Dict owned by:")
+                        for owner in owners[:10]:
+                            print(f"      - {owner}")
+                    
+                elif hasattr(ref, '__class__'):
+                    class_name = ref.__class__.__name__
+                    module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
+                    
+                    # Find which attribute holds the tensor
+                    holding_attr = None
+                    if hasattr(ref, '__dict__'):
+                        for attr_name, attr_value in ref.__dict__.items():
+                            if attr_value is tensor:
+                                holding_attr = attr_name
+                                break
+                    
+                    if holding_attr:
+                        print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}.{holding_attr}")
                     else:
-                        # Try to identify dict owner
-                        dict_id = id(ref)
-                        owner_found = False
-                        for owner in gc.get_objects():
-                            try:
-                                if hasattr(owner, '__dict__') and id(owner.__dict__) == dict_id:
-                                    owner_class = owner.__class__.__name__
-                                    ref_info = f"Dict of {owner_class} instance"
-                                    owner_found = True
-                                    break
-                            except:
-                                pass
-                        if not owner_found:
-                            ref_info = f"Dict with {len(ref)} keys"
-                    ref_categories['dicts'].append(ref_info)
-                    
-                elif isinstance(ref, (list, tuple)):
-                    ref_info = f"{ref_type} with {len(ref)} items"
-                    ref_categories['lists'].append(ref_info)
-                    
-                else:
-                    ref_info = ref_type
-                    ref_categories['others'].append(ref_info)
-                    
+                        print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}")
+                
             except Exception as e:
-                ref_categories['others'].append(f"<Error: {e}>")
-        
-        # Print categorized referrers
-        for category, refs in ref_categories.items():
-            if refs:
-                print(f"\n    {category.capitalize()}:")
-                for ref in refs[:max_referrers//5]:  # Limit each category
-                    print(f"      - {ref}")
-                if len(refs) > max_referrers//5:
-                    print(f"      ... and {len(refs) - max_referrers//5} more")
+                print(f"\n  Referrer #{ref_idx + 1}: Error analyzing - {e}")
     
     # GPU memory summary
     print(f"\n{'='*80}")

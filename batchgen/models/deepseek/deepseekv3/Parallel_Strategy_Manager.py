@@ -573,6 +573,7 @@ class Parallel_Strategy_Manager:
 			self.model.model.layers[layer_idx].mlp.experts[expert_idx].down_proj.weight.data = tensors["down_proj.weight"].to(
 				self.engine_config.Basic_Config.device_torch
 			)
+			del tensors
 		logging.debug(f"Local routed experts loaded")
 
 	def _load_model_skeleton(self):
