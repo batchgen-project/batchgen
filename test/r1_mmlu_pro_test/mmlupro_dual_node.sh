@@ -6,7 +6,7 @@ python <dir-to-r1_mmlu_pro_test.py> \
     --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
 	--host_kv_cache_size 256 \
     --max_input_length 4096 \
-    --max_decoding_length 4096 \
+    --max_decoding_length 2048 \
     --ATTN_MODE 3 \
     --cache_dir <dir to model checkpoint> \
     --server_host "localhost" \
