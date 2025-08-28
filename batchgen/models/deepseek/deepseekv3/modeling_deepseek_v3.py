@@ -1436,7 +1436,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		# )
 		if(len(eids) == 0):
-			logger.warning_once("No tokens routed to this rank.")
+			# logger.warning_once("No tokens routed to this rank.")
 			assert len(x) == 0, "If no tokens routed, x should be empty too."
 			return x
 

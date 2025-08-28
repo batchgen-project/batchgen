@@ -268,8 +268,12 @@ void BatchGen::create_fake_kv_storage() {
     this->kv_storage_.create_fake_kv_storage();
 };
 
-std::unordered_map<std::string, torch::Tensor> BatchGen::get_tensor(
-    std::string module_key)
+// std::unordered_map<std::string, torch::Tensor> BatchGen::get_tensor(
+//     std::string module_key)
+// {
+//     return this->weights_storage_.get_tensor(module_key);
+// }
+py::dict BatchGen::get_tensor(std::string module_key)
 {
     return this->weights_storage_.get_tensor(module_key);
 }

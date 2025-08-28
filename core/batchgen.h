@@ -102,8 +102,9 @@ class BatchGen {
     void reset_weight_copy_queue();
     void reset_prefill_buffer();
     void create_fake_kv_storage();
-    std::unordered_map<std::string, torch::Tensor> get_tensor(
-        std::string module_key);
+    // std::unordered_map<std::string, torch::Tensor> get_tensor(
+        // std::string module_key);
+    py::dict get_tensor(std::string module_key);
     void start_h2d_worker();
     void set_global_routed_experts_data_ptr(
         const py::dict& experts_IPC_handles,
@@ -125,7 +126,10 @@ class BatchGen {
         this->kv_storage_.clear_kv_gpu_storage();
     }
 
-    std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+    // std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+    //     return this->kv_storage_.get_past_key_states(query_global_indices, max_seq_len);
+    // }
+    py::list get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
         return this->kv_storage_.get_past_key_states(query_global_indices, max_seq_len);
     }
     std::vector<torch::Tensor> get_kv_scale(std::vector<int64_t> query_global_indices, int64_t seq_len){

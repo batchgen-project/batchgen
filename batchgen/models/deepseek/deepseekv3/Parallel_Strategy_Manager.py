@@ -545,6 +545,17 @@ class Parallel_Strategy_Manager:
 		logging.debug(
 			f"Attn module configuration time: {end_time - start_time:.2f} seconds"
 		)
+	
+	def _unregister_fp8_weights(self):
+		# set all fp8 weights to None
+		for layer_idx in range(len(self.model.model.layers)):
+			attn_module = self.model.model.layers[layer_idx].self_attn
+			attn_module._unregister_fp8_weights()
+			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+				for routed_expert_idx in self.local_routed_experts:
+					self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
+
+
 
 
 	def _load_local_routed_experts(self):
@@ -562,6 +573,7 @@ class Parallel_Strategy_Manager:
 			self.model.model.layers[layer_idx].mlp.experts[expert_idx].down_proj.weight.data = tensors["down_proj.weight"].to(
 				self.engine_config.Basic_Config.device_torch
 			)
+			del tensors
 		logging.debug(f"Local routed experts loaded")
 
 	def _load_model_skeleton(self):
