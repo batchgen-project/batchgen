@@ -17,9 +17,6 @@ jobs:
     name: MMLU Test Node0
     runs-on: [self-hosted, gpu, node0]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
       - name: Print runner info
         run: |
           echo "Runner: ${{ runner.name }}"
@@ -48,11 +45,7 @@ jobs:
   test-node1:
     name: MMLU Test Node1
     runs-on: [self-hosted, gpu, node1]
-    needs: test-node0
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
       - name: Print runner info
         run: |
           echo "Runner: ${{ runner.name }}"
