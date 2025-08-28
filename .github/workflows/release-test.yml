@@ -1,0 +1,44 @@
+name: Runner Release Test On H20 Nodes
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Docker image to test"
+        required: true
+        default: "nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04"
+
+jobs:
+  check-node0:
+    name: Healthcheck Node0
+    runs-on: [self-hosted, gpu, node0]
+    steps:
+      - name: Print runner info
+        run: |
+          echo "Runner: ${{ runner.name }}"
+          echo "Labels: ${{ toJson(runner.labels) }}"
+      - name: Check Docker
+        run: |
+          docker version
+          docker info | head -n 30
+      - name: Check NVIDIA driver
+        run: nvidia-smi
+      - name: Check NVIDIA in container
+        run: docker run --rm --gpus all ${{ github.event.inputs.image }} nvidia-smi
+
+  check-node1:
+    name: Healthcheck Node1
+    runs-on: [self-hosted, gpu, node1]
+    steps:
+      - name: Print runner info
+        run: |
+          echo "Runner: ${{ runner.name }}"
+          echo "Labels: ${{ toJson(runner.labels) }}"
+      - name: Check Docker
+        run: |
+          docker version
+          docker info | head -n 30
+      - name: Check NVIDIA driver
+        run: nvidia-smi
+      - name: Check NVIDIA in container
+        run: docker run --rm --gpus all ${{ github.event.inputs.image }} nvidia-smi
