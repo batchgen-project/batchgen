@@ -125,7 +125,10 @@ class BatchGen {
         this->kv_storage_.clear_kv_gpu_storage();
     }
 
-    std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+    // std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+    //     return this->kv_storage_.get_past_key_states(query_global_indices, max_seq_len);
+    // }
+    py::list get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
         return this->kv_storage_.get_past_key_states(query_global_indices, max_seq_len);
     }
     std::vector<torch::Tensor> get_kv_scale(std::vector<int64_t> query_global_indices, int64_t seq_len){
