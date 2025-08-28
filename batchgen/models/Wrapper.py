@@ -532,7 +532,7 @@ class Attn_Wrapper(torch.nn.Module):
 		self.fp8_o_proj = self.module.o_proj.weight.data
 	
 	def _unregister_fp8_weights(self):
-		logging.info(f"Cleaning Attn weights. Layer idx {self.layer_idx}")
+		logging.debug(f"Cleaning Attn weights. Layer idx {self.layer_idx}")
 		self.fp8_q_a_proj = None
 		self.fp8_q_b_proj = None
 		self.fp8_kv_a_proj_with_mqa = None
@@ -694,7 +694,7 @@ class Expert_Wrapper(torch.nn.Module):
 		self.fp8_up = self.module.up_proj.weight.data
 
 	def _unregister_fp8_weights(self):
-		logging.info(f"Clearing expert weights. Layer idx {self.layer_idx}, expert idx{self.expert_idx}")
+		logging.debug(f"Clearing expert weights. Layer idx {self.layer_idx}, expert idx{self.expert_idx}")
 		self.fp8_gate = None
 		self.fp8_down = None
 		self.fp8_up = None
