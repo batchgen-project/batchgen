@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 
 class ParameterServer:
-	def __init__(self, host='localhost', port=9090, model_name=None,
+	def __init__(self, host='localhost', port=10900, model_name=None,
 				 hf_cache_dir=None, cache_dir=None, pt_ckpt_dir=None):
 		"""
 		Initialize the Parameter Server.
@@ -882,7 +882,7 @@ def parse_args():
 	parser.add_argument(
 		"--port", 
 		type=int, 
-		default=9090,
+		default=10900,
 		help="Port to listen on"
 	)
 	parser.add_argument(
