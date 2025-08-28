@@ -2054,26 +2054,83 @@ void KV_Storage::clear_kv_gpu_storage(){
 //     return past_key_states;
 // }
 
-std::vector<torch::Tensor> KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
-    // Currently only support deepseek models. TODO:
-    // From blob in cpu to get the torch tensor representation of the kv cache in kv_storage.
-    // The slot for the same layer should be concatenated together.
-    // Copy the tensor to GPU device.
-    // Return a vector of torch::Tensor, each tensor is the past key states for a layer.
-    // The result tensor shape is [batch_size, max_seq_len, 576] 
+// std::vector<torch::Tensor> KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+//     // Currently only support deepseek models. TODO:
+//     // From blob in cpu to get the torch tensor representation of the kv cache in kv_storage.
+//     // The slot for the same layer should be concatenated together.
+//     // Copy the tensor to GPU device.
+//     // Return a vector of torch::Tensor, each tensor is the past key states for a layer.
+//     // The result tensor shape is [batch_size, max_seq_len, 576] 
 
+//     auto start_time = std::chrono::high_resolution_clock::now();
+//     this->logger_->debug("KV_Storage get_past_key_states(): Getting past key states.");
+//     std::vector<torch::Tensor> past_key_states;
+//     for (int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
+//         // std::vector<torch::Tensor> k_tensors;
+//         torch::Tensor k_tensor = torch::zeros(
+//             {static_cast<int64_t>(query_global_indices.size()), max_seq_len, 576},
+//             torch::TensorOptions()
+//                 .dtype(this->engine_config_.basic_config.kv_dtype_torch)
+//                 .device(this->engine_config_.basic_config.device_torch)
+//                 .requires_grad(false));
+//         // Fill the tensor with data from k_storage
+//         for (int64_t i = 0; i < static_cast<int64_t>(query_global_indices.size()); i++) {
+//             auto query_idx = query_global_indices[i];
+//             int64_t slot_idx = -1;
+//             {
+//                 std::lock_guard<std::mutex> lock(this->mutex_);
+//                 slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+//             }
+//             c10::Float8_e4m3fn* k_ptr = nullptr;
+//             {
+//                 std::lock_guard<std::mutex> lock(
+//                     this->per_element_mutex_[slot_idx * this->model_config_.num_hidden_layers + layer_idx]);
+//                 k_ptr = static_cast<c10::Float8_e4m3fn*>(
+//                     this->k_storage[slot_idx][layer_idx].start_ptr);
+//             }
+//             // Copy the data from k_ptr to k_tensor
+//             auto dst_ptr = k_tensor.data_ptr() + i * max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch);
+//             CUDA_CHECK(cudaMemcpyAsync(
+//                 dst_ptr, k_ptr, max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch),
+//                 cudaMemcpyHostToDevice, this->stream_));
+//         }
+//         // Synchronize the stream
+//         CUDA_CHECK(cudaStreamSynchronize(this->stream_));
+//         past_key_states.push_back(k_tensor);
+//     }
+//     this->logger_->debug("KV_Storage get_past_key_states(): Past key states retrieved.");
+//     auto end_time = std::chrono::high_resolution_clock::now();
+//     auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time -
+//         start_time);
+//     this->logger_->debug("KV_Storage get_past_key_states(): Time taken to get past key states: {} seconds", duration.count());
+//     return past_key_states;
+// }
+
+std::vector<torch::Tensor> KV_Storage::get_past_key_states(
+    std::vector<int64_t> query_global_indices, 
+    int64_t max_seq_len) {
+    
     auto start_time = std::chrono::high_resolution_clock::now();
     this->logger_->debug("KV_Storage get_past_key_states(): Getting past key states.");
+    
     std::vector<torch::Tensor> past_key_states;
+    past_key_states.reserve(this->model_config_.num_hidden_layers); // Pre-allocate
+    
     for (int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
-        // std::vector<torch::Tensor> k_tensors;
-        torch::Tensor k_tensor = torch::zeros(
+        // Create tensor WITH pinned memory for better async copy
+        auto options = torch::TensorOptions()
+            .dtype(this->engine_config_.basic_config.kv_dtype_torch)
+            .device(torch::kCUDA, this->engine_config_.basic_config.device_id)  // Specify device ID
+            .requires_grad(false);
+            
+        torch::Tensor k_tensor = torch::empty(  // Use empty instead of zeros for performance
             {static_cast<int64_t>(query_global_indices.size()), max_seq_len, 576},
-            torch::TensorOptions()
-                .dtype(this->engine_config_.basic_config.kv_dtype_torch)
-                .device(this->engine_config_.basic_config.device_torch)
-                .requires_grad(false));
-        // Fill the tensor with data from k_storage
+            options);
+        
+        // Ensure tensor is contiguous
+        k_tensor = k_tensor.contiguous();
+        
+        // Your copy logic with proper pointer arithmetic
         for (int64_t i = 0; i < static_cast<int64_t>(query_global_indices.size()); i++) {
             auto query_idx = query_global_indices[i];
             int64_t slot_idx = -1;
@@ -2081,6 +2138,7 @@ std::vector<torch::Tensor> KV_Storage::get_past_key_states(std::vector<int64_t> 
                 std::lock_guard<std::mutex> lock(this->mutex_);
                 slot_idx = this->query_idx_to_slot_idx_map[query_idx];
             }
+            
             c10::Float8_e4m3fn* k_ptr = nullptr;
             {
                 std::lock_guard<std::mutex> lock(
@@ -2088,21 +2146,32 @@ std::vector<torch::Tensor> KV_Storage::get_past_key_states(std::vector<int64_t> 
                 k_ptr = static_cast<c10::Float8_e4m3fn*>(
                     this->k_storage[slot_idx][layer_idx].start_ptr);
             }
-            // Copy the data from k_ptr to k_tensor
-            auto dst_ptr = k_tensor.data_ptr() + i * max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch);
+            
+            // Fix: Proper pointer arithmetic for float8
+            auto element_size = k_tensor.element_size();
+            auto dst_ptr = static_cast<char*>(k_tensor.data_ptr()) + 
+                           i * max_seq_len * 576 * element_size;
+            
             CUDA_CHECK(cudaMemcpyAsync(
-                dst_ptr, k_ptr, max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch),
-                cudaMemcpyHostToDevice, this->stream_));
+                dst_ptr, 
+                k_ptr, 
+                max_seq_len * 576 * element_size,
+                cudaMemcpyHostToDevice, 
+                this->stream_));
         }
-        // Synchronize the stream
-        CUDA_CHECK(cudaStreamSynchronize(this->stream_));
-        past_key_states.push_back(k_tensor);
+        
+        // Move tensor into vector
+        past_key_states.emplace_back(std::move(k_tensor));
     }
+    
+    // Synchronize after all copies
+    CUDA_CHECK(cudaStreamSynchronize(this->stream_));
+    
     this->logger_->debug("KV_Storage get_past_key_states(): Past key states retrieved.");
     auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time -
-        start_time);
-    this->logger_->debug("KV_Storage get_past_key_states(): Time taken to get past key states: {} seconds", duration.count());
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+    this->logger_->debug("KV_Storage get_past_key_states(): Time taken: {} seconds", duration.count());
+    
     return past_key_states;
 }
 
