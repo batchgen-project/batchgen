@@ -33,6 +33,17 @@ if [[ -z "$NODE_RANK" || -z "$DIST_INIT_ADDR" || -z "$CACHE_DIR" ]]; then
     exit 1
 fi
 
+TARGET_SHM_GB=2048
+CURRENT_SHM_GB=$(df -BG --output=size /dev/shm | tail -n1 | tr -dc '0-9')
+
+if (( CURRENT_SHM_GB < TARGET_SHM_GB )); then
+  echo "Resizing /dev/shm from ${CURRENT_SHM_GB}G to ${TARGET_SHM_GB}G..."
+  sudo mount -o remount,size=${TARGET_SHM_GB}G /dev/shm || \
+    echo "Warning: failed to remount /dev/shm"
+else
+  echo "/dev/shm already ${CURRENT_SHM_GB}G, no remount needed."
+fi
+
 # start parameter server
 HF_ENDPOINT=https://hf-mirror.com \
 python -m batchgen.parameter_server \
@@ -46,7 +57,7 @@ trap "kill $PARAM_SERVER_PID 2>/dev/null" EXIT
 # wait for the parameter server to be ready
 function wait_for_port() {
     local host="localhost"
-    local port=9090
+    local port=10900
     while ! (echo > "/dev/tcp/$host/$port") >/dev/null 2>&1; do
         echo "Waiting for port $port to become available..."
         sleep 10
@@ -67,7 +78,7 @@ python test/r1_mmlu_pro_test/r1_mmlu_pro_test.py \
         --ATTN_MODE 3 \
         --cache_dir "$CACHE_DIR" \
         --server_host "localhost" \
-        --server_port 9090 \
+        --server_port 10900 \
         --dist_init_addr "$DIST_INIT_ADDR" \
         --nnodes 2 \
         --node_rank "$NODE_RANK"
