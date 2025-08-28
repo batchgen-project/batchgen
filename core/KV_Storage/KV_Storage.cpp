@@ -41,6 +41,7 @@
 #include <unistd.h>      // getpagesize
 #include <linux/mman.h>  // For MAP_HUGE_2MB
 
+namespace py = pybind11;
 // Fallback calculation if MAP_HUGE_2MB is not directly available
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
