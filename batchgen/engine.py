@@ -86,52 +86,185 @@ def signal_handler(signum, frame):
 	time.sleep(0.5)
 	sys.exit(1)
 
-def check_large_tensors(threshold_mb=10):
-    """Simple function to find and print all tensors larger than threshold"""
+# def check_large_tensors(threshold_mb=10):
+#     """Simple function to find and print all tensors larger than threshold"""
+#     import gc
+#     import torch
+    
+#     print(f"\nSearching for tensors > {threshold_mb} MB...")
+#     print("-" * 60)
+    
+#     found_any = False
+#     total_mb = 0
+    
+#     for obj in gc.get_objects():
+#         try:
+#             if torch.is_tensor(obj):
+#                 size_bytes = obj.element_size() * obj.numel()
+#                 size_mb = size_bytes / (1024 * 1024)
+                
+#                 if size_mb >= threshold_mb:
+#                     found_any = True
+#                     total_mb += size_mb
+                    
+#                     print(f"\nTensor found:")
+#                     print(f"  Shape: {list(obj.shape)}")
+#                     print(f"  Dtype: {obj.dtype}")
+#                     print(f"  Size: {size_mb:.2f} MB")  # <- This is what should be here
+#                     print(f"  Device: {obj.device}")
+#                     print(f"  Requires grad: {obj.requires_grad}")
+#                     print(f"  Memory address: {hex(obj.data_ptr())}")
+                    
+#                     # Check if it's part of a model
+#                     referrers = gc.get_referrers(obj)
+#                     for ref in referrers:
+#                         if hasattr(ref, '__class__') and 'Module' in str(type(ref)):
+#                             print(f"  Part of module: {type(ref).__name__}")
+#                             break
+#         except:
+#             pass
+    
+#     if found_any:
+#         print(f"\nTotal memory in large tensors: {total_mb:.2f} MB")
+#     else:
+#         print(f"No tensors found larger than {threshold_mb} MB")
+    
+#     # GPU memory summary
+#     if torch.cuda.is_available():
+#         print(f"\nGPU memory: {torch.cuda.memory_allocated() / 1024**2:.2f} MB allocated")
+
+def check_large_tensors(threshold_mb=10, max_referrers=30):
+    """Detailed GPU tensor memory analysis with better referrer identification"""
     import gc
     import torch
+    import inspect
     
-    print(f"\nSearching for tensors > {threshold_mb} MB...")
-    print("-" * 60)
+    print(f"\nSearching for GPU tensors > {threshold_mb} MB...")
+    print("=" * 80)
     
-    found_any = False
-    total_mb = 0
+    found_tensors = []
     
     for obj in gc.get_objects():
         try:
-            if torch.is_tensor(obj):
+            if torch.is_tensor(obj) and obj.is_cuda:
                 size_bytes = obj.element_size() * obj.numel()
                 size_mb = size_bytes / (1024 * 1024)
                 
                 if size_mb >= threshold_mb:
-                    found_any = True
-                    total_mb += size_mb
-                    
-                    print(f"\nTensor found:")
-                    print(f"  Shape: {list(obj.shape)}")
-                    print(f"  Dtype: {obj.dtype}")
-                    print(f"  Size: {size_mb:.2f} MB")  # <- This is what should be here
-                    print(f"  Device: {obj.device}")
-                    print(f"  Requires grad: {obj.requires_grad}")
-                    print(f"  Memory address: {hex(obj.data_ptr())}")
-                    
-                    # Check if it's part of a model
-                    referrers = gc.get_referrers(obj)
-                    for ref in referrers:
-                        if hasattr(ref, '__class__') and 'Module' in str(type(ref)):
-                            print(f"  Part of module: {type(ref).__name__}")
-                            break
+                    found_tensors.append((size_mb, obj))
         except:
             pass
     
-    if found_any:
-        print(f"\nTotal memory in large tensors: {total_mb:.2f} MB")
-    else:
-        print(f"No tensors found larger than {threshold_mb} MB")
+    if not found_tensors:
+        print(f"No GPU tensors found larger than {threshold_mb} MB")
+        return
+    
+    # Sort by size (largest first)
+    found_tensors.sort(key=lambda x: x[0], reverse=True)
+    
+    total_mb = sum(size for size, _ in found_tensors)
+    print(f"Found {len(found_tensors)} GPU tensors using {total_mb:.2f} MB total\n")
+    
+    for idx, (size_mb, tensor) in enumerate(found_tensors, 1):
+        print(f"\n{'-'*80}")
+        print(f"Tensor #{idx}:")
+        print(f"  Shape: {list(tensor.shape)}")
+        print(f"  Dtype: {tensor.dtype}")
+        print(f"  Size: {size_mb:.2f} MB")
+        print(f"  Device: {tensor.device}")
+        print(f"  Requires grad: {tensor.requires_grad}")
+        print(f"  Is leaf: {tensor.is_leaf}")
+        print(f"  Grad fn: {tensor.grad_fn.__class__.__name__ if tensor.grad_fn else 'None'}")
+        print(f"  Memory address: {hex(tensor.data_ptr())}")
+        
+        # Detailed referrer analysis
+        referrers = gc.get_referrers(tensor)
+        print(f"\n  Referenced by {len(referrers)} objects:")
+        
+        # Categorize referrers
+        ref_categories = {
+            'modules': [],
+            'optimizers': [],
+            'dicts': [],
+            'lists': [],
+            'functions': [],
+            'others': []
+        }
+        
+        for ref in referrers:
+            try:
+                ref_type = type(ref).__name__
+                ref_info = None
+                
+                # Check for PyTorch modules
+                if hasattr(ref, '__class__'):
+                    class_name = ref.__class__.__name__
+                    module_name = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
+                    
+                    if 'torch.nn' in module_name or 'Module' in class_name:
+                        ref_info = f"{module_name}.{class_name}"
+                        ref_categories['modules'].append(ref_info)
+                    elif 'optim' in module_name.lower() or 'optimizer' in class_name.lower():
+                        ref_info = f"{module_name}.{class_name}"
+                        ref_categories['optimizers'].append(ref_info)
+                    else:
+                        ref_info = f"{ref_type} ({module_name}.{class_name})"
+                        ref_categories['others'].append(ref_info)
+                        
+                elif callable(ref):
+                    # Function or method
+                    name = getattr(ref, '__name__', '<anonymous>')
+                    ref_info = f"Function: {name}"
+                    ref_categories['functions'].append(ref_info)
+                    
+                elif isinstance(ref, dict):
+                    if '__name__' in ref:
+                        ref_info = f"Module dict: {ref['__name__']}"
+                    else:
+                        # Try to identify dict owner
+                        dict_id = id(ref)
+                        owner_found = False
+                        for owner in gc.get_objects():
+                            try:
+                                if hasattr(owner, '__dict__') and id(owner.__dict__) == dict_id:
+                                    owner_class = owner.__class__.__name__
+                                    ref_info = f"Dict of {owner_class} instance"
+                                    owner_found = True
+                                    break
+                            except:
+                                pass
+                        if not owner_found:
+                            ref_info = f"Dict with {len(ref)} keys"
+                    ref_categories['dicts'].append(ref_info)
+                    
+                elif isinstance(ref, (list, tuple)):
+                    ref_info = f"{ref_type} with {len(ref)} items"
+                    ref_categories['lists'].append(ref_info)
+                    
+                else:
+                    ref_info = ref_type
+                    ref_categories['others'].append(ref_info)
+                    
+            except Exception as e:
+                ref_categories['others'].append(f"<Error: {e}>")
+        
+        # Print categorized referrers
+        for category, refs in ref_categories.items():
+            if refs:
+                print(f"\n    {category.capitalize()}:")
+                for ref in refs[:max_referrers//5]:  # Limit each category
+                    print(f"      - {ref}")
+                if len(refs) > max_referrers//5:
+                    print(f"      ... and {len(refs) - max_referrers//5} more")
     
     # GPU memory summary
+    print(f"\n{'='*80}")
+    print("GPU Memory Summary:")
     if torch.cuda.is_available():
-        print(f"\nGPU memory: {torch.cuda.memory_allocated() / 1024**2:.2f} MB allocated")
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / 1024**2
+            reserved = torch.cuda.memory_reserved(i) / 1024**2
+            print(f"  GPU {i}: {allocated:.2f} MB allocated / {reserved:.2f} MB reserved")
 
 class query:
 	def __init__(
@@ -980,9 +1113,10 @@ class BatchGen:
 				self.core_engine.clear_kv_storage()
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
-				check_large_tensors()
+				
 				
 				if self.rank == 0:
+					check_large_tensors()
 					allocated_memory = torch.cuda.memory_allocated(self.torch_device)
 					logging.info(
 						f"Rank: {self.rank} Decoding done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
