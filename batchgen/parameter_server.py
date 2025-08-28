@@ -392,9 +392,12 @@ class ParameterServer:
 			except Exception as e:
 				logging.error(f"Failed to preload model {self.initial_model_name}: {e}")
 				logging.error("Server will start without a preloaded model")
+				self.cleanup()
+				raise RuntimeError("Failed to preload model")
 				# Continue running the server even if model loading fails
 		else:
 			# logging.info("No initial model specified. Server starting without preloaded model.")
+			self.cleanup()
 			raise RuntimeError("No initial model specified.")
 		
 	
