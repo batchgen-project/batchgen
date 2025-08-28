@@ -2120,7 +2120,7 @@ std::vector<torch::Tensor> KV_Storage::get_past_key_states(
         // Create tensor WITH pinned memory for better async copy
         auto options = torch::TensorOptions()
             .dtype(this->engine_config_.basic_config.kv_dtype_torch)
-            .device(torch::kCUDA, this->engine_config_.basic_config.device_id)  // Specify device ID
+            .device(torch::kCUDA, this->engine_config_.basic_config.device_torch) 
             .requires_grad(false);
             
         torch::Tensor k_tensor = torch::empty(  // Use empty instead of zeros for performance
