@@ -388,6 +388,7 @@ class ParameterServer:
 					finally:
 						self.cleanup()
 				else:
+					self.cleanup()
 					raise RuntimeError(f"Failed to preload model: {result.get('message', 'Unknown error')}")
 			except Exception as e:
 				logging.error(f"Failed to preload model {self.initial_model_name}: {e}")
