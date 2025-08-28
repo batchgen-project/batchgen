@@ -2106,31 +2106,24 @@ void KV_Storage::clear_kv_gpu_storage(){
 //     return past_key_states;
 // }
 
-std::vector<torch::Tensor> KV_Storage::get_past_key_states(
-    std::vector<int64_t> query_global_indices, 
-    int64_t max_seq_len) {
-    
+py::list KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
     auto start_time = std::chrono::high_resolution_clock::now();
     this->logger_->debug("KV_Storage get_past_key_states(): Getting past key states.");
     
-    std::vector<torch::Tensor> past_key_states;
-    past_key_states.reserve(this->model_config_.num_hidden_layers); // Pre-allocate
+    // Use py::list instead of std::vector
+    py::list past_key_states;
     
     for (int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
-        // Create tensor WITH pinned memory for better async copy
+        // Create tensor with options
         auto options = torch::TensorOptions()
             .dtype(this->engine_config_.basic_config.kv_dtype_torch)
-            .device(this->engine_config_.basic_config.device_torch) 
+            .device(this->engine_config_.basic_config.device_torch)
             .requires_grad(false);
             
-        torch::Tensor k_tensor = torch::empty(  // Use empty instead of zeros for performance
+        torch::Tensor k_tensor = torch::zeros(
             {static_cast<int64_t>(query_global_indices.size()), max_seq_len, 576},
             options);
-        
-        // Ensure tensor is contiguous
-        k_tensor = k_tensor.contiguous();
-        
-        // Your copy logic with proper pointer arithmetic
+        // Fill the tensor with data from k_storage
         for (int64_t i = 0; i < static_cast<int64_t>(query_global_indices.size()); i++) {
             auto query_idx = query_global_indices[i];
             int64_t slot_idx = -1;
@@ -2138,7 +2131,6 @@ std::vector<torch::Tensor> KV_Storage::get_past_key_states(
                 std::lock_guard<std::mutex> lock(this->mutex_);
                 slot_idx = this->query_idx_to_slot_idx_map[query_idx];
             }
-            
             c10::Float8_e4m3fn* k_ptr = nullptr;
             {
                 std::lock_guard<std::mutex> lock(
@@ -2146,32 +2138,20 @@ std::vector<torch::Tensor> KV_Storage::get_past_key_states(
                 k_ptr = static_cast<c10::Float8_e4m3fn*>(
                     this->k_storage[slot_idx][layer_idx].start_ptr);
             }
-            
-            // Fix: Proper pointer arithmetic for float8
-            auto element_size = k_tensor.element_size();
-            auto dst_ptr = static_cast<char*>(k_tensor.data_ptr()) + 
-                           i * max_seq_len * 576 * element_size;
-            
+            // Copy the data from k_ptr to k_tensor
+            auto dst_ptr = k_tensor.data_ptr() + i * max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch);
             CUDA_CHECK(cudaMemcpyAsync(
-                dst_ptr, 
-                k_ptr, 
-                max_seq_len * 576 * element_size,
-                cudaMemcpyHostToDevice, 
-                this->stream_));
+                dst_ptr, k_ptr, max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch),
+                cudaMemcpyHostToDevice, this->stream_));
         }
+        // Synchronize the stream
+        CUDA_CHECK(cudaStreamSynchronize(this->stream_));
         
-        // Move tensor into vector
-        past_key_states.emplace_back(std::move(k_tensor));
+        // Important: Use move semantics when appending
+        past_key_states.append(std::move(k_tensor));
     }
     
-    // Synchronize after all copies
-    CUDA_CHECK(cudaStreamSynchronize(this->stream_));
-    
     this->logger_->debug("KV_Storage get_past_key_states(): Past key states retrieved.");
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
-    this->logger_->debug("KV_Storage get_past_key_states(): Time taken: {} seconds", duration.count());
-    
     return past_key_states;
 }
 
