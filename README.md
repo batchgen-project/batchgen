@@ -135,7 +135,7 @@ if __name__ == "__main__":
     engine_config_json_dir = "/BatchGen/configurations/DeepSeek-R1/engine_config_H20_8.json"
     # Change if there is port conflict.
     server_host = "localhost"
-    server_port = "9090" 
+    server_port = "10900" 
 
 
     """

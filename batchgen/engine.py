@@ -857,7 +857,7 @@ def batchgen(
 	pt_ckpt_dir: Optional[str] = None,
 	host_kv_cache_size: Optional[int] = None,  # If not set, use all host memory
 	parameter_server_host: str = 'localhost',
-	parameter_server_port: int = 9090,
+	parameter_server_port: int = 10900,
 	dist_init_addr: Optional[str] = "localhost:12355",
 	nnodes: Optional[int] = 1,
 	node_rank: Optional[int] = 0,

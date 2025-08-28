@@ -33,7 +33,7 @@ if __name__ == "__main__":
 	parser.add_argument("--cache_dir", type=str, default=None)
 	# Add parameter server connection options
 	parser.add_argument("--server_host", type=str, default="localhost")
-	parser.add_argument("--server_port", type=int, default=9090)
+	parser.add_argument("--server_port", type=int, default=10900)
 	parser.add_argument("--dist_init_addr", type=str)
 	parser.add_argument("--nnodes", type=int, default=2)
 	parser.add_argument("--node_rank", type=int, default=0)

@@ -69,8 +69,8 @@ def server_argparser():
 	parser.add_argument(
 		'--server_port',
 		type=validate_server_port,
-		default=9090,
-		help='Server port number. Default is 9090.'
+		default=10900,
+		help='Server port number. Default is 10900.'
 	)
 
 	args = parser.parse_args()

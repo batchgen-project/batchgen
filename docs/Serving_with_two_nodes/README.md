@@ -24,7 +24,7 @@ python "<dir-to-two_nodes_H20_benchmark.py>" \
     --ATTN_MODE 3 \
     --cache_dir "<dir-to-model-checkpoint>" \
     --server_host "localhost" \
-    --server_port 9090 \
+    --server_port 10900 \
 	--dist_init_addr "10.0.0.8:12335" \
 	--nnodes 2 \
 	--node_rank 0
@@ -43,7 +43,7 @@ python "<dir-to-two_nodes_H20_benchmark.py>" \
     --ATTN_MODE 3 \
     --cache_dir "<dir-to-model-checkpoint>" \
     --server_host "localhost" \
-    --server_port 9090 \
+    --server_port 10900 \
 	--dist_init_addr "10.0.0.8:12335" \
 	--nnodes 2 \
 	--node_rank 1

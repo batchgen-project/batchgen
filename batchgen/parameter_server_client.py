@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 class ParameterServerClient:
-    def __init__(self, host='localhost', port=9090, timeout=60):
+    def __init__(self, host='localhost', port=10900, timeout=60):
         """
         Initialize a client connection to the parameter server.
         
