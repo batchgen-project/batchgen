@@ -1113,6 +1113,9 @@ class BatchGen:
 				self.core_engine.clear_kv_storage()
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
+				del past_key_states
+				del scale_dict
+				gc.collect()
 				
 				
 				if self.rank == 0:
