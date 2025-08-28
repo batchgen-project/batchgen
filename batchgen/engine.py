@@ -1073,16 +1073,6 @@ class BatchGen:
 					)
 
 	def _config_prefill(self):
-		if self.model is not None:
-			self.model = self.model.to("cpu")
-			# Set all model parameters to None
-			for param in self.model.parameters():
-				param.data = torch.zeros(
-					1, dtype=torch.bfloat16, device=param.device)
-			# del self.model
-			self.model = None
-			gc.collect()  
-			torch.cuda.empty_cache()
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
 		self.core_engine.stop_h2d_worker()
@@ -1751,6 +1741,7 @@ class BatchGen:
 		"""Deep cleanup of model and all its submodules"""
 		
 		if not hasattr(self, 'model'):
+			logging.warning("No model attribute found.")
 			return
 		
 		# Step 1: Set model to eval and disable gradients
