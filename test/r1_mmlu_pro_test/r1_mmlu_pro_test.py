@@ -180,5 +180,8 @@ if __name__ == "__main__":
 			fail += 1
 
 	print(f"Total samples: {success + fail}, Success: {success}, Fail: {fail}")
-	print(f"Accuracy: {success / (success + fail)}")
+	accuracy = success / (success + fail)
+	print(f"Accuracy: {accuracy}")
+	assert accuracy >= 0.80, "Accuracy is below 80%, test failed"
+	
 		
