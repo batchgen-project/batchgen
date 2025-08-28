@@ -701,5 +701,9 @@ class Expert_Wrapper(torch.nn.Module):
 		self.module.gate_proj.weight.data = torch.empty(0, device=self.module.gate_proj.weight.data.device)
 		self.module.down_proj.weight.data = torch.empty(0, device=self.module.down_proj.weight.data.device)
 		self.module.up_proj.weight.data = torch.empty(0, device=self.module.up_proj.weight.data.device)
-
+		for name, param in self.module.named_parameters():
+			param.data = torch.empty(
+				0,
+				device=param.data.device,
+			)
 	

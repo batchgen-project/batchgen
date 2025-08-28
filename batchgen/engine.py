@@ -1733,6 +1733,8 @@ class BatchGen:
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			attn_module._unregister_fp8_weights()
 			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+				if hasattr(self.model.model.layers[layer_idx].mlp.shared_experts, '_unregister_fp8_weights'):
+					self.model.model.layers[layer_idx].mlp.shared_experts._unregister_fp8_weights()
 				for routed_expert_idx in range(self.model_config.num_local_experts):
 					if hasattr(self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx], '_unregister_fp8_weights'):
 						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
