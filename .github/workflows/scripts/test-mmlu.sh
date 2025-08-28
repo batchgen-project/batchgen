@@ -1,0 +1,76 @@
+#!/bin/bash
+set -euo pipefail
+
+# check dependencies
+command -v nc >/dev/null 2>&1 || { echo "Error: nc (netcat) is required."; exit 1; }
+
+# parse arguments
+NODE_RANK=""
+DIST_INIT_ADDR=""
+CACHE_DIR=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --node-rank)
+            NODE_RANK="$2"
+            shift 2
+            ;;
+        --dist-init-addr)
+            DIST_INIT_ADDR="$2"
+            shift 2
+            ;;
+        --cache-dir)
+            CACHE_DIR="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# check arguments
+if [[ -z "$NODE_RANK" || -z "$DIST_INIT_ADDR" || -z "$CACHE_DIR" ]]; then
+    echo "Error: --node-rank, --dist-init-addr, and --cache-dir are required."
+    exit 1
+fi
+
+# start parameter server
+HF_ENDPOINT=https://hf-mirror.com \
+python -m batchgen.parameter_server \
+        --model deepseek-ai/DeepSeek-R1 \
+        --cache-dir "$CACHE_DIR" &
+PARAM_SERVER_PID=$!
+
+# ensure the parameter server is killed on script exit
+trap "kill $PARAM_SERVER_PID 2>/dev/null" EXIT
+
+# wait for the parameter server to be ready
+function wait_for_port() {
+    local host="localhost"
+    local port=9090
+    while ! nc -z "$host" "$port"; do
+            echo "Waiting for port $port to become available..."
+            sleep 10
+    done
+    echo "Port $port is available."
+}
+
+wait_for_port
+
+# run test
+HF_ENDPOINT=https://hf-mirror.com \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python test/r1_mmlu_pro_test/r1_mmlu_pro_test.py \
+        --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
+        --host_kv_cache_size 256 \
+        --max_input_length 4096 \
+        --max_decoding_length 2048 \
+        --ATTN_MODE 3 \
+        --cache_dir "$CACHE_DIR" \
+        --server_host "localhost" \
+        --server_port 9090 \
+        --dist_init_addr "$DIST_INIT_ADDR" \
+        --nnodes 2 \
+        --node_rank "$NODE_RANK"

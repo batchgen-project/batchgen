@@ -1,4 +1,4 @@
-name: Runner Release Test On H20 Nodes
+name: MMLU Pro Test On H20 Nodes
 
 on:
   workflow_dispatch:
@@ -7,38 +7,73 @@ on:
         description: "Docker image to test"
         required: true
         default: "nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04"
+      dist_init_addr:
+        description: "Distributed initialization address"
+        required: true
+        default: "29.194.13.138:20000"
 
 jobs:
-  check-node0:
-    name: Healthcheck Node0
+  test-node0:
+    name: MMLU Test Node0
     runs-on: [self-hosted, gpu, node0]
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
       - name: Print runner info
         run: |
           echo "Runner: ${{ runner.name }}"
           echo "Labels: ${{ toJson(runner.labels) }}"
-      - name: Check Docker
-        run: |
-          docker version
-          docker info | head -n 30
-      - name: Check NVIDIA driver
-        run: nvidia-smi
-      - name: Check NVIDIA in container
-        run: docker run --rm --gpus all ${{ github.event.inputs.image }} nvidia-smi
 
-  check-node1:
-    name: Healthcheck Node1
-    runs-on: [self-hosted, gpu, node1]
-    steps:
-      - name: Print runner info
-        run: |
-          echo "Runner: ${{ runner.name }}"
-          echo "Labels: ${{ toJson(runner.labels) }}"
       - name: Check Docker
         run: |
           docker version
           docker info | head -n 30
+      
       - name: Check NVIDIA driver
         run: nvidia-smi
-      - name: Check NVIDIA in container
-        run: docker run --rm --gpus all ${{ github.event.inputs.image }} nvidia-smi
+      
+      - name: Run MMLU Test in Container
+        run: |
+          docker run --rm --gpus all \
+            -v /data2/tairan/modelscope/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
+            --network host \
+            ${{ github.event.inputs.image }} \
+            bash .github/workflows/scripts/test-mmlu.sh \
+            --privileged \
+            --node-rank 0 \
+            --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
+            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/"
+
+  test-node1:
+    name: MMLU Test Node1
+    runs-on: [self-hosted, gpu, node1]
+    needs: test-node0
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Print runner info
+        run: |
+          echo "Runner: ${{ runner.name }}"
+          echo "Labels: ${{ toJson(runner.labels) }}"
+
+      - name: Check Docker
+        run: |
+          docker version
+          docker info | head -n 30
+      
+      - name: Check NVIDIA driver
+        run: nvidia-smi
+      
+      - name: Run MMLU Test in Container
+        run: |
+          docker run --rm --gpus all \
+            -v /data0/.cache/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
+            --network host \
+            ${{ github.event.inputs.image }} \
+            bash .github/workflows/scripts/test-mmlu.sh \
+            --privileged \
+            --node-rank 1 \
+            --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
+            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/"
