@@ -1121,6 +1121,7 @@ class BatchGen:
 					logging.info(
 						f"Rank: {self.rank} Decoding done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
 					)
+				dist.barrier()
 		else:
 			# For small input batch, some worker might do not have any input.
 			# In this case, it only participate in the decoding phase.
