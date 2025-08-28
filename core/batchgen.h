@@ -102,8 +102,9 @@ class BatchGen {
     void reset_weight_copy_queue();
     void reset_prefill_buffer();
     void create_fake_kv_storage();
-    std::unordered_map<std::string, torch::Tensor> get_tensor(
-        std::string module_key);
+    // std::unordered_map<std::string, torch::Tensor> get_tensor(
+        // std::string module_key);
+    py::dict get_tensor(std::string module_key);
     void start_h2d_worker();
     void set_global_routed_experts_data_ptr(
         const py::dict& experts_IPC_handles,

@@ -32,6 +32,14 @@
 #include "../utils.h"
 #include "Weights_Storage.h"
 
+
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+
+namespace py = pybind11;
+
 Weights_Storage::Weights_Storage(const EngineConfig& engine_config,
                                  const ModelConfig& model_config)
     : engine_config_(engine_config), model_config_(model_config) {
@@ -99,41 +107,98 @@ Weights_Storage::get_module_weights_storage(std::string module_key) {
     return this->module_weights_storage_[module_key];
 };
 
-std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(std::string module_key){
-    /* Get the tensor from the weights storage. */
+// std::unordered_map<std::string, torch::Tensor> Weights_Storage::get_tensor(std::string module_key){
+//     /* Get the tensor from the weights storage. */
+//     if (this->module_weights_storage_.find(module_key) ==
+//         this->module_weights_storage_.end()) {
+//         this->logger->error("Module key not found in storage.");
+//         throw std::runtime_error("Module key not found in storage.");
+//     };
+//     auto module_weights = this->module_weights_storage_[module_key];
+//     auto bf16_option = torch::TensorOptions()
+//         .dtype(torch::kBFloat16)
+//         .device(torch::kCPU)
+//         .requires_grad(false)
+//         .memory_format(torch::MemoryFormat::Contiguous);
+//     auto fp8_option = torch::TensorOptions()
+//         .dtype(torch::kFloat8_e4m3fn)
+//         .device(torch::kCPU)
+//         .requires_grad(false)
+//         .memory_format(torch::MemoryFormat::Contiguous);
+//     std::unordered_map<std::string, torch::Tensor> tensors;
+//     for (auto& [tensor_key, tensor_buffer] : module_weights) {
+//         // If "norm" in module_key, use bf16 dtype.
+//         if (tensor_key.find("norm") != std::string::npos) {
+//             auto tensor = torch::from_blob(
+//                 tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
+//                 // [buffer_copy = tensor_buffer](void* ptr) {},
+//                 bf16_option);
+//             tensors[tensor_key] = tensor;
+//         }
+//         else{
+//             auto tensor = torch::from_blob(
+//                 tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
+//                 // [buffer_copy = tensor_buffer](void* ptr) {},
+//                 fp8_option);
+//             tensors[tensor_key] = tensor;
+//         }
+//     }
+//     return tensors;
+// }
+
+py::dict Weights_Storage::get_tensor(std::string module_key) {
+    /* Get the tensor from the weights storage and return as Python dict. */
+    
+    // Check if module key exists
     if (this->module_weights_storage_.find(module_key) ==
         this->module_weights_storage_.end()) {
         this->logger->error("Module key not found in storage.");
         throw std::runtime_error("Module key not found in storage.");
-    };
+    }
+    
+    // Get module weights
     auto module_weights = this->module_weights_storage_[module_key];
+    
+    // Define tensor options
     auto bf16_option = torch::TensorOptions()
         .dtype(torch::kBFloat16)
         .device(torch::kCPU)
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
+        
     auto fp8_option = torch::TensorOptions()
         .dtype(torch::kFloat8_e4m3fn)
         .device(torch::kCPU)
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
-    std::unordered_map<std::string, torch::Tensor> tensors;
+    
+    // Create Python dict to store tensors
+    py::dict tensors;
+    
+    // Iterate through module weights and create tensors
     for (auto& [tensor_key, tensor_buffer] : module_weights) {
-        // If "norm" in module_key, use bf16 dtype.
+        torch::Tensor tensor;
+        
+        // If "norm" in tensor_key, use bf16 dtype
         if (tensor_key.find("norm") != std::string::npos) {
-            auto tensor = torch::from_blob(
-                tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
-                // [buffer_copy = tensor_buffer](void* ptr) {},
-                bf16_option).clone();
-            tensors[tensor_key] = tensor;
+            tensor = torch::from_blob(
+                tensor_buffer.data_ptr, 
+                tensor_buffer.tensor_shape,
+                bf16_option
+            );
+        } else {
+            tensor = torch::from_blob(
+                tensor_buffer.data_ptr, 
+                tensor_buffer.tensor_shape,
+                fp8_option
+            );
         }
-        else{
-            auto tensor = torch::from_blob(
-                tensor_buffer.data_ptr, tensor_buffer.tensor_shape,
-                // [buffer_copy = tensor_buffer](void* ptr) {},
-                fp8_option).clone();
-            tensors[tensor_key] = tensor;
-        }
+        
+        // Add tensor to Python dict
+        // PyTorch tensors are automatically converted to Python tensors
+        tensors[tensor_key.c_str()] = tensor;
     }
+    
     return tensors;
 }
+

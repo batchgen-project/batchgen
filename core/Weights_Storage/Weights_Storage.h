@@ -32,6 +32,13 @@
 #include "../data_structures.h"
 #include "../utils.h"
 
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+
+namespace py = pybind11;
+
 struct tensor_buffer {
     void* data_ptr;
     std::vector<int64_t> tensor_shape;
@@ -59,8 +66,9 @@ class Weights_Storage {
     std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
         std::string module_key);
 
-    std::unordered_map<std::string, torch::Tensor> get_tensor(
-        std::string module_key);
+    // std::unordered_map<std::string, torch::Tensor> get_tensor(
+    //     std::string module_key);
+    py::dict get_tensor(std::string module_key);
 
    private:
     /* Template */
