@@ -1,9 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# check dependencies
-command -v nc >/dev/null 2>&1 || { echo "Error: nc (netcat) is required."; exit 1; }
-
 # parse arguments
 NODE_RANK=""
 DIST_INIT_ADDR=""
@@ -50,9 +47,9 @@ trap "kill $PARAM_SERVER_PID 2>/dev/null" EXIT
 function wait_for_port() {
     local host="localhost"
     local port=9090
-    while ! nc -z "$host" "$port"; do
-            echo "Waiting for port $port to become available..."
-            sleep 10
+    while ! (echo > "/dev/tcp/$host/$port") >/dev/null 2>&1; do
+        echo "Waiting for port $port to become available..."
+        sleep 10
     done
     echo "Port $port is available."
 }
