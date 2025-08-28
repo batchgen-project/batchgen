@@ -37,6 +37,10 @@
 #include "../data_structures.h"
 #include "../utils.h"
 
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+namespace py = pybind11;
+
 /*
         Manage the Key-Value Cache Storage in the Host Memory.
 */
@@ -90,7 +94,8 @@ class KV_Storage {
         torch::Tensor k, torch::Tensor v, torch::Tensor k_quantize_scale);
     void clear_kv_gpu_storage();
     std::vector<torch::Tensor> get_kv_scale(std::vector<int64_t> query_global_indices, int64_t seq_len);
-    std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len);
+    //  std::vector<torch::Tensor> get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len);
+    py::list get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len);
 
    private:
     /* Template */

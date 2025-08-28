@@ -530,6 +530,19 @@ class Attn_Wrapper(torch.nn.Module):
 		self.fp8_kv_a_proj_with_mqa = self.module.kv_a_proj_with_mqa.weight.data
 		self.fp8_kv_b_proj = self.module.kv_b_proj.weight.data
 		self.fp8_o_proj = self.module.o_proj.weight.data
+	
+	def _unregister_fp8_weights(self):
+		logging.debug(f"Cleaning Attn weights. Layer idx {self.layer_idx}")
+		self.fp8_q_a_proj = None
+		self.fp8_q_b_proj = None
+		self.fp8_kv_a_proj_with_mqa = None
+		self.fp8_kv_b_proj = None
+		self.fp8_o_proj = None
+		self.module.q_a_proj.weight.data = torch.empty(0, device=self.module.q_a_proj.weight.data.device)
+		self.module.q_b_proj.weight.data = torch.empty(0, device=self.module.q_b_proj.weight.data.device)
+		self.module.kv_a_proj_with_mqa.weight.data = torch.empty(0, device=self.module.kv_a_proj_with_mqa.weight.data.device)
+		self.module.kv_b_proj.weight.data = torch.empty(0, device=self.module.kv_b_proj.weight.data.device)
+		self.module.o_proj.weight.data = torch.empty(0, device=self.module.o_proj.weight.data.device)
 
 
 class Expert_Wrapper(torch.nn.Module):
@@ -680,5 +693,17 @@ class Expert_Wrapper(torch.nn.Module):
 		self.fp8_down = self.module.down_proj.weight.data
 		self.fp8_up = self.module.up_proj.weight.data
 
-
+	def _unregister_fp8_weights(self):
+		logging.debug(f"Clearing expert weights. Layer idx {self.layer_idx}, expert idx{self.expert_idx}")
+		self.fp8_gate = None
+		self.fp8_down = None
+		self.fp8_up = None
+		self.module.gate_proj.weight.data = torch.empty(0, device=self.module.gate_proj.weight.data.device)
+		self.module.down_proj.weight.data = torch.empty(0, device=self.module.down_proj.weight.data.device)
+		self.module.up_proj.weight.data = torch.empty(0, device=self.module.up_proj.weight.data.device)
+		for name, param in self.module.named_parameters():
+			param.data = torch.empty(
+				0,
+				device=param.data.device,
+			)
 	
