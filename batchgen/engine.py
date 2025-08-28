@@ -86,6 +86,52 @@ def signal_handler(signum, frame):
 	time.sleep(0.5)
 	sys.exit(1)
 
+def check_large_tensors(threshold_mb=10):
+    """Simple function to find and print all tensors larger than threshold"""
+    import gc
+    import torch
+    
+    print(f"\nSearching for tensors > {threshold_mb} MB...")
+    print("-" * 60)
+    
+    found_any = False
+    total_mb = 0
+    
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                size_bytes = obj.element_size() * obj.numel()
+                size_mb = size_bytes / (1024 * 1024)
+                
+                if size_mb >= threshold_mb:
+                    found_any = True
+                    total_mb += size_mb
+                    
+                    print(f"\nTensor found:")
+                    print(f"  Shape: {list(obj.shape)}")
+                    print(f"  Dtype: {obj.dtype}")
+                    print(f"  Size: {size_mb:.2f} MB")  # <- This is what should be here
+                    print(f"  Device: {obj.device}")
+                    print(f"  Requires grad: {obj.requires_grad}")
+                    print(f"  Memory address: {hex(obj.data_ptr())}")
+                    
+                    # Check if it's part of a model
+                    referrers = gc.get_referrers(obj)
+                    for ref in referrers:
+                        if hasattr(ref, '__class__') and 'Module' in str(type(ref)):
+                            print(f"  Part of module: {type(ref).__name__}")
+                            break
+        except:
+            pass
+    
+    if found_any:
+        print(f"\nTotal memory in large tensors: {total_mb:.2f} MB")
+    else:
+        print(f"No tensors found larger than {threshold_mb} MB")
+    
+    # GPU memory summary
+    if torch.cuda.is_available():
+        print(f"\nGPU memory: {torch.cuda.memory_allocated() / 1024**2:.2f} MB allocated")
 
 class query:
 	def __init__(
@@ -934,6 +980,7 @@ class BatchGen:
 				self.core_engine.clear_kv_storage()
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
+				check_large_tensors()
 				
 				if self.rank == 0:
 					allocated_memory = torch.cuda.memory_allocated(self.torch_device)
