@@ -64,7 +64,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("clear_weight_copy_queue", &BatchGen::clear_weight_copy_queue)
         .def("reset_prefill_buffer", &BatchGen::reset_prefill_buffer)
         .def("create_fake_kv_storage", &BatchGen::create_fake_kv_storage)
-        .def("get_tensor", &BatchGen::get_tensor)
+        .def("get_tensor", &BatchGen::get_tensor,py::return_value_policy::take_ownership)
         .def("start_h2d_worker", &BatchGen::start_h2d_worker)
         .def("set_global_routed_experts_data_ptr",
              &BatchGen::set_global_routed_experts_data_ptr)
