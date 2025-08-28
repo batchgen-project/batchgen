@@ -933,17 +933,8 @@ class BatchGen:
 				decoding_time += time.perf_counter() - decoding_start_time
 				self.core_engine.clear_kv_storage()
 				self._unregister_fp8_weights()
-				# del past_key_states
-				# del scale_dict
-				# self.model = self.model.to("cpu")
-				# # Set all model parameters to None
-				# for param in self.model.parameters():
-				# 	param.data = torch.zeros(
-				# 		1, dtype=torch.bfloat16, device=param.device)
-				del self.model
-				self.model = None
-				gc.collect()  
-				torch.cuda.empty_cache()
+				self.deep_free_model_memory()
+				
 				if self.rank == 0:
 					allocated_memory = torch.cuda.memory_allocated(self.torch_device)
 					logging.info(
@@ -1756,4 +1747,56 @@ class BatchGen:
 					if hasattr(self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx], '_unregister_fp8_weights'):
 						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
 
-	
+	def deep_free_model_memory(self):
+		"""Deep cleanup of model and all its submodules"""
+		
+		if not hasattr(self, 'model'):
+			return
+		
+		# Step 1: Set model to eval and disable gradients
+		self.model.eval()
+		with torch.no_grad():
+			# Step 2: Recursively clear all module parameters and buffers
+			def clear_module(module):
+				# Clear parameters
+				for param in module.parameters():
+					param.data = torch.empty(0)
+					if param.grad is not None:
+						param.grad.data = torch.empty(0)
+						param.grad = None
+				
+				# Clear buffers
+				for buffer in module.buffers():
+					buffer.data = torch.empty(0)
+				
+				# Clear module hooks
+				module._forward_hooks.clear()
+				module._forward_pre_hooks.clear()
+				module._backward_hooks.clear()
+				
+				# Recursively clear submodules
+				for submodule in module.children():
+					clear_module(submodule)
+			
+			clear_module(self.model)
+		
+		# Step 3: Move to CPU and delete
+		self.model.to('cpu')
+		del self.model
+		
+		# Step 4: Clear optimizer if exists
+		if hasattr(self, 'optimizer'):
+			self.optimizer.zero_grad(set_to_none=True)
+			del self.optimizer
+		
+		# Step 5: Clear any cached computational graphs
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+			torch.cuda.synchronize()
+		
+		# Step 6: Aggressive garbage collection
+		import gc
+		for _ in range(3):  # Multiple passes can help
+			gc.collect()
+			if torch.cuda.is_available():
+				torch.cuda.empty_cache()
