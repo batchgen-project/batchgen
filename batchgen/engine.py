@@ -220,7 +220,7 @@ def signal_handler(signum, frame):
 #             print(f"  GPU {i}: {allocated:.2f} MB allocated / {reserved:.2f} MB reserved")
 
 
-def check_large_tensors_with_names(threshold_mb=10, max_depth=3):
+def check_large_tensors(threshold_mb=10, max_depth=3):
     """Find large GPU tensors and trace back to find actual variable names"""
     import gc
     import torch
