@@ -17,9 +17,6 @@ jobs:
     name: MMLU Test Node0
     runs-on: [self-hosted, gpu, node0]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
       - name: Print runner info
         run: |
           echo "Runner: ${{ runner.name }}"
@@ -36,11 +33,20 @@ jobs:
       - name: Run MMLU Test in Container
         run: |
           docker run --rm --gpus all \
+            -e GLOO_SOCKET_IFNAME=bond0 \
+            -e NCCL_SOCKET_IFNAME=bond0 \
+            -e NCCL_IB_DISABLE='0' \
+            -e NCCL_NET="ib" \
+            -e NCCL_OOB_NET_IFNAME="mlx5_" \
+            -e NCCL_OOB_NET_ENABLE=1 \
+            -e NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7 \
             -v /data2/tairan/modelscope/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
             --network host \
+            --privileged \
+            --shm-size 32g \
+            --ipc=host \
             ${{ github.event.inputs.image }} \
             bash .github/workflows/scripts/test-mmlu.sh \
-            --privileged \
             --node-rank 0 \
             --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
             --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/"
@@ -48,11 +54,7 @@ jobs:
   test-node1:
     name: MMLU Test Node1
     runs-on: [self-hosted, gpu, node1]
-    needs: test-node0
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
       - name: Print runner info
         run: |
           echo "Runner: ${{ runner.name }}"
@@ -69,11 +71,20 @@ jobs:
       - name: Run MMLU Test in Container
         run: |
           docker run --rm --gpus all \
+            -e GLOO_SOCKET_IFNAME=bond0 \
+            -e NCCL_SOCKET_IFNAME=bond0 \
+            -e NCCL_IB_DISABLE='0' \
+            -e NCCL_NET="ib" \
+            -e NCCL_OOB_NET_IFNAME="mlx5_" \
+            -e NCCL_OOB_NET_ENABLE=1 \
+            -e NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7 \
             -v /data0/.cache/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
             --network host \
+            --privileged \
+            --shm-size 32g \
+            --ipc=host \
             ${{ github.event.inputs.image }} \
             bash .github/workflows/scripts/test-mmlu.sh \
-            --privileged \
             --node-rank 1 \
             --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
             --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/"
