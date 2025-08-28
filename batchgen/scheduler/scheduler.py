@@ -5,7 +5,7 @@ class Scheduler:
 		""" 
 			Exclusively for H20 and DeepSeek-R1
 		"""
-		return "0.1.4"
+		return "0.1.6"
 	
 	def __init__(self, Max_Prompt_Length, Max_Response_Length, world_size):
 		self.config = EngineConfig()
