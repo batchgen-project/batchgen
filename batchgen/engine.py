@@ -1539,7 +1539,7 @@ class BatchGen:
 				
 				
 				if self.rank == 0:
-					check_large_tensors()
+					# check_large_tensors()
 					allocated_memory = torch.cuda.memory_allocated(self.torch_device)
 					logging.info(
 						f"Rank: {self.rank} Decoding done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
