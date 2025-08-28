@@ -38,7 +38,7 @@ CURRENT_SHM_GB=$(df -BG --output=size /dev/shm | tail -n1 | tr -dc '0-9')
 
 if (( CURRENT_SHM_GB < TARGET_SHM_GB )); then
   echo "Resizing /dev/shm from ${CURRENT_SHM_GB}G to ${TARGET_SHM_GB}G..."
-  sudo mount -o remount,size=${TARGET_SHM_GB}G /dev/shm || \
+  mount -o remount,size=${TARGET_SHM_GB}G /dev/shm || \
     echo "Warning: failed to remount /dev/shm"
 else
   echo "/dev/shm already ${CURRENT_SHM_GB}G, no remount needed."
