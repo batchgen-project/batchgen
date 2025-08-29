@@ -43,7 +43,7 @@ jobs:
             -v /data2/tairan/modelscope/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
             --network host \
             --privileged \
-            --shm-size 32g \
+            --shm-size 512g \
             --ipc=host \
             ${{ github.event.inputs.image }} \
             bash .github/workflows/scripts/test-mmlu.sh \
@@ -81,7 +81,7 @@ jobs:
             -v /data0/.cache/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
             --network host \
             --privileged \
-            --shm-size 32g \
+            --shm-size 512g \
             --ipc=host \
             ${{ github.event.inputs.image }} \
             bash .github/workflows/scripts/test-mmlu.sh \
