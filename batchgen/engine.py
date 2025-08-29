@@ -1034,12 +1034,6 @@ def batchgen(
 	end_time = time.perf_counter()
 	logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
 
-	# Communicate to let each node get all the results
-	# The results should remain the order of node rank.
-	# global_results = [None] * nnodes
-	# dist.all_gather_object(global_results, all_results)
-
-
 	return all_results
 
 
@@ -1598,8 +1592,10 @@ class BatchGen:
 		dist.all_gather_object(all_results, res)
 		dist.destroy_process_group()
 		all_result = [item for sublist in all_results for item in sublist]
+		# Concat to a single tensor and copy to cpu
+		res_tensor = torch.cat(all_results, dim=0).cpu()
 		if self.rank == 0:
-			return all_result
+			return [res_tensor]
 		else:
 			return []
 
