@@ -1034,6 +1034,8 @@ def batchgen(
 	end_time = time.perf_counter()
 	logging.info(f"Inference complete. Total time: {end_time - start_time:.2f}s")
 
+	all_results = [item for result in all_results for item in result][0]
+	print(all_results)
 	return all_results
 
 
