@@ -1591,7 +1591,7 @@ class BatchGen:
 		all_results = [None] * self.world_size
 		dist.all_gather_object(all_results, res)
 		dist.destroy_process_group()
-		all_result = [item for sublist in all_results for item in sublist]
+		all_results = [item for sublist in all_results for item in sublist]
 		# Concat to a single tensor and copy to cpu
 		res_tensor = torch.cat(all_results, dim=0).cpu()
 		if self.rank == 0:
