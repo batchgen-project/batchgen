@@ -141,8 +141,12 @@ if __name__ == "__main__":
 		# for idx in range(4):
 			tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
 			# print(f"Prompt {idx}: {queries[idx][:args.max_input_length]}")
+			print("==================================================================")
+			print(f"Query {idx}: {queries[idx][:args.max_input_length]}")
+			print("\n\n")
 			print(f"Answer {idx}: {tmp_answer}")
-			print("\n\n")	
+			print("==================================================================")
+			print("\n\n")
 	
 
 	"""
