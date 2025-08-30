@@ -1590,12 +1590,15 @@ class BatchGen:
 		#     )
 
 		# Gather results from all rank to rank 0
+		logging.info(f"Rank {self.rank} res: {res}")
 		all_results = [None] * self.world_size
 		dist.all_gather_object(all_results, res)
 		dist.destroy_process_group()
 		all_results = [item for sublist in all_results for item in sublist]
+		logging.info(f"Size of all_results: {len(all_results)}")
 		# Concat to a single tensor and copy to cpu
 		res_tensor = torch.cat(all_results, dim=0).cpu()
+		logging.info(f"res_tensor shape {res_tensor.shape}")
 		if self.rank == 0:
 			return [res_tensor]
 		else:
