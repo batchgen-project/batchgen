@@ -40,6 +40,7 @@ class Parallel_Strategy_Manager:
 		self.local_rank = local_rank
 		self.global_rank = global_rank
 		self.world_size = world_size
+		self.rank = global_rank
 		
 	def configure_prefill(self):
 		"""
