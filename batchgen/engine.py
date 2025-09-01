@@ -1464,8 +1464,16 @@ class BatchGen:
 				with torch.inference_mode():
 					new_token = self.prefill(self.model_batches[model_batch_idx])
 				prefill_time += time.perf_counter() - prefill_start_time
-				# self.core_engine.prefill_complete_sync()
-				logging.info(f"Rank: {self.rank} prefill complete.")
+
+				dist.barrier()
+				if self.rank == 0:
+					print("\n\n", flush=True)
+					total, used, free, usage = get_gpu_memory_usage(self.device)
+					logging.info(
+						f"{self.rank} Prefill Complete.\n"
+						f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+						f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+				)
 
 				# Random create new token.
 				# new_token = torch.randint(
