@@ -347,9 +347,10 @@ class Parallel_Strategy_Manager:
 
 		self.model = None
 		torch.cuda.empty_cache()
-		self.model = DeepseekV3ForCausalLM._from_config(
-			self.hf_model_config, comm
-		)
+		# self.model = DeepseekV3ForCausalLM._from_config(
+		# 	self.hf_model_config, comm
+		# )
+		self.model = DeepseekV3ForCausalLM(self.hf_model_config, comm)
 		if self.rank == 0:
 			torch.cuda.empty_cache()
 			total, used, free, usage = get_gpu_memory_usage(self.rank)
