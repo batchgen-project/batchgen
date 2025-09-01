@@ -1467,6 +1467,17 @@ class BatchGen:
 						f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
 						f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 				)
+				if hasattr(self, 'model'):
+					if self.model is not None:
+						self.deep_free_model_memory()
+						if self.rank == 0:
+							torch.cuda.empty_cache()
+							total, used, free, usage = get_gpu_memory_usage(self.device)
+							logging.info(
+								f"{self.rank} Start Prefill Configuration. deep_free_model_memory \n"
+								f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+								f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+							)
 				self._config_prefill()
 				prefill_start_time = time.perf_counter()
 				with torch.inference_mode():
