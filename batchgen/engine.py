@@ -45,7 +45,7 @@ from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausal
 from tqdm import trange
 import gc
 from datetime import timedelta
-from .utils import torch_gpu_mem_usage
+from .utils import torch_gpu_mem_usage, get_gpu_memory_usage
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -1742,6 +1742,8 @@ class BatchGen:
 		"""
 		if self.rank == 0:
 			logging.info(f"{self.rank} Start Prefill. Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}")
+			get_gpu_memory_usage()
+
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
@@ -2256,7 +2258,9 @@ class BatchGen:
 						# logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
 					new_token_idx += 1
 
-		
+		if self.rank == 0:
+			logging.info(f"Decoding done.")
+			get_gpu_memory_usage()
 		# if RUNTIME_ATTN_MODE == 3:
 		#     self.core_engine.clear_kv_gpu_storage()    
 	
