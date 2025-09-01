@@ -234,15 +234,15 @@ torch::Tensor GPU_KV_Buffer::get_v(int64_t layer_idx, int64_t micro_batch_idx,
 };
 
 GPU_KV_Buffer::~GPU_KV_Buffer() {
-    // for (int64_t buffer_idx = 0;
-    //      buffer_idx < this->engine_config_.gpu_buffer_config.num_kv_buffer;
-    //      buffer_idx++) {
-    //     cudaFree(this->k_buffers_[buffer_idx]);
-    //     // v_buffer can be nullptr
-    //     if (this->v_buffers_[buffer_idx] != nullptr) {
-    //         cudaFree(this->v_buffers_[buffer_idx]);
-    //     }
-    // }
+    for (int64_t buffer_idx = 0;
+         buffer_idx < this->engine_config_.gpu_buffer_config.num_kv_buffer;
+         buffer_idx++) {
+        cudaFree(this->k_buffers_[buffer_idx]);
+        // v_buffer can be nullptr
+        if (this->v_buffers_[buffer_idx] != nullptr) {
+            cudaFree(this->v_buffers_[buffer_idx]);
+        }
+    }
 };
 
 void GPU_KV_Buffer::clear_kv_buffer() {
