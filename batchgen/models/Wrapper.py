@@ -543,6 +543,8 @@ class Attn_Wrapper(torch.nn.Module):
 		self.module.kv_a_proj_with_mqa.weight.data = torch.empty(0, device=self.module.kv_a_proj_with_mqa.weight.data.device)
 		self.module.kv_b_proj.weight.data = torch.empty(0, device=self.module.kv_b_proj.weight.data.device)
 		self.module.o_proj.weight.data = torch.empty(0, device=self.module.o_proj.weight.data.device)
+		self.module.kv_a_layernorm.weight.data = torch.empty(0, device=self.module.kv_a_layernorm.weight.data.device)
+		self.module.q_a_layernorm.weight.data = torch.empty(0, device=self.module.q_a_layernorm.weight.data.device)
 		for key,value in self.weight_dequant_scale.items():
 			self.weight_dequant_scale[key] = None
 
