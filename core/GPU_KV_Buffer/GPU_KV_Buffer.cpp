@@ -181,7 +181,7 @@ torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
     torch::Tensor k_tensor =
         torch::from_blob(this->k_buffers_[buffer_idx], tensor_shape,
                          // [](void*){},
-                         option).clone();
+                         option);
     CUDA_CHECK(cudaStreamSynchronize(0));
     // Check if k_tensor contains nan
     // if (torch::any(torch::isnan(k_tensor)).item<bool>()) {
