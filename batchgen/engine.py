@@ -1726,8 +1726,13 @@ class BatchGen:
 		Handle the prefill for a full model batch.
 		"""
 		if self.rank == 0:
-			logging.info(f"{self.rank} Start Prefill. Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}")
-			get_gpu_memory_usage()
+			print("\n\n", flush=True)
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} Start Prefill.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		 )
 
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
@@ -2244,8 +2249,12 @@ class BatchGen:
 					new_token_idx += 1
 
 		if self.rank == 0:
-			logging.info(f"Decoding done.")
-			get_gpu_memory_usage()
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
+			logging.info(
+				f"Decoding done.\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%\n"
+				f"Torch usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3):.2f} GB"
+		 )
 		# if RUNTIME_ATTN_MODE == 3:
 		#     self.core_engine.clear_kv_gpu_storage()    
 	
