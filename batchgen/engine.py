@@ -1459,6 +1459,14 @@ class BatchGen:
 			):
 				dist.barrier()
 				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
+				if self.rank == 0:
+					print("\n\n", flush=True)
+					total, used, free, usage = get_gpu_memory_usage(self.device)
+					logging.info(
+						f"{self.rank} Start Prefill Configuration.\n"
+						f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+						f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+				)
 				self._config_prefill()
 				prefill_start_time = time.perf_counter()
 				with torch.inference_mode():
