@@ -92,33 +92,33 @@ def signal_handler(signum, frame):
 #     import gc
 #     import torch
 #     import inspect
-    
+	
 #     print(f"\nSearching for GPU tensors > {threshold_mb} MB...")
 #     print("=" * 80)
-    
+	
 #     found_tensors = []
-    
+	
 #     for obj in gc.get_objects():
 #         try:
 #             if torch.is_tensor(obj) and obj.is_cuda:
 #                 size_bytes = obj.element_size() * obj.numel()
 #                 size_mb = size_bytes / (1024 * 1024)
-                
+				
 #                 if size_mb >= threshold_mb:
 #                     found_tensors.append((size_mb, obj))
 #         except:
 #             pass
-    
+	
 #     if not found_tensors:
 #         print(f"No GPU tensors found larger than {threshold_mb} MB")
 #         return
-    
+	
 #     # Sort by size (largest first)
 #     found_tensors.sort(key=lambda x: x[0], reverse=True)
-    
+	
 #     total_mb = sum(size for size, _ in found_tensors)
 #     print(f"Found {len(found_tensors)} GPU tensors using {total_mb:.2f} MB total\n")
-    
+	
 #     for idx, (size_mb, tensor) in enumerate(found_tensors, 1):
 #         print(f"\n{'-'*80}")
 #         print(f"Tensor #{idx}:")
@@ -130,11 +130,11 @@ def signal_handler(signum, frame):
 #         print(f"  Is leaf: {tensor.is_leaf}")
 #         print(f"  Grad fn: {tensor.grad_fn.__class__.__name__ if tensor.grad_fn else 'None'}")
 #         print(f"  Memory address: {hex(tensor.data_ptr())}")
-        
+		
 #         # Detailed referrer analysis
 #         referrers = gc.get_referrers(tensor)
 #         print(f"\n  Referenced by {len(referrers)} objects:")
-        
+		
 #         # Categorize referrers
 #         ref_categories = {
 #             'modules': [],
@@ -144,17 +144,17 @@ def signal_handler(signum, frame):
 #             'functions': [],
 #             'others': []
 #         }
-        
+		
 #         for ref in referrers:
 #             try:
 #                 ref_type = type(ref).__name__
 #                 ref_info = None
-                
+				
 #                 # Check for PyTorch modules
 #                 if hasattr(ref, '__class__'):
 #                     class_name = ref.__class__.__name__
 #                     module_name = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
-                    
+					
 #                     if 'torch.nn' in module_name or 'Module' in class_name:
 #                         ref_info = f"{module_name}.{class_name}"
 #                         ref_categories['modules'].append(ref_info)
@@ -164,13 +164,13 @@ def signal_handler(signum, frame):
 #                     else:
 #                         ref_info = f"{ref_type} ({module_name}.{class_name})"
 #                         ref_categories['others'].append(ref_info)
-                        
+						
 #                 elif callable(ref):
 #                     # Function or method
 #                     name = getattr(ref, '__name__', '<anonymous>')
 #                     ref_info = f"Function: {name}"
 #                     ref_categories['functions'].append(ref_info)
-                    
+					
 #                 elif isinstance(ref, dict):
 #                     if '__name__' in ref:
 #                         ref_info = f"Module dict: {ref['__name__']}"
@@ -190,18 +190,18 @@ def signal_handler(signum, frame):
 #                         if not owner_found:
 #                             ref_info = f"Dict with {len(ref)} keys"
 #                     ref_categories['dicts'].append(ref_info)
-                    
+					
 #                 elif isinstance(ref, (list, tuple)):
 #                     ref_info = f"{ref_type} with {len(ref)} items"
 #                     ref_categories['lists'].append(ref_info)
-                    
+					
 #                 else:
 #                     ref_info = ref_type
 #                     ref_categories['others'].append(ref_info)
-                    
+					
 #             except Exception as e:
 #                 ref_categories['others'].append(f"<Error: {e}>")
-        
+		
 #         # Print categorized referrers
 #         for category, refs in ref_categories.items():
 #             if refs:
@@ -210,7 +210,7 @@ def signal_handler(signum, frame):
 #                     print(f"      - {ref}")
 #                 if len(refs) > max_referrers//5:
 #                     print(f"      ... and {len(refs) - max_referrers//5} more")
-    
+	
 #     # GPU memory summary
 #     print(f"\n{'='*80}")
 #     print("GPU Memory Summary:")
@@ -227,10 +227,10 @@ def signal_handler(signum, frame):
 #     import torch
 #     import inspect
 #     import sys
-    
+	
 #     print(f"\nSearching for GPU tensors > {threshold_mb} MB...")
 #     print("=" * 80)
-    
+	
 #     def find_name_in_namespace(obj, namespace, namespace_name=""):
 #         """Find variable name of an object in a namespace"""
 #         names = []
@@ -245,24 +245,24 @@ def signal_handler(signum, frame):
 #                     if v is obj:
 #                         names.append(f"{namespace_name}.{name}['{k}']" if namespace_name else f"{name}['{k}']")
 #         return names
-    
+	
 #     def find_container_owners(container, max_depth=3, current_depth=0):
 #         """Recursively find what owns a container"""
 #         if current_depth >= max_depth:
 #             return []
-        
+		
 #         owners = []
 #         container_refs = gc.get_referrers(container)
-        
+		
 #         for ref in container_refs:
 #             try:
 #                 # Skip frames and internal references
 #                 if type(ref).__name__ in ['frame', 'cell', 'method', 'function']:
 #                     continue
-                
+				
 #                 ref_type = type(ref).__name__
 #                 ref_module = type(ref).__module__ if hasattr(type(ref), '__module__') else ''
-                
+				
 #                 # Check if it's an object with attributes
 #                 if hasattr(ref, '__dict__'):
 #                     # Find which attribute holds our container
@@ -272,7 +272,7 @@ def signal_handler(signum, frame):
 #                             module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
 #                             owners.append(f"{module}.{class_name}.{attr_name}")
 #                             break
-                
+				
 #                 # Check if it's another container
 #                 elif isinstance(ref, (list, tuple)):
 #                     # Recursively find what owns this container
@@ -283,7 +283,7 @@ def signal_handler(signum, frame):
 #                             owners.append(f"{po}[{idx}]")
 #                     else:
 #                         owners.append(f"{ref_type} (depth {current_depth + 1})")
-                
+				
 #                 # Check if it's a dict
 #                 elif isinstance(ref, dict):
 #                     # Find which key holds our container
@@ -297,14 +297,14 @@ def signal_handler(signum, frame):
 #                             else:
 #                                 owners.append(f"Dict key: '{key}'")
 #                             break
-                
+				
 #                 # Check globals and locals
 #                 if not owners:
 #                     # Check main module
 #                     import __main__
 #                     names = find_name_in_namespace(container, vars(__main__), "__main__")
 #                     owners.extend(names)
-                    
+					
 #                     # Check all modules
 #                     for module_name, module in sys.modules.items():
 #                         if module and hasattr(module, '__dict__'):
@@ -313,35 +313,35 @@ def signal_handler(signum, frame):
 #                                 owners.extend(names)
 #                             except:
 #                                 pass
-                
+				
 #             except Exception as e:
 #                 pass
-        
+		
 #         return owners
-    
+	
 #     found_tensors = []
-    
+	
 #     for obj in gc.get_objects():
 #         try:
 #             if torch.is_tensor(obj) and obj.is_cuda:
 #                 size_bytes = obj.element_size() * obj.numel()
 #                 size_mb = size_bytes / (1024 * 1024)
-                
+				
 #                 if size_mb >= threshold_mb:
 #                     found_tensors.append((size_mb, obj))
 #         except:
 #             pass
-    
+	
 #     if not found_tensors:
 #         print(f"No GPU tensors found larger than {threshold_mb} MB")
 #         return
-    
+	
 #     # Sort by size (largest first)
 #     found_tensors.sort(key=lambda x: x[0], reverse=True)
-    
+	
 #     total_mb = sum(size for size, _ in found_tensors)
 #     print(f"Found {len(found_tensors)} GPU tensors using {total_mb:.2f} MB total\n")
-    
+	
 #     for idx, (size_mb, tensor) in enumerate(found_tensors, 1):
 #         print(f"\n{'-'*80}")
 #         print(f"Tensor #{idx}:")
@@ -350,25 +350,25 @@ def signal_handler(signum, frame):
 #         print(f"  Size: {size_mb:.2f} MB")
 #         print(f"  Device: {tensor.device}")
 #         print(f"  Memory address: {hex(tensor.data_ptr())}")
-        
+		
 #         # Find direct referrers
 #         referrers = gc.get_referrers(tensor)
 #         print(f"\n  Direct references: {len(referrers)}")
-        
+		
 #         # Check global namespace for direct tensor references
 #         import __main__
 #         direct_names = find_name_in_namespace(tensor, vars(__main__), "__main__")
 #         if direct_names:
 #             print(f"  Found in global namespace: {direct_names}")
-        
+		
 #         # Analyze each referrer
 #         for ref_idx, ref in enumerate(referrers):
 #             try:
 #                 ref_type = type(ref).__name__
-                
+				
 #                 if isinstance(ref, (list, tuple)):
 #                     print(f"\n  Referrer #{ref_idx + 1}: {ref_type} with {len(ref)} items")
-                    
+					
 #                     # Find what owns this container
 #                     owners = find_container_owners(ref, max_depth)
 #                     if owners:
@@ -377,7 +377,7 @@ def signal_handler(signum, frame):
 #                             print(f"      - {owner}")
 #                     else:
 #                         print(f"    Container owner: NOT FOUND (orphaned or temporary)")
-                    
+					
 #                 elif isinstance(ref, dict):
 #                     # Find which key holds the tensor
 #                     tensor_key = None
@@ -385,18 +385,18 @@ def signal_handler(signum, frame):
 #                         if v is tensor:
 #                             tensor_key = k
 #                             break
-                    
+					
 #                     print(f"\n  Referrer #{ref_idx + 1}: Dict with key '{tensor_key}'")
 #                     owners = find_container_owners(ref, max_depth)
 #                     if owners:
 #                         print(f"    Dict owned by:")
 #                         for owner in owners[:10]:
 #                             print(f"      - {owner}")
-                    
+					
 #                 elif hasattr(ref, '__class__'):
 #                     class_name = ref.__class__.__name__
 #                     module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
-                    
+					
 #                     # Find which attribute holds the tensor
 #                     holding_attr = None
 #                     if hasattr(ref, '__dict__'):
@@ -404,15 +404,15 @@ def signal_handler(signum, frame):
 #                             if attr_value is tensor:
 #                                 holding_attr = attr_name
 #                                 break
-                    
+					
 #                     if holding_attr:
 #                         print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}.{holding_attr}")
 #                     else:
 #                         print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}")
-                
+				
 #             except Exception as e:
 #                 print(f"\n  Referrer #{ref_idx + 1}: Error analyzing - {e}")
-    
+	
 #     # GPU memory summary
 #     print(f"\n{'='*80}")
 #     print("GPU Memory Summary:")
@@ -423,269 +423,269 @@ def signal_handler(signum, frame):
 #             print(f"  GPU {i}: {allocated:.2f} MB allocated / {reserved:.2f} MB reserved")
 
 def check_large_tensors(threshold_mb=10, max_depth=3, max_tensors=3):
-    """Find large GPU tensors and trace back to find actual variable names"""
-    import gc
-    import torch
-    import inspect
-    import sys
-    
-    print(f"\nSearching for GPU tensors > {threshold_mb} MB...")
-    print("=" * 80)
-    
-    def find_name_in_namespace(obj, namespace, namespace_name=""):
-        """Find variable name of an object in a namespace"""
-        names = []
-        for name, value in namespace.items():
-            if value is obj:
-                names.append(f"{namespace_name}.{name}" if namespace_name else name)
-            elif isinstance(value, (list, tuple)) and obj in value:
-                try:
-                    idx = value.index(obj) if isinstance(value, list) else list(value).index(obj)
-                    names.append(f"{namespace_name}.{name}[{idx}]" if namespace_name else f"{name}[{idx}]")
-                except:
-                    pass
-            elif isinstance(value, dict):
-                for k, v in value.items():
-                    if v is obj:
-                        names.append(f"{namespace_name}.{name}['{k}']" if namespace_name else f"{name}['{k}']")
-        return names
-    
-    def find_container_owners(container, max_depth=3, current_depth=0):
-        """Recursively find what owns a container"""
-        if current_depth >= max_depth:
-            return []
-        
-        owners = []
-        container_refs = gc.get_referrers(container)
-        
-        # Limit the number of refs to check for performance
-        for ref in container_refs[:10]:  # Check only first 10 refs
-            try:
-                # Skip frames and internal references
-                if type(ref).__name__ in ['frame', 'cell', 'method', 'function']:
-                    continue
-                
-                ref_type = type(ref).__name__
-                ref_module = type(ref).__module__ if hasattr(type(ref), '__module__') else ''
-                
-                # Check if it's an object with attributes
-                if hasattr(ref, '__dict__'):
-                    # Find which attribute holds our container
-                    for attr_name, attr_value in ref.__dict__.items():
-                        if attr_value is container:
-                            class_name = ref.__class__.__name__
-                            module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
-                            owners.append(f"{module}.{class_name}.{attr_name}")
-                            break
-                
-                # Check if it's another container
-                elif isinstance(ref, (list, tuple)):
-                    # Recursively find what owns this container
-                    parent_owners = find_container_owners(ref, max_depth, current_depth + 1)
-                    if parent_owners:
-                        try:
-                            idx = ref.index(container) if isinstance(ref, list) else list(ref).index(container)
-                            for po in parent_owners[:3]:  # Limit parent owners
-                                owners.append(f"{po}[{idx}]")
-                        except:
-                            pass
-                    else:
-                        owners.append(f"{ref_type} (depth {current_depth + 1})")
-                
-                # Check if it's a dict
-                elif isinstance(ref, dict):
-                    # Find which key holds our container
-                    for key, value in ref.items():
-                        if value is container:
-                            # Check if this dict belongs to a module or object
-                            dict_owners = find_container_owners(ref, max_depth, current_depth + 1)
-                            if dict_owners:
-                                for do in dict_owners[:3]:  # Limit dict owners
-                                    owners.append(f"{do}['{key}']")
-                            else:
-                                owners.append(f"Dict key: '{key}'")
-                            break
-                
-                # Don't check all modules - too slow
-                if not owners and current_depth == 0:  # Only check at first level
-                    # Check main module only
-                    import __main__
-                    names = find_name_in_namespace(container, vars(__main__), "__main__")
-                    owners.extend(names[:3])  # Limit names
-                
-            except Exception as e:
-                pass
-        
-        return owners[:10]  # Limit total owners returned
-    
-    # Collect tensors
-    found_tensors = []
-    tensor_count = 0
-    
-    for obj in gc.get_objects():
-        try:
-            if torch.is_tensor(obj) and obj.is_cuda:
-                size_bytes = obj.element_size() * obj.numel()
-                size_mb = size_bytes / (1024 * 1024)
-                
-                if size_mb >= threshold_mb:
-                    found_tensors.append((size_mb, obj))
-                    tensor_count += 1
-                    
-                    # Early exit if we have enough tensors
-                    if len(found_tensors) >= max_tensors * 2:  # Get a bit more for sorting
-                        break
-        except:
-            pass
-    
-    if not found_tensors:
-        print(f"No GPU tensors found larger than {threshold_mb} MB")
-        return
-    
-    # Sort by size (largest first)
-    found_tensors.sort(key=lambda x: x[0], reverse=True)
-    
-    # Take only the first max_tensors
-    found_tensors = found_tensors[:max_tensors]
-    
-    total_mb = sum(size for size, _ in found_tensors)
-    print(f"Analyzing top {len(found_tensors)} tensors (found more, showing largest only)")
-    print(f"Top {len(found_tensors)} tensors use {total_mb:.2f} MB\n")
-    
-    for idx, (size_mb, tensor) in enumerate(found_tensors, 1):
-        print(f"\n{'-'*80}")
-        print(f"Tensor #{idx}:")
-        print(f"  Shape: {list(tensor.shape)}")
-        print(f"  Dtype: {tensor.dtype}")
-        print(f"  Size: {size_mb:.2f} MB")
-        print(f"  Device: {tensor.device}")
-        print(f"  Memory address: {hex(tensor.data_ptr())}")
-        
-        # Find direct referrers
-        referrers = gc.get_referrers(tensor)
-        print(f"\n  Direct references: {len(referrers)}")
-        
-        # Quick check in main namespace only
-        import __main__
-        direct_names = find_name_in_namespace(tensor, vars(__main__), "__main__")
-        if direct_names:
-            print(f"  Found in global namespace: {direct_names[:3]}")  # Limit output
-        
-        # Analyze only first 3 referrers
-        for ref_idx, ref in enumerate(referrers[:3]):
-            try:
-                ref_type = type(ref).__name__
-                
-                if isinstance(ref, (list, tuple)):
-                    print(f"\n  Referrer #{ref_idx + 1}: {ref_type} with {len(ref)} items")
-                    
-                    # Find what owns this container
-                    owners = find_container_owners(ref, max_depth)
-                    if owners:
-                        print(f"    Container owned by:")
-                        for owner in owners[:5]:  # Show only first 5
-                            print(f"      - {owner}")
-                        if len(owners) > 5:
-                            print(f"      ... and {len(owners) - 5} more")
-                    else:
-                        print(f"    Container owner: NOT FOUND (orphaned or temporary)")
-                    
-                elif isinstance(ref, dict):
-                    # Find which key holds the tensor
-                    tensor_key = None
-                    for k, v in ref.items():
-                        if v is tensor:
-                            tensor_key = k
-                            break
-                    
-                    print(f"\n  Referrer #{ref_idx + 1}: Dict with key '{tensor_key}'")
-                    owners = find_container_owners(ref, max_depth)
-                    if owners:
-                        print(f"    Dict owned by:")
-                        for owner in owners[:5]:
-                            print(f"      - {owner}")
-                    
-                elif hasattr(ref, '__class__'):
-                    class_name = ref.__class__.__name__
-                    module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
-                    
-                    # Find which attribute holds the tensor
-                    holding_attr = None
-                    if hasattr(ref, '__dict__'):
-                        for attr_name, attr_value in ref.__dict__.items():
-                            if attr_value is tensor:
-                                holding_attr = attr_name
-                                break
-                    
-                    if holding_attr:
-                        print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}.{holding_attr}")
-                    else:
-                        print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}")
-                
-            except Exception as e:
-                print(f"\n  Referrer #{ref_idx + 1}: Error analyzing - {e}")
-        
-        if len(referrers) > 3:
-            print(f"\n  ... and {len(referrers) - 3} more referrers not shown")
-    
-    # GPU memory summary
-    print(f"\n{'='*80}")
-    print("GPU Memory Summary:")
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            allocated = torch.cuda.memory_allocated(i) / 1024**2
-            reserved = torch.cuda.memory_reserved(i) / 1024**2
-            print(f"  GPU {i}: {allocated:.2f} MB allocated / {reserved:.2f} MB reserved")
+	"""Find large GPU tensors and trace back to find actual variable names"""
+	import gc
+	import torch
+	import inspect
+	import sys
+	
+	print(f"\nSearching for GPU tensors > {threshold_mb} MB...")
+	print("=" * 80)
+	
+	def find_name_in_namespace(obj, namespace, namespace_name=""):
+		"""Find variable name of an object in a namespace"""
+		names = []
+		for name, value in namespace.items():
+			if value is obj:
+				names.append(f"{namespace_name}.{name}" if namespace_name else name)
+			elif isinstance(value, (list, tuple)) and obj in value:
+				try:
+					idx = value.index(obj) if isinstance(value, list) else list(value).index(obj)
+					names.append(f"{namespace_name}.{name}[{idx}]" if namespace_name else f"{name}[{idx}]")
+				except:
+					pass
+			elif isinstance(value, dict):
+				for k, v in value.items():
+					if v is obj:
+						names.append(f"{namespace_name}.{name}['{k}']" if namespace_name else f"{name}['{k}']")
+		return names
+	
+	def find_container_owners(container, max_depth=3, current_depth=0):
+		"""Recursively find what owns a container"""
+		if current_depth >= max_depth:
+			return []
+		
+		owners = []
+		container_refs = gc.get_referrers(container)
+		
+		# Limit the number of refs to check for performance
+		for ref in container_refs[:10]:  # Check only first 10 refs
+			try:
+				# Skip frames and internal references
+				if type(ref).__name__ in ['frame', 'cell', 'method', 'function']:
+					continue
+				
+				ref_type = type(ref).__name__
+				ref_module = type(ref).__module__ if hasattr(type(ref), '__module__') else ''
+				
+				# Check if it's an object with attributes
+				if hasattr(ref, '__dict__'):
+					# Find which attribute holds our container
+					for attr_name, attr_value in ref.__dict__.items():
+						if attr_value is container:
+							class_name = ref.__class__.__name__
+							module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
+							owners.append(f"{module}.{class_name}.{attr_name}")
+							break
+				
+				# Check if it's another container
+				elif isinstance(ref, (list, tuple)):
+					# Recursively find what owns this container
+					parent_owners = find_container_owners(ref, max_depth, current_depth + 1)
+					if parent_owners:
+						try:
+							idx = ref.index(container) if isinstance(ref, list) else list(ref).index(container)
+							for po in parent_owners[:3]:  # Limit parent owners
+								owners.append(f"{po}[{idx}]")
+						except:
+							pass
+					else:
+						owners.append(f"{ref_type} (depth {current_depth + 1})")
+				
+				# Check if it's a dict
+				elif isinstance(ref, dict):
+					# Find which key holds our container
+					for key, value in ref.items():
+						if value is container:
+							# Check if this dict belongs to a module or object
+							dict_owners = find_container_owners(ref, max_depth, current_depth + 1)
+							if dict_owners:
+								for do in dict_owners[:3]:  # Limit dict owners
+									owners.append(f"{do}['{key}']")
+							else:
+								owners.append(f"Dict key: '{key}'")
+							break
+				
+				# Don't check all modules - too slow
+				if not owners and current_depth == 0:  # Only check at first level
+					# Check main module only
+					import __main__
+					names = find_name_in_namespace(container, vars(__main__), "__main__")
+					owners.extend(names[:3])  # Limit names
+				
+			except Exception as e:
+				pass
+		
+		return owners[:10]  # Limit total owners returned
+	
+	# Collect tensors
+	found_tensors = []
+	tensor_count = 0
+	
+	for obj in gc.get_objects():
+		try:
+			if torch.is_tensor(obj) and obj.is_cuda:
+				size_bytes = obj.element_size() * obj.numel()
+				size_mb = size_bytes / (1024 * 1024)
+				
+				if size_mb >= threshold_mb:
+					found_tensors.append((size_mb, obj))
+					tensor_count += 1
+					
+					# Early exit if we have enough tensors
+					if len(found_tensors) >= max_tensors * 2:  # Get a bit more for sorting
+						break
+		except:
+			pass
+	
+	if not found_tensors:
+		print(f"No GPU tensors found larger than {threshold_mb} MB")
+		return
+	
+	# Sort by size (largest first)
+	found_tensors.sort(key=lambda x: x[0], reverse=True)
+	
+	# Take only the first max_tensors
+	found_tensors = found_tensors[:max_tensors]
+	
+	total_mb = sum(size for size, _ in found_tensors)
+	print(f"Analyzing top {len(found_tensors)} tensors (found more, showing largest only)")
+	print(f"Top {len(found_tensors)} tensors use {total_mb:.2f} MB\n")
+	
+	for idx, (size_mb, tensor) in enumerate(found_tensors, 1):
+		print(f"\n{'-'*80}")
+		print(f"Tensor #{idx}:")
+		print(f"  Shape: {list(tensor.shape)}")
+		print(f"  Dtype: {tensor.dtype}")
+		print(f"  Size: {size_mb:.2f} MB")
+		print(f"  Device: {tensor.device}")
+		print(f"  Memory address: {hex(tensor.data_ptr())}")
+		
+		# Find direct referrers
+		referrers = gc.get_referrers(tensor)
+		print(f"\n  Direct references: {len(referrers)}")
+		
+		# Quick check in main namespace only
+		import __main__
+		direct_names = find_name_in_namespace(tensor, vars(__main__), "__main__")
+		if direct_names:
+			print(f"  Found in global namespace: {direct_names[:3]}")  # Limit output
+		
+		# Analyze only first 3 referrers
+		for ref_idx, ref in enumerate(referrers[:3]):
+			try:
+				ref_type = type(ref).__name__
+				
+				if isinstance(ref, (list, tuple)):
+					print(f"\n  Referrer #{ref_idx + 1}: {ref_type} with {len(ref)} items")
+					
+					# Find what owns this container
+					owners = find_container_owners(ref, max_depth)
+					if owners:
+						print(f"    Container owned by:")
+						for owner in owners[:5]:  # Show only first 5
+							print(f"      - {owner}")
+						if len(owners) > 5:
+							print(f"      ... and {len(owners) - 5} more")
+					else:
+						print(f"    Container owner: NOT FOUND (orphaned or temporary)")
+					
+				elif isinstance(ref, dict):
+					# Find which key holds the tensor
+					tensor_key = None
+					for k, v in ref.items():
+						if v is tensor:
+							tensor_key = k
+							break
+					
+					print(f"\n  Referrer #{ref_idx + 1}: Dict with key '{tensor_key}'")
+					owners = find_container_owners(ref, max_depth)
+					if owners:
+						print(f"    Dict owned by:")
+						for owner in owners[:5]:
+							print(f"      - {owner}")
+					
+				elif hasattr(ref, '__class__'):
+					class_name = ref.__class__.__name__
+					module = ref.__class__.__module__ if hasattr(ref.__class__, '__module__') else ''
+					
+					# Find which attribute holds the tensor
+					holding_attr = None
+					if hasattr(ref, '__dict__'):
+						for attr_name, attr_value in ref.__dict__.items():
+							if attr_value is tensor:
+								holding_attr = attr_name
+								break
+					
+					if holding_attr:
+						print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}.{holding_attr}")
+					else:
+						print(f"\n  Referrer #{ref_idx + 1}: {module}.{class_name}")
+				
+			except Exception as e:
+				print(f"\n  Referrer #{ref_idx + 1}: Error analyzing - {e}")
+		
+		if len(referrers) > 3:
+			print(f"\n  ... and {len(referrers) - 3} more referrers not shown")
+	
+	# GPU memory summary
+	print(f"\n{'='*80}")
+	print("GPU Memory Summary:")
+	if torch.cuda.is_available():
+		for i in range(torch.cuda.device_count()):
+			allocated = torch.cuda.memory_allocated(i) / 1024**2
+			reserved = torch.cuda.memory_reserved(i) / 1024**2
+			print(f"  GPU {i}: {allocated:.2f} MB allocated / {reserved:.2f} MB reserved")
 
 
 def quick_tensor_summary(threshold_mb=10):
-    """Quick summary of large tensors without detailed analysis"""
-    import gc
-    import torch
-    from collections import defaultdict
-    
-    print(f"\nQuick summary of GPU tensors > {threshold_mb} MB...")
-    print("=" * 80)
-    
-    # Group tensors by shape
-    shape_groups = defaultdict(list)
-    total_count = 0
-    total_mb = 0
-    
-    for obj in gc.get_objects():
-        try:
-            if torch.is_tensor(obj) and obj.is_cuda:
-                size_mb = obj.element_size() * obj.numel() / (1024 * 1024)
-                if size_mb >= threshold_mb:
-                    shape_key = (tuple(obj.shape), str(obj.dtype))
-                    shape_groups[shape_key].append(size_mb)
-                    total_count += 1
-                    total_mb += size_mb
-        except:
-            pass
-    
-    if not shape_groups:
-        print("No large tensors found")
-        return
-    
-    print(f"Total: {total_count} tensors using {total_mb:.2f} MB\n")
-    
-    # Sort by total memory per shape
-    sorted_groups = sorted(
-        shape_groups.items(),
-        key=lambda x: sum(x[1]),
-        reverse=True
-    )
-    
-    print("Grouped by shape and dtype:")
-    for (shape, dtype), sizes in sorted_groups[:10]:  # Show top 10 groups
-        count = len(sizes)
-        total = sum(sizes)
-        avg = total / count
-        print(f"  {shape} ({dtype}): {count} tensor(s), {total:.2f} MB total, {avg:.2f} MB avg")
-    
-    if len(sorted_groups) > 10:
-        print(f"  ... and {len(sorted_groups) - 10} more shape groups")
+	"""Quick summary of large tensors without detailed analysis"""
+	import gc
+	import torch
+	from collections import defaultdict
+	
+	print(f"\nQuick summary of GPU tensors > {threshold_mb} MB...")
+	print("=" * 80)
+	
+	# Group tensors by shape
+	shape_groups = defaultdict(list)
+	total_count = 0
+	total_mb = 0
+	
+	for obj in gc.get_objects():
+		try:
+			if torch.is_tensor(obj) and obj.is_cuda:
+				size_mb = obj.element_size() * obj.numel() / (1024 * 1024)
+				if size_mb >= threshold_mb:
+					shape_key = (tuple(obj.shape), str(obj.dtype))
+					shape_groups[shape_key].append(size_mb)
+					total_count += 1
+					total_mb += size_mb
+		except:
+			pass
+	
+	if not shape_groups:
+		print("No large tensors found")
+		return
+	
+	print(f"Total: {total_count} tensors using {total_mb:.2f} MB\n")
+	
+	# Sort by total memory per shape
+	sorted_groups = sorted(
+		shape_groups.items(),
+		key=lambda x: sum(x[1]),
+		reverse=True
+	)
+	
+	print("Grouped by shape and dtype:")
+	for (shape, dtype), sizes in sorted_groups[:10]:  # Show top 10 groups
+		count = len(sizes)
+		total = sum(sizes)
+		avg = total / count
+		print(f"  {shape} ({dtype}): {count} tensor(s), {total:.2f} MB total, {avg:.2f} MB avg")
+	
+	if len(sorted_groups) > 10:
+		print(f"  ... and {len(sorted_groups) - 10} more shape groups")
 
 class query:
 	def __init__(
@@ -1689,7 +1689,7 @@ class BatchGen:
 
 	def _config_prefill(self):
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
-		if self.rank == 0:
+		if self.rank == 0: 
 			torch.cuda.empty_cache()
 			total, used, free, usage = get_gpu_memory_usage(self.device)
 			logging.info(
@@ -1761,13 +1761,20 @@ class BatchGen:
 		# 	param.data = torch.zeros(
 		# 		1, dtype=torch.bfloat16, device=param.device)
 		# # del self.model
-		del self.model
-		self.model = None
-		gc.collect()  
-		torch.cuda.empty_cache()
+		# del self.model
+		# self.model = None
+		# gc.collect()  
+		# torch.cuda.empty_cache()
+		self.deep_free_model_memory()
 
-		# Log device memory usage before configure decoding
-		logging.info(f"{self.rank} Device memory usage before configure decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} Config decodong deep_free_model_memory()\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 
 		# Get number of sequences for each rank 
 		num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
@@ -1790,12 +1797,61 @@ class BatchGen:
 			self.core_engine.start_h2d_worker()
 		else:
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq)
+			if self.rank == 0:
+				torch.cuda.empty_cache()
+				total, used, free, usage = get_gpu_memory_usage(self.device)
+				logging.info(
+					f"{self.rank} Config decodong pure_gpu_decoding()\n"
+					f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+					f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+			)
+
 			self.set_phase("decoding")
 			self.core_engine.stop_h2d_worker()
+			if self.rank == 0:
+				torch.cuda.empty_cache()
+				total, used, free, usage = get_gpu_memory_usage(self.device)
+				logging.info(
+					f"{self.rank} Config decodong stop_h2d_worker()\n"
+					f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+					f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+			)
 			self.core_engine.clear_kv_copy_queue()
+			if self.rank == 0:
+				torch.cuda.empty_cache()
+				total, used, free, usage = get_gpu_memory_usage(self.device)
+				logging.info(
+					f"{self.rank} Config decodong clear_kv_copy_queue()\n"
+					f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+					f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+			)
 			self.core_engine.clear_kv_buffer()
+			if self.rank == 0:
+				torch.cuda.empty_cache()
+				total, used, free, usage = get_gpu_memory_usage(self.device)
+				logging.info(
+					f"{self.rank} Config decodong clear_kv_buffer()\n"
+					f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+					f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+			)
 			self.core_engine.clear_weight_copy_queue()
+			if self.rank == 0:
+				torch.cuda.empty_cache()
+				total, used, free, usage = get_gpu_memory_usage(self.device)
+				logging.info(
+					f"{self.rank} Config decodong clear_weight_copy_queue()\n"
+					f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+					f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+			)
 			self.core_engine.reset_decoding_buffer()
+			if self.rank == 0:
+				torch.cuda.empty_cache()
+				total, used, free, usage = get_gpu_memory_usage(self.device)
+				logging.info(
+					f"{self.rank} Config decodong reset_decoding_buffer()\n"
+					f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+					f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+			)
 			# self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			# self.core_engine.start_h2d_worker()
 
