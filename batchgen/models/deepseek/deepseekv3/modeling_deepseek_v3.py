@@ -1283,8 +1283,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
-		self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
-		self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
+		token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
+		topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
 		
 
 		device = x.device
@@ -1313,8 +1313,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		expanded_x  = global_x.repeat_interleave(K, dim=0)
 		sorted_eids, sort_idx = flat_eids.sort()
 		sorted_x   = expanded_x[sort_idx]
-		sorted_tok = self.token_idx[sort_idx]
-		sorted_pos = self.topk_pos[sort_idx]
+		sorted_tok = token_idx[sort_idx]
+		sorted_pos = topk_pos[sort_idx]
 
 		# ---- 3.2) Build tensor for local expert input sorted by expert id ----
 		"""
