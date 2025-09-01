@@ -1998,6 +1998,14 @@ class BatchGen:
 				# Log for every 50 tokens.
 				if self.rank == 0 and new_token_idx % 50 == 0:
 					logging.info(f"Decoding new token idx: {new_token_idx}")
+				if self.rank == 0 and new_token_idx % 500 == 0:
+					torch.cuda.empty_cache()
+					total, used, free, usage = get_gpu_memory_usage(self.rank)
+					logging.info(
+						f"{self.rank} configure_prefill() called.\n"
+						f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
+						f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+				)					
 				
 				# micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
 				# num_micro_batches = math.ceil(len(batch) / micro_batch_size)
