@@ -159,7 +159,7 @@ class StatelessProcessGroup:
         port: int,
         rank: int,
         world_size: int,
-        data_expiration_seconds: int = 3600,
+        data_expiration_seconds: int = 36000,
     ) -> "StatelessProcessGroup":
         """A replacement for `torch.distributed.init_process_group` that does not
         pollute the global state.

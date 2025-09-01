@@ -2995,7 +2995,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 		config: DeepseekV3Config
 	"""
 
-	def __init__(self, config: DeepseekV3Config):
+	def __init__(self, config: DeepseekV3Config, comm=None):
 		super().__init__(config)
 		self.padding_idx = config.pad_token_id
 		self.vocab_size = config.vocab_size
@@ -3003,29 +3003,29 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 		self.embed_tokens = nn.Embedding(
 			config.vocab_size, config.hidden_size, self.padding_idx
 		)
-		self.comm = None
-		if self.config.phase == "decoding":
-			from batchgen.distributed.utils import StatelessProcessGroup
-			from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
-			self.rank = dist.get_rank()
-			self.world_size = dist.get_world_size()
-			device = torch.device("cuda", self.rank % torch.cuda.device_count())
-			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-			try:
-				group = StatelessProcessGroup.create(
-					host=comm_master_addr,
-					port=20001,
-					rank=self.rank,
-					world_size=self.world_size,
-					data_expiration_seconds=6000,
-				)
-				self.comm = PyNcclCommunicator(
-					group=group,
-					device=device
-				)		
-			except Exception as e:
-				logger.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		self.comm = comm
+		# if self.config.phase == "decoding":
+		# 	from batchgen.distributed.utils import StatelessProcessGroup
+		# 	from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
+		# 	self.rank = dist.get_rank()
+		# 	self.world_size = dist.get_world_size()
+		# 	device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		# 	comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+		# 	try:
+		# 		group = StatelessProcessGroup.create(
+		# 			host=comm_master_addr,
+		# 			port=20001,
+		# 			rank=self.rank,
+		# 			world_size=self.world_size,
+		# 			data_expiration_seconds=6000,
+		# 		)
+		# 		self.comm = PyNcclCommunicator(
+		# 			group=group,
+		# 			device=device
+		# 		)		
+		# 	except Exception as e:
+		# 		logger.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		# 		raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 			
 				
 	
@@ -3229,9 +3229,9 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 	_tied_weights_keys = ["lm_head.weight"]
 
-	def __init__(self, config):
+	def __init__(self, config, comm=None):
 		super().__init__(config)
-		self.model = DeepseekV3Model(config)
+		self.model = DeepseekV3Model(config, comm)
 		self.vocab_size = config.vocab_size
 		self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

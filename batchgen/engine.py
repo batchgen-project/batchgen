@@ -1451,6 +1451,28 @@ class BatchGen:
 		logging.debug("Initial batching done.")
 
 	def generate(self):
+		from batchgen.distributed.utils import StatelessProcessGroup
+		from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
+		self.rank = dist.get_rank()
+		self.world_size = dist.get_world_size()
+		device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+		self.comm = None
+		try:
+			group = StatelessProcessGroup.create(
+				host=comm_master_addr,
+				port=20001,
+				rank=self.rank,
+				world_size=self.world_size,
+				data_expiration_seconds=6000,
+			)
+			self.comm = PyNcclCommunicator(
+				group=group,
+				device=device
+			)		
+		except Exception as e:
+			logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+			raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 		prefill_time = 0
 		decoding_time = 0
 		if len(self.model_batches) > 0:
@@ -1508,7 +1530,7 @@ class BatchGen:
 				# self.core_engine.start_h2d_worker()
 				# time.sleep(2)
 					
-				self._config_decoding(len(new_token))
+				self._config_decoding(len(new_token), self.comm)
 				# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 				if self.engine_config.Basic_Config.attn_mode == 3:
 					# FULL GPU DECODING MODE.
@@ -1764,7 +1786,7 @@ class BatchGen:
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 	
-	def _config_decoding(self, num_seq):
+	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		# self.model = self.model.to("cpu")
 		# # Set all model parameters to None
@@ -1807,7 +1829,7 @@ class BatchGen:
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 		else:
-			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq)
+			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
 			if self.rank == 0:
 				torch.cuda.empty_cache()
 				total, used, free, usage = get_gpu_memory_usage(self.device)

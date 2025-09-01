@@ -336,7 +336,7 @@ class Parallel_Strategy_Manager:
 		return self.model, self.weight_copy_task
 
 
-	def pure_gpu_decoding(self, padding_bsz):
+	def pure_gpu_decoding(self, padding_bsz, comm=None):
 		"""
 			Beta 1: Load full mode into GPU.
 			Duplicate attention modules and shared experts in each dp worker.
@@ -344,10 +344,11 @@ class Parallel_Strategy_Manager:
 		"""
 		self.hf_model_config.phase = "decoding"
 		self.hf_model_config._attn_implementation = "eager"
+
 		self.model = None
 		torch.cuda.empty_cache()
 		self.model = DeepseekV3ForCausalLM._from_config(
-			self.hf_model_config
+			self.hf_model_config, comm
 		)
 		if self.rank == 0:
 			torch.cuda.empty_cache()
