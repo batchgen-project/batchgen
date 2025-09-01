@@ -1467,6 +1467,8 @@ class BatchGen:
 						f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
 						f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 				)
+				if self.model:
+					self.deep_free_model_memory()
 				self._config_prefill()
 				prefill_start_time = time.perf_counter()
 				with torch.inference_mode():
