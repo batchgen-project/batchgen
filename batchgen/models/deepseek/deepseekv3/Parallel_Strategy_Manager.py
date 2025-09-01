@@ -53,10 +53,10 @@ class Parallel_Strategy_Manager:
 		)
 		if self.rank == 0: 
 			torch.cuda.empty_cache()
-			total, used, free, usage = get_gpu_memory_usage(self.device)
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"{self.rank} Config prefill model instance instantiated.\n"
-				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 		self.state_dict_name_map = {}
@@ -128,56 +128,56 @@ class Parallel_Strategy_Manager:
 		self._extract_dequantize_scale()
 		if self.rank == 0: 
 			torch.cuda.empty_cache()
-			total, used, free, usage = get_gpu_memory_usage(self.device)
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"{self.rank} Config prefill _extract_dequantize_scale() invoked.\n"
-				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 		self._load_model_skeleton()
 		if self.rank == 0: 
 			torch.cuda.empty_cache()
-			total, used, free, usage = get_gpu_memory_usage(self.device)
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"{self.rank} Config prefill _load_model_skeleton() invoked.\n"
-				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 		self._config_attn_module()
 		if self.rank == 0: 
 			torch.cuda.empty_cache()
-			total, used, free, usage = get_gpu_memory_usage(self.device)
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"{self.rank} Config prefill _config_attn_module() invoked.\n"
-				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 		self._config_expert_module()
 		if self.rank == 0: 
 			torch.cuda.empty_cache()
-			total, used, free, usage = get_gpu_memory_usage(self.device)
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"{self.rank} Config prefill _config_expert_module() invoked.\n"
-				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 		self._config_lm_head_hook()
 		if self.rank == 0: 
 			torch.cuda.empty_cache()
-			total, used, free, usage = get_gpu_memory_usage(self.device)
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"{self.rank} Config prefill _config_lm_head_hook() invoked.\n"
-				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 		self.model.eval()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
 		if self.rank == 0: 
 			torch.cuda.empty_cache()
-			total, used, free, usage = get_gpu_memory_usage(self.device)
+			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"{self.rank} Config prefill model moved.\n"
-				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.rank)}\n"
 				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
 		)
 		# self._warmup()
