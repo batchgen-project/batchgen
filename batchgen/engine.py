@@ -1472,7 +1472,7 @@ class BatchGen:
 				with torch.inference_mode():
 					new_token = self.prefill(self.model_batches[model_batch_idx])
 				prefill_time += time.perf_counter() - prefill_start_time
-
+				self._unregister_fp8_weights()
 				dist.barrier()
 				if self.rank == 0:
 					torch.cuda.empty_cache()
