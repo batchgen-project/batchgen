@@ -1491,22 +1491,7 @@ class BatchGen:
 						# scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
 						scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 						
-						
-						# Compute the byte size of past_key_states
-						# past_key_states_byte_size = 0
-						# for value in past_key_states:
-						#     past_key_states_byte_size += value.numel() * value.element_size()
-						# logging.info(
-						#     f"Rank: {self.rank} past_key_states byte size: {past_key_states_byte_size / 1024 / 1024 / 1024:.2f} GB"
-						# )
-						# # Compute the byte size of scale_dict
-						# scale_dict_byte_size = 0
-						# for value in scale_dict:
-						#     scale_dict_byte_size += value.numel() * value.element_size()
-						# logging.info(
-						#     f"Rank: {self.rank} scale_dict byte size: {scale_dict_byte_size / 1024 / 1024:.2f} MB"
-						# )
-		
+				
 					else:
 						# TODO:
 						pass
