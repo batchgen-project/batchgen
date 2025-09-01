@@ -1496,11 +1496,19 @@ class BatchGen:
 						# TODO:
 						pass
 				
+				# if self.rank == 0:
+				# 	allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+				# 	logging.info(
+				# 		f"Rank: {self.rank} Decoding configuration done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
+				# 	)
 				if self.rank == 0:
-					allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+					print("\n\n", flush=True)
+					total, used, free, usage = get_gpu_memory_usage(self.device)
 					logging.info(
-						f"Rank: {self.rank} Decoding configuration done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
-					)
+						f"{self.rank} Decoding Configuration Done\n"
+						f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+						f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+				)
 				
 				dist.barrier()
 				torch.cuda.empty_cache()
@@ -1519,12 +1527,12 @@ class BatchGen:
 				gc.collect()
 				
 				
-				if self.rank == 0:
-					# check_large_tensors()
-					allocated_memory = torch.cuda.memory_allocated(self.torch_device)
-					logging.info(
-						f"Rank: {self.rank} Decoding done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
-					)
+				# if self.rank == 0:
+				# 	# check_large_tensors()
+				# 	allocated_memory = torch.cuda.memory_allocated(self.torch_device)
+				# 	logging.info(
+				# 		f"Rank: {self.rank} Decoding done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
+				# 	)
 				dist.barrier()
 		else:
 			# For small input batch, some worker might do not have any input.
@@ -2235,17 +2243,11 @@ class BatchGen:
 							# position_ids=position_ids,
 							use_cache=False,
 						)
-						# torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-						# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 						new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
 							-1, 1
 						)
-						# start = time.perf_counter()
 						self.update_new_token(new_tokens, batch, new_token_idx)
-						# torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-						# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 						print(f"New tokens: {new_tokens}")
-						# logging.info(f"Update new token time is ms: {(time.perf_counter() - start) * 1000} ms")
 					new_token_idx += 1
 
 		if self.rank == 0:
