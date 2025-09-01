@@ -1460,7 +1460,7 @@ class BatchGen:
 				dist.barrier()
 				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
 				if self.rank == 0:
-					print("\n\n", flush=True)
+					torch.cuda.empty_cache()
 					total, used, free, usage = get_gpu_memory_usage(self.device)
 					logging.info(
 						f"{self.rank} Start Prefill Configuration.\n"
@@ -1475,7 +1475,7 @@ class BatchGen:
 
 				dist.barrier()
 				if self.rank == 0:
-					print("\n\n", flush=True)
+					torch.cuda.empty_cache()
 					total, used, free, usage = get_gpu_memory_usage(self.device)
 					logging.info(
 						f"{self.rank} Prefill Complete.\n"
@@ -1518,7 +1518,7 @@ class BatchGen:
 				# 		f"Rank: {self.rank} Decoding configuration done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
 				# 	)
 				if self.rank == 0:
-					print("\n\n", flush=True)
+					torch.cuda.empty_cache()
 					total, used, free, usage = get_gpu_memory_usage(self.device)
 					logging.info(
 						f"{self.rank} Decoding Configuration Done\n"
@@ -1689,13 +1689,69 @@ class BatchGen:
 
 	def _config_prefill(self):
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} configure_prefill() called.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 		self.set_phase("prefill")
 		self.core_engine.stop_h2d_worker()
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} stop_h2d_worker() called.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 		self.core_engine.clear_weight_copy_queue()
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} clear_weight_copy_queue() called.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 		self.core_engine.reset_prefill_buffer()
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} reset_prefill_buffer() called.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} set_weight_copy_queue() called.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 		self.core_engine.clear_kv_storage()
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} clear_kv_storage() called.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 		self.core_engine.start_h2d_worker()
+		if self.rank == 0:
+			torch.cuda.empty_cache()
+			total, used, free, usage = get_gpu_memory_usage(self.device)
+			logging.info(
+				f"{self.rank} start_h2d_worker() called.\n"
+				f"Torch GPU Mem Usage: {torch_gpu_mem_usage(self.device)}\n"
+				f"GPU Memory Usage - Total: {total:.2f} GB, Used: {used:.2f} GB, Free: {free:.2f} GB, Usage: {usage:.2f}%"
+		)
 	
 	def _config_decoding(self, num_seq):
 		logging.info(f"Start Config Decoding")
@@ -1750,7 +1806,7 @@ class BatchGen:
 		Handle the prefill for a full model batch.
 		"""
 		if self.rank == 0:
-			print("\n\n", flush=True)
+			torch.cuda.empty_cache()
 			total, used, free, usage = get_gpu_memory_usage(self.device)
 			logging.info(
 				f"{self.rank} Start Prefill.\n"
@@ -2267,6 +2323,7 @@ class BatchGen:
 					new_token_idx += 1
 
 		if self.rank == 0:
+			torch.cuda.empty_cache()
 			total, used, free, usage = get_gpu_memory_usage(self.rank)
 			logging.info(
 				f"Decoding done.\n"
