@@ -86,6 +86,9 @@ void GPU_KV_Buffer::init_kv_buffer() {
         // int64_t buffer_size =
         //     this->engine_config_.gpu_buffer_config.kv_buffer_num_tokens *
         //     this->model_config_.compressed_kv_dim * 2;
+        this->logger_->info(
+            "init_kv_buffer. Num K Buffers: {}",
+            this->engine_config_.gpu_buffer_config.num_k_buffer);
         int64_t buffer_size =
             this->engine_config_.gpu_buffer_config.kv_buffer_num_tokens *
             this->model_config_.compressed_kv_dim;
