@@ -427,7 +427,6 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
     
-    // Prepare bf16 options once (not in the loop)
     auto bf16_options = torch::TensorOptions()
         .dtype(torch::kBFloat16)
         .device(torch::kCUDA, this->engine_config_.basic_config.device)
@@ -440,52 +439,51 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
         // Step 1: Log initial memory state
         size_t memory_before = 0;
         if (torch::cuda::is_available()) {
-            // Correct C++ API call
-            memory_before = c10::cuda::CUDACachingAllocator::getDeviceStats(
-                this->engine_config_.basic_config.device).allocated_bytes[0].current;
+            size_t free_bytes, total_bytes;
+            cudaSetDevice(this->engine_config_.basic_config.device);
+            cudaMemGetInfo(&free_bytes, &total_bytes);
+            memory_before = total_bytes - free_bytes;
             this->logger_->info("Prefill reset - Memory before: {} MB", 
                               memory_before / (1024.0 * 1024.0));
         }
         
-        // Step 2: Explicitly release ALL existing tensors in ALL buffer types
+        // Step 2: Explicitly release ALL existing tensors
         for (auto& [buffer_type, buffer_vector] : this->buffers_) {
             for (auto& module_map : buffer_vector) {
                 for (auto& [name, tensor] : module_map) {
-                    // Explicitly release each tensor
                     tensor = torch::Tensor();
                 }
                 module_map.clear();
             }
             buffer_vector.clear();
-            
-            // Force deallocation of vector memory
             buffer_vector.shrink_to_fit();
         }
         
         // Step 3: Clear module mappings
         this->module_in_buffers_.clear();
         
-        // Step 4: Force CUDA synchronization and aggressive memory cleanup
+        // Step 4: Force CUDA synchronization and cleanup
         if (torch::cuda::is_available()) {
-            // Ensure all CUDA operations complete
-            at::cuda::synchronize();
+            // Use CUDA runtime API
+            cudaDeviceSynchronize();
             
-            // Force return memory to system
+            // Empty the cache
             c10::cuda::CUDACachingAllocator::emptyCache();
             
             // Log memory after clearing
-            size_t memory_after_clear = c10::cuda::CUDACachingAllocator::getDeviceStats(
-                this->engine_config_.basic_config.device).allocated_bytes[0].current;
+            size_t free_bytes, total_bytes;
+            cudaMemGetInfo(&free_bytes, &total_bytes);
+            size_t memory_after_clear = total_bytes - free_bytes;
             this->logger_->info("Prefill reset - Memory after clearing: {} MB (freed: {} MB)", 
                               memory_after_clear / (1024.0 * 1024.0),
                               (memory_before - memory_after_clear) / (1024.0 * 1024.0));
         }
         
-        // Step 5: Create new prefill buffers for routed_expert
+        // Step 5: Create new prefill buffers
         this->buffers_["routed_expert"].reserve(num_buffers["routed_expert"]);
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
         
-        // Pre-calculate buffer names that need norm (for efficiency)
+        // Pre-calculate norm buffer names
         std::unordered_set<std::string> norm_buffers;
         for (const auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
             if (buffer_name.find("norm") != std::string::npos) {
@@ -502,40 +500,31 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::zeros(buffer_shape, options);
                 } else {
-                    // Use bf16 for norm layers
+                    // Use bf16 for norm layers in prefill
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::ones(buffer_shape, bf16_options);
                 }
             }
         }
         
-        // Step 6: Reset buffer status for ALL module types
+        // Step 6: Reset buffer status
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->buffer_status_[module_type].clear();
-            this->buffer_status_[module_type].shrink_to_fit();  // Release old memory
+            this->buffer_status_[module_type].shrink_to_fit();
             this->buffer_status_[module_type].resize(num_buffer, 0);
         }
         
-        // Step 7: Final memory check and logging
+        // Step 7: Final memory check
         if (torch::cuda::is_available()) {
-            size_t memory_final = c10::cuda::CUDACachingAllocator::getDeviceStats(
-                this->engine_config_.basic_config.device).allocated_bytes[0].current;
+            size_t free_bytes, total_bytes;
+            cudaMemGetInfo(&free_bytes, &total_bytes);
+            size_t memory_final = total_bytes - free_bytes;
             this->logger_->info("Prefill reset - Memory after recreation: {} MB (net change: {} MB)", 
                               memory_final / (1024.0 * 1024.0),
                               (static_cast<int64_t>(memory_final) - static_cast<int64_t>(memory_before)) / (1024.0 * 1024.0));
         }
         
-        // Log buffer status
-        for (auto& [module_type, num_buffer] : num_buffers) {
-            this->logger_->debug("Module type: {}, Number of buffer: {}",
-                               module_type, num_buffer);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffer; buffer_idx++) {
-                this->logger_->debug("Buffer_idx: {}, Buffer status: {}", 
-                                   buffer_idx, this->buffer_status_[module_type][buffer_idx]);
-            }
-        }
-        
-        this->logger_->debug("Prefill buffer reset complete.");
+        this->logger_->info("Prefill buffer reset complete");
     }
 }
 
@@ -625,7 +614,6 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
         }
         
         // Step 2: Explicitly release ALL existing tensors in ALL buffer types
-        // Important: Release all buffers, not just routed_expert
         for (auto& [buffer_type, buffer_vector] : this->buffers_) {
             for (auto& module_map : buffer_vector) {
                 for (auto& [name, tensor] : module_map) {
@@ -645,8 +633,12 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
         
         // Step 4: Force CUDA synchronization and aggressive memory cleanup
         if (torch::cuda::is_available()) {
-            // Ensure all CUDA operations complete
+            // CORRECT SYNTAX: Use cudaDeviceSynchronize() from CUDA runtime
             cudaDeviceSynchronize();
+            
+            // OR use AT namespace correctly:
+            // at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+            // stream.synchronize();
             
             // Force return memory to system
             c10::cuda::CUDACachingAllocator::emptyCache();
@@ -681,7 +673,6 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::zeros(buffer_shape, options);
                 } else {
-                    // Note: Using same dtype as default options for decoding (unlike prefill which uses bf16)
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::ones(buffer_shape, options);
                 }
@@ -691,7 +682,7 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
         // Step 6: Reset buffer status for ALL module types
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->buffer_status_[module_type].clear();
-            this->buffer_status_[module_type].shrink_to_fit();  // Release old memory
+            this->buffer_status_[module_type].shrink_to_fit();
             this->buffer_status_[module_type].resize(num_buffer, 0);
         }
         
