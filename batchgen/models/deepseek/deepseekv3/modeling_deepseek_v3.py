@@ -59,6 +59,7 @@ import torch.distributed as dist
 import numpy as np
 import os
 import triton
+import gc
 
 if is_flash_attn_2_available():
 	from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -1192,6 +1193,22 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.gate_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.gate_scale_list], dtype=torch.int64, device=self.device)
 			self.up_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.up_scale_list], dtype=torch.int64, device=self.device)
 			self.down_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.down_scale_list], dtype=torch.int64, device=self.device)
+	
+	def cleanup(self):
+		self.gate_list = None
+		self.up_list = None
+		self.down_list = None
+		self.gate_scale_list = None
+		self.up_scale_list = None
+		self.down_scale_list = None
+		self.gate_ptrs_ptr = None
+		self.up_ptrs_ptr = None
+		self.down_ptrs_ptr = None
+		self.gate_scale_ptrs_ptr = None
+		self.up_scale_ptrs_ptr = None
+		self.down_scale_ptrs_ptr = None
+		gc.collect()
+
 
 
 	def forward(self, hidden_states):

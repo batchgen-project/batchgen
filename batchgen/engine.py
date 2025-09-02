@@ -2517,6 +2517,8 @@ class BatchGen:
 				for routed_expert_idx in range(self.model_config.num_local_experts):
 					if hasattr(self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx], '_unregister_fp8_weights'):
 						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
+				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
+					self.model.model.layers[layer_idx].mlp.cleanup()
 
 	def deep_free_model_memory(self):
 		"""Deep cleanup of model and all its submodules"""
