@@ -206,7 +206,7 @@ void BatchGen::kv_offload(int64_t layer_idx, std::vector<int64_t> query_idx,
 //     return *this->gpu_weight_buffer_.get_weights(module_key);  // blocking.
 // };
 
-std::unordered_map<std::string, torch::Tensor> BatchGen::get_weights(
+const std::unordered_map<std::string, torch::Tensor>& BatchGen::get_weights(
     std::string module_key,
     std::string& phase) 
 {
