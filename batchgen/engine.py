@@ -1945,7 +1945,6 @@ class BatchGen:
 		for micro_batch_idx in tqdm(
 			range(num_prefill_micro_batches), desc="Prefill Micro Batch"
 		):
-			print("\n")
 			with torch.inference_mode():
 				Attn_Wrapper.attention_mask = (
 					Prefill_micro_batch_attention_masks[micro_batch_idx]
