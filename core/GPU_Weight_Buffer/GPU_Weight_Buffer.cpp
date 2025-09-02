@@ -359,61 +359,180 @@ void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_id
 }
 
 
+// void GPU_Weight_Buffer::reset_prefill_buffer() {
+//     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
+//     auto& num_buffers =
+//         this->engine_config_.gpu_buffer_config
+//             .num_prefill_module_buffer;  // {"attn": 1, "routed_expert": 160,
+//                                          // "shared_expert": 1}
+//     auto options =
+//         torch::TensorOptions()
+//             .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+//             .device(torch::kCUDA, this->engine_config_.basic_config.device)
+//             .requires_grad(false)
+//             .memory_format(torch::MemoryFormat::Contiguous);
+//     {
+//         std::lock_guard<std::mutex> lock(this->mutex_);
+//         // reset the buffer size as the prefill buffer size.
+//         this->buffers_["routed_expert"].clear();
+//         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
+//         for (auto& [buffer_name, buffer_shape] :
+//              buffer_shapes["routed_expert"]) {
+//             for (int64_t buffer_idx = 0;
+//                  buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
+//                 if (buffer_name.find("norm") == std::string::npos) {
+//                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
+//                         torch::zeros(buffer_shape, options);
+//                 } else {
+//                     auto bf16_options =
+//                         torch::TensorOptions()
+//                             .dtype(torch::kBFloat16)
+//                             .device(torch::kCUDA,
+//                                     this->engine_config_.basic_config.device)
+//                             .requires_grad(false)
+//                             .memory_format(torch::MemoryFormat::Contiguous);
+//                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
+//                         torch::ones(buffer_shape, bf16_options);
+//                 }
+//             }
+//         }
+//         this->module_in_buffers_.clear();
+
+//         // Set all buffer status to 0.
+//         for (auto& [module_type, num_buffer] : num_buffers) {
+//             this->buffer_status_[module_type].clear();
+//             this->buffer_status_[module_type].resize(num_buffer, 0);
+//         }
+//         // Log the buffer status and size of each buffer.
+//         for (auto& [module_type, num_buffer] : num_buffers) {
+//             this->logger_->debug("Module type: {}, Number of buffer: {}",
+//                                  module_type, num_buffer);
+//             for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
+//                  buffer_idx++) {
+//                 this->logger_->debug(
+//                     "Buffer_idx: {}, Buffer status: {}", buffer_idx,
+//                     this->buffer_status_[module_type][buffer_idx]);
+//             }
+//         }
+//     }
+// }
+
 void GPU_Weight_Buffer::reset_prefill_buffer() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
-    auto& num_buffers =
-        this->engine_config_.gpu_buffer_config
-            .num_prefill_module_buffer;  // {"attn": 1, "routed_expert": 160,
-                                         // "shared_expert": 1}
-    auto options =
-        torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
-            .device(torch::kCUDA, this->engine_config_.basic_config.device)
-            .requires_grad(false)
-            .memory_format(torch::MemoryFormat::Contiguous);
+    auto& num_buffers = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer;
+    
+    auto options = torch::TensorOptions()
+        .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+        .device(torch::kCUDA, this->engine_config_.basic_config.device)
+        .requires_grad(false)
+        .memory_format(torch::MemoryFormat::Contiguous);
+    
+    // Prepare bf16 options once (not in the loop)
+    auto bf16_options = torch::TensorOptions()
+        .dtype(torch::kBFloat16)
+        .device(torch::kCUDA, this->engine_config_.basic_config.device)
+        .requires_grad(false)
+        .memory_format(torch::MemoryFormat::Contiguous);
+    
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        // reset the buffer size as the prefill buffer size.
-        this->buffers_["routed_expert"].clear();
+        
+        // Step 1: Log initial memory state
+        size_t memory_before = 0;
+        if (torch::cuda::is_available()) {
+            memory_before = torch::cuda::memory_allocated(this->engine_config_.basic_config.device);
+            this->logger_->info("Prefill reset - Memory before: {} MB", 
+                              memory_before / (1024.0 * 1024.0));
+        }
+        
+        // Step 2: Explicitly release ALL existing tensors in ALL buffer types
+        // This is important because prefill might affect multiple buffer types
+        for (auto& [buffer_type, buffer_vector] : this->buffers_) {
+            for (auto& module_map : buffer_vector) {
+                for (auto& [name, tensor] : module_map) {
+                    // Explicitly release each tensor
+                    tensor = torch::Tensor();
+                }
+                module_map.clear();
+            }
+            buffer_vector.clear();
+            
+            // Force deallocation of vector memory
+            buffer_vector.shrink_to_fit();
+        }
+        
+        // Step 3: Clear module mappings
+        this->module_in_buffers_.clear();
+        
+        // Step 4: Force CUDA synchronization and aggressive memory cleanup
+        if (torch::cuda::is_available()) {
+            // Ensure all CUDA operations complete
+            torch::cuda::synchronize();
+            
+            // Force return memory to system
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            
+            // Log memory after clearing
+            size_t memory_after_clear = torch::cuda::memory_allocated(this->engine_config_.basic_config.device);
+            this->logger_->info("Prefill reset - Memory after clearing: {} MB (freed: {} MB)", 
+                              memory_after_clear / (1024.0 * 1024.0),
+                              (memory_before - memory_after_clear) / (1024.0 * 1024.0));
+        }
+        
+        // Step 5: Create new prefill buffers for routed_expert
+        this->buffers_["routed_expert"].reserve(num_buffers["routed_expert"]);
         this->buffers_["routed_expert"].resize(num_buffers["routed_expert"]);
-        for (auto& [buffer_name, buffer_shape] :
-             buffer_shapes["routed_expert"]) {
-            for (int64_t buffer_idx = 0;
-                 buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
-                if (buffer_name.find("norm") == std::string::npos) {
+        
+        // Pre-calculate buffer names that need norm (for efficiency)
+        std::unordered_set<std::string> norm_buffers;
+        for (const auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
+            if (buffer_name.find("norm") != std::string::npos) {
+                norm_buffers.insert(buffer_name);
+            }
+        }
+        
+        // Create tensors
+        for (auto& [buffer_name, buffer_shape] : buffer_shapes["routed_expert"]) {
+            bool is_norm = norm_buffers.count(buffer_name) > 0;
+            
+            for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
+                if (!is_norm) {
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::zeros(buffer_shape, options);
                 } else {
-                    auto bf16_options =
-                        torch::TensorOptions()
-                            .dtype(torch::kBFloat16)
-                            .device(torch::kCUDA,
-                                    this->engine_config_.basic_config.device)
-                            .requires_grad(false)
-                            .memory_format(torch::MemoryFormat::Contiguous);
+                    // Use bf16 for norm layers
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::ones(buffer_shape, bf16_options);
                 }
             }
         }
-        this->module_in_buffers_.clear();
-
-        // Set all buffer status to 0.
+        
+        // Step 6: Reset buffer status for ALL module types
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->buffer_status_[module_type].clear();
+            this->buffer_status_[module_type].shrink_to_fit();  // Release old memory
             this->buffer_status_[module_type].resize(num_buffer, 0);
         }
-        // Log the buffer status and size of each buffer.
+        
+        // Step 7: Final memory check and logging
+        if (torch::cuda::is_available()) {
+            size_t memory_final = torch::cuda::memory_allocated(this->engine_config_.basic_config.device);
+            this->logger_->info("Prefill reset - Memory after recreation: {} MB (net change: {} MB)", 
+                              memory_final / (1024.0 * 1024.0),
+                              (static_cast<int64_t>(memory_final) - static_cast<int64_t>(memory_before)) / (1024.0 * 1024.0));
+        }
+        
+        // Log buffer status
         for (auto& [module_type, num_buffer] : num_buffers) {
             this->logger_->debug("Module type: {}, Number of buffer: {}",
-                                 module_type, num_buffer);
-            for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
-                 buffer_idx++) {
-                this->logger_->debug(
-                    "Buffer_idx: {}, Buffer status: {}", buffer_idx,
-                    this->buffer_status_[module_type][buffer_idx]);
+                               module_type, num_buffer);
+            for (int64_t buffer_idx = 0; buffer_idx < num_buffer; buffer_idx++) {
+                this->logger_->debug("Buffer_idx: {}, Buffer status: {}", 
+                                   buffer_idx, this->buffer_status_[module_type][buffer_idx]);
             }
         }
+        
+        this->logger_->debug("Prefill buffer reset complete.");
     }
 }
 
