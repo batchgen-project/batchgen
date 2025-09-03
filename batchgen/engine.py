@@ -1486,6 +1486,7 @@ class BatchGen:
 				dist.barrier()
 				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
 				self._config_prefill()
+				logging.info(f"Rank: {self.rank} prefill config done.")
 				prefill_start_time = time.perf_counter()
 				with torch.inference_mode():
 					new_token = self.prefill(self.model_batches[model_batch_idx])
@@ -1687,13 +1688,21 @@ class BatchGen:
 
 	def _config_prefill(self):
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+		logging.info(f"Rank: {self.rank} configure_prefill done.")
 		self.set_phase("prefill")
+		logging.info(f"Rank: {self.rank} set phase to prefill.")
 		self.core_engine.stop_h2d_worker()
+		logging.info(f"Rank: {self.rank} stop h2d worker.")
 		self.core_engine.clear_weight_copy_queue()
+		logging.info(f"Rank: {self.rank} clear weight copy queue.")
 		self.core_engine.reset_prefill_buffer()
+		logging.info(f"Rank: {self.rank} reset_prefill_buffer.")
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+		logging.info(f"Rank: {self.rank} set_weight_copy_queue.")
 		self.core_engine.clear_kv_storage()
+		logging.info(f"Rank: {self.rank} clear_kv_storage.")
 		self.core_engine.start_h2d_worker()
+		logging.info(f"Rank: {self.rank} start_h2d_worker.")
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")

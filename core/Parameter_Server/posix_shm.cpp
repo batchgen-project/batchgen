@@ -135,84 +135,84 @@ int execute_command(const std::string& cmd) {
 }
 
 // Helper function for page touching with signal handling
-bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
-    // Set up signal handlers
-    struct sigaction sa;
-    sa.sa_sigaction = segv_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO;
-    struct sigaction old_sa_segv, old_sa_bus;
-    sigaction(SIGSEGV, &sa, &old_sa_segv);
-    sigaction(SIGBUS, &sa, &old_sa_bus);
+// bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
+//     // Set up signal handlers
+//     struct sigaction sa;
+//     sa.sa_sigaction = segv_handler;
+//     sigemptyset(&sa.sa_mask);
+//     sa.sa_flags = SA_SIGINFO;
+//     struct sigaction old_sa_segv, old_sa_bus;
+//     sigaction(SIGSEGV, &sa, &old_sa_segv);
+//     sigaction(SIGBUS, &sa, &old_sa_bus);
     
-    bool success = false;
-    auto start_time = std::chrono::high_resolution_clock::now();
+//     bool success = false;
+//     auto start_time = std::chrono::high_resolution_clock::now();
     
-    if (multi_threaded) {
-        logger->info("Attempting multi-threaded memory initialization...");
-        const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
-        const int64_t chunk_size = size / num_threads;
+//     if (multi_threaded) {
+//         logger->info("Attempting multi-threaded memory initialization...");
+//         const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
+//         const int64_t chunk_size = size / num_threads;
         
-        std::vector<std::thread> threads;
-        std::atomic<int> failed_threads(0);
+//         std::vector<std::thread> threads;
+//         std::atomic<int> failed_threads(0);
         
-        for (int i = 0; i < num_threads; i++) {
-            threads.emplace_back([=, &failed_threads]() {
-                int64_t start_offset = i * chunk_size;
-                int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
-                volatile char* p = reinterpret_cast<volatile char*>(ptr);
+//         for (int i = 0; i < num_threads; i++) {
+//             threads.emplace_back([=, &failed_threads]() {
+//                 int64_t start_offset = i * chunk_size;
+//                 int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
+//                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
                 
-                g_in_page_touch = true;
-                if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-                    for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
-                        p[offset] = 0;
-                    }
-                } else {
-                    logger->warn("Thread {} caught signal during page touch", i);
-                    failed_threads++;
-                }
-                g_in_page_touch = false;
-            });
-        }
+//                 g_in_page_touch = true;
+//                 if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
+//                     for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
+//                         p[offset] = 0;
+//                     }
+//                 } else {
+//                     logger->warn("Thread {} caught signal during page touch", i);
+//                     failed_threads++;
+//                 }
+//                 g_in_page_touch = false;
+//             });
+//         }
         
-        for (auto& t : threads) {
-            t.join();
-        }
+//         for (auto& t : threads) {
+//             t.join();
+//         }
         
-        success = (failed_threads == 0);
-        if (!success) {
-            logger->warn("{} threads failed during initialization", failed_threads.load());
-        }
-    } else {
-        logger->info("Attempting single-threaded memory initialization...");
-        volatile char* p = reinterpret_cast<volatile char*>(ptr);
+//         success = (failed_threads == 0);
+//         if (!success) {
+//             logger->warn("{} threads failed during initialization", failed_threads.load());
+//         }
+//     } else {
+//         logger->info("Attempting single-threaded memory initialization...");
+//         volatile char* p = reinterpret_cast<volatile char*>(ptr);
         
-        g_in_page_touch = true;
-        if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-            for (int64_t offset = 0; offset < size; offset += page_size) {
-                p[offset] = 0;
-            }
-            success = true;
-        } else {
-            logger->error("Single-threaded initialization failed with signal");
-        }
-        g_in_page_touch = false;
-    }
+//         g_in_page_touch = true;
+//         if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
+//             for (int64_t offset = 0; offset < size; offset += page_size) {
+//                 p[offset] = 0;
+//             }
+//             success = true;
+//         } else {
+//             logger->error("Single-threaded initialization failed with signal");
+//         }
+//         g_in_page_touch = false;
+//     }
     
-    // Restore original signal handlers
-    sigaction(SIGSEGV, &old_sa_segv, nullptr);
-    sigaction(SIGBUS, &old_sa_bus, nullptr);
+//     // Restore original signal handlers
+//     sigaction(SIGSEGV, &old_sa_segv, nullptr);
+//     sigaction(SIGBUS, &old_sa_bus, nullptr);
     
-    if (success) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::high_resolution_clock::now() - start_time);
-        logger->info("{} initialization completed in {:.2f}s", 
-                   multi_threaded ? "Multi-threaded" : "Single-threaded",
-                   duration.count() / 1000.0);
-    }
+//     if (success) {
+//         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+//             std::chrono::high_resolution_clock::now() - start_time);
+//         logger->info("{} initialization completed in {:.2f}s", 
+//                    multi_threaded ? "Multi-threaded" : "Single-threaded",
+//                    duration.count() / 1000.0);
+//     }
     
-    return success;
-}
+//     return success;
+// }
 
 // void* allocate_shared_pinned_memory(const std::string& shm_name,
 //                                     int64_t size,
@@ -389,6 +389,88 @@ bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
 //     return ptr;
 // }
 
+bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
+    // Set up signal handlers
+    struct sigaction sa;
+    sa.sa_sigaction = segv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    struct sigaction old_sa_segv, old_sa_bus;
+    sigaction(SIGSEGV, &sa, &old_sa_segv);
+    sigaction(SIGBUS, &sa, &old_sa_bus);
+    
+    bool success = false;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    if (multi_threaded) {
+        logger->info("Attempting multi-threaded memory initialization...");
+        const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
+        const int64_t chunk_size = size / num_threads;
+        
+        std::vector<std::thread> threads;
+        std::atomic<int> failed_threads(0);
+        
+        for (int i = 0; i < num_threads; i++) {
+            threads.emplace_back([=, &failed_threads]() {
+                int64_t start_offset = i * chunk_size;
+                int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
+                volatile char* p = reinterpret_cast<volatile char*>(ptr);
+                
+                g_in_page_touch = true;
+                if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
+                    for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
+                        p[offset] = 0;
+                    }
+                } else {
+                    logger->warn("Thread {} caught signal during page touch", i);
+                    failed_threads++;
+                }
+                g_in_page_touch = false;
+            });
+        }
+        
+        for (auto& t : threads) {
+            t.join();
+        }
+        
+        success = (failed_threads == 0);
+        if (!success) {
+            logger->warn("{} threads failed during initialization", failed_threads.load());
+        }
+    } else {
+        logger->info("Attempting single-threaded memory initialization...");
+        volatile char* p = reinterpret_cast<volatile char*>(ptr);
+        
+        g_in_page_touch = true;
+        if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
+            for (int64_t offset = 0; offset < size; offset += page_size) {
+                p[offset] = 0;
+            }
+            success = true;
+        } else {
+            logger->error("Single-threaded initialization failed with signal");
+        }
+        g_in_page_touch = false;
+    }
+    
+    // Restore original signal handlers
+    sigaction(SIGSEGV, &old_sa_segv, nullptr);
+    sigaction(SIGBUS, &old_sa_bus, nullptr);
+    
+    if (success) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - start_time);
+        logger->info("{} initialization completed in {:.2f}s", 
+                   multi_threaded ? "Multi-threaded" : "Single-threaded",
+                   duration.count() / 1000.0);
+    }
+    
+    return success;
+}
+
+// --- End of Mocked Dependencies ---
+
+
 /**
  * @brief Allocates shared memory that is pinned for CUDA operations.
  * * This function supports two allocation strategies:
@@ -431,17 +513,12 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         int fd = open(hugepage_path.c_str(), flags, 0666);
 
         if (fd >= 0) {
-            int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
-
-            if (!create || (ftruncate64(fd, huge_aligned_size) == 0)) {
-                ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                if (ptr != MAP_FAILED) {
-                    allocated_size = huge_aligned_size;
-                    logger->info("Successfully mapped {:.3f}GB using hugetlbfs",
-                               allocated_size / (1024.0 * 1024.0 * 1024.0));
-
-                    if (create) {
-                        // Use multi-threaded page touching by default.
+            if (create) {
+                int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
+                if (ftruncate64(fd, huge_aligned_size) == 0) {
+                    ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    if (ptr != MAP_FAILED) {
+                        allocated_size = huge_aligned_size;
                         if (touch_pages(ptr, size, huge_page_size, true)) {
                             using_huge_pages = true;
                             logger->info("Hugepage multi-threaded initialization succeeded");
@@ -451,20 +528,42 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                             ptr = nullptr; // Signal failure to fallback
                         }
                     } else {
-                        // For workers, just accept the mapping without touching.
-                        using_huge_pages = true;
+                        logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
+                        ptr = nullptr; // Ensure ptr is null for fallback
                     }
                 } else {
-                    logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
-                    ptr = nullptr; // Ensure ptr is null for fallback
+                    logger->warn("hugetlbfs ftruncate failed: {}", strerror(errno));
                 }
-            } else {
-                logger->warn("hugetlbfs ftruncate failed: {}", strerror(errno));
+            } else { // Worker logic: wait for file to be sized by server
+                struct stat sb;
+                int64_t file_size = 0;
+                for (int retry = 0; retry < 20; ++retry) { // Retry for up to 2 seconds
+                    if (fstat(fd, &sb) == -1) {
+                        close(fd);
+                        throw std::runtime_error("fstat on hugepage file failed: " + std::string(strerror(errno)));
+                    }
+                    if (sb.st_size > 0) {
+                        file_size = sb.st_size;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                if (file_size > 0) {
+                    ptr = mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    if (ptr != MAP_FAILED) {
+                        allocated_size = file_size;
+                        using_huge_pages = true;
+                    } else {
+                        logger->warn("hugetlbfs mmap failed for worker: {}", strerror(errno));
+                        ptr = nullptr;
+                    }
+                } else {
+                    logger->error("Timed out waiting for server to create hugepage file.");
+                }
             }
-            
             close(fd);
 
-            // If hugepage approach failed, clean up the created file before fallback.
             if (!using_huge_pages && create) {
                 logger->info("Cleaning up failed hugepage allocation at '{}'", hugepage_path);
                 unlink(hugepage_path.c_str());
@@ -480,28 +579,49 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
              logger->info("Falling back to regular shared memory...");
         }
 
-        int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
         int flags = O_RDWR | (create ? O_CREAT : 0);
         int fd = shm_open(shm_name.c_str(), flags, 0666);
         if (fd < 0) {
             throw std::runtime_error("shm_open failed for '" + shm_name + "': " + strerror(errno));
         }
 
-        if (create && ftruncate64(fd, aligned_size) == -1) {
-            close(fd);
-            shm_unlink(shm_name.c_str());
-            throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
+        if (create) {
+            int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
+            if (ftruncate64(fd, aligned_size) == -1) {
+                close(fd);
+                shm_unlink(shm_name.c_str());
+                throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
+            }
+            ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            allocated_size = aligned_size;
+        } else { // Worker logic
+            struct stat sb;
+            int64_t file_size = 0;
+            for (int retry = 0; retry < 20; ++retry) {
+                if (fstat(fd, &sb) == -1) {
+                    close(fd);
+                    throw std::runtime_error("fstat on shm file failed: " + std::string(strerror(errno)));
+                }
+                if (sb.st_size > 0) {
+                    file_size = sb.st_size;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (file_size > 0) {
+                ptr = mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                allocated_size = file_size;
+            } else {
+                 logger->error("Timed out waiting for server to create shm file.");
+            }
         }
-
-        ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
 
         if (ptr == MAP_FAILED) {
             if (create) shm_unlink(shm_name.c_str());
             throw std::runtime_error("mmap for regular shm failed: " + std::string(strerror(errno)));
         }
-
-        allocated_size = aligned_size;
+        
         logger->info("Allocated {:.3f}GB using regular pages",
                    allocated_size / (1024.0 * 1024.0 * 1024.0));
 
@@ -510,7 +630,6 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         }
 
         if (create) {
-            // Use multi-threaded touch for regular pages as well.
             if (!touch_pages(ptr, size, page_size, true)) {
                 logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
             }
@@ -550,7 +669,6 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
     return ptr;
 }
-
 
 
 // Helper function to verify NUMA allocation
