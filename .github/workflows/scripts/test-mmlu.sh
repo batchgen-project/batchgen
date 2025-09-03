@@ -73,8 +73,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python test/r1_mmlu_pro_test/r1_mmlu_pro_test.py \
         --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
         --host_kv_cache_size 256 \
-        --max_input_length 4096 \
-        --max_decoding_length 2048 \
+        --max_input_length 8192 \
+        --max_decoding_length 8192 \
         --ATTN_MODE 3 \
         --cache_dir "$CACHE_DIR" \
         --server_host "localhost" \
