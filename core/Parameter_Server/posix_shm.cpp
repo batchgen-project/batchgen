@@ -214,112 +214,277 @@ bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
     return success;
 }
 
+// void* allocate_shared_pinned_memory(const std::string& shm_name,
+//                                     int64_t size,
+//                                     bool create) {
+//     if (size <= 0) {
+//         throw std::runtime_error("Invalid size: " + std::to_string(size));
+//     }
+    
+//     const size_t page_size = sysconf(_SC_PAGESIZE);
+//     const size_t huge_page_size = 2 * 1024 * 1024;  // 2MB
+    
+//     logger->info("Allocating shared memory: name={}, size={}MB, mode={}", 
+//                 shm_name, size / (1024*1024), 
+//                 create ? "server" : "worker");
+    
+//     void* ptr = nullptr;
+//     bool using_huge_pages = false;
+//     int64_t allocated_size = 0;
+//     std::string hugepage_path = "/dev/hugepages/" + shm_name;
+    
+//     // STAGE 1: Try hugetlbfs allocation (DEFAULT CHOICE)
+//     logger->info("Attempting hugepage allocation...");
+//     int flags = O_RDWR | (create ? O_CREAT : 0);
+//     int fd = open(hugepage_path.c_str(), flags, 0666);
+    
+//     if (fd >= 0) {
+//         // Align to huge page size
+//         int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
+        
+//         bool huge_alloc_success = false;
+//         if (create) {
+//             if (ftruncate64(fd, huge_aligned_size) == 0) {
+//                 huge_alloc_success = true;
+//             } else {
+//                 logger->warn("hugetlbfs ftruncate failed: {}", strerror(errno));
+//             }
+//         } else {
+//             huge_alloc_success = true;  // For workers, just try mmap
+//         }
+        
+//         if (huge_alloc_success) {
+//             ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+//             if (ptr != MAP_FAILED) {
+//                 allocated_size = huge_aligned_size;
+//                 logger->info("Successfully mapped {}GB using hugetlbfs", 
+//                            allocated_size / (1024.0*1024.0*1024.0));
+                
+//                 // For create mode, try page touching
+//                 if (create) {
+//                     // Try multi-threaded page touch first
+//                     if (touch_pages(ptr, size, huge_page_size, true)) {
+//                         using_huge_pages = true;
+//                         logger->info("Hugepage multi-threaded initialization succeeded");
+//                     } else {
+//                         // Fallback to single-threaded page touch
+//                         logger->warn("Multi-threaded hugepage touch failed, trying single-threaded...");
+//                         if (touch_pages(ptr, size, huge_page_size, false)) {
+//                             using_huge_pages = true;
+//                             logger->info("Hugepage single-threaded initialization succeeded");
+//                         } else {
+//                             // Both failed - give up hugepages
+//                             logger->error("Both multi and single threaded hugepage touch failed");
+//                             munmap(ptr, allocated_size);
+//                             ptr = nullptr;
+//                         }
+//                     }
+//                 } else {
+//                     // For workers, just accept the mapping
+//                     using_huge_pages = true;
+//                 }
+//             } else {
+//                 logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
+//                 ptr = nullptr;
+//             }
+//         }
+        
+//         close(fd);
+        
+//         // If hugepage approach failed and we're in create mode, clean up
+//         if (!using_huge_pages && create) {
+//             logger->info("Cleaning up failed hugepage allocation...");
+//             unlink(hugepage_path.c_str());
+            
+//             // Reset hugepages to 0
+//             logger->info("Resetting hugepages to 0...");
+//             int ret = execute_command("sysctl -w vm.nr_hugepages=0");
+//             if (ret == 0) {
+//                 logger->info("Successfully reset hugepages");
+//             } else {
+//                 logger->warn("Failed to reset hugepages, user may need to manually clean up");
+//             }
+//         }
+//     } else {
+//         logger->debug("Could not open hugetlbfs: {}", strerror(errno));
+//     }
+    
+//     // STAGE 2: Fallback to regular shared memory with single-threaded touch
+//     if (!ptr) {
+//         logger->info("Falling back to regular shared memory...");
+        
+//         // Align to regular page size
+//         int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
+        
+//         int flags = O_RDWR | (create ? O_CREAT : 0);
+//         int fd = shm_open(shm_name.c_str(), flags, 0666);
+//         if (fd < 0) {
+//             throw std::runtime_error("shm_open failed: " + std::string(strerror(errno)));
+//         }
+
+//         if (create && ftruncate64(fd, aligned_size) == -1) {
+//             close(fd);
+//             shm_unlink(shm_name.c_str());
+//             throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
+//         }
+
+//         ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+//         close(fd);
+        
+//         if (ptr == MAP_FAILED) {
+//             if (create) shm_unlink(shm_name.c_str());
+//             throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
+//         }
+        
+//         allocated_size = aligned_size;
+//         logger->info("Allocated {}GB using regular pages", 
+//                    allocated_size / (1024.0*1024.0*1024.0));
+        
+//         // Try to enable transparent huge pages
+//         if (madvise(ptr, allocated_size, MADV_HUGEPAGE) == 0) {
+//             logger->debug("Enabled transparent huge pages hint");
+//         }
+        
+//         // For regular pages, only use single-threaded touch
+//         if (create) {
+//             if (!touch_pages(ptr, size, page_size, false)) {
+//                 logger->error("Regular page touch failed - memory may not be fully resident");
+//                 // Continue anyway - the allocation succeeded even if touch failed
+//             }
+//         }
+//     }
+    
+//     // STAGE 3: Register with CUDA
+//     try {
+//         logger->info("Registering {}GB with CUDA...", size / (1024.0*1024.0*1024.0));
+//         auto cuda_start = std::chrono::high_resolution_clock::now();
+        
+//         cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+        
+//         auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+//             std::chrono::high_resolution_clock::now() - cuda_start);
+        
+//         if (err != cudaSuccess) {
+//             throw std::runtime_error("cudaHostRegister failed: " + 
+//                                     std::string(cudaGetErrorString(err)));
+//         }
+        
+//         logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
+//     } catch (const std::exception& e) {
+//         // Clean up and rethrow
+//         munmap(ptr, allocated_size);
+//         if (create) {
+//             if (using_huge_pages) {
+//                 unlink(hugepage_path.c_str());
+//             } else {
+//                 shm_unlink(shm_name.c_str());
+//             }
+//         }
+//         throw;
+//     }
+    
+//     logger->info("Memory allocation completed successfully using {} pages",
+//                using_huge_pages ? "huge" : "regular");
+    
+//     return ptr;
+// }
+
+/**
+ * @brief Allocates shared memory that is pinned for CUDA operations.
+ * * This function supports two allocation strategies:
+ * 1.  Hugetlbfs: Uses large 2MB pages for potentially better performance, but requires
+ * root privileges and proper system configuration. Controlled by enable_hugetlbfs.
+ * 2.  Regular Shared Memory: A fallback using standard 4KB pages via shm_open.
+ * * In both cases, the allocated memory is "touched" to ensure it is resident in RAM
+ * and then pinned using cudaHostRegister for efficient GPU access.
+ * * @param shm_name The name for the shared memory segment.
+ * @param size The desired size of the allocation in bytes.
+ * @param create True if the caller is the server (creates the segment), false for workers.
+ * @param enable_hugetlbfs If true, attempts to use hugetlbfs for allocation.
+ * @return A void pointer to the allocated and pinned shared memory.
+ * @throws std::runtime_error on failure.
+ */
 void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int64_t size,
-                                    bool create) {
+                                    bool create,
+                                    bool enable_hugetlbfs) {
     if (size <= 0) {
-        throw std::runtime_error("Invalid size: " + std::to_string(size));
+        throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
-    
+
     const size_t page_size = sysconf(_SC_PAGESIZE);
-    const size_t huge_page_size = 2 * 1024 * 1024;  // 2MB
-    
-    logger->info("Allocating shared memory: name={}, size={}MB, mode={}", 
-                shm_name, size / (1024*1024), 
-                create ? "server" : "worker");
-    
+    const size_t huge_page_size = 2 * 1024 * 1024; // 2MB
+
+    logger->info("Allocating shared memory: name={}, size={}MB, mode={}",
+                 shm_name, size / (1024 * 1024),
+                 create ? "server" : "worker");
+
     void* ptr = nullptr;
     bool using_huge_pages = false;
     int64_t allocated_size = 0;
     std::string hugepage_path = "/dev/hugepages/" + shm_name;
-    
-    // STAGE 1: Try hugetlbfs allocation (DEFAULT CHOICE)
-    logger->info("Attempting hugepage allocation...");
-    int flags = O_RDWR | (create ? O_CREAT : 0);
-    int fd = open(hugepage_path.c_str(), flags, 0666);
-    
-    if (fd >= 0) {
-        // Align to huge page size
-        int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
-        
-        bool huge_alloc_success = false;
-        if (create) {
-            if (ftruncate64(fd, huge_aligned_size) == 0) {
-                huge_alloc_success = true;
+
+    // STAGE 1: Attempt allocation using hugetlbfs if enabled
+    if (enable_hugetlbfs) {
+        logger->info("Attempting hugepage allocation...");
+        int flags = O_RDWR | (create ? O_CREAT : 0);
+        int fd = open(hugepage_path.c_str(), flags, 0666);
+
+        if (fd >= 0) {
+            int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
+
+            if (!create || (ftruncate64(fd, huge_aligned_size) == 0)) {
+                ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (ptr != MAP_FAILED) {
+                    allocated_size = huge_aligned_size;
+                    logger->info("Successfully mapped {:.3f}GB using hugetlbfs",
+                               allocated_size / (1024.0 * 1024.0 * 1024.0));
+
+                    if (create) {
+                        // Use multi-threaded page touching by default.
+                        if (touch_pages(ptr, size, huge_page_size, true)) {
+                            using_huge_pages = true;
+                            logger->info("Hugepage multi-threaded initialization succeeded");
+                        } else {
+                            logger->error("Multi-threaded hugepage touch failed. Aborting hugepage allocation.");
+                            munmap(ptr, allocated_size);
+                            ptr = nullptr; // Signal failure to fallback
+                        }
+                    } else {
+                        // For workers, just accept the mapping without touching.
+                        using_huge_pages = true;
+                    }
+                } else {
+                    logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
+                    ptr = nullptr; // Ensure ptr is null for fallback
+                }
             } else {
                 logger->warn("hugetlbfs ftruncate failed: {}", strerror(errno));
             }
-        } else {
-            huge_alloc_success = true;  // For workers, just try mmap
-        }
-        
-        if (huge_alloc_success) {
-            ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (ptr != MAP_FAILED) {
-                allocated_size = huge_aligned_size;
-                logger->info("Successfully mapped {}GB using hugetlbfs", 
-                           allocated_size / (1024.0*1024.0*1024.0));
-                
-                // For create mode, try page touching
-                if (create) {
-                    // Try multi-threaded page touch first
-                    if (touch_pages(ptr, size, huge_page_size, true)) {
-                        using_huge_pages = true;
-                        logger->info("Hugepage multi-threaded initialization succeeded");
-                    } else {
-                        // Fallback to single-threaded page touch
-                        logger->warn("Multi-threaded hugepage touch failed, trying single-threaded...");
-                        if (touch_pages(ptr, size, huge_page_size, false)) {
-                            using_huge_pages = true;
-                            logger->info("Hugepage single-threaded initialization succeeded");
-                        } else {
-                            // Both failed - give up hugepages
-                            logger->error("Both multi and single threaded hugepage touch failed");
-                            munmap(ptr, allocated_size);
-                            ptr = nullptr;
-                        }
-                    }
-                } else {
-                    // For workers, just accept the mapping
-                    using_huge_pages = true;
-                }
-            } else {
-                logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
-                ptr = nullptr;
-            }
-        }
-        
-        close(fd);
-        
-        // If hugepage approach failed and we're in create mode, clean up
-        if (!using_huge_pages && create) {
-            logger->info("Cleaning up failed hugepage allocation...");
-            unlink(hugepage_path.c_str());
             
-            // Reset hugepages to 0
-            logger->info("Resetting hugepages to 0...");
-            int ret = execute_command("sysctl -w vm.nr_hugepages=0");
-            if (ret == 0) {
-                logger->info("Successfully reset hugepages");
-            } else {
-                logger->warn("Failed to reset hugepages, user may need to manually clean up");
+            close(fd);
+
+            // If hugepage approach failed, clean up the created file before fallback.
+            if (!using_huge_pages && create) {
+                logger->info("Cleaning up failed hugepage allocation at '{}'", hugepage_path);
+                unlink(hugepage_path.c_str());
             }
+        } else {
+            logger->warn("Could not open hugetlbfs path '{}': {}. Check permissions and mount.", hugepage_path, strerror(errno));
         }
-    } else {
-        logger->debug("Could not open hugetlbfs: {}", strerror(errno));
     }
-    
-    // STAGE 2: Fallback to regular shared memory with single-threaded touch
+
+    // STAGE 2: Fallback to regular shared memory if hugepages were disabled or failed
     if (!ptr) {
-        logger->info("Falling back to regular shared memory...");
-        
-        // Align to regular page size
+        if (enable_hugetlbfs) {
+             logger->info("Falling back to regular shared memory...");
+        }
+
         int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
-        
         int flags = O_RDWR | (create ? O_CREAT : 0);
         int fd = shm_open(shm_name.c_str(), flags, 0666);
         if (fd < 0) {
-            throw std::runtime_error("shm_open failed: " + std::string(strerror(errno)));
+            throw std::runtime_error("shm_open failed for '" + shm_name + "': " + strerror(errno));
         }
 
         if (create && ftruncate64(fd, aligned_size) == -1) {
@@ -330,48 +495,45 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
 
         ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
-        
+
         if (ptr == MAP_FAILED) {
             if (create) shm_unlink(shm_name.c_str());
-            throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
+            throw std::runtime_error("mmap for regular shm failed: " + std::string(strerror(errno)));
         }
-        
+
         allocated_size = aligned_size;
-        logger->info("Allocated {}GB using regular pages", 
-                   allocated_size / (1024.0*1024.0*1024.0));
-        
-        // Try to enable transparent huge pages
+        logger->info("Allocated {:.3f}GB using regular pages",
+                   allocated_size / (1024.0 * 1024.0 * 1024.0));
+
         if (madvise(ptr, allocated_size, MADV_HUGEPAGE) == 0) {
-            logger->debug("Enabled transparent huge pages hint");
+            logger->debug("Successfully enabled transparent huge pages hint.");
         }
-        
-        // For regular pages, only use single-threaded touch
+
         if (create) {
-            if (!touch_pages(ptr, size, page_size, false)) {
-                logger->error("Regular page touch failed - memory may not be fully resident");
-                // Continue anyway - the allocation succeeded even if touch failed
+            // Use multi-threaded touch for regular pages as well.
+            if (!touch_pages(ptr, size, page_size, true)) {
+                logger->error("Multi-threaded regular page touch failed - memory may not be fully resident.");
             }
         }
     }
-    
-    // STAGE 3: Register with CUDA
+
+    // STAGE 3: Register the successfully allocated memory with CUDA
     try {
-        logger->info("Registering {}GB with CUDA...", size / (1024.0*1024.0*1024.0));
+        logger->info("Registering {:.3f}GB with CUDA...", size / (1024.0 * 1024.0 * 1024.0));
         auto cuda_start = std::chrono::high_resolution_clock::now();
-        
+
         cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
-        
+
         auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now() - cuda_start);
-        
+
         if (err != cudaSuccess) {
-            throw std::runtime_error("cudaHostRegister failed: " + 
-                                    std::string(cudaGetErrorString(err)));
+            throw std::runtime_error("cudaHostRegister failed: " + std::string(cudaGetErrorString(err)));
         }
-        
+
         logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
     } catch (const std::exception& e) {
-        // Clean up and rethrow
+        // Clean up memory and rethrow if CUDA registration fails
         munmap(ptr, allocated_size);
         if (create) {
             if (using_huge_pages) {
@@ -382,12 +544,13 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         }
         throw;
     }
-    
-    logger->info("Memory allocation completed successfully using {} pages",
+
+    logger->info("Memory allocation completed successfully using {} pages.",
                using_huge_pages ? "huge" : "regular");
-    
+
     return ptr;
 }
+
 
 
 // Helper function to verify NUMA allocation

@@ -33,7 +33,7 @@ logging.basicConfig(
 
 class ParameterServer:
 	def __init__(self, host='localhost', port=10900, model_name=None,
-				 hf_cache_dir=None, cache_dir=None, pt_ckpt_dir=None):
+				 hf_cache_dir=None, cache_dir=None, pt_ckpt_dir=None, enable_hugetlbfs=False):
 		"""
 		Initialize the Parameter Server.
 		
@@ -50,6 +50,7 @@ class ParameterServer:
 		self.server_socket = None
 		self.clients = []
 		self.running = False
+		self.enable_hugetlbfs = enable_hugetlbfs
 
 		# _init_dist_process_group(0,1)
 		# Initial model parameters
@@ -787,7 +788,7 @@ class ParameterServer:
 			if "deepseek" in huggingface_ckpt_name:
 				from batchgen.models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 				self.parameter_server_instance = DeepSeek_Parameter_Server(
-					huggingface_ckpt_name, cache_dir, pt_ckpt_dir
+					huggingface_ckpt_name, cache_dir, pt_ckpt_dir, self.enable_hugetlbfs
 				)
 			elif "Mixtral" in huggingface_ckpt_name:
 				from batchgen.models.mixtral.mixtral_parameter_server import Mixtral_Parameter_Server
@@ -910,6 +911,12 @@ def parse_args():
 		default=None,
 		help="Directory for PyTorch checkpoints"
 	)
+	parser.add_argument(
+		"--enable-hugetlbfs",
+		action='store_true',
+		default=False,
+		help="Enable hugetlbfs for shared memory (requires root privileges)"
+	)
 	return parser.parse_args()
 
 
@@ -922,7 +929,8 @@ if __name__ == "__main__":
 		model_name=args.model,
 		hf_cache_dir=args.hf_cache_dir,
 		cache_dir=args.cache_dir,
-		pt_ckpt_dir=args.pt_ckpt_dir
+		pt_ckpt_dir=args.pt_ckpt_dir,
+		enable_hugetlbfs=args.enable_hugetlbfs
 	)
 	
 	try:

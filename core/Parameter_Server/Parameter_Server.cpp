@@ -420,7 +420,7 @@ void Parameter_Server::Init(
     
     // Allocate shared pinned memory for weights
     void* weight_ptr = nullptr;
-    weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true);
+    weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true, this->enable_hugetlbfs);
     this->byte_size_ = byte_size;
     this->weight_ptr_ = weight_ptr;
 
@@ -437,8 +437,9 @@ void Parameter_Server::Init(
 
 
 
-Parameter_Server::Parameter_Server() {
+Parameter_Server::Parameter_Server(bool enable_hugetlbfs) {
     this->logger = init_logger("info", "Parameter_Server");
+    this->enable_hugetlbfs = enable_hugetlbfs;
 };
 // void Parameter_Server::Init(
 //     std::string& weight_shm_name, std::string& tensor_meta_shm_name,

@@ -995,7 +995,7 @@ def batchgen(
 			dist_init_addr = dist_init_addr,
 			local_rank = local_rank,
 			global_rank = global_rank,
-			world_size = nnodes * device_per_node,
+			world_size = nnodes * device_per_node
 		)
 		batchgens.append(batchgen_instance)
 	
