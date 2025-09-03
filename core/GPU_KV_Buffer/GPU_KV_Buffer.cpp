@@ -86,6 +86,9 @@ void GPU_KV_Buffer::init_kv_buffer() {
         // int64_t buffer_size =
         //     this->engine_config_.gpu_buffer_config.kv_buffer_num_tokens *
         //     this->model_config_.compressed_kv_dim * 2;
+        this->logger_->info(
+            "init_kv_buffer. Num K Buffers: {}",
+            this->engine_config_.gpu_buffer_config.num_k_buffer);
         int64_t buffer_size =
             this->engine_config_.gpu_buffer_config.kv_buffer_num_tokens *
             this->model_config_.compressed_kv_dim;
@@ -181,7 +184,7 @@ torch::Tensor GPU_KV_Buffer::get_k(int64_t layer_idx, int64_t micro_batch_idx,
     torch::Tensor k_tensor =
         torch::from_blob(this->k_buffers_[buffer_idx], tensor_shape,
                          // [](void*){},
-                         option).clone();
+                         option);
     CUDA_CHECK(cudaStreamSynchronize(0));
     // Check if k_tensor contains nan
     // if (torch::any(torch::isnan(k_tensor)).item<bool>()) {
@@ -234,15 +237,15 @@ torch::Tensor GPU_KV_Buffer::get_v(int64_t layer_idx, int64_t micro_batch_idx,
 };
 
 GPU_KV_Buffer::~GPU_KV_Buffer() {
-    // for (int64_t buffer_idx = 0;
-    //      buffer_idx < this->engine_config_.gpu_buffer_config.num_kv_buffer;
-    //      buffer_idx++) {
-    //     cudaFree(this->k_buffers_[buffer_idx]);
-    //     // v_buffer can be nullptr
-    //     if (this->v_buffers_[buffer_idx] != nullptr) {
-    //         cudaFree(this->v_buffers_[buffer_idx]);
-    //     }
-    // }
+    for (int64_t buffer_idx = 0;
+         buffer_idx < this->engine_config_.gpu_buffer_config.num_kv_buffer;
+         buffer_idx++) {
+        CUDA_CHECK(cudaFree(this->k_buffers_[buffer_idx]));
+        // v_buffer can be nullptr
+        if (this->v_buffers_[buffer_idx] != nullptr) {
+            CUDA_CHECK(cudaFree(this->v_buffers_[buffer_idx]));
+        }
+    }
 };
 
 void GPU_KV_Buffer::clear_kv_buffer() {

@@ -14,6 +14,7 @@ import torch.distributed as dist
 import time
 import torch 
 import gc
+from batchgen.utils import torch_gpu_mem_usage, get_gpu_memory_usage
 	
 
 
@@ -39,6 +40,7 @@ class Parallel_Strategy_Manager:
 		self.local_rank = local_rank
 		self.global_rank = global_rank
 		self.world_size = world_size
+		self.rank = global_rank
 		
 	def configure_prefill(self):
 		"""
@@ -278,7 +280,7 @@ class Parallel_Strategy_Manager:
 		return self.model, self.weight_copy_task
 
 
-	def pure_gpu_decoding(self, padding_bsz):
+	def pure_gpu_decoding(self, padding_bsz, comm=None):
 		"""
 			Beta 1: Load full mode into GPU.
 			Duplicate attention modules and shared experts in each dp worker.
@@ -286,11 +288,13 @@ class Parallel_Strategy_Manager:
 		"""
 		self.hf_model_config.phase = "decoding"
 		self.hf_model_config._attn_implementation = "eager"
+
 		self.model = None
 		torch.cuda.empty_cache()
-		self.model = DeepseekV3ForCausalLM._from_config(
-			self.hf_model_config
-		)
+		# self.model = DeepseekV3ForCausalLM._from_config(
+		# 	self.hf_model_config, comm
+		# )
+		self.model = DeepseekV3ForCausalLM(self.hf_model_config, comm)
 		""" In this case, empty copy task. """
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}

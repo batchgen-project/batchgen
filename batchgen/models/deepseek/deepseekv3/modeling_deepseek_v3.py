@@ -59,6 +59,7 @@ import torch.distributed as dist
 import numpy as np
 import os
 import triton
+import gc
 
 if is_flash_attn_2_available():
 	from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -1192,6 +1193,22 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.gate_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.gate_scale_list], dtype=torch.int64, device=self.device)
 			self.up_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.up_scale_list], dtype=torch.int64, device=self.device)
 			self.down_scale_ptrs_ptr = torch.tensor([s.data_ptr() for s in self.down_scale_list], dtype=torch.int64, device=self.device)
+	
+	def cleanup(self):
+		self.gate_list = None
+		self.up_list = None
+		self.down_list = None
+		self.gate_scale_list = None
+		self.up_scale_list = None
+		self.down_scale_list = None
+		self.gate_ptrs_ptr = None
+		self.up_ptrs_ptr = None
+		self.down_ptrs_ptr = None
+		self.gate_scale_ptrs_ptr = None
+		self.up_scale_ptrs_ptr = None
+		self.down_scale_ptrs_ptr = None
+		gc.collect()
+
 
 
 	def forward(self, hidden_states):
@@ -1283,8 +1300,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# logger.warning_once(f"Actuall num tokens per rank is {self.num_tokens_per_rank}")
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
-		self.token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
-		self.topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
+		token_idx = torch.arange(global_num_tokens, device=self.device).repeat_interleave(K)
+		topk_pos = torch.arange(K, device=self.device).repeat(global_num_tokens)
 		
 
 		device = x.device
@@ -1313,8 +1330,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		expanded_x  = global_x.repeat_interleave(K, dim=0)
 		sorted_eids, sort_idx = flat_eids.sort()
 		sorted_x   = expanded_x[sort_idx]
-		sorted_tok = self.token_idx[sort_idx]
-		sorted_pos = self.topk_pos[sort_idx]
+		sorted_tok = token_idx[sort_idx]
+		sorted_pos = topk_pos[sort_idx]
 
 		# ---- 3.2) Build tensor for local expert input sorted by expert id ----
 		"""
@@ -2995,7 +3012,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 		config: DeepseekV3Config
 	"""
 
-	def __init__(self, config: DeepseekV3Config):
+	def __init__(self, config: DeepseekV3Config, comm=None):
 		super().__init__(config)
 		self.padding_idx = config.pad_token_id
 		self.vocab_size = config.vocab_size
@@ -3003,29 +3020,29 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 		self.embed_tokens = nn.Embedding(
 			config.vocab_size, config.hidden_size, self.padding_idx
 		)
-		self.comm = None
-		if self.config.phase == "decoding":
-			from batchgen.distributed.utils import StatelessProcessGroup
-			from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
-			self.rank = dist.get_rank()
-			self.world_size = dist.get_world_size()
-			device = torch.device("cuda", self.rank % torch.cuda.device_count())
-			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-			try:
-				group = StatelessProcessGroup.create(
-					host=comm_master_addr,
-					port=20001,
-					rank=self.rank,
-					world_size=self.world_size,
-					data_expiration_seconds=6000,
-				)
-				self.comm = PyNcclCommunicator(
-					group=group,
-					device=device
-				)		
-			except Exception as e:
-				logger.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		self.comm = comm
+		# if self.config.phase == "decoding":
+		# 	from batchgen.distributed.utils import StatelessProcessGroup
+		# 	from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
+		# 	self.rank = dist.get_rank()
+		# 	self.world_size = dist.get_world_size()
+		# 	device = torch.device("cuda", self.rank % torch.cuda.device_count())
+		# 	comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+		# 	try:
+		# 		group = StatelessProcessGroup.create(
+		# 			host=comm_master_addr,
+		# 			port=20001,
+		# 			rank=self.rank,
+		# 			world_size=self.world_size,
+		# 			data_expiration_seconds=6000,
+		# 		)
+		# 		self.comm = PyNcclCommunicator(
+		# 			group=group,
+		# 			device=device
+		# 		)		
+		# 	except Exception as e:
+		# 		logger.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		# 		raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 			
 				
 	
@@ -3229,9 +3246,9 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 	_tied_weights_keys = ["lm_head.weight"]
 
-	def __init__(self, config):
+	def __init__(self, config, comm=None):
 		super().__init__(config)
-		self.model = DeepseekV3Model(config)
+		self.model = DeepseekV3Model(config, comm)
 		self.vocab_size = config.vocab_size
 		self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
