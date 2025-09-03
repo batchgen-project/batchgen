@@ -89,7 +89,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
              
     py::class_<Parameter_Server>(m, "Parameter_Server")
-        .def(py::init<>())
+        .def(py::init<bool>())
         .def("Init", &Parameter_Server::Init)
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)
