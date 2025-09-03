@@ -453,6 +453,7 @@ class DeepSeekV3_Initializer:
         self.local_rank = local_rank
         self.global_rank = global_rank
         self.world_size = world_size    
+        self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
 
         self.fp8_weights_IPC_handle = {}
 
@@ -722,7 +723,8 @@ class DeepSeekV3_Initializer:
             self.core_engine.Init(
                 self.shm_name,
                 self.tensor_meta_shm_name,
-                param_byte_size
+                param_byte_size,
+                self.enable_hugetlbfs
             )
             logging.info("Core engine initialized")
             

@@ -863,6 +863,7 @@ def batchgen(
 	nnodes: Optional[int] = 1,
 	node_rank: Optional[int] = 0,
 	device_per_node: Optional[int] = 8,
+	enable_hugetlbfs = False
 ):
 	"""
 	Run batchgen using the standalone parameter server.
@@ -894,6 +895,9 @@ def batchgen(
 
 	# Enable faulthandler to get stack traces on segfault
 	faulthandler.enable()
+
+	if enable_hugetlbfs:
+		os.environ["BATCHGEN_ENABLE_HUGETLBFS"] = "1"
 	
 	# Get model info from the parameter server - just retrieve existing info
 	logging.info(f"Connecting to parameter server at {parameter_server_host}:{parameter_server_port}")
@@ -995,7 +999,7 @@ def batchgen(
 			dist_init_addr = dist_init_addr,
 			local_rank = local_rank,
 			global_rank = global_rank,
-			world_size = nnodes * device_per_node
+			world_size = nnodes * device_per_node,
 		)
 		batchgens.append(batchgen_instance)
 	
