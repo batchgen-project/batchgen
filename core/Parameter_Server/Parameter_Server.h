@@ -60,7 +60,7 @@ struct tensor_meta {
 
 class Parameter_Server {
    public:
-    Parameter_Server();
+    Parameter_Server(bool enable_hugetlbfs);
     ~Parameter_Server();
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
               int64_t byte_size, std::string& model_weights_path,
