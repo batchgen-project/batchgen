@@ -77,7 +77,7 @@ if __name__ == "__main__":
 	queries = []
 	for row_idx, entry in dataset.iterrows():
 		prefix = prompts[entry['category']]
-		prompt = prefix + 'Q: ' + entry['question'] + '\n' + form_options(entry['options']) + '\n' 
+		prompt = 'Please read the following 5 examples: \n' + prefix + 'Please answer the following question: \n' + 'Q: ' + entry['question'] + '\n' + form_options(entry['options']) + '\n' 
 		queries.append(prompt)
 
 	tokenizer = AutoTokenizer.from_pretrained(

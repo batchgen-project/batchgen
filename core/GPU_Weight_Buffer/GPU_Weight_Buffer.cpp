@@ -168,7 +168,7 @@ void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     this->buffer_status_[module_type][buffer_idx] = 0;
 };
 
-const module_weight_tensor_map& GPU_Weight_Buffer::get_weights(
+module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     const std::string& module_name,
     std::string& phase) 
 {
