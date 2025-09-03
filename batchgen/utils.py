@@ -1,20 +1,20 @@
 import torch
-import pynvml
+# import pynvml
 import logging
 
 
-def get_gpu_memory_usage(device:int):
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(device)
-    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    pynvml.nvmlShutdown()
-    # return {
-    #     "total": mem_info.total / 1024**3,
-    #     "used": mem_info.used / 1024**3,
-    #     "free": mem_info.free / 1024**3,
-    #     "usage": mem_info.used / mem_info.total * 100
-    # }
-    return mem_info.total / 1024**3, mem_info.used / 1024**3, mem_info.free / 1024**3, mem_info.used / mem_info.total * 100
+# def get_gpu_memory_usage(device:int):
+#     pynvml.nvmlInit()
+#     handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+#     mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+#     pynvml.nvmlShutdown()
+#     # return {
+#     #     "total": mem_info.total / 1024**3,
+#     #     "used": mem_info.used / 1024**3,
+#     #     "free": mem_info.free / 1024**3,
+#     #     "usage": mem_info.used / mem_info.total * 100
+#     # }
+#     return mem_info.total / 1024**3, mem_info.used / 1024**3, mem_info.free / 1024**3, mem_info.used / mem_info.total * 100
 
 
 # def get_gpu_memory_usage():

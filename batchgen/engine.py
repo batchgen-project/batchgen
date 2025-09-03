@@ -45,7 +45,7 @@ from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausal
 from tqdm import trange
 import gc
 from datetime import timedelta
-from .utils import torch_gpu_mem_usage, get_gpu_memory_usage
+from .utils import torch_gpu_mem_usage
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
