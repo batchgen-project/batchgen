@@ -16,6 +16,7 @@ jobs:
   test-node0:
     name: MMLU Test Node0
     runs-on: [self-hosted, gpu, node0]
+    timeout-minutes: 5760
     steps:
       - name: Print runner info
         run: |
@@ -54,6 +55,7 @@ jobs:
   test-node1:
     name: MMLU Test Node1
     runs-on: [self-hosted, gpu, node1]
+    timeout-minutes: 5760
     steps:
       - name: Print runner info
         run: |
