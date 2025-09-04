@@ -60,7 +60,7 @@ class GPU_Weight_Buffer {
 
     // std::shared_ptr<module_weight_tensor_map> get_weights(
     //     const std::string& module_name);
-    const module_weight_tensor_map& get_weights(
+    module_weight_tensor_map get_weights(
             const std::string& module_name,
             std::string& phase);
 

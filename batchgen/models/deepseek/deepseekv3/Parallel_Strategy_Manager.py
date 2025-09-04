@@ -14,7 +14,7 @@ import torch.distributed as dist
 import time
 import torch 
 import gc
-from batchgen.utils import torch_gpu_mem_usage, get_gpu_memory_usage
+from batchgen.utils import torch_gpu_mem_usage
 	
 
 

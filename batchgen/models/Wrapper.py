@@ -312,15 +312,17 @@ class Attn_Wrapper(torch.nn.Module):
 						#     cur_attention_mask.to(cur_hidden_states.device),
 						#     position_ids.to(cur_hidden_states.device),
 						# )
-						# logging.info(f"Cur attention mask shape {cur_attention_mask.shape}")
-						# logging.info(f"Cur attention mask{cur_attention_mask[0].tolist()}")
+						# logging.debug(f"Cur attention mask shape {cur_attention_mask.shape}")
+						# logging.debug(f"Cur attention mask{cur_attention_mask[0].tolist()}")
 						# exit()
+						logging.debug(f"Rank {dist.get_rank()} - Entering prefill attention")
 						output = self.module.prefill_attn_w8a16(
 							cur_hidden_states,
 							cur_attention_mask.to(cur_hidden_states.device),
 							position_ids.to(cur_hidden_states.device),
 							self.weight_dequant_scale
 						)
+						logging.debug(f"Rank {dist.get_rank()} - Quiting prefill attention")
 						key_cache = output[1]
 						value_cache = torch.ones(
 							1,
