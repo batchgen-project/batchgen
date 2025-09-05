@@ -688,8 +688,8 @@ def mla_decoding_flashmla_attn_mode_3(
 			tile_scheduler_metadata,
 			num_splits,
 			# self.softmax_scale,
-			qk_head_dim ** -0.5,
-			True
+			# qk_head_dim ** -0.5,
+			casual = True
 		)
 	except Exception as e:
 		logging.error(f"Error in flash_mla_with_kvcache: {e}")
