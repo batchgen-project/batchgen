@@ -680,7 +680,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
 		cache_seqlens, 128, 1
 	)
-	logging.warning(f"qk_head_dim: {qk_head_dim}, num_heads: {self.num_heads}, self.softmax_scale: {self.softmax_scale}")
+	# logging.warning(f"qk_head_dim: {qk_head_dim}, num_heads: {self.num_heads}, self.softmax_scale: {self.softmax_scale}")
 	try:
 		attn_out, _ = flash_mla_with_kvcache(
 			query_states,
