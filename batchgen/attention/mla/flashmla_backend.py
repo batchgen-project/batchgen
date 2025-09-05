@@ -667,6 +667,7 @@ def mla_decoding_flashmla_attn_mode_3(
 
 	assert qk_head_dim == 576, f"qk_head_dim should be 576, but got {qk_head_dim}"
 	assert self.num_heads == 128, f"num_heads should be 128, but got {self.num_heads}"
+	
 
 	block_table = torch.arange(
 		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv.device
@@ -679,7 +680,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
 		cache_seqlens, 128, 1
 	)
-
+	logging.warning(f"qk_head_dim: {qk_head_dim}, num_heads: {self.num_heads}, self.softmax_scale: {self.softmax_scale}")
 	try:
 		attn_out, _ = flash_mla_with_kvcache(
 			query_states,
