@@ -665,6 +665,8 @@ def mla_decoding_flashmla_attn_mode_3(
 		bsz, 1, self.num_heads, qk_head_dim
 	)
 
+	assert qk_head_dim == 576, f"qk_head_dim should be 576, but got {qk_head_dim}"
+	assert self.num_heads == 128, f"num_heads should be 128, but got {self.num_heads}"
 
 	block_table = torch.arange(
 		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv.device
