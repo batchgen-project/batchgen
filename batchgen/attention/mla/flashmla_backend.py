@@ -687,7 +687,8 @@ def mla_decoding_flashmla_attn_mode_3(
 			512,
 			tile_scheduler_metadata,
 			num_splits,
-			self.softmax_scale,
+			# self.softmax_scale,
+			qk_head_dim ** -0.5,
 			True
 		)
 	except Exception as e:
