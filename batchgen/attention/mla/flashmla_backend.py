@@ -689,7 +689,7 @@ def mla_decoding_flashmla_attn_mode_3(
 			num_splits,
 			# self.softmax_scale,
 			# qk_head_dim ** -0.5,
-			casual = True
+			causal = True
 		)
 	except Exception as e:
 		logging.error(f"Error in flash_mla_with_kvcache: {e}")
