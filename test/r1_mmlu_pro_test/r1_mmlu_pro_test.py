@@ -51,7 +51,8 @@ if __name__ == "__main__":
 	logging.info(f"Loading dataset {benchmark_name}")
 	dataset = pd.read_parquet(os.path.join(os.path.dirname(__file__), 'mmlu_pro_test.parquet'))	
 	if args.max_prompts != 0:
-		dataset = dataset.head(args.max_prompts)
+		# dataset = dataset.head(args.max_prompts)
+		dataset = dataset[3105:3105+args.max_prompts]
 
 	def form_options(options: list):
 		option_str = 'Options are:\n'
