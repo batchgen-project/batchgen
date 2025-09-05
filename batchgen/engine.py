@@ -46,6 +46,7 @@ from tqdm import trange
 import gc
 from datetime import timedelta
 from .utils import torch_gpu_mem_usage
+from .sampling import greedy_decode, sample_with_temperature_top_p
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -1042,8 +1043,6 @@ def batchgen(
 	all_results = [item for result in all_results for item in result]
 	return all_results
 
-
-
 class BatchGen:
 	def __init__(
 		self,
@@ -1688,21 +1687,13 @@ class BatchGen:
 
 	def _config_prefill(self):
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
-		logging.info(f"Rank: {self.rank} configure_prefill done.")
 		self.set_phase("prefill")
-		logging.info(f"Rank: {self.rank} set phase to prefill.")
 		self.core_engine.stop_h2d_worker()
-		logging.info(f"Rank: {self.rank} stop h2d worker.")
 		self.core_engine.clear_weight_copy_queue()
-		logging.info(f"Rank: {self.rank} clear weight copy queue.")
 		self.core_engine.reset_prefill_buffer()
-		logging.info(f"Rank: {self.rank} reset_prefill_buffer.")
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-		logging.info(f"Rank: {self.rank} set_weight_copy_queue.")
 		self.core_engine.clear_kv_storage()
-		logging.info(f"Rank: {self.rank} clear_kv_storage.")
 		self.core_engine.start_h2d_worker()
-		logging.info(f"Rank: {self.rank} start_h2d_worker.")
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
@@ -1824,8 +1815,13 @@ class BatchGen:
 					use_cache=False,
 				)
 				# Greedy
-				new_tokens = torch.argmax(
-					outputs.logits[:, -1, :], dim=-1
+				# new_tokens = torch.argmax(
+				# 	outputs.logits[:, -1, :], dim=-1
+				# ).view(-1, 1)
+				new_tokens = sample_with_temperature_top_p(
+					outputs.logits[:, -1, :],
+					temperature=0.6,
+					top_p=0.95,
 				).view(-1, 1)
 				output_tokens.append(new_tokens)
 
