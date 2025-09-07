@@ -2182,7 +2182,8 @@ class DeepseekV3Attention(nn.Module):
 		)
 		self._init_rope()
 
-		self.softmax_scale = self.q_head_dim ** (-0.5)
+		# self.softmax_scale = self.q_head_dim ** (-0.5)
+		self.softmax_scale = 576 ** (-0.5)  # use fixed scale to match DeepseekV3
 		if self.config.rope_scaling is not None:
 			mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
 			scaling_factor = self.config.rope_scaling["factor"]
