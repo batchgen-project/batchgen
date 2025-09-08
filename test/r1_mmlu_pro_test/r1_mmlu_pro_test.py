@@ -95,6 +95,12 @@ if __name__ == "__main__":
 	
 	
 	logging.info(f"Loaded {len(queries)} samples from the dataset.")
+	# Log the longest query length
+	# logging.info(f"Longest query length: {max([len(q.split(' ')) for q in queries])} tokens")
+	tokenized = tokenizer.encode(queries, add_special_tokens=True)
+	logging.info(f"Longest query length: {max([len(t) for t in tokenized])} tokens")
+
+
 	"""
 		Step 3: Launch BatchGen using the standalone parameter server
 	"""
