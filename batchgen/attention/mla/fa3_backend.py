@@ -309,7 +309,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		cu_seqlens_k=cu_seqlens_k,
 		max_seqlen_q=max_seqlen_in_batch_q,
 		max_seqlen_k=max_seqlen_in_batch_k,
-		softmax_scale=self.softmax_scale,
+		softmax_scale=self.qkv_materialized_softmax_scale,
 		# softmax_scale=self.q_head_dim ** (-0.5),
 		causal=True
 	)
