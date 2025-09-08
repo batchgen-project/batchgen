@@ -922,6 +922,8 @@ def parse_args():
 
 if __name__ == "__main__":
 	args = parse_args()
+	if args.enable_hugetlbfs:
+		os.environ["BATCHGEN_ENABLE_HUGETLBFS"] = "1"
 	
 	server = ParameterServer(
 		host=args.host,
