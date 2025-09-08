@@ -1815,14 +1815,14 @@ class BatchGen:
 					use_cache=False,
 				)
 				# Greedy
-				# new_tokens = torch.argmax(
-				# 	outputs.logits[:, -1, :], dim=-1
-				# ).view(-1, 1)
-				new_tokens = sample_with_temperature_top_p(
-					outputs.logits[:, -1, :],
-					temperature=0.6,
-					top_p=0.95,
+				new_tokens = torch.argmax(
+					outputs.logits[:, -1, :], dim=-1
 				).view(-1, 1)
+				# new_tokens = sample_with_temperature_top_p(
+				# 	outputs.logits[:, -1, :],
+				# 	temperature=0.6,
+				# 	top_p=0.95,
+				# ).view(-1, 1)
 				output_tokens.append(new_tokens)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
