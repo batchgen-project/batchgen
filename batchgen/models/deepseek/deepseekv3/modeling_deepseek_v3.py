@@ -2183,13 +2183,21 @@ class DeepseekV3Attention(nn.Module):
 		self._init_rope()
 
 		# self.softmax_scale = self.q_head_dim ** (-0.5)
-		self.softmax_scale = 576 ** (-0.5)  # use fixed scale to match DeepseekV3
+		# self.softmax_scale = 576 ** (-0.5)  # use fixed scale to match DeepseekV3
+		self.qkv_materialized_softmax_scale = (self.q_head_dim) ** -0.5
+		self.qkv_unmaterialized_softmax_scale = (576) ** -0.5
 		if self.config.rope_scaling is not None:
 			mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
 			scaling_factor = self.config.rope_scaling["factor"]
 			if mscale_all_dim:
 				mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-				self.softmax_scale = self.softmax_scale * mscale * mscale
+				# self.softmax_scale = self.softmax_scale * mscale * mscale
+				self.qkv_materialized_softmax_scale = (
+					self.qkv_materialized_softmax_scale * mscale * mscale
+				)
+				self.qkv_unmaterialized_softmax_scale = (
+					self.qkv_unmaterialized_softmax_scale * mscale * mscale
+				)
 
 
 	def initialize(self):
