@@ -691,8 +691,8 @@ def mla_decoding_flashmla_attn_mode_3(
 			tile_scheduler_metadata,
 			num_splits,
 			# self.softmax_scale,
-			softmax_scale=self.qkv_materialized_softmax_scale,
-			# qk_head_dim ** -0.5,
+			# softmax_scale=self.qkv_materialized_softmax_scale,
+			192 ** -0.5,
 			causal = True
 		)
 	except Exception as e:
