@@ -98,8 +98,17 @@ if __name__ == "__main__":
 	logging.info(f"Loaded {len(queries)} samples from the dataset.")
 	# Log the longest query length
 	# logging.info(f"Longest query length: {max([len(q.split(' ')) for q in queries])} tokens")
-	tokenized = tokenizer.encode(queries, add_special_tokens=True)
-	logging.info(f"Longest query length: {max([len(t) for t in tokenized])} tokens")
+	tokenized = tokenizer(
+		queries, 
+		add_special_tokens=True,
+		padding=True,          # Pads sentences to the same length in the batch
+		truncation=True,       # Truncates sentences that are too long
+		max_length=args.max_input_length         # Specify a max length for truncation
+	)
+
+	# Note: The output 'tokenized' is now a dictionary containing 'input_ids', 'attention_mask', etc.
+	# To get the lengths, you access the 'input_ids' key.
+	logging.info(f"Longest query length: {max([len(t) for t in tokenized['input_ids']])} tokens")
 
 
 	"""
