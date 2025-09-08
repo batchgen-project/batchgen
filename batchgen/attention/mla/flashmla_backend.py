@@ -682,9 +682,9 @@ def mla_decoding_flashmla_attn_mode_3(
 		cache_seqlens, 128, 1
 	)
 	# logging.warning(f"qk_head_dim: {qk_head_dim}, num_heads: {self.num_heads}, self.softmax_scale: {self.softmax_scale}")
-	softmax_scale = 192 ** -0.5
-	mscale = 0.1 * math.log(40) + 1.0
-	softmax_scale = softmax_scale * mscale * mscale
+	# softmax_scale = 192 ** -0.5
+	# mscale = 0.1 * math.log(40) + 1.0
+	# softmax_scale = softmax_scale * mscale * mscale
 	try:
 		attn_out, _ = flash_mla_with_kvcache(
 			query_states,
@@ -694,10 +694,7 @@ def mla_decoding_flashmla_attn_mode_3(
 			512,
 			tile_scheduler_metadata,
 			num_splits,
-			softmax_scale,
-			# self.softmax_scale,
-			# softmax_scale=self.qkv_materialized_softmax_scale,
-			# 192 ** -0.5,
+			self.softmax_scale,
 			causal = True
 		)
 	except Exception as e:
