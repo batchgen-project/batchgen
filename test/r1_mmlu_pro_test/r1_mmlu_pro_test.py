@@ -250,60 +250,60 @@ if __name__ == "__main__":
 	# --- Step 2: Main Evaluation Logic ---
 	# These variables are assumed to be defined elsewhere in your script
 	# tokenizer, answer_set, dataset, decode_to_eos
+	if args.node_rank == 0:  
+		# Initialize counters for a detailed summary
+		success = 0
+		extraction_failures = 0
+		no_think_tag_count = 0
+		predictions = []
+		ground_truths = dataset['answer'].tolist()
+		total_samples = len(answer_set)
 
-	# Initialize counters for a detailed summary
-	success = 0
-	extraction_failures = 0
-	no_think_tag_count = 0
-	predictions = []
-	ground_truths = dataset['answer'].tolist()
-	total_samples = len(answer_set)
+		# Process each sample
+		for i in range(total_samples):
+			# Decode the model's raw output to a string
+			model_output = decode_to_eos(tokenizer, answer_set[i].tolist())
 
-	# Process each sample
-	for i in range(total_samples):
-		# Decode the model's raw output to a string
-		model_output = decode_to_eos(tokenizer, answer_set[i].tolist())
+			# Use the refined function to extract the answer
+			extracted_answer, was_think_tag_found = extract_prediction(model_output)
 
-		# Use the refined function to extract the answer
-		extracted_answer, was_think_tag_found = extract_prediction(model_output)
+			# Log if the <think> tag was missing
+			if not was_think_tag_found:
+				no_think_tag_count += 1
+				logging.warning(f"Sample {i}: No </think> tag found.")
 
-		# Log if the <think> tag was missing
-		if not was_think_tag_found:
-			no_think_tag_count += 1
-			logging.warning(f"Sample {i}: No </think> tag found.")
+			# Determine the final prediction, guessing if extraction failed
+			if extracted_answer:
+				prediction = extracted_answer
+			else:
+				extraction_failures += 1
+				logging.warning(f"Sample {i}: Could not extract answer. Making a random guess.")
+				# Fallback to a random guess if the pattern isn't found
+				prediction = random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
 
-		# Determine the final prediction, guessing if extraction failed
-		if extracted_answer:
-			prediction = extracted_answer
-		else:
-			extraction_failures += 1
-			logging.warning(f"Sample {i}: Could not extract answer. Making a random guess.")
-			# Fallback to a random guess if the pattern isn't found
-			prediction = random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
+			predictions.append(prediction)
 
-		predictions.append(prediction)
+			# Check if the prediction was correct
+			if prediction == ground_truths[i]:
+				success += 1
 
-		# Check if the prediction was correct
-		if prediction == ground_truths[i]:
-			success += 1
+		# --- Step 3: Calculate and Display Results ---
+		accuracy = success / total_samples if total_samples > 0 else 0
 
-	# --- Step 3: Calculate and Display Results ---
-	accuracy = success / total_samples if total_samples > 0 else 0
+		# Print a comprehensive summary
+		print("\n--- ✅ Evaluation Summary ---")
+		print(f"Total Samples: {total_samples}")
+		print(f"✅ Correct: {success}")
+		print(f"❌ Incorrect: {total_samples - success}")
+		print("-" * 30)
+		print(f"🎯 Accuracy: {accuracy:.2%}")
+		print("-" * 30)
+		# This is the log you requested, plus additional helpful metrics
+		print(f"⚠️ Outputs missing '</think>' tag: {no_think_tag_count} ({no_think_tag_count / total_samples:.2%})")
+		print(f"❓ Extraction Failures (random guess used): {extraction_failures} ({extraction_failures / total_samples:.2%})")
+		print("---------------------------------\n")
 
-	# Print a comprehensive summary
-	print("\n--- ✅ Evaluation Summary ---")
-	print(f"Total Samples: {total_samples}")
-	print(f"✅ Correct: {success}")
-	print(f"❌ Incorrect: {total_samples - success}")
-	print("-" * 30)
-	print(f"🎯 Accuracy: {accuracy:.2%}")
-	print("-" * 30)
-	# This is the log you requested, plus additional helpful metrics
-	print(f"⚠️ Outputs missing '</think>' tag: {no_think_tag_count} ({no_think_tag_count / total_samples:.2%})")
-	print(f"❓ Extraction Failures (random guess used): {extraction_failures} ({extraction_failures / total_samples:.2%})")
-	print("---------------------------------\n")
-
-	# Assert the final accuracy against the required threshold
-	assert accuracy >= 0.80, f"Test Failed: Accuracy of {accuracy:.2%} is below the 80% threshold."
-	
+		# Assert the final accuracy against the required threshold
+		assert accuracy >= 0.80, f"Test Failed: Accuracy of {accuracy:.2%} is below the 80% threshold."
 		
+			
