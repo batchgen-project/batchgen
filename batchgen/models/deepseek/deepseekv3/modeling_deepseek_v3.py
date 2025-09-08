@@ -2198,7 +2198,7 @@ class DeepseekV3Attention(nn.Module):
 				self.qkv_unmaterialized_softmax_scale = (
 					self.qkv_unmaterialized_softmax_scale * mscale * mscale
 				)
-
+		self.softmax_scale = self.qkv_materialized_softmax_scale
 
 	def initialize(self):
 		if self.config.phase == "decoding":
