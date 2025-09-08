@@ -454,6 +454,7 @@ class DeepSeekV3_Initializer:
         self.global_rank = global_rank
         self.world_size = world_size    
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
+        logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
         self.fp8_weights_IPC_handle = {}
 

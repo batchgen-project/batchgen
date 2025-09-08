@@ -897,8 +897,10 @@ def batchgen(
 	# Enable faulthandler to get stack traces on segfault
 	faulthandler.enable()
 
-	if enable_hugetlbfs:
-		os.environ["BATCHGEN_ENABLE_HUGETLBFS"] = "1"
+	# if enable_hugetlbfs:
+	# 	os.environ["BATCHGEN_ENABLE_HUGETLBFS"] = "1"
+	logging.info(f"environ BATCHGEN_ENABLE_HUGETLBFS: {os.environ.get('BATCHGEN_ENABLE_HUGETLBFS', '0')}")
+
 	
 	# Get model info from the parameter server - just retrieve existing info
 	logging.info(f"Connecting to parameter server at {parameter_server_host}:{parameter_server_port}")

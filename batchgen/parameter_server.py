@@ -924,7 +924,9 @@ if __name__ == "__main__":
 	args = parse_args()
 	if args.enable_hugetlbfs:
 		os.environ["BATCHGEN_ENABLE_HUGETLBFS"] = "1"
-	
+	logging.info(f"Starting Parameter Server on {args.host}:{args.port}")
+	logging.info(f"Enable hugetlbfs: {os.environ.get('BATCHGEN_ENABLE_HUGETLBFS', '0')}")
+
 	server = ParameterServer(
 		host=args.host,
 		port=args.port,
