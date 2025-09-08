@@ -139,8 +139,8 @@ if __name__ == "__main__":
 	if print_result:
 		for idx in range(len(answer_set)):
 		# for idx in range(4):
-			# tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
-			tmp_answer = tokenizer.decode(answer_set[idx].tolist(), skip_special_tokens=False)
+			tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
+			# tmp_answer = tokenizer.decode(answer_set[idx].tolist(), skip_special_tokens=False)
 			# print(f"Prompt {idx}: {queries[idx][:args.max_input_length]}")
 			print("==================================================================")
 			print(f"Query {idx}: {queries[idx][:args.max_input_length]}")
@@ -178,8 +178,8 @@ if __name__ == "__main__":
 	answers = []
 	ground_truths = dataset['answer'].tolist()
 	for answer_idx in range(len(answer_set)):
-		# pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist())
-		pred_answer = tokenizer.decode(answer_set[answer_idx].tolist(), skip_special_tokens=False)
+		pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist())
+		# pred_answer = tokenizer.decode(answer_set[answer_idx].tolist(), skip_special_tokens=False)
 		prediction = get_prediction(pred_answer, answer_idx)
 		answers.append(prediction)
 
