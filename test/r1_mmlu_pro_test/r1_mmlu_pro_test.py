@@ -178,7 +178,8 @@ if __name__ == "__main__":
 	answers = []
 	ground_truths = dataset['answer'].tolist()
 	for answer_idx in range(len(answer_set)):
-		pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist())
+		# pred_answer = decode_to_eos(tokenizer, answer_set[answer_idx].tolist())
+		pred_answer = tokenizer.decode(answer_set[answer_idx].tolist(), skip_special_tokens=False)
 		prediction = get_prediction(pred_answer, answer_idx)
 		answers.append(prediction)
 
