@@ -155,8 +155,8 @@ if __name__ == "__main__":
 	if print_result:
 		for idx in range(len(answer_set)):
 		# for idx in range(4):
-			tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
-			# tmp_answer = tokenizer.decode(answer_set[idx].tolist(), skip_special_tokens=False)
+			# tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
+			tmp_answer = tokenizer.decode(answer_set[idx].tolist(), skip_special_tokens=True)
 			# print(f"Prompt {idx}: {queries[idx][:args.max_input_length]}")
 			print("==================================================================")
 			print(f"Query {idx}: {queries[idx]}")
