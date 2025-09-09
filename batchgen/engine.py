@@ -1321,6 +1321,7 @@ class BatchGen:
 				max_length=self.max_input_length,
 				truncation=True,
 				padding="max_length",
+				add_special_tokens=True,
 			)
 			query_instance.encoded = tokenized_query
 			extended_size = self.max_input_length + self.max_decoding_length
@@ -1538,18 +1539,6 @@ class BatchGen:
 				self.core_engine.clear_kv_storage()
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
-				# del past_key_states
-				# del scale_dict
-				# gc.collect()
-				
-				
-				# if self.rank == 0:
-				# 	# check_large_tensors()
-				# 	allocated_memory = torch.cuda.memory_allocated(self.torch_device)
-				# 	logging.info(
-				# 		f"Rank: {self.rank} Decoding done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
-				# 	)
-				dist.barrier()
 		else:
 			# For small input batch, some worker might do not have any input.
 			# In this case, it only participate in the decoding phase.
@@ -1577,7 +1566,7 @@ class BatchGen:
 
 
 		
-		# dist.barrier()
+		dist.barrier()
 		self.model = None 
 		# torch.cuda.empty_cache()
 
