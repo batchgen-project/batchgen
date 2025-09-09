@@ -214,7 +214,7 @@ def w8a16_gemm(
 	return out
 
 @torch.inference_mode()
-def mla_prefill_flashattention3_w8a16_deepgemm(
+def mla_prefill_flashattention3_w8a16_deepgemm_bak(
 	self,
 	hidden_states: torch.Tensor,
 	attention_mask: torch.Tensor,
@@ -329,9 +329,9 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 
 	return attn_output, offload_kv
 
-
+# mla_prefill_w8a16_deepgemm
 @torch.inference_mode()
-def mla_prefill_w8a16_deepgemm(
+def mla_prefill_flashattention3_w8a16_deepgemm(
 	self,
 	hidden_states: torch.Tensor,
 	attention_mask: torch.Tensor,
