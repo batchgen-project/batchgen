@@ -603,8 +603,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	# max_seqlen = cache_seqlens.max().item()
 	
 	# _,max_seq_len, _ = past_key_states.size()
-	# compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
-	compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
+	compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
+	# compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
 	max_seqlen_pad = compressed_kv.size(1)
 
 	# q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
