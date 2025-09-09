@@ -279,7 +279,10 @@ if __name__ == "__main__":
 				extraction_failures += 1
 				logging.warning(f"Sample {i}: Could not extract answer. Making a random guess.")
 				# Fallback to a random guess if the pattern isn't found
-				prediction = random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
+				# prediction = random.choice(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
+
+				# Just mark as incorrect instead of random guess
+				prediction = "Z"  # Invalid answer to ensure it's counted as incorrect
 
 			predictions.append(prediction)
 
