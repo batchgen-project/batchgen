@@ -603,8 +603,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	# max_seqlen = cache_seqlens.max().item()
 	
 	# _,max_seq_len, _ = past_key_states.size()
-	compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
-	# compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
+	# compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
+	compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
 	max_seqlen_pad = compressed_kv.size(1)
 
 	# q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
@@ -681,10 +681,6 @@ def mla_decoding_flashmla_attn_mode_3(
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
 		cache_seqlens, 128, 1
 	)
-	# logging.warning(f"qk_head_dim: {qk_head_dim}, num_heads: {self.num_heads}, self.softmax_scale: {self.softmax_scale}")
-	# softmax_scale = 192 ** -0.5
-	# mscale = 0.1 * math.log(40) + 1.0
-	# softmax_scale = softmax_scale * mscale * mscale
 	try:
 		attn_out, _ = flash_mla_with_kvcache(
 			query_states,
