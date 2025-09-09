@@ -149,7 +149,7 @@ if __name__ == "__main__":
 		valid_eos_positions = eos_positions[eos_positions >= min_tokens]
 		
 		end_pos = valid_eos_positions[0] if len(valid_eos_positions) > 0 else len(tokens_array)
-		return tokenizer.decode(tokens[:end_pos], skip_special_tokens=False)
+		return tokenizer.decode(tokens[:end_pos], skip_special_tokens=True)
 
 	print_result = True
 	if print_result:
@@ -298,7 +298,6 @@ if __name__ == "__main__":
 		print("-" * 30)
 		print(f"🎯 Accuracy: {accuracy:.2%}")
 		print("-" * 30)
-		# This is the log you requested, plus additional helpful metrics
 		print(f"⚠️ Outputs missing '</think>' tag: {no_think_tag_count} ({no_think_tag_count / total_samples:.2%})")
 		print(f"❓ Extraction Failures (random guess used): {extraction_failures} ({extraction_failures / total_samples:.2%})")
 		print("---------------------------------\n")
