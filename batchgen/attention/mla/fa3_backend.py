@@ -418,7 +418,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		value_states.view(bsz, seq_len, self.num_heads, self.v_head_dim).transpose(1, 2),
 		attn_mask=attention_mask,
 		dropout_p=0.0,
-		scale=self.softmax_scale,
+		# scale=self.softmax_scale,
 		is_causal=True,
 	).transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.v_head_dim)
 
