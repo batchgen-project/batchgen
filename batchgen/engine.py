@@ -1577,9 +1577,9 @@ class BatchGen:
 
 
 		
-		dist.barrier()
+		# dist.barrier()
 		self.model = None 
-		torch.cuda.empty_cache()
+		# torch.cuda.empty_cache()
 
 		logging.info(
 			f"Rank {self.rank} Prefill total time: {prefill_time:.1f} seconds,\n"
