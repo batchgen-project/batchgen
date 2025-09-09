@@ -563,7 +563,7 @@ def mla_decoding_flashmla_attn_mode_3_(
 
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3(
+def mla_decoding_flashmla_attn_mode_3_bak(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
@@ -709,6 +709,143 @@ def mla_decoding_flashmla_attn_mode_3(
 	attn_output = self.o_proj(attn_output)
 
 	return attn_output, past_key_states, scale
+
+# mla_decoding_torch_attn
+@torch.inference_mode()
+def mla_decoding_flashmla_attn_mode_3(
+    self,
+    hidden_states: torch.Tensor,
+    past_key_states: torch.Tensor,
+    past_value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    q_position_ids: torch.Tensor,
+    scale: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen: int,
+    weight_scale: dict = None
+):
+    """
+    MLA decoding function using torch.matmul as the attention mechanism backend.
+
+    This function serves as a vanilla PyTorch alternative to the FlashMLA implementation,
+    making the logic more transparent and easier to debug, though potentially at the
+    cost of performance.
+
+    Args:
+        hidden_states (torch.Tensor): Input hidden states of shape (batch_size, 1, hidden_size).
+        past_key_states (torch.Tensor): Past key states cache of shape (batch_size, max_seqlen, kv_dim).
+        past_value_states (torch.Tensor): None. Placeholder for API consistency.
+        attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
+        q_position_ids (torch.Tensor): Position IDs for the query, shape (batch_size, 1).
+        scale (torch.Tensor): Scale tensor for KV cache dequantization.
+        cache_seqlens (torch.Tensor): Tensor containing the sequence length of each item in the batch.
+        max_seqlen (int): The maximum sequence length allocated in the cache.
+        weight_scale (dict, optional): Scales for model weight dequantization. Defaults to None.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
+            - attn_output (torch.Tensor): The output of the attention mechanism.
+            - past_key_states (torch.Tensor): The updated key states cache.
+            - scale (torch.Tensor): The updated scale tensor for the cache.
+    """
+    assert attention_mask.dim() == 2
+    bsz, _ = attention_mask.size()
+
+    # [START] Common Logic with FlashMLA version
+    # This section for preparing Q, K, V and updating the cache is identical to the original function.
+    
+    # Dequantize the compressed KV cache to get the full key-value states
+    compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
+    max_seqlen_pad = compressed_kv.size(1)
+
+    # Calculate query states (q)
+    q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    q = q.view(bsz, 1, self.num_heads, self.q_head_dim).transpose(1, 2)
+    q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+    # Calculate the new key-value pair to be added to the cache
+    new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+    kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
+    
+    # Apply rotary position embeddings
+    cos, sin = self.rotary_emb(k_pe, seq_len=max_seqlen_pad)
+    k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
+    q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+    
+    kv = self.kv_a_layernorm(kv)
+    k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
+    
+    # Concatenate and update the cache
+    offload_kv = torch.cat([kv, k_pe], dim=-1)
+    batch_indices = torch.arange(bsz, device=hidden_states.device)
+    compressed_kv[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
+    
+    # Quantize and write back to the past_key_states tensor for the next iteration
+    new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+    past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+    scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+    
+    # Prepare projections for query and value
+    kv_b_proj = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
+    q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+    out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+    # Construct the final query states
+    qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+    query_states = torch.empty(
+        bsz, self.num_heads, 1, qk_head_dim,
+        dtype=compressed_kv.dtype,
+        device=compressed_kv.device,
+    )
+    query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+    query_states[:, :, :, self.kv_lora_rank :] = q_pe
+    # [END] Common Logic with FlashMLA version
+
+    # [START] Vanilla Torch Attention Calculation
+    # This section replaces the call to `flash_mla_with_kvcache`.
+    
+    # Reshape key cache for matrix multiplication. Shape: (bsz, num_heads, max_seqlen_pad, qk_head_dim)
+    key_states = compressed_kv.view(bsz, max_seqlen_pad, qk_head_dim).unsqueeze(1)
+    
+    # 1. Calculate Attention Scores (Q @ K.T)
+    # query_states: (bsz, num_heads, 1, qk_head_dim)
+    # key_states.transpose: (bsz, num_heads, qk_head_dim, max_seqlen_pad)
+    # attn_scores: (bsz, num_heads, 1, max_seqlen_pad)
+    attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.softmax_scale
+    
+    # 2. Apply Attention Mask
+    # Create a casual mask to prevent attention to future tokens.
+    mask = torch.arange(max_seqlen_pad, device=query_states.device)[None, None, :] < cache_seqlens[:, None, None]
+    mask = mask.unsqueeze(1) # expand for num_heads dimension
+    attn_scores = attn_scores.masked_fill(~mask, torch.finfo(attn_scores.dtype).min)
+
+    # 3. Calculate Attention Probabilities (Softmax)
+    attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+    # 4. Calculate weighted sum of the LoRA part of the Key
+    # The value matrix is implicitly constructed by projecting the weighted sum of K_lora.
+    key_lora, _ = torch.split(key_states, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    # attn_probs: (bsz, num_heads, 1, max_seqlen_pad)
+    # key_lora: (bsz, num_heads, max_seqlen_pad, kv_lora_rank)
+    # attn_out_lora: (bsz, num_heads, 1, kv_lora_rank)
+    attn_out_lora = torch.matmul(attn_probs, key_lora)
+    
+    # 5. Project the weighted sum to get the final attention output
+    # attn_out_lora: (bsz, num_heads, 1, kv_lora_rank)
+    # out_absorb.transpose: (num_heads, kv_lora_rank, v_head_dim)
+    # attn_output: (bsz, num_heads, 1, v_head_dim)
+    attn_output = torch.matmul(attn_out_lora, out_absorb.transpose(-1, -2))
+    # [END] Vanilla Torch Attention Calculation
+
+    # [START] Common Final Projection
+    # This section is identical to the original function.
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.view(bsz, 1, self.num_heads * self.v_head_dim)
+    attn_output = self.o_proj(attn_output)
+    # [END] Common Final Projection
+
+    return attn_output, past_key_states, scale
 
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_bak(
