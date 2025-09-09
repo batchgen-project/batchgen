@@ -1893,7 +1893,8 @@ class BatchGen:
 					#     )[:, -1].unsqueeze(-1)
 
 					Attn_Wrapper.attention_mask = attention_mask
-					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+					# Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+					Attn_Wrapper.position_ids = (attention_mask.sum(-1)).unsqueeze(-1)
 					Attn_Wrapper.cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
 					Attn_Wrapper.max_seqlen = Attn_Wrapper.cache_seqlens.max().item()
 
