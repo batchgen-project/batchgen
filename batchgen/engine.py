@@ -1539,6 +1539,11 @@ class BatchGen:
 				self.core_engine.clear_kv_storage()
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
+				del past_key_states
+				del past_value_states
+				del scale_dict
+				gc.collect()
+				torch.cuda.empty_cache()
 		else:
 			# For small input batch, some worker might do not have any input.
 			# In this case, it only participate in the decoding phase.
