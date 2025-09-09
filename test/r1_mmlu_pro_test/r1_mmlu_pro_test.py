@@ -159,7 +159,7 @@ if __name__ == "__main__":
 			# tmp_answer = tokenizer.decode(answer_set[idx].tolist(), skip_special_tokens=False)
 			# print(f"Prompt {idx}: {queries[idx][:args.max_input_length]}")
 			print("==================================================================")
-			print(f"Query {idx}: {queries[idx][:args.max_input_length]}")
+			print(f"Query {idx}: {queries[idx]}")
 			print("\n\n")
 			print(f"Answer {idx}: {tmp_answer}")
 			print("==================================================================")
