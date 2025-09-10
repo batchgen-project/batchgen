@@ -1307,7 +1307,7 @@ class BatchGen:
 		self.query_book = {
 			query_idx: query(
 				text=text,
-				decoded_tokens=torch.zeros(
+				decoded_tokens=torch.ones(
 					1, self.max_decoding_length, dtype=torch.int64
 				),
 			)
@@ -1842,7 +1842,7 @@ class BatchGen:
 		"""
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
-		new_token_idx = 2
+		new_token_idx = 1
 		# attention_mask = torch.cat([self.query_book[query_idx].encoded["attention_mask"][:,:self.max_max_input_length + new_token_idx] for query_idx in batch], dim=0)
 		# if attention_mask.dim() == 2 and (self.model_config.model_type not in ["Qwen2"]):
 		#  	attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
