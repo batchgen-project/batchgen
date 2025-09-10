@@ -1496,6 +1496,12 @@ class BatchGen:
 				self._unregister_fp8_weights()
 				dist.barrier()
 
+				# log new_tokens from prefill:
+				if self.rank == 0:
+					logging.info(
+						f"Model batch {model_batch_idx} prefill new tokens: {new_token.squeeze().tolist()}"
+					)
+
 
 				# Random create new token.
 				# new_token = torch.randint(
