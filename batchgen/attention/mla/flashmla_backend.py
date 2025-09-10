@@ -802,18 +802,23 @@ def mla_decoding_flashmla_attn_mode_3(
     kv_nope = self.kv_a_layernorm(kv_nope)
 
     # --- 6. Apply Rotary Position Embeddings (RoPE) ---
-    # FIXED: Use consistent position encoding approach
     # Create position_ids for all tokens in the sequence (0, 1, 2, ..., kv_len-1)
     position_ids_full = torch.arange(kv_len, device=q_position_ids.device).unsqueeze(0).expand(bsz, -1)
     
-    # Prepare k_pe for RoPE application
-    k_pe_for_rope = k_pe.view(bsz, 1, kv_len, self.qk_rope_head_dim)
+    # Prepare k_pe for RoPE application - it needs to have 4 dimensions (b, h, s, d)
+    # k_pe currently has shape (bsz, kv_len, qk_rope_head_dim)
+    # We need to add a num_heads dimension and expand it
+    k_pe_for_rope = k_pe.unsqueeze(1).expand(-1, self.num_heads, -1, -1)  # (bsz, num_heads, kv_len, qk_rope_head_dim)
+    
+    # Generate cos and sin for the max sequence length
     cos, sin = self.rotary_emb(k_pe_for_rope, seq_len=kv_len)
-
-    # Apply RoPE to keys using full position sequence
-    k_pe_rotated = rotary_pos_emb(k_pe_for_rope, cos, sin, position_ids_full.unsqueeze(1))
+    
+    # Apply RoPE to keys
+    # position_ids_full has shape (bsz, kv_len) - this is what rotary_pos_emb expects for indexing
+    k_pe_rotated = rotary_pos_emb(k_pe_for_rope, cos, sin, position_ids_full)
     
     # Apply RoPE to queries using their actual position
+    # q_pe has shape (bsz, num_heads, 1, qk_rope_head_dim) and q_position_ids has shape (bsz, 1)
     q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 
     # --- 7. Compute Attention Weights & Output ---
@@ -825,8 +830,8 @@ def mla_decoding_flashmla_attn_mode_3(
     q_nope_absorbed = torch.matmul(q_nope, q_absorb)
 
     # Compute attention weights for both components
-    # FIXED: Align einsum patterns and ensure correct tensor dimensions
-    attn_weights_pe = torch.einsum("bhqd,bhkd->bhqk", q_pe, k_pe_rotated.squeeze(1))
+    # Now both tensors have the correct shapes for einsum
+    attn_weights_pe = torch.einsum("bhqd,bhkd->bhqk", q_pe, k_pe_rotated)
     attn_weights_nope = torch.einsum("bhqd,bkd->bhqk", q_nope_absorbed, kv_nope)
     attn_weights = (attn_weights_pe + attn_weights_nope) * self.softmax_scale
 
@@ -861,6 +866,7 @@ def mla_decoding_flashmla_attn_mode_3(
 
     return attn_output, past_key_states, scale
 
+	
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_bak(
 	self,
