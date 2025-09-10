@@ -108,7 +108,7 @@ if __name__ == "__main__":
 
 	# Note: The output 'tokenized' is now a dictionary containing 'input_ids', 'attention_mask', etc.
 	# To get the lengths, you access the 'input_ids' key.
-	logging.info(f"Longest query length: {max([len(t) for t in tokenized['input_ids']])} tokens")
+	logging.info(f"Longest query length: {max([len(t) for t in tokenized['input_ids']])} tokens")	
 
 
 	"""
