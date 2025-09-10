@@ -804,7 +804,7 @@ def mla_decoding_flashmla_attn_mode_3(
     # --- 6. Apply Rotary Position Embeddings (RoPE) ---
     # Create position_ids for the full sequence
     # Note: We need to create position_ids that match what the torch version expects
-    position_ids = torch.arange(kv_len, device=q_position_ids.device).unsqueeze(0).expand(bsz, -1)
+    # position_ids = torch.arange(kv_len, device=q_position_ids.device).unsqueeze(0).expand(bsz, -1)
     
     # FIXED: Use view with 1 head dimension, not expand to num_heads
     k_pe = k_pe.view(bsz, 1, kv_len, self.qk_rope_head_dim)
@@ -813,7 +813,7 @@ def mla_decoding_flashmla_attn_mode_3(
     cos, sin = self.rotary_emb(k_pe, seq_len=kv_len)
     
     # Apply RoPE to keys using position_ids
-    k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids)
+    k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
     
     # Apply RoPE to queries using their actual position
     q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
