@@ -864,7 +864,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	).to(q_nope.dtype)
 
 	# Compute attention output
-	attn_output = torch.einsum("bhql,blc->bhqc", attn_weights, compressed_kv_ref.squeeze(1))
+	attn_output = torch.einsum("bhql,blc->bhqc", attn_weights, compressed_kv_ref.squeeze(2))
 	attn_output = torch.matmul(attn_output, out_absorb.mT)
 
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
