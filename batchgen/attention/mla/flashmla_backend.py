@@ -843,7 +843,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	# FIXED: Add nope attention weights with correct unsqueeze
 	# compressed_kv_ref needs to be unsqueezed to add head dimension
 	attn_weights = attn_weights + torch.einsum(
-		"bhqd,bhcd->bhqc", q_nope_absorbed, compressed_kv_ref
+		"bhqd,bhcd->bhqc", q_nope_absorbed, compressed_kv_ref.transpose(1, 2)
 	)
 	
 	# Apply scaling
