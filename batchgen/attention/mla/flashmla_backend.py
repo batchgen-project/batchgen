@@ -836,6 +836,8 @@ def mla_decoding_flashmla_attn_mode_3(
 
 	# FIXED: Compute attention weights with correct dimensions
 	# First compute PE attention weights
+	k_pe = k_pe.view(bsz, self.num_heads, max_seqlen_pad, self.qk_rope_head_dim)
+	q_pe = q_pe.view(bsz, self.num_heads, 1, self.qk_rope_head_dim)
 	attn_weights = torch.einsum("bhqd,bhcd->bhqc", q_pe, k_pe)
 	
 	# FIXED: Add nope attention weights with correct unsqueeze
