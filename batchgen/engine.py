@@ -1587,10 +1587,10 @@ class BatchGen:
 		]
 
 		# Print first 5 sequences
-		# for query_idx in range(5):
-		#     logging.info(
-		#         f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
-		#     )
+		for query_idx in range(10):
+			logging.info(
+				f"Decoded tokens: {res[query_idx].squeeze().tolist()[:20]}"
+			)
 
 		# Gather results from all rank to rank 0
 		# logging.info(f"Rank {self.rank} res: {res}")

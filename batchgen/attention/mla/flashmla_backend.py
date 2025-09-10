@@ -563,7 +563,7 @@ def mla_decoding_flashmla_attn_mode_3_(
 
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3_bak(
+def mla_decoding_flashmla_attn_mode_3(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
@@ -711,7 +711,7 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 	return attn_output, past_key_states, scale
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3(
+def mla_decoding_flashmla_attn_mode_3_dep(
     self,
     hidden_states: torch.Tensor,
     past_key_states: torch.Tensor,
