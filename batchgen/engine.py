@@ -1915,9 +1915,14 @@ class BatchGen:
 						# position_ids=position_ids.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-						-1, 1
-					)
+					# new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
+					# 	-1, 1
+					# )
+					new_tokens = sample_with_temperature_top_p(
+						new_tokens.logits[:, -1, :],
+						temperature=0.6,
+						top_p=0.95,
+					).view(-1, 1)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 				new_token_idx += 1
 			Attn_Wrapper.scale = None
