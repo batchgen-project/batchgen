@@ -795,30 +795,27 @@ def mla_decoding_flashmla_attn_mode_3(
         0
     ).to(hidden_states.dtype)
 
-    # Split compressed KV into components
-    kv_nope, k_pe = torch.split(
+    # Split compressed KV into components and apply layernorm
+    compressed_kv_ref, k_pe = torch.split(
         compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
     )
-    kv_nope = self.kv_a_layernorm(kv_nope)
+    compressed_kv_ref = self.kv_a_layernorm(compressed_kv_ref)
 
     # --- 6. Apply Rotary Position Embeddings (RoPE) ---
-    # Create position_ids for all tokens in the sequence (0, 1, 2, ..., kv_len-1)
-    position_ids_full = torch.arange(kv_len, device=q_position_ids.device).unsqueeze(0).expand(bsz, -1)
+    # Create position_ids for the full sequence
+    # Note: We need to create position_ids that match what the torch version expects
+    position_ids = torch.arange(kv_len, device=q_position_ids.device).unsqueeze(0).expand(bsz, -1)
     
-    # Prepare k_pe for RoPE application - it needs to have 4 dimensions (b, h, s, d)
-    # k_pe currently has shape (bsz, kv_len, qk_rope_head_dim)
-    # We need to add a num_heads dimension and expand it
-    k_pe_for_rope = k_pe.unsqueeze(1).expand(-1, self.num_heads, -1, -1)  # (bsz, num_heads, kv_len, qk_rope_head_dim)
+    # FIXED: Use view with 1 head dimension, not expand to num_heads
+    k_pe = k_pe.view(bsz, 1, kv_len, self.qk_rope_head_dim)
     
-    # Generate cos and sin for the max sequence length
-    cos, sin = self.rotary_emb(k_pe_for_rope, seq_len=kv_len)
+    # Generate cos and sin for the sequence
+    cos, sin = self.rotary_emb(k_pe, seq_len=kv_len)
     
-    # Apply RoPE to keys
-    # position_ids_full has shape (bsz, kv_len) - this is what rotary_pos_emb expects for indexing
-    k_pe_rotated = rotary_pos_emb(k_pe_for_rope, cos, sin, position_ids_full)
+    # Apply RoPE to keys using position_ids
+    k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids)
     
     # Apply RoPE to queries using their actual position
-    # q_pe has shape (bsz, num_heads, 1, qk_rope_head_dim) and q_position_ids has shape (bsz, 1)
     q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 
     # --- 7. Compute Attention Weights & Output ---
@@ -826,14 +823,21 @@ def mla_decoding_flashmla_attn_mode_3(
     q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
     out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
 
-    # FIXED: Apply q_absorb multiplication to align with torch implementation
+    # Apply q_absorb multiplication
     q_nope_absorbed = torch.matmul(q_nope, q_absorb)
 
-    # Compute attention weights for both components
-    # Now both tensors have the correct shapes for einsum
-    attn_weights_pe = torch.einsum("bhqd,bhkd->bhqk", q_pe, k_pe_rotated)
-    attn_weights_nope = torch.einsum("bhqd,bkd->bhqk", q_nope_absorbed, kv_nope)
-    attn_weights = (attn_weights_pe + attn_weights_nope) * self.softmax_scale
+    # FIXED: Compute attention weights with correct dimensions
+    # First compute PE attention weights
+    attn_weights = torch.einsum("bhqd,bhcd->bhqc", q_pe, k_pe)
+    
+    # FIXED: Add nope attention weights with correct unsqueeze
+    # compressed_kv_ref needs to be unsqueezed to add head dimension
+    attn_weights = attn_weights + torch.einsum(
+        "bhqd,bhcd->bhqc", q_nope_absorbed, compressed_kv_ref.unsqueeze(-3)
+    )
+    
+    # Apply scaling
+    attn_weights = attn_weights * self.softmax_scale
 
     if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
         raise ValueError(
@@ -850,7 +854,7 @@ def mla_decoding_flashmla_attn_mode_3(
     ).to(q_nope.dtype)
 
     # Compute attention output
-    attn_output = torch.einsum("bhql,blc->bhqc", attn_weights, kv_nope)
+    attn_output = torch.einsum("bhql,blc->bhqc", attn_weights, compressed_kv_ref)
     attn_output = torch.matmul(attn_output, out_absorb.mT)
 
     if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
@@ -866,7 +870,7 @@ def mla_decoding_flashmla_attn_mode_3(
 
     return attn_output, past_key_states, scale
 
-	
+
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_bak(
 	self,
