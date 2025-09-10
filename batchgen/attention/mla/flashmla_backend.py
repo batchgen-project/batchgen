@@ -777,6 +777,9 @@ def mla_decoding_flashmla_attn_mode_3(
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
 	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
 	compressed_kv_ref = compressed_kv_ref.view(bsz, max_seqlen_pad, 1, 576)
+	compressed_kv_ref, k_pe = torch.split(
+		compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)
 
 	# Quantize and write to past_key_states
 	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
