@@ -784,7 +784,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	# Extend attention mask to max_seq_len with zeros
 	# assert kv_len == max_seqlen, f"kv_len should be equal to max_seqlen, but got {kv_len} and {max_seqlen}"
 	if attention_mask.size(-1) < kv_len:
-		attention_mask = torch.cat([attention_mask, torch.zeros((bsz, 1), device=attention_mask.device)], dim=-1)
+		attention_mask = torch.cat([attention_mask, torch.zeros((bsz, kv_len - attention_mask.size(-1)), device=attention_mask.device)], dim=-1)
 
 
 	kv_nope, k_pe = torch.split(
