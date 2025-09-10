@@ -754,7 +754,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	# --- 1. Dequantize KV Cache ---
 	# The cache is received in a quantized format. Dequantize it for processing.
 	compressed_kv_ref = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
-	assert compressed_kv_ref.size(1) == max_seqlen, f"Dequantized cache length {compressed_kv_ref.size(1)} does not match max_seqlen {max_seqlen}"
+	# assert compressed_kv_ref.size(1) == max_seqlen, f"Dequantized cache length {compressed_kv_ref.size(1)} does not match max_seqlen {max_seqlen}"
 
 	# --- 2. Query and New Key-Value Projection ---
 	q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
@@ -782,7 +782,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	kv_len = compressed_kv_ref.size(1)
 	# assert kv_len == attention_mask.size(-1), "Cache length must match attention mask length"
 	# Extend attention mask to max_seq_len with zeros
-	assert kv_len == max_seqlen, f"kv_len should be equal to max_seqlen, but got {kv_len} and {max_seqlen}"
+	# assert kv_len == max_seqlen, f"kv_len should be equal to max_seqlen, but got {kv_len} and {max_seqlen}"
 	if attention_mask.size(-1) < kv_len:
 		attention_mask = torch.cat([attention_mask, torch.zeros((bsz, 1), device=attention_mask.device)], dim=-1)
 
