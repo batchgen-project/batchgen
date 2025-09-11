@@ -1593,7 +1593,7 @@ class BatchGen:
 		]
 
 		# Print first 5 sequences
-		for query_idx in range(10):
+		for query_idx in range(5):
 			logging.info(
 				f"Decoded tokens: {res[query_idx].squeeze().tolist()[:20]}"
 			)
