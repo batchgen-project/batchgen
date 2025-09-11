@@ -835,30 +835,25 @@ def mla_decoding_flashmla_attn_mode_3(
     ).to(hidden_states.dtype)
     
     # --- 7. Compute Attention Weights ---
-    # Compute PE attention weights
-    # Expand k_pe_states for all heads (broadcasting across head dimension)
+    # Compute PE attention weights using einsum for proper broadcasting
     # k_pe_states: [bsz, max_seqlen_pad, qk_rope_head_dim]
     # q_pe: [bsz, num_heads, 1, qk_rope_head_dim]
-    k_pe_expanded = k_pe_states.unsqueeze(1)  # [bsz, 1, max_seqlen_pad, qk_rope_head_dim]
-    attn_weights = torch.matmul(q_pe, k_pe_expanded.transpose(-2, -1))
+    # Need to add dimension for broadcasting: k_pe_states -> [bsz, 1, max_seqlen_pad, qk_rope_head_dim]
+    k_pe_expanded = k_pe_states.unsqueeze(1)
+    attn_weights = torch.einsum("bhqd,blcd->bhqc", q_pe, k_pe_expanded)
     # attn_weights shape: [bsz, num_heads, 1, max_seqlen_pad]
     
-    # Compute nope attention weights
+    # Compute nope attention weights using einsum
     # kv_states: [bsz, max_seqlen_pad, kv_lora_rank]
     # q_nope_absorbed: [bsz, num_heads, 1, kv_lora_rank]
-    kv_states_expanded = kv_states.unsqueeze(1)  # [bsz, 1, max_seqlen_pad, kv_lora_rank]
-    attn_weights_nope = torch.matmul(q_nope_absorbed, kv_states_expanded.transpose(-2, -1))
-    # attn_weights_nope shape: [bsz, num_heads, 1, max_seqlen_pad]
-    
-    # Combine attention weights
-    attn_weights = attn_weights + attn_weights_nope
+    # Add dimension for broadcasting: kv_states -> [bsz, 1, max_seqlen_pad, kv_lora_rank]
+    kv_states_expanded = kv_states.unsqueeze(1)
+    attn_weights = attn_weights + torch.einsum(
+        "bhqd,blcd->bhqc", q_nope_absorbed, kv_states_expanded
+    )
     
     # Apply scaling
     attn_weights = attn_weights * self.softmax_scale
-    
-    # Squeeze the query dimension for shape validation
-    attn_weights = attn_weights.squeeze(2)  # [bsz, num_heads, max_seqlen_pad]
-    attn_weights = attn_weights.unsqueeze(2)  # [bsz, num_heads, 1, max_seqlen_pad]
     
     if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
         raise ValueError(
@@ -875,18 +870,16 @@ def mla_decoding_flashmla_attn_mode_3(
     ).to(q_nope.dtype)
     
     # --- 8. Compute Attention Output ---
+    # Use einsum for the attention output computation
     # attn_weights: [bsz, num_heads, 1, max_seqlen_pad]
     # kv_states: [bsz, max_seqlen_pad, kv_lora_rank]
-    
-    # Expand kv_states for matrix multiplication
-    kv_states_expanded = kv_states.unsqueeze(1)  # [bsz, 1, max_seqlen_pad, kv_lora_rank]
-    
-    # Compute weighted sum
-    attn_output = torch.matmul(attn_weights, kv_states_expanded)
+    attn_output = torch.einsum(
+        "bhql,blc->bhqc", attn_weights, kv_states
+    )
     # attn_output shape: [bsz, num_heads, 1, kv_lora_rank]
     
     # Apply out_absorb projection
-    attn_output = torch.matmul(attn_output, out_absorb.transpose(-2, -1))
+    attn_output = torch.matmul(attn_output, out_absorb.mT)
     # attn_output shape: [bsz, num_heads, 1, v_head_dim]
     
     if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
