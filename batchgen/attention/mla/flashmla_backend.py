@@ -1,27 +1,35 @@
+import logging
+from typing import Tuple
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from flash_mla import (
 	flash_mla_with_kvcache,
 	get_mla_metadata,
 )
-from .rotary_embedding import rotary_pos_emb
-import logging
-import torch.distributed as dist
-from ..quantization import dequant_per_token_triton, dequant_per_token_return_with_max_seqlen_pad
-import triton
-import triton.language as tl
-from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
-from .fused_bhd_hdc_kernel import fused_bhd_hdc, fused_bhd_hdc_inplace
-from .fused_rotary_embedding import fused_rotary_embedding, fused_rotary_embedding_inplace
-from ...quantization.fp8e4m3 import (
-	per_token_blocked_quantize_bf16_to_fp8, 
-	dequant_compressed_kv_per_token_with_length, 
-	dequant_compressed_kv_per_token_with_length_v2,
-	dequant_compressed_kv_per_token
-)
 
-from typing import Tuple
+from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
+from ...quantization.fp8e4m3 import (
+	dequant_compressed_kv_per_token,
+	dequant_compressed_kv_per_token_with_length,
+	dequant_compressed_kv_per_token_with_length_v2,
+	per_token_blocked_quantize_bf16_to_fp8,
+)
+from ..quantization import (
+	dequant_per_token_return_with_max_seqlen_pad,
+	dequant_per_token_triton,
+)
+from .fused_bhd_hdc_kernel import fused_bhd_hdc, fused_bhd_hdc_inplace
+from .fused_rotary_embedding import (
+	fused_rotary_embedding,
+	fused_rotary_embedding_inplace,
+)
+from .rotary_embedding import rotary_pos_emb
+
 
 def quant_per_token(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 	"""
@@ -399,8 +407,10 @@ def mla_decoding_flashmla_(
 	)
 
 
-from batchgen.gemm.w8a8 import w8a8_gemm
 from batchgen.attention.mla.fa3_backend import act_quant
+from batchgen.gemm.w8a8 import w8a8_gemm
+
+
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_(
 	self,

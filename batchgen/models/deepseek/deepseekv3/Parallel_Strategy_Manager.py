@@ -1,21 +1,16 @@
-from .modeling_deepseek_v3 import (
-	DeepseekV3ForCausalLM
-)
-from ...Wrapper import (
-	Attn_Wrapper,
-	Expert_Wrapper
-)
-import logging
-from ....quantization.fp8e4m3 import (
-	deepseek_v3_dequantization
-)
-import types
-import torch.distributed as dist	
-import time
-import torch 
 import gc
+import logging
+import time
+import types
+
+import torch
+import torch.distributed as dist
+
 from batchgen.utils import torch_gpu_mem_usage
-	
+
+from ....quantization.fp8e4m3 import deepseek_v3_dequantization
+from ...Wrapper import Attn_Wrapper, Expert_Wrapper
+from .modeling_deepseek_v3 import DeepseekV3ForCausalLM
 
 
 class Parallel_Strategy_Manager:
@@ -430,17 +425,21 @@ class Parallel_Strategy_Manager:
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			if self.engine_config.Basic_Config.gpu_arch == "hooper":
+				from batchgen.attention.mla.torch_backend import (
+					mla_decoding_torch_with_fp8_kv,
+				)
+
 				from ....attention.mla.fa3_backend import (
-					mla_prefill_flashattention3, 
+					mla_prefill_flashattention3,
+					mla_prefill_flashattention3_fused_dequant,
 					mla_prefill_flashattention3_w8a16_deepgemm,
-					mla_prefill_flashattention3_fused_dequant
 				)
 				from ....attention.mla.flashmla_backend import (
-					mla_decoding_flashmla,
-					mla_decoding_flashmla_v2,
 					fused_get_query_states_triton,
+					mla_decoding_flashmla,
 					mla_decoding_flashmla_attn_mode_3,
-					mla_decoding_flashmla_attn_mode_3_dequant_fusion
+					mla_decoding_flashmla_attn_mode_3_dequant_fusion,
+					mla_decoding_flashmla_v2,
 				)
 				setattr(
 					attn_module,
@@ -469,7 +468,7 @@ class Parallel_Strategy_Manager:
 					attn_module,
 					"decoding_attn_mode_3",
 					types.MethodType(
-						mla_decoding_flashmla_attn_mode_3, attn_module
+						mla_decoding_torch_with_fp8_kv, attn_module
 					),
 				)
 

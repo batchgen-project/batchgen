@@ -1,8 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .rotary_embedding import rotary_pos_emb, apply_rotary_pos_emb
-from ..attention_mask import convert_to_causal_attention_mask
+
+from batchgen.attention.attention_mask import convert_to_causal_attention_mask
+from batchgen.attention.mla.fa3_backend import act_quant
+from batchgen.attention.mla.rotary_embedding import (
+	apply_rotary_pos_emb,
+	rotary_pos_emb,
+)
+from batchgen.gemm.w8a8 import w8a8_gemm
+from batchgen.quantization.fp8e4m3 import (
+	deepseek_v3_dequantization,
+	dequant_compressed_kv_per_token,
+	per_token_blocked_quantize_bf16_to_fp8,
+)
+
 
 @torch.inference_mode()
 def mla_decoding_torch(
@@ -96,6 +108,113 @@ def mla_decoding_torch(
 		compressed_kv,
 		torch.tensor([], device=hidden_states.device),
 	)
+
+@torch.inference_mode()
+def mla_decoding_torch_with_fp8_kv(
+	self,
+	hidden_states: torch.Tensor,
+	past_key_states: torch.Tensor,
+	past_value_states: torch.Tensor,
+	attention_mask: torch.Tensor, # (bsz, seq_len)
+	q_position_ids: torch.Tensor,
+	scale: torch.Tensor,
+	cache_seqlens: torch.Tensor,
+	max_seqlen: int,
+	weight_scale: dict = None
+):
+    # attention_mask: (bsz, seq_len)
+    assert attention_mask.dim() == 2
+    bsz, seq_len = attention_mask.size()
+    # (bsz, seq_len, kv_dim)
+    compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
+
+    # pad attention mask to max_seqlen_pad
+    max_seqlen_pad = compressed_kv.size(1)
+    if seq_len < max_seqlen_pad:
+        pad_len = max_seqlen_pad - seq_len
+        attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_len), value=0)
+    elif seq_len > max_seqlen_pad:
+        raise ValueError(f"Input seq_len {seq_len} exceeds max_seqlen_pad {max_seqlen_pad}")
+    # Convert to additive mask
+    attention_mask = torch.where(
+        attention_mask == 0,
+        torch.finfo(hidden_states.dtype).min,
+        0.0
+    ).to(hidden_states.dtype)
+    attention_mask = attention_mask[:, None, None, :] # broadcast shape for attn_weights
+
+    
+    q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    q = q.view(bsz, 1, self.num_heads, self.q_head_dim).transpose(1, 2)
+    q_nope, q_pe = torch.split(
+		q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)
+    new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+
+
+    kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # [bsz, 1, kv_lora_rank], [bsz, 1, qk_rope_head_dim]
+    k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
+    cos, sin = self.rotary_emb(k_pe, seq_len=max_seqlen_pad)
+    k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
+    q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+    kv = self.kv_a_layernorm(kv)
+    k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
+
+    # update compressed_kv with the new key and value
+    offload_kv = torch.cat([kv, k_pe], dim=-1)
+    batch_indices = torch.arange(bsz, device=hidden_states.device)
+    compressed_kv[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
+    compressed_kv = compressed_kv.view(bsz, max_seqlen_pad, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+
+    # Quantize and write to past_key_states
+    new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+    past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+    scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+
+    kv_b_proj = self.kv_b_proj.weight.view(
+		self.num_heads, -1, self.kv_lora_rank
+	)
+    q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+    out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+    q_nope = torch.matmul(q_nope, q_absorb)
+    
+    attn_weights = torch.einsum("bhqd,bhcd->bhqc", q_pe, k_pe)
+    attn_weights += torch.einsum(
+		"bhqd,bhcd->bhqc", q_nope, compressed_kv.squeeze(-3) # einsum
+    )
+    attn_weights = attn_weights * self.softmax_scale
+    if attn_weights.size() != (bsz, self.num_heads, 1, max_seqlen_pad):
+        raise ValueError(
+			f"Attention weights should be of size {(bsz, self.num_heads, max_seqlen_pad, kv.size(1))}, but is"
+			f" {attn_weights.size()}"
+		)
+
+    attn_weights = attn_weights + attention_mask
+    # upcast attention to fp32
+    attn_weights = nn.functional.softmax(
+		attn_weights, dim=-1, dtype=torch.float32
+    ).to(q_nope.dtype)
+    attn_output = torch.einsum(
+		"bhql,blc->bhqc", attn_weights, compressed_kv
+    )
+    attn_output = torch.matmul(
+		attn_output, out_absorb.mT
+    )  # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+
+    if attn_output.size() != (bsz, self.num_heads, 1, self.v_head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, 1, self.v_head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(
+		bsz, 1, self.num_heads * self.v_head_dim
+    )
+    attn_output = self.o_proj(attn_output)
+
+    return attn_output, past_key_states, scale
 
 
 @torch.inference_mode()
