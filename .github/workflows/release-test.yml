@@ -11,6 +11,18 @@ on:
         description: "Distributed initialization address"
         required: true
         default: "29.194.13.138:20000"
+      max_prompts:
+        description: "Maximum number of prompts to test (0 for all)"
+        required: false
+        default: "0"
+      max_input_length:
+        description: "Maximum input length"
+        required: false
+        default: "8192"
+      max_decoding_length:
+        description: "Maximum decoding length"
+        required: false
+        default: "8192"
 
 jobs:
   test-node0:
@@ -50,7 +62,10 @@ jobs:
             bash .github/workflows/scripts/test-mmlu.sh \
             --node-rank 0 \
             --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
-            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/"
+            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
+            --max-prompts "${{ github.event.inputs.max_prompts }}" \
+            --max-input-length "${{ github.event.inputs.max_input_length }}" \
+            --max-decoding-length "${{ github.event.inputs.max_decoding_length }}"
 
   test-node1:
     name: MMLU Test Node1
@@ -89,4 +104,7 @@ jobs:
             bash .github/workflows/scripts/test-mmlu.sh \
             --node-rank 1 \
             --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
-            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/"
+            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
+            --max-prompts "${{ github.event.inputs.max_prompts }}" \
+            --max-input-length "${{ github.event.inputs.max_input_length }}" \
+            --max-decoding-length "${{ github.event.inputs.max_decoding_length }}"

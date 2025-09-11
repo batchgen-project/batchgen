@@ -63,6 +63,6 @@ COPY . /root/moegen
 RUN uv pip install -e . -v \
     && uv cache clean
 
-ENV NCCL_BUFFSIZE=67108864
+ENV NCCL_BUFFSIZE=16777216
  
 CMD ["sleep", "infinity"]
