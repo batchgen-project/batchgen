@@ -13,38 +13,38 @@ Then run following commands.
 Cache-dir can be something like: ```**/modelscope/hub/models/deepseek-ai/DeepSeek-R1```
 ```python
 echo "🚀 Launch Node 0"
-export HF_ENDPOINT=https://hf-mirror.com
+export HF_ENDPOINT=https://hf-mirror.com \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-python "<dir-to-two_nodes_H20_benchmark.py>" \
+python two_nodes_H20_benchmark.py \
     --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
 	--host_kv_cache_size 192 \
     --max_prompts 768 \
     --max_input_length 13000 \
     --max_decoding_length 1000 \
     --ATTN_MODE 3 \
-    --cache_dir "<dir-to-model-checkpoint>" \
+    --cache_dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/snapshots/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad" \
     --server_host "localhost" \
     --server_port 10900 \
-	--dist_init_addr "10.0.0.8:12335" \
+	--dist_init_addr "29.194.13.138:20001" \
 	--nnodes 2 \
 	--node_rank 0
 ```
 
 ```python
 echo "🚀 Launch Node 1"
-export HF_ENDPOINT=https://hf-mirror.com
+export HF_ENDPOINT=https://hf-mirror.com \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-python "<dir-to-two_nodes_H20_benchmark.py>" \
+python two_nodes_H20_benchmark.py \
     --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
 	--host_kv_cache_size 192 \
     --max_prompts 768 \
     --max_input_length 13000 \
     --max_decoding_length 1000 \
     --ATTN_MODE 3 \
-    --cache_dir "<dir-to-model-checkpoint>" \
+    --cache_dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
     --server_host "localhost" \
     --server_port 10900 \
-	--dist_init_addr "10.0.0.8:12335" \
+	--dist_init_addr "29.194.13.138:20001" \
 	--nnodes 2 \
 	--node_rank 1
 ```
