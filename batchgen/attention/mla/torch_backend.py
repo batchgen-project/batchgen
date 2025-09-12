@@ -110,12 +110,12 @@ def mla_decoding_torch(
 @torch.inference_mode()
 def mla_decoding_torch_with_fp8_kv(
 	self,
-	hidden_states: torch.Tensor,
-	past_key_states: torch.Tensor,
+	hidden_states: torch.Tensor, # [bs, 1, hidden_dim]
+	past_key_states: torch.Tensor, # [bs, max_input + max_output, kv_dim]
 	past_value_states: torch.Tensor,
 	attention_mask: torch.Tensor, # (bsz, seq_len)
-	q_position_ids: torch.Tensor,
-	scale: torch.Tensor,
+	q_position_ids: torch.Tensor, # (bsz, 1)
+	scale: torch.Tensor, # [bs, max_input + max_output, kv_dim]
 	cache_seqlens: torch.Tensor,
 	max_seqlen: int,
 	weight_scale: dict = None
@@ -132,13 +132,13 @@ def mla_decoding_torch_with_fp8_kv(
     # Reshape attention_mask to [bs, max_seqlen_pad] while preserving all 1s
     if seq_len > max_seqlen_pad:
         # Remove zeros from the left, keep rightmost max_seqlen_pad tokens (including all 1s)
-        attention_mask = attention_mask[:, -max_seqlen_pad:]
+        attention_mask = attention_mask[:, :max_seqlen_pad]
     elif seq_len == max_seqlen_pad:
         # Length matches exactly, no need to modify
         pass
     else:  # seq_len < max_seqlen_pad
-         # pad on the left with zeros using torch.nn.functional.pad
-        attention_mask = F.pad(attention_mask, (max_seqlen_pad - seq_len, 0), "constant", 0)
+         # pad on the right with zeros using torch.nn.functional.pad
+        attention_mask = F.pad(attention_mask, (0, max_seqlen_pad - seq_len), "constant", 0)
 
     assert attention_mask.size(1) == max_seqlen_pad, f"attention_mask size {attention_mask.size()} does not match max_seqlen_pad {max_seqlen_pad}"
     # Convert to additive mask
