@@ -8,6 +8,7 @@ CACHE_DIR=""
 MAX_PROMPTS="0"
 MAX_INPUT_LENGTH="8192"
 MAX_DECODING_LENGTH="8192"
+KV_CACHE_SIZE="256"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max-decoding-length)
             MAX_DECODING_LENGTH="$2"
+            shift 2
+            ;;
+        --kv-cache-size)
+            KV_CACHE_SIZE="$2"
             shift 2
             ;;
         *)
@@ -87,7 +92,7 @@ HF_ENDPOINT=https://hf-mirror.com \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python test/r1_mmlu_pro_test/r1_mmlu_pro_test.py \
         --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
-        --host_kv_cache_size 256 \
+        --host_kv_cache_size "$KV_CACHE_SIZE" \
         --max_prompts "$MAX_PROMPTS" \
         --max_input_length "$MAX_INPUT_LENGTH" \
         --max_decoding_length "$MAX_DECODING_LENGTH" \
