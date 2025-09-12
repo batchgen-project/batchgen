@@ -10,7 +10,6 @@ from batchgen.attention.mla.rotary_embedding import (
 )
 from batchgen.gemm.w8a8 import w8a8_gemm
 from batchgen.quantization.fp8e4m3 import (
-	deepseek_v3_dequantization,
 	dequant_compressed_kv_per_token,
 	per_token_blocked_quantize_bf16_to_fp8,
 )
