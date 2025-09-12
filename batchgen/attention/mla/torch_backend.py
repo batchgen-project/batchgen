@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.attention.attention_mask import convert_to_causal_attention_mask
-from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.rotary_embedding import (
 	apply_rotary_pos_emb,
 	rotary_pos_emb,
@@ -124,16 +123,24 @@ def mla_decoding_torch_with_fp8_kv(
     # attention_mask: (bsz, seq_len)
     assert attention_mask.dim() == 2
     bsz, seq_len = attention_mask.size()
-    # (bsz, seq_len, kv_dim)
+    # (bsz, max_seqlen_pad, kv_dim) where max_seqlen_pad is aligned (e.g., to 64)
     compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
 
-    # pad attention mask to max_seqlen_pad
+    # max_seqlen_pad is the aligned effective max sequence length
     max_seqlen_pad = compressed_kv.size(1)
-    if seq_len < max_seqlen_pad:
-        pad_len = max_seqlen_pad - seq_len
-        attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_len), value=0)
-    elif seq_len > max_seqlen_pad:
-        raise ValueError(f"Input seq_len {seq_len} exceeds max_seqlen_pad {max_seqlen_pad}")
+    
+    # Reshape attention_mask to [bs, max_seqlen_pad] while preserving all 1s
+    if seq_len > max_seqlen_pad:
+        # Remove zeros from the left, keep rightmost max_seqlen_pad tokens (including all 1s)
+        attention_mask = attention_mask[:, -max_seqlen_pad:]
+    elif seq_len == max_seqlen_pad:
+        # Length matches exactly, no need to modify
+        pass
+    else:  # seq_len < max_seqlen_pad
+         # pad on the left with zeros using torch.nn.functional.pad
+        attention_mask = F.pad(attention_mask, (max_seqlen_pad - seq_len, 0), "constant", 0)
+
+    assert attention_mask.size(1) == max_seqlen_pad, f"attention_mask size {attention_mask.size()} does not match max_seqlen_pad {max_seqlen_pad}"
     # Convert to additive mask
     attention_mask = torch.where(
         attention_mask == 0,
@@ -150,6 +157,7 @@ def mla_decoding_torch_with_fp8_kv(
 	)
     new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
+    # import pdb; pdb.set_trace()
 
     kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # [bsz, 1, kv_lora_rank], [bsz, 1, qk_rope_head_dim]
     k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
@@ -163,7 +171,10 @@ def mla_decoding_torch_with_fp8_kv(
     offload_kv = torch.cat([kv, k_pe], dim=-1)
     batch_indices = torch.arange(bsz, device=hidden_states.device)
     compressed_kv[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
-    compressed_kv = compressed_kv.view(bsz, max_seqlen_pad, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+    compressed_kv = compressed_kv.view(bsz, max_seqlen_pad, 1, self.kv_lora_rank + self.qk_rope_head_dim).transpose(1, 2)
+    compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+    )
 
     # Quantize and write to past_key_states
     new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
@@ -177,11 +188,12 @@ def mla_decoding_torch_with_fp8_kv(
     out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
 
     q_nope = torch.matmul(q_nope, q_absorb)
-    
-    attn_weights = torch.einsum("bhqd,bhcd->bhqc", q_pe, k_pe)
+
+    attn_weights = torch.einsum("bhqd,bhcd->bhqc", q_pe, k_pe) # (bsz, num_heads, 1, max_seqlen_pad)
     attn_weights += torch.einsum(
-		"bhqd,bhcd->bhqc", q_nope, compressed_kv.squeeze(-3) # einsum
+		"bhqd,bhcd->bhqc", q_nope, compressed_kv # einsum
     )
+    
     attn_weights = attn_weights * self.softmax_scale
     if attn_weights.size() != (bsz, self.num_heads, 1, max_seqlen_pad):
         raise ValueError(
@@ -194,9 +206,11 @@ def mla_decoding_torch_with_fp8_kv(
     attn_weights = nn.functional.softmax(
 		attn_weights, dim=-1, dtype=torch.float32
     ).to(q_nope.dtype)
+
     attn_output = torch.einsum(
-		"bhql,blc->bhqc", attn_weights, compressed_kv
+		"bhql,bld->bhqd", attn_weights, compressed_kv.squeeze(1) # einsum
     )
+    # import pdb; pdb.set_trace()
     attn_output = torch.matmul(
 		attn_output, out_absorb.mT
     )  # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
