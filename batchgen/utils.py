@@ -52,3 +52,21 @@ def torch_gpu_mem_usage(rank):
 
 	mem = torch.cuda.memory_allocated(device=rank) / (1024 ** 3)
 	return mem
+
+def create_position_ids_from_attention_mask(
+	attention_mask: torch.Tensor,
+) -> torch.Tensor:
+	"""
+	attention_mask: shape [batch_size, seq_len], with values in {0, 1}.
+	Returns position_ids: same shape, where
+	  - tokens with attention_mask=0 get position_id=1
+	  - tokens with attention_mask=1 get a cumsum starting at 0
+	"""
+	# Cumulative sum along the sequence dimension
+	cumsum = attention_mask.cumsum(dim=-1)
+	# Shift by -1 and clamp at 0 so first 1-based token starts at 0
+	position_ids = torch.clamp(cumsum - 1, min=0)
+	# Zero out positions where mask=0, then replace those with 1
+	position_ids = position_ids * attention_mask
+	position_ids = position_ids + (attention_mask.eq(0) * (-1))
+	return position_ids
