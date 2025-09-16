@@ -41,6 +41,18 @@ from .scheduler.scheduler import Scheduler
 # 	nvidia_dlprof_pytorch_nvtx.init()
 import sys
 
+class query:
+	def __init__(
+		self,
+		text: str = None,
+		encoded: Dict[str, torch.Tensor] = None,
+		decoded_tokens: torch.Tensor = None,
+	):
+		self.text = text
+		self.encoded = encoded
+		self.decoded_tokens = decoded_tokens
+
+
 
 class BatchGenWorker:
 	def __init__(
