@@ -151,7 +151,7 @@ def mla_decoding_torch_with_fp8_kv(
 
     
     q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-    q = q.view(bsz, 1, self.num_heads, self.q_head_dim).transpose(1, 2)
+    q = q.view(bsz, self.num_heads, 1, self.q_head_dim)
     q_nope, q_pe = torch.split(
 		q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
 	)
@@ -171,7 +171,7 @@ def mla_decoding_torch_with_fp8_kv(
     offload_kv = torch.cat([kv, k_pe], dim=-1)
     batch_indices = torch.arange(bsz, device=hidden_states.device)
     compressed_kv[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
-    compressed_kv = compressed_kv.view(bsz, max_seqlen_pad, 1, self.kv_lora_rank + self.qk_rope_head_dim).transpose(1, 2)
+    compressed_kv = compressed_kv.view(bsz, 1, max_seqlen_pad, self.kv_lora_rank + self.qk_rope_head_dim)
     compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
     )
@@ -207,10 +207,6 @@ def mla_decoding_torch_with_fp8_kv(
 		attn_weights, dim=-1, dtype=torch.float32
     ).to(q_nope.dtype)
 
-    attn_output = torch.einsum(
-		"bhql,bld->bhqd", attn_weights, compressed_kv.squeeze(1) # einsum
-    )
-    # import pdb; pdb.set_trace()
     attn_output = torch.matmul(
 		attn_output, out_absorb.mT
     )  # torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
