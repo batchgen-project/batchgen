@@ -12,6 +12,7 @@ from batchgen.quantization.fp8e4m3 import (
 	dequant_compressed_kv_per_token,
 	per_token_blocked_quantize_bf16_to_fp8,
 )
+import torch.distributed as dist
 
 
 @torch.inference_mode()
@@ -120,6 +121,9 @@ def mla_decoding_torch_with_fp8_kv(
 	max_seqlen: int,
 	weight_scale: dict = None
 ):
+    if dist.is_initialized():
+         dist.breakpoint(rank=0)
+
     # attention_mask: (bsz, seq_len)
     assert attention_mask.dim() == 2
     bsz, seq_len = attention_mask.size()
@@ -206,6 +210,11 @@ def mla_decoding_torch_with_fp8_kv(
     attn_weights = nn.functional.softmax(
 		attn_weights, dim=-1, dtype=torch.float32
     ).to(q_nope.dtype)
+
+    attn_output = torch.einsum(
+		"bhql,blc->bhqc", attn_weights, compressed_kv.squeeze(1) # einsum
+    )
+
 
     attn_output = torch.matmul(
 		attn_output, out_absorb.mT
