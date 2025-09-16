@@ -155,16 +155,16 @@ class BatchGen():
 		tensor_meta_shm_name = model_info.get('tensor_meta_shm_name')
 		skeleton_state_dict = model_info.get('skeleton_state_dict')  # This now comes from shared memory
 		parameter_server_size = model_info.get('parameter_server_size')
-		if pt_ckpt_dir == None:
-			pt_ckpt_dir = model_info.get('pt_ckpt_dir')
+		if self.pt_ckpt_dir == None:
+			self.pt_ckpt_dir = model_info.get('pt_ckpt_dir')
 		
-		if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, pt_ckpt_dir]):
+		if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.pt_ckpt_dir]):
 			missing = []
 			if not shm_name: missing.append('shm_name')
 			if not tensor_meta_shm_name: missing.append('tensor_meta_shm_name')
 			if not skeleton_state_dict: missing.append('skeleton_state_dict')
 			if not parameter_server_size: missing.append('parameter_server_size')
-			if not pt_ckpt_dir: missing.append('pt_ckpt_dir')
+			if not self.pt_ckpt_dir: missing.append('pt_ckpt_dir')
 			raise RuntimeError(f"Missing required information from parameter server: {', '.join(missing)}")
 		
 		# Calculate host KV cache size if not provided
@@ -187,7 +187,7 @@ class BatchGen():
 		else:
 			raise RuntimeError("No CUDA devices available. Please check your setup.")
 		
-		return (shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, pt_ckpt_dir, host_kv_cache_size, num_devices)
+		return (shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.pt_ckpt_dir, host_kv_cache_size, num_devices)
 	
 	def safe_collect_results(self, futures):
 		all_results = []
