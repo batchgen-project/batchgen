@@ -168,13 +168,13 @@ class BatchGen():
 			raise RuntimeError(f"Missing required information from parameter server: {', '.join(missing)}")
 		
 		# Calculate host KV cache size if not provided
-		if host_kv_cache_size is None:
+		if self.host_kv_cache_size is None:
 			from batchgen.utils import get_physical_memory_info
 			mem_info = get_physical_memory_info()
 			free_mem = mem_info["actually_free"]
 			# We don't need to subtract parameter_server_size since it's in a separate process
-			host_kv_cache_size = math.floor(free_mem)
-			logging.info(f"Host KV Cache Size: {host_kv_cache_size}")
+			self.host_kv_cache_size = math.floor(free_mem)
+			logging.info(f"Host KV Cache Size: {self.host_kv_cache_size}")
 		
 
 		if torch.cuda.is_available():
@@ -187,7 +187,7 @@ class BatchGen():
 		else:
 			raise RuntimeError("No CUDA devices available. Please check your setup.")
 		
-		return (shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.pt_ckpt_dir, host_kv_cache_size, num_devices)
+		return (shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.pt_ckpt_dir, self.host_kv_cache_size, num_devices)
 	
 	def safe_collect_results(self, futures):
 		all_results = []
