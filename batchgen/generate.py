@@ -11,7 +11,7 @@ from batchgen.prefill import Prefill
 from batchgen.decode import Decode
 from batchgen.distributed.utils import StatelessProcessGroup
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
-from batchgen.query_scheduler import QueryScheduler
+from batchgen.task_scheduler import QueryScheduler
 
 
 
@@ -19,46 +19,37 @@ class Generate():
 	"""
 		Give a batch of sequences, schedule the prefill and decode stages.
 	"""
-	def __init__(self, model_config, engine_config, core_engine, parallel_manager, comm):
+	def __init__(self, model_config, engine_config, core_engine, parallel_manager, task_scheduler):
 		self.model_config = model_config
 		self.engine_config = engine_config
 		self.core_engine = core_engine
 		self.parallel_manager = parallel_manager
-		self.comm = comm
-
+		self.task_scheduler = task_scheduler
+		
 		self.comm = self._init_communicator()
 		self.prefill = Prefill(model_config, engine_config, core_engine, parallel_manager, self.comm)
 		self.decode = Decode(model_config, engine_config, core_engine, parallel_manager, self.comm)
 
-		self.query_scheduler = QueryScheduler() # TODO: implement QueryBatcher
 
-	def default_scheduler(self):
-		"""
-			Default schedule:
-			1. We first prefill untill all the reserved KV in host memory are fulfilled.
-			2. Then we do the decoding.
-			3. When the remaining sequences in the prefilled pool under 50%, we switch back to prefill phase.
-		"""
-		pass
 	
 	def run(self):
-		while self.query_scheduler.has_pending_queries():
-			task = self.query_scheduler.get_next_task()
+		while self.task_scheduler.has_pending_queries():
+			task = self.task_scheduler.get_next_task()
 			if task.type == "prefill":
 				self.prefill.config_prefill()
 				new_token = self.prefill(task.batch)
-				self.query_scheduler.update_new_token(new_token, task.batch)
+				self.task_scheduler.update_new_token(new_token, task.batch)
 				self.prefill.cleanup_prefill()
 			elif task.type == "decode":
-				self.decode.config_decoding(len(task.batch), self.comm)
+				self.decode.config_decode(len(task.batch), self.comm)
 				self.decode(task.new_token, task.batch)
-				self.query_scheduler.update_new_token(task.new_token, task.batch)
-				self.decode.cleanup_decoding()
+				self.task_scheduler.update_new_token(task.new_token, task.batch)
+				self.decode.cleanup_decode()
 			else:
 				logging.error(f"Unknown task type: {task.type}")
 				raise ValueError(f"Unknown task type: {task.type}")
 
-			self.query_scheduler.update_query_status(task.batch)
+			self.task_scheduler.update_query_status(task.batch)
 
 	def run_bak(self):
 		prefill_time = 0

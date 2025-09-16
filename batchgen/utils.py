@@ -1,6 +1,8 @@
 import torch
 # import pynvml
 import logging
+import functools
+from typing import Callable
 
 
 # def get_gpu_memory_usage(device:int):
@@ -42,6 +44,53 @@ import logging
 
 #     pynvml.nvmlShutdown()
 
+def config_torch_module_initializer():
+	def do_nothing_decorator(orig_func: Callable) -> Callable:
+		@functools.wraps(orig_func)
+		def do_nothing(*args, **kwargs):
+			pass
+
+		return do_nothing
+
+	def param_init_decorator(orig_param_init: Callable) -> Callable:
+		@functools.wraps(orig_param_init)
+		def archer_param_init(cls, *args, **kwargs):
+			orig_param_init(cls, *args, **kwargs)
+
+			for name, param in cls.named_parameters(recurse=False):
+				param.data = torch.zeros(
+					1, dtype=torch.bfloat16, device=param.device
+				)
+
+			# for name, buf in cls.named_buffers(recurse=False):
+			# 	buf.data = torch.zeros(1, dtype=torch.bfloat16, device=buf.device)
+
+		return archer_param_init
+
+	# for all the modules in torch.nn, add post_init method
+	# assert False, torch.nn.modules.__dict__
+	for name, module in torch.nn.modules.__dict__.items():
+		if not isinstance(module, type):
+			continue
+		if not issubclass(module, torch.nn.modules.module.Module):
+			continue
+		if name in [
+			"Module",
+			"Sequential",
+			"ModuleDict",
+			"ModuleList",
+			"ParameterList",
+			"ParameterDict",
+		]:
+			continue
+		module._old_init = module.__init__
+		module.__init__ = param_init_decorator(module.__init__)
+
+		if hasattr(module, "reset_parameters"):
+			module._old_reset_parameters = module.reset_parameters
+			module.reset_parameters = do_nothing_decorator(
+				module.reset_parameters
+			)
 	
 def torch_gpu_mem_usage(rank):
 	"""
