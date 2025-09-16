@@ -19,7 +19,8 @@
 import logging
 import os
 from transformers import AutoTokenizer
-from batchgen.engine import batchgen
+# from batchgen.engine import batchgen
+from batchgen.entrypoint import BatchGen
 import numpy as np
 import datasets
 import argparse
@@ -141,7 +142,7 @@ if __name__ == "__main__":
 	gpu0_memory = torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024
 	logging.info(f"GPU 0 memory usage before BatchGen init: {gpu0_memory} GB")
 	# Run inference with our standalone parameter server
-	answer_set = batchgen(
+	answer_set = BatchGen(
 		huggingface_ckpt_name=hugging_face_checkpoint,
 		queries=queries,
 		max_input_length=args.max_input_length,
@@ -156,7 +157,7 @@ if __name__ == "__main__":
 		nnodes = args.nnodes,
 		node_rank = args.node_rank,
 		device_per_node= 8,
-	)
+	).run()
 
 	"""
 		Step 4: Print responses to the prompts.
