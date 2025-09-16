@@ -17,7 +17,7 @@ from .config.config import EngineConfig
 
 from batchgen.parameter_server_client import ParameterServerClient
 from .utils import config_torch_module_initializer
-from batchgen.engine import BatchGen
+from batchgen.batchgen_worker import BatchGenWorker
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -298,7 +298,7 @@ class BatchGen():
 			start_query_idx, end_query_idx = distribution[global_rank]
 			logging.info(f"Global rank {global_rank}: Processing queries from {start_query_idx} to {end_query_idx}")
 					
-			batchgen_instance = BatchGen(
+			batchgen_instance = BatchGenWorker(
 				huggingface_ckpt_name=self.huggingface_ckpt_name,
 				hf_cache_dir=self.hf_cache_dir,
 				cache_dir=self.cache_dir,
