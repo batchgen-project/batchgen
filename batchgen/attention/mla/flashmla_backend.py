@@ -713,7 +713,7 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 
 def update_causal_mask(attention_mask):
     """
-    Create causal mask for decoding at the last position.
+    Create causal mask for decoding.
     
     Args:
         attention_mask: [bsz, seq_len] - 1 for valid tokens, 0 for padding
@@ -724,32 +724,30 @@ def update_causal_mask(attention_mask):
     dtype = torch.bfloat16
     min_dtype = torch.finfo(dtype).min
     device = attention_mask.device
-    bsz, target_length = attention_mask.shape
+    bsz, seq_len = attention_mask.shape
     
-    # For decoding, we're generating the next token (at position target_length)
-    # Query length is 1 (single new token)
-    sequence_length = 1
+    # Query length is 1 (single new token being generated)
+    query_length = 1
     
-    # Since we're at the last position, we can attend to all previous positions
-    # No need for upper triangular masking - we can see everything up to current
-    causal_mask = torch.zeros(
-        (sequence_length, target_length),
-        dtype=dtype,
-        device=device,
-    )
+    # Current position is the last position (seq_len - 1 in 0-indexing)
+    current_position = seq_len - 1
+    
+    # Create causal mask: current token can only attend to positions 0 to current_position
+    # Shape: [1, seq_len]
+    causal_mask = torch.zeros((query_length, seq_len), dtype=dtype, device=device)
+    
+    # Mask future positions (though there shouldn't be any if we're at the last position)
+    # This is important if seq_len includes future placeholder positions
+    if current_position < seq_len - 1:
+        causal_mask[:, current_position + 1:] = min_dtype
     
     # Expand to [bsz, 1, 1, seq_len]
-    causal_mask = causal_mask[None, None, :, :].expand(
-        bsz, 1, -1, -1
-    )
+    causal_mask = causal_mask[None, None, :, :].expand(bsz, 1, -1, -1)
     
     # Apply padding mask: set padding positions to min_dtype
     # attention_mask: 1 for valid, 0 for padding
-    # We want: 0 for valid positions, min_dtype for padding
-    padding_mask = (1.0 - attention_mask[:, None, None, :]) * min_dtype
-    
-    # Combine causal and padding masks
-    causal_mask = causal_mask + padding_mask.to(dtype)
+    padding_mask = (attention_mask[:, None, None, :] == 0)
+    causal_mask = causal_mask.masked_fill(padding_mask, min_dtype)
     
     return causal_mask
 
