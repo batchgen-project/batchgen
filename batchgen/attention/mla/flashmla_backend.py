@@ -907,7 +907,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	# logging attention weights at 0
 
 	# Apply scaling
-	attn_weights = attn_weights * self.softmax_scale
+	# attn_weights = attn_weights * self.softmax_scale
 	# attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
 
 	
@@ -918,14 +918,12 @@ def mla_decoding_flashmla_attn_mode_3(
 		)
 	
 	# Apply attention mask
-	attn_weights = attn_weights + attention_mask_processed
+	# attn_weights = attn_weights + attention_mask_processed
 	
 	# Apply softmax
 	attn_weights = nn.functional.softmax(
 		attn_weights, dim=-1, dtype=torch.float32
 	).to(q_nope.dtype)
-	logging.info(f"Attention weights sample: {attn_weights[0, 0, 0, :20]}")
-	exit()
 	
 	# --- 8. Compute Attention Output ---
 	# Use einsum for the attention output computation
