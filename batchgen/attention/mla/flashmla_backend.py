@@ -926,6 +926,8 @@ def mla_decoding_flashmla_attn_mode_3(
 		attn_weights, dim=-1, dtype=torch.float32
 	).to(q_nope.dtype)
 	
+	assert not torch.isnan(attn_weights).any(), "NaN in attention weights"
+	assert not torch.isinf(attn_weights).any(), "Inf in attention weights"
 	# --- 8. Compute Attention Output ---
 	# Use einsum for the attention output computation
 	# attn_weights: [bsz, num_heads, 1, max_seqlen_pad]
