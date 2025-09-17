@@ -881,10 +881,10 @@ def mla_decoding_flashmla_attn_mode_3(
 
 	# For causal masking in decoder (if needed)
 	# Create causal mask and combine with padding mask
-	seq_len = attention_mask.size(1)
-	causal_mask = torch.triu(torch.ones(1, seq_len), diagonal=1)
+	# seq_len = attention_mask.size(1)
+	# causal_mask = torch.triu(torch.ones(1, seq_len), diagonal=1)
 	# attention_mask_processed = causal_mask.masked_fill(causal_mask == 1, float('-inf')).to(hidden_states.device)
-	attention_mask_processed = torch.where(causal_mask == 1, 0.0, float('-inf')).to(hidden_states.device)
+	attention_mask_processed = torch.where(mask_4d == 1, 0.0, float('-inf')).to(hidden_states.device)
 
 	
 	# --- 7. Compute Attention Weights ---
