@@ -905,11 +905,12 @@ def mla_decoding_flashmla_attn_mode_3(
 		"bhqd,blcd->bhqc", q_nope_absorbed, kv_states_expanded
 	)
 	# logging attention weights at 0
-	logging.info(f"Attention weights sample: {attn_weights[0, 0, 0, :20]}")
-	exit()
+
 	# Apply scaling
 	attn_weights = attn_weights * self.softmax_scale
 	# attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
+	logging.info(f"Attention weights sample: {attn_weights[0, 0, 0, :20]}")
+	exit()
 	
 	if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
 		raise ValueError(
