@@ -711,42 +711,47 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 	return attn_output, past_key_states, scale
 
 
-def update_casual_mask(attention_mask):
-	dtype = torch.bfloat16
-	min_dtype = torch.finfo(dtype).min
-	device = attention_mask.device
-	target_length = attention_mask.size(-1)
-	sequence_length = 1
-	cache_position = torch.arange(
-		target_length - 1, target_length, device=device
-	)
-	causal_mask = torch.full(
-		(sequence_length, target_length),
-		fill_value=min_dtype,
-		dtype=dtype,
-		device=device,
-	)
-	causal_mask = torch.triu(causal_mask, diagonal=1)
-	causal_mask *= torch.arange(
-		target_length, device=device
-	) > cache_position.reshape(-1, 1)
-	causal_mask = causal_mask[None, None, :, :].expand(
-		attention_mask.shape[0], 1, -1, -1
-	)
-	if attention_mask is not None:
-		causal_mask = (
-			causal_mask.clone()
-		)  # copy to contiguous memory for in-place edit
-		mask_length = attention_mask.shape[-1]
-		padding_mask = (
-			causal_mask[:, :, :, :mask_length]
-			+ attention_mask[:, None, None, :]
-		)
-		padding_mask = padding_mask == 0
-		causal_mask[:, :, :, :mask_length] = causal_mask[
-			:, :, :, :mask_length
-		].masked_fill(padding_mask, min_dtype)
-	return causal_mask
+def update_causal_mask(attention_mask):
+    """
+    Create causal mask for decoding at the last position.
+    
+    Args:
+        attention_mask: [bsz, seq_len] - 1 for valid tokens, 0 for padding
+    
+    Returns:
+        causal_mask: [bsz, 1, 1, seq_len] - additive mask for attention
+    """
+    dtype = torch.bfloat16
+    min_dtype = torch.finfo(dtype).min
+    device = attention_mask.device
+    bsz, target_length = attention_mask.shape
+    
+    # For decoding, we're generating the next token (at position target_length)
+    # Query length is 1 (single new token)
+    sequence_length = 1
+    
+    # Since we're at the last position, we can attend to all previous positions
+    # No need for upper triangular masking - we can see everything up to current
+    causal_mask = torch.zeros(
+        (sequence_length, target_length),
+        dtype=dtype,
+        device=device,
+    )
+    
+    # Expand to [bsz, 1, 1, seq_len]
+    causal_mask = causal_mask[None, None, :, :].expand(
+        bsz, 1, -1, -1
+    )
+    
+    # Apply padding mask: set padding positions to min_dtype
+    # attention_mask: 1 for valid, 0 for padding
+    # We want: 0 for valid positions, min_dtype for padding
+    padding_mask = (1.0 - attention_mask[:, None, None, :]) * min_dtype
+    
+    # Combine causal and padding masks
+    causal_mask = causal_mask + padding_mask.to(dtype)
+    
+    return causal_mask
 
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3(
