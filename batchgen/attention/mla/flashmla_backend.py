@@ -894,6 +894,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	# Need to add dimension for broadcasting: k_pe_states -> [bsz, 1, max_seqlen_pad, qk_rope_head_dim]
 	k_pe_expanded = k_pe_states.unsqueeze(1)
 	attn_weights = torch.einsum("bhqd,blcd->bhqc", q_pe, k_pe_expanded)
+	assert not torch.isnan(attn_weights).any(), "NaN in attention weights after PE"
+	assert not torch.isinf(attn_weights).any(), "Inf in attention weights after PE"
 	# attn_weights shape: [bsz, num_heads, 1, max_seqlen_pad]
 	
 	# Compute nope attention weights using einsum
@@ -904,10 +906,14 @@ def mla_decoding_flashmla_attn_mode_3(
 	attn_weights = attn_weights + torch.einsum(
 		"bhqd,blcd->bhqc", q_nope_absorbed, kv_states_expanded
 	)
+	assert not torch.isnan(attn_weights).any(), "NaN in attention weights before scaling"
+	assert not torch.isinf(attn_weights).any(), "Inf in attention weights before scaling"
 	# logging attention weights at 0
 
 	# Apply scaling
 	attn_weights = attn_weights * self.softmax_scale
+	assert not torch.isnan(attn_weights).any(), "NaN in attention weights before mask"
+	assert not torch.isinf(attn_weights).any(), "Inf in attention weights before mask"
 	# attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
 	# attention_weights = 1
 
@@ -920,6 +926,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	
 	# Apply attention mask
 	attn_weights = attn_weights + attention_mask_processed
+	assert not torch.isnan(attn_weights).any(), "NaN in attention weights after mask"
+	assert not torch.isinf(attn_weights).any(), "Inf in attention weights after mask"
 	
 	# Apply softmax
 	attn_weights = nn.functional.softmax(
