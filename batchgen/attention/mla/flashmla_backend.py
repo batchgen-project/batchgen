@@ -906,8 +906,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	)
 	
 	# Apply scaling
-	# attn_weights = attn_weights * self.softmax_scale
-	attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
+	attn_weights = attn_weights * self.softmax_scale
+	# attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
 	
 	if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
 		raise ValueError(
@@ -916,7 +916,7 @@ def mla_decoding_flashmla_attn_mode_3(
 		)
 	
 	# Apply attention mask
-	attn_weights = attn_weights + attention_mask_processed
+	# attn_weights = attn_weights + attention_mask_processed
 	
 	# Apply softmax
 	attn_weights = nn.functional.softmax(
