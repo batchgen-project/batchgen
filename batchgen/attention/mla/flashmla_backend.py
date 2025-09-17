@@ -898,6 +898,11 @@ def mla_decoding_flashmla_attn_mode_3(
 	# q_pe: [bsz, num_heads, 1, qk_rope_head_dim]
 	# Need to add dimension for broadcasting: k_pe_states -> [bsz, 1, max_seqlen_pad, qk_rope_head_dim]
 	k_pe_expanded = k_pe_states.unsqueeze(1)
+	# check if there is NaN or Inf in q_pe or k_pe_expanded
+	assert not torch.isnan(q_pe).any(), "NaN in q_pe"
+	assert not torch.isinf(q_pe).any(), "Inf in q_pe"
+	assert not torch.isnan(k_pe_expanded).any(), "NaN in k_pe_expanded"
+	assert not torch.isinf(k_pe_expanded).any(), "Inf in k_pe_expanded"
 	attn_weights = torch.einsum("bhqd,blcd->bhqc", q_pe, k_pe_expanded)
 	assert not torch.isnan(attn_weights).any(), "NaN in attention weights after PE"
 	assert not torch.isinf(attn_weights).any(), "Inf in attention weights after PE"
