@@ -937,7 +937,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	
 	# Apply out_absorb projection
 	# attn_output = torch.matmul(attn_output, out_absorb.mT)
-	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_output, out_absorb)
+	attn_output = torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
 	# attn_output shape: [bsz, num_heads, 1, v_head_dim]
 	
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
