@@ -774,7 +774,7 @@ def dequant_compressed_kv_per_token_kernel(
     fp8_block = tl.load(
         kv_base + kv_offsets,
         mask=mask_2d,
-        other=tl.cast(0.0, tl.float8e4m3fn),  # Use FP8 zero
+        other=tl.cast(0.0, tl.float8e4nv),  # Use FP8 zero
         cache_modifier='.cg'
     )
     
