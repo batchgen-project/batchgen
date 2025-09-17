@@ -797,8 +797,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	# assert not torch.isnan(past_key_states).any(), "NaN in past_key_states before dequantization"
 	# assert not torch.isinf(past_key_states).any(), "Inf in past_key_states before dequantization"
 	compressed_kv_ref = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
-	assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref after dequantization"
-	assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref after dequantization"
+	# assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref after dequantization"
+	# assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref after dequantization"
 	max_seqlen_pad = compressed_kv_ref.size(1)
 
 	# --- 2. Query and New Key-Value Projection ---
@@ -828,13 +828,13 @@ def mla_decoding_flashmla_attn_mode_3(
 	# --- 3. Update Cache ---
 	# Update the dequantized cache at the current position
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
-	assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref before update"
-	assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref before update"
+	# assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref before update"
+	# assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref before update"
 	
 	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
 	# log if there is NaN or Inf in compressed_kv_ref
-	assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref after update"
-	assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref after update"
+	# assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref after update"
+	# assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref after update"
 	
 	# Quantize and write to past_key_states
 	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
@@ -909,13 +909,13 @@ def mla_decoding_flashmla_attn_mode_3(
 	# Need to add dimension for broadcasting: k_pe_states -> [bsz, 1, max_seqlen_pad, qk_rope_head_dim]
 	k_pe_expanded = k_pe_states.unsqueeze(1)
 	# check if there is NaN or Inf in q_pe or k_pe_expanded
-	assert not torch.isnan(q_pe).any(), "NaN in q_pe"
-	assert not torch.isinf(q_pe).any(), "Inf in q_pe"
-	assert not torch.isnan(k_pe_expanded).any(), "NaN in k_pe_expanded"
-	assert not torch.isinf(k_pe_expanded).any(), "Inf in k_pe_expanded"
+	# assert not torch.isnan(q_pe).any(), "NaN in q_pe"
+	# assert not torch.isinf(q_pe).any(), "Inf in q_pe"
+	# assert not torch.isnan(k_pe_expanded).any(), "NaN in k_pe_expanded"
+	# assert not torch.isinf(k_pe_expanded).any(), "Inf in k_pe_expanded"
 	attn_weights = torch.einsum("bhqd,blcd->bhqc", q_pe, k_pe_expanded)
-	assert not torch.isnan(attn_weights).any(), "NaN in attention weights after PE"
-	assert not torch.isinf(attn_weights).any(), "Inf in attention weights after PE"
+	# assert not torch.isnan(attn_weights).any(), "NaN in attention weights after PE"
+	# assert not torch.isinf(attn_weights).any(), "Inf in attention weights after PE"
 	# attn_weights shape: [bsz, num_heads, 1, max_seqlen_pad]
 	
 	# Compute nope attention weights using einsum
@@ -926,14 +926,14 @@ def mla_decoding_flashmla_attn_mode_3(
 	attn_weights = attn_weights + torch.einsum(
 		"bhqd,blcd->bhqc", q_nope_absorbed, kv_states_expanded
 	)
-	assert not torch.isnan(attn_weights).any(), "NaN in attention weights before scaling"
-	assert not torch.isinf(attn_weights).any(), "Inf in attention weights before scaling"
+	# assert not torch.isnan(attn_weights).any(), "NaN in attention weights before scaling"
+	# assert not torch.isinf(attn_weights).any(), "Inf in attention weights before scaling"
 	# logging attention weights at 0
 
 	# Apply scaling
 	attn_weights = attn_weights * self.softmax_scale
-	assert not torch.isnan(attn_weights).any(), "NaN in attention weights before mask"
-	assert not torch.isinf(attn_weights).any(), "Inf in attention weights before mask"
+	# assert not torch.isnan(attn_weights).any(), "NaN in attention weights before mask"
+	# assert not torch.isinf(attn_weights).any(), "Inf in attention weights before mask"
 	# attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
 	# attention_weights = 1
 
@@ -946,16 +946,16 @@ def mla_decoding_flashmla_attn_mode_3(
 	
 	# Apply attention mask
 	attn_weights = attn_weights + attention_mask_processed
-	assert not torch.isnan(attn_weights).any(), "NaN in attention weights after mask"
-	assert not torch.isinf(attn_weights).any(), "Inf in attention weights after mask"
+	# assert not torch.isnan(attn_weights).any(), "NaN in attention weights after mask"
+	# assert not torch.isinf(attn_weights).any(), "Inf in attention weights after mask"
 	
 	# Apply softmax
 	attn_weights = nn.functional.softmax(
 		attn_weights, dim=-1, dtype=torch.float32
 	).to(q_nope.dtype)
 	
-	assert not torch.isnan(attn_weights).any(), "NaN in attention weights"
-	assert not torch.isinf(attn_weights).any(), "Inf in attention weights"
+	# assert not torch.isnan(attn_weights).any(), "NaN in attention weights"
+	# assert not torch.isinf(attn_weights).any(), "Inf in attention weights"
 	# --- 8. Compute Attention Output ---
 	# Use einsum for the attention output computation
 	# attn_weights: [bsz, num_heads, 1, max_seqlen_pad]
