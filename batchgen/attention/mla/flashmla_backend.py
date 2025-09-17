@@ -877,7 +877,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	# attention_mask_processed = update_causal_mask(attention_mask)
 	# Option 2: If you need [bsz, num_heads, 1, seq_len]
 	mask_4d = attention_mask.unsqueeze(1).unsqueeze(2)
-	mask_4d = mask_4d.expand(bsz, self.num_heads, 1, seq_len)
+	mask_4d = mask_4d.expand(bsz, self.num_heads, 1, kv_len)
 
 	# For causal masking in decoder (if needed)
 	# Create causal mask and combine with padding mask
