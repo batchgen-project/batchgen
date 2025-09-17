@@ -918,7 +918,7 @@ def mla_decoding_flashmla_attn_mode_3(
 		)
 	
 	# Apply attention mask
-	# attn_weights = attn_weights + attention_mask_processed
+	attn_weights = attn_weights + attention_mask_processed
 	
 	# Apply softmax
 	attn_weights = nn.functional.softmax(
