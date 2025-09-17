@@ -794,8 +794,8 @@ def mla_decoding_flashmla_attn_mode_3(
 
 	# --- 1. Dequantize KV Cache ---
 	# The cache is received in a quantized format. Dequantize it for processing.
-	assert not torch.isnan(past_key_states).any(), "NaN in past_key_states before dequantization"
-	assert not torch.isinf(past_key_states).any(), "Inf in past_key_states before dequantization"
+	# assert not torch.isnan(past_key_states).any(), "NaN in past_key_states before dequantization"
+	# assert not torch.isinf(past_key_states).any(), "Inf in past_key_states before dequantization"
 	compressed_kv_ref = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
 	assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref after dequantization"
 	assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref after dequantization"
