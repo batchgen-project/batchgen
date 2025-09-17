@@ -710,6 +710,44 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 
 	return attn_output, past_key_states, scale
 
+
+def update_casual_mask(attention_mask):
+	dtype = torch.bfloat16
+	min_dtype = torch.finfo(dtype).min
+	device = attention_mask.device
+	target_length = attention_mask.size(-1)
+	sequence_length = 1
+	cache_position = torch.arange(
+		target_length - 1, target_length, device=device
+	)
+	causal_mask = torch.full(
+		(sequence_length, target_length),
+		fill_value=min_dtype,
+		dtype=dtype,
+		device=device,
+	)
+	causal_mask = torch.triu(causal_mask, diagonal=1)
+	causal_mask *= torch.arange(
+		target_length, device=device
+	) > cache_position.reshape(-1, 1)
+	causal_mask = causal_mask[None, None, :, :].expand(
+		attention_mask.shape[0], 1, -1, -1
+	)
+	if attention_mask is not None:
+		causal_mask = (
+			causal_mask.clone()
+		)  # copy to contiguous memory for in-place edit
+		mask_length = attention_mask.shape[-1]
+		padding_mask = (
+			causal_mask[:, :, :, :mask_length]
+			+ attention_mask[:, None, None, :]
+		)
+		padding_mask = padding_mask == 0
+		causal_mask[:, :, :, :mask_length] = causal_mask[
+			:, :, :, :mask_length
+		].masked_fill(padding_mask, min_dtype)
+	return causal_mask
+
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3(
 	self,
@@ -833,18 +871,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	#     torch.finfo(hidden_states.dtype).min,
 	#     0
 	# ).to(hidden_states.dtype)
-	bsz, seq_len = attention_mask.shape
+	attention_mask_processed = update_casual_mask(attention_mask)
 
-	# Create causal mask
-	causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attention_mask.device))
-
-	# Combine padding and causal masks, expand to 4D
-	# Shape: [bsz, 1, seq_len, seq_len]
-	attention_mask_processed = attention_mask.unsqueeze(1).unsqueeze(-1) * causal_mask.unsqueeze(0).unsqueeze(0)
-
-	# Convert to additive mask format
-	attention_mask_processed = (1.0 - attention_mask_processed) * torch.finfo(hidden_states.dtype).min
-	attention_mask_processed = attention_mask_processed.to(hidden_states.dtype)
 	
 	# --- 7. Compute Attention Weights ---
 	# Compute PE attention weights using einsum for proper broadcasting
