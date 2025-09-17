@@ -711,45 +711,45 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 	return attn_output, past_key_states, scale
 
 
-def update_causal_mask(attention_mask):
-    """
-    Create causal mask for decoding.
+# def update_causal_mask(attention_mask):
+#     """
+#     Create causal mask for decoding.
     
-    Args:
-        attention_mask: [bsz, seq_len] - 1 for valid tokens, 0 for padding
+#     Args:
+#         attention_mask: [bsz, seq_len] - 1 for valid tokens, 0 for padding
     
-    Returns:
-        causal_mask: [bsz, 1, 1, seq_len] - additive mask for attention
-    """
-    dtype = torch.bfloat16
-    min_dtype = torch.finfo(dtype).min
-    device = attention_mask.device
-    bsz, seq_len = attention_mask.shape
+#     Returns:
+#         causal_mask: [bsz, 1, 1, seq_len] - additive mask for attention
+#     """
+#     dtype = torch.bfloat16
+#     min_dtype = torch.finfo(dtype).min
+#     device = attention_mask.device
+#     bsz, seq_len = attention_mask.shape
     
-    # Query length is 1 (single new token being generated)
-    query_length = 1
+#     # Query length is 1 (single new token being generated)
+#     query_length = 1
     
-    # Current position is the last position (seq_len - 1 in 0-indexing)
-    current_position = seq_len - 1
+#     # Current position is the last position (seq_len - 1 in 0-indexing)
+#     current_position = seq_len - 1
     
-    # Create causal mask: current token can only attend to positions 0 to current_position
-    # Shape: [1, seq_len]
-    causal_mask = torch.zeros((query_length, seq_len), dtype=dtype, device=device)
+#     # Create causal mask: current token can only attend to positions 0 to current_position
+#     # Shape: [1, seq_len]
+#     causal_mask = torch.zeros((query_length, seq_len), dtype=dtype, device=device)
     
-    # Mask future positions (though there shouldn't be any if we're at the last position)
-    # This is important if seq_len includes future placeholder positions
-    if current_position < seq_len - 1:
-        causal_mask[:, current_position + 1:] = min_dtype
+#     # Mask future positions (though there shouldn't be any if we're at the last position)
+#     # This is important if seq_len includes future placeholder positions
+#     if current_position < seq_len - 1:
+#         causal_mask[:, current_position + 1:] = min_dtype
     
-    # Expand to [bsz, 1, 1, seq_len]
-    causal_mask = causal_mask[None, None, :, :].expand(bsz, 1, -1, -1)
+#     # Expand to [bsz, 1, 1, seq_len]
+#     causal_mask = causal_mask[None, None, :, :].expand(bsz, 1, -1, -1)
     
-    # Apply padding mask: set padding positions to min_dtype
-    # attention_mask: 1 for valid, 0 for padding
-    padding_mask = (attention_mask[:, None, None, :] == 0)
-    causal_mask = causal_mask.masked_fill(padding_mask, min_dtype)
+#     # Apply padding mask: set padding positions to min_dtype
+#     # attention_mask: 1 for valid, 0 for padding
+#     padding_mask = (attention_mask[:, None, None, :] == 0)
+#     causal_mask = causal_mask.masked_fill(padding_mask, min_dtype)
     
-    return causal_mask
+#     return causal_mask
 
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3(
@@ -874,7 +874,16 @@ def mla_decoding_flashmla_attn_mode_3(
 	#     torch.finfo(hidden_states.dtype).min,
 	#     0
 	# ).to(hidden_states.dtype)
-	attention_mask_processed = update_causal_mask(attention_mask)
+	# attention_mask_processed = update_causal_mask(attention_mask)
+	# Option 2: If you need [bsz, num_heads, 1, seq_len]
+	mask_4d = attention_mask.unsqueeze(1).unsqueeze(2)
+	mask_4d = mask_4d.expand(bsz, self.num_heads, 1, seq_len)
+
+	# For causal masking in decoder (if needed)
+	# Create causal mask and combine with padding mask
+	seq_len = attention_mask.size(1)
+	causal_mask = torch.triu(torch.ones(1, seq_len), diagonal=1)
+	attention_mask_processed = causal_mask.masked_fill(causal_mask == 1, float('-inf'))
 
 	
 	# --- 7. Compute Attention Weights ---
