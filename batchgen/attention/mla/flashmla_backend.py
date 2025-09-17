@@ -904,7 +904,9 @@ def mla_decoding_flashmla_attn_mode_3(
 	attn_weights = attn_weights + torch.einsum(
 		"bhqd,blcd->bhqc", q_nope_absorbed, kv_states_expanded
 	)
-	
+	# logging attention weights at 0
+	logging.info(f"Attention weights sample: {attn_weights[0, 0, 0, :20]}")
+	exit()
 	# Apply scaling
 	attn_weights = attn_weights * self.softmax_scale
 	# attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
