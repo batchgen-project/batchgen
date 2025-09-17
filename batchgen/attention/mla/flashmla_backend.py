@@ -876,7 +876,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	#     torch.finfo(hidden_states.dtype).min,
 	#     0
 	# ).to(hidden_states.dtype)
-	attention_mask_processed = update_casual_mask(attention_mask)
+	attention_mask_processed = update_causal_mask(attention_mask)
 
 	
 	# --- 7. Compute Attention Weights ---
