@@ -824,7 +824,13 @@ def mla_decoding_flashmla_attn_mode_3(
 	# --- 3. Update Cache ---
 	# Update the dequantized cache at the current position
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
+	assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref before update"
+	assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref before update"
+	
 	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
+	# log if there is NaN or Inf in compressed_kv_ref
+	assert not torch.isnan(compressed_kv_ref).any(), "NaN in compressed_kv_ref after update"
+	assert not torch.isinf(compressed_kv_ref).any(), "Inf in compressed_kv_ref after update"
 	
 	# Quantize and write to past_key_states
 	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
