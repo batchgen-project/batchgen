@@ -907,8 +907,9 @@ def mla_decoding_flashmla_attn_mode_3(
 	# logging attention weights at 0
 
 	# Apply scaling
-	# attn_weights = attn_weights * self.softmax_scale
+	attn_weights = attn_weights * self.softmax_scale
 	# attn_weights = attn_weights / (self.qk_nope_head_dim ** 0.5)
+	# attention_weights = 1
 
 	
 	if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
@@ -918,7 +919,7 @@ def mla_decoding_flashmla_attn_mode_3(
 		)
 	
 	# Apply attention mask
-	# attn_weights = attn_weights + attention_mask_processed
+	attn_weights = attn_weights + attention_mask_processed
 	
 	# Apply softmax
 	attn_weights = nn.functional.softmax(
@@ -935,7 +936,8 @@ def mla_decoding_flashmla_attn_mode_3(
 	# attn_output shape: [bsz, num_heads, 1, kv_lora_rank]
 	
 	# Apply out_absorb projection
-	attn_output = torch.matmul(attn_output, out_absorb.mT)
+	# attn_output = torch.matmul(attn_output, out_absorb.mT)
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_output, out_absorb)
 	# attn_output shape: [bsz, num_heads, 1, v_head_dim]
 	
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
