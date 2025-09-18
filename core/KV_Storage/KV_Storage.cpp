@@ -195,7 +195,7 @@ std::tuple<at::Tensor, at::Tensor> quant_per_token(torch::Tensor x) {
     return std::make_tuple(q, scale);
 }
 
-// std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
+// std::tuple<at::Tensor, at::Tensor> quant_per_token_bak(const at::Tensor& x) {
 //     /*
 //      * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
 //      * Args:
@@ -257,87 +257,87 @@ std::tuple<at::Tensor, at::Tensor> quant_per_token(torch::Tensor x) {
 //     return std::make_tuple(q, scale);
 // }
 
-// std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
-//     /*
-//      * Enhanced quantization with outlier handling and better numerical stability
-//      */
-//     TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
-//                 "Input tensor must be of dtype BFloat16");
-//     TORCH_CHECK(x.size(-1) == 576,
-//                 "Last dimension of input tensor must be 576");
-//     TORCH_CHECK(x.is_contiguous(),
-//                 "Input tensor must be contiguous");
-//     TORCH_CHECK(x.dim() == 3,
-//                 "Input tensor must have 3 dimensions");
+std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
+    /*
+     * Enhanced quantization with outlier handling and better numerical stability
+     */
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
+                "Input tensor must be of dtype BFloat16");
+    TORCH_CHECK(x.size(-1) == 576,
+                "Last dimension of input tensor must be 576");
+    TORCH_CHECK(x.is_contiguous(),
+                "Input tensor must be contiguous");
+    TORCH_CHECK(x.dim() == 3,
+                "Input tensor must have 3 dimensions");
 
-//     const int64_t bsz = x.size(0);
-//     const int64_t seq_len = x.size(1);
-//     const int64_t dim = x.size(2);
-//     const int64_t M = bsz * seq_len;
+    const int64_t bsz = x.size(0);
+    const int64_t seq_len = x.size(1);
+    const int64_t dim = x.size(2);
+    const int64_t M = bsz * seq_len;
 
-//     const int64_t block_size = 128;
-//     const int64_t num_full_blocks = dim / block_size;
-//     const bool has_last_block = (dim % block_size != 0);
-//     const int64_t last_block_size = dim % block_size;
-//     const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0);
+    const int64_t block_size = 128;
+    const int64_t num_full_blocks = dim / block_size;
+    const bool has_last_block = (dim % block_size != 0);
+    const int64_t last_block_size = dim % block_size;
+    const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0);
 
-//     // Work in float32 for precision
-//     auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+    // Work in float32 for precision
+    auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
 
-//     // Prepare output tensors
-//     auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
-//     auto q_flat = at::empty({M, dim}, x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
+    // Prepare output tensors
+    auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
+    auto q_flat = at::empty({M, dim}, x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
 
-//     // Use percentile-based scaling for outlier robustness (optional)
-//     constexpr float PERCENTILE = 0.999f;  // Use 99.9th percentile instead of max
-//     constexpr float FP8_SAFE_MAX = 440.0f;
+    // Use percentile-based scaling for outlier robustness (optional)
+    constexpr float PERCENTILE = 0.999f;  // Use 99.9th percentile instead of max
+    constexpr float FP8_SAFE_MAX = 440.0f;
 
-//     for (int64_t b = 0; b < num_blocks; ++b) {
-//         const int64_t start = b * block_size;
-//         const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+    for (int64_t b = 0; b < num_blocks; ++b) {
+        const int64_t start = b * block_size;
+        const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
 
-//         auto x_block = x_flat.narrow(1, start, length);
+        auto x_block = x_flat.narrow(1, start, length);
         
-//         // Compute absolute values
-//         auto x_abs = at::abs(x_block);
+        // Compute absolute values
+        auto x_abs = at::abs(x_block);
         
-//         // Option 1: Use max (original approach)
-//         auto amax = at::amax(x_abs, /*dim=*/1, /*keepdim=*/false);
+        // Option 1: Use max (original approach)
+        auto amax = at::amax(x_abs, /*dim=*/1, /*keepdim=*/false);
         
-//         // Option 2: Use percentile for outlier robustness (commented out)
-//         // auto amax = at::quantile(x_abs, PERCENTILE, /*dim=*/1, /*keepdim=*/false);
+        // Option 2: Use percentile for outlier robustness (commented out)
+        // auto amax = at::quantile(x_abs, PERCENTILE, /*dim=*/1, /*keepdim=*/false);
         
-//         // Ensure minimum scale to avoid precision issues
-//         constexpr float MIN_SCALE = 1e-6f;
-//         amax = at::maximum(amax, at::full_like(amax, MIN_SCALE));
+        // Ensure minimum scale to avoid precision issues
+        constexpr float MIN_SCALE = 1e-6f;
+        amax = at::maximum(amax, at::full_like(amax, MIN_SCALE));
         
-//         // Compute scale with safety margin
-//         auto scale = amax / FP8_SAFE_MAX;
+        // Compute scale with safety margin
+        auto scale = amax / FP8_SAFE_MAX;
         
-//         // Store scale
-//         scale_flat.select(1, b).copy_(scale);
+        // Store scale
+        scale_flat.select(1, b).copy_(scale);
 
-//         // Quantize with proper scaling
-//         auto scale_expanded = scale.unsqueeze(1);
+        // Quantize with proper scaling
+        auto scale_expanded = scale.unsqueeze(1);
         
-//         // Divide and clamp in one operation for efficiency
-//         auto y = at::clamp(
-//             x_block / scale_expanded,
-//             /*min=*/-FP8_SAFE_MAX,
-//             /*max=*/FP8_SAFE_MAX
-//         );
+        // Divide and clamp in one operation for efficiency
+        auto y = at::clamp(
+            x_block / scale_expanded,
+            /*min=*/-FP8_SAFE_MAX,
+            /*max=*/FP8_SAFE_MAX
+        );
         
-//         // Cast to FP8
-//         auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
-//         q_flat.narrow(1, start, length).copy_(q_block);
-//     }
+        // Cast to FP8
+        auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
+        q_flat.narrow(1, start, length).copy_(q_block);
+    }
 
-//     // Reshape outputs
-//     auto q = q_flat.view({bsz, seq_len, dim});
-//     auto scale = scale_flat.view({bsz, seq_len, num_blocks});
+    // Reshape outputs
+    auto q = q_flat.view({bsz, seq_len, dim});
+    auto scale = scale_flat.view({bsz, seq_len, num_blocks});
 
-//     return std::make_tuple(q, scale);
-// }
+    return std::make_tuple(q, scale);
+}
 
 
 // KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
@@ -1192,7 +1192,7 @@ torch::Tensor KV_Storage::get_k_quantize_scale(
 // };
 
 
-void KV_Storage::
+void KV_Storage::offload(
     int64_t layer_idx,
     std::vector<int64_t> query_global_idx, 
     torch::Tensor k,
@@ -1204,8 +1204,8 @@ void KV_Storage::
         [&]() {
             auto worker = std::thread(&KV_Storage::offload_helper_, this,
                                       layer_idx, query_global_idx, k, v, attention_mask);
-            worker.detach();
-            // worker.join();
+            // worker.detach();
+            worker.join();
         },
         this->logger_);
 
