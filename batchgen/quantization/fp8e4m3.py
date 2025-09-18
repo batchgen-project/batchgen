@@ -720,231 +720,231 @@ def dequant_compressed_kv_per_token_with_length_v2(
 
 
 """ V2 """
-# @triton.jit
-# def dequant_compressed_kv_per_token_kernel(
-#     kv_ptr, scale_ptr, output_ptr,
-#     dim: tl.constexpr, 
-#     quant_block_size: tl.constexpr,
-#     seq_len: tl.constexpr,
-#     bsz: tl.constexpr, 
-#     padded_seq_len: tl.constexpr, 
-#     max_seq_len: tl.constexpr,
-#     BLOCK_SIZE_M: tl.constexpr,
-#     BLOCK_SIZE_N: tl.constexpr,
-#     kv_stride0, kv_stride1, kv_stride2,
-#     scale_stride0, scale_stride1, scale_stride2,
-#     output_stride0, output_stride1, output_stride2,
-# ):
-#     # Get batch index
-#     batch_idx = tl.program_id(0)
-#     # Get sequence tile index
-#     seq_tile_idx = tl.program_id(1)
-#     # Get dimension tile index
-#     dim_tile_idx = tl.program_id(2)
+@triton.jit
+def dequant_compressed_kv_per_token_kernel(
+    kv_ptr, scale_ptr, output_ptr,
+    dim: tl.constexpr, 
+    quant_block_size: tl.constexpr,
+    seq_len: tl.constexpr,
+    bsz: tl.constexpr, 
+    padded_seq_len: tl.constexpr, 
+    max_seq_len: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    kv_stride0, kv_stride1, kv_stride2,
+    scale_stride0, scale_stride1, scale_stride2,
+    output_stride0, output_stride1, output_stride2,
+):
+    # Get batch index
+    batch_idx = tl.program_id(0)
+    # Get sequence tile index
+    seq_tile_idx = tl.program_id(1)
+    # Get dimension tile index
+    dim_tile_idx = tl.program_id(2)
     
-#     # Calculate starting positions
-#     seq_start = seq_tile_idx * BLOCK_SIZE_M
-#     dim_start = dim_tile_idx * BLOCK_SIZE_N
+    # Calculate starting positions
+    seq_start = seq_tile_idx * BLOCK_SIZE_M
+    dim_start = dim_tile_idx * BLOCK_SIZE_N
     
-#     # Create offset arrays
-#     seq_offsets = seq_start + tl.arange(0, BLOCK_SIZE_M)
-#     dim_offsets = dim_start + tl.arange(0, BLOCK_SIZE_N)
+    # Create offset arrays
+    seq_offsets = seq_start + tl.arange(0, BLOCK_SIZE_M)
+    dim_offsets = dim_start + tl.arange(0, BLOCK_SIZE_N)
     
-#     # Create masks - ensure we respect actual sequence length
-#     seq_mask = seq_offsets < tl.minimum(seq_len, padded_seq_len)
-#     dim_mask = dim_offsets < dim
+    # Create masks - ensure we respect actual sequence length
+    seq_mask = seq_offsets < tl.minimum(seq_len, padded_seq_len)
+    dim_mask = dim_offsets < dim
     
-#     # Calculate which quantization blocks we're accessing
-#     quant_block_start = dim_start // quant_block_size
-#     quant_block_end = tl.minimum(
-#         (dim_start + BLOCK_SIZE_N + quant_block_size - 1) // quant_block_size,
-#         (dim + quant_block_size - 1) // quant_block_size
-#     )
+    # Calculate which quantization blocks we're accessing
+    quant_block_start = dim_start // quant_block_size
+    quant_block_end = tl.minimum(
+        (dim_start + BLOCK_SIZE_N + quant_block_size - 1) // quant_block_size,
+        (dim + quant_block_size - 1) // quant_block_size
+    )
     
-#     # Load FP8 data
-#     kv_base = kv_ptr + batch_idx * kv_stride0
+    # Load FP8 data
+    kv_base = kv_ptr + batch_idx * kv_stride0
     
-#     # Create 2D mask
-#     mask_2d = seq_mask[:, None] & dim_mask[None, :]
+    # Create 2D mask
+    mask_2d = seq_mask[:, None] & dim_mask[None, :]
     
-#     # Calculate pointers for KV data
-#     kv_offsets = seq_offsets[:, None] * kv_stride1 + dim_offsets[None, :] * kv_stride2
+    # Calculate pointers for KV data
+    kv_offsets = seq_offsets[:, None] * kv_stride1 + dim_offsets[None, :] * kv_stride2
     
-#     # Load FP8 values with explicit float8 type
-#     fp8_block = tl.load(
-#         kv_base + kv_offsets,
-#         mask=mask_2d,
-#         other=tl.cast(0.0, tl.float8e4nv),  # Use FP8 zero
-#         cache_modifier='.cg'
-#     )
+    # Load FP8 values with explicit float8 type
+    fp8_block = tl.load(
+        kv_base + kv_offsets,
+        mask=mask_2d,
+        other=tl.cast(0.0, tl.float8e4nv),  # Use FP8 zero
+        cache_modifier='.cg'
+    )
     
-#     # Convert FP8 to float32 safely
-#     # FP8 E4M3 range is approximately ±448, so clamp to avoid overflow
-#     fp32_block = tl.cast(fp8_block, tl.float32)
+    # Convert FP8 to float32 safely
+    # FP8 E4M3 range is approximately ±448, so clamp to avoid overflow
+    fp32_block = tl.cast(fp8_block, tl.float32)
     
-#     # Clamp to valid range to prevent NaN/Inf
-#     fp32_block = tl.where(
-#         mask_2d,
-#         tl.minimum(tl.maximum(fp32_block, -448.0), 448.0),
-#         0.0
-#     )
+    # Clamp to valid range to prevent NaN/Inf
+    fp32_block = tl.where(
+        mask_2d,
+        tl.minimum(tl.maximum(fp32_block, -448.0), 448.0),
+        0.0
+    )
     
-#     # Initialize output block with zeros
-#     output_block = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Initialize output block with zeros
+    output_block = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
-#     # Scale base pointer
-#     scale_base = scale_ptr + batch_idx * scale_stride0
+    # Scale base pointer
+    scale_base = scale_ptr + batch_idx * scale_stride0
     
-#     # Process each quantization block separately
-#     for block_idx in range(quant_block_start, quant_block_end):
-#         # Determine which elements belong to this quantization block
-#         block_start_dim = block_idx * quant_block_size
-#         block_end_dim = tl.minimum((block_idx + 1) * quant_block_size, dim)
+    # Process each quantization block separately
+    for block_idx in range(quant_block_start, quant_block_end):
+        # Determine which elements belong to this quantization block
+        block_start_dim = block_idx * quant_block_size
+        block_end_dim = tl.minimum((block_idx + 1) * quant_block_size, dim)
         
-#         # Create mask for elements in this quantization block
-#         in_block = (dim_offsets >= block_start_dim) & (dim_offsets < block_end_dim)
+        # Create mask for elements in this quantization block
+        in_block = (dim_offsets >= block_start_dim) & (dim_offsets < block_end_dim)
         
-#         # Load scales for this block
-#         scale_offsets = seq_offsets * scale_stride1 + block_idx * scale_stride2
+        # Load scales for this block
+        scale_offsets = seq_offsets * scale_stride1 + block_idx * scale_stride2
         
-#         # Load scales with proper masking
-#         scales = tl.load(
-#             scale_base + scale_offsets,
-#             mask=seq_mask,
-#             other=0.0,  # Use 0.0 for invalid positions
-#             cache_modifier='.cg'
-#         )
+        # Load scales with proper masking
+        scales = tl.load(
+            scale_base + scale_offsets,
+            mask=seq_mask,
+            other=0.0,  # Use 0.0 for invalid positions
+            cache_modifier='.cg'
+        )
         
-#         # Ensure scales are valid (non-NaN, non-Inf, non-zero)
-#         scales = tl.where(
-#             seq_mask,
-#             tl.where(
-#                 tl.abs(scales) > 1e-10,  # Avoid division by zero
-#                 scales,
-#                 1.0
-#             ),
-#             0.0
-#         )
+        # Ensure scales are valid (non-NaN, non-Inf, non-zero)
+        scales = tl.where(
+            seq_mask,
+            tl.where(
+                tl.abs(scales) > 1e-10,  # Avoid division by zero
+                scales,
+                1.0
+            ),
+            0.0
+        )
         
-#         # Check for NaN/Inf in scales and replace with 1.0
-#         scale_is_finite = (scales == scales) & (tl.abs(scales) < 1e10)
-#         scales = tl.where(scale_is_finite, scales, 1.0)
+        # Check for NaN/Inf in scales and replace with 1.0
+        scale_is_finite = (scales == scales) & (tl.abs(scales) < 1e10)
+        scales = tl.where(scale_is_finite, scales, 1.0)
         
-#         # Create combined mask for this block
-#         block_mask = mask_2d & in_block[None, :]
+        # Create combined mask for this block
+        block_mask = mask_2d & in_block[None, :]
         
-#         # Dequantize elements in this block
-#         # Broadcast scales and apply only to relevant elements
-#         dequantized = fp32_block * scales[:, None]
+        # Dequantize elements in this block
+        # Broadcast scales and apply only to relevant elements
+        dequantized = fp32_block * scales[:, None]
         
-#         # Check for NaN/Inf in dequantized values
-#         dequantized_is_finite = (dequantized == dequantized) & (tl.abs(dequantized) < 65504.0)  # BF16 max
-#         dequantized = tl.where(dequantized_is_finite, dequantized, 0.0)
+        # Check for NaN/Inf in dequantized values
+        dequantized_is_finite = (dequantized == dequantized) & (tl.abs(dequantized) < 65504.0)  # BF16 max
+        dequantized = tl.where(dequantized_is_finite, dequantized, 0.0)
         
-#         # Accumulate to output only for valid positions
-#         output_block = tl.where(
-#             block_mask,
-#             dequantized,
-#             output_block
-#         )
+        # Accumulate to output only for valid positions
+        output_block = tl.where(
+            block_mask,
+            dequantized,
+            output_block
+        )
     
-#     # Convert to bfloat16 with clamping
-#     output_block = tl.where(
-#         mask_2d,
-#         tl.cast(
-#             tl.minimum(tl.maximum(output_block, -65504.0), 65504.0),  # BF16 range
-#             tl.bfloat16
-#         ),
-#         tl.cast(0.0, tl.bfloat16)
-#     )
+    # Convert to bfloat16 with clamping
+    output_block = tl.where(
+        mask_2d,
+        tl.cast(
+            tl.minimum(tl.maximum(output_block, -65504.0), 65504.0),  # BF16 range
+            tl.bfloat16
+        ),
+        tl.cast(0.0, tl.bfloat16)
+    )
     
-#     # Store the result
-#     output_base = output_ptr + batch_idx * output_stride0
-#     output_offsets = seq_offsets[:, None] * output_stride1 + dim_offsets[None, :] * output_stride2
+    # Store the result
+    output_base = output_ptr + batch_idx * output_stride0
+    output_offsets = seq_offsets[:, None] * output_stride1 + dim_offsets[None, :] * output_stride2
     
-#     # Final mask for output - only store to valid padded positions
-#     output_mask = (seq_offsets[:, None] < padded_seq_len) & (dim_offsets[None, :] < dim)
+    # Final mask for output - only store to valid padded positions
+    output_mask = (seq_offsets[:, None] < padded_seq_len) & (dim_offsets[None, :] < dim)
     
-#     tl.store(
-#         output_base + output_offsets,
-#         output_block,
-#         mask=output_mask
-#     )
+    tl.store(
+        output_base + output_offsets,
+        output_block,
+        mask=output_mask
+    )
 
 
-# def dequant_compressed_kv_per_token(
-#     q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
-# ):
-#     """
-#     Dequantize FP8 compressed KV cache with per-token quantization.
+def dequant_compressed_kv_per_token(
+    q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
+):
+    """
+    Dequantize FP8 compressed KV cache with per-token quantization.
     
-#     Args:
-#         q: FP8 quantized tensor of shape (bsz, max_seq_len, dim)
-#         scale: Scaling factors of shape (bsz, max_seq_len, num_quant_blocks)
-#         seq_len: Actual sequence length to process
-#         BLOCK_SIZE: Quantization block size
+    Args:
+        q: FP8 quantized tensor of shape (bsz, max_seq_len, dim)
+        scale: Scaling factors of shape (bsz, max_seq_len, num_quant_blocks)
+        seq_len: Actual sequence length to process
+        BLOCK_SIZE: Quantization block size
     
-#     Returns:
-#         Dequantized BF16 tensor of shape (bsz, padded_seq_len, dim)
-#     """
-#     assert q.is_cuda and scale.is_cuda
-#     assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
-#     assert seq_len >= 0 and seq_len <= q.size(1)
-#     assert q.is_contiguous() and scale.is_contiguous()
+    Returns:
+        Dequantized BF16 tensor of shape (bsz, padded_seq_len, dim)
+    """
+    assert q.is_cuda and scale.is_cuda
+    assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
+    assert seq_len >= 0 and seq_len <= q.size(1)
+    assert q.is_contiguous() and scale.is_contiguous()
     
-#     bsz, max_seq_len, dim = q.shape
-#     padded_seq_len = ((seq_len + 63) // 64) * 64
+    bsz, max_seq_len, dim = q.shape
+    padded_seq_len = ((seq_len + 63) // 64) * 64
     
-#     # Calculate number of quantization blocks per token
-#     num_quant_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-#     assert scale.shape == (bsz, max_seq_len, num_quant_blocks), \
-#         f"Scale shape mismatch: expected {(bsz, max_seq_len, num_quant_blocks)}, got {scale.shape}"
+    # Calculate number of quantization blocks per token
+    num_quant_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
+    assert scale.shape == (bsz, max_seq_len, num_quant_blocks), \
+        f"Scale shape mismatch: expected {(bsz, max_seq_len, num_quant_blocks)}, got {scale.shape}"
     
-#     # Check for NaN/Inf in input tensors
-#     if torch.isnan(scale).any() or torch.isinf(scale).any():
-#         print("Warning: NaN or Inf values detected in scale tensor")
-#         # Replace NaN/Inf with 1.0
-#         scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+    # Check for NaN/Inf in input tensors
+    if torch.isnan(scale).any() or torch.isinf(scale).any():
+        print("Warning: NaN or Inf values detected in scale tensor")
+        # Replace NaN/Inf with 1.0
+        scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
     
-#     # Initialize result tensor with zeros
-#     result = torch.zeros((bsz, padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+    # Initialize result tensor with zeros
+    result = torch.zeros((bsz, padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
     
-#     # Use 3D grid: (batch, sequence tiles, dim tiles)
-#     BLOCK_SIZE_M = 64
-#     BLOCK_SIZE_N = 64
+    # Use 3D grid: (batch, sequence tiles, dim tiles)
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_N = 64
     
-#     grid = (
-#         bsz,
-#         (padded_seq_len + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M,
-#         (dim + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
-#     )
+    grid = (
+        bsz,
+        (padded_seq_len + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M,
+        (dim + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    )
     
-#     dequant_compressed_kv_per_token_kernel[grid](
-#         q, scale, result,
-#         dim, BLOCK_SIZE, seq_len,
-#         bsz, padded_seq_len, max_seq_len,
-#         BLOCK_SIZE_M, BLOCK_SIZE_N,
-#         q.stride(0), q.stride(1), q.stride(2),
-#         scale.stride(0), scale.stride(1), scale.stride(2),
-#         result.stride(0), result.stride(1), result.stride(2)
-#     )
+    dequant_compressed_kv_per_token_kernel[grid](
+        q, scale, result,
+        dim, BLOCK_SIZE, seq_len,
+        bsz, padded_seq_len, max_seq_len,
+        BLOCK_SIZE_M, BLOCK_SIZE_N,
+        q.stride(0), q.stride(1), q.stride(2),
+        scale.stride(0), scale.stride(1), scale.stride(2),
+        result.stride(0), result.stride(1), result.stride(2)
+    )
     
-#     return result
+    return result
 
 
-# # Optional: Debug helper function
-# def check_for_nans(tensor, name):
-#     """Helper function to check for NaN values in tensors."""
-#     if torch.isnan(tensor).any():
-#         nan_count = torch.isnan(tensor).sum().item()
-#         print(f"Warning: {name} contains {nan_count} NaN values")
-#         print(f"  Shape: {tensor.shape}")
-#         print(f"  Dtype: {tensor.dtype}")
-#         nan_indices = torch.where(torch.isnan(tensor))
-#         if len(nan_indices[0]) > 0:
-#             print(f"  First NaN at: {[idx[0].item() for idx in nan_indices]}")
-#         return True
-#     return False
+# Optional: Debug helper function
+def check_for_nans(tensor, name):
+    """Helper function to check for NaN values in tensors."""
+    if torch.isnan(tensor).any():
+        nan_count = torch.isnan(tensor).sum().item()
+        print(f"Warning: {name} contains {nan_count} NaN values")
+        print(f"  Shape: {tensor.shape}")
+        print(f"  Dtype: {tensor.dtype}")
+        nan_indices = torch.where(torch.isnan(tensor))
+        if len(nan_indices[0]) > 0:
+            print(f"  First NaN at: {[idx[0].item() for idx in nan_indices]}")
+        return True
+    return False
 
 
 
@@ -952,182 +952,182 @@ def dequant_compressed_kv_per_token_with_length_v2(
 		
 
 
-""" V3 """
-@triton.jit
-def dequant_compressed_kv_per_token_kernel(
-    kv_ptr, scale_ptr, output_ptr,
-    dim: tl.constexpr, quant_block_size: tl.constexpr,
-    bsz, padded_seq_len, max_seq_len,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    # Strides
-    kv_stride0, kv_stride1,
-    scale_stride0, scale_stride1,
-    output_stride0, output_stride1,
-):
-    """
-    Kernel to dequantize FP8 KV-Cache tensor with scale.
-    Args:
-        kv_ptr: Pointer to the quantized KV tensor [bsz, max_seq_len, dim]
-        scale_ptr: Pointer to the scale tensor [bsz, max_seq_len, num_blocks]
-        output_ptr: Pointer to the output tensor [bsz, padded_seq_len, dim]
+# """ V3 """
+# @triton.jit
+# def dequant_compressed_kv_per_token_kernel(
+#     kv_ptr, scale_ptr, output_ptr,
+#     dim: tl.constexpr, quant_block_size: tl.constexpr,
+#     bsz, padded_seq_len, max_seq_len,
+#     BLOCK_SIZE_M: tl.constexpr,
+#     BLOCK_SIZE_N: tl.constexpr,
+#     # Strides
+#     kv_stride0, kv_stride1,
+#     scale_stride0, scale_stride1,
+#     output_stride0, output_stride1,
+# ):
+#     """
+#     Kernel to dequantize FP8 KV-Cache tensor with scale.
+#     Args:
+#         kv_ptr: Pointer to the quantized KV tensor [bsz, max_seq_len, dim]
+#         scale_ptr: Pointer to the scale tensor [bsz, max_seq_len, num_blocks]
+#         output_ptr: Pointer to the output tensor [bsz, padded_seq_len, dim]
     
-    Notes:
-        - This kernel loads first seq_len elements of each sequence in the KV tensor
-          and dequantizes them using the corresponding scale factors.
-        - Includes numerical precision protection for FP8->FP32->BF16 conversion
-    """
-    tile_m = tl.program_id(0)  
-    tile_n = tl.program_id(1)  
-    token_idx = tile_m * BLOCK_SIZE_M
-    seq_idx = token_idx // padded_seq_len
-    kv_token_idx = seq_idx * max_seq_len + token_idx % padded_seq_len
+#     Notes:
+#         - This kernel loads first seq_len elements of each sequence in the KV tensor
+#           and dequantizes them using the corresponding scale factors.
+#         - Includes numerical precision protection for FP8->FP32->BF16 conversion
+#     """
+#     tile_m = tl.program_id(0)  
+#     tile_n = tl.program_id(1)  
+#     token_idx = tile_m * BLOCK_SIZE_M
+#     seq_idx = token_idx // padded_seq_len
+#     kv_token_idx = seq_idx * max_seq_len + token_idx % padded_seq_len
 
-    block_idx = tile_n * BLOCK_SIZE_N // quant_block_size
+#     block_idx = tile_n * BLOCK_SIZE_N // quant_block_size
 
-    block_ptr = kv_ptr + kv_token_idx * kv_stride0 + tile_n * BLOCK_SIZE_N * kv_stride1
+#     block_ptr = kv_ptr + kv_token_idx * kv_stride0 + tile_n * BLOCK_SIZE_N * kv_stride1
     
-    # Load the [BLOCK_SIZE_M, BLOCK_SIZE_N] FP8 blocks
-    mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len) & \
-           (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
+#     # Load the [BLOCK_SIZE_M, BLOCK_SIZE_N] FP8 blocks
+#     mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len) & \
+#            (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
     
-    # Load FP8 data with explicit FP8 zero for masked elements
-    fp8_block = tl.load(
-        block_ptr + (tl.arange(0, BLOCK_SIZE_M)[:, None] * kv_stride0 + 
-                    tl.arange(0, BLOCK_SIZE_N)[None, :] * kv_stride1),
-        mask=mask, 
-        other=tl.cast(0.0, tl.float8e4nv),  # Use FP8 zero instead of float zero
-        cache_modifier='.cg'
-    )
+#     # Load FP8 data with explicit FP8 zero for masked elements
+#     fp8_block = tl.load(
+#         block_ptr + (tl.arange(0, BLOCK_SIZE_M)[:, None] * kv_stride0 + 
+#                     tl.arange(0, BLOCK_SIZE_N)[None, :] * kv_stride1),
+#         mask=mask, 
+#         other=tl.cast(0.0, tl.float8e4nv),  # Use FP8 zero instead of float zero
+#         cache_modifier='.cg'
+#     )
     
-    # Load scale values
-    scale_offsets = scale_ptr + (kv_token_idx + tl.arange(0, BLOCK_SIZE_M)[:, None]) * scale_stride0 + \
-                   block_idx * scale_stride1
-    scale_mask = tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len
-    scale = tl.load(
-        scale_offsets, 
-        mask=scale_mask, 
-        other=1.0,  # Use 1.0 as default scale to avoid corruption
-        cache_modifier='.cg'
-    )
+#     # Load scale values
+#     scale_offsets = scale_ptr + (kv_token_idx + tl.arange(0, BLOCK_SIZE_M)[:, None]) * scale_stride0 + \
+#                    block_idx * scale_stride1
+#     scale_mask = tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len
+#     scale = tl.load(
+#         scale_offsets, 
+#         mask=scale_mask, 
+#         other=1.0,  # Use 1.0 as default scale to avoid corruption
+#         cache_modifier='.cg'
+#     )
     
-    # NUMERICAL FIX 1: Cast FP8 to FP32 with clamping
-    # FP8 E4M3 range is approximately ±448
-    fp32_block = tl.cast(fp8_block, tl.float32)
+#     # NUMERICAL FIX 1: Cast FP8 to FP32 with clamping
+#     # FP8 E4M3 range is approximately ±448
+#     fp32_block = tl.cast(fp8_block, tl.float32)
     
-    # NUMERICAL FIX 2: Clamp FP32 values to valid range before scaling
-    fp32_block = tl.where(
-        mask,
-        tl.minimum(tl.maximum(fp32_block, -448.0), 448.0),
-        0.0
-    )
+#     # NUMERICAL FIX 2: Clamp FP32 values to valid range before scaling
+#     fp32_block = tl.where(
+#         mask,
+#         tl.minimum(tl.maximum(fp32_block, -448.0), 448.0),
+#         0.0
+#     )
     
-    # NUMERICAL FIX 3: Validate scales before multiplication
-    # Check for NaN/Inf in scales (NaN != NaN, Inf has large absolute value)
-    scale_is_finite = (scale == scale) & (tl.abs(scale) < 1e10)
-    scale_is_valid = scale_is_finite & (tl.abs(scale) > 1e-10)  # Avoid near-zero scales
+#     # NUMERICAL FIX 3: Validate scales before multiplication
+#     # Check for NaN/Inf in scales (NaN != NaN, Inf has large absolute value)
+#     scale_is_finite = (scale == scale) & (tl.abs(scale) < 1e10)
+#     scale_is_valid = scale_is_finite & (tl.abs(scale) > 1e-10)  # Avoid near-zero scales
     
-    # Use safe scale values (1.0 for invalid scales to preserve the value)
-    safe_scale = tl.where(
-        scale_mask,
-        tl.where(scale_is_valid, scale, 1.0),
-        1.0
-    )
+#     # Use safe scale values (1.0 for invalid scales to preserve the value)
+#     safe_scale = tl.where(
+#         scale_mask,
+#         tl.where(scale_is_valid, scale, 1.0),
+#         1.0
+#     )
     
-    # NUMERICAL FIX 4: Dequantize with safe multiplication
-    fp32_block = fp32_block * safe_scale
+#     # NUMERICAL FIX 4: Dequantize with safe multiplication
+#     fp32_block = fp32_block * safe_scale
     
-    # NUMERICAL FIX 5: Check for NaN/Inf after dequantization
-    # BF16 has same range as FP32 (±3.39e38) but we clamp to reasonable values
-    MAX_BF16_SAFE = 65504.0  # Use FP16 max as safe value for stability
-    dequant_is_finite = (fp32_block == fp32_block) & (tl.abs(fp32_block) < MAX_BF16_SAFE)
-    fp32_block = tl.where(
-        dequant_is_finite,
-        fp32_block,
-        0.0  # Replace NaN/Inf with zero
-    )
+#     # NUMERICAL FIX 5: Check for NaN/Inf after dequantization
+#     # BF16 has same range as FP32 (±3.39e38) but we clamp to reasonable values
+#     MAX_BF16_SAFE = 65504.0  # Use FP16 max as safe value for stability
+#     dequant_is_finite = (fp32_block == fp32_block) & (tl.abs(fp32_block) < MAX_BF16_SAFE)
+#     fp32_block = tl.where(
+#         dequant_is_finite,
+#         fp32_block,
+#         0.0  # Replace NaN/Inf with zero
+#     )
     
-    # NUMERICAL FIX 6: Final clamping before BF16 conversion
-    # This prevents overflow when converting to BF16
-    fp32_block = tl.where(
-        mask,
-        tl.minimum(tl.maximum(fp32_block, -MAX_BF16_SAFE), MAX_BF16_SAFE),
-        0.0
-    )
+#     # NUMERICAL FIX 6: Final clamping before BF16 conversion
+#     # This prevents overflow when converting to BF16
+#     fp32_block = tl.where(
+#         mask,
+#         tl.minimum(tl.maximum(fp32_block, -MAX_BF16_SAFE), MAX_BF16_SAFE),
+#         0.0
+#     )
     
-    # Convert to BF16
-    bf16_block = tl.cast(fp32_block, tl.bfloat16)
+#     # Convert to BF16
+#     bf16_block = tl.cast(fp32_block, tl.bfloat16)
     
-    # Store the dequantized blocks
-    output_ptrs = output_ptr + tile_m * BLOCK_SIZE_M * output_stride0 + tile_n * BLOCK_SIZE_N * output_stride1
-    output_offsets = tl.arange(0, BLOCK_SIZE_M)[:, None] * output_stride0 + \
-                    tl.arange(0, BLOCK_SIZE_N)[None, :] * output_stride1
-    output_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * padded_seq_len) & \
-                  (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
+#     # Store the dequantized blocks
+#     output_ptrs = output_ptr + tile_m * BLOCK_SIZE_M * output_stride0 + tile_n * BLOCK_SIZE_N * output_stride1
+#     output_offsets = tl.arange(0, BLOCK_SIZE_M)[:, None] * output_stride0 + \
+#                     tl.arange(0, BLOCK_SIZE_N)[None, :] * output_stride1
+#     output_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * padded_seq_len) & \
+#                   (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
     
-    tl.store(output_ptrs + output_offsets, bf16_block, mask=output_mask)
+#     tl.store(output_ptrs + output_offsets, bf16_block, mask=output_mask)
 
 
-def dequant_compressed_kv_per_token(
-    q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
-):
-    """
-    Dequantize FP8 KV-Cache tensor with scale.
-    Args:
-        q: [bsz, max_seq_len, dim] - FP8 quantized tensor
-        scale: [bsz, max_seq_len, num_blocks] - scale factors
-        seq_len: actual sequence length to dequantize
-        BLOCK_SIZE: quantization block size (default 128)
-    Returns:
-        x: [bsz, padded_seq_len, dim] - dequantized BF16 tensor
+# def dequant_compressed_kv_per_token(
+#     q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
+# ):
+#     """
+#     Dequantize FP8 KV-Cache tensor with scale.
+#     Args:
+#         q: [bsz, max_seq_len, dim] - FP8 quantized tensor
+#         scale: [bsz, max_seq_len, num_blocks] - scale factors
+#         seq_len: actual sequence length to dequantize
+#         BLOCK_SIZE: quantization block size (default 128)
+#     Returns:
+#         x: [bsz, padded_seq_len, dim] - dequantized BF16 tensor
     
-    Notes:
-        - Returns x with padded_seq_len (nearest multiple of 64 >= seq_len)
-        - Dequantizes first seq_len elements of max_seq_len tensor
-        - Includes numerical safety checks for FP8->FP32->BF16 conversion
-    """
-    assert q.is_cuda and scale.is_cuda, "Tensors must be on CUDA"
-    assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32, \
-        f"Expected q to be float8_e4m3fn and scale to be float32, got {q.dtype} and {scale.dtype}"
-    assert seq_len >= 0, f"seq_len must be >= 0, got {seq_len}"
-    assert seq_len <= q.size(1), f"seq_len must be <= max_seq_len, got {seq_len} > {q.size(1)}"
-    assert q.is_contiguous() and scale.is_contiguous(), "q and scale must be contiguous tensors"
-    assert q.dim() == scale.dim() == 3, f"Expected 3D tensors, got q: {q.dim()}D, scale: {scale.dim()}D"
+#     Notes:
+#         - Returns x with padded_seq_len (nearest multiple of 64 >= seq_len)
+#         - Dequantizes first seq_len elements of max_seq_len tensor
+#         - Includes numerical safety checks for FP8->FP32->BF16 conversion
+#     """
+#     assert q.is_cuda and scale.is_cuda, "Tensors must be on CUDA"
+#     assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32, \
+#         f"Expected q to be float8_e4m3fn and scale to be float32, got {q.dtype} and {scale.dtype}"
+#     assert seq_len >= 0, f"seq_len must be >= 0, got {seq_len}"
+#     assert seq_len <= q.size(1), f"seq_len must be <= max_seq_len, got {seq_len} > {q.size(1)}"
+#     assert q.is_contiguous() and scale.is_contiguous(), "q and scale must be contiguous tensors"
+#     assert q.dim() == scale.dim() == 3, f"Expected 3D tensors, got q: {q.dim()}D, scale: {scale.dim()}D"
     
-    bsz, max_seq_len, dim = q.shape
-    _, _, num_blocks = scale.shape
+#     bsz, max_seq_len, dim = q.shape
+#     _, _, num_blocks = scale.shape
     
-    # Verify scale dimensions match expected number of blocks
-    expected_num_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-    assert num_blocks == expected_num_blocks, \
-        f"Scale has {num_blocks} blocks but expected {expected_num_blocks} for dim={dim}, BLOCK_SIZE={BLOCK_SIZE}"
+#     # Verify scale dimensions match expected number of blocks
+#     expected_num_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
+#     assert num_blocks == expected_num_blocks, \
+#         f"Scale has {num_blocks} blocks but expected {expected_num_blocks} for dim={dim}, BLOCK_SIZE={BLOCK_SIZE}"
     
-    padded_seq_len = ceil(seq_len / 64) * 64  # Nearest multiple of 64
+#     padded_seq_len = ceil(seq_len / 64) * 64  # Nearest multiple of 64
     
-    # Initialize output with zeros (safer than arbitrary values)
-    result = torch.zeros((bsz * padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+#     # Initialize output with zeros (safer than arbitrary values)
+#     result = torch.zeros((bsz * padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
     
-    # Set up kernel launch parameters
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    num_blocks_m = ceil(bsz * padded_seq_len / BLOCK_SIZE_M)
-    num_blocks_n = ceil(dim / BLOCK_SIZE_N)
+#     # Set up kernel launch parameters
+#     BLOCK_SIZE_M = 64
+#     BLOCK_SIZE_N = 64
+#     num_blocks_m = ceil(bsz * padded_seq_len / BLOCK_SIZE_M)
+#     num_blocks_n = ceil(dim / BLOCK_SIZE_N)
     
-    # Flatten batch dimension for kernel processing
-    q_flat = q.view(-1, dim)
-    scale_flat = scale.view(-1, scale.shape[-1])
+#     # Flatten batch dimension for kernel processing
+#     q_flat = q.view(-1, dim)
+#     scale_flat = scale.view(-1, scale.shape[-1])
     
-    grid = (num_blocks_m, num_blocks_n)
+#     grid = (num_blocks_m, num_blocks_n)
     
-    # Launch kernel with numerical safety
-    dequant_compressed_kv_per_token_kernel[grid](
-        q_flat, scale_flat, result,
-        dim, BLOCK_SIZE,
-        bsz, padded_seq_len, max_seq_len,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
-        q_flat.stride(0), q_flat.stride(1),
-        scale_flat.stride(0), scale_flat.stride(1),
-        result.stride(0), result.stride(1)
-    )
+#     # Launch kernel with numerical safety
+#     dequant_compressed_kv_per_token_kernel[grid](
+#         q_flat, scale_flat, result,
+#         dim, BLOCK_SIZE,
+#         bsz, padded_seq_len, max_seq_len,
+#         BLOCK_SIZE_M, BLOCK_SIZE_N,
+#         q_flat.stride(0), q_flat.stride(1),
+#         scale_flat.stride(0), scale_flat.stride(1),
+#         result.stride(0), result.stride(1)
+#     )
     
-    return result.view(bsz, padded_seq_len, dim)
+#     return result.view(bsz, padded_seq_len, dim)
