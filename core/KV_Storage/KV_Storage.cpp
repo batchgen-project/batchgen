@@ -1204,8 +1204,8 @@ void KV_Storage::offload(
         [&]() {
             auto worker = std::thread(&KV_Storage::offload_helper_, this,
                                       layer_idx, query_global_idx, k, v, attention_mask);
-            // worker.detach();
-            worker.join();
+            worker.detach();
+            // worker.join();
         },
         this->logger_);
 
