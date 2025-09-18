@@ -150,7 +150,7 @@ constexpr float EPSILON = 1e-12f;  // Small value to prevent division by zero
 
 
 
-std::tuple<at::Tensor, at::Tensor> per_token_quant(torch::Tensor x) {
+std::tuple<at::Tensor, at::Tensor> quant_per_token(torch::Tensor x) {
     /* 
      * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per-token.
      * Args:
