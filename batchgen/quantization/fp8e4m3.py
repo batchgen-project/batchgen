@@ -960,7 +960,7 @@ def dequant_compressed_kv_per_token_kernel(
     batch_idx = tl.program_id(0)
     # Get sequence tile index
     seq_tile_idx = tl.program_id(1)
-    # Get dimension tile index
+    # Get dimension tile index  
     dim_tile_idx = tl.program_id(2)
     
     # Calculate starting positions for this tile
@@ -972,7 +972,7 @@ def dequant_compressed_kv_per_token_kernel(
     dim_offsets = dim_start + tl.arange(0, BLOCK_SIZE_N)
     
     # Create masks - only process valid tokens (up to seq_len)
-    seq_mask = seq_offsets < seq_len  # Only valid tokens
+    seq_mask = seq_offsets < seq_len
     dim_mask = dim_offsets < dim
     
     # Combined mask for loading
@@ -985,68 +985,73 @@ def dequant_compressed_kv_per_token_kernel(
     fp8_block = tl.load(
         kv_base + kv_offsets,
         mask=mask_2d,
-        other=0.0,  # Use 0 for out-of-bounds
+        other=0.0,
         eviction_policy='evict_last'
     )
     
     # Convert FP8 to float32 for computation
     fp32_block = fp8_block.to(tl.float32)
     
-    # Scale base pointer
-    scale_base = scale_ptr + batch_idx * scale_stride0
-    
-    # Compute which quantization block each column belongs to
-    # This creates an array of block indices for each column
-    quant_block_indices = dim_offsets // quant_block_size
-    
-    # Get the range of quantization blocks we need to process
-    num_quant_blocks = (dim + quant_block_size - 1) // quant_block_size
-    
     # Initialize output block
     output_block = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
-    # Process each unique quantization block in this tile
-    # We'll use a different approach: compute scale for each column
-    for block_idx in range((dim + quant_block_size - 1) // quant_block_size):
-        # Check if this block is relevant to our tile
-        block_start_dim = block_idx * quant_block_size
-        block_end_dim = tl.minimum((block_idx + 1) * quant_block_size, dim)
-        
-        # Skip if this block doesn't overlap with our tile
-        if block_end_dim <= dim_start or block_start_dim >= dim_start + BLOCK_SIZE_N:
-            continue
-        
-        # Load scales for this quantization block
-        scale_offsets = seq_offsets * scale_stride1 + block_idx * scale_stride2
-        scales = tl.load(
-            scale_base + scale_offsets,
-            mask=seq_mask,
-            other=1.0,  # Use 1.0 for missing scales
-            eviction_policy='evict_last'
-        )
-        
-        # Validate scales
-        scales = tl.where(
-            tl.abs(scales) < 1e-10,
-            1.0,
-            scales
-        )
-        
-        # Create mask for columns belonging to this quantization block
-        col_in_block = quant_block_indices == block_idx
-        
-        # Broadcast scales for this block
-        scales_expanded = scales[:, None]
-        
-        # Apply scale to elements in this quantization block
-        block_mask = seq_mask[:, None] & col_in_block[None, :] & dim_mask[None, :]
-        
-        # Dequantize and update output for this block
-        output_block = tl.where(
-            block_mask,
-            fp32_block * scales_expanded,
-            output_block
-        )
+    # Scale base pointer
+    scale_base = scale_ptr + batch_idx * scale_stride0
+    
+    # Approach: Process each column independently based on its quantization block
+    # This avoids loops and dynamic conditionals
+    
+    # Compute which quantization block each column belongs to
+    quant_block_indices = dim_offsets // quant_block_size
+    
+    # We know that with BLOCK_SIZE_N=64 and quant_block_size=128,
+    # we can have at most 2 different blocks in a tile
+    # Let's handle up to 4 blocks for generality
+    
+    # Process block 0 (if present)
+    block_0_mask = quant_block_indices == 0
+    if tl.sum(block_0_mask.to(tl.int32)) > 0:
+        scale_offsets_0 = seq_offsets * scale_stride1 + 0 * scale_stride2
+        scales_0 = tl.load(scale_base + scale_offsets_0, mask=seq_mask, other=1.0)
+        scales_0 = tl.where(tl.abs(scales_0) < 1e-10, 1.0, scales_0)
+        mask_0 = seq_mask[:, None] & block_0_mask[None, :] & dim_mask[None, :]
+        output_block = tl.where(mask_0, fp32_block * scales_0[:, None], output_block)
+    
+    # Process block 1 (if present)
+    block_1_mask = quant_block_indices == 1
+    if tl.sum(block_1_mask.to(tl.int32)) > 0:
+        scale_offsets_1 = seq_offsets * scale_stride1 + 1 * scale_stride2
+        scales_1 = tl.load(scale_base + scale_offsets_1, mask=seq_mask, other=1.0)
+        scales_1 = tl.where(tl.abs(scales_1) < 1e-10, 1.0, scales_1)
+        mask_1 = seq_mask[:, None] & block_1_mask[None, :] & dim_mask[None, :]
+        output_block = tl.where(mask_1, fp32_block * scales_1[:, None], output_block)
+    
+    # Process block 2 (if present)
+    block_2_mask = quant_block_indices == 2
+    if tl.sum(block_2_mask.to(tl.int32)) > 0:
+        scale_offsets_2 = seq_offsets * scale_stride1 + 2 * scale_stride2
+        scales_2 = tl.load(scale_base + scale_offsets_2, mask=seq_mask, other=1.0)
+        scales_2 = tl.where(tl.abs(scales_2) < 1e-10, 1.0, scales_2)
+        mask_2 = seq_mask[:, None] & block_2_mask[None, :] & dim_mask[None, :]
+        output_block = tl.where(mask_2, fp32_block * scales_2[:, None], output_block)
+    
+    # Process block 3 (if present)
+    block_3_mask = quant_block_indices == 3
+    if tl.sum(block_3_mask.to(tl.int32)) > 0:
+        scale_offsets_3 = seq_offsets * scale_stride1 + 3 * scale_stride2
+        scales_3 = tl.load(scale_base + scale_offsets_3, mask=seq_mask, other=1.0)
+        scales_3 = tl.where(tl.abs(scales_3) < 1e-10, 1.0, scales_3)
+        mask_3 = seq_mask[:, None] & block_3_mask[None, :] & dim_mask[None, :]
+        output_block = tl.where(mask_3, fp32_block * scales_3[:, None], output_block)
+    
+    # Process block 4 (if present) 
+    block_4_mask = quant_block_indices == 4
+    if tl.sum(block_4_mask.to(tl.int32)) > 0:
+        scale_offsets_4 = seq_offsets * scale_stride1 + 4 * scale_stride2
+        scales_4 = tl.load(scale_base + scale_offsets_4, mask=seq_mask, other=1.0)
+        scales_4 = tl.where(tl.abs(scales_4) < 1e-10, 1.0, scales_4)
+        mask_4 = seq_mask[:, None] & block_4_mask[None, :] & dim_mask[None, :]
+        output_block = tl.where(mask_4, fp32_block * scales_4[:, None], output_block)
     
     # Clamp to BF16 range before conversion
     output_block = tl.minimum(tl.maximum(output_block, -65504.0), 65504.0)
