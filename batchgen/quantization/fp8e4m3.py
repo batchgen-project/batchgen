@@ -141,7 +141,7 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
              pid_block * scale_stride2, scale)
 
 
-			 
+
 def per_token_blocked_quantize_bf16_to_fp8(x: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
 	Quantize q [bsz, seq, token_dim] BF16 tensor to FP8 per token with a default block size 128.
@@ -1025,63 +1025,111 @@ def dequant_compressed_kv_per_token_kernel(
 
 
 def dequant_compressed_kv_per_token(
-    q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
+    q: torch.Tensor, 
+    scale: torch.Tensor, 
+    BLOCK_SIZE: int = 128
 ):
     """
-    Dequantize FP8 compressed KV cache with per-token quantization.
+    Dequantize FP8 compressed KV cache.
     
     Args:
-        q: FP8 quantized tensor of shape (bsz, max_seq_len, dim)
-        scale: Scaling factors of shape (bsz, max_seq_len, num_quant_blocks)
-        seq_len: Actual sequence length to process
-        BLOCK_SIZE: Quantization block size
+        q: FP8 quantized tensor [bsz, seq_len, dim]
+        scale: Scale factors [bsz, seq_len, num_blocks]
+        BLOCK_SIZE: Quantization block size (must match quantization)
     
     Returns:
-        Dequantized BF16 tensor of shape (bsz, padded_seq_len, dim)
+        Dequantized BF16 tensor [bsz, seq_len, dim]
     """
-    assert q.is_cuda and scale.is_cuda
-    assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
-    assert seq_len >= 0 and seq_len <= q.size(1)
-    assert q.is_contiguous() and scale.is_contiguous()
+    assert q.dtype == torch.float8_e4m3fn
+    assert scale.dtype == torch.float32
     
-    bsz, max_seq_len, dim = q.shape
-    padded_seq_len = ((seq_len + 63) // 64) * 64
+    bsz, seq_len, dim = q.shape
+    num_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
     
-    # Calculate number of quantization blocks per token
-    num_quant_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-    assert scale.shape == (bsz, max_seq_len, num_quant_blocks), \
-        f"Scale shape mismatch: expected {(bsz, max_seq_len, num_quant_blocks)}, got {scale.shape}"
+    assert scale.shape == (bsz, seq_len, num_blocks)
     
-    # Check for NaN/Inf in input tensors
-    if torch.isnan(scale).any() or torch.isinf(scale).any():
-        print("Warning: NaN or Inf values detected in scale tensor")
-        # Replace NaN/Inf with 1.0
-        scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+    # Simple implementation for verification:
+    # result = q.to(torch.float32)
+    # for b in range(num_blocks):
+    #     start = b * BLOCK_SIZE
+    #     end = min((b + 1) * BLOCK_SIZE, dim)
+    #     result[..., start:end] *= scale[..., b:b+1]
+    # return result.to(torch.bfloat16)
     
-    # Initialize result tensor with zeros
-    result = torch.zeros((bsz, padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+    # Use the corrected kernel...
+    output = torch.empty_like(q, dtype=torch.bfloat16)
     
-    # Use 3D grid: (batch, sequence tiles, dim tiles)
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    
-    grid = (
-        bsz,
-        (padded_seq_len + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M,
-        (dim + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
-    )
+    # Grid configuration
+    grid = (bsz * seq_len, num_blocks)
     
     dequant_compressed_kv_per_token_kernel[grid](
-        q, scale, result,
-        dim, BLOCK_SIZE, seq_len,
-        bsz, padded_seq_len, max_seq_len,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
-        q.stride(0), q.stride(1), q.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        result.stride(0), result.stride(1), result.stride(2)
+        q, scale, output,
+        dim, BLOCK_SIZE, bsz * seq_len,
+        q.stride(0), q.stride(1),
+        scale.stride(0), scale.stride(1),
+        output.stride(0), output.stride(1)
     )
     
-    return result
+    return output
+
+# def dequant_compressed_kv_per_token_bak(
+#     q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
+# ):
+#     """
+#     Dequantize FP8 compressed KV cache with per-token quantization.
+    
+#     Args:
+#         q: FP8 quantized tensor of shape (bsz, max_seq_len, dim)
+#         scale: Scaling factors of shape (bsz, max_seq_len, num_quant_blocks)
+#         seq_len: Actual sequence length to process
+#         BLOCK_SIZE: Quantization block size
+    
+#     Returns:
+#         Dequantized BF16 tensor of shape (bsz, padded_seq_len, dim)
+#     """
+#     assert q.is_cuda and scale.is_cuda
+#     assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
+#     assert seq_len >= 0 and seq_len <= q.size(1)
+#     assert q.is_contiguous() and scale.is_contiguous()
+    
+#     bsz, max_seq_len, dim = q.shape
+#     padded_seq_len = ((seq_len + 63) // 64) * 64
+    
+#     # Calculate number of quantization blocks per token
+#     num_quant_blocks = (dim + BLOCK_SIZE - 1) // BLOCK_SIZE
+#     assert scale.shape == (bsz, max_seq_len, num_quant_blocks), \
+#         f"Scale shape mismatch: expected {(bsz, max_seq_len, num_quant_blocks)}, got {scale.shape}"
+    
+#     # Check for NaN/Inf in input tensors
+#     if torch.isnan(scale).any() or torch.isinf(scale).any():
+#         print("Warning: NaN or Inf values detected in scale tensor")
+#         # Replace NaN/Inf with 1.0
+#         scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+    
+#     # Initialize result tensor with zeros
+#     result = torch.zeros((bsz, padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+    
+#     # Use 3D grid: (batch, sequence tiles, dim tiles)
+#     BLOCK_SIZE_M = 64
+#     BLOCK_SIZE_N = 64
+    
+#     grid = (
+#         bsz,
+#         (padded_seq_len + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M,
+#         (dim + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+#     )
+    
+#     dequant_compressed_kv_per_token_kernel[grid](
+#         q, scale, result,
+#         dim, BLOCK_SIZE, seq_len,
+#         bsz, padded_seq_len, max_seq_len,
+#         BLOCK_SIZE_M, BLOCK_SIZE_N,
+#         q.stride(0), q.stride(1), q.stride(2),
+#         scale.stride(0), scale.stride(1), scale.stride(2),
+#         result.stride(0), result.stride(1), result.stride(2)
+#     )
+    
+#     return result
 
 
 # # Optional: Debug helper function
