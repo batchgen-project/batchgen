@@ -26,62 +26,122 @@ def compressed_kv_bf16_to_fp8_per_token(x: torch.Tensor) -> tuple[torch.Tensor, 
 	q = y.to(torch.float8_e4m3fn)                    # [M, 576] in FP8
 	return q.view(bsz, seq_len, dim), scale.view(bsz, seq_len)	
 
+# @triton.jit
+# def per_token_blocked_quantize_bf16_to_fp8_kernel_v1(
+# 	q_ptr, scale_ptr, out_ptr,
+# 	dim: tl.constexpr, block_size: tl.constexpr,
+# 	# Strides
+# 	q_stride0, q_stride1, q_stride2,
+# 	scale_stride0, scale_stride1, scale_stride2,
+# 	out_stride0, out_stride1, out_stride2
+# ):
+# 	"""
+# 	This kernel handle the following operations.def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+# 		assert x.dim() == 2 and x.size(1) % 128 == 0
+# 		m, n = x.shape
+# 		x_view = x.view(m, -1, 128)
+# 		x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+# 		return (x_view * (448.0 / x_amax.unsqueeze(2))).to(
+# 			torch.float8_e4m3fn
+# 		).view(m, n), (x_amax / 448.0).view(m, -1)
+
+# 	Args:
+# 		q_ptr: Pointer to the quantized KV tensor [bsz, seq_len, dim], BF16
+# 		scale_ptr: Pointer to the scale tensor [bsz, seq_len, num_blocks], float32
+# 		out_ptr: Pointer to the output tensor [bsz, seq_len, dim], float8_e4m3fn
+	
+# 	Notes:
+# 		- This kernel quantizes the input BF16 tensor to FP8 per token with a block size.
+# 			The input dim may not be divisible by the block size for instance, 576. 
+# 			This kernel handles the last block with a size less than the block size.
+# 	"""
+# 	pid_seq = tl.program_id(0)  # seq
+# 	pid_token = tl.program_id(1)
+# 	pid_block = tl.program_id(2)  # quantize block sized 128
+
+# 	# Calculate the block index and offset in the q tensor
+# 	block_offsets = pid_seq * q_stride0 + pid_token * q_stride1 + (pid_block * block_size + tl.arange(0, block_size)) * q_stride2
+# 	# The size of the block can be less than 128 for the last block
+# 	q_bf16 = tl.load(q_ptr + block_offsets, mask=(pid_block * block_size + tl.arange(0, block_size)) < dim, other=0.0)
+# 	# x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+# 	# Find max for this block
+# 	# q_abs = tl.abs(q_bf16)
+# 	q_float = q_bf16.to(tl.float32)
+# 	q_abs = tl.abs(q_float)
+# 	amax = tl.max(q_abs, axis=0)  # [M] max across the block
+# 	# amax = tl.where(amax < 1e-4, 1e-4, amax) 
+# 	amax = tl.maximum(amax, 1e-6) 
+	
+# 	scale = amax / 448.0 
+# 	q_fp8 = (q_float * (448.0 / amax)).to(tl.float8e4nv)  # quantize to FP8
+# 	# Store the quantized tensor
+# 	out_offsets = pid_seq * out_stride0 + pid_token * out_stride1 + (pid_block * block_size + tl.arange(0, block_size)) * out_stride2
+# 	tl.store(out_ptr + out_offsets, q_fp8, mask=(pid_block * block_size + tl.arange(0, block_size)) < dim)
+# 	# Store the scale factor
+# 	tl.store(scale_ptr + pid_seq * scale_stride0 + pid_token * scale_stride1 + pid_block * scale_stride2, scale)
+
+
 @triton.jit
 def per_token_blocked_quantize_bf16_to_fp8_kernel(
-	q_ptr, scale_ptr, out_ptr,
-	dim: tl.constexpr, block_size: tl.constexpr,
-	# Strides
-	q_stride0, q_stride1, q_stride2,
-	scale_stride0, scale_stride1, scale_stride2,
-	out_stride0, out_stride1, out_stride2
+    q_ptr, scale_ptr, out_ptr,
+    dim: tl.constexpr, block_size: tl.constexpr,
+    # Strides
+    q_stride0, q_stride1, q_stride2,
+    scale_stride0, scale_stride1, scale_stride2,
+    out_stride0, out_stride1, out_stride2
 ):
-	"""
-	This kernel handle the following operations.def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-		assert x.dim() == 2 and x.size(1) % 128 == 0
-		m, n = x.shape
-		x_view = x.view(m, -1, 128)
-		x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-		return (x_view * (448.0 / x_amax.unsqueeze(2))).to(
-			torch.float8_e4m3fn
-		).view(m, n), (x_amax / 448.0).view(m, -1)
+    # Constants matching C++ implementation
+    FP8_SAFE_MAX: tl.constexpr = 440.0  # Leave headroom
+    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
+    EPSILON: tl.constexpr = 1e-12
+    
+    pid_seq = tl.program_id(0)
+    pid_token = tl.program_id(1)
+    pid_block = tl.program_id(2)
+    
+    # Calculate offsets
+    block_start = pid_block * block_size
+    block_offsets = pid_seq * q_stride0 + pid_token * q_stride1 + \
+                    (block_start + tl.arange(0, block_size)) * q_stride2
+    
+    # Load with masking for partial blocks
+    mask = (block_start + tl.arange(0, block_size)) < dim
+    q_bf16 = tl.load(q_ptr + block_offsets, mask=mask, other=0.0)
+    
+    # Convert to float32 for computation
+    q_float = q_bf16.to(tl.float32)
+    
+    # Compute absolute maximum (symmetric quantization)
+    q_abs = tl.abs(q_float)
+    amax = tl.max(q_abs, axis=0)
+    
+    # Apply minimum threshold (matching C++)
+    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
+    
+    # Compute scale factor
+    scale = tl.maximum(amax / FP8_SAFE_MAX, EPSILON)
+    
+    # Quantize with explicit clamping
+    q_scaled = q_float / scale
+    q_scaled = tl.minimum(q_scaled, FP8_SAFE_MAX)
+    q_scaled = tl.maximum(q_scaled, -FP8_SAFE_MAX)
+    
+    # Handle NaN/Inf (set to 0)
+    is_finite = tl.abs(q_scaled) < 1e30  # Triton doesn't have isfinite
+    q_scaled = tl.where(is_finite, q_scaled, 0.0)
+    
+    # Convert to FP8
+    q_fp8 = q_scaled.to(tl.float8e4nv)
+    
+    # Store results
+    out_offsets = pid_seq * out_stride0 + pid_token * out_stride1 + \
+                  (block_start + tl.arange(0, block_size)) * out_stride2
+    tl.store(out_ptr + out_offsets, q_fp8, mask=mask)
+    tl.store(scale_ptr + pid_seq * scale_stride0 + pid_token * scale_stride1 + \
+             pid_block * scale_stride2, scale)
 
-	Args:
-		q_ptr: Pointer to the quantized KV tensor [bsz, seq_len, dim], BF16
-		scale_ptr: Pointer to the scale tensor [bsz, seq_len, num_blocks], float32
-		out_ptr: Pointer to the output tensor [bsz, seq_len, dim], float8_e4m3fn
-	
-	Notes:
-		- This kernel quantizes the input BF16 tensor to FP8 per token with a block size.
-			The input dim may not be divisible by the block size for instance, 576. 
-			This kernel handles the last block with a size less than the block size.
-	"""
-	pid_seq = tl.program_id(0)  # seq
-	pid_token = tl.program_id(1)
-	pid_block = tl.program_id(2)  # quantize block sized 128
 
-	# Calculate the block index and offset in the q tensor
-	block_offsets = pid_seq * q_stride0 + pid_token * q_stride1 + (pid_block * block_size + tl.arange(0, block_size)) * q_stride2
-	# The size of the block can be less than 128 for the last block
-	q_bf16 = tl.load(q_ptr + block_offsets, mask=(pid_block * block_size + tl.arange(0, block_size)) < dim, other=0.0)
-	# x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-	# Find max for this block
-	# q_abs = tl.abs(q_bf16)
-	q_float = q_bf16.to(tl.float32)
-	q_abs = tl.abs(q_float)
-	amax = tl.max(q_abs, axis=0)  # [M] max across the block
-	# amax = tl.where(amax < 1e-4, 1e-4, amax) 
-	amax = tl.maximum(amax, 1e-6) 
-	
-	scale = amax / 448.0 
-	q_fp8 = (q_float * (448.0 / amax)).to(tl.float8e4nv)  # quantize to FP8
-	# Store the quantized tensor
-	out_offsets = pid_seq * out_stride0 + pid_token * out_stride1 + (pid_block * block_size + tl.arange(0, block_size)) * out_stride2
-	tl.store(out_ptr + out_offsets, q_fp8, mask=(pid_block * block_size + tl.arange(0, block_size)) < dim)
-	# Store the scale factor
-	tl.store(scale_ptr + pid_seq * scale_stride0 + pid_token * scale_stride1 + pid_block * scale_stride2, scale)
-
-
-
+			 
 def per_token_blocked_quantize_bf16_to_fp8(x: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
 	Quantize q [bsz, seq, token_dim] BF16 tensor to FP8 per token with a default block size 128.
