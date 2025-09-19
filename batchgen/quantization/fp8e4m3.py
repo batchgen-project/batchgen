@@ -992,58 +992,61 @@ def dequant_compressed_kv_per_token_kernel(
     # Convert FP8 to float32 for computation
     fp32_block = fp8_block.to(tl.float32)
     
-    # Initialize output block with zeros
-    output_block = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
     # Scale base pointer
     scale_base = scale_ptr + batch_idx * scale_stride0
     
-    # Determine which quantization blocks we need
-    quant_block_start = dim_start // quant_block_size
-    quant_block_end = tl.minimum(
-        (dim_start + BLOCK_SIZE_N + quant_block_size - 1) // quant_block_size,
-        (dim + quant_block_size - 1) // quant_block_size
-    )
+    # Compute which quantization block each column belongs to
+    # This creates an array of block indices for each column
+    quant_block_indices = dim_offsets // quant_block_size
     
-    # Process each quantization block separately
-    for block_idx in range(quant_block_start, quant_block_end):
-        # Determine the dimension range for this quantization block
+    # Get the range of quantization blocks we need to process
+    num_quant_blocks = (dim + quant_block_size - 1) // quant_block_size
+    
+    # Initialize output block
+    output_block = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Process each unique quantization block in this tile
+    # We'll use a different approach: compute scale for each column
+    for block_idx in range((dim + quant_block_size - 1) // quant_block_size):
+        # Check if this block is relevant to our tile
         block_start_dim = block_idx * quant_block_size
         block_end_dim = tl.minimum((block_idx + 1) * quant_block_size, dim)
         
-        # Create mask for elements belonging to this quantization block
-        # This is the KEY FIX: only select columns that belong to this block
-        block_dim_mask = (dim_offsets >= block_start_dim) & (dim_offsets < block_end_dim)
+        # Skip if this block doesn't overlap with our tile
+        if block_end_dim <= dim_start or block_start_dim >= dim_start + BLOCK_SIZE_N:
+            continue
         
         # Load scales for this quantization block
         scale_offsets = seq_offsets * scale_stride1 + block_idx * scale_stride2
         scales = tl.load(
             scale_base + scale_offsets,
             mask=seq_mask,
-            other=1.0,  # IMPORTANT: Use 1.0, not 0.0 for missing scales
+            other=1.0,  # Use 1.0 for missing scales
             eviction_policy='evict_last'
         )
         
-        # Validate scales (avoid NaN, Inf, and zero)
+        # Validate scales
         scales = tl.where(
-            tl.abs(scales) < 1e-10,  # Too small, would cause overflow
+            tl.abs(scales) < 1e-10,
             1.0,
             scales
         )
         
-        # Apply scale only to elements in this quantization block
-        # This is the CRITICAL FIX: use block_dim_mask to select columns
-        for col_idx in range(BLOCK_SIZE_N):
-            col_dim = dim_start + col_idx
-            if col_dim >= block_start_dim and col_dim < block_end_dim:
-                # This column belongs to the current quantization block
-                col_mask = seq_mask & (col_dim < dim)
-                dequantized_col = fp32_block[:, col_idx] * scales
-                output_block[:, col_idx] = tl.where(
-                    col_mask,
-                    dequantized_col,
-                    output_block[:, col_idx]
-                )
+        # Create mask for columns belonging to this quantization block
+        col_in_block = quant_block_indices == block_idx
+        
+        # Broadcast scales for this block
+        scales_expanded = scales[:, None]
+        
+        # Apply scale to elements in this quantization block
+        block_mask = seq_mask[:, None] & col_in_block[None, :] & dim_mask[None, :]
+        
+        # Dequantize and update output for this block
+        output_block = tl.where(
+            block_mask,
+            fp32_block * scales_expanded,
+            output_block
+        )
     
     # Clamp to BF16 range before conversion
     output_block = tl.minimum(tl.maximum(output_block, -65504.0), 65504.0)
