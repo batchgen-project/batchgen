@@ -1319,6 +1319,13 @@ void KV_Storage::offload_helper_(
             CUDA_CHECK(cudaSetDevice(
                 this->engine_config_.basic_config.device));
             auto [k, k_quantize_scale] = quant_per_token(bf16_k);
+            if (torch::isnan(k_quantize_scale).any().item<bool>() || 
+                torch::isinf(k_quantize_scale).any().item<bool>()) {
+                this->logger_->error(
+                    "KV_Storage: NaN or Inf detected in quantization scale at layer_idx: {}.", 
+                    layer_idx);
+                throw std::runtime_error("NaN or Inf detected in quantization scale.");
+            }
             // log k_quantize_scale shape
             // this->logger_->info("k_quantize_scale shape: {}",
             //                      get_tensor_shape(k_quantize_scale));
