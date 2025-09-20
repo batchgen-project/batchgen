@@ -137,50 +137,134 @@ import triton.language as tl
 from triton import Config
 
 
+# @triton.jit
+# def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
+# 	"""
+# 	Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
+
+# 	Args:
+# 		x_ptr (triton.Pointer): Pointer to the input tensor.
+# 		y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
+# 		s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
+# 		BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
+
+# 	Returns:
+# 		None
+# 	"""
+# 	pid = tl.program_id(axis=0)
+# 	offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+# 	x = tl.load(x_ptr + offs).to(tl.float32)
+# 	s = tl.max(tl.abs(x)) / 448.
+# 	y = x / s
+# 	y = y.to(y_ptr.dtype.element_ty)
+# 	tl.store(y_ptr + offs, y)
+# 	tl.store(s_ptr + pid, s)
+
+
+# def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+# 	"""
+# 	Quantizes the input tensor `x` using block-wise quantization.
+
+# 	Args:
+# 		x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+# 		block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
+
+# 	Returns:
+# 		Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+# 			- The quantized tensor with dtype `torch.float8_e4m3fn`.
+# 			- A tensor of scaling factors with dtype `torch.float32`.
+# 	"""
+# 	assert x.is_contiguous(), 'Input tensor must be contiguous'
+# 	assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
+# 	y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+# 	s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+# 	grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
+# 	act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+# 	return y, s
+
 @triton.jit
-def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
-	"""
-	Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
+def act_quant_kernel(
+    x_ptr, y_ptr, s_ptr,
+    eps: tl.constexpr,
+    percentile_clipping: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    """
+    Improved quantization kernel with numerical stability.
+    """
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offs).to(tl.float32)
+    
+    # Handle special values
+    x = tl.where(tl.math.isnan(x), 0.0, x)
+    x = tl.where(tl.math.isinf(x), tl.where(x > 0, 1e10, -1e10), x)
+    
+    abs_x = tl.abs(x)
+    
+    if percentile_clipping:
+        # More robust: use a high percentile instead of max
+        # This is a simplified version - in practice you might want
+        # to sort and take actual percentile
+        max_val = tl.max(abs_x)
+        mean_val = tl.sum(abs_x) / BLOCK_SIZE
+        # Clip at 2.5x mean or max, whichever is smaller
+        # This reduces outlier impact
+        clip_val = tl.minimum(max_val, mean_val * 2.5)
+        s = tl.maximum(clip_val / 448.0, eps)
+    else:
+        # Original max-based approach with epsilon protection
+        s = tl.maximum(tl.max(abs_x) / 448.0, eps)
+    
+    # Quantize with clamping
+    y = x / s
+    
+    # Clamp to FP8 E4M3 range (-448, 448)
+    y = tl.minimum(y, 448.0)
+    y = tl.maximum(y, -448.0)
+    
+    # Check for underflow (FP8 E4M3 min normal is ~0.001953125)
+    min_fp8_normal = 0.001953125
+    y = tl.where(tl.abs(y) < min_fp8_normal, 0.0, y)
+    
+    # Convert to FP8
+    y = y.to(y_ptr.dtype.element_ty)
+    
+    tl.store(y_ptr + offs, y)
+    tl.store(s_ptr + pid, s)
 
-	Args:
-		x_ptr (triton.Pointer): Pointer to the input tensor.
-		y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
-		s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
-		BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
 
-	Returns:
-		None
-	"""
-	pid = tl.program_id(axis=0)
-	offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-	x = tl.load(x_ptr + offs).to(tl.float32)
-	s = tl.max(tl.abs(x)) / 448.
-	y = x / s
-	y = y.to(y_ptr.dtype.element_ty)
-	tl.store(y_ptr + offs, y)
-	tl.store(s_ptr + pid, s)
-
-
-def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
-	"""
-	Quantizes the input tensor `x` using block-wise quantization.
-
-	Args:
-		x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
-		block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
-
-	Returns:
-		Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-			- The quantized tensor with dtype `torch.float8_e4m3fn`.
-			- A tensor of scaling factors with dtype `torch.float32`.
-	"""
-	assert x.is_contiguous(), 'Input tensor must be contiguous'
-	assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
-	y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-	s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
-	grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
-	act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
-	return y, s
+def act_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+    eps: float = 1e-8,
+    percentile_clipping: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Improved quantization with stability features.
+    
+    Args:
+        x: Input tensor (BF16)
+        block_size: Size of quantization blocks
+        eps: Small epsilon for numerical stability
+        percentile_clipping: Use percentile-based clipping instead of max
+    """
+    assert x.is_contiguous(), 'Input tensor must be contiguous'
+    assert x.size(-1) % block_size == 0
+    
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+    
+    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']),)
+    
+    act_quant_kernel[grid](
+        x, y, s,
+        eps=eps,
+        percentile_clipping=percentile_clipping,
+        BLOCK_SIZE=block_size
+    )
+    
+    return y, s
 
 def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
