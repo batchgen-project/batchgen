@@ -1510,11 +1510,11 @@ void KV_Storage::offload_helper_(
                     this->k_storage[slot_idx][layer_idx].num_tokens = attention_mask[i].sum().item<int64_t>();
                     this->k_storage[slot_idx][layer_idx].used_byte_size =
                         attention_mask[i].sum().item<int64_t>() * token_byte_size;
-                    // this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)}).clone().unsqueeze(0);  
-                    this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale[i]
-                    .clone()
-                    .to(torch::kCPU) // <-- Move tensor to CPU memory
-                    .unsqueeze(0);    
+                    this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)}).clone().unsqueeze(0);  
+                    // this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale[i]
+                    // .clone()
+                    // .to(torch::kCPU) // <-- Move tensor to CPU memory
+                    // .unsqueeze(0);    
                     // log quantize_scale shape
                     // this->logger_->info("quantize_scale shape: {}",
                     //                      get_tensor_shape(this->k_storage[slot_idx][layer_idx].quantize_scale));              
