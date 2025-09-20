@@ -184,87 +184,152 @@ from triton import Config
 
 @triton.jit
 def act_quant_kernel(
-    x_ptr, y_ptr, s_ptr,
+    x_ptr, 
+    y_ptr, 
+    scale_ptr,
+    n_elements,
     eps: tl.constexpr,
-    percentile_clipping: tl.constexpr,
+    fp8_max: tl.constexpr,
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    Improved quantization kernel with numerical stability.
+    Industry standard block quantization kernel for BF16 -> FP8 E4M3.
+    Based on NVIDIA Transformer Engine and FP8 training best practices.
     """
     pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
     
-    # Handle special values
-    x = tl.where(tl.math.isnan(x), 0.0, x)
-    x = tl.where(tl.math.isinf(x), tl.where(x > 0, 1e10, -1e10), x)
+    # Load input in FP32 for numerical stability
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     
-    abs_x = tl.abs(x)
+    # Compute absmax with epsilon for stability (industry standard)
+    absmax = tl.max(tl.abs(x), axis=0)
+    absmax = tl.maximum(absmax, eps)
     
-    if percentile_clipping:
-        # More robust: use a high percentile instead of max
-        # This is a simplified version - in practice you might want
-        # to sort and take actual percentile
-        max_val = tl.max(abs_x)
-        mean_val = tl.sum(abs_x) / BLOCK_SIZE
-        # Clip at 2.5x mean or max, whichever is smaller
-        # This reduces outlier impact
-        clip_val = tl.minimum(max_val, mean_val * 2.5)
-        s = tl.maximum(clip_val / 448.0, eps)
-    else:
-        # Original max-based approach with epsilon protection
-        s = tl.maximum(tl.max(abs_x) / 448.0, eps)
+    # Standard FP8 E4M3 scaling
+    # FP8 E4M3 max value is 448, but use 448.0 for safety
+    scale = absmax / fp8_max
     
-    # Quantize with clamping
-    y = x / s
+    # Quantize and clamp
+    x_scaled = x / scale
     
-    # Clamp to FP8 E4M3 range (-448, 448)
-    y = tl.minimum(y, 448.0)
-    y = tl.maximum(y, -448.0)
-    
-    # Check for underflow (FP8 E4M3 min normal is ~0.001953125)
-    min_fp8_normal = 0.001953125
-    y = tl.where(tl.abs(y) < min_fp8_normal, 0.0, y)
+    # Clamp to FP8 E4M3 range - this is critical
+    x_scaled = tl.minimum(x_scaled, fp8_max)
+    x_scaled = tl.maximum(x_scaled, -fp8_max)
     
     # Convert to FP8
-    y = y.to(y_ptr.dtype.element_ty)
+    y = x_scaled.to(y_ptr.dtype.element_ty)
     
-    tl.store(y_ptr + offs, y)
-    tl.store(s_ptr + pid, s)
+    # Store outputs
+    tl.store(y_ptr + offsets, y, mask=mask)
+    tl.store(scale_ptr + pid, scale)
+
+
+@triton.jit
+def act_quant_kernel_2d(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    M, N,
+    eps: tl.constexpr,
+    fp8_max: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    """
+    2D version for better efficiency with matrices.
+    Quantizes along the last dimension (row-wise).
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    # Each program handles one block in a row
+    row_start = x_ptr + pid_m * N
+    block_start = pid_n * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    
+    # Load block
+    x = tl.load(row_start + offsets, mask=mask, other=0.0).to(tl.float32)
+    
+    # Compute scale (absmax)
+    absmax = tl.max(tl.abs(x), axis=0)
+    scale = tl.maximum(absmax, eps) / fp8_max
+    
+    # Quantize
+    x_scaled = x / scale
+    x_scaled = tl.minimum(x_scaled, fp8_max)
+    x_scaled = tl.maximum(x_scaled, -fp8_max)
+    
+    # Store
+    y = x_scaled.to(y_ptr.dtype.element_ty)
+    y_row_start = y_ptr + pid_m * N
+    tl.store(y_row_start + offsets, y, mask=mask)
+    
+    # Store scale (one per block)
+    scale_offset = pid_m * ((N + BLOCK_SIZE - 1) // BLOCK_SIZE) + pid_n
+    tl.store(scale_ptr + scale_offset, scale)
 
 
 def act_quant(
-    x: torch.Tensor,
+    x: torch.Tensor, 
     block_size: int = 128,
-    eps: float = 1e-8,
-    percentile_clipping: bool = True
+    eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Improved quantization with stability features.
+    Industry standard BF16 to FP8 E4M3 block quantization.
     
     Args:
-        x: Input tensor (BF16)
-        block_size: Size of quantization blocks
-        eps: Small epsilon for numerical stability
-        percentile_clipping: Use percentile-based clipping instead of max
+        x: Input tensor in BF16/FP16/FP32
+        block_size: Block size for quantization (typically 128 or 256)
+        eps: Epsilon for numerical stability (1e-12 is standard)
+    
+    Returns:
+        y: Quantized tensor in FP8 E4M3
+        scale: Per-block scaling factors
     """
-    assert x.is_contiguous(), 'Input tensor must be contiguous'
-    assert x.size(-1) % block_size == 0
+    assert x.is_contiguous(), 'Input must be contiguous'
     
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+    # FP8 E4M3 characteristics
+    fp8_max = 448.0
     
-    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']),)
+    # Flatten all dimensions except last for block processing
+    original_shape = x.shape
+    x_flat = x.view(-1, x.shape[-1])
+    M, N = x_flat.shape
     
-    act_quant_kernel[grid](
-        x, y, s,
-        eps=eps,
-        percentile_clipping=percentile_clipping,
-        BLOCK_SIZE=block_size
-    )
+    # Allocate outputs
+    y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
+    num_blocks = (N + block_size - 1) // block_size
+    scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
     
-    return y, s
+    # Launch kernel
+    if N <= 2048:  # Use 2D kernel for smaller dimensions
+        grid = (M, num_blocks)
+        act_quant_kernel_2d[grid](
+            x_flat, y, scale,
+            M, N,
+            eps=eps,
+            fp8_max=fp8_max,
+            BLOCK_SIZE=block_size
+        )
+    else:  # Use 1D kernel for larger dimensions
+        total_blocks = M * num_blocks
+        grid = (total_blocks,)
+        act_quant_kernel[grid](
+            x_flat, y, scale,
+            n_elements=x_flat.numel(),
+            eps=eps,
+            fp8_max=fp8_max,
+            BLOCK_SIZE=block_size
+        )
+        scale = scale.view(M, num_blocks)
+    
+    # Restore original shape
+    y = y.view(original_shape)
+    
+    return y, scale
 
 def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
