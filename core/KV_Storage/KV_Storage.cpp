@@ -2389,6 +2389,7 @@ std::vector<torch::Tensor> KV_Storage::get_kv_scale(std::vector<int64_t> query_g
 
         for (int64_t i = 0; i < query_global_indices.size(); i++) {
             // ... find slot_idx ...
+            auto query_idx = query_global_indices[i];
             int64_t slot_idx = -1;
             {
                 std::lock_guard<std::mutex> lock(this->mutex_);
