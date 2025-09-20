@@ -2389,6 +2389,11 @@ std::vector<torch::Tensor> KV_Storage::get_kv_scale(std::vector<int64_t> query_g
 
         for (int64_t i = 0; i < query_global_indices.size(); i++) {
             // ... find slot_idx ...
+            int64_t slot_idx = -1;
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+            }
             
             // 1. Get the scale tensor (it's on the CPU)
             torch::Tensor scale_tensor = this->k_storage[slot_idx][layer_idx].quantize_scale;
