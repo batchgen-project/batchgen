@@ -2429,13 +2429,13 @@ py::list KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indic
                     this->k_storage[slot_idx][layer_idx].start_ptr);
             }
             // Copy the data from k_ptr to k_tensor
-            // auto dst_ptr = k_tensor.data_ptr() + i * max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch);
+            auto dst_ptr = k_tensor.data_ptr() + i * max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch);
             
             // Get a view of the destination slice for the i-th sequence
-            auto k_tensor_slice = k_tensor.slice(/*dim=*/0, /*start=*/i, /*end=*/i + 1);
+            // auto k_tensor_slice = k_tensor.slice(/*dim=*/0, /*start=*/i, /*end=*/i + 1);
 
             // Get the data pointer of that specific slice
-            auto dst_ptr = k_tensor_slice.data_ptr();
+            // auto dst_ptr = k_tensor_slice.data_ptr();
             CUDA_CHECK(cudaMemcpyAsync(
                 dst_ptr, k_ptr, max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch),
                 cudaMemcpyHostToDevice, this->stream_));
@@ -2447,7 +2447,7 @@ py::list KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indic
         past_key_states.append(std::move(k_tensor));
     }
     
-    this->logger_->debug("KV_Storage get_past_key_states(): Past key states retrieved.");
+    this->logger_->info("KV_Storage get_past_key_states(): Past key states retrieved.");
     return past_key_states;
 }
 
@@ -2530,7 +2530,7 @@ std::vector<torch::Tensor> KV_Storage::get_kv_scale(std::vector<int64_t> query_g
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time -
         start_time);
-    this->logger_->debug("KV_Storage get_kv_scale(): Time taken to get kv scale: {} seconds", duration.count());
+    this->logger_->info("KV_Storage get_kv_scale(): Time taken to get kv scale: {} seconds", duration.count());
     return kv_scale;
 }
 
