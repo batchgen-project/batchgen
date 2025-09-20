@@ -2459,72 +2459,72 @@ std::vector<torch::Tensor> KV_Storage::get_kv_scale(std::vector<int64_t> query_g
     std::vector<torch::Tensor> kv_scale;
     for (int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
         // Get the quantization scale for k
-        // std::vector<torch::Tensor> k_quantize_scale;
-        // for (int64_t i = 0; i < static_cast<int64_t>(query_global_indices.size()); i++) {
-        //     auto query_idx = query_global_indices[i];
-        //     int64_t slot_idx = -1;
-        //     {
-        //         std::lock_guard<std::mutex> lock(this->mutex_);
-        //         slot_idx = this->query_idx_to_slot_idx_map[query_idx];
-        //     }
-        //     // Get the scale tensor from k_storage
-        //     // The scale should be of shape [bsz, seq_len, num_block].
-        //     // If the scale's seq_len is less than the seq_len, pad it with zeros.
-        //     torch::Tensor scale_tensor = this->k_storage[slot_idx][layer_idx].quantize_scale;
-        //     if (scale_tensor.size(1) < seq_len) {
-        //         // Pad the scale tensor with zeros
-        //         auto options = torch::TensorOptions()
-        //             .dtype(torch::kFloat32)
-        //             .device(this->engine_config_.basic_config.device_torch)
-        //             .requires_grad(false);
-        //         torch::Tensor padded_scale_tensor = torch::zeros(
-        //             {scale_tensor.size(0), seq_len - scale_tensor.size(1), scale_tensor.size(2)},
-        //             options);
-        //         scale_tensor = torch::cat({scale_tensor, padded_scale_tensor}, 1);
-        //     }
-        //     k_quantize_scale.push_back(scale_tensor);
-        // }
-        // // Concatenate the scale tensors for each layer
-        // torch::Tensor k_scale_tensor = torch::cat(k_quantize_scale, 0);
-        // kv_scale.push_back(k_scale_tensor);
-
-        std::vector<torch::Tensor> scales_for_layer; // Will hold CPU tensors
-
-        for (int64_t i = 0; i < query_global_indices.size(); i++) {
-            // ... find slot_idx ...
+        std::vector<torch::Tensor> k_quantize_scale;
+        for (int64_t i = 0; i < static_cast<int64_t>(query_global_indices.size()); i++) {
             auto query_idx = query_global_indices[i];
             int64_t slot_idx = -1;
             {
                 std::lock_guard<std::mutex> lock(this->mutex_);
                 slot_idx = this->query_idx_to_slot_idx_map[query_idx];
             }
-            
-            // 1. Get the scale tensor (it's on the CPU)
+            // Get the scale tensor from k_storage
+            // The scale should be of shape [bsz, seq_len, num_block].
+            // If the scale's seq_len is less than the seq_len, pad it with zeros.
             torch::Tensor scale_tensor = this->k_storage[slot_idx][layer_idx].quantize_scale;
-
-            // 2. Pad it on the CPU if necessary
             if (scale_tensor.size(1) < seq_len) {
-                auto cpu_options = torch::TensorOptions()
+                // Pad the scale tensor with zeros
+                auto options = torch::TensorOptions()
                     .dtype(torch::kFloat32)
-                    .device(torch::kCPU); // <-- Create padding on the CPU
-                    
-                torch::Tensor padding = torch::zeros(
+                    .device(this->engine_config_.basic_config.device_torch)
+                    .requires_grad(false);
+                torch::Tensor padded_scale_tensor = torch::zeros(
                     {scale_tensor.size(0), seq_len - scale_tensor.size(1), scale_tensor.size(2)},
-                    cpu_options);
-                    
-                scale_tensor = torch::cat({scale_tensor, padding}, 1);
+                    options);
+                scale_tensor = torch::cat({scale_tensor, padded_scale_tensor}, 1);
             }
-            scales_for_layer.push_back(scale_tensor);
+            k_quantize_scale.push_back(scale_tensor);
         }
+        // Concatenate the scale tensors for each layer
+        torch::Tensor k_scale_tensor = torch::cat(k_quantize_scale, 0);
+        kv_scale.push_back(k_scale_tensor);
 
-        // 3. Concatenate all CPU tensors for the batch
-        torch::Tensor final_scale_tensor_cpu = torch::cat(scales_for_layer, 0);
+        // std::vector<torch::Tensor> scales_for_layer; // Will hold CPU tensors
 
-        // 4. Move the final, complete tensor to the GPU
-        torch::Tensor final_scale_tensor_gpu = final_scale_tensor_cpu.to(
-            this->engine_config_.basic_config.device_torch);
+        // for (int64_t i = 0; i < query_global_indices.size(); i++) {
+        //     // ... find slot_idx ...
+        //     auto query_idx = query_global_indices[i];
+        //     int64_t slot_idx = -1;
+        //     {
+        //         std::lock_guard<std::mutex> lock(this->mutex_);
+        //         slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+        //     }
             
-        kv_scale.push_back(final_scale_tensor_gpu);
+        //     // 1. Get the scale tensor (it's on the CPU)
+        //     torch::Tensor scale_tensor = this->k_storage[slot_idx][layer_idx].quantize_scale;
+
+        //     // 2. Pad it on the CPU if necessary
+        //     if (scale_tensor.size(1) < seq_len) {
+        //         auto cpu_options = torch::TensorOptions()
+        //             .dtype(torch::kFloat32)
+        //             .device(torch::kCPU); // <-- Create padding on the CPU
+                    
+        //         torch::Tensor padding = torch::zeros(
+        //             {scale_tensor.size(0), seq_len - scale_tensor.size(1), scale_tensor.size(2)},
+        //             cpu_options);
+                    
+        //         scale_tensor = torch::cat({scale_tensor, padding}, 1);
+        //     }
+        //     scales_for_layer.push_back(scale_tensor);
+        // }
+
+        // // 3. Concatenate all CPU tensors for the batch
+        // torch::Tensor final_scale_tensor_cpu = torch::cat(scales_for_layer, 0);
+
+        // // 4. Move the final, complete tensor to the GPU
+        // torch::Tensor final_scale_tensor_gpu = final_scale_tensor_cpu.to(
+        //     this->engine_config_.basic_config.device_torch);
+            
+        // kv_scale.push_back(final_scale_tensor_gpu);
     }
     this->logger_->debug("KV_Storage get_kv_scale(): KV scale retrieved.");
     auto end_time = std::chrono::high_resolution_clock::now();
