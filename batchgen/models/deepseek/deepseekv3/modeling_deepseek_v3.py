@@ -567,7 +567,8 @@ def compiled_moe_gate_forward(hidden_states, weight, e_score_correction_bias,
 	topk_weight = topk_weight / denominator
 	topk_weight = topk_weight * routed_scaling_factor # must multiply the scaling factor
 
-	return topk_idx, topk_weight.to(hidden_states.dtype)
+	# return topk_idx, topk_weight.to(hidden_states.dtype)
+	return topk_idx, topk_weight
 
 from torch._inductor import config as ind_config
 # ind_config.triton.force_cudagraphs_warmup = True
