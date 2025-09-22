@@ -508,7 +508,7 @@ class DeepseekV3MLP(nn.Module):
 		return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
 
 
-torch.set_float32_matmul_precision('high')
+# torch.set_float32_matmul_precision('high')
 # import torch._dynamo.config as dynamo_config
 # import os
 
