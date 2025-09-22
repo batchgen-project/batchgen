@@ -520,59 +520,59 @@ def dequant_compressed_kv_per_token_with_length_v2(
 # 		return result
 
 
-@triton.jit
-def dequant_compressed_kv_per_token_kernel(
-			kv_ptr, scale_ptr, output_ptr,
-			dim: tl.constexpr, quant_block_size: tl.constexpr,
-			bsz, padded_seq_len, max_seq_len,
+# @triton.jit
+# def dequant_compressed_kv_per_token_kernel_dep(
+# 			kv_ptr, scale_ptr, output_ptr,
+# 			dim: tl.constexpr, quant_block_size: tl.constexpr,
+# 			bsz, padded_seq_len, max_seq_len,
 
-			BLOCK_SIZE_M: tl.constexpr,
-			BLOCK_SIZE_N: tl.constexpr,
-			# Strides
-			kv_stride0, kv_stride1,
-			scale_stride0, scale_stride1,
-			output_stride0, output_stride1,
+# 			BLOCK_SIZE_M: tl.constexpr,
+# 			BLOCK_SIZE_N: tl.constexpr,
+# 			# Strides
+# 			kv_stride0, kv_stride1,
+# 			scale_stride0, scale_stride1,
+# 			output_stride0, output_stride1,
 		
-):
-		"""
-			Kernel to dequantize FP8 KV-Cache tensor with scale.
-			Args:
-					kv_ptr: Pointer to the quantized KV tensor [bsz, max_seq_len, dim]
-					scale_ptr: Pointer to the scale tensor [bsz, max_seq_len, num_blocks]
-					output_ptr: Pointer to the output tensor [bsz, padded_seq_len, dim]
+# ):
+# 		"""
+# 			Kernel to dequantize FP8 KV-Cache tensor with scale.
+# 			Args:
+# 					kv_ptr: Pointer to the quantized KV tensor [bsz, max_seq_len, dim]
+# 					scale_ptr: Pointer to the scale tensor [bsz, max_seq_len, num_blocks]
+# 					output_ptr: Pointer to the output tensor [bsz, padded_seq_len, dim]
 
-			Notes:
-					- This kernel load first seq_len elements of each sequence in the KV tensor
-						and dequantizes them using the corresponding scale factors.
-		"""
-		tile_m = tl.program_id(0)  
-		tile_n = tl.program_id(1)  
-		token_idx = tile_m * BLOCK_SIZE_M
-		seq_idx = token_idx // padded_seq_len
-		kv_token_idx = seq_idx * max_seq_len + token_idx % padded_seq_len
+# 			Notes:
+# 					- This kernel load first seq_len elements of each sequence in the KV tensor
+# 						and dequantizes them using the corresponding scale factors.
+# 		"""
+# 		tile_m = tl.program_id(0)  
+# 		tile_n = tl.program_id(1)  
+# 		token_idx = tile_m * BLOCK_SIZE_M
+# 		seq_idx = token_idx // padded_seq_len
+# 		kv_token_idx = seq_idx * max_seq_len + token_idx % padded_seq_len
 
-		block_idx = tile_n * BLOCK_SIZE_N // quant_block_size
+# 		block_idx = tile_n * BLOCK_SIZE_N // quant_block_size
 
-		block_ptr = kv_ptr + kv_token_idx * kv_stride0 + tile_n * BLOCK_SIZE_N * kv_stride1
-		# Load the [BLOCK_SIZE_M, BLOCK_SIZE_N] FP8 blocks
-		mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len) & (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
-		fp8_block = tl.load(
-			block_ptr + (tl.arange(0, BLOCK_SIZE_M)[:, None] * kv_stride0 + tl.arange(0, BLOCK_SIZE_N)[None, :] * kv_stride1),
-			mask=mask, other=0.0, cache_modifier='.cg'
-		)
-		scale_offsets = scale_ptr + (kv_token_idx + tl.arange(0, BLOCK_SIZE_M)[:, None]) * scale_stride0 + block_idx * scale_stride1
-		scale = tl.load(scale_offsets, mask=(tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len), other=0.0, cache_modifier='.cg')
+# 		block_ptr = kv_ptr + kv_token_idx * kv_stride0 + tile_n * BLOCK_SIZE_N * kv_stride1
+# 		# Load the [BLOCK_SIZE_M, BLOCK_SIZE_N] FP8 blocks
+# 		mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len) & (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
+# 		fp8_block = tl.load(
+# 			block_ptr + (tl.arange(0, BLOCK_SIZE_M)[:, None] * kv_stride0 + tl.arange(0, BLOCK_SIZE_N)[None, :] * kv_stride1),
+# 			mask=mask, other=0.0, cache_modifier='.cg'
+# 		)
+# 		scale_offsets = scale_ptr + (kv_token_idx + tl.arange(0, BLOCK_SIZE_M)[:, None]) * scale_stride0 + block_idx * scale_stride1
+# 		scale = tl.load(scale_offsets, mask=(tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len), other=0.0, cache_modifier='.cg')
 
-		# Dequantize the FP8 blocks
-		fp32_block = tl.cast(fp8_block, tl.float32) * scale
-		# Convert to BF16
-		bf16_block = tl.cast(fp32_block, tl.bfloat16)
+# 		# Dequantize the FP8 blocks
+# 		fp32_block = tl.cast(fp8_block, tl.float32) * scale
+# 		# Convert to BF16
+# 		bf16_block = tl.cast(fp32_block, tl.bfloat16)
 
-		# Store the dequantized blocks
-		output_ptrs = output_ptr + tile_m * BLOCK_SIZE_M * output_stride0 + tile_n * BLOCK_SIZE_N * output_stride1
-		output_offsets = tl.arange(0, BLOCK_SIZE_M)[:, None] * output_stride0 + tl.arange(0, BLOCK_SIZE_N)[None, :] * output_stride1
-		output_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * padded_seq_len) & (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
-		tl.store(output_ptrs + output_offsets, bf16_block, mask=output_mask)
+# 		# Store the dequantized blocks
+# 		output_ptrs = output_ptr + tile_m * BLOCK_SIZE_M * output_stride0 + tile_n * BLOCK_SIZE_N * output_stride1
+# 		output_offsets = tl.arange(0, BLOCK_SIZE_M)[:, None] * output_stride0 + tl.arange(0, BLOCK_SIZE_N)[None, :] * output_stride1
+# 		output_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * padded_seq_len) & (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
+# 		tl.store(output_ptrs + output_offsets, bf16_block, mask=output_mask)
 
 
 # def dequant_compressed_kv_per_token(
@@ -630,113 +630,113 @@ def dequant_compressed_kv_per_token_kernel(
 
 
 
-# @triton.jit
-# def dequant_compressed_kv_per_token_kernel(
-#     kv_ptr, scale_ptr, output_ptr,
-#     dim: tl.constexpr, 
-#     quant_block_size: tl.constexpr,
-#     seq_len: tl.constexpr,
-#     bsz: tl.constexpr, 
-#     padded_seq_len: tl.constexpr, 
-#     max_seq_len: tl.constexpr,
-#     BLOCK_SIZE_M: tl.constexpr,
-#     BLOCK_SIZE_N: tl.constexpr,
-#     kv_stride0, kv_stride1, kv_stride2,
-#     scale_stride0, scale_stride1, scale_stride2,
-#     output_stride0, output_stride1, output_stride2,
-# ):
-#     # Get batch index
-#     batch_idx = tl.program_id(0)
-#     # Get sequence tile index
-#     seq_tile_idx = tl.program_id(1)
-#     # Get dimension tile index
-#     dim_tile_idx = tl.program_id(2)
+@triton.jit
+def dequant_compressed_kv_per_token_kernel(
+    kv_ptr, scale_ptr, output_ptr,
+    dim: tl.constexpr, 
+    quant_block_size: tl.constexpr,
+    seq_len: tl.constexpr,
+    bsz: tl.constexpr, 
+    padded_seq_len: tl.constexpr, 
+    max_seq_len: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    kv_stride0, kv_stride1, kv_stride2,
+    scale_stride0, scale_stride1, scale_stride2,
+    output_stride0, output_stride1, output_stride2,
+):
+    # Get batch index
+    batch_idx = tl.program_id(0)
+    # Get sequence tile index
+    seq_tile_idx = tl.program_id(1)
+    # Get dimension tile index
+    dim_tile_idx = tl.program_id(2)
     
-#     # Calculate starting positions
-#     seq_start = seq_tile_idx * BLOCK_SIZE_M
-#     dim_start = dim_tile_idx * BLOCK_SIZE_N
+    # Calculate starting positions
+    seq_start = seq_tile_idx * BLOCK_SIZE_M
+    dim_start = dim_tile_idx * BLOCK_SIZE_N
     
-#     # Create offset arrays
-#     seq_offsets = seq_start + tl.arange(0, BLOCK_SIZE_M)
-#     dim_offsets = dim_start + tl.arange(0, BLOCK_SIZE_N)
+    # Create offset arrays
+    seq_offsets = seq_start + tl.arange(0, BLOCK_SIZE_M)
+    dim_offsets = dim_start + tl.arange(0, BLOCK_SIZE_N)
     
-#     # Create masks
-#     seq_mask = seq_offsets < tl.minimum(seq_len, padded_seq_len)
-#     dim_mask = dim_offsets < dim
+    # Create masks
+    seq_mask = seq_offsets < tl.minimum(seq_len, padded_seq_len)
+    dim_mask = dim_offsets < dim
     
-#     # Calculate which quantization blocks we're accessing
-#     quant_block_start = dim_start // quant_block_size
-#     quant_block_end = tl.minimum(
-#         (dim_start + BLOCK_SIZE_N + quant_block_size - 1) // quant_block_size,
-#         (dim + quant_block_size - 1) // quant_block_size
-#     )
+    # Calculate which quantization blocks we're accessing
+    quant_block_start = dim_start // quant_block_size
+    quant_block_end = tl.minimum(
+        (dim_start + BLOCK_SIZE_N + quant_block_size - 1) // quant_block_size,
+        (dim + quant_block_size - 1) // quant_block_size
+    )
     
-#     # Load FP8 data
-#     kv_base = kv_ptr + batch_idx * kv_stride0
+    # Load FP8 data
+    kv_base = kv_ptr + batch_idx * kv_stride0
     
-#     # Create 2D mask
-#     mask_2d = seq_mask[:, None] & dim_mask[None, :]
+    # Create 2D mask
+    mask_2d = seq_mask[:, None] & dim_mask[None, :]
     
-#     # Calculate pointers for KV data
-#     kv_offsets = seq_offsets[:, None] * kv_stride1 + dim_offsets[None, :] * kv_stride2
+    # Calculate pointers for KV data
+    kv_offsets = seq_offsets[:, None] * kv_stride1 + dim_offsets[None, :] * kv_stride2
     
-#     # Load FP8 values
-#     fp8_block = tl.load(
-#         kv_base + kv_offsets,
-#         mask=mask_2d,
-#         other=0.0,
-#         cache_modifier='.cg'
-#     )
+    # Load FP8 values
+    fp8_block = tl.load(
+        kv_base + kv_offsets,
+        mask=mask_2d,
+        other=0.0,
+        cache_modifier='.cg'
+    )
     
-#     # For each element, determine which quantization block it belongs to
-#     # and load the corresponding scale
-#     scale_base = scale_ptr + batch_idx * scale_stride0
+    # For each element, determine which quantization block it belongs to
+    # and load the corresponding scale
+    scale_base = scale_ptr + batch_idx * scale_stride0
     
-#     # Initialize output block
-#     output_block = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.bfloat16)
+    # Initialize output block
+    output_block = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.bfloat16)
     
-#     # Process each quantization block separately
-#     for block_idx in range(quant_block_start, quant_block_end):
-#         # Determine which elements belong to this quantization block
-#         block_start_dim = block_idx * quant_block_size
-#         block_end_dim = tl.minimum((block_idx + 1) * quant_block_size, dim)
+    # Process each quantization block separately
+    for block_idx in range(quant_block_start, quant_block_end):
+        # Determine which elements belong to this quantization block
+        block_start_dim = block_idx * quant_block_size
+        block_end_dim = tl.minimum((block_idx + 1) * quant_block_size, dim)
         
-#         # Create mask for elements in this quantization block
-#         in_block = (dim_offsets >= block_start_dim) & (dim_offsets < block_end_dim)
+        # Create mask for elements in this quantization block
+        in_block = (dim_offsets >= block_start_dim) & (dim_offsets < block_end_dim)
         
-#         # Load scales for this block
-#         scale_offsets = seq_offsets * scale_stride1 + block_idx * scale_stride2
-#         scales = tl.load(
-#             scale_base + scale_offsets,
-#             mask=seq_mask,
-#             other=1.0,  # Use 1.0 as default to avoid NaN
-#             cache_modifier='.cg'
-#         )
+        # Load scales for this block
+        scale_offsets = seq_offsets * scale_stride1 + block_idx * scale_stride2
+        scales = tl.load(
+            scale_base + scale_offsets,
+            mask=seq_mask,
+            other=1.0,  # Use 1.0 as default to avoid NaN
+            cache_modifier='.cg'
+        )
         
-#         # Dequantize elements in this block
-#         # Broadcast scales and apply only to relevant elements
-#         block_mask = mask_2d & in_block[None, :]
-#         dequantized = tl.cast(fp8_block, tl.float32) * scales[:, None]
+        # Dequantize elements in this block
+        # Broadcast scales and apply only to relevant elements
+        block_mask = mask_2d & in_block[None, :]
+        dequantized = tl.cast(fp8_block, tl.float32) * scales[:, None]
         
-#         # Accumulate to output (using where to avoid NaN propagation)
-#         output_block = tl.where(
-#             block_mask,
-#             tl.cast(dequantized, tl.bfloat16),
-#             output_block
-#         )
+        # Accumulate to output (using where to avoid NaN propagation)
+        output_block = tl.where(
+            block_mask,
+            tl.cast(dequantized, tl.bfloat16),
+            output_block
+        )
     
-#     # Store the result
-#     output_base = output_ptr + batch_idx * output_stride0
-#     output_offsets = seq_offsets[:, None] * output_stride1 + dim_offsets[None, :] * output_stride2
+    # Store the result
+    output_base = output_ptr + batch_idx * output_stride0
+    output_offsets = seq_offsets[:, None] * output_stride1 + dim_offsets[None, :] * output_stride2
     
-#     # Final mask for output
-#     output_mask = (seq_offsets[:, None] < padded_seq_len) & (dim_offsets[None, :] < dim)
+    # Final mask for output
+    output_mask = (seq_offsets[:, None] < padded_seq_len) & (dim_offsets[None, :] < dim)
     
-#     tl.store(
-#         output_base + output_offsets,
-#         output_block,
-#         mask=output_mask
-#     )
+    tl.store(
+        output_base + output_offsets,
+        output_block,
+        mask=output_mask
+    )
 
 # def dequant_compressed_kv_per_token(
 #     q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
