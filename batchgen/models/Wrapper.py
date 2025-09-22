@@ -29,57 +29,133 @@ from ..quantization.fp8e4m3 import (
 	compressed_kv_fp8_to_bf16_per_token
 )
 
+# @triton.jit
+# def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+# 	"""
+# 	Dequantizes weights using the provided scaling factors and stores the result.
+
+# 	Args:
+# 		x_ptr (tl.pointer): Pointer to the quantized weights.
+# 		s_ptr (tl.pointer): Pointer to the scaling factors.
+# 		y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+# 		M (int): Number of rows in the weight matrix.
+# 		N (int): Number of columns in the weight matrix.
+# 		BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+# 	Returns:
+# 		None
+# 	"""
+# 	pid_m = tl.program_id(axis=0)
+# 	pid_n = tl.program_id(axis=1)
+# 	n = tl.cdiv(N, BLOCK_SIZE)
+# 	offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+# 	offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+# 	offs = offs_m[:, None] * N + offs_n[None, :]
+# 	mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+# 	x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+# 	s = tl.load(s_ptr + pid_m * n + pid_n)
+# 	y = x * s
+# 	tl.store(y_ptr + offs, y, mask=mask)
+
+
+# def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+# 	"""
+# 	Dequantizes the given weight tensor using the provided scale tensor.
+
+# 	Args:
+# 		x (torch.Tensor): The quantized weight tensor of shape (M, N).
+# 		s (torch.Tensor): The scale tensor of shape (M//block_size, N//block_size).
+# 		block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+# 	Returns:
+# 		torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+# 	Raises:
+# 		AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+# 	"""
+# 	assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
+# 	assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions but got {} and {}'.format(x.shape, s.shape)
+# 	M, N = x.size()
+# 	y = torch.empty_like(x, dtype=torch.bfloat16)
+# 	grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
+# 	weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+# 	return y
+
 @triton.jit
-def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
-	"""
-	Dequantizes weights using the provided scaling factors and stores the result.
+def weight_dequant_kernel(
+    x_ptr, s_ptr, y_ptr, 
+    M, N, 
+    BLOCK_SIZE: tl.constexpr
+):
+    """
+    Dequantizes FP8 weights to BF16 using block-wise scaling factors.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    # Calculate offsets for this block
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # Create 2D offset and mask
+    offs = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    # Load FP8 data and convert to float32 for computation
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    
+    # Load the scale factor for this block
+    # Scale tensor is (M//BLOCK_SIZE, N//BLOCK_SIZE)
+    num_blocks_n = tl.cdiv(N, BLOCK_SIZE)
+    s_idx = pid_m * num_blocks_n + pid_n
+    s = tl.load(s_ptr + s_idx).to(tl.float32)
+    
+    # Apply scaling
+    y = x * s
+    
+    # Convert to BF16 and store
+    tl.store(y_ptr + offs, y.to(tl.bfloat16), mask=mask)
 
-	Args:
-		x_ptr (tl.pointer): Pointer to the quantized weights.
-		s_ptr (tl.pointer): Pointer to the scaling factors.
-		y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
-		M (int): Number of rows in the weight matrix.
-		N (int): Number of columns in the weight matrix.
-		BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
 
-	Returns:
-		None
-	"""
-	pid_m = tl.program_id(axis=0)
-	pid_n = tl.program_id(axis=1)
-	n = tl.cdiv(N, BLOCK_SIZE)
-	offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-	offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-	offs = offs_m[:, None] * N + offs_n[None, :]
-	mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-	x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-	s = tl.load(s_ptr + pid_m * n + pid_n)
-	y = x * s
-	tl.store(y_ptr + offs, y, mask=mask)
-
-
-def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
-	"""
-	Dequantizes the given weight tensor using the provided scale tensor.
-
-	Args:
-		x (torch.Tensor): The quantized weight tensor of shape (M, N).
-		s (torch.Tensor): The scale tensor of shape (M//block_size, N//block_size).
-		block_size (int, optional): The block size to use for dequantization. Defaults to 128.
-
-	Returns:
-		torch.Tensor: The dequantized weight tensor of the same shape as `x`.
-
-	Raises:
-		AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
-	"""
-	assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
-	assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions but got {} and {}'.format(x.shape, s.shape)
-	M, N = x.size()
-	y = torch.empty_like(x, dtype=torch.bfloat16)
-	grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
-	weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
-	return y
+def deepseek_v3_dequantization(
+    x: torch.Tensor, 
+    s: torch.Tensor, 
+    block_size: int = 128
+) -> torch.Tensor:
+    """
+    Dequantizes FP8 weights to BF16 using block-wise scaling.
+    """
+    assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
+    assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
+    
+    M, N = x.size()
+    
+    # Validate scale tensor dimensions
+    expected_s_shape = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    assert s.shape == expected_s_shape, \
+        f"Scale shape {s.shape} doesn't match expected {expected_s_shape}"
+    
+    # Ensure input is FP8
+    assert x.dtype == torch.float8_e4m3fn or x.dtype == torch.float8_e5m2, \
+        f"Input should be FP8 but got {x.dtype}"
+    
+    # Create output tensor
+    y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+    
+    # Launch kernel
+    grid = lambda meta: (
+        triton.cdiv(M, meta['BLOCK_SIZE']), 
+        triton.cdiv(N, meta['BLOCK_SIZE'])
+    )
+    
+    weight_dequant_kernel[grid](
+        x, s, y, 
+        M, N, 
+        BLOCK_SIZE=block_size
+    )
+    
+    return y
 
 
 
