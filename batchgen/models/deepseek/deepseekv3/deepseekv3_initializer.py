@@ -133,7 +133,7 @@ def deepseek_v3_dequantization(
 
 
 
-class DeepSeekV3_Initializer:
+class DeepseekV3_Initializer:
     def __init__(
         self,
         huggingface_ckpt_name: str,

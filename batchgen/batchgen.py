@@ -141,10 +141,10 @@ class BatchGen:
 			)
 		elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
 			from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import (
-				DeepSeekV3_Initializer,
+				DeepseekV3_Initializer,
 			)
 
-			self.initializer = DeepSeekV3_Initializer(
+			self.initializer = DeepseekV3_Initializer(
 				self.huggingface_ckpt_name,
 				self.hf_cache_dir,
 				self.cache_dir,
