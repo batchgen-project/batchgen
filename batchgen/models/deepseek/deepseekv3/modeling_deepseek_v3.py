@@ -188,7 +188,7 @@ ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 # 		)
 
 class DeepseekV3RotaryEmbedding(nn.Module):
-	def __init__(self, dim, max_position_embeddings=30000, base=10000, device=None):
+	def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
 		super().__init__()
 
 		self.dim = dim

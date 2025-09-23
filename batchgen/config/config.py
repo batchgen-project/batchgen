@@ -16,93 +16,8 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-
-# class AttrDict(dict):
-#     def __init__(self, *args, **kwargs):
-#         super(AttrDict, self).__init__(*args, **kwargs)
-#         self.__dict__ = self
-
-#     def __setitem__(self, key, value):
-#         super(AttrDict, self).__setitem__(key, value)
-#         self.__dict__[key] = value
-
-#     def __setattr__(self, key, value):
-#         super(AttrDict, self).__setitem__(key, value)
-#         super().__setattr__(key, value)
-
-#     def __str__(self):
-#         return "\n".join(
-#             f"    {k}: {v}"
-#             for k, v in self.__dict__.items()
-#             if not k.startswith("_")
-#         )
-
-
-# class EngineConfig:
-#     def __init__(self):
-#         self.Basic_Config = AttrDict(
-#             {
-#                 "log_level": "info",
-#                 "device": None,
-#                 "torch_dtype": None,
-#                 "dtype_str": None,
-#                 "device_torch": None,
-#                 "attn_mode": 1,
-#                 "module_types": None,
-#                 "num_threads": None,
-#                 "padding_length": None,
-#                 "max_decoding_length": None,
-#                 "num_queries": None,
-#                 "kv_dtype": None,
-#             }
-#         )
-
-#         self.Module_Batching_Config = AttrDict(
-#             {
-#                 # "prefill_micro_batch_size": None,
-#                 "global_batch_size": None,
-#                 "attn_prefill_micro_batch_size": None,
-#                 "MoE_prefill_micro_batch_size": None,
-#                 "expert_prefill_batch_size_upper_bound": None,
-#                 "attn_decoding_micro_batch_size": None,
-#                 "MoE_decoding_micro_batch_size": None,
-#                 "expert_decoding_batch_size_upper_bound": None,
-#             }
-#         )
-
-#         self.GPU_Buffer_Config = AttrDict(
-#             {
-#                 "num_prefill_module_buffer": None,
-#                 "num_decoding_module_buffer": None,
-#                 "num_k_buffer": 0,
-#                 "num_v_buffer": 0,
-#                 "kv_buffer_num_tokens": 64 * 576,
-#                 "module_shapes": {},
-#             }
-#         )
-
-#         self.KV_Storage_Config = AttrDict(
-#             {
-#                 "num_host_slots": 200,
-#                 "reserved_length": 576,
-#                 "slot_byte_size": 576 * 1024 * 2,
-#                 "storage_byte_size": 200 * 576 * 1024 * 2 * 32,
-#             }
-#         )
-
-#     def __str__(self):
-#         return (
-#             "EngineConfig:\n"
-#             f"  Module_Batching_Config:\n{self.Module_Batching_Config}\n"
-#             f"  Basic_Config:\n{self.Basic_Config}\n"
-#             f"  GPU_Buffer_Config:\n{self.GPU_Buffer_Config}\n"
-#             f"  KV_Storage_Config:\n{self.KV_Storage_Config}"
-#         )
-
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union
-import json
-import yaml
 from pathlib import Path
 import torch
 import logging
@@ -116,10 +31,9 @@ class BasicConfig:
     weight_dtype_torch: Optional[Any] = None
     kv_dtype: Optional[str] = None
     kv_dtype_torch: Optional[Any] = None
+    attention_dtype: Optional[str] = None
     activation_dtype: Optional[str] = None
     activation_dtype_torch: Optional[Any] = None
-    # torch_dtype: Optional[Any] = None
-    # dtype_str: Optional[str] = None
     device: Optional[str] = None
     device_torch: Optional[Any] = None
     attn_mode: int = 1
@@ -242,74 +156,6 @@ class EngineConfig:
     KV_Storage_Config: KVStorageConfig = field(default_factory=KVStorageConfig)
     EP_Config: EPConfig = field(default_factory=EPConfig)
 
-#     @classmethod
-#     def from_dict(cls, config_dict: Dict[str, Any]) -> 'EngineConfig':
-#         """Create EngineConfig from a dictionary"""
-#         return cls(
-#             Basic_Config=BasicConfig(**config_dict.get('Basic_Config', {})),
-#             Module_Batching_Config=ModuleBatchingConfig(**config_dict.get('Module_Batching_Config', {})),
-#             GPU_Buffer_Config=GPUBufferConfig(**config_dict.get('GPU_Buffer_Config', {})),
-#             KV_Storage_Config=KVStorageConfig(**config_dict.get('KV_Storage_Config', {})),
-#             EP_Config=EPConfig(**config_dict.get('EP_Config', {}))
-#         )
-
-#     @classmethod
-#     def from_json(cls, json_path: Union[str, Path]) -> 'EngineConfig':
-#         """Load configuration from JSON file"""
-#         with open(json_path, 'r') as f:
-#             config_dict = json.load(f)
-#         return cls.from_dict(config_dict)
-
-#     @classmethod
-#     def from_yaml(cls, yaml_path: Union[str, Path]) -> 'EngineConfig':
-#         """Load configuration from YAML file"""
-#         with open(yaml_path, 'r') as f:
-#             config_dict = yaml.safe_load(f)
-#         return cls.from_dict(config_dict)
-
-#     def to_dict(self) -> Dict[str, Any]:
-#         """Convert config to dictionary for serialization"""
-#         # Use asdict but handle torch dtypes which aren't serializable
-#         config_dict = asdict(self)
-        
-#         # Handle torch dtypes
-#         if self.Basic_Config.torch_dtype is not None:
-#             if isinstance(self.Basic_Config.torch_dtype, torch.dtype):
-#                 for torch_type_name in ["float16", "float32", "bfloat16", "float8_e4m3fn", "float8_e5m2"]:
-#                     if getattr(torch, torch_type_name, None) == self.Basic_Config.torch_dtype:
-#                         config_dict["Basic_Config"]["torch_dtype"] = torch_type_name
-#                         break
-#                 else:
-#                     config_dict["Basic_Config"]["torch_dtype"] = str(self.Basic_Config.torch_dtype)
-        
-#         return config_dict
-
-#     def to_json(self, json_path: Union[str, Path], indent: int = 2) -> None:
-#         """Save configuration to JSON file"""
-#         with open(json_path, 'w') as f:
-#             json.dump(self.to_dict(), f, indent=indent)
-#         logging.info(f"Configuration saved to {json_path}")
-
-#     def to_yaml(self, yaml_path: Union[str, Path]) -> None:
-#         """Save configuration to YAML file"""
-#         with open(yaml_path, 'w') as f:
-#             yaml.dump(self.to_dict(), f, default_flow_style=False)
-#         logging.info(f"Configuration saved to {yaml_path}")
-
-#     def merge_with(self, other: 'EngineConfig') -> 'EngineConfig':
-#         """Merge with another config, with other taking precedence"""
-#         result = deepcopy(self)
-#         other_dict = other.to_dict()
-        
-#         # Merge each section
-#         for section in ['Basic_Config', 'Module_Batching_Config', 'GPU_Buffer_Config', 
-#                        'KV_Storage_Config', 'EP_Config']:
-#             if section in other_dict:
-#                 for key, value in other_dict[section].items():
-#                     if value is not None:  # Only overwrite if value is not None
-#                         getattr(result, section).__dict__[key] = value
-        
-#         return result
 
     def __str__(self) -> str:
         sections = [
