@@ -157,6 +157,9 @@ class DeepSeekV3_Initializer:
         self.skeleton_state_dict = skeleton_state_dict
         self.model = None
         self.hf_model_config = DeepseekV3Config()
+        config_dir = 'batchgen/models/deepseek/deepseekv3/config_v3.json'
+        self.hf_model_config.from_json_file(config_dir)
+        logging.info(f"{self.hf_model_config.rope_scaling}")
         self.hf_model_config._name_or_path = huggingface_ckpt_name
         self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
 
@@ -168,8 +171,6 @@ class DeepSeekV3_Initializer:
         self.world_size = world_size    
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
-
-        self.fp8_weights_IPC_handle = {}
 
         # TODO:
         self.model_config = self._parse_model_config()
