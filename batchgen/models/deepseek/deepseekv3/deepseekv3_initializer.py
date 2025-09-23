@@ -157,7 +157,8 @@ class DeepSeekV3_Initializer:
         self.skeleton_state_dict = skeleton_state_dict
         self.model = None
         self.hf_model_config = DeepseekV3Config()
-        config_dir = 'batchgen/models/deepseek/deepseekv3/config_v3.json'
+        # config_v3.json under the same dir as current file
+        config_dir = os.path.join(os.path.dirname(__file__), "config_v3.json")
         self.hf_model_config.from_json_file(config_dir)
         logging.info(f"{self.hf_model_config.rope_scaling}")
         self.hf_model_config._name_or_path = huggingface_ckpt_name
