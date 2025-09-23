@@ -49,6 +49,49 @@ python "<dir-to-two_nodes_H20_benchmark.py>" \
 	--node_rank 1
 ```
 
+## Run tasks on two nodes with local LongBench dataset
+```python
+echo "🚀 Launch Node 0"
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python "<dir-to-local_dataset_two_nodes_H20_benchmark.py>" \
+    --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
+	--host_kv_cache_size 192 \
+    --max_prompts 768 \
+    --max_input_length 13000 \
+    --max_decoding_length 1000 \
+    --ATTN_MODE 3 \
+    --dataset_cache_dir "<dir-to-longbench-dataset-dir>" \
+    --cache_dir "<dir-to-model-checkpoint>" \
+    --server_host "localhost" \
+    --server_port 10900 \
+	--dist_init_addr "10.0.0.8:12335" \
+	--nnodes 2 \
+	--node_rank 0
+
+# Our example is based on Longbench. If you would like to switch dataset please modify the example code.
+```
+
+```python
+echo "🚀 Launch Node 1"
+export HF_ENDPOINT=https://hf-mirror.com
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python "<dir-to-two_nodes_H20_benchmark.py>" \
+    --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
+	--host_kv_cache_size 192 \
+    --max_prompts 768 \
+    --max_input_length 13000 \
+    --max_decoding_length 1000 \
+    --ATTN_MODE 3 \
+    --cache_dir "<dir-to-model-checkpoint>" \
+    --dataset_cache_dir "<dir-to-longbench-dataset-dir>" \
+    --server_host "localhost" \
+    --server_port 10900 \
+	--dist_init_addr "10.0.0.8:12335" \
+	--nnodes 2 \
+	--node_rank 1
+
+# Our example is based on Longbench. If you would like to switch dataset please modify the example code.
+```
 ## Clean-up(Optional)
 If the program terminated or killed without proper clean-up, you may need to manually clean the occupied pages before next start BatchGen server.
 ```bash
