@@ -22,8 +22,8 @@ import numpy as np
 from typing import Dict, Any, Optional, Tuple
 import torch
 import torch.distributed as dist
-from .engine import _config_torch_module_initializer
-_config_torch_module_initializer()
+from batchgen.utils import config_torch_module_initializer
+config_torch_module_initializer()
 # Configure logging
 
 logging.basicConfig(

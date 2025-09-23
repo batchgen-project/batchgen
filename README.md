@@ -117,7 +117,7 @@ Please prepare the batch in python and call the client.
 import logging
 import os
 from transformers import AutoTokenizer
-from batchgen.engine import batchgen
+from batchgen.entrypoint import BatchGen
 import numpy as np
 import datasets
 
@@ -192,7 +192,7 @@ if __name__ == "__main__":
     logging.info(f"Using model {hugging_face_checkpoint}")
     
     # Run inference with our standalone parameter server
-    answer_set = batchgen(
+    answer_set = BatchGen(
         huggingface_ckpt_name=hugging_face_checkpoint,
         queries=queries,
         max_input_length=max_input_length,
@@ -204,7 +204,7 @@ if __name__ == "__main__":
         # Connect to our standalone parameter server
         parameter_server_host=server_host,
         parameter_server_port=server_port,
-    )
+    ).run()
 
     """
         Step 4: Print responses to the prompts.
