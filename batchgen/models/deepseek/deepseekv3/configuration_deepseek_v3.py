@@ -166,7 +166,7 @@ class DeepseekV3Config(PretrainedConfig):
         aux_loss_alpha=0.001,
         seq_aux=True,
         hidden_act="silu",
-        max_position_embeddings=4096,
+        max_position_embeddings=163840,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
