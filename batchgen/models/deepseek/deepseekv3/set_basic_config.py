@@ -62,6 +62,7 @@ def set_basic_config(engine_config: EngineConfig, **kwargs):
 
 	""" Num Threads """
 	# Deprecated
+	engine_config.Basic_Config.num_threads = 0
 	
 	""" Padding Length """
 	if not kwargs.get('padding_length', None):

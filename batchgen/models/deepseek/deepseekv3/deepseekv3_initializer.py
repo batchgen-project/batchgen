@@ -156,12 +156,7 @@ class DeepSeekV3_Initializer:
         self.engine_config = engine_config
         self.skeleton_state_dict = skeleton_state_dict
         self.model = None
-        self.hf_model_config = DeepseekV3Config.from_pretrained(
-            self.cache_dir,
-            # huggingface_ckpt_name,
-            # cache_dir=hf_cache_dir,
-            # trust_remote_code=True,
-        )
+        self.hf_model_config = DeepseekV3Config()
         self.hf_model_config._name_or_path = huggingface_ckpt_name
         self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
 
