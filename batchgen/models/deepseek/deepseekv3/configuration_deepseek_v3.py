@@ -322,7 +322,12 @@ class DeepseekV3Config(PretrainedConfig):
         self.q_lora_rank = q_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.quantization_config = quantization_config
+        self.quantization_config = quantization_config or {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        }
         self.rms_norm_eps = rms_norm_eps
         self.rope_scaling = rope_scaling or {
             "beta_fast": 32,
