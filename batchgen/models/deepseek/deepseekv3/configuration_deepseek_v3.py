@@ -235,130 +235,131 @@ DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 #             **kwargs,
 #         )
 
-def __init__(
-    self,
-    architectures=None,
-    attention_bias=False,
-    attention_dropout=0.0,
-    auto_map=None,
-    bos_token_id=0,
-    eos_token_id=1,
-    ep_size=1,
-    first_k_dense_replace=3,
-    hidden_act="silu",
-    hidden_size=7168,
-    initializer_range=0.02,
-    intermediate_size=18432,
-    kv_lora_rank=512,
-    max_position_embeddings=163840,
-    model_type="deepseek_v3",
-    moe_intermediate_size=2048,
-    moe_layer_freq=1,
-    n_group=8,
-    n_routed_experts=256,
-    n_shared_experts=1,
-    norm_topk_prob=True,
-    num_attention_heads=128,
-    num_experts_per_tok=8,
-    num_hidden_layers=61,
-    num_key_value_heads=128,
-    num_nextn_predict_layers=1,
-    q_lora_rank=1536,
-    qk_nope_head_dim=128,
-    qk_rope_head_dim=64,
-    quantization_config=None,
-    rms_norm_eps=1e-6,
-    rope_scaling=None,
-    rope_theta=10000.0,
-    routed_scaling_factor=2.5,
-    scoring_func="sigmoid",
-    tie_word_embeddings=False,
-    topk_group=4,
-    topk_method="noaux_tc",
-    torch_dtype=None,
-    transformers_version=None,
-    use_cache=True,
-    v_head_dim=128,
-    vocab_size=129280,
-    # Additional parameters not in JSON but in original init
-    aux_loss_alpha=0.001,
-    seq_aux=True,
-    pad_token_id=None,
-    pretraining_tp=1,
-    **kwargs,
-):
-    # Set attributes in the same order as JSON
-    self.architectures = architectures or ["DeepseekV3ForCausalLM"]
-    self.attention_bias = attention_bias
-    self.attention_dropout = attention_dropout
-    self.auto_map = auto_map or {
-        "AutoConfig": "configuration_deepseek.DeepseekV3Config",
-        "AutoModel": "modeling_deepseek.DeepseekV3Model",
-        "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM"
-    }
-    self.bos_token_id = bos_token_id
-    self.eos_token_id = eos_token_id
-    self.ep_size = ep_size
-    self.first_k_dense_replace = first_k_dense_replace
-    self.hidden_act = hidden_act
-    self.hidden_size = hidden_size
-    self.initializer_range = initializer_range
-    self.intermediate_size = intermediate_size
-    self.kv_lora_rank = kv_lora_rank
-    self.max_position_embeddings = max_position_embeddings
-    self.model_type = model_type
-    self.moe_intermediate_size = moe_intermediate_size
-    self.moe_layer_freq = moe_layer_freq
-    self.n_group = n_group
-    self.n_routed_experts = n_routed_experts
-    self.n_shared_experts = n_shared_experts
-    self.norm_topk_prob = norm_topk_prob
-    self.num_attention_heads = num_attention_heads
-    self.num_experts_per_tok = num_experts_per_tok
-    self.num_hidden_layers = num_hidden_layers
-    self.num_key_value_heads = num_key_value_heads
-    self.num_nextn_predict_layers = num_nextn_predict_layers
-    self.q_lora_rank = q_lora_rank
-    self.qk_nope_head_dim = qk_nope_head_dim
-    self.qk_rope_head_dim = qk_rope_head_dim
-    self.quantization_config = quantization_config
-    self.rms_norm_eps = rms_norm_eps
-    self.rope_scaling = rope_scaling or {
-        "beta_fast": 32,
-        "beta_slow": 1,
-        "factor": 40,
-        "mscale": 1.0,
-        "mscale_all_dim": 1.0,
-        "original_max_position_embeddings": 4096,
-        "type": "yarn"
-    }
-    self.rope_theta = rope_theta
-    self.routed_scaling_factor = routed_scaling_factor
-    self.scoring_func = scoring_func
-    self.tie_word_embeddings = tie_word_embeddings
-    self.topk_group = topk_group
-    self.topk_method = topk_method
-    self.torch_dtype = torch_dtype
-    self.transformers_version = transformers_version
-    self.use_cache = use_cache
-    self.v_head_dim = v_head_dim
-    self.vocab_size = vocab_size
-    
-    # Additional attributes from original class not in JSON
-    self.aux_loss_alpha = aux_loss_alpha
-    self.seq_aux = seq_aux
-    self.pad_token_id = pad_token_id
-    self.pretraining_tp = pretraining_tp
-    
-    # Class-level attributes from original
-    self.phase = None
-    self._name_or_path = "deepseek-ai/DeepSeek-R1"
-    
-    # Call parent init
-    super().__init__(
-        pad_token_id=pad_token_id,
-        bos_token_id=bos_token_id,
-        eos_token_id=eos_token_id,
-        tie_word_embeddings=tie_word_embeddings,
+class DeepseekV3Config(PretrainedConfig):
+    def __init__(
+        self,
+        architectures=None,
+        attention_bias=False,
+        attention_dropout=0.0,
+        auto_map=None,
+        bos_token_id=0,
+        eos_token_id=1,
+        ep_size=1,
+        first_k_dense_replace=3,
+        hidden_act="silu",
+        hidden_size=7168,
+        initializer_range=0.02,
+        intermediate_size=18432,
+        kv_lora_rank=512,
+        max_position_embeddings=163840,
+        model_type="deepseek_v3",
+        moe_intermediate_size=2048,
+        moe_layer_freq=1,
+        n_group=8,
+        n_routed_experts=256,
+        n_shared_experts=1,
+        norm_topk_prob=True,
+        num_attention_heads=128,
+        num_experts_per_tok=8,
+        num_hidden_layers=61,
+        num_key_value_heads=128,
+        num_nextn_predict_layers=1,
+        q_lora_rank=1536,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        quantization_config=None,
+        rms_norm_eps=1e-6,
+        rope_scaling=None,
+        rope_theta=10000.0,
+        routed_scaling_factor=2.5,
+        scoring_func="sigmoid",
+        tie_word_embeddings=False,
+        topk_group=4,
+        topk_method="noaux_tc",
+        torch_dtype=None,
+        transformers_version=None,
+        use_cache=True,
+        v_head_dim=128,
+        vocab_size=129280,
+        # Additional parameters not in JSON but in original init
+        aux_loss_alpha=0.001,
+        seq_aux=True,
+        pad_token_id=None,
+        pretraining_tp=1,
         **kwargs,
-    )
+    ):
+        # Set attributes in the same order as JSON
+        self.architectures = architectures or ["DeepseekV3ForCausalLM"]
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.auto_map = auto_map or {
+            "AutoConfig": "configuration_deepseek.DeepseekV3Config",
+            "AutoModel": "modeling_deepseek.DeepseekV3Model",
+            "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM"
+        }
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.ep_size = ep_size
+        self.first_k_dense_replace = first_k_dense_replace
+        self.hidden_act = hidden_act
+        self.hidden_size = hidden_size
+        self.initializer_range = initializer_range
+        self.intermediate_size = intermediate_size
+        self.kv_lora_rank = kv_lora_rank
+        self.max_position_embeddings = max_position_embeddings
+        self.model_type = model_type
+        self.moe_intermediate_size = moe_intermediate_size
+        self.moe_layer_freq = moe_layer_freq
+        self.n_group = n_group
+        self.n_routed_experts = n_routed_experts
+        self.n_shared_experts = n_shared_experts
+        self.norm_topk_prob = norm_topk_prob
+        self.num_attention_heads = num_attention_heads
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_hidden_layers = num_hidden_layers
+        self.num_key_value_heads = num_key_value_heads
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.q_lora_rank = q_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.quantization_config = quantization_config
+        self.rms_norm_eps = rms_norm_eps
+        self.rope_scaling = rope_scaling or {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 40,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn"
+        }
+        self.rope_theta = rope_theta
+        self.routed_scaling_factor = routed_scaling_factor
+        self.scoring_func = scoring_func
+        self.tie_word_embeddings = tie_word_embeddings
+        self.topk_group = topk_group
+        self.topk_method = topk_method
+        self.torch_dtype = torch_dtype
+        self.transformers_version = transformers_version
+        self.use_cache = use_cache
+        self.v_head_dim = v_head_dim
+        self.vocab_size = vocab_size
+        
+        # Additional attributes from original class not in JSON
+        self.aux_loss_alpha = aux_loss_alpha
+        self.seq_aux = seq_aux
+        self.pad_token_id = pad_token_id
+        self.pretraining_tp = pretraining_tp
+        
+        # Class-level attributes from original
+        self.phase = None
+        self._name_or_path = "deepseek-ai/DeepSeek-R1"
+        
+        # Call parent init
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
