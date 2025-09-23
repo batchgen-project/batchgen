@@ -27,7 +27,6 @@ from typing import Optional, Union, List
 import torch
 import torch.nn as nn
 import triton.language as tl
-from transformers import AutoConfig
 import torch.distributed as dist
 
 # from batchgen.config import EngineConfig, ModelConfig
@@ -157,10 +156,6 @@ class DeepSeekV3_Initializer:
         self.skeleton_state_dict = skeleton_state_dict
         self.model = None
         self.hf_model_config = DeepseekV3Config()
-        # config_v3.json under the same dir as current file
-        # config_dir = os.path.join(os.path.dirname(__file__), "config_v3.json")
-        # self.hf_model_config.from_json_file(config_dir)
-        logging.info(f"{self.hf_model_config.rope_scaling}")
         self.hf_model_config._name_or_path = huggingface_ckpt_name
         self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
 
@@ -176,8 +171,7 @@ class DeepSeekV3_Initializer:
         # TODO:
         self.model_config = self._parse_model_config()
         self._default_engine_config()
-        self.state_dict_name_map = {}
-        self.weight_copy_task = {}
+        # self.engine_config = set_basic_config(self.engine_config)
 
         self.shm_name = shm_name
         self.tensor_meta_shm_name = tensor_meta_shm_name
