@@ -48,9 +48,10 @@ class Parallel_Strategy_Manager:
 			and the corresponding weight copy task.
 		"""
 		self.hf_model_config.phase = "prefill"
-		self.model = DeepseekV3ForCausalLM._from_config(
-			self.hf_model_config
-		)
+		# self.model = DeepseekV3ForCausalLM._from_config(
+		# 	self.hf_model_config
+		# )
+		self.model = DeepseekV3ForCausalLM(self.hf_model_config)
 		self.state_dict_name_map = {}
 		self.weight_copy_task = {}
 		self.weight_copy_task["attn"] = []
