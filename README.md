@@ -59,7 +59,7 @@ conda activate batchgen
 ```
 
 ### Dependencies installation
-Currently, BatchGen depends on torch==2.70+cu128
+Currently, BatchGen depends on torch==2.7.0+cu128
 ```bash
 pip install torch==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 ```
