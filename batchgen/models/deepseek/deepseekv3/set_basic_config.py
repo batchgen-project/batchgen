@@ -10,7 +10,7 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 	
 	""" Weight Dtype """
 	engine_config.Basic_Config.weight_dtype = "float8_e4m3fn"
-	engine_config.Basic_Config.weight_dtype_torch = torch.dtype(engine_config.Basic_Config.weight_dtype)
+	engine_config.Basic_Config.weight_dtype_torch = torch.float8_e4m3fn
 	
 	""" KV Dtype """
 	# If kv_dtype is not provided, use bf16
