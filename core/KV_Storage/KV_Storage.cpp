@@ -1402,85 +1402,74 @@ void KV_Storage::offload_helper_(
             this->logger_->debug("Offloading layer_idx: {} completed.",
                                  layer_idx);
         } else {
-            CUDA_CHECK(cudaSetDevice(
-                this->engine_config_.basic_config.device));
-            // check if NaN of Inf in bf16_k
-            if (torch::isnan(bf16_k).any().item<bool>() || 
-                torch::isinf(bf16_k).any().item<bool>()) {
-                this->logger_->error(
-                    "KV_Storage: NaN or Inf detected in quantized k at layer_idx: {}.", 
-                    layer_idx);
-                throw std::runtime_error("NaN or Inf detected in quantized k.");
+            CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+            
+            torch::Tensor k;
+            torch::Tensor k_quantize_scale;
+            
+            // Check if dtype is BFloat16 - if so, skip quantization
+            if (this->engine_config_.basic_config.kv_dtype == torch::kBFloat16) {
+                // Direct offload without quantization for BFloat16
+                k = bf16_k;
+                // No quantization scale needed for BFloat16
+                // You might want to create a dummy scale tensor or handle this case differently
+                // depending on your downstream code expectations
+                k_quantize_scale = torch::ones({bf16_k.size(0), bf16_k.size(1)}, 
+                                            torch::TensorOptions()
+                                                .dtype(torch::kFloat32)
+                                                .device(bf16_k.device()));
+            } else {
+                // Perform quantization for other dtypes (e.g., Float8)
+                // Check for NaN or Inf in bf16_k before quantization
+                if (torch::isnan(bf16_k).any().item<bool>() || 
+                    torch::isinf(bf16_k).any().item<bool>()) {
+                    this->logger_->error(
+                        "KV_Storage: NaN or Inf detected in input k at layer_idx: {}.", 
+                        layer_idx);
+                    throw std::runtime_error("NaN or Inf detected in input k.");
+                }
+                
+                // Perform quantization
+                auto [quantized_k, quantize_scale] = quant_per_token(bf16_k);
+                k = quantized_k;
+                k_quantize_scale = quantize_scale;
+                
+                // Check for NaN or Inf in quantization scale
+                if (torch::isnan(k_quantize_scale).any().item<bool>() || 
+                    torch::isinf(k_quantize_scale).any().item<bool>()) {
+                    this->logger_->error(
+                        "KV_Storage: NaN or Inf detected in quantization scale at layer_idx: {}.", 
+                        layer_idx);
+                    throw std::runtime_error("NaN or Inf detected in quantization scale.");
+                }
             }
-            auto [k, k_quantize_scale] = quant_per_token(bf16_k);
-            if (torch::isnan(k_quantize_scale).any().item<bool>() || 
-                torch::isinf(k_quantize_scale).any().item<bool>()) {
-                this->logger_->error(
-                    "KV_Storage: NaN or Inf detected in quantization scale at layer_idx: {}.", 
-                    layer_idx);
-                throw std::runtime_error("NaN or Inf detected in quantization scale.");
-            }
-
-
-            // log k_quantize_scale shape
-            // this->logger_->info("k_quantize_scale shape: {}",
-            //                      get_tensor_shape(k_quantize_scale));
-            // Check k or k_quantize_scale has nan values
+            
             CUDA_CHECK(cudaStreamSynchronize(0));
-            // if (torch::any(torch::isnan(k)).item<bool>()){
-            //     for (int64_t i = 0; i < k.size(0); i++) {
-            //         if(torch::any(torch::isnan(k[i])).item<bool>()) {
-            //             this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
-            //                                  i, this->engine_config_.basic_config.device,
-            //                                  layer_idx);
-            //         }
-            //     }
-            //     // throw std::runtime_error("k has nan values");
-            // }
-            // if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
-            //     for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
-            //         if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
-            //             this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
-            //                                  i, this->engine_config_.basic_config.device,
-            //                                  layer_idx);
-            //         }
-            //     }
-            //     // throw std::runtime_error("k_quantize_scale has nan values");
-            // }
-
-
-            // If k_quantize_scale[layer_idx] is torch.empty({0,0}), assign it to k_quantize_scale
-            // other wise concatenate it.
-            // if (this->k_quantize_scale[layer_idx].numel() == 0) {
-            //     this->k_quantize_scale[layer_idx] = k_quantize_scale;
-            // } else {
-            //     this->k_quantize_scale[layer_idx] = torch::cat(
-            //         {this->k_quantize_scale[layer_idx], k_quantize_scale}, 0);
-            // }
-            /* Step 1: Permute k and v in the device. */
+            
+            /* Step 1: Prepare k tensor for offloading */
             int64_t bsz = k.size(0);
             int64_t seq_len = k.size(1);
             int64_t k_seq_byte_size = k.size(1) * k.size(2) * k.element_size();
             int64_t token_byte_size = k.size(2) * k.element_size();
             k = k.contiguous();
 
-            /* Launch DMA per sequence. */
-            this->logger_->debug("query_global_idx.size(): {}",
-                                 query_global_idx.size());
+            /* Launch DMA per sequence */
+            this->logger_->debug("query_global_idx.size(): {}", query_global_idx.size());
+            
             for (int64_t i = 0; i < query_global_idx.size(); i++) {
-                // this->logger_->debug("{}/{}", i, query_global_idx.size());
                 auto query_idx = query_global_idx[i];
-                auto device_k_ptr = k.data_ptr() + i * k_seq_byte_size;
+                
+                // Calculate device pointer offset using char* for byte arithmetic
+                char* k_base_ptr = static_cast<char*>(k.data_ptr());
+                void* device_k_ptr = k_base_ptr + (i * k_seq_byte_size);
 
-                /* Get an empty slot for new query. */
+                /* Get an empty slot for new query */
                 int64_t slot_idx = -1;
                 if (layer_idx == 0) {
                     std::lock_guard<std::mutex> lock(this->mutex_);
                     if (this->empty_slots.empty()) {
-                        this->logger_->debug(
-                            "KV_Storage: No empty slot available.");
-                        throw std::runtime_error(
-                            "KV_Storage: No empty slot available.");
+                        this->logger_->debug("KV_Storage: No empty slot available.");
+                        throw std::runtime_error("KV_Storage: No empty slot available.");
                     }
                     slot_idx = *this->empty_slots.begin();
                     this->empty_slots.erase(slot_idx);
@@ -1490,55 +1479,50 @@ void KV_Storage::offload_helper_(
                     slot_idx = this->query_idx_to_slot_idx_map[query_idx];
                 }
 
-                // this->logger_->debug("slot_idx: {}", slot_idx);
-                auto host_k_ptr =
-                    this->k_storage[slot_idx][layer_idx].start_ptr;
+                auto host_k_ptr = this->k_storage[slot_idx][layer_idx].start_ptr;
 
                 {
                     std::lock_guard<std::mutex> lock(
-                        this->per_element_mutex_
-                            [slot_idx * this->model_config_.num_hidden_layers +
-                             layer_idx]);
-                    this->d2h_engine_.submit_to_queue_B(/* Blocking and sync
-                                                           copy function call */
-                                                        host_k_ptr,
-                                                        device_k_ptr,
-                                                        k_seq_byte_size);
-                    // Only note non-padding token.
-                    // num_tokens = attention_mask.sum(1).item<int64_t>();
-                    // used_byte_size = num_tokens * token_byte_size;
-                    this->k_storage[slot_idx][layer_idx].num_tokens = attention_mask[i].sum().item<int64_t>();
+                        this->per_element_mutex_[slot_idx * this->model_config_.num_hidden_layers + layer_idx]);
+                    
+                    // Submit DMA transfer
+                    this->d2h_engine_.submit_to_queue_B(
+                        host_k_ptr,
+                        device_k_ptr,
+                        k_seq_byte_size);
+                    
+                    // Store metadata
+                    this->k_storage[slot_idx][layer_idx].num_tokens = 
+                        attention_mask[i].sum().item<int64_t>();
                     this->k_storage[slot_idx][layer_idx].used_byte_size =
                         attention_mask[i].sum().item<int64_t>() * token_byte_size;
-                    this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)}).clone().unsqueeze(0);  
-                    // this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale[i]
-                    // .clone()
-                    // .to(torch::kCPU) // <-- Move tensor to CPU memory
-                    // .unsqueeze(0);    
-                    // log quantize_scale shape
-                    // this->logger_->info("quantize_scale shape: {}",
-                    //                      get_tensor_shape(this->k_storage[slot_idx][layer_idx].quantize_scale));              
+                    
+                    // Handle quantization scale based on dtype
+                    if (this->engine_config_.basic_config.kv_dtype == torch::kBFloat16) {
+                        // For BFloat16, either store a dummy scale or handle it differently
+                        // Option 1: Store ones as scale (no scaling needed)
+                        this->k_storage[slot_idx][layer_idx].quantize_scale = 
+                            torch::ones({1, this->k_storage[slot_idx][layer_idx].num_tokens},
+                                    torch::TensorOptions().dtype(torch::kFloat32));
                         
-                    // this->logger_->info("k_storage[{}][{}].num_tokens: {}, used_byte_size: {}",
-                    //                     slot_idx, layer_idx,
-                    //                     this->k_storage[slot_idx][layer_idx].num_tokens,
-                    //                     this->k_storage[slot_idx][layer_idx].used_byte_size);
-                    // this->k_storage[slot_idx][layer_idx].used_byte_size =
-                    //     k_seq_byte_size;
-                    // this->k_storage[slot_idx][layer_idx].num_tokens = seq_len;
+                        // Option 2: Leave it empty/unset if your system supports that
+                        // this->k_storage[slot_idx][layer_idx].quantize_scale = torch::Tensor();
+                    } else {
+                        // Store the actual quantization scale for quantized dtypes
+                        this->k_storage[slot_idx][layer_idx].quantize_scale = 
+                            k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)})
+                            .clone()
+                            .unsqueeze(0);
+                    }
                 }
+                
                 {
                     std::lock_guard<std::mutex> lock(this->mutex_);
                     this->query_idx_to_slot_idx_map[query_idx] = slot_idx;
                 }
             }
-            // CUDA_CHECK(cudaStreamSynchronize(
-            //     this->d2h_engine_.DtoH_stream));
-            // CUDA_CHECK(cudaStreamSynchronize(0));
-            // CUDA_CHECK(cudaDeviceSynchronize());
             
-            this->logger_->debug("Offloading layer_idx: {} completed.",
-                                 layer_idx);
+            this->logger_->debug("Offloading layer_idx: {} completed.", layer_idx);
         }
     } catch (const c10::Error& e) {
         this->logger_->debug(
