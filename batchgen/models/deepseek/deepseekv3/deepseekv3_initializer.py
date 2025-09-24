@@ -135,17 +135,7 @@ def deepseek_v3_dequantization(
 
 
 class DeepseekV3Initializer:
-    def __init__(
-        self,
-        # huggingface_ckpt_name: str,
-        # shm_name: str,
-        # tensor_meta_shm_name: str,
-        # host_kv_cache_size: Optional[int] = None,
-        # local_rank: Optional[int] = 0,
-        # global_rank: Optional[int] = 0,
-        # world_size: Optional[int] = 1,
-        input_arguments
-    ):
+    def __init__(self, input_arguments):
         self.hf_model_config = DeepseekV3Config()
         self.hf_model_config._name_or_path = input_arguments.huggingface_ckpt_name
         self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
@@ -186,7 +176,8 @@ class DeepseekV3Initializer:
         self.engine_config.KV_Storage_Config.slot_byte_size = (
             self.engine_config.KV_Storage_Config.reserved_length
             * self.model_config.compressed_kv_dim
-        )  # KV saved in FP8
+            * torch.finfo(self.engine_config.Basic_Config.kv_dtype_torch).bits // 8
+        )  
         self.engine_config.KV_Storage_Config.num_host_slots = (
             self.host_kv_cache_byte_size
             // self.engine_config.KV_Storage_Config.slot_byte_size
@@ -195,9 +186,6 @@ class DeepseekV3Initializer:
         self.engine_config.KV_Storage_Config.storage_byte_size = (
             self.host_kv_cache_byte_size
         )
-        # logging.info(
-        #     f"KV storage byte size: {self.engine_config.KV_Storage_Config.storage_byte_size}"
-        # )
         logging.info(
             f"Number of host kv slots: {self.engine_config.KV_Storage_Config.num_host_slots}"
         )
