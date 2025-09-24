@@ -65,7 +65,7 @@ class InputArguments:
 	cache_dir: Optional[str] = None
 	pt_ckpt_dir: Optional[str] = None
 	queries: Optional[List[str]] = None
-	max_input_length: int = 512
+	padding_length: int = 512
 	max_decoding_length: int = 128
 	device: int = 0
 	skeleton_state_dict: Optional[Dict] = None
