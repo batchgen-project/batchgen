@@ -95,7 +95,7 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 		engine_config.Basic_Config.num_queries = input_arguments.num_queries
 
 	""" Rank """
-	if not input_arguments.get('rank', None):
+	if input_arguments.get('rank', None) is None:
 		raise ValueError("Rank must be specified")
 	else:
 		engine_config.Basic_Config.rank = input_arguments.rank
