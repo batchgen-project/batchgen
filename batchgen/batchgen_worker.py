@@ -137,6 +137,7 @@ class BatchGenWorker:
 			"global_rank": global_rank,
 			"world_size": world_size
 		}
+		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 		self.input_arguments = InputArguments(**input_arguments)
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
