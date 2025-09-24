@@ -19,6 +19,7 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 		engine_config.Basic_Config.kv_dtype = "bfloat16"
 	else:
 		logging.info(f"kv_dtype is set to {input_arguments.kv_dtype}")
+		logging.info(f"attn_mode is set to {input_arguments.get('attn_mode')}")
 		if input_arguments.kv_dtype.lower() in ['bfloat16', 'bf16']:
 			engine_config.Basic_Config.kv_dtype = "bfloat16"
 		elif input_arguments.kv_dtype.lower() in ['fp8', 'float8', 'float8_e4m3fn']:
