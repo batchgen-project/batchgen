@@ -6,7 +6,6 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 	"""
 		Basic Config
 	"""
-	logging.info(f"Input Arguments: {input_arguments}")
 	engine_config.Basic_Config.log_level = "info"
 	
 	""" Weight Dtype """
