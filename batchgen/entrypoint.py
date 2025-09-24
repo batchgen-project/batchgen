@@ -108,7 +108,7 @@ class BatchGen():
 		self.nnodes = nnodes
 		self.node_rank = node_rank
 		self.device_per_node = device_per_node
-		self.kv_dtype = kv_dtype,
+		self.kv_dtype = kv_dtype
 
 		self.system_setup()
 		(
