@@ -73,7 +73,7 @@ class InputArguments:
 	tensor_meta_shm_name: Optional[str] = None
 	engine_config_json_dir: Optional[str] = None
 	host_kv_cache_size: Optional[int] = None
-	kv_dtype: str = "float16"
+	kv_dtype: str = "bfloat16"
 	dist_init_addr: Optional[str] = None
 	local_rank: int = 0
 	global_rank: int = 0

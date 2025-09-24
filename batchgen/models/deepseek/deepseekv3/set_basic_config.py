@@ -18,6 +18,7 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 		logging.info("kv_dtype is not provided, using bfloat16 as default")
 		engine_config.Basic_Config.kv_dtype = "bfloat16"
 	else:
+		logging.info(f"kv_dtype is set to {input_arguments.kv_dtype}")
 		if input_arguments.kv_dtype.lower() in ['bfloat16', 'bf16']:
 			engine_config.Basic_Config.kv_dtype = "bfloat16"
 		elif input_arguments.kv_dtype.lower() in ['fp8', 'float8', 'float8_e4m3fn']:
