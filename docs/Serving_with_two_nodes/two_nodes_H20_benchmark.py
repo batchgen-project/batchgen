@@ -35,6 +35,7 @@ if __name__ == "__main__":
 	parser.add_argument("--SPLIT_RATIO_W", type=str)
 	parser.add_argument("--max_input_length", type=int)
 	parser.add_argument("--max_decoding_length", type=int)
+	parser.add_argument("--dataset_cache_dir", type=str, default="~/.cache/huggingface/datasets/Xnhyacinth___long_bench")
 	parser.add_argument("--cache_dir", type=str, default=None)
 	# Add parameter server connection options
 	parser.add_argument("--server_host", type=str, default="localhost")
@@ -97,8 +98,7 @@ if __name__ == "__main__":
 	queries = []
 	for task_name in task_names:
 		dataset = datasets.load_dataset(
-			benchmark_name, 
-			name=task_name,
+			f"{args.dataset_cache_dir}/{task_name}",
 			split="test",
 			trust_remote_code=True
 		)
