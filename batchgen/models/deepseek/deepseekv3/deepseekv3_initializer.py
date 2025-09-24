@@ -166,7 +166,7 @@ class DeepseekV3Initializer:
         self.engine_config = set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
         self.scheduler = Scheduler()
-        self.engine_config = self.scheduler(self.engine_config)
+        self.engine_config = self.scheduler.generate_config(self.engine_config)
 
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name
