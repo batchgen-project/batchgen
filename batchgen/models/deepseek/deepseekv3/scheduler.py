@@ -131,7 +131,7 @@ class Scheduler:
 		}
 		self.config.GPU_Buffer_Config.num_k_buffer = None  # This will be set later based on available memory
 		self.config.GPU_Buffer_Config.num_v_buffer = 0  # No value buffer for now
-		self.config.GPU_Buffer_Config.kv_buffer_num_tokens = None  # This will be set later based on available memory
+		# self.config.GPU_Buffer_Config.kv_buffer_num_tokens = None  # This will be set later based on available memory
 		
 
 		""" Default EP Config """
