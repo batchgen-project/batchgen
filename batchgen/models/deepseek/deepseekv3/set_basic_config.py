@@ -26,7 +26,12 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 			engine_config.Basic_Config.kv_dtype = "float8_e4m3fn"
 		else:
 			raise ValueError(f"Unsupported kv_dtype: {input_arguments.kv_dtype}, only support ['bfloat16','float8_e4m3fn']")
-	engine_config.Basic_Config.kv_dtype_torch = torch.dtype(engine_config.Basic_Config.kv_dtype)
+	# engine_config.Basic_Config.kv_dtype_torch = torch.dtype(engine_config.Basic_Config.kv_dtype)
+	if engine_config.Basic_Config.kv_dtype == "bfloat16":
+		engine_config.Basic_Config.kv_dtype_torch = torch.bfloat16
+	elif engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
+		engine_config.Basic_Config.kv_dtype_torch = torch.float8_e4m3fn
+		
 
 	""" Attention Dtype """
 	# If attention_dtype is not provided, use bf16
