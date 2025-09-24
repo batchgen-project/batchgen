@@ -73,11 +73,13 @@ class BatchGenWorker:
 		tensor_meta_shm_name,
 		engine_config_json_dir = None, # Will be deprecated in the future
 		host_kv_cache_size: Optional[int] = None,
+		kv_dtype: str = "bfloat16",
 		dist_init_addr: str = "localhost:12355",
 		local_rank: Optional[int] = 0,
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
 	):
+		self.input_arguments = copy.deepcopy(locals())
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
 		# hf_cache_dir will be deprecated in the future.
@@ -116,9 +118,6 @@ class BatchGenWorker:
 
 		if(self.rank == 0):
 			print(self.engine_config)
-		
-		
-		
 		
 		self.device = device
 		self.torch_device = torch.device(f"cuda:{device}")
@@ -167,93 +166,9 @@ class BatchGenWorker:
 		)
 		# Use flash_attn by default thus right padding.
 		self.tokenizer.padding_side = "right"
-
-		# if self.model_config.architectures[0] == "MixtralForCausalLM":
-		# 	self.tokenizer.pad_token = self.tokenizer.eos_token
-
-		# if self.model_config.architectures[0] == "MixtralForCausalLM":
-		# 	from batchgen.models.mixtral.Mixtral_Initializer import (
-		# 		Mixtral_Initializer,
-		# 	)
-
-		# 	self.initializer = Mixtral_Initializer(
-		# 		self.huggingface_ckpt_name,
-		# 		self.hf_cache_dir,
-		# 		self.cache_dir,
-		# 		self.engine_config,
-		# 		self.skeleton_state_dict,
-		# 		self.shm_name,
-		# 		self.tensor_meta_shm_name,
-		# 		self.pt_ckpt_dir,
-		# 		self.host_kv_cache_size,
-		# 	)
-		# elif self.model_config.architectures[0] == "Qwen2MoeForCausalLM":
-		# 	from batchgen.models.Qwen_Initializer import Qwen_Initializer
-
-		# 	self.initializer = Qwen_Initializer(
-		# 		self.huggingface_ckpt_name,
-		# 		self.hf_cache_dir,
-		# 		self.cache_dir,
-		# 		self.engine_config,
-		# 		self.pt_ckpt_dir,
-		# 	)
-		# elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
-		# 	from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import (
-		# 		DeepseekV3Initializer,
-		# 	)
-
-		# 	self.initializer = DeepseekV3Initializer(
-		# 		self.huggingface_ckpt_name,
-		# 		self.hf_cache_dir,
-		# 		self.cache_dir,
-		# 		self.engine_config,
-		# 		self.skeleton_state_dict,
-		# 		self.shm_name,
-		# 		self.tensor_meta_shm_name,
-		# 		self.pt_ckpt_dir,
-		# 		self.host_kv_cache_size,
-		# 		self.local_rank,
-		# 		self.global_rank,
-		# 		self.world_size
-		# 	)
-
-		# elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
-		# 	from batchgen.models.deepseek.deepseekv2.deepseekv2_initializer import (
-		# 		DeepSeek_Initializer,
-		# 	)
-
-		# 	self.initializer = DeepSeek_Initializer(
-		# 		self.huggingface_ckpt_name,
-		# 		self.hf_cache_dir,
-		# 		self.cache_dir,
-		# 		self.engine_config,
-		# 		self.skeleton_state_dict,
-		# 		self.shm_name,
-		# 		self.tensor_meta_shm_name,
-		# 		self.pt_ckpt_dir,
-		# 		self.host_kv_cache_size,
-		# 	)
-
-		# else:
-		# 	raise ValueError(
-		# 		f"Model architecture {self.model_config.architectures[0]} not supported yet."
-		# 	)
 		self.initializer = get_initializer(self.huggingface_ckpt_name)
-		self.initializer = self.initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.skeleton_state_dict,
-				self.shm_name,
-				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
-				self.host_kv_cache_size,
-				self.local_rank,
-				self.global_rank,
-				self.world_size
-		)
-		self.core_engine, self.model, self.engine_config, self.model_config, self.hf_model_config = (
+		self.initializer = self.initializer(self.input_arguments)
+		self.core_engine, self.engine_config, self.model_config, self.hf_model_config = (
 			self.initializer.Init()
 		)
 

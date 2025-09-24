@@ -41,6 +41,7 @@ except ImportError:
 from typing import Tuple
 from ....config.engine_config_parser import parse_config_from_json
 from .set_basic_config import set_basic_config
+from .scheduler import Scheduler
 
 def ceil_div(x: int, y: int) -> int:
     """
@@ -136,45 +137,38 @@ def deepseek_v3_dequantization(
 class DeepseekV3Initializer:
     def __init__(
         self,
-        huggingface_ckpt_name: str,
-        hf_cache_dir: str,
-        cache_dir: Optional[str],
-        engine_config,
-        skeleton_state_dict: Optional[dict],
-        shm_name: str,
-        tensor_meta_shm_name: str,
-        pt_ckpt_dir,
-        host_kv_cache_size: Optional[int] = None,
-        local_rank: Optional[int] = 0,
-        global_rank: Optional[int] = 0,
-        world_size: Optional[int] = 1,
+        # huggingface_ckpt_name: str,
+        # shm_name: str,
+        # tensor_meta_shm_name: str,
+        # host_kv_cache_size: Optional[int] = None,
+        # local_rank: Optional[int] = 0,
+        # global_rank: Optional[int] = 0,
+        # world_size: Optional[int] = 1,
+        input_arguments
     ):
-        self.huggingface_ckpt_name = huggingface_ckpt_name
-        self.cache_dir = cache_dir
-        self.pt_ckpt_dir = pt_ckpt_dir
-        self.engine_config = engine_config
-        self.skeleton_state_dict = skeleton_state_dict
-        self.model = None
         self.hf_model_config = DeepseekV3Config()
-        self.hf_model_config._name_or_path = huggingface_ckpt_name
+        self.hf_model_config._name_or_path = input_arguments.huggingface_ckpt_name
         self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
 
-        self.host_kv_cache_size = host_kv_cache_size
-        self.host_kv_cache_byte_size = host_kv_cache_size * (1024**3)
+        self.host_kv_cache_size = input_arguments.host_kv_cache_size
+        self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
 
-        self.local_rank = local_rank
-        self.global_rank = global_rank
-        self.world_size = world_size    
+        self.local_rank = input_arguments.local_rank
+        self.global_rank = input_arguments.global_rank
+        self.world_size = input_arguments.world_size    
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
-        # TODO:
         self.model_config = self._parse_model_config()
-        self._default_engine_config()
-        # self.engine_config = set_basic_config(self.engine_config)
 
-        self.shm_name = shm_name
-        self.tensor_meta_shm_name = tensor_meta_shm_name
+        self.engine_config = EngineConfig()
+        self.engine_config = set_basic_config(self.engine_config, input_arguments)
+        self._default_engine_config()
+        self.scheduler = Scheduler()
+        self.engine_config = self.scheduler(self.engine_config)
+
+        self.shm_name = input_arguments.shm_name
+        self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name
 
     def _default_engine_config(self):
         props = torch.cuda.get_device_properties(
@@ -182,8 +176,6 @@ class DeepseekV3Initializer:
         )
         total_memory = props.total_memory / (1024**3)
         logging.info(f"Current device total memory: {total_memory} GB")
-
-
 
         # Determine the number of host kv slots.
         self.engine_config.KV_Storage_Config.reserved_length = (
@@ -279,7 +271,6 @@ class DeepseekV3Initializer:
             raise e
         return (
             self.core_engine,
-            self.model,
             self.engine_config,
             self.model_config,
             self.hf_model_config

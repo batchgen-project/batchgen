@@ -38,6 +38,7 @@ if __name__ == "__main__":
 	parser.add_argument("--dist_init_addr", type=str)
 	parser.add_argument("--nnodes", type=int, default=2)
 	parser.add_argument("--node_rank", type=int, default=0)
+	parser.add_argument("--kv_dtype", type=str, default="bfloat16", help="Key-Value cache data type, options are ['bf16','fp9']")
 	args = parser.parse_args()
 
 	"""
@@ -135,7 +136,8 @@ if __name__ == "__main__":
 		dist_init_addr = args.dist_init_addr,
 		nnodes = args.nnodes,
 		node_rank = args.node_rank,
-		device_per_node= 8
+		device_per_node= 8,
+		kv_dtype=args.kv_dtype
 	).run()
 
 	"""

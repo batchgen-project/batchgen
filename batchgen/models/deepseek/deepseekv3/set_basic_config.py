@@ -1,5 +1,6 @@
 from batchgen.config.config import EngineConfig
 import torch
+import logging
 
 def set_basic_config(engine_config: EngineConfig, **kwargs):
 	"""
@@ -14,6 +15,7 @@ def set_basic_config(engine_config: EngineConfig, **kwargs):
 	""" KV Dtype """
 	# If kv_dtype is not provided, use bf16
 	if not kwargs.get('kv_dtype', None):
+		logging.info("kv_dtype is not provided, using bfloat16 as default")
 		engine_config.Basic_Config.kv_dtype = "bfloat16"
 	else:
 		if kwargs.kv_dtype.lower() in ['bfloat16', 'bf16']:
@@ -27,6 +29,7 @@ def set_basic_config(engine_config: EngineConfig, **kwargs):
 	""" Attention Dtype """
 	# If attention_dtype is not provided, use bf16
 	if not kwargs.get('attention_dtype', None):
+		logging.info("attention_dtype is not provided, using bfloat16 as default")
 		engine_config.Basic_Config.attention_dtype = "bfloat16"
 	else:
 		if kwargs.attention_dtype.lower() in ['bfloat16', 'bf16']:
@@ -48,13 +51,13 @@ def set_basic_config(engine_config: EngineConfig, **kwargs):
 		engine_config.Basic_Config.device = kwargs.device
 		engine_config.Basic_Config.device_torch = torch.device(f"cuda:{kwargs.device}")
 
-	""" Attn Mode """
-	if not kwargs.get('attn_mode', None):
-		engine_config.Basic_Config.attn_mode = 1
-	else:
-		if kwargs.attn_mode not in [1, 2, 3]:
-			raise ValueError("Currently attn_mode must be 1, 2, or 3")
-		engine_config.Basic_Config.attn_mode = kwargs.attn_mode
+	# """ Attn Mode """
+	# if not kwargs.get('attn_mode', None):
+	# 	# raise ValueError("Attn mode must be specified")
+	# else:
+	# 	if kwargs.attn_mode not in [1, 2, 3]:
+	# 		raise ValueError("Currently attn_mode must be 1, 2, or 3")
+	# 	engine_config.Basic_Config.attn_mode = kwargs.attn_mode
 
 	""" Module Types """
 	engine_config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
