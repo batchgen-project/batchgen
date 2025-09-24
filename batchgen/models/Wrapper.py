@@ -531,7 +531,6 @@ class Attn_Wrapper(torch.nn.Module):
 				else:
 					# TODO:
 					pass
-				kv_scale = Attn_Wrapper.scale[self.layer_idx]
 				# TODO:
 				# new_scale = torch.empty(kv_scale.size(0),kv_scale.size(1)+1, kv_scale.size(2), device=kv_scale.device, dtype=kv_scale.dtype)
 				num_micro_batch = math.ceil(
@@ -552,29 +551,38 @@ class Attn_Wrapper(torch.nn.Module):
 						else (i + 1)
 						* self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
 					)
-					attn_result, kv, scale = self.module.decoding_attn_mode_3(
-						hidden_states[start_ids:end_ids],
-						past_key_states[start_ids:end_ids],
-						past_value_states[start_ids:end_ids] if past_value_states is not None else None,
-						attention_mask[start_ids:end_ids],
-						position_ids[start_ids:end_ids],
-						kv_scale[start_ids:end_ids],
-						Attn_Wrapper.cache_seqlens[start_ids:end_ids],
-						Attn_Wrapper.max_seqlen,
-						self.weight_dequant_scale
-					)
-					# attn_result, kv, scale = self.module.decoding_attn_mode_3_dequant_fusion(
-					# 	hidden_states[start_ids:end_ids],
-					# 	past_key_states[start_ids:end_ids],
-					# 	past_value_states[start_ids:end_ids] if past_value_states is not None else None,
-					# 	attention_mask[start_ids:end_ids],
-					# 	None,
-					# 	kv_scale[start_ids:end_ids],
-					# 	self.weight_dequant_scale
-					# )
+					if self.engine_config.Basic_Config.kv_dtype == "fp8":
+						kv_scale = Attn_Wrapper.scale[self.layer_idx]
+						attn_result, kv, scale = self.module.decoding_attn_mode_3(
+							hidden_states[start_ids:end_ids],
+							past_key_states[start_ids:end_ids],
+							past_value_states[start_ids:end_ids] if past_value_states is not None else None,
+							attention_mask[start_ids:end_ids],
+							position_ids[start_ids:end_ids],
+							kv_scale[start_ids:end_ids],
+							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
+							Attn_Wrapper.max_seqlen,
+							self.weight_dequant_scale
+						)
+						past_key_states[start_ids:end_ids].copy_(kv)
+						kv_scale[start_ids:end_ids].copy_(scale)
+					elif self.engine_config.Basic_Config.kv_dtype == "bf16":
+						attn_result, kv = self.module.decoding_attn_mode_3_bf16(
+							hidden_states[start_ids:end_ids],
+							past_key_states[start_ids:end_ids],
+							past_value_states[start_ids:end_ids] if past_value_states is not None else None,
+							attention_mask[start_ids:end_ids],
+							position_ids[start_ids:end_ids],
+							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
+							Attn_Wrapper.max_seqlen,
+						)
+						scale = None
+						past_key_states[start_ids:end_ids].copy_(kv)
+					else:
+						raise NotImplementedError
+
 					final_attn_result[start_ids:end_ids] = attn_result
-					past_key_states[start_ids:end_ids].copy_(kv)
-					kv_scale[start_ids:end_ids].copy_(scale)
+
 
 				Attn_Wrapper.past_key_states[self.layer_idx] = past_key_states
 				# new_scale[start_ids:end_ids] = scale
