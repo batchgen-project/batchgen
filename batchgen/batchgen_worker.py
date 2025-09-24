@@ -31,6 +31,7 @@ from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
+from dataclasses import dataclass
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -56,6 +57,39 @@ class query:
 		self.decoded_tokens = decoded_tokens
 
 
+@dataclass
+class InputArguments:
+    """Input arguments as a dataclass with type hints"""
+    huggingface_ckpt_name: str
+    hf_cache_dir: Optional[str] = None
+    cache_dir: Optional[str] = None
+    pt_ckpt_dir: Optional[str] = None
+    queries: Optional[List[str]] = None
+    max_input_length: int = 512
+    max_decoding_length: int = 128
+    device: str = "cuda"
+    skeleton_state_dict: Optional[Dict] = None
+    shm_name: Optional[str] = None
+    tensor_meta_shm_name: Optional[str] = None
+    engine_config_json_dir: Optional[str] = None
+    host_kv_cache_size: Optional[int] = None
+    kv_dtype: str = "float16"
+    dist_init_addr: Optional[str] = None
+    local_rank: int = 0
+    global_rank: int = 0
+    world_size: int = 1
+    
+    def to_dict(self) -> Dict:
+        """Convert back to dictionary if needed"""
+        return self.__dict__.copy()
+    
+    def update(self, **kwargs):
+        """Update multiple attributes at once"""
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                raise AttributeError(f"InputArguments has no attribute '{key}'")
 
 class BatchGenWorker:
 	def __init__(
@@ -79,8 +113,7 @@ class BatchGenWorker:
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
 	):
-		# self.input_arguments = copy.deepcopy(locals())
-		self.input_arguments = {
+		input_arguments = {
 			"huggingface_ckpt_name": huggingface_ckpt_name,
 			"hf_cache_dir": hf_cache_dir,
 			"cache_dir": cache_dir,
@@ -100,6 +133,7 @@ class BatchGenWorker:
 			"global_rank": global_rank,
 			"world_size": world_size
 		}
+		self.input_arguments = InputArguments(**input_arguments)
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
 		# hf_cache_dir will be deprecated in the future.
