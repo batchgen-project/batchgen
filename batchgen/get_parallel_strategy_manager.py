@@ -2,7 +2,7 @@ from batchgen.models.deepseek.deepseekv3.Parallel_Strategy_Manager import Deepse
 
 
 def get_parallel_strategy_manager(model_name:str):
-	if model_name.lower() in ["deepseek-ai/DeepSeek-R1", "deepseek-ai/DeepSeek-V3"]:
+	if model_name.lower() in ["deepseek-ai/deepseek-r1", "deepseek-ai/deepseek-v3"]:
 		return DeepseekV3ParallelStrategyManager
 	else:
 		raise ValueError(f"Unsupported model name: {model_name}")
