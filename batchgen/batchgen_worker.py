@@ -67,7 +67,7 @@ class InputArguments:
 	queries: Optional[List[str]] = None
 	max_input_length: int = 512
 	max_decoding_length: int = 128
-	device: str = "cuda"
+	device: int = 0
 	skeleton_state_dict: Optional[Dict] = None
 	shm_name: Optional[str] = None
 	tensor_meta_shm_name: Optional[str] = None
@@ -137,7 +137,7 @@ class BatchGenWorker:
 			"global_rank": global_rank,
 			"world_size": world_size
 		}
-		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
+		# logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 		self.input_arguments = InputArguments(**input_arguments)
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
