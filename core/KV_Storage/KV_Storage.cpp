@@ -1408,7 +1408,7 @@ void KV_Storage::offload_helper_(
             torch::Tensor k_quantize_scale;
             
             // Check if dtype is BFloat16 - if so, skip quantization
-            if (this->engine_config_.basic_config.kv_dtype == torch::kBFloat16) {
+            if (this->engine_config_.basic_config.kv_dtype == "bfloat16") {
                 // Direct offload without quantization for BFloat16
                 k = bf16_k;
                 // No quantization scale needed for BFloat16
