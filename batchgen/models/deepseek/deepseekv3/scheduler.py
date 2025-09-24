@@ -20,6 +20,7 @@ class Scheduler:
 		self.world_size = config.Basic_Config.world_size	
 
 		self._set_default_configs()
+		kv_element_size = 2 if self.config.Basic_Config.kv_dtype == "bfloat16" else 1
 		"""
 			Configure the rest.
 		"""
@@ -40,7 +41,7 @@ class Scheduler:
 		est_kv_cp_t_per_micro_batch = attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) / 52 * 1000 # in ms
 		# num_k_buffer = self.compute_profiler.profile(MoE_module) // est_kv_cp_t_per_micro_batch + 2
 		num_k_buffer = 6
-		k_buffer_size = num_k_buffer * attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) # in GB
+		k_buffer_size = num_k_buffer * attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) * kv_element_size # in GB
 
 
 		available_gpu_mem = 96 * DEFAULT_MEM_FRAC  # Assuming 96GB GPU memory
@@ -56,7 +57,7 @@ class Scheduler:
 			num_local_expert_per_layer = EXPERT_PER_RANK
 			expert_size = num_local_expert_per_layer * 2.4
 			# Fix 
-			self.per_seq_size = self.Max_Context_Length * 61 * 576 / (1024 ** 3) # in GB
+			self.per_seq_size = self.Max_Context_Length * 61 * 576 / (1024 ** 3) * kv_element_size # in GB
 			self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = (
 				int((available_gpu_mem - model_skeleton_size - cuda_page_table_default_size - expert_size - NCCL_default_buffer_usage) / self.per_seq_size)
 			)
