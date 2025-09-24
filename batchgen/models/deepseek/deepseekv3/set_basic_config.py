@@ -31,7 +31,7 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 		engine_config.Basic_Config.kv_dtype_torch = torch.bfloat16
 	elif engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
 		engine_config.Basic_Config.kv_dtype_torch = torch.float8_e4m3fn
-		
+
 
 	""" Attention Dtype """
 	# If attention_dtype is not provided, use bf16
@@ -49,7 +49,8 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 
 	""" Activation Dtype """
 	engine_config.Basic_Config.activation_dtype = "bfloat16"
-	engine_config.Basic_Config.activation_dtype_torch = torch.dtype(engine_config.Basic_Config.activation_dtype)
+	# engine_config.Basic_Config.activation_dtype_torch = torch.dtype(engine_config.Basic_Config.activation_dtype)
+	engine_config.Basic_Config.activation_dtype_torch = torch.bfloat16
 
 	""" Device """
 	if not input_arguments.get('device', None):
