@@ -59,37 +59,41 @@ class query:
 
 @dataclass
 class InputArguments:
-    """Input arguments as a dataclass with type hints"""
-    huggingface_ckpt_name: str
-    hf_cache_dir: Optional[str] = None
-    cache_dir: Optional[str] = None
-    pt_ckpt_dir: Optional[str] = None
-    queries: Optional[List[str]] = None
-    max_input_length: int = 512
-    max_decoding_length: int = 128
-    device: str = "cuda"
-    skeleton_state_dict: Optional[Dict] = None
-    shm_name: Optional[str] = None
-    tensor_meta_shm_name: Optional[str] = None
-    engine_config_json_dir: Optional[str] = None
-    host_kv_cache_size: Optional[int] = None
-    kv_dtype: str = "float16"
-    dist_init_addr: Optional[str] = None
-    local_rank: int = 0
-    global_rank: int = 0
-    world_size: int = 1
-    
-    def to_dict(self) -> Dict:
-        """Convert back to dictionary if needed"""
-        return self.__dict__.copy()
-    
-    def update(self, **kwargs):
-        """Update multiple attributes at once"""
-        for key, value in kwargs.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-            else:
-                raise AttributeError(f"InputArguments has no attribute '{key}'")
+	"""Input arguments as a dataclass with type hints"""
+	huggingface_ckpt_name: str
+	hf_cache_dir: Optional[str] = None
+	cache_dir: Optional[str] = None
+	pt_ckpt_dir: Optional[str] = None
+	queries: Optional[List[str]] = None
+	max_input_length: int = 512
+	max_decoding_length: int = 128
+	device: str = "cuda"
+	skeleton_state_dict: Optional[Dict] = None
+	shm_name: Optional[str] = None
+	tensor_meta_shm_name: Optional[str] = None
+	engine_config_json_dir: Optional[str] = None
+	host_kv_cache_size: Optional[int] = None
+	kv_dtype: str = "float16"
+	dist_init_addr: Optional[str] = None
+	local_rank: int = 0
+	global_rank: int = 0
+	world_size: int = 1
+
+	def get(self, key, default=None):
+		"""Get attribute value with a default fallback"""
+		return getattr(self, key, default)
+	
+	def to_dict(self) -> Dict:
+		"""Convert back to dictionary if needed"""
+		return self.__dict__.copy()
+	
+	def update(self, **kwargs):
+		"""Update multiple attributes at once"""
+		for key, value in kwargs.items():
+			if hasattr(self, key):
+				setattr(self, key, value)
+			else:
+				raise AttributeError(f"InputArguments has no attribute '{key}'")
 
 class BatchGenWorker:
 	def __init__(
