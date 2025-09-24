@@ -79,7 +79,27 @@ class BatchGenWorker:
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
 	):
-		self.input_arguments = copy.deepcopy(locals())
+		# self.input_arguments = copy.deepcopy(locals())
+		self.input_arguments = {
+			"huggingface_ckpt_name": huggingface_ckpt_name,
+			"hf_cache_dir": hf_cache_dir,
+			"cache_dir": cache_dir,
+			"pt_ckpt_dir": pt_ckpt_dir,
+			"queries": queries,
+			"max_input_length": max_input_length,
+			"max_decoding_length": max_decoding_length,
+			"device": device,
+			"skeleton_state_dict": skeleton_state_dict,
+			"shm_name": shm_name,
+			"tensor_meta_shm_name": tensor_meta_shm_name,
+			"engine_config_json_dir": engine_config_json_dir,
+			"host_kv_cache_size": host_kv_cache_size,
+			"kv_dtype": kv_dtype,
+			"dist_init_addr": dist_init_addr,
+			"local_rank": local_rank,
+			"global_rank": global_rank,
+			"world_size": world_size
+		}
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
 		# hf_cache_dir will be deprecated in the future.
