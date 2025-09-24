@@ -77,7 +77,7 @@ class InputArguments:
 	kv_dtype: str = "bfloat16"
 	dist_init_addr: Optional[str] = None
 	local_rank: int = 0
-	global_rank: int = 0
+	rank: int = 0
 	world_size: int = 1
 
 	def get(self, key, default=None):
@@ -136,7 +136,7 @@ class BatchGenWorker:
 			"num_queries": len(queries),
 			"dist_init_addr": dist_init_addr,
 			"local_rank": local_rank,
-			"global_rank": global_rank,
+			"rank": global_rank,
 			"world_size": world_size
 		}
 		# logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
