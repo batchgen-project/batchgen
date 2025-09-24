@@ -28,6 +28,9 @@ from tqdm import trange
 import gc
 from datetime import timedelta
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
+from get_initializer import get_initializer
+from get_parallel_strategy_manager import get_parallel_strategy_manager
+from batchgen.utils import config_torch_module_initializer
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -154,7 +157,7 @@ class BatchGenWorker:
 			trust_remote_code=True,
 			local_files_only=True,
 		)
-		self._config_torch_module_initializer()
+		config_torch_module_initializer()
 		self.tokenizer = AutoTokenizer.from_pretrained(
 			# self.huggingface_ckpt_name,
 			self.hf_cache_dir,
@@ -165,42 +168,78 @@ class BatchGenWorker:
 		# Use flash_attn by default thus right padding.
 		self.tokenizer.padding_side = "right"
 
+		# if self.model_config.architectures[0] == "MixtralForCausalLM":
+		# 	self.tokenizer.pad_token = self.tokenizer.eos_token
 
-		if self.model_config.architectures[0] == "MixtralForCausalLM":
-			self.tokenizer.pad_token = self.tokenizer.eos_token
+		# if self.model_config.architectures[0] == "MixtralForCausalLM":
+		# 	from batchgen.models.mixtral.Mixtral_Initializer import (
+		# 		Mixtral_Initializer,
+		# 	)
 
-		if self.model_config.architectures[0] == "MixtralForCausalLM":
-			from batchgen.models.mixtral.Mixtral_Initializer import (
-				Mixtral_Initializer,
-			)
+		# 	self.initializer = Mixtral_Initializer(
+		# 		self.huggingface_ckpt_name,
+		# 		self.hf_cache_dir,
+		# 		self.cache_dir,
+		# 		self.engine_config,
+		# 		self.skeleton_state_dict,
+		# 		self.shm_name,
+		# 		self.tensor_meta_shm_name,
+		# 		self.pt_ckpt_dir,
+		# 		self.host_kv_cache_size,
+		# 	)
+		# elif self.model_config.architectures[0] == "Qwen2MoeForCausalLM":
+		# 	from batchgen.models.Qwen_Initializer import Qwen_Initializer
 
-			self.initializer = Mixtral_Initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.skeleton_state_dict,
-				self.shm_name,
-				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
-				self.host_kv_cache_size,
-			)
-		elif self.model_config.architectures[0] == "Qwen2MoeForCausalLM":
-			from batchgen.models.Qwen_Initializer import Qwen_Initializer
+		# 	self.initializer = Qwen_Initializer(
+		# 		self.huggingface_ckpt_name,
+		# 		self.hf_cache_dir,
+		# 		self.cache_dir,
+		# 		self.engine_config,
+		# 		self.pt_ckpt_dir,
+		# 	)
+		# elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
+		# 	from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import (
+		# 		DeepseekV3Initializer,
+		# 	)
 
-			self.initializer = Qwen_Initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.pt_ckpt_dir,
-			)
-		elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
-			from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import (
-				DeepseekV3_Initializer,
-			)
+		# 	self.initializer = DeepseekV3Initializer(
+		# 		self.huggingface_ckpt_name,
+		# 		self.hf_cache_dir,
+		# 		self.cache_dir,
+		# 		self.engine_config,
+		# 		self.skeleton_state_dict,
+		# 		self.shm_name,
+		# 		self.tensor_meta_shm_name,
+		# 		self.pt_ckpt_dir,
+		# 		self.host_kv_cache_size,
+		# 		self.local_rank,
+		# 		self.global_rank,
+		# 		self.world_size
+		# 	)
 
-			self.initializer = DeepseekV3_Initializer(
+		# elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
+		# 	from batchgen.models.deepseek.deepseekv2.deepseekv2_initializer import (
+		# 		DeepSeek_Initializer,
+		# 	)
+
+		# 	self.initializer = DeepSeek_Initializer(
+		# 		self.huggingface_ckpt_name,
+		# 		self.hf_cache_dir,
+		# 		self.cache_dir,
+		# 		self.engine_config,
+		# 		self.skeleton_state_dict,
+		# 		self.shm_name,
+		# 		self.tensor_meta_shm_name,
+		# 		self.pt_ckpt_dir,
+		# 		self.host_kv_cache_size,
+		# 	)
+
+		# else:
+		# 	raise ValueError(
+		# 		f"Model architecture {self.model_config.architectures[0]} not supported yet."
+		# 	)
+		self.initializer = get_initializer(self.huggingface_ckpt_name)
+		self.initializer = self.initializer(
 				self.huggingface_ckpt_name,
 				self.hf_cache_dir,
 				self.cache_dir,
@@ -213,41 +252,15 @@ class BatchGenWorker:
 				self.local_rank,
 				self.global_rank,
 				self.world_size
-			)
-
-		elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
-			from batchgen.models.deepseek.deepseekv2.deepseekv2_initializer import (
-				DeepSeek_Initializer,
-			)
-
-			self.initializer = DeepSeek_Initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.skeleton_state_dict,
-				self.shm_name,
-				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
-				self.host_kv_cache_size,
-			)
-
-		else:
-			raise ValueError(
-				f"Model architecture {self.model_config.architectures[0]} not supported yet."
-			)
-
+		)
 		self.core_engine, self.model, self.engine_config, self.model_config, self.hf_model_config = (
 			self.initializer.Init()
 		)
+
 		self.vanilla_batching()
 		
-		
-		#TODO:
-		from .models.deepseek.deepseekv3.Parallel_Strategy_Manager import(  
-			Parallel_Strategy_Manager,
-		)
-		self.parallel_manager = Parallel_Strategy_Manager(
+		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
+		self.parallel_manager = self.parallel_manager(
 			self.hf_model_config,
 			self.engine_config,
 			self.model_config,
@@ -260,53 +273,6 @@ class BatchGenWorker:
 				
 		logging.info(f"Engine on device {self.device} initialized.")
 
-	def _config_torch_module_initializer(self):
-		def do_nothing_decorator(orig_func: Callable) -> Callable:
-			@functools.wraps(orig_func)
-			def do_nothing(*args, **kwargs):
-				pass
-
-			return do_nothing
-
-		def param_init_decorator(orig_param_init: Callable) -> Callable:
-			@functools.wraps(orig_param_init)
-			def archer_param_init(cls, *args, **kwargs):
-				orig_param_init(cls, *args, **kwargs)
-
-				for name, param in cls.named_parameters(recurse=False):
-					param.data = torch.zeros(
-						1, dtype=torch.bfloat16, device=param.device
-					)
-
-				# for name, buf in cls.named_buffers(recurse=False):
-				# 	buf.data = torch.zeros(1, dtype=torch.bfloat16, device=buf.device)
-
-			return archer_param_init
-
-		# for all the modules in torch.nn, add post_init method
-		# assert False, torch.nn.modules.__dict__
-		for name, module in torch.nn.modules.__dict__.items():
-			if not isinstance(module, type):
-				continue
-			if not issubclass(module, torch.nn.modules.module.Module):
-				continue
-			if name in [
-				"Module",
-				"Sequential",
-				"ModuleDict",
-				"ModuleList",
-				"ParameterList",
-				"ParameterDict",
-			]:
-				continue
-			module._old_init = module.__init__
-			module.__init__ = param_init_decorator(module.__init__)
-
-			if hasattr(module, "reset_parameters"):
-				module._old_reset_parameters = module.reset_parameters
-				module.reset_parameters = do_nothing_decorator(
-					module.reset_parameters
-				)
 
 	def vanilla_batching(self):
 		"""

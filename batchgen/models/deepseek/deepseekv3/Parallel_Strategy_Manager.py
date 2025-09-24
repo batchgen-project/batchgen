@@ -18,7 +18,7 @@ from batchgen.utils import torch_gpu_mem_usage
 	
 
 
-class Parallel_Strategy_Manager:
+class DeepseekV3ParallelStrategyManager:
 	def __init__(
 		self, 
 		hf_model_config, 
