@@ -704,7 +704,7 @@ def mla_decoding_flashmla_attn_mode_3(
 	# 	self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
 	# )
 	attn_output = self.o_proj(attn_output)
-
+	wait_for_debugger(target_rank=0)
 	return attn_output, past_key_states, scale
 
 @torch.inference_mode()
