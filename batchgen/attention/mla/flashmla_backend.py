@@ -1214,7 +1214,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
 	attn_output = self.o_proj(attn_output)
 	
-	return attn_output, past_key_states, scale
+	return attn_output, past_key_states
 
 
 @torch.inference_mode()
