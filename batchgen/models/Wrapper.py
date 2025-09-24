@@ -566,6 +566,7 @@ class Attn_Wrapper(torch.nn.Module):
 						)
 						past_key_states[start_ids:end_ids].copy_(kv)
 						kv_scale[start_ids:end_ids].copy_(scale)
+						Attn_Wrapper.scale[self.layer_idx] = kv_scale
 					elif self.engine_config.Basic_Config.kv_dtype == "bfloat16":
 						attn_result, kv = self.module.decoding_attn_mode_3_bf16(
 							hidden_states[start_ids:end_ids],
@@ -585,8 +586,7 @@ class Attn_Wrapper(torch.nn.Module):
 
 
 				Attn_Wrapper.past_key_states[self.layer_idx] = past_key_states
-				# new_scale[start_ids:end_ids] = scale
-				Attn_Wrapper.scale[self.layer_idx] = kv_scale
+				
 
 			# Step 4: Clean up
 			if self.get_weights:
