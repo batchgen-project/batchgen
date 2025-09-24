@@ -993,9 +993,9 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	past_value_states: torch.Tensor,
 	attention_mask: torch.Tensor,
 	q_position_ids: torch.Tensor,
-	scale: torch.Tensor,
 	cache_seqlens: torch.Tensor,
 	max_seqlen: int,
+	scale: torch.Tensor = None,
 	weight_scale: dict = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""

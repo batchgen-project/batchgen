@@ -144,7 +144,7 @@ class BatchGenWorker:
 			"world_size": world_size,
 			"gpu_arch": gpu_arch
 		}
-		# logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
+		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 		self.input_arguments = InputArguments(**input_arguments)
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
@@ -473,7 +473,10 @@ class BatchGenWorker:
 						past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 						past_value_states = None
 						# scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
-						scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+						if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
+							scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+						else:
+							scale_dict = None
 						
 				
 					else:
