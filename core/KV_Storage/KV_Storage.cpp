@@ -1498,7 +1498,7 @@ void KV_Storage::offload_helper_(
                         attention_mask[i].sum().item<int64_t>() * token_byte_size;
                     
                     // Handle quantization scale based on dtype
-                    if (this->engine_config_.basic_config.kv_dtype == torch::kBFloat16) {
+                    if (this->engine_config_.basic_config.kv_dtype == "bfloat16") {
                         // For BFloat16, either store a dummy scale or handle it differently
                         // Option 1: Store ones as scale (no scaling needed)
                         this->k_storage[slot_idx][layer_idx].quantize_scale = 
