@@ -80,6 +80,7 @@ class InputArguments:
 	rank: int = 0
 	global_rank: int = 0
 	world_size: int = 1
+	gpu_arch: str = "hooper"
 
 	def get(self, key, default=None):
 		"""Get attribute value with a default fallback"""
@@ -118,6 +119,7 @@ class BatchGenWorker:
 		local_rank: Optional[int] = 0,
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
+		gpu_arch: str = "hooper"
 	):
 		input_arguments = {
 			"huggingface_ckpt_name": huggingface_ckpt_name,
@@ -139,7 +141,8 @@ class BatchGenWorker:
 			"local_rank": local_rank,
 			"rank": global_rank,
 			"global_rank": global_rank,
-			"world_size": world_size
+			"world_size": world_size,
+			"gpu_arch": gpu_arch
 		}
 		# logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 		self.input_arguments = InputArguments(**input_arguments)
