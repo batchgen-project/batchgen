@@ -68,6 +68,7 @@ class InputArguments:
 	padding_length: int = 512
 	max_decoding_length: int = 128
 	device: int = 0
+	num_queries: int = 0
 	skeleton_state_dict: Optional[Dict] = None
 	shm_name: Optional[str] = None
 	tensor_meta_shm_name: Optional[str] = None
@@ -132,6 +133,7 @@ class BatchGenWorker:
 			"engine_config_json_dir": engine_config_json_dir,
 			"host_kv_cache_size": host_kv_cache_size,
 			"kv_dtype": kv_dtype,
+			"num_queries": len(queries),
 			"dist_init_addr": dist_init_addr,
 			"local_rank": local_rank,
 			"global_rank": global_rank,
