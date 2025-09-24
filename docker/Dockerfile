@@ -63,8 +63,6 @@ COPY . /root/moegen
 RUN uv pip install -e . -v \
     && uv cache clean
 
-RUN uv pip install debugpy && uv cache clean
-
 ENV NCCL_BUFFSIZE=16777216
  
 CMD ["sleep", "infinity"]

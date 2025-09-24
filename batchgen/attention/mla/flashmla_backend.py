@@ -7,7 +7,6 @@ from flash_mla import (
 )
 from .rotary_embedding import rotary_pos_emb
 import logging
-import torch.distributed as dist
 from ..quantization import dequant_per_token_triton, dequant_per_token_return_with_max_seqlen_pad
 import triton
 import triton.language as tl
@@ -704,7 +703,6 @@ def mla_decoding_flashmla_attn_mode_3(
 	# 	self.o_proj.weight.data, weight_scale["o_proj.weight_scale_inv"]
 	# )
 	attn_output = self.o_proj(attn_output)
-	wait_for_debugger(target_rank=0)
 	return attn_output, past_key_states, scale
 
 @torch.inference_mode()
