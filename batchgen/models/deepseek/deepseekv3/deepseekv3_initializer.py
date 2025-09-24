@@ -162,6 +162,7 @@ class DeepseekV3Initializer:
         self.model_config = self._parse_model_config()
 
         self.engine_config = EngineConfig()
+        logging.info(f"device: {input_arguments.device}")
         self.engine_config = set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
         self.scheduler = Scheduler()
