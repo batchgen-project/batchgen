@@ -123,7 +123,7 @@ class BatchGenWorker:
 			"cache_dir": cache_dir,
 			"pt_ckpt_dir": pt_ckpt_dir,
 			"queries": queries,
-			"max_input_length": max_input_length,
+			"padding_length": max_input_length,
 			"max_decoding_length": max_decoding_length,
 			"device": device,
 			"skeleton_state_dict": skeleton_state_dict,
