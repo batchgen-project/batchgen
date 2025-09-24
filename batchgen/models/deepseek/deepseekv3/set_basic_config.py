@@ -53,8 +53,7 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 	engine_config.Basic_Config.activation_dtype_torch = torch.bfloat16
 
 	""" Device """
-	logging.info(f"???device: {input_arguments.get('device')}")
-	if not input_arguments.get('device', None):
+	if input_arguments.get('device', None) is None:
 		raise ValueError("Device must be specified")
 	else:
 		engine_config.Basic_Config.device = input_arguments.device
