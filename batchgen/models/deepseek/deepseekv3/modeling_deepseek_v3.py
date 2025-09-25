@@ -699,7 +699,7 @@ class MoEGate(nn.Module):
 			topk_weight = topk_weight / denominator
 		topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
 
-		return topk_idx, topk_weight.to(hidden_states.dtype)
+		return topk_idx, topk_weight
 	
 	# @torch.compile(fullgraph=True, mode="reduce-overhead")
 	# @torch.compile(mode="reduce-overhead", backend="inductor")
@@ -935,9 +935,16 @@ class DeepseekV3MoE_Prefill(nn.Module):
 
 		new_x = torch.empty_like(outs)
 		new_x[idxs] = outs
-		topk_weight = topk_weight.to(torch.bfloat16)
+		# topk_weight = topk_weight.to(torch.bfloat16)
+		# final_out = (
+		# 	new_x.view(*topk_ids.shape, -1)
+		# 	.mul_(topk_weight.unsqueeze(dim=-1))
+		# 	.sum(dim=1)
+		# 	.type(new_x.dtype)
+		# )
 		final_out = (
 			new_x.view(*topk_ids.shape, -1)
+			.type(topk_weight.dtype)
 			.mul_(topk_weight.unsqueeze(dim=-1))
 			.sum(dim=1)
 			.type(new_x.dtype)
