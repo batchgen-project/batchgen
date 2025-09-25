@@ -942,6 +942,7 @@ class DeepseekV3MoE_Prefill(nn.Module):
 		# 	.sum(dim=1)
 		# 	.type(new_x.dtype)
 		# )
+		assert topk_weight.dtype == torch.float32
 		final_out = (
 			new_x.view(*topk_ids.shape, -1)
 			.type(topk_weight.dtype)
