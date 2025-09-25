@@ -373,7 +373,7 @@ def act_quant_hidden_states_kernel(
     x_scaled = tl.maximum(x_scaled, -fp8_max)
     
     # Convert to FP8
-    y = x_scaled.to(tl.float8e4m3fn)
+    y = x_scaled.to(tl.float8e4nv)
     
     # Store quantized values
     tl.store(y_ptr + token_offset + offsets, y, mask=mask)
@@ -385,7 +385,7 @@ def act_quant_hidden_states_kernel(
     tl.store(scale_ptr + scale_offset, scale)
 
 
-def act_quant_hidden_states(
+def act_quant(
     x: torch.Tensor,  # [bsz, seq_len, hidden_dim]
     block_size: int = 128,
     eps: float = 1e-12
