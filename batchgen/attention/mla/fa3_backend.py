@@ -368,7 +368,7 @@ def act_quant_kernel_2d(
     x_scaled = tl.maximum(x_scaled, -fp8_max)
     
     # Store
-    y = x_scaled.to(tl.float8e4m3fn)  # Fixed: explicit FP8 type
+    y = x_scaled.to(tl.float8e4nv)  # Fixed: explicit FP8 type
     y_row_start = y_ptr + pid_m * N
     tl.store(y_row_start + offsets, y, mask=mask)
     
