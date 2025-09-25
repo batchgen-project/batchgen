@@ -183,154 +183,50 @@ from triton import Config
 # 	return y, s
 
 """ V2 """
-# @triton.jit
-# def act_quant_kernel(
-#     x_ptr, 
-#     y_ptr, 
-#     scale_ptr,
-#     n_elements,
-#     eps: tl.constexpr,
-#     fp8_max: tl.constexpr,
-#     BLOCK_SIZE: tl.constexpr
-# ):
-#     """
-#     Industry standard block quantization kernel for BF16 -> FP8 E4M3.
-#     Based on NVIDIA Transformer Engine and FP8 training best practices.
-#     """
-#     pid = tl.program_id(axis=0)
-#     block_start = pid * BLOCK_SIZE
-#     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-#     mask = offsets < n_elements
+@triton.jit
+def act_quant_kernel(
+    x_ptr, 
+    y_ptr, 
+    scale_ptr,
+    n_elements,
+    eps: tl.constexpr,
+    fp8_max: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    """
+    Industry standard block quantization kernel for BF16 -> FP8 E4M3.
+    Based on NVIDIA Transformer Engine and FP8 training best practices.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
     
-#     # Load input in FP32 for numerical stability
-#     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    # Load input in FP32 for numerical stability
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     
-#     # Compute absmax with epsilon for stability (industry standard)
-#     absmax = tl.max(tl.abs(x), axis=0)
-#     absmax = tl.maximum(absmax, eps)
+    # Compute absmax with epsilon for stability (industry standard)
+    absmax = tl.max(tl.abs(x), axis=0)
+    absmax = tl.maximum(absmax, eps)
     
-#     # Standard FP8 E4M3 scaling
-#     # FP8 E4M3 max value is 448, but use 448.0 for safety
-#     scale = absmax / fp8_max
+    # Standard FP8 E4M3 scaling
+    # FP8 E4M3 max value is 448, but use 448.0 for safety
+    scale = absmax / fp8_max
     
-#     # Quantize and clamp
-#     x_scaled = x / scale
+    # Quantize and clamp
+    x_scaled = x / scale
     
-#     # Clamp to FP8 E4M3 range - this is critical
-#     x_scaled = tl.minimum(x_scaled, fp8_max)
-#     x_scaled = tl.maximum(x_scaled, -fp8_max)
+    # Clamp to FP8 E4M3 range - this is critical
+    x_scaled = tl.minimum(x_scaled, fp8_max)
+    x_scaled = tl.maximum(x_scaled, -fp8_max)
     
-#     # Convert to FP8
-#     y = x_scaled.to(y_ptr.dtype.element_ty)
+    # Convert to FP8
+    y = x_scaled.to(y_ptr.dtype.element_ty)
     
-#     # Store outputs
-#     tl.store(y_ptr + offsets, y, mask=mask)
-#     tl.store(scale_ptr + pid, scale)
+    # Store outputs
+    tl.store(y_ptr + offsets, y, mask=mask)
+    tl.store(scale_ptr + pid, scale)
 
-
-# @triton.jit
-# def act_quant_kernel_2d(
-#     x_ptr,
-#     y_ptr,
-#     scale_ptr,
-#     M, N,
-#     eps: tl.constexpr,
-#     fp8_max: tl.constexpr,
-#     BLOCK_SIZE: tl.constexpr
-# ):
-#     """
-#     2D version for better efficiency with matrices.
-#     Quantizes along the last dimension (row-wise).
-#     """
-#     pid_m = tl.program_id(axis=0)
-#     pid_n = tl.program_id(axis=1)
-    
-#     # Each program handles one block in a row
-#     row_start = x_ptr + pid_m * N
-#     block_start = pid_n * BLOCK_SIZE
-#     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-#     mask = offsets < N
-    
-#     # Load block
-#     x = tl.load(row_start + offsets, mask=mask, other=0.0).to(tl.float32)
-    
-#     # Compute scale (absmax)
-#     absmax = tl.max(tl.abs(x), axis=0)
-#     scale = tl.maximum(absmax, eps) / fp8_max
-    
-#     # Quantize
-#     x_scaled = x / scale
-#     x_scaled = tl.minimum(x_scaled, fp8_max)
-#     x_scaled = tl.maximum(x_scaled, -fp8_max)
-    
-#     # Store
-#     y = x_scaled.to(y_ptr.dtype.element_ty)
-#     y_row_start = y_ptr + pid_m * N
-#     tl.store(y_row_start + offsets, y, mask=mask)
-    
-#     # Store scale (one per block)
-#     scale_offset = pid_m * ((N + BLOCK_SIZE - 1) // BLOCK_SIZE) + pid_n
-#     tl.store(scale_ptr + scale_offset, scale)
-
-
-# def act_quant(
-#     x: torch.Tensor, 
-#     block_size: int = 128,
-#     eps: float = 1e-12
-# ) -> Tuple[torch.Tensor, torch.Tensor]:
-#     """
-#     Industry standard BF16 to FP8 E4M3 block quantization.
-    
-#     Args:
-#         x: Input tensor in BF16/FP16/FP32
-#         block_size: Block size for quantization (typically 128 or 256)
-#         eps: Epsilon for numerical stability (1e-12 is standard)
-    
-#     Returns:
-#         y: Quantized tensor in FP8 E4M3
-#         scale: Per-block scaling factors
-#     """
-#     assert x.is_contiguous(), 'Input must be contiguous'
-    
-#     # FP8 E4M3 characteristics
-#     fp8_max = 448.0
-    
-#     # Flatten all dimensions except last for block processing
-#     original_shape = x.shape
-#     x_flat = x.view(-1, x.shape[-1])
-#     M, N = x_flat.shape
-    
-#     # Allocate outputs
-#     y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
-#     num_blocks = (N + block_size - 1) // block_size
-#     scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
-    
-#     # Launch kernel
-#     if N <= 2048:  # Use 2D kernel for smaller dimensions
-#         grid = (M, num_blocks)
-#         act_quant_kernel_2d[grid](
-#             x_flat, y, scale,
-#             M, N,
-#             eps=eps,
-#             fp8_max=fp8_max,
-#             BLOCK_SIZE=block_size
-#         )
-#     else:  # Use 1D kernel for larger dimensions
-#         total_blocks = M * num_blocks
-#         grid = (total_blocks,)
-#         act_quant_kernel[grid](
-#             x_flat, y, scale,
-#             n_elements=x_flat.numel(),
-#             eps=eps,
-#             fp8_max=fp8_max,
-#             BLOCK_SIZE=block_size
-#         )
-#         scale = scale.view(M, num_blocks)
-    
-#     # Restore original shape
-#     y = y.view(original_shape)
-    
-#     return y, scale
 
 @triton.jit
 def act_quant_kernel_2d(
@@ -343,13 +239,13 @@ def act_quant_kernel_2d(
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    Quantizes each row (token) independently in blocks.
-    This kernel is already correct!
+    2D version for better efficiency with matrices.
+    Quantizes along the last dimension (row-wise).
     """
-    pid_m = tl.program_id(axis=0)  # Token index
-    pid_n = tl.program_id(axis=1)  # Block index within token
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
     
-    # Each program handles one block in one token
+    # Each program handles one block in a row
     row_start = x_ptr + pid_m * N
     block_start = pid_n * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -358,7 +254,7 @@ def act_quant_kernel_2d(
     # Load block
     x = tl.load(row_start + offsets, mask=mask, other=0.0).to(tl.float32)
     
-    # Compute scale for this block
+    # Compute scale (absmax)
     absmax = tl.max(tl.abs(x), axis=0)
     scale = tl.maximum(absmax, eps) / fp8_max
     
@@ -368,57 +264,161 @@ def act_quant_kernel_2d(
     x_scaled = tl.maximum(x_scaled, -fp8_max)
     
     # Store
-    y = x_scaled.to(tl.float8e4nv)  # Fixed: explicit FP8 type
+    y = x_scaled.to(y_ptr.dtype.element_ty)
     y_row_start = y_ptr + pid_m * N
     tl.store(y_row_start + offsets, y, mask=mask)
     
-    # Store scale: one per block per token
+    # Store scale (one per block)
     scale_offset = pid_m * ((N + BLOCK_SIZE - 1) // BLOCK_SIZE) + pid_n
     tl.store(scale_ptr + scale_offset, scale)
 
 
 def act_quant(
-    x: torch.Tensor,  # [bsz * seq_len, hidden_dim]
+    x: torch.Tensor, 
     block_size: int = 128,
     eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize activations with per-token block quantization.
+    Industry standard BF16 to FP8 E4M3 block quantization.
     
     Args:
-        x: Input tensor [num_tokens, hidden_dim]
-        block_size: Block size for quantization (128)
-        eps: Epsilon for numerical stability
-        
+        x: Input tensor in BF16/FP16/FP32
+        block_size: Block size for quantization (typically 128 or 256)
+        eps: Epsilon for numerical stability (1e-12 is standard)
+    
     Returns:
-        y: Quantized tensor [num_tokens, hidden_dim] in FP8
-        scale: Scale factors [num_tokens, hidden_dim // block_size]
+        y: Quantized tensor in FP8 E4M3
+        scale: Per-block scaling factors
     """
     assert x.is_contiguous(), 'Input must be contiguous'
-    assert x.dim() == 2, 'Expected 2D tensor [num_tokens, hidden_dim]'
     
-    M, N = x.shape  # M = num_tokens, N = hidden_dim
+    # FP8 E4M3 characteristics
     fp8_max = 448.0
     
+    # Flatten all dimensions except last for block processing
+    original_shape = x.shape
+    x_flat = x.view(-1, x.shape[-1])
+    M, N = x_flat.shape
+    
     # Allocate outputs
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
     num_blocks = (N + block_size - 1) // block_size
     scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
     
-    # ALWAYS use 2D kernel for per-token block quantization
-    # Never use the 1D kernel as it doesn't respect token boundaries
-    grid = (M, num_blocks)
-    act_quant_kernel_2d[grid](
-        x, y, scale,
-        M, N,
-        eps=eps,
-        fp8_max=fp8_max,
-        BLOCK_SIZE=block_size,
-        num_warps=4,
-        num_stages=2
-    )
+    # Launch kernel
+    if N <= 2048:  # Use 2D kernel for smaller dimensions
+        grid = (M, num_blocks)
+        act_quant_kernel_2d[grid](
+            x_flat, y, scale,
+            M, N,
+            eps=eps,
+            fp8_max=fp8_max,
+            BLOCK_SIZE=block_size
+        )
+    else:  # Use 1D kernel for larger dimensions
+        total_blocks = M * num_blocks
+        grid = (total_blocks,)
+        act_quant_kernel[grid](
+            x_flat, y, scale,
+            n_elements=x_flat.numel(),
+            eps=eps,
+            fp8_max=fp8_max,
+            BLOCK_SIZE=block_size
+        )
+        scale = scale.view(M, num_blocks)
+    
+    # Restore original shape
+    y = y.view(original_shape)
     
     return y, scale
+
+# @triton.jit
+# def act_quant_kernel_2d(
+#     x_ptr,
+#     y_ptr,
+#     scale_ptr,
+#     M, N,
+#     eps: tl.constexpr,
+#     fp8_max: tl.constexpr,
+#     BLOCK_SIZE: tl.constexpr
+# ):
+#     """
+#     Quantizes each row (token) independently in blocks.
+#     This kernel is already correct!
+#     """
+#     pid_m = tl.program_id(axis=0)  # Token index
+#     pid_n = tl.program_id(axis=1)  # Block index within token
+    
+#     # Each program handles one block in one token
+#     row_start = x_ptr + pid_m * N
+#     block_start = pid_n * BLOCK_SIZE
+#     offsets = block_start + tl.arange(0, BLOCK_SIZE)
+#     mask = offsets < N
+    
+#     # Load block
+#     x = tl.load(row_start + offsets, mask=mask, other=0.0).to(tl.float32)
+    
+#     # Compute scale for this block
+#     absmax = tl.max(tl.abs(x), axis=0)
+#     scale = tl.maximum(absmax, eps) / fp8_max
+    
+#     # Quantize
+#     x_scaled = x / scale
+#     x_scaled = tl.minimum(x_scaled, fp8_max)
+#     x_scaled = tl.maximum(x_scaled, -fp8_max)
+    
+#     # Store
+#     y = x_scaled.to(tl.float8e4nv)  # Fixed: explicit FP8 type
+#     y_row_start = y_ptr + pid_m * N
+#     tl.store(y_row_start + offsets, y, mask=mask)
+    
+#     # Store scale: one per block per token
+#     scale_offset = pid_m * ((N + BLOCK_SIZE - 1) // BLOCK_SIZE) + pid_n
+#     tl.store(scale_ptr + scale_offset, scale)
+
+
+# def act_quant(
+#     x: torch.Tensor,  # [bsz * seq_len, hidden_dim]
+#     block_size: int = 128,
+#     eps: float = 1e-12
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     """
+#     Quantize activations with per-token block quantization.
+    
+#     Args:
+#         x: Input tensor [num_tokens, hidden_dim]
+#         block_size: Block size for quantization (128)
+#         eps: Epsilon for numerical stability
+        
+#     Returns:
+#         y: Quantized tensor [num_tokens, hidden_dim] in FP8
+#         scale: Scale factors [num_tokens, hidden_dim // block_size]
+#     """
+#     assert x.is_contiguous(), 'Input must be contiguous'
+#     assert x.dim() == 2, 'Expected 2D tensor [num_tokens, hidden_dim]'
+    
+#     M, N = x.shape  # M = num_tokens, N = hidden_dim
+#     fp8_max = 448.0
+    
+#     # Allocate outputs
+#     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+#     num_blocks = (N + block_size - 1) // block_size
+#     scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
+    
+#     # ALWAYS use 2D kernel for per-token block quantization
+#     # Never use the 1D kernel as it doesn't respect token boundaries
+#     grid = (M, num_blocks)
+#     act_quant_kernel_2d[grid](
+#         x, y, scale,
+#         M, N,
+#         eps=eps,
+#         fp8_max=fp8_max,
+#         BLOCK_SIZE=block_size,
+#         num_warps=4,
+#         num_stages=2
+#     )
+    
+#     return y, scale
 
 def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
