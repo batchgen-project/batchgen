@@ -333,93 +333,84 @@ from triton import Config
 #     return y, scale
 
 @triton.jit
-def act_quant_hidden_states_kernel(
+def act_quant_kernel_2d(
     x_ptr,
-    y_ptr, 
+    y_ptr,
     scale_ptr,
-    B, S, H,  # batch_size, seq_len, hidden_dim
+    M, N,
     eps: tl.constexpr,
     fp8_max: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr  # Should be 128
+    BLOCK_SIZE: tl.constexpr
 ):
     """
-    Quantize hidden states with per-token block quantization.
-    Each token gets quantized in blocks of 128 elements.
+    Quantizes each row (token) independently in blocks.
+    This kernel is already correct!
     """
-    # Program IDs for 3D grid
-    pid_b = tl.program_id(axis=0)  # batch dim
-    pid_s = tl.program_id(axis=1)  # sequence dim  
-    pid_h = tl.program_id(axis=2)  # hidden dim blocks
+    pid_m = tl.program_id(axis=0)  # Token index
+    pid_n = tl.program_id(axis=1)  # Block index within token
     
-    # Calculate offsets for this block
-    token_offset = (pid_b * S + pid_s) * H
-    block_start = pid_h * BLOCK_SIZE
+    # Each program handles one block in one token
+    row_start = x_ptr + pid_m * N
+    block_start = pid_n * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < H
+    mask = offsets < N
     
-    # Load block of hidden states for this token
-    x = tl.load(x_ptr + token_offset + offsets, mask=mask, other=0.0).to(tl.float32)
+    # Load block
+    x = tl.load(row_start + offsets, mask=mask, other=0.0).to(tl.float32)
     
-    # Compute absmax for this block (standard FP8 quantization)
+    # Compute scale for this block
     absmax = tl.max(tl.abs(x), axis=0)
-    absmax = tl.maximum(absmax, eps)
+    scale = tl.maximum(absmax, eps) / fp8_max
     
-    # Compute scale
-    scale = absmax / fp8_max
-    
-    # Quantize with clamping
+    # Quantize
     x_scaled = x / scale
     x_scaled = tl.minimum(x_scaled, fp8_max)
     x_scaled = tl.maximum(x_scaled, -fp8_max)
     
-    # Convert to FP8
-    y = x_scaled.to(tl.float8e4nv)
+    # Store
+    y = x_scaled.to(tl.float8e4m3fn)  # Fixed: explicit FP8 type
+    y_row_start = y_ptr + pid_m * N
+    tl.store(y_row_start + offsets, y, mask=mask)
     
-    # Store quantized values
-    tl.store(y_ptr + token_offset + offsets, y, mask=mask)
-    
-    # Store scale - maintaining 3D structure
-    # Scale has shape [B, S, H//BLOCK_SIZE]
-    num_blocks_per_token = (H + BLOCK_SIZE - 1) // BLOCK_SIZE
-    scale_offset = pid_b * S * num_blocks_per_token + pid_s * num_blocks_per_token + pid_h
+    # Store scale: one per block per token
+    scale_offset = pid_m * ((N + BLOCK_SIZE - 1) // BLOCK_SIZE) + pid_n
     tl.store(scale_ptr + scale_offset, scale)
 
 
 def act_quant(
-    x: torch.Tensor,  # [bsz, seq_len, hidden_dim]
+    x: torch.Tensor,  # [bsz * seq_len, hidden_dim]
     block_size: int = 128,
     eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize hidden states with per-token block quantization.
+    Quantize activations with per-token block quantization.
     
     Args:
-        x: Hidden states [bsz, seq_len, hidden_dim]
-        block_size: Block size for quantization (128 for standard FP8)
+        x: Input tensor [num_tokens, hidden_dim]
+        block_size: Block size for quantization (128)
         eps: Epsilon for numerical stability
         
     Returns:
-        y: Quantized tensor [bsz, seq_len, hidden_dim] in FP8
-        scale: Scale factors [bsz, seq_len, hidden_dim // block_size]
+        y: Quantized tensor [num_tokens, hidden_dim] in FP8
+        scale: Scale factors [num_tokens, hidden_dim // block_size]
     """
     assert x.is_contiguous(), 'Input must be contiguous'
-    assert x.dim() == 3, 'Expected 3D tensor [bsz, seq_len, hidden_dim]'
+    assert x.dim() == 2, 'Expected 2D tensor [num_tokens, hidden_dim]'
     
-    B, S, H = x.shape
-    assert H % block_size == 0, f'hidden_dim {H} must be divisible by block_size {block_size}'
-    
+    M, N = x.shape  # M = num_tokens, N = hidden_dim
     fp8_max = 448.0
-    num_blocks = H // block_size
     
-    # Allocate outputs maintaining 3D structure
+    # Allocate outputs
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    scale = torch.empty((B, S, num_blocks), dtype=torch.float32, device=x.device)
+    num_blocks = (N + block_size - 1) // block_size
+    scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
     
-    # Launch kernel with 3D grid
-    grid = (B, S, num_blocks)
-    act_quant_hidden_states_kernel[grid](
+    # ALWAYS use 2D kernel for per-token block quantization
+    # Never use the 1D kernel as it doesn't respect token boundaries
+    grid = (M, num_blocks)
+    act_quant_kernel_2d[grid](
         x, y, scale,
-        B, S, H,
+        M, N,
         eps=eps,
         fp8_max=fp8_max,
         BLOCK_SIZE=block_size,
