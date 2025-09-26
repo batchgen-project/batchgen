@@ -1356,8 +1356,17 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 		bsz, 1, self.num_heads, qk_head_dim
 	)
 
+	# Pad the kv cache to be multiple of 64
+	if kv_seqlen % 64 != 0:
+		pad_len = 64 - (kv_seqlen % 64)
+		past_key_states = torch.cat([
+			past_key_states, 
+			torch.zeros((bsz, pad_len, past_key_states.size(-1)), device=past_key_states.device, dtype=past_key_states.dtype)
+		], dim=1)
+		cache_seqlens = cache_seqlens + pad_len
+		kv_seqlen = past_key_states.size(1)
 
-	block_size = 128
+	block_size = 64
 	block_table = torch.arange(
 		bsz * kv_seqlen // block_size, dtype=torch.int32, device=past_key_states.device
 	).view(bsz, kv_seqlen // block_size)
