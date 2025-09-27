@@ -1424,7 +1424,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		# res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
 		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		 									 device=self.device, dtype=torch.bfloat16)
 		global_results[global_indices, token_topk_pos, :] = res
@@ -1494,6 +1495,50 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			group_size, activated_group_idx, group_start_indices
 		)
 		return res
+
+	def grouped_weight_dequant_moe_a16w8(self, x, eids):
+		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
+		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+		# )
+		if(len(eids) == 0):
+			# logger.warning_once("No tokens routed to this rank.")
+			assert len(x) == 0, "If no tokens routed, x should be empty too."
+			return x
+
+		group_size, activated_group_idx, group_start_indices = expert_bincount(
+			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+		)
+
+		# Quantize the recv_x tensor to fp8_e4m3
+		# x, x_scale = act_quant(x)
+		# intermediate = fused_fp8_moe_stage_1(
+		# 	x, x_scale, 
+		# 	self.gate_list, self.gate_ptrs_ptr,
+		# 	self.up_list, self.up_ptrs_ptr,
+		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
+		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices
+		# )	
+		
+		# intermediate, intermediate_scale = act_quant(intermediate)
+		# res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+		# 	intermediate, intermediate_scale, 
+		# 	self.down_list, self.down_ptrs_ptr,
+		# 	self.down_scale_list, self.down_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices
+		# )
+		# group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=device)
+		# Please get group_sizes from group_size tensor
+		group_sizes = [(int(idx), int(size)) for idx, size in zip(activated_group_idx.tolist(), group_size.tolist())]
+		intermediate = fused_dequant_weighted_moe_stage_1(
+			x, self.gate_list, self.up_list, self.gate_scale_list, self.up_scale_list, group_sizes, group_start_indices
+		)	
+		
+		res = fused_dequant_grouped_gemm_bf16_fp8_triton_v2(
+			intermediate, self.down_list, self.down_scale_list, group_sizes, group_start_indices, gemm_block_size = [64, 16, 64]
+		)
+		return res
+
 
 	
 
