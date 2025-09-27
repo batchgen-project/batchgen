@@ -1225,8 +1225,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
 		
-		# out = self.moe_infer_allgather_allreduce_opt(hidden_states)
-		out = self.moe_infer_alltoall(hidden_states)
+		out = self.moe_infer_allgather_allreduce_opt(hidden_states)
+		# out = self.moe_infer_alltoall(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
@@ -1426,8 +1426,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		# res = self.grouped_dequant_moe_fp8(input_x, input_eids)
-		res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
+		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		# res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
 		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		 									 device=self.device, dtype=torch.bfloat16)
 		global_results[global_indices, token_topk_pos, :] = res
@@ -1474,9 +1474,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			assert len(x) == 0, "If no tokens routed, x should be empty too."
 			return x
 
-		group_size, activated_group_idx, group_start_indices = expert_bincount(
-			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
-		)
+		# group_size, activated_group_idx, group_start_indices = expert_bincount(
+		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+		# )
+		# eids = recv_eid - self.routed_expert_start_idx
+		counts = torch.bincount(eids, minlength=self.experts_per_rank)
+		group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)	
+		group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=self.device)
+		group_start_indices = torch.roll(torch.cumsum(group_size, dim=0), 1)
+		group_start_indices[0] = 0  # The first group starts at index 0	
+		activated_group_idx = torch.tensor([idx for idx, _ in group_sizes], dtype=torch.int32, device=self.device)
 
 		# Quantize the recv_x tensor to fp8_e4m3
 		x, x_scale = act_quant(x)
