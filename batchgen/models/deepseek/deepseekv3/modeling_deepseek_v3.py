@@ -1477,7 +1477,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# group_size, activated_group_idx, group_start_indices = expert_bincount(
 		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		# )
-		# eids = recv_eid - self.routed_expert_start_idx
+		eids = eids - self.routed_expert_start_idx
 		counts = torch.bincount(eids, minlength=self.experts_per_rank)
 		group_sizes = sorted((idx, sz) for idx, sz in enumerate(counts.tolist()) if sz)	
 		group_size = torch.tensor([size for _, size in group_sizes], dtype=torch.int32, device=self.device)
