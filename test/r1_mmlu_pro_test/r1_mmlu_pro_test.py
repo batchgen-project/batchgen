@@ -239,7 +239,8 @@ if __name__ == "__main__":
 			search_text = model_output # Search the entire output if the tag is missing
 
 		# A more flexible regex to capture "answer is A", "answer is: (B)", etc.
-		pattern = r"answer is\s*:?\s*\(?([A-J])\)?"
+		# pattern = r"answer is\s*:?\s*\(?([A-J])\)?"
+		pattern =  r"answer is \(?([ABCDEFGHIJ])\)?"
 		match = re.search(pattern, search_text, re.IGNORECASE)
 
 		if match:
