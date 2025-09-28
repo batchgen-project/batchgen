@@ -422,7 +422,7 @@ class BatchGenWorker:
 		try:
 			group = StatelessProcessGroup.create(
 				host=comm_master_addr,
-				port=20001,
+				port=20003,
 				rank=self.rank,
 				world_size=self.world_size,
 				data_expiration_seconds=6000,
