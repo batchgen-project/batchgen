@@ -74,12 +74,6 @@ class DeepSeek_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free mem pm start Init: {gpu0_memory} GB / {total_memory} GB")
         
-        self._save_safetensors_to_pt()
-        free_memory, total_memory = torch.cuda.mem_get_info()
-        gpu0_memory = free_memory / 1024 / 1024 / 1024
-        total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(f"GPU 0 free mem after save safetensors to pt: {gpu0_memory} GB / {total_memory} GB")
-
         self._parse_state_dict()
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
