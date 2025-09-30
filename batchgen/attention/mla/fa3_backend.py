@@ -552,7 +552,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		max_seqlen_q=max_seqlen_in_batch_q,
 		max_seqlen_k=max_seqlen_in_batch_k,
 		# softmax_scale=self.qkv_materialized_softmax_scale,
-		softmax_scale=self.q_head_dim ** (-0.5),
+		softmax_scale=self.softmax_scale,
+		# softmax_scale=self.q_head_dim ** (-0.5),
 		causal=True
 	)
 	# if attn_output_unpad is a tuple, we use attn_output_unpad[0]
