@@ -865,10 +865,10 @@ class DeepseekV3MoE_Prefill(nn.Module):
 		if not self.training:
 			y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
 		if self.config.n_shared_experts is not None:
-			# y = y + self.shared_experts(identity)
+			y = y + self.shared_experts(identity)
 			# accumulate in fp32
-			y = y.to(torch.float32) + self.shared_experts(identity).to(torch.float32)
-			y = y.type(identity.dtype)
+			# y = y.to(torch.float32) + self.shared_experts(identity).to(torch.float32)
+			# y = y.type(identity.dtype)
 		return y
 
 	@torch.no_grad()
@@ -946,6 +946,7 @@ class DeepseekV3MoE_Prefill(nn.Module):
 		# 	.type(new_x.dtype)
 		# )
 		assert topk_weight.dtype == torch.float32
+		topk_weight = topk_weight.to(new_x.dtype)
 		final_out = (
 			new_x.view(*topk_ids.shape, -1)
 			.type(topk_weight.dtype)
@@ -1230,11 +1231,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		out = self.moe_infer_allgather_allreduce_opt(hidden_states)
 		# out = self.moe_infer_alltoall(hidden_states)
-		# out = out + self.shared_experts(identity)
+		out = out + self.shared_experts(identity)
 		# accumulate with fp32
-		out = out.float()
-		out = out + self.shared_experts(identity).float()
-		out = out.to(hidden_states.dtype)
+		# out = out.float()
+		# out = out + self.shared_experts(identity).float()
+		# out = out.to(hidden_states.dtype)
 
 
 		return out.view(*orig_shape)
