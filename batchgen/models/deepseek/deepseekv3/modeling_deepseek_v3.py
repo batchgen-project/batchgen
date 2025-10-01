@@ -811,129 +811,92 @@ class MoEGate(nn.Module):
 import triton
 import triton.language as tl
 @triton.jit
-def fused_moe_permute_aggregate_kernel(
-    # Input pointers
-    outs_ptr,           # [total_tokens, hidden_dim] - expert outputs
-    idxs_ptr,           # [total_tokens] - scatter indices
-    topk_weight_ptr,    # [batch*seq, topk] - routing weights
-    topk_ids_ptr,       # [batch*seq, topk] - which experts were selected
-    # Output pointer
-    final_out_ptr,      # [batch*seq, hidden_dim]
-    # Dimensions
-    batch_seq,          # batch_size * seq_len
-    topk,               # number of experts per token
-    hidden_dim,         # model hidden dimension
-    total_tokens,       # batch*seq*topk (total expert calls)
-    # Block size
+def moe_fp32_accum_kernel_v2(
+    outs_ptr,
+    inv_idxs_ptr,
+    topk_weights_ptr,
+    output_ptr,
+    total_tokens: tl.constexpr,
+    topk: tl.constexpr,
+    hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Fuses:
-    1. Permutation: new_x[idxs] = outs
-    2. Weighted sum: final_out = (new_x * weights).sum(dim=topk)
-    
-    Each program processes one (batch_seq_idx, hidden_block) tile.
+    Optimized version with better memory access patterns.
+    Each block processes multiple tokens to improve memory coalescing.
     """
+    # Program handles a block of tokens and a chunk of hidden dims
+    token_block_id = tl.program_id(0)
+    h_block_id = tl.program_id(1)
     
-    # Program ID determines which output position we're computing
-    pid_batch = tl.program_id(0)  # Which token in [batch*seq]
-    pid_hidden = tl.program_id(1)  # Which block of hidden_dim
+    # Token range for this block
+    TOKENS_PER_BLOCK: tl.constexpr = 4
+    token_start = token_block_id * TOKENS_PER_BLOCK
     
-    # Hidden dimension offsets for this block
-    hidden_offset = pid_hidden * BLOCK_SIZE
-    hidden_offsets = hidden_offset + tl.arange(0, BLOCK_SIZE)
-    hidden_mask = hidden_offsets < hidden_dim
+    # Hidden dim range
+    h_start = h_block_id * BLOCK_SIZE
+    h_offsets = h_start + tl.arange(0, BLOCK_SIZE)
+    h_mask = h_offsets < hidden_dim
     
-    # Accumulator in FP32 for numerical stability
-    accumulator = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    
-    # Loop over topk experts for this token
-    for k in range(topk):
-        # Load the routing weight for this expert
-        weight_idx = pid_batch * topk + k
-        weight = tl.load(topk_weight_ptr + weight_idx).to(tl.float32)
+    # Process each token in this block
+    for t_idx in range(TOKENS_PER_BLOCK):
+        token_id = token_start + t_idx
         
-        # Find where this expert's output is stored in `outs`
-        # The relationship: new_x[batch*topk + k, :] = outs[idxs[batch*topk + k], :]
-        # We need to find the source index in outs
-        new_x_idx = pid_batch * topk + k  # Index in the "new_x" logical space
-        
-        # Load the scatter index (where in outs this data came from)
-        source_idx = tl.load(idxs_ptr + new_x_idx)
-        
-        # Load the expert output data (BF16) and convert to FP32
-        outs_offset = source_idx * hidden_dim + hidden_offsets
-        expert_output = tl.load(
-            outs_ptr + outs_offset,
-            mask=hidden_mask,
-            other=0.0
-        ).to(tl.float32)
-        
-        # Weighted accumulation: accumulator += weight * expert_output
-        accumulator += weight * expert_output
-    
-    # Write final result back to global memory (convert FP32 -> BF16)
-    final_out_offset = pid_batch * hidden_dim + hidden_offsets
-    tl.store(
-        final_out_ptr + final_out_offset,
-        accumulator.to(outs_ptr.dtype.element_ty),  # Match input dtype
-        mask=hidden_mask
-    )
+        # Check if this token is valid
+        if token_id < total_tokens:
+            # Accumulator for this token
+            accum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+            
+            # Accumulate over topk experts
+            for k in range(topk):
+                new_x_idx = token_id * topk + k
+                outs_idx = tl.load(inv_idxs_ptr + new_x_idx)
+                
+                # topk_weights is [total_tokens, topk], need 2D indexing
+                weight_offset = token_id * topk + k
+                weight = tl.load(topk_weights_ptr + weight_offset).to(tl.float32)
+                
+                outs_offsets = outs_idx * hidden_dim + h_offsets
+                expert_out = tl.load(outs_ptr + outs_offsets, mask=h_mask, other=0.0)
+                accum += expert_out.to(tl.float32) * weight
+            
+            # Store result
+            output_offsets = token_id * hidden_dim + h_offsets
+            tl.store(output_ptr + output_offsets, accum.to(output_ptr.dtype.element_ty), mask=h_mask)
 
 
-def fused_moe_permute_aggregate(
-    outs: torch.Tensor,          # [total_tokens, hidden_dim]
-    idxs: torch.Tensor,          # [total_tokens] - int64
-    topk_weight: torch.Tensor,   # [batch*seq, topk]
-    topk_ids: torch.Tensor,      # [batch*seq, topk] - not needed in kernel but kept for API
+def moe_fp32_accum_triton_v2(
+    outs: torch.Tensor,
+    idxs: torch.Tensor,
+    topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Fused operation that combines:
-    1. new_x[idxs] = outs (permutation)
-    2. (new_x * topk_weight).sum(dim=1) (weighted aggregation)
+    """Version 2 with better memory coalescing."""
+    total_tokens, topk = topk_weights.shape
+    hidden_dim = outs.shape[1]
     
-    Args:
-        outs: Expert outputs [total_tokens, hidden_dim] in BF16/FP16
-        idxs: Scatter indices [total_tokens] indicating where each expert output goes
-        topk_weight: Routing weights [batch*seq, topk] in FP32/BF16
-        topk_ids: Expert IDs [batch*seq, topk] (unused in kernel, kept for compatibility)
+    # Create inverse index
+    inv_idxs = torch.empty_like(idxs)
+    inv_idxs[idxs] = torch.arange(len(idxs), device=idxs.device, dtype=idxs.dtype)
     
-    Returns:
-        final_out: Aggregated outputs [batch*seq, hidden_dim] in same dtype as outs
-    """
+    output = torch.empty((total_tokens, hidden_dim), device=outs.device, dtype=outs.dtype)
     
-    # Extract dimensions
-    total_tokens, hidden_dim = outs.shape
-    batch_seq, topk = topk_weight.shape
+    BLOCK_SIZE = 128
+    TOKENS_PER_BLOCK = 4
     
-    # Validate inputs
-    assert idxs.shape[0] == total_tokens, "idxs must match total_tokens"
-    assert batch_seq * topk == total_tokens, "batch*seq*topk must equal total_tokens"
-    assert topk_ids.shape == topk_weight.shape, "topk_ids and topk_weight must match"
-    
-    # Allocate output
-    final_out = torch.empty(
-        batch_seq, hidden_dim,
-        dtype=outs.dtype,
-        device=outs.device
+    grid = lambda META: (
+        triton.cdiv(total_tokens, TOKENS_PER_BLOCK),
+        triton.cdiv(hidden_dim, META['BLOCK_SIZE'])
     )
     
-    # Configure kernel launch
-    BLOCK_SIZE = 128  # Tune this: 128 or 256 typically optimal
-    grid = (
-        batch_seq,                          # One program per output token
-        triton.cdiv(hidden_dim, BLOCK_SIZE) # One program per hidden_dim block
+    moe_fp32_accum_kernel_v2[grid](
+        outs, inv_idxs, topk_weights, output,
+        total_tokens=total_tokens,
+        topk=topk,
+        hidden_dim=hidden_dim,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
     
-    # Launch kernel
-    fused_moe_permute_aggregate_kernel[grid](
-        outs, idxs, topk_weight, topk_ids,
-        final_out,
-        batch_seq, topk, hidden_dim, total_tokens,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return final_out
+    return output
 
 class DeepseekV3MoE_Prefill(nn.Module):
 	"""
@@ -1075,6 +1038,8 @@ class DeepseekV3MoE_Prefill(nn.Module):
 		# 	.type(new_x.dtype)
 		# )
 
+		# new_x = torch.empty_like(outs)
+		# new_x[idxs] = outs
 		# assert topk_weight.dtype == torch.float32
 		# topk_weight = topk_weight.to(new_x.dtype)
 		# final_out = (
@@ -1085,8 +1050,8 @@ class DeepseekV3MoE_Prefill(nn.Module):
 		# 	.type(new_x.dtype)
 		# )
 
-		final_out = fused_moe_permute_aggregate(
-			outs, idxs, topk_weight, topk_ids
+		final_out = moe_fp32_accum_triton_v2(
+			outs, idxs, topk_weight
 		)
 		return final_out
 
