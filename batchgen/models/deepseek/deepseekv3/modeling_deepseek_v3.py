@@ -1224,6 +1224,104 @@ from batchgen.moe.token_permutation.token_permutation_launcher import FusedMoETo
 # from batchgen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
 from mgn_kernel import expert_bincount, fused_moe_token_dispatch, moe_fused_gate
 from batchgen.moe.moe_weighted_sum import moe_weighted_sum_triton_v2, moe_weighted_sum_v3
+@triton.jit
+def scatter_weight_reduce_optimized_kernel(
+    # Input pointers
+    res_ptr,                    # [nnz, hidden_size]
+    nnz_indices_ptr,            # [num_tokens, num_experts_per_tok] - mapping to nnz indices (-1 if empty)
+    topk_weight_ptr,            # [num_tokens, num_experts_per_tok]
+    # Output pointer
+    output_ptr,                 # [num_tokens, hidden_size]
+    # Dimensions
+    num_tokens,
+    num_experts_per_tok,
+    hidden_size,
+    # Block sizes
+    BLOCK_SIZE_H: tl.constexpr,
+):
+    """
+    Optimized version that uses pre-computed inverse mapping.
+    This avoids scanning all nnz entries for each token.
+    """
+    token_idx = tl.program_id(0)
+    
+    if token_idx >= num_tokens:
+        return
+    
+    h_offset = tl.program_id(1) * BLOCK_SIZE_H
+    h_indices = h_offset + tl.arange(0, BLOCK_SIZE_H)
+    h_mask = h_indices < hidden_size
+    
+    accumulator = tl.zeros([BLOCK_SIZE_H], dtype=tl.float32)
+    
+    # Only loop over experts for this specific token
+    for k in range(num_experts_per_tok):
+        # Get the nnz index for this token's k-th expert
+        mapping_offset = token_idx * num_experts_per_tok + k
+        nnz_idx = tl.load(nnz_indices_ptr + mapping_offset)
+        
+        # Skip if no assignment for this slot
+        if nnz_idx >= 0:
+            # Load weight
+            weight = tl.load(topk_weight_ptr + mapping_offset)
+            
+            # Load and weight the result
+            res_offset = nnz_idx * hidden_size + h_indices
+            res_vals = tl.load(res_ptr + res_offset, mask=h_mask, other=0.0)
+            res_vals_fp32 = res_vals.to(tl.float32)
+            
+            accumulator += res_vals_fp32 * weight
+    
+    # Write result
+    output_offset = token_idx * hidden_size + h_indices
+    tl.store(output_ptr + output_offset, accumulator, mask=h_mask)
+
+
+def build_inverse_mapping(
+    global_indices: torch.Tensor,     # [nnz]
+    token_topk_pos: torch.Tensor,     # [nnz]
+    num_tokens: int,
+    num_experts_per_tok: int,
+) -> torch.Tensor:
+    """Build inverse mapping: [num_tokens, num_experts_per_tok] -> nnz_idx"""
+    mapping = torch.full((num_tokens, num_experts_per_tok), -1, 
+                         dtype=torch.int32, device=global_indices.device)
+    mapping[global_indices, token_topk_pos] = torch.arange(
+        len(global_indices), dtype=torch.int32, device=global_indices.device
+    )
+    return mapping
+
+
+def scatter_weight_reduce_optimized(
+    res: torch.Tensor,
+    global_indices: torch.Tensor,
+    token_topk_pos: torch.Tensor,
+    topk_weight: torch.Tensor,
+    num_tokens: int,
+    hidden_size: int,
+    num_experts_per_tok: int,
+) -> torch.Tensor:
+    """Optimized version using inverse mapping."""
+    assert topk_weight.dtype == torch.float32
+    
+    # Build inverse mapping (can be cached if indices don't change)
+    nnz_indices = build_inverse_mapping(
+        global_indices, token_topk_pos, num_tokens, num_experts_per_tok
+    )
+    
+    output = torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+    
+    BLOCK_SIZE_H = 128 if hidden_size > 64 else 64
+    grid = (num_tokens, triton.cdiv(hidden_size, BLOCK_SIZE_H))
+    
+    scatter_weight_reduce_optimized_kernel[grid](
+        res, nnz_indices, topk_weight,
+        output,
+        num_tokens, num_experts_per_tok, hidden_size,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+    )
+    
+    return output
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1537,14 +1635,18 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 3) Process tokens assigned to local experts ------------------
 		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
 		# res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
-		global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
-		 									 device=self.device, dtype=torch.bfloat16)
-		global_results[global_indices, token_topk_pos, :] = res
+		# global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
+		#  									 device=self.device, dtype=torch.bfloat16)
+		# global_results[global_indices, token_topk_pos, :] = res
 
-		""" FP32 Weighting """
-		assert topk_weight.dtype == torch.float32
-		weighted_output = global_results.to(torch.float32) * topk_weight.unsqueeze(-1)
-		global_results = weighted_output.sum(dim=1)
+		# """ FP32 Weighting """
+		# assert topk_weight.dtype == torch.float32
+		# weighted_output = global_results.to(torch.float32) * topk_weight.unsqueeze(-1)
+		# global_results = weighted_output.sum(dim=1)
+		global_results = scatter_weight_reduce_optimized(
+			res, global_indices, token_topk_pos, topk_weight,
+			self.num_tokens_per_rank * self.world_size, self.config.hidden_size, self.num_experts_per_tok
+		)
 		
 		""" BF16 Weighting """
 		# topk_weight = topk_weight.to(x.dtype)
