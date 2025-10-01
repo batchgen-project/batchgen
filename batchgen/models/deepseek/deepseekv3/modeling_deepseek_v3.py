@@ -808,6 +808,133 @@ class MoEGate(nn.Module):
 			self.top_k, self.routed_scaling_factor
 		)
 
+import triton
+import triton.language as tl
+@triton.jit
+def fused_moe_permute_aggregate_kernel(
+    # Input pointers
+    outs_ptr,           # [total_tokens, hidden_dim] - expert outputs
+    idxs_ptr,           # [total_tokens] - scatter indices
+    topk_weight_ptr,    # [batch*seq, topk] - routing weights
+    topk_ids_ptr,       # [batch*seq, topk] - which experts were selected
+    # Output pointer
+    final_out_ptr,      # [batch*seq, hidden_dim]
+    # Dimensions
+    batch_seq,          # batch_size * seq_len
+    topk,               # number of experts per token
+    hidden_dim,         # model hidden dimension
+    total_tokens,       # batch*seq*topk (total expert calls)
+    # Block size
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fuses:
+    1. Permutation: new_x[idxs] = outs
+    2. Weighted sum: final_out = (new_x * weights).sum(dim=topk)
+    
+    Each program processes one (batch_seq_idx, hidden_block) tile.
+    """
+    
+    # Program ID determines which output position we're computing
+    pid_batch = tl.program_id(0)  # Which token in [batch*seq]
+    pid_hidden = tl.program_id(1)  # Which block of hidden_dim
+    
+    # Hidden dimension offsets for this block
+    hidden_offset = pid_hidden * BLOCK_SIZE
+    hidden_offsets = hidden_offset + tl.arange(0, BLOCK_SIZE)
+    hidden_mask = hidden_offsets < hidden_dim
+    
+    # Accumulator in FP32 for numerical stability
+    accumulator = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    # Loop over topk experts for this token
+    for k in range(topk):
+        # Load the routing weight for this expert
+        weight_idx = pid_batch * topk + k
+        weight = tl.load(topk_weight_ptr + weight_idx).to(tl.float32)
+        
+        # Find where this expert's output is stored in `outs`
+        # The relationship: new_x[batch*topk + k, :] = outs[idxs[batch*topk + k], :]
+        # We need to find the source index in outs
+        new_x_idx = pid_batch * topk + k  # Index in the "new_x" logical space
+        
+        # Load the scatter index (where in outs this data came from)
+        source_idx = tl.load(idxs_ptr + new_x_idx)
+        
+        # Load the expert output data (BF16) and convert to FP32
+        outs_offset = source_idx * hidden_dim + hidden_offsets
+        expert_output = tl.load(
+            outs_ptr + outs_offset,
+            mask=hidden_mask,
+            other=0.0
+        ).to(tl.float32)
+        
+        # Weighted accumulation: accumulator += weight * expert_output
+        accumulator += weight * expert_output
+    
+    # Write final result back to global memory (convert FP32 -> BF16)
+    final_out_offset = pid_batch * hidden_dim + hidden_offsets
+    tl.store(
+        final_out_ptr + final_out_offset,
+        accumulator.to(outs_ptr.dtype.element_ty),  # Match input dtype
+        mask=hidden_mask
+    )
+
+
+def fused_moe_permute_aggregate(
+    outs: torch.Tensor,          # [total_tokens, hidden_dim]
+    idxs: torch.Tensor,          # [total_tokens] - int64
+    topk_weight: torch.Tensor,   # [batch*seq, topk]
+    topk_ids: torch.Tensor,      # [batch*seq, topk] - not needed in kernel but kept for API
+) -> torch.Tensor:
+    """
+    Fused operation that combines:
+    1. new_x[idxs] = outs (permutation)
+    2. (new_x * topk_weight).sum(dim=1) (weighted aggregation)
+    
+    Args:
+        outs: Expert outputs [total_tokens, hidden_dim] in BF16/FP16
+        idxs: Scatter indices [total_tokens] indicating where each expert output goes
+        topk_weight: Routing weights [batch*seq, topk] in FP32/BF16
+        topk_ids: Expert IDs [batch*seq, topk] (unused in kernel, kept for compatibility)
+    
+    Returns:
+        final_out: Aggregated outputs [batch*seq, hidden_dim] in same dtype as outs
+    """
+    
+    # Extract dimensions
+    total_tokens, hidden_dim = outs.shape
+    batch_seq, topk = topk_weight.shape
+    
+    # Validate inputs
+    assert idxs.shape[0] == total_tokens, "idxs must match total_tokens"
+    assert batch_seq * topk == total_tokens, "batch*seq*topk must equal total_tokens"
+    assert topk_ids.shape == topk_weight.shape, "topk_ids and topk_weight must match"
+    
+    # Allocate output
+    final_out = torch.empty(
+        batch_seq, hidden_dim,
+        dtype=outs.dtype,
+        device=outs.device
+    )
+    
+    # Configure kernel launch
+    BLOCK_SIZE = 128  # Tune this: 128 or 256 typically optimal
+    grid = (
+        batch_seq,                          # One program per output token
+        triton.cdiv(hidden_dim, BLOCK_SIZE) # One program per hidden_dim block
+    )
+    
+    # Launch kernel
+    fused_moe_permute_aggregate_kernel[grid](
+        outs, idxs, topk_weight, topk_ids,
+        final_out,
+        batch_seq, topk, hidden_dim, total_tokens,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return final_out
+
 class DeepseekV3MoE_Prefill(nn.Module):
 	"""
 	A mixed expert module containing shared experts.
@@ -870,6 +997,8 @@ class DeepseekV3MoE_Prefill(nn.Module):
 			# y = y.to(torch.float32) + self.shared_experts(identity).to(torch.float32)
 			# y = y.type(identity.dtype)
 		return y
+
+
 
 	@torch.no_grad()
 	def moe_infer(self, x, topk_ids, topk_weight):
@@ -936,8 +1065,8 @@ class DeepseekV3MoE_Prefill(nn.Module):
 			)
 			outs = gathered_tokens
 
-		new_x = torch.empty_like(outs)
-		new_x[idxs] = outs
+		# new_x = torch.empty_like(outs)
+		# new_x[idxs] = outs
 		# topk_weight = topk_weight.to(torch.bfloat16)
 		# final_out = (
 		# 	new_x.view(*topk_ids.shape, -1)
@@ -945,14 +1074,19 @@ class DeepseekV3MoE_Prefill(nn.Module):
 		# 	.sum(dim=1)
 		# 	.type(new_x.dtype)
 		# )
-		assert topk_weight.dtype == torch.float32
-		topk_weight = topk_weight.to(new_x.dtype)
-		final_out = (
-			new_x.view(*topk_ids.shape, -1)
-			.type(topk_weight.dtype)
-			.mul_(topk_weight.unsqueeze(dim=-1))
-			.sum(dim=1)
-			.type(new_x.dtype)
+
+		# assert topk_weight.dtype == torch.float32
+		# topk_weight = topk_weight.to(new_x.dtype)
+		# final_out = (
+		# 	new_x.view(*topk_ids.shape, -1)
+		# 	.type(topk_weight.dtype)
+		# 	.mul_(topk_weight.unsqueeze(dim=-1))
+		# 	.sum(dim=1)
+		# 	.type(new_x.dtype)
+		# )
+
+		final_out = fused_moe_permute_aggregate(
+			outs, idxs, topk_weight, topk_ids
 		)
 		return final_out
 
