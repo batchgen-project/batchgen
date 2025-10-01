@@ -102,8 +102,8 @@ if __name__ == "__main__":
 	tokenized = tokenizer(
 		queries, 
 		add_special_tokens=True,
-		padding=True,          # Pads sentences to the same length in the batch
-		truncation=True,       # Truncates sentences that are too long
+		padding=False,          # Pads sentences to the same length in the batch
+		truncation=False,       # Truncates sentences that are too long
 		max_length=args.max_input_length         # Specify a max length for truncation
 	)
 
