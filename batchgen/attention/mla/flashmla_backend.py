@@ -1363,7 +1363,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 			past_key_states, 
 			torch.zeros((bsz, pad_len, past_key_states.size(-1)), device=past_key_states.device, dtype=past_key_states.dtype)
 		], dim=1)
-		cache_seqlens = cache_seqlens + pad_len
+		# cache_seqlens = cache_seqlens + pad_len
 		kv_seqlen = past_key_states.size(1)
 
 	block_size = 64
