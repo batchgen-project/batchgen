@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <filesystem>
 
 #include <cuda_runtime_api.h>
 #include "../utils.h"
@@ -54,6 +55,7 @@
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
 #endif
+namespace fs = std::filesystem; 
 
 std::shared_ptr<spdlog::logger> logger = init_logger("info", "Server");
 
@@ -504,7 +506,8 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     void* ptr = nullptr;
     bool using_huge_pages = false;
     int64_t allocated_size = 0;
-    std::string hugepage_path = "/dev/hugepages/" + shm_name;
+    // std::string hugepage_path = "/dev/hugepages/" + shm_name;
+    fs::path hugepage_path = fs::path("/dev/hugepages") / shm_name;
 
     // STAGE 1: Attempt allocation using hugetlbfs if enabled
     if (enable_hugetlbfs) {
