@@ -1415,7 +1415,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	# assert not torch.isnan(attn_output).any(), "NaN in attn_output after o_proj"
 	# assert not torch.isinf(attn_output).any(), "Inf in attn_output after o_proj"
 	
-	return attn_output, past_key_states
+	return attn_output, past_key_states[:, :kv_len, :]
 
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_bak(
