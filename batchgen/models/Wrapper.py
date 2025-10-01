@@ -553,7 +553,7 @@ class Attn_Wrapper(torch.nn.Module):
 					)
 					if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
 						kv_scale = Attn_Wrapper.scale[self.layer_idx]
-						attn_result, kv, scale = self.module.decoding_attn_mode_3(
+						attn_result, kv, scale = self.module.decoding_attn_mode_3_fp8(
 							hidden_states[start_ids:end_ids],
 							past_key_states[start_ids:end_ids],
 							past_value_states[start_ids:end_ids] if past_value_states is not None else None,
