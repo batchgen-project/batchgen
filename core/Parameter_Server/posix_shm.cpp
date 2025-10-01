@@ -507,8 +507,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     bool using_huge_pages = false;
     int64_t allocated_size = 0;
     // std::string hugepage_path = "/dev/hugepages/" + shm_name;
-    fs::path hugepage_path = fs::path("/dev/hugepages") / shm_name;
-
+    std::string hugepage_path = "/dev/hugepages/" + 
+        (shm_name[0] == '/' ? shm_name.substr(1) : shm_name);
+        
     // STAGE 1: Attempt allocation using hugetlbfs if enabled
     if (enable_hugetlbfs) {
         logger->info("Attempting hugepage allocation...");
