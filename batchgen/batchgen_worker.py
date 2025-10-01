@@ -472,15 +472,14 @@ class BatchGenWorker:
 					if self.model_config.model_type == "deepseek_v3":
 						past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 						# Pad the kv cache to be multiple of 64
-						bsz, kv_seqlen, _ = past_key_states.size()
+						bsz, kv_seqlen, _ = past_key_states[0].size()
 						if kv_seqlen % 64 != 0:
 							pad_len = 64 - (kv_seqlen % 64)
-							past_key_states = torch.cat([
-								past_key_states, 
-								torch.zeros((bsz, pad_len, past_key_states.size(-1)), device=past_key_states.device, dtype=past_key_states.dtype)
-							], dim=1)
-							# cache_seqlens = cache_seqlens + pad_len
-							# kv_seqlen = past_key_states.size(1)
+							for i in range(len(past_key_states)):
+								past_key_states[i] = torch.cat([
+									past_key_states[i], 
+									torch.zeros((bsz, pad_len, past_key_states[i].size(-1)), device=past_key_states[i].device, dtype=past_key_states[i].dtype)
+								], dim=1)
 						past_value_states = None
 						# scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
 						if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
