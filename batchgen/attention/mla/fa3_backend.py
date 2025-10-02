@@ -459,9 +459,9 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		hidden_states
 	)
 	# Check if NaN or Inf in query_states
-	if torch.isnan(query_states).any() or torch.isinf(query_states).any():
-		logging.error("NaN or Inf detected in query_states after first GEMM.")
-		raise ValueError("NaN or Inf detected in query_states after first GEMM.")
+	# if torch.isnan(query_states).any() or torch.isinf(query_states).any():
+	# 	logging.error("NaN or Inf detected in query_states after first GEMM.")
+	# 	raise ValueError("NaN or Inf detected in query_states after first GEMM.")
 	query_states = self.q_a_layernorm(query_states)
 	query_states = w8a16_gemm(
 		self.q_b_proj.weight.data,
@@ -469,9 +469,9 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		query_states
 	)
 	# Check if NaN or Inf in query_states
-	if torch.isnan(query_states).any() or torch.isinf(query_states).any():
-		logging.error("NaN or Inf detected in query_states after second GEMM.")
-		raise ValueError("NaN or Inf detected in query_states after second GEMM.")
+	# if torch.isnan(query_states).any() or torch.isinf(query_states).any():
+	# 	logging.error("NaN or Inf detected in query_states after second GEMM.")
+	# 	raise ValueError("NaN or Inf detected in query_states after second GEMM.")
 
 	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -483,9 +483,9 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		hidden_states
 	)	
 	# Check if NaN or Inf in compressed_kv
-	if torch.isnan(compressed_kv).any() or torch.isinf(compressed_kv).any():
-		logging.error("NaN or Inf detected in compressed_kv after third GEMM.")
-		raise ValueError("NaN or Inf detected in compressed_kv after third GEMM.")
+	# if torch.isnan(compressed_kv).any() or torch.isinf(compressed_kv).any():
+	# 	logging.error("NaN or Inf detected in compressed_kv after third GEMM.")
+	# 	raise ValueError("NaN or Inf detected in compressed_kv after third GEMM.")
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)	
@@ -505,9 +505,9 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		normed_kv
 	)
 	# Check if NaN or Inf in kv
-	if torch.isnan(kv).any() or torch.isinf(kv).any():
-		logging.error("NaN or Inf detected in kv after fourth GEMM.")
-		raise ValueError("NaN or Inf detected in kv after fourth GEMM.")
+	# if torch.isnan(kv).any() or torch.isinf(kv).any():
+	# 	logging.error("NaN or Inf detected in kv after fourth GEMM.")
+	# 	raise ValueError("NaN or Inf detected in kv after fourth GEMM.")
 	kv = kv.view(bsz, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -564,18 +564,18 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		bsz, seq_len, self.num_heads * self.v_head_dim
 	).contiguous()
 	# Check if NaN or Inf in attn_output before o_proj
-	if torch.isnan(attn_output).any() or torch.isinf(attn_output).any():
-		logging.error("NaN or Inf detected in attn_output before o_proj.")
-		raise ValueError("NaN or Inf detected in attn_output before o_proj.")
+	# if torch.isnan(attn_output).any() or torch.isinf(attn_output).any():
+	# 	logging.error("NaN or Inf detected in attn_output before o_proj.")
+	# 	raise ValueError("NaN or Inf detected in attn_output before o_proj.")
 	attn_output = w8a16_gemm(
 		self.o_proj.weight.data,
 		weight_scale["o_proj.weight_scale_inv"],
 		attn_output
 	)
 	# Check if NaN or Inf in attn_output after o_proj
-	if torch.isnan(attn_output).any() or torch.isinf(attn_output).any():
-		logging.error("NaN or Inf detected in attn_output after o_proj.")
-		raise ValueError("NaN or Inf detected in attn_output after o_proj.")
+	# if torch.isnan(attn_output).any() or torch.isinf(attn_output).any():
+	# 	logging.error("NaN or Inf detected in attn_output after o_proj.")
+	# 	raise ValueError("NaN or Inf detected in attn_output after o_proj.")
 
 	return attn_output, offload_kv
 
