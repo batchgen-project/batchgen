@@ -181,7 +181,7 @@ std::vector<torch::Tensor> expert_bincount_cuda(
         );
     }
     
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
     
     // Step 4: Resize output tensors to actual number of active experts
     int32_t actual_active_experts = num_active_experts.item<int32_t>();
