@@ -1666,7 +1666,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# global_results = weighted_output.sum(dim=1)
 		global_results = scatter_weight_reduce_optimized(
 			res, global_indices, token_topk_pos, topk_weight,
-			self.num_tokens_per_rank * self.world_size, self.config.hidden_size, self.num_experts_per_tok
+			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
 		)
 		
 		""" BF16 Weighting """
