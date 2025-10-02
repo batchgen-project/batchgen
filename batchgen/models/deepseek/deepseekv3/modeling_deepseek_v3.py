@@ -1299,9 +1299,13 @@ def build_inverse_mapping(
     mapping = torch.full((num_tokens, num_experts_per_tok), -1, 
                          dtype=torch.int64, device=global_indices.device)
     
+    # Handle empty case
+    if global_indices.numel() == 0:
+        return mapping
+    
     # Ensure indices are within bounds
     assert global_indices.max() < num_tokens, "global_indices out of bounds"
-    assert token_topk_pos.max() < num_experts_per_tok, "token_topk_pos out of bounds"
+    assert token_topk_pos.max() < num_tokens_per_tok, "token_topk_pos out of bounds"
     
     mapping[global_indices, token_topk_pos] = torch.arange(
         len(global_indices), dtype=torch.int64, device=global_indices.device
@@ -1323,12 +1327,20 @@ def scatter_weight_reduce_optimized(
     
     nnz, hidden_size = res.shape
     
+    # Handle empty res case
+    if nnz == 0:
+        return torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+    
     # Build inverse mapping (can be cached if indices don't change)
     nnz_indices = build_inverse_mapping(
         global_indices, token_topk_pos, num_tokens, num_experts_per_tok
     )
     
     output = torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+    
+    # Skip kernel launch if no work to do
+    if num_tokens == 0:
+        return output
     
     # Adaptive block size
     BLOCK_SIZE_H = min(triton.next_power_of_2(hidden_size), 256)
