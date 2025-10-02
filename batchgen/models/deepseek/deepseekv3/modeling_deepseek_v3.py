@@ -110,24 +110,6 @@ def _get_unpad_data(attention_mask):
 # 		hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 # 		return self.weight * hidden_states.to(input_dtype)
 
-class DeepseekV3RMSNorm(nn.Module):
-	def __init__(self, hidden_size, eps=1e-6):
-		"""
-		DeepseekV3RMSNorm is equivalent to T5LayerNorm
-		"""
-		super().__init__()
-		self.weight = nn.Parameter(torch.ones(hidden_size))
-		self.variance_epsilon = eps
-		self.dim = hidden_size
-
-	def forward(self, hidden_states):
-		# logger.info(f"Hidden states dtype: {hidden_states.dtype}")
-		# logger.info(f"Weight dtype: {self.weight.dtype}")
-		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
-
-# from batchgen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
-# from mgn_kernel import fused_rmsnorm
-
 # class DeepseekV3RMSNorm(nn.Module):
 # 	def __init__(self, hidden_size, eps=1e-6):
 # 		"""
@@ -139,8 +121,26 @@ class DeepseekV3RMSNorm(nn.Module):
 # 		self.dim = hidden_size
 
 # 	def forward(self, hidden_states):
-# 		# return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
-# 		return fused_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
+# 		# logger.info(f"Hidden states dtype: {hidden_states.dtype}")
+# 		# logger.info(f"Weight dtype: {self.weight.dtype}")
+# 		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
+
+# from batchgen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
+from mgn_kernel import fused_rmsnorm
+
+class DeepseekV3RMSNorm(nn.Module):
+	def __init__(self, hidden_size, eps=1e-6):
+		"""
+		DeepseekV3RMSNorm is equivalent to T5LayerNorm
+		"""
+		super().__init__()
+		self.weight = nn.Parameter(torch.ones(hidden_size))
+		self.variance_epsilon = eps
+		self.dim = hidden_size
+
+	def forward(self, hidden_states):
+		# return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
+		return fused_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
@@ -1236,6 +1236,7 @@ def scatter_weight_reduce_optimized_kernel(
     num_tokens,
     num_experts_per_tok,
     hidden_size,
+    nnz,                        # Total number of non-zero entries (for bounds checking)
     # Block sizes
     BLOCK_SIZE_H: tl.constexpr,
 ):
@@ -1260,17 +1261,27 @@ def scatter_weight_reduce_optimized_kernel(
         mapping_offset = token_idx * num_experts_per_tok + k
         nnz_idx = tl.load(nnz_indices_ptr + mapping_offset)
         
-        # Skip if no assignment for this slot
-        if nnz_idx >= 0:
-            # Load weight
-            weight = tl.load(topk_weight_ptr + mapping_offset)
-            
-            # Load and weight the result
-            res_offset = nnz_idx * hidden_size + h_indices
-            res_vals = tl.load(res_ptr + res_offset, mask=h_mask, other=0.0)
-            res_vals_fp32 = res_vals.to(tl.float32)
-            
-            accumulator += res_vals_fp32 * weight
+        # Create mask for valid entries (use mask instead of if statement)
+        is_valid = (nnz_idx >= 0) & (nnz_idx < nnz)
+        
+        # Load weight (masked)
+        weight = tl.load(topk_weight_ptr + mapping_offset)
+        
+        # Load result values with proper masking
+        # Use tl.where to handle invalid indices safely
+        safe_nnz_idx = tl.where(is_valid, nnz_idx, 0)  # Use 0 as safe fallback
+        res_offset = safe_nnz_idx * hidden_size + h_indices
+        
+        # Load with combined mask: valid entry AND within hidden_size bounds
+        load_mask = h_mask & is_valid
+        res_vals = tl.load(res_ptr + res_offset, mask=load_mask, other=0.0)
+        
+        # Convert to FP32 and accumulate
+        res_vals_fp32 = res_vals.to(tl.float32)
+        
+        # Only accumulate if valid (weight is already 0 for invalid entries conceptually)
+        weighted = tl.where(is_valid, res_vals_fp32 * weight, 0.0)
+        accumulator += weighted
     
     # Write result
     output_offset = token_idx * hidden_size + h_indices
@@ -1284,10 +1295,16 @@ def build_inverse_mapping(
     num_experts_per_tok: int,
 ) -> torch.Tensor:
     """Build inverse mapping: [num_tokens, num_experts_per_tok] -> nnz_idx"""
+    # Use int64 for better compatibility with Triton indexing
     mapping = torch.full((num_tokens, num_experts_per_tok), -1, 
-                         dtype=torch.int32, device=global_indices.device)
+                         dtype=torch.int64, device=global_indices.device)
+    
+    # Ensure indices are within bounds
+    assert global_indices.max() < num_tokens, "global_indices out of bounds"
+    assert token_topk_pos.max() < num_experts_per_tok, "token_topk_pos out of bounds"
+    
     mapping[global_indices, token_topk_pos] = torch.arange(
-        len(global_indices), dtype=torch.int32, device=global_indices.device
+        len(global_indices), dtype=torch.int64, device=global_indices.device
     )
     return mapping
 
@@ -1298,11 +1315,13 @@ def scatter_weight_reduce_optimized(
     token_topk_pos: torch.Tensor,
     topk_weight: torch.Tensor,
     num_tokens: int,
-    hidden_size: int,
     num_experts_per_tok: int,
 ) -> torch.Tensor:
     """Optimized version using inverse mapping."""
-    assert topk_weight.dtype == torch.float32
+    assert topk_weight.dtype == torch.float32, "topk_weight must be float32"
+    assert topk_weight.shape == (num_tokens, num_experts_per_tok), "topk_weight shape mismatch"
+    
+    nnz, hidden_size = res.shape
     
     # Build inverse mapping (can be cached if indices don't change)
     nnz_indices = build_inverse_mapping(
@@ -1311,17 +1330,19 @@ def scatter_weight_reduce_optimized(
     
     output = torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
     
-    BLOCK_SIZE_H = 128 if hidden_size > 64 else 64
+    # Adaptive block size
+    BLOCK_SIZE_H = min(triton.next_power_of_2(hidden_size), 256)
     grid = (num_tokens, triton.cdiv(hidden_size, BLOCK_SIZE_H))
     
     scatter_weight_reduce_optimized_kernel[grid](
         res, nnz_indices, topk_weight,
         output,
-        num_tokens, num_experts_per_tok, hidden_size,
+        num_tokens, num_experts_per_tok, hidden_size, nnz,
         BLOCK_SIZE_H=BLOCK_SIZE_H,
     )
     
     return output
+
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
