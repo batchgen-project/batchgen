@@ -133,19 +133,26 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
         global_x, "count_local_expert_tokens", [&] {
             count_local_expert_tokens_kernel<scalar_t><<<blocks, threads>>>(
                 topk_idx.data_ptr<int32_t>(), expert_counts.data_ptr<int32_t>(),
-                num_tokens, K, static_cast<int32_t>(routed_expert_start_idx), 
-                static_cast<int32_t>(routed_expert_end_idx));
+                num_tokens, K, static_cast<int32_t>(routed_expert_start_idx), static_cast<int32_t>(routed_expert_end_idx));
         });
 
-    // Step 2: Compute prefix sum entirely on GPU (exclusive scan)
-    // Result: [0, count[0], count[0]+count[1], ..., sum(counts)]
-    auto expert_offsets = torch::cat({
-        torch::zeros({1}, expert_counts.options()),
-        torch::cumsum(expert_counts, /*dim=*/0)
-    }, /*dim=*/0);
+    // Step 2: Compute prefix sum to get expert offsets
+    auto expert_offsets = torch::zeros(
+        {num_local_experts + 1},
+        torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
 
-    // Get total number of local tokens (this is a small sync, but only 1 int)
-    int total_local_tokens = expert_offsets[-1].item<int>();
+    // Copy counts to CPU for prefix sum (could be optimized with GPU scan)
+    auto expert_counts_cpu = expert_counts.cpu();
+    auto expert_offsets_cpu = expert_offsets.cpu();
+
+    int total_local_tokens = 0;
+    for (int i = 0; i < num_local_experts; i++) {
+        expert_offsets_cpu[i] = total_local_tokens;
+        total_local_tokens += expert_counts_cpu[i].item<int>();
+    }
+    expert_offsets_cpu[num_local_experts] = total_local_tokens;
+
+    expert_offsets = expert_offsets_cpu.to(global_x.device());
 
     // Step 3: Allocate output tensors
     auto output_x = torch::empty({total_local_tokens, hidden_size},
@@ -174,12 +181,10 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
             output_topk_pos.data_ptr<int32_t>(),
             expert_counts.data_ptr<int32_t>(),
             expert_offsets.data_ptr<int32_t>(), num_tokens, hidden_size, K,
-            static_cast<int32_t>(routed_expert_start_idx), 
-            static_cast<int32_t>(routed_expert_end_idx));
+            static_cast<int32_t>(routed_expert_start_idx), static_cast<int32_t>(routed_expert_end_idx));
     });
 
-    // Only sync if you need CPU-side guarantees; otherwise let PyTorch handle it
-    // cudaDeviceSynchronize();
+    cudaDeviceSynchronize();
 
     return {output_x, output_eids, output_token_idx, output_topk_pos,
             expert_counts};
