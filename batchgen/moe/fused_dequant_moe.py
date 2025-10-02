@@ -333,16 +333,16 @@ def fused_fp8_moe_stage_1(
 	num_stages = 2,
 	num_warps = 4
 ):
-	assert hidden_states.dtype == torch.float8_e4m3fn, "hidden_states must be of dtype float8_e4m3fn"
-	assert hidden_states_scale.dtype == torch.float32, "hiden_states_scale must be of dtype float32"
-	assert hidden_states.shape[0] == hidden_states_scale.shape[0], "hidden_states and hiden_states_scale must have the same batch size"
-	assert hidden_states_scale.shape[1] == hidden_states.shape[1] // 128, "hiden_states_scale must have the same number of columns as hidden_states divided by 128"
-	assert all(r.dtype == torch.float8_e4m3fn for r in gate_weight_list), "All gate weights must be of dtype float8_e4m3fn"
-	assert all(r.dtype == torch.float8_e4m3fn for r in up_weight_list), "All up weights must be of dtype float8_e4m3fn"
-	assert all(s.dtype == torch.float32 for s in gate_scale_list), "All gate scales must be of dtype float32"
-	assert all(s.dtype == torch.float32 for s in up_scale_list), "All up scales must be of dtype float32"
-	assert len(gate_weight_list) == len(gate_scale_list), "gate_weight_list and gate_scale_list must have the same length"
-	assert len(up_weight_list) == len(up_scale_list), "up_weight_list and up_scale_list must have the same length"
+	# assert hidden_states.dtype == torch.float8_e4m3fn, "hidden_states must be of dtype float8_e4m3fn"
+	# assert hidden_states_scale.dtype == torch.float32, "hiden_states_scale must be of dtype float32"
+	# assert hidden_states.shape[0] == hidden_states_scale.shape[0], "hidden_states and hiden_states_scale must have the same batch size"
+	# assert hidden_states_scale.shape[1] == hidden_states.shape[1] // 128, "hiden_states_scale must have the same number of columns as hidden_states divided by 128"
+	# assert all(r.dtype == torch.float8_e4m3fn for r in gate_weight_list), "All gate weights must be of dtype float8_e4m3fn"
+	# assert all(r.dtype == torch.float8_e4m3fn for r in up_weight_list), "All up weights must be of dtype float8_e4m3fn"
+	# assert all(s.dtype == torch.float32 for s in gate_scale_list), "All gate scales must be of dtype float32"
+	# assert all(s.dtype == torch.float32 for s in up_scale_list), "All up scales must be of dtype float32"
+	# assert len(gate_weight_list) == len(gate_scale_list), "gate_weight_list and gate_scale_list must have the same length"
+	# assert len(up_weight_list) == len(up_scale_list), "up_weight_list and up_scale_list must have the same length"
 
 	device = hidden_states.device
 	M = hidden_states.shape[0]
