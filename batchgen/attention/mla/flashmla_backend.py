@@ -1325,13 +1325,13 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	# scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
 		
 	# Extend or truncate attention mask to match kv_len
-	if attention_mask.size(-1) < kv_len:
-		attention_mask = torch.cat([
-			attention_mask, 
-			torch.zeros((bsz, kv_len - attention_mask.size(-1)), device=attention_mask.device)
-		], dim=-1)
-	else:
-		attention_mask = attention_mask[:, :kv_len]
+	# if attention_mask.size(-1) < kv_len:
+	# 	attention_mask = torch.cat([
+	# 		attention_mask, 
+	# 		torch.zeros((bsz, kv_len - attention_mask.size(-1)), device=attention_mask.device)
+	# 	], dim=-1)
+	# else:
+	# 	attention_mask = attention_mask[:, :kv_len]
 
 	kv_seqlen = past_key_states.size(1)
 	kv_b_proj = self.kv_b_proj.weight.view(
@@ -1396,8 +1396,8 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 		raise
 	
 	# Apply out_absorb projection
-	# attn_output = torch.matmul(attn_output, out_absorb.mT)
-	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	attn_output = torch.matmul(attn_out, out_absorb.mT)
+	# attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
 	# attn_output shape: [bsz, num_heads, 1, v_head_dim]
 	
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
