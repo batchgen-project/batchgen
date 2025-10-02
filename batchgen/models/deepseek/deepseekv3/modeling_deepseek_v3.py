@@ -600,7 +600,7 @@ def warmup_compiled_moe_gate(device):
 
 from torch.utils.cpp_extension import load
 current_dir = os.path.dirname(os.path.abspath(__file__))
-source_dir = os.path.join(current_dir, "..", "..", "..", "test", "fused_moe_gate.cu")
+source_dir = os.path.join(current_dir, "..", "..", "..", "..", "test", "fused_moe_gate.cu")
 parallel_moe = load(
     name="parallel_moe_gate",
     sources=[source_dir],
