@@ -514,8 +514,9 @@ class Attn_Wrapper(torch.nn.Module):
 				# 			param.data,
 				# 			self.weight_dequant_scale[name + "_scale_inv"],
 				# 		)
-				for name, param in self.module.named_parameters():
-					param.data = weights_dict[name]
+				# for name, param in self.module.named_parameters():
+				# 	param.data = weights_dict[name]
+				pass
 				
 				
 			hidden_states = kwargs["hidden_states"]
