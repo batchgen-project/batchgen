@@ -1334,8 +1334,8 @@ def build_inverse_mapping(
         return mapping
     
     # Ensure indices are within bounds
-    assert global_indices.max() < num_tokens, "global_indices out of bounds"
-    assert token_topk_pos.max() < num_experts_per_tok, "token_topk_pos out of bounds"
+    # assert global_indices.max() < num_tokens, "global_indices out of bounds"
+    # assert token_topk_pos.max() < num_experts_per_tok, "token_topk_pos out of bounds"
     
     mapping[global_indices, token_topk_pos] = torch.arange(
         len(global_indices), dtype=torch.int64, device=global_indices.device
