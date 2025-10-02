@@ -1382,10 +1382,12 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	
 	# --- 9. Final Projection and Return ---
 	attn_output = attn_output.transpose(1, 2).contiguous()
-	attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+	# attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
 	# attn_output = self.o_proj(attn_output)
 	attn_output_fp8, attn_output_scale = act_quant(attn_output)
 	attn_output = w8a8_gemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
+	attn_output = attn_output.view(bsz, 1, -1)
 	
 	return attn_output, past_key_states[:, :kv_len, :]
 
