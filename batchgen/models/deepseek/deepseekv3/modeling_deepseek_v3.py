@@ -599,9 +599,11 @@ def warmup_compiled_moe_gate(device):
 			torch.cuda.synchronize(device=device)
 
 from torch.utils.cpp_extension import load
+current_dir = os.path.dirname(os.path.abspath(__file__))
+source_dir = os.path.join(current_dir, "..", "..", "test", "fused_moe_gate.cu")
 parallel_moe = load(
     name="parallel_moe_gate",
-    sources=["/data2/tairan/workspace/BatchGen/test/fused_moe_gate.cu"],
+    sources=[source_dir],
     extra_cuda_cflags=["-O3", "--use_fast_math"],
     verbose=True
 )
