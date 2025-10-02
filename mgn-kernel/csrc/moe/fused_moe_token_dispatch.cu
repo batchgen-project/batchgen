@@ -142,7 +142,7 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     auto expert_offsets = torch::cat({
         torch::zeros({1}, expert_counts.options()),
         torch::cumsum(expert_counts, /*dim=*/0)
-    }, /*dim=*/0);
+    }, /*dim=*/0).to(torch::kInt32);
 
     // Get total number of local tokens (this is a small sync, but only 1 int)
     int total_local_tokens = expert_offsets[-1].item<int>();
