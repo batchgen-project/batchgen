@@ -598,8 +598,13 @@ def warmup_compiled_moe_gate(device):
 			)
 			torch.cuda.synchronize(device=device)
 
-
-
+from torch.utils.cpp_extension import load
+parallel_moe = load(
+    name="parallel_moe_gate",
+    sources=["/data2/tairan/workspace/BatchGen/test/fused_moe_gate.cu"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=True
+)
 class MoEGate(nn.Module):
 	def __init__(self, config):
 		super().__init__()
@@ -746,7 +751,30 @@ class MoEGate(nn.Module):
 		topk_weight = topk_weight * routed_scaling_factor # must multiply the scaling factor
 
 		return topk_idx, topk_weight.to(hidden_states.dtype)
-
+	
+	@torch.inference_mode()
+	def moe_gate_forward_hybrid(self, hidden_states):
+		"""Hybrid: PyTorch matmul + sigmoid, then custom kernel"""
+		bsz, seq_len, h = hidden_states.shape
+		
+		# PyTorch handles heavy lifting
+		hidden_states_flat = hidden_states.view(-1, h)
+		logits = F.linear(hidden_states_flat.float(), self.weight.float(), None)
+		scores = torch.sigmoid(logits)
+		
+		# Custom kernel handles MoE routing
+		topk_idx, topk_weight = parallel_moe.forward(
+			scores,
+			self.e_score_correction_bias,
+			self.n_group,
+			self.topk_group,
+			self.n_routed_experts,
+			self.top_k,
+			self.routed_scaling_factor
+		)
+		
+		return topk_idx, topk_weight
+	
 	@torch.inference_mode()
 	def _decoding_forward(self, hidden_states):
 		bsz, seq_len, h = hidden_states.shape
@@ -1632,7 +1660,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 2) Gate computation on global tokens --------------------------
 		global_x = all_tokens
 		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
-		topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
 		
 		# logits = F.linear(
 		# 	global_x.type(torch.float32), self.gate.weight.type(torch.float32), None

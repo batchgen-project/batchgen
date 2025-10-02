@@ -1,13 +1,10 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
-
-namespace cg = cooperative_groups;
 
 constexpr int WARP_SIZE = 32;
 
-// Warp-level reduction primitives
+// Warp-level primitives
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -16,41 +13,70 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// Fast top-k selection using register-based heap
-template<int K>
-__device__ void topk_insert(float val, int idx, float* topk_vals, int* topk_idxs) {
-    // Check if val should be in top-k
-    if (val <= topk_vals[K-1]) return;
-    
-    // Find insertion position
-    int pos = K - 1;
+__device__ __forceinline__ float warp_reduce_max(float val) {
     #pragma unroll
-    for (int i = 0; i < K - 1; i++) {
-        if (val > topk_vals[i]) {
-            pos = i;
-            break;
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+// Block-level max reduction with index tracking
+__device__ void block_argmax(float val, int idx, float* max_val, int* max_idx, 
+                             float* smem_vals, int* smem_idxs) {
+    const int tid = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, val, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, idx, offset);
+        if (other_val > val) {
+            val = other_val;
+            idx = other_idx;
         }
     }
     
-    // Shift and insert
-    #pragma unroll
-    for (int i = K - 1; i > pos; i--) {
-        topk_vals[i] = topk_vals[i-1];
-        topk_idxs[i] = topk_idxs[i-1];
+    // First thread in each warp writes to shared memory
+    if (lane == 0) {
+        smem_vals[warp_id] = val;
+        smem_idxs[warp_id] = idx;
     }
-    topk_vals[pos] = val;
-    topk_idxs[pos] = idx;
+    __syncthreads();
+    
+    // Final reduction in first warp
+    if (warp_id == 0) {
+        val = (tid < blockDim.x / WARP_SIZE) ? smem_vals[tid] : -1e9f;
+        idx = (tid < blockDim.x / WARP_SIZE) ? smem_idxs[tid] : -1;
+        
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, val, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, idx, offset);
+            if (other_val > val) {
+                val = other_val;
+                idx = other_idx;
+            }
+        }
+        
+        if (lane == 0) {
+            *max_val = val;
+            *max_idx = idx;
+        }
+    }
+    __syncthreads();
 }
 
-// Main fused kernel - processes one token per block
-template<int TOP_K, int TOPK_GROUP>
-__global__ void fused_moe_gate_kernel(
-    const float* __restrict__ hidden_states,
-    const float* __restrict__ weight,
-    const float* __restrict__ e_score_bias,
-    int* __restrict__ topk_indices,
-    float* __restrict__ topk_weights,
-    const int n, const int h, const int e,
+// Fully parallel MoE gate kernel
+template<int TOP_K, int TOPK_GROUP, int THREADS>
+__global__ void parallel_moe_gate_kernel(
+    const float* __restrict__ scores,           // [n, e]
+    const float* __restrict__ e_score_bias,     // [e]
+    int* __restrict__ topk_indices,             // [n, TOP_K]
+    float* __restrict__ topk_weights,           // [n, TOP_K]
+    const int n, const int e,
     const int n_group, const int experts_per_group,
     const float routed_scaling_factor) {
     
@@ -58,40 +84,37 @@ __global__ void fused_moe_gate_kernel(
     if (token_idx >= n) return;
     
     const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
     
+    // Shared memory layout
     extern __shared__ float smem[];
-    float* s_scores = smem;  // [e]
-    float* s_group_scores = &smem[e];  // [n_group]
+    float* s_scores = smem;                      // [e]
+    float* s_group_scores = &smem[e];            // [n_group]
+    int* s_selected_groups = (int*)&smem[e + n_group];  // [TOPK_GROUP]
+    int* s_selected_experts = &s_selected_groups[TOPK_GROUP];  // [TOP_K]
+    float* s_reduction_vals = (float*)&s_selected_experts[TOP_K];  // [THREADS/32]
+    int* s_reduction_idxs = (int*)&s_reduction_vals[THREADS/32];   // [THREADS/32]
     
-    const float* hs = &hidden_states[token_idx * h];
+    const float* token_scores = &scores[token_idx * e];
     
-    // Step 1: Compute all expert scores using all threads
-    for (int expert_idx = tid; expert_idx < e; expert_idx += num_threads) {
-        const float* w = &weight[expert_idx * h];
-        
-        // Dot product with vectorized loads
-        float logit = 0.0f;
-        #pragma unroll 4
-        for (int i = 0; i < h; i++) {
-            logit += hs[i] * w[i];
-        }
-        
-        // Sigmoid + bias
-        float score = 1.0f / (1.0f + __expf(-logit));
-        s_scores[expert_idx] = score + e_score_bias[expert_idx];
+    // =====================================================================
+    // STEP 1: Load scores + bias (PARALLEL)
+    // =====================================================================
+    for (int i = tid; i < e; i += THREADS) {
+        s_scores[i] = token_scores[i] + e_score_bias[i];
     }
     __syncthreads();
     
-    // Step 2: Compute group scores (each warp handles groups)
-    if (tid < n_group) {
-        const int group_start = tid * experts_per_group;
-        const float* group_scores_ptr = &s_scores[group_start];
+    // =====================================================================
+    // STEP 2: Compute group scores (PARALLEL)
+    // =====================================================================
+    for (int g = tid; g < n_group; g += THREADS) {
+        const int start = g * experts_per_group;
         
+        // Find top-2 in group
         float max1 = -1e9f, max2 = -1e9f;
-        #pragma unroll
+        #pragma unroll 4
         for (int i = 0; i < experts_per_group; i++) {
-            float val = group_scores_ptr[i];
+            float val = s_scores[start + i];
             if (val > max1) {
                 max2 = max1;
                 max1 = val;
@@ -99,122 +122,173 @@ __global__ void fused_moe_gate_kernel(
                 max2 = val;
             }
         }
-        s_group_scores[tid] = max1 + max2;
+        s_group_scores[g] = max1 + max2;
     }
     __syncthreads();
     
-    // Step 3: Select top groups (single thread with registers)
-    __shared__ int s_selected_groups[16];  // Max we'll ever need
-    if (tid == 0) {
-        float group_vals[16];
-        int group_idxs[16];
+    // =====================================================================
+    // STEP 3: Select top TOPK_GROUP groups (PARALLEL with successive argmax)
+    // =====================================================================
+    for (int k = 0; k < TOPK_GROUP; k++) {
+        // Each thread finds best group among its subset
+        float my_best_val = -1e9f;
+        int my_best_idx = -1;
         
-        #pragma unroll
-        for (int i = 0; i < TOPK_GROUP; i++) {
-            group_vals[i] = -1e9f;
-            group_idxs[i] = -1;
-        }
-        
-        // Find top-k groups
-        for (int g = 0; g < n_group; g++) {
-            topk_insert<TOPK_GROUP>(s_group_scores[g], g, group_vals, group_idxs);
-        }
-        
-        // Store selected groups
-        #pragma unroll
-        for (int i = 0; i < TOPK_GROUP; i++) {
-            s_selected_groups[i] = group_idxs[i];
-        }
-    }
-    __syncthreads();
-    
-    // Step 4: Mask scores and find top-k experts
-    // Each thread maintains its own top-k candidates
-    float my_topk_vals[16];  // Max top_k we support
-    int my_topk_idxs[16];
-    
-    if (tid == 0) {
-        #pragma unroll
-        for (int i = 0; i < TOP_K; i++) {
-            my_topk_vals[i] = -1e9f;
-            my_topk_idxs[i] = -1;
-        }
-        
-        // Check all experts in selected groups
-        #pragma unroll
-        for (int g = 0; g < TOPK_GROUP; g++) {
-            int group_idx = s_selected_groups[g];
-            int group_start = group_idx * experts_per_group;
+        for (int g = tid; g < n_group; g += THREADS) {
+            // Skip already selected groups
+            bool already_selected = false;
+            for (int i = 0; i < k; i++) {
+                if (s_selected_groups[i] == g) {
+                    already_selected = true;
+                    break;
+                }
+            }
             
-            for (int i = 0; i < experts_per_group; i++) {
-                int expert_idx = group_start + i;
-                topk_insert<TOP_K>(s_scores[expert_idx], expert_idx, my_topk_vals, my_topk_idxs);
+            if (!already_selected && s_group_scores[g] > my_best_val) {
+                my_best_val = s_group_scores[g];
+                my_best_idx = g;
             }
         }
         
-        // Step 5: Get original scores (without bias) and normalize
-        float sum = 1e-20f;
-        float orig_scores[16];
+        // Block-level argmax to find global best
+        float best_val;
+        int best_idx;
+        block_argmax(my_best_val, my_best_idx, &best_val, &best_idx,
+                    s_reduction_vals, s_reduction_idxs);
+        
+        if (tid == 0) {
+            s_selected_groups[k] = best_idx;
+        }
+        __syncthreads();
+    }
+    
+    // =====================================================================
+    // STEP 4: Find top TOP_K experts in selected groups (PARALLEL)
+    // =====================================================================
+    // Mark selected experts with their scores, unselected with -inf
+    for (int i = tid; i < e; i += THREADS) {
+        int expert_group = i / experts_per_group;
+        bool in_selected_group = false;
         
         #pragma unroll
-        for (int i = 0; i < TOP_K; i++) {
-            int expert_idx = my_topk_idxs[i];
-            float orig_score = s_scores[expert_idx] - e_score_bias[expert_idx];
-            orig_scores[i] = orig_score;
+        for (int k = 0; k < TOPK_GROUP; k++) {
+            if (s_selected_groups[k] == expert_group) {
+                in_selected_group = true;
+                break;
+            }
+        }
+        
+        if (!in_selected_group) {
+            s_scores[i] = -1e9f;  // Mask out
+        }
+    }
+    __syncthreads();
+    
+    // Now find top-k using successive argmax
+    for (int k = 0; k < TOP_K; k++) {
+        float my_best_val = -1e9f;
+        int my_best_idx = -1;
+        
+        for (int i = tid; i < e; i += THREADS) {
+            // Skip already selected
+            bool already_selected = false;
+            for (int j = 0; j < k; j++) {
+                if (s_selected_experts[j] == i) {
+                    already_selected = true;
+                    break;
+                }
+            }
+            
+            if (!already_selected && s_scores[i] > my_best_val) {
+                my_best_val = s_scores[i];
+                my_best_idx = i;
+            }
+        }
+        
+        float best_val;
+        int best_idx;
+        block_argmax(my_best_val, my_best_idx, &best_val, &best_idx,
+                    s_reduction_vals, s_reduction_idxs);
+        
+        if (tid == 0) {
+            s_selected_experts[k] = best_idx;
+        }
+        __syncthreads();
+    }
+    
+    // =====================================================================
+    // STEP 5: Compute weights and normalize (PARALLEL reduction for sum)
+    // =====================================================================
+    // Reload original scores (without bias) for selected experts
+    if (tid == 0) {
+        float orig_scores[16];
+        float sum = 0.0f;
+        
+        #pragma unroll
+        for (int k = 0; k < TOP_K; k++) {
+            int expert_idx = s_selected_experts[k];
+            float orig_score = token_scores[expert_idx];  // Original score without bias
+            orig_scores[k] = orig_score;
             sum += orig_score;
         }
         
-        // Write final output
-        const float inv_sum = routed_scaling_factor / sum;
+        // Normalize and write output
+        const float scale = routed_scaling_factor / (sum + 1e-20f);
         #pragma unroll
-        for (int i = 0; i < TOP_K; i++) {
-            topk_weights[token_idx * TOP_K + i] = orig_scores[i] * inv_sum;
-            topk_indices[token_idx * TOP_K + i] = my_topk_idxs[i];
+        for (int k = 0; k < TOP_K; k++) {
+            topk_indices[token_idx * TOP_K + k] = s_selected_experts[k];
+            topk_weights[token_idx * TOP_K + k] = orig_scores[k] * scale;
         }
     }
 }
 
-// Launcher function to handle different top_k values
-std::vector<torch::Tensor> fused_moe_gate_forward(
-    torch::Tensor hidden_states,
-    torch::Tensor weight,
-    torch::Tensor e_score_correction_bias,
+// Launcher
+std::vector<torch::Tensor> parallel_moe_gate_forward(
+    torch::Tensor scores,                    // [n, n_routed_experts] - already sigmoid'd
+    torch::Tensor e_score_correction_bias,   // [n_routed_experts]
     int64_t n_group,
     int64_t topk_group,
     int64_t n_routed_experts,
     int64_t top_k,
     double routed_scaling_factor) {
     
-    const auto bsz = hidden_states.size(0);
-    const auto seq_len = hidden_states.size(1);
-    const auto h = hidden_states.size(2);
-    const auto n = bsz * seq_len;
+    const auto n = scores.size(0);
     const auto e = n_routed_experts;
+    
+    // Verify tensor dimensions match
+    TORCH_CHECK(scores.size(1) == n_routed_experts, 
+                "scores dimension 1 (", scores.size(1), ") must match n_routed_experts (", n_routed_experts, ")");
+    TORCH_CHECK(e_score_correction_bias.size(0) == n_routed_experts,
+                "e_score_correction_bias size (", e_score_correction_bias.size(0), ") must match n_routed_experts (", n_routed_experts, ")");
+    TORCH_CHECK(e % n_group == 0,
+                "n_routed_experts (", e, ") must be divisible by n_group (", n_group, ")");
+    
     const auto experts_per_group = e / n_group;
     
-    hidden_states = hidden_states.view({-1, h}).contiguous().to(torch::kFloat32);
-    weight = weight.contiguous().to(torch::kFloat32);
+    scores = scores.contiguous().to(torch::kFloat32);
     e_score_correction_bias = e_score_correction_bias.contiguous().to(torch::kFloat32);
     
-    auto device = hidden_states.device();
-    auto topk_indices = torch::empty({n, top_k}, 
+    auto device = scores.device();
+    auto topk_indices = torch::empty({n, top_k},
         torch::TensorOptions().dtype(torch::kInt32).device(device));
-    auto topk_weights = torch::empty({n, top_k}, 
+    auto topk_weights = torch::empty({n, top_k},
         torch::TensorOptions().dtype(torch::kFloat32).device(device));
     
     const int threads = 256;
     const int blocks = n;
-    const size_t smem_size = (e + n_group) * sizeof(float);
     
-    // Template dispatch based on top_k and topk_group values
+    // Shared memory: scores + group_scores + selected_groups + selected_experts + reduction buffers
+    const size_t smem_size = (e + n_group) * sizeof(float) + 
+                             (topk_group + top_k) * sizeof(int) +
+                             (threads / 32) * (sizeof(float) + sizeof(int));
+    
     #define LAUNCH_KERNEL(TK, TG) \
-        fused_moe_gate_kernel<TK, TG><<<blocks, threads, smem_size>>>( \
-            hidden_states.data_ptr<float>(), \
-            weight.data_ptr<float>(), \
+        parallel_moe_gate_kernel<TK, TG, threads><<<blocks, threads, smem_size>>>( \
+            scores.data_ptr<float>(), \
             e_score_correction_bias.data_ptr<float>(), \
             topk_indices.data_ptr<int>(), \
             topk_weights.data_ptr<float>(), \
-            n, h, e, n_group, experts_per_group, \
+            n, e, n_group, experts_per_group, \
             static_cast<float>(routed_scaling_factor))
     
     if (top_k == 2 && topk_group == 2) {
@@ -230,8 +304,7 @@ std::vector<torch::Tensor> fused_moe_gate_forward(
     } else if (top_k == 8 && topk_group == 4) {
         LAUNCH_KERNEL(8, 4);
     } else {
-        AT_ERROR("Unsupported top_k=", top_k, " topk_group=", topk_group, 
-                 ". Supported: (2,2), (2,4), (4,2), (4,4), (6,4), (8,4)");
+        AT_ERROR("Unsupported top_k=", top_k, " topk_group=", topk_group);
     }
     
     #undef LAUNCH_KERNEL
@@ -243,5 +316,5 @@ std::vector<torch::Tensor> fused_moe_gate_forward(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &fused_moe_gate_forward, "Fused MoE Gate Forward");
+    m.def("forward", &parallel_moe_gate_forward, "Parallel MoE Gate Forward");
 }
