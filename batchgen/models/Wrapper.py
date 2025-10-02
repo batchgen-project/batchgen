@@ -588,7 +588,7 @@ class Attn_Wrapper(torch.nn.Module):
 							position_ids[start_ids:end_ids],
 							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
 							Attn_Wrapper.max_seqlen,
-							self.weight_dequant_scale
+							weight_scale = self.weight_dequant_scale
 						)
 						scale = None
 						past_key_states[start_ids:end_ids].copy_(kv)
