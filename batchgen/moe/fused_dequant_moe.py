@@ -333,7 +333,7 @@ def fused_fp8_moe_stage_1_kernel_v2(
 	"""
 	FP8 MoE Stage 1: act(hidden_states @ deq(gate)) * (hidden_states @ deq(up))
 	
-	Now correctly handles GEMM tiles that span multiple quantization blocks.
+	Correctly handles GEMM tiles that span multiple quantization blocks.
 	GEMM_BLOCK_SIZE_K can be > SCALE_BLOCK_SIZE_K (e.g., 256 vs 128).
 	"""
 	pid = tl.program_id(axis=0)
@@ -387,12 +387,10 @@ def fused_fp8_moe_stage_1_kernel_v2(
 				for quant_sub_idx in range(num_quant_blocks_per_gemm):
 					# Calculate K range for this quantization sub-block
 					sub_k_start = gemm_k_start + quant_sub_idx * SCALE_BLOCK_SIZE_K
-					sub_k_end = tl.minimum(sub_k_start + SCALE_BLOCK_SIZE_K, K)
-					sub_k_size = sub_k_end - sub_k_start
 					
-					# Early exit if we've exceeded K
-					if sub_k_start >= K:
-						break
+					# CRITICAL: Use masking instead of break
+					# This sub-block is valid only if sub_k_start < K
+					sub_block_valid = sub_k_start < K
 					
 					# Offsets for this sub-block (aligned to quantization boundaries)
 					offsets_k = sub_k_start + tl.arange(0, SCALE_BLOCK_SIZE_K)
@@ -406,7 +404,7 @@ def fused_fp8_moe_stage_1_kernel_v2(
 					up_scale = tl.load(up_scale_ptr)
 					
 					# LHS scales: per-row quantization along K
-					lhs_scale_k = sub_k_start // SCALE_BLOCK_SIZE_K  # Consistent with weight scales
+					lhs_scale_k = sub_k_start // SCALE_BLOCK_SIZE_K
 					l_scale_ptr = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + lhs_scale_k * stride_lhs_scale_k)
 					lhs_scale = tl.load(l_scale_ptr, mask=(abs_row_indices[:, None] < M), other=1.0, cache_modifier='.cg')
 					
@@ -416,8 +414,8 @@ def fused_fp8_moe_stage_1_kernel_v2(
 					gate_ptrs = gate_base_ptr + (offsets_n[:, None] * stride_gate_n + offsets_k[None, :] * stride_gate_k)
 					up_ptrs = up_base_ptr + (offsets_n[:, None] * stride_up_n + offsets_k[None, :] * stride_up_k)
 					
-					# Create masks
-					k_mask = offsets_k < K
+					# Create masks - include sub_block_valid check
+					k_mask = (offsets_k < K) & sub_block_valid
 					lhs_mask = (abs_row_indices[:, None] < M) & k_mask[None, :] & (offsets_m[:, None] < valid_rows_this_block)
 					rhs_mask = (offsets_n[:, None] < N) & k_mask[None, :]
 					
@@ -428,6 +426,7 @@ def fused_fp8_moe_stage_1_kernel_v2(
 					
 					# ===== COMPUTE AND ACCUMULATE =====
 					# Each sub-block uses its own scale
+					# When sub_block_valid is False, loaded values are 0.0, so contribution is 0
 					gate_acc += tl.dot(lhs, tl.trans(gate_fp8)) * lhs_scale * gate_scale
 					up_acc += tl.dot(lhs, tl.trans(up_fp8)) * lhs_scale * up_scale
 
