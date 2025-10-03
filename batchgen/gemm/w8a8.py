@@ -754,7 +754,7 @@ def w8a8_gemm(
         w_scale.stride(0), w_scale.stride(1),
         BLOCK_SIZE_M=64,
         BLOCK_SIZE_N=16,
-        BLOCK_SIZE_K=256,
+        BLOCK_SIZE_K=128,
         GROUP_SIZE_M=1,
         # num_stages=3,
         # num_warps=4
