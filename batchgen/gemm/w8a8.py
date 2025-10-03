@@ -630,12 +630,10 @@ def w8a8_gemm(
         c.stride(0), c.stride(1),
         a_scale.stride(0), a_scale.stride(1),
         w_scale.stride(0), w_scale.stride(1),
-        BLOCK_SIZE_M=128,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=128,
-        GROUP_SIZE_M=8,
-        num_stages=3,
-        num_warps=8,
+        BLOCK_SIZE_M=64,
+        BLOCK_SIZE_N=64,
+        BLOCK_SIZE_K=256,
+        GROUP_SIZE_M=4
     )
     
     return c
@@ -678,3 +676,392 @@ def test_w8a8_gemm():
 
 if __name__ == "__main__":
     test_w8a8_gemm()
+
+
+# import torch
+# import triton
+# import triton.language as tl
+# import math
+# import time
+# from typing import Dict, List, Tuple
+# import pandas as pd
+
+
+# @triton.jit
+# def w8a8_gemm_kernel(
+#     # Pointers to matrices
+#     a_ptr, w_ptr, c_ptr,
+#     # Pointers to scales
+#     a_scale_ptr, w_scale_ptr,
+#     # Matrix dimensions
+#     M, N, K,
+#     # Quantization block sizes
+#     a_block_size, w_block_size_k, w_block_size_n,
+#     # Strides
+#     stride_am, stride_ak,
+#     stride_wn, stride_wk,
+#     stride_cm, stride_cn,
+#     stride_a_scale_m, stride_a_scale_k,
+#     stride_w_scale_n, stride_w_scale_k,
+#     # Meta-parameters
+#     BLOCK_SIZE_M: tl.constexpr,
+#     BLOCK_SIZE_N: tl.constexpr,
+#     BLOCK_SIZE_K: tl.constexpr,
+#     GROUP_SIZE_M: tl.constexpr,
+# ):
+#     """Optimized kernel for computing C = A @ W^T with blocked quantized FP8 inputs."""
+#     # Program ID and block mapping
+#     pid = tl.program_id(axis=0)
+#     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+#     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+#     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+#     group_id = pid // num_pid_in_group
+#     first_pid_m = group_id * GROUP_SIZE_M
+#     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+#     pid_m = first_pid_m + (pid % group_size_m)
+#     pid_n = (pid % num_pid_in_group) // group_size_m
+
+#     # Compute offsets
+#     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+#     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+#     offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+#     # Initialize pointers
+#     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+#     w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+
+#     # Initialize accumulator
+#     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+#     # Main computation loop
+#     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+#         k_start = k * BLOCK_SIZE_K
+#         k_remaining = K - k_start
+        
+#         # Compute masks
+#         k_mask = offs_k < k_remaining
+#         a_mask = (offs_am[:, None] < M) & (k_mask[None, :])
+#         w_mask = (offs_bn[:, None] < N) & (k_mask[None, :])
+        
+#         # Load FP8 data
+#         a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
+#         w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+#         # Compute matmul
+#         acc_block = tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32)
+        
+#         # Load scales
+#         a_k_block_idx = k_start // a_block_size
+#         a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
+#         a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
+        
+#         w_k_block_idx = k_start // w_block_size_k
+#         n_block_indices = offs_bn // w_block_size_n
+#         w_scale_ptrs = w_scale_ptr + (n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
+#         w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
+        
+#         # Apply scales
+#         scale_factor = a_scales[:, None] * w_scales[None, :]
+#         accumulator += acc_block * scale_factor
+        
+#         # Advance pointers
+#         a_ptrs += BLOCK_SIZE_K * stride_ak
+#         w_ptrs += BLOCK_SIZE_K * stride_wk
+
+#     # Convert to bfloat16
+#     c = accumulator.to(tl.bfloat16)
+
+#     # Write output
+#     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+#     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+#     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+#     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+#     tl.store(c_ptrs, c, mask=c_mask)
+
+
+# def w8a8_gemm(
+#     a: torch.Tensor,
+#     a_scale: torch.Tensor,
+#     w: torch.Tensor,
+#     w_scale: torch.Tensor,
+#     a_block_size: int,
+#     w_block_size_k: int,
+#     w_block_size_n: int,
+#     block_size_m: int,
+#     block_size_n: int,
+#     block_size_k: int,
+#     group_size_m: int,
+#     num_warps: int,
+#     num_stages: int,
+# ) -> torch.Tensor:
+#     """GEMM with configurable block sizes."""
+#     M, K = a.shape
+#     N, K_w = w.shape
+    
+#     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    
+#     grid = lambda META: (
+#         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+#     )
+    
+#     w8a8_gemm_kernel[grid](
+#         a, w, c,
+#         a_scale, w_scale,
+#         M, N, K,
+#         a_block_size, w_block_size_k, w_block_size_n,
+#         a.stride(0), a.stride(1),
+#         w.stride(0), w.stride(1),
+#         c.stride(0), c.stride(1),
+#         a_scale.stride(0), a_scale.stride(1),
+#         w_scale.stride(0), w_scale.stride(1),
+#         BLOCK_SIZE_M=block_size_m,
+#         BLOCK_SIZE_N=block_size_n,
+#         BLOCK_SIZE_K=block_size_k,
+#         GROUP_SIZE_M=group_size_m,
+#         num_warps=num_warps,
+#         num_stages=num_stages,
+#     )
+    
+#     return c
+
+
+# def benchmark_config(
+#     a: torch.Tensor,
+#     a_scale: torch.Tensor,
+#     w: torch.Tensor,
+#     w_scale: torch.Tensor,
+#     a_block_size: int,
+#     w_block_size_k: int,
+#     w_block_size_n: int,
+#     config: Dict,
+#     warmup: int = 10,
+#     repetitions: int = 100,
+# ) -> Tuple[float, bool]:
+#     """Benchmark a specific configuration."""
+#     try:
+#         # Warmup
+#         for _ in range(warmup):
+#             c = w8a8_gemm(
+#                 a, a_scale, w, w_scale,
+#                 a_block_size, w_block_size_k, w_block_size_n,
+#                 config['BLOCK_SIZE_M'],
+#                 config['BLOCK_SIZE_N'],
+#                 config['BLOCK_SIZE_K'],
+#                 config['GROUP_SIZE_M'],
+#                 config['num_warps'],
+#                 config['num_stages'],
+#             )
+#         torch.cuda.synchronize()
+        
+#         # Benchmark
+#         start = time.time()
+#         for _ in range(repetitions):
+#             c = w8a8_gemm(
+#                 a, a_scale, w, w_scale,
+#                 a_block_size, w_block_size_k, w_block_size_n,
+#                 config['BLOCK_SIZE_M'],
+#                 config['BLOCK_SIZE_N'],
+#                 config['BLOCK_SIZE_K'],
+#                 config['GROUP_SIZE_M'],
+#                 config['num_warps'],
+#                 config['num_stages'],
+#             )
+#         torch.cuda.synchronize()
+#         end = time.time()
+        
+#         avg_time_ms = (end - start) / repetitions * 1000
+#         return avg_time_ms, True
+    
+#     except Exception as e:
+#         print(f"Config failed: {config}, Error: {e}")
+#         return float('inf'), False
+
+
+# def grid_search(
+#     M: int,
+#     N: int,
+#     K: int = 7168,
+#     a_block_size: int = 128,
+#     w_block_size_k: int = 128,
+#     w_block_size_n: int = 128,
+#     warmup: int = 10,
+#     repetitions: int = 100,
+# ) -> pd.DataFrame:
+#     """
+#     Perform grid search over block size configurations.
+    
+#     Args:
+#         M, N, K: Matrix dimensions
+#         a_block_size, w_block_size_k, w_block_size_n: Quantization block sizes
+#         warmup: Number of warmup iterations
+#         repetitions: Number of benchmark iterations
+#     """
+#     device = torch.device('cuda')
+#     torch.manual_seed(42)
+    
+#     # Create test data
+#     print(f"Creating test data: M={M}, N={N}, K={K}")
+#     a = torch.randn(M, K, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+#     w = torch.randn(N, K, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+#     a_scale = torch.rand(M, math.ceil(K / a_block_size), device=device, dtype=torch.float32) * 0.1
+#     w_scale = torch.rand(
+#         math.ceil(N / w_block_size_n),
+#         math.ceil(K / w_block_size_k),
+#         device=device,
+#         dtype=torch.float32
+#     ) * 0.1
+    
+#     # Define search space
+#     # For K=7168, good BLOCK_SIZE_K candidates: 64, 128, 256
+#     # These divide K reasonably: 7168/64=112, 7168/128=56, 7168/256=28
+#     configs = []
+    
+#     # BLOCK_SIZE_M options
+#     block_m_options = [32, 64, 128, 256]
+#     # BLOCK_SIZE_N options
+#     block_n_options = [32, 64, 128, 256]
+#     # BLOCK_SIZE_K options - important for K=7168
+#     block_k_options = [32, 64, 128, 256]
+#     # GROUP_SIZE_M options
+#     group_m_options = [4]
+#     # num_warps options
+#     warp_options = [4]
+#     # num_stages options
+#     # stage_options = [2, 3, 4, 5]
+#     stage_options = [2]
+    
+#     print("Generating configurations...")
+#     for bm in block_m_options:
+#         for bn in block_n_options:
+#             for bk in block_k_options:
+#                 for gm in group_m_options:
+#                     for nw in warp_options:
+#                         for ns in stage_options:
+#                             # Filter out invalid combinations
+#                             # Ensure blocks aren't too large for register pressure
+#                             if bm * bn > 65536:  # Too large
+#                                 continue
+#                             # Ensure reasonable warp/stage combinations
+#                             if nw == 8 and ns > 4:
+#                                 continue
+                            
+#                             configs.append({
+#                                 'BLOCK_SIZE_M': bm,
+#                                 'BLOCK_SIZE_N': bn,
+#                                 'BLOCK_SIZE_K': bk,
+#                                 'GROUP_SIZE_M': gm,
+#                                 'num_warps': nw,
+#                                 'num_stages': ns,
+#                             })
+    
+#     print(f"Testing {len(configs)} configurations...")
+    
+#     results = []
+#     for i, config in enumerate(configs):
+#         if i % 10 == 0:
+#             print(f"Progress: {i}/{len(configs)}")
+        
+#         avg_time_ms, success = benchmark_config(
+#             a, a_scale, w, w_scale,
+#             a_block_size, w_block_size_k, w_block_size_n,
+#             config,
+#             warmup=warmup,
+#             repetitions=repetitions,
+#         )
+        
+#         if success:
+#             # Calculate TFLOPS
+#             # For FP8 matmul: 2*M*N*K operations (multiply-add)
+#             flops = 2 * M * N * K
+#             tflops = (flops / (avg_time_ms / 1000)) / 1e12
+            
+#             results.append({
+#                 'BLOCK_SIZE_M': config['BLOCK_SIZE_M'],
+#                 'BLOCK_SIZE_N': config['BLOCK_SIZE_N'],
+#                 'BLOCK_SIZE_K': config['BLOCK_SIZE_K'],
+#                 'GROUP_SIZE_M': config['GROUP_SIZE_M'],
+#                 'num_warps': config['num_warps'],
+#                 'num_stages': config['num_stages'],
+#                 'time_ms': avg_time_ms,
+#                 'TFLOPS': tflops,
+#             })
+    
+#     # Create DataFrame and sort by performance
+#     df = pd.DataFrame(results)
+#     df = df.sort_values('TFLOPS', ascending=False)
+    
+#     return df
+
+
+# def run_grid_search():
+#     """Run grid search with typical LLM dimensions."""
+#     print("="*80)
+#     print("FP8-FP8 W8A8 GEMM Grid Search (K=7168)")
+#     print("="*80)
+    
+#     # Common LLM dimensions
+#     test_cases = [
+#         # (M, N, K)
+#         (32, 1536, 7168),
+#         (32, 24576, 1536),
+
+#         # (8192, 8192, 7168),
+#         # (2048, 2048, 7168),
+#     ]
+    
+#     all_results = {}
+    
+#     for M, N, K in test_cases:
+#         print(f"\n{'='*80}")
+#         print(f"Testing M={M}, N={N}, K={K}")
+#         print(f"{'='*80}\n")
+        
+#         df = grid_search(M, N, K, warmup=5, repetitions=50)
+#         all_results[f"M{M}_N{N}_K{K}"] = df
+        
+#         print(f"\n{'='*80}")
+#         print(f"Top 10 configurations for M={M}, N={N}, K={K}:")
+#         print(f"{'='*80}")
+#         print(df.head(10).to_string(index=False))
+#         print(f"\nBest config: {df.iloc[0]['TFLOPS']:.2f} TFLOPS")
+#         print(f"Worst config: {df.iloc[-1]['TFLOPS']:.2f} TFLOPS")
+#         print(f"Speedup: {df.iloc[0]['TFLOPS'] / df.iloc[-1]['TFLOPS']:.2f}x")
+    
+#     # Find most consistent best config across all test cases
+#     print(f"\n{'='*80}")
+#     print("Finding best overall configuration...")
+#     print(f"{'='*80}\n")
+    
+#     # Combine rankings
+#     config_scores = {}
+#     for test_name, df in all_results.items():
+#         for idx, row in df.iterrows():
+#             config_key = (
+#                 row['BLOCK_SIZE_M'],
+#                 row['BLOCK_SIZE_N'],
+#                 row['BLOCK_SIZE_K'],
+#                 row['GROUP_SIZE_M'],
+#                 row['num_warps'],
+#                 row['num_stages'],
+#             )
+#             if config_key not in config_scores:
+#                 config_scores[config_key] = []
+#             config_scores[config_key].append(row['TFLOPS'])
+    
+#     # Find config with best average performance
+#     best_config = max(config_scores.items(), key=lambda x: sum(x[1]) / len(x[1]))
+    
+#     print("Best overall configuration:")
+#     print(f"  BLOCK_SIZE_M: {best_config[0][0]}")
+#     print(f"  BLOCK_SIZE_N: {best_config[0][1]}")
+#     print(f"  BLOCK_SIZE_K: {best_config[0][2]}")
+#     print(f"  GROUP_SIZE_M: {best_config[0][3]}")
+#     print(f"  num_warps: {best_config[0][4]}")
+#     print(f"  num_stages: {best_config[0][5]}")
+#     print(f"  Average TFLOPS: {sum(best_config[1]) / len(best_config[1]):.2f}")
+    
+#     return all_results, best_config
+
+
+# if __name__ == "__main__":
+#     results, best_config = run_grid_search()
