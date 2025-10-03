@@ -327,7 +327,7 @@ def fused_fp8_moe_stage_1(
 	group_sizes: torch.Tensor,
 	activated_group_idx: torch.Tensor,
 	group_start_indices: torch.Tensor,
-	gate_gemm_block_size=[64,16,256],
+	gate_gemm_block_size=[64,16,128],
 	up_gemm_block_size=[64,16,128],
 	scale_block_size=[128,128],
 	num_stages = 2,
