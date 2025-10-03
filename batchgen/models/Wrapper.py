@@ -475,48 +475,50 @@ class Attn_Wrapper(torch.nn.Module):
 				self.core_engine.clear_expert_buffer(self.layer_idx, 
 													current_rank_offloaded_expert_idx,
 													Attn_Wrapper.phase)
-			# if self.get_weights:
-			# 	weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
-			# 	for name, param in self.module.named_parameters():
-			# 		if (
-			# 			self.weight_dequant_scale is not None
-			# 			and name + "_scale_inv" in self.weight_dequant_scale
-			# 		):
-			# 			param.data = deepseek_v3_dequantization(
-			# 				weights_dict[name],
-			# 				self.weight_dequant_scale[name + "_scale_inv"],
-			# 			)
-			# 		else:
-			# 			param.data = weights_dict[name]
-			# 	# for name, param in self.module.named_parameters():
-			# 	# 	param.data = weights_dict[name]
-			# else:
-			# 	for name, param in self.module.named_parameters():
-			# 		if (
-			# 			self.weight_dequant_scale is not None
-			# 			and name + "_scale_inv" in self.weight_dequant_scale
-			# 		):
-			# 			param.data = deepseek_v3_dequantization(
-			# 				param.data,
-			# 				self.weight_dequant_scale[name + "_scale_inv"],
-			# 			)
 			if self.get_weights:
 				weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
 				for name, param in self.module.named_parameters():
-					param.data = weights_dict[name]
-			else:
-				# for name, param in self.module.named_parameters():
-				# 	if (
-				# 		self.weight_dequant_scale is not None
-				# 		and name + "_scale_inv" in self.weight_dequant_scale
-				# 	):
-				# 		param.data = deepseek_v3_dequantization(
-				# 			param.data,
-				# 			self.weight_dequant_scale[name + "_scale_inv"],
-				# 		)
+					if (
+						self.weight_dequant_scale is not None
+						and name + "_scale_inv" in self.weight_dequant_scale
+					):
+						param.data = deepseek_v3_dequantization(
+							weights_dict[name],
+							self.weight_dequant_scale[name + "_scale_inv"],
+						)
+					else:
+						param.data = weights_dict[name]
 				# for name, param in self.module.named_parameters():
 				# 	param.data = weights_dict[name]
-				pass
+			else:
+				for name, param in self.module.named_parameters():
+					if (
+						self.weight_dequant_scale is not None
+						and name + "_scale_inv" in self.weight_dequant_scale
+					):
+						param.data = deepseek_v3_dequantization(
+							param.data,
+							self.weight_dequant_scale[name + "_scale_inv"],
+						)
+
+
+			# if self.get_weights:
+			# 	weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
+			# 	for name, param in self.module.named_parameters():
+			# 		param.data = weights_dict[name]
+			# else:
+			# 	# for name, param in self.module.named_parameters():
+			# 	# 	if (
+			# 	# 		self.weight_dequant_scale is not None
+			# 	# 		and name + "_scale_inv" in self.weight_dequant_scale
+			# 	# 	):
+			# 	# 		param.data = deepseek_v3_dequantization(
+			# 	# 			param.data,
+			# 	# 			self.weight_dequant_scale[name + "_scale_inv"],
+			# 	# 		)
+			# 	# for name, param in self.module.named_parameters():
+			# 	# 	param.data = weights_dict[name]
+			# 	pass
 				
 				
 			hidden_states = kwargs["hidden_states"]
