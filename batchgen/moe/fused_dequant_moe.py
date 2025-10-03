@@ -311,6 +311,139 @@ def fused_fp8_moe_stage_1_kernel(
 			output = tl.cast(output_acc, lhs_dtype)
 			tl.store(output_ptrs, output, mask=output_mask)
 
+@triton.jit
+def fused_fp8_moe_stage_1_kernel_v2(
+	lhs_ptr, lhs_scale_ptr,
+	gate_ptrs_ptr, up_ptrs_ptr,
+	gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+	group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+	output_ptr,
+	M, N: tl.constexpr, K: tl.constexpr, num_groups,
+	stride_lhs_m, stride_lhs_k,
+	stride_lhs_scale_m, stride_lhs_scale_k,
+	stride_gate_n, stride_gate_k,
+	stride_up_n, stride_up_k,
+	stride_output_m, stride_output_n,
+	stride_group_idx, stride_group_sizes, stride_group_start_indices,
+	stride_weight_ptrs, stride_scale_ptrs,
+
+	GEMM_BLOCK_SIZE_M: tl.constexpr, GEMM_BLOCK_SIZE_N: tl.constexpr, GEMM_BLOCK_SIZE_K: tl.constexpr,
+	SCALE_BLOCK_SIZE_N: tl.constexpr, SCALE_BLOCK_SIZE_K: tl.constexpr
+):
+	"""
+	FP8 MoE Stage 1: act(hidden_states @ deq(gate)) * (hidden_states @ deq(up))
+	
+	Now correctly handles GEMM tiles that span multiple quantization blocks.
+	GEMM_BLOCK_SIZE_K can be > SCALE_BLOCK_SIZE_K (e.g., 256 vs 128).
+	"""
+	pid = tl.program_id(axis=0)
+	lhs_dtype = tl.bfloat16
+	rhs_dtype = tl.float8e4nv
+	scale_dtype = tl.float32
+	acc_dtype = tl.float32
+
+	offsets_n = pid * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
+	scale_n = pid * GEMM_BLOCK_SIZE_N // SCALE_BLOCK_SIZE_N
+	num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
+	
+	# Calculate how many quantization blocks fit in one GEMM block
+	num_quant_blocks_per_gemm = tl.cdiv(GEMM_BLOCK_SIZE_K, SCALE_BLOCK_SIZE_K)
+	
+	for g in range(num_groups):
+		# Get group size: gm
+		gm = tl.load(group_sizes_ptr + g * stride_group_sizes)
+		group_idx = tl.load(group_idx_ptr + g * stride_group_idx)
+		# Get row indices for the current group
+		start_idx = tl.load(group_start_indices_ptr + g * stride_group_start_indices)
+		num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+
+		# Load expert weight pointers
+		gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
+		up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
+		gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(scale_dtype))
+		up_scale_base_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(scale_dtype))
+
+		for sub_group_idx in range(num_sub_groups):
+			# Calculate the base pointer for the current sub-group
+			sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+			# Remaining rows in the group:
+			remaining_rows_in_group = start_idx + gm - sub_group_start_idx
+			valid_rows_this_block = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows_in_group)
+
+			# Process the associated tile
+			offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+			abs_row_indices = sub_group_start_idx + offsets_m
+
+			# Initialize accumulators
+			gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
+			up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
+			
+			# ===== OUTER LOOP: Iterate over GEMM tiles in K dimension =====
+			num_gemm_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+			for gemm_k_idx in range(num_gemm_k_blocks):
+				gemm_k_start = gemm_k_idx * GEMM_BLOCK_SIZE_K
+				
+				# ===== INNER LOOP: Iterate over quantization sub-blocks within this GEMM tile =====
+				for quant_sub_idx in range(num_quant_blocks_per_gemm):
+					# Calculate K range for this quantization sub-block
+					sub_k_start = gemm_k_start + quant_sub_idx * SCALE_BLOCK_SIZE_K
+					sub_k_end = tl.minimum(sub_k_start + SCALE_BLOCK_SIZE_K, K)
+					sub_k_size = sub_k_end - sub_k_start
+					
+					# Early exit if we've exceeded K
+					if sub_k_start >= K:
+						break
+					
+					# Offsets for this sub-block (aligned to quantization boundaries)
+					offsets_k = sub_k_start + tl.arange(0, SCALE_BLOCK_SIZE_K)
+					
+					# ===== LOAD SCALES (one scale per quantization block) =====
+					# Weight scales: which quantization block in K dimension?
+					scale_k = sub_k_start // SCALE_BLOCK_SIZE_K
+					gate_scale_ptr = gate_scale_base_ptr + (scale_n * num_scale_k + scale_k)
+					up_scale_ptr = up_scale_base_ptr + (scale_n * num_scale_k + scale_k)
+					gate_scale = tl.load(gate_scale_ptr)
+					up_scale = tl.load(up_scale_ptr)
+					
+					# LHS scales: per-row quantization along K
+					lhs_scale_k = sub_k_start // SCALE_BLOCK_SIZE_K  # Consistent with weight scales
+					l_scale_ptr = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + lhs_scale_k * stride_lhs_scale_k)
+					lhs_scale = tl.load(l_scale_ptr, mask=(abs_row_indices[:, None] < M), other=1.0, cache_modifier='.cg')
+					
+					# ===== LOAD DATA =====
+					# Create pointers for lhs and rhs
+					lhs_ptrs = lhs_ptr + (abs_row_indices[:, None] * stride_lhs_m + offsets_k[None, :] * stride_lhs_k)
+					gate_ptrs = gate_base_ptr + (offsets_n[:, None] * stride_gate_n + offsets_k[None, :] * stride_gate_k)
+					up_ptrs = up_base_ptr + (offsets_n[:, None] * stride_up_n + offsets_k[None, :] * stride_up_k)
+					
+					# Create masks
+					k_mask = offsets_k < K
+					lhs_mask = (abs_row_indices[:, None] < M) & k_mask[None, :] & (offsets_m[:, None] < valid_rows_this_block)
+					rhs_mask = (offsets_n[:, None] < N) & k_mask[None, :]
+					
+					# Load FP8 data
+					lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0, cache_modifier='.cg')
+					gate_fp8 = tl.load(gate_ptrs, mask=rhs_mask, other=0.0, cache_modifier='.cg')
+					up_fp8 = tl.load(up_ptrs, mask=rhs_mask, other=0.0, cache_modifier='.cg')
+					
+					# ===== COMPUTE AND ACCUMULATE =====
+					# Each sub-block uses its own scale
+					gate_acc += tl.dot(lhs, tl.trans(gate_fp8)) * lhs_scale * gate_scale
+					up_acc += tl.dot(lhs, tl.trans(up_fp8)) * lhs_scale * up_scale
+
+			# ===== APPLY ACTIVATION AND STORE =====
+			# SiLU activation: x / (1 + exp(-x))
+			output_acc = gate_acc / (1.0 + tl.exp(-gate_acc)) * up_acc
+			output = tl.cast(output_acc, lhs_dtype)
+			
+			# Store output
+			offs_output_m = sub_group_start_idx + tl.arange(0, GEMM_BLOCK_SIZE_M)
+			offs_output_n = pid * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
+			output_ptrs = output_ptr + (offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n)
+			output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & (tl.arange(0, GEMM_BLOCK_SIZE_M)[:, None] < valid_rows_this_block)
+			
+			tl.store(output_ptrs, output, mask=output_mask)
+
 
 @torch.inference_mode()
 def fused_fp8_moe_stage_1(
@@ -327,7 +460,7 @@ def fused_fp8_moe_stage_1(
 	group_sizes: torch.Tensor,
 	activated_group_idx: torch.Tensor,
 	group_start_indices: torch.Tensor,
-	gate_gemm_block_size=[64,16,128],
+	gate_gemm_block_size=[64,16,256],
 	up_gemm_block_size=[64,16,128],
 	scale_block_size=[128,128],
 	num_stages = 2,
@@ -362,7 +495,7 @@ def fused_fp8_moe_stage_1(
 	grid = lambda META: (triton.cdiv(N, META['GEMM_BLOCK_SIZE_N']), )
 	# Launch the kernel
 	try:
-		fused_fp8_moe_stage_1_kernel[grid](
+		fused_fp8_moe_stage_1_kernel_v2[grid](
 			hidden_states, hidden_states_scale,
 			gate_ptrs_ptr, up_ptrs_ptr,
 			gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
