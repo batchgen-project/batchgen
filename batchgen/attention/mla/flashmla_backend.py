@@ -752,7 +752,149 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 #     return causal_mask
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3(
+def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
+	self,
+	hidden_states: torch.Tensor,
+	past_key_states: torch.Tensor,
+	past_value_states: torch.Tensor,
+	attention_mask: torch.Tensor,
+	q_position_ids: torch.Tensor,
+	scale: torch.Tensor,
+	cache_seqlens: torch.Tensor,
+	max_seqlen: int,
+	weight_scale: dict = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""
+	MLA decoding function with FP8 KV cache quantization and BF16 attention computation.
+
+	Args:
+		hidden_states: Input hidden states of shape (batch_size, 1, hidden_size).
+		past_key_states: Quantized (FP8) past compressed key states cache of shape (batch_size, max_seqlen, kv_dim).
+		past_value_states: Not used. Placeholder for compatibility.
+		attention_mask: Attention mask of shape (batch_size, seq_len).
+		q_position_ids: Position ids of shape (batch_size, 1) indicating where to write the new KV cache.
+		scale: Dequantization scale for past_key_states.
+		cache_seqlens: Sequence lengths of the cache.
+		max_seqlen: Maximum sequence length of the cache.
+		weight_scale: Weight quantization scales dictionary.
+
+	Returns:
+		Tuple of (attn_output, updated past_key_states, updated scale).
+	"""
+	bsz, q_len, _ = hidden_states.size()
+	assert q_len == 1, "The PyTorch MLA decoding backend currently only supports a query length of 1."
+
+	# Dequantize KV cache
+	compressed_kv_ref = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
+	max_seqlen_pad = compressed_kv_ref.size(1)
+
+	# Query and key-value projection with W8A8 quantization
+	hidden_states = hidden_states.squeeze(1)
+	hidden_states, hidden_states_scale = act_quant(hidden_states)
+	
+	q = w8a8_gemm(hidden_states, hidden_states_scale, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"])
+	new_compressed_kv = w8a8_gemm(hidden_states, hidden_states_scale, self.kv_a_proj_with_mqa.weight, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]).view(bsz, 1, -1)
+	
+	q = self.q_a_layernorm(q)
+	q, q_scale = act_quant(q)
+	q = w8a8_gemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
+
+	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+	# Split and process KV
+	kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+	
+	# Apply RoPE
+	k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
+	cos, sin = self.rotary_emb(k_pe, seq_len=max_seqlen_pad)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+	
+	kv = self.kv_a_layernorm(kv)
+	k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
+	offload_kv = torch.cat([kv, k_pe], dim=-1)
+	
+	# Update cache with new KV
+	batch_indices = torch.arange(bsz, device=hidden_states.device)
+	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
+	
+	# Quantize and update past_key_states
+	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+	
+	# Split compressed KV for attention computation
+	kv_states, k_pe_states = torch.split(
+		compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)
+	
+	# Prepare KV projection weights with dequantization
+	kv_b_proj = deepseek_v3_dequantization(
+		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+	).view(self.num_heads, -1, self.kv_lora_rank)
+	
+	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+	
+	q_nope_absorbed = torch.matmul(q_nope, q_absorb)
+	
+	# Prepare attention mask
+	kv_len = compressed_kv_ref.size(1)
+	
+	if attention_mask.size(-1) < kv_len:
+		attention_mask = torch.cat([
+			attention_mask, 
+			torch.zeros((bsz, kv_len - attention_mask.size(-1)), device=attention_mask.device)
+		], dim=-1)
+	else:
+		attention_mask = attention_mask[:, :kv_len]
+	
+	mask_4d = attention_mask.unsqueeze(1).unsqueeze(2).expand(bsz, self.num_heads, 1, kv_len)
+	attention_mask_processed = torch.where(
+		mask_4d == 1, 
+		0.0, 
+		torch.finfo(hidden_states.dtype).min
+	).to(hidden_states.device)
+	
+	# Compute attention weights
+	k_pe_expanded = k_pe_states.unsqueeze(1)
+	attn_weights = torch.einsum("bhqd,blcd->bhqc", q_pe, k_pe_expanded)
+	
+	kv_states_expanded = kv_states.unsqueeze(1)
+	attn_weights = attn_weights + torch.einsum("bhqd,blcd->bhqc", q_nope_absorbed, kv_states_expanded)
+	
+	attn_weights = attn_weights * self.softmax_scale
+	
+	if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
+		raise ValueError(
+			f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_len)}, but is {attn_weights.size()}"
+		)
+	
+	attn_weights = attn_weights + attention_mask_processed
+	attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_nope.dtype)
+	
+	# Compute attention output
+	attn_output = torch.einsum("bhql,blc->bhqc", attn_weights, kv_states)
+	attn_output = torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+	
+	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+		raise ValueError(
+			f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is {attn_output.size()}"
+		)
+	
+	# Final projection with W8A8 quantization
+	attn_output = attn_output.transpose(1, 2).contiguous()
+	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
+	
+	attn_output_fp8, attn_output_scale = act_quant(attn_output)
+	attn_output = w8a8_gemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
+	attn_output = attn_output.view(bsz, 1, -1)
+	
+	return attn_output, past_key_states, scale
+
+@torch.inference_mode()
+def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_bak(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
