@@ -466,7 +466,7 @@ def w8a8_gemm_kernel(
     a_scale_ptr, w_scale_ptr,
     # Matrix dimensions
     M, N, K,
-    # Quantization block sizes
+    # Quantization block sizes (both 128 for your case)
     a_block_size, w_block_size_k, w_block_size_n,
     # Strides
     stride_am, stride_ak,
@@ -481,13 +481,18 @@ def w8a8_gemm_kernel(
     GROUP_SIZE_M: tl.constexpr,
 ):
     """
-    Optimized kernel for computing C = A @ W^T with blocked quantized FP8 inputs.
+    Optimized FP8 GEMM kernel: C = A @ W^T with blocked quantization.
     
-    A: [M, K] in fp8e4m3 with per-row block quantization
-    W: [N, K] in fp8e4m3 with 2D block quantization
+    A: [M, K] in fp8e4m3fn with per-row block quantization (block_size=128 along K)
+    W: [N, K] in fp8e4m3fn with 2D block quantization (128x128 blocks)
     C: [M, N] in bfloat16
+    
+    Key insight: BLOCK_SIZE_K must divide the scale block size (128) evenly
+    to avoid tiles spanning multiple scale blocks.
+    
+    For large K (1536, 7168), use small BLOCK_SIZE_N to maximize CTA count.
     """
-    # Program ID and block mapping with swizzling for better L2 cache reuse
+    # Program ID with swizzling for better cache locality
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -498,24 +503,25 @@ def w8a8_gemm_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Compute offsets
+    # Offsets for M and N dimensions
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # Initialize pointers for A and W
+    # Initialize pointers
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
 
-    # Initialize accumulator in fp32 for numerical stability
+    # Accumulator in fp32 for numerical stability
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    # Main computation loop over K dimension
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    # Main loop over K dimension
+    num_k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
+    for k in range(num_k_blocks):
         k_start = k * BLOCK_SIZE_K
         k_remaining = K - k_start
         
-        # Compute masks for boundary conditions
+        # Boundary masks
         k_mask = offs_k < k_remaining
         a_mask = (offs_am[:, None] < M) & (k_mask[None, :])
         w_mask = (offs_bn[:, None] < N) & (k_mask[None, :])
@@ -524,37 +530,30 @@ def w8a8_gemm_kernel(
         a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
         w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
         
-        # Compute FP8 matmul with Hopper tensor cores
-        # Use input_precision for FP8 accumulation on Hopper
-        acc_block = tl.dot(a_fp8, tl.trans(w_fp8), input_precision="tf32", out_dtype=tl.float32)
-        
-        # Load quantization scales for this K block
-        # A scales: per-row, indexed by K block
+        # ===== CORRECTED SCALE LOADING =====
+        # For A scales: per-row quantization along K
         a_k_block_idx = k_start // a_block_size
         a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
         a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
         
-        # W scales: 2D block indexed by (N block, K block)
+        # For W scales: 2D block quantization
         w_k_block_idx = k_start // w_block_size_k
-        n_block_indices = offs_bn // w_block_size_n
-        w_scale_ptrs = w_scale_ptr + (n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
+        w_n_block_indices = offs_bn // w_block_size_n
+        w_scale_ptrs = w_scale_ptr + (w_n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
         w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
         
-        # Apply scales with proper broadcasting
-        # a_scales: (BLOCK_SIZE_M,) -> (BLOCK_SIZE_M, 1)
-        # w_scales: (BLOCK_SIZE_N,) -> (1, BLOCK_SIZE_N)
-        # Result: (BLOCK_SIZE_M, BLOCK_SIZE_N)
-        scale_factor = a_scales[:, None] * w_scales[None, :]
-        accumulator += acc_block * scale_factor
+        # FP8 matmul and scale application (grouped_gemm style)
+        # Apply scales immediately after dot product for numerical clarity
+        accumulator += tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32) * a_scales[:, None] * w_scales[None, :]
         
-        # Advance pointers for next K block
+        # Advance pointers
         a_ptrs += BLOCK_SIZE_K * stride_ak
         w_ptrs += BLOCK_SIZE_K * stride_wk
 
-    # Convert to bfloat16 for output
+    # Convert to bfloat16
     c = accumulator.to(tl.bfloat16)
 
-    # Write output with boundary checking
+    # Store output
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -579,14 +578,14 @@ def w8a8_gemm(
         a_scale: Scales [M, ceil(K/a_block_size)] in fp32
         w: Weights [N, K] in fp8e4m3fn
         w_scale: Scales [ceil(N/w_block_size_n), ceil(K/w_block_size_k)] in fp32
-        a_block_size: Block size for A quantization along K
-        w_block_size_k: Block size for W quantization along K
-        w_block_size_n: Block size for W quantization along N
+        a_block_size: Block size for A quantization along K (default: 128)
+        w_block_size_k: Block size for W quantization along K (default: 128)
+        w_block_size_n: Block size for W quantization along N (default: 128)
         
     Returns:
         Output [M, N] in bfloat16
     """
-    # Validate inputs
+    # Input validation
     assert a.dtype == torch.float8_e4m3fn, f"Expected fp8e4m3fn for a, got {a.dtype}"
     assert w.dtype == torch.float8_e4m3fn, f"Expected fp8e4m3fn for w, got {w.dtype}"
     assert a_scale.dtype == torch.float32, f"Expected fp32 for a_scale, got {a_scale.dtype}"
@@ -609,17 +608,23 @@ def w8a8_gemm(
     # Allocate output
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     
-    # Define grid
+    # Grid configuration
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
     )
     
-    # Launch kernel with optimized defaults for Hopper
-    # BLOCK_SIZE_M=128, BLOCK_SIZE_N=256: Good balance for Hopper's register file
-    # BLOCK_SIZE_K=128: Matches typical quantization block sizes
-    # GROUP_SIZE_M=8: Promotes L2 cache reuse
-    # num_stages=3: Pipeline depth for latency hiding
-    # num_warps=8: Fully utilizes Hopper's warp schedulers
+    # CRITICAL: BLOCK_SIZE_K must evenly divide scale block sizes (128)
+    # Valid options: 32, 64, 128
+    
+    # For large K (1536, 7168), use small BLOCK_SIZE_N to maximize CTA count
+    # CTA count = cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N)
+    # With large K and potentially small M/N, need many CTAs along N dimension
+    
+    # Launch kernel with optimized configuration for Hopper
+    # BLOCK_SIZE_M=64, BLOCK_SIZE_N=64: Balanced, good register usage
+    # BLOCK_SIZE_K=64: Divides scale block (128) evenly
+    # GROUP_SIZE_M=4: Moderate L2 cache reuse
+    # num_warps=4: Good occupancy
     w8a8_gemm_kernel[grid](
         a, w, c,
         a_scale, w_scale,
@@ -631,9 +636,11 @@ def w8a8_gemm(
         a_scale.stride(0), a_scale.stride(1),
         w_scale.stride(0), w_scale.stride(1),
         BLOCK_SIZE_M=64,
-        BLOCK_SIZE_N=64,
-        BLOCK_SIZE_K=256,
-        GROUP_SIZE_M=4
+        BLOCK_SIZE_N=16,
+        BLOCK_SIZE_K=128,
+        GROUP_SIZE_M=1,
+        # num_stages=3,
+        # num_warps=4
     )
     
     return c
