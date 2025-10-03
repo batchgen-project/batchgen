@@ -458,108 +458,6 @@ import triton.language as tl
 import math
 
 
-@triton.jit
-def w8a8_gemm_kernel(
-    # Pointers to matrices
-    a_ptr, w_ptr, c_ptr,
-    # Pointers to scales
-    a_scale_ptr, w_scale_ptr,
-    # Matrix dimensions
-    M, N, K,
-    # Quantization block sizes (both 128 for your case)
-    a_block_size, w_block_size_k, w_block_size_n,
-    # Strides
-    stride_am, stride_ak,
-    stride_wn, stride_wk,
-    stride_cm, stride_cn,
-    stride_a_scale_m, stride_a_scale_k,
-    stride_w_scale_n, stride_w_scale_k,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    """
-    Optimized FP8 GEMM kernel: C = A @ W^T with blocked quantization.
-    
-    A: [M, K] in fp8e4m3fn with per-row block quantization (block_size=128 along K)
-    W: [N, K] in fp8e4m3fn with 2D block quantization (128x128 blocks)
-    C: [M, N] in bfloat16
-    
-    Key insight: BLOCK_SIZE_K must divide the scale block size (128) evenly
-    to avoid tiles spanning multiple scale blocks.
-    
-    For large K (1536, 7168), use small BLOCK_SIZE_N to maximize CTA count.
-    """
-    # Program ID with swizzling for better cache locality
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # Offsets for M and N dimensions
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # Initialize pointers
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
-
-    # Accumulator in fp32 for numerical stability
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    # Main loop over K dimension
-    num_k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
-    for k in range(num_k_blocks):
-        k_start = k * BLOCK_SIZE_K
-        k_remaining = K - k_start
-        
-        # Boundary masks
-        k_mask = offs_k < k_remaining
-        a_mask = (offs_am[:, None] < M) & (k_mask[None, :])
-        w_mask = (offs_bn[:, None] < N) & (k_mask[None, :])
-        
-        # Load FP8 data
-        a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
-        
-        # ===== CORRECTED SCALE LOADING =====
-        # For A scales: per-row quantization along K
-        a_k_block_idx = k_start // a_block_size
-        a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
-        a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
-        
-        # For W scales: 2D block quantization
-        w_k_block_idx = k_start // w_block_size_k
-        w_n_block_indices = offs_bn // w_block_size_n
-        w_scale_ptrs = w_scale_ptr + (w_n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
-        w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
-        
-        # FP8 matmul and scale application (grouped_gemm style)
-        # Apply scales immediately after dot product for numerical clarity
-        accumulator += tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32) * a_scales[:, None] * w_scales[None, :]
-        
-        # Advance pointers
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        w_ptrs += BLOCK_SIZE_K * stride_wk
-
-    # Convert to bfloat16
-    c = accumulator.to(tl.bfloat16)
-
-    # Store output
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-
 # @triton.jit
 # def w8a8_gemm_kernel(
 #     # Pointers to matrices
@@ -568,7 +466,7 @@ def w8a8_gemm_kernel(
 #     a_scale_ptr, w_scale_ptr,
 #     # Matrix dimensions
 #     M, N, K,
-#     # Quantization block sizes
+#     # Quantization block sizes (both 128 for your case)
 #     a_block_size, w_block_size_k, w_block_size_n,
 #     # Strides
 #     stride_am, stride_ak,
@@ -585,14 +483,16 @@ def w8a8_gemm_kernel(
 #     """
 #     Optimized FP8 GEMM kernel: C = A @ W^T with blocked quantization.
     
-#     A: [M, K] in fp8e4m3fn with per-row block quantization
-#     W: [N, K] in fp8e4m3fn with 2D block quantization
+#     A: [M, K] in fp8e4m3fn with per-row block quantization (block_size=128 along K)
+#     W: [N, K] in fp8e4m3fn with 2D block quantization (128x128 blocks)
 #     C: [M, N] in bfloat16
     
-#     BLOCK_SIZE_K can be larger than quantization block sizes.
-#     Uses masking instead of break for Triton compatibility.
+#     Key insight: BLOCK_SIZE_K must divide the scale block size (128) evenly
+#     to avoid tiles spanning multiple scale blocks.
+    
+#     For large K (1536, 7168), use small BLOCK_SIZE_N to maximize CTA count.
 #     """
-#     # Program ID with swizzling
+#     # Program ID with swizzling for better cache locality
 #     pid = tl.program_id(axis=0)
 #     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
 #     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -606,76 +506,176 @@ def w8a8_gemm_kernel(
 #     # Offsets for M and N dimensions
 #     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
 #     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+#     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-#     # Accumulator in fp32
+#     # Initialize pointers
+#     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+#     w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+
+#     # Accumulator in fp32 for numerical stability
 #     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-#     # Determine sub-block size (minimum of the two quantization block sizes)
-#     # For simplicity and correctness, use the smaller block size
-#     sub_block_size_k = tl.minimum(a_block_size, w_block_size_k)
-    
-#     # Calculate how many sub-blocks per GEMM K-block
-#     num_sub_blocks_per_gemm = tl.cdiv(BLOCK_SIZE_K, sub_block_size_k)
-
-#     # ===== OUTER LOOP: Iterate over GEMM K-tiles =====
-#     num_gemm_k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
-#     for gemm_k_idx in range(num_gemm_k_blocks):
-#         gemm_k_start = gemm_k_idx * BLOCK_SIZE_K
+#     # Main loop over K dimension
+#     num_k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
+#     for k in range(num_k_blocks):
+#         k_start = k * BLOCK_SIZE_K
+#         k_remaining = K - k_start
         
-#         # ===== INNER LOOP: Iterate over quantization sub-blocks =====
-#         for sub_k_idx in range(num_sub_blocks_per_gemm):
-#             # Calculate K range for this sub-block
-#             sub_k_start = gemm_k_start + sub_k_idx * sub_block_size_k
-            
-#             # CRITICAL: Use masking instead of break
-#             sub_block_valid = sub_k_start < K
-            
-#             # Offsets for this sub-block (size = sub_block_size_k)
-#             # We still use BLOCK_SIZE_K for array dimensions but mask appropriately
-#             offs_k = sub_k_start + tl.arange(0, BLOCK_SIZE_K)
-            
-#             # ===== LOAD SCALES =====
-#             # For A scales: per-row quantization along K
-#             a_k_block_idx = sub_k_start // a_block_size
-#             a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
-#             a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
-            
-#             # For W scales: 2D block quantization
-#             w_k_block_idx = sub_k_start // w_block_size_k
-#             w_n_block_indices = offs_bn // w_block_size_n
-#             w_scale_ptrs = w_scale_ptr + (w_n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
-#             w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
-            
-#             # ===== LOAD DATA =====
-#             # Boundary masks - include sub_block_valid and limit to sub_block_size_k
-#             k_valid = offs_k < K
-#             k_in_sub_block = offs_k < (sub_k_start + sub_block_size_k)
-#             k_mask = k_valid & k_in_sub_block & sub_block_valid
-            
-#             a_mask = (offs_am[:, None] < M) & k_mask[None, :]
-#             w_mask = (offs_bn[:, None] < N) & k_mask[None, :]
-            
-#             # Initialize pointers
-#             a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-#             w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
-            
-#             # Load FP8 data
-#             a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
-#             w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
-            
-#             # ===== COMPUTE AND ACCUMULATE =====
-#             # When sub_block_valid is False, loaded values are 0.0, so contribution is 0
-#             accumulator += tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32) * a_scales[:, None] * w_scales[None, :]
+#         # Boundary masks
+#         k_mask = offs_k < k_remaining
+#         a_mask = (offs_am[:, None] < M) & (k_mask[None, :])
+#         w_mask = (offs_bn[:, None] < N) & (k_mask[None, :])
+        
+#         # Load FP8 data
+#         a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
+#         w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+#         # ===== CORRECTED SCALE LOADING =====
+#         # For A scales: per-row quantization along K
+#         a_k_block_idx = k_start // a_block_size
+#         a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
+#         a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
+        
+#         # For W scales: 2D block quantization
+#         w_k_block_idx = k_start // w_block_size_k
+#         w_n_block_indices = offs_bn // w_block_size_n
+#         w_scale_ptrs = w_scale_ptr + (w_n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
+#         w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
+        
+#         # FP8 matmul and scale application (grouped_gemm style)
+#         # Apply scales immediately after dot product for numerical clarity
+#         accumulator += tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32) * a_scales[:, None] * w_scales[None, :]
+        
+#         # Advance pointers
+#         a_ptrs += BLOCK_SIZE_K * stride_ak
+#         w_ptrs += BLOCK_SIZE_K * stride_wk
 
-#     # Convert to bfloat16 and store
+#     # Convert to bfloat16
 #     c = accumulator.to(tl.bfloat16)
-    
+
 #     # Store output
 #     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
 #     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 #     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
 #     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 #     tl.store(c_ptrs, c, mask=c_mask)
+
+@triton.jit
+def w8a8_gemm_kernel(
+    # Pointers to matrices
+    a_ptr, w_ptr, c_ptr,
+    # Pointers to scales
+    a_scale_ptr, w_scale_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Quantization block sizes
+    a_block_size, w_block_size_k, w_block_size_n,
+    # Strides
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_cm, stride_cn,
+    stride_a_scale_m, stride_a_scale_k,
+    stride_w_scale_n, stride_w_scale_k,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    Optimized FP8 GEMM kernel: C = A @ W^T with blocked quantization.
+    
+    A: [M, K] in fp8e4m3fn with per-row block quantization
+    W: [N, K] in fp8e4m3fn with 2D block quantization
+    C: [M, N] in bfloat16
+    
+    BLOCK_SIZE_K can be larger than quantization block sizes.
+    Uses masking instead of break for Triton compatibility.
+    """
+    # Program ID with swizzling
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Offsets for M and N dimensions
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+    # Accumulator in fp32
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Determine sub-block size (minimum of the two quantization block sizes)
+    # For simplicity and correctness, use the smaller block size
+    sub_block_size_k = tl.minimum(a_block_size, w_block_size_k)
+    
+    # Calculate how many sub-blocks per GEMM K-block
+    num_sub_blocks_per_gemm = tl.cdiv(BLOCK_SIZE_K, sub_block_size_k)
+
+    # ===== OUTER LOOP: Iterate over GEMM K-tiles =====
+    num_gemm_k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
+    for gemm_k_idx in range(num_gemm_k_blocks):
+        gemm_k_start = gemm_k_idx * BLOCK_SIZE_K
+        
+        # ===== INNER LOOP: Iterate over quantization sub-blocks =====
+        for sub_k_idx in range(num_sub_blocks_per_gemm):
+            # Calculate K range for this sub-block
+            sub_k_start = gemm_k_start + sub_k_idx * sub_block_size_k
+            
+            # CRITICAL: Use masking instead of break
+            sub_block_valid = sub_k_start < K
+            
+            # Offsets for this sub-block (size = sub_block_size_k)
+            # We still use BLOCK_SIZE_K for array dimensions but mask appropriately
+            offs_k = sub_k_start + tl.arange(0, BLOCK_SIZE_K)
+            
+            # ===== LOAD SCALES =====
+            # For A scales: per-row quantization along K
+            a_k_block_idx = sub_k_start // a_block_size
+            a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
+            a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
+            
+            # For W scales: 2D block quantization
+            w_k_block_idx = sub_k_start // w_block_size_k
+            w_n_block_indices = offs_bn // w_block_size_n
+            w_scale_ptrs = w_scale_ptr + (w_n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
+            w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
+            
+            # ===== LOAD DATA =====
+            # Boundary masks - include sub_block_valid and limit to sub_block_size_k
+            k_valid = offs_k < K
+            k_in_sub_block = offs_k < (sub_k_start + sub_block_size_k)
+            k_mask = k_valid & k_in_sub_block & sub_block_valid
+            
+            a_mask = (offs_am[:, None] < M) & k_mask[None, :]
+            w_mask = (offs_bn[:, None] < N) & k_mask[None, :]
+            
+            # Initialize pointers
+            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+            
+            # Load FP8 data
+            a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
+            
+            # ===== COMPUTE AND ACCUMULATE =====
+            # When sub_block_valid is False, loaded values are 0.0, so contribution is 0
+            accumulator += tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32) * a_scales[:, None] * w_scales[None, :]
+
+    # Convert to bfloat16 and store
+    c = accumulator.to(tl.bfloat16)
+    
+    # Store output
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 def w8a8_gemm(
@@ -754,7 +754,7 @@ def w8a8_gemm(
         w_scale.stride(0), w_scale.stride(1),
         BLOCK_SIZE_M=64,
         BLOCK_SIZE_N=16,
-        BLOCK_SIZE_K=128,
+        BLOCK_SIZE_K=256,
         GROUP_SIZE_M=1,
         # num_stages=3,
         # num_warps=4
