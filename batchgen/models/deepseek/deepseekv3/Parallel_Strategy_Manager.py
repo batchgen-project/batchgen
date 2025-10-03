@@ -441,7 +441,7 @@ class DeepseekV3ParallelStrategyManager:
 					mla_decoding_flashmla,
 					mla_decoding_flashmla_v2,
 					fused_get_query_states_triton,
-					mla_decoding_flashmla_attn_mode_3,
+					# mla_decoding_flashmla_attn_mode_3,
 					mla_decoding_flashmla_attn_mode_3_bf16,
 					mla_decoding_flashmla_attn_mode_3_dequant_fusion,
 					mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn
