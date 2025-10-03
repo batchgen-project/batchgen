@@ -824,11 +824,6 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
 	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
 	
-	# Split compressed KV for attention computation
-	kv_states, k_pe_states = torch.split(
-		compressed_kv_ref, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-	)
-	
 	# Prepare KV projection weights with dequantization
 	kv_b_proj = deepseek_v3_dequantization(
 		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
@@ -836,47 +831,51 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	
 	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
 	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+	query_states = torch.empty(
+		bsz, self.num_heads, 1, qk_head_dim,
+		dtype=compressed_kv_ref.dtype,
+		device=compressed_kv_ref.device,
+	)
+
+	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+	query_states[:, :, :, self.kv_lora_rank :] = q_pe
+	query_states = query_states.view(
+		bsz, 1, self.num_heads, qk_head_dim
+	)
+
+	assert qk_head_dim == 576, f"qk_head_dim should be 576, but got {qk_head_dim}"
+	assert self.num_heads == 128, f"num_heads should be 128, but got {self.num_heads}"
 	
-	q_nope_absorbed = torch.matmul(q_nope, q_absorb)
-	
-	# Prepare attention mask
-	kv_len = compressed_kv_ref.size(1)
-	
-	if attention_mask.size(-1) < kv_len:
-		attention_mask = torch.cat([
-			attention_mask, 
-			torch.zeros((bsz, kv_len - attention_mask.size(-1)), device=attention_mask.device)
-		], dim=-1)
-	else:
-		attention_mask = attention_mask[:, :kv_len]
-	
-	mask_4d = attention_mask.unsqueeze(1).unsqueeze(2).expand(bsz, self.num_heads, 1, kv_len)
-	attention_mask_processed = torch.where(
-		mask_4d == 1, 
-		0.0, 
-		torch.finfo(hidden_states.dtype).min
-	).to(hidden_states.device)
-	
-	# Compute attention weights
-	k_pe_expanded = k_pe_states.unsqueeze(1)
-	attn_weights = torch.einsum("bhqd,blcd->bhqc", q_pe, k_pe_expanded)
-	
-	kv_states_expanded = kv_states.unsqueeze(1)
-	attn_weights = attn_weights + torch.einsum("bhqd,blcd->bhqc", q_nope_absorbed, kv_states_expanded)
-	
-	attn_weights = attn_weights * self.softmax_scale
-	
-	if attn_weights.size() != (bsz, self.num_heads, q_len, kv_len):
-		raise ValueError(
-			f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_len)}, but is {attn_weights.size()}"
+	block_size = 64	
+	block_table = torch.arange(
+		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv_ref.device
+	).view(bsz, max_seqlen_pad // block_size)
+
+	blocked_k = compressed_kv_ref.view(
+		bsz * max_seqlen_pad // block_size, block_size, 1, compressed_kv_ref.size(-1)
+	)
+
+	tile_scheduler_metadata, num_splits = get_mla_metadata(
+		cache_seqlens, 128, 1
+	)
+	try:
+		attn_out, _ = flash_mla_with_kvcache(
+			query_states,
+			blocked_k,
+			block_table,
+			cache_seqlens,
+			512,
+			tile_scheduler_metadata,
+			num_splits,
+			self.softmax_scale,
+			causal = True
 		)
-	
-	attn_weights = attn_weights + attention_mask_processed
-	attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_nope.dtype)
-	
-	# Compute attention output
-	attn_output = torch.einsum("bhql,blc->bhqc", attn_weights, kv_states)
-	attn_output = torch.einsum('bhqc,hdc->bhqd', attn_output, out_absorb)
+	except Exception as e:
+		logging.error(f"Error in flash_mla_with_kvcache: {e}")
+		raise
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
 	
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
 		raise ValueError(
