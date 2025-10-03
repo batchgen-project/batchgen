@@ -986,7 +986,7 @@ def mla_decoding_flashmla_attn_mode_3(
 
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3_bf16_bak(
+def mla_decoding_flashmla_attn_mode_3_bf16(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
@@ -1228,7 +1228,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_bak(
 
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3_bf16(
+def mla_decoding_flashmla_attn_mode_3_bf16_attn_fp8_gemm(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
