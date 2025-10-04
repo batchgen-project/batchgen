@@ -1253,7 +1253,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 
 from batchgen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
 # from batchgen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
-from mgn_kernel import expert_bincount, fused_moe_token_dispatch, moe_fused_gate
+from mgn_kernel import expert_bincount, fused_moe_token_dispatch
 from batchgen.moe.moe_weighted_sum import moe_weighted_sum_triton_v2, moe_weighted_sum_v3
 @triton.jit
 def scatter_weight_reduce_optimized_kernel(
@@ -1354,7 +1354,7 @@ def scatter_weight_reduce_optimized(
 ) -> torch.Tensor:
     """Optimized version using inverse mapping."""
     assert topk_weight.dtype == torch.float32, "topk_weight must be float32"
-    assert topk_weight.shape == (num_tokens, num_experts_per_tok), "topk_weight shape mismatch"
+    assert topk_weight.shape == (num_tokens, num_experts_per_tok), f"topk_weight shape mismatch, expected ({num_tokens}, {num_experts_per_tok}), got {topk_weight.shape}"
     
     nnz, hidden_size = res.shape
     
