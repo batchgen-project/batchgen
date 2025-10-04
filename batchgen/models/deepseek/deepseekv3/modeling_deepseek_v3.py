@@ -1665,6 +1665,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
 		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
+		assert topk_weight.dtype == torch.float32, "checking: topk_weight must be float32"
 		
 		# logits = F.linear(
 		# 	global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
