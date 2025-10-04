@@ -217,6 +217,8 @@
 # # Install the compiled library to the 'mgn_kernel' directory
 # install(TARGETS common_ops LIBRARY DESTINATION mgn_kernel)
 
+
+
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(mgn-kernel LANGUAGES CXX CUDA)
 
@@ -228,9 +230,8 @@ set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
-# Python
-# SKBUILD_SABI_COMPONENT is typically passed by scikit-build.
-find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
+# Python - Find it but don't use Python_add_library
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
 # CXX
 set(CMAKE_CXX_STANDARD 17)
@@ -256,11 +257,9 @@ endif()
 
 # Torch
 find_package(Torch REQUIRED)
-# The 'clear_cuda_arches' function comes from the included utils.cmake.
-# It's used to clean up default CUDA architectures set by PyTorch.
 clear_cuda_arches(CMAKE_FLAG)
 
-# CUTLASS - Use local clone instead of FetchContent
+# CUTLASS
 set(CUTLASS_DIR "${PROJECT_SOURCE_DIR}/csrc/cutlass")
 if(NOT EXISTS "${CUTLASS_DIR}/include")
     message(FATAL_ERROR 
@@ -269,7 +268,7 @@ if(NOT EXISTS "${CUTLASS_DIR}/include")
 endif()
 message(STATUS "Using local CUTLASS at: ${CUTLASS_DIR}")
 
-# ccache (optional)
+# ccache
 option(ENABLE_CCACHE "Whether to use ccache" ON)
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
@@ -278,35 +277,23 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
 endif()
 
-
 # ==================== Project Configuration ====================
 
-# Enable gencode below SM90
 option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
 
-# For aarch64, disable older architectures by default as they are often not relevant
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(ENABLE_BELOW_SM90 OFF)
     message(STATUS "For aarch64, disabling gencode below SM90 by default.")
 endif()
 
-# Include directories
-include_directories(
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/csrc
-    ${CUTLASS_DIR}/include
-    ${CUTLASS_DIR}/tools/util/include
-)
-
-
-# Set up CUDA compiler flags
+# CUDA compiler flags
 set(MGN_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
     "-DOPERATOR_NAMESPACE=mgn-kernel"
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90" # Hopper support by default
+    "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DCUTE_USE_PACKED_TUPLE=1"
     "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
@@ -317,21 +304,17 @@ set(MGN_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
     "--threads=32"
-
-    # Supress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 )
 
-option(MGN_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
-option(MGN_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
-option(MGN_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
-option(MGN_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
-option(MGN_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
-option(MGN_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+option(MGN_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
+option(MGN_KERNEL_ENABLE_SM90A "Enable SM90A" OFF)
+option(MGN_KERNEL_ENABLE_BF16 "Enable BF16" ON)
+option(MGN_KERNEL_ENABLE_FP8 "Enable FP8" ON)
+option(MGN_KERNEL_ENABLE_FP4 "Enable FP4" OFF)
+option(MGN_KERNEL_ENABLE_FA3 "Enable FA3" OFF)
 
-
-# Add GPU architecture flags based on options
 if (ENABLE_BELOW_SM90)
     list(APPEND MGN_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_75,code=sm_75"
@@ -369,18 +352,15 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR MGN_KERNEL_ENABLE_SM90A)
     )
 endif()
 
-
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR MGN_KERNEL_ENABLE_FP4)
     list(APPEND MGN_KERNEL_CUDA_FLAGS "-DENABLE_NVFP4=1")
 endif()
 
-
-# Remove problematic flags that PyTorch might add by default
-string(REPLACE "-D__CUDA_NO_HALF_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__"    "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+# Remove problematic flags
+string(REPLACE "-D__CUDA_NO_HALF_OPERATORS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"     "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-
+string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
 # ==================== Build Target ====================
 
@@ -392,42 +372,67 @@ set(SOURCES
     "csrc/elementwise/rmsnorm.cu"
 )
 
-# Create the Python module
-Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+# DON'T use Python_add_library - create a regular MODULE library instead
+add_library(common_ops MODULE ${SOURCES})
 
-# Apply the CUDA compile flags to our target
-target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${MGN_KERNEL_CUDA_FLAGS}>)
+# Set Python module properties manually
+set_target_properties(common_ops PROPERTIES
+    PREFIX ""  # No 'lib' prefix
+    SUFFIX "${Python_SOABI}.so"  # Use Python SOABI suffix
+)
 
-# Add include directories needed by the target
+# Add includes in CORRECT order - Python FIRST as regular includes (NOT SYSTEM)
 target_include_directories(common_ops PRIVATE
-    # These CUTLASS example paths can be useful for reference
+    ${Python_INCLUDE_DIRS}
+)
+
+# Now add Torch includes - but extract them WITHOUT the INTERFACE_SYSTEM property
+# Get torch include dirs from the imported target
+get_target_property(TORCH_INCLUDE_DIRS_RAW torch INTERFACE_INCLUDE_DIRECTORIES)
+target_include_directories(common_ops PRIVATE
+    ${TORCH_INCLUDE_DIRS_RAW}
+)
+
+# Add project includes
+target_include_directories(common_ops PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/csrc
+    ${CUTLASS_DIR}/include
+    ${CUTLASS_DIR}/tools/util/include
     ${CUTLASS_DIR}/examples/77_blackwell_fmha
     ${CUTLASS_DIR}/examples/common
 )
 
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
+# Apply CUDA compile flags
+target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${MGN_KERNEL_CUDA_FLAGS}>)
 
 # Match PyTorch's C++ ABI
 execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+    COMMAND ${Python_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
     OUTPUT_VARIABLE TORCH_CXX11_ABI
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+
 if(TORCH_CXX11_ABI STREQUAL "0")
     message(STATUS "Using old C++ ABI (-D_GLIBCXX_USE_CXX11_ABI=0)")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+    target_compile_definitions(common_ops PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
 else()
     message(STATUS "Using new C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI=1)")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+    target_compile_definitions(common_ops PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
 endif()
 
-target_compile_options(common_ops PRIVATE ${CXX11_ABI_FLAG})
+# Get torch libraries without their interface includes
+get_target_property(TORCH_LIBS_RAW torch INTERFACE_LINK_LIBRARIES)
 
+# Link libraries - link to torch's libraries but not the torch target itself
+target_link_libraries(common_ops PRIVATE
+    ${TORCH_LIBS_RAW}
+    c10
+    CUDA::cuda_driver
+    CUDA::cublas
+    CUDA::cublasLt
+    ${Python_LIBRARIES}
+)
 
-# Link against PyTorch and CUDA libraries
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
-
-# Install the compiled library to the 'mgn_kernel' directory
+# Install
 install(TARGETS common_ops LIBRARY DESTINATION mgn_kernel)
