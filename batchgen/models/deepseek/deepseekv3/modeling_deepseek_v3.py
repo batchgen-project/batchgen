@@ -598,15 +598,16 @@ def warmup_compiled_moe_gate(device):
 			)
 			torch.cuda.synchronize(device=device)
 
-from torch.utils.cpp_extension import load
-current_dir = os.path.dirname(os.path.abspath(__file__))
-source_dir = os.path.join(current_dir, "..", "..", "..", "..", "test", "fused_moe_gate.cu")
-parallel_moe = load(
-    name="parallel_moe_gate",
-    sources=[source_dir],
-    extra_cuda_cflags=["-O3", "--use_fast_math"],
-    verbose=True
-)
+# from torch.utils.cpp_extension import load
+# current_dir = os.path.dirname(os.path.abspath(__file__))
+# source_dir = os.path.join(current_dir, "..", "..", "..", "..", "test", "fused_moe_gate.cu")
+# parallel_moe = load(
+#     name="parallel_moe_gate",
+#     sources=[source_dir],
+#     extra_cuda_cflags=["-O3", "--use_fast_math"],
+#     verbose=True
+# )
+from mgn_kernel import moe_fused_gate
 class MoEGate(nn.Module):
 	def __init__(self, config):
 		super().__init__()
@@ -765,7 +766,7 @@ class MoEGate(nn.Module):
 		scores = torch.sigmoid(logits)
 		
 		# Custom kernel handles MoE routing
-		topk_idx, topk_weight = parallel_moe.forward(
+		topk_idx, topk_weight = moe_fused_gate.forward(
 			scores,
 			self.e_score_correction_bias,
 			self.n_group,
