@@ -378,7 +378,7 @@ add_library(common_ops MODULE ${SOURCES})
 # Set Python module properties manually
 set_target_properties(common_ops PROPERTIES
     PREFIX ""  # No 'lib' prefix
-    SUFFIX "${Python_SOABI}.so"  # Use Python SOABI suffix
+    SUFFIX ".${Python_SOABI}.so"  # Use Python SOABI suffix
 )
 
 # Add includes in CORRECT order - Python FIRST as regular includes (NOT SYSTEM)
