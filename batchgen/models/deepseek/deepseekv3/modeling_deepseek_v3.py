@@ -766,7 +766,7 @@ class MoEGate(nn.Module):
 		scores = torch.sigmoid(logits)
 		
 		# Custom kernel handles MoE routing
-		topk_idx, topk_weight = moe_fused_gate(
+		topk_weight, topk_idx = moe_fused_gate(
 			scores,
 			self.e_score_correction_bias,
 			self.n_group,
