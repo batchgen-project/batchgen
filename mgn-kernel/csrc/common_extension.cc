@@ -31,7 +31,7 @@ TORCH_LIBRARY_FRAGMENT(mgn_kernel, m) {
         "expert_bincount(Tensor eids, int routed_expert_start_idx, int "
         "experts_per_rank, Device device) -> "
         "(Tensor[])");
-    m.impl("expert_bincount", torch::kCUDA, &expert_bincount_cuda);
+    m.impl("expert_bincount", torch::kCUDA, &expert_bincount_cuda_sliced);
     m.def(
         "fused_moe_token_dispatch(Tensor global_x, Tensor topk_idx, Tensor "
         "token_idx, Tensor topk_pos, int "

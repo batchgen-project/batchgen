@@ -274,6 +274,6 @@ std::vector<torch::Tensor> expert_bincount_cuda_sliced(
     return {group_size, activated_group_idx, group_start_indices};
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("expert_bincount", &expert_bincount_cuda_sliced, "Optimized Expert Bincount (GPU slicing)");
-}
+// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//     m.def("expert_bincount", &expert_bincount_cuda_sliced, "Optimized Expert Bincount (GPU slicing)");
+// }

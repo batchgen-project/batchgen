@@ -71,6 +71,12 @@ std::vector<torch::Tensor> expert_bincount_cuda(
     int64_t experts_per_rank,
     torch::Device device);
 
+std::vector<torch::Tensor> expert_bincount_cuda_sliced(
+    torch::Tensor eids,                         
+    int64_t routed_expert_start_idx,
+    int64_t experts_per_rank,
+    torch::Device device);
+
 
 std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     torch::Tensor global_x,
