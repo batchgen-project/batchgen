@@ -119,7 +119,7 @@ __global__ void compact_active_experts_single_block_kernel(
     }
 }
 
-std::vector<torch::Tensor> expert_bincount_cuda(
+std::vector<torch::Tensor> expert_bincount_cuda_bak(
     torch::Tensor eids,                         // [num_tokens] - expert IDs
     int64_t routed_expert_start_idx,
     int64_t experts_per_rank,

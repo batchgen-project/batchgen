@@ -1751,7 +1751,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			assert len(x) == 0, "If no tokens routed, x should be empty too."
 			return x
 
-		group_size, activated_group_idx, group_start_indices = expert_bincount(
+		group_size, activated_group_idx, group_start_indices, num_active_experts = expert_bincount(
 			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		)
 		# eids = eids - self.routed_expert_start_idx
@@ -1770,7 +1770,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.up_list, self.up_ptrs_ptr,
 			self.gate_scale_list, self.gate_scale_ptrs_ptr,
 			self.up_scale_list, self.up_scale_ptrs_ptr,
-			group_size, activated_group_idx, group_start_indices
+			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)	
 		
 		intermediate, intermediate_scale = act_quant(intermediate)
@@ -1778,7 +1778,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
-			group_size, activated_group_idx, group_start_indices
+			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)
 		return res
 
