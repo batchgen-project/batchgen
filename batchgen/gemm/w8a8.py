@@ -872,7 +872,7 @@ def w8a8_gemm_kernel_optimized(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def w8a8_gemm(
+def w8a8_gemm_autotune(
     a: torch.Tensor,
     a_scale: torch.Tensor,
     w: torch.Tensor,
@@ -985,7 +985,7 @@ def w8a8_gemm(
 
 
 # ===== MANUAL TUNING VERSION (if auto-tune overhead is too high) =====
-def w8a8_gemm_manual(
+def w8a8_gemm(
     a: torch.Tensor,
     a_scale: torch.Tensor,
     w: torch.Tensor,
