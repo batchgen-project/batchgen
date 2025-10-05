@@ -1619,3 +1619,250 @@ def fused_fp8_moe_stage_1(
     return output
 
 	
+
+# ============================================================================
+# HELPER: PRE-COMPUTE GROUP TILE MAPPING
+# ============================================================================
+
+def compute_group_tile_mapping(group_sizes: torch.Tensor, block_size_m: int = 64):
+    """
+    Pre-compute mapping from global tile ID to (group_id, local_tile_id).
+    
+    This avoids sequential scan in kernel for finding which group a tile belongs to.
+    
+    Returns:
+        tile_to_group: [total_tiles] - which group each tile belongs to
+        tile_to_local: [total_tiles] - local tile index within that group
+        tiles_per_group: [num_groups] - number of tiles for each group
+    """
+    num_groups = len(group_sizes)
+    tiles_per_group = torch.zeros(num_groups, dtype=torch.int32, device=group_sizes.device)
+    
+    # Calculate tiles per group
+    for i in range(num_groups):
+        tiles_per_group[i] = (group_sizes[i] + block_size_m - 1) // block_size_m
+    
+    total_tiles = tiles_per_group.sum().item()
+    
+    # Build mapping arrays
+    tile_to_group = torch.zeros(total_tiles, dtype=torch.int32, device=group_sizes.device)
+    tile_to_local = torch.zeros(total_tiles, dtype=torch.int32, device=group_sizes.device)
+    
+    tile_idx = 0
+    for group_id in range(num_groups):
+        num_tiles = tiles_per_group[group_id].item()
+        for local_tile in range(num_tiles):
+            tile_to_group[tile_idx] = group_id
+            tile_to_local[tile_idx] = local_tile
+            tile_idx += 1
+    
+    return tile_to_group, tile_to_local, tiles_per_group
+
+
+# ============================================================================
+# OPTIMIZED KERNEL WITH PRE-COMPUTED MAPPING
+# ============================================================================
+
+@triton.jit
+def fused_fp8_moe_stage_1_kernel_v3(
+    # Input
+    lhs_ptr, lhs_scale_ptr,
+    # Weights
+    gate_ptrs_ptr, up_ptrs_ptr,
+    gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+    # Group metadata
+    group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+    # Pre-computed tile mapping (NEW!)
+    tile_to_group_ptr, tile_to_local_ptr,
+    # Output
+    output_ptr,
+    # Dimensions
+    M, N: tl.constexpr, K: tl.constexpr,
+    # Strides
+    stride_lhs_m, stride_lhs_k,
+    stride_lhs_scale_m, stride_lhs_scale_k,
+    stride_gate_n, stride_gate_k,
+    stride_up_n, stride_up_k,
+    stride_output_m, stride_output_n,
+    stride_group_idx, stride_group_sizes, stride_group_start_indices,
+    stride_weight_ptrs, stride_scale_ptrs,
+    # Block sizes
+    GEMM_BLOCK_SIZE_M: tl.constexpr,
+    GEMM_BLOCK_SIZE_N: tl.constexpr,
+    GEMM_BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_SIZE_N: tl.constexpr,
+):
+    """
+    V3: Uses pre-computed tile mapping for O(1) group lookup.
+    No more sequential scan!
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    lhs_dtype = tl.bfloat16
+    rhs_dtype = tl.float8e4nv
+    scale_dtype = tl.float32
+    acc_dtype = tl.float32
+    
+    # ===== O(1) GROUP LOOKUP (instead of sequential scan) =====
+    group_id = tl.load(tile_to_group_ptr + pid_m)
+    local_tile_idx = tl.load(tile_to_local_ptr + pid_m)
+    
+    # Load group metadata
+    group_idx = tl.load(group_idx_ptr + group_id * stride_group_idx)
+    gm = tl.load(group_sizes_ptr + group_id * stride_group_sizes)
+    start_idx = tl.load(group_start_indices_ptr + group_id * stride_group_start_indices)
+    
+    # Calculate offsets
+    offs_n = pid_n * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
+    mask_n = offs_n < N
+    
+    tile_start_m = start_idx + local_tile_idx * GEMM_BLOCK_SIZE_M
+    offs_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+    abs_row_indices = tile_start_m + offs_m
+    
+    remaining_rows = start_idx + gm - tile_start_m
+    valid_rows = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows)
+    mask_m = (offs_m < valid_rows) & (abs_row_indices < M)
+    
+    # Load weight pointers
+    gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
+    up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
+    gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(scale_dtype))
+    up_scale_base_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(scale_dtype))
+    
+    # Initialize accumulators
+    gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
+    up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
+    
+    # Scale indices
+    num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
+    scale_n_idx = pid_n * GEMM_BLOCK_SIZE_N // SCALE_BLOCK_SIZE_N
+    
+    # Single K-loop
+    for k_tile in range(0, tl.cdiv(K, GEMM_BLOCK_SIZE_K)):
+        k_start = k_tile * GEMM_BLOCK_SIZE_K
+        offs_k = k_start + tl.arange(0, GEMM_BLOCK_SIZE_K)
+        mask_k = offs_k < K
+        
+        # Load scales
+        scale_k_idx = k_start // SCALE_BLOCK_SIZE_K
+        
+        gate_scale_addr = gate_scale_base_ptr + scale_n_idx * num_scale_k + scale_k_idx
+        up_scale_addr = up_scale_base_ptr + scale_n_idx * num_scale_k + scale_k_idx
+        gate_scale = tl.load(gate_scale_addr)
+        up_scale = tl.load(up_scale_addr)
+        
+        lhs_scale_ptrs = lhs_scale_ptr + abs_row_indices * stride_lhs_scale_m + scale_k_idx * stride_lhs_scale_k
+        lhs_scale = tl.load(lhs_scale_ptrs, mask=mask_m, other=1.0)
+        
+        # Load data
+        lhs_ptrs = lhs_ptr + (abs_row_indices[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k)
+        lhs_mask = mask_m[:, None] & mask_k[None, :]
+        lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+        
+        gate_ptrs = gate_base_ptr + (offs_n[:, None] * stride_gate_n + offs_k[None, :] * stride_gate_k)
+        gate_mask = mask_n[:, None] & mask_k[None, :]
+        gate_fp8 = tl.load(gate_ptrs, mask=gate_mask, other=0.0)
+        
+        up_ptrs = up_base_ptr + (offs_n[:, None] * stride_up_n + offs_k[None, :] * stride_up_k)
+        up_mask = mask_n[:, None] & mask_k[None, :]
+        up_fp8 = tl.load(up_ptrs, mask=up_mask, other=0.0)
+        
+        # Compute
+        gate_partial = tl.dot(lhs, tl.trans(gate_fp8), out_dtype=acc_dtype)
+        gate_acc += gate_partial * (lhs_scale[:, None] * gate_scale)
+        
+        up_partial = tl.dot(lhs, tl.trans(up_fp8), out_dtype=acc_dtype)
+        up_acc += up_partial * (lhs_scale[:, None] * up_scale)
+    
+    # Fused SiLU activation
+    gate_silu = gate_acc / (1.0 + tl.exp(-gate_acc))
+    output_acc = gate_silu * up_acc
+    output = output_acc.to(lhs_dtype)
+    
+    # Store
+    offs_output_m = tile_start_m + tl.arange(0, GEMM_BLOCK_SIZE_M)
+    offs_output_n = pid_n * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
+    output_ptrs = output_ptr + (offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n)
+    output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & mask_m[:, None]
+    
+    tl.store(output_ptrs, output, mask=output_mask)
+
+
+@torch.inference_mode()
+def fused_fp8_moe_stage_1_v3(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gate_weight_list: list[torch.Tensor],
+    gate_ptrs_ptr: torch.Tensor,
+    up_weight_list: list[torch.Tensor],
+    up_ptrs_ptr: torch.Tensor,
+    gate_scale_list: list[torch.Tensor],
+    gate_scale_ptrs_ptr: torch.Tensor,
+    up_scale_list: list[torch.Tensor],
+    up_scale_ptrs_ptr: torch.Tensor,
+    group_sizes: torch.Tensor,
+    activated_group_idx: torch.Tensor,
+    group_start_indices: torch.Tensor,
+    num_active_experts: torch.Tensor,
+):
+    """
+    V3: Pre-computes tile mapping for O(1) lookup.
+    Best performance for scenarios with many small groups.
+    """
+    device = hidden_states.device
+    M = hidden_states.shape[0]
+    N = gate_weight_list[0].shape[0]
+    K = hidden_states.shape[1]
+    
+    # Select config
+    if N >= 8192:
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 128
+        num_warps, num_stages = 8, 4
+    elif N >= 2048:
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 128
+        num_warps, num_stages = 4, 5
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 128
+        num_warps, num_stages = 4, 4
+    
+    # Pre-compute tile mapping
+    tile_to_group, tile_to_local, tiles_per_group = compute_group_tile_mapping(
+        group_sizes, BLOCK_M
+    )
+    total_m_tiles = len(tile_to_group)
+    
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    
+    grid = (total_m_tiles, triton.cdiv(N, BLOCK_N))
+    
+    fused_fp8_moe_stage_1_kernel_v3[grid](
+        hidden_states, hidden_states_scale,
+        gate_ptrs_ptr, up_ptrs_ptr,
+        gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+        activated_group_idx, group_sizes, group_start_indices,
+        tile_to_group, tile_to_local,
+        output,
+        M, N, K,
+        hidden_states.stride(0), hidden_states.stride(1),
+        hidden_states_scale.stride(0), hidden_states_scale.stride(1),
+        gate_weight_list[0].stride(0), gate_weight_list[0].stride(1),
+        up_weight_list[0].stride(0), up_weight_list[0].stride(1),
+        output.stride(0), output.stride(1),
+        activated_group_idx.stride(0),
+        group_sizes.stride(0),
+        group_start_indices.stride(0),
+        gate_ptrs_ptr.stride(0),
+        gate_scale_ptrs_ptr.stride(0),
+        GEMM_BLOCK_SIZE_M=BLOCK_M,
+        GEMM_BLOCK_SIZE_N=BLOCK_N,
+        GEMM_BLOCK_SIZE_K=BLOCK_K,
+        SCALE_BLOCK_SIZE_K=128,
+        SCALE_BLOCK_SIZE_N=128,
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+    
+    return output
