@@ -1571,7 +1571,7 @@ def fused_fp8_moe_stage_1(
     activated_group_idx: torch.Tensor,
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
-    gate_gemm_block_size=[64, 16, 256],  # Using 256 for unrolling
+    gate_gemm_block_size=[64, 16, 128],  # Using 256 for unrolling
     scale_block_size=[128, 128],
     num_stages=3,  # More stages for pipelining
     num_warps=4
@@ -1585,7 +1585,7 @@ def fused_fp8_moe_stage_1(
     grid = lambda META: (triton.cdiv(N, META['GEMM_BLOCK_SIZE_N']), )
     
     try:
-        fused_fp8_moe_stage_1_kernel_optimized[grid](
+        fused_fp8_moe_stage_1_kernel_v2[grid](
             hidden_states, hidden_states_scale,
             gate_ptrs_ptr, up_ptrs_ptr,
             gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
