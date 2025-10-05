@@ -560,16 +560,226 @@ import math
 #     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 #     tl.store(c_ptrs, c, mask=c_mask)
 
+
+""" V1 """
+# @triton.jit
+# def w8a8_gemm_kernel(
+#     # Pointers to matrices
+#     a_ptr, w_ptr, c_ptr,
+#     # Pointers to scales
+#     a_scale_ptr, w_scale_ptr,
+#     # Matrix dimensions
+#     M, N, K,
+#     # Quantization block sizes
+#     a_block_size, w_block_size_k, w_block_size_n,
+#     # Strides
+#     stride_am, stride_ak,
+#     stride_wn, stride_wk,
+#     stride_cm, stride_cn,
+#     stride_a_scale_m, stride_a_scale_k,
+#     stride_w_scale_n, stride_w_scale_k,
+#     # Meta-parameters
+#     BLOCK_SIZE_M: tl.constexpr,
+#     BLOCK_SIZE_N: tl.constexpr,
+#     BLOCK_SIZE_K: tl.constexpr,
+#     GROUP_SIZE_M: tl.constexpr,
+# ):
+#     """
+#     Optimized FP8 GEMM kernel: C = A @ W^T with blocked quantization.
+    
+#     A: [M, K] in fp8e4m3fn with per-row block quantization
+#     W: [N, K] in fp8e4m3fn with 2D block quantization
+#     C: [M, N] in bfloat16
+    
+#     BLOCK_SIZE_K can be larger than quantization block sizes.
+#     Uses masking instead of break for Triton compatibility.
+#     """
+#     # Program ID with swizzling
+#     pid = tl.program_id(axis=0)
+#     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+#     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+#     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+#     group_id = pid // num_pid_in_group
+#     first_pid_m = group_id * GROUP_SIZE_M
+#     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+#     pid_m = first_pid_m + (pid % group_size_m)
+#     pid_n = (pid % num_pid_in_group) // group_size_m
+
+#     # Offsets for M and N dimensions
+#     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+#     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+#     # Accumulator in fp32
+#     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+#     # Determine sub-block size (minimum of the two quantization block sizes)
+#     # For simplicity and correctness, use the smaller block size
+#     sub_block_size_k = tl.minimum(a_block_size, w_block_size_k)
+    
+#     # Calculate how many sub-blocks per GEMM K-block
+#     num_sub_blocks_per_gemm = tl.cdiv(BLOCK_SIZE_K, sub_block_size_k)
+
+#     # ===== OUTER LOOP: Iterate over GEMM K-tiles =====
+#     num_gemm_k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
+#     for gemm_k_idx in range(num_gemm_k_blocks):
+#         gemm_k_start = gemm_k_idx * BLOCK_SIZE_K
+        
+#         # ===== INNER LOOP: Iterate over quantization sub-blocks =====
+#         for sub_k_idx in range(num_sub_blocks_per_gemm):
+#             # Calculate K range for this sub-block
+#             sub_k_start = gemm_k_start + sub_k_idx * sub_block_size_k
+            
+#             # CRITICAL: Use masking instead of break
+#             sub_block_valid = sub_k_start < K
+            
+#             # Offsets for this sub-block (size = sub_block_size_k)
+#             # We still use BLOCK_SIZE_K for array dimensions but mask appropriately
+#             offs_k = sub_k_start + tl.arange(0, BLOCK_SIZE_K)
+            
+#             # ===== LOAD SCALES =====
+#             # For A scales: per-row quantization along K
+#             a_k_block_idx = sub_k_start // a_block_size
+#             a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
+#             a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
+            
+#             # For W scales: 2D block quantization
+#             w_k_block_idx = sub_k_start // w_block_size_k
+#             w_n_block_indices = offs_bn // w_block_size_n
+#             w_scale_ptrs = w_scale_ptr + (w_n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
+#             w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
+            
+#             # ===== LOAD DATA =====
+#             # Boundary masks - include sub_block_valid and limit to sub_block_size_k
+#             k_valid = offs_k < K
+#             k_in_sub_block = offs_k < (sub_k_start + sub_block_size_k)
+#             k_mask = k_valid & k_in_sub_block & sub_block_valid
+            
+#             a_mask = (offs_am[:, None] < M) & k_mask[None, :]
+#             w_mask = (offs_bn[:, None] < N) & k_mask[None, :]
+            
+#             # Initialize pointers
+#             a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+#             w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+            
+#             # Load FP8 data
+#             a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
+#             w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
+            
+#             # ===== COMPUTE AND ACCUMULATE =====
+#             # When sub_block_valid is False, loaded values are 0.0, so contribution is 0
+#             accumulator += tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32) * a_scales[:, None] * w_scales[None, :]
+
+#     # Convert to bfloat16 and store
+#     c = accumulator.to(tl.bfloat16)
+    
+#     # Store output
+#     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+#     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+#     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+#     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+#     tl.store(c_ptrs, c, mask=c_mask)
+
+
+# def w8a8_gemm(
+#     a: torch.Tensor,
+#     a_scale: torch.Tensor,
+#     w: torch.Tensor,
+#     w_scale: torch.Tensor,
+#     a_block_size: int = 128,
+#     w_block_size_k: int = 128,
+#     w_block_size_n: int = 128,
+# ) -> torch.Tensor:
+#     """
+#     Performs quantized GEMM: C = A @ W^T with blocked quantization.
+    
+#     Args:
+#         a: Activations [M, K] in fp8e4m3fn
+#         a_scale: Scales [M, ceil(K/a_block_size)] in fp32
+#         w: Weights [N, K] in fp8e4m3fn
+#         w_scale: Scales [ceil(N/w_block_size_n), ceil(K/w_block_size_k)] in fp32
+#         a_block_size: Block size for A quantization along K (default: 128)
+#         w_block_size_k: Block size for W quantization along K (default: 128)
+#         w_block_size_n: Block size for W quantization along N (default: 128)
+        
+#     Returns:
+#         Output [M, N] in bfloat16
+#     """
+#     # Input validation
+#     assert a.dtype == torch.float8_e4m3fn, f"Expected fp8e4m3fn for a, got {a.dtype}"
+#     assert w.dtype == torch.float8_e4m3fn, f"Expected fp8e4m3fn for w, got {w.dtype}"
+#     assert a_scale.dtype == torch.float32, f"Expected fp32 for a_scale, got {a_scale.dtype}"
+#     assert w_scale.dtype == torch.float32, f"Expected fp32 for w_scale, got {w_scale.dtype}"
+#     assert a.is_contiguous(), "a must be contiguous"
+#     assert w.is_contiguous(), "w must be contiguous"
+    
+#     M, K = a.shape
+#     N, K_w = w.shape
+#     assert K == K_w, f"K dimension mismatch: A has {K}, W has {K_w}"
+    
+#     # Validate scale shapes
+#     expected_a_scale_shape = (M, math.ceil(K / a_block_size))
+#     expected_w_scale_shape = (math.ceil(N / w_block_size_n), math.ceil(K / w_block_size_k))
+#     assert a_scale.shape == expected_a_scale_shape, \
+#         f"a_scale shape mismatch: expected {expected_a_scale_shape}, got {a_scale.shape}"
+#     assert w_scale.shape == expected_w_scale_shape, \
+#         f"w_scale shape mismatch: expected {expected_w_scale_shape}, got {w_scale.shape}"
+    
+#     # Allocate output
+#     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    
+#     # Grid configuration
+#     grid = lambda META: (
+#         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+#     )
+    
+#     # CRITICAL: BLOCK_SIZE_K must evenly divide scale block sizes (128)
+#     # Valid options: 32, 64, 128
+    
+#     # For large K (1536, 7168), use small BLOCK_SIZE_N to maximize CTA count
+#     # CTA count = cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N)
+#     # With large K and potentially small M/N, need many CTAs along N dimension
+    
+#     # Launch kernel with optimized configuration for Hopper
+#     # BLOCK_SIZE_M=64, BLOCK_SIZE_N=64: Balanced, good register usage
+#     # BLOCK_SIZE_K=64: Divides scale block (128) evenly
+#     # GROUP_SIZE_M=4: Moderate L2 cache reuse
+#     # num_warps=4: Good occupancy
+#     w8a8_gemm_kernel[grid](
+#         a, w, c,
+#         a_scale, w_scale,
+#         M, N, K,
+#         a_block_size, w_block_size_k, w_block_size_n,
+#         a.stride(0), a.stride(1),
+#         w.stride(0), w.stride(1),
+#         c.stride(0), c.stride(1),
+#         a_scale.stride(0), a_scale.stride(1),
+#         w_scale.stride(0), w_scale.stride(1),
+#         BLOCK_SIZE_M=64,
+#         BLOCK_SIZE_N=16,
+#         BLOCK_SIZE_K=256,
+#         GROUP_SIZE_M=1,
+#         # num_stages=3,
+#         # num_warps=4
+#     )
+    
+#     return c
+
+
+""" 
+    V2 
+"""
 @triton.jit
-def w8a8_gemm_kernel(
+def w8a8_gemm_kernel_optimized(
     # Pointers to matrices
     a_ptr, w_ptr, c_ptr,
     # Pointers to scales
     a_scale_ptr, w_scale_ptr,
     # Matrix dimensions
     M, N, K,
-    # Quantization block sizes
-    a_block_size, w_block_size_k, w_block_size_n,
+    # Quantization block sizes (compile-time)
+    a_block_size: tl.constexpr,
+    w_block_size_k: tl.constexpr,
+    w_block_size_n: tl.constexpr,
     # Strides
     stride_am, stride_ak,
     stride_wn, stride_wk,
@@ -583,16 +793,15 @@ def w8a8_gemm_kernel(
     GROUP_SIZE_M: tl.constexpr,
 ):
     """
-    Optimized FP8 GEMM kernel: C = A @ W^T with blocked quantization.
+    High-performance FP8 GEMM: C = A @ W^T with blocked quantization.
     
-    A: [M, K] in fp8e4m3fn with per-row block quantization
-    W: [N, K] in fp8e4m3fn with 2D block quantization
-    C: [M, N] in bfloat16
-    
-    BLOCK_SIZE_K can be larger than quantization block sizes.
-    Uses masking instead of break for Triton compatibility.
+    Key optimizations:
+    - Single K-loop (no nested sub-blocking)
+    - BLOCK_SIZE_K matches quantization block size
+    - Optimal tile sizes for Hopper/Ampere
+    - Efficient scale broadcasting
     """
-    # Program ID with swizzling
+    # Program ID with improved swizzling for L2 locality
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -603,78 +812,63 @@ def w8a8_gemm_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Offsets for M and N dimensions
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    # Block offsets
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    # Masks for boundary conditions
+    mask_m = offs_am < M
+    mask_n = offs_bn < N
 
-    # Accumulator in fp32
+    # FP32 accumulator for numerical stability
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    # Determine sub-block size (minimum of the two quantization block sizes)
-    # For simplicity and correctness, use the smaller block size
-    sub_block_size_k = tl.minimum(a_block_size, w_block_size_k)
-    
-    # Calculate how many sub-blocks per GEMM K-block
-    num_sub_blocks_per_gemm = tl.cdiv(BLOCK_SIZE_K, sub_block_size_k)
-
-    # ===== OUTER LOOP: Iterate over GEMM K-tiles =====
-    num_gemm_k_blocks = tl.cdiv(K, BLOCK_SIZE_K)
-    for gemm_k_idx in range(num_gemm_k_blocks):
-        gemm_k_start = gemm_k_idx * BLOCK_SIZE_K
+    # ===== SINGLE K-LOOP: Iterate over K dimension =====
+    # CRITICAL: BLOCK_SIZE_K should equal quantization block size (128)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_start = k * BLOCK_SIZE_K
+        offs_k = k_start + tl.arange(0, BLOCK_SIZE_K)
+        mask_k = offs_k < K
         
-        # ===== INNER LOOP: Iterate over quantization sub-blocks =====
-        for sub_k_idx in range(num_sub_blocks_per_gemm):
-            # Calculate K range for this sub-block
-            sub_k_start = gemm_k_start + sub_k_idx * sub_block_size_k
-            
-            # CRITICAL: Use masking instead of break
-            sub_block_valid = sub_k_start < K
-            
-            # Offsets for this sub-block (size = sub_block_size_k)
-            # We still use BLOCK_SIZE_K for array dimensions but mask appropriately
-            offs_k = sub_k_start + tl.arange(0, BLOCK_SIZE_K)
-            
-            # ===== LOAD SCALES =====
-            # For A scales: per-row quantization along K
-            a_k_block_idx = sub_k_start // a_block_size
-            a_scale_ptrs = a_scale_ptr + (offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k)
-            a_scales = tl.load(a_scale_ptrs, mask=offs_am < M, other=1.0)
-            
-            # For W scales: 2D block quantization
-            w_k_block_idx = sub_k_start // w_block_size_k
-            w_n_block_indices = offs_bn // w_block_size_n
-            w_scale_ptrs = w_scale_ptr + (w_n_block_indices * stride_w_scale_n + w_k_block_idx * stride_w_scale_k)
-            w_scales = tl.load(w_scale_ptrs, mask=offs_bn < N, other=1.0)
-            
-            # ===== LOAD DATA =====
-            # Boundary masks - include sub_block_valid and limit to sub_block_size_k
-            k_valid = offs_k < K
-            k_in_sub_block = offs_k < (sub_k_start + sub_block_size_k)
-            k_mask = k_valid & k_in_sub_block & sub_block_valid
-            
-            a_mask = (offs_am[:, None] < M) & k_mask[None, :]
-            w_mask = (offs_bn[:, None] < N) & k_mask[None, :]
-            
-            # Initialize pointers
-            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-            w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
-            
-            # Load FP8 data
-            a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
-            w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
-            
-            # ===== COMPUTE AND ACCUMULATE =====
-            # When sub_block_valid is False, loaded values are 0.0, so contribution is 0
-            accumulator += tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32) * a_scales[:, None] * w_scales[None, :]
+        # ===== LOAD SCALES (once per K-block) =====
+        # A scales: per-row, per-block along K
+        a_k_block_idx = k_start // a_block_size
+        a_scale_ptrs = a_scale_ptr + offs_am * stride_a_scale_m + a_k_block_idx * stride_a_scale_k
+        a_scales = tl.load(a_scale_ptrs, mask=mask_m, other=1.0)
+        
+        # W scales: 2D blocking
+        w_k_block_idx = k_start // w_block_size_k
+        w_n_block_idx = offs_bn // w_block_size_n
+        w_scale_ptrs = w_scale_ptr + w_n_block_idx * stride_w_scale_n + w_k_block_idx * stride_w_scale_k
+        w_scales = tl.load(w_scale_ptrs, mask=mask_n, other=1.0)
+        
+        # ===== LOAD FP8 DATA =====
+        # Pointers for this K-block
+        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        w_ptrs = w_ptr + (offs_bn[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+        
+        # Load with boundary masking
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        w_mask = mask_n[:, None] & mask_k[None, :]
+        
+        a_fp8 = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+        # ===== COMPUTE: FP8 matmul + scale =====
+        # Matmul returns FP32, then multiply by scales
+        # Broadcasting: a_scales [M] x w_scales [N] -> [M, N]
+        partial = tl.dot(a_fp8, tl.trans(w_fp8), out_dtype=tl.float32)
+        accumulator += partial * (a_scales[:, None] * w_scales[None, :])
 
-    # Convert to bfloat16 and store
+    # ===== STORE OUTPUT =====
+    # Convert to BF16 and write back
     c = accumulator.to(tl.bfloat16)
     
-    # Store output
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -688,61 +882,94 @@ def w8a8_gemm(
     w_block_size_n: int = 128,
 ) -> torch.Tensor:
     """
-    Performs quantized GEMM: C = A @ W^T with blocked quantization.
+    High-performance quantized GEMM: C = A @ W^T
     
     Args:
         a: Activations [M, K] in fp8e4m3fn
         a_scale: Scales [M, ceil(K/a_block_size)] in fp32
-        w: Weights [N, K] in fp8e4m3fn
+        w: Weights [N, K] in fp8e4m3fn  
         w_scale: Scales [ceil(N/w_block_size_n), ceil(K/w_block_size_k)] in fp32
-        a_block_size: Block size for A quantization along K (default: 128)
-        w_block_size_k: Block size for W quantization along K (default: 128)
-        w_block_size_n: Block size for W quantization along N (default: 128)
         
     Returns:
         Output [M, N] in bfloat16
     """
-    # Input validation
-    assert a.dtype == torch.float8_e4m3fn, f"Expected fp8e4m3fn for a, got {a.dtype}"
-    assert w.dtype == torch.float8_e4m3fn, f"Expected fp8e4m3fn for w, got {w.dtype}"
-    assert a_scale.dtype == torch.float32, f"Expected fp32 for a_scale, got {a_scale.dtype}"
-    assert w_scale.dtype == torch.float32, f"Expected fp32 for w_scale, got {w_scale.dtype}"
-    assert a.is_contiguous(), "a must be contiguous"
-    assert w.is_contiguous(), "w must be contiguous"
+    # Validation
+    assert a.dtype == torch.float8_e4m3fn
+    assert w.dtype == torch.float8_e4m3fn
+    assert a_scale.dtype == torch.float32
+    assert w_scale.dtype == torch.float32
+    assert a.is_contiguous() and w.is_contiguous()
     
     M, K = a.shape
     N, K_w = w.shape
-    assert K == K_w, f"K dimension mismatch: A has {K}, W has {K_w}"
+    assert K == K_w
     
     # Validate scale shapes
-    expected_a_scale_shape = (M, math.ceil(K / a_block_size))
-    expected_w_scale_shape = (math.ceil(N / w_block_size_n), math.ceil(K / w_block_size_k))
-    assert a_scale.shape == expected_a_scale_shape, \
-        f"a_scale shape mismatch: expected {expected_a_scale_shape}, got {a_scale.shape}"
-    assert w_scale.shape == expected_w_scale_shape, \
-        f"w_scale shape mismatch: expected {expected_w_scale_shape}, got {w_scale.shape}"
+    expected_a_scale = (M, math.ceil(K / a_block_size))
+    expected_w_scale = (math.ceil(N / w_block_size_n), math.ceil(K / w_block_size_k))
+    assert a_scale.shape == expected_a_scale, f"Expected {expected_a_scale}, got {a_scale.shape}"
+    assert w_scale.shape == expected_w_scale, f"Expected {expected_w_scale}, got {w_scale.shape}"
     
     # Allocate output
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     
+    # Auto-tune configurations based on problem size
+    configs = [
+        # For large matrices (M, N > 1024)
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        
+        # For medium matrices
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
+        
+        # For small M or N
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 4}, num_stages=5, num_warps=2),
+    ]
+    
+    # Key function for auto-tuning
+    key = ['M', 'N', 'K']
+    
+    @triton.autotune(configs=configs, key=key)
+    @triton.jit
+    def kernel_wrapper(
+        a_ptr, w_ptr, c_ptr,
+        a_scale_ptr, w_scale_ptr,
+        M, N, K,
+        a_block_size: tl.constexpr,
+        w_block_size_k: tl.constexpr,
+        w_block_size_n: tl.constexpr,
+        stride_am, stride_ak,
+        stride_wn, stride_wk,
+        stride_cm, stride_cn,
+        stride_a_scale_m, stride_a_scale_k,
+        stride_w_scale_n, stride_w_scale_k,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+    ):
+        w8a8_gemm_kernel_optimized(
+            a_ptr, w_ptr, c_ptr,
+            a_scale_ptr, w_scale_ptr,
+            M, N, K,
+            a_block_size, w_block_size_k, w_block_size_n,
+            stride_am, stride_ak,
+            stride_wn, stride_wk,
+            stride_cm, stride_cn,
+            stride_a_scale_m, stride_a_scale_k,
+            stride_w_scale_n, stride_w_scale_k,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
+        )
+    
     # Grid configuration
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
-    )
+    def grid(META):
+        return (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
     
-    # CRITICAL: BLOCK_SIZE_K must evenly divide scale block sizes (128)
-    # Valid options: 32, 64, 128
-    
-    # For large K (1536, 7168), use small BLOCK_SIZE_N to maximize CTA count
-    # CTA count = cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N)
-    # With large K and potentially small M/N, need many CTAs along N dimension
-    
-    # Launch kernel with optimized configuration for Hopper
-    # BLOCK_SIZE_M=64, BLOCK_SIZE_N=64: Balanced, good register usage
-    # BLOCK_SIZE_K=64: Divides scale block (128) evenly
-    # GROUP_SIZE_M=4: Moderate L2 cache reuse
-    # num_warps=4: Good occupancy
-    w8a8_gemm_kernel[grid](
+    # Launch kernel
+    kernel_wrapper[grid](
         a, w, c,
         a_scale, w_scale,
         M, N, K,
@@ -752,12 +979,64 @@ def w8a8_gemm(
         c.stride(0), c.stride(1),
         a_scale.stride(0), a_scale.stride(1),
         w_scale.stride(0), w_scale.stride(1),
-        BLOCK_SIZE_M=64,
-        BLOCK_SIZE_N=16,
-        BLOCK_SIZE_K=256,
-        GROUP_SIZE_M=1,
-        # num_stages=3,
-        # num_warps=4
+    )
+    
+    return c
+
+
+# ===== MANUAL TUNING VERSION (if auto-tune overhead is too high) =====
+def w8a8_gemm_manual(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    a_block_size: int = 128,
+    w_block_size_k: int = 128,
+    w_block_size_n: int = 128,
+) -> torch.Tensor:
+    """Manual tuning for production use after finding best config."""
+    M, K = a.shape
+    N = w.shape[0]
+    
+    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    
+    # Choose config based on problem size
+    if M >= 1024 and N >= 1024:
+        # Large matrices: maximize throughput
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 128
+        GROUP_M = 8
+        num_warps, num_stages = 8, 4
+    elif M < 128 or N < 128:
+        # Skinny matrices: optimize for small dimensions
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 128
+        GROUP_M = 4
+        num_warps, num_stages = 4, 4
+    else:
+        # Medium matrices: balanced config
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128
+        GROUP_M = 8
+        num_warps, num_stages = 4, 5
+    
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
+    
+    w8a8_gemm_kernel_optimized[grid](
+        a, w, c,
+        a_scale, w_scale,
+        M, N, K,
+        a_block_size, w_block_size_k, w_block_size_n,
+        a.stride(0), a.stride(1),
+        w.stride(0), w.stride(1),
+        c.stride(0), c.stride(1),
+        a_scale.stride(0), a_scale.stride(1),
+        w_scale.stride(0), w_scale.stride(1),
+        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_N=BLOCK_N,
+        BLOCK_SIZE_K=BLOCK_K,
+        GROUP_SIZE_M=GROUP_M,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     
     return c
@@ -789,7 +1068,7 @@ def test_w8a8_gemm():
     ) * 0.1
     
     # Run kernel
-    c = w8a8_gemm(a, a_scale, w, w_scale, a_block_size, w_block_size_k, w_block_size_n)
+    c = w8a8_gemm_optimized(a, a_scale, w, w_scale, a_block_size, w_block_size_k, w_block_size_n)
     
     print(f"Output shape: {c.shape}")
     print(f"Output dtype: {c.dtype}")
@@ -798,9 +1077,192 @@ def test_w8a8_gemm():
     return c
 
 
+def benchmark_w8a8_gemm(M, N, K, warmup=10, iters=100):
+    """
+    Benchmark W8A8 GEMM performance and compare with theoretical peak.
+    
+    Returns TFLOPS and efficiency metrics.
+    """
+    device = torch.device('cuda')
+    
+    # Generate test data
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    
+    # Quantize using your act_quant function
+    # from your_module import act_quant, w8a8_gemm, w8a8_gemm_optimized
+    from batchgen.attention.mla.fa3_backend import act_quant
+    # from batchgen.gemm.w8a8 import w8a8_gemm
+    
+    a_fp8, a_scale = act_quant(a, block_size=128)
+    w_fp8, w_scale = act_quant(w.view(1, -1), block_size=128)
+    w_scale = w_scale.view(N // 128 + (1 if N % 128 else 0), K // 128)
+    
+    # Warmup
+    for _ in range(warmup):
+        _ = w8a8_gemm(a_fp8, a_scale, w_fp8, w_scale)
+    torch.cuda.synchronize()
+    
+    # Benchmark original kernel
+    start = time.perf_counter()
+    for _ in range(iters):
+        c_original = w8a8_gemm(a_fp8, a_scale, w_fp8, w_scale)
+    torch.cuda.synchronize()
+    time_original = (time.perf_counter() - start) / iters
+    
+    # Warmup optimized
+    for _ in range(warmup):
+        _ = w8a8_gemm_optimized(a_fp8, a_scale, w_fp8, w_scale)
+    torch.cuda.synchronize()
+    
+    # Benchmark optimized kernel
+    start = time.perf_counter()
+    for _ in range(iters):
+        c_optimized = w8a8_gemm_optimized(a_fp8, a_scale, w_fp8, w_scale)
+    torch.cuda.synchronize()
+    time_optimized = (time.perf_counter() - start) / iters
+    
+    # Calculate FLOPS (FP8 GEMM)
+    # C = A @ W^T requires 2*M*N*K operations
+    flops = 2 * M * N * K
+    tflops_original = (flops / time_original) / 1e12
+    tflops_optimized = (flops / time_optimized) / 1e12
+    
+    # Get GPU specs
+    gpu_name = torch.cuda.get_device_name()
+    
+    # Theoretical peak TFLOPS for FP8 on common GPUs
+    theoretical_peak = {
+        'H100': 1979,   # H100 SXM5
+        'H200': 1979,   # H200
+        'A100': 312,    # A100 80GB (FP8 Tensor Core)
+        'L40S': 733,    # L40S
+    }
+    
+    # Estimate peak for this GPU
+    peak_tflops = 1000  # Default estimate
+    for gpu, peak in theoretical_peak.items():
+        if gpu in gpu_name:
+            peak_tflops = peak
+            break
+    
+    # Calculate efficiency
+    efficiency_original = (tflops_original / peak_tflops) * 100
+    efficiency_optimized = (tflops_optimized / peak_tflops) * 100
+    
+    # Verify correctness
+    torch.cuda.synchronize()
+    max_diff = (c_original - c_optimized).abs().max().item()
+    
+    print(f"\n{'='*70}")
+    print(f"Benchmark Results: M={M}, N={N}, K={K}")
+    print(f"GPU: {gpu_name}")
+    print(f"Theoretical Peak: {peak_tflops:.1f} TFLOPS (FP8)")
+    print(f"{'='*70}")
+    print(f"\n{'Original Kernel':30} {'Optimized Kernel':30}")
+    print(f"{'-'*70}")
+    print(f"{'Time (ms)':20} {time_original*1000:10.3f} ms {time_optimized*1000:20.3f} ms")
+    print(f"{'TFLOPS':20} {tflops_original:10.2f} {tflops_optimized:20.2f}")
+    print(f"{'Efficiency':20} {efficiency_original:10.1f}% {efficiency_optimized:20.1f}%")
+    print(f"{'Speedup':20} {'-':>10} {time_original/time_optimized:20.2f}x")
+    print(f"{'Max Error':20} {max_diff:10.2e}")
+    print(f"{'='*70}\n")
+    
+    return {
+        'time_original': time_original,
+        'time_optimized': time_optimized,
+        'tflops_original': tflops_original,
+        'tflops_optimized': tflops_optimized,
+        'speedup': time_original / time_optimized,
+        'efficiency': efficiency_optimized,
+    }
+
+
+def benchmark_suite():
+    """Run comprehensive benchmark suite."""
+    
+    # Test cases covering different matrix shapes
+    test_cases = [
+        # (M, N, K, Description)
+        (1024, 1024, 1024, "Square 1K"),
+        (2048, 2048, 2048, "Square 2K"),
+        (4096, 4096, 4096, "Square 4K"),
+        (8192, 8192, 1536, "LLM: q_proj (Llama 70B)"),
+        (8192, 28672, 1536, "LLM: mlp_up (Llama 70B)"),
+        (8192, 8192, 7168, "LLM: mlp_down"),
+        (1, 4096, 4096, "Batch=1 inference"),
+        (128, 4096, 4096, "Small batch"),
+        (16384, 4096, 1536, "Large batch"),
+    ]
+    
+    results = []
+    for M, N, K, desc in test_cases:
+        print(f"\n{'#'*70}")
+        print(f"# {desc}")
+        print(f"{'#'*70}")
+        result = benchmark_w8a8_gemm(M, N, K, warmup=5, iters=50)
+        result['shape'] = (M, N, K)
+        result['description'] = desc
+        results.append(result)
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print(f"SUMMARY")
+    print(f"{'='*70}")
+    print(f"{'Shape':30} {'Speedup':15} {'Efficiency':15}")
+    print(f"{'-'*70}")
+    for r in results:
+        M, N, K = r['shape']
+        print(f"{f'{M}x{N}x{K}':30} {r['speedup']:10.2f}x {r['efficiency']:10.1f}%")
+    
+    avg_speedup = sum(r['speedup'] for r in results) / len(results)
+    print(f"{'-'*70}")
+    print(f"{'Average Speedup':30} {avg_speedup:10.2f}x")
+    print(f"{'='*70}\n")
+
+
+def profile_kernel_details():
+    """
+    Profile kernel with Nsight Compute metrics.
+    
+    Run with: ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed python script.py
+    """
+    M, N, K = 4096, 4096, 4096
+    
+    device = torch.device('cuda')
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    
+    from your_module import act_quant, w8a8_gemm_optimized
+    
+    a_fp8, a_scale = act_quant(a, block_size=128)
+    w_fp8, w_scale = act_quant(w.view(1, -1), block_size=128)
+    w_scale = w_scale.view(N // 128, K // 128)
+    
+    # Single run for profiling
+    torch.cuda.cudart().cudaProfilerStart()
+    c = w8a8_gemm_optimized(a_fp8, a_scale, w_fp8, w_scale)
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+    
+    print("Profiling complete. Check ncu output for detailed metrics:")
+    print("- sm__throughput.avg.pct_of_peak_sustained_elapsed")
+    print("- smsp__sass_thread_inst_executed_op_fadd_pred_on.sum (FP8 ops)")
+    print("- l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum (Global memory loads)")
+    print("- smsp__warps_launched.sum (Warp count)")
+
+
 if __name__ == "__main__":
     test_w8a8_gemm()
-
+    # Quick test
+    print("Running quick benchmark...")
+    benchmark_w8a8_gemm(2048, 2048, 2048, warmup=5, iters=20)
+    
+    # Full suite (uncomment to run)
+    # benchmark_suite()
+    
+    # For profiling (run with ncu)
+    # profile_kernel_details()
 
 # import torch
 # import triton
