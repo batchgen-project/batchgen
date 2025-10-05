@@ -1556,7 +1556,7 @@ def fused_fp8_moe_stage_1_v2_kernel(
 
 				
 @torch.inference_mode()
-def fused_fp8_moe_stage_1_v2(
+def fused_fp8_moe_stage_1(
 	hidden_states: torch.Tensor,
 	hidden_states_scale: torch.Tensor,
 	gate_weight_list: list[torch.Tensor],
