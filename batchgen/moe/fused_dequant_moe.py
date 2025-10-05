@@ -1338,7 +1338,214 @@ def fused_fp8_moe_stage_1_v2_kernel(
 
 
 
-				
+import torch
+import triton
+import triton.language as tl
+import logging
+
+@triton.jit
+def fused_fp8_moe_stage_1_optimized_kernel(
+    lhs_ptr, lhs_scale_ptr,
+    gate_ptrs_ptr, up_ptrs_ptr,
+    gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+    group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+    output_ptr,
+    M, N: tl.constexpr, K: tl.constexpr, num_groups,
+    stride_lhs_m, stride_lhs_k,
+    stride_lhs_scale_m, stride_lhs_scale_k,
+    stride_gate_n, stride_gate_k,
+    stride_up_n, stride_up_k,
+    stride_gate_scale_n, stride_gate_scale_k,
+    stride_up_scale_n, stride_up_scale_k,
+    stride_output_m, stride_output_n,
+    stride_group_idx, stride_group_sizes, stride_group_start_indices,
+    stride_weight_ptrs, stride_scale_ptrs,
+    GEMM_BLOCK_SIZE_M: tl.constexpr, 
+    GEMM_BLOCK_SIZE_N: tl.constexpr, 
+    GEMM_BLOCK_SIZE_K: tl.constexpr,
+    ACT_SCALE_BLOCK: tl.constexpr = 128,
+    WEIGHT_SCALE_BLOCK_N: tl.constexpr = 128,
+    WEIGHT_SCALE_BLOCK_K: tl.constexpr = 128,
+):
+    tile_idx = tl.program_id(axis=0)
+    num_ctas = tl.num_programs(axis=0)
+    
+    dtype = tl.float8e4nv
+    acc_dtype = tl.float32
+    
+    last_problem_end = 0
+    num_n_tiles = tl.cdiv(N, GEMM_BLOCK_SIZE_N)
+    
+    for g in range(num_groups):
+        gm = tl.load(group_sizes_ptr + g * stride_group_sizes)
+        group_idx = tl.load(group_idx_ptr + g * stride_group_idx)
+        start_idx = tl.load(group_start_indices_ptr + g * stride_group_start_indices)
+        
+        num_m_tiles = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+        num_tiles = num_m_tiles * num_n_tiles
+        
+        # Load pointers for this expert group
+        gate_group_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(dtype))
+        up_group_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(dtype))
+        gate_scale_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+        up_scale_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+        
+        # FIXED: Correct condition (was tile_idx < last_problem_end - always false!)
+        if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
+            lhs_group_ptr = lhs_ptr + (start_idx * stride_lhs_m)
+            lhs_scale_group_ptr = lhs_scale_ptr + (start_idx * stride_lhs_scale_m)
+            
+            # Persistent kernel loop
+            local_tile_idx = tile_idx
+            while local_tile_idx >= last_problem_end and local_tile_idx < last_problem_end + num_tiles:
+                tile_idx_in_gemm = local_tile_idx - last_problem_end
+                tile_m_idx = tile_idx_in_gemm // num_n_tiles
+                tile_n_idx = tile_idx_in_gemm % num_n_tiles
+                
+                offs_am = tile_m_idx * GEMM_BLOCK_SIZE_M
+                offs_bn = tile_n_idx * GEMM_BLOCK_SIZE_N
+                
+                # Range arrays for indexing
+                rm = tl.arange(0, GEMM_BLOCK_SIZE_M)
+                rn = tl.arange(0, GEMM_BLOCK_SIZE_N)
+                rk = tl.arange(0, GEMM_BLOCK_SIZE_K)
+                
+                gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
+                up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
+                
+                # K-dimension loop - accumulate FP8 dot products, then scale
+                for k_tile in range(0, tl.cdiv(K, GEMM_BLOCK_SIZE_K)):
+                    offs_k = k_tile * GEMM_BLOCK_SIZE_K
+                    
+                    # Load FP8 activations [BLOCK_M, BLOCK_K]
+                    lhs_ptrs = lhs_group_ptr + (offs_am + rm)[:, None] * stride_lhs_m + (offs_k + rk)[None, :] * stride_lhs_k
+                    lhs_mask = ((offs_am + rm)[:, None] < gm) & ((offs_k + rk)[None, :] < K)
+                    lhs_fp8 = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0).to(dtype)
+                    
+                    # Load FP8 gate weights [BLOCK_N, BLOCK_K]
+                    gate_ptrs = gate_group_ptr + (offs_bn + rn)[:, None] * stride_gate_n + (offs_k + rk)[None, :] * stride_gate_k
+                    gate_mask = ((offs_bn + rn)[:, None] < N) & ((offs_k + rk)[None, :] < K)
+                    gate_fp8 = tl.load(gate_ptrs, mask=gate_mask, other=0.0).to(dtype)
+                    
+                    # Load FP8 up weights [BLOCK_N, BLOCK_K]
+                    up_ptrs = up_group_ptr + (offs_bn + rn)[:, None] * stride_up_n + (offs_k + rk)[None, :] * stride_up_k
+                    up_mask = ((offs_bn + rn)[:, None] < N) & ((offs_k + rk)[None, :] < K)
+                    up_fp8 = tl.load(up_ptrs, mask=up_mask, other=0.0).to(dtype)
+                    
+                    # FP8 dot products -> FP32 accumulator (unscaled)
+                    gate_k_acc = tl.dot(lhs_fp8, tl.trans(gate_fp8), out_dtype=acc_dtype)
+                    up_k_acc = tl.dot(lhs_fp8, tl.trans(up_fp8), out_dtype=acc_dtype)
+                    
+                    # Load activation scales for this K-block
+                    # Scale shape: [M, K/128], one scale per row per 128 elements in K
+                    # Need scales for rows [offs_am:offs_am+BLOCK_M] at K-block offs_k//128
+                    act_scale_k_idx = offs_k // ACT_SCALE_BLOCK
+                    act_scale_ptrs = lhs_scale_group_ptr + (offs_am + rm) * stride_lhs_scale_m + act_scale_k_idx * stride_lhs_scale_k
+                    act_scale_mask = (offs_am + rm) < gm
+                    act_scales = tl.load(act_scale_ptrs, mask=act_scale_mask, other=1.0)  # [BLOCK_M]
+                    
+                    # Load gate weight scales for this K-block
+                    # Scale shape: [N/128, K/128], one scale per [128, 128] block
+                    # Need scales for N positions [offs_bn:offs_bn+BLOCK_N] at K-block offs_k//128
+                    gate_scale_n_idx = (offs_bn + rn) // WEIGHT_SCALE_BLOCK_N  # [BLOCK_N]
+                    gate_scale_k_idx = offs_k // WEIGHT_SCALE_BLOCK_K
+                    gate_scale_ptrs = gate_scale_ptr + gate_scale_n_idx * stride_gate_scale_n + gate_scale_k_idx * stride_gate_scale_k
+                    gate_scale_mask = (offs_bn + rn) < N
+                    gate_scales = tl.load(gate_scale_ptrs, mask=gate_scale_mask, other=1.0)  # [BLOCK_N]
+                    
+                    # Load up weight scales
+                    up_scale_ptrs = up_scale_ptr + gate_scale_n_idx * stride_up_scale_n + gate_scale_k_idx * stride_up_scale_k
+                    up_scales = tl.load(up_scale_ptrs, mask=gate_scale_mask, other=1.0)  # [BLOCK_N]
+                    
+                    # Apply scales to this K-block's contribution
+                    # Result[m,n] *= act_scale[m] * weight_scale[n]
+                    gate_acc += gate_k_acc * act_scales[:, None] * gate_scales[None, :]
+                    up_acc += up_k_acc * act_scales[:, None] * up_scales[None, :]
+                
+                # Apply SiLU activation: gate * sigmoid(gate) * up
+                # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                sigmoid_gate = 1.0 / (1.0 + tl.exp(-gate_acc))
+                output_acc = gate_acc * sigmoid_gate * up_acc
+                
+                # Convert to bf16 and store
+                output_bf16 = output_acc.to(tl.bfloat16)
+                
+                offs_output_m = start_idx + offs_am + rm
+                offs_output_n = offs_bn + rn
+                output_ptrs = output_ptr + offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n
+                output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & (rm[:, None] < tl.minimum(GEMM_BLOCK_SIZE_M, gm - offs_am))
+                tl.store(output_ptrs, output_bf16, mask=output_mask)
+                
+                local_tile_idx += num_ctas
+        
+        last_problem_end += num_tiles
+
+
+@torch.inference_mode()
+def fused_fp8_moe_stage_1_optimized(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gate_weight_list: list[torch.Tensor],
+    gate_ptrs_ptr: torch.Tensor,
+    up_weight_list: list[torch.Tensor],
+    up_ptrs_ptr: torch.Tensor,
+    gate_scale_list: list[torch.Tensor],
+    gate_scale_ptrs_ptr: torch.Tensor,
+    up_scale_list: list[torch.Tensor],
+    up_scale_ptrs_ptr: torch.Tensor,
+    group_sizes: torch.Tensor,
+    activated_group_idx: torch.Tensor,
+    group_start_indices: torch.Tensor,
+    num_active_experts: torch.Tensor,
+    gate_gemm_block_size=[128, 64, 128],  # [M, N, K] - optimized for alignment
+    num_stages=4,
+    num_warps=8
+):
+    device = hidden_states.device
+    M = hidden_states.shape[0]
+    N = gate_weight_list[0].shape[0]
+    K = hidden_states.shape[1]
+
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    
+    # Calculate total tiles for proper grid sizing
+    total_tiles = 0
+    for i in range(len(group_sizes)):
+        gm = group_sizes[i].item()
+        num_m_tiles = (gm + gate_gemm_block_size[0] - 1) // gate_gemm_block_size[0]
+        num_n_tiles = (N + gate_gemm_block_size[1] - 1) // gate_gemm_block_size[1]
+        total_tiles += num_m_tiles * num_n_tiles
+    
+    # Cap grid at reasonable SM occupancy (108 SMs * 4 waves for H100)
+    grid = (min(total_tiles, 432),)
+    
+    fused_fp8_moe_stage_1_optimized_kernel[grid](
+        hidden_states, hidden_states_scale,
+        gate_ptrs_ptr, up_ptrs_ptr,
+        gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+        activated_group_idx, group_sizes, group_start_indices,
+        output,
+        M, N, K, len(group_sizes),
+        hidden_states.stride(0), hidden_states.stride(1),
+        hidden_states_scale.stride(0), hidden_states_scale.stride(1),
+        gate_weight_list[0].stride(0), gate_weight_list[0].stride(1),
+        up_weight_list[0].stride(0), up_weight_list[0].stride(1),
+        gate_scale_list[0].stride(0), gate_scale_list[0].stride(1),
+        up_scale_list[0].stride(0), up_scale_list[0].stride(1),
+        output.stride(0), output.stride(1),
+        activated_group_idx.stride(0),
+        group_sizes.stride(0),
+        group_start_indices.stride(0),
+        gate_ptrs_ptr.stride(0),
+        gate_scale_ptrs_ptr.stride(0),
+        GEMM_BLOCK_SIZE_M=gate_gemm_block_size[0],
+        GEMM_BLOCK_SIZE_N=gate_gemm_block_size[1],
+        GEMM_BLOCK_SIZE_K=gate_gemm_block_size[2],
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+    
+    return output
 
 @torch.inference_mode()
 def fused_fp8_moe_stage_1(
