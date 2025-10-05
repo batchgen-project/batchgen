@@ -1488,50 +1488,62 @@ def fused_fp8_moe_stage_1_kernel_optimized(
     scale_n = pid_n * GEMM_BLOCK_SIZE_N // SCALE_BLOCK_SIZE_N
     num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
     
-    # Outer loop over K dimension
-    for k_tile in range(0, K, GEMM_BLOCK_SIZE_K):
+    # Iterate over K dimension in GEMM tiles
+    num_gemm_k_tiles = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+    
+    for gemm_k_idx in range(num_gemm_k_tiles):
+        k_tile = gemm_k_idx * GEMM_BLOCK_SIZE_K
+        
         # Determine which quantization blocks this K tile spans
         k_start_block = k_tile // SCALE_BLOCK_SIZE_K
-        k_end_block = tl.minimum((k_tile + GEMM_BLOCK_SIZE_K - 1) // SCALE_BLOCK_SIZE_K, num_scale_k - 1)
+        k_end_tile = tl.minimum(k_tile + GEMM_BLOCK_SIZE_K, K)
+        k_end_block = (k_end_tile - 1) // SCALE_BLOCK_SIZE_K
         
         # Process each quantization block within this K tile
-        for scale_k in range(k_start_block, k_end_block + 1):
-            quant_k_start = scale_k * SCALE_BLOCK_SIZE_K
-            quant_k_end = tl.minimum(quant_k_start + SCALE_BLOCK_SIZE_K, K)
+        num_quant_blocks = k_end_block - k_start_block + 1
+        
+        for quant_idx in range(16):  # Max reasonable number of quant blocks in one GEMM tile
+            # Only process valid quantization blocks
+            scale_k = k_start_block + quant_idx
             
-            # Only process the intersection with current K tile
-            actual_k_start = tl.maximum(quant_k_start, k_tile)
-            actual_k_end = tl.minimum(quant_k_end, k_tile + GEMM_BLOCK_SIZE_K)
-            
-            if actual_k_start >= actual_k_end:
-                continue
-            
-            k_size = actual_k_end - actual_k_start
-            offs_k = actual_k_start + tl.arange(0, SCALE_BLOCK_SIZE_K)
-            k_mask = offs_k < actual_k_end
-            
-            # Load scales once per quantization block
-            gate_scale = tl.load(gate_scale_base_ptr + scale_n * num_scale_k + scale_k)
-            up_scale = tl.load(up_scale_base_ptr + scale_n * num_scale_k + scale_k)
-            
-            lhs_scale_ptr_base = lhs_scale_ptr + abs_row_indices[:, None] * stride_lhs_scale_m + scale_k * stride_lhs_scale_k
-            lhs_scale_vals = tl.load(lhs_scale_ptr_base, mask=(abs_row_indices[:, None] < M) & (offs_m[:, None] < valid_rows), other=1.0)
-            
-            # Load activations and weights
-            lhs_ptrs = lhs_ptr + abs_row_indices[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k
-            gate_ptrs = gate_base_ptr + offs_n[:, None] * stride_gate_n + offs_k[None, :] * stride_gate_k
-            up_ptrs = up_base_ptr + offs_n[:, None] * stride_up_n + offs_k[None, :] * stride_up_k
-            
-            lhs_mask = (abs_row_indices[:, None] < M) & k_mask[None, :] & (offs_m[:, None] < valid_rows)
-            rhs_mask = (offs_n[:, None] < N) & k_mask[None, :]
-            
-            lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
-            gate_fp8 = tl.load(gate_ptrs, mask=rhs_mask, other=0.0)
-            up_fp8 = tl.load(up_ptrs, mask=rhs_mask, other=0.0)
-            
-            # Accumulate with dequantization
-            gate_acc += tl.dot(lhs, tl.trans(gate_fp8)) * lhs_scale_vals * gate_scale
-            up_acc += tl.dot(lhs, tl.trans(up_fp8)) * lhs_scale_vals * up_scale
+            # Check if this quant block is valid
+            if quant_idx < num_quant_blocks:
+                quant_k_start = scale_k * SCALE_BLOCK_SIZE_K
+                quant_k_end = tl.minimum(quant_k_start + SCALE_BLOCK_SIZE_K, K)
+                
+                # Only process the intersection with current K tile
+                actual_k_start = tl.maximum(quant_k_start, k_tile)
+                actual_k_end = tl.minimum(quant_k_end, k_end_tile)
+                
+                # Check if there's an intersection
+                has_intersection = actual_k_start < actual_k_end
+                
+                if has_intersection:
+                    offs_k = actual_k_start + tl.arange(0, SCALE_BLOCK_SIZE_K)
+                    k_mask = offs_k < actual_k_end
+                    
+                    # Load scales once per quantization block
+                    gate_scale = tl.load(gate_scale_base_ptr + scale_n * num_scale_k + scale_k)
+                    up_scale = tl.load(up_scale_base_ptr + scale_n * num_scale_k + scale_k)
+                    
+                    lhs_scale_ptr_base = lhs_scale_ptr + abs_row_indices[:, None] * stride_lhs_scale_m + scale_k * stride_lhs_scale_k
+                    lhs_scale_vals = tl.load(lhs_scale_ptr_base, mask=(abs_row_indices[:, None] < M) & (offs_m[:, None] < valid_rows), other=1.0)
+                    
+                    # Load activations and weights
+                    lhs_ptrs = lhs_ptr + abs_row_indices[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k
+                    gate_ptrs = gate_base_ptr + offs_n[:, None] * stride_gate_n + offs_k[None, :] * stride_gate_k
+                    up_ptrs = up_base_ptr + offs_n[:, None] * stride_up_n + offs_k[None, :] * stride_up_k
+                    
+                    lhs_mask = (abs_row_indices[:, None] < M) & k_mask[None, :] & (offs_m[:, None] < valid_rows)
+                    rhs_mask = (offs_n[:, None] < N) & k_mask[None, :]
+                    
+                    lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+                    gate_fp8 = tl.load(gate_ptrs, mask=rhs_mask, other=0.0)
+                    up_fp8 = tl.load(up_ptrs, mask=rhs_mask, other=0.0)
+                    
+                    # Accumulate with dequantization
+                    gate_acc += tl.dot(lhs, tl.trans(gate_fp8)) * lhs_scale_vals * gate_scale
+                    up_acc += tl.dot(lhs, tl.trans(up_fp8)) * lhs_scale_vals * up_scale
     
     # Apply SiLU activation and multiply
     output_acc = gate_acc / (1.0 + tl.exp(-gate_acc)) * up_acc
@@ -1616,6 +1628,7 @@ def fused_fp8_moe_stage_1_v2(
     )
     
     return output
+
 
 
 
