@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <vector>
+#include <cstdint>
 
 // Kernel to count tokens per expert using atomic operations
 __global__ void expert_bincount_kernel(
@@ -114,8 +115,8 @@ __global__ void compact_active_experts_multiblock_kernel(
 
 std::vector<torch::Tensor> expert_bincount_cuda(
     torch::Tensor eids,                         // [num_tokens] - expert IDs
-    int32_t routed_expert_start_idx,
-    int32_t experts_per_rank,
+    int64_t routed_expert_start_idx,
+    int64_t experts_per_rank,
     torch::Device device) {
     
     const auto num_tokens = eids.size(0);
@@ -124,6 +125,12 @@ std::vector<torch::Tensor> expert_bincount_cuda(
     TORCH_CHECK(eids.is_cuda(), "eids must be a CUDA tensor");
     TORCH_CHECK(eids.dtype() == torch::kInt32, "eids must be int32");
     TORCH_CHECK(eids.dim() == 1, "eids must be 1-dimensional");
+    TORCH_CHECK(experts_per_rank <= INT32_MAX, "experts_per_rank must fit in int32");
+    TORCH_CHECK(routed_expert_start_idx <= INT32_MAX && routed_expert_start_idx >= INT32_MIN, 
+                "routed_expert_start_idx must fit in int32");
+    TORCH_CHECK(experts_per_rank <= INT32_MAX, "experts_per_rank must fit in int32");
+    TORCH_CHECK(routed_expert_start_idx <= INT32_MAX && routed_expert_start_idx >= INT32_MIN, 
+                "routed_expert_start_idx must fit in int32");
     
     // Step 1: Count tokens per expert
     auto expert_counts = torch::zeros({experts_per_rank}, 
@@ -136,8 +143,8 @@ std::vector<torch::Tensor> expert_bincount_cuda(
         eids.data_ptr<int32_t>(),
         expert_counts.data_ptr<int32_t>(),
         num_tokens,
-        routed_expert_start_idx,
-        experts_per_rank
+        static_cast<int32_t>(routed_expert_start_idx),
+        static_cast<int32_t>(experts_per_rank)
     );
     
     // Step 2: Allocate output tensors (worst case: all experts active)
@@ -159,7 +166,7 @@ std::vector<torch::Tensor> expert_bincount_cuda(
             group_size.data_ptr<int32_t>(),
             group_start_indices.data_ptr<int32_t>(),
             num_active_experts.data_ptr<int32_t>(),
-            experts_per_rank
+            static_cast<int32_t>(experts_per_rank)
         );
     } else {
         // Use multi-block kernel for larger expert counts
@@ -177,7 +184,7 @@ std::vector<torch::Tensor> expert_bincount_cuda(
             num_active_experts.data_ptr<int32_t>(),
             temp_flags.data_ptr<int32_t>(),
             temp_positions.data_ptr<int32_t>(),
-            experts_per_rank
+            static_cast<int32_t>(experts_per_rank)
         );
     }
     
@@ -204,8 +211,8 @@ std::vector<torch::Tensor> expert_bincount_cuda(
 // Alternative API: Return count tensor, let caller handle slicing
 std::vector<torch::Tensor> expert_bincount_cuda_v2(
     torch::Tensor eids,
-    int32_t routed_expert_start_idx,
-    int32_t experts_per_rank,
+    int64_t routed_expert_start_idx,
+    int64_t experts_per_rank,
     torch::Device device) {
     
     const auto num_tokens = eids.size(0);
@@ -224,8 +231,8 @@ std::vector<torch::Tensor> expert_bincount_cuda_v2(
         eids.data_ptr<int32_t>(),
         expert_counts.data_ptr<int32_t>(),
         num_tokens,
-        routed_expert_start_idx,
-        experts_per_rank
+        static_cast<int32_t>(routed_expert_start_idx),
+        static_cast<int32_t>(experts_per_rank)
     );
     
     auto activated_group_idx = torch::empty({experts_per_rank}, 
@@ -244,7 +251,7 @@ std::vector<torch::Tensor> expert_bincount_cuda_v2(
             group_size.data_ptr<int32_t>(),
             group_start_indices.data_ptr<int32_t>(),
             num_active_experts.data_ptr<int32_t>(),
-            experts_per_rank
+            static_cast<int32_t>(experts_per_rank)
         );
     }
     
