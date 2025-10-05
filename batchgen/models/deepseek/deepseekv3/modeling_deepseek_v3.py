@@ -1093,8 +1093,7 @@ from ....moe.fused_grouped_dequant_gemm import (
 )
 from ....moe.fused_dequant_moe import (
 	fused_dequant_weighted_moe_stage_1, 
-	fused_fp8_moe_stage_1,
-	fused_fp8_moe_stage_1_v2,
+	fused_fp8_moe_stage_1
 )
 from ....attention.mla.fa3_backend import act_quant
 class DeepseekV3MoE_Decoding(nn.Module):
