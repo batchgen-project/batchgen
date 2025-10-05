@@ -116,10 +116,10 @@ __global__ void compact_active_experts_multiblock_kernel(
 std::vector<torch::Tensor> expert_bincount_cuda(
     torch::Tensor eids,                         // [num_tokens] - expert IDs
     int64_t routed_expert_start_idx,
-    int64_t experts_per_rank,
-    torch::Device device) {
+    int64_t experts_per_rank) {
     
     const auto num_tokens = eids.size(0);
+    auto device = eids.device();  // Infer device from input tensor
     
     // Validate inputs
     TORCH_CHECK(eids.is_cuda(), "eids must be a CUDA tensor");
@@ -212,10 +212,10 @@ std::vector<torch::Tensor> expert_bincount_cuda(
 std::vector<torch::Tensor> expert_bincount_cuda_v2(
     torch::Tensor eids,
     int64_t routed_expert_start_idx,
-    int64_t experts_per_rank,
-    torch::Device device) {
+    int64_t experts_per_rank) {
     
     const auto num_tokens = eids.size(0);
+    auto device = eids.device();  // Infer device from input tensor
     
     TORCH_CHECK(eids.is_cuda(), "eids must be a CUDA tensor");
     TORCH_CHECK(eids.dtype() == torch::kInt32, "eids must be int32");
