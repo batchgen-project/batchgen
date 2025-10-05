@@ -1369,115 +1369,119 @@ def fused_fp8_moe_stage_1_optimized_kernel(
 ):
     tile_idx = tl.program_id(axis=0)
     num_ctas = tl.num_programs(axis=0)
-    
+
     dtype = tl.float8e4nv
     acc_dtype = tl.float32
-    
+
     last_problem_end = 0
     num_n_tiles = tl.cdiv(N, GEMM_BLOCK_SIZE_N)
-    
+
+    # small debug safeguard; set to > num_tiles to be safe, remove later
+    DEBUG_MAX_ITERS = 1024
+
     for g in range(num_groups):
         gm = tl.load(group_sizes_ptr + g * stride_group_sizes)
         group_idx = tl.load(group_idx_ptr + g * stride_group_idx)
         start_idx = tl.load(group_start_indices_ptr + g * stride_group_start_indices)
-        
+
         num_m_tiles = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
         num_tiles = num_m_tiles * num_n_tiles
-        
-        # Load pointers for this expert group
-        gate_group_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(dtype))
-        up_group_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(dtype))
-        gate_scale_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
-        up_scale_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
-        
-        # FIXED: Correct condition (was tile_idx < last_problem_end - always false!)
+
+        # Load raw pointer value (assume gate_ptrs_ptr holds int64 addresses)
+        raw_gate_ptr_val = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs)
+        raw_up_ptr_val = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs)
+        # Cast to typed pointer
+        gate_group_ptr = tl.ptr_cast(raw_gate_ptr_val, tl.pointer_type(dtype))
+        up_group_ptr = tl.ptr_cast(raw_up_ptr_val, tl.pointer_type(dtype))
+
+        raw_gate_scale_val = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs)
+        raw_up_scale_val = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs)
+        gate_scale_ptr = tl.ptr_cast(raw_gate_scale_val, tl.pointer_type(tl.float32))
+        up_scale_ptr = tl.ptr_cast(raw_up_scale_val, tl.pointer_type(tl.float32))
+
         if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
             lhs_group_ptr = lhs_ptr + (start_idx * stride_lhs_m)
             lhs_scale_group_ptr = lhs_scale_ptr + (start_idx * stride_lhs_scale_m)
-            
-            # Persistent kernel loop
+
             local_tile_idx = tile_idx
-            while local_tile_idx >= last_problem_end and local_tile_idx < last_problem_end + num_tiles:
+            iter_count = 0
+            while local_tile_idx < last_problem_end + num_tiles:
+                # safe-guard
+                iter_count += 1
+                if iter_count > DEBUG_MAX_ITERS:
+                    break
+
                 tile_idx_in_gemm = local_tile_idx - last_problem_end
                 tile_m_idx = tile_idx_in_gemm // num_n_tiles
                 tile_n_idx = tile_idx_in_gemm % num_n_tiles
-                
+
                 offs_am = tile_m_idx * GEMM_BLOCK_SIZE_M
                 offs_bn = tile_n_idx * GEMM_BLOCK_SIZE_N
-                
-                # Range arrays for indexing
+
                 rm = tl.arange(0, GEMM_BLOCK_SIZE_M)
                 rn = tl.arange(0, GEMM_BLOCK_SIZE_N)
                 rk = tl.arange(0, GEMM_BLOCK_SIZE_K)
-                
+
                 gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
                 up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=acc_dtype)
-                
-                # K-dimension loop - accumulate FP8 dot products, then scale
+
                 for k_tile in range(0, tl.cdiv(K, GEMM_BLOCK_SIZE_K)):
                     offs_k = k_tile * GEMM_BLOCK_SIZE_K
-                    
-                    # Load FP8 activations [BLOCK_M, BLOCK_K]
+
+                    # Build addresses
                     lhs_ptrs = lhs_group_ptr + (offs_am + rm)[:, None] * stride_lhs_m + (offs_k + rk)[None, :] * stride_lhs_k
                     lhs_mask = ((offs_am + rm)[:, None] < gm) & ((offs_k + rk)[None, :] < K)
-                    lhs_fp8 = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0).to(dtype)
-                    
-                    # Load FP8 gate weights [BLOCK_N, BLOCK_K]
+                    # load as FP8 (explicit dtype) if supported
+                    lhs_fp8 = tl.load(lhs_ptrs, mask=lhs_mask, other=0, dtype=dtype)
+                    lhs_f32 = tl.cast(lhs_fp8, acc_dtype)
+
                     gate_ptrs = gate_group_ptr + (offs_bn + rn)[:, None] * stride_gate_n + (offs_k + rk)[None, :] * stride_gate_k
                     gate_mask = ((offs_bn + rn)[:, None] < N) & ((offs_k + rk)[None, :] < K)
-                    gate_fp8 = tl.load(gate_ptrs, mask=gate_mask, other=0.0).to(dtype)
-                    
-                    # Load FP8 up weights [BLOCK_N, BLOCK_K]
+                    gate_fp8 = tl.load(gate_ptrs, mask=gate_mask, other=0, dtype=dtype)
+                    gate_f32 = tl.cast(gate_fp8, acc_dtype)
+
                     up_ptrs = up_group_ptr + (offs_bn + rn)[:, None] * stride_up_n + (offs_k + rk)[None, :] * stride_up_k
                     up_mask = ((offs_bn + rn)[:, None] < N) & ((offs_k + rk)[None, :] < K)
-                    up_fp8 = tl.load(up_ptrs, mask=up_mask, other=0.0).to(dtype)
-                    
-                    # FP8 dot products -> FP32 accumulator (unscaled)
-                    gate_k_acc = tl.dot(lhs_fp8, tl.trans(gate_fp8), out_dtype=acc_dtype)
-                    up_k_acc = tl.dot(lhs_fp8, tl.trans(up_fp8), out_dtype=acc_dtype)
-                    
-                    # Load activation scales for this K-block
-                    # Scale shape: [M, K/128], one scale per row per 128 elements in K
-                    # Need scales for rows [offs_am:offs_am+BLOCK_M] at K-block offs_k//128
+                    up_fp8 = tl.load(up_ptrs, mask=up_mask, other=0, dtype=dtype)
+                    up_f32 = tl.cast(up_fp8, acc_dtype)
+
+                    gate_k_acc = tl.dot(lhs_f32, tl.trans(gate_f32), out_dtype=acc_dtype)
+                    up_k_acc = tl.dot(lhs_f32, tl.trans(up_f32), out_dtype=acc_dtype)
+
+                    # activation scales
                     act_scale_k_idx = offs_k // ACT_SCALE_BLOCK
                     act_scale_ptrs = lhs_scale_group_ptr + (offs_am + rm) * stride_lhs_scale_m + act_scale_k_idx * stride_lhs_scale_k
                     act_scale_mask = (offs_am + rm) < gm
-                    act_scales = tl.load(act_scale_ptrs, mask=act_scale_mask, other=1.0)  # [BLOCK_M]
-                    
-                    # Load gate weight scales for this K-block
-                    # Scale shape: [N/128, K/128], one scale per [128, 128] block
-                    # Need scales for N positions [offs_bn:offs_bn+BLOCK_N] at K-block offs_k//128
-                    gate_scale_n_idx = (offs_bn + rn) // WEIGHT_SCALE_BLOCK_N  # [BLOCK_N]
+                    act_scales = tl.load(act_scale_ptrs, mask=act_scale_mask, other=1.0)
+
+                    # weight scales (vector for N)
+                    gate_scale_n_idx = (offs_bn + rn) // WEIGHT_SCALE_BLOCK_N
                     gate_scale_k_idx = offs_k // WEIGHT_SCALE_BLOCK_K
                     gate_scale_ptrs = gate_scale_ptr + gate_scale_n_idx * stride_gate_scale_n + gate_scale_k_idx * stride_gate_scale_k
                     gate_scale_mask = (offs_bn + rn) < N
-                    gate_scales = tl.load(gate_scale_ptrs, mask=gate_scale_mask, other=1.0)  # [BLOCK_N]
-                    
-                    # Load up weight scales
+                    gate_scales = tl.load(gate_scale_ptrs, mask=gate_scale_mask, other=1.0)
+
                     up_scale_ptrs = up_scale_ptr + gate_scale_n_idx * stride_up_scale_n + gate_scale_k_idx * stride_up_scale_k
-                    up_scales = tl.load(up_scale_ptrs, mask=gate_scale_mask, other=1.0)  # [BLOCK_N]
-                    
-                    # Apply scales to this K-block's contribution
-                    # Result[m,n] *= act_scale[m] * weight_scale[n]
+                    up_scales = tl.load(up_scale_ptrs, mask=gate_scale_mask, other=1.0)
+
                     gate_acc += gate_k_acc * act_scales[:, None] * gate_scales[None, :]
                     up_acc += up_k_acc * act_scales[:, None] * up_scales[None, :]
-                
-                # Apply SiLU activation: gate * sigmoid(gate) * up
-                # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+
+                # SiLU and store
                 sigmoid_gate = 1.0 / (1.0 + tl.exp(-gate_acc))
                 output_acc = gate_acc * sigmoid_gate * up_acc
-                
-                # Convert to bf16 and store
-                output_bf16 = output_acc.to(tl.bfloat16)
-                
+                output_bf16 = tl.cast(output_acc, tl.bfloat16)
+
                 offs_output_m = start_idx + offs_am + rm
                 offs_output_n = offs_bn + rn
-                output_ptrs = output_ptr + offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n
-                output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & (rm[:, None] < tl.minimum(GEMM_BLOCK_SIZE_M, gm - offs_am))
-                tl.store(output_ptrs, output_bf16, mask=output_mask)
-                
-                local_tile_idx += num_ctas
-        
+
+                out_ptrs = output_ptr + offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n
+                out_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & ((offs_am + rm)[:, None] < (start_idx + gm))
+                tl.store(out_ptrs, output_bf16, mask=out_mask)
+
+                # advance to next tile assigned to this CTA
+                local_tile_idx = local_tile_idx + num_ctas
+
         last_problem_end += num_tiles
 
 
