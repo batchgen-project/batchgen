@@ -230,7 +230,7 @@ set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
-# Python - Find it but don't use Python_add_library
+# Python
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
 # CXX
@@ -372,28 +372,25 @@ set(SOURCES
     "csrc/elementwise/rmsnorm.cu"
 )
 
-# DON'T use Python_add_library - create a regular MODULE library instead
+# Create MODULE library
 add_library(common_ops MODULE ${SOURCES})
 
-# Set Python module properties manually
+# Set Python module properties
 set_target_properties(common_ops PROPERTIES
-    PREFIX ""  # No 'lib' prefix
-    SUFFIX ".${Python_SOABI}.so"  # Use Python SOABI suffix
+    PREFIX ""
+    SUFFIX ".${Python_SOABI}.so"
 )
 
-# Add includes in CORRECT order - Python FIRST as regular includes (NOT SYSTEM)
+# Include directories
 target_include_directories(common_ops PRIVATE
     ${Python_INCLUDE_DIRS}
 )
 
-# Now add Torch includes - but extract them WITHOUT the INTERFACE_SYSTEM property
-# Get torch include dirs from the imported target
 get_target_property(TORCH_INCLUDE_DIRS_RAW torch INTERFACE_INCLUDE_DIRECTORIES)
 target_include_directories(common_ops PRIVATE
     ${TORCH_INCLUDE_DIRS_RAW}
 )
 
-# Add project includes
 target_include_directories(common_ops PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/csrc
@@ -421,17 +418,22 @@ else()
     target_compile_definitions(common_ops PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
 endif()
 
-# Get torch libraries without their interface includes
-get_target_property(TORCH_LIBS_RAW torch INTERFACE_LINK_LIBRARIES)
+# Find torch_python library explicitly
+find_library(TORCH_PYTHON_LIBRARY 
+    NAMES torch_python 
+    PATHS "${TORCH_INSTALL_PREFIX}/lib"
+    REQUIRED
+)
+message(STATUS "Found torch_python: ${TORCH_PYTHON_LIBRARY}")
 
-# Link libraries - link to torch's libraries but not the torch target itself
+# Link libraries - CRITICAL FIX: Include torch_python for Python binding symbols
 target_link_libraries(common_ops PRIVATE
-    ${TORCH_LIBS_RAW}
-    c10
+    torch              # Main PyTorch library
+    ${TORCH_PYTHON_LIBRARY}  # PyTorch Python bindings (provides THPDeviceType)
+    c10                # Core tensor library
     CUDA::cuda_driver
     CUDA::cublas
     CUDA::cublasLt
-    ${Python_LIBRARIES}
 )
 
 # Install
