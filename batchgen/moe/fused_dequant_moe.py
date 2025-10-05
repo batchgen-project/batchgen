@@ -2301,3 +2301,238 @@ def moe_stage1_v3(
         )
     
     return output
+
+
+
+def compute_group_tile_mapping(group_sizes: torch.Tensor, block_size_m: int = 64):
+    """Pre-compute mapping from tile ID to group."""
+    num_groups = len(group_sizes)
+    tiles_per_group = torch.zeros(num_groups, dtype=torch.int32, device=group_sizes.device)
+    
+    for i in range(num_groups):
+        tiles_per_group[i] = (group_sizes[i] + block_size_m - 1) // block_size_m
+    
+    total_tiles = tiles_per_group.sum().item()
+    
+    tile_to_group = torch.zeros(total_tiles, dtype=torch.int32, device=group_sizes.device)
+    tile_to_local = torch.zeros(total_tiles, dtype=torch.int32, device=group_sizes.device)
+    
+    tile_idx = 0
+    for group_id in range(num_groups):
+        num_tiles = tiles_per_group[group_id].item()
+        for local_tile in range(num_tiles):
+            tile_to_group[tile_idx] = group_id
+            tile_to_local[tile_idx] = local_tile
+            tile_idx += 1
+    
+    return tile_to_group, tile_to_local, tiles_per_group
+
+
+@triton.jit
+def moe_stage1_v3_simple_kernel(
+    # Input
+    lhs_ptr, lhs_scale_ptr,
+    # Weights
+    gate_ptrs_ptr, up_ptrs_ptr,
+    gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+    # Group metadata
+    group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+    # Pre-computed tile mapping
+    tile_to_group_ptr, tile_to_local_ptr,
+    # Output
+    output_ptr,
+    # Dimensions
+    M, N: tl.constexpr, K: tl.constexpr,
+    # Strides
+    stride_lhs_m, stride_lhs_k,
+    stride_lhs_scale_m, stride_lhs_scale_k,
+    stride_gate_n, stride_gate_k,
+    stride_up_n, stride_up_k,
+    stride_output_m, stride_output_n,
+    stride_group_idx, stride_group_sizes, stride_group_start_indices,
+    stride_weight_ptrs, stride_scale_ptrs,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_K: tl.constexpr,
+    SCALE_N: tl.constexpr,
+):
+    """
+    Simple V3 kernel with pre-computed mapping.
+    No break, no continue, no persistent CTA.
+    Just works!
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    # Data types
+    acc_dtype = tl.float32
+    out_dtype = tl.bfloat16
+    weight_dtype = tl.float8e4nv  # Correct Triton FP8 type
+    
+    # ===== O(1) GROUP LOOKUP =====
+    group_id = tl.load(tile_to_group_ptr + pid_m)
+    local_tile_idx = tl.load(tile_to_local_ptr + pid_m)
+    
+    # Load group metadata
+    expert_idx = tl.load(group_idx_ptr + group_id * stride_group_idx)
+    group_size = tl.load(group_sizes_ptr + group_id * stride_group_sizes)
+    group_start = tl.load(group_start_indices_ptr + group_id * stride_group_start_indices)
+    
+    # N dimension
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    
+    # M dimension
+    tile_m_start = group_start + local_tile_idx * BLOCK_M
+    offs_m = tl.arange(0, BLOCK_M)
+    abs_m = tile_m_start + offs_m
+    
+    rows_in_tile = tl.minimum(BLOCK_M, group_start + group_size - tile_m_start)
+    mask_m = (offs_m < rows_in_tile) & (abs_m < M)
+    
+    # Load expert pointers
+    gate_ptr = tl.load(gate_ptrs_ptr + expert_idx * stride_weight_ptrs).to(tl.pointer_type(weight_dtype))
+    up_ptr = tl.load(up_ptrs_ptr + expert_idx * stride_weight_ptrs).to(tl.pointer_type(weight_dtype))
+    gate_scale_ptr = tl.load(gate_scale_ptrs_ptr + expert_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+    up_scale_ptr = tl.load(up_scale_ptrs_ptr + expert_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+    
+    # Initialize accumulators
+    gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
+    up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
+    
+    # Scale indices
+    num_scale_k = tl.cdiv(K, SCALE_K)
+    scale_n_idx = pid_n * BLOCK_N // SCALE_N
+    
+    # ===== SINGLE K-LOOP =====
+    for k_tile in range(0, tl.cdiv(K, BLOCK_K)):
+        k_start = k_tile * BLOCK_K
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        
+        # Load scales
+        scale_k_idx = k_start // SCALE_K
+        
+        gate_scale = tl.load(gate_scale_ptr + scale_n_idx * num_scale_k + scale_k_idx)
+        up_scale = tl.load(up_scale_ptr + scale_n_idx * num_scale_k + scale_k_idx)
+        
+        lhs_scale_ptrs = lhs_scale_ptr + abs_m * stride_lhs_scale_m + scale_k_idx * stride_lhs_scale_k
+        lhs_scale = tl.load(lhs_scale_ptrs, mask=mask_m, other=1.0)
+        
+        # Load FP8 data
+        lhs_ptrs = lhs_ptr + (abs_m[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k)
+        lhs_mask = mask_m[:, None] & mask_k[None, :]
+        lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+        
+        gate_ptrs = gate_ptr + (offs_n[:, None] * stride_gate_n + offs_k[None, :] * stride_gate_k)
+        gate_mask = mask_n[:, None] & mask_k[None, :]
+        gate_fp8 = tl.load(gate_ptrs, mask=gate_mask, other=0.0)
+        
+        up_ptrs = up_ptr + (offs_n[:, None] * stride_up_n + offs_k[None, :] * stride_up_k)
+        up_mask = mask_n[:, None] & mask_k[None, :]
+        up_fp8 = tl.load(up_ptrs, mask=up_mask, other=0.0)
+        
+        # Compute
+        gate_partial = tl.dot(lhs, tl.trans(gate_fp8), out_dtype=acc_dtype)
+        gate_acc += gate_partial * (lhs_scale[:, None] * gate_scale)
+        
+        up_partial = tl.dot(lhs, tl.trans(up_fp8), out_dtype=acc_dtype)
+        up_acc += up_partial * (lhs_scale[:, None] * up_scale)
+    
+    # Fused SiLU activation
+    gate_silu = gate_acc / (1.0 + tl.exp(-gate_acc))
+    result = gate_silu * up_acc
+    output = result.to(out_dtype)
+    
+    # Store output
+    offs_out_m = tile_m_start + tl.arange(0, BLOCK_M)
+    offs_out_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + (offs_out_m[:, None] * stride_output_m + offs_out_n[None, :] * stride_output_n)
+    out_mask = (offs_out_m[:, None] < M) & (offs_out_n[None, :] < N) & mask_m[:, None]
+    
+    tl.store(out_ptrs, output, mask=out_mask)
+
+
+@torch.inference_mode()
+def moe_stage1_v3_simple(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gate_list: list[torch.Tensor],
+    gate_ptrs_ptr: torch.Tensor,
+    up_list: list[torch.Tensor],
+    up_ptrs_ptr: torch.Tensor,
+    gate_scale_list: list[torch.Tensor],
+    gate_scale_ptrs_ptr: torch.Tensor,
+    up_scale_list: list[torch.Tensor],
+    up_scale_ptrs_ptr: torch.Tensor,
+    group_sizes: torch.Tensor,
+    activated_group_idx: torch.Tensor,
+    group_start_indices: torch.Tensor,
+    num_active_experts: torch.Tensor,
+):
+    """
+    Simple V3 that just works.
+    
+    Key fixes:
+    - Pre-computed tile mapping (no break statement)
+    - No persistent CTA complexity
+    - Should work immediately
+    """
+    device = hidden_states.device
+    M = hidden_states.shape[0]
+    N = gate_list[0].shape[0]
+    K = hidden_states.shape[1]
+    
+    # Select block sizes based on problem dimensions
+    if N >= 8192:
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 128
+        num_warps, num_stages = 8, 4
+    elif N >= 2048:
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 128
+        num_warps, num_stages = 4, 5
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 128
+        num_warps, num_stages = 4, 4
+    
+    # Pre-compute tile mapping (this is the key fix!)
+    tile_to_group, tile_to_local, tiles_per_group = compute_group_tile_mapping(
+        group_sizes, BLOCK_M
+    )
+    total_m_tiles = len(tile_to_group)
+    
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    
+    # Simple 2D grid
+    grid = (total_m_tiles, triton.cdiv(N, BLOCK_N))
+    
+    # Launch kernel
+    moe_stage1_v3_simple_kernel[grid](
+        hidden_states, hidden_states_scale,
+        gate_ptrs_ptr, up_ptrs_ptr,
+        gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+        activated_group_idx, group_sizes, group_start_indices,
+        tile_to_group, tile_to_local,
+        output,
+        M, N, K,
+        hidden_states.stride(0), hidden_states.stride(1),
+        hidden_states_scale.stride(0), hidden_states_scale.stride(1),
+        gate_list[0].stride(0), gate_list[0].stride(1),
+        up_list[0].stride(0), up_list[0].stride(1),
+        output.stride(0), output.stride(1),
+        activated_group_idx.stride(0),
+        group_sizes.stride(0),
+        group_start_indices.stride(0),
+        gate_ptrs_ptr.stride(0),
+        gate_scale_ptrs_ptr.stride(0),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        SCALE_K=128,
+        SCALE_N=128,
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+    
+    return output

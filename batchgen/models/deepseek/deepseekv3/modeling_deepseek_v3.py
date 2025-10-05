@@ -1094,6 +1094,7 @@ from ....moe.fused_grouped_dequant_gemm import (
 from ....moe.fused_dequant_moe import (
 	fused_dequant_weighted_moe_stage_1, 
 	moe_stage1_v3,
+	moe_stage1_v3_simple,
 	fused_fp8_moe_stage_1_v2,
 	fused_fp8_moe_stage_1,
 	fused_fp8_moe_stage_1_optimized
@@ -1759,7 +1760,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# Quantize the recv_x tensor to fp8_e4m3
 		x, x_scale = act_quant(x)
-		intermediate = moe_stage1_v3(
+		intermediate = moe_stage1_v3_simple(
 			x, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
