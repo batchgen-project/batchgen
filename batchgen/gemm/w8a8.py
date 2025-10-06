@@ -768,6 +768,7 @@ import math
 """ 
     V2 
 """
+import time
 @triton.jit
 def w8a8_gemm_kernel_optimized(
     # Pointers to matrices
@@ -1068,7 +1069,7 @@ def test_w8a8_gemm():
     ) * 0.1
     
     # Run kernel
-    c = w8a8_gemm_optimized(a, a_scale, w, w_scale, a_block_size, w_block_size_k, w_block_size_n)
+    c = w8a8_gemm(a, a_scale, w, w_scale, a_block_size, w_block_size_k, w_block_size_n)
     
     print(f"Output shape: {c.shape}")
     print(f"Output dtype: {c.dtype}")
@@ -1112,13 +1113,13 @@ def benchmark_w8a8_gemm(M, N, K, warmup=10, iters=100):
     
     # Warmup optimized
     for _ in range(warmup):
-        _ = w8a8_gemm_optimized(a_fp8, a_scale, w_fp8, w_scale)
+        _ = w8a8_gemm(a_fp8, a_scale, w_fp8, w_scale)
     torch.cuda.synchronize()
     
     # Benchmark optimized kernel
     start = time.perf_counter()
     for _ in range(iters):
-        c_optimized = w8a8_gemm_optimized(a_fp8, a_scale, w_fp8, w_scale)
+        c_optimized = w8a8_gemm(a_fp8, a_scale, w_fp8, w_scale)
     torch.cuda.synchronize()
     time_optimized = (time.perf_counter() - start) / iters
     
@@ -1233,7 +1234,7 @@ def profile_kernel_details():
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     
-    from your_module import act_quant, w8a8_gemm_optimized
+    # from your_module import act_quant, w8a8_gemm_optimized
     
     a_fp8, a_scale = act_quant(a, block_size=128)
     w_fp8, w_scale = act_quant(w.view(1, -1), block_size=128)
@@ -1241,7 +1242,7 @@ def profile_kernel_details():
     
     # Single run for profiling
     torch.cuda.cudart().cudaProfilerStart()
-    c = w8a8_gemm_optimized(a_fp8, a_scale, w_fp8, w_scale)
+    c = w8a8_gemm(a_fp8, a_scale, w_fp8, w_scale)
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
     

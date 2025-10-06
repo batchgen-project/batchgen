@@ -400,7 +400,8 @@ def mla_decoding_flashmla_(
 	)
 
 
-from batchgen.gemm.w8a8 import w8a8_gemm
+# from batchgen.gemm.w8a8 import w8a8_gemm
+from batchgen.test.w8a8_triton.w8a8_gemm_no_persistent_cta import w8a8_gemm_dispatch as w8a8_gemm
 from batchgen.attention.mla.fa3_backend import act_quant
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_(
