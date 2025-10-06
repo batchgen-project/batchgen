@@ -539,7 +539,7 @@ def fused_fp8_moe_stage_1(
     activated_group_idx: torch.Tensor,
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
-    gate_gemm_block_size=[64, 16, 256],  # Using 256 for unrolling
+    gate_gemm_block_size=[64, 16, 128],  # Using 256 for unrolling
     scale_block_size=[128, 128],
     num_stages=3,  # More stages for pipelining
     num_warps=4
