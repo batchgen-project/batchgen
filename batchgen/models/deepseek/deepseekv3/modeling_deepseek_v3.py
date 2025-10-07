@@ -1095,8 +1095,8 @@ from ....moe.fused_dequant_moe import (
 	fused_dequant_weighted_moe_stage_1, 
 	fused_fp8_moe_stage_1
 )
-from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized
-from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized
+from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_no_activation
+from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized, 
 from ....attention.mla.fa3_backend import act_quant
 class DeepseekV3MoE_Decoding(nn.Module):
 	def __init__(self, config):
@@ -1758,7 +1758,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# Quantize the recv_x tensor to fp8_e4m3
 		x, x_scale = act_quant(x)
-		intermediate = fused_fp8_moe_stage_1_optimized(
+		# intermediate = fused_fp8_moe_stage_1_optimized(
+		# 	x, x_scale, 
+		# 	self.gate_list, self.gate_ptrs_ptr,
+		# 	self.up_list, self.up_ptrs_ptr,
+		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
+		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
+		# )	
+		
+		gate_acc, up_acc = fused_fp8_moe_stage_1_no_activation(
 			x, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
@@ -1766,7 +1775,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.up_scale_list, self.up_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)	
-		
+		gate_activated = torch.nn.functional.silu(gate_acc)
+		intermediate = gate_activated * up_acc
+		intermediate = intermediate.to(torch.bfloat16)
 		intermediate, intermediate_scale = act_quant(intermediate)
 		res = fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
 			intermediate, intermediate_scale, 
