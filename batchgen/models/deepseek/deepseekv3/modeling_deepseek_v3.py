@@ -1768,7 +1768,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)	
 		
 		intermediate, intermediate_scale = act_quant(intermediate)
-		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
