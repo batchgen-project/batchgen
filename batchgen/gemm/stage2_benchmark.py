@@ -337,11 +337,11 @@ def run_stage2_benchmark(
     # Typical down projection: hidden_dim (14336) → model_dim (4096)
     test_configs = [
         {
-            'M': 16,
-            'N': 1536,
-            'K': 7168,
+            'M': 368,
+            'N': 7168,
+            'K': 1536,
             'num_experts': 32,
-            'group_sizes': [8] * 8,
+            'group_sizes': [23] * 32,
         },
         {
             'M': 128,
