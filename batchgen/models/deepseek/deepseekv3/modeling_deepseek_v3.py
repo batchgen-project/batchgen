@@ -1387,6 +1387,109 @@ def scatter_weight_reduce_optimized(
     
     return output
 
+
+@triton.jit
+def activation_gating_kernel(
+    gate_acc_ptr,
+    up_acc_ptr,
+    output_ptr,
+    M, N: tl.constexpr,
+    stride_gate_m, stride_gate_n,
+    stride_up_m, stride_up_n,
+    stride_output_m, stride_output_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """
+    Fused kernel for SiLU activation and gating, output in bfloat16.
+    
+    Operations:
+    1. gate_activated = silu(gate_acc) where silu(x) = x / (1 + exp(-x))
+    2. intermediate = gate_activated * up_acc
+    3. Convert to bfloat16
+    """
+    # Program IDs
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    # Offsets
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    # Masks
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask = mask_m[:, None] & mask_n[None, :]
+    
+    # Load gate_acc and up_acc (float32)
+    gate_ptrs = gate_acc_ptr + (offs_m[:, None] * stride_gate_m + offs_n[None, :] * stride_gate_n)
+    up_ptrs = up_acc_ptr + (offs_m[:, None] * stride_up_m + offs_n[None, :] * stride_up_n)
+    
+    gate_acc = tl.load(gate_ptrs, mask=mask, other=0.0)
+    up_acc = tl.load(up_ptrs, mask=mask, other=0.0)
+    
+    # SiLU activation: silu(x) = x / (1 + exp(-x))
+    gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
+    
+    # Gating: element-wise multiplication
+    intermediate = gate_activated * up_acc
+    
+    # Convert to bfloat16
+    output_bf16 = intermediate.to(tl.bfloat16)
+    
+    # Store output
+    output_ptrs = output_ptr + (offs_m[:, None] * stride_output_m + offs_n[None, :] * stride_output_n)
+    tl.store(output_ptrs, output_bf16, mask=mask)
+
+
+@torch.inference_mode()
+def activation_gating(
+    gate_acc: torch.Tensor,
+    up_acc: torch.Tensor,
+    block_size_m: int = 64,
+    block_size_n: int = 64,
+    num_warps: int = 4,
+):
+    """
+    Apply SiLU activation and gating, returning bfloat16 output.
+    
+    Equivalent to:
+        gate_activated = torch.nn.functional.silu(gate_acc)
+        intermediate = gate_activated * up_acc
+        intermediate = intermediate.to(torch.bfloat16)
+    
+    Args:
+        gate_acc: (M, N) float32 tensor - gate projection accumulator
+        up_acc: (M, N) float32 tensor - up projection accumulator
+        block_size_m: Block size for M dimension
+        block_size_n: Block size for N dimension
+        num_warps: Number of warps for kernel execution
+    
+    Returns:
+        intermediate: (M, N) bfloat16 tensor - activated and gated result
+    """
+    M, N = gate_acc.shape
+    assert up_acc.shape == (M, N), "gate_acc and up_acc must have same shape"
+    assert gate_acc.dtype == torch.float32, "gate_acc must be float32"
+    assert up_acc.dtype == torch.float32, "up_acc must be float32"
+    
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=gate_acc.device)
+    
+    grid = (triton.cdiv(M, block_size_m), triton.cdiv(N, block_size_n))
+    
+    activation_gating_kernel[grid](
+        gate_acc, up_acc, output,
+        M, N,
+        gate_acc.stride(0), gate_acc.stride(1),
+        up_acc.stride(0), up_acc.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        num_warps=num_warps,
+    )
+    
+    return output
+
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1775,9 +1878,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.up_scale_list, self.up_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)	
-		gate_activated = torch.nn.functional.silu(gate_acc)
-		intermediate = gate_activated * up_acc
-		intermediate = intermediate.to(torch.bfloat16)
+		# gate_activated = torch.nn.functional.silu(gate_acc)
+		# intermediate = gate_activated * up_acc
+		# intermediate = intermediate.to(torch.bfloat16)
+		intermediate = activation_gating(gate_acc, up_acc)
 		intermediate, intermediate_scale = act_quant(intermediate)
 		res = fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
 			intermediate, intermediate_scale, 
