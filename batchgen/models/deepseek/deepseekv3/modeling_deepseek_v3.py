@@ -1861,16 +1861,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# Quantize the recv_x tensor to fp8_e4m3
 		x, x_scale = act_quant(x)
-		# intermediate = fused_fp8_moe_stage_1_optimized(
-		# 	x, x_scale, 
-		# 	self.gate_list, self.gate_ptrs_ptr,
-		# 	self.up_list, self.up_ptrs_ptr,
-		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
-		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
-		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
-		# )	
-		
-		gate_acc, up_acc = fused_fp8_moe_stage_1_no_activation(
+		intermediate = fused_fp8_moe_stage_1_optimized(
 			x, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
@@ -1878,10 +1869,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.up_scale_list, self.up_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)	
-		# gate_activated = torch.nn.functional.silu(gate_acc)
-		# intermediate = gate_activated * up_acc
-		# intermediate = intermediate.to(torch.bfloat16)
-		intermediate = activation_gating(gate_acc, up_acc)
+		
+		# gate_acc, up_acc = fused_fp8_moe_stage_1_no_activation(
+		# 	x, x_scale, 
+		# 	self.gate_list, self.gate_ptrs_ptr,
+		# 	self.up_list, self.up_ptrs_ptr,
+		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
+		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
+		# )	
+		# intermediate = activation_gating(gate_acc, up_acc)
 		intermediate, intermediate_scale = act_quant(intermediate)
 		res = fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
 			intermediate, intermediate_scale, 
