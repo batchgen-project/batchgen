@@ -1096,7 +1096,7 @@ from ....moe.fused_dequant_moe import (
 	fused_fp8_moe_stage_1
 )
 from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_no_activation
-from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized, 
+from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized
 from ....attention.mla.fa3_backend import act_quant
 class DeepseekV3MoE_Decoding(nn.Module):
 	def __init__(self, config):
