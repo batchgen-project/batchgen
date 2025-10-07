@@ -49,6 +49,8 @@ python "<dir-to-two_nodes_H20_benchmark.py>" \
 	--node_rank 1
 ```
 
+# Our example is based on Longbench. If you would like to switch dataset please modify the example code.
+```
 ## Clean-up(Optional)
 If the program terminated or killed without proper clean-up, you may need to manually clean the occupied pages before next start BatchGen server.
 ```bash
