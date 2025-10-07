@@ -1096,7 +1096,7 @@ from ....moe.fused_dequant_moe import (
 	fused_fp8_moe_stage_1
 )
 from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_no_activation
-from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized
+from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized, fused_dequant_grouped_gemm_fp8_fp8_fp32_triton
 from ....attention.mla.fa3_backend import act_quant
 class DeepseekV3MoE_Decoding(nn.Module):
 	def __init__(self, config):
@@ -1803,7 +1803,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		res = self.grouped_dequant_moe_fp8_v2(input_x, input_eids)
 		# res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
 		# global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		#  									 device=self.device, dtype=torch.bfloat16)
@@ -1880,7 +1880,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# )	
 		# intermediate = activation_gating(gate_acc, up_acc)
 		intermediate, intermediate_scale = act_quant(intermediate)
-		res = fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
@@ -1888,39 +1888,42 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		return res
 
-
-		# x, x_scale = act_quant(x)
-		# gate_acc = grouped_fp8_gemm(
-		# 	x, x_scale, 
-		# 	self.gate_list, self.gate_ptrs_ptr,
-		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
-		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
+	def grouped_dequant_moe_fp8_v2(self, x, eids):
+		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
+		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		# )
-		# up_acc = grouped_fp8_gemm(
-		# 	x, x_scale, 
-		# 	self.up_list, self.up_ptrs_ptr,
-		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
-		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
-		# )
-		# intermediate = activation_gating(gate_acc, up_acc)
+		if(len(eids) == 0):
+			# logger.warning_once("No tokens routed to this rank.")
+			assert len(x) == 0, "If no tokens routed, x should be empty too."
+			return x
 
+		group_size, activated_group_idx, group_start_indices, num_active_experts = expert_bincount(
+			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+		)
+
+		x, x_scale = act_quant(x)
+		gate_acc = fused_dequant_grouped_gemm_fp8_fp8_fp32_triton(
+			x, x_scale, 
+			self.gate_list, self.gate_ptrs_ptr,
+			self.gate_scale_list, self.gate_scale_ptrs_ptr,
+			group_size, activated_group_idx, group_start_indices, num_active_experts
+		)
+		up_acc = fused_dequant_grouped_gemm_fp8_fp8_fp32_triton(
+			x, x_scale, 
+			self.up_list, self.up_ptrs_ptr,
+			self.up_scale_list, self.up_scale_ptrs_ptr,
+			group_size, activated_group_idx, group_start_indices, num_active_experts
+		)
+		intermediate = activation_gating(gate_acc, up_acc)
+		intermediate, intermediate_scale = act_quant(intermediate)
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+			intermediate, intermediate_scale, 
+			self.down_list, self.down_ptrs_ptr,
+			self.down_scale_list, self.down_scale_ptrs_ptr,
+			group_size, activated_group_idx, group_start_indices, num_active_experts
+		)
+		return res
 		
-		# # gate_acc, up_acc = fused_fp8_moe_stage_1_no_activation(
-		# # 	x, x_scale, 
-		# # 	self.gate_list, self.gate_ptrs_ptr,
-		# # 	self.up_list, self.up_ptrs_ptr,
-		# # 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
-		# # 	self.up_scale_list, self.up_scale_ptrs_ptr,
-		# # 	group_size, activated_group_idx, group_start_indices, num_active_experts
-		# # )	
-		# # intermediate = activation_gating(gate_acc, up_acc)
-		# intermediate, intermediate_scale = act_quant(intermediate)
-		# res = fused_dequant_grouped_gemm_fp8_fp8_triton(
-		# 	intermediate, intermediate_scale, 
-		# 	self.down_list, self.down_ptrs_ptr,
-		# 	self.down_scale_list, self.down_scale_ptrs_ptr,
-		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
-		# )
 
 	def grouped_weight_dequant_moe_a16w8(self, x, eids):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
