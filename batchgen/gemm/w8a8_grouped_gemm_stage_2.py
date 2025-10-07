@@ -455,7 +455,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_fp32_kernel(
         output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & (tl.arange(0, GEMM_BLOCK_SIZE_M)[:, None] < valid_rows_this_block)
         
         # output = acc.to(tl.bfloat16)
-        tl.store(output_ptrs, output, mask=output_mask)
+        tl.store(output_ptrs, acc, mask=output_mask)
 
 
 @torch.inference_mode()
