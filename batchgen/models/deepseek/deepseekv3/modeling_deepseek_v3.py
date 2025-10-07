@@ -1880,13 +1880,47 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# )	
 		# intermediate = activation_gating(gate_acc, up_acc)
 		intermediate, intermediate_scale = act_quant(intermediate)
-		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)
 		return res
+
+
+		# x, x_scale = act_quant(x)
+		# gate_acc = grouped_fp8_gemm(
+		# 	x, x_scale, 
+		# 	self.gate_list, self.gate_ptrs_ptr,
+		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
+		# )
+		# up_acc = grouped_fp8_gemm(
+		# 	x, x_scale, 
+		# 	self.up_list, self.up_ptrs_ptr,
+		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
+		# )
+		# intermediate = activation_gating(gate_acc, up_acc)
+
+		
+		# # gate_acc, up_acc = fused_fp8_moe_stage_1_no_activation(
+		# # 	x, x_scale, 
+		# # 	self.gate_list, self.gate_ptrs_ptr,
+		# # 	self.up_list, self.up_ptrs_ptr,
+		# # 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
+		# # 	self.up_scale_list, self.up_scale_ptrs_ptr,
+		# # 	group_size, activated_group_idx, group_start_indices, num_active_experts
+		# # )	
+		# # intermediate = activation_gating(gate_acc, up_acc)
+		# intermediate, intermediate_scale = act_quant(intermediate)
+		# res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+		# 	intermediate, intermediate_scale, 
+		# 	self.down_list, self.down_ptrs_ptr,
+		# 	self.down_scale_list, self.down_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
+		# )
 
 	def grouped_weight_dequant_moe_a16w8(self, x, eids):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
