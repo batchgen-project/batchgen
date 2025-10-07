@@ -1861,7 +1861,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# Quantize the recv_x tensor to fp8_e4m3
 		x, x_scale = act_quant(x)
-		intermediate = fused_fp8_moe_stage_1_optimized(
+		intermediate = fused_fp8_moe_stage_1_no_activation(
 			x, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
