@@ -1879,7 +1879,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
 		# )	
 		# intermediate = activation_gating(gate_acc, up_acc)
-		# intermediate, intermediate_scale = act_quant(intermediate)
+		intermediate, intermediate_scale = act_quant(intermediate)
 		res = fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
