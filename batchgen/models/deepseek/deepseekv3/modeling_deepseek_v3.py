@@ -1425,8 +1425,8 @@ def activation_gating_kernel(
     gate_ptrs = gate_acc_ptr + (offs_m[:, None] * stride_gate_m + offs_n[None, :] * stride_gate_n)
     up_ptrs = up_acc_ptr + (offs_m[:, None] * stride_up_m + offs_n[None, :] * stride_up_n)
     
-    gate_acc = tl.load(gate_ptrs, mask=mask, other=0.0)
-    up_acc = tl.load(up_ptrs, mask=mask, other=0.0)
+    gate_acc = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up_acc = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
     
     # SiLU activation: silu(x) = x / (1 + exp(-x))
     gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
@@ -1470,8 +1470,8 @@ def activation_gating(
     """
     M, N = gate_acc.shape
     assert up_acc.shape == (M, N), "gate_acc and up_acc must have same shape"
-    assert gate_acc.dtype == torch.float32, "gate_acc must be float32"
-    assert up_acc.dtype == torch.float32, "up_acc must be float32"
+    # assert gate_acc.dtype == torch.float32, "gate_acc must be float32"
+    # assert up_acc.dtype == torch.float32, "up_acc must be float32"
     
     output = torch.empty((M, N), dtype=torch.bfloat16, device=gate_acc.device)
     

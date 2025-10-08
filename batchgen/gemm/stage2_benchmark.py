@@ -340,14 +340,14 @@ def run_stage2_benchmark(
             'M': 368,
             'N': 7168,
             'K': 1536,
-            'num_experts': 32,
+            'num_experts': 16,
             'group_sizes': [23] * 16,
         },
         {
             'M': 368,
-            'N': 1536,
+            'N': 2048,
             'K': 7168,
-            'num_experts': 32,
+            'num_experts': 16,
             'group_sizes': [23] * 16,
         },
         {

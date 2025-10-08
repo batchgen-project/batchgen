@@ -454,7 +454,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_fp32_kernel(
         output_ptrs = output_ptr + (offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n)
         output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & (tl.arange(0, GEMM_BLOCK_SIZE_M)[:, None] < valid_rows_this_block)
         
-        # output = acc.to(tl.bfloat16)
+        output = acc.to(tl.bfloat16)
         tl.store(output_ptrs, acc, mask=output_mask)
 
 
@@ -483,7 +483,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_fp32_triton(
     N = rhs_list[0].shape[0]
     K = lhs.shape[1]
     
-    output = torch.empty((M, N), dtype=torch.float32, device=device)
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
     
     # num_groups = num_active_experts.item()
     # TODO:
