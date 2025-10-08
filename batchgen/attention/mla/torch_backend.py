@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from .rotary_embedding import rotary_pos_emb, apply_rotary_pos_emb
