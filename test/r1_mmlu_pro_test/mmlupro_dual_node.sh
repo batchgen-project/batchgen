@@ -14,7 +14,6 @@ python <dir-to-r1_mmlu_pro_test.py> \
 	--dist_init_addr <dist-init-addr> \
 	--nnodes 2 \
 	--node_rank <node-rank> \
-    --kv_dtype "bf16" \
+    --kv_dtype "fp8" \
     > ./deepseek-r1-bench/${datetime}.log 2>&1
 
-    
