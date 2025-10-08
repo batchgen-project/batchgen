@@ -259,75 +259,6 @@ class ParameterServer:
 			
 			
 
-
-	
-	# def start(self):
-	# 	"""Start the parameter server"""
-	# 	start_time = time.time()
-	# 	# Preload model if specified - BEFORE starting the server socket
-	# 	if self.initial_model_name:
-	# 		logging.info(f"Preloading model: {self.initial_model_name}")
-	# 		try:
-	# 			start_time = time.time()
-	# 			self.config_hugepages()
-	# 			self._preload_model(
-	# 				self.initial_model_name,
-	# 				self.hf_cache_dir,
-	# 				self.cache_dir,
-	# 				self.pt_ckpt_dir
-	# 			)
-	# 			end_time = time.time()
-	# 			logging.info(f"Model {self.initial_model_name} loaded successfully in {end_time - start_time:.2f} seconds")
-	# 			logging.info(f"Model loaded with shared memory name: {self.model_info.get('shm_name')}")
-	# 			logging.info(f"Parameter server size: {self.model_info.get('parameter_server_size')} bytes")
-	# 		except Exception as e:
-	# 			logging.error(f"Failed to preload model {self.initial_model_name}: {e}")
-	# 			logging.error("Server will start without a preloaded model")
-	# 			# Continue running the server even if model loading fails
-	# 	else:
-	# 		logging.info("No initial model specified. Server starting without preloaded model.")
-		
-	# 	# Only start listening for connections AFTER model is loaded
-	# 	logging.info("Starting server socket...")
-		
-	# 	# Start the server socket
-	# 	self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	# 	# Allow address reuse to avoid "address already in use" errors on restart
-	# 	self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-	# 	self.server_socket.bind((self.host, self.port))
-	# 	self.server_socket.listen(10)  # Allow up to 10 pending connections
-		
-	# 	self.running = True
-	# 	logging.info(f"Parameter server is now listening on {self.host}:{self.port}")
-	# 	end_time = time.time()
-	# 	logging.info(f"Server started in {end_time - start_time:.2f} seconds")
-		
-	# 	try:
-	# 		while self.running:
-	# 			try:
-	# 				# Accept client connections with a timeout to allow checking self.running
-	# 				self.server_socket.settimeout(1.0)
-	# 				client_socket, address = self.server_socket.accept()
-	# 				logging.info(f"New client connected: {address}")
-					
-	# 				# Start a new thread to handle this client
-	# 				client_thread = threading.Thread(
-	# 					target=self.handle_client,
-	# 					args=(client_socket, address),
-	# 					daemon=True
-	# 				)
-	# 				client_thread.start()
-	# 				self.clients.append((client_socket, client_thread))
-					
-	# 			except socket.timeout:
-	# 				# This is expected due to the timeout, just continue
-	# 				continue
-	# 			except Exception as e:
-	# 				if self.running:  # Only log if we're not shutting down
-	# 					logging.error(f"Error accepting client connection: {e}")
-	# 	finally:
-	# 		self.cleanup()
-
 	def start(self):
 		"""Start the parameter server"""
 		start_time = time.time()
@@ -336,7 +267,8 @@ class ParameterServer:
 			logging.info(f"Preloading model: {self.initial_model_name}")
 			try:
 				start_time = time.time()
-				self.config_hugepages()
+				if self.enable_hugetlbfs:
+					self.config_hugepages()
 				result = self._preload_model(
 					self.initial_model_name,
 					self.hf_cache_dir,
