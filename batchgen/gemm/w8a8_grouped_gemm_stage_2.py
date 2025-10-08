@@ -305,7 +305,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
     activated_group_idx: torch.Tensor,
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
-    gemm_block_size=(64, 64, 128), 
+    gemm_block_size=(64, 32, 128), 
     scale_block_size=(128, 128),
     num_stages=3,
     num_warps=4
@@ -320,9 +320,9 @@ def fused_dequant_grouped_gemm_fp8_fp8_triton_optimized(
     
     output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
     
-    # num_groups = num_active_experts.item()
+    num_groups = num_active_experts.item()
     # TODO:
-    num_groups = 16
+    # num_groups = 16
     
     # 2D GRID: (experts, N_blocks)
     grid = (num_groups, triton.cdiv(N, gemm_block_size[1]))
@@ -470,7 +470,7 @@ def fused_dequant_grouped_gemm_fp8_fp8_fp32_triton(
     activated_group_idx: torch.Tensor,
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
-    gemm_block_size=(64, 64, 128), 
+    gemm_block_size=(64, 16, 128), 
     scale_block_size=(128, 128),
     num_stages=3,
     num_warps=4
@@ -485,9 +485,9 @@ def fused_dequant_grouped_gemm_fp8_fp8_fp32_triton(
     
     output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
     
-    # num_groups = num_active_experts.item()
+    num_groups = num_active_experts.item()
     # TODO:
-    num_groups = 16
+    # num_groups = 16
     
     # 2D GRID: (experts, N_blocks)
     grid = (num_groups, triton.cdiv(N, gemm_block_size[1]))

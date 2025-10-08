@@ -1593,16 +1593,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		
 		out = self.moe_infer_allgather_allreduce_opt(hidden_states)
-		# out = self.moe_infer_alltoall(hidden_states)
 		out = out + self.shared_experts(identity)
-		# accumulate with fp32
-		# out = out.float()
-		# out = out + self.shared_experts(identity).float()
-		# out = out.to(hidden_states.dtype)
-
-
 		return out.view(*orig_shape)
 	
 	@torch.inference_mode()
@@ -1770,40 +1762,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
 		assert topk_weight.dtype == torch.float32, f"topk_weight must be float32, got {topk_weight.dtype}"
-		
-		# logits = F.linear(
-		# 	global_x.type(torch.float32), self.gate.weight.type(torch.float32), None
-		# ).to(torch.bfloat16)
-
-		# logits = logits.squeeze(1)  
-		# topk_weight, topk_idx = moe_fused_gate(
-		# 	logits, 
-		# 	self.gate_bias,
-		# 	self.config.n_group,
-		# 	self.config.topk_group,
-		# 	self.config.num_experts_per_tok,
-		# 	0,
-		# 	self.config.routed_scaling_factor
-		# )
 		global_x = global_x.squeeze(1) 
-		
-
-
 		# ---- 3) Process tokens assigned to local experts ------------------
-		topk_idx = topk_idx.to(torch.int32)
-		# dispatcher = FusedMoETokenPermutation(use_cuda_if_available=True)
-		# input_x, input_eids, global_indices, token_topk_pos = dispatcher(
-		# 	global_x, topk_idx, self.token_idx, self.topk_pos,
-		# 	self.routed_expert_start_idx, self.routed_expert_end_idx
-		# )
-		
+		topk_idx = topk_idx.to(torch.int32)		
 		input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
 			global_x, topk_idx, self.token_idx, self.topk_pos,
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		res = self.grouped_dequant_moe_fp8_v2(input_x, input_eids)
+		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
 		# res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
 		# global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		#  									 device=self.device, dtype=torch.bfloat16)
@@ -1869,16 +1837,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.up_scale_list, self.up_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)	
-		
-		# gate_acc, up_acc = fused_fp8_moe_stage_1_no_activation(
-		# 	x, x_scale, 
-		# 	self.gate_list, self.gate_ptrs_ptr,
-		# 	self.up_list, self.up_ptrs_ptr,
-		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
-		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
-		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
-		# )	
-		# intermediate = activation_gating(gate_acc, up_acc)
 		intermediate, intermediate_scale = act_quant(intermediate)
 		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
 			intermediate, intermediate_scale, 

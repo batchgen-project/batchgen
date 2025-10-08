@@ -421,11 +421,11 @@ def run_comprehensive_benchmark(
 	
 	test_configs = [
 		{
-			'M': 64,
-			'N': 4096,
-			'K': 11008,
-			'num_experts': 8,
-			'group_sizes': [8] * 8,
+			'M': 368,
+			'N': 2048,
+			'K': 7168,
+			'num_experts': 16,
+			'group_sizes': [23] * 16,
 		},
 		{
 			'M': 128,
@@ -485,8 +485,14 @@ If not hitting targets:
 
 if __name__ == "__main__":
 	from batchgen.moe.fused_dequant_moe import fused_fp8_moe_stage_1
-	from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized
-	run_comprehensive_benchmark(fused_fp8_moe_stage_1, fused_fp8_moe_stage_1_optimized)
+	from batchgen.gemm.w8a8_grouped_gemm_stage_1 import (
+		fused_fp8_moe_stage_1_optimized, 
+		fused_fp8_moe_stage_1_pipelined, 
+		fused_fp8_moe_stage_1_bf16_epilogue,
+		fused_fp8_moe_stage_1_persistent,
+		fused_fp8_moe_stage_1_persistent_v2
+	)
+	run_comprehensive_benchmark(fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_persistent_v2)
 #     print("""
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  🔥 MoE KERNEL BENCHMARKING SUITE                                    ║
