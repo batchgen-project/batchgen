@@ -50,8 +50,193 @@ namespace py = pybind11;
 #endif
 
 
-constexpr float FP8_MAX = 448.0f;
-// std::tuple<at::Tensor, at::Tensor> per_token_quant(torch::Tensor x) {
+// constexpr float FP8_MAX = 448.0f;
+// // FP8 E4M3 constants
+// constexpr float FP8_E4M3_MAX = 448.0f;  // Max representable value in FP8 E4M3
+// constexpr float FP8_E4M3_MIN_NORMAL = 0.001953125f;  // Smallest normal value (2^-9)
+// constexpr float EPSILON = 1e-12f;  // Small value to prevent division by zero
+
+// std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
+//     /*
+//      * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
+//      * Args:
+//      *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
+//      * Returns:
+//      *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+//      *   s: Scale factors [bsz, seq, num_blocks] with dtype float32
+//      */
+//     TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
+//                 "Input tensor must be of dtype BFloat16");
+//     TORCH_CHECK(x.size(-1) == 576,
+//                 "Last dimension of input tensor must be 576");
+//     TORCH_CHECK(x.is_contiguous(),
+//                 "Input tensor must be contiguous");
+//     TORCH_CHECK(x.dim() == 3,
+//                 "Input tensor must have 3 dimensions");
+
+//     const int64_t bsz = x.size(0);
+//     const int64_t seq_len = x.size(1);
+//     const int64_t dim = x.size(2);
+//     const int64_t M = bsz * seq_len;
+
+//     const int64_t block_size = 128;
+//     const int64_t num_full_blocks = dim / block_size; // 576 / 128 = 4
+//     const bool has_last_block = (dim % block_size != 0);
+//     const int64_t last_block_size = dim % block_size; // 64
+//     const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0); // 5
+
+//     // IMPORTANT: Keep computation in float32 for precision
+//     // Cast to float32 for accurate computation
+//     auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+
+//     // Prepare output tensors
+//     auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
+//     auto q_flat = at::empty({M, dim}, x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
+
+//     // Process each block independently
+//     for (int64_t b = 0; b < num_blocks; ++b) {
+//         const int64_t start = b * block_size;
+//         const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+
+//         auto x_block = x_flat.narrow(1, start, length);
+        
+//         // IMPROVEMENT 1: Use both max and min for symmetric quantization
+//         // This handles both positive and negative values properly
+//         auto max_vals = at::amax(x_block, /*dim=*/1, /*keepdim=*/false);
+//         auto min_vals = at::amin(x_block, /*dim=*/1, /*keepdim=*/false);
+//         auto amax = at::maximum(at::abs(max_vals), at::abs(min_vals));
+        
+//         // IMPROVEMENT 2: Better clamping strategy
+//         // Use a larger minimum to avoid precision issues with very small values
+//         // FP8 E4M3 has limited precision for small numbers
+//         amax = at::maximum(amax, at::full_like(amax, FP8_E4M3_MIN_NORMAL));
+        
+//         // IMPROVEMENT 3: Use a small headroom to avoid saturation
+//         // FP8 E4M3 max is 448, but we use slightly less to avoid edge cases
+//         constexpr float FP8_SAFE_MAX = 440.0f;  // Leave small headroom
+        
+//         // IMPROVEMENT 4: Compute scale more carefully
+//         // scale = amax / FP8_SAFE_MAX, but ensure scale is never zero
+//         auto scale = amax / FP8_SAFE_MAX;
+//         scale = at::maximum(scale, at::full_like(scale, EPSILON));
+        
+//         // Store scale for this block
+//         scale_flat.select(1, b).copy_(scale);
+
+//         // IMPROVEMENT 5: Quantize with clamping to avoid overflow
+//         auto scale_expanded = scale.unsqueeze(1);
+//         auto y = x_block / scale_expanded;
+        
+//         // IMPROVEMENT 6: Explicitly clamp before casting to FP8
+//         // This prevents overflow and ensures values are in valid FP8 range
+//         y = at::clamp(y, /*min=*/-FP8_SAFE_MAX, /*max=*/FP8_SAFE_MAX);
+        
+//         // IMPROVEMENT 7: Handle NaN/Inf before casting
+//         // Replace any NaN/Inf with 0
+//         y = at::where(at::isfinite(y), y, at::zeros_like(y));
+        
+//         // Cast to FP8
+//         auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
+//         q_flat.narrow(1, start, length).copy_(q_block);
+//     }
+
+//     // Reshape back to [bsz, seq_len, dim] and [bsz, seq_len, num_blocks]
+//     auto q = q_flat.view({bsz, seq_len, dim});
+//     auto scale = scale_flat.view({bsz, seq_len, num_blocks});
+
+//     return std::make_tuple(q, scale);
+// }
+
+// FP8 E4M3 constants
+constexpr float FP8_E4M3_MAX = 448.0f;
+constexpr float FP8_E4M3_MIN_NORMAL = 0.001953125f;
+constexpr float EPSILON = 1e-12f;
+
+std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
+    /*
+     * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
+     */
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
+                "Input tensor must be of dtype BFloat16");
+    TORCH_CHECK(x.size(-1) == 576,
+                "Last dimension of input tensor must be 576");
+    TORCH_CHECK(x.is_contiguous(),
+                "Input tensor must be contiguous");
+    TORCH_CHECK(x.dim() == 3,
+                "Input tensor must have 3 dimensions");
+
+    const int64_t bsz = x.size(0);
+    const int64_t seq_len = x.size(1);
+    const int64_t dim = x.size(2);
+    const int64_t M = bsz * seq_len;
+
+    const int64_t block_size = 128;
+    const int64_t num_full_blocks = dim / block_size;
+    const bool has_last_block = (dim % block_size != 0);
+    const int64_t last_block_size = dim % block_size;
+    const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0);
+
+    // Cast to float32 for accurate computation
+    auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+
+    // Prepare output tensors
+    auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
+    auto q_flat = at::empty({M, dim}, x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
+
+    // Process each block independently
+    for (int64_t b = 0; b < num_blocks; ++b) {
+        const int64_t start = b * block_size;
+        const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+
+        auto x_block = x_flat.narrow(1, start, length);
+        
+        // Calculate absolute maximum value in the block
+        auto max_vals = at::amax(x_block, /*dim=*/1, /*keepdim=*/false);
+        auto min_vals = at::amin(x_block, /*dim=*/1, /*keepdim=*/false);
+        auto amax = at::maximum(at::abs(max_vals), at::abs(min_vals));
+        
+        // ✅ **CORRECTION**: Sanitize amax to handle non-finite inputs.
+        // If amax is NaN or Inf (from non-finite inputs), replace it with 1.0.
+        // This ensures the scale calculation is always valid.
+        amax = at::where(at::isfinite(amax), amax, at::full_like(amax, 1.0));
+
+        // Clamp amax to a minimum value to avoid issues with all-zero blocks
+        amax = at::maximum(amax, at::full_like(amax, FP8_E4M3_MIN_NORMAL));
+        
+        constexpr float FP8_SAFE_MAX = 440.0f;
+        
+        // Compute the scale factor
+        auto scale = amax / FP8_SAFE_MAX;
+        scale = at::maximum(scale, at::full_like(scale, EPSILON));
+        
+        // Store scale for this block
+        scale_flat.select(1, b).copy_(scale);
+
+        // Quantize the block using the calculated scale
+        auto scale_expanded = scale.unsqueeze(1);
+        auto y = x_block / scale_expanded;
+        
+        // Clamp the scaled values to the safe FP8 range
+        y = at::clamp(y, /*min=*/-FP8_SAFE_MAX, /*max=*/FP8_SAFE_MAX);
+        
+        // Replace any remaining NaN/Inf in the data with 0 before casting
+        y = at::where(at::isfinite(y), y, at::zeros_like(y));
+        
+        // Cast to FP8
+        auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
+        q_flat.narrow(1, start, length).copy_(q_block);
+    }
+
+    // Reshape outputs to their original 3D shape
+    auto q = q_flat.view({bsz, seq_len, dim});
+    auto scale = scale_flat.view({bsz, seq_len, num_blocks});
+
+    return std::make_tuple(q, scale);
+}
+
+
+
+// std::tuple<at::Tensor, at::Tensor> quant_per_token(torch::Tensor x) {
 //     /* 
 //      * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per-token.
 //      * Args:
@@ -96,68 +281,149 @@ constexpr float FP8_MAX = 448.0f;
 //     return std::make_tuple(q, scale);
 // }
 
-std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
-    /*
-     * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
-     * Args:
-     *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
-     * Returns:
-     *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
-     *   s: Scale factors [bsz, seq, num_blocks] with dtype float32
-     */
-    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
-                "Input tensor must be of dtype BFloat16");
-    TORCH_CHECK(x.size(-1) == 576,
-                "Last dimension of input tensor must be 576");
-    TORCH_CHECK(x.is_contiguous(),
-                "Input tensor must be contiguous");
-    TORCH_CHECK(x.dim() == 3,
-                "Input tensor must have 3 dimensions");
+// std::tuple<at::Tensor, at::Tensor> quant_per_token_bak(const at::Tensor& x) {
+//     /*
+//      * Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
+//      * Args:
+//      *   x: Input tensor of shape [bsz, seq, 576] with dtype bfloat16
+//      * Returns:
+//      *   q: Quantized tensor [bsz, seq, 576] with dtype float8_e4m3fn
+//      *   s: Scale factors [bsz, seq, num_blocks] with dtype float32
+//      */
+//     TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
+//                 "Input tensor must be of dtype BFloat16");
+//     TORCH_CHECK(x.size(-1) == 576,
+//                 "Last dimension of input tensor must be 576");
+//     TORCH_CHECK(x.is_contiguous(),
+//                 "Input tensor must be contiguous");
+//     TORCH_CHECK(x.dim() == 3,
+//                 "Input tensor must have 3 dimensions");
 
-    const int64_t bsz = x.size(0);
-    const int64_t seq_len = x.size(1);
-    const int64_t dim = x.size(2);
-    const int64_t M = bsz * seq_len;
+//     const int64_t bsz = x.size(0);
+//     const int64_t seq_len = x.size(1);
+//     const int64_t dim = x.size(2);
+//     const int64_t M = bsz * seq_len;
 
-    const int64_t block_size = 128;
-    const int64_t num_full_blocks = dim / block_size; // 576 / 128 = 4
-    const bool has_last_block = (dim % block_size != 0);
-    const int64_t last_block_size = dim % block_size; // 64
-    const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0); // 5
+//     const int64_t block_size = 128;
+//     const int64_t num_full_blocks = dim / block_size; // 576 / 128 = 4
+//     const bool has_last_block = (dim % block_size != 0);
+//     const int64_t last_block_size = dim % block_size; // 64
+//     const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0); // 5
 
-    // Flatten and cast to float32
-    auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+//     // Flatten and cast to float32
+//     auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
 
-    // Prepare output tensors
-    auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
-    auto q_flat     = at::empty({M, dim},   x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
+//     // Prepare output tensors
+//     auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
+//     auto q_flat     = at::empty({M, dim},   x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
 
-    // Process each block independently
-    for (int64_t b = 0; b < num_blocks; ++b) {
-        const int64_t start  = b * block_size;
-        const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+//     // Process each block independently
+//     for (int64_t b = 0; b < num_blocks; ++b) {
+//         const int64_t start  = b * block_size;
+//         const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
 
-        auto x_block = x_flat.narrow(1, start, length);
-        auto amax    = at::amax(at::abs(x_block), /*dim=*/1);
-        amax = at::clamp(amax, /*min=*/1e-4f);
+//         auto x_block = x_flat.narrow(1, start, length);
+//         auto amax    = at::amax(at::abs(x_block), /*dim=*/1);
+//         amax = at::clamp(amax, /*min=*/1e-4f);
 
-        // Compute scale for this block
-        auto scale = amax / FP8_MAX;
-        scale_flat.select(1, b).copy_(scale);
+//         // Compute scale for this block
+//         auto scale = amax / FP8_MAX;
+//         scale_flat.select(1, b).copy_(scale);
 
-        // Quantize block
-        auto y       = x_block / scale.unsqueeze(1);
-        auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
-        q_flat.narrow(1, start, length).copy_(q_block);
-    }
+//         // Quantize block
+//         auto y       = x_block / scale.unsqueeze(1);
+//         auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
+//         q_flat.narrow(1, start, length).copy_(q_block);
+//     }
 
-    // Reshape back to [bsz, seq_len, dim] and [bsz, seq_len, num_blocks]
-    auto q     = q_flat.view({bsz, seq_len, dim});
-    auto scale = scale_flat.view({bsz, seq_len, num_blocks});
+//     // Reshape back to [bsz, seq_len, dim] and [bsz, seq_len, num_blocks]
+//     auto q     = q_flat.view({bsz, seq_len, dim});
+//     auto scale = scale_flat.view({bsz, seq_len, num_blocks});
 
-    return std::make_tuple(q, scale);
-}
+//     return std::make_tuple(q, scale);
+// }
 
+// std::tuple<at::Tensor, at::Tensor> quant_per_token(const at::Tensor& x) {
+//     /*
+//      * Enhanced quantization with outlier handling and better numerical stability
+//      */
+//     TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16,
+//                 "Input tensor must be of dtype BFloat16");
+//     TORCH_CHECK(x.size(-1) == 576,
+//                 "Last dimension of input tensor must be 576");
+//     TORCH_CHECK(x.is_contiguous(),
+//                 "Input tensor must be contiguous");
+//     TORCH_CHECK(x.dim() == 3,
+//                 "Input tensor must have 3 dimensions");
+
+//     const int64_t bsz = x.size(0);
+//     const int64_t seq_len = x.size(1);
+//     const int64_t dim = x.size(2);
+//     const int64_t M = bsz * seq_len;
+
+//     const int64_t block_size = 128;
+//     const int64_t num_full_blocks = dim / block_size;
+//     const bool has_last_block = (dim % block_size != 0);
+//     const int64_t last_block_size = dim % block_size;
+//     const int64_t num_blocks = num_full_blocks + (has_last_block ? 1 : 0);
+
+//     // Work in float32 for precision
+//     auto x_flat = x.view({M, dim}).to(at::ScalarType::Float);
+
+//     // Prepare output tensors
+//     auto scale_flat = at::empty({M, num_blocks}, x_flat.options().dtype(at::ScalarType::Float));
+//     auto q_flat = at::empty({M, dim}, x_flat.options().dtype(at::ScalarType::Float8_e4m3fn));
+
+//     // Use percentile-based scaling for outlier robustness (optional)
+//     constexpr float PERCENTILE = 0.999f;  // Use 99.9th percentile instead of max
+//     constexpr float FP8_SAFE_MAX = 440.0f;
+
+//     for (int64_t b = 0; b < num_blocks; ++b) {
+//         const int64_t start = b * block_size;
+//         const int64_t length = (b < num_full_blocks ? block_size : last_block_size);
+
+//         auto x_block = x_flat.narrow(1, start, length);
+        
+//         // Compute absolute values
+//         auto x_abs = at::abs(x_block);
+        
+//         // Option 1: Use max (original approach)
+//         auto amax = at::amax(x_abs, /*dim=*/1, /*keepdim=*/false);
+        
+//         // Option 2: Use percentile for outlier robustness (commented out)
+//         // auto amax = at::quantile(x_abs, PERCENTILE, /*dim=*/1, /*keepdim=*/false);
+        
+//         // Ensure minimum scale to avoid precision issues
+//         constexpr float MIN_SCALE = 1e-6f;
+//         amax = at::maximum(amax, at::full_like(amax, MIN_SCALE));
+        
+//         // Compute scale with safety margin
+//         auto scale = amax / FP8_SAFE_MAX;
+        
+//         // Store scale
+//         scale_flat.select(1, b).copy_(scale);
+
+//         // Quantize with proper scaling
+//         auto scale_expanded = scale.unsqueeze(1);
+        
+//         // Divide and clamp in one operation for efficiency
+//         auto y = at::clamp(
+//             x_block / scale_expanded,
+//             /*min=*/-FP8_SAFE_MAX,
+//             /*max=*/FP8_SAFE_MAX
+//         );
+        
+//         // Cast to FP8
+//         auto q_block = y.to(at::ScalarType::Float8_e4m3fn);
+//         q_flat.narrow(1, start, length).copy_(q_block);
+//     }
+
+//     // Reshape outputs
+//     auto q = q_flat.view({bsz, seq_len, dim});
+//     auto scale = scale_flat.view({bsz, seq_len, num_blocks});
+
+//     return std::make_tuple(q, scale);
+// }
 
 
 // KV_Storage::KV_Storage(EngineConfig& engine_config, ModelConfig& model_config,
@@ -642,7 +908,7 @@ void KV_Storage::Init() {
                     return true;
                 }
                 // memset
-                CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
+                CUDA_CHECK(cudaMemset(*out_ptr, 0, per_layer_size));
                 return false;
             }
 
@@ -657,7 +923,7 @@ void KV_Storage::Init() {
 
             // Allocate write-combined memory
             cudaError_t err = cudaHostAlloc(out_ptr, per_layer_size, cudaHostAllocWriteCombined);
-            CUDA_CHECK(cudaMemset(*out_ptr, 9999999.0, per_layer_size));
+            CUDA_CHECK(cudaMemset(*out_ptr, 0, per_layer_size));
             
             if (err == cudaSuccess) {
                 // Verify the allocation is on correct NUMA node
@@ -1136,68 +1402,74 @@ void KV_Storage::offload_helper_(
             this->logger_->debug("Offloading layer_idx: {} completed.",
                                  layer_idx);
         } else {
-            CUDA_CHECK(cudaSetDevice(
-                this->engine_config_.basic_config.device));
-            auto [k, k_quantize_scale] = quant_per_token(bf16_k);
-            // log k_quantize_scale shape
-            // this->logger_->info("k_quantize_scale shape: {}",
-            //                      get_tensor_shape(k_quantize_scale));
-            // Check k or k_quantize_scale has nan values
+            CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+            
+            torch::Tensor k;
+            torch::Tensor k_quantize_scale;
+            
+            // Check if dtype is BFloat16 - if so, skip quantization
+            if (this->engine_config_.basic_config.kv_dtype == "bfloat16") {
+                // Direct offload without quantization for BFloat16
+                k = bf16_k;
+                // No quantization scale needed for BFloat16
+                // You might want to create a dummy scale tensor or handle this case differently
+                // depending on your downstream code expectations
+                k_quantize_scale = torch::ones({bf16_k.size(0), bf16_k.size(1)}, 
+                                            torch::TensorOptions()
+                                                .dtype(torch::kFloat32)
+                                                .device(bf16_k.device()));
+            } else {
+                // Perform quantization for other dtypes (e.g., Float8)
+                // Check for NaN or Inf in bf16_k before quantization
+                if (torch::isnan(bf16_k).any().item<bool>() || 
+                    torch::isinf(bf16_k).any().item<bool>()) {
+                    this->logger_->error(
+                        "KV_Storage: NaN or Inf detected in input k at layer_idx: {}.", 
+                        layer_idx);
+                    throw std::runtime_error("NaN or Inf detected in input k.");
+                }
+                
+                // Perform quantization
+                auto [quantized_k, quantize_scale] = quant_per_token(bf16_k);
+                k = quantized_k;
+                k_quantize_scale = quantize_scale;
+                
+                // Check for NaN or Inf in quantization scale
+                if (torch::isnan(k_quantize_scale).any().item<bool>() || 
+                    torch::isinf(k_quantize_scale).any().item<bool>()) {
+                    this->logger_->error(
+                        "KV_Storage: NaN or Inf detected in quantization scale at layer_idx: {}.", 
+                        layer_idx);
+                    throw std::runtime_error("NaN or Inf detected in quantization scale.");
+                }
+            }
+            
             CUDA_CHECK(cudaStreamSynchronize(0));
-            // if (torch::any(torch::isnan(k)).item<bool>()){
-            //     for (int64_t i = 0; i < k.size(0); i++) {
-            //         if(torch::any(torch::isnan(k[i])).item<bool>()) {
-            //             this->logger_->debug("k[{}] has nan values, rank: {}, layer_idx: {}",
-            //                                  i, this->engine_config_.basic_config.device,
-            //                                  layer_idx);
-            //         }
-            //     }
-            //     // throw std::runtime_error("k has nan values");
-            // }
-            // if (torch::any(torch::isnan(k_quantize_scale)).item<bool>()){
-            //     for (int64_t i = 0; i < k_quantize_scale.size(0); i++) {
-            //         if(torch::any(torch::isnan(k_quantize_scale[i])).item<bool>()) {
-            //             this->logger_->debug("k_quantize_scale[{}] has nan values, rank: {}, layer_idx: {}",
-            //                                  i, this->engine_config_.basic_config.device,
-            //                                  layer_idx);
-            //         }
-            //     }
-            //     // throw std::runtime_error("k_quantize_scale has nan values");
-            // }
-
-
-            // If k_quantize_scale[layer_idx] is torch.empty({0,0}), assign it to k_quantize_scale
-            // other wise concatenate it.
-            // if (this->k_quantize_scale[layer_idx].numel() == 0) {
-            //     this->k_quantize_scale[layer_idx] = k_quantize_scale;
-            // } else {
-            //     this->k_quantize_scale[layer_idx] = torch::cat(
-            //         {this->k_quantize_scale[layer_idx], k_quantize_scale}, 0);
-            // }
-            /* Step 1: Permute k and v in the device. */
+            
+            /* Step 1: Prepare k tensor for offloading */
             int64_t bsz = k.size(0);
             int64_t seq_len = k.size(1);
             int64_t k_seq_byte_size = k.size(1) * k.size(2) * k.element_size();
             int64_t token_byte_size = k.size(2) * k.element_size();
             k = k.contiguous();
 
-            /* Launch DMA per sequence. */
-            this->logger_->debug("query_global_idx.size(): {}",
-                                 query_global_idx.size());
+            /* Launch DMA per sequence */
+            this->logger_->debug("query_global_idx.size(): {}", query_global_idx.size());
+            
             for (int64_t i = 0; i < query_global_idx.size(); i++) {
-                // this->logger_->debug("{}/{}", i, query_global_idx.size());
                 auto query_idx = query_global_idx[i];
-                auto device_k_ptr = k.data_ptr() + i * k_seq_byte_size;
+                
+                // Calculate device pointer offset using char* for byte arithmetic
+                char* k_base_ptr = static_cast<char*>(k.data_ptr());
+                void* device_k_ptr = k_base_ptr + (i * k_seq_byte_size);
 
-                /* Get an empty slot for new query. */
+                /* Get an empty slot for new query */
                 int64_t slot_idx = -1;
                 if (layer_idx == 0) {
                     std::lock_guard<std::mutex> lock(this->mutex_);
                     if (this->empty_slots.empty()) {
-                        this->logger_->debug(
-                            "KV_Storage: No empty slot available.");
-                        throw std::runtime_error(
-                            "KV_Storage: No empty slot available.");
+                        this->logger_->debug("KV_Storage: No empty slot available.");
+                        throw std::runtime_error("KV_Storage: No empty slot available.");
                     }
                     slot_idx = *this->empty_slots.begin();
                     this->empty_slots.erase(slot_idx);
@@ -1207,51 +1479,50 @@ void KV_Storage::offload_helper_(
                     slot_idx = this->query_idx_to_slot_idx_map[query_idx];
                 }
 
-                // this->logger_->debug("slot_idx: {}", slot_idx);
-                auto host_k_ptr =
-                    this->k_storage[slot_idx][layer_idx].start_ptr;
+                auto host_k_ptr = this->k_storage[slot_idx][layer_idx].start_ptr;
 
                 {
                     std::lock_guard<std::mutex> lock(
-                        this->per_element_mutex_
-                            [slot_idx * this->model_config_.num_hidden_layers +
-                             layer_idx]);
-                    this->d2h_engine_.submit_to_queue_B(/* Blocking and sync
-                                                           copy function call */
-                                                        host_k_ptr,
-                                                        device_k_ptr,
-                                                        k_seq_byte_size);
-                    // Only note non-padding token.
-                    // num_tokens = attention_mask.sum(1).item<int64_t>();
-                    // used_byte_size = num_tokens * token_byte_size;
-                    this->k_storage[slot_idx][layer_idx].num_tokens = attention_mask[i].sum().item<int64_t>();
+                        this->per_element_mutex_[slot_idx * this->model_config_.num_hidden_layers + layer_idx]);
+                    
+                    // Submit DMA transfer
+                    this->d2h_engine_.submit_to_queue_B(
+                        host_k_ptr,
+                        device_k_ptr,
+                        k_seq_byte_size);
+                    
+                    // Store metadata
+                    this->k_storage[slot_idx][layer_idx].num_tokens = 
+                        attention_mask[i].sum().item<int64_t>();
                     this->k_storage[slot_idx][layer_idx].used_byte_size =
                         attention_mask[i].sum().item<int64_t>() * token_byte_size;
-                    this->k_storage[slot_idx][layer_idx].quantize_scale = k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)}).clone().unsqueeze(0);       
-                    // log quantize_scale shape
-                    // this->logger_->info("quantize_scale shape: {}",
-                    //                      get_tensor_shape(this->k_storage[slot_idx][layer_idx].quantize_scale));              
+                    
+                    // Handle quantization scale based on dtype
+                    if (this->engine_config_.basic_config.kv_dtype == "bfloat16") {
+                        // For BFloat16, either store a dummy scale or handle it differently
+                        // Option 1: Store ones as scale (no scaling needed)
+                        this->k_storage[slot_idx][layer_idx].quantize_scale = 
+                            torch::ones({1, this->k_storage[slot_idx][layer_idx].num_tokens},
+                                    torch::TensorOptions().dtype(torch::kFloat32));
                         
-                    // this->logger_->info("k_storage[{}][{}].num_tokens: {}, used_byte_size: {}",
-                    //                     slot_idx, layer_idx,
-                    //                     this->k_storage[slot_idx][layer_idx].num_tokens,
-                    //                     this->k_storage[slot_idx][layer_idx].used_byte_size);
-                    // this->k_storage[slot_idx][layer_idx].used_byte_size =
-                    //     k_seq_byte_size;
-                    // this->k_storage[slot_idx][layer_idx].num_tokens = seq_len;
+                        // Option 2: Leave it empty/unset if your system supports that
+                        // this->k_storage[slot_idx][layer_idx].quantize_scale = torch::Tensor();
+                    } else {
+                        // Store the actual quantization scale for quantized dtypes
+                        this->k_storage[slot_idx][layer_idx].quantize_scale = 
+                            k_quantize_scale.index({i, torch::indexing::Slice(0, this->k_storage[slot_idx][layer_idx].num_tokens)})
+                            .clone()
+                            .unsqueeze(0);
+                    }
                 }
+                
                 {
                     std::lock_guard<std::mutex> lock(this->mutex_);
                     this->query_idx_to_slot_idx_map[query_idx] = slot_idx;
                 }
             }
-            // CUDA_CHECK(cudaStreamSynchronize(
-            //     this->d2h_engine_.DtoH_stream));
-            // CUDA_CHECK(cudaStreamSynchronize(0));
-            // CUDA_CHECK(cudaDeviceSynchronize());
             
-            this->logger_->debug("Offloading layer_idx: {} completed.",
-                                 layer_idx);
+            this->logger_->debug("Offloading layer_idx: {} completed.", layer_idx);
         }
     } catch (const c10::Error& e) {
         this->logger_->debug(
@@ -2109,12 +2380,71 @@ void KV_Storage::clear_kv_gpu_storage(){
 //     return past_key_states;
 // }
 
+// py::list KV_Storage::get_past_key_states_bak(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
+//     auto start_time = std::chrono::high_resolution_clock::now();
+//     this->logger_->debug("KV_Storage get_past_key_states(): Getting past key states.");
+    
+//     // Use py::list instead of std::vector
+//     py::list past_key_states;
+    
+//     for (int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
+//         // Create tensor with options
+//         auto options = torch::TensorOptions()
+//             .dtype(this->engine_config_.basic_config.kv_dtype_torch)
+//             .device(this->engine_config_.basic_config.device_torch)
+//             .requires_grad(false);
+            
+//         torch::Tensor k_tensor = torch::zeros(
+//             {static_cast<int64_t>(query_global_indices.size()), max_seq_len, 576},
+//             options);
+//         // Fill the tensor with data from k_storage
+//         for (int64_t i = 0; i < static_cast<int64_t>(query_global_indices.size()); i++) {
+//             auto query_idx = query_global_indices[i];
+//             int64_t slot_idx = -1;
+//             {
+//                 std::lock_guard<std::mutex> lock(this->mutex_);
+//                 slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+//             }
+//             c10::Float8_e4m3fn* k_ptr = nullptr;
+//             {
+//                 std::lock_guard<std::mutex> lock(
+//                     this->per_element_mutex_[slot_idx * this->model_config_.num_hidden_layers + layer_idx]);
+//                 k_ptr = static_cast<c10::Float8_e4m3fn*>(
+//                     this->k_storage[slot_idx][layer_idx].start_ptr);
+//             }
+//             // Copy the data from k_ptr to k_tensor
+//             auto dst_ptr = k_tensor.data_ptr() + i * max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch);
+            
+//             // Get a view of the destination slice for the i-th sequence
+//             // auto k_tensor_slice = k_tensor.slice(/*dim=*/0, /*start=*/i, /*end=*/i + 1);
+
+//             // Get the data pointer of that specific slice
+//             // auto dst_ptr = k_tensor_slice.data_ptr();
+//             CUDA_CHECK(cudaMemcpyAsync(
+//                 dst_ptr, k_ptr, max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch),
+//                 cudaMemcpyHostToDevice, this->stream_));
+//         }
+//         // Synchronize the stream
+//         CUDA_CHECK(cudaStreamSynchronize(this->stream_));
+        
+//         // Important: Use move semantics when appending
+//         past_key_states.append(std::move(k_tensor));
+//     }
+    
+//     this->logger_->info("KV_Storage get_past_key_states(): Past key states retrieved.");
+//     return past_key_states;
+// }
+
+
 py::list KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indices, int64_t max_seq_len) {
     auto start_time = std::chrono::high_resolution_clock::now();
     this->logger_->debug("KV_Storage get_past_key_states(): Getting past key states.");
     
     // Use py::list instead of std::vector
     py::list past_key_states;
+    
+    // Get the element size based on the actual dtype
+    size_t element_size = torch::elementSize(this->engine_config_.basic_config.kv_dtype_torch);
     
     for (int64_t layer_idx = 0; layer_idx < this->model_config_.num_hidden_layers; layer_idx++) {
         // Create tensor with options
@@ -2126,6 +2456,7 @@ py::list KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indic
         torch::Tensor k_tensor = torch::zeros(
             {static_cast<int64_t>(query_global_indices.size()), max_seq_len, 576},
             options);
+            
         // Fill the tensor with data from k_storage
         for (int64_t i = 0; i < static_cast<int64_t>(query_global_indices.size()); i++) {
             auto query_idx = query_global_indices[i];
@@ -2134,19 +2465,28 @@ py::list KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indic
                 std::lock_guard<std::mutex> lock(this->mutex_);
                 slot_idx = this->query_idx_to_slot_idx_map[query_idx];
             }
-            c10::Float8_e4m3fn* k_ptr = nullptr;
+            
+            // Use void* for generic pointer handling
+            void* k_ptr = nullptr;
             {
                 std::lock_guard<std::mutex> lock(
                     this->per_element_mutex_[slot_idx * this->model_config_.num_hidden_layers + layer_idx]);
-                k_ptr = static_cast<c10::Float8_e4m3fn*>(
-                    this->k_storage[slot_idx][layer_idx].start_ptr);
+                k_ptr = this->k_storage[slot_idx][layer_idx].start_ptr;
             }
-            // Copy the data from k_ptr to k_tensor
-            auto dst_ptr = k_tensor.data_ptr() + i * max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch);
+            
+            // Calculate the correct offset for the destination pointer
+            // data_ptr() returns void*, so cast to char* for byte-level arithmetic
+            char* base_ptr = static_cast<char*>(k_tensor.data_ptr());
+            void* dst_ptr = base_ptr + (i * max_seq_len * 576 * element_size);
+            
+            // Calculate the size to copy
+            size_t copy_size = max_seq_len * 576 * element_size;
+            
             CUDA_CHECK(cudaMemcpyAsync(
-                dst_ptr, k_ptr, max_seq_len * 576 * sizeof(this->engine_config_.basic_config.kv_dtype_torch),
+                dst_ptr, k_ptr, copy_size,
                 cudaMemcpyHostToDevice, this->stream_));
         }
+        
         // Synchronize the stream
         CUDA_CHECK(cudaStreamSynchronize(this->stream_));
         
@@ -2154,7 +2494,7 @@ py::list KV_Storage::get_past_key_states(std::vector<int64_t> query_global_indic
         past_key_states.append(std::move(k_tensor));
     }
     
-    this->logger_->debug("KV_Storage get_past_key_states(): Past key states retrieved.");
+    this->logger_->info("KV_Storage get_past_key_states(): Past key states retrieved.");
     return past_key_states;
 }
 
@@ -2194,12 +2534,50 @@ std::vector<torch::Tensor> KV_Storage::get_kv_scale(std::vector<int64_t> query_g
         // Concatenate the scale tensors for each layer
         torch::Tensor k_scale_tensor = torch::cat(k_quantize_scale, 0);
         kv_scale.push_back(k_scale_tensor);
+
+        // std::vector<torch::Tensor> scales_for_layer; // Will hold CPU tensors
+
+        // for (int64_t i = 0; i < query_global_indices.size(); i++) {
+        //     // ... find slot_idx ...
+        //     auto query_idx = query_global_indices[i];
+        //     int64_t slot_idx = -1;
+        //     {
+        //         std::lock_guard<std::mutex> lock(this->mutex_);
+        //         slot_idx = this->query_idx_to_slot_idx_map[query_idx];
+        //     }
+            
+        //     // 1. Get the scale tensor (it's on the CPU)
+        //     torch::Tensor scale_tensor = this->k_storage[slot_idx][layer_idx].quantize_scale;
+
+        //     // 2. Pad it on the CPU if necessary
+        //     if (scale_tensor.size(1) < seq_len) {
+        //         auto cpu_options = torch::TensorOptions()
+        //             .dtype(torch::kFloat32)
+        //             .device(torch::kCPU); // <-- Create padding on the CPU
+                    
+        //         torch::Tensor padding = torch::zeros(
+        //             {scale_tensor.size(0), seq_len - scale_tensor.size(1), scale_tensor.size(2)},
+        //             cpu_options);
+                    
+        //         scale_tensor = torch::cat({scale_tensor, padding}, 1);
+        //     }
+        //     scales_for_layer.push_back(scale_tensor);
+        // }
+
+        // // 3. Concatenate all CPU tensors for the batch
+        // torch::Tensor final_scale_tensor_cpu = torch::cat(scales_for_layer, 0);
+
+        // // 4. Move the final, complete tensor to the GPU
+        // torch::Tensor final_scale_tensor_gpu = final_scale_tensor_cpu.to(
+        //     this->engine_config_.basic_config.device_torch);
+            
+        // kv_scale.push_back(final_scale_tensor_gpu);
     }
     this->logger_->debug("KV_Storage get_kv_scale(): KV scale retrieved.");
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time -
         start_time);
-    this->logger_->debug("KV_Storage get_kv_scale(): Time taken to get kv scale: {} seconds", duration.count());
+    this->logger_->info("KV_Storage get_kv_scale(): Time taken to get kv scale: {} seconds", duration.count());
     return kv_scale;
 }
 

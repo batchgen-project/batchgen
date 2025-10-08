@@ -49,7 +49,7 @@ class BatchGen {
     ~BatchGen();
 
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-            int64_t byte_size);
+            int64_t byte_size, bool enable_hugetlbfs);
     void Terminate();
 
     /*

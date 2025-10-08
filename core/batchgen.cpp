@@ -108,7 +108,7 @@ BatchGen::~BatchGen() { this->Terminate(); }
 // };
 
 void BatchGen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-                    int64_t byte_size) 
+                    int64_t byte_size, bool enable_hugetlbfs) 
 {
     this->logger->info("BatchGen Init.");
     this->logger->info("model type: {}", this->model_config_.model_type);
@@ -121,7 +121,7 @@ void BatchGen::Init(std::string& shm_name, std::string& tensor_meta_shm_name,
     this->logger->info("weights_map deserialized.");
     this->logger->info("shm_name: {}", shm_name);
     this->logger->info("byte_size: {}", byte_size);
-    this->weights_storage_.Init(shm_name, byte_size, weights_map);
+    this->weights_storage_.Init(shm_name, byte_size, weights_map, enable_hugetlbfs);
     this->logger->info("weights_storage initialized.");
     // this->weights_storage_.Init(this->parameter_server_.attr("byte_size").cast<int64_t>(),
     // this->parameter_server_.attr("module_weights_shm").cast<std::unordered_map<std::string,

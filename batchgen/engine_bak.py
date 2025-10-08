@@ -46,6 +46,7 @@ from tqdm import trange
 import gc
 from datetime import timedelta
 from .utils import torch_gpu_mem_usage
+from .sampling import greedy_decode, sample_with_temperature_top_p
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -863,6 +864,7 @@ def batchgen(
 	nnodes: Optional[int] = 1,
 	node_rank: Optional[int] = 0,
 	device_per_node: Optional[int] = 8,
+	enable_hugetlbfs = False
 ):
 	"""
 	Run batchgen using the standalone parameter server.
@@ -894,6 +896,11 @@ def batchgen(
 
 	# Enable faulthandler to get stack traces on segfault
 	faulthandler.enable()
+
+	# if enable_hugetlbfs:
+	# 	os.environ["BATCHGEN_ENABLE_HUGETLBFS"] = "1"
+	logging.info(f"environ BATCHGEN_ENABLE_HUGETLBFS: {os.environ.get('BATCHGEN_ENABLE_HUGETLBFS', '0')}")
+
 	
 	# Get model info from the parameter server - just retrieve existing info
 	logging.info(f"Connecting to parameter server at {parameter_server_host}:{parameter_server_port}")
@@ -1038,8 +1045,6 @@ def batchgen(
 	all_results = [item for result in all_results for item in result]
 	return all_results
 
-
-
 class BatchGen:
 	def __init__(
 		self,
@@ -1183,10 +1188,10 @@ class BatchGen:
 			)
 		elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
 			from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import (
-				DeepSeekV3_Initializer,
+				DeepseekV3Initializer,
 			)
 
-			self.initializer = DeepSeekV3_Initializer(
+			self.initializer = DeepseekV3Initializer(
 				self.huggingface_ckpt_name,
 				self.hf_cache_dir,
 				self.cache_dir,
@@ -1302,7 +1307,7 @@ class BatchGen:
 		self.query_book = {
 			query_idx: query(
 				text=text,
-				decoded_tokens=torch.zeros(
+				decoded_tokens=torch.ones(
 					1, self.max_decoding_length, dtype=torch.int64
 				),
 			)
@@ -1316,6 +1321,7 @@ class BatchGen:
 				max_length=self.max_input_length,
 				truncation=True,
 				padding="max_length",
+				add_special_tokens=True,
 			)
 			query_instance.encoded = tokenized_query
 			extended_size = self.max_input_length + self.max_decoding_length
@@ -1482,12 +1488,19 @@ class BatchGen:
 				dist.barrier()
 				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
 				self._config_prefill()
+				logging.info(f"Rank: {self.rank} prefill config done.")
 				prefill_start_time = time.perf_counter()
 				with torch.inference_mode():
 					new_token = self.prefill(self.model_batches[model_batch_idx])
 				prefill_time += time.perf_counter() - prefill_start_time
 				self._unregister_fp8_weights()
 				dist.barrier()
+
+				# log new_tokens from prefill:
+				if self.rank == 0:
+					logging.info(
+						f"Model batch {model_batch_idx} prefill new tokens: {new_token.squeeze().tolist()}"
+					)
 
 
 				# Random create new token.
@@ -1533,17 +1546,10 @@ class BatchGen:
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
 				del past_key_states
+				del past_value_states
 				del scale_dict
 				gc.collect()
-				
-				
-				# if self.rank == 0:
-				# 	# check_large_tensors()
-				# 	allocated_memory = torch.cuda.memory_allocated(self.torch_device)
-				# 	logging.info(
-				# 		f"Rank: {self.rank} Decoding done. Allocated memory: {allocated_memory / 1024 / 1024 / 1024:.2f} GB"
-				# 	)
-				dist.barrier()
+				torch.cuda.empty_cache()
 		else:
 			# For small input batch, some worker might do not have any input.
 			# In this case, it only participate in the decoding phase.
@@ -1573,7 +1579,7 @@ class BatchGen:
 		
 		dist.barrier()
 		self.model = None 
-		torch.cuda.empty_cache()
+		# torch.cuda.empty_cache()
 
 		logging.info(
 			f"Rank {self.rank} Prefill total time: {prefill_time:.1f} seconds,\n"
@@ -1587,10 +1593,10 @@ class BatchGen:
 		]
 
 		# Print first 5 sequences
-		# for query_idx in range(5):
-		#     logging.info(
-		#         f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
-		#     )
+		for query_idx in range(5):
+			logging.info(
+				f"Decoded tokens: {res[query_idx].squeeze().tolist()[:20]}"
+			)
 
 		# Gather results from all rank to rank 0
 		# logging.info(f"Rank {self.rank} res: {res}")
@@ -1814,6 +1820,11 @@ class BatchGen:
 				new_tokens = torch.argmax(
 					outputs.logits[:, -1, :], dim=-1
 				).view(-1, 1)
+				# new_tokens = sample_with_temperature_top_p(
+				# 	outputs.logits[:, -1, :],
+				# 	temperature=0.6,
+				# 	top_p=0.95,
+				# ).view(-1, 1)
 				output_tokens.append(new_tokens)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
@@ -1894,6 +1905,7 @@ class BatchGen:
 
 					Attn_Wrapper.attention_mask = attention_mask
 					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+					# Attn_Wrapper.position_ids = (attention_mask.sum(-1)).unsqueeze(-1)
 					Attn_Wrapper.cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
 					Attn_Wrapper.max_seqlen = Attn_Wrapper.cache_seqlens.max().item()
 
@@ -1906,6 +1918,11 @@ class BatchGen:
 					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
 						-1, 1
 					)
+					# new_tokens = sample_with_temperature_top_p(
+					# 	new_tokens.logits[:, -1, :],
+					# 	temperature=0.6,
+					# 	top_p=0.95,
+					# ).view(-1, 1)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 				new_token_idx += 1
 			Attn_Wrapper.scale = None

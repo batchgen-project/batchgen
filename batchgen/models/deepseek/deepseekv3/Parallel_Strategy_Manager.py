@@ -18,7 +18,7 @@ from batchgen.utils import torch_gpu_mem_usage
 	
 
 
-class Parallel_Strategy_Manager:
+class DeepseekV3ParallelStrategyManager:
 	def __init__(
 		self, 
 		hf_model_config, 
@@ -48,9 +48,11 @@ class Parallel_Strategy_Manager:
 			and the corresponding weight copy task.
 		"""
 		self.hf_model_config.phase = "prefill"
-		self.model = DeepseekV3ForCausalLM._from_config(
-			self.hf_model_config
-		)
+		# self.model = DeepseekV3ForCausalLM._from_config(
+		# 	self.hf_model_config
+		# )
+		# logging.info(f"hf_model_config: {self.hf_model_config}")
+		self.model = DeepseekV3ForCausalLM(self.hf_model_config)
 		self.state_dict_name_map = {}
 		self.weight_copy_task = {}
 		self.weight_copy_task["attn"] = []
@@ -439,8 +441,10 @@ class Parallel_Strategy_Manager:
 					mla_decoding_flashmla,
 					mla_decoding_flashmla_v2,
 					fused_get_query_states_triton,
-					mla_decoding_flashmla_attn_mode_3,
-					mla_decoding_flashmla_attn_mode_3_dequant_fusion
+					# mla_decoding_flashmla_attn_mode_3,
+					mla_decoding_flashmla_attn_mode_3_bf16,
+					mla_decoding_flashmla_attn_mode_3_dequant_fusion,
+					mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn
 				)
 				setattr(
 					attn_module,
@@ -467,9 +471,17 @@ class Parallel_Strategy_Manager:
 
 				setattr(
 					attn_module,
-					"decoding_attn_mode_3",
+					"decoding_attn_mode_3_fp8",
 					types.MethodType(
-						mla_decoding_flashmla_attn_mode_3, attn_module
+						mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn, attn_module
+					),
+				)
+
+				setattr(
+					attn_module,
+					"decoding_attn_mode_3_bf16",
+					types.MethodType(
+						mla_decoding_flashmla_attn_mode_3_bf16, attn_module
 					),
 				)
 

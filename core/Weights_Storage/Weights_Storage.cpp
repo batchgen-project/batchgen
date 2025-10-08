@@ -61,7 +61,7 @@ void Weights_Storage::Init(
     std::string& shm_name, int64_t byte_size,
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_meta>>
-        module_weights_shm) {
+        module_weights_shm, bool enable_hugetlbfs) {
     CUDA_CHECK(cudaSetDevice(
         this->engine_config_.basic_config.device));
     this->shm_name = shm_name;
@@ -71,7 +71,7 @@ void Weights_Storage::Init(
         "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
         shm_name, byte_size);
     void* weight_ptr =
-        allocate_shared_pinned_memory(shm_name, byte_size, false);
+        allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs);
     // Check if weight_ptr is null
     if (weight_ptr == nullptr) {
         this->logger->error("Failed to allocate shared pinned memory.");

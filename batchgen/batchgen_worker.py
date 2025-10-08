@@ -28,6 +28,10 @@ from tqdm import trange
 import gc
 from datetime import timedelta
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
+from .get_initializer import get_initializer
+from .get_parallel_strategy_manager import get_parallel_strategy_manager
+from batchgen.utils import config_torch_module_initializer
+from dataclasses import dataclass
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -53,6 +57,46 @@ class query:
 		self.decoded_tokens = decoded_tokens
 
 
+@dataclass
+class InputArguments:
+	"""Input arguments as a dataclass with type hints"""
+	huggingface_ckpt_name: str
+	hf_cache_dir: Optional[str] = None
+	cache_dir: Optional[str] = None
+	pt_ckpt_dir: Optional[str] = None
+	queries: Optional[List[str]] = None
+	padding_length: int = 512
+	max_decoding_length: int = 128
+	device: int = 0
+	num_queries: int = 0
+	skeleton_state_dict: Optional[Dict] = None
+	shm_name: Optional[str] = None
+	tensor_meta_shm_name: Optional[str] = None
+	engine_config_json_dir: Optional[str] = None
+	host_kv_cache_size: Optional[int] = None
+	kv_dtype: str = "bfloat16"
+	dist_init_addr: Optional[str] = None
+	local_rank: int = 0
+	rank: int = 0
+	global_rank: int = 0
+	world_size: int = 1
+	gpu_arch: str = "hooper"
+
+	def get(self, key, default=None):
+		"""Get attribute value with a default fallback"""
+		return getattr(self, key, default)
+	
+	def to_dict(self) -> Dict:
+		"""Convert back to dictionary if needed"""
+		return self.__dict__.copy()
+	
+	def update(self, **kwargs):
+		"""Update multiple attributes at once"""
+		for key, value in kwargs.items():
+			if hasattr(self, key):
+				setattr(self, key, value)
+			else:
+				raise AttributeError(f"InputArguments has no attribute '{key}'")
 
 class BatchGenWorker:
 	def __init__(
@@ -70,11 +114,38 @@ class BatchGenWorker:
 		tensor_meta_shm_name,
 		engine_config_json_dir = None, # Will be deprecated in the future
 		host_kv_cache_size: Optional[int] = None,
+		kv_dtype: str = "bfloat16",
 		dist_init_addr: str = "localhost:12355",
 		local_rank: Optional[int] = 0,
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
+		gpu_arch: str = "hooper"
 	):
+		input_arguments = {
+			"huggingface_ckpt_name": huggingface_ckpt_name,
+			"hf_cache_dir": hf_cache_dir,
+			"cache_dir": cache_dir,
+			"pt_ckpt_dir": pt_ckpt_dir,
+			"queries": queries,
+			"padding_length": max_input_length,
+			"max_decoding_length": max_decoding_length,
+			"device": device,
+			"skeleton_state_dict": skeleton_state_dict,
+			"shm_name": shm_name,
+			"tensor_meta_shm_name": tensor_meta_shm_name,
+			"engine_config_json_dir": engine_config_json_dir,
+			"host_kv_cache_size": host_kv_cache_size,
+			"kv_dtype": kv_dtype,
+			"num_queries": len(queries),
+			"dist_init_addr": dist_init_addr,
+			"local_rank": local_rank,
+			"rank": global_rank,
+			"global_rank": global_rank,
+			"world_size": world_size,
+			"gpu_arch": gpu_arch
+		}
+		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
+		self.input_arguments = InputArguments(**input_arguments)
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
 		# hf_cache_dir will be deprecated in the future.
@@ -114,9 +185,6 @@ class BatchGenWorker:
 		if(self.rank == 0):
 			print(self.engine_config)
 		
-		
-		
-		
 		self.device = device
 		self.torch_device = torch.device(f"cuda:{device}")
 		self.host_kv_cache_size = host_kv_cache_size
@@ -154,7 +222,7 @@ class BatchGenWorker:
 			trust_remote_code=True,
 			local_files_only=True,
 		)
-		self._config_torch_module_initializer()
+		config_torch_module_initializer()
 		self.tokenizer = AutoTokenizer.from_pretrained(
 			# self.huggingface_ckpt_name,
 			self.hf_cache_dir,
@@ -164,90 +232,16 @@ class BatchGenWorker:
 		)
 		# Use flash_attn by default thus right padding.
 		self.tokenizer.padding_side = "right"
-
-
-		if self.model_config.architectures[0] == "MixtralForCausalLM":
-			self.tokenizer.pad_token = self.tokenizer.eos_token
-
-		if self.model_config.architectures[0] == "MixtralForCausalLM":
-			from batchgen.models.mixtral.Mixtral_Initializer import (
-				Mixtral_Initializer,
-			)
-
-			self.initializer = Mixtral_Initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.skeleton_state_dict,
-				self.shm_name,
-				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
-				self.host_kv_cache_size,
-			)
-		elif self.model_config.architectures[0] == "Qwen2MoeForCausalLM":
-			from batchgen.models.Qwen_Initializer import Qwen_Initializer
-
-			self.initializer = Qwen_Initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.pt_ckpt_dir,
-			)
-		elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
-			from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import (
-				DeepSeekV3_Initializer,
-			)
-
-			self.initializer = DeepSeekV3_Initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.skeleton_state_dict,
-				self.shm_name,
-				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
-				self.host_kv_cache_size,
-				self.local_rank,
-				self.global_rank,
-				self.world_size
-			)
-
-		elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
-			from batchgen.models.deepseek.deepseekv2.deepseekv2_initializer import (
-				DeepSeek_Initializer,
-			)
-
-			self.initializer = DeepSeek_Initializer(
-				self.huggingface_ckpt_name,
-				self.hf_cache_dir,
-				self.cache_dir,
-				self.engine_config,
-				self.skeleton_state_dict,
-				self.shm_name,
-				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
-				self.host_kv_cache_size,
-			)
-
-		else:
-			raise ValueError(
-				f"Model architecture {self.model_config.architectures[0]} not supported yet."
-			)
-
-		self.core_engine, self.model, self.engine_config, self.model_config, self.hf_model_config = (
+		self.initializer = get_initializer(self.huggingface_ckpt_name)
+		self.initializer = self.initializer(self.input_arguments)
+		self.core_engine, self.engine_config, self.model_config, self.hf_model_config = (
 			self.initializer.Init()
 		)
+
 		self.vanilla_batching()
 		
-		
-		#TODO:
-		from .models.deepseek.deepseekv3.Parallel_Strategy_Manager import(  
-			Parallel_Strategy_Manager,
-		)
-		self.parallel_manager = Parallel_Strategy_Manager(
+		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
+		self.parallel_manager = self.parallel_manager(
 			self.hf_model_config,
 			self.engine_config,
 			self.model_config,
@@ -260,53 +254,6 @@ class BatchGenWorker:
 				
 		logging.info(f"Engine on device {self.device} initialized.")
 
-	def _config_torch_module_initializer(self):
-		def do_nothing_decorator(orig_func: Callable) -> Callable:
-			@functools.wraps(orig_func)
-			def do_nothing(*args, **kwargs):
-				pass
-
-			return do_nothing
-
-		def param_init_decorator(orig_param_init: Callable) -> Callable:
-			@functools.wraps(orig_param_init)
-			def archer_param_init(cls, *args, **kwargs):
-				orig_param_init(cls, *args, **kwargs)
-
-				for name, param in cls.named_parameters(recurse=False):
-					param.data = torch.zeros(
-						1, dtype=torch.bfloat16, device=param.device
-					)
-
-				# for name, buf in cls.named_buffers(recurse=False):
-				# 	buf.data = torch.zeros(1, dtype=torch.bfloat16, device=buf.device)
-
-			return archer_param_init
-
-		# for all the modules in torch.nn, add post_init method
-		# assert False, torch.nn.modules.__dict__
-		for name, module in torch.nn.modules.__dict__.items():
-			if not isinstance(module, type):
-				continue
-			if not issubclass(module, torch.nn.modules.module.Module):
-				continue
-			if name in [
-				"Module",
-				"Sequential",
-				"ModuleDict",
-				"ModuleList",
-				"ParameterList",
-				"ParameterDict",
-			]:
-				continue
-			module._old_init = module.__init__
-			module.__init__ = param_init_decorator(module.__init__)
-
-			if hasattr(module, "reset_parameters"):
-				module._old_reset_parameters = module.reset_parameters
-				module.reset_parameters = do_nothing_decorator(
-					module.reset_parameters
-				)
 
 	def vanilla_batching(self):
 		"""
@@ -475,7 +422,7 @@ class BatchGenWorker:
 		try:
 			group = StatelessProcessGroup.create(
 				host=comm_master_addr,
-				port=20001,
+				port=20003,
 				rank=self.rank,
 				world_size=self.world_size,
 				data_expiration_seconds=6000,
@@ -524,9 +471,21 @@ class BatchGenWorker:
 					# FULL GPU DECODING MODE.
 					if self.model_config.model_type == "deepseek_v3":
 						past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+						# Pad the kv cache to be multiple of 64
+						bsz, kv_seqlen, _ = past_key_states[0].size()
+						if kv_seqlen % 64 != 0:
+							pad_len = 64 - (kv_seqlen % 64)
+							for i in range(len(past_key_states)):
+								past_key_states[i] = torch.cat([
+									past_key_states[i], 
+									torch.zeros((bsz, pad_len, past_key_states[i].size(-1)), device=past_key_states[i].device, dtype=past_key_states[i].dtype)
+								], dim=1)
 						past_value_states = None
 						# scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
-						scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+						if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
+							scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+						else:
+							scale_dict = None
 						
 				
 					else:

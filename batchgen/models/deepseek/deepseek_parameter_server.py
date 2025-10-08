@@ -41,12 +41,13 @@ except ImportError:
 
 
 class DeepSeek_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, pt_ckpt_dir):
+    def __init__(self, huggingface_ckpt_name, cache_dir, pt_ckpt_dir, enable_hugetlbfs):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.pt_ckpt_dir = pt_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
+        self.enable_hugetlbfs = enable_hugetlbfs
         config_cls = (
             DeepseekV2Config
             if "V2" in huggingface_ckpt_name
@@ -80,7 +81,7 @@ class DeepSeek_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory} GB / {total_memory} GB")
 
-        self.parameter_server = Parameter_Server()
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
         logging.info(f"architectures: {self.hf_model_config.architectures[0]}")
         if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
             if "DeepSeek-V2-Lite" in self.huggingface_ckpt_name:

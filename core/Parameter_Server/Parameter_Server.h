@@ -60,7 +60,7 @@ struct tensor_meta {
 
 class Parameter_Server {
    public:
-    Parameter_Server();
+    Parameter_Server(bool enable_hugetlbfs);
     ~Parameter_Server();
     void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
               int64_t byte_size, std::string& model_weights_path,
@@ -86,7 +86,7 @@ class Parameter_Server {
                        std::unordered_map<std::string, tensor_meta>>
         module_weights_storage_;
     std::unordered_map<std::string, torch::Tensor> skeleton_state_dict_;
-
+    bool enable_hugetlbfs;
     void _load_cus_format_file_to_host_mem(
         const std::string& model_weights_path,
         void* weight_ptr,

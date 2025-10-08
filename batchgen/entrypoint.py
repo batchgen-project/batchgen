@@ -89,7 +89,8 @@ class BatchGen():
 		dist_init_addr: Optional[str] = "localhost:12355",
 		nnodes: Optional[int] = 1,
 		node_rank: Optional[int] = 0,
-		device_per_node: Optional[int] = 8
+		device_per_node: Optional[int] = 8,
+		kv_dtype: str = "bfloat16"
 	):
 		self.huggingface_ckpt_name = huggingface_ckpt_name
 		self.queries = queries
@@ -107,6 +108,7 @@ class BatchGen():
 		self.nnodes = nnodes
 		self.node_rank = node_rank
 		self.device_per_node = device_per_node
+		self.kv_dtype = kv_dtype
 
 		self.system_setup()
 		(
@@ -316,6 +318,7 @@ class BatchGen():
 				local_rank = local_rank,
 				global_rank = global_rank,
 				world_size = self.nnodes * self.device_per_node,
+				kv_dtype=self.kv_dtype,
 			)
 			batchgens.append(batchgen_instance)
 		

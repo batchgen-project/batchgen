@@ -1,4 +1,4 @@
-/* Copyright 2025 SGLang Team. All Rights Reserved.
+/* Copyright 2025 BatchGen Team. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,20 +47,36 @@ using fptr_t = int64_t;
  * From csrc/moe
  */
 
-std::vector<at::Tensor> moe_fused_gate(
-    at::Tensor& input,
-    at::Tensor& bias,
-    int64_t num_expert_group,
+// std::vector<at::Tensor> moe_fused_gate(
+//     at::Tensor& input,
+//     at::Tensor& bias,
+//     int64_t num_expert_group,
+//     int64_t topk_group,
+//     int64_t topk,
+//     int64_t num_fused_shared_experts,
+//     double routed_scaling_factor);
+
+std::vector<torch::Tensor> moe_fused_gate(
+    torch::Tensor scores,                    // [n, n_routed_experts] - already sigmoid'd
+    torch::Tensor e_score_correction_bias,   // [n_routed_experts]
+    int64_t n_group,
     int64_t topk_group,
-    int64_t topk,
-    int64_t num_fused_shared_experts,
-    double routed_scaling_factor);
+    int64_t n_routed_experts,
+    int64_t top_k,
+    double routed_scaling_factor); 
 
 std::vector<torch::Tensor> expert_bincount_cuda(
     torch::Tensor eids,
     int64_t routed_expert_start_idx,
     int64_t experts_per_rank,
     torch::Device device);
+
+std::vector<torch::Tensor> expert_bincount_cuda_sliced(
+    torch::Tensor eids,                         
+    int64_t routed_expert_start_idx,
+    int64_t experts_per_rank,
+    torch::Device device);
+
 
 std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     torch::Tensor global_x,
