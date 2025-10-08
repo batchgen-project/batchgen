@@ -283,7 +283,7 @@ class BatchGen():
 		logging.info(f"World size: {world_size}")
 		logging.info(f"Total number of queries: {num_queries}")
 
-		assert num_queries >= world_size, "Current version requires at least as many queries as devices. Will be fixed in the future version."
+		# assert num_queries >= world_size, "Current version requires at least as many queries as devices. Will be fixed in the future version."
 
 		distribution = self.distribute_sequences(num_queries, world_size)
 		per_device_host_kv_cache_size = self.host_kv_cache_size // self.num_devices
