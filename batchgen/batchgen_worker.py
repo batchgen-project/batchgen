@@ -444,8 +444,9 @@ class BatchGenWorker:
 				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
 				self._config_prefill()
 				prefill_start_time = time.perf_counter()
-				with torch.inference_mode():
-					new_token = self.prefill(self.model_batches[model_batch_idx])
+				if len(self.model_batches[model_batch_idx]) > 0:
+					with torch.inference_mode():
+						new_token = self.prefill(self.model_batches[model_batch_idx])
 				prefill_time += time.perf_counter() - prefill_start_time
 				self._unregister_fp8_weights()
 				dist.barrier()
