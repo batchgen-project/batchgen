@@ -20,5 +20,5 @@ from .moe import (
 from .elementwise import fused_rmsnorm
 
 build_tree_kernel = (
-    None  # TODO(ying): remove this after updating the sglang python code.
+    None
 )
