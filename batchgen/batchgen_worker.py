@@ -211,17 +211,17 @@ class BatchGenWorker:
 		# Use flash_attn by default thus right padding.
 		self.tokenizer.padding_side = "right"
 
-		self.queries, self.model_batches = self.vanilla_batching(
-			self.global_queries, self.global_rank, self.world_size)
-		self.num_queries = len(self.queries)
-		# TODO: Move to centralized config later.
-		self.engine_config.Basic_Config.num_queries = self.num_queries
+		# self.queries, self.model_batches = self.vanilla_batching(
+		# 	self.global_queries, self.global_rank, self.world_size)
+		# self.num_queries = len(self.queries)
+		# # TODO: Move to centralized config later.
+		# self.engine_config.Basic_Config.num_queries = self.num_queries
 		input_arguments = {
 			"huggingface_ckpt_name": self.huggingface_ckpt_name,
 			"hf_cache_dir": self.hf_cache_dir,
 			"cache_dir": self.cache_dir,
 			"pt_ckpt_dir": self.pt_ckpt_dir,
-			"queries": self.queries,
+			# "queries": self.queries,
 			"padding_length": self.max_input_length,
 			"max_decoding_length": self.max_decoding_length,
 			"device": self.device,
@@ -231,7 +231,7 @@ class BatchGenWorker:
 			"engine_config_json_dir": self.engine_config_json_dir,
 			"host_kv_cache_size": self.host_kv_cache_size,
 			"kv_dtype": self.kv_dtype,
-			"num_queries": len(self.queries),
+			# "num_queries": len(self.queries),
 			"dist_init_addr": self.dist_init_addr,
 			"local_rank": self.local_rank,
 			"rank": self.global_rank,
@@ -246,6 +246,11 @@ class BatchGenWorker:
 		self.core_engine, self.engine_config, self.model_config, self.hf_model_config = (
 			self.initializer.Init()
 		)
+		self.queries, self.model_batches = self.vanilla_batching(
+			self.global_queries, self.global_rank, self.world_size)
+		self.num_queries = len(self.queries)
+		# TODO: Move to centralized config later.
+		self.engine_config.Basic_Config.num_queries = self.num_queries
 		
 		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
 		self.parallel_manager = self.parallel_manager(
@@ -485,7 +490,9 @@ class BatchGenWorker:
 				self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size,
 				self.engine_config.KV_Storage_Config.num_host_slots
 			)
-		
+		logging.info(f"Rank {rank}: Model batch size: {model_batch_size}")
+		logging.info(f"Rank {rank}: MoE decoding micro batch size: {self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size}")
+		logging.info(f"Rank {rank}: Global batch size: {self.engine_config.KV_Storage_Config.num_host_slots}")
 		# Step 4: Calculate the maximum number of batches globally
 		# This ensures all ranks have the same number of batches
 		max_num_batches = math.ceil(num_global_queries / model_batch_size)
