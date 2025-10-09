@@ -5,6 +5,7 @@
 # The script is configured to use fp8 for key-value cache storage and runs on 2 nodes
 datetime=$(date '+%Y-%m-%d-%H-%M-%S')
 export HF_ENDPOINT=https://hf-mirror.com
+export NCCL_BUFFSIZE=16777216
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python <dir-to-r1_mmlu_pro_test.py> \
     --hugging_face_checkpoint "deepseek-ai/DeepSeek-R1" \
