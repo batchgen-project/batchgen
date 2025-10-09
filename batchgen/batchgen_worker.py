@@ -1036,7 +1036,7 @@ class BatchGenWorker:
 			Attn_Wrapper.scale = scale_dict
 			Attn_Wrapper.past_key_states = past_key_states
 			Attn_Wrapper.past_value_states = past_value_states
-			while new_token_idx < self.max_decoding_length and len(batch) > 0:
+			while new_token_idx < self.max_decoding_length:
 				# Log for every 50 tokens.
 				if self.rank == 0 and new_token_idx % 50 == 0:
 					logging.info(f"Decoding new token idx: {new_token_idx}")
@@ -1102,7 +1102,7 @@ class BatchGenWorker:
 		
 		
 		else:
-			while new_token_idx < self.max_decoding_length and len(batch) > 0:
+			while new_token_idx < self.max_decoding_length:
 				if self.rank == 0:
 					logging.info(f"Decoding new token idx: {new_token_idx}")
 				# Step 1: Before each round of decoding, review the attention mode and batching plan.
