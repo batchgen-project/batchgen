@@ -522,6 +522,11 @@ class Attn_Wrapper(torch.nn.Module):
 				
 				
 			hidden_states = kwargs["hidden_states"]
+			if hidden_states.shape[0] == 0:
+				logging.debug(
+					f"[Rank: {dist.get_rank()} Layer {self.layer_idx} - Attn_Wrapper] Empty hidden states, skip."
+				)
+				return hidden_states, None, None
 			attention_mask = Attn_Wrapper.attention_mask
 			position_ids = Attn_Wrapper.position_ids
 			# attention_mask = attention_mask.to(torch.int64)

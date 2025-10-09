@@ -654,8 +654,12 @@ class BatchGenWorker:
 				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
 			self._config_prefill()
 			prefill_start_time = time.perf_counter()
-			with torch.inference_mode():
-				new_token = self.prefill(self.model_batches[model_batch_idx])
+			if len(self.model_batches[model_batch_idx]) > 0:
+				with torch.inference_mode():
+					new_token = self.prefill(self.model_batches[model_batch_idx])
+			else:
+				new_token = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
+				logging.info(f"Rank {self.rank} model batch {model_batch_idx} is empty, skipping prefill.")
 			prefill_time += time.perf_counter() - prefill_start_time
 			self._unregister_fp8_weights()
 			dist.barrier()
@@ -1051,15 +1055,16 @@ class BatchGenWorker:
 				# ]
 				# Attn_Wrapper.cur_batch = micro_batches
 				with torch.inference_mode():
-					attention_mask = torch.cat(
-						[
-							self.query_book[query_idx].encoded[
-								"attention_mask"
-							][:, : self.max_input_length + new_token_idx]
-							for query_idx in batch
-						],
-						dim=0,
-					).to(self.torch_device)
+					if len(batch) != 0:
+						attention_mask = torch.cat(
+							[
+								self.query_book[query_idx].encoded[
+									"attention_mask"
+								][:, : self.max_input_length + new_token_idx]
+								for query_idx in batch
+							],
+							dim=0,
+						).to(self.torch_device)
 					# if "deepseek" in self.model_config.model_type:
 					#     position_ids = create_position_ids_from_attention_mask(
 					#         attention_mask
@@ -1069,14 +1074,20 @@ class BatchGenWorker:
 					#         attention_mask
 					#     )[:, -1].unsqueeze(-1)
 
-					Attn_Wrapper.attention_mask = attention_mask
-					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
-					Attn_Wrapper.cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
-					Attn_Wrapper.max_seqlen = Attn_Wrapper.cache_seqlens.max().item()
+						Attn_Wrapper.attention_mask = attention_mask
+						Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+						Attn_Wrapper.cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+						Attn_Wrapper.max_seqlen = Attn_Wrapper.cache_seqlens.max().item()
+					else:
+						attention_mask = torch.zeros((0, self.max_input_length + new_token_idx), dtype=torch.int64, device=self.torch_device)
+						Attn_Wrapper.attention_mask = attention_mask
+						Attn_Wrapper.position_ids = attention_mask
+						Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
+						Attn_Wrapper.max_seqlen = 0
 
 					new_tokens = self.model(
 						new_tokens.to(self.torch_device),
-						attention_mask=attention_mask.to(self.torch_device),
+						attention_mask=attention_mask,
 						# position_ids=position_ids.to(self.torch_device),
 						use_cache=False,
 					)
