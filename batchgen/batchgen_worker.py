@@ -695,11 +695,11 @@ class BatchGenWorker:
 								torch.zeros((bsz, pad_len, past_key_states[i].size(-1)), device=past_key_states[i].device, dtype=past_key_states[i].dtype)
 							], dim=1)
 					past_value_states = None
-					# scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
+					scale_dict = None
 					if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
-						scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
-					else:
-						scale_dict = None
+						if len(self.model_batches[model_batch_idx]) > []:
+							scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+						
 					
 			
 				else:
