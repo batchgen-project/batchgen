@@ -159,9 +159,6 @@ if __name__ == "__main__":
 	if len(queries) < max_prompts:
 		queries = queries * (max_prompts // len(queries)) + queries[: max_prompts % len(queries)]
 	
-	# tokenizer = AutoTokenizer.from_pretrained(
-	# 	hugging_face_checkpoint, trust_remote_code=True
-	# )
 	tokenizer = AutoTokenizer.from_pretrained(
 		args.cache_dir,
 		trust_remote_code=True,
