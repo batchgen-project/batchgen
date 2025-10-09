@@ -159,8 +159,13 @@ if __name__ == "__main__":
 	if len(queries) < max_prompts:
 		queries = queries * (max_prompts // len(queries)) + queries[: max_prompts % len(queries)]
 	
+	# tokenizer = AutoTokenizer.from_pretrained(
+	# 	hugging_face_checkpoint, trust_remote_code=True
+	# )
 	tokenizer = AutoTokenizer.from_pretrained(
-		hugging_face_checkpoint, trust_remote_code=True
+		args.cache_dir,
+		trust_remote_code=True,
+		local_files_only=True
 	)
 	for prompt_idx in range(len(queries)):
 		messages = [
