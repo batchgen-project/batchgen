@@ -697,7 +697,7 @@ class BatchGenWorker:
 					past_value_states = None
 					scale_dict = None
 					if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
-						if len(self.model_batches[model_batch_idx]) > []:
+						if len(self.model_batches[model_batch_idx]) > 0:
 							scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 						
 					
