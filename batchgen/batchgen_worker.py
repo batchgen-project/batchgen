@@ -679,13 +679,14 @@ class BatchGenWorker:
 					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 					# Pad the kv cache to be multiple of 64
 					bsz, kv_seqlen, _ = past_key_states[0].size()
-					if kv_seqlen % 64 != 0:
-						pad_len = 64 - (kv_seqlen % 64)
-						for i in range(len(past_key_states)):
-							past_key_states[i] = torch.cat([
-								past_key_states[i], 
-								torch.zeros((bsz, pad_len, past_key_states[i].size(-1)), device=past_key_states[i].device, dtype=past_key_states[i].dtype)
-							], dim=1)
+					if self.engine_config.Basic_Config.kv_dtype == "bfloat16":
+						if kv_seqlen % 64 != 0:
+							pad_len = 64 - (kv_seqlen % 64)
+							for i in range(len(past_key_states)):
+								past_key_states[i] = torch.cat([
+									past_key_states[i], 
+									torch.zeros((bsz, pad_len, past_key_states[i].size(-1)), device=past_key_states[i].device, dtype=past_key_states[i].dtype)
+								], dim=1)
 					past_value_states = None
 					scale_dict = None
 					if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
