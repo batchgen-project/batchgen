@@ -89,7 +89,7 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 
 
 	""" Num Queries """
-	if not input_arguments.get('num_queries', None):
+	if input_arguments.get('num_queries') is None:
 		raise ValueError("Num queries must be specified")
 	else:
 		engine_config.Basic_Config.num_queries = input_arguments.num_queries

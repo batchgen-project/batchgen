@@ -283,7 +283,7 @@ class BatchGen():
 		logging.info(f"World size: {world_size}")
 		logging.info(f"Total number of queries: {num_queries}")
 
-		assert num_queries >= world_size, "Current version requires at least as many queries as devices. Will be fixed in the future version."
+		# assert num_queries >= world_size, "Current version requires at least as many queries as devices. Will be fixed in the future version."
 
 		distribution = self.distribute_sequences(num_queries, world_size)
 		per_device_host_kv_cache_size = self.host_kv_cache_size // self.num_devices
@@ -297,14 +297,15 @@ class BatchGen():
 		for local_rank, global_rank in indices:
 			# start_query_idx = device_idx * queries_per_device
 			# end_query_idx = min((device_idx + 1) * queries_per_device, num_queries)
-			start_query_idx, end_query_idx = distribution[global_rank]
-			logging.info(f"Global rank {global_rank}: Processing queries from {start_query_idx} to {end_query_idx}")
+			# start_query_idx, end_query_idx = distribution[global_rank]
+			# logging.info(f"Global rank {global_rank}: Processing queries from {start_query_idx} to {end_query_idx}")
 					
 			batchgen_instance = BatchGenWorker(
 				huggingface_ckpt_name=self.huggingface_ckpt_name,
 				hf_cache_dir=self.hf_cache_dir,
 				cache_dir=self.cache_dir,
-				queries=self.queries[start_query_idx:end_query_idx],
+				# queries=self.queries[start_query_idx:end_query_idx],
+				queries=self.queries, # Global queries. Leave the packing rules into each worker.
 				max_input_length=self.max_input_length,
 				max_decoding_length=self.max_decoding_length,
 				device=self.device[local_rank],
