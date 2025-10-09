@@ -140,6 +140,8 @@ class DeepseekV3RMSNorm(nn.Module):
 
 	def forward(self, hidden_states):
 		# return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
+		if hidden_states.shape[0] == 0:
+			return hidden_states
 		return fused_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
