@@ -490,32 +490,23 @@ class BatchGenWorker:
 				self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size,
 				self.engine_config.KV_Storage_Config.num_host_slots
 			)
-		logging.info(f"Rank {rank}: Model batch size: {model_batch_size}")
-		logging.info(f"Rank {rank}: MoE decoding micro batch size: {self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size}")
-		logging.info(f"Rank {rank}: Global batch size: {self.engine_config.KV_Storage_Config.num_host_slots}")
-		# Step 4: Calculate the maximum number of batches globally
-		# This ensures all ranks have the same number of batches
-		max_num_batches = math.ceil(num_global_queries / model_batch_size)
+		
+		# Step 4: Calculate the maximum number of batches based on the rank with most queries
+		# The rank with the most queries determines how many batches all ranks need
+		max_local_queries = math.ceil(num_global_queries / num_devices)
+		max_num_batches = math.ceil(max_local_queries / model_batch_size)
 		
 		# Step 5: Create model batches for this rank's local queries
 		model_batches = []
 		
 		for batch_idx in range(max_num_batches):
-			# Calculate the global batch range
-			global_batch_start = batch_idx * model_batch_size
-			global_batch_end = min((batch_idx + 1) * model_batch_size, num_global_queries)
+			# Calculate the local batch range for this rank
+			local_batch_start = batch_idx * model_batch_size
+			local_batch_end = min((batch_idx + 1) * model_batch_size, num_local_queries)
 			
-			# Find the intersection of this global batch with this rank's assigned range
-			# Rank owns global sequences in [start_idx, end_idx)
-			rank_batch_start = max(global_batch_start, start_idx)
-			rank_batch_end = min(global_batch_end, end_idx)
-			
-			if rank_batch_start < rank_batch_end:
+			if local_batch_start < num_local_queries:
 				# This rank has sequences in this batch
-				# Convert global indices to local indices (0-indexed for this rank)
-				local_start = rank_batch_start - start_idx
-				local_end = rank_batch_end - start_idx
-				local_indices = list(range(local_start, local_end))
+				local_indices = list(range(local_batch_start, local_batch_end))
 				model_batches.append(local_indices)
 			else:
 				# This rank has no sequences in this batch - append empty list
@@ -528,6 +519,7 @@ class BatchGenWorker:
 		logging.info(f"  Assigned global range: [{start_idx}, {end_idx})")
 		logging.info(f"  Local query count: {num_local_queries}")
 		logging.info(f"  Model batch size: {model_batch_size}")
+		logging.info(f"  Max local queries per rank: {max_local_queries}")
 		logging.info(f"  Total batches (all ranks): {len(model_batches)}")
 		logging.info(f"  Non-empty batches (this rank): {sum(1 for b in model_batches if b)}")
 		logging.info(f"  Batch contents (local indices):")
