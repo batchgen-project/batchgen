@@ -43,10 +43,10 @@ jobs:
         run: |
           docker version
           docker info | head -n 30
-      
+
       - name: Check NVIDIA driver
         run: nvidia-smi
-      
+
       - name: Run MMLU Test in Container
         run: |
           docker run --rm --gpus all \
@@ -86,10 +86,10 @@ jobs:
         run: |
           docker version
           docker info | head -n 30
-      
+
       - name: Check NVIDIA driver
         run: nvidia-smi
-      
+
       - name: Run MMLU Test in Container
         run: |
           docker run --rm --gpus all \

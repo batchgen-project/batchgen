@@ -262,7 +262,7 @@ clear_cuda_arches(CMAKE_FLAG)
 # CUTLASS
 set(CUTLASS_DIR "${PROJECT_SOURCE_DIR}/csrc/cutlass")
 if(NOT EXISTS "${CUTLASS_DIR}/include")
-    message(FATAL_ERROR 
+    message(FATAL_ERROR
         "CUTLASS not found at ${CUTLASS_DIR}. "
         "Please clone it with: git clone https://github.com/NVIDIA/cutlass ${CUTLASS_DIR}")
 endif()
@@ -419,8 +419,8 @@ else()
 endif()
 
 # Find torch_python library explicitly
-find_library(TORCH_PYTHON_LIBRARY 
-    NAMES torch_python 
+find_library(TORCH_PYTHON_LIBRARY
+    NAMES torch_python
     PATHS "${TORCH_INSTALL_PREFIX}/lib"
     REQUIRED
 )

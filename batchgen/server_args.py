@@ -1,7 +1,9 @@
 import argparse
 import dataclasses
+import os
 import tempfile
 from typing import Optional
+from pathlib import Path
 
 from batchgen.utils import is_port_available
 
@@ -9,6 +11,7 @@ from batchgen.utils import is_port_available
 @dataclasses.dataclass
 class ServerArgs:
     model_path: str
+    file_path: Optional[str] = None
 
     # http server
     host: str = "127.0.0.1"
@@ -26,6 +29,12 @@ class ServerArgs:
             type=str,
             required=True,
             help="Path to the model checkpoint or model name",
+        )
+        parser.add_argument(
+            "--file_path",
+            type=str,
+            default=None,
+            help="Path to the file storage directory",
         )
         parser.add_argument(
             "--host",
@@ -63,7 +72,16 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace) -> "ServerArgs":
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
+    
+    def __post_init__(self):
+        if not is_port_available(self.port):
+            raise ValueError(f"Port {self.port} is not available. Please choose another port.")
+        
+        # if file_path is not provided, use a model path
+        if not self.file_path:
+            self.file_path = os.path.join(os.path.dirname(self.model_path), "files")
 
+        self.file_path = Path(os.path.abspath(self.file_path))
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()

@@ -1,9 +1,28 @@
 from pydantic import BaseModel, Field
+from typing import List, Optional
+
+# ============= Pydantic Models for File API =============
+
+class FileObject(BaseModel):
+    id: str
+    object: str = "file"
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: str
+    status: str = "processed"
+    status_details: Optional[str] = None
 
 
+class ListFilesResponse(BaseModel):
+    object: str = "list"
+    data: List[FileObject]
 
-# Parameter Server for development
 
+class DeleteFileResponse(BaseModel):
+    id: str
+    object: str = "file"
+    deleted: bool
 
 
 # HTTP Server for receiving requests and send back responses

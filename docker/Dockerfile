@@ -19,16 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
 
-    
-WORKDIR /root/moegen
+
+WORKDIR /root/batchgen
 RUN uv venv --python ${PYTHON_VERSION}
 
-ENV PATH="/root/moegen/.venv/bin:$PATH"
+ENV PATH="/root/batchgen/.venv/bin:$PATH"
 
 # Make sure to install ninja to enable fast builds
 RUN uv pip install torch==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128 wheel packaging ninja \
     && uv cache clean
-    
+
 # Install Flash Attention, DeepGEMM and FlashMLA
 RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && cd flash-attention \
@@ -57,12 +57,12 @@ task_names = [ \
 [load_dataset('Xnhyacinth/LongBench', name, split='test') for name in task_names] \
 "
 
-# Install from moe gen source
-COPY . /root/moegen
+# Install from batchgen source
+COPY . /root/batchgen
 
 RUN uv pip install -e . -v \
     && uv cache clean
 
 ENV NCCL_BUFFSIZE=16777216
- 
+
 CMD ["sleep", "infinity"]

@@ -2,7 +2,7 @@
 ## Start server on two nodes respectively:
 ```python
 #Add the following line if you have problem in accessing Huggingface.co
-export HF_ENDPOINT=https://hf-mirror.com 
+export HF_ENDPOINT=https://hf-mirror.com
 python -m batchgen.parameter_server --model deepseek-ai/DeepSeek-R1 --cache-dir "<dir-to-your-model-checkpoint>"
 ```
 
@@ -56,4 +56,4 @@ If the program terminated or killed without proper clean-up, you may need to man
 ```bash
 rm -f /dev/hugepages/*
 ```
-By ```sudo sysctl -w vm.nr_hugepages=0```, we can revert to default page configurations. 
+By ```sudo sysctl -w vm.nr_hugepages=0```, we can revert to default page configurations.
