@@ -22,6 +22,8 @@ from batchgen.managers.io_struct import (
     BatchObject,
     BatchStatus,
     CreateBatchRequest,
+    ListBatchesRequest,
+    ListBatchesResponse,
 )
 from batchgen.server_args import ServerArgs
 
@@ -261,7 +263,24 @@ async def create_batch(request: CreateBatchRequest):
     
     The batch will be processed asynchronously. You can poll the batch status
     using the retrieve batch endpoint.
+    
+    Reference: https://platform.openai.com/docs/api-reference/batch/create
     """
+    # Validate that the input file exists
+    input_file_metadata = load_metadata(request.input_file_id)
+    if not input_file_metadata:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No such file object: {request.input_file_id}"
+        )
+    
+    # Validate that the input file has the correct purpose
+    if input_file_metadata.get("purpose") != "batch":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file purpose. Expected 'batch', got '{input_file_metadata.get('purpose')}'"
+        )
+    
     # Generate unique batch ID
     batch_id = f"batch_{uuid.uuid4().hex[:24]}"
     
@@ -282,6 +301,111 @@ async def create_batch(request: CreateBatchRequest):
     )
     
     # Save batch
+    save_batch(batch)
+    
+    return batch
+
+
+@app.get("/v1/batches", response_model=ListBatchesResponse)
+async def list_batches(
+    after: Optional[str] = None,
+    limit: int = 20
+):
+    """
+    List all batches with pagination support.
+    
+    Reference: https://platform.openai.com/docs/api-reference/batch/list
+    """
+    # Validate query parameters using Pydantic model
+    try:
+        query_params = ListBatchesRequest(
+            after=after,
+            limit=limit
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Get all batches (already sorted by creation time, newest first)
+    all_batches = list_all_batches()
+    
+    # Apply pagination with 'after' cursor
+    if query_params.after:
+        # Find the index of the 'after' batch
+        after_index = None
+        for i, batch in enumerate(all_batches):
+            if batch.id == query_params.after:
+                after_index = i
+                break
+        
+        if after_index is not None:
+            # Get batches after this index
+            all_batches = all_batches[after_index + 1:]
+    
+    # Apply limit
+    has_more = len(all_batches) > query_params.limit
+    limited_batches = all_batches[:query_params.limit]
+    
+    # Get first and last IDs
+    first_id = limited_batches[0].id if limited_batches else None
+    last_id = limited_batches[-1].id if limited_batches else None
+    
+    return ListBatchesResponse(
+        data=limited_batches,
+        first_id=first_id,
+        last_id=last_id,
+        has_more=has_more
+    )
+
+
+@app.get("/v1/batches/{batch_id}", response_model=BatchObject)
+async def retrieve_batch(batch_id: str):
+    """
+    Retrieve information about a specific batch.
+    
+    Reference: https://platform.openai.com/docs/api-reference/batch/retrieve
+    """
+    batch = load_batch(batch_id)
+    
+    if not batch:
+        raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
+    
+    return batch
+
+
+@app.post("/v1/batches/{batch_id}/cancel", response_model=BatchObject)
+async def cancel_batch(batch_id: str):
+    """
+    Cancel a batch that is in progress.
+    
+    You can only cancel batches with status 'validating' or 'in_progress'.
+    
+    Reference: https://platform.openai.com/docs/api-reference/batch/cancel
+    """
+    batch = load_batch(batch_id)
+    
+    if not batch:
+        raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
+    
+    # Check if batch can be cancelled
+    cancellable_statuses = [BatchStatus.VALIDATING, BatchStatus.IN_PROGRESS]
+    if batch.status not in [s.value for s in cancellable_statuses]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel batch with status '{batch.status}'. "
+                   f"Only batches with status 'validating' or 'in_progress' can be cancelled."
+        )
+    
+    # Update batch status to cancelling
+    now = int(datetime.now().timestamp())
+    batch.status = BatchStatus.CANCELLING
+    batch.cancelling_at = now
+    
+    # In a real implementation, you would trigger the cancellation process here
+    # For now, we'll immediately mark it as cancelled
+    batch.status = BatchStatus.CANCELLED
+    batch.cancelled_at = now
+    
+    # Save updated batch
     save_batch(batch)
     
     return batch
