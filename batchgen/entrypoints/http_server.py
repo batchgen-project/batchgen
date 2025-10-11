@@ -35,6 +35,20 @@ STORAGE_PATH = None
 METADATA_PATH = None
 BATCHES_PATH = None
 
+@contextmanager
+async def lifespan(app: FastAPI):
+    # Startup code
+    # load parameter, return a shm_name
+    # allocate kv cache
+
+    # init global ServerScheduler
+    yield
+    # Shutdown code
+    # free kv cache
+    # free parameter
+    # free global ServerScheduler
+    pass
+
 
 def setup_storage(path: str):
     global STORAGE_PATH, METADATA_PATH, BATCHES_PATH
