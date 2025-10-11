@@ -12,3 +12,4 @@ fastapi
 zmq
 python-multipart
 openai
+unittest
