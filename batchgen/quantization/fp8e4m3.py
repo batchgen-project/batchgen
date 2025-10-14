@@ -631,7 +631,7 @@ def dequant_compressed_kv_per_token_with_length_v2(
 
 
 @triton.jit
-def dequant_compressed_kv_per_token_kernel(
+def dequant_compressed_kv_per_token_kernel_3d(
     kv_ptr, scale_ptr, output_ptr,
     dim: tl.constexpr, 
     quant_block_size: tl.constexpr,
@@ -1193,7 +1193,7 @@ def dequant_compressed_kv_per_token_kernel(
 #     )
 
 
-def dequant_compressed_kv_per_token(
+def dequant_compressed_kv_per_token_3D(
     q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
 ):
     """
@@ -1240,7 +1240,7 @@ def dequant_compressed_kv_per_token(
         (dim + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
     )
     
-    dequant_compressed_kv_per_token_kernel[grid](
+    dequant_compressed_kv_per_token_kernel_3d[grid](
         q, scale, result,
         dim, BLOCK_SIZE, seq_len,
         bsz, padded_seq_len, max_seq_len,
@@ -1656,3 +1656,111 @@ def dequant_compressed_kv_per_token(
 #     )
     
 #     return result
+
+@triton.jit
+def dequant_compressed_kv_per_token_kernel(
+			kv_ptr, scale_ptr, output_ptr,
+			dim: tl.constexpr, quant_block_size: tl.constexpr,
+			bsz, padded_seq_len, max_seq_len,
+
+			BLOCK_SIZE_M: tl.constexpr,
+			BLOCK_SIZE_N: tl.constexpr,
+			# Strides
+			kv_stride0, kv_stride1,
+			scale_stride0, scale_stride1,
+			output_stride0, output_stride1,
+		
+):
+		"""
+			Kernel to dequantize FP8 KV-Cache tensor with scale.
+			Args:
+					kv_ptr: Pointer to the quantized KV tensor [bsz, max_seq_len, dim]
+					scale_ptr: Pointer to the scale tensor [bsz, max_seq_len, num_blocks]
+					output_ptr: Pointer to the output tensor [bsz, padded_seq_len, dim]
+
+			Notes:
+					- This kernel load first seq_len elements of each sequence in the KV tensor
+						and dequantizes them using the corresponding scale factors.
+		"""
+		tile_m = tl.program_id(0)  
+		tile_n = tl.program_id(1)  
+		token_idx = tile_m * BLOCK_SIZE_M
+		seq_idx = token_idx // padded_seq_len
+		kv_token_idx = seq_idx * max_seq_len + token_idx % padded_seq_len
+
+		block_idx = tile_n * BLOCK_SIZE_N // quant_block_size
+
+		block_ptr = kv_ptr + kv_token_idx * kv_stride0 + tile_n * BLOCK_SIZE_N * kv_stride1
+		# Load the [BLOCK_SIZE_M, BLOCK_SIZE_N] FP8 blocks
+		mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len) & (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
+		fp8_block = tl.load(
+			block_ptr + (tl.arange(0, BLOCK_SIZE_M)[:, None] * kv_stride0 + tl.arange(0, BLOCK_SIZE_N)[None, :] * kv_stride1),
+			mask=mask, other=0.0, cache_modifier='.cg'
+		)
+		scale_offsets = scale_ptr + (kv_token_idx + tl.arange(0, BLOCK_SIZE_M)[:, None]) * scale_stride0 + block_idx * scale_stride1
+		scale = tl.load(scale_offsets, mask=(tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * max_seq_len), other=0.0, cache_modifier='.cg')
+
+		# Dequantize the FP8 blocks
+		fp32_block = tl.cast(fp8_block, tl.float32) * scale
+		# Convert to BF16
+		bf16_block = tl.cast(fp32_block, tl.bfloat16)
+
+		# Store the dequantized blocks
+		output_ptrs = output_ptr + tile_m * BLOCK_SIZE_M * output_stride0 + tile_n * BLOCK_SIZE_N * output_stride1
+		output_offsets = tl.arange(0, BLOCK_SIZE_M)[:, None] * output_stride0 + tl.arange(0, BLOCK_SIZE_N)[None, :] * output_stride1
+		output_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < bsz * padded_seq_len) & (tl.arange(0, BLOCK_SIZE_N)[None, :] < dim)
+		tl.store(output_ptrs + output_offsets, bf16_block, mask=output_mask)
+
+
+def dequant_compressed_kv_per_token(
+		q: torch.Tensor, scale: torch.Tensor, seq_len: int, BLOCK_SIZE: int = 128
+):
+		"""
+		Dequantize FP8 KV-Cache tensor with scale.
+		Args:
+				q: [bsz, max_seq_len, dim]
+				scale: [bsz, max_seq_len, num_blocks]
+		Returns:
+				x: [bsz, padded_seq_len, dim]
+
+		Notes:
+				- return x with padded_seq_len.
+					Where padded_seq_len is the nearest multiple of 64(page size for FlashMLA) greater than or equal to seq_len.
+				- We dequantize the first seq_len elements of the max_seq_len tensor and write to x.
+		"""
+		assert q.is_cuda and scale.is_cuda
+		assert q.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32, f"Expected q to be float8_e4m3fn and scale to be float32, got {q.dtype} and {scale.dtype}"
+		assert seq_len >= 0, f"seq_len must be >= 0, got {seq_len}"
+		assert seq_len <= q.size(1), f"seq_len must be <= max_seq_len, got {seq_len} > {q.size(1)}"
+		assert q.is_contiguous() and scale.is_contiguous(), "q and scale must be contiguous tensors"
+		assert q.dim() == scale.dim(), f"Expected q and scale to have the same number of dimensions, got {q.dim()} and {scale.dim()}"
+
+		bsz, max_seq_len, dim = q.shape
+		padded_seq_len = ceil(seq_len / 64) * 64  # Nearest multiple of 64
+
+		result = torch.ones((bsz * padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+		# Assign max value to result tensor
+		# result.fill_(1e10)
+
+		# Construct 3D triton grid: bsz, seq_len, num_blocks
+		BLOCK_SIZE_M = 64
+		BLOCK_SIZE_N = 64
+		num_blocks_m = ceil(bsz * padded_seq_len / BLOCK_SIZE_M)
+		num_blocks_n = ceil(dim / BLOCK_SIZE_N)
+		q = q.view(-1, dim)
+		scale = scale.view(-1, scale.shape[-1])  # Flatten the first two dimensions
+		
+		grid = (num_blocks_m, num_blocks_n)
+		# Call the kernel
+		dequant_compressed_kv_per_token_kernel[grid](
+				q, scale, result,
+				dim, BLOCK_SIZE,
+				bsz, padded_seq_len, max_seq_len,
+				BLOCK_SIZE_M, BLOCK_SIZE_N,
+
+				q.stride(0), q.stride(1),
+				scale.stride(0), scale.stride(1),
+				result.stride(0), result.stride(1)
+		)
+		# result = torch.ones((bsz * padded_seq_len, dim), device=q.device, dtype=torch.bfloat16)
+		return result.view(bsz, padded_seq_len, dim)  # Reshape back to [bsz, padded_seq_len, dim]
