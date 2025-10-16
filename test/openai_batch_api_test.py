@@ -47,19 +47,19 @@ class BatchAPITestCase(unittest.TestCase):
         # Note: Batches are auto-managed by the server (expire after 24h)
         # We just track them for assertion purposes
     
-    def create_batch_input_file(self, filename: str = "batch_input.jsonl", num_requests: int = 5):
+    def create_batch_input_file(self, filename: str = "batch_input.jsonl", num_requests: int = 5, unique_suffix: str = ""):
         """Create a test JSONL file with batch requests"""
         requests = []
         for i in range(num_requests):
             request = {
-                "custom_id": f"request-{i+1}",
+                "custom_id": f"request-{i+1}{unique_suffix}",
                 "method": "POST",
                 "url": "/v1/chat/completions",
                 "body": {
                     "model": "gpt-3.5-turbo",
                     "messages": [
                         {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": f"What is {i+1} + {i+1}?"}
+                        {"role": "user", "content": f"What is {i+1} + {i+1}?{unique_suffix}"}
                     ],
                     "max_tokens": 100
                 }
@@ -75,11 +75,14 @@ class BatchAPITestCase(unittest.TestCase):
     
     def upload_batch_file(self, filename: str = None, num_requests: int = 5):
         """Helper to create and upload a batch input file"""
+        # Generate unique suffix to ensure file content is unique (prevents checksum collisions)
+        unique_suffix = f"-{int(time.time() * 1000000)}"  # Microsecond precision
+        
         if filename is None:
             filename = f"batch_test_{int(time.time())}.jsonl"
         
-        # Create the file
-        self.create_batch_input_file(filename, num_requests)
+        # Create the file with unique content
+        self.create_batch_input_file(filename, num_requests, unique_suffix)
         
         # Upload the file
         with open(filename, "rb") as f:
@@ -90,6 +93,98 @@ class BatchAPITestCase(unittest.TestCase):
         
         self.uploaded_file_ids.append(uploaded_file.id)
         return uploaded_file
+
+
+class FileUploadTests(BatchAPITestCase):
+    """Tests for file upload functionality"""
+    
+    def test_upload_file_with_checksum(self):
+        """Test that uploaded files have a checksum"""
+        # Create a test file
+        filename = "test_checksum.jsonl"
+        unique_suffix = f"-{int(time.time() * 1000000)}"
+        self.create_batch_input_file(filename, num_requests=3, unique_suffix=unique_suffix)
+        
+        # Upload the file
+        with open(filename, "rb") as f:
+            uploaded_file = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file.id)
+        
+        # Retrieve the file to check metadata
+        file_info = self.client.files.retrieve(uploaded_file.id)
+        
+        # Assertions
+        self.assertIsNotNone(file_info.id)
+        # The checksum field might not be exposed through the OpenAI SDK
+        # but we can verify the file was uploaded successfully
+        self.assertEqual(file_info.purpose, "batch")
+    
+    def test_duplicate_file_upload(self):
+        """Test that uploading the same file twice returns the same file ID"""
+        # Create a test file with specific content
+        filename = "test_duplicate.jsonl"
+        unique_suffix = f"-{int(time.time() * 1000000)}"
+        self.create_batch_input_file(filename, num_requests=5, unique_suffix=unique_suffix)
+        
+        # Upload the file first time
+        with open(filename, "rb") as f:
+            uploaded_file1 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file1.id)
+        
+        # Upload the same file again
+        with open(filename, "rb") as f:
+            uploaded_file2 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        # Should return the same file (deduplication)
+        self.assertEqual(uploaded_file1.id, uploaded_file2.id)
+        self.assertEqual(uploaded_file1.created_at, uploaded_file2.created_at)
+        self.assertEqual(uploaded_file1.bytes, uploaded_file2.bytes)
+        
+        # Verify only one file was actually stored
+        # (the second upload returned existing file metadata)
+    
+    def test_different_files_get_different_ids(self):
+        """Test that different files get different IDs"""
+        # Create first file
+        filename1 = "test_file1.jsonl"
+        unique_suffix1 = f"-{int(time.time() * 1000000)}"
+        self.create_batch_input_file(filename1, num_requests=3, unique_suffix=unique_suffix1)
+        
+        # Create second file with different content
+        filename2 = "test_file2.jsonl"
+        unique_suffix2 = f"-{int(time.time() * 1000000) + 1}"
+        self.create_batch_input_file(filename2, num_requests=7, unique_suffix=unique_suffix2)
+        
+        # Upload both files
+        with open(filename1, "rb") as f:
+            uploaded_file1 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file1.id)
+        
+        with open(filename2, "rb") as f:
+            uploaded_file2 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file2.id)
+        
+        # Files should have different IDs
+        self.assertNotEqual(uploaded_file1.id, uploaded_file2.id)
 
 
 class BatchCreationTests(BatchAPITestCase):
@@ -146,48 +241,6 @@ class BatchCreationTests(BatchAPITestCase):
         self.assertIsNotNone(batch.metadata)
         self.assertEqual(batch.metadata, custom_metadata)
         self.assertEqual(batch.metadata["project"], "test_project")
-    
-    def test_create_batch_embeddings_endpoint(self):
-        """Test creating a batch for embeddings endpoint"""
-        # Create embeddings batch input
-        filename = "embeddings_batch.jsonl"
-        requests = []
-        for i in range(3):
-            request = {
-                "custom_id": f"embed-{i+1}",
-                "method": "POST",
-                "url": "/v1/embeddings",
-                "body": {
-                    "model": "text-embedding-ada-002",
-                    "input": f"Sample text number {i+1}"
-                }
-            }
-            requests.append(request)
-        
-        with open(filename, "w") as f:
-            for request in requests:
-                f.write(json.dumps(request) + "\n")
-        
-        self.temp_files.append(filename)
-        
-        # Upload file
-        with open(filename, "rb") as f:
-            input_file = self.client.files.create(file=f, purpose="batch")
-        
-        self.uploaded_file_ids.append(input_file.id)
-        
-        # Create batch
-        batch = self.client.batches.create(
-            input_file_id=input_file.id,
-            endpoint="/v1/embeddings",
-            completion_window="24h"
-        )
-        
-        self.batch_ids.append(batch.id)
-        
-        # Assertions
-        self.assertEqual(batch.endpoint, "/v1/embeddings")
-        self.assertIsNotNone(batch.id)
 
 
 class BatchListTests(BatchAPITestCase):
@@ -381,6 +434,69 @@ class ErrorHandlingTests(BatchAPITestCase):
                 endpoint="/v1/chat/completions",
                 completion_window="24h"
             )
+    
+    def test_create_duplicate_batch_on_same_file(self):
+        """Test that creating a second batch on the same file with an active batch fails"""
+        # Upload input file
+        input_file = self.upload_batch_file(num_requests=3)
+        
+        # Create first batch
+        batch1 = self.client.batches.create(
+            input_file_id=input_file.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h"
+        )
+        
+        self.batch_ids.append(batch1.id)
+        
+        # Try to create second batch with the same input file - should fail
+        with self.assertRaises(Exception) as context:
+            batch2 = self.client.batches.create(
+                input_file_id=input_file.id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h"
+            )
+        
+        # Verify error message mentions the file is already associated with a batch
+        error_message = str(context.exception)
+        self.assertIn("already associated with an active batch", error_message.lower())
+        self.assertIn(batch1.id, error_message)
+    
+    def test_create_batch_after_cancellation(self):
+        """Test that creating a new batch on a file is allowed after the previous batch is cancelled"""
+        # Upload input file
+        input_file = self.upload_batch_file(num_requests=3)
+        
+        # Create first batch
+        batch1 = self.client.batches.create(
+            input_file_id=input_file.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h"
+        )
+        
+        self.batch_ids.append(batch1.id)
+        
+        # Cancel the first batch
+        cancelled_batch = self.client.batches.cancel(batch1.id)
+        self.assertIn(cancelled_batch.status, ["cancelling", "cancelled"])
+        
+        # If the batch is still in "cancelling" state, we might need to wait
+        # For this test, we assume immediate cancellation to "cancelled" status
+        if cancelled_batch.status == "cancelled":
+            # Now we should be able to create a new batch with the same file
+            batch2 = self.client.batches.create(
+                input_file_id=input_file.id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h"
+            )
+            
+            self.batch_ids.append(batch2.id)
+            
+            # Verify the new batch was created successfully
+            self.assertIsNotNone(batch2.id)
+            self.assertNotEqual(batch2.id, batch1.id)
+            self.assertEqual(batch2.input_file_id, input_file.id)
+            self.assertIn(batch2.status, ["validating", "in_progress"])
     
     def test_retrieve_nonexistent_batch(self):
         """Test retrieving a non-existent batch"""

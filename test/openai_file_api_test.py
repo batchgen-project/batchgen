@@ -68,17 +68,6 @@ class FilesAPITestCase(unittest.TestCase):
         
         self.temp_files.append(filename)
         return filename
-    
-    def create_sample_text_file(self, filename: str = "sample.txt", content: str = None):
-        """Create a simple text file for testing"""
-        if content is None:
-            content = "This is a sample text file for testing the Files API.\n" * 10
-        
-        with open(filename, "w") as f:
-            f.write(content)
-        
-        self.temp_files.append(filename)
-        return filename
 
 
 class FileUploadTests(FilesAPITestCase):
@@ -105,6 +94,136 @@ class FileUploadTests(FilesAPITestCase):
         self.assertEqual(uploaded_file.purpose, "batch")
         self.assertGreater(uploaded_file.bytes, 0)
         self.assertIsNotNone(uploaded_file.created_at)
+    
+    def test_upload_duplicate_file(self):
+        """Test that uploading the same file twice returns the same file ID (deduplication)"""
+        # Create a test file with specific content
+        test_file = self.create_test_file("duplicate_test.jsonl", num_requests=5)
+        
+        # Upload the file first time
+        with open(test_file, "rb") as f:
+            uploaded_file1 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file1.id)
+        
+        # Upload the same file again
+        with open(test_file, "rb") as f:
+            uploaded_file2 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        # Assertions - should return the same file (deduplication)
+        self.assertEqual(uploaded_file1.id, uploaded_file2.id)
+        self.assertEqual(uploaded_file1.created_at, uploaded_file2.created_at)
+        self.assertEqual(uploaded_file1.bytes, uploaded_file2.bytes)
+        self.assertEqual(uploaded_file1.filename, uploaded_file2.filename)
+        
+        # Verify we can retrieve the file
+        retrieved = self.client.files.retrieve(uploaded_file1.id)
+        self.assertEqual(retrieved.id, uploaded_file1.id)
+    
+    def test_different_files_get_different_ids(self):
+        """Test that files with different content get different IDs"""
+        # Create first file
+        test_file1 = self.create_test_file("different_file1.jsonl", num_requests=3)
+        
+        # Create second file with different content
+        test_file2 = self.create_test_file("different_file2.jsonl", num_requests=7)
+        
+        # Upload both files
+        with open(test_file1, "rb") as f:
+            uploaded_file1 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file1.id)
+        
+        with open(test_file2, "rb") as f:
+            uploaded_file2 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file2.id)
+        
+        # Files should have different IDs
+        self.assertNotEqual(uploaded_file1.id, uploaded_file2.id)
+        self.assertNotEqual(uploaded_file1.bytes, uploaded_file2.bytes)
+    
+    def test_duplicate_file_same_content_different_filename(self):
+        """Test that files with same content but different filenames are deduplicated"""
+        # Create two files with identical batch content but different filenames
+        test_file1 = self.create_test_file("same_content_a.jsonl", num_requests=3)
+        test_file2 = self.create_test_file("same_content_b.jsonl", num_requests=3)
+        
+        # Verify files have different names but same content
+        self.assertNotEqual(test_file1, test_file2)
+        with open(test_file1, "rb") as f1, open(test_file2, "rb") as f2:
+            self.assertEqual(f1.read(), f2.read())
+        
+        # Upload first file
+        with open(test_file1, "rb") as f:
+            uploaded_file1 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file1.id)
+        
+        # Upload second file with same content but different name
+        with open(test_file2, "rb") as f:
+            uploaded_file2 = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        # Should return the same file ID (content-based deduplication)
+        self.assertEqual(uploaded_file1.id, uploaded_file2.id)
+        self.assertEqual(uploaded_file1.bytes, uploaded_file2.bytes)
+        self.assertEqual(uploaded_file1.created_at, uploaded_file2.created_at)
+    
+    def test_upload_batch_file_with_consistent_max_tokens(self):
+        """Test uploading a valid batch file with consistent max_tokens"""
+        # Create a batch file with all requests having the same max_tokens
+        filename = "valid_consistent_max_tokens.jsonl"
+        max_tokens = 150
+        
+        with open(filename, "w") as f:
+            for i in range(5):
+                request = {
+                    "custom_id": f"req-{i+1}",
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": "gpt-3.5-turbo",
+                        "messages": [
+                            {"role": "user", "content": f"Test request {i+1}"}
+                        ],
+                        "max_tokens": max_tokens
+                    }
+                }
+                f.write(json.dumps(request) + "\n")
+        
+        self.temp_files.append(filename)
+        
+        # Upload should succeed
+        with open(filename, "rb") as f:
+            uploaded_file = self.client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        self.uploaded_file_ids.append(uploaded_file.id)
+        
+        # Assertions
+        self.assertIsNotNone(uploaded_file.id)
+        self.assertEqual(uploaded_file.purpose, "batch")
+        self.assertGreater(uploaded_file.bytes, 0)
     
     def test_large_file_upload(self):
         """Test uploading a larger file"""
@@ -140,7 +259,8 @@ class FileListTests(FilesAPITestCase):
         file_ids = []
         for i in range(3):
             filename = f"list_test_{i+1}.jsonl"
-            self.create_test_file(filename, num_requests=2)
+            # Create files with different number of requests to ensure unique content
+            self.create_test_file(filename, num_requests=i+2)  # 2, 3, 4 requests
             
             with open(filename, "rb") as f:
                 uploaded = self.client.files.create(file=f, purpose="batch")
@@ -211,9 +331,12 @@ class FileRetrievalTests(FilesAPITestCase):
     
     def test_retrieve_file_content(self):
         """Test retrieving file content"""
-        # Upload a file with known content
-        original_content = "Test content for file retrieval.\nLine 2.\nLine 3."
-        test_file = self.create_sample_text_file("content_test.txt", original_content)
+        # Upload a file with known content (batch format)
+        test_file = self.create_test_file("content_test.jsonl", num_requests=2)
+        
+        # Read the original content
+        with open(test_file, "rb") as f:
+            original_content = f.read()
         
         with open(test_file, "rb") as f:
             uploaded_file = self.client.files.create(file=f, purpose="batch")
@@ -222,7 +345,7 @@ class FileRetrievalTests(FilesAPITestCase):
         
         # Retrieve file content
         content = self.client.files.content(uploaded_file.id)
-        retrieved_content = content.read().decode('utf-8')
+        retrieved_content = content.read()
         
         # Assertions
         self.assertEqual(retrieved_content, original_content)
@@ -269,7 +392,7 @@ class ErrorHandlingTests(FilesAPITestCase):
     
     def test_upload_with_invalid_purpose(self):
         """Test uploading with an invalid purpose raises an error"""
-        test_file = self.create_sample_text_file("error_test.txt")
+        test_file = self.create_test_file("error_test.jsonl", num_requests=1)
         
         with open(test_file, "rb") as f:
             with self.assertRaises(Exception):
@@ -279,6 +402,146 @@ class ErrorHandlingTests(FilesAPITestCase):
         """Test retrieving content of non-existent file raises an error"""
         with self.assertRaises(Exception):
             self.client.files.content("file-nonexistent789")
+    
+    def test_upload_batch_file_missing_required_fields(self):
+        """Test uploading a batch file with missing required fields"""
+        # Create a file with missing custom_id
+        filename = "invalid_missing_field.jsonl"
+        with open(filename, "w") as f:
+            # Missing 'custom_id' field
+            f.write(json.dumps({
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {"model": "gpt-3.5-turbo", "messages": [], "max_tokens": 100}
+            }) + "\n")
+        
+        self.temp_files.append(filename)
+        
+        with open(filename, "rb") as f:
+            with self.assertRaises(Exception) as context:
+                self.client.files.create(file=f, purpose="batch")
+        
+        # Verify error message mentions missing field
+        error_str = str(context.exception).lower()
+        self.assertIn("missing", error_str)
+    
+    def test_upload_batch_file_missing_max_tokens(self):
+        """Test uploading a batch file with missing max_tokens"""
+        filename = "invalid_no_max_tokens.jsonl"
+        with open(filename, "w") as f:
+            # Missing 'max_tokens' in body
+            f.write(json.dumps({
+                "custom_id": "req-1",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {"model": "gpt-3.5-turbo", "messages": []}
+            }) + "\n")
+        
+        self.temp_files.append(filename)
+        
+        with open(filename, "rb") as f:
+            with self.assertRaises(Exception) as context:
+                self.client.files.create(file=f, purpose="batch")
+        
+        # Verify error message mentions max_tokens
+        error_str = str(context.exception).lower()
+        self.assertIn("max_tokens", error_str)
+    
+    def test_upload_batch_file_inconsistent_max_tokens(self):
+        """Test uploading a batch file with inconsistent max_tokens values"""
+        filename = "invalid_inconsistent_max_tokens.jsonl"
+        with open(filename, "w") as f:
+            # First request with max_tokens=100
+            f.write(json.dumps({
+                "custom_id": "req-1",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-3.5-turbo",
+                    "messages": [{"role": "user", "content": "Test"}],
+                    "max_tokens": 100
+                }
+            }) + "\n")
+            # Second request with different max_tokens=200
+            f.write(json.dumps({
+                "custom_id": "req-2",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-3.5-turbo",
+                    "messages": [{"role": "user", "content": "Test"}],
+                    "max_tokens": 200
+                }
+            }) + "\n")
+        
+        self.temp_files.append(filename)
+        
+        with open(filename, "rb") as f:
+            with self.assertRaises(Exception) as context:
+                self.client.files.create(file=f, purpose="batch")
+        
+        # Verify error message mentions inconsistent max_tokens
+        error_str = str(context.exception).lower()
+        self.assertIn("inconsistent", error_str)
+        self.assertIn("max_tokens", error_str)
+    
+    def test_upload_batch_file_invalid_json(self):
+        """Test uploading a batch file with invalid JSON"""
+        filename = "invalid_json.jsonl"
+        with open(filename, "w") as f:
+            f.write("This is not valid JSON\n")
+        
+        self.temp_files.append(filename)
+        
+        with open(filename, "rb") as f:
+            with self.assertRaises(Exception) as context:
+                self.client.files.create(file=f, purpose="batch")
+        
+        # Verify error message mentions JSON error
+        error_str = str(context.exception).lower()
+        self.assertIn("json", error_str)
+    
+    def test_upload_batch_file_empty(self):
+        """Test uploading an empty batch file"""
+        filename = "empty_batch.jsonl"
+        with open(filename, "w") as f:
+            f.write("")
+        
+        self.temp_files.append(filename)
+        
+        with open(filename, "rb") as f:
+            with self.assertRaises(Exception) as context:
+                self.client.files.create(file=f, purpose="batch")
+        
+        # Verify error message mentions empty file
+        error_str = str(context.exception).lower()
+        self.assertIn("empty", error_str)
+    
+    def test_upload_batch_file_invalid_max_tokens_type(self):
+        """Test uploading a batch file with invalid max_tokens type"""
+        filename = "invalid_max_tokens_type.jsonl"
+        with open(filename, "w") as f:
+            f.write(json.dumps({
+                "custom_id": "req-1",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "gpt-3.5-turbo",
+                    "messages": [{"role": "user", "content": "Test"}],
+                    "max_tokens": "invalid"  # Should be integer
+                }
+            }) + "\n")
+        
+        self.temp_files.append(filename)
+        
+        with open(filename, "rb") as f:
+            with self.assertRaises(Exception) as context:
+                self.client.files.create(file=f, purpose="batch")
+        
+        # Verify error mentions max_tokens must be integer
+        error_str = str(context.exception).lower()
+        self.assertIn("max_tokens", error_str)
+        self.assertIn("integer", error_str)
 
 
 if __name__ == "__main__":

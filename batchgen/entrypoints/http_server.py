@@ -3,22 +3,32 @@ import json
 import os
 import time
 import uuid
+import hashlib
+import logging
 from pathlib import Path
+import multiprocessing as mp
 from typing import List, Optional
 from datetime import datetime
+from functools import partial
+from contextlib import asynccontextmanager
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from batchgen.managers.io_struct import (
+from batchgen.managers.file_schema import (
     DeleteFileResponse,
     FileObject,
     ListFilesResponse,
     FilePurpose,
     FileStatus,
     ListFilesRequest,
+)
+from batchgen.managers.batch_schema import (
     BatchObject,
     BatchStatus,
     CreateBatchRequest,
@@ -26,88 +36,138 @@ from batchgen.managers.io_struct import (
     ListBatchesResponse,
 )
 from batchgen.server_args import ServerArgs
+from batchgen.managers.scheduler import ServerScheduler
+from batchgen.managers.storage import StorageManager
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-app = FastAPI(title="OpenAI Compatible Files API")
 
-# Storage configuration
-STORAGE_PATH = None
-METADATA_PATH = None
-BATCHES_PATH = None
+# Global rank tracking
+CURRENT_RANK = 0
 
-@contextmanager
+# Global scheduler instance
+# SCHEDULER = None
+
+# Global storage instance
+STORAGE = None
+
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup code
     # load parameter, return a shm_name
     # allocate kv cache
+    
+    # create a seperate process to handle batch tasks
+    stop_event = mp.Event()
+    batch_process = mp.Process(target=partial(ServerScheduler(app.server_args), stop_event=stop_event), daemon=True)
+    batch_process.start()
 
     # init global ServerScheduler
+    global STORAGE
+    
+    # logging.info(f"Initializing ServerScheduler (rank={CURRENT_RANK}, nnodes={app.server_args.nnodes})")
+    # SCHEDULER = ServerScheduler(app.server_args)
+    # logging.info("ServerScheduler initialized successfully")
+
+    # init global StorageManager
+    STORAGE = StorageManager(app.server_args)
+    logging.info("StorageManager initialized successfully")
+
     yield
+    
     # Shutdown code
     # free kv cache
     # free parameter
     # free global ServerScheduler
-    pass
+    stop_event.set()
+    batch_process.join()
+
+app = FastAPI(title="OpenAI Compatible API", lifespan=lifespan)
 
 
-def setup_storage(path: str):
-    global STORAGE_PATH, METADATA_PATH, BATCHES_PATH
-    STORAGE_PATH = Path(path)
-    METADATA_PATH = STORAGE_PATH / "metadata"
-    BATCHES_PATH = STORAGE_PATH / "batches"
-    STORAGE_PATH.mkdir(parents=True, exist_ok=True)
-    METADATA_PATH.mkdir(parents=True, exist_ok=True)
-    BATCHES_PATH.mkdir(parents=True, exist_ok=True)
-
-
-def save_metadata(file_id: str, metadata: dict):
-    """Save file metadata to disk."""
-    metadata_file = METADATA_PATH / f"{file_id}.json"
-    with open(metadata_file, "w") as f:
-        json.dump(metadata, f)
-
-
-def load_metadata(file_id: str) -> Optional[dict]:
-    """Load file metadata from disk."""
-    metadata_file = METADATA_PATH / f"{file_id}.json"
-    if not metadata_file.exists():
-        return None
-    with open(metadata_file, "r") as f:
-        return json.load(f)
-
-
-def list_all_metadata() -> List[dict]:
-    """List all file metadata."""
-    metadata_list = []
-    for metadata_file in (METADATA_PATH).glob("*.json"):
-        with open(metadata_file, "r") as f:
-            metadata_list.append(json.load(f))
-    return metadata_list
-
-def save_batch(batch: BatchObject) -> None:
-    """Save batch metadata to disk"""
-    batch_file = BATCHES_PATH / f"{batch.id}.json"
-    with open(batch_file, "w") as f:
-        json.dump(batch.dict(), f)
-
-def load_batch(batch_id: str) -> Optional[BatchObject]:
-    """Load batch metadata from disk"""
-    batch_file = BATCHES_PATH / f"{batch_id}.json"
-    if not batch_file.exists():
-        return None
-    with open(batch_file, "r") as f:
-        data = json.load(f)
-    return BatchObject(**data)
-
-def list_all_batches() -> List[BatchObject]:
-    """List all batches sorted by creation time (newest first)"""
-    batches = []
-    for batch_file in BATCHES_PATH.glob("*.json"):
-        batch = load_batch(batch_file.stem)
-        if batch:
-            batches.append(batch)
-    return sorted(batches, key=lambda x: x.created_at, reverse=True)
-
+def validate_batch_file_content(content: bytes, purpose: str) -> tuple[bool, Optional[str]]:
+    """
+    Validate batch file content for required fields and consistency.
+    
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    if purpose != "batch":
+        # Only validate batch purpose files
+        return True, None
+    
+    try:
+        lines = content.decode('utf-8').strip().split('\n')
+    except UnicodeDecodeError:
+        return False, "File must be UTF-8 encoded"
+    
+    if not lines or (len(lines) == 1 and not lines[0].strip()):
+        return False, "Batch file cannot be empty"
+    
+    max_tokens_value = None
+    model_value = None
+    required_fields = ["custom_id", "method", "url", "body"]
+    
+    for line_num, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+            
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as e:
+            return False, f"Line {line_num}: Invalid JSON - {str(e)}"
+        
+        # Check required fields
+        missing_fields = [field for field in required_fields if field not in request]
+        if missing_fields:
+            return False, f"Line {line_num}: Missing required fields: {', '.join(missing_fields)}"
+        
+        # Validate body exists and is a dict
+        if not isinstance(request.get("body"), dict):
+            return False, f"Line {line_num}: 'body' must be an object"
+        
+        body = request["body"]
+        
+        # Check if model exists in body
+        if "model" not in body:
+            return False, f"Line {line_num}: Missing 'model' in request body"
+        
+        current_model = body["model"]
+        
+        # Validate model is a string
+        if not isinstance(current_model, str) or not current_model.strip():
+            return False, f"Line {line_num}: 'model' must be a non-empty string, got {current_model}"
+        
+        # Check consistency of model across all requests
+        if model_value is None:
+            model_value = current_model
+        elif model_value != current_model:
+            return False, f"Line {line_num}: Inconsistent model value. Expected '{model_value}', got '{current_model}'. All requests must have the same model value."
+        
+        # Check if max_tokens exists in body
+        if "max_tokens" not in body:
+            return False, f"Line {line_num}: Missing 'max_tokens' in request body"
+        
+        current_max_tokens = body["max_tokens"]
+        
+        # Validate max_tokens is a positive integer
+        if not isinstance(current_max_tokens, int) or current_max_tokens <= 0:
+            return False, f"Line {line_num}: 'max_tokens' must be a positive integer, got {current_max_tokens}"
+        
+        # Check consistency of max_tokens across all requests
+        if max_tokens_value is None:
+            max_tokens_value = current_max_tokens
+        elif max_tokens_value != current_max_tokens:
+            return False, f"Line {line_num}: Inconsistent max_tokens value. Expected {max_tokens_value}, got {current_max_tokens}. All requests must have the same max_tokens value."
+        
+        # Validate method
+        if request["method"] not in ["POST", "GET", "PUT", "DELETE", "PATCH"]:
+            return False, f"Line {line_num}: Invalid method '{request['method']}'"
+        
+        # Validate url format
+        if not isinstance(request["url"], str) or not request["url"].startswith("/"):
+            return False, f"Line {line_num}: 'url' must be a string starting with '/'"
+    
+    return True, None
 
 @app.post("/v1/files", response_model=FileObject)
 async def upload_file(file: UploadFile = File(...), purpose: str = Form(...)):
@@ -128,12 +188,31 @@ async def upload_file(file: UploadFile = File(...), purpose: str = Form(...)):
             detail=f"Invalid purpose '{purpose}'. Must be one of: {', '.join(valid_purposes)}",
         )
 
+    # Read file content
+    content = await file.read()
+    
+    # Validate batch file content
+    is_valid, error_message = validate_batch_file_content(content, file_purpose.value)
+    if not is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid batch file: {error_message}"
+        )
+    
+    # Calculate SHA-256 checksum
+    checksum = hashlib.sha256(content).hexdigest()
+    
+    # Check for duplicate file
+    existing_file = STORAGE.find_file_by_checksum(checksum)
+    if existing_file:
+        # Return existing file metadata if duplicate is found
+        return FileObject(**existing_file)
+
     # Generate unique file ID
     file_id = f"file-{uuid.uuid4().hex}"
 
     # Save file to disk
     file_path = app.server_args.file_path / file_id
-    content = await file.read()
 
     with open(file_path, "wb") as f:
         f.write(content)
@@ -149,9 +228,10 @@ async def upload_file(file: UploadFile = File(...), purpose: str = Form(...)):
         "purpose": file_purpose.value,
         "status": FileStatus.PROCESSED.value,
         "status_details": None,
+        "checksum": checksum,
     }
 
-    save_metadata(file_id, metadata)
+    STORAGE.save_metadata(file_id, metadata)
 
     return FileObject(**metadata)
 
@@ -179,7 +259,7 @@ async def list_files(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-    all_metadata = list_all_metadata()
+    all_metadata = STORAGE.list_all_metadata()
 
     # Filter by purpose if specified
     if query_params.purpose:
@@ -217,7 +297,7 @@ async def retrieve_file(file_id: str):
     """
     Returns information about a specific file.
     """
-    metadata = load_metadata(file_id)
+    metadata = STORAGE.load_metadata(file_id)
 
     if not metadata:
         raise HTTPException(status_code=404, detail="File not found")
@@ -230,20 +310,18 @@ async def delete_file(file_id: str):
     """
     Delete a file.
     """
-    metadata = load_metadata(file_id)
+    metadata = STORAGE.load_metadata(file_id)
 
     if not metadata:
         raise HTTPException(status_code=404, detail="File not found")
 
     # Delete actual file
-    file_path = STORAGE_PATH / file_id
+    file_path = STORAGE.storage_path / file_id
     if file_path.exists():
         file_path.unlink()
 
     # Delete metadata
-    metadata_file = METADATA_PATH / f"{file_id}.json"
-    if metadata_file.exists():
-        metadata_file.unlink()
+    STORAGE.delete_file_metadata(file_id)
 
     return DeleteFileResponse(id=file_id, deleted=True)
 
@@ -253,12 +331,12 @@ async def retrieve_file_content(file_id: str):
     """
     Returns the contents of the specified file.
     """
-    metadata = load_metadata(file_id)
+    metadata = STORAGE.load_metadata(file_id)
 
     if not metadata:
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_path = STORAGE_PATH / file_id
+    file_path = STORAGE.storage_path / file_id
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File content not found")
@@ -281,7 +359,7 @@ async def create_batch(request: CreateBatchRequest):
     Reference: https://platform.openai.com/docs/api-reference/batch/create
     """
     # Validate that the input file exists
-    input_file_metadata = load_metadata(request.input_file_id)
+    input_file_metadata = STORAGE.load_metadata(request.input_file_id)
     if not input_file_metadata:
         raise HTTPException(
             status_code=400,
@@ -293,6 +371,15 @@ async def create_batch(request: CreateBatchRequest):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid file purpose. Expected 'batch', got '{input_file_metadata.get('purpose')}'"
+        )
+    
+    # Check if the file already has an active batch
+    existing_batch = STORAGE.get_active_batch_for_file(request.input_file_id)
+    if existing_batch:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File '{request.input_file_id}' is already associated with an active batch '{existing_batch.id}' "
+                   f"with status '{existing_batch.status}'. Please wait for it to complete or cancel it before creating a new batch."
         )
     
     # Generate unique batch ID
@@ -315,7 +402,7 @@ async def create_batch(request: CreateBatchRequest):
     )
     
     # Save batch
-    save_batch(batch)
+    STORAGE.save_batch(batch)
     
     return batch
 
@@ -340,7 +427,7 @@ async def list_batches(
         raise HTTPException(status_code=400, detail=str(e))
     
     # Get all batches (already sorted by creation time, newest first)
-    all_batches = list_all_batches()
+    all_batches = STORAGE.list_all_batches()
     
     # Apply pagination with 'after' cursor
     if query_params.after:
@@ -378,7 +465,7 @@ async def retrieve_batch(batch_id: str):
     
     Reference: https://platform.openai.com/docs/api-reference/batch/retrieve
     """
-    batch = load_batch(batch_id)
+    batch = STORAGE.load_batch(batch_id)
     
     if not batch:
         raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
@@ -395,7 +482,7 @@ async def cancel_batch(batch_id: str):
     
     Reference: https://platform.openai.com/docs/api-reference/batch/cancel
     """
-    batch = load_batch(batch_id)
+    batch = STORAGE.load_batch(batch_id)
     
     if not batch:
         raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
@@ -420,7 +507,7 @@ async def cancel_batch(batch_id: str):
     batch.cancelled_at = now
     
     # Save updated batch
-    save_batch(batch)
+    STORAGE.save_batch(batch)
     
     return batch
 
@@ -428,16 +515,65 @@ async def cancel_batch(batch_id: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "rank": CURRENT_RANK,
+        "api_enabled": CURRENT_RANK == 0
+    }
 
 
-def launch_server(server_args: ServerArgs):
+@app.get("/rank")
+async def get_rank():
+    """Get current rank information."""
+    return {
+        "rank": CURRENT_RANK,
+    }
+
+def launch_server(server_args: ServerArgs, rank: int = None):
+    """
+    Launch the HTTP server.
+    
+    Args:
+        server_args: Server configuration arguments
+        rank: Process rank (0 to world_size-1). If None, uses server_args.node_rank.
+              Only rank 0 can handle API requests.
+    """
+    
+    
+    global CURRENT_RANK
+    # Use provided rank or fall back to node_rank from server_args
+    if rank is None:
+        rank = server_args.node_rank
+    CURRENT_RANK = rank
+    
+    # Set up server args before lifespan (needed for scheduler initialization)
+    # Storage setup is now handled by the scheduler during lifespan startup
     app.server_args = server_args
-    setup_storage(server_args.file_path)
+    
+    # # Log configuration
+    # logging.info(f"Starting server with rank={rank}, nnodes={server_args.nnodes}")
+    # if server_args.nnodes > 1:
+    #     logging.info(f"Broadcaster endpoint: {server_args.get_broadcaster_endpoint()}")
+    
+    # # Only rank 0 should actually start the HTTP server
+    # if rank != 0:
+    #     logging.warning(f"Rank {rank}: HTTP server is disabled. Only rank 0 can serve API requests.")
+        
+    #     # For non-zero ranks in multi-node setup, still need to participate in broadcaster
+    #     if server_args.nnodes > 1:
+    #         logging.info(f"Rank {rank}: Initializing as broadcaster subscriber")
+    #         # The broadcaster will be initialized in the lifespan context
+    #         # Keep process alive to participate in broadcasts
+    #         import signal
+    #         signal.pause()  # Wait indefinitely
+    #     return
+    
+    # Rank 0 starts the HTTP server
+    logging.info(f"Rank {rank}: Starting HTTP server on {server_args.listen_ip}:{server_args.listen_port}")
     uvicorn.run(
         app,
-        host=server_args.host,
-        port=server_args.port,
+        host=server_args.listen_ip,
+        port=server_args.listen_port,
         log_level="info",
         timeout_keep_alive=300,
         loop="uvloop",

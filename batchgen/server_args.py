@@ -14,8 +14,8 @@ class ServerArgs:
     file_path: Optional[str] = None
 
     # http server
-    host: str = "127.0.0.1"
-    port: int = 40000
+    listen_addr: str = "0.0.0.0:40000"
+    param_addr: str = "127.0.0.1:10900"
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -37,16 +37,16 @@ class ServerArgs:
             help="Path to the file storage directory",
         )
         parser.add_argument(
-            "--host",
+            "--listen-addr",
             type=str,
-            default=ServerArgs.host,
-            help="Host for the HTTP server",
+            default=ServerArgs.listen_addr,
+            help="The address (host:port) for the HTTP server to listen on.",
         )
         parser.add_argument(
-            "--port",
-            type=int,
-            default=ServerArgs.port,
-            help="Port for the HTTP server",
+            "--param-addr",
+            type=str,
+            default=ServerArgs.param_addr,
+            help="The address (host:port) for the parameter server (default: 127.0.0.1:10900).",
         )
 
         # Multi-node distributed serving
@@ -74,14 +74,35 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
     
     def __post_init__(self):
-        if not is_port_available(self.port):
-            raise ValueError(f"Port {self.port} is not available. Please choose another port.")
+        
         
         # if file_path is not provided, use a model path
         if not self.file_path:
             self.file_path = os.path.join(os.path.dirname(self.model_path), "files")
 
         self.file_path = Path(os.path.abspath(self.file_path))
+        
+        self.listen_ip, self.listen_port = self.listen_addr.split(":")
+        self.listen_port = int(self.listen_port)
+        self.param_ip, self.param_port = self.param_addr.split(":")
+        self.param_port = int(self.param_port)
+
+        if not is_port_available(self.listen_port):
+            raise ValueError(f"Port {self.listen_port} is not available. Please choose another port.")
+    
+    def create_broadcaster(self):
+        """
+        Create a ZMQBroadcaster instance configured from server args.
+        
+        Returns:
+            ZMQBroadcaster instance
+        """
+        from batchgen.utils import ZMQBroadcaster
+        return ZMQBroadcaster(
+            rank=self.node_rank,
+            world_size=self.nnodes,
+            endpoint=self.dist_init_addr
+        )
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
@@ -122,4 +143,43 @@ class PortArgs:
         return PortArgs(
             scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
             scheduler_output_ipc_name=f"tcp://{dist_init_host}:{scheduler_output_port}",
+        )
+
+
+@dataclasses.dataclass
+class ParameterArgs:
+    """Arguments for parameter server client configuration"""
+    host: str = "localhost"
+    port: int = 10900
+    timeout: int = 300  # seconds (default matches model loading timeout)
+
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser) -> None:
+        """Add parameter server arguments to CLI parser"""
+        parser.add_argument(
+            "--param-host",
+            type=str,
+            default=ParameterArgs.host,
+            help="Parameter server host address",
+        )
+        parser.add_argument(
+            "--param-port",
+            type=int,
+            default=ParameterArgs.port,
+            help="Parameter server port (default: 10900)",
+        )
+        parser.add_argument(
+            "--param-timeout",
+            type=int,
+            default=ParameterArgs.timeout,
+            help="Parameter server HTTP request timeout in seconds (default: 300)",
+        )
+
+    @classmethod
+    def from_cli_args(cls, args: argparse.Namespace) -> "ParameterArgs":
+        """Create ParameterArgs from parsed CLI arguments"""
+        return cls(
+            host=getattr(args, "param_host", cls.host),
+            port=getattr(args, "param_port", cls.port),
+            timeout=getattr(args, "param_timeout", cls.timeout),
         )

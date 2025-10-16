@@ -197,6 +197,12 @@ def get_zmq_socket(
     elif socket_type == zmq.DEALER:
         set_send_opt()
         set_recv_opt()
+    elif socket_type == zmq.PUB:
+        set_send_opt()
+    elif socket_type == zmq.SUB:
+        set_recv_opt()
+        # Subscribe to all messages by default
+        socket.setsockopt(zmq.SUBSCRIBE, b"")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
@@ -219,3 +225,270 @@ def is_port_available(port):
             return False
         except OverflowError:
             return False
+
+
+class ZMQBroadcaster:
+    """
+    ZMQ-based broadcast communication class.
+    Rank 0 broadcasts objects to all other ranks.
+    
+    Uses PUB-SUB pattern where:
+    - Rank 0 is the publisher (PUB socket)
+    - All other ranks are subscribers (SUB socket)
+    
+    Uses barrier synchronization to ensure all subscribers are connected
+    before broadcasting begins.
+    """
+    
+    def __init__(self, rank: int, world_size: int, endpoint: str, context: zmq.Context = None, barrier_endpoint: str = None):
+        """
+        Initialize ZMQ broadcaster.
+        
+        Args:
+            rank: Current process rank (0 to world_size-1)
+            world_size: Total number of processes
+            endpoint: ZMQ endpoint address (e.g., "tcp://127.0.0.1:5555")
+            context: ZMQ context (creates new one if None)
+            barrier_endpoint: ZMQ endpoint for barrier synchronization (auto-generated if None)
+        """
+        self.rank = rank
+        self.world_size = world_size
+        self.endpoint = endpoint
+        self.context = context if context is not None else zmq.Context()
+        self.socket = None
+        self.barrier_socket = None
+        self.ack_socket = None
+        
+        # Auto-generate barrier endpoint if not provided
+        if barrier_endpoint is None:
+            # Extract port from endpoint and use next port for barrier
+            import re
+            match = re.search(r':(\d+)$', endpoint)
+            if match:
+                base_port = int(match.group(1))
+                barrier_endpoint = endpoint.rsplit(':', 1)[0] + f':{base_port + 1000}'
+            else:
+                barrier_endpoint = endpoint + '_barrier'
+        
+        self.barrier_endpoint = barrier_endpoint
+        self.ack_endpoint = barrier_endpoint.rsplit(':', 1)[0] + ':' + str(int(barrier_endpoint.rsplit(':', 1)[1]) + 1)
+        
+        if self.rank == 0:
+            # Rank 0 is the broadcaster (PUB socket)
+            self.socket = get_zmq_socket(
+                context=self.context,
+                socket_type=zmq.PUB,
+                endpoint=self.endpoint,
+                bind=True
+            )
+            logging.info(f"Rank {self.rank}: Broadcasting on {self.endpoint}")
+            
+            # Setup barrier socket (PULL to collect ready signals)
+            self.barrier_socket = self.context.socket(zmq.PULL)
+            self.barrier_socket.bind(self.barrier_endpoint)
+            logging.info(f"Rank {self.rank}: Barrier setup on {self.barrier_endpoint}")
+            
+            # Setup ack socket (PUB to send ready signal)
+            self.ack_socket = self.context.socket(zmq.PUB)
+            self.ack_socket.bind(self.ack_endpoint)
+            logging.info(f"Rank {self.rank}: Ack socket on {self.ack_endpoint}")
+            
+            # Small delay to ensure ack socket is bound before subscribers connect
+            import time
+            time.sleep(0.1)
+            
+            # Wait for all subscribers to signal ready
+            self._barrier_wait()
+            
+        else:
+            # Setup ack socket first (SUB to receive ready signal)
+            self.ack_socket = self.context.socket(zmq.SUB)
+            self.ack_socket.setsockopt(zmq.SUBSCRIBE, b"")
+            self.ack_socket.connect(self.ack_endpoint)
+            logging.info(f"Rank {self.rank}: Connected to ack socket {self.ack_endpoint}")
+            
+            # Other ranks are subscribers (SUB socket)
+            self.socket = get_zmq_socket(
+                context=self.context,
+                socket_type=zmq.SUB,
+                endpoint=self.endpoint,
+                bind=False
+            )
+            logging.info(f"Rank {self.rank}: Subscribed to {self.endpoint}")
+            
+            # Setup barrier socket (PUSH to signal ready)
+            self.barrier_socket = self.context.socket(zmq.PUSH)
+            self.barrier_socket.connect(self.barrier_endpoint)
+            logging.info(f"Rank {self.rank}: Connected to barrier {self.barrier_endpoint}")
+            
+            # Signal that this subscriber is ready
+            self._barrier_signal()
+    
+    def _barrier_wait(self):
+        """Wait for all subscribers to be ready (rank 0 only)."""
+        if self.rank != 0:
+            return
+        
+        expected_signals = self.world_size - 1  # All ranks except rank 0
+        logging.info(f"Rank {self.rank}: Waiting for {expected_signals} subscribers at barrier")
+        
+        for i in range(expected_signals):
+            msg = self.barrier_socket.recv()
+            logging.info(f"Rank {self.rank}: Barrier signal {i+1}/{expected_signals} received")
+        
+        logging.info(f"Rank {self.rank}: All subscribers ready, sending ack")
+        
+        # Send acknowledgment to all subscribers via PUB socket
+        import time
+        time.sleep(0.1)  # Allow subscribers to connect to ack socket
+        
+        for _ in range(3):  # Send multiple times to ensure delivery with PUB-SUB
+            self.ack_socket.send(b'ready')
+            time.sleep(0.05)
+        
+        logging.info(f"Rank {self.rank}: Ack sent, all ready")
+    
+    def _barrier_signal(self):
+        """Signal that this subscriber is ready (non-zero ranks only)."""
+        if self.rank == 0:
+            return
+        
+        import time
+        # Small delay to ensure connection is established
+        time.sleep(0.05)
+        
+        self.barrier_socket.send(f"rank_{self.rank}_ready".encode('utf-8'))
+        logging.info(f"Rank {self.rank}: Sent barrier signal")
+        
+        # Wait for acknowledgment from rank 0
+        poller = zmq.Poller()
+        poller.register(self.ack_socket, zmq.POLLIN)
+        
+        timeout = 10000  # 10 seconds
+        if poller.poll(timeout):
+            msg = self.ack_socket.recv()
+            logging.info(f"Rank {self.rank}: Received barrier acknowledgment")
+        else:
+            logging.warning(f"Rank {self.rank}: Barrier ack timeout")
+        
+        poller.unregister(self.ack_socket)
+    
+    def broadcast(self, obj):
+        """
+        Broadcast an object from rank 0 to all other ranks.
+        
+        Args:
+            obj: Object to broadcast (Pydantic BaseModel instance or dict with '__class__' key)
+            
+        Returns:
+            The object itself (rank 0 returns input, others return received object)
+            
+        Note:
+            Objects are assumed to be Pydantic BaseModel instances.
+            They are serialized to JSON for efficient transmission.
+            A barrier synchronization is performed after broadcast to ensure all ranks have received.
+        """
+        import json
+        from pydantic import BaseModel
+        
+        if self.rank == 0:
+            # Rank 0 sends the object
+            if isinstance(obj, BaseModel):
+                # Serialize Pydantic model to JSON with class info
+                obj_dict = obj.model_dump()
+                obj_dict['__class__'] = f"{obj.__class__.__module__}.{obj.__class__.__name__}"
+                serialized = json.dumps(obj_dict).encode('utf-8')
+            elif isinstance(obj, dict):
+                # Already a dict, just serialize
+                serialized = json.dumps(obj).encode('utf-8')
+            else:
+                # Fallback to pickle for other types
+                import pickle
+                serialized = pickle.dumps(obj)
+                
+            self.socket.send(serialized)
+            logging.debug(f"Rank {self.rank}: Broadcasted object of size {len(serialized)} bytes")
+            
+            # Wait for all subscribers to acknowledge receipt
+            self._post_broadcast_barrier()
+            
+            return obj
+        else:
+            # Other ranks receive the object
+            serialized = self.socket.recv()
+            
+            try:
+                # Try JSON deserialization first
+                obj_dict = json.loads(serialized.decode('utf-8'))
+                
+                # Check if we need to reconstruct a Pydantic model
+                if isinstance(obj_dict, dict) and '__class__' in obj_dict:
+                    class_path = obj_dict.pop('__class__')
+                    module_name, class_name = class_path.rsplit('.', 1)
+                    
+                    # Import the class dynamically
+                    import importlib
+                    module = importlib.import_module(module_name)
+                    obj_class = getattr(module, class_name)
+                    
+                    # Reconstruct the Pydantic model
+                    obj = obj_class(**obj_dict)
+                else:
+                    # Return as dict
+                    obj = obj_dict
+                    
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Fallback to pickle if JSON fails
+                import pickle
+                obj = pickle.loads(serialized)
+                
+            logging.debug(f"Rank {self.rank}: Received object of size {len(serialized)} bytes")
+            
+            # Signal that this rank has received the broadcast
+            self._post_broadcast_barrier()
+            
+            return obj
+    
+    def _post_broadcast_barrier(self):
+        """Barrier synchronization after broadcast to ensure all ranks have received."""
+        if self.rank == 0:
+            # Rank 0 waits for acknowledgments from all subscribers
+            expected_acks = self.world_size - 1
+            logging.debug(f"Rank {self.rank}: Waiting for {expected_acks} broadcast acknowledgments")
+            
+            for i in range(expected_acks):
+                msg = self.barrier_socket.recv()
+                logging.debug(f"Rank {self.rank}: Received ack {i+1}/{expected_acks}")
+            
+            logging.debug(f"Rank {self.rank}: All ranks acknowledged broadcast")
+        else:
+            # Other ranks send acknowledgment
+            self.barrier_socket.send(f"rank_{self.rank}_ack".encode('utf-8'))
+            logging.debug(f"Rank {self.rank}: Sent broadcast acknowledgment")
+    
+    def __len__(self):
+        """Return the world size (total number of processes)."""
+        return self.world_size
+    
+    def close(self):
+        """Close the ZMQ sockets."""
+        if self.socket is not None:
+            self.socket.close()
+            logging.info(f"Rank {self.rank}: Closed broadcaster socket")
+        
+        if self.barrier_socket is not None:
+            self.barrier_socket.close()
+            logging.info(f"Rank {self.rank}: Closed barrier socket")
+        
+        if self.ack_socket is not None:
+            self.ack_socket.close()
+            logging.info(f"Rank {self.rank}: Closed ack socket")
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+        return False
