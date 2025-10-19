@@ -4,10 +4,117 @@ import logging
 import tqdm
 from typing import Optional, List, Dict
 import torch.distributed as dist
+from dataclasses import dataclass
 
 from batchgen.models.Wrapper import Attn_Wrapper
 from batchgen.utils import create_position_ids_from_attention_mask
 from batchgen.sampling import sample_with_temperature_top_p, greedy_decode
+from batchgen.sequence import SequenceBatch
+
+@dataclass
+class DecodeInput:
+	"""
+	DecodeRequest holds the input data for model forward pass in decode stage.
+	"""
+	sequence_uuids: List[int]
+	input_tokens: torch.Tensor  # (batch_size, 1) - current tokens to decode
+	attention_mask: torch.Tensor # 
+	
+	@property
+	def batch_size(self):
+		return len(self.sequence_uuids)
+
+@dataclass
+class DecodeOutput:
+    """
+    DecodeStepResult encapsulates the output from a single decode step.
+    """
+    sequence_uuids: List[int]
+    new_tokens: torch.Tensor  # (batch_size, 1)
+    # finished_uuids: List[int]  # Sequences that reached EOS or max length
+
+
+
+class DecodeExecutor:
+	"""
+	DecodeExecutor manages the decoding process with a preset number of steps(e.g. 1 or page size). 
+	It only handles the core logic of decoding. I.e. decoding the input batch for a few steps and update the status of each sequence.
+
+	"""
+
+	"""
+	Deprecated:
+	Core logic:
+	1. Configure the engine for decoding phase.
+	2. After each forward pass:
+		- Update newly generated tokens.
+		- Check EOS, max_decode_tokens, and context window limits.
+		- Mark completed sequences as COMPLETED.
+		- If continuous_batching=True: backfill with PREFILLED sequences.
+		- If continuous_batching=False: decode batch to completion, then load next batch from PREFILLED.
+	3. Stop signal: decode batch is empty (no active sequences).
+		- For continuous_batching=True, this means no enough PREFILLED sequences so BatchGen shift back to prefill phase or all the sequences are completed.
+		- For continuous_batching=False, this means all PREFILLED sequences are processed. 
+			BatchGen shift back to prefill phase or terminate.
+	"""
+	def __init__(self, model_config, engine_config, core_engine, parallel_manager, comm, 
+			  decode_batch: SequenceBatch, decode_steps=1):
+		self.model_config = model_config
+		self.engine_config = engine_config
+		self.parallel_manager = parallel_manager
+		self.core_engine = core_engine
+		self.comm = comm
+		self.decode_batch = decode_batch # A view from global batch.
+		self.decode_step = decode_steps # Number of decode steps in one execute() call.
+
+		self.rank = self.engine_config.Basic_Config.rank
+		self.world_size = self.engine_config.Basic_Config.world_size
+		self.torch_device = self.engine_config.Basic_Config.device_torch
+	
+	def _prepare_forward_input(self) -> DecodeInput:
+		"""
+		Prepare the input dictionary for model forward pass.
+		1. Gather current tokens from decode_batch.
+		2. Create attention masks and position ids if needed.
+		3. Return a dictionary with all necessary inputs for the model.
+		"""
+		pass
+
+	def _decode_one_step(self) -> DecodeOutput:
+		"""
+		Perform a single decode step for the given DecodeRequest.
+		1. Run model forward pass.
+		2. Process the output to get new tokens.
+		3. Identify finished sequences.
+		4. Return DecodeStepResult with new tokens and finished sequence UUIDs.
+		"""
+		pass
+
+	def _update_sequences(self, decode_result:dict):
+		"""
+		Update the sequences in decode_batch based on the DecodeStepResult.
+		1. Append new tokens to each sequence.
+		2. Update sequence status (ACTIVE, COMPLETED).
+		3. Handle context window overflow if necessary.
+		"""
+		pass
+
+	def execute(self)		
+		"""
+		Decode the current decode_batch for a preset number of steps.
+		1. Prepare the input DecodeRequest.
+		2. Run model forward.
+		3. Process the output DecodeStepResult.
+		4. Return the finished sequences and the number of active sequences remaining.
+		"""
+		cur_step = 0
+		while cur_step < self.decode_step:
+			cur_decode_result = self._decode_one_step(self.decode_batch)
+			self._update_sequences(cur_decode_result)
+			cur_step += 1
+
+
+
 
 class Decode():
 	def __init__(self, model_config, engine_config, core_engine, parallel_manager, comm):
@@ -86,7 +193,7 @@ class Decode():
 
 		if RUNTIME_ATTN_MODE == 3:
 			"""
-				KV ACCUMULATION IN GPU.
+				KV ACCUMULATION IN GPU.`
 			"""
 			Attn_Wrapper.scale = scale_dict
 			Attn_Wrapper.past_key_states = past_key_states
