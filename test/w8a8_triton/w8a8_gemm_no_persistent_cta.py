@@ -73,6 +73,7 @@ def w8a8_gemm_small_m_kernel(
         # FP8 matmul with scale
         partial = tl.dot(a_tile, tl.trans(w_tile), out_dtype=tl.float32)
         acc += partial * (a_scales[:, None] * w_scales[None, :])
+        # acc += tl.dot(a_tile, tl.trans(w_tile), out_dtype=tl.float32) * (a_scales[:, None] * w_scales[None, :])
     
     # Store result
     c = acc.to(tl.bfloat16)
@@ -246,18 +247,20 @@ class W8A8GemmConfig:
         # (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)
         (16, 128, 128, 4, 3),   # Ultra-small M (1-16)
         (32, 128, 128, 4, 3),   # Small M (17-32)
+        # (64, 16, 128, 4, 2),   # Ultra-small M (1-16)
+        # (64, 16, 128, 4, 2),   # Small M (17-32)
     ]
     
     # Medium M configs (32 < M < 128)
     MEDIUM_M_CONFIGS = [
-        (64, 128, 128, 4, 4),   # M in [32, 64]
-        (128, 128, 128, 4, 4),  # M in [64, 128]
+        (64, 16, 128, 4, 2),   # M in [32, 64]
+        (64, 16, 128, 4, 2),  # M in [64, 128]
     ]
     
     # Large M configs (M >= 128)
     LARGE_M_CONFIGS = [
-        (128, 128, 128, 8, 4),  # M in [128, 512]
-        (128, 256, 128, 8, 5),  # M >= 512, wide N
+        (64, 16, 128, 4, 3),  # M in [128, 512]
+        (64, 16, 128, 4, 3),  # M >= 512, wide N
     ]
     
     @staticmethod
@@ -392,10 +395,13 @@ def warmup_kernels(device='cuda'):
     test_sizes = [
         (1, 4096, 4096),    # Tiny M
         (8, 4096, 11008),   # Small M
+        (13, 4096, 11008),  # Small M
         (16, 4096, 11008),  # Small M
         (32, 4096, 11008),  # Medium M boundary
         (64, 4096, 11008),  # Medium M
+        (82, 4096, 11008),  # Medium M
         (128, 4096, 11008), # Large M
+        (200, 4096, 11008), # Large M
     ]
     
     for M, N, K in test_sizes:
