@@ -1421,13 +1421,13 @@ void KV_Storage::offload_helper_(
             } else {
                 // Perform quantization for other dtypes (e.g., Float8)
                 // Check for NaN or Inf in bf16_k before quantization
-                if (torch::isnan(bf16_k).any().item<bool>() || 
-                    torch::isinf(bf16_k).any().item<bool>()) {
-                    this->logger_->error(
-                        "KV_Storage: NaN or Inf detected in input k at layer_idx: {}.", 
-                        layer_idx);
-                    throw std::runtime_error("NaN or Inf detected in input k.");
-                }
+                // if (torch::isnan(bf16_k).any().item<bool>() || 
+                //     torch::isinf(bf16_k).any().item<bool>()) {
+                //     this->logger_->error(
+                //         "KV_Storage: NaN or Inf detected in input k at layer_idx: {}.", 
+                //         layer_idx);
+                //     throw std::runtime_error("NaN or Inf detected in input k.");
+                // }
                 
                 // Perform quantization
                 auto [quantized_k, quantize_scale] = quant_per_token(bf16_k);
@@ -1435,13 +1435,13 @@ void KV_Storage::offload_helper_(
                 k_quantize_scale = quantize_scale;
                 
                 // Check for NaN or Inf in quantization scale
-                if (torch::isnan(k_quantize_scale).any().item<bool>() || 
-                    torch::isinf(k_quantize_scale).any().item<bool>()) {
-                    this->logger_->error(
-                        "KV_Storage: NaN or Inf detected in quantization scale at layer_idx: {}.", 
-                        layer_idx);
-                    throw std::runtime_error("NaN or Inf detected in quantization scale.");
-                }
+                // if (torch::isnan(k_quantize_scale).any().item<bool>() || 
+                //     torch::isinf(k_quantize_scale).any().item<bool>()) {
+                //     this->logger_->error(
+                //         "KV_Storage: NaN or Inf detected in quantization scale at layer_idx: {}.", 
+                //         layer_idx);
+                //     throw std::runtime_error("NaN or Inf detected in quantization scale.");
+                // }
             }
             
             CUDA_CHECK(cudaStreamSynchronize(0));

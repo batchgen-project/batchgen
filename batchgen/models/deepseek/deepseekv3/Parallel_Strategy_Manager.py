@@ -16,8 +16,6 @@ import torch
 import gc
 from batchgen.utils import torch_gpu_mem_usage
 	
-
-
 class DeepseekV3ParallelStrategyManager:
 	def __init__(
 		self, 
@@ -163,7 +161,7 @@ class DeepseekV3ParallelStrategyManager:
 			Configure a model skeletion for decoding, 
 			DP + EP 
 		"""
-		self.hf_model_config.phase = "decoding"
+		self.hf_model_config.phase = "decode"
 		self.hf_model_config._attn_implementation = "eager"
 		self.model = None
 		torch.cuda.empty_cache()
@@ -288,7 +286,7 @@ class DeepseekV3ParallelStrategyManager:
 			Duplicate attention modules and shared experts in each dp worker.
 			Split routed experts.
 		"""
-		self.hf_model_config.phase = "decoding"
+		self.hf_model_config.phase = "decode"
 		self.hf_model_config._attn_implementation = "eager"
 
 		self.model = None

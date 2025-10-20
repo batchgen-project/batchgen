@@ -462,7 +462,7 @@ class Attn_Wrapper(torch.nn.Module):
 
 			return attn_output, None, None
 
-		elif Attn_Wrapper.phase == "decoding":
+		elif Attn_Wrapper.phase == "decode":
 			# TODO: FIX
 			rank = dist.get_rank() 
 			world_size = dist.get_world_size()

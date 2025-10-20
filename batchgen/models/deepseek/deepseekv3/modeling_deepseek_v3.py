@@ -2649,7 +2649,7 @@ class DeepseekV3Attention(nn.Module):
 		self.softmax_scale = self.qkv_materialized_softmax_scale
 
 	def initialize(self):
-		if self.config.phase == "decoding":
+		if self.config.phase == "decode":
 			kv_b_proj = self.kv_b_proj.weight.view(
 				self.num_heads, -1, self.kv_lora_rank
 			)
@@ -3259,7 +3259,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 		self.comm = comm
 		if config.phase == "prefill":
 			cls = DeepseekV3MoE_Prefill
-		elif config.phase == "decoding":
+		elif config.phase == "decode":
 			cls = DeepseekV3MoE_Decoding_FP8
 		else:
 			cls = DeepseekV3MoE_Prefill
@@ -3478,7 +3478,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 			config.vocab_size, config.hidden_size, self.padding_idx
 		)
 		self.comm = comm
-		# if self.config.phase == "decoding":
+		# if self.config.phase == "decode":
 		# 	from batchgen.distributed.utils import StatelessProcessGroup
 		# 	from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 		# 	self.rank = dist.get_rank()
@@ -3503,7 +3503,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 			
 				
 	
-		# if self.config.phase == "decoding":
+		# if self.config.phase == "decode":
 		# 	self.rank = dist.get_rank()
 		# 	cus_group = dist.new_group(backend="nccl")
 		# 	device = torch.device("cuda", self.rank % torch.cuda.device_count())

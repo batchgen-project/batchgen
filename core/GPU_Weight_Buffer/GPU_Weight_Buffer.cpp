@@ -306,7 +306,7 @@ void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_id
     int64_t num_expert_buffer;
     if (phase == "prefill") {
         num_expert_buffer = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer["routed_expert"];
-    } else if (phase == "decoding") {
+    } else if (phase == "decode") {
         num_expert_buffer = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer["routed_expert"];
     } else {
         throw std::runtime_error("Invalid phase: " + std::string(phase));
