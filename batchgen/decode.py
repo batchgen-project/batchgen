@@ -19,6 +19,7 @@ class DecodeInput:
 	sequence_uuids: List[int]
 	input_tokens: torch.Tensor  # (batch_size, 1) - current tokens to decode
 	attention_mask: torch.Tensor # 
+	position_ids: torch.Tensor  # (batch_size, seq_len)
 	
 	@property
 	def batch_size(self):
@@ -34,51 +35,41 @@ class DecodeOutput:
     # finished_uuids: List[int]  # Sequences that reached EOS or max length
 
 
-
 class DecodeExecutor:
 	"""
 	DecodeExecutor manages the decoding process with a preset number of steps(e.g. 1 or page size). 
-	It only handles the core logic of decoding. I.e. decoding the input batch for a few steps and update the status of each sequence.
-
+	It only handles the core logic of decoding. 
+	I.e. decoding the input batch for a few steps and update the status of each sequence.
 	"""
-
-	"""
-	Deprecated:
-	Core logic:
-	1. Configure the engine for decoding phase.
-	2. After each forward pass:
-		- Update newly generated tokens.
-		- Check EOS, max_decode_tokens, and context window limits.
-		- Mark completed sequences as COMPLETED.
-		- If continuous_batching=True: backfill with PREFILLED sequences.
-		- If continuous_batching=False: decode batch to completion, then load next batch from PREFILLED.
-	3. Stop signal: decode batch is empty (no active sequences).
-		- For continuous_batching=True, this means no enough PREFILLED sequences so BatchGen shift back to prefill phase or all the sequences are completed.
-		- For continuous_batching=False, this means all PREFILLED sequences are processed. 
-			BatchGen shift back to prefill phase or terminate.
-	"""
-	def __init__(self, model_config, engine_config, core_engine, parallel_manager, comm, 
-			  decode_batch: SequenceBatch, decode_steps=1):
+	def __init__(self, model_config, engine_config, inference_runtime, 
+			  		decode_batch: SequenceBatch, decode_steps=1):
 		self.model_config = model_config
 		self.engine_config = engine_config
-		self.parallel_manager = parallel_manager
-		self.core_engine = core_engine
-		self.comm = comm
+		self.inference_runtime = inference_runtime
 		self.decode_batch = decode_batch # A view from global batch.
-		self.decode_step = decode_steps # Number of decode steps in one execute() call.
+		self.decode_step = decode_steps 
+		# Number of decode steps in one execute() call. This determines the granularity of pd scheduling.
 
 		self.rank = self.engine_config.Basic_Config.rank
 		self.world_size = self.engine_config.Basic_Config.world_size
 		self.torch_device = self.engine_config.Basic_Config.device_torch
-	
-	def _prepare_forward_input(self) -> DecodeInput:
+
+		self.decode_input = self._prepare_forward_input(decode_batch)
+
+	def _prepare_forward_input(self, decode_batch: SequenceBatch) -> DecodeInput:
 		"""
 		Prepare the input dictionary for model forward pass.
 		1. Gather current tokens from decode_batch.
 		2. Create attention masks and position ids if needed.
 		3. Return a dictionary with all necessary inputs for the model.
 		"""
-		pass
+		attention_mask = decode_batch.get_attention_mask()
+		return DecodeInput(
+			sequence_uuids=decode_batch.get_sequence_uuids(),
+			input_tokens=decode_batch.get_last_tokens(),
+			attention_mask=attention_mask,
+			position_ids=create_position_ids_from_attention_mask(attention_mask)
+		)
 
 	def _decode_one_step(self) -> DecodeOutput:
 		"""
@@ -88,18 +79,19 @@ class DecodeExecutor:
 		3. Identify finished sequences.
 		4. Return DecodeStepResult with new tokens and finished sequence UUIDs.
 		"""
-		pass
+		return self.inference_runtime.decode(self.decode_input)
+		
 
-	def _update_sequences(self, decode_result:dict):
+	def _update_sequences(self, decode_result:DecodeOutput):
 		"""
 		Update the sequences in decode_batch based on the DecodeStepResult.
 		1. Append new tokens to each sequence.
 		2. Update sequence status (ACTIVE, COMPLETED).
 		3. Handle context window overflow if necessary.
 		"""
-		pass
+		self.decode_batch.update_result(decode_result.sequence_uuids, decode_result.new_tokens)
 
-	def execute(self)		
+	def execute(self):	
 		"""
 		Decode the current decode_batch for a preset number of steps.
 		1. Prepare the input DecodeRequest.
@@ -107,6 +99,7 @@ class DecodeExecutor:
 		3. Process the output DecodeStepResult.
 		4. Return the finished sequences and the number of active sequences remaining.
 		"""
+		assert self.inference_runtime.get_current_phase() == "decode", "DecodeExecutor can only run in decode phase."
 		cur_step = 0
 		while cur_step < self.decode_step:
 			cur_decode_result = self._decode_one_step(self.decode_batch)

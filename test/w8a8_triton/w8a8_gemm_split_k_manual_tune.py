@@ -1,7 +1,21 @@
+"""
+🔥 W8A8 GEMM: High-Performance FP8 Matrix Multiplication with Integrated Benchmarking
+
+Features:
+- Adaptive block sizing and device-aware split-K
+- Comprehensive benchmarking and validation suite
+- Detailed performance analysis with configuration info
+"""
+
 import torch
 import triton
 import triton.language as tl
+from typing import List, Tuple, Dict, Optional
 import math
+import time
+import numpy as np
+from dataclasses import dataclass
+
 
 # ==================== TRITON KERNELS ====================
 
@@ -23,7 +37,7 @@ def w8a8_gemm_small_m_split_k_kernel(
 	BLOCK_SIZE_K: tl.constexpr,
 	SPLIT_K: tl.constexpr,
 ):
-	"""Split-K variant: Each CTA computes partial result for a K-slice."""
+	"""Split-K variant for small M: Each CTA computes partial result for a K-slice."""
 	pid_m = tl.program_id(axis=0)
 	pid_n = tl.program_id(axis=1)
 	pid_k = tl.program_id(axis=2)
@@ -317,23 +331,22 @@ def w8a8_gemm_large_m_kernel(
 	tl.store(c_ptrs, c, mask=c_mask)
 
 
-# ==================== SIMPLIFIED CONFIG SELECTOR ====================
+# ==================== CONFIG SELECTOR ====================
 
 class W8A8GemmConfig:
-	"""
-	Simplified tiling strategy:
+	"""Pre-optimized configurations with device-aware Split-K."""
 	
-	For M ≤ 32 (small-M cases):
-	1. BAD SHAPES (small N + large K, like N≤2048 and K>4096):
-	   - Use (16, 32, 128) tiles
-	   - NO split-K (overhead too high)
-	   - Minimize padding waste with small M tile
-	   
-	2. GOOD SHAPES (everything else):
-	   - Use (64, 32, 128) tiles
-	   - WITH split-K (4-8×) for parallelism
-	   - Larger M tile for efficiency
-	"""
+	SMALL_M_BASE_CONFIG = (128, 4, 3)  # (BLOCK_K, num_warps, num_stages)
+	
+	MEDIUM_M_CONFIGS = [
+		(64, 128, 128, 4, 4),
+		(128, 128, 128, 4, 4),
+	]
+	
+	LARGE_M_CONFIGS = [
+		(128, 128, 128, 8, 4),
+		(128, 256, 128, 8, 5),
+	]
 	
 	_sm_count_cache = {}
 	
@@ -349,54 +362,101 @@ class W8A8GemmConfig:
 		return W8A8GemmConfig._sm_count_cache[device_idx]
 	
 	@staticmethod
-	def select_config(M: int, N: int, K: int, device):
-		"""
-		Simplified config selection.
-		Returns: (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, GROUP_M, kernel_type, split_k)
-		"""
-		if M <= 32:
-			# Small M: Choose between two strategies
-			is_bad_shape = (N <= 2048) and (K > 4096)
-			
-			if is_bad_shape:
-				# Strategy 1: Small tiles, no split-K
-				# (16, 32, 128) - minimize padding waste for small M
-				BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 128
-				split_k = 1
-				num_warps = 4
-				num_stages = 3
-			else:
-				# Strategy 2: Larger tiles, with split-K
-				# (64, 32, 128) - better efficiency, use split-K for parallelism
-				BLOCK_M, BLOCK_N, BLOCK_K = 64, 32, 128
-				
-				# Compute split-K factor
-				num_sms = W8A8GemmConfig.get_sm_count(device)
-				target_ctas = int(num_sms * 1.5)
-				base_ctas = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-				
-				if base_ctas >= target_ctas:
-					split_k = 1
-				else:
-					# Need split-K for more parallelism
-					split_k_needed = triton.cdiv(target_ctas, base_ctas)
-					
-					# Limit split based on K size
-					if K <= 2048:
-						max_split_k = 8
-					elif K <= 4096:
-						max_split_k = 4
-					else:
-						max_split_k = 2
-					
-					split_k = min(split_k_needed, max_split_k)
-					split_k = 2 ** int(math.log2(max(1, split_k)))
-				
-				num_warps = 4
-				num_stages = 3
-			
-			return (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, 4, 'small', split_k)
+	def compute_optimal_config(M: int, N: int, K: int, device, oversubscribe_factor: float = 1.5):
+		"""Compute optimal BLOCK_N and Split-K factor together."""
+		num_sms = W8A8GemmConfig.get_sm_count(device)
+		target_ctas = int(num_sms * oversubscribe_factor)
 		
+		if M <= 16:
+			BLOCK_M = 16
+		elif M <= 32:
+			BLOCK_M = 32
+		else:
+			BLOCK_M = 64
+		
+		needs_split_k = (M <= 32) or (N <= 2048)
+		
+		if not needs_split_k:
+			return BLOCK_M, 128, 1
+		
+		if K > 4096:
+			base_ctas_16 = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, 16)
+			base_ctas_64 = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, 64)
+			base_ctas_128 = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, 128)
+			base_ctas_256 = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, 256)
+			
+			if base_ctas_16 < num_sms // 2:
+				if base_ctas_256 >= 4:
+					return BLOCK_M, 256, 1
+				elif base_ctas_128 >= 8:
+					return BLOCK_M, 128, 1
+				elif base_ctas_64 >= 16:
+					return BLOCK_M, 64, 1
+				else:
+					return BLOCK_M, 32, 1
+			else:
+				if base_ctas_128 >= num_sms // 4:
+					return BLOCK_M, 128, 1
+				elif base_ctas_64 >= num_sms // 3:
+					return BLOCK_M, 64, 1
+				else:
+					return BLOCK_M, 32, 1
+		
+		candidate_block_ns = [64, 32, 16]
+		
+		for BLOCK_N in candidate_block_ns:
+			base_ctas = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+			
+			if base_ctas >= target_ctas:
+				return BLOCK_M, BLOCK_N, 1
+			
+			split_k_needed = triton.cdiv(target_ctas, base_ctas)
+			
+			min_k_per_split = 1024
+			if N <= 576:
+				min_k_per_split = 512
+			
+			max_split_k = max(1, K // min_k_per_split)
+			split_k = min(split_k_needed, max_split_k)
+			split_k = 2 ** int(math.log2(max(1, split_k)))
+			
+			if K <= 2048:
+				split_k = min(split_k, 4)
+			elif K <= 4096:
+				split_k = min(split_k, 8)
+			else:
+				split_k = 1
+			
+			total_ctas = base_ctas * split_k
+			if total_ctas >= target_ctas or split_k >= max_split_k:
+				return BLOCK_M, BLOCK_N, split_k
+		
+		BLOCK_N = 16
+		base_ctas = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+		split_k_needed = triton.cdiv(target_ctas, base_ctas)
+		
+		min_k_per_split = 512 if N <= 576 else 1024
+		max_split_k = max(1, K // min_k_per_split)
+		
+		split_k = min(split_k_needed, max_split_k)
+		split_k = 2 ** int(math.log2(max(1, split_k)))
+		
+		if K <= 2048:
+			split_k = min(split_k, 4)
+		elif K <= 4096:
+			split_k = min(split_k, 8)
+		else:
+			split_k = 1
+		
+		return BLOCK_M, BLOCK_N, split_k
+	
+	@staticmethod
+	def select_config(M: int, N: int, K: int, device):
+		"""Select optimal configuration."""
+		if M <= 32:
+			BLOCK_M, BLOCK_N, split_k = W8A8GemmConfig.compute_optimal_config(M, N, K, device)
+			split_k = 2
+			return (BLOCK_M, BLOCK_N, 128, 4, 3, 4, 'small', split_k)
 		elif M <= 64:
 			return (64, 128, 128, 4, 4, 8, 'medium', 1)
 		elif M < 128:
@@ -416,13 +476,7 @@ def w8a8_gemm_dispatch(
 	w_block_size_k: int = 128,
 	w_block_size_n: int = 128,
 ) -> torch.Tensor:
-	"""
-	🔥 W8A8 GEMM with Simplified Tiling Strategy 🔥
-	
-	Two-tier approach:
-	- Bad shapes (small N + large K): (16, 32, 128) tiles, no split-K
-	- Good shapes: (64, 32, 128) tiles, with split-K (4-8×)
-	"""
+	"""Device-aware W8A8 GEMM with automatic Split-K."""
 	M, K = a.shape
 	N = w.shape[0]
 	
@@ -542,3 +596,369 @@ def w8a8_gemm_dispatch(
 		)
 	
 	return c
+
+
+# ==================== BENCHMARKING INFRASTRUCTURE ====================
+
+@dataclass
+class BenchmarkResult:
+	"""Container for benchmark results."""
+	shape: Tuple[int, int, int]
+	time_ms: float
+	tflops: float
+	bandwidth_gb_s: float
+	kernel_type: str
+	config: Dict
+
+
+class W8A8Benchmarker:
+	"""Comprehensive benchmarking suite."""
+	
+	def __init__(self, device='cuda', warmup_iters=10, bench_iters=100):
+		self.device = device
+		self.warmup_iters = warmup_iters
+		self.bench_iters = bench_iters
+		self.results = []
+	
+	def benchmark_kernel(
+		self,
+		M: int,
+		N: int,
+		K: int,
+		a_block_size: int = 128,
+		w_block_size: int = 128,
+	) -> BenchmarkResult:
+		"""Benchmark a single configuration."""
+		# Create test data
+		a = torch.randn(M, K, device=self.device, dtype=torch.float16).to(torch.float8_e4m3fn)
+		w = torch.randn(N, K, device=self.device, dtype=torch.float16).to(torch.float8_e4m3fn)
+		
+		a_scale = torch.ones(M, (K + 127) // 128, device=self.device, dtype=torch.float32)
+		w_scale = torch.ones((N + 127) // 128, (K + 127) // 128, device=self.device, dtype=torch.float32)
+		
+		# Get config info
+		config_tuple = W8A8GemmConfig.select_config(M, N, K, torch.device(self.device))
+		BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, GROUP_M, kernel_type, split_k = config_tuple
+		
+		# Warmup
+		for _ in range(self.warmup_iters):
+			_ = w8a8_gemm_dispatch(a, a_scale, w, w_scale, a_block_size, w_block_size, w_block_size)
+		
+		torch.cuda.synchronize()
+		
+		# Benchmark
+		start_event = torch.cuda.Event(enable_timing=True)
+		end_event = torch.cuda.Event(enable_timing=True)
+		
+		start_event.record()
+		for _ in range(self.bench_iters):
+			_ = w8a8_gemm_dispatch(a, a_scale, w, w_scale, a_block_size, w_block_size, w_block_size)
+		end_event.record()
+		
+		torch.cuda.synchronize()
+		
+		# Calculate metrics
+		total_time_ms = start_event.elapsed_time(end_event)
+		avg_time_ms = total_time_ms / self.bench_iters
+		
+		flops = 2 * M * N * K
+		tflops = (flops / avg_time_ms / 1e9)
+		
+		bytes_read = M * K + N * K + M * ((K + 127) // 128) * 4 + ((N + 127) // 128) * ((K + 127) // 128) * 4
+		bytes_write = M * N * 2
+		total_bytes = bytes_read + bytes_write
+		bandwidth_gb_s = (total_bytes / avg_time_ms / 1e6)
+		
+		# Calculate CTAs
+		base_ctas = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+		total_ctas = base_ctas * split_k
+		
+		result = BenchmarkResult(
+			shape=(M, N, K),
+			time_ms=avg_time_ms,
+			tflops=tflops,
+			bandwidth_gb_s=bandwidth_gb_s,
+			kernel_type=kernel_type,
+			config={
+				'BLOCK_M': BLOCK_M,
+				'BLOCK_N': BLOCK_N,
+				'BLOCK_K': BLOCK_K,
+				'split_k': split_k,
+				'num_warps': num_warps,
+				'num_stages': num_stages,
+				'base_ctas': base_ctas,
+				'total_ctas': total_ctas,
+			},
+		)
+		
+		self.results.append(result)
+		return result
+	
+	def sweep_shapes(self, test_shapes: List[Tuple[int, int, int]]) -> List[BenchmarkResult]:
+		"""Sweep through multiple problem sizes with detailed config output."""
+		results = []
+		
+		print("\n" + "=" * 120)
+		print("🔥 PERFORMANCE SWEEP WITH DETAILED CONFIGURATION")
+		print("=" * 120)
+		print(f"{'M':>5} {'N':>6} {'K':>6} │ {'BM':>3} {'BN':>3} {'BK':>3} │ {'SK':>2} │ {'CTAs':>5} │ {'Type':>6} │ {'Time(ms)':>9} {'TFLOPS':>7} {'BW(GB/s)':>9}")
+		print("-" * 120)
+		
+		for M, N, K in test_shapes:
+			result = self.benchmark_kernel(M, N, K)
+			results.append(result)
+			
+			cfg = result.config
+			
+			# Format output with all details
+			print(f"{M:>5} {N:>6} {K:>6} │ "
+				  f"{cfg['BLOCK_M']:>3} {cfg['BLOCK_N']:>3} {cfg['BLOCK_K']:>3} │ "
+				  f"{cfg['split_k']:>2} │ "
+				  f"{cfg['total_ctas']:>5} │ "
+				  f"{result.kernel_type:>6} │ "
+				  f"{result.time_ms:>9.4f} {result.tflops:>7.2f} {result.bandwidth_gb_s:>9.2f}")
+		
+		print("=" * 120)
+		print("Legend: BM/BN/BK = Block sizes (M/N/K), SK = Split-K factor, CTAs = Total thread blocks")
+		print("=" * 120)
+		
+		return results
+	
+	def compare_with_torch(self, M: int, N: int, K: int):
+		"""Compare with PyTorch baseline."""
+		print(f"\n🔥 COMPARISON: Custom vs PyTorch (M={M}, N={N}, K={K})")
+		print("=" * 80)
+		
+		a_fp16 = torch.randn(M, K, device=self.device, dtype=torch.float16)
+		w_fp16 = torch.randn(N, K, device=self.device, dtype=torch.float16)
+		
+		a_fp8 = a_fp16.to(torch.float8_e4m3fn)
+		w_fp8 = w_fp16.to(torch.float8_e4m3fn)
+		
+		a_scale = torch.ones(M, (K + 127) // 128, device=self.device, dtype=torch.float32)
+		w_scale = torch.ones((N + 127) // 128, (K + 127) // 128, device=self.device, dtype=torch.float32)
+		
+		# PyTorch benchmark
+		torch.cuda.synchronize()
+		torch_times = []
+		for _ in range(self.bench_iters):
+			start = time.perf_counter()
+			_ = torch.matmul(a_fp16, w_fp16.t())
+			torch.cuda.synchronize()
+			torch_times.append((time.perf_counter() - start) * 1000)
+		torch_time_ms = np.median(torch_times)
+		
+		# Custom kernel benchmark
+		result = self.benchmark_kernel(M, N, K)
+		
+		speedup = torch_time_ms / result.time_ms
+		
+		print(f"PyTorch FP16:     {torch_time_ms:.4f} ms")
+		print(f"Custom FP8:       {result.time_ms:.4f} ms")
+		print(f"Speedup:          {speedup:.2f}x")
+		print(f"TFLOPS:           {result.tflops:.2f}")
+		print(f"Configuration:    BM={result.config['BLOCK_M']}, BN={result.config['BLOCK_N']}, "
+			  f"BK={result.config['BLOCK_K']}, Split-K={result.config['split_k']}")
+		print("=" * 80)
+		
+		return speedup
+
+
+class W8A8Validator:
+	"""Numerical validation suite."""
+	
+	@staticmethod
+	def validate_correctness(
+		M: int = 16,
+		N: int = 128,
+		K: int = 256,
+		rtol: float = 1e-1,
+		atol: float = 1e-2,
+	) -> bool:
+		"""Validate kernel correctness."""
+		print(f"\n✅ CORRECTNESS VALIDATION (M={M}, N={N}, K={K})")
+		print("=" * 80)
+		
+		device = 'cuda'
+		
+		torch.manual_seed(42)
+		a_fp16 = torch.randn(M, K, device=device, dtype=torch.float16)
+		w_fp16 = torch.randn(N, K, device=device, dtype=torch.float16)
+		
+		a_fp8 = a_fp16.to(torch.float8_e4m3fn)
+		w_fp8 = w_fp16.to(torch.float8_e4m3fn)
+		
+		a_scale = torch.ones(M, (K + 127) // 128, device=device, dtype=torch.float32) * 0.5
+		w_scale = torch.ones((N + 127) // 128, (K + 127) // 128, device=device, dtype=torch.float32) * 0.5
+		
+		a_dequant = a_fp8.to(torch.float16)
+		w_dequant = w_fp8.to(torch.float16)
+		
+		reference = torch.matmul(a_dequant, w_dequant.t()) * 0.25
+		custom = w8a8_gemm_dispatch(a_fp8, a_scale, w_fp8, w_scale, 128, 128, 128)
+		
+		max_diff = torch.max(torch.abs(reference.to(torch.bfloat16) - custom)).item()
+		mean_diff = torch.mean(torch.abs(reference.to(torch.bfloat16) - custom)).item()
+		rel_error = mean_diff / (torch.mean(torch.abs(reference)).item() + 1e-8)
+		
+		print(f"Max absolute error:   {max_diff:.6f}")
+		print(f"Mean absolute error:  {mean_diff:.6f}")
+		print(f"Relative error:       {rel_error:.6f}")
+		
+		passed = rel_error < rtol and max_diff < atol
+		
+		if passed:
+			print("✅ PASSED: Kernel is numerically correct!")
+		else:
+			print("❌ FAILED: Numerical errors exceed tolerance!")
+		
+		print("=" * 80)
+		return passed
+
+
+def warmup_kernels(device='cuda'):
+	"""Pre-compile all kernel variants."""
+	print("🔥 Warming up W8A8 GEMM kernels...")
+	
+	test_sizes = [
+		(8, 7168, 2048),
+		(8, 2048, 7168),
+		(8, 1536, 7168),
+		(8, 576, 7168),
+		(16, 4096, 11008),
+		(32, 4096, 11008),
+		(64, 4096, 11008),
+		(128, 4096, 11008),
+	]
+	
+	for M, N, K in test_sizes:
+		a = torch.randn(M, K, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+		w = torch.randn(N, K, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+		a_scale = torch.ones(M, (K + 127) // 128, device=device, dtype=torch.float32)
+		w_scale = torch.ones((N + 127) // 128, (K + 127) // 128, device=device, dtype=torch.float32)
+		
+		_ = w8a8_gemm_dispatch(a, a_scale, w, w_scale)
+	
+	torch.cuda.synchronize()
+	print("✅ All kernels warmed up and ready!")
+
+
+def run_full_benchmark_suite():
+	"""Run comprehensive benchmark suite."""
+	print("\n" + "=" * 80)
+	print("🚀 W8A8 GEMM COMPREHENSIVE BENCHMARK SUITE")
+	print("=" * 80)
+	
+	# Device info
+	device = torch.device('cuda')
+	props = torch.cuda.get_device_properties(0)
+	num_sms = props.multi_processor_count
+	
+	print(f"\n🖥️  Device: {props.name}")
+	print(f"   SM Count: {num_sms}")
+	print(f"   Target CTAs: {int(num_sms * 1.5)} (1.5x oversubscription)")
+	
+	# Warmup
+	warmup_kernels()
+	
+	# Validation
+	validator = W8A8Validator()
+	validator.validate_correctness()
+	
+	# Benchmarking
+	benchmarker = W8A8Benchmarker(warmup_iters=10, bench_iters=100)
+	
+	# Test shapes (DeepSeek-like patterns)
+	llm_shapes = [
+		# Token generation (M=1)
+		(1, 7168, 2048),
+		(1, 2048, 7168),
+		(1, 1536, 7168),
+		(1, 24576, 1536),
+		(1, 576, 7168),
+		(1, 32768, 512),
+		(1, 7168, 16384),
+
+		# (1, 11008, 4096),
+		
+		# Small batch inference (M=8-16)
+		(8, 7168, 2048),
+		(8, 2048, 7168),
+		(8, 1536, 7168),
+		(8, 24576, 1536),
+		(8, 576, 7168),
+		(8, 32768, 512),
+		(8, 7168, 16384),
+		
+		(16, 7168, 2048),
+		(16, 2048, 7168),
+		(16, 1536, 7168),
+		(16, 24576, 1536),
+		(16, 576, 7168),
+		(16, 32768, 512),
+		(16, 7168, 16384),
+		
+		
+		# Medium batch (M=32)
+		(32, 7168, 2048),
+		(32, 2048, 7168),
+		(32, 1536, 7168),
+		(32, 24576, 1536),
+		(32, 576, 7168),
+		(32, 32768, 512),
+		(32, 7168, 16384),
+		
+		# Larger batches
+		(64, 7168, 2048),
+		(64, 2048, 7168),
+		(64, 1536, 7168),
+		(64, 24576, 1536),
+		(64, 576, 7168),
+		(64, 32768, 512),
+		(64, 7168, 16384),
+
+		(128, 7168, 2048),
+		(128, 2048, 7168),
+		(128, 1536, 7168),
+		(128, 24576, 1536),
+		(128, 576, 7168),
+		(128, 32768, 512),
+		(128, 7168, 16384),
+	]
+	
+	results = benchmarker.sweep_shapes(llm_shapes)
+	
+	# PyTorch comparison
+	print("\n" + "=" * 80)
+	print("🔥 PYTORCH COMPARISON")
+	print("=" * 80)
+	for M in [1, 8, 16, 32]:
+		benchmarker.compare_with_torch(M, 4096, 11008)
+	
+	# Summary
+	print("\n" + "=" * 80)
+	print("📊 PERFORMANCE SUMMARY")
+	print("=" * 80)
+	
+	best_tflops = max(results, key=lambda r: r.tflops)
+	print(f"Peak TFLOPS:        {best_tflops.tflops:.2f} at shape {best_tflops.shape}")
+	print(f"                    Config: BM={best_tflops.config['BLOCK_M']}, "
+		  f"BN={best_tflops.config['BLOCK_N']}, BK={best_tflops.config['BLOCK_K']}, "
+		  f"Split-K={best_tflops.config['split_k']}")
+	
+	best_bw = max(results, key=lambda r: r.bandwidth_gb_s)
+	print(f"Peak Bandwidth:     {best_bw.bandwidth_gb_s:.2f} GB/s at shape {best_bw.shape}")
+	
+	small_m_results = [r for r in results if r.shape[0] <= 16]
+	if small_m_results:
+		best_small_m = max(small_m_results, key=lambda r: r.tflops)
+		print(f"Best Small-M:       {best_small_m.tflops:.2f} TFLOPS at shape {best_small_m.shape}")
+		print(f"                    Config: BM={best_small_m.config['BLOCK_M']}, "
+			  f"BN={best_small_m.config['BLOCK_N']}, BK={best_small_m.config['BLOCK_K']}, "
+			  f"Split-K={best_small_m.config['split_k']}")
+	
+	print("=" * 80)
+
+
+if __name__ == "__main__":
+	run_full_benchmark_suite()
