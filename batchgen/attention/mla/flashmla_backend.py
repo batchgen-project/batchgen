@@ -751,6 +751,148 @@ def mla_decoding_flashmla_attn_mode_3_bak(
     
 #     return causal_mask
 
+# @torch.inference_mode()
+# def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
+# 	self,
+# 	hidden_states: torch.Tensor,
+# 	past_key_states: torch.Tensor,
+# 	past_value_states: torch.Tensor,
+# 	attention_mask: torch.Tensor,
+# 	q_position_ids: torch.Tensor,
+# 	scale: torch.Tensor,
+# 	cache_seqlens: torch.Tensor,
+# 	max_seqlen: int,
+# 	weight_scale: dict = None,
+# ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+# 	"""
+# 	MLA decoding function with FP8 KV cache quantization and BF16 attention computation.
+
+# 	Args:
+# 		hidden_states: Input hidden states of shape (batch_size, 1, hidden_size).
+# 		past_key_states: Quantized (FP8) past compressed key states cache of shape (batch_size, max_seqlen, kv_dim).
+# 		past_value_states: Not used. Placeholder for compatibility.
+# 		attention_mask: Attention mask of shape (batch_size, seq_len).
+# 		q_position_ids: Position ids of shape (batch_size, 1) indicating where to write the new KV cache.
+# 		scale: Dequantization scale for past_key_states.
+# 		cache_seqlens: Sequence lengths of the cache.
+# 		max_seqlen: Maximum sequence length of the cache.
+# 		weight_scale: Weight quantization scales dictionary.
+
+# 	Returns:
+# 		Tuple of (attn_output, updated past_key_states, updated scale).
+# 	"""
+# 	bsz, q_len, _ = hidden_states.size()
+# 	assert q_len == 1, "The PyTorch MLA decoding backend currently only supports a query length of 1."
+
+# 	# Dequantize KV cache
+# 	compressed_kv_ref = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
+# 	max_seqlen_pad = compressed_kv_ref.size(1)
+
+# 	# Query and key-value projection with W8A8 quantization
+# 	hidden_states = hidden_states.squeeze(1)
+# 	hidden_states, hidden_states_scale = act_quant(hidden_states)
+	
+# 	q = w8a8_gemm(hidden_states, hidden_states_scale, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"])
+# 	new_compressed_kv = w8a8_gemm(hidden_states, hidden_states_scale, self.kv_a_proj_with_mqa.weight, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]).view(bsz, 1, -1)
+	
+# 	q = self.q_a_layernorm(q)
+# 	q, q_scale = act_quant(q)
+# 	q = w8a8_gemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
+
+# 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+# 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+# 	# Split and process KV
+# 	kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+	
+# 	# Apply RoPE
+# 	k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
+# 	cos, sin = self.rotary_emb(k_pe, seq_len=max_seqlen_pad)
+# 	k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
+# 	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+	
+# 	kv = self.kv_a_layernorm(kv)
+# 	k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
+# 	offload_kv = torch.cat([kv, k_pe], dim=-1)
+	
+# 	# Update cache with new KV
+# 	batch_indices = torch.arange(bsz, device=hidden_states.device)
+# 	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
+	
+# 	# Quantize and update past_key_states
+# 	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+# 	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+# 	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+	
+# 	# Prepare KV projection weights with dequantization
+# 	kv_b_proj = deepseek_v3_dequantization(
+# 		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+# 	).view(self.num_heads, -1, self.kv_lora_rank)
+	
+# 	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+# 	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+# 	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+# 	query_states = torch.empty(
+# 		bsz, self.num_heads, 1, qk_head_dim,
+# 		dtype=compressed_kv_ref.dtype,
+# 		device=compressed_kv_ref.device,
+# 	)
+
+# 	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+# 	query_states[:, :, :, self.kv_lora_rank :] = q_pe
+# 	query_states = query_states.view(
+# 		bsz, 1, self.num_heads, qk_head_dim
+# 	)
+
+# 	assert qk_head_dim == 576, f"qk_head_dim should be 576, but got {qk_head_dim}"
+# 	assert self.num_heads == 128, f"num_heads should be 128, but got {self.num_heads}"
+	
+# 	block_size = 64	
+# 	block_table = torch.arange(
+# 		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv_ref.device
+# 	).view(bsz, max_seqlen_pad // block_size)
+
+# 	blocked_k = compressed_kv_ref.view(
+# 		bsz * max_seqlen_pad // block_size, block_size, 1, compressed_kv_ref.size(-1)
+# 	)
+
+# 	tile_scheduler_metadata, num_splits = get_mla_metadata(
+# 		cache_seqlens, 128, 1
+# 	)
+# 	try:
+# 		attn_out, _ = flash_mla_with_kvcache(
+# 			query_states,
+# 			blocked_k,
+# 			block_table,
+# 			cache_seqlens,
+# 			512,
+# 			tile_scheduler_metadata,
+# 			num_splits,
+# 			self.softmax_scale,
+# 			causal = True
+# 		)
+# 	except Exception as e:
+# 		logging.error(f"Error in flash_mla_with_kvcache: {e}")
+# 		raise
+# 	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	
+# 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+# 		raise ValueError(
+# 			f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is {attn_output.size()}"
+# 		)
+	
+# 	# Final projection with W8A8 quantization
+# 	attn_output = attn_output.transpose(1, 2).contiguous()
+# 	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
+	
+# 	attn_output_fp8, attn_output_scale = act_quant(attn_output)
+# 	attn_output = w8a8_gemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
+# 	attn_output = attn_output.view(bsz, 1, -1)
+	
+# 	return attn_output, past_key_states, scale
+
+from .fused_kv_kernel import fused_kv_update_and_rope
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	self,
@@ -802,27 +944,33 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-	# Split and process KV
-	kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+	# Get rotary embedding tables
+	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen_pad)
 	
-	# Apply RoPE
-	k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
-	cos, sin = self.rotary_emb(k_pe, seq_len=max_seqlen_pad)
-	k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
-	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+	# ===== FUSED KERNEL: Replace the entire KV processing block =====
+	# This replaces:
+	# - Split new_compressed_kv into kv and k_pe
+	# - Apply LayerNorm to kv
+	# - Apply RoPE to k_pe and q_pe
+	# - Concatenate kv and k_pe
+	# - Update compressed_kv_ref (BF16 cache)
+	# - Quantize to FP8 and update past_key_states
+	# - Update scale cache
 	
-	kv = self.kv_a_layernorm(kv)
-	k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
-	offload_kv = torch.cat([kv, k_pe], dim=-1)
-	
-	# Update cache with new KV
-	batch_indices = torch.arange(bsz, device=hidden_states.device)
-	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
-	
-	# Quantize and update past_key_states
-	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
-	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
-	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+	q_pe = fused_kv_update_and_rope(
+		new_compressed_kv,           # (bsz, 1, kv_dim)
+		q_pe,                         # (bsz, num_heads, 1, rope_dim)
+		q_position_ids,               # (bsz, 1)
+		cos,                          # (max_seqlen, rope_dim)
+		sin,                          # (max_seqlen, rope_dim)
+		self.kv_a_layernorm,         # LayerNorm module
+		compressed_kv_ref,            # Updated in-place (BF16 cache)
+		past_key_states,              # Updated in-place (FP8 cache)
+		scale,                        # Updated in-place (scale cache)
+		self.kv_lora_rank,           # 448
+		self.qk_rope_head_dim,       # 128
+	)
+	# ===== END FUSED KERNEL =====
 	
 	# Prepare KV projection weights with dequantization
 	kv_b_proj = deepseek_v3_dequantization(
