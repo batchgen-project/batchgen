@@ -20,7 +20,7 @@ from .utils import config_torch_module_initializer
 from batchgen.batchgen_worker import BatchGenWorker
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
-	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 	datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
 )
 
