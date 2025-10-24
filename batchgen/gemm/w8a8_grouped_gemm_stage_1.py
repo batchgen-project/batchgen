@@ -594,7 +594,8 @@ def fused_fp8_moe_stage_1_optimized(
     
     output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
     
-    num_groups = num_active_experts.item()
+    # num_groups = num_active_experts.item()
+    num_groups = 16
     
     # 2D GRID: (experts, N_blocks)
     grid = (num_groups, triton.cdiv(N, gate_gemm_block_size[1]))
