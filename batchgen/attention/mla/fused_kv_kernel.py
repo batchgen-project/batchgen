@@ -226,7 +226,7 @@ def fused_kv_update_and_rope(
     q_position_ids: torch.Tensor,       # (bsz, 1)
     rotary_emb_cos: torch.Tensor,       # (max_seqlen, rope_dim)
     rotary_emb_sin: torch.Tensor,       # (max_seqlen, rope_dim)
-    kv_a_rmsnorm,                       # RMSNorm module (only has weight, no bias)
+    kv_a_layernorm,                     # LayerNorm or RMSNorm module
     
     # Caches to be updated in-place
     compressed_kv_ref: torch.Tensor,    # (bsz, max_seqlen_pad, kv_dim)
@@ -265,8 +265,19 @@ def fused_kv_update_and_rope(
     # (bsz, 1) -> (bsz)
     pos_ids = q_position_ids.squeeze(1).contiguous()
     
-    # Get RMSNorm weight (no bias)
-    rms_weight = kv_a_rmsnorm.weight.contiguous()
+    # Get LN weights - handle both LayerNorm and RMSNorm
+    ln_weight = kv_a_layernorm.weight.contiguous()
+    # RMSNorm doesn't have bias, so create a zero tensor if it doesn't exist
+    if hasattr(kv_a_layernorm, 'bias') and kv_a_layernorm.bias is not None:
+        ln_bias = kv_a_layernorm.bias.contiguous()
+    else:
+        ln_bias = torch.zeros_like(ln_weight)
+    
+    # Get epsilon - handle both attribute names
+    if hasattr(kv_a_layernorm, 'variance_epsilon'):
+        ln_eps = kv_a_layernorm.variance_epsilon
+    else:
+        ln_eps = kv_a_layernorm.eps
     
     # Rotary embeddings
     cos_cache = rotary_emb_cos.contiguous()
@@ -298,14 +309,15 @@ def fused_kv_update_and_rope(
     BLOCK_LORA = triton.next_power_of_2(kv_lora_rank)
     
     fused_kv_processing_kernel[grid_kv](
-        in_kv, pos_ids, cos_cache, sin_cache, rms_weight,
+        in_kv, pos_ids, cos_cache, sin_cache, ln_weight, ln_bias,
         compressed_kv_ref, past_key_states, scale_cache,
         # Strides
         in_kv.stride(0), in_kv.stride(1),
         pos_ids.stride(0),
         cos_cache.stride(0), cos_cache.stride(1),
         sin_cache.stride(0), sin_cache.stride(1),
-        rms_weight.stride(0),
+        ln_weight.stride(0),
+        ln_bias.stride(0),
         compressed_kv_ref.stride(0), compressed_kv_ref.stride(1), compressed_kv_ref.stride(2),
         past_key_states.stride(0), past_key_states.stride(1), past_key_states.stride(2),
         scale_cache.stride(0), scale_cache.stride(1), scale_cache.stride(2),
@@ -314,7 +326,7 @@ def fused_kv_update_and_rope(
         ROPE_DIM=qk_rope_head_dim,
         KV_DIM=kv_dim,
         MAX_SEQLEN_PAD=max_seqlen_pad,
-        RMS_EPS=kv_a_rmsnorm.variance_epsilon,
+        LN_EPS=ln_eps,
         BLOCK_LORA=BLOCK_LORA,
     )
     
