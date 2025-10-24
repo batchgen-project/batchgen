@@ -39,8 +39,7 @@ def fused_kv_processing_kernel(
     POS_IDS,                # Pointer to q_position_ids, shape (bsz)
     COS_CACHE,              # Pointer to rotary_emb.cos_cached, shape (max_seqlen, rope_dim)
     SIN_CACHE,              # Pointer to rotary_emb.sin_cached, shape (max_seqlen, rope_dim)
-    LN_WEIGHT,              # Pointer to kv_a_layernorm.weight, shape (lora_rank)
-    LN_BIAS,                # Pointer to kv_a_layernorm.bias, shape (lora_rank)
+    RMS_WEIGHT,             # Pointer to kv_a_layernorm.weight, shape (lora_rank)
     
     # --- Outputs ---
     OUT_KV_CACHE_BF16,      # Pointer to compressed_kv_ref, shape (bsz, max_seqlen_pad, kv_dim)
@@ -52,8 +51,7 @@ def fused_kv_processing_kernel(
     stride_pos_b,
     stride_cos_s, stride_cos_d,
     stride_sin_s, stride_sin_d,
-    stride_ln_w,
-    stride_ln_b,
+    stride_rms_w,
     stride_out_bf16_b, stride_out_bf16_s, stride_out_bf16_d,
     stride_out_fp8_b, stride_out_fp8_s, stride_out_fp8_d,
     stride_out_scale_b, stride_out_scale_s, stride_out_scale_d,
@@ -63,7 +61,7 @@ def fused_kv_processing_kernel(
     ROPE_DIM: tl.constexpr,
     KV_DIM: tl.constexpr,
     MAX_SEQLEN_PAD: tl.constexpr,
-    LN_EPS: tl.constexpr,
+    RMS_EPS: tl.constexpr,
     BLOCK_LORA: tl.constexpr, # Next power of 2 >= LORA_RANK
 ):
     """
@@ -89,21 +87,22 @@ def fused_kv_processing_kernel(
     in_k_pe_base_ptr = IN_NEW_KV + pid * stride_in_kv_b + LORA_RANK * stride_in_kv_d  # Base pointer (scalar)
     k_pe = tl.load(in_k_pe_base_ptr + rope_offsets * stride_in_kv_d) # shape (ROPE_DIM,)
     
-    # --- 4. Apply LayerNorm to kv_lora (in float32) ---
+    # --- 4. Apply RMSNorm to kv_lora (in float32) ---
     kv_lora_f32 = kv_lora.to(tl.float32)
     
-    # Masked mean and variance
-    kv_lora_f32_masked = tl.where(lora_mask, kv_lora_f32, 0.0) # 0.0 for padding
-    mean = tl.sum(kv_lora_f32_masked) / LORA_RANK
-    var_unbiased = (kv_lora_f32 - mean) * (kv_lora_f32 - mean)
-    var = tl.sum(tl.where(lora_mask, var_unbiased, 0.0)) / LORA_RANK
+    # RMSNorm: no mean subtraction, only RMS normalization
+    # Compute mean of squares (only for valid elements)
+    kv_lora_f32_masked = tl.where(lora_mask, kv_lora_f32, 0.0)
+    mean_sq = tl.sum(kv_lora_f32_masked * kv_lora_f32_masked) / LORA_RANK
     
-    rstd = 1.0 / tl.sqrt(var + LN_EPS)
+    # RMS normalization
+    rrms = 1.0 / tl.sqrt(mean_sq + RMS_EPS)
     
-    ln_w = tl.load(LN_WEIGHT + lora_offsets * stride_ln_w, mask=lora_mask, other=0.0)
-    ln_b = tl.load(LN_BIAS + lora_offsets * stride_ln_b, mask=lora_mask, other=0.0)
+    # Load weight (no bias for RMSNorm)
+    rms_w = tl.load(RMS_WEIGHT + lora_offsets * stride_rms_w, mask=lora_mask, other=0.0)
     
-    kv_lora_normed_f32 = (kv_lora_f32 - mean) * rstd * ln_w + ln_b
+    # Apply RMSNorm: x * rrms * weight
+    kv_lora_normed_f32 = kv_lora_f32 * rrms * rms_w
     kv_lora_normed_bf16 = kv_lora_normed_f32.to(tl.bfloat16) # final BF16 lora part
     
     # --- 5. Apply RoPE to k_pe (in bfloat16) ---
@@ -227,7 +226,7 @@ def fused_kv_update_and_rope(
     q_position_ids: torch.Tensor,       # (bsz, 1)
     rotary_emb_cos: torch.Tensor,       # (max_seqlen, rope_dim)
     rotary_emb_sin: torch.Tensor,       # (max_seqlen, rope_dim)
-    kv_a_layernorm: torch.nn.LayerNorm,
+    kv_a_rmsnorm,                       # RMSNorm module (only has weight, no bias)
     
     # Caches to be updated in-place
     compressed_kv_ref: torch.Tensor,    # (bsz, max_seqlen_pad, kv_dim)
@@ -266,9 +265,8 @@ def fused_kv_update_and_rope(
     # (bsz, 1) -> (bsz)
     pos_ids = q_position_ids.squeeze(1).contiguous()
     
-    # Get LN weights
-    ln_weight = kv_a_layernorm.weight.contiguous()
-    ln_bias = kv_a_layernorm.bias.contiguous()
+    # Get RMSNorm weight (no bias)
+    rms_weight = kv_a_rmsnorm.weight.contiguous()
     
     # Rotary embeddings
     cos_cache = rotary_emb_cos.contiguous()
@@ -300,15 +298,14 @@ def fused_kv_update_and_rope(
     BLOCK_LORA = triton.next_power_of_2(kv_lora_rank)
     
     fused_kv_processing_kernel[grid_kv](
-        in_kv, pos_ids, cos_cache, sin_cache, ln_weight, ln_bias,
+        in_kv, pos_ids, cos_cache, sin_cache, rms_weight,
         compressed_kv_ref, past_key_states, scale_cache,
         # Strides
         in_kv.stride(0), in_kv.stride(1),
         pos_ids.stride(0),
         cos_cache.stride(0), cos_cache.stride(1),
         sin_cache.stride(0), sin_cache.stride(1),
-        ln_weight.stride(0),
-        ln_bias.stride(0),
+        rms_weight.stride(0),
         compressed_kv_ref.stride(0), compressed_kv_ref.stride(1), compressed_kv_ref.stride(2),
         past_key_states.stride(0), past_key_states.stride(1), past_key_states.stride(2),
         scale_cache.stride(0), scale_cache.stride(1), scale_cache.stride(2),
@@ -317,8 +314,8 @@ def fused_kv_update_and_rope(
         ROPE_DIM=qk_rope_head_dim,
         KV_DIM=kv_dim,
         MAX_SEQLEN_PAD=max_seqlen_pad,
-        LN_EPS=kv_a_layernorm.eps,
-        BLOCK_LORA=BLOCK_LORA, # Pass the new block size
+        RMS_EPS=kv_a_rmsnorm.variance_epsilon,
+        BLOCK_LORA=BLOCK_LORA,
     )
     
     # --- 4. Return rotated q_pe with original shape ---
