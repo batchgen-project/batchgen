@@ -220,6 +220,119 @@ def rotate_q_pe_kernel(
     tl.store(out_q_pe_ptr, q_pe_rotated)
 
 
+# def fused_kv_update_and_rope(
+#     new_compressed_kv: torch.Tensor,    # (bsz, 1, kv_dim)
+#     q_pe: torch.Tensor,                 # (bsz, num_heads, 1, rope_dim)
+#     q_position_ids: torch.Tensor,       # (bsz, 1)
+#     rotary_emb_cos: torch.Tensor,       # (max_seqlen, rope_dim)
+#     rotary_emb_sin: torch.Tensor,       # (max_seqlen, rope_dim)
+#     kv_a_layernorm,                     # LayerNorm or RMSNorm module
+    
+#     # Caches to be updated in-place
+#     compressed_kv_ref: torch.Tensor,    # (bsz, max_seqlen_pad, kv_dim)
+#     past_key_states: torch.Tensor,      # (bsz, max_seqlen_pad, kv_dim)
+#     scale_cache: torch.Tensor,          # (bsz, max_seqlen_pad, 1)
+    
+#     # Model dims
+#     kv_lora_rank: int,
+#     qk_rope_head_dim: int,
+# ) -> torch.Tensor:
+#     """
+#     Python wrapper to replace the original block of PyTorch operations.
+    
+#     Returns:
+#         rotated_q_pe: The RoPE-applied q_pe tensor, shape (bsz, num_heads, 1, rope_dim)
+#     """
+    
+#     # --- 1. Prepare inputs and dimensions ---
+#     bsz, num_heads, _, rope_dim = q_pe.shape
+#     assert rope_dim == qk_rope_head_dim
+    
+#     _, _, kv_dim_in = new_compressed_kv.shape
+#     kv_dim = kv_lora_rank + qk_rope_head_dim
+#     assert kv_dim_in == kv_dim
+    
+#     max_seqlen = rotary_emb_cos.shape[0]
+#     max_seqlen_pad = compressed_kv_ref.shape[1]
+    
+#     # Ensure inputs are contiguous and squeezed to expected kernel shapes
+#     # (bsz, 1, kv_dim) -> (bsz, kv_dim)
+#     in_kv = new_compressed_kv.squeeze(1).contiguous()
+    
+#     # (bsz, num_heads, 1, rope_dim) -> (bsz, num_heads, rope_dim)
+#     in_q_pe = q_pe.squeeze(2).contiguous()
+    
+#     # (bsz, 1) -> (bsz)
+#     pos_ids = q_position_ids.squeeze(1).contiguous()
+    
+#     # Get LN weights - handle both LayerNorm and RMSNorm
+#     ln_weight = kv_a_layernorm.weight.contiguous()
+#     # RMSNorm doesn't have bias, so create a zero tensor if it doesn't exist
+#     if hasattr(kv_a_layernorm, 'bias') and kv_a_layernorm.bias is not None:
+#         ln_bias = kv_a_layernorm.bias.contiguous()
+#     else:
+#         ln_bias = torch.zeros_like(ln_weight)
+    
+#     # Get epsilon - handle both attribute names
+#     if hasattr(kv_a_layernorm, 'variance_epsilon'):
+#         ln_eps = kv_a_layernorm.variance_epsilon
+#     else:
+#         ln_eps = kv_a_layernorm.eps
+    
+#     # Rotary embeddings
+#     cos_cache = rotary_emb_cos.contiguous()
+#     sin_cache = rotary_emb_sin.contiguous()
+
+#     # --- 2. Launch rotate_q_pe_kernel ---
+#     out_q_pe = torch.empty_like(in_q_pe)
+#     grid_q = (bsz, num_heads)
+    
+#     rotate_q_pe_kernel[grid_q](
+#         in_q_pe, out_q_pe,
+#         pos_ids, cos_cache, sin_cache,
+#         # Strides
+#         in_q_pe.stride(0), in_q_pe.stride(1), in_q_pe.stride(2),
+#         out_q_pe.stride(0), out_q_pe.stride(1), out_q_pe.stride(2),
+#         pos_ids.stride(0),
+#         cos_cache.stride(0), cos_cache.stride(1),
+#         sin_cache.stride(0), sin_cache.stride(1),
+#         # Constants
+#         ROPE_DIM=qk_rope_head_dim,
+#         MAX_SEQLEN=max_seqlen,
+#         NUM_HEADS=num_heads,
+#     )
+    
+#     # --- 3. Launch fused_kv_processing_kernel ---
+#     grid_kv = (bsz,)
+    
+#     # Calculate next power of 2 for LORA_RANK
+#     BLOCK_LORA = triton.next_power_of_2(kv_lora_rank)
+    
+#     fused_kv_processing_kernel[grid_kv](
+#         in_kv, pos_ids, cos_cache, sin_cache, ln_weight, ln_bias,
+#         compressed_kv_ref, past_key_states, scale_cache,
+#         # Strides
+#         in_kv.stride(0), in_kv.stride(1),
+#         pos_ids.stride(0),
+#         cos_cache.stride(0), cos_cache.stride(1),
+#         sin_cache.stride(0), sin_cache.stride(1),
+#         ln_weight.stride(0),
+#         ln_bias.stride(0),
+#         compressed_kv_ref.stride(0), compressed_kv_ref.stride(1), compressed_kv_ref.stride(2),
+#         past_key_states.stride(0), past_key_states.stride(1), past_key_states.stride(2),
+#         scale_cache.stride(0), scale_cache.stride(1), scale_cache.stride(2),
+#         # Constants
+#         LORA_RANK=kv_lora_rank,
+#         ROPE_DIM=qk_rope_head_dim,
+#         KV_DIM=kv_dim,
+#         MAX_SEQLEN_PAD=max_seqlen_pad,
+#         LN_EPS=ln_eps,
+#         BLOCK_LORA=BLOCK_LORA,
+#     )
+    
+#     # --- 4. Return rotated q_pe with original shape ---
+#     return out_q_pe.unsqueeze(2)
+
 def fused_kv_update_and_rope(
     new_compressed_kv: torch.Tensor,    # (bsz, 1, kv_dim)
     q_pe: torch.Tensor,                 # (bsz, num_heads, 1, rope_dim)
@@ -309,19 +422,45 @@ def fused_kv_update_and_rope(
     BLOCK_LORA = triton.next_power_of_2(kv_lora_rank)
     
     fused_kv_processing_kernel[grid_kv](
-        in_kv, pos_ids, cos_cache, sin_cache, ln_weight, ln_bias,
-        compressed_kv_ref, past_key_states, scale_cache,
-        # Strides
-        in_kv.stride(0), in_kv.stride(1),
+        # Inputs
+        in_kv, 
+        pos_ids, 
+        cos_cache, 
+        sin_cache, 
+        ln_weight, 
+        ln_bias,
+        # Outputs
+        compressed_kv_ref, 
+        past_key_states, 
+        scale_cache,
+        # Strides - in_kv
+        in_kv.stride(0), 
+        in_kv.stride(1),
+        # Strides - pos_ids
         pos_ids.stride(0),
-        cos_cache.stride(0), cos_cache.stride(1),
-        sin_cache.stride(0), sin_cache.stride(1),
+        # Strides - cos_cache
+        cos_cache.stride(0), 
+        cos_cache.stride(1),
+        # Strides - sin_cache
+        sin_cache.stride(0), 
+        sin_cache.stride(1),
+        # Strides - ln_weight
         ln_weight.stride(0),
+        # Strides - ln_bias
         ln_bias.stride(0),
-        compressed_kv_ref.stride(0), compressed_kv_ref.stride(1), compressed_kv_ref.stride(2),
-        past_key_states.stride(0), past_key_states.stride(1), past_key_states.stride(2),
-        scale_cache.stride(0), scale_cache.stride(1), scale_cache.stride(2),
-        # Constants
+        # Strides - compressed_kv_ref
+        compressed_kv_ref.stride(0), 
+        compressed_kv_ref.stride(1), 
+        compressed_kv_ref.stride(2),
+        # Strides - past_key_states
+        past_key_states.stride(0), 
+        past_key_states.stride(1), 
+        past_key_states.stride(2),
+        # Strides - scale_cache
+        scale_cache.stride(0), 
+        scale_cache.stride(1), 
+        scale_cache.stride(2),
+        # Constants (as keyword arguments)
         LORA_RANK=kv_lora_rank,
         ROPE_DIM=qk_rope_head_dim,
         KV_DIM=kv_dim,
