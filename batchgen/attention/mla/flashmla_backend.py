@@ -893,7 +893,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	return attn_output, past_key_states, scale
 
 # from .fused_kv_kernel import fused_kv_update_and_rope
-from .fused_rmsnorm_rope import fused_rmsnorm_rope, fused_rmsnorm_rope_cache_update
+from .fused_rmsnorm_rope import fused_rmsnorm_rope, fused_rmsnorm_rope_cache_update,fused_rmsnorm_rope_cache_update_with_q
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	self,
@@ -1642,7 +1642,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 	cos, sin = self.rotary_emb(q_pe, seq_len=kv_len)
-	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+	# q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 	# Project the new compressed key-value pair in full precision.
 	# new_compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
@@ -1674,9 +1674,10 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	# Update the dequantized cache at the current position
 	# batch_indices = torch.arange(bsz, device=hidden_states.device)
 	# past_key_states[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
-	fused_rmsnorm_rope_cache_update(
+	fused_rmsnorm_rope_cache_update_with_q(
 		new_compressed_kv,
 		past_key_states,
+		q_pe,
 		cos,
 		sin,
 		q_position_ids,
@@ -1700,9 +1701,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 		device=past_key_states.device,
 	)
 	q_nope = q_nope.squeeze(2)
-	query_states[:, :, :, : self.kv_lora_rank] = torch.matmul(q_nope, q_absorb).view(
-		bsz, self.num_heads, 1, self.kv_lora_rank
-	)
+	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('bhd,hdc->bhc', q_nope, q_absorb).view(bsz, self.num_heads, 1, self.kv_lora_rank)
 	# query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
 	query_states[:, :, :, self.kv_lora_rank :] = q_pe
 	query_states = query_states.view(
