@@ -398,13 +398,13 @@ class W8A8GemmConfig:
 			return (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, 4, 'small', split_k)
 		
 		elif M <= 64:
-			return (64, 128, 128, 4, 4, 8, 'medium', 1)
+			return (64, 128, 128, 4, 3, 8, 'medium', 1)
 		elif M < 128:
-			return (128, 128, 128, 4, 4, 8, 'medium', 1)
+			return (128, 128, 128, 4, 3, 8, 'medium', 1)
 		elif M < 512 or N < 2048:
-			return (128, 128, 128, 8, 4, 8, 'large', 1)
+			return (128, 128, 128, 4, 3, 8, 'large', 1)
 		else:
-			return (128, 256, 128, 8, 5, 8, 'large', 1)
+			return (128, 256, 128, 4, 3, 8, 'large', 1)
 
 
 def w8a8_gemm_dispatch(
