@@ -108,3 +108,27 @@ def fused_rmsnorm_rope_kernel(
         tl.store(data_ptr + rope_offset + half_dim + offsets, out_second, mask=mask)
 
 
+def fused_rmsnorm_rope(
+    data: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+    norm_weight: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Wrapper for fused kernel"""
+    bsz, q_len, _ = data.shape
+    max_seq_len = cos.shape[0]
+    
+    # Launch kernel
+    grid = lambda meta: (bsz * q_len,)
+    fused_rmsnorm_rope_kernel[grid](
+        data, cos, sin, position_ids, norm_weight,
+        bsz, q_len, kv_lora_rank, qk_rope_head_dim, max_seq_len,
+        eps,
+        BLOCK_SIZE=64,
+    )
+    
+    return data
