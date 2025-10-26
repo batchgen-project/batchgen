@@ -991,8 +991,8 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	q_absorb_blocks = self.qk_nope_head_dim // 128
 
 
-	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
-	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :].contiguous()
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :].contiguous()
 	# odd chunk of 128 are q_absorb's weight scale.
 	q_absorb_weight_scale = scale_reshaped[:, :q_absorb_blocks, :].contiguous() 
 	q_absorb_weight_scale = q_absorb_weight_scale.view(-1, q_absorb_weight_scale.size(-1))
