@@ -1008,7 +1008,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	)
 
 	# query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
-	q_nope = q_nope.view(bsz * self.num_heads, self.qk_nope_head_dim)
+	q_nope = q_nope.view(bsz * self.num_heads, self.qk_nope_head_dim).contiguous()
 	q_nope_fp8, q_nope_scale = act_quant(q_nope)
 	q_absorb = q_absorb.view(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank)
 	query_states[:, :, :, : self.kv_lora_rank] = w8a8_gemm(q_nope_fp8, q_nope_scale, q_absorb, q_absorb_weight_scale).view(bsz, self.num_heads, 1, self.kv_lora_rank)
@@ -1053,7 +1053,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	# 	raise ValueError(
 	# 		f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is {attn_output.size()}"
 	# 	)
-	
+
 	# Stack all head weight matrices vertically
 	# out_absorb: (num_heads, v_head_dim, c) -> (num_heads * v_head_dim, c)
 	out_absorb_stacked = out_absorb.reshape(self.num_heads * self.v_head_dim, -1)
