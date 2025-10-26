@@ -752,7 +752,7 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 #     return causal_mask
 
 @torch.inference_mode()
-def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
+def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	self,
 	hidden_states: torch.Tensor,
 	past_key_states: torch.Tensor,
@@ -892,7 +892,8 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	
 	return attn_output, past_key_states, scale
 
-from .fused_kv_kernel import fused_kv_update_and_rope
+# from .fused_kv_kernel import fused_kv_update_and_rope
+from .fused_rmsnorm_rope import fused_rmsnorm_rope
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	self,
@@ -943,34 +944,39 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-	# Get rotary embedding tables
+	
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen_pad)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+
+
+	# # Split and process KV
+	# kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 	
-	# ===== FUSED KERNEL: Replace the entire KV processing block =====
-	# This replaces:
-	# - Split new_compressed_kv into kv and k_pe
-	# - Apply LayerNorm to kv
-	# - Apply RoPE to k_pe and q_pe
-	# - Concatenate kv and k_pe
-	# - Update compressed_kv_ref (BF16 cache)
-	# - Quantize to FP8 and update past_key_states
-	# - Update scale cache
+	# # Apply RoPE
+	# k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
+	# k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
 	
-	q_pe = fused_kv_update_and_rope(
-		new_compressed_kv,           # (bsz, 1, kv_dim)
-		q_pe,                         # (bsz, num_heads, 1, rope_dim)
-		q_position_ids,               # (bsz, 1)
-		cos,                          # (max_seqlen, rope_dim)
-		sin,                          # (max_seqlen, rope_dim)
-		self.kv_a_layernorm,         # LayerNorm module
-		compressed_kv_ref,            # Updated in-place (BF16 cache)
-		past_key_states,              # Updated in-place (FP8 cache)
-		scale,                        # Updated in-place (scale cache)
-		self.kv_lora_rank,           # 448
-		self.qk_rope_head_dim,       # 128
+	# kv = self.kv_a_layernorm(kv)
+	# k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
+	# offload_kv = torch.cat([kv, k_pe], dim=-1)
+	offload_kv = fused_rmsnorm_rope(
+		new_compressed_kv,
+		cos,
+		sin,
+		q_position_ids,
+		self.kv_a_layernorm.weight,
+		self.kv_lora_rank,
+		self.qk_rope_head_dim,
 	)
-	# ===== END FUSED KERNEL =====
+	
+	# Update cache with new KV
+	batch_indices = torch.arange(bsz, device=hidden_states.device)
+	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
+	
+	# Quantize and update past_key_states
+	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
 	
 	# Prepare KV projection weights with dequantization
 	kv_b_proj = deepseek_v3_dequantization(
@@ -1039,6 +1045,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	attn_output = attn_output.view(bsz, 1, -1)
 	
 	return attn_output, past_key_states, scale
+
 
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_bak(
