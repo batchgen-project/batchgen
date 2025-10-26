@@ -1641,6 +1641,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=kv_len)
 	# q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 	# Project the new compressed key-value pair in full precision.
