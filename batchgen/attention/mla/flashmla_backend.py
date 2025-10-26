@@ -1008,10 +1008,11 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	)
 
 	# query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
-	q_nope = q_nope.view(bsz * self.num_heads, self.qk_nope_head_dim).contiguous()
+	q_nope = q_nope.view(bsz, self.num_heads * self.qk_nope_head_dim).contiguous()
 	q_nope_fp8, q_nope_scale = act_quant(q_nope)
-	q_absorb = q_absorb.view(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank)
+	q_absorb = q_absorb.view(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank).permute(1,0).contiguous()
 	query_states[:, :, :, : self.kv_lora_rank] = w8a8_gemm(q_nope_fp8, q_nope_scale, q_absorb, q_absorb_weight_scale).view(bsz, self.num_heads, 1, self.kv_lora_rank)
+	# RuntimeError: shape '[8, 128, 1, 512]' is invalid for input of size 16777216
 	query_states[:, :, :, self.kv_lora_rank :] = q_pe
 	query_states = query_states.view(
 		bsz, 1, self.num_heads, qk_head_dim
