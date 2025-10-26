@@ -979,12 +979,26 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
 	
 	# Prepare KV projection weights with dequantization
-	kv_b_proj = deepseek_v3_dequantization(
-		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
-	).view(self.num_heads, -1, self.kv_lora_rank)
-	
+	# kv_b_proj = deepseek_v3_dequantization(
+	# 	self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+	# ).view(self.num_heads, -1, self.kv_lora_rank)
+	kv_b_proj = self.kv_b_proj.weight.view(
+		self.num_heads, -1, self.kv_lora_rank
+	)
+	combined_dim  = kv_b_proj.size(1)
+	scale_reshaped = weight_scale["kv_b_proj.weight_scale_inv"].view(self.num_heads, combined_dim // 128, -1)
+	# Calculate which blocks correspond to each slice
+	q_absorb_blocks = self.qk_nope_head_dim // 128
+
+
 	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
 	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+	# odd chunk of 128 are q_absorb's weight scale.
+	q_absorb_weight_scale = scale_reshaped[:, :q_absorb_blocks, :].contiguous() 
+	q_absorb_weight_scale = q_absorb_weight_scale.view(-1, q_absorb_weight_scale.size(-1))
+	out_absorb_weight_scale = scale_reshaped[:, q_absorb_blocks:, :].contiguous()
+	out_absorb_weight_scale = out_absorb_weight_scale.view(-1, out_absorb_weight_scale.size(-1))
+
 
 	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
 	query_states = torch.empty(
@@ -993,7 +1007,11 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 		device=compressed_kv_ref.device,
 	)
 
-	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+	# query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+	q_nope = q_nope.view(bsz * self.num_heads, self.qk_nope_head_dim)
+	q_nope_fp8, q_nope_scale = act_quant(q_nope)
+	q_absorb = q_absorb.view(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank)
+	query_states[:, :, :, : self.kv_lora_rank] = w8a8_gemm(q_nope_fp8, q_nope_scale, q_absorb, q_absorb_weight_scale).view(bsz, self.num_heads, 1, self.kv_lora_rank)
 	query_states[:, :, :, self.kv_lora_rank :] = q_pe
 	query_states = query_states.view(
 		bsz, 1, self.num_heads, qk_head_dim
@@ -1029,8 +1047,54 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	except Exception as e:
 		logging.error(f"Error in flash_mla_with_kvcache: {e}")
 		raise
-	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	# attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
 	
+	# if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+	# 	raise ValueError(
+	# 		f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is {attn_output.size()}"
+	# 	)
+	
+	# Stack all head weight matrices vertically
+	# out_absorb: (num_heads, v_head_dim, c) -> (num_heads * v_head_dim, c)
+	out_absorb_stacked = out_absorb.reshape(self.num_heads * self.v_head_dim, -1)
+
+	# Stack weight scales accordingly
+	# out_absorb_weight_scale: (num_heads, v_head_dim//128, c//128) -> (num_heads*v_head_dim//128, c//128)
+	out_absorb_scale_stacked = out_absorb_weight_scale.reshape(
+		self.num_heads * self.v_head_dim // 128, -1
+	)
+
+	# Flatten activations: (bsz, q_len, num_heads, c) -> (bsz*num_heads*q_len, c)
+	# Order: [b0,h0,q0], [b0,h0,q1], ..., [b0,h1,q0], ..., [b1,h0,q0], ...
+	attn_out_flat = attn_out.permute(0, 2, 1, 3).reshape(bsz * self.num_heads * q_len, -1)
+
+	# Quantize activations to FP8
+	attn_out_fp8, attn_out_scale = act_quant(attn_out_flat)
+
+	# FP8 GEMM: (bsz*num_heads*q_len, c) @ (c, num_heads*v_head_dim)^T 
+	# -> (bsz*num_heads*q_len, num_heads*v_head_dim)
+	flat_res = w8a8_gemm(
+		attn_out_fp8,              # (bsz*num_heads*q_len, c)
+		attn_out_scale,
+		out_absorb_stacked.T,      # (c, num_heads*v_head_dim)
+		out_absorb_scale_stacked
+	)
+
+	# Indexing to extract correct outputs
+	# Reshape to expose the head dimension: (bsz*num_heads*q_len, num_heads, v_head_dim)
+	flat_res_view = flat_res.view(bsz * self.num_heads * q_len, self.num_heads, self.v_head_dim)
+
+	# For each row i, we need to select the columns corresponding to its head
+	# Row i = b*num_heads*q_len + h*q_len + q, and we want columns from head h
+	row_indices = torch.arange(bsz * self.num_heads * q_len, device=flat_res.device)
+	head_indices = (row_indices // q_len) % self.num_heads
+
+	# Gather the correct head outputs for each row
+	attn_output_flat = flat_res_view[row_indices, head_indices, :]  # (bsz*num_heads*q_len, v_head_dim)
+
+	# Reshape to final output shape
+	attn_output = attn_output_flat.view(bsz, self.num_heads, q_len, self.v_head_dim)
+
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
 		raise ValueError(
 			f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is {attn_output.size()}"

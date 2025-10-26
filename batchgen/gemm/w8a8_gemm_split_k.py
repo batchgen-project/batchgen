@@ -426,8 +426,8 @@ def w8a8_gemm_dispatch(
 	M, K = a.shape
 	N = w.shape[0]
 	
-	assert a.dtype == torch.float8_e4m3fn or a.dtype == torch.float8_e5m2, "A must be FP8"
-	assert w.dtype == torch.float8_e4m3fn or w.dtype == torch.float8_e5m2, "W must be FP8"
+	assert a.dtype == torch.float8_e4m3fn, "A must be FP8"
+	assert w.dtype == torch.float8_e4m3fn, "W must be FP8"
 	assert a.is_contiguous() and w.is_contiguous(), "Tensors must be contiguous"
 	
 	BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, GROUP_M, kernel_type, split_k = \
