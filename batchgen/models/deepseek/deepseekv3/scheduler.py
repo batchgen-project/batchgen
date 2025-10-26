@@ -26,7 +26,7 @@ class Scheduler:
 		"""
 		DEFAULT_MEM_FRAC = 0.75
 		# MAGIC_NUM = self.compute_profiler.profile(attn_decoding_module)
-		MAGIC_NUM = 224000
+		MAGIC_NUM = 224000 * 2
 		EXPERT_PER_RANK = 256 // self.world_size
 		assert EXPERT_PER_RANK > 0, "EXPERT_PER_RANK must be greater than 0"
 		if self.world_size > 8:

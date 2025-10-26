@@ -368,7 +368,7 @@ class W8A8GemmConfig:
 			else:
 				# Strategy 2: Larger tiles, with split-K
 				# (64, 32, 128) - better efficiency, use split-K for parallelism
-				BLOCK_M, BLOCK_N, BLOCK_K = 64, 16, 128
+				BLOCK_M, BLOCK_N, BLOCK_K = 64, 32, 128
 				
 				# Compute split-K factor
 				num_sms = W8A8GemmConfig.get_sm_count(device)
@@ -394,7 +394,7 @@ class W8A8GemmConfig:
 				
 				num_warps = 4
 				num_stages = 3
-				split_k = 1
+				# split_k = 1
 			
 			return (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, 4, 'small', split_k)
 		
