@@ -1596,7 +1596,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
     past_value_states: torch.Tensor,  # Not used, kept for compatibility
     attention_mask: torch.Tensor,  # Already sliced
     q_position_ids: torch.Tensor,  # Already sliced
-    cache_seqlens: torch.Tensor,  # Already sliced
+    cache_seqlens: torch.Tensor,  # Already slicedcp
     max_seqlen: int,
     batch_start_idx: int,  # NEW: which batch slice we're working on
     batch_end_idx: int,    # NEW: end of batch slice
