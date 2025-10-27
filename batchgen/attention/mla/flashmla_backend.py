@@ -976,8 +976,8 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
 	query_states = torch.empty(
 		bsz, self.num_heads, 1, qk_head_dim,
-		dtype=past_key_states.dtype,
-		device=past_key_states.device,
+		dtype=compressed_kv_ref.dtype,
+		device=compressed_kv_ref.device,
 	)
 	q_nope = q_nope.squeeze(2)
 	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('bhd,hdc->bhc', q_nope, q_absorb).view(bsz, self.num_heads, 1, self.kv_lora_rank)
