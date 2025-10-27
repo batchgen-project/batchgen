@@ -898,6 +898,104 @@ from .fused_rmsnorm_rope import (
 	fused_rmsnorm_rope_cache_update_with_q_return_new_kv
 )
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+@triton.jit
+def quantize_and_scatter_kernel(
+    input_bf16_ptr,           # [bsz, 1, total_dim] - input
+    output_fp8_ptr,           # [bsz, max_seq_len, total_dim] - output
+    scale_ptr,                # [bsz, max_seq_len, num_blocks] - output
+    position_ids_ptr,         # [bsz, 1]
+    bsz,
+    max_seq_len,
+    total_dim,
+    quant_block_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Quantize bf16 input to fp8 and write directly to target position in cache.
+    Eliminates fancy indexing overhead.
+    """
+    batch_idx = tl.program_id(0)
+    quant_block_idx = tl.program_id(1)
+    
+    # Constants
+    FP8_SAFE_MAX: tl.constexpr = 440.0
+    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
+    EPSILON: tl.constexpr = 1e-12
+    
+    pos_id = tl.load(position_ids_ptr + batch_idx)
+    
+    # Input offset: [bsz, 1, total_dim] with seq_dim=1
+    input_offset = batch_idx * total_dim
+    
+    # Output offset: [bsz, max_seq_len, total_dim]
+    output_offset = batch_idx * max_seq_len * total_dim + pos_id * total_dim
+    
+    # This quantization block's range
+    block_start = quant_block_idx * quant_block_size
+    block_end = tl.minimum(block_start + quant_block_size, total_dim)
+    
+    # Find amax for this block
+    amax = 0.0
+    for i in range(block_start, block_end, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = (offsets >= block_start) & (offsets < block_end)
+        
+        data = tl.load(input_bf16_ptr + input_offset + offsets, mask=mask, other=0.0)
+        data_fp32 = data.to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(data_fp32)))
+    
+    # Compute scale
+    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
+    scale = tl.maximum(amax / FP8_SAFE_MAX, EPSILON)
+    
+    # Store scale
+    num_blocks = (total_dim + quant_block_size - 1) // quant_block_size
+    scale_offset = batch_idx * max_seq_len * num_blocks + pos_id * num_blocks + quant_block_idx
+    tl.store(scale_ptr + scale_offset, scale)
+    
+    # Quantize and store
+    for i in range(block_start, block_end, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = (offsets >= block_start) & (offsets < block_end)
+        
+        data = tl.load(input_bf16_ptr + input_offset + offsets, mask=mask, other=0.0)
+        data_fp32 = data.to(tl.float32)
+        
+        # Quantize
+        data_scaled = data_fp32 / scale
+        data_scaled = tl.minimum(data_scaled, FP8_SAFE_MAX)
+        data_scaled = tl.maximum(data_scaled, -FP8_SAFE_MAX)
+        data_fp8 = data_scaled.to(tl.float8e4nv)
+        
+        # Write directly to target position
+        tl.store(output_fp8_ptr + output_offset + offsets, data_fp8, mask=mask)
+
+
+def quantize_and_scatter_write(
+    input_bf16: torch.Tensor,       # [bsz, 1, total_dim]
+    output_fp8: torch.Tensor,       # [bsz, max_seq_len, total_dim]
+    scale: torch.Tensor,            # [bsz, max_seq_len, num_blocks]
+    position_ids: torch.Tensor,     # [bsz, 1]
+    quant_block_size: int = 128,
+):
+    """Quantize and write directly to cache, eliminating fancy indexing."""
+    bsz, _, total_dim = input_bf16.shape
+    max_seq_len = output_fp8.shape[1]
+    num_blocks = (total_dim + quant_block_size - 1) // quant_block_size
+    
+    grid = (bsz, num_blocks)
+    
+    quantize_and_scatter_kernel[grid](
+        input_bf16,
+        output_fp8,
+        scale,
+        position_ids,
+        bsz,
+        max_seq_len,
+        total_dim,
+        quant_block_size,
+        BLOCK_SIZE=64,
+    )
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	self,
@@ -952,11 +1050,18 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 		self.qk_rope_head_dim
 	)
 
-	batch_indices = torch.arange(bsz, device=hidden_states.device)
-	# Quantize and update past_key_states
-	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
-	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
-	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+	# batch_indices = torch.arange(bsz, device=hidden_states.device)
+	# # Quantize and update past_key_states
+	# new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+	# past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+	# scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+	quantize_and_scatter_write(
+		offload_kv,
+		past_key_states,  # fp8 cache
+		scale,            # fp32 scales
+		q_position_ids,
+		quant_block_size=128
+	)
 
 	kv_seqlen = past_key_states.size(1)
 	kv_b_proj = deepseek_v3_dequantization(
