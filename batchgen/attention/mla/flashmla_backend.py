@@ -714,10 +714,10 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 # def update_causal_mask(attention_mask):
 #     """
 #     Create causal mask for decoding.
-    
+	
 #     Args:
 #         attention_mask: [bsz, seq_len] - 1 for valid tokens, 0 for padding
-    
+	
 #     Returns:
 #         causal_mask: [bsz, 1, 1, seq_len] - additive mask for attention
 #     """
@@ -725,30 +725,30 @@ def mla_decoding_flashmla_attn_mode_3_bak(
 #     min_dtype = torch.finfo(dtype).min
 #     device = attention_mask.device
 #     bsz, seq_len = attention_mask.shape
-    
+	
 #     # Query length is 1 (single new token being generated)
 #     query_length = 1
-    
+	
 #     # Current position is the last position (seq_len - 1 in 0-indexing)
 #     current_position = seq_len - 1
-    
+	
 #     # Create causal mask: current token can only attend to positions 0 to current_position
 #     # Shape: [1, seq_len]
 #     causal_mask = torch.zeros((query_length, seq_len), dtype=dtype, device=device)
-    
+	
 #     # Mask future positions (though there shouldn't be any if we're at the last position)
 #     # This is important if seq_len includes future placeholder positions
 #     if current_position < seq_len - 1:
 #         causal_mask[:, current_position + 1:] = min_dtype
-    
+	
 #     # Expand to [bsz, 1, 1, seq_len]
 #     causal_mask = causal_mask[None, None, :, :].expand(bsz, 1, -1, -1)
-    
+	
 #     # Apply padding mask: set padding positions to min_dtype
 #     # attention_mask: 1 for valid, 0 for padding
 #     padding_mask = (attention_mask[:, None, None, :] == 0)
 #     causal_mask = causal_mask.masked_fill(padding_mask, min_dtype)
-    
+	
 #     return causal_mask
 
 @torch.inference_mode()
@@ -894,6 +894,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 
 # from .fused_kv_kernel import fused_kv_update_and_rope
 from .fused_rmsnorm_rope import fused_rmsnorm_rope, fused_rmsnorm_rope_cache_update,fused_rmsnorm_rope_cache_update_with_q
+from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	self,
@@ -906,59 +907,47 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	cache_seqlens: torch.Tensor,
 	max_seqlen: int,
 	weight_scale: dict = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:  # Only return attn_output now
 	"""
-	MLA decoding function with FP8 KV cache quantization and BF16 attention computation.
-
-	Args:
-		hidden_states: Input hidden states of shape (batch_size, 1, hidden_size).
-		past_key_states: Quantized (FP8) past compressed key states cache of shape (batch_size, max_seqlen, kv_dim).
-		past_value_states: Not used. Placeholder for compatibility.
-		attention_mask: Attention mask of shape (batch_size, seq_len).
-		q_position_ids: Position ids of shape (batch_size, 1) indicating where to write the new KV cache.
-		scale: Dequantization scale for past_key_states.
-		cache_seqlens: Sequence lengths of the cache.
-		max_seqlen: Maximum sequence length of the cache.
-		weight_scale: Weight quantization scales dictionary.
-
-	Returns:
-		Tuple of (attn_output, updated past_key_states, updated scale).
+	Modified to update past_key_states in-place via the full tensor reference.
 	"""
 	bsz, q_len, _ = hidden_states.size()
 	assert q_len == 1, "The PyTorch MLA decoding backend currently only supports a query length of 1."
-
-	# Dequantize KV cache
+	
 	compressed_kv_ref = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
 	max_seqlen_pad = compressed_kv_ref.size(1)
 
-	# Query and key-value projection with W8A8 quantization
+	# Work on a VIEW of the batch slice
+	# past_key_states = past_key_states_full[batch_start_idx:batch_end_idx]
+	_, kv_len, _ = past_key_states.size()
+
+	# --- 2. Query and New Key-Value Projection ---
 	hidden_states = hidden_states.squeeze(1)
 	hidden_states, hidden_states_scale = act_quant(hidden_states)
-	
-	q = w8a8_gemm(hidden_states, hidden_states_scale, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"])
-	new_compressed_kv = w8a8_gemm(hidden_states, hidden_states_scale, self.kv_a_proj_with_mqa.weight, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]).view(bsz, 1, -1)
-	
+	q = w8a8_deepgemm(hidden_states, hidden_states_scale, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"])
+	new_compressed_kv = w8a8_deepgemm(hidden_states, hidden_states_scale, self.kv_a_proj_with_mqa.weight, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]).view(bsz, 1, -1)
 	q = self.q_a_layernorm(q)
 	q, q_scale = act_quant(q)
-	q = w8a8_gemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
+	q = w8a8_deepgemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
 
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-	
-	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen_pad)
+	q_pe = q_pe.contiguous()
+	cos, sin = self.rotary_emb(q_pe, seq_len=kv_len)
 	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
-
-
-	# # Split and process KV
-	# kv, k_pe = torch.split(new_compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 	
-	# # Apply RoPE
-	# k_pe = k_pe.view(bsz, 1, 1, self.qk_rope_head_dim)
-	# k_pe = rotary_pos_emb(k_pe, cos, sin, q_position_ids)
-	
-	# kv = self.kv_a_layernorm(kv)
-	# k_pe = k_pe.view(bsz, 1, self.qk_rope_head_dim)
-	# offload_kv = torch.cat([kv, k_pe], dim=-1)
+	# This modifies past_key_states in-place (which is a view of the full tensor!)
+	# fused_rmsnorm_rope_cache_update_with_q(
+	# 	new_compressed_kv,
+	# 	past_key_states,  # This is a VIEW, so modifications affect past_key_states_full!
+	# 	q_pe,
+	# 	cos,
+	# 	sin,
+	# 	q_position_ids,
+	# 	self.kv_a_layernorm.weight,
+	# 	self.kv_lora_rank,
+	# 	self.qk_rope_head_dim
+	# )
 	offload_kv = fused_rmsnorm_rope(
 		new_compressed_kv,
 		cos,
@@ -966,9 +955,8 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 		q_position_ids,
 		self.kv_a_layernorm.weight,
 		self.kv_lora_rank,
-		self.qk_rope_head_dim,
+		self.qk_rope_head_dim
 	)
-	
 	# Update cache with new KV
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
 	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
@@ -977,62 +965,50 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
 	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
 	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
-	
-	# Prepare KV projection weights with dequantization
-	# kv_b_proj = deepseek_v3_dequantization(
-	# 	self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
-	# ).view(self.num_heads, -1, self.kv_lora_rank)
-	kv_b_proj = self.kv_b_proj.weight.view(
-		self.num_heads, -1, self.kv_lora_rank
-	)
-	combined_dim  = kv_b_proj.size(1)
-	scale_reshaped = weight_scale["kv_b_proj.weight_scale_inv"].view(self.num_heads, combined_dim // 128, -1)
-	# Calculate which blocks correspond to each slice
-	q_absorb_blocks = self.qk_nope_head_dim // 128
 
-
-	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :].contiguous()
-	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :].contiguous()
-	# odd chunk of 128 are q_absorb's weight scale.
-	q_absorb_weight_scale = scale_reshaped[:, :q_absorb_blocks, :].contiguous() 
-	q_absorb_weight_scale = q_absorb_weight_scale.view(-1, q_absorb_weight_scale.size(-1))
-	out_absorb_weight_scale = scale_reshaped[:, q_absorb_blocks:, :].contiguous()
-	out_absorb_weight_scale = out_absorb_weight_scale.view(-1, out_absorb_weight_scale.size(-1))
-
+	kv_seqlen = past_key_states.size(1)
+	kv_b_proj = deepseek_v3_dequantization(
+		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+	).view(self.num_heads, -1, self.kv_lora_rank)
+	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
 
 	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
 	query_states = torch.empty(
 		bsz, self.num_heads, 1, qk_head_dim,
-		dtype=compressed_kv_ref.dtype,
-		device=compressed_kv_ref.device,
+		dtype=past_key_states.dtype,
+		device=past_key_states.device,
 	)
-
-	# query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
-	q_nope = q_nope.view(bsz, self.num_heads * self.qk_nope_head_dim).contiguous()
-	q_nope_fp8, q_nope_scale = act_quant(q_nope)
-	q_absorb = q_absorb.view(self.num_heads * self.qk_nope_head_dim, self.kv_lora_rank).permute(1,0).contiguous()
-	query_states[:, :, :, : self.kv_lora_rank] = w8a8_gemm(q_nope_fp8, q_nope_scale, q_absorb, q_absorb_weight_scale).view(bsz, self.num_heads, 1, self.kv_lora_rank)
-	# RuntimeError: shape '[8, 128, 1, 512]' is invalid for input of size 16777216
+	q_nope = q_nope.squeeze(2)
+	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('bhd,hdc->bhc', q_nope, q_absorb).view(bsz, self.num_heads, 1, self.kv_lora_rank)
 	query_states[:, :, :, self.kv_lora_rank :] = q_pe
-	query_states = query_states.view(
-		bsz, 1, self.num_heads, qk_head_dim
-	)
+	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
 
-	assert qk_head_dim == 576, f"qk_head_dim should be 576, but got {qk_head_dim}"
-	assert self.num_heads == 128, f"num_heads should be 128, but got {self.num_heads}"
-	
-	block_size = 64	
+	# Pad the kv cache to be multiple of 64 (create a NEW tensor for computation)
+	# if kv_seqlen % 64 != 0:
+	# 	pad_len = 64 - (kv_seqlen % 64)
+	# 	past_key_states_padded = torch.cat([
+	# 		past_key_states, 
+	# 		torch.zeros((bsz, pad_len, past_key_states.size(-1)), device=past_key_states.device, dtype=past_key_states.dtype)
+	# 	], dim=1)
+	# 	kv_seqlen_padded = past_key_states_padded.size(1)
+	# else:
+	# 	past_key_states_padded = past_key_states
+	# 	kv_seqlen_padded = kv_seqlen
+	kv_seqlen_padded = compressed_kv_ref.size(1)
+	block_size = 64
 	block_table = torch.arange(
-		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv_ref.device
-	).view(bsz, max_seqlen_pad // block_size)
+		bsz * kv_seqlen_padded // block_size, dtype=torch.int32, device=past_key_states.device
+	).view(bsz, kv_seqlen_padded // block_size)
 
 	blocked_k = compressed_kv_ref.view(
-		bsz * max_seqlen_pad // block_size, block_size, 1, compressed_kv_ref.size(-1)
+		bsz * kv_seqlen_padded // block_size, block_size, 1, compressed_kv_ref.size(-1)
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
 		cache_seqlens, 128, 1
 	)
+
 	try:
 		attn_out, _ = flash_mla_with_kvcache(
 			query_states,
@@ -1043,72 +1019,29 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 			tile_scheduler_metadata,
 			num_splits,
 			self.softmax_scale,
-			causal = True
+			True
 		)
 	except Exception as e:
 		logging.error(f"Error in flash_mla_with_kvcache: {e}")
 		raise
-	# attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
 	
-	# if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
-	# 	raise ValueError(
-	# 		f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is {attn_output.size()}"
-	# 	)
-
-	# Stack all head weight matrices vertically
-	# out_absorb: (num_heads, v_head_dim, c) -> (num_heads * v_head_dim, c)
-	out_absorb_stacked = out_absorb.reshape(self.num_heads * self.v_head_dim, -1)
-
-	# Stack weight scales accordingly
-	# out_absorb_weight_scale: (num_heads, v_head_dim//128, c//128) -> (num_heads*v_head_dim//128, c//128)
-	out_absorb_scale_stacked = out_absorb_weight_scale.reshape(
-		self.num_heads * self.v_head_dim // 128, -1
-	)
-
-	# Flatten activations: (bsz, q_len, num_heads, c) -> (bsz*num_heads*q_len, c)
-	# Order: [b0,h0,q0], [b0,h0,q1], ..., [b0,h1,q0], ..., [b1,h0,q0], ...
-	attn_out_flat = attn_out.permute(0, 2, 1, 3).reshape(bsz * self.num_heads * q_len, -1)
-
-	# Quantize activations to FP8
-	attn_out_fp8, attn_out_scale = act_quant(attn_out_flat)
-
-	# FP8 GEMM: (bsz*num_heads*q_len, c) @ (c, num_heads*v_head_dim)^T 
-	# -> (bsz*num_heads*q_len, num_heads*v_head_dim)
-	flat_res = w8a8_gemm(
-		attn_out_fp8,              # (bsz*num_heads*q_len, c)
-		attn_out_scale,
-		out_absorb_stacked.T,      # (c, num_heads*v_head_dim)
-		out_absorb_scale_stacked
-	)
-
-	# Indexing to extract correct outputs
-	# Reshape to expose the head dimension: (bsz*num_heads*q_len, num_heads, v_head_dim)
-	flat_res_view = flat_res.view(bsz * self.num_heads * q_len, self.num_heads, self.v_head_dim)
-
-	# For each row i, we need to select the columns corresponding to its head
-	# Row i = b*num_heads*q_len + h*q_len + q, and we want columns from head h
-	row_indices = torch.arange(bsz * self.num_heads * q_len, device=flat_res.device)
-	head_indices = (row_indices // q_len) % self.num_heads
-
-	# Gather the correct head outputs for each row
-	attn_output_flat = flat_res_view[row_indices, head_indices, :]  # (bsz*num_heads*q_len, v_head_dim)
-
-	# Reshape to final output shape
-	attn_output = attn_output_flat.view(bsz, self.num_heads, q_len, self.v_head_dim)
-
+	# Apply out_absorb projection
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
 		raise ValueError(
-			f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is {attn_output.size()}"
+			f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+			f" {attn_output.size()}"
 		)
 	
-	# Final projection with W8A8 quantization
+	# --- 9. Final Projection and Return ---
 	attn_output = attn_output.transpose(1, 2).contiguous()
 	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
-	
 	attn_output_fp8, attn_output_scale = act_quant(attn_output)
-	attn_output = w8a8_gemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
+	attn_output = w8a8_deepgemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
 	attn_output = attn_output.view(bsz, 1, -1)
 	
+
 	return attn_output, past_key_states, scale
 
 
@@ -1590,134 +1523,134 @@ def mla_decoding_flashmla_attn_mode_3_bf16_bak(
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_bf16(
-    self,
-    hidden_states: torch.Tensor,  # Already sliced: (batch_slice, 1, hidden_size)
-    past_key_states_full: torch.Tensor,  # Full tensor: (full_batch, max_seqlen, kv_dim)
-    past_value_states: torch.Tensor,  # Not used, kept for compatibility
-    attention_mask: torch.Tensor,  # Already sliced
-    q_position_ids: torch.Tensor,  # Already sliced
-    cache_seqlens: torch.Tensor,  # Already slicedcp
-    max_seqlen: int,
-    batch_start_idx: int,  # NEW: which batch slice we're working on
-    batch_end_idx: int,    # NEW: end of batch slice
-    scale: torch.Tensor = None,
-    weight_scale: dict = None,
+	self,
+	hidden_states: torch.Tensor,  # Already sliced: (batch_slice, 1, hidden_size)
+	past_key_states_full: torch.Tensor,  # Full tensor: (full_batch, max_seqlen, kv_dim)
+	past_value_states: torch.Tensor,  # Not used, kept for compatibility
+	attention_mask: torch.Tensor,  # Already sliced
+	q_position_ids: torch.Tensor,  # Already sliced
+	cache_seqlens: torch.Tensor,  # Already slicedcp
+	max_seqlen: int,
+	batch_start_idx: int,  # NEW: which batch slice we're working on
+	batch_end_idx: int,    # NEW: end of batch slice
+	scale: torch.Tensor = None,
+	weight_scale: dict = None,
 ) -> torch.Tensor:  # Only return attn_output now
-    """
-    Modified to update past_key_states in-place via the full tensor reference.
-    """
-    bsz, q_len, _ = hidden_states.size()
-    assert q_len == 1, "The PyTorch MLA decoding backend currently only supports a query length of 1."
-    
-    # Work on a VIEW of the batch slice
-    past_key_states = past_key_states_full[batch_start_idx:batch_end_idx]
-    _, kv_len, _ = past_key_states.size()
+	"""
+	Modified to update past_key_states in-place via the full tensor reference.
+	"""
+	bsz, q_len, _ = hidden_states.size()
+	assert q_len == 1, "The PyTorch MLA decoding backend currently only supports a query length of 1."
+	
+	# Work on a VIEW of the batch slice
+	past_key_states = past_key_states_full[batch_start_idx:batch_end_idx]
+	_, kv_len, _ = past_key_states.size()
 
-    # --- 2. Query and New Key-Value Projection ---
-    hidden_states = hidden_states.squeeze(1)
-    hidden_states, hidden_states_scale = act_quant(hidden_states)
-    q = w8a8_deepgemm(hidden_states, hidden_states_scale, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"])
-    new_compressed_kv = w8a8_deepgemm(hidden_states, hidden_states_scale, self.kv_a_proj_with_mqa.weight, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]).view(bsz, 1, -1)
-    q = self.q_a_layernorm(q)
-    q, q_scale = act_quant(q)
-    q = w8a8_deepgemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
+	# --- 2. Query and New Key-Value Projection ---
+	hidden_states = hidden_states.squeeze(1)
+	hidden_states, hidden_states_scale = act_quant(hidden_states)
+	q = w8a8_deepgemm(hidden_states, hidden_states_scale, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"])
+	new_compressed_kv = w8a8_deepgemm(hidden_states, hidden_states_scale, self.kv_a_proj_with_mqa.weight, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]).view(bsz, 1, -1)
+	q = self.q_a_layernorm(q)
+	q, q_scale = act_quant(q)
+	q = w8a8_deepgemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
 
-    q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-    q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-    q_pe = q_pe.contiguous()
-    cos, sin = self.rotary_emb(q_pe, seq_len=kv_len)
-    
-    # This modifies past_key_states in-place (which is a view of the full tensor!)
-    fused_rmsnorm_rope_cache_update_with_q(
-        new_compressed_kv,
-        past_key_states,  # This is a VIEW, so modifications affect past_key_states_full!
-        q_pe,
-        cos,
-        sin,
-        q_position_ids,
-        self.kv_a_layernorm.weight,
-        self.kv_lora_rank,
-        self.qk_rope_head_dim
-    )
+	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+	q_pe = q_pe.contiguous()
+	cos, sin = self.rotary_emb(q_pe, seq_len=kv_len)
+	
+	# This modifies past_key_states in-place (which is a view of the full tensor!)
+	fused_rmsnorm_rope_cache_update_with_q(
+		new_compressed_kv,
+		past_key_states,  # This is a VIEW, so modifications affect past_key_states_full!
+		q_pe,
+		cos,
+		sin,
+		q_position_ids,
+		self.kv_a_layernorm.weight,
+		self.kv_lora_rank,
+		self.qk_rope_head_dim
+	)
 
-    kv_seqlen = past_key_states.size(1)
-    kv_b_proj = deepseek_v3_dequantization(
-        self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
-    ).view(self.num_heads, -1, self.kv_lora_rank)
-    q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
-    out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+	kv_seqlen = past_key_states.size(1)
+	kv_b_proj = deepseek_v3_dequantization(
+		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+	).view(self.num_heads, -1, self.kv_lora_rank)
+	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
 
-    qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-    query_states = torch.empty(
-        bsz, self.num_heads, 1, qk_head_dim,
-        dtype=past_key_states.dtype,
-        device=past_key_states.device,
-    )
-    q_nope = q_nope.squeeze(2)
-    query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('bhd,hdc->bhc', q_nope, q_absorb).view(bsz, self.num_heads, 1, self.kv_lora_rank)
-    query_states[:, :, :, self.kv_lora_rank :] = q_pe
-    query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
+	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+	query_states = torch.empty(
+		bsz, self.num_heads, 1, qk_head_dim,
+		dtype=past_key_states.dtype,
+		device=past_key_states.device,
+	)
+	q_nope = q_nope.squeeze(2)
+	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('bhd,hdc->bhc', q_nope, q_absorb).view(bsz, self.num_heads, 1, self.kv_lora_rank)
+	query_states[:, :, :, self.kv_lora_rank :] = q_pe
+	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
 
-    # Pad the kv cache to be multiple of 64 (create a NEW tensor for computation)
-    if kv_seqlen % 64 != 0:
-        pad_len = 64 - (kv_seqlen % 64)
-        past_key_states_padded = torch.cat([
-            past_key_states, 
-            torch.zeros((bsz, pad_len, past_key_states.size(-1)), device=past_key_states.device, dtype=past_key_states.dtype)
-        ], dim=1)
-        kv_seqlen_padded = past_key_states_padded.size(1)
-    else:
-        past_key_states_padded = past_key_states
-        kv_seqlen_padded = kv_seqlen
+	# Pad the kv cache to be multiple of 64 (create a NEW tensor for computation)
+	if kv_seqlen % 64 != 0:
+		pad_len = 64 - (kv_seqlen % 64)
+		past_key_states_padded = torch.cat([
+			past_key_states, 
+			torch.zeros((bsz, pad_len, past_key_states.size(-1)), device=past_key_states.device, dtype=past_key_states.dtype)
+		], dim=1)
+		kv_seqlen_padded = past_key_states_padded.size(1)
+	else:
+		past_key_states_padded = past_key_states
+		kv_seqlen_padded = kv_seqlen
 
-    block_size = 64
-    block_table = torch.arange(
-        bsz * kv_seqlen_padded // block_size, dtype=torch.int32, device=past_key_states.device
-    ).view(bsz, kv_seqlen_padded // block_size)
+	block_size = 64
+	block_table = torch.arange(
+		bsz * kv_seqlen_padded // block_size, dtype=torch.int32, device=past_key_states.device
+	).view(bsz, kv_seqlen_padded // block_size)
 
-    blocked_k = past_key_states_padded.view(
-        bsz * kv_seqlen_padded // block_size, block_size, 1, past_key_states_padded.size(-1)
-    )
+	blocked_k = past_key_states_padded.view(
+		bsz * kv_seqlen_padded // block_size, block_size, 1, past_key_states_padded.size(-1)
+	)
 
-    tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens, 128, 1
-    )
+	tile_scheduler_metadata, num_splits = get_mla_metadata(
+		cache_seqlens, 128, 1
+	)
 
-    try:
-        attn_out, _ = flash_mla_with_kvcache(
-            query_states,
-            blocked_k,
-            block_table,
-            cache_seqlens,
-            512,
-            tile_scheduler_metadata,
-            num_splits,
-            self.softmax_scale,
-            True
-        )
-    except Exception as e:
-        logging.error(f"Error in flash_mla_with_kvcache: {e}")
-        raise
-    
-    # Apply out_absorb projection
-    attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
-    
-    if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
-        raise ValueError(
-            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
-            f" {attn_output.size()}"
-        )
-    
-    # --- 9. Final Projection and Return ---
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
-    attn_output_fp8, attn_output_scale = act_quant(attn_output)
-    attn_output = w8a8_deepgemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
-    attn_output = attn_output.view(bsz, 1, -1)
-    
-    # past_key_states is already updated in-place (it's a view of past_key_states_full)
-    # No need to return it!
-    return attn_output
+	try:
+		attn_out, _ = flash_mla_with_kvcache(
+			query_states,
+			blocked_k,
+			block_table,
+			cache_seqlens,
+			512,
+			tile_scheduler_metadata,
+			num_splits,
+			self.softmax_scale,
+			True
+		)
+	except Exception as e:
+		logging.error(f"Error in flash_mla_with_kvcache: {e}")
+		raise
+	
+	# Apply out_absorb projection
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	
+	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+		raise ValueError(
+			f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+			f" {attn_output.size()}"
+		)
+	
+	# --- 9. Final Projection and Return ---
+	attn_output = attn_output.transpose(1, 2).contiguous()
+	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
+	attn_output_fp8, attn_output_scale = act_quant(attn_output)
+	attn_output = w8a8_deepgemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
+	attn_output = attn_output.view(bsz, 1, -1)
+	
+	# past_key_states is already updated in-place (it's a view of past_key_states_full)
+	# No need to return it!
+	return attn_output
 
 # @torch.inference_mode()
 # def mla_decoding_flashmla_attn_mode_3_bf16_without_inplace_cache_update(
