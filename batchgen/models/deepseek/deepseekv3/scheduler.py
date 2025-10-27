@@ -24,7 +24,7 @@ class Scheduler:
 		"""
 			Configure the rest.
 		"""
-		DEFAULT_MEM_FRAC = 0.75
+		DEFAULT_MEM_FRAC = 0.80
 		# MAGIC_NUM = self.compute_profiler.profile(attn_decoding_module)
 		MAGIC_NUM = 224000 * 2
 		EXPERT_PER_RANK = 256 // self.world_size
