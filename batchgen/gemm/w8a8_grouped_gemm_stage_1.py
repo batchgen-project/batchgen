@@ -574,6 +574,7 @@ def fused_fp8_moe_stage_1_optimized(
     activated_group_idx: torch.Tensor,
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
+    num_groups: int,
     gate_gemm_block_size=[64, 16, 128],
     scale_block_size=128,
     num_stages=3,
@@ -595,7 +596,7 @@ def fused_fp8_moe_stage_1_optimized(
     output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
     
     # num_groups = num_active_experts.item()
-    num_groups = 16
+    # num_groups = 16
     
     # 2D GRID: (experts, N_blocks)
     grid = (num_groups, triton.cdiv(N, gate_gemm_block_size[1]))

@@ -252,8 +252,8 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
     
     // 🔑 Initialize sentinel values (expert IDs are never negative)
-    output_eids.fill_(-1);        // Primary filter key
-    output_token_idx.fill_(-1);   // Backup (both work)
+    // output_eids.fill_(-1);        // Primary filter key
+    // output_token_idx.fill_(-1);   // Backup (both work)
     expert_counts.zero_();
     
     // Step 4: Launch dispatch kernel with auto-vectorization
@@ -292,14 +292,14 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     
     // CRITICAL FIX: Slice outputs to actual size using GPU indexing
     // This avoids processing garbage data in downstream kernels
-    // auto actual_size_tensor = expert_offsets.index({num_local_experts});  // Last element
-    // int64_t actual_size = actual_size_tensor.item<int32_t>();  // One small sync here
+    auto actual_size_tensor = expert_offsets.index({num_local_experts});  // Last element
+    int64_t actual_size = actual_size_tensor.item<int32_t>();  // One small sync here
     
-    // // Slice to actual size (creates views, no data copy)
-    // output_x = output_x.index({torch::indexing::Slice(0, actual_size)});
-    // output_eids = output_eids.index({torch::indexing::Slice(0, actual_size)});
-    // output_token_idx = output_token_idx.index({torch::indexing::Slice(0, actual_size)});
-    // output_topk_pos = output_topk_pos.index({torch::indexing::Slice(0, actual_size)});
+    // Slice to actual size (creates views, no data copy)
+    output_x = output_x.index({torch::indexing::Slice(0, actual_size)});
+    output_eids = output_eids.index({torch::indexing::Slice(0, actual_size)});
+    output_token_idx = output_token_idx.index({torch::indexing::Slice(0, actual_size)});
+    output_topk_pos = output_topk_pos.index({torch::indexing::Slice(0, actual_size)});
     
     return {output_x, output_eids, output_token_idx, output_topk_pos, expert_counts};
 }

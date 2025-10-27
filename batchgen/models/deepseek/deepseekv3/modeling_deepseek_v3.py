@@ -1779,13 +1779,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
 		# # Filter out sentinels here because the token dispatch kernel reserved oversized space.
-		valid_mask = input_eids >= 0  # Expert IDs are never negative
+		# valid_mask = input_eids >= 0  # Expert IDs are never negative
 
-		# Apply filter to all tensors
-		input_x = input_x[valid_mask]
-		input_eids = input_eids[valid_mask]
-		global_indices = global_indices[valid_mask]
-		token_topk_pos = token_topk_pos[valid_mask]
+		# # Apply filter to all tensors
+		# input_x = input_x[valid_mask]
+		# input_eids = input_eids[valid_mask]
+		# global_indices = global_indices[valid_mask]
+		# token_topk_pos = token_topk_pos[valid_mask]
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
@@ -1852,7 +1852,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.up_list, self.up_ptrs_ptr,
 			self.gate_scale_list, self.gate_scale_ptrs_ptr,
 			self.up_scale_list, self.up_scale_ptrs_ptr,
-			group_size, activated_group_idx, group_start_indices, num_active_experts
+			group_size, activated_group_idx, group_start_indices, num_active_experts, self.experts_per_rank
 		)	
 		intermediate, intermediate_scale = act_quant(intermediate)
 		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
