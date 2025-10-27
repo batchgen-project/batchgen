@@ -893,7 +893,10 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	return attn_output, past_key_states, scale
 
 # from .fused_kv_kernel import fused_kv_update_and_rope
-from .fused_rmsnorm_rope import fused_rmsnorm_rope, fused_rmsnorm_rope_cache_update,fused_rmsnorm_rope_cache_update_with_q
+from .fused_rmsnorm_rope import (
+	fused_rmsnorm_rope, fused_rmsnorm_rope_cache_update,fused_rmsnorm_rope_cache_update_with_q,
+	fused_rmsnorm_rope_cache_update_with_q_return_new_kv
+)
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
@@ -934,22 +937,13 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=kv_len)
-	q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
+	# q_pe = rotary_pos_emb(q_pe, cos, sin, q_position_ids)
 	
 	# This modifies past_key_states in-place (which is a view of the full tensor!)
-	# fused_rmsnorm_rope_cache_update_with_q(
-	# 	new_compressed_kv,
-	# 	past_key_states,  # This is a VIEW, so modifications affect past_key_states_full!
-	# 	q_pe,
-	# 	cos,
-	# 	sin,
-	# 	q_position_ids,
-	# 	self.kv_a_layernorm.weight,
-	# 	self.kv_lora_rank,
-	# 	self.qk_rope_head_dim
-	# )
-	offload_kv = fused_rmsnorm_rope(
+	offload_kv = fused_rmsnorm_rope_cache_update_with_q_return_new_kv(
 		new_compressed_kv,
+		compressed_kv_ref,  # This is a VIEW, so modifications affect past_key_states_full!
+		q_pe,
 		cos,
 		sin,
 		q_position_ids,
@@ -957,10 +951,8 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 		self.kv_lora_rank,
 		self.qk_rope_head_dim
 	)
-	# Update cache with new KV
+
 	batch_indices = torch.arange(bsz, device=hidden_states.device)
-	compressed_kv_ref[batch_indices, q_position_ids[:, 0], :] = offload_kv[:, 0, :]
-	
 	# Quantize and update past_key_states
 	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
 	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
