@@ -760,17 +760,14 @@ class Expert_Wrapper(torch.nn.Module):
 			if Attn_Wrapper.phase == "prefill":
 				"""deepgemm kernel"""
 				result[start:end] = self.module.deepgemm_forward(micro_batch, self.weight_dequant_scale)
-				# hidden_states[start:end] = self.module.deepgemm_forward(
-				# 	hidden_states[start:end], self.weight_dequant_scale
-				# )
 			else:
 				"""Triton kernel""" 
-				# offset = start * result.shape[-1] if hidden_states.dim() == 2 else start * result.shape[-1] * result.shape[-2]
-				# self.module.fused_fp8_forward(micro_batch, self.weight_dequant_scale, result, offset)
-				result[start:end] = self.module.fused_fp8_forward(
-					micro_batch, self.weight_dequant_scale
-				)
-
+				# result[start:end] = self.module.fused_fp8_forward(
+				# 	micro_batch, self.weight_dequant_scale
+				# )
+				"""deepgemm kernel"""
+				result[start:end] = self.module.deepgemm_forward(micro_batch, self.weight_dequant_scale)
+				
 		# Step 3: Clean up
 		if self.get_weights:
 			torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize() 

@@ -472,6 +472,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 from ....moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 from ....attention.mla.fa3_backend import w8a16_gemm
+from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 class DeepseekV3MLP(nn.Module):
 	def __init__(self, config, hidden_size=None, intermediate_size=None):
 		super().__init__()
@@ -508,6 +509,12 @@ class DeepseekV3MLP(nn.Module):
 		gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x)
 		intermediate = self.act_fn(gate) * up
 		return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
+		# x_fp8, x_scale = act_quant(x)
+		# up = w8a8_deepgemm(x_fp8, x_scale, self.up_proj.weight.data, scale['up_proj.weight_scale_inv'])
+		# gate = w8a8_deepgemm(x_fp8, x_scale, self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'])
+		# intermediate = self.act_fn(gate) * up
+		# intermediate_fp8, intermediate_scale = act_quant(intermediate)
+		# return w8a8_deepgemm(intermediate_fp8, intermediate_scale, self.down_proj.weight.data, scale['down_proj.weight_scale_inv'])
 
 
 # torch.set_float32_matmul_precision('highest')
