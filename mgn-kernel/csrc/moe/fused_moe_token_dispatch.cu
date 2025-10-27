@@ -3,7 +3,8 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <vector>
-#include <torch/extension.h>
+// #include <torch/extension.h>
+#include <torch/all.h>
 #include <cub/cub.cuh>
 
 // Macro for dispatching including bfloat16 support
