@@ -9,7 +9,7 @@ from flash_attn_interface import flash_attn_varlen_func
 from .padding import _upad_input, pad_input
 from .rotary_embedding import mla_rotary_pos_emb, rotary_pos_emb, apply_rotary_pos_emb
 import deep_gemm
-from deep_gemm import get_col_major_tma_aligned_tensor
+# from deep_gemm import get_col_major_tma_aligned_tensor
 import logging
 from typing import Tuple
 import torch.distributed as dist
