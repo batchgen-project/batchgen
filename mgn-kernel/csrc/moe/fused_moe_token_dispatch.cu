@@ -3,8 +3,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <vector>
-// #include <torch/extension.h>
-#include <torch/all.h>
+#include <torch/extension.h>
 #include <cub/cub.cuh>
 
 // Macro for dispatching including bfloat16 support
@@ -34,31 +33,24 @@
         }                                                                      \
     }()
 
-// Warp size constant
 constexpr int WARP_SIZE = 32;
 
 /**
- * OPTIMIZED DISPATCH KERNEL
- * 
- * Key improvements:
- * 1. Cooperative warp-level token copying for coalesced memory access
- * 2. Each warp processes one (token, k) pair together
- * 3. Vectorized loads/stores when possible
+ * OPTIMIZED DISPATCH KERNEL - Warp-level cooperative copying
  */
 template <typename scalar_t, int THREADS_PER_TOKEN = 32>
 __global__ void fused_moe_token_dispatch_kernel_optimized(
-    const scalar_t* __restrict__ global_x,  // [num_tokens, hidden_size]
-    const int32_t* __restrict__ topk_idx,   // [num_tokens, K]
-    scalar_t* __restrict__ output_x,  // Output: local tokens
-    int32_t* __restrict__ output_eids,  // Output: expert IDs
-    int32_t* __restrict__ output_token_idx,  // Output: original token indices
-    int32_t* __restrict__ output_topk_pos,   // Output: position in topk
-    int32_t* __restrict__ expert_counters,   // Atomic counters per local expert
-    const int32_t* __restrict__ expert_offsets,  // Prefix sum for write positions
+    const scalar_t* __restrict__ global_x,
+    const int32_t* __restrict__ topk_idx,
+    scalar_t* __restrict__ output_x,
+    int32_t* __restrict__ output_eids,
+    int32_t* __restrict__ output_token_idx,
+    int32_t* __restrict__ output_topk_pos,
+    int32_t* __restrict__ expert_counters,
+    const int32_t* __restrict__ expert_offsets,
     int32_t num_tokens, int32_t hidden_size, int32_t K,
     int32_t routed_expert_start_idx, int32_t routed_expert_end_idx) {
     
-    // Each warp processes one (token, k) pair
     const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
     const int lane_id = threadIdx.x % WARP_SIZE;
     const int num_warps = (blockDim.x * gridDim.x) / WARP_SIZE;
@@ -69,32 +61,25 @@ __global__ void fused_moe_token_dispatch_kernel_optimized(
         
         int expert_id = topk_idx[token_id * K + topk_pos];
         
-        // Only process if expert is local
         if (expert_id >= routed_expert_start_idx && 
             expert_id < routed_expert_end_idx) {
             
             int local_expert_id = expert_id - routed_expert_start_idx;
             
-            // Only one thread per warp does the atomic operation
             int write_pos;
             if (lane_id == 0) {
                 int relative_pos = atomicAdd(&expert_counters[local_expert_id], 1);
                 write_pos = expert_offsets[local_expert_id] + relative_pos;
             }
-            // Broadcast write position to all threads in warp
             write_pos = __shfl_sync(0xffffffff, write_pos, 0);
             
-            // Cooperative copying: each thread in warp copies a portion
-            // This ensures coalesced memory access
             const scalar_t* src = global_x + token_id * hidden_size;
             scalar_t* dst = output_x + write_pos * hidden_size;
             
-            // Each thread copies multiple elements with stride
             for (int h = lane_id; h < hidden_size; h += WARP_SIZE) {
                 dst[h] = src[h];
             }
             
-            // Only one thread writes metadata
             if (lane_id == 0) {
                 output_eids[write_pos] = expert_id;
                 output_token_idx[write_pos] = token_id;
@@ -105,8 +90,7 @@ __global__ void fused_moe_token_dispatch_kernel_optimized(
 }
 
 /**
- * Vectorized version for large hidden sizes (uses float4 for better throughput)
- * Requires hidden_size to be divisible by 4 (or 8 for larger types)
+ * Vectorized version
  */
 template <typename scalar_t>
 __global__ void fused_moe_token_dispatch_kernel_vectorized(
@@ -145,7 +129,6 @@ __global__ void fused_moe_token_dispatch_kernel_vectorized(
             }
             write_pos = __shfl_sync(0xffffffff, write_pos, 0);
             
-            // Vectorized copying
             const float4* src = reinterpret_cast<const float4*>(
                 global_x + token_id * hidden_size);
             float4* dst = reinterpret_cast<float4*>(
@@ -164,7 +147,6 @@ __global__ void fused_moe_token_dispatch_kernel_vectorized(
     }
 }
 
-// Count kernel (unchanged, already efficient)
 template <typename scalar_t>
 __global__ void count_local_expert_tokens_kernel(
     const int32_t* __restrict__ topk_idx,
@@ -187,27 +169,23 @@ __global__ void count_local_expert_tokens_kernel(
 }
 
 /**
- * OPTIMIZED VERSION: No CPU-GPU sync!
+ * FIXED VERSION: Properly slices outputs to actual size
  * 
- * Key changes:
- * 1. Pre-allocate outputs with upper bound (num_tokens * K)
- * 2. No blocking cudaMemcpy to get total count
- * 3. Return actual count as a tensor for async access if needed
+ * Key fix: Returns correctly-sized tensors by slicing to actual count
  */
 std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
-    torch::Tensor global_x,  // [num_tokens, hidden_size]
-    torch::Tensor topk_idx,  // [num_tokens, K]
-    torch::Tensor token_idx,  // Unused artifact
-    torch::Tensor topk_pos,   // Unused artifact
-    int64_t routed_expert_start_idx, int64_t routed_expert_end_idx,
-    bool use_vectorized = false) {
+    torch::Tensor global_x,
+    torch::Tensor topk_idx,
+    torch::Tensor token_idx,
+    torch::Tensor topk_pos,
+    int64_t routed_expert_start_idx, 
+    int64_t routed_expert_end_idx) {
     
     const auto num_tokens = global_x.size(0);
     const auto hidden_size = global_x.size(1);
     const auto K = topk_idx.size(1);
     const auto num_local_experts = routed_expert_end_idx - routed_expert_start_idx;
     
-    // Validate inputs
     TORCH_CHECK(global_x.is_cuda(), "global_x must be a CUDA tensor");
     TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
     TORCH_CHECK(global_x.is_contiguous(), "global_x must be contiguous");
@@ -229,7 +207,7 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
                 static_cast<int32_t>(routed_expert_end_idx));
         });
     
-    // Step 2: Compute prefix sum (no sync needed!)
+    // Step 2: Compute prefix sum
     auto expert_offsets = torch::empty(
         {num_local_experts + 1},
         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
@@ -256,7 +234,7 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
         num_local_experts + 1
     );
     
-    // Step 3: Pre-allocate with UPPER BOUND - no sync needed!
+    // Step 3: Pre-allocate with upper bound
     const int64_t max_local_tokens = num_tokens * K;
     
     auto output_x = torch::empty({max_local_tokens, hidden_size},
@@ -273,17 +251,18 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
         {max_local_tokens},
         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
     
-    // Reset counters for dispatch kernel
     expert_counts.zero_();
     
-    // Step 4: Launch OPTIMIZED dispatch kernel
-    // Use warp-sized thread blocks (multiple of 32) for better efficiency
-    const int opt_threads = 256;  // 8 warps per block
+    // Step 4: Launch dispatch kernel with auto-vectorization
+    const int opt_threads = 256;
     const int opt_blocks = std::min(65535, 
                                     (int)((num_tokens * K * WARP_SIZE + opt_threads - 1) / opt_threads));
     
     DISPATCH_FLOAT_AND_HALF_AND_BF16(global_x, "fused_moe_token_dispatch", [&] {
-        if (use_vectorized && hidden_size % 4 == 0) {
+        // Auto-detect vectorization
+        bool use_vectorized = (hidden_size % 4 == 0) && (hidden_size >= 512);
+        
+        if (use_vectorized) {
             fused_moe_token_dispatch_kernel_vectorized<scalar_t><<<opt_blocks, opt_threads>>>(
                 global_x.data_ptr<scalar_t>(), topk_idx.data_ptr<int32_t>(),
                 output_x.data_ptr<scalar_t>(), output_eids.data_ptr<int32_t>(),
@@ -308,15 +287,21 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
         }
     });
     
-    // Optional: If you need exact-sized tensors, slice them
-    // For now, return with upper bound and let caller handle
-    // You can get actual size from expert_offsets[-1] on device if needed
+    // CRITICAL FIX: Slice outputs to actual size using GPU indexing
+    // This avoids processing garbage data in downstream kernels
+    auto actual_size_tensor = expert_offsets.index({num_local_experts});  // Last element
+    int64_t actual_size = actual_size_tensor.item<int32_t>();  // One small sync here
+    
+    // Slice to actual size (creates views, no data copy)
+    output_x = output_x.index({torch::indexing::Slice(0, actual_size)});
+    output_eids = output_eids.index({torch::indexing::Slice(0, actual_size)});
+    output_token_idx = output_token_idx.index({torch::indexing::Slice(0, actual_size)});
+    output_topk_pos = output_topk_pos.index({torch::indexing::Slice(0, actual_size)});
     
     return {output_x, output_eids, output_token_idx, output_topk_pos, expert_counts};
 }
 
-// Binding for PyTorch
 // PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//     m.def("fused_moe_token_dispatch_optimized", &fused_moe_token_dispatch_cuda_optimized,
-//           "Optimized MoE Token Dispatch (CUDA)");
+//     m.def("fused_moe_token_dispatch_cuda", &fused_moe_token_dispatch_cuda,
+//           "Optimized MoE Token Dispatch with proper output slicing (CUDA)");
 // }

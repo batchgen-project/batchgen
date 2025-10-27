@@ -35,7 +35,7 @@ TORCH_LIBRARY_FRAGMENT(mgn_kernel, m) {
     m.def(
         "fused_moe_token_dispatch(Tensor global_x, Tensor topk_idx, Tensor "
         "token_idx, Tensor topk_pos, int "
-        "routed_expert_start_idx, int routed_expert_end_idx, bool use_vectorized=False) -> "
+        "routed_expert_start_idx, int routed_expert_end_idx) -> "
         "(Tensor[])");
     m.impl("fused_moe_token_dispatch", torch::kCUDA,
            &fused_moe_token_dispatch_cuda);

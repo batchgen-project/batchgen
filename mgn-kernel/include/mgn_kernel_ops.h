@@ -84,8 +84,7 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     torch::Tensor token_idx,
     torch::Tensor topk_pos,
     int64_t routed_expert_start_idx,
-    int64_t routed_expert_end_idx,
-    bool use_vectorized);
+    int64_t routed_expert_end_idx);
 
 /*
  * From csrc/elementwise
