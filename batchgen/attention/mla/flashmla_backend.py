@@ -1050,18 +1050,18 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 		self.qk_rope_head_dim
 	)
 
-	# batch_indices = torch.arange(bsz, device=hidden_states.device)
-	# # Quantize and update past_key_states
-	# new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
-	# past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
-	# scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
-	quantize_and_scatter_write(
-		offload_kv,
-		past_key_states,  # fp8 cache
-		scale,            # fp32 scales
-		q_position_ids,
-		quant_block_size=128
-	)
+	batch_indices = torch.arange(bsz, device=hidden_states.device)
+	# Quantize and update past_key_states
+	new_compressed_kv_fp8, new_scale = per_token_blocked_quantize_bf16_to_fp8(offload_kv)
+	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
+	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
+	# quantize_and_scatter_write(
+	# 	offload_kv,
+	# 	past_key_states,  # fp8 cache
+	# 	scale,            # fp32 scales
+	# 	q_position_ids,
+	# 	quant_block_size=128
+	# )
 
 	kv_seqlen = past_key_states.size(1)
 	kv_b_proj = deepseek_v3_dequantization(
