@@ -1778,6 +1778,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			global_x, topk_idx, self.token_idx, self.topk_pos,
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
+		# Filter out sentinels here because the token dispatch kernel reserved oversized space.
+		valid_mask = input_eids >= 0  # Expert IDs are never negative
+
+		# Apply filter to all tensors
+		input_x = input_x[valid_mask]
+		input_eids = input_eids[valid_mask]
+		global_indices = global_indices[valid_mask]
+		token_topk_pos = token_topk_pos[valid_mask]
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
