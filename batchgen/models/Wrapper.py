@@ -602,7 +602,7 @@ class Attn_Wrapper(torch.nn.Module):
 							hidden_states[start_ids:end_ids],
 							past_key_states,  # Pass FULL tensor
 							past_value_states,
-							final_attn_result,
+							# final_attn_result,
 							attention_mask[start_ids:end_ids],
 							position_ids[start_ids:end_ids],
 							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
@@ -613,6 +613,7 @@ class Attn_Wrapper(torch.nn.Module):
 						)
 						# scale = None
 						# past_key_states[start_ids:end_ids].copy_(kv)
+						final_attn_result[start_ids:end_ids].copy_(attn_result)
 					else:
 						raise NotImplementedError
 
