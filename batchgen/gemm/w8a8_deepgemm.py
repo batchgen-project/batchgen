@@ -8,6 +8,7 @@ def w8a8_deepgemm(
     c: torch.Tensor = None,  # Optional accumulation tensor
     disable_ue8m0_cast: bool = True,  # UE8M0 optimization control
     recipe: tuple = None,  # Optional recipe for kernel config
+    out: torch.Tensor = None  # Optional output tensor
 ) -> torch.Tensor:
     """
     Advanced W8A8 GEMM with optional accumulation and settings.
@@ -25,7 +26,10 @@ def w8a8_deepgemm(
     rhs = (w, w_scale)
     
     # Allocate output
-    output = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    if out is None:
+        output = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    else:
+        output = out
     
     # Call with optional parameters
     deep_gemm.fp8_gemm_nt(
@@ -36,4 +40,4 @@ def w8a8_deepgemm(
         recipe=recipe
     )
     
-    return output
+    return output if out is None else None
