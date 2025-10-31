@@ -632,12 +632,13 @@ class Attn_Wrapper(torch.nn.Module):
 						0.0, dtype=param.data.dtype, device=param.data.device
 					)
 			else:
-				torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-				self.module.q_a_proj.weight.data = self.fp8_q_a_proj
-				self.module.q_b_proj.weight.data = self.fp8_q_b_proj
-				self.module.kv_a_proj_with_mqa.weight.data = self.fp8_kv_a_proj_with_mqa
-				self.module.kv_b_proj.weight.data = self.fp8_kv_b_proj
-				self.module.o_proj.weight.data = self.fp8_o_proj
+				# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+				# self.module.q_a_proj.weight.data = self.fp8_q_a_proj
+				# self.module.q_b_proj.weight.data = self.fp8_q_b_proj
+				# self.module.kv_a_proj_with_mqa.weight.data = self.fp8_kv_a_proj_with_mqa
+				# self.module.kv_b_proj.weight.data = self.fp8_kv_b_proj
+				# self.module.o_proj.weight.data = self.fp8_o_proj
+				pass
 			logging.debug(
 				f"[Rank: {dist.get_rank()} Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
 			)
