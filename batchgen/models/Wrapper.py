@@ -586,6 +586,7 @@ class Attn_Wrapper(torch.nn.Module):
 						past_key_states[start_ids:end_ids].copy_(kv)
 						kv_scale[start_ids:end_ids].copy_(scale)
 						Attn_Wrapper.scale[self.layer_idx] = kv_scale
+						final_attn_result[start_ids:end_ids] = attn_result
 					elif self.engine_config.Basic_Config.kv_dtype == "bfloat16":
 						# attn_result, kv = self.module.decoding_attn_mode_3_bf16(
 						# 	hidden_states[start_ids:end_ids],
@@ -601,6 +602,7 @@ class Attn_Wrapper(torch.nn.Module):
 							hidden_states[start_ids:end_ids],
 							past_key_states,  # Pass FULL tensor
 							past_value_states,
+							final_attn_result,
 							attention_mask[start_ids:end_ids],
 							position_ids[start_ids:end_ids],
 							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
@@ -614,7 +616,7 @@ class Attn_Wrapper(torch.nn.Module):
 					else:
 						raise NotImplementedError
 
-					final_attn_result[start_ids:end_ids] = attn_result
+					
 
 
 				Attn_Wrapper.past_key_states[self.layer_idx] = past_key_states
