@@ -173,6 +173,138 @@ __global__ void count_local_expert_tokens_kernel(
  * 
  * Key fix: Returns correctly-sized tensors by slicing to actual count
  */
+// std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
+//     torch::Tensor global_x,
+//     torch::Tensor topk_idx,
+//     torch::Tensor token_idx,
+//     torch::Tensor topk_pos,
+//     int64_t routed_expert_start_idx, 
+//     int64_t routed_expert_end_idx) {
+    
+//     const auto num_tokens = global_x.size(0);
+//     const auto hidden_size = global_x.size(1);
+//     const auto K = topk_idx.size(1);
+//     const auto num_local_experts = routed_expert_end_idx - routed_expert_start_idx;
+    
+//     TORCH_CHECK(global_x.is_cuda(), "global_x must be a CUDA tensor");
+//     TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
+//     TORCH_CHECK(global_x.is_contiguous(), "global_x must be contiguous");
+//     TORCH_CHECK(topk_idx.is_contiguous(), "topk_idx must be contiguous");
+    
+//     // Step 1: Count tokens per local expert
+//     auto expert_counts = torch::zeros(
+//         {num_local_experts},
+//         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+    
+//     const int threads = 256;
+//     const int blocks = std::min(65535, (int)((num_tokens * K + threads - 1) / threads));
+    
+//     DISPATCH_FLOAT_AND_HALF_AND_BF16(
+//         global_x, "count_local_expert_tokens", [&] {
+//             count_local_expert_tokens_kernel<scalar_t><<<blocks, threads>>>(
+//                 topk_idx.data_ptr<int32_t>(), expert_counts.data_ptr<int32_t>(),
+//                 num_tokens, K, static_cast<int32_t>(routed_expert_start_idx), 
+//                 static_cast<int32_t>(routed_expert_end_idx));
+//         });
+    
+//     // Step 2: Compute prefix sum
+//     auto expert_offsets = torch::empty(
+//         {num_local_experts + 1},
+//         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+    
+//     void* d_temp_storage = nullptr;
+//     size_t temp_storage_bytes = 0;
+    
+//     cub::DeviceScan::ExclusiveSum(
+//         d_temp_storage, temp_storage_bytes,
+//         expert_counts.data_ptr<int32_t>(),
+//         expert_offsets.data_ptr<int32_t>(),
+//         num_local_experts + 1
+//     );
+    
+//     auto temp_storage = torch::empty(
+//         {static_cast<int64_t>(temp_storage_bytes)},
+//         torch::TensorOptions().dtype(torch::kUInt8).device(global_x.device()));
+//     d_temp_storage = temp_storage.data_ptr<uint8_t>();
+    
+//     cub::DeviceScan::ExclusiveSum(
+//         d_temp_storage, temp_storage_bytes,
+//         expert_counts.data_ptr<int32_t>(),
+//         expert_offsets.data_ptr<int32_t>(),
+//         num_local_experts + 1
+//     );
+    
+//     // Step 3: Pre-allocate with upper bound
+//     const int64_t max_local_tokens = num_tokens * K;
+    
+//     auto output_x = torch::empty({max_local_tokens, hidden_size},
+//                                  torch::TensorOptions()
+//                                      .dtype(global_x.dtype())
+//                                      .device(global_x.device()));
+//     auto output_eids = torch::empty(
+//         {max_local_tokens},
+//         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+//     auto output_token_idx = torch::empty(
+//         {max_local_tokens},
+//         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+//     auto output_topk_pos = torch::empty(
+//         {max_local_tokens},
+//         torch::TensorOptions().dtype(torch::kInt32).device(global_x.device()));
+    
+//     // 🔑 Initialize sentinel values (expert IDs are never negative)
+//     // output_eids.fill_(-1);        // Primary filter key
+//     // output_token_idx.fill_(-1);   // Backup (both work)
+//     expert_counts.zero_();
+    
+//     // Step 4: Launch dispatch kernel with auto-vectorization
+//     const int opt_threads = 256;
+//     const int opt_blocks = std::min(65535, 
+//                                     (int)((num_tokens * K * WARP_SIZE + opt_threads - 1) / opt_threads));
+    
+//     DISPATCH_FLOAT_AND_HALF_AND_BF16(global_x, "fused_moe_token_dispatch", [&] {
+//         // Auto-detect vectorization
+//         bool use_vectorized = (hidden_size % 4 == 0) && (hidden_size >= 512);
+        
+//         if (use_vectorized) {
+//             fused_moe_token_dispatch_kernel_vectorized<scalar_t><<<opt_blocks, opt_threads>>>(
+//                 global_x.data_ptr<scalar_t>(), topk_idx.data_ptr<int32_t>(),
+//                 output_x.data_ptr<scalar_t>(), output_eids.data_ptr<int32_t>(),
+//                 output_token_idx.data_ptr<int32_t>(),
+//                 output_topk_pos.data_ptr<int32_t>(),
+//                 expert_counts.data_ptr<int32_t>(),
+//                 expert_offsets.data_ptr<int32_t>(), 
+//                 num_tokens, hidden_size, K,
+//                 static_cast<int32_t>(routed_expert_start_idx), 
+//                 static_cast<int32_t>(routed_expert_end_idx));
+//         } else {
+//             fused_moe_token_dispatch_kernel_optimized<scalar_t, 32><<<opt_blocks, opt_threads>>>(
+//                 global_x.data_ptr<scalar_t>(), topk_idx.data_ptr<int32_t>(),
+//                 output_x.data_ptr<scalar_t>(), output_eids.data_ptr<int32_t>(),
+//                 output_token_idx.data_ptr<int32_t>(),
+//                 output_topk_pos.data_ptr<int32_t>(),
+//                 expert_counts.data_ptr<int32_t>(),
+//                 expert_offsets.data_ptr<int32_t>(), 
+//                 num_tokens, hidden_size, K,
+//                 static_cast<int32_t>(routed_expert_start_idx), 
+//                 static_cast<int32_t>(routed_expert_end_idx));
+//         }
+//     });
+    
+//     // CRITICAL FIX: Slice outputs to actual size using GPU indexing
+//     // This avoids processing garbage data in downstream kernels
+//     auto actual_size_tensor = expert_offsets.index({num_local_experts});  // Last element
+//     int64_t actual_size = actual_size_tensor.item<int32_t>();  // One small sync here
+    
+//     // Slice to actual size (creates views, no data copy)
+//     output_x = output_x.index({torch::indexing::Slice(0, actual_size)});
+//     output_eids = output_eids.index({torch::indexing::Slice(0, actual_size)});
+//     output_token_idx = output_token_idx.index({torch::indexing::Slice(0, actual_size)});
+//     output_topk_pos = output_topk_pos.index({torch::indexing::Slice(0, actual_size)});
+    
+//     return {output_x, output_eids, output_token_idx, output_topk_pos, expert_counts};
+// }
+
+
 std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     torch::Tensor global_x,
     torch::Tensor topk_idx,
@@ -292,19 +424,15 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
     
     // CRITICAL FIX: Slice outputs to actual size using GPU indexing
     // This avoids processing garbage data in downstream kernels
-    auto actual_size_tensor = expert_offsets.index({num_local_experts});  // Last element
-    int64_t actual_size = actual_size_tensor.item<int32_t>();  // One small sync here
+    // auto actual_size_tensor = expert_offsets.index({num_local_experts});  // Last element
+    // int64_t actual_size = actual_size_tensor.item<int32_t>();  // One small sync here
     
-    // Slice to actual size (creates views, no data copy)
-    output_x = output_x.index({torch::indexing::Slice(0, actual_size)});
-    output_eids = output_eids.index({torch::indexing::Slice(0, actual_size)});
-    output_token_idx = output_token_idx.index({torch::indexing::Slice(0, actual_size)});
-    output_topk_pos = output_topk_pos.index({torch::indexing::Slice(0, actual_size)});
+    // // Slice to actual size (creates views, no data copy)
+    // output_x = output_x.index({torch::indexing::Slice(0, actual_size)});
+    // output_eids = output_eids.index({torch::indexing::Slice(0, actual_size)});
+    // output_token_idx = output_token_idx.index({torch::indexing::Slice(0, actual_size)});
+    // output_topk_pos = output_topk_pos.index({torch::indexing::Slice(0, actual_size)});
     
-    return {output_x, output_eids, output_token_idx, output_topk_pos, expert_counts};
+    return {output_x, output_eids, output_token_idx, output_topk_pos, expert_counts, expert_offsets};
 }
 
-// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//     m.def("fused_moe_token_dispatch_cuda", &fused_moe_token_dispatch_cuda,
-//           "Optimized MoE Token Dispatch with proper output slicing (CUDA)");
-// }

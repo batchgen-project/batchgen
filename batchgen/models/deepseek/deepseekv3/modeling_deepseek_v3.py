@@ -1774,10 +1774,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		global_x = global_x.squeeze(1) 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		topk_idx = topk_idx.to(torch.int32)		
-		input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
-			global_x, topk_idx, self.token_idx, self.topk_pos,
-			self.routed_expert_start_idx, self.routed_expert_end_idx,
-		)
+		# input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
+		# 	global_x, topk_idx, self.token_idx, self.topk_pos,
+		# 	self.routed_expert_start_idx, self.routed_expert_end_idx,
+		# )
+		input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
+					global_x, topk_idx, self.token_idx, self.topk_pos,
+					self.routed_expert_start_idx, self.routed_expert_end_idx,
+				)
 		# # Filter out sentinels here because the token dispatch kernel reserved oversized space.
 		# valid_mask = input_eids >= 0  # Expert IDs are never negative
 
@@ -1788,7 +1792,17 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# token_topk_pos = token_topk_pos[valid_mask]
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		# res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		res = self.grouped_dequant_moe_fp8(
+					input_x,          # Oversized
+					input_eids,         # Oversized
+					expert_counts,    # [num_local_experts] (on GPU)
+					expert_offsets    # [num_local_experts + 1] (on GPU)
+				)	
+
+
+
+
 		# res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
 		# global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
 		#  									 device=self.device, dtype=torch.bfloat16)
@@ -1831,7 +1845,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 	# 	return group_size, activated_group_idx, group_start_indices
 
-	def grouped_dequant_moe_fp8(self, x, eids):
+	def grouped_dequant_moe_fp8_bak(self, x, eids):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
 		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		# )
@@ -1843,7 +1857,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		group_size, activated_group_idx, group_start_indices, num_active_experts = expert_bincount(
 			eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		)
-
 		# Quantize the recv_x tensor to fp8_e4m3
 		x, x_scale = act_quant(x)
 		intermediate = fused_fp8_moe_stage_1_optimized(
@@ -1862,6 +1875,71 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			group_size, activated_group_idx, group_start_indices, num_active_experts
 		)
 		return res
+
+	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
+			# 'x' and 'eids' are the oversized tensors.
+			# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
+
+			# 1. Get the actual token count as a 0-dim *tensor* on the GPU.
+			# This is the last element of the prefix sum. NO sync.
+			actual_num_tokens = expert_offsets[-1]
+
+			# 2. Remove the synchronizing 'if' check.
+			# We assume downstream kernels (act_quant, fused_moe)
+			# can handle 0-sized inputs, which is standard for robust ops.
+			# if(len(eids) == 0):  <--- REMOVE
+			#     assert len(x) == 0
+			#     return x
+
+			# 3. ELIMINATE REDUNDANT bincount.
+			# You already have this data from the dispatch kernel.
+			# 
+			# --- REMOVE THIS ---
+			# group_size, activated_group_idx, group_start_indices, num_active_experts = expert_bincount(
+			#     eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+			# )
+			
+			# --- REPLACE WITH THIS (all async) ---
+			group_size = expert_counts
+			group_start_indices = expert_offsets # Check if kernel needs expert_offsets[:-1]
+			
+			# These ops are async and return tensors on the GPU
+			activated_group_idx = torch.nonzero(group_size > 0, as_tuple=True)[0].to(torch.int32)
+			num_active_experts = torch.count_nonzero(group_size) # 0-dim GPU tensor
+			
+			# --- End Replacement ---
+
+			# 4. Perform dynamic slicing (async).
+			# We slice the oversized 'x' tensor using the GPU-side 'actual_num_tokens' tensor.
+			# This creates a dynamically-sized view.
+			x_sliced = x[:actual_num_tokens]
+
+			# 5. Quantize only the valid data.
+			# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
+			x_quant, x_scale = act_quant(x_sliced)
+			
+			intermediate = fused_fp8_moe_stage_1_optimized(
+				x_quant, x_scale, 
+				self.gate_list, self.gate_ptrs_ptr,
+				self.up_list, self.up_ptrs_ptr,
+				self.gate_scale_list, self.gate_scale_ptrs_ptr,
+				self.up_scale_list, self.up_scale_ptrs_ptr,
+				group_size, activated_group_idx, group_start_indices, 
+				num_active_experts, # Pass the 0-dim *tensor*
+				self.experts_per_rank
+			)
+			
+			# 'intermediate' is also dynamically shaped
+			intermediate, intermediate_scale = act_quant(intermediate)
+			
+			res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+				intermediate, intermediate_scale, 
+				self.down_list, self.down_ptrs_ptr,
+				self.down_scale_list, self.down_scale_ptrs_ptr,
+				group_size, activated_group_idx, group_start_indices, 
+				num_active_experts # Pass the 0-dim *tensor*
+			)
+			return res
 
 	def grouped_dequant_moe_fp8_v2(self, x, eids):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
