@@ -593,13 +593,14 @@ def fused_fp8_moe_stage_1_optimized(
     assert gate_gemm_block_size[2] == scale_block_size, \
         f"GEMM_BLOCK_SIZE_K ({gate_gemm_block_size[2]}) must equal SCALE_BLOCK_SIZE_K ({scale_block_size})"
     
-    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    output = torch.zeros((M, N), dtype=torch.bfloat16, device=device)
     
     # num_groups = num_active_experts.item()
     # num_groups = 16
     
     # 2D GRID: (experts, N_blocks)
-    grid = (num_groups, triton.cdiv(N, gate_gemm_block_size[1]))
+    # grid = (num_groups, triton.cdiv(N, gate_gemm_block_size[1]))
+    grid = (num_groups, N // gate_gemm_block_size[1])
     
     fused_fp8_moe_parallel_experts_kernel_optimized[grid](
         hidden_states, hidden_states_scale,
