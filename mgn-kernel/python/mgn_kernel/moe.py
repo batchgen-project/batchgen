@@ -92,3 +92,23 @@ def fused_moe_token_dispatch(
         routed_expert_start_idx,
         routed_expert_end_idx,
     )
+
+def compact_expert_data(
+    expert_counts: torch.Tensor,
+):
+    """
+    Compact expert data by removing experts with zero counts.
+
+    Args:
+        expert_counts (torch.Tensor): Tensor containing counts of tokens per expert.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: 
+            - compacted_expert_counts: Counts of active experts.
+            - activated_expert_indices: Indices of active experts.
+            - compacted_expert_start_indices: Start indices for active experts.
+            - num_active_experts: Number of active experts.
+    """
+    return torch.ops.mgn_kernel.compact_expert_data.default(
+        expert_counts
+    )
