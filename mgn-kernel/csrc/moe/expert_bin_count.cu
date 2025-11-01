@@ -274,3 +274,81 @@ std::vector<torch::Tensor> expert_bincount_cuda_sliced(
     return {group_size, activated_group_idx, group_start_indices};
 }
 
+
+// -----------------------------------------------------------------
+// NEW WRAPPER FUNCTION
+// -----------------------------------------------------------------
+// This function replaces torch.nonzero() and torch.count_nonzero()
+// It takes the expert_counts (already computed) and finds the
+// active expert indices and metadata.
+std::vector<torch::Tensor> compact_expert_data_cuda(
+    torch::Tensor expert_counts) {
+    
+    // Get dimensions and device
+    const auto experts_per_rank = expert_counts.size(0);
+    const auto device = expert_counts.device();
+
+    TORCH_CHECK(expert_counts.is_cuda(), "expert_counts must be a CUDA tensor");
+    TORCH_CHECK(expert_counts.dtype() == torch::kInt32, "expert_counts must be int32");
+
+    // Step 1: Allocate output tensors (oversized)
+    auto activated_group_idx = torch::empty({experts_per_rank}, 
+                                           torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto group_size = torch::empty({experts_per_rank}, 
+                                  torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto group_start_indices = torch::empty({experts_per_rank}, 
+                                           torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto num_active_experts = torch::zeros({1}, 
+                                          torch::TensorOptions().dtype(torch::kInt32).device(device));
+
+    // Step 2: Compact active experts and compute start indices (logic from your file)
+    if (experts_per_rank <= 512) {
+        // Use optimized single-block kernel
+        const int threads = 256; // Or whatever is best for this kernel
+        compact_active_experts_single_block_kernel<<<1, threads>>>(
+            expert_counts.data_ptr<int32_t>(),
+            activated_group_idx.data_ptr<int32_t>(),
+            group_size.data_ptr<int32_t>(),
+            group_start_indices.data_ptr<int32_t>(),
+            num_active_experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(experts_per_rank)
+        );
+    } else {
+        // Use two-pass approach
+        const int threads = 256;
+        const int compact_blocks = (experts_per_rank + threads - 1) / threads;
+        
+        compact_active_experts_parallel_kernel<<<compact_blocks, threads>>>(
+            expert_counts.data_ptr<int32_t>(),
+            activated_group_idx.data_ptr<int32_t>(),
+            group_size.data_ptr<int32_t>(),
+            group_start_indices.data_ptr<int32_t>(),
+            num_active_experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(experts_per_rank)
+        );
+        
+        compute_start_indices_kernel<<<1, 256>>>(
+            group_size.data_ptr<int32_t>(),
+            group_start_indices.data_ptr<int32_t>(),
+            num_active_experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(experts_per_rank)
+        );
+    }
+    
+    // Return all computed tensors. They are async.
+    // NOTE: These are oversized, and need to be sliced in Python
+    // using the num_active_experts tensor.
+    return {group_size, activated_group_idx, group_start_indices, num_active_experts};
+}
+
+
+// -----------------------------------------------------------------
+// Your existing PYBIND11_MODULE
+// -----------------------------------------------------------------
+// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//     m.def("expert_bincount_cuda", &expert_bincount_cuda, "...");
+//
+//     // --- ADD THIS NEW BINDING ---
+//     m.def("compact_expert_data_cuda", &compact_expert_data_cuda,
+//           "Compacts expert_counts into active indices and groups (CUDA)");
+// }
