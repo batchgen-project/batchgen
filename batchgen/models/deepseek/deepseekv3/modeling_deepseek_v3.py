@@ -852,91 +852,91 @@ import triton
 import triton.language as tl
 @triton.jit
 def moe_fp32_accum_kernel_v2(
-    outs_ptr,
-    inv_idxs_ptr,
-    topk_weights_ptr,
-    output_ptr,
-    total_tokens: tl.constexpr,
-    topk: tl.constexpr,
-    hidden_dim: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+	outs_ptr,
+	inv_idxs_ptr,
+	topk_weights_ptr,
+	output_ptr,
+	total_tokens: tl.constexpr,
+	topk: tl.constexpr,
+	hidden_dim: tl.constexpr,
+	BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    Optimized version with better memory access patterns.
-    Each block processes multiple tokens to improve memory coalescing.
-    """
-    # Program handles a block of tokens and a chunk of hidden dims
-    token_block_id = tl.program_id(0)
-    h_block_id = tl.program_id(1)
-    
-    # Token range for this block
-    TOKENS_PER_BLOCK: tl.constexpr = 4
-    token_start = token_block_id * TOKENS_PER_BLOCK
-    
-    # Hidden dim range
-    h_start = h_block_id * BLOCK_SIZE
-    h_offsets = h_start + tl.arange(0, BLOCK_SIZE)
-    h_mask = h_offsets < hidden_dim
-    
-    # Process each token in this block
-    for t_idx in range(TOKENS_PER_BLOCK):
-        token_id = token_start + t_idx
-        
-        # Check if this token is valid
-        if token_id < total_tokens:
-            # Accumulator for this token
-            accum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-            
-            # Accumulate over topk experts
-            for k in range(topk):
-                new_x_idx = token_id * topk + k
-                outs_idx = tl.load(inv_idxs_ptr + new_x_idx)
-                
-                # topk_weights is [total_tokens, topk], need 2D indexing
-                weight_offset = token_id * topk + k
-                weight = tl.load(topk_weights_ptr + weight_offset).to(tl.float32)
-                
-                outs_offsets = outs_idx * hidden_dim + h_offsets
-                expert_out = tl.load(outs_ptr + outs_offsets, mask=h_mask, other=0.0)
-                accum += expert_out.to(tl.float32) * weight
-            
-            # Store result
-            output_offsets = token_id * hidden_dim + h_offsets
-            tl.store(output_ptr + output_offsets, accum.to(output_ptr.dtype.element_ty), mask=h_mask)
+	"""
+	Optimized version with better memory access patterns.
+	Each block processes multiple tokens to improve memory coalescing.
+	"""
+	# Program handles a block of tokens and a chunk of hidden dims
+	token_block_id = tl.program_id(0)
+	h_block_id = tl.program_id(1)
+	
+	# Token range for this block
+	TOKENS_PER_BLOCK: tl.constexpr = 4
+	token_start = token_block_id * TOKENS_PER_BLOCK
+	
+	# Hidden dim range
+	h_start = h_block_id * BLOCK_SIZE
+	h_offsets = h_start + tl.arange(0, BLOCK_SIZE)
+	h_mask = h_offsets < hidden_dim
+	
+	# Process each token in this block
+	for t_idx in range(TOKENS_PER_BLOCK):
+		token_id = token_start + t_idx
+		
+		# Check if this token is valid
+		if token_id < total_tokens:
+			# Accumulator for this token
+			accum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+			
+			# Accumulate over topk experts
+			for k in range(topk):
+				new_x_idx = token_id * topk + k
+				outs_idx = tl.load(inv_idxs_ptr + new_x_idx)
+				
+				# topk_weights is [total_tokens, topk], need 2D indexing
+				weight_offset = token_id * topk + k
+				weight = tl.load(topk_weights_ptr + weight_offset).to(tl.float32)
+				
+				outs_offsets = outs_idx * hidden_dim + h_offsets
+				expert_out = tl.load(outs_ptr + outs_offsets, mask=h_mask, other=0.0)
+				accum += expert_out.to(tl.float32) * weight
+			
+			# Store result
+			output_offsets = token_id * hidden_dim + h_offsets
+			tl.store(output_ptr + output_offsets, accum.to(output_ptr.dtype.element_ty), mask=h_mask)
 
 
 def moe_fp32_accum_triton_v2(
-    outs: torch.Tensor,
-    idxs: torch.Tensor,
-    topk_weights: torch.Tensor,
+	outs: torch.Tensor,
+	idxs: torch.Tensor,
+	topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Version 2 with better memory coalescing."""
-    total_tokens, topk = topk_weights.shape
-    hidden_dim = outs.shape[1]
-    
-    # Create inverse index
-    inv_idxs = torch.empty_like(idxs)
-    inv_idxs[idxs] = torch.arange(len(idxs), device=idxs.device, dtype=idxs.dtype)
-    
-    output = torch.empty((total_tokens, hidden_dim), device=outs.device, dtype=outs.dtype)
-    
-    BLOCK_SIZE = 128
-    TOKENS_PER_BLOCK = 4
-    
-    grid = lambda META: (
-        triton.cdiv(total_tokens, TOKENS_PER_BLOCK),
-        triton.cdiv(hidden_dim, META['BLOCK_SIZE'])
-    )
-    
-    moe_fp32_accum_kernel_v2[grid](
-        outs, inv_idxs, topk_weights, output,
-        total_tokens=total_tokens,
-        topk=topk,
-        hidden_dim=hidden_dim,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    
-    return output
+	"""Version 2 with better memory coalescing."""
+	total_tokens, topk = topk_weights.shape
+	hidden_dim = outs.shape[1]
+	
+	# Create inverse index
+	inv_idxs = torch.empty_like(idxs)
+	inv_idxs[idxs] = torch.arange(len(idxs), device=idxs.device, dtype=idxs.dtype)
+	
+	output = torch.empty((total_tokens, hidden_dim), device=outs.device, dtype=outs.dtype)
+	
+	BLOCK_SIZE = 128
+	TOKENS_PER_BLOCK = 4
+	
+	grid = lambda META: (
+		triton.cdiv(total_tokens, TOKENS_PER_BLOCK),
+		triton.cdiv(hidden_dim, META['BLOCK_SIZE'])
+	)
+	
+	moe_fp32_accum_kernel_v2[grid](
+		outs, inv_idxs, topk_weights, output,
+		total_tokens=total_tokens,
+		topk=topk,
+		hidden_dim=hidden_dim,
+		BLOCK_SIZE=BLOCK_SIZE,
+	)
+	
+	return output
 
 class DeepseekV3MoE_Prefill(nn.Module):
 	"""
@@ -1267,237 +1267,240 @@ from mgn_kernel import expert_bincount, fused_moe_token_dispatch
 from batchgen.moe.moe_weighted_sum import moe_weighted_sum_triton_v2, moe_weighted_sum_v3
 @triton.jit
 def scatter_weight_reduce_optimized_kernel(
-    # Input pointers
-    res_ptr,                    # [nnz, hidden_size]
-    nnz_indices_ptr,            # [num_tokens, num_experts_per_tok] - mapping to nnz indices (-1 if empty)
-    topk_weight_ptr,            # [num_tokens, num_experts_per_tok]
-    # Output pointer
-    output_ptr,                 # [num_tokens, hidden_size]
-    # Dimensions
-    num_tokens,
-    num_experts_per_tok,
-    hidden_size,
-    nnz,                        # Total number of non-zero entries (for bounds checking)
-    # Block sizes
-    BLOCK_SIZE_H: tl.constexpr,
+	# Input pointers
+	res_ptr,                    # [nnz, hidden_size]
+	nnz_indices_ptr,            # [num_tokens, num_experts_per_tok] - mapping to nnz indices (-1 if empty)
+	topk_weight_ptr,            # [num_tokens, num_experts_per_tok]
+	# Output pointer
+	output_ptr,                 # [num_tokens, hidden_size]
+	# Dimensions
+	num_tokens,
+	num_experts_per_tok,
+	hidden_size,
+	nnz,                        # Total number of non-zero entries (for bounds checking)
+	# Block sizes
+	BLOCK_SIZE_H: tl.constexpr,
 ):
-    """
-    Optimized version that uses pre-computed inverse mapping.
-    This avoids scanning all nnz entries for each token.
-    """
-    token_idx = tl.program_id(0)
-    
-    if token_idx >= num_tokens:
-        return
-    
-    h_offset = tl.program_id(1) * BLOCK_SIZE_H
-    h_indices = h_offset + tl.arange(0, BLOCK_SIZE_H)
-    h_mask = h_indices < hidden_size
-    
-    accumulator = tl.zeros([BLOCK_SIZE_H], dtype=tl.float32)
-    
-    # Only loop over experts for this specific token
-    for k in range(num_experts_per_tok):
-        # Get the nnz index for this token's k-th expert
-        mapping_offset = token_idx * num_experts_per_tok + k
-        nnz_idx = tl.load(nnz_indices_ptr + mapping_offset)
-        
-        # Create mask for valid entries (use mask instead of if statement)
-        is_valid = (nnz_idx >= 0) & (nnz_idx < nnz)
-        
-        # Load weight (masked)
-        weight = tl.load(topk_weight_ptr + mapping_offset)
-        
-        # Load result values with proper masking
-        # Use tl.where to handle invalid indices safely
-        safe_nnz_idx = tl.where(is_valid, nnz_idx, 0)  # Use 0 as safe fallback
-        res_offset = safe_nnz_idx * hidden_size + h_indices
-        
-        # Load with combined mask: valid entry AND within hidden_size bounds
-        load_mask = h_mask & is_valid
-        res_vals = tl.load(res_ptr + res_offset, mask=load_mask, other=0.0)
-        
-        # Convert to FP32 and accumulate
-        res_vals_fp32 = res_vals.to(tl.float32)
-        
-        # Only accumulate if valid (weight is already 0 for invalid entries conceptually)
-        weighted = tl.where(is_valid, res_vals_fp32 * weight, 0.0)
-        accumulator += weighted
-    
-    # Write result
-    output_offset = token_idx * hidden_size + h_indices
-    tl.store(output_ptr + output_offset, accumulator, mask=h_mask)
+	"""
+	Optimized version that uses pre-computed inverse mapping.
+	This avoids scanning all nnz entries for each token.
+	"""
+	token_idx = tl.program_id(0)
+	
+	if token_idx >= num_tokens:
+		return
+	
+	h_offset = tl.program_id(1) * BLOCK_SIZE_H
+	h_indices = h_offset + tl.arange(0, BLOCK_SIZE_H)
+	h_mask = h_indices < hidden_size
+	
+	accumulator = tl.zeros([BLOCK_SIZE_H], dtype=tl.float32)
+	
+	# Only loop over experts for this specific token
+	for k in range(num_experts_per_tok):
+		# Get the nnz index for this token's k-th expert
+		mapping_offset = token_idx * num_experts_per_tok + k
+		nnz_idx = tl.load(nnz_indices_ptr + mapping_offset)
+		
+		# Create mask for valid entries (use mask instead of if statement)
+		is_valid = (nnz_idx >= 0) & (nnz_idx < nnz)
+		
+		# Load weight (masked)
+		weight = tl.load(topk_weight_ptr + mapping_offset)
+		
+		# Load result values with proper masking
+		# Use tl.where to handle invalid indices safely
+		safe_nnz_idx = tl.where(is_valid, nnz_idx, 0)  # Use 0 as safe fallback
+		res_offset = safe_nnz_idx * hidden_size + h_indices
+		
+		# Load with combined mask: valid entry AND within hidden_size bounds
+		load_mask = h_mask & is_valid
+		res_vals = tl.load(res_ptr + res_offset, mask=load_mask, other=0.0)
+		
+		# Convert to FP32 and accumulate
+		res_vals_fp32 = res_vals.to(tl.float32)
+		
+		# Only accumulate if valid (weight is already 0 for invalid entries conceptually)
+		weighted = tl.where(is_valid, res_vals_fp32 * weight, 0.0)
+		accumulator += weighted
+	
+	# Write result
+	output_offset = token_idx * hidden_size + h_indices
+	tl.store(output_ptr + output_offset, accumulator, mask=h_mask)
 
 
 def build_inverse_mapping(
-    global_indices: torch.Tensor,     # [nnz]
-    token_topk_pos: torch.Tensor,     # [nnz]
-    num_tokens: int,
-    num_experts_per_tok: int,
+	global_indices: torch.Tensor,     # [nnz]
+	token_topk_pos: torch.Tensor,     # [nnz]
+	num_tokens: int,
+	num_experts_per_tok: int,
 ) -> torch.Tensor:
-    """Build inverse mapping: [num_tokens, num_experts_per_tok] -> nnz_idx"""
-    # Use int64 for better compatibility with Triton indexing
-    mapping = torch.full((num_tokens, num_experts_per_tok), -1, 
-                         dtype=torch.int64, device=global_indices.device)
-    
-    # Handle empty case
-    if global_indices.numel() == 0:
-        return mapping
-    
-    # Ensure indices are within bounds
-    # assert global_indices.max() < num_tokens, "global_indices out of bounds"
-    # assert token_topk_pos.max() < num_experts_per_tok, "token_topk_pos out of bounds"
-    
-    mapping[global_indices, token_topk_pos] = torch.arange(
-        len(global_indices), dtype=torch.int64, device=global_indices.device
-    )
-    return mapping
+	"""Build inverse mapping: [num_tokens, num_experts_per_tok] -> nnz_idx"""
+	# Use int64 for better compatibility with Triton indexing
+	mapping = torch.full((num_tokens, num_experts_per_tok), -1, 
+						 dtype=torch.int64, device=global_indices.device)
+	
+	# Handle empty case
+	if global_indices.numel() == 0:
+		return mapping
+	
+	# Ensure indices are within bounds
+	# assert global_indices.max() < num_tokens, "global_indices out of bounds"
+	# assert token_topk_pos.max() < num_experts_per_tok, "token_topk_pos out of bounds"
+	
+	mapping[global_indices, token_topk_pos] = torch.arange(
+		len(global_indices), dtype=torch.int64, device=global_indices.device
+	)
+	return mapping
 
 
 def scatter_weight_reduce_optimized(
-    res: torch.Tensor,
-    global_indices: torch.Tensor,
-    token_topk_pos: torch.Tensor,
-    topk_weight: torch.Tensor,
-    num_tokens: int,
-    num_experts_per_tok: int,
+	res: torch.Tensor,
+	global_indices: torch.Tensor, # This is oversized
+	token_topk_pos: torch.Tensor, # This is oversized
+	topk_weight: torch.Tensor,
+	num_tokens: int,
+	num_experts_per_tok: int,
 ) -> torch.Tensor:
-    """Optimized version using inverse mapping."""
-    assert topk_weight.dtype == torch.float32, "topk_weight must be float32"
-    assert topk_weight.shape == (num_tokens, num_experts_per_tok), f"topk_weight shape mismatch, expected ({num_tokens}, {num_experts_per_tok}), got {topk_weight.shape}"
-    
-    nnz, hidden_size = res.shape
-    
-    # Handle empty res case
-    if nnz == 0:
-        return torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
-    
-    # Build inverse mapping (can be cached if indices don't change)
-    nnz_indices = build_inverse_mapping(
-        global_indices, token_topk_pos, num_tokens, num_experts_per_tok
-    )
-    
-    output = torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
-    
-    # Skip kernel launch if no work to do
-    if num_tokens == 0:
-        return output
-    
-    # Adaptive block size
-    BLOCK_SIZE_H = min(triton.next_power_of_2(hidden_size), 256)
-    grid = (num_tokens, triton.cdiv(hidden_size, BLOCK_SIZE_H))
-    
-    scatter_weight_reduce_optimized_kernel[grid](
-        res, nnz_indices, topk_weight,
-        output,
-        num_tokens, num_experts_per_tok, hidden_size, nnz,
-        BLOCK_SIZE_H=BLOCK_SIZE_H,
-    )
-    
-    return output
+	"""Optimized version using inverse mapping."""
+	assert topk_weight.dtype == torch.float32, "topk_weight must be float32"
+	assert topk_weight.shape == (num_tokens, num_experts_per_tok), f"topk_weight shape mismatch, expected ({num_tokens}, {num_experts_per_tok}), got {topk_weight.shape}"
+	
+	nnz, hidden_size = res.shape
+	
+	# Handle empty res case
+	if nnz == 0:
+		return torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+
+	global_indices_sliced = global_indices[:nnz]
+	token_topk_pos_sliced = token_topk_pos[:nnz]
+	
+	# Build inverse mapping (can be cached if indices don't change)
+	nnz_indices = build_inverse_mapping(
+		global_indices_sliced, token_topk_pos_sliced, num_tokens, num_experts_per_tok
+	)
+	
+	output = torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+	
+	# Skip kernel launch if no work to do
+	if num_tokens == 0:
+		return output
+	
+	# Adaptive block size
+	BLOCK_SIZE_H = min(triton.next_power_of_2(hidden_size), 256)
+	grid = (num_tokens, triton.cdiv(hidden_size, BLOCK_SIZE_H))
+	
+	scatter_weight_reduce_optimized_kernel[grid](
+		res, nnz_indices, topk_weight,
+		output,
+		num_tokens, num_experts_per_tok, hidden_size, nnz,
+		BLOCK_SIZE_H=BLOCK_SIZE_H,
+	)
+	
+	return output
 
 
 @triton.jit
 def activation_gating_kernel(
-    gate_acc_ptr,
-    up_acc_ptr,
-    output_ptr,
-    M, N: tl.constexpr,
-    stride_gate_m, stride_gate_n,
-    stride_up_m, stride_up_n,
-    stride_output_m, stride_output_n,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
+	gate_acc_ptr,
+	up_acc_ptr,
+	output_ptr,
+	M, N: tl.constexpr,
+	stride_gate_m, stride_gate_n,
+	stride_up_m, stride_up_n,
+	stride_output_m, stride_output_n,
+	BLOCK_SIZE_M: tl.constexpr,
+	BLOCK_SIZE_N: tl.constexpr,
 ):
-    """
-    Fused kernel for SiLU activation and gating, output in bfloat16.
-    
-    Operations:
-    1. gate_activated = silu(gate_acc) where silu(x) = x / (1 + exp(-x))
-    2. intermediate = gate_activated * up_acc
-    3. Convert to bfloat16
-    """
-    # Program IDs
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    
-    # Offsets
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    
-    # Masks
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
-    
-    # Load gate_acc and up_acc (float32)
-    gate_ptrs = gate_acc_ptr + (offs_m[:, None] * stride_gate_m + offs_n[None, :] * stride_gate_n)
-    up_ptrs = up_acc_ptr + (offs_m[:, None] * stride_up_m + offs_n[None, :] * stride_up_n)
-    
-    gate_acc = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
-    up_acc = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
-    
-    # SiLU activation: silu(x) = x / (1 + exp(-x))
-    gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
-    
-    # Gating: element-wise multiplication
-    intermediate = gate_activated * up_acc
-    
-    # Convert to bfloat16
-    output_bf16 = intermediate.to(tl.bfloat16)
-    
-    # Store output
-    output_ptrs = output_ptr + (offs_m[:, None] * stride_output_m + offs_n[None, :] * stride_output_n)
-    tl.store(output_ptrs, output_bf16, mask=mask)
+	"""
+	Fused kernel for SiLU activation and gating, output in bfloat16.
+	
+	Operations:
+	1. gate_activated = silu(gate_acc) where silu(x) = x / (1 + exp(-x))
+	2. intermediate = gate_activated * up_acc
+	3. Convert to bfloat16
+	"""
+	# Program IDs
+	pid_m = tl.program_id(axis=0)
+	pid_n = tl.program_id(axis=1)
+	
+	# Offsets
+	offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+	offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+	
+	# Masks
+	mask_m = offs_m < M
+	mask_n = offs_n < N
+	mask = mask_m[:, None] & mask_n[None, :]
+	
+	# Load gate_acc and up_acc (float32)
+	gate_ptrs = gate_acc_ptr + (offs_m[:, None] * stride_gate_m + offs_n[None, :] * stride_gate_n)
+	up_ptrs = up_acc_ptr + (offs_m[:, None] * stride_up_m + offs_n[None, :] * stride_up_n)
+	
+	gate_acc = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+	up_acc = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+	
+	# SiLU activation: silu(x) = x / (1 + exp(-x))
+	gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
+	
+	# Gating: element-wise multiplication
+	intermediate = gate_activated * up_acc
+	
+	# Convert to bfloat16
+	output_bf16 = intermediate.to(tl.bfloat16)
+	
+	# Store output
+	output_ptrs = output_ptr + (offs_m[:, None] * stride_output_m + offs_n[None, :] * stride_output_n)
+	tl.store(output_ptrs, output_bf16, mask=mask)
 
 
 @torch.inference_mode()
 def activation_gating(
-    gate_acc: torch.Tensor,
-    up_acc: torch.Tensor,
-    block_size_m: int = 64,
-    block_size_n: int = 64,
-    num_warps: int = 4,
+	gate_acc: torch.Tensor,
+	up_acc: torch.Tensor,
+	block_size_m: int = 64,
+	block_size_n: int = 64,
+	num_warps: int = 4,
 ):
-    """
-    Apply SiLU activation and gating, returning bfloat16 output.
-    
-    Equivalent to:
-        gate_activated = torch.nn.functional.silu(gate_acc)
-        intermediate = gate_activated * up_acc
-        intermediate = intermediate.to(torch.bfloat16)
-    
-    Args:
-        gate_acc: (M, N) float32 tensor - gate projection accumulator
-        up_acc: (M, N) float32 tensor - up projection accumulator
-        block_size_m: Block size for M dimension
-        block_size_n: Block size for N dimension
-        num_warps: Number of warps for kernel execution
-    
-    Returns:
-        intermediate: (M, N) bfloat16 tensor - activated and gated result
-    """
-    M, N = gate_acc.shape
-    assert up_acc.shape == (M, N), "gate_acc and up_acc must have same shape"
-    # assert gate_acc.dtype == torch.float32, "gate_acc must be float32"
-    # assert up_acc.dtype == torch.float32, "up_acc must be float32"
-    
-    output = torch.empty((M, N), dtype=torch.bfloat16, device=gate_acc.device)
-    
-    grid = (triton.cdiv(M, block_size_m), triton.cdiv(N, block_size_n))
-    
-    activation_gating_kernel[grid](
-        gate_acc, up_acc, output,
-        M, N,
-        gate_acc.stride(0), gate_acc.stride(1),
-        up_acc.stride(0), up_acc.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        num_warps=num_warps,
-    )
-    
-    return output
+	"""
+	Apply SiLU activation and gating, returning bfloat16 output.
+	
+	Equivalent to:
+		gate_activated = torch.nn.functional.silu(gate_acc)
+		intermediate = gate_activated * up_acc
+		intermediate = intermediate.to(torch.bfloat16)
+	
+	Args:
+		gate_acc: (M, N) float32 tensor - gate projection accumulator
+		up_acc: (M, N) float32 tensor - up projection accumulator
+		block_size_m: Block size for M dimension
+		block_size_n: Block size for N dimension
+		num_warps: Number of warps for kernel execution
+	
+	Returns:
+		intermediate: (M, N) bfloat16 tensor - activated and gated result
+	"""
+	M, N = gate_acc.shape
+	assert up_acc.shape == (M, N), "gate_acc and up_acc must have same shape"
+	# assert gate_acc.dtype == torch.float32, "gate_acc must be float32"
+	# assert up_acc.dtype == torch.float32, "up_acc must be float32"
+	
+	output = torch.empty((M, N), dtype=torch.bfloat16, device=gate_acc.device)
+	
+	grid = (triton.cdiv(M, block_size_m), triton.cdiv(N, block_size_n))
+	
+	activation_gating_kernel[grid](
+		gate_acc, up_acc, output,
+		M, N,
+		gate_acc.stride(0), gate_acc.stride(1),
+		up_acc.stride(0), up_acc.stride(1),
+		output.stride(0), output.stride(1),
+		BLOCK_SIZE_M=block_size_m,
+		BLOCK_SIZE_N=block_size_n,
+		num_warps=num_warps,
+	)
+	
+	return output
 
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
