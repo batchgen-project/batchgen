@@ -2088,8 +2088,38 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			if expert_tokens.shape[0] == 0:
 				continue
 			
-			expert_output = self.experts[expert_id].deepgemm_forward(expert_tokens)
-			
+			# expert_output = self.experts[expert_id].deepgemm_forward(expert_tokens)
+			"""
+			def deepgemm_forward(self, x, scale):
+				up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x)
+				gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x)
+				intermediate = self.act_fn(gate) * up
+				return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
+
+			self.gate_list.append(self.experts[e].fp8_gate)
+			self.up_list.append(self.experts[e].fp8_up)
+			self.down_list.append(self.experts[e].fp8_down)
+			self.gate_scale_list.append(self.experts[e].weight_dequant_scale['gate_proj.weight_scale_inv'])
+			self.up_scale_list.append(self.experts[e].weight_dequant_scale['up_proj.weight_scale_inv'])
+			self.down_scale_list.append(self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv'])
+
+			"""
+			up = w8a16_gemm(
+				self.experts[expert_id].fp8_up,
+				self.experts[expert_id].weight_dequant_scale['up_proj.weight_scale_inv'],
+				expert_tokens
+			)
+			gate = w8a16_gemm(
+				self.experts[expert_id].fp8_gate,
+				self.experts[expert_id].weight_dequant_scale['gate_proj.weight_scale_inv'],
+				expert_tokens
+			)
+			intermediate = self.act_fn(gate) * up
+			expert_output = w8a16_gemm(
+				self.experts[expert_id].fp8_down,
+				self.experts[expert_id].weight_dequant_scale['down_proj.weight_scale_inv'],
+				intermediate
+			)
 			# Place results back in output buffer
 			# WARNING: This also causes sync due to dynamic indexing!
 			output[start_idx:end_idx] = expert_output
