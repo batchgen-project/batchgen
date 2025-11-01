@@ -1879,7 +1879,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		return res
 
-	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
+	def grouped_dequant_moe_fp8_(self, x, eids, expert_counts, expert_offsets):
 		# 'x' and 'eids' are the oversized tensors.
 		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
 
@@ -2026,7 +2026,77 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		return res
 
+	# def single_expert_forward(self, x):
+	# 	"""
+	# 		@torch.inference_mode
+	# 		def deepgemm_forward(self, x, scale):
+	# 			up = w8a16_gemm(self.up_proj.weight.data, scale['up_proj.weight_scale_inv'], x)
+	# 			gate = w8a16_gemm(self.gate_proj.weight.data, scale['gate_proj.weight_scale_inv'], x)
+	# 			intermediate = self.act_fn(gate) * up
+	# 			return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
+	# 	"""
+	# 	for expert_id in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+			
+	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
+		# 'x' and 'eids' are the oversized tensors.
+		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
 
+		# 1. Get the actual token count as a 0-dim *tensor* on the GPU.
+		# This is the last element of the prefix sum. NO sync.
+		actual_num_tokens = expert_offsets[-1]
+		x_sliced = x[:actual_num_tokens]
+
+		res = self.single_expert_forward(x_sliced, expert_offsets)
+		return res
+
+
+
+
+	def single_expert_forward(self, x, expert_offsets):
+		"""
+		Process each expert separately with dedicated kernel launches.
+		Alternative to grouped GEMM - trades batching efficiency for simpler logic.
+		
+		Args:
+			x: Input tokens [max_tokens, hidden_size] (oversized buffer)
+			eids: Expert IDs for each token [max_tokens] (oversized)
+			expert_counts: Number of tokens per expert [num_experts]
+			expert_offsets: Cumulative sum of expert_counts [num_experts + 1]
+		
+		Note: After dispatch, tokens are sorted by expert_id, so expert i's tokens
+			are in x[expert_offsets[i]:expert_offsets[i+1]]
+		"""
+		actual_num_tokens = expert_offsets[-1]  # 0-dim GPU tensor
+		
+		# Allocate output buffer for actual tokens only
+		# WARNING: This line causes 4-byte CPU-GPU sync! See solutions below.
+		output = torch.empty(actual_num_tokens, x.shape[1], dtype=x.dtype, device=x.device)
+		
+		for expert_id in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+			local_expert_id = expert_id - self.routed_expert_start_idx
+			
+			# Get token range for this expert using offsets
+			start_idx = expert_offsets[local_expert_id]
+			end_idx = expert_offsets[local_expert_id + 1]
+			
+			# WARNING: Dynamic slicing causes CPU-GPU sync! 
+			# Both start_idx and end_idx are 0-dim GPU tensors.
+			expert_tokens = x[start_idx:end_idx]
+			
+			# Skip if no tokens for this expert
+			# Note: This check also causes sync. Consider removing if rare.
+			if expert_tokens.shape[0] == 0:
+				continue
+			
+			expert_output = self.experts[expert_id].deepgemm_forward(expert_tokens)
+			
+			# Place results back in output buffer
+			# WARNING: This also causes sync due to dynamic indexing!
+			output[start_idx:end_idx] = expert_output
+		
+		return output
+
+		
 	
 
 class DeepseekV3MoE_Decoding_v2_bak2(nn.Module): 
