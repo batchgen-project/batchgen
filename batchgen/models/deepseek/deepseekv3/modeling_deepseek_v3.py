@@ -1263,7 +1263,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 
 from batchgen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
 # from batchgen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
-from mgn_kernel import expert_bincount, fused_moe_token_dispatch
+from mgn_kernel import expert_bincount, fused_moe_token_dispatch, compact_expert_data
 from batchgen.moe.moe_weighted_sum import moe_weighted_sum_triton_v2, moe_weighted_sum_v3
 @triton.jit
 def scatter_weight_reduce_optimized_kernel(
@@ -1880,69 +1880,71 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return res
 
 	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
-			# 'x' and 'eids' are the oversized tensors.
-			# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
+		# 'x' and 'eids' are the oversized tensors.
+		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
 
-			# 1. Get the actual token count as a 0-dim *tensor* on the GPU.
-			# This is the last element of the prefix sum. NO sync.
-			actual_num_tokens = expert_offsets[-1]
+		# 1. Get the actual token count as a 0-dim *tensor* on the GPU.
+		# This is the last element of the prefix sum. NO sync.
+		actual_num_tokens = expert_offsets[-1]
 
-			# 2. Remove the synchronizing 'if' check.
-			# We assume downstream kernels (act_quant, fused_moe)
-			# can handle 0-sized inputs, which is standard for robust ops.
-			# if(len(eids) == 0):  <--- REMOVE
-			#     assert len(x) == 0
-			#     return x
+		# 2. Remove the synchronizing 'if' check.
+		# We assume downstream kernels (act_quant, fused_moe)
+		# can handle 0-sized inputs, which is standard for robust ops.
+		# if(len(eids) == 0):  <--- REMOVE
+		#     assert len(x) == 0
+		#     return x
 
-			# 3. ELIMINATE REDUNDANT bincount.
-			# You already have this data from the dispatch kernel.
-			# 
-			# --- REMOVE THIS ---
-			# group_size, activated_group_idx, group_start_indices, num_active_experts = expert_bincount(
-			#     eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
-			# )
-			
-			# --- REPLACE WITH THIS (all async) ---
-			group_size = expert_counts
-			group_start_indices = expert_offsets # Check if kernel needs expert_offsets[:-1]
-			
-			# These ops are async and return tensors on the GPU
-			activated_group_idx = torch.nonzero(group_size > 0, as_tuple=True)[0].to(torch.int32)
-			num_active_experts = torch.count_nonzero(group_size) # 0-dim GPU tensor
-			
-			# --- End Replacement ---
+		# 3. ELIMINATE REDUNDANT bincount.
+		# You already have this data from the dispatch kernel.
+		# 
+		# --- REMOVE THIS ---
+		# group_size, activated_group_idx, group_start_indices, num_active_experts = expert_bincount(
+		#     eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
+		# )
+		
+		# --- REPLACE WITH THIS (all async) ---
+		# group_size = expert_counts
+		# group_start_indices = expert_offsets # Check if kernel needs expert_offsets[:-1]
+		
+		# These ops are async and return tensors on the GPU
+		# activated_group_idx = torch.nonzero(group_size > 0, as_tuple=True)[0].to(torch.int32)
+		# num_active_experts = torch.count_nonzero(group_size) # 0-dim GPU tensor
+		group_size, activated_group_idx, group_start_indices, num_active_experts = compact_expert_data(
+					expert_counts
+		)		
+		# --- End Replacement ---
 
-			# 4. Perform dynamic slicing (async).
-			# We slice the oversized 'x' tensor using the GPU-side 'actual_num_tokens' tensor.
-			# This creates a dynamically-sized view.
-			x_sliced = x[:actual_num_tokens]
+		# 4. Perform dynamic slicing (async).
+		# We slice the oversized 'x' tensor using the GPU-side 'actual_num_tokens' tensor.
+		# This creates a dynamically-sized view.
+		x_sliced = x[:actual_num_tokens]
 
-			# 5. Quantize only the valid data.
-			# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
-			x_quant, x_scale = act_quant(x_sliced)
-			
-			intermediate = fused_fp8_moe_stage_1_optimized(
-				x_quant, x_scale, 
-				self.gate_list, self.gate_ptrs_ptr,
-				self.up_list, self.up_ptrs_ptr,
-				self.gate_scale_list, self.gate_scale_ptrs_ptr,
-				self.up_scale_list, self.up_scale_ptrs_ptr,
-				group_size, activated_group_idx, group_start_indices, 
-				num_active_experts, # Pass the 0-dim *tensor*
-				self.experts_per_rank
-			)
-			
-			# 'intermediate' is also dynamically shaped
-			intermediate, intermediate_scale = act_quant(intermediate)
-			
-			res = fused_dequant_grouped_gemm_fp8_fp8_triton(
-				intermediate, intermediate_scale, 
-				self.down_list, self.down_ptrs_ptr,
-				self.down_scale_list, self.down_scale_ptrs_ptr,
-				group_size, activated_group_idx, group_start_indices, 
-				num_active_experts # Pass the 0-dim *tensor*
-			)
-			return res
+		# 5. Quantize only the valid data.
+		# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
+		x_quant, x_scale = act_quant(x_sliced)
+		
+		intermediate = fused_fp8_moe_stage_1_optimized(
+			x_quant, x_scale, 
+			self.gate_list, self.gate_ptrs_ptr,
+			self.up_list, self.up_ptrs_ptr,
+			self.gate_scale_list, self.gate_scale_ptrs_ptr,
+			self.up_scale_list, self.up_scale_ptrs_ptr,
+			group_size, activated_group_idx, group_start_indices, 
+			num_active_experts, # Pass the 0-dim *tensor*
+			self.experts_per_rank
+		)
+		
+		# 'intermediate' is also dynamically shaped
+		intermediate, intermediate_scale = act_quant(intermediate)
+		
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+			intermediate, intermediate_scale, 
+			self.down_list, self.down_ptrs_ptr,
+			self.down_scale_list, self.down_scale_ptrs_ptr,
+			group_size, activated_group_idx, group_start_indices, 
+			num_active_experts # Pass the 0-dim *tensor*
+		)
+		return res
 
 	def grouped_dequant_moe_fp8_v2(self, x, eids):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
