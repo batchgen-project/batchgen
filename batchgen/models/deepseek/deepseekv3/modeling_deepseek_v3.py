@@ -1937,8 +1937,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# 'intermediate' is also dynamically shaped
 		intermediate, intermediate_scale = act_quant(intermediate)
-		
-		res = fp8_grouped_gemm_persistent_tma(
+		# fp8_grouped_gemm_persistent_tma
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
