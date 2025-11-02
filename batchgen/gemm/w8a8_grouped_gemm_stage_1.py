@@ -653,7 +653,6 @@ def fused_fp8_moe_persistent_descriptor_kernel(
     GEMM_BLOCK_SIZE_N: tl.constexpr,
     GEMM_BLOCK_SIZE_K: tl.constexpr,
     SCALE_BLOCK_SIZE_K: tl.constexpr,
-    # --- NEW ARGS for persistent launch ---
     NUM_SMS: tl.constexpr,
     NUM_N_BLOCKS: tl.constexpr,
     MAX_NUM_GROUPS: tl.constexpr
@@ -664,6 +663,7 @@ def fused_fp8_moe_persistent_descriptor_kernel(
     - 1D persistent grid loops over flattened (group_pid, n_pid) work items.
     - Uses tl.make_tensor_descriptor for LHS, RHS (gate/up), and Output.
     - Uses tl.load for scales to avoid 16-byte TMA alignment issues.
+    - NOTE: Does not use 'continue', wraps logic in 'if' blocks.
     """
     # 1D program ID
     start_pid = tl.program_id(axis=0)
@@ -694,107 +694,108 @@ def fused_fp8_moe_persistent_descriptor_kernel(
         
         # Un-flatten 1D pid to 2D (group_pid, n_pid)
         group_pid = work_item_id // NUM_N_BLOCKS
-        n_pid = work_item_id % NUM_N_BLOCKS
         
-        # Bounds check: Skip work items for inactive experts
-        if group_pid >= actual_num_groups:
-            continue
-        
-        # --- Load THIS expert's metadata ---
-        gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
-        if gm == 0:
-            continue
-        
-        group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
-        start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
-        
-        # --- Create Dynamic Descriptors (per-expert) ---
-        gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
-        up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
-        
-        gate_desc = tl.make_tensor_descriptor(
-            gate_base_ptr,
-            shape=[N, K],
-            strides=[stride_gate_n, stride_gate_k],
-            block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
-        )
-        up_desc = tl.make_tensor_descriptor(
-            up_base_ptr,
-            shape=[N, K],
-            strides=[stride_up_n, stride_up_k],
-            block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
-        )
+        # --- FIX: Refactored 'continue' into 'if' block ---
+        # Check if this group is active
+        if group_pid < actual_num_groups:
+            # Load this expert's metadata
+            gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
+            
+            # Check if this group has any work
+            if gm > 0:
+                # This is a valid work item, calculate n_pid
+                n_pid = work_item_id % NUM_N_BLOCKS
+                
+                group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
+                start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
+                
+                # --- Create Dynamic Descriptors (per-expert) ---
+                gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+                up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+                
+                gate_desc = tl.make_tensor_descriptor(
+                    gate_base_ptr,
+                    shape=[N, K],
+                    strides=[stride_gate_n, stride_gate_k],
+                    block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
+                )
+                up_desc = tl.make_tensor_descriptor(
+                    up_base_ptr,
+                    shape=[N, K],
+                    strides=[stride_up_n, stride_up_k],
+                    block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
+                )
 
-        # Base pointers for scales (using tl.load)
-        gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
-        up_scale_base_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
-        
-        # N-block offsets for this work item
-        offs_bn = n_pid * GEMM_BLOCK_SIZE_N # Base offset for descriptor
-        scale_n_idx = n_pid * GEMM_BLOCK_SIZE_N // SCALE_BLOCK_SIZE_K
-        
-        # M-dimension offsets
-        offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
-        
-        # Process all M-blocks for THIS expert and THIS N-block
-        num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
-        
-        for sub_group_idx in range(num_sub_groups):
-            sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
-            offs_am = sub_group_start_idx # Base offset for descriptor
+                # Base pointers for scales (using tl.load)
+                gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+                up_scale_base_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+                
+                # N-block offsets for this work item
+                offs_bn = n_pid * GEMM_BLOCK_SIZE_N # Base offset for descriptor
+                scale_n_idx = n_pid * GEMM_BLOCK_SIZE_N // SCALE_BLOCK_SIZE_K
+                
+                # M-dimension offsets
+                offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+                
+                # Process all M-blocks for THIS expert and THIS N-block
+                num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+                
+                for sub_group_idx in range(num_sub_groups):
+                    sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+                    offs_am = sub_group_start_idx # Base offset for descriptor
 
-            remaining_rows_in_group = start_idx + gm - sub_group_start_idx
-            valid_rows_this_block = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows_in_group)
-            
-            abs_row_indices = sub_group_start_idx + offsets_m
-            
-            # Logical mask (for rows within this group)
-            valid_mask = (offsets_m < valid_rows_this_block)[:, None] # [M, 1]
-            
-            # Initialize accumulators
-            gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
-            up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
-            
-            num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
-            for k_block_idx in range(num_k_blocks):
-                offs_k = k_block_idx * GEMM_BLOCK_SIZE_K # Base offset for descriptor
-                
-                # --- Load Scales (No TMA) ---
-                scale_k_idx = k_block_idx
-                scale_offset = scale_n_idx * num_scale_k + scale_k_idx
-                
-                gate_scale = tl.load(gate_scale_base_ptr + scale_offset)
-                up_scale = tl.load(up_scale_base_ptr + scale_offset)
-                
-                lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
-                                                  scale_k_idx * stride_lhs_scale_k)
-                # Mask for tl.load needs to be boundary AND logical
-                lhs_scale_mask = (abs_row_indices[:, None] < M) & valid_mask
-                lhs_scale = tl.load(lhs_scale_ptrs, mask=lhs_scale_mask, other=1.0)
-                
-                # --- Load Data (TMA) ---
-                # Descriptors handle M, K, N boundary checks
-                lhs = lhs_desc.load([offs_am, offs_k])
-                gate_fp8 = gate_desc.load([offs_bn, offs_k])
-                up_fp8 = up_desc.load([offs_bn, offs_k])
-                
-                # Apply logical mask (zeros out rows not in this group)
-                lhs = tl.where(valid_mask, lhs, 0.0)
-                
-                # --- Compute ---
-                gate_acc += tl.dot(lhs, tl.trans(gate_fp8), out_dtype=tl.float32) * lhs_scale * gate_scale
-                up_acc += tl.dot(lhs, tl.trans(up_fp8), out_dtype=tl.float32) * lhs_scale * up_scale
-            
-            # --- Epilogue ---
-            gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
-            output_acc = gate_activated * up_acc
-            output = output_acc.to(tl.bfloat16)
-            
-            # --- Store (TMA) ---
-            # Descriptor handles M, N boundary checks.
-            # Logical masking (valid_mask) was handled by zeroing `lhs`,
-            # which zeroes `acc` and `output`, so store is safe.
-            output_desc.store([offs_am, offs_bn], output)
+                    remaining_rows_in_group = start_idx + gm - sub_group_start_idx
+                    valid_rows_this_block = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows_in_group)
+                    
+                    abs_row_indices = sub_group_start_idx + offsets_m
+                    
+                    # Logical mask (for rows within this group)
+                    valid_mask = (offsets_m < valid_rows_this_block)[:, None] # [M, 1]
+                    
+                    # Initialize accumulators
+                    gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+                    up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+                    
+                    num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+                    for k_block_idx in range(num_k_blocks):
+                        offs_k = k_block_idx * GEMM_BLOCK_SIZE_K # Base offset for descriptor
+                        
+                        # --- Load Scales (No TMA) ---
+                        scale_k_idx = k_block_idx
+                        scale_offset = scale_n_idx * num_scale_k + scale_k_idx
+                        
+                        gate_scale = tl.load(gate_scale_base_ptr + scale_offset)
+                        up_scale = tl.load(up_scale_base_ptr + scale_offset)
+                        
+                        lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
+                                                          scale_k_idx * stride_lhs_scale_k)
+                        # Mask for tl.load needs to be boundary AND logical
+                        lhs_scale_mask = (abs_row_indices[:, None] < M) & valid_mask
+                        lhs_scale = tl.load(lhs_scale_ptrs, mask=lhs_scale_mask, other=1.0)
+                        
+                        # --- Load Data (TMA) ---
+                        # Descriptors handle M, K, N boundary checks
+                        lhs = lhs_desc.load([offs_am, offs_k])
+                        gate_fp8 = gate_desc.load([offs_bn, offs_k])
+                        up_fp8 = up_desc.load([offs_bn, offs_k])
+                        
+                        # Apply logical mask (zeros out rows not in this group)
+                        lhs = tl.where(valid_mask, lhs, 0.0)
+                        
+                        # --- Compute ---
+                        gate_acc += tl.dot(lhs, tl.trans(gate_fp8), out_dtype=tl.float32) * lhs_scale * gate_scale
+                        up_acc += tl.dot(lhs, tl.trans(up_fp8), out_dtype=tl.float32) * lhs_scale * up_scale
+                    
+                    # --- Epilogue ---
+                    gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
+                    output_acc = gate_activated * up_acc
+                    output = output_acc.to(tl.bfloat16)
+                    
+                    # --- Store (TMA) ---
+                    # Descriptor handles M, N boundary checks.
+                    # Logical masking (valid_mask) was handled by zeroing `lhs`,
+                    # which zeroes `acc` and `output`, so store is safe.
+                    output_desc.store([offs_am, offs_bn], output)
 
 @torch.inference_mode()
 def fused_fp8_moe_stage_1_optimized(
