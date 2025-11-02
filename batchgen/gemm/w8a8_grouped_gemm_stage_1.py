@@ -1098,9 +1098,9 @@ def fused_fp8_moe_stage_1_persistent_v2(
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
     num_groups: int,
-    gate_gemm_block_size=[64, 128, 128],
+    gate_gemm_block_size=[64, 256, 128],
     scale_block_size=128,
-    num_stages=3,
+    num_stages=2,
     num_warps=8
 ):
     """
