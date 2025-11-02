@@ -1879,7 +1879,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		return res
 
-	def grouped_dequant_moe_fp8_(self, x, eids, expert_counts, expert_offsets):
+	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
 		# 'x' and 'eids' are the oversized tensors.
 		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
 
@@ -2037,7 +2037,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	# 	"""
 	# 	for expert_id in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
 			
-	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
+	def moe_fp8(self, x, eids, expert_counts, expert_offsets):
 		# 'x' and 'eids' are the oversized tensors.
 		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
 
