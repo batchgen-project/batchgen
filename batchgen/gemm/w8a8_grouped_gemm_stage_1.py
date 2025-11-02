@@ -1128,7 +1128,8 @@ def fused_fp8_moe_stage_1_persistent_v2(
     
     # --- FIX 5: Use actual number of experts ---
     # Get actual number of active experts from the tensor
-    actual_num_experts = num_active_experts.item()
+    # actual_num_experts = num_active_experts.item()
+    actual_num_experts = num_groups
     
     # Calculate total work based on ACTUAL experts
     total_work_items = actual_num_experts * num_n_blocks
