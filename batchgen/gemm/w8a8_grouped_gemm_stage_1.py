@@ -885,6 +885,287 @@ def fused_fp8_moe_stage_1_optimized(
     return output
 
 
+# =============================================================================
+# ALLOCATOR SETUP (Required for TMA descriptors)
+# =============================================================================
+_allocator_set = False
+
+def _setup_allocator_once():
+    """Set up Triton allocator for TMA descriptors (call once per process)."""
+    global _allocator_set
+    if not _allocator_set:
+        def alloc_fn(size: int, alignment: int, stream: int):
+            return torch.empty(size, device='cuda', dtype=torch.int8)
+        
+        triton.set_allocator(alloc_fn)
+        _allocator_set = True
+
+
+@triton.jit
+def fused_fp8_moe_persistent_descriptor_kernel_v2(
+    lhs_ptr, lhs_scale_ptr,
+    gate_ptrs_ptr, up_ptrs_ptr,
+    gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+    group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+    num_active_experts_ptr,
+    output_ptr,
+    M, N: tl.constexpr, K: tl.constexpr,
+    stride_lhs_m, stride_lhs_k,
+    stride_lhs_scale_m, stride_lhs_scale_k,
+    stride_gate_n, stride_gate_k,
+    stride_up_n, stride_up_k,
+    stride_output_m, stride_output_n,
+    stride_group_idx, stride_group_sizes, stride_group_start_indices,
+    stride_weight_ptrs, stride_scale_ptrs,
+    GEMM_BLOCK_SIZE_M: tl.constexpr,
+    GEMM_BLOCK_SIZE_N: tl.constexpr,
+    GEMM_BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_SIZE_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_N_BLOCKS: tl.constexpr,
+):
+    """
+    Fixed TMA Persistent Kernel - Version 2
+    
+    Key improvement: Better work distribution
+    - Removed MAX_NUM_GROUPS parameter
+    - Calculate total_work based on ACTUAL number of active experts
+    - No wasted iterations checking invalid work items
+    - Better load balance across SMs
+    """
+    # 1D program ID
+    start_pid = tl.program_id(axis=0)
+    
+    # --- Load actual number of active experts FIRST ---
+    actual_num_groups = tl.load(num_active_experts_ptr)
+    
+    # --- FIX 5: Calculate total work based on ACTUAL experts ---
+    # OLD: total_work_items = MAX_NUM_GROUPS * NUM_N_BLOCKS  (e.g., 32 * 64 = 2048)
+    # NEW: total_work_items = actual_num_groups * NUM_N_BLOCKS  (e.g., 8 * 64 = 512)
+    total_work_items = actual_num_groups * NUM_N_BLOCKS
+    
+    # Early exit if no work for this thread block
+    if start_pid >= total_work_items:
+        return
+    
+    # --- Create Static Descriptors ONCE (outside all loops) ---
+    lhs_desc = tl.make_tensor_descriptor(
+        lhs_ptr,
+        shape=[M, K],
+        strides=[stride_lhs_m, stride_lhs_k],
+        block_shape=[GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_K]
+    )
+    output_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[M, N],
+        strides=[stride_output_m, stride_output_n],
+        block_shape=[GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N]
+    )
+    
+    # Constants
+    num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
+    
+    # Pre-compute offsets (hoisted)
+    offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+    offsets_n = tl.arange(0, GEMM_BLOCK_SIZE_N)
+    
+    # --- Persistent Loop over all work items ---
+    work_item_id = start_pid
+    while work_item_id < total_work_items:
+        
+        # Un-flatten 1D pid to 2D (group_pid, n_pid)
+        group_pid = work_item_id // NUM_N_BLOCKS
+        n_pid = work_item_id % NUM_N_BLOCKS
+        
+        # --- FIX 5: No need to check group_pid < actual_num_groups ---
+        # Since total_work_items is based on actual_num_groups, 
+        # all work items are guaranteed to be valid
+        
+        # Load this expert's metadata
+        gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
+        
+        # Check if this group has any work
+        if gm > 0:
+            group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
+            start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
+            
+            # --- Create Dynamic Descriptors ONCE per expert ---
+            gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+            up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+            
+            gate_desc = tl.make_tensor_descriptor(
+                gate_base_ptr,
+                shape=[N, K],
+                strides=[stride_gate_n, stride_gate_k],
+                block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
+            )
+            up_desc = tl.make_tensor_descriptor(
+                up_base_ptr,
+                shape=[N, K],
+                strides=[stride_up_n, stride_up_k],
+                block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
+            )
+
+            # Base pointers for scales
+            gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+            up_scale_base_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+            
+            # N-block offsets for this work item (hoisted out of M-loop)
+            offs_bn = n_pid * GEMM_BLOCK_SIZE_N
+            offs_n = offs_bn + offsets_n
+            n_mask = offs_n < N
+            scale_n_idx = n_pid * GEMM_BLOCK_SIZE_N // SCALE_BLOCK_SIZE_K
+            
+            # Process all M-blocks for THIS expert and THIS N-block
+            num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+            num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+            
+            for sub_group_idx in range(num_sub_groups):
+                sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+                offs_am = sub_group_start_idx
+
+                remaining_rows_in_group = start_idx + gm - sub_group_start_idx
+                valid_rows_this_block = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows_in_group)
+                
+                abs_row_indices = sub_group_start_idx + offsets_m
+                offs_m = abs_row_indices
+                m_mask = offs_m < M
+                
+                # Logical mask (for rows within this group)
+                valid_mask = (offsets_m < valid_rows_this_block)[:, None]
+                
+                # Initialize accumulators
+                gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+                up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+                
+                for k_block_idx in range(num_k_blocks):
+                    offs_k = k_block_idx * GEMM_BLOCK_SIZE_K
+                    
+                    # --- Load Scales (No TMA) ---
+                    scale_k_idx = k_block_idx
+                    scale_offset = scale_n_idx * num_scale_k + scale_k_idx
+                    
+                    gate_scale = tl.load(gate_scale_base_ptr + scale_offset)
+                    up_scale = tl.load(up_scale_base_ptr + scale_offset)
+                    
+                    lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
+                                                      scale_k_idx * stride_lhs_scale_k)
+                    lhs_scale_mask = (abs_row_indices[:, None] < M) & valid_mask
+                    lhs_scale = tl.load(lhs_scale_ptrs, mask=lhs_scale_mask, other=1.0)
+                    
+                    # --- Load Data (TMA) ---
+                    lhs = lhs_desc.load([offs_am, offs_k])
+                    gate_fp8 = gate_desc.load([offs_bn, offs_k])
+                    up_fp8 = up_desc.load([offs_bn, offs_k])
+                    
+                    # Apply valid mask to LHS
+                    lhs = tl.where(valid_mask, lhs, 0.0)
+                    
+                    # --- Compute ---
+                    gate_acc += tl.dot(lhs, tl.trans(gate_fp8), out_dtype=tl.float32) * lhs_scale * gate_scale
+                    up_acc += tl.dot(lhs, tl.trans(up_fp8), out_dtype=tl.float32) * lhs_scale * up_scale
+                
+                # --- Epilogue ---
+                gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
+                output_acc = gate_activated * up_acc
+                output = output_acc.to(tl.bfloat16)
+                
+                # --- Add proper output masking ---
+                output_mask = (m_mask[:, None] & n_mask[None, :] & valid_mask)
+                output_masked = tl.where(output_mask, output, 0.0)
+                
+                # Store (TMA)
+                output_desc.store([offs_am, offs_bn], output_masked)
+        
+        # Increment to next work item for this thread block
+        work_item_id += NUM_SMS
+
+
+@torch.inference_mode()
+def fused_fp8_moe_stage_1_persistent_v2(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gate_weight_list: list[torch.Tensor],
+    gate_ptrs_ptr: torch.Tensor,
+    up_weight_list: list[torch.Tensor],
+    up_ptrs_ptr: torch.Tensor,
+    gate_scale_list: list[torch.Tensor],
+    gate_scale_ptrs_ptr: torch.Tensor,
+    up_scale_list: list[torch.Tensor],
+    up_scale_ptrs_ptr: torch.Tensor,
+    group_sizes: torch.Tensor,
+    activated_group_idx: torch.Tensor,
+    group_start_indices: torch.Tensor,
+    num_active_experts: torch.Tensor,
+    num_groups: int,
+    gate_gemm_block_size=[64, 128, 128],
+    scale_block_size=128,
+    num_stages=3,
+    num_warps=8
+):
+    """
+    Python wrapper for the fixed TMA persistent kernel (version 2).
+    
+    Key improvement: Uses actual number of experts for work calculation,
+    eliminating wasted iterations and improving load balance.
+    """
+    # Set up allocator for TMA descriptors (once per process)
+    _setup_allocator_once()
+    
+    device = hidden_states.device
+    M = hidden_states.shape[0]
+    N = gate_weight_list[0].shape[0]
+    K = hidden_states.shape[1]
+    
+    assert gate_gemm_block_size[2] == scale_block_size, \
+        f"GEMM_BLOCK_SIZE_K ({gate_gemm_block_size[2]}) must equal SCALE_BLOCK_SIZE_K ({scale_block_size})"
+    
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    
+    # --- Persistent 1D GRID ---
+    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+    num_n_blocks = triton.cdiv(N, gate_gemm_block_size[1])
+    
+    # --- FIX 5: Use actual number of experts ---
+    # Get actual number of active experts from the tensor
+    actual_num_experts = num_active_experts.item()
+    
+    # Calculate total work based on ACTUAL experts
+    total_work_items = actual_num_experts * num_n_blocks
+    
+    # Launch enough blocks to cover the work, but not more than we have work
+    grid = (min(NUM_SMS, total_work_items),)
+
+    fused_fp8_moe_persistent_descriptor_kernel_v2[grid](
+        hidden_states, hidden_states_scale,
+        gate_ptrs_ptr, up_ptrs_ptr,
+        gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+        activated_group_idx, group_sizes, group_start_indices,
+        num_active_experts,
+        output,
+        M, N, K,
+        hidden_states.stride(0), hidden_states.stride(1),
+        hidden_states_scale.stride(0), hidden_states_scale.stride(1),
+        gate_weight_list[0].stride(0), gate_weight_list[0].stride(1),
+        up_weight_list[0].stride(0), up_weight_list[0].stride(1),
+        output.stride(0), output.stride(1),
+        activated_group_idx.stride(0),
+        group_sizes.stride(0),
+        group_start_indices.stride(0),
+        gate_ptrs_ptr.stride(0),
+        gate_scale_ptrs_ptr.stride(0),
+        GEMM_BLOCK_SIZE_M=gate_gemm_block_size[0],
+        GEMM_BLOCK_SIZE_N=gate_gemm_block_size[1],
+        GEMM_BLOCK_SIZE_K=gate_gemm_block_size[2],
+        SCALE_BLOCK_SIZE_K=scale_block_size,
+        NUM_SMS=NUM_SMS,
+        NUM_N_BLOCKS=num_n_blocks,
+        # Note: MAX_NUM_GROUPS removed!
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+    
+    return output
 
 # @triton.jit
 # def fused_fp8_moe_parallel_experts_kernel_no_activation(
