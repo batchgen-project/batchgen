@@ -1058,7 +1058,7 @@ def fp8_grouped_gemm_persistent_tma(
 	group_start_indices: torch.Tensor,
 	num_active_experts: torch.Tensor,
 	num_groups: int,
-	gemm_block_size=[64, 128, 128],  # Larger N-tiles like v3!
+	gemm_block_size=[64, 256, 128],  # Larger N-tiles like v3!
 	scale_block_size=128,
 	num_stages=3,
 	num_warps=8
