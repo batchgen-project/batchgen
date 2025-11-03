@@ -28,6 +28,7 @@ class GPUKVCacheManager:
 		self.num_total_pages: int = 0
 		self.free_pages: List[int] = []
 		self.page_table: Dict[int, List[int]] = {} # sequence_id -> List[page_indices]
+		self.sequence_lengths: Dict[int, int] = {}  # sequence_id -> current sequence length
 
 		self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -74,32 +75,95 @@ class GPUKVCacheManager:
 		self.page_table: Dict[int, List[int]] = {}  # sequence_id -> List of allocated page IDs
 	
 	# --- 1. Page Management Primitives ---
-	def allocate_pages(self, sequence_id: int, num_pages: int) -> List[int]:
-		"""
-		Allocates 'num_pages' from the free list for a sequence.
+	# def allocate_pages(self, sequence_id: int, num_pages: int) -> List[int]:
+	# 	"""
+	# 	Allocates 'num_pages' from the free list for a sequence.
 		
-		This method asssumes the caller (upper-level scheduler) has already ensured
-		there is enough free pages.
+	# 	This method asssumes the caller (upper-level scheduler) has already ensured
+	# 	there is enough free pages.
+
+	# 	Args:
+	# 		sequence_id (int): Unique identifier for the sequence.
+	# 		num_pages (int): Number of pages to allocate.
+		
+	# 	Returns:
+	# 		List[int]: List of allocated page indices.
+
+	# 	Raises:
+	# 		RuntimeError: If not enough free pages are available indicating a scheduler logic error.
+
+	# 	"""
+	# 	if len(self.free_pages) < num_pages:
+	# 		self.logger.error(
+	# 			f"Not enough free pages to allocate {num_pages} pages for sequence {sequence_id}."
+	# 			f" Available: {len(self.free_pages)}. This indicates a scheduler logic error."
+	# 		)
+	# 		raise RuntimeError(f"{self.__class__.__name__}: Insufficient free pages for allocation.")
+
+	# 	# Pop Pages from the free list(LIFO).
+	# 	new_pages = [self.free_pages.pop() for _ in range(num_pages)]
+
+	# 	# Add to the page table
+	# 	if sequence_id not in self.page_table:
+	# 		self.page_table[sequence_id] = []
+	# 	self.page_table[sequence_id].extend(new_pages)
+		
+	# 	self.logger.debug(f"Allocated {num_pages} new pages for seq {sequence_id}: {new_pages}")
+	# 	return new_pages
+
+	# --- 1. Page Management Primitives ---
+	def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
+		"""
+		Allocates pages from the free list for a sequence based on the number of tokens.
+		
+		This method automatically calculates the number of pages needed based on
+		the page size and number of tokens. It assumes the caller (upper-level scheduler)
+		has already ensured there are enough free pages.
 
 		Args:
 			sequence_id (int): Unique identifier for the sequence.
-			num_pages (int): Number of pages to allocate.
+			num_tokens (int): Number of tokens that need to be stored for this sequence.
 		
 		Returns:
 			List[int]: List of allocated page indices.
 
 		Raises:
-			RuntimeError: If not enough free pages are available indicating a scheduler logic error.
+			ValueError: If num_tokens is invalid (≤ 0).
+			RuntimeError: If not enough free pages are available, indicating a scheduler logic error.
 
+		Example:
+			>>> # Allocate pages for a sequence with 150 tokens
+			>>> # If page_size_tokens=64, this will allocate 3 pages (ceil(150/64)=3)
+			>>> allocated = manager.allocate_pages(sequence_id=42, num_tokens=150)
+			>>> # allocated = [5, 7, 2]  # Example page indices
 		"""
+		# Validate input
+		if num_tokens <= 0:
+			raise ValueError(
+				f"{self.__class__.__name__}: num_tokens must be positive, got {num_tokens}"
+			)
+		
+		# Calculate number of pages needed
+		num_pages = math.ceil(num_tokens / self.config.page_size_tokens)
+		
+		self.logger.debug(
+			f"Sequence {sequence_id} requires {num_pages} pages "
+			f"for {num_tokens} tokens (page_size={self.config.page_size_tokens})"
+		)
+		
+		# Check if enough free pages available
 		if len(self.free_pages) < num_pages:
 			self.logger.error(
-				f"Not enough free pages to allocate {num_pages} pages for sequence {sequence_id}."
-				f" Available: {len(self.free_pages)}. This indicates a scheduler logic error."
+				f"Not enough free pages to allocate {num_pages} pages for sequence {sequence_id}. "
+				f"Required: {num_pages}, Available: {len(self.free_pages)}. "
+				f"This indicates a scheduler logic error."
 			)
-			raise RuntimeError(f"{self.__class__.__name__}: Insufficient free pages for allocation.")
+			raise RuntimeError(
+				f"{self.__class__.__name__}: Insufficient free pages for allocation. "
+				f"Need {num_pages} pages for {num_tokens} tokens, only {len(self.free_pages)} available."
+			)
 
-		# Pop Pages from the free list(LIFO).
+		# Pop pages from the free list (LIFO)
 		new_pages = [self.free_pages.pop() for _ in range(num_pages)]
 
 		# Add to the page table
@@ -107,7 +171,15 @@ class GPUKVCacheManager:
 			self.page_table[sequence_id] = []
 		self.page_table[sequence_id].extend(new_pages)
 		
-		self.logger.debug(f"Allocated {num_pages} new pages for seq {sequence_id}: {new_pages}")
+		# Track sequence length
+		if hasattr(self, 'sequence_lengths'):
+			self.sequence_lengths[sequence_id] = num_tokens
+		
+		self.logger.debug(
+			f"Allocated {num_pages} pages for seq {sequence_id} "
+			f"({num_tokens} tokens): {new_pages}"
+		)
+		
 		return new_pages
 
 	def free_sequence(self, sequence_id: int):
@@ -280,6 +352,17 @@ class GPUKVCacheManager:
 		)
 		
 		return (k_page_ptrs, v_page_ptrs)
+
+	def update_new_token(self, k_tensor: torch.Tensor, v_tensor: Optional[torch.Tensor], sequence_ids: List[int], layer_idx: int):
+		"""
+		This function would append the KV-Cache for the new token to its correct page(s)
+		Expected k_tensor shape: [batch_size, seq_len, num_k_heads, k_head_dim]
+		Expected v_tensor shape: [batch_size, seq_len, num_v_heads, v_head_dim] or None
+
+		Note that seq_len normally equals 1 for autoregressive generation but could be >1 in multi-token prediction.
+		"""
+
+
 
 
 	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:

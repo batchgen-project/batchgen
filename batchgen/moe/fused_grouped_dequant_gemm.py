@@ -892,157 +892,317 @@ def _setup_allocator_once():
 		_allocator_set = True
 
 
+# @triton.jit
+# def fp8_grouped_gemm_persistent_tma_kernel(
+# 	lhs_ptr, lhs_scale_ptr,
+# 	rhs_ptrs_ptr, rhs_scale_ptrs_ptr,
+# 	group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+# 	num_active_experts_ptr,
+# 	output_ptr,
+# 	M, N: tl.constexpr, K: tl.constexpr,
+# 	stride_lhs_m, stride_lhs_k,
+# 	stride_lhs_scale_m, stride_lhs_scale_k,
+# 	stride_rhs_n, stride_rhs_k,
+# 	stride_output_m, stride_output_n,
+# 	stride_group_idx, stride_group_sizes, stride_group_start_indices,
+# 	stride_rhs_ptrs, stride_rhs_scale_ptrs,
+# 	GEMM_BLOCK_SIZE_M: tl.constexpr,
+# 	GEMM_BLOCK_SIZE_N: tl.constexpr,
+# 	GEMM_BLOCK_SIZE_K: tl.constexpr,
+# 	SCALE_BLOCK_SIZE_K: tl.constexpr,
+# 	NUM_SMS: tl.constexpr,
+# 	NUM_N_BLOCKS: tl.constexpr,
+# ):
+# 	"""
+# 	Persistent kernel for FP8 grouped GEMM with TMA descriptors.
+	
+# 	Key features from v3:
+# 	- Persistent scheduling (work stealing across experts)
+# 	- TMA descriptors for efficient memory access
+# 	- Larger N-tiles to reduce overhead
+# 	- Combined scale factors for better ILP
+# 	- Hoisted invariants
+	
+# 	One CTA processes multiple (expert, N-block) pairs.
+# 	"""
+# 	start_pid = tl.program_id(axis=0)
+	
+# 	# Load actual number of active experts
+# 	num_groups = tl.load(num_active_experts_ptr)
+# 	total_work_items = num_groups * NUM_N_BLOCKS
+	
+# 	# Early exit if no work
+# 	if start_pid >= total_work_items:
+# 		return
+	
+# 	# --- Create Static Descriptors ONCE (for LHS and output) ---
+# 	lhs_desc = tl.make_tensor_descriptor(
+# 		lhs_ptr,
+# 		shape=[M, K],
+# 		strides=[stride_lhs_m, stride_lhs_k],
+# 		block_shape=[GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_K]
+# 	)
+# 	output_desc = tl.make_tensor_descriptor(
+# 		output_ptr,
+# 		shape=[M, N],
+# 		strides=[stride_output_m, stride_output_n],
+# 		block_shape=[GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N]
+# 	)
+	
+# 	# Pre-compute constants (hoisted)
+# 	num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
+# 	num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+# 	offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+# 	offsets_n = tl.arange(0, GEMM_BLOCK_SIZE_N)
+	
+# 	# --- Persistent Loop: Work Stealing ---
+# 	work_item_id = start_pid
+# 	while work_item_id < total_work_items:
+		
+# 		# Unpack work item into (group_id, n_block_id)
+# 		group_pid = work_item_id // NUM_N_BLOCKS
+# 		n_pid = work_item_id % NUM_N_BLOCKS
+		
+# 		# Load expert metadata
+# 		gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
+		
+# 		if gm > 0:
+# 			# Load expert data
+# 			group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
+# 			start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
+			
+# 			# Load RHS weight pointers for this expert
+# 			rhs_base_ptr = tl.load(rhs_ptrs_ptr + group_idx * stride_rhs_ptrs).to(tl.pointer_type(tl.float8e4nv))
+# 			rhs_scale_base_ptr = tl.load(rhs_scale_ptrs_ptr + group_idx * stride_rhs_scale_ptrs).to(tl.pointer_type(tl.float32))
+			
+# 			# Create TMA descriptor for RHS (dynamic per expert)
+# 			rhs_desc = tl.make_tensor_descriptor(
+# 				rhs_base_ptr,
+# 				shape=[N, K],
+# 				strides=[stride_rhs_n, stride_rhs_k],
+# 				block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
+# 			)
+			
+# 			# N-block offsets (hoisted out of M-loop)
+# 			offs_bn = n_pid * GEMM_BLOCK_SIZE_N
+# 			offs_n = offs_bn + offsets_n
+# 			n_mask = offs_n < N
+# 			scale_n_idx = offs_bn // SCALE_BLOCK_SIZE_K
+			
+# 			# M-loop bounds
+# 			num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+			
+# 			# --- M-block loop ---
+# 			for sub_group_idx in range(num_sub_groups):
+# 				sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+# 				offs_am = sub_group_start_idx
+				
+# 				remaining_rows = start_idx + gm - sub_group_start_idx
+# 				valid_rows = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows)
+				
+# 				abs_row_indices = sub_group_start_idx + offsets_m
+# 				m_mask = abs_row_indices < M
+# 				valid_mask = (offsets_m < valid_rows)[:, None]
+				
+# 				# Initialize accumulator
+# 				acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+				
+# 				# --- K-block loop ---
+# 				for k_block_idx in range(num_k_blocks):
+# 					offs_k = k_block_idx * GEMM_BLOCK_SIZE_K
+					
+# 					# Load scales
+# 					scale_offset = scale_n_idx * num_scale_k + k_block_idx
+# 					rhs_scale = tl.load(rhs_scale_base_ptr + scale_offset)
+					
+# 					lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
+# 													  k_block_idx * stride_lhs_scale_k)
+# 					lhs_scale_mask = m_mask[:, None] & valid_mask
+# 					lhs_scale = tl.load(lhs_scale_ptrs, mask=lhs_scale_mask, other=1.0)
+					
+# 					# Load data via TMA descriptors
+# 					lhs = lhs_desc.load([offs_am, offs_k])
+# 					rhs_fp8 = rhs_desc.load([offs_bn, offs_k])
+					
+# 					# Apply masking to LHS
+# 					lhs = tl.where(valid_mask, lhs, 0.0)
+					
+# 					# Combined scale factors (better ILP)
+# 					combined_scale = lhs_scale * rhs_scale
+					
+# 					# GEMM accumulation
+# 					acc += tl.dot(lhs, tl.trans(rhs_fp8), out_dtype=tl.float32) * combined_scale
+				
+# 				# Convert to output dtype
+# 				output = acc.to(tl.bfloat16)
+				
+# 				# Store with masking
+# 				output_mask = m_mask[:, None] & n_mask[None, :] & valid_mask
+# 				output_masked = tl.where(output_mask, output, 0.0)
+# 				output_desc.store([offs_am, offs_bn], output_masked)
+		
+# 		# Work stealing: grab next work item
+# 		work_item_id += NUM_SMS
+
 @triton.jit
 def fp8_grouped_gemm_persistent_tma_kernel(
-	lhs_ptr, lhs_scale_ptr,
-	rhs_ptrs_ptr, rhs_scale_ptrs_ptr,
-	group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
-	num_active_experts_ptr,
-	output_ptr,
-	M, N: tl.constexpr, K: tl.constexpr,
-	stride_lhs_m, stride_lhs_k,
-	stride_lhs_scale_m, stride_lhs_scale_k,
-	stride_rhs_n, stride_rhs_k,
-	stride_output_m, stride_output_n,
-	stride_group_idx, stride_group_sizes, stride_group_start_indices,
-	stride_rhs_ptrs, stride_rhs_scale_ptrs,
-	GEMM_BLOCK_SIZE_M: tl.constexpr,
-	GEMM_BLOCK_SIZE_N: tl.constexpr,
-	GEMM_BLOCK_SIZE_K: tl.constexpr,
-	SCALE_BLOCK_SIZE_K: tl.constexpr,
-	NUM_SMS: tl.constexpr,
-	NUM_N_BLOCKS: tl.constexpr,
+    lhs_ptr, lhs_scale_ptr,
+    rhs_ptrs_ptr, rhs_scale_ptrs_ptr,
+    group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+    num_active_experts_ptr,
+    output_ptr,
+    M, N: tl.constexpr, K: tl.constexpr,
+    stride_lhs_m, stride_lhs_k,
+    stride_lhs_scale_m, stride_lhs_scale_k,
+    stride_rhs_n, stride_rhs_k,
+    stride_output_m, stride_output_n,
+    stride_group_idx, stride_group_sizes, stride_group_start_indices,
+    stride_rhs_ptrs, stride_rhs_scale_ptrs,
+    GEMM_BLOCK_SIZE_M: tl.constexpr,
+    GEMM_BLOCK_SIZE_N: tl.constexpr,
+    GEMM_BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_SIZE_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_N_BLOCKS: tl.constexpr,
 ):
-	"""
-	Persistent kernel for FP8 grouped GEMM with TMA descriptors.
-	
-	Key features from v3:
-	- Persistent scheduling (work stealing across experts)
-	- TMA descriptors for efficient memory access
-	- Larger N-tiles to reduce overhead
-	- Combined scale factors for better ILP
-	- Hoisted invariants
-	
-	One CTA processes multiple (expert, N-block) pairs.
-	"""
-	start_pid = tl.program_id(axis=0)
-	
-	# Load actual number of active experts
-	num_groups = tl.load(num_active_experts_ptr)
-	total_work_items = num_groups * NUM_N_BLOCKS
-	
-	# Early exit if no work
-	if start_pid >= total_work_items:
-		return
-	
-	# --- Create Static Descriptors ONCE (for LHS and output) ---
-	lhs_desc = tl.make_tensor_descriptor(
-		lhs_ptr,
-		shape=[M, K],
-		strides=[stride_lhs_m, stride_lhs_k],
-		block_shape=[GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_K]
-	)
-	output_desc = tl.make_tensor_descriptor(
-		output_ptr,
-		shape=[M, N],
-		strides=[stride_output_m, stride_output_n],
-		block_shape=[GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N]
-	)
-	
-	# Pre-compute constants (hoisted)
-	num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
-	num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
-	offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
-	offsets_n = tl.arange(0, GEMM_BLOCK_SIZE_N)
-	
-	# --- Persistent Loop: Work Stealing ---
-	work_item_id = start_pid
-	while work_item_id < total_work_items:
-		
-		# Unpack work item into (group_id, n_block_id)
-		group_pid = work_item_id // NUM_N_BLOCKS
-		n_pid = work_item_id % NUM_N_BLOCKS
-		
-		# Load expert metadata
-		gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
-		
-		if gm > 0:
-			# Load expert data
-			group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
-			start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
-			
-			# Load RHS weight pointers for this expert
-			rhs_base_ptr = tl.load(rhs_ptrs_ptr + group_idx * stride_rhs_ptrs).to(tl.pointer_type(tl.float8e4nv))
-			rhs_scale_base_ptr = tl.load(rhs_scale_ptrs_ptr + group_idx * stride_rhs_scale_ptrs).to(tl.pointer_type(tl.float32))
-			
-			# Create TMA descriptor for RHS (dynamic per expert)
-			rhs_desc = tl.make_tensor_descriptor(
-				rhs_base_ptr,
-				shape=[N, K],
-				strides=[stride_rhs_n, stride_rhs_k],
-				block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K]
-			)
-			
-			# N-block offsets (hoisted out of M-loop)
-			offs_bn = n_pid * GEMM_BLOCK_SIZE_N
-			offs_n = offs_bn + offsets_n
-			n_mask = offs_n < N
-			scale_n_idx = offs_bn // SCALE_BLOCK_SIZE_K
-			
-			# M-loop bounds
-			num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
-			
-			# --- M-block loop ---
-			for sub_group_idx in range(num_sub_groups):
-				sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
-				offs_am = sub_group_start_idx
-				
-				remaining_rows = start_idx + gm - sub_group_start_idx
-				valid_rows = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows)
-				
-				abs_row_indices = sub_group_start_idx + offsets_m
-				m_mask = abs_row_indices < M
-				valid_mask = (offsets_m < valid_rows)[:, None]
-				
-				# Initialize accumulator
-				acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
-				
-				# --- K-block loop ---
-				for k_block_idx in range(num_k_blocks):
-					offs_k = k_block_idx * GEMM_BLOCK_SIZE_K
-					
-					# Load scales
-					scale_offset = scale_n_idx * num_scale_k + k_block_idx
-					rhs_scale = tl.load(rhs_scale_base_ptr + scale_offset)
-					
-					lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
-													  k_block_idx * stride_lhs_scale_k)
-					lhs_scale_mask = m_mask[:, None] & valid_mask
-					lhs_scale = tl.load(lhs_scale_ptrs, mask=lhs_scale_mask, other=1.0)
-					
-					# Load data via TMA descriptors
-					lhs = lhs_desc.load([offs_am, offs_k])
-					rhs_fp8 = rhs_desc.load([offs_bn, offs_k])
-					
-					# Apply masking to LHS
-					lhs = tl.where(valid_mask, lhs, 0.0)
-					
-					# Combined scale factors (better ILP)
-					combined_scale = lhs_scale * rhs_scale
-					
-					# GEMM accumulation
-					acc += tl.dot(lhs, tl.trans(rhs_fp8), out_dtype=tl.float32) * combined_scale
-				
-				# Convert to output dtype
-				output = acc.to(tl.bfloat16)
-				
-				# Store with masking
-				output_mask = m_mask[:, None] & n_mask[None, :] & valid_mask
-				output_masked = tl.where(output_mask, output, 0.0)
-				output_desc.store([offs_am, offs_bn], output_masked)
-		
-		# Work stealing: grab next work item
-		work_item_id += NUM_SMS
+    """
+    ... (kernel docstring) ...
+    """
+    start_pid = tl.program_id(axis=0)
+    
+    # Load actual number of active experts
+    num_groups = tl.load(num_active_experts_ptr)
+    total_work_items = num_groups * NUM_N_BLOCKS
+    
+    # Early exit if no work
+    if start_pid >= total_work_items:
+        return
+    
+    # --- REMOVE Static Descriptors ---
+    # lhs_desc = tl.make_tensor_descriptor(...)
+    # output_desc = tl.make_tensor_descriptor(...)
+    
+    # Pre-compute constants (hoisted)
+    num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
+    num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+    offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+    offsets_n_block = tl.arange(0, GEMM_BLOCK_SIZE_N) # Renamed
+    
+    # --- Persistent Loop: Work Stealing ---
+    work_item_id = start_pid
+    while work_item_id < total_work_items:
+        
+        # Unpack work item into (group_id, n_block_id)
+        group_pid = work_item_id // NUM_N_BLOCKS
+        n_pid = work_item_id % NUM_N_BLOCKS
+        
+        # Load expert metadata
+        gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
+        
+        if gm > 0:
+            # Load expert data
+            group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
+            start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
+            
+            # Load RHS weight pointers for this expert
+            rhs_base_ptr = tl.load(rhs_ptrs_ptr + group_idx * stride_rhs_ptrs).to(tl.pointer_type(tl.float8e4nv))
+            rhs_scale_base_ptr = tl.load(rhs_scale_ptrs_ptr + group_idx * stride_rhs_scale_ptrs).to(tl.pointer_type(tl.float32))
+            
+            # --- REMOVE DYNAMIC RHS Descriptor ---
+            # rhs_desc = tl.make_tensor_descriptor(...)
+            
+			# N-block offsets
+            offs_bn = n_pid * GEMM_BLOCK_SIZE_N
+            offs_n = offs_bn + offsets_n_block       # Absolute N offsets
+            
+            # N mask for output store (shape [1, 256])
+            n_mask_out = offs_n[None, :] < N
+            
+            # N mask for RHS load (shape [256, 1])
+            n_mask_rhs = offs_n[:, None] < N
+            
+            scale_n_idx = offs_bn // SCALE_BLOCK_SIZE_K
+            
+            # M-loop bounds
+            num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+            
+            # --- M-block loop ---
+            for sub_group_idx in range(num_sub_groups):
+                sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+                # offs_am = sub_group_start_idx # No longer needed
+                
+                remaining_rows = start_idx + gm - sub_group_start_idx
+                valid_rows = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows)
+                
+                abs_row_indices = sub_group_start_idx + offsets_m
+                m_mask = abs_row_indices[:, None] < M           # M boundary mask
+                valid_mask = (offsets_m < valid_rows)[:, None]  # Expert token mask
+                
+                # Initialize accumulator
+                acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+                
+                # --- K-block loop ---
+                for k_block_idx in range(num_k_blocks):
+                    offs_k_start = k_block_idx * GEMM_BLOCK_SIZE_K
+                    offsets_k = offs_k_start + tl.arange(0, GEMM_BLOCK_SIZE_K) # Absolute K offsets
+                    k_mask = offsets_k[None, :] < K # K boundary mask
+
+                    # Load scales (This logic was already correct)
+                    scale_offset = scale_n_idx * num_scale_k + k_block_idx
+                    rhs_scale = tl.load(rhs_scale_base_ptr + scale_offset)
+                    
+                    lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
+                                                      k_block_idx * stride_lhs_scale_k)
+                    lhs_scale_mask = m_mask & valid_mask # Correct combined mask
+                    lhs_scale = tl.load(lhs_scale_ptrs, mask=lhs_scale_mask, other=1.0)
+                    
+                    # --- START FIX: Manual Ptr + Mask (replaces TMA load) ---
+                    
+                    # 1. LHS Pointers & Load
+                    lhs_ptrs = lhs_ptr + (abs_row_indices[:, None] * stride_lhs_m + 
+                                          offsets_k[None, :] * stride_lhs_k)
+                    lhs_mask = m_mask & k_mask & valid_mask
+                    lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+
+                    # 2. RHS Pointers & Load
+                    rhs_ptrs = rhs_base_ptr + (offs_n[None, :] * stride_rhs_n + 
+                                               offsets_k[:, None] * stride_rhs_k)
+                    # This is (K, N) shape, we need (N, K) for tl.trans
+                    rhs_ptrs = rhs_base_ptr + (offs_n[:, None] * stride_rhs_n + 
+                                               offsets_k[None, :] * stride_rhs_k)
+                    rhs_mask = n_mask_rhs & k_mask
+                    rhs_fp8 = tl.load(rhs_ptrs, mask=rhs_mask, other=0.0)
+                    
+                    # --- END FIX ---
+
+                    # REMOVE: lhs = tl.where(valid_mask, lhs, 0.0)
+                    
+                    # Combined scale factors
+                    combined_scale = lhs_scale * rhs_scale
+                    
+                    # GEMM accumulation
+                    acc += tl.dot(lhs, tl.trans(rhs_fp8), out_dtype=tl.float32) * combined_scale
+                
+                # --- START FIX: Manual Ptr + Mask (replaces TMA store) ---
+                # Convert to output dtype
+                output = acc.to(tl.bfloat16)
+                
+                # Store with masking
+                output_ptrs = output_ptr + (abs_row_indices[:, None] * stride_output_m + 
+                                            offs_n[None, :] * stride_output_n)
+                
+                # Use all three masks for store
+                output_mask = m_mask & n_mask_out & valid_mask
+                
+                tl.store(output_ptrs, output, mask=output_mask)
+                
+                # --- REMOVE TMA Store ---
+                # output_masked = tl.where(output_mask, output, 0.0)
+                # output_desc.store([offs_am, offs_bn], output_masked)
+        
+        # Work stealing: grab next work item
+        work_item_id += NUM_SMS
+
 
 
 @torch.inference_mode()
