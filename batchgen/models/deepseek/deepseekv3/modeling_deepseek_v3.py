@@ -1946,7 +1946,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.down_scale_list, self.down_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, 
 			num_active_experts, # Pass the 0-dim *tensor*
-			# self.experts_per_rank
+			self.experts_per_rank
 		)
 		return res
 

@@ -353,16 +353,215 @@ class GPUKVCacheManager:
 		
 		return (k_page_ptrs, v_page_ptrs)
 
-	def update_new_token(self, k_tensor: torch.Tensor, v_tensor: Optional[torch.Tensor], sequence_ids: List[int], layer_idx: int):
+	def update_new_token(
+		self, 
+		k_tensor: torch.Tensor, 
+		v_tensor: Optional[torch.Tensor], 
+		sequence_ids: List[int], 
+		layer_idx: int
+	):
 		"""
-		This function would append the KV-Cache for the new token to its correct page(s)
+		Appends new KV cache data for newly generated tokens to their correct page(s).
+		
+		This function is called during the decode phase to write new KV pairs to the cache.
+		It handles both single-token (typical autoregressive) and multi-token (speculative
+		decoding, Medusa) generation scenarios.
+		
 		Expected k_tensor shape: [batch_size, seq_len, num_k_heads, k_head_dim]
 		Expected v_tensor shape: [batch_size, seq_len, num_v_heads, v_head_dim] or None
-
-		Note that seq_len normally equals 1 for autoregressive generation but could be >1 in multi-token prediction.
+		
+		Note: seq_len normally equals 1 for autoregressive generation but could be >1
+		in multi-token prediction scenarios.
+		
+		Args:
+			k_tensor: K cache tensor for new tokens [batch_size, seq_len, num_k_heads, k_head_dim]
+			v_tensor: V cache tensor for new tokens (optional, for non-MLA models)
+			sequence_ids: List of sequence IDs, length must match batch_size
+			layer_idx: Which layer to update (0-indexed)
+		
+		Raises:
+			ValueError: If input validation fails
+			RuntimeError: If cache not initialized or insufficient pages allocated
+		
+		Example:
+			>>> # Single token generation (batch_size=2, seq_len=1)
+			>>> k_new = torch.randn(2, 1, 8, 128, device='cuda')
+			>>> v_new = torch.randn(2, 1, 8, 128, device='cuda')
+			>>> manager.update_new_token(k_new, v_new, sequence_ids=[42, 43], layer_idx=0)
+			
+			>>> # Multi-token generation (batch_size=1, seq_len=3)
+			>>> k_new = torch.randn(1, 3, 8, 128, device='cuda')
+			>>> manager.update_new_token(k_new, None, sequence_ids=[42], layer_idx=0)
 		"""
-
-
+		# --- 1. Validate Inputs ---
+		if self.k_cache_gpu is None:
+			raise RuntimeError(
+				f"{self.__class__.__name__}: GPU KV cache not initialized. Call init() first."
+			)
+		
+		if layer_idx < 0 or layer_idx >= self.config.num_layers:
+			raise ValueError(
+				f"{self.__class__.__name__}: Invalid layer_idx {layer_idx}. "
+				f"Must be in range [0, {self.config.num_layers})"
+			)
+		
+		# Validate tensor dimensions
+		if k_tensor.dim() != 4:
+			raise ValueError(
+				f"{self.__class__.__name__}: Expected k_tensor to have 4 dimensions "
+				f"[batch_size, seq_len, num_k_heads, k_head_dim], got shape {k_tensor.shape}"
+			)
+		
+		batch_size, seq_len, num_k_heads, k_head_dim = k_tensor.shape
+		
+		# Validate batch size matches sequence_ids
+		if len(sequence_ids) != batch_size:
+			raise ValueError(
+				f"{self.__class__.__name__}: Batch size mismatch. "
+				f"k_tensor batch_size={batch_size}, len(sequence_ids)={len(sequence_ids)}"
+			)
+		
+		# Validate K tensor dimensions match config
+		if num_k_heads != self.config.num_k_heads or k_head_dim != self.config.k_head_dim:
+			raise ValueError(
+				f"{self.__class__.__name__}: K tensor dimension mismatch. "
+				f"Expected (num_k_heads={self.config.num_k_heads}, k_head_dim={self.config.k_head_dim}), "
+				f"got ({num_k_heads}, {k_head_dim})"
+			)
+		
+		# Validate V tensor if provided
+		if v_tensor is not None:
+			if self.v_cache_gpu is None:
+				raise ValueError(
+					f"{self.__class__.__name__}: V tensor provided but V cache not initialized "
+					"(running in K-only mode, e.g., MLA)"
+				)
+			
+			if v_tensor.dim() != 4:
+				raise ValueError(
+					f"{self.__class__.__name__}: Expected v_tensor to have 4 dimensions, "
+					f"got shape {v_tensor.shape}"
+				)
+			
+			v_batch_size, v_seq_len, num_v_heads, v_head_dim = v_tensor.shape
+			
+			if v_batch_size != batch_size or v_seq_len != seq_len:
+				raise ValueError(
+					f"{self.__class__.__name__}: V tensor shape mismatch. "
+					f"Expected batch_size={batch_size}, seq_len={seq_len}, "
+					f"got batch_size={v_batch_size}, seq_len={v_seq_len}"
+				)
+			
+			if num_v_heads != self.config.num_v_heads or v_head_dim != self.config.v_head_dim:
+				raise ValueError(
+					f"{self.__class__.__name__}: V tensor dimension mismatch. "
+					f"Expected (num_v_heads={self.config.num_v_heads}, v_head_dim={self.config.v_head_dim}), "
+					f"got ({num_v_heads}, {v_head_dim})"
+				)
+		elif self.v_cache_gpu is not None:
+			# V cache exists but no tensor provided - this might be intentional (MLA mode)
+			# Just log a debug message
+			self.logger.debug(
+				f"V cache exists but v_tensor is None for layer {layer_idx}. "
+				"Assuming K-only update."
+			)
+		
+		# Validate device
+		if k_tensor.device != self.device:
+			raise ValueError(
+				f"{self.__class__.__name__}: K tensor on wrong device. "
+				f"Expected {self.device}, got {k_tensor.device}"
+			)
+		
+		if v_tensor is not None and v_tensor.device != self.device:
+			raise ValueError(
+				f"{self.__class__.__name__}: V tensor on wrong device. "
+				f"Expected {self.device}, got {v_tensor.device}"
+			)
+		
+		# Validate all sequences exist and have pages allocated
+		for seq_id in sequence_ids:
+			if seq_id not in self.page_table:
+				raise ValueError(
+					f"{self.__class__.__name__}: Sequence {seq_id} not found in page table"
+				)
+			
+			if not self.page_table[seq_id]:
+				raise ValueError(
+					f"{self.__class__.__name__}: Sequence {seq_id} has no pages allocated"
+				)
+		
+		# --- 2. Update Cache for Each Sequence in Batch ---
+		for batch_idx, seq_id in enumerate(sequence_ids):
+			# Get current token count for this sequence
+			current_tokens = self.sequence_lengths.get(seq_id, 0)
+			
+			# Extract K and V tensors for this sequence
+			# Shape: [seq_len, num_k_heads, k_head_dim]
+			k_seq = k_tensor[batch_idx]
+			v_seq = v_tensor[batch_idx] if v_tensor is not None else None
+			
+			# Get allocated pages for this sequence
+			page_indices = self.page_table[seq_id]
+			
+			# Calculate current capacity
+			current_capacity = len(page_indices) * self.config.page_size_tokens
+			
+			# Check if we need more pages
+			new_total_tokens = current_tokens + seq_len
+			required_pages = math.ceil(new_total_tokens / self.config.page_size_tokens)
+			
+			if required_pages > len(page_indices):
+				raise RuntimeError(
+					f"{self.__class__.__name__}: Insufficient pages for sequence {seq_id}. "
+					f"Current pages: {len(page_indices)}, Required: {required_pages}. "
+					f"Current tokens: {current_tokens}, New tokens: {seq_len}. "
+					f"Call append_tokens() or allocate_pages() before update_new_token()."
+				)
+			
+			# --- 3. Write Tokens to Pages ---
+			tokens_written = 0
+			
+			for token_idx in range(seq_len):
+				# Calculate absolute token position in the sequence
+				absolute_token_pos = current_tokens + token_idx
+				
+				# Determine which page and offset within that page
+				page_idx_in_seq = absolute_token_pos // self.config.page_size_tokens
+				offset_in_page = absolute_token_pos % self.config.page_size_tokens
+				
+				# Get the actual GPU page index
+				gpu_page_idx = page_indices[page_idx_in_seq]
+				
+				# Write K cache
+				# Source: k_seq[token_idx] has shape [num_k_heads, k_head_dim]
+				# Destination: self.k_cache_gpu[layer_idx, gpu_page_idx, offset_in_page]
+				self.k_cache_gpu[layer_idx, gpu_page_idx, offset_in_page].copy_(
+					k_seq[token_idx]
+				)
+				
+				# Write V cache if applicable
+				if v_seq is not None and self.v_cache_gpu is not None:
+					self.v_cache_gpu[layer_idx, gpu_page_idx, offset_in_page].copy_(
+						v_seq[token_idx]
+					)
+				
+				tokens_written += 1
+			
+			# --- 4. Update Bookkeeping ---
+			# Update sequence length tracking
+			self.sequence_lengths[seq_id] = new_total_tokens
+			
+			self.logger.debug(
+				f"Updated {tokens_written} tokens for seq {seq_id} at layer {layer_idx}. "
+				f"Token range: [{current_tokens}, {new_total_tokens}), "
+				f"Pages used: {page_idx_in_seq + 1}/{len(page_indices)}"
+			)
+		
+		self.logger.debug(
+			f"Batch update complete for layer {layer_idx}: "
+			f"{batch_size} sequences, {seq_len} tokens each"
+		)
 
 
 	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
