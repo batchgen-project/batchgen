@@ -1799,7 +1799,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# res = self.grouped_dequant_moe_fp8_(input_x, input_eids)
 		
 		
-		res = self.grouped_dequant_moe_fp8_(
+		res = self.grouped_dequant_moe_fp8(
 					input_x,          # Oversized
 					input_eids,         # Oversized
 					expert_counts,    # [num_local_experts] (on GPU)
