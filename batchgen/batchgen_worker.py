@@ -27,11 +27,15 @@ from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausal
 from tqdm import trange
 import gc
 from datetime import timedelta
+from dataclasses import dataclass
+
+
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
-from dataclasses import dataclass
+from batchgen.kv_cache.gpu_paged_kv_manager import GPUKVCacheManager
+
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -675,6 +679,12 @@ class BatchGenWorker:
 			# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 			if self.engine_config.Basic_Config.attn_mode == 3:
 				# FULL GPU DECODING MODE.
+				# Need to instantiate GPU KV-Cache Here. 
+				# gpu_kv_cache = GPUKVCacheManager(self.engine_config).init(self.core_engine)
+				# for query_idx in self.model_batches[model_batch_idx]:
+				# 	gpu_kv_cache.allocate_pages(query_idx, self.max_input_length + self.max_decoding_length)
+				# 	gpu_kv_cache.load_offloaded_context(query_idx, self.max_input_length) # Load offloaded context kv-cache to gpu.
+
 				if self.model_config.model_type == "deepseek_v3":
 					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 					# Pad the kv cache to be multiple of 64
@@ -1553,18 +1563,18 @@ class BatchGenWorker:
 		del self.model
 		
 		# Step 4: Clear optimizer if exists
-		if hasattr(self, 'optimizer'):
-			self.optimizer.zero_grad(set_to_none=True)
-			del self.optimizer
+		# if hasattr(self, 'optimizer'):
+		# 	self.optimizer.zero_grad(set_to_none=True)
+		# 	del self.optimizer
 		
-		# Step 5: Clear any cached computational graphs
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-			torch.cuda.synchronize()
+		# # Step 5: Clear any cached computational graphs
+		# if torch.cuda.is_available():
+		# 	torch.cuda.empty_cache()
+		# 	torch.cuda.synchronize()
 		
-		# Step 6: Aggressive garbage collection
-		import gc
-		for _ in range(3):  # Multiple passes can help
-			gc.collect()
-			if torch.cuda.is_available():
-				torch.cuda.empty_cache()
+		# # Step 6: Aggressive garbage collection
+		# import gc
+		# for _ in range(3):  # Multiple passes can help
+		# 	gc.collect()
+		# 	if torch.cuda.is_available():
+		# 		torch.cuda.empty_cache()

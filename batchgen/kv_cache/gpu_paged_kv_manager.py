@@ -17,6 +17,16 @@ class GPUKVCacheManager:
 	It executes low-level page allocation and copy commands.
 	Not include any high-level scheduling logic.
 	This class supports GQA, MQA, and MLA-style layouts throught its configuration.
+
+	Main APIs:
+		- init(): Instantiate GPU KV cache tensors and allocator states.
+		- allocate_pages(sequence_id: int, num_tokens: int) -> List[int]:
+			Allocates pages for a sequence based on number of tokens.
+		- free_sequence(sequence_id: int):
+			Frees all pages associated with a sequence.
+		- get_layer_kv_with_page_table(layer_idx: int, sequence_ids: List[int]) 
+			-> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+			Returns KV cache tensors for a layer along with the page table for a batch.
 	"""
 	def __init__(self, engine_config):
 		self.config = engine_config.gpu_kv_config
@@ -31,10 +41,12 @@ class GPUKVCacheManager:
 		self.sequence_lengths: Dict[int, int] = {}  # sequence_id -> current sequence length
 
 		self.logger = logging.getLogger(self.__class__.__name__)
+		self.core_engine = None # To be set in init()
 
 	"""Public APIs"""
-	def init(self):
+	def init(self, core_engine):
 		"""Instantiate GPU KV tensors and allocator states"""
+		self.core_engine = core_engine
 		# --- 1. Instantiate K-Cache ---
 		# Shape: [num_layers, num_gpu_pages, page_size, num_k_heads, k_head_dim]
 		# For MLA of DeepSeek-V3, this would be num_k_heads=1, k_head_dim=576.
@@ -74,43 +86,6 @@ class GPUKVCacheManager:
 		self.free_pages: List[int] = list(range(self.num_total_pages))
 		self.page_table: Dict[int, List[int]] = {}  # sequence_id -> List of allocated page IDs
 	
-	# --- 1. Page Management Primitives ---
-	# def allocate_pages(self, sequence_id: int, num_pages: int) -> List[int]:
-	# 	"""
-	# 	Allocates 'num_pages' from the free list for a sequence.
-		
-	# 	This method asssumes the caller (upper-level scheduler) has already ensured
-	# 	there is enough free pages.
-
-	# 	Args:
-	# 		sequence_id (int): Unique identifier for the sequence.
-	# 		num_pages (int): Number of pages to allocate.
-		
-	# 	Returns:
-	# 		List[int]: List of allocated page indices.
-
-	# 	Raises:
-	# 		RuntimeError: If not enough free pages are available indicating a scheduler logic error.
-
-	# 	"""
-	# 	if len(self.free_pages) < num_pages:
-	# 		self.logger.error(
-	# 			f"Not enough free pages to allocate {num_pages} pages for sequence {sequence_id}."
-	# 			f" Available: {len(self.free_pages)}. This indicates a scheduler logic error."
-	# 		)
-	# 		raise RuntimeError(f"{self.__class__.__name__}: Insufficient free pages for allocation.")
-
-	# 	# Pop Pages from the free list(LIFO).
-	# 	new_pages = [self.free_pages.pop() for _ in range(num_pages)]
-
-	# 	# Add to the page table
-	# 	if sequence_id not in self.page_table:
-	# 		self.page_table[sequence_id] = []
-	# 	self.page_table[sequence_id].extend(new_pages)
-		
-	# 	self.logger.debug(f"Allocated {num_pages} new pages for seq {sequence_id}: {new_pages}")
-	# 	return new_pages
-
 	# --- 1. Page Management Primitives ---
 	def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
 		"""
@@ -181,6 +156,198 @@ class GPUKVCacheManager:
 		)
 		
 		return new_pages
+
+	def load_offloaded_context(self, sequence_id: int, context_length: int):
+		"""
+		Load offloaded context KV cache from CPU to GPU for a sequence.
+
+		Args:
+			sequence_id (int): Unique identifier for the sequence.
+			context_length (int): Number of tokens in the context to load.
+
+		Note: the pages should have already been allocated for this sequence.
+		"""
+		# --- 1. Verify Sufficient Pages Allocated ---
+		required_pages = math.ceil(context_length / self.config.page_size_tokens)
+		allocated_pages = len(self.page_table[sequence_id])
+		if allocated_pages < required_pages:
+			raise ValueError(
+				f"{self.__class__.__name__}: Insufficient pages for sequence {sequence_id}. "
+				f"Required: {required_pages} pages for {context_length} tokens, "
+				f"Allocated: {allocated_pages} pages. "
+				f"Allocate more pages before loading context."
+			)		
+		self.logger.debug(
+			f"Loading {context_length} tokens for sequence {sequence_id} "
+			f"from CPU to GPU ({required_pages} pages)"
+		)
+
+		# --- 2. Get Page Pointers ---
+		try:
+			# Get GPU page pointers for this sequence
+			gpu_k_page_ptrs, gpu_v_page_ptrs = self.get_context_kv_page_ptrs(
+				sequence_id, context_length
+			)
+			
+			# Get CPU page pointers from the core engine (CPU KV cache manager)
+			cpu_k_page_ptrs, cpu_v_page_ptrs = self.core_engine.get_context_kv_page_ptrs(
+				sequence_id, context_length
+			)
+		except Exception as e:
+			self.logger.error(
+				f"Failed to get page pointers for sequence {sequence_id}: {e}"
+			)
+			raise RuntimeError(
+				f"{self.__class__.__name__}: Failed to retrieve page pointers for swap-in"
+			) from e
+	
+		# --- 3. Perform Blocking Copy (K Cache) ---
+		try:
+			self.logger.debug(
+				f"Copying K cache: {len(cpu_k_page_ptrs)} pages "
+				f"({len(cpu_k_page_ptrs) * self.config.k_page_byte_size} bytes)"
+			)
+			
+			self.core_engine.blocking_h2d_kv_page_copy(
+				cpu_k_page_ptrs, 
+				gpu_k_page_ptrs, 
+				self.config.k_page_byte_size
+			)
+			
+		except Exception as e:
+			self.logger.error(
+				f"Failed to copy K cache for sequence {sequence_id}: {e}"
+			)
+			raise RuntimeError(
+				f"{self.__class__.__name__}: K cache copy failed during swap-in"
+			) from e
+		
+		# --- 4. Perform Blocking Copy (V Cache, if applicable) ---
+		if gpu_v_page_ptrs is not None and cpu_v_page_ptrs is not None:
+			try:
+				self.logger.debug(
+					f"Copying V cache: {len(cpu_v_page_ptrs)} pages "
+					f"({len(cpu_v_page_ptrs) * self.config.v_page_byte_size} bytes)"
+				)
+				
+				self.core_engine.blocking_h2d_kv_page_copy(
+					cpu_v_page_ptrs, 
+					gpu_v_page_ptrs, 
+					self.config.v_page_byte_size
+				)
+				
+			except Exception as e:
+				self.logger.error(
+					f"Failed to copy V cache for sequence {sequence_id}: {e}"
+				)
+				raise RuntimeError(
+					f"{self.__class__.__name__}: V cache copy failed during swap-in"
+				) from e
+
+		# --- 5. Update Bookkeeping ---
+		self.sequence_lengths[sequence_id] = context_length
+
+	def get_context_kv_page_ptrs(self, sequence_id: int, layer_idx: int, context_length: int) \
+			-> Tuple[List[int], Optional[List[int]]]:
+		"""
+		Get GPU page pointers for a specific layer for loading context.
+		
+		This is a helper method that retrieves page pointers for a single layer
+		for a given sequence and context length.
+		
+		Args:
+			sequence_id: Unique identifier for the sequence
+			layer_idx: Which layer to get pointers for (0-indexed)
+			context_length: Number of tokens in the context
+		
+		Returns:
+			Tuple of (k_page_ptrs, v_page_ptrs) where:
+			- k_page_ptrs: List of K cache page pointers for this layer [page0, page1, ...]
+			- v_page_ptrs: List of V cache page pointers for this layer, or None if not applicable
+		
+		Raises:
+			ValueError: If sequence not found, layer invalid, or insufficient pages
+		
+		Example:
+			>>> # Get pointers for layer 0 to load 150 tokens
+			>>> k_ptrs, v_ptrs = manager.get_context_kv_page_ptrs(42, layer_idx=0, context_length=150)
+			>>> # If page_size=64, k_ptrs will have 3 pointers (ceil(150/64)=3 pages)
+		"""
+
+		# --- 1. Input Validation ---
+		if sequence_id not in self.page_table:
+			raise ValueError(
+				f"{self.__class__.__name__}: Sequence {sequence_id} not found in page table"
+			)
+		
+		if layer_idx < 0 or layer_idx >= self.config.num_layers:
+			raise ValueError(
+				f"{self.__class__.__name__}: Invalid layer_idx {layer_idx}. "
+				f"Must be in range [0, {self.config.num_layers})"
+			)
+		
+		if context_length <= 0:
+			raise ValueError(
+				f"{self.__class__.__name__}: context_length must be positive, got {context_length}"
+			)
+		
+		# Calculate required pages
+		required_pages = math.ceil(context_length / self.config.page_size_tokens)
+		allocated_pages = len(self.page_table[sequence_id])
+		
+		if required_pages > allocated_pages:
+			raise ValueError(
+				f"{self.__class__.__name__}: Insufficient pages for sequence {sequence_id}. "
+				f"Need {required_pages} pages for {context_length} tokens, "
+				f"have {allocated_pages} pages allocated"
+			)
+		
+		# --- 2. Gather Page Pointers for This Layer ---
+		# Get the page indices allocated to this sequence (only what we need)
+		page_indices = self.page_table[sequence_id][:required_pages]
+		
+		# Collect K cache page pointers for this layer
+		k_page_ptrs = []
+		for page_idx in page_indices:
+			# Get the page tensor for this layer and page
+			# Shape: [page_size_tokens, num_k_heads, k_head_dim]
+			k_page = self.k_cache_gpu[layer_idx, page_idx]
+			
+			# Validate contiguity
+			if not k_page.is_contiguous():
+				raise RuntimeError(
+					f"{self.__class__.__name__}: K cache page {page_idx} at layer {layer_idx} "
+					"is not contiguous"
+				)
+			
+			k_page_ptrs.append(k_page.data_ptr())
+		
+		# Collect V cache page pointers (if applicable)
+		v_page_ptrs = None
+		if self.v_cache_gpu is not None:
+			v_page_ptrs = []
+			for page_idx in page_indices:
+				# Shape: [page_size_tokens, num_v_heads, v_head_dim]
+				v_page = self.v_cache_gpu[layer_idx, page_idx]
+				
+				# Validate contiguity
+				if not v_page.is_contiguous():
+					raise RuntimeError(
+						f"{self.__class__.__name__}: V cache page {page_idx} at layer {layer_idx} "
+						"is not contiguous"
+					)
+				
+				v_page_ptrs.append(v_page.data_ptr())
+		
+		self.logger.debug(
+			f"Retrieved {len(k_page_ptrs)} page pointers for sequence {sequence_id}, "
+			f"layer {layer_idx}, context_length {context_length}"
+		)
+		
+		return (k_page_ptrs, v_page_ptrs)
+		
+
+
 
 	def free_sequence(self, sequence_id: int):
 		"""
