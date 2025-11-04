@@ -1849,7 +1849,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 	# 	return group_size, activated_group_idx, group_start_indices
 
-	def grouped_dequant_moe_fp8_bak(self, x, eids):
+	def grouped_dequant_moe_fp8(self, x, eids):
 		# group_size, activated_group_idx, group_start_indices = self.expert_bincount(
 		# 	eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
 		# )
@@ -1872,7 +1872,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			group_size, activated_group_idx, group_start_indices, num_active_experts, self.experts_per_rank
 		)	
 		intermediate, intermediate_scale = act_quant(intermediate)
-		res = fp8_grouped_gemm_persistent_tma(
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
@@ -1880,7 +1880,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		return res
 
-	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
+	def grouped_dequant_moe_fp8_(self, x, eids, expert_counts, expert_offsets):
 		# 'x' and 'eids' are the oversized tensors.
 		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
 
