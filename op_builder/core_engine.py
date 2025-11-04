@@ -1,7 +1,9 @@
-from .builder import CUDAOpBuilder  # Change from OpBuilder
+from .builder import CUDAOpBuilder
+
 batchgen_CORE_ROOT = "core/"
 
-class CoreEngineBuilder(CUDAOpBuilder):  # Change from OpBuilder
+
+class CoreEngineBuilder(CUDAOpBuilder):
     BUILD_VAR = "MOE_BUILD_CORE_ENGINE"
     NAME = "core_engine"
 
@@ -18,8 +20,8 @@ class CoreEngineBuilder(CUDAOpBuilder):  # Change from OpBuilder
             f"{batchgen_CORE_ROOT}/batchgen.cpp",
             f"{batchgen_CORE_ROOT}/DtoH_Engine/DtoH_Engine.cpp",
             f"{batchgen_CORE_ROOT}/Hetero_Attn/Hetero_Attn.cpp",
-            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cpp",
-            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine_Kernels.cu",  
+            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cu",
+            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine_Kernels.cu",  # Your CUDA kernel
             f"{batchgen_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
             f"{batchgen_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
             f"{batchgen_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
@@ -33,14 +35,16 @@ class CoreEngineBuilder(CUDAOpBuilder):  # Change from OpBuilder
     def include_paths(self):
         return ["core/", "external"]
 
-    # Remove the cxx_args() method or simplify it
     def cxx_args(self):
-        args = super().cxx_args()  # Get base CUDA args
+        """C++ compiler flags - DON'T call super() to avoid conflicts"""
         CPU_ARCH = self.cpu_arch()
         SIMD_WIDTH = self.simd_width()
-        args += [
-            "-Wall",
+        
+        args = [
             "-O2",
+            "-std=c++17",  # Must be C++17 for PyTorch
+            "-fPIC",
+            "-Wall",
             "-fipa-pta",
             "-ffast-math",
             "-fno-unsafe-math-optimizations",
@@ -55,11 +59,11 @@ class CoreEngineBuilder(CUDAOpBuilder):  # Change from OpBuilder
 
     def nvcc_args(self):
         """CUDA compiler flags for .cu files"""
-        args = super().nvcc_args()  # Get base compute capabilities
+        args = super().nvcc_args()  # Get compute capabilities from base class
         args += [
             "-O3",
             "--use_fast_math",
-            "-std=c++17",
+            "-std=c++17",  # Match C++ standard
         ]
         return args
 
@@ -70,7 +74,7 @@ class CoreEngineBuilder(CUDAOpBuilder):  # Change from OpBuilder
             '-lcudart',
             '-lcublas',
             '-lpthread',
-            '-ltcmalloc',
+            # '-ltcmalloc',
             '-lcufile',
         ]
 
