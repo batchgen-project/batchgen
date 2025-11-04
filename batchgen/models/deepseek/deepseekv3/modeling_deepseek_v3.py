@@ -1940,13 +1940,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		intermediate, intermediate_scale = act_quant(intermediate)
 		# fp8_grouped_gemm_persistent_tma
 		# fused_dequant_grouped_gemm_fp8_fp8_triton
-		res = fp8_grouped_gemm_persistent_tma(
+		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, 
 			num_active_experts, # Pass the 0-dim *tensor*
-			self.experts_per_rank
+			# self.experts_per_rank
 		)
 		return res
 
