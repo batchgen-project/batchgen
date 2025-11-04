@@ -19,7 +19,7 @@ class CoreEngineBuilder(CUDAOpBuilder):  # Change from OpBuilder
             f"{batchgen_CORE_ROOT}/DtoH_Engine/DtoH_Engine.cpp",
             f"{batchgen_CORE_ROOT}/Hetero_Attn/Hetero_Attn.cpp",
             f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cpp",
-            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine_kernels.cu",  # Your CUDA kernel
+            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine_Kernels.cu",  
             f"{batchgen_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
             f"{batchgen_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
             f"{batchgen_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
