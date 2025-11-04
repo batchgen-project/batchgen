@@ -829,7 +829,7 @@ def fused_fp8_moe_stage_1_baseline_v2(
             # Large N (Mixtral up proj, Llama): larger tiles
             gate_gemm_block_size = [64, 128, 128]
         
-        print(f"[Auto-tuned] block_size={gate_gemm_block_size} for shape M={M}, N={N}, K={K}")
+        # print(f"[Auto-tuned] block_size={gate_gemm_block_size} for shape M={M}, N={N}, K={K}")
     
     assert gate_gemm_block_size[2] == scale_block_size
     
