@@ -1,44 +1,7 @@
-# ---------------------------------------------------------------------------- #
-#  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
-#                                                                               #
-#  licensed under the apache license, version 2.0 (the "license");              #
-#  you may not use this file except in compliance with the license.             #
-#                                                                               #
-#  you may obtain a copy of the license at                                      #
-#                                                                               #
-#                  http://www.apache.org/licenses/license-2.0                   #
-#                                                                               #
-#  unless required by applicable law or agreed to in writing, software          #
-#  distributed under the license is distributed on an "as is" basis,            #
-#  without warranties or conditions of any kind, either express or implied.     #
-#  see the license for the specific language governing permissions and          #
-#  limitations under the license.                                               #
-# ---------------------------------------------------------------------------- #
-
-#!/usr/bin/env python3
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-
-# op_builder/async_io.py
-#
-# Part of the DeepSpeed Project, under the Apache-2.0 License.
-# See https://github.com/microsoft/DeepSpeed/blob/master/LICENSE for license information.
-# SPDX-License-Identifier: Apache-2.0
-
-# MoE-Infinity: replaced AsyncIOBuilder with CoreEngineBuilder
-
-import glob
-import os
-
-from .builder import OpBuilder
-
+from .builder import CUDAOpBuilder  # Change from OpBuilder
 batchgen_CORE_ROOT = "core/"
 
-
-class CoreEngineBuilder(OpBuilder):
+class CoreEngineBuilder(CUDAOpBuilder):  # Change from OpBuilder
     BUILD_VAR = "MOE_BUILD_CORE_ENGINE"
     NAME = "core_engine"
 
@@ -56,7 +19,7 @@ class CoreEngineBuilder(OpBuilder):
             f"{batchgen_CORE_ROOT}/DtoH_Engine/DtoH_Engine.cpp",
             f"{batchgen_CORE_ROOT}/Hetero_Attn/Hetero_Attn.cpp",
             f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cpp",
-            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine_Kernels.cu", 
+            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine_kernels.cu",  # Your CUDA kernel
             f"{batchgen_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
             f"{batchgen_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
             f"{batchgen_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
@@ -70,40 +33,46 @@ class CoreEngineBuilder(OpBuilder):
     def include_paths(self):
         return ["core/", "external"]
 
+    # Remove the cxx_args() method or simplify it
     def cxx_args(self):
-        # -O0 for improved debugging, since performance is bound by I/O
+        args = super().cxx_args()  # Get base CUDA args
         CPU_ARCH = self.cpu_arch()
         SIMD_WIDTH = self.simd_width()
-        return [
+        args += [
             "-Wall",
             "-O2",
-            "-std=c++17",
             "-fipa-pta",
             "-ffast-math",
             "-fno-unsafe-math-optimizations",
             "-fprefetch-loop-arrays",
             "-fopenmp",
-            "-shared",
-            "-fPIC",
             "-Wno-reorder",
-            # '-DSPDLOG_HEADER_ONLY',
             CPU_ARCH,
-            "-fopenmp",
             SIMD_WIDTH,
-            "-I/usr/local/cuda/include",
-            "-L/usr/local/cuda/lib64",
             "-D_GLIBCXX_USE_CXX11_ABI=1",
-            "-lcuda",
-            "-lcudart",
-            "-lcublas",
-            "-lpthread",
-            "-ltcmalloc",
-            "-lcufile",
-            "-lnuma",
         ]
+        return args
+
+    def nvcc_args(self):
+        """CUDA compiler flags for .cu files"""
+        args = super().nvcc_args()  # Get base compute capabilities
+        args += [
+            "-O3",
+            "--use_fast_math",
+            "-std=c++17",
+        ]
+        return args
 
     def extra_ldflags(self):
-        return ['-lnuma']
+        return [
+            '-lnuma',
+            '-lcuda',
+            '-lcudart',
+            '-lcublas',
+            '-lpthread',
+            '-ltcmalloc',
+            '-lcufile',
+        ]
 
     def is_compatible(self, verbose=True):
         return super().is_compatible(verbose)

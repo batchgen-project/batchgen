@@ -478,7 +478,7 @@ void HtoD_Engine::batched_page_copy(const std::vector<void*>& gpu_ptrs,
     // One block per page, 256 threads per block
     constexpr int THREADS_PER_BLOCK = 256;
     batched_page_copy_kernel<<<num_pages, THREADS_PER_BLOCK, 0, this->HtoD_stream>>>(
-        d_src_ptrs, d_dst_ptrs, page_size, num_pages
+        d_src_ptrs, d_dst_ptrs, page_byte_size, num_pages
     );
 
     // Check for kernel launch errors
