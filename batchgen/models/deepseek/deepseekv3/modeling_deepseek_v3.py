@@ -1925,7 +1925,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		x_quant, x_scale = act_quant(x_sliced)
 		# fused_fp8_moe_stage_1_persistent_v2
 		# fused_fp8_moe_stage_1
-		intermediate = fused_fp8_moe_stage_1_baseline_v2(
+		intermediate = fused_fp8_moe_stage_1_optimized(
 			x_quant, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
