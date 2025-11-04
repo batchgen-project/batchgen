@@ -1105,7 +1105,7 @@ from ....moe.fused_dequant_moe import (
 	fused_dequant_weighted_moe_stage_1, 
 	fused_fp8_moe_stage_1
 )
-from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_baseline_v2
+from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_baseline_v2, fused_fp8_moe_stage_1_tma
 from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized, fused_dequant_grouped_gemm_fp8_fp8_fp32_triton
 from ....attention.mla.fa3_backend import act_quant
 class DeepseekV3MoE_Decoding(nn.Module):
@@ -1926,8 +1926,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
 		x_quant, x_scale = act_quant(x_sliced)
 		# fused_fp8_moe_stage_1_persistent_v2
-		# fused_fp8_moe_stage_1
-		intermediate = fused_fp8_moe_stage_1_optimized(
+		# fused_fp8_moe_stage_1_tma
+		# fused_fp8_moe_stage_1_optimized
+		intermediate = fused_fp8_moe_stage_1_tma(
 			x_quant, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,

@@ -867,6 +867,259 @@ def fused_fp8_moe_stage_1_baseline_v2(
     return output
 
 
+
+# =============================================================================
+# TMA Support Detection
+# =============================================================================
+
+def supports_tma():
+    return (triton.runtime.driver.active.get_current_target().backend == "cuda" and 
+            torch.cuda.get_device_capability()[0] >= 9)
+
+HAS_TENSOR_DESC = supports_tma() and hasattr(tl, "make_tensor_descriptor")
+
+
+# =============================================================================
+# TMA-Optimized Fused Two-GEMM Kernel (SM_90a)
+# =============================================================================
+
+@triton.jit
+def fused_fp8_moe_parallel_experts_kernel_tma(
+    lhs_ptr, lhs_scale_ptr,
+    gate_ptrs_ptr, up_ptrs_ptr,
+    gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+    group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+    num_active_experts_ptr,
+    output_ptr,
+    M, N: tl.constexpr, K: tl.constexpr,
+    stride_lhs_m, stride_lhs_k,
+    stride_lhs_scale_m, stride_lhs_scale_k,
+    stride_gate_n, stride_gate_k,
+    stride_up_n, stride_up_k,
+    stride_output_m, stride_output_n,
+    stride_group_idx, stride_group_sizes, stride_group_start_indices,
+    stride_weight_ptrs, stride_scale_ptrs,
+    GEMM_BLOCK_SIZE_M: tl.constexpr,
+    GEMM_BLOCK_SIZE_N: tl.constexpr,
+    GEMM_BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_SIZE_K: tl.constexpr,
+):
+    """
+    TMA-OPTIMIZED: 2D grid parallelizes over BOTH experts and N-blocks.
+    Uses TWO TMA descriptors for gate_proj and up_proj weights.
+    
+    Key optimizations:
+    1. TMA for gate and up weight loads (hardware-accelerated)
+    2. Removed nested quantization loop (1:1 mapping)
+    3. Hoisted mask computations outside K-loop
+    4. Simplified scale loading
+    """
+    # 2D program IDs
+    group_pid = tl.program_id(axis=0)  # Which expert
+    n_pid = tl.program_id(axis=1)      # Which N-block
+    
+    # Bounds check
+    num_groups = tl.load(num_active_experts_ptr)
+    if group_pid >= num_groups:
+        return
+    
+    # Load THIS expert's metadata
+    gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
+    if gm == 0:
+        return
+    
+    group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
+    start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
+    
+    # Load THIS expert's weight pointers
+    gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+    up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+    gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+    up_scale_base_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+    
+    # ============================================================================
+    # TMA OPTIMIZATION: Create descriptors for gate and up weights
+    # ============================================================================
+    gate_desc = tl.make_tensor_descriptor(
+        gate_base_ptr,
+        shape=[N, K],
+        strides=[stride_gate_n, stride_gate_k],
+        block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K],
+    )
+    
+    up_desc = tl.make_tensor_descriptor(
+        up_base_ptr,
+        shape=[N, K],
+        strides=[stride_up_n, stride_up_k],
+        block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K],
+    )
+    # ============================================================================
+    
+    # N-block offsets (fixed for this program) - HOISTED
+    offsets_n_base = n_pid * GEMM_BLOCK_SIZE_N
+    
+    # Scale N index (fixed for this program) - HOISTED
+    num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
+    scale_n_idx = n_pid * GEMM_BLOCK_SIZE_N // SCALE_BLOCK_SIZE_K
+    
+    # M-dimension offsets - HOISTED
+    offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+    
+    # Process all M-blocks for THIS expert
+    num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+    
+    for sub_group_idx in range(num_sub_groups):
+        sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+        remaining_rows_in_group = start_idx + gm - sub_group_start_idx
+        valid_rows_this_block = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows_in_group)
+        
+        abs_row_indices = sub_group_start_idx + offsets_m
+        
+        # HOISTED: Compute M-dimension masks ONCE per M-block
+        m_mask = abs_row_indices < M  # [M]
+        valid_mask = offsets_m < valid_rows_this_block  # [M]
+        m_base_mask = m_mask & valid_mask  # [M] - Combined M-dimension mask
+        
+        # Initialize accumulators
+        gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+        up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+        
+        # K-loop: SIMPLIFIED! One K-block = one scale block
+        num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+
+        for k_block_idx in range(num_k_blocks):
+            k_start = k_block_idx * GEMM_BLOCK_SIZE_K
+            offsets_k = k_start + tl.arange(0, GEMM_BLOCK_SIZE_K)
+            k_mask = offsets_k < K  # [K]
+            
+            # Load scales - direct mapping
+            scale_k_idx = k_block_idx
+            scale_offset = scale_n_idx * num_scale_k + scale_k_idx
+            
+            gate_scale = tl.load(gate_scale_base_ptr + scale_offset)
+            up_scale = tl.load(up_scale_base_ptr + scale_offset)
+            
+            # Load LHS scale
+            lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
+                                              scale_k_idx * stride_lhs_scale_k)
+            lhs_scale = tl.load(lhs_scale_ptrs, mask=m_mask[:, None], other=1.0)
+            
+            # Load LHS data (activations)
+            lhs_ptrs = lhs_ptr + (abs_row_indices[:, None] * stride_lhs_m + offsets_k[None, :] * stride_lhs_k)
+            lhs_mask = m_base_mask[:, None] & k_mask[None, :]  # [M, K]
+            lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+            
+            # ============================================================================
+            # TMA LOAD: Hardware-accelerated loads for gate and up weights
+            # ============================================================================
+            gate_fp8 = gate_desc.load([offsets_n_base, k_start])
+            up_fp8 = up_desc.load([offsets_n_base, k_start])
+            # ============================================================================
+            
+            # Fused multiply-add with scales
+            gate_acc += tl.dot(lhs, tl.trans(gate_fp8), out_dtype=tl.float32) * lhs_scale * gate_scale
+            up_acc += tl.dot(lhs, tl.trans(up_fp8), out_dtype=tl.float32) * lhs_scale * up_scale
+        
+        # SiLU activation: silu(x) = x / (1 + exp(-x))
+        gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
+        output_acc = gate_activated * up_acc
+        output = output_acc.to(tl.bfloat16)
+        
+        # Store results
+        offs_output_m = sub_group_start_idx + tl.arange(0, GEMM_BLOCK_SIZE_M)
+        offs_output_n = n_pid * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
+        
+        output_ptrs = output_ptr + (offs_output_m[:, None] * stride_output_m + 
+                                    offs_output_n[None, :] * stride_output_n)
+        output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & valid_mask[:, None]
+        
+        tl.store(output_ptrs, output, mask=output_mask)
+
+
+@torch.inference_mode()
+def fused_fp8_moe_stage_1_tma(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gate_weight_list: list[torch.Tensor],
+    gate_ptrs_ptr: torch.Tensor,
+    up_weight_list: list[torch.Tensor],
+    up_ptrs_ptr: torch.Tensor,
+    gate_scale_list: list[torch.Tensor],
+    gate_scale_ptrs_ptr: torch.Tensor,
+    up_scale_list: list[torch.Tensor],
+    up_scale_ptrs_ptr: torch.Tensor,
+    group_sizes: torch.Tensor,
+    activated_group_idx: torch.Tensor,
+    group_start_indices: torch.Tensor,
+    num_active_experts: torch.Tensor,
+    num_groups: int,
+    gate_gemm_block_size=[64, 16, 128],
+    scale_block_size=128,
+    num_stages=3,
+    num_warps=4
+):
+    """
+    TMA-OPTIMIZED: 2D grid for parallel expert processing with TMA.
+    Uses hardware-accelerated memory loads for both gate and up weights.
+    
+    Args:
+        Same as fused_fp8_moe_stage_1_optimized
+    
+    Returns:
+        output: torch.Tensor of shape (M, N) in bfloat16
+    """
+    if not HAS_TENSOR_DESC:
+        raise RuntimeError("TMA not supported on this GPU (requires SM_90+)")
+    
+    device = hidden_states.device
+    M = hidden_states.shape[0]
+    N = gate_weight_list[0].shape[0]
+    K = hidden_states.shape[1]
+    
+    # Validate assumption
+    assert gate_gemm_block_size[2] == scale_block_size, \
+        f"GEMM_BLOCK_SIZE_K ({gate_gemm_block_size[2]}) must equal SCALE_BLOCK_SIZE_K ({scale_block_size})"
+    
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    
+    # TMA requires special allocator
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+    
+    triton.set_allocator(alloc_fn)
+    
+    # 2D GRID: (experts, N_blocks)
+    grid = (num_groups, triton.cdiv(N, gate_gemm_block_size[1]))
+    
+    fused_fp8_moe_parallel_experts_kernel_tma[grid](
+        hidden_states, hidden_states_scale,
+        gate_ptrs_ptr, up_ptrs_ptr,
+        gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+        activated_group_idx, group_sizes, group_start_indices,
+        num_active_experts,
+        output,
+        M, N, K,
+        hidden_states.stride(0), hidden_states.stride(1),
+        hidden_states_scale.stride(0), hidden_states_scale.stride(1),
+        gate_weight_list[0].stride(0), gate_weight_list[0].stride(1),
+        up_weight_list[0].stride(0), up_weight_list[0].stride(1),
+        output.stride(0), output.stride(1),
+        activated_group_idx.stride(0),
+        group_sizes.stride(0),
+        group_start_indices.stride(0),
+        gate_ptrs_ptr.stride(0),
+        gate_scale_ptrs_ptr.stride(0),
+        GEMM_BLOCK_SIZE_M=gate_gemm_block_size[0],
+        GEMM_BLOCK_SIZE_N=gate_gemm_block_size[1],
+        GEMM_BLOCK_SIZE_K=gate_gemm_block_size[2],
+        SCALE_BLOCK_SIZE_K=scale_block_size,
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+    
+    return output
+
+
 ## Persistent + TMA
 
 # @triton.jit
