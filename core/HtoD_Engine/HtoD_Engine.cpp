@@ -449,13 +449,13 @@ void HtoD_Engine::batched_page_copy(const std::vector<void*>& gpu_ptrs,
                                     const std::vector<void*>& host_ptrs,
                                     int64_t page_byte_size) {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
-    int num_pages = cpu_ptrs.size();
+    int num_pages = host_ptrs.size();
 
     // Convert void* vectors to uint8_t* for the kernel
     std::vector<uint8_t*> src_ptrs(num_pages);
     std::vector<uint8_t*> dst_ptrs(num_pages);
     for (int i = 0; i < num_pages; ++i) {
-        src_ptrs[i] = static_cast<uint8_t*>(cpu_ptrs[i]);
+        src_ptrs[i] = static_cast<uint8_t*>(host_ptrs[i]);
         dst_ptrs[i] = static_cast<uint8_t*>(gpu_ptrs[i]);
     }
 
