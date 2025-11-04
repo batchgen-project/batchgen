@@ -631,6 +631,242 @@ import triton.language as tl
     
 #     return output
 
+from typing import Optional, List
+@triton.jit
+def fused_fp8_moe_baseline_optimized_v2(
+    lhs_ptr, lhs_scale_ptr,
+    gate_ptrs_ptr, up_ptrs_ptr,
+    gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+    group_idx_ptr, group_sizes_ptr, group_start_indices_ptr,
+    num_active_experts_ptr,
+    output_ptr,
+    M, N: tl.constexpr, K: tl.constexpr,
+    stride_lhs_m, stride_lhs_k,
+    stride_lhs_scale_m, stride_lhs_scale_k,
+    stride_gate_n, stride_gate_k,
+    stride_up_n, stride_up_k,
+    stride_output_m, stride_output_n,
+    stride_group_idx, stride_group_sizes, stride_group_start_indices,
+    stride_weight_ptrs, stride_scale_ptrs,
+    GEMM_BLOCK_SIZE_M: tl.constexpr,
+    GEMM_BLOCK_SIZE_N: tl.constexpr,
+    GEMM_BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_SIZE_K: tl.constexpr,
+):
+    """
+    OPTIMIZED BASELINE: Same algorithm, better implementation
+    
+    Improvements:
+    - Reduced register pressure
+    - Better instruction scheduling
+    - Hoisted invariants out of loops
+    - Fewer memory operations
+    """
+    # Get 2D program IDs
+    group_pid = tl.program_id(axis=0)
+    n_pid = tl.program_id(axis=1)
+    
+    # Early exit check
+    num_groups = tl.load(num_active_experts_ptr)
+    if group_pid >= num_groups:
+        return
+    
+    # Load group metadata
+    gm = tl.load(group_sizes_ptr + group_pid * stride_group_sizes)
+    if gm == 0:
+        return
+    
+    group_idx = tl.load(group_idx_ptr + group_pid * stride_group_idx)
+    start_idx = tl.load(group_start_indices_ptr + group_pid * stride_group_start_indices)
+    
+    # Load weight pointers (hoisted out of M-loop)
+    gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+    up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(tl.float8e4nv))
+    gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+    up_scale_base_ptr = tl.load(up_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(tl.float32))
+    
+    # Pre-compute N-block offsets and mask (hoisted)
+    base_n = n_pid * GEMM_BLOCK_SIZE_N
+    offsets_n = base_n + tl.arange(0, GEMM_BLOCK_SIZE_N)
+    n_mask = offsets_n < N
+    
+    # Pre-compute scale indices (hoisted)
+    scale_n_idx = base_n // SCALE_BLOCK_SIZE_K
+    num_scale_k = tl.cdiv(K, SCALE_BLOCK_SIZE_K)
+    
+    # Pre-compute offsets (hoisted)
+    offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+    offsets_k = tl.arange(0, GEMM_BLOCK_SIZE_K)
+    
+    # Pre-compute loop bounds (hoisted)
+    num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
+    num_k_blocks = tl.cdiv(K, GEMM_BLOCK_SIZE_K)
+    
+    # ===== M-BLOCK LOOP =====
+    for sub_group_idx in range(num_sub_groups):
+        sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+        remaining_rows = start_idx + gm - sub_group_start_idx
+        valid_rows = tl.minimum(GEMM_BLOCK_SIZE_M, remaining_rows)
+        
+        # Row indices for this M-block
+        abs_row_indices = sub_group_start_idx + offsets_m
+        m_mask = abs_row_indices < M
+        valid_mask = offsets_m < valid_rows
+        m_base_mask = m_mask & valid_mask
+        
+        # Initialize accumulators with explicit dtype
+        gate_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+        up_acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+        
+        # ===== K-BLOCK LOOP =====
+        for k_block_idx in range(num_k_blocks):
+            k_start = k_block_idx * GEMM_BLOCK_SIZE_K
+            offs_k = k_start + offsets_k
+            k_mask = offs_k < K
+            
+            # === LOAD SCALES ===
+            scale_k_idx = k_block_idx
+            scale_offset = scale_n_idx * num_scale_k + scale_k_idx
+            
+            # Load RHS scales (single scalar per K-block)
+            gate_scale = tl.load(gate_scale_base_ptr + scale_offset)
+            up_scale = tl.load(up_scale_base_ptr + scale_offset)
+            
+            # Load LHS scales (per row)
+            # This pointer calculation is safe because the baseline passed
+            # the non-aligned tests in your previous run.
+            lhs_scale_ptrs = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + 
+                                              scale_k_idx * stride_lhs_scale_k)
+            lhs_scale = tl.load(lhs_scale_ptrs, mask=m_mask[:, None], other=1.0)
+            
+            # === LOAD DATA ===
+            # LHS (activations)
+            lhs_ptrs = lhs_ptr + (abs_row_indices[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k)
+            lhs_mask = m_base_mask[:, None] & k_mask[None, :]
+            lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+            
+            # RHS (weights) - gate and up
+            gate_ptrs = gate_base_ptr + (offsets_n[:, None] * stride_gate_n + offs_k[None, :] * stride_gate_k)
+            up_ptrs = up_base_ptr + (offsets_n[:, None] * stride_up_n + offs_k[None, :] * stride_up_k)
+            rhs_mask = n_mask[:, None] & k_mask[None, :]
+            
+            gate_fp8 = tl.load(gate_ptrs, mask=rhs_mask, other=0.0)
+            up_fp8 = tl.load(up_ptrs, mask=rhs_mask, other=0.0)
+            
+            # === COMPUTE ===
+            # Combined scale factor
+            combined_gate_scale = lhs_scale * gate_scale
+            combined_up_scale = lhs_scale * up_scale
+            
+            # GEMM with fused scaling
+            gate_acc += tl.dot(lhs, tl.trans(gate_fp8), out_dtype=tl.float32) * combined_gate_scale
+            up_acc += tl.dot(lhs, tl.trans(up_fp8), out_dtype=tl.float32) * combined_up_scale
+        
+        # === EPILOGUE ===
+        # SiLU activation: x / (1 + exp(-x))
+        gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
+        
+        # Element-wise multiply
+        output_acc = gate_activated * up_acc
+        
+        # Convert to output dtype
+        output = output_acc.to(tl.bfloat16)
+        
+        # === STORE ===
+        offs_output_m = sub_group_start_idx + offsets_m
+        
+        # =================== START FIX ===================
+        # Use offsets_n directly, which already includes base_n
+        offs_output_n = offsets_n 
+        # ==================== END FIX ====================
+        
+        output_ptrs = output_ptr + (offs_output_m[:, None] * stride_output_m + 
+                                    offs_output_n[None, :] * stride_output_n)
+        output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & valid_mask[:, None]
+        
+        tl.store(output_ptrs, output, mask=output_mask)
+
+@torch.inference_mode()
+def fused_fp8_moe_stage_1_baseline_v2(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gate_weight_list: List[torch.Tensor],
+    gate_ptrs_ptr: torch.Tensor,
+    up_weight_list: List[torch.Tensor],
+    up_ptrs_ptr: torch.Tensor,
+    gate_scale_list: List[torch.Tensor],
+    gate_scale_ptrs_ptr: torch.Tensor,
+    up_scale_list: List[torch.Tensor],
+    up_scale_ptrs_ptr: torch.Tensor,
+    group_sizes: torch.Tensor,
+    activated_group_idx: torch.Tensor,
+    group_start_indices: torch.Tensor,
+    num_active_experts: torch.Tensor,
+    num_groups: int,
+    gate_gemm_block_size=None,  # Auto-tune if None
+    scale_block_size=128,
+    num_stages=3,
+    num_warps=4  
+):
+    """
+    OPTIMIZED WRAPPER: Better defaults and auto-tuning
+    """
+    device = hidden_states.device
+    M = hidden_states.shape[0]
+    N = gate_weight_list[0].shape[0]
+    K = hidden_states.shape[1]
+    
+    # === AUTO-TUNE BLOCK SIZES ===
+    if gate_gemm_block_size is None:
+        # Heuristics based on shape
+        if N <= 2048:
+            # Smaller N (Mixtral gate proj): prefer more N parallelism
+            gate_gemm_block_size = [64, 32, 128]
+        elif N <= 4096:
+            # Medium N: balance
+            gate_gemm_block_size = [64, 64, 128]
+        else:
+            # Large N (Mixtral up proj, Llama): larger tiles
+            gate_gemm_block_size = [64, 128, 128]
+        
+        print(f"[Auto-tuned] block_size={gate_gemm_block_size} for shape M={M}, N={N}, K={K}")
+    
+    assert gate_gemm_block_size[2] == scale_block_size
+    
+    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    
+    # 2D GRID: (experts, N_blocks)
+    grid = (num_groups, triton.cdiv(N, gate_gemm_block_size[1]))
+    
+    fused_fp8_moe_baseline_optimized_v2[grid](
+        hidden_states, hidden_states_scale,
+        gate_ptrs_ptr, up_ptrs_ptr,
+        gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
+        activated_group_idx, group_sizes, group_start_indices,
+        num_active_experts,
+        output,
+        M, N, K,
+        hidden_states.stride(0), hidden_states.stride(1),
+        hidden_states_scale.stride(0), hidden_states_scale.stride(1),
+        gate_weight_list[0].stride(0), gate_weight_list[0].stride(1),
+        up_weight_list[0].stride(0), up_weight_list[0].stride(1),
+        output.stride(0), output.stride(1),
+        activated_group_idx.stride(0),
+        group_sizes.stride(0),
+        group_start_indices.stride(0),
+        gate_ptrs_ptr.stride(0),
+        gate_scale_ptrs_ptr.stride(0),
+        GEMM_BLOCK_SIZE_M=gate_gemm_block_size[0],
+        GEMM_BLOCK_SIZE_N=gate_gemm_block_size[1],
+        GEMM_BLOCK_SIZE_K=gate_gemm_block_size[2],
+        SCALE_BLOCK_SIZE_K=scale_block_size,
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+    
+    return output
+
+
 ## Persistent + TMA
 
 @triton.jit
