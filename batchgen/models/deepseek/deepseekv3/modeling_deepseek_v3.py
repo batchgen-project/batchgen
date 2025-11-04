@@ -1796,15 +1796,15 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# token_topk_pos = token_topk_pos[valid_mask]
 
 		# ---- 3) Process tokens assigned to local experts ------------------
-		res = self.grouped_dequant_moe_fp8(input_x, input_eids)
+		# res = self.grouped_dequant_moe_fp8_(input_x, input_eids)
 		
 		
-		# res = self.grouped_dequant_moe_fp8_(
-		# 			input_x,          # Oversized
-		# 			input_eids,         # Oversized
-		# 			expert_counts,    # [num_local_experts] (on GPU)
-		# 			expert_offsets    # [num_local_experts + 1] (on GPU)
-		# 		)	
+		res = self.grouped_dequant_moe_fp8_(
+					input_x,          # Oversized
+					input_eids,         # Oversized
+					expert_counts,    # [num_local_experts] (on GPU)
+					expert_offsets    # [num_local_experts + 1] (on GPU)
+				)	
 
 
 
