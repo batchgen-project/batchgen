@@ -40,24 +40,126 @@ class DeepseekV3ParallelStrategyManager:
 		self.world_size = world_size
 		self.rank = global_rank
 		
+	# def configure_prefill(self):
+	# 	"""
+	# 		Configure a model skeletion for prefill pure dp 
+	# 		and the corresponding weight copy task.
+	# 	"""
+	# 	self.hf_model_config.phase = "prefill"
+	# 	# self.model = DeepseekV3ForCausalLM._from_config(
+	# 	# 	self.hf_model_config
+	# 	# )
+	# 	# logging.info(f"hf_model_config: {self.hf_model_config}")
+	# 	self.model = DeepseekV3ForCausalLM(self.hf_model_config)
+	# 	self.state_dict_name_map = {}
+	# 	self.weight_copy_task = {}
+	# 	self.weight_copy_task["attn"] = []
+	# 	self.weight_copy_task["routed_expert"] = []
+	# 	self.weight_copy_task["shared_expert"] = []
+
+	# 	for layer_idx in range(self.model_config.num_hidden_layers):
+	# 		for name, _ in self.model.model.layers[
+	# 			layer_idx
+	# 		].self_attn.named_parameters():
+	# 			tensor_full_name = (
+	# 				"model.layers." + str(layer_idx) + ".self_attn." + name
+	# 			)
+	# 			self.state_dict_name_map[tensor_full_name] = {
+	# 				"module_key": "attn_" + str(layer_idx),
+	# 				"tensor_key": name,
+	# 			}
+	# 		self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
+
+	# 		if layer_idx >= self.hf_model_config.first_k_dense_replace:
+	# 			for name, _ in self.model.model.layers[
+	# 				layer_idx
+	# 			].mlp.shared_experts.named_parameters():
+	# 				tensor_full_name = (
+	# 					"model.layers."
+	# 					+ str(layer_idx)
+	# 					+ ".mlp.shared_experts."
+	# 					+ name
+	# 				)
+	# 				self.state_dict_name_map[tensor_full_name] = {
+	# 					"module_key": "shared_expert_" + str(layer_idx),
+	# 					"tensor_key": name,
+	# 				}
+	# 			self.weight_copy_task["shared_expert"].append(
+	# 				"shared_expert_" + str(layer_idx)
+	# 			)
+
+	# 			for expert_idx in range(self.model_config.num_local_experts):
+	# 				for name, _ in (
+	# 					self.model.model.layers[layer_idx]
+	# 					.mlp.experts[expert_idx]
+	# 					.named_parameters()
+	# 				):
+	# 					tensor_full_name = (
+	# 						"model.layers."
+	# 						+ str(layer_idx)
+	# 						+ ".mlp.experts."
+	# 						+ str(expert_idx)
+	# 						+ "."
+	# 						+ name
+	# 					)
+	# 					self.state_dict_name_map[tensor_full_name] = {
+	# 						"module_key": "routed_expert_"
+	# 						+ str(layer_idx)
+	# 						+ "_"
+	# 						+ str(expert_idx),
+	# 						"tensor_key": name,
+	# 					}
+	# 				self.weight_copy_task["routed_expert"].append(
+	# 					"routed_expert_"
+	# 					+ str(layer_idx)
+	# 					+ "_"
+	# 					+ str(expert_idx)
+	# 				)
+
+	# 	# Load Model Skeleton
+	# 	self._extract_dequantize_scale()
+	# 	self._load_model_skeleton()
+	# 	self._config_attn_module()
+	# 	self._config_expert_module()
+	# 	self._config_lm_head_hook()
+	# 	self.model.eval()
+	# 	self.model.to(self.engine_config.Basic_Config.device_torch)
+	# 	# self._warmup()
+	# 	return self.model, self.weight_copy_task
+
 	def configure_prefill(self):
 		"""
 			Configure a model skeletion for prefill pure dp 
 			and the corresponding weight copy task.
 		"""
+		import time
+		start_time = time.perf_counter()
+		logging.info("Starting configure_prefill")
+		
+		# Step 1: Set phase
+		step_start = time.perf_counter()
 		self.hf_model_config.phase = "prefill"
-		# self.model = DeepseekV3ForCausalLM._from_config(
-		# 	self.hf_model_config
-		# )
-		# logging.info(f"hf_model_config: {self.hf_model_config}")
+		logging.info(f"Set phase to prefill took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 2: Initialize model
+		step_start = time.perf_counter()
 		self.model = DeepseekV3ForCausalLM(self.hf_model_config)
+		logging.info(f"DeepseekV3ForCausalLM initialization took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 3: Initialize data structures
+		step_start = time.perf_counter()
 		self.state_dict_name_map = {}
 		self.weight_copy_task = {}
 		self.weight_copy_task["attn"] = []
 		self.weight_copy_task["routed_expert"] = []
 		self.weight_copy_task["shared_expert"] = []
-
+		logging.info(f"Initialize data structures took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 4: Build weight copy task mappings
+		step_start = time.perf_counter()
+		loop_start = time.perf_counter()
 		for layer_idx in range(self.model_config.num_hidden_layers):
+			# Attention parameters
 			for name, _ in self.model.model.layers[
 				layer_idx
 			].self_attn.named_parameters():
@@ -71,6 +173,7 @@ class DeepseekV3ParallelStrategyManager:
 			self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
 
 			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+				# Shared experts
 				for name, _ in self.model.model.layers[
 					layer_idx
 				].mlp.shared_experts.named_parameters():
@@ -88,6 +191,7 @@ class DeepseekV3ParallelStrategyManager:
 					"shared_expert_" + str(layer_idx)
 				)
 
+				# Routed experts
 				for expert_idx in range(self.model_config.num_local_experts):
 					for name, _ in (
 						self.model.model.layers[layer_idx]
@@ -115,16 +219,47 @@ class DeepseekV3ParallelStrategyManager:
 						+ "_"
 						+ str(expert_idx)
 					)
-
-		# Load Model Skeleton
+		
+		logging.info(f"Build weight copy task mappings (loop over {self.model_config.num_hidden_layers} layers) took {time.perf_counter() - loop_start:.4f}s")
+		
+		# Step 5: Extract dequantize scale
+		step_start = time.perf_counter()
 		self._extract_dequantize_scale()
+		logging.info(f"_extract_dequantize_scale took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 6: Load model skeleton
+		step_start = time.perf_counter()
 		self._load_model_skeleton()
+		logging.info(f"_load_model_skeleton took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 7: Config attention module
+		step_start = time.perf_counter()
 		self._config_attn_module()
+		logging.info(f"_config_attn_module took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 8: Config expert module
+		step_start = time.perf_counter()
 		self._config_expert_module()
+		logging.info(f"_config_expert_module took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 9: Config lm_head hook
+		step_start = time.perf_counter()
 		self._config_lm_head_hook()
+		logging.info(f"_config_lm_head_hook took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 10: Set model to eval mode
+		step_start = time.perf_counter()
 		self.model.eval()
+		logging.info(f"model.eval() took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 11: Move model to device
+		step_start = time.perf_counter()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
-		# self._warmup()
+		logging.info(f"model.to(device) took {time.perf_counter() - step_start:.4f}s")
+		
+		total_time = time.perf_counter() - start_time
+		logging.info(f"configure_prefill completed in {total_time:.4f}s")
+		
 		return self.model, self.weight_copy_task
 	
 	def _warmup(self):
@@ -280,28 +415,103 @@ class DeepseekV3ParallelStrategyManager:
 		return self.model, self.weight_copy_task
 
 
+	# def pure_gpu_decoding(self, padding_bsz, comm=None):
+	# 	"""
+	# 		Beta 1: Load full mode into GPU.
+	# 		Duplicate attention modules and shared experts in each dp worker.
+	# 		Split routed experts.
+	# 	"""
+	# 	self.hf_model_config.phase = "decode"
+	# 	self.hf_model_config._attn_implementation = "eager"
+
+	# 	self.model = None
+	# 	torch.cuda.empty_cache()
+	# 	# self.model = DeepseekV3ForCausalLM._from_config(
+	# 	# 	self.hf_model_config, comm
+	# 	# )
+	# 	self.model = DeepseekV3ForCausalLM(self.hf_model_config, comm)
+	# 	""" In this case, empty copy task. """
+	# 	self.weight_copy_task = {}
+	# 	self.state_dict_name_map = {}
+	# 	self.weight_copy_task["attn"] = []
+	# 	self.weight_copy_task["routed_expert"] = []
+	# 	self.weight_copy_task["shared_expert"] = []
+
+	# 	NUM_TOTAL_EXPERTS = 256          # Total experts per layer
+	# 	NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
+
+	# 	routed_expert_gpu_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
+	# 	routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_EXPERT_PER_RANK
+
+	# 	self.local_routed_experts = []
+	# 	for layer_idx in range(
+	# 		self.hf_model_config.first_k_dense_replace,
+	# 		self.model_config.num_hidden_layers,
+	# 	):
+	# 		# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
+	# 		# The rest of the experts in the part are stored in the host memory.
+	# 		for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
+	# 			self.local_routed_experts.append(
+	# 				"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+	# 			)
+
+
+	# 	self._extract_dequantize_scale()
+	# 	self._load_model_skeleton()
+	# 	self._load_local_routed_experts()
+	# 	self._load_attn_module()
+	# 	self._load_shared_expert_module()
+	# 	self._config_attn_module()
+	# 	self._config_expert_module()
+	# 	self._config_lm_head_hook()
+	# 	self._init_mode_decoding()
+	# 	self._init_decoding_padding_bsz(padding_bsz)
+	# 	used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
+	# 	used_memory_gb = used_memory / (1024**3)
+	# 	logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
+	# 	self.model.eval()
+	# 	self.model.to(self.engine_config.Basic_Config.device_torch)
+	# 	self._warmup()
+	# 	return self.model, self.weight_copy_task
+
 	def pure_gpu_decoding(self, padding_bsz, comm=None):
 		"""
 			Beta 1: Load full mode into GPU.
 			Duplicate attention modules and shared experts in each dp worker.
 			Split routed experts.
 		"""
+		import time
+		start_time = time.perf_counter()
+		logging.info(f"Rank {self.global_rank}: Starting pure_gpu_decoding with padding_bsz={padding_bsz}")
+		
+		# Step 1: Set phase and config
+		step_start = time.perf_counter()
 		self.hf_model_config.phase = "decode"
 		self.hf_model_config._attn_implementation = "eager"
-
+		logging.info(f"Rank {self.global_rank}: Set phase and config took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 2: Clear model and cache
+		step_start = time.perf_counter()
 		self.model = None
 		torch.cuda.empty_cache()
-		# self.model = DeepseekV3ForCausalLM._from_config(
-		# 	self.hf_model_config, comm
-		# )
+		logging.info(f"Rank {self.global_rank}: Clear model and empty_cache took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 3: Initialize model
+		step_start = time.perf_counter()
 		self.model = DeepseekV3ForCausalLM(self.hf_model_config, comm)
-		""" In this case, empty copy task. """
+		logging.info(f"Rank {self.global_rank}: DeepseekV3ForCausalLM initialization took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 4: Initialize data structures
+		step_start = time.perf_counter()
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
 		self.weight_copy_task["attn"] = []
 		self.weight_copy_task["routed_expert"] = []
 		self.weight_copy_task["shared_expert"] = []
-
+		logging.info(f"Rank {self.global_rank}: Initialize data structures took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 5: Calculate expert distribution
+		step_start = time.perf_counter()
 		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
 		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
@@ -313,30 +523,87 @@ class DeepseekV3ParallelStrategyManager:
 			self.hf_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
-			# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
-			# The rest of the experts in the part are stored in the host memory.
 			for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
 				self.local_routed_experts.append(
 					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 				)
-
-
+		logging.info(f"Rank {self.global_rank}: Calculate expert distribution ({len(self.local_routed_experts)} local experts) took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 6: Extract dequantize scale
+		step_start = time.perf_counter()
 		self._extract_dequantize_scale()
+		logging.info(f"Rank {self.global_rank}: _extract_dequantize_scale took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 7: Load model skeleton
+		step_start = time.perf_counter()
 		self._load_model_skeleton()
+		logging.info(f"Rank {self.global_rank}: _load_model_skeleton took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 8: Load local routed experts
+		step_start = time.perf_counter()
 		self._load_local_routed_experts()
+		logging.info(f"Rank {self.global_rank}: _load_local_routed_experts took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 9: Load attention module
+		step_start = time.perf_counter()
 		self._load_attn_module()
+		logging.info(f"Rank {self.global_rank}: _load_attn_module took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 10: Load shared expert module
+		step_start = time.perf_counter()
 		self._load_shared_expert_module()
+		logging.info(f"Rank {self.global_rank}: _load_shared_expert_module took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 11: Config attention module
+		step_start = time.perf_counter()
 		self._config_attn_module()
+		logging.info(f"Rank {self.global_rank}: _config_attn_module took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 12: Config expert module
+		step_start = time.perf_counter()
 		self._config_expert_module()
+		logging.info(f"Rank {self.global_rank}: _config_expert_module took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 13: Config lm_head hook
+		step_start = time.perf_counter()
 		self._config_lm_head_hook()
+		logging.info(f"Rank {self.global_rank}: _config_lm_head_hook took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 14: Init mode decoding
+		step_start = time.perf_counter()
 		self._init_mode_decoding()
+		logging.info(f"Rank {self.global_rank}: _init_mode_decoding took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 15: Init decoding padding batch size
+		step_start = time.perf_counter()
 		self._init_decoding_padding_bsz(padding_bsz)
+		logging.info(f"Rank {self.global_rank}: _init_decoding_padding_bsz took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 16: Log memory usage
+		step_start = time.perf_counter()
 		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
 		used_memory_gb = used_memory / (1024**3)
-		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
+		logging.info(f"Rank {self.global_rank}: Used GPU memory: {used_memory_gb:.2f} GB")
+		logging.info(f"Rank {self.global_rank}: Memory logging took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 17: Set model to eval mode
+		step_start = time.perf_counter()
 		self.model.eval()
+		logging.info(f"Rank {self.global_rank}: model.eval() took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 18: Move model to device
+		step_start = time.perf_counter()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
+		logging.info(f"Rank {self.global_rank}: model.to(device) took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 19: Warmup
+		step_start = time.perf_counter()
 		self._warmup()
+		logging.info(f"Rank {self.global_rank}: _warmup took {time.perf_counter() - step_start:.4f}s")
+		
+		total_time = time.perf_counter() - start_time
+		logging.info(f"Rank {self.global_rank}: pure_gpu_decoding completed in {total_time:.4f}s")
+		
 		return self.model, self.weight_copy_task
 	
 	def _init_decoding_padding_bsz(self, padding_bsz):
