@@ -640,15 +640,21 @@ class BatchGenWorker:
 		except Exception as e:
 			logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 			raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		generation_start_time = time.perf_counter()
 		prefill_time = 0
 		decoding_time = 0
+		phase_switching_time = 0
+		config_prefill_time = 0
+		config_decode_time = 0
 		for model_batch_idx in tqdm(
 			range(len(self.model_batches)), desc="Model Batch"
 		):
 			dist.barrier()
-			if self.rank == 0:
-				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
+			# if self.rank == 0:
+			# 	logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
+			tmp_start = time.perf_counter()
 			self._config_prefill()
+			config_prefill_time += time.perf_counter() - tmp_start
 			prefill_start_time = time.perf_counter()
 			if len(self.model_batches[model_batch_idx]) > 0:
 				with torch.inference_mode():
@@ -674,7 +680,8 @@ class BatchGenWorker:
 			# self.core_engine.create_fake_kv_storage()
 			# self.core_engine.start_h2d_worker()
 			# time.sleep(2)
-				
+			
+			tmp_start = time.perf_counter()
 			self._config_decoding(len(new_token), self.comm)
 			# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 			if self.engine_config.Basic_Config.attn_mode == 3:
@@ -709,9 +716,9 @@ class BatchGenWorker:
 					# TODO:
 					pass
 			
-			
+			config_decode_time += time.perf_counter() - tmp_start
 			dist.barrier()
-			torch.cuda.empty_cache()
+			# torch.cuda.empty_cache()
 			decoding_start_time = time.perf_counter()
 			with torch.inference_mode():
 				logging.info(
@@ -724,7 +731,7 @@ class BatchGenWorker:
 			self.deep_free_model_memory()
 			del past_key_states
 			del scale_dict
-			gc.collect()
+			# gc.collect()
 			dist.barrier()
 		
 		
@@ -755,13 +762,19 @@ class BatchGenWorker:
 
 
 		
-		dist.barrier()
-		self.model = None 
-		torch.cuda.empty_cache()
+		# dist.barrier()
+		generation_time = time.perf_counter() - generation_start_time
 
+		self.model = None 
+		# torch.cuda.empty_cache()
+		phase_switching_time = (config_prefill_time + config_decode_time)
 		logging.info(
 			f"Rank {self.rank} Prefill total time: {prefill_time:.1f} seconds,\n"
 			f"Decoding total time: {decoding_time:.1f} seconds,\n"
+			f"Generation total time: {generation_time:.1f} seconds."
+			f"Phase switching time: {phase_switching_time:.1f} seconds.\n"
+			f"Config prefill time: {config_prefill_time:.1f} seconds.\n"
+			f"Config decoding time: {config_decode_time:.1f} seconds.\n"
 			f"Waiting for process clean up..."
 		)
 
