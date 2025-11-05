@@ -718,6 +718,8 @@ class BatchGenWorker:
 
 			else:
 				past_key_states = None
+				past_value_states = None
+				scale_dict = None
 			config_decode_time += time.perf_counter() - tmp_start
 			dist.barrier()
 			# torch.cuda.empty_cache()
