@@ -343,11 +343,58 @@ void HtoD_Engine::HtoD_Worker() {
                     // int64_t v_offset = 0;
                     int64_t k_byte_size = byte_size; // TODO:
                     // int64_t v_byte_size = byte_size;
+
                     this->logger_->debug(
                         "copying micro_batch_idx: {}, layer_idx: {}, "
                         "byte_size: {}",
                         micro_batch_idx, layer_idx, k_byte_size);
+                    // for (int64_t i = 0; i < cur_batch.size(); i++) {
+                    //     CUDA_CHECK(cudaMemcpyAsync(
+                    //         dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,
+                    //         cudaMemcpyHostToDevice, this->HtoD_stream));
+                    //     k_offset += k_byte_size;
+                    // }
                     for (int64_t i = 0; i < cur_batch.size(); i++) {
+                        // Validation checks
+                        if (dst_k_ptr == nullptr) {
+                            this->logger_->error("dst_k_ptr is NULL!");
+                            throw std::runtime_error("Invalid dst_k_ptr");
+                        }
+                        
+                        if (host_k_ptrs[i] == nullptr) {
+                            this->logger_->error("host_k_ptrs[{}] is NULL!", i);
+                            throw std::runtime_error("Invalid host_k_ptrs at index " + std::to_string(i));
+                        }
+                        
+                        if (k_byte_size <= 0) {
+                            this->logger_->error("Invalid k_byte_size: {}", k_byte_size);
+                            throw std::runtime_error("Invalid k_byte_size");
+                        }
+                        
+                        // Check if destination pointer is valid CUDA memory
+                        cudaPointerAttributes dst_attrs;
+                        cudaError_t dst_err = cudaPointerGetAttributes(&dst_attrs, dst_k_ptr + k_offset);
+                        if (dst_err != cudaSuccess) {
+                            this->logger_->error("dst_k_ptr + {} offset is not valid CUDA memory: {}", 
+                                            k_offset, cudaGetErrorString(dst_err));
+                            cudaGetLastError(); // Clear the error
+                        }
+                        
+                        // Check if source pointer is valid host memory
+                        cudaPointerAttributes src_attrs;
+                        cudaError_t src_err = cudaPointerGetAttributes(&src_attrs, host_k_ptrs[i]);
+                        if (src_err != cudaSuccess) {
+                            this->logger_->error("host_k_ptrs[{}] is not valid memory: {}", 
+                                            i, cudaGetErrorString(src_err));
+                            cudaGetLastError(); // Clear the error
+                        }
+                        
+                        // Log memory info
+                        this->logger_->debug("Copying batch[{}]: dst_offset={}, size={}, "
+                                            "dst_ptr={}, src_ptr={}", 
+                                            i, k_offset, k_byte_size, 
+                                            (void*)(dst_k_ptr + k_offset), host_k_ptrs[i]);
+                        
                         CUDA_CHECK(cudaMemcpyAsync(
                             dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,
                             cudaMemcpyHostToDevice, this->HtoD_stream));

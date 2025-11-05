@@ -940,156 +940,156 @@ class BatchGenWorker:
 		total_time = time.perf_counter() - start_time
 		logging.info(f"_config_prefill completed in {total_time:.4f}s")
 	
-	# def _config_decoding(self, num_seq, comm=None):
-	# 	logging.info(f"Start Config Decoding")
-	# 	self.deep_free_model_memory()
-
-
-	# 	# Get number of sequences for each rank 
-	# 	num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
-	# 	num_seq_per_rank[self.rank] = num_seq
-	# 	dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
-	# 	# Get the maximum number of sequences across all ranks
-	# 	max_num_seq = int(num_seq_per_rank.max().item())
-
-
-	# 	# TODO:
-	# 	if self.world_size <= 8:
-	# 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-	# 		self.set_phase("decode")
-	# 		self.core_engine.stop_h2d_worker()
-	# 		self.core_engine.clear_kv_copy_queue()
-	# 		self.core_engine.clear_kv_buffer()
-	# 		self.core_engine.clear_weight_copy_queue()
-	# 		self.core_engine.reset_decoding_buffer()
-	# 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-	# 		self.core_engine.start_h2d_worker()
-	# 	else:
-	# 		self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
-
-	# 		self.set_phase("decode")
-	# 		self.core_engine.stop_h2d_worker()
-	# 		self.core_engine.clear_kv_copy_queue()
-	# 		self.core_engine.clear_kv_buffer()
-	# 		self.core_engine.clear_weight_copy_queue()
-	# 		self.core_engine.reset_decoding_buffer()
-
-	# 	logging.info(f"{self.rank} End Config Decoding")
-
 	def _config_decoding(self, num_seq, comm=None):
-		start_time = time.perf_counter()
-		logging.info(f"Rank {self.rank}: Starting _config_decoding with num_seq={num_seq}")
-		
-		# Step 1: Deep free model memory
-		step_start = time.perf_counter()
+		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
-		logging.info(f"Rank {self.rank}: deep_free_model_memory took {time.perf_counter() - step_start:.4f}s")
-		
-		# Step 2: Prepare num_seq_per_rank tensor
-		step_start = time.perf_counter()
+
+
+		# Get number of sequences for each rank 
 		num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
 		num_seq_per_rank[self.rank] = num_seq
-		logging.info(f"Rank {self.rank}: tensor preparation took {time.perf_counter() - step_start:.4f}s")
-		
-		# Step 3: All-reduce to gather sequence counts
-		step_start = time.perf_counter()
 		dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
-		logging.info(f"Rank {self.rank}: all_reduce took {time.perf_counter() - step_start:.4f}s")
-		
-		# Step 4: Get max number of sequences
-		step_start = time.perf_counter()
+		# Get the maximum number of sequences across all ranks
 		max_num_seq = int(num_seq_per_rank.max().item())
-		logging.info(f"Rank {self.rank}: max_num_seq={max_num_seq}, computation took {time.perf_counter() - step_start:.4f}s")
-		
-		# Branch based on world size
+
+
+		# TODO:
 		if self.world_size <= 8:
-			logging.info(f"Rank {self.rank}: Taking world_size <= 8 branch")
-			
-			# Step 5a: Configure decoding
-			step_start = time.perf_counter()
 			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-			logging.info(f"Rank {self.rank}: configure_decoding took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 6a: Set phase
-			step_start = time.perf_counter()
 			self.set_phase("decode")
-			logging.info(f"Rank {self.rank}: set_phase took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 7a: Stop H2D worker
-			step_start = time.perf_counter()
 			self.core_engine.stop_h2d_worker()
-			logging.info(f"Rank {self.rank}: stop_h2d_worker took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 8a: Clear KV copy queue
-			step_start = time.perf_counter()
 			self.core_engine.clear_kv_copy_queue()
-			logging.info(f"Rank {self.rank}: clear_kv_copy_queue took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 9a: Clear KV buffer
-			step_start = time.perf_counter()
 			self.core_engine.clear_kv_buffer()
-			logging.info(f"Rank {self.rank}: clear_kv_buffer took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 10a: Clear weight copy queue
-			step_start = time.perf_counter()
 			self.core_engine.clear_weight_copy_queue()
-			logging.info(f"Rank {self.rank}: clear_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 11a: Reset decoding buffer
-			step_start = time.perf_counter()
 			self.core_engine.reset_decoding_buffer()
-			logging.info(f"Rank {self.rank}: reset_decoding_buffer took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 12a: Set weight copy queue
-			step_start = time.perf_counter()
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-			logging.info(f"Rank {self.rank}: set_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 13a: Start H2D worker
-			step_start = time.perf_counter()
 			self.core_engine.start_h2d_worker()
-			logging.info(f"Rank {self.rank}: start_h2d_worker took {time.perf_counter() - step_start:.4f}s")
-			
 		else:
-			logging.info(f"Rank {self.rank}: Taking world_size > 8 branch (pure GPU decoding)")
-			
-			# Step 5b: Pure GPU decoding
-			step_start = time.perf_counter()
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
-			logging.info(f"Rank {self.rank}: pure_gpu_decoding took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 6b: Set phase
-			step_start = time.perf_counter()
+
 			self.set_phase("decode")
-			logging.info(f"Rank {self.rank}: set_phase took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 7b: Stop H2D worker
-			step_start = time.perf_counter()
 			self.core_engine.stop_h2d_worker()
-			logging.info(f"Rank {self.rank}: stop_h2d_worker took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 8b: Clear KV copy queue
-			step_start = time.perf_counter()
 			self.core_engine.clear_kv_copy_queue()
-			logging.info(f"Rank {self.rank}: clear_kv_copy_queue took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 9b: Clear KV buffer
-			step_start = time.perf_counter()
 			self.core_engine.clear_kv_buffer()
-			logging.info(f"Rank {self.rank}: clear_kv_buffer took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 10b: Clear weight copy queue
-			step_start = time.perf_counter()
 			self.core_engine.clear_weight_copy_queue()
-			logging.info(f"Rank {self.rank}: clear_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
-			
-			# Step 11b: Reset decoding buffer
-			step_start = time.perf_counter()
 			self.core_engine.reset_decoding_buffer()
-			logging.info(f"Rank {self.rank}: reset_decoding_buffer took {time.perf_counter() - step_start:.4f}s")
+
+		logging.info(f"{self.rank} End Config Decoding")
+
+	# def _config_decoding(self, num_seq, comm=None):
+	# 	start_time = time.perf_counter()
+	# 	logging.info(f"Rank {self.rank}: Starting _config_decoding with num_seq={num_seq}")
 		
-		total_time = time.perf_counter() - start_time
-		logging.info(f"Rank {self.rank}: _config_decoding completed in {total_time:.4f}s")
+	# 	# Step 1: Deep free model memory
+	# 	step_start = time.perf_counter()
+	# 	self.deep_free_model_memory()
+	# 	logging.info(f"Rank {self.rank}: deep_free_model_memory took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Step 2: Prepare num_seq_per_rank tensor
+	# 	step_start = time.perf_counter()
+	# 	num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
+	# 	num_seq_per_rank[self.rank] = num_seq
+	# 	logging.info(f"Rank {self.rank}: tensor preparation took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Step 3: All-reduce to gather sequence counts
+	# 	step_start = time.perf_counter()
+	# 	dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
+	# 	logging.info(f"Rank {self.rank}: all_reduce took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Step 4: Get max number of sequences
+	# 	step_start = time.perf_counter()
+	# 	max_num_seq = int(num_seq_per_rank.max().item())
+	# 	logging.info(f"Rank {self.rank}: max_num_seq={max_num_seq}, computation took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Branch based on world size
+	# 	if self.world_size <= 8:
+	# 		logging.info(f"Rank {self.rank}: Taking world_size <= 8 branch")
+			
+	# 		# Step 5a: Configure decoding
+	# 		step_start = time.perf_counter()
+	# 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+	# 		logging.info(f"Rank {self.rank}: configure_decoding took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 6a: Set phase
+	# 		step_start = time.perf_counter()
+	# 		self.set_phase("decode")
+	# 		logging.info(f"Rank {self.rank}: set_phase took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 7a: Stop H2D worker
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.stop_h2d_worker()
+	# 		logging.info(f"Rank {self.rank}: stop_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 8a: Clear KV copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 9a: Clear KV buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_buffer()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_buffer took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 10a: Clear weight copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_weight_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 11a: Reset decoding buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.reset_decoding_buffer()
+	# 		logging.info(f"Rank {self.rank}: reset_decoding_buffer took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 12a: Set weight copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+	# 		logging.info(f"Rank {self.rank}: set_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 13a: Start H2D worker
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.start_h2d_worker()
+	# 		logging.info(f"Rank {self.rank}: start_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+			
+	# 	else:
+	# 		logging.info(f"Rank {self.rank}: Taking world_size > 8 branch (pure GPU decoding)")
+			
+	# 		# Step 5b: Pure GPU decoding
+	# 		step_start = time.perf_counter()
+	# 		self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
+	# 		logging.info(f"Rank {self.rank}: pure_gpu_decoding took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 6b: Set phase
+	# 		step_start = time.perf_counter()
+	# 		self.set_phase("decode")
+	# 		logging.info(f"Rank {self.rank}: set_phase took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 7b: Stop H2D worker
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.stop_h2d_worker()
+	# 		logging.info(f"Rank {self.rank}: stop_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 8b: Clear KV copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 9b: Clear KV buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_buffer()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_buffer took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 10b: Clear weight copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_weight_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 11b: Reset decoding buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.reset_decoding_buffer()
+	# 		logging.info(f"Rank {self.rank}: reset_decoding_buffer took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	total_time = time.perf_counter() - start_time
+	# 	logging.info(f"Rank {self.rank}: _config_decoding completed in {total_time:.4f}s")
 
 	def prefill(self, batch: list[int]):
 		"""
