@@ -493,7 +493,7 @@ class DeepseekV3ParallelStrategyManager:
 		# Step 2: Clear model and cache
 		step_start = time.perf_counter()
 		self.model = None
-		torch.cuda.empty_cache()
+		# torch.cuda.empty_cache()
 		logging.info(f"Rank {self.global_rank}: Clear model and empty_cache took {time.perf_counter() - step_start:.4f}s")
 		
 		# Step 3: Initialize model
