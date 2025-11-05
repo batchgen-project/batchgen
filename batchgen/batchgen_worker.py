@@ -713,9 +713,11 @@ class BatchGenWorker:
 					
 			
 				else:
-					# TODO:
+					# TODO: we do
 					pass
-			
+
+			else:
+				past_key_states = None
 			config_decode_time += time.perf_counter() - tmp_start
 			dist.barrier()
 			# torch.cuda.empty_cache()
