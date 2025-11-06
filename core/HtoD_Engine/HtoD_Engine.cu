@@ -389,11 +389,11 @@ void HtoD_Engine::HtoD_Worker() {
                             cudaGetLastError(); // Clear the error
                         }
                         
-                        // Log memory info
+
                         this->logger_->debug("Copying batch[{}]: dst_offset={}, size={}, "
                                             "dst_ptr={}, src_ptr={}", 
                                             i, k_offset, k_byte_size, 
-                                            (void*)(dst_k_ptr + k_offset), host_k_ptrs[i]);
+                                            (void*)(dst_k_ptr + k_offset), (void*)host_k_ptrs[i]);
                         
                         CUDA_CHECK(cudaMemcpyAsync(
                             dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,

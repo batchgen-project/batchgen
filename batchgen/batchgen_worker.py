@@ -166,7 +166,9 @@ class BatchGenWorker:
 
 		if(self.rank == 0):
 			print(self.engine_config)
-		
+		if not self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens:
+			logging.warning(f"kv_buffer_num_tokens is set to {self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens}")
+			# exit()
 		self.device = device
 		self.torch_device = torch.device(f"cuda:{device}")
 		self.host_kv_cache_size = host_kv_cache_size
