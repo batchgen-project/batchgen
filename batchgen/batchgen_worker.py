@@ -684,6 +684,7 @@ class BatchGenWorker:
 			# time.sleep(2)
 			
 			tmp_start = time.perf_counter()
+			torch.cuda.empty_cache()
 			self._config_decoding(len(new_token), self.comm)
 			# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 			if self.engine_config.Basic_Config.attn_mode == 3:
