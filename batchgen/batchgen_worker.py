@@ -696,6 +696,18 @@ class BatchGenWorker:
 				# 	gpu_kv_cache.load_offloaded_context(query_idx, self.max_input_length) # Load offloaded context kv-cache to gpu.
 
 				if self.model_config.model_type == "deepseek_v3":
+					# show rank 0 gpu memory usage before getting past key values
+					free_memory, total_memory = torch.cuda.mem_get_info()
+					free_memory = free_memory / 1024 / 1024 / 1024
+					total_memory = total_memory / 1024 / 1024 / 1024
+					logging.info(
+						f"Rank: {self.rank} Device torch memory usage before getting past key values: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+					)
+					logging.info(
+						f"Rank: {self.rank} Device torch free memory before getting past key values: {free_memory} GB / {total_memory} GB"
+					)
+
+
 					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 					# Pad the kv cache to be multiple of 64
 					bsz, kv_seqlen, _ = past_key_states[0].size()
