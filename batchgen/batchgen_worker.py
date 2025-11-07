@@ -1758,18 +1758,18 @@ class BatchGenWorker:
 		del self.model
 		
 		# Step 4: Clear optimizer if exists
-		# if hasattr(self, 'optimizer'):
-		# 	self.optimizer.zero_grad(set_to_none=True)
-		# 	del self.optimizer
+		if hasattr(self, 'optimizer'):
+			self.optimizer.zero_grad(set_to_none=True)
+			del self.optimizer
 		
-		# # Step 5: Clear any cached computational graphs
-		# if torch.cuda.is_available():
-		# 	torch.cuda.empty_cache()
-		# 	torch.cuda.synchronize()
+		# Step 5: Clear any cached computational graphs
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+			torch.cuda.synchronize()
 		
-		# # Step 6: Aggressive garbage collection
-		# import gc
-		# for _ in range(3):  # Multiple passes can help
-		# 	gc.collect()
-		# 	if torch.cuda.is_available():
-		# 		torch.cuda.empty_cache()
+		# Step 6: Aggressive garbage collection
+		import gc
+		for _ in range(3):  # Multiple passes can help
+			gc.collect()
+			if torch.cuda.is_available():
+				torch.cuda.empty_cache()
