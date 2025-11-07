@@ -255,6 +255,15 @@ elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
     message("CUDA_VERSION ${CUDA_VERSION} >= 11.8")
 endif()
 
+if(DEFINED ENV{CUDA_HOME})
+    set(CUDAToolkit_ROOT $ENV{CUDA_HOME})
+    set(CUDA_TOOLKIT_ROOT_DIR $ENV{CUDA_HOME})
+    set(CUDA_INCLUDE_DIRS $ENV{CUDA_HOME}/targets/x86_64-linux/include)
+    set(CUDA_CUDART_LIBRARY $ENV{CUDA_HOME}/lib/libcudart.so)
+    # Mark as found to bypass PyTorch's CUDA check
+    set(CUDA_FOUND TRUE)
+endif()
+
 # Torch
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
