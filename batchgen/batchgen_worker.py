@@ -685,6 +685,16 @@ class BatchGenWorker:
 			
 			tmp_start = time.perf_counter()
 			torch.cuda.empty_cache()
+			# Log memory usage before decode phase configuration:
+			free_memory, total_memory = torch.cuda.mem_get_info()
+			free_memory = free_memory / 1024 / 1024 / 1024
+			total_memory = total_memory / 1024 / 1024 / 1024
+			logging.info(
+				f"Rank: {self.rank} Device torch memory usage before decode phase: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+			)
+			logging.info(
+				f"Rank: {self.rank} Device torch free memory before decode phase: {free_memory} GB / {total_memory} GB"
+			)
 			self._config_decoding(len(new_token), self.comm)
 			# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 			if self.engine_config.Basic_Config.attn_mode == 3:
