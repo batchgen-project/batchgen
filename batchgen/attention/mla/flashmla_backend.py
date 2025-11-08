@@ -1754,7 +1754,7 @@ from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 # 	return 
 
 
-
+from batchgen.quantization.block_quantization import act_quant_transposed_scale
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_bf16(
 	self,
@@ -1782,11 +1782,14 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 
 	# --- 2. Query and New Key-Value Projection ---
 	hidden_states = hidden_states.squeeze(1)
-	hidden_states, hidden_states_scale = act_quant(hidden_states)
+	# hidden_states, hidden_states_scale = act_quant(hidden_states)
+	hidden_states, hidden_states_scale = act_quant_transposed_scale(hidden_states)
+
 	q = w8a8_deepgemm(hidden_states, hidden_states_scale, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"])
 	new_compressed_kv = w8a8_deepgemm(hidden_states, hidden_states_scale, self.kv_a_proj_with_mqa.weight, weight_scale["kv_a_proj_with_mqa.weight_scale_inv"]).view(bsz, 1, -1)
 	q = self.q_a_layernorm(q)
-	q, q_scale = act_quant(q)
+	# q, q_scale = act_quant(q)
+	q, q_scale = act_quant_transposed_scale(q)
 	q = w8a8_deepgemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
 
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
@@ -1878,7 +1881,8 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	# --- 9. Final Projection and Return ---
 	attn_output = attn_output.transpose(1, 2).contiguous()
 	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
-	attn_output_fp8, attn_output_scale = act_quant(attn_output)
+	# attn_output_fp8, attn_output_scale = act_quant(attn_output)
+	attn_output_fp8, attn_output_scale = act_quant_transposed_scale(attn_output)
 	attn_output = w8a8_deepgemm(attn_output_fp8, attn_output_scale, self.o_proj.weight, weight_scale["o_proj.weight_scale_inv"])
 	attn_output = attn_output.view(bsz, 1, -1)
 	

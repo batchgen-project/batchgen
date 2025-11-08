@@ -1108,6 +1108,7 @@ from ....moe.fused_dequant_moe import (
 from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_baseline_v2, fused_fp8_moe_stage_1_tma
 from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized, fused_dequant_grouped_gemm_fp8_fp8_fp32_triton
 from ....attention.mla.fa3_backend import act_quant
+from batchgen.quantization.block_quantization import act_quant_transposed_scale
 class DeepseekV3MoE_Decoding(nn.Module):
 	def __init__(self, config):
 		super().__init__()
@@ -1924,7 +1925,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# 5. Quantize only the valid data.
 		# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
-		x_quant, x_scale = act_quant(x_sliced)
+		x_quant, x_scale = act_quant_transposed_scale(x_sliced)
 		# fused_fp8_moe_stage_1_persistent_v2
 		# fused_fp8_moe_stage_1_tma
 		# fused_fp8_moe_stage_1_optimized
@@ -1940,7 +1941,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		
 		# 'intermediate' is also dynamically shaped
-		intermediate, intermediate_scale = act_quant(intermediate)
+		intermediate, intermediate_scale = act_quant_transposed_scale(intermediate)
 		# fp8_grouped_gemm_persistent_tma
 		# fused_dequant_grouped_gemm_fp8_fp8_triton
 		# fused_dequant_grouped_gemm_fp8_tma

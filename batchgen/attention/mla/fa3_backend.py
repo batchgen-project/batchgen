@@ -408,6 +408,7 @@ def act_quant(
 	
 #     return y, scale
 
+from batchgen.quantization.block_quantization import act_quant_transposed_scale
 def w8a16_gemm(
 	weight_data_fp8: torch.Tensor,
 	weight_scale_inv_fp32: torch.Tensor,
@@ -430,7 +431,8 @@ def w8a16_gemm(
 	y_fp8 = (weight_data_fp8, weight_scale_inv_fp32)
 	
 	# x_fp8 = per_token_cast_to_fp8(x)
-	x_fp8 = act_quant(x)
+	# x_fp8 = act_quant(x)
+	x_fp8 = act_quant_transposed_scale(x)
 	# x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 	# deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out)
