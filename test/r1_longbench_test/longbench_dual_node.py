@@ -211,7 +211,7 @@ if __name__ == "__main__":
 	def decode_to_eos(tokenizer, tokens):
 		tokens_array = np.array(tokens)
 		eos_positions = np.where(tokens_array == tokenizer.eos_token_id)[0]
-		end_pos = eos_positions[0] if len(eos_positions) > 0 else len(tokens_array)
+		end_pos = eos_positions[0] if len(eos_positions) > 0 else len(tokens_array[0])
 		return tokenizer.decode(tokens[:end_pos], skip_special_tokens=True)
 
 	print_result = True
