@@ -1925,7 +1925,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# 5. Quantize only the valid data.
 		# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
-		x_quant, x_scale = act_quant_transposed_scale(x_sliced)
+		x_quant, x_scale = act_quant(x_sliced)
 		# fused_fp8_moe_stage_1_persistent_v2
 		# fused_fp8_moe_stage_1_tma
 		# fused_fp8_moe_stage_1_optimized
@@ -1941,7 +1941,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		
 		# 'intermediate' is also dynamically shaped
-		intermediate, intermediate_scale = act_quant_transposed_scale(intermediate)
+		intermediate, intermediate_scale = act_quant(intermediate)
 		# fp8_grouped_gemm_persistent_tma
 		# fused_dequant_grouped_gemm_fp8_fp8_triton
 		# fused_dequant_grouped_gemm_fp8_tma
