@@ -1008,7 +1008,7 @@ def fused_dequant_grouped_gemm_fp8_tma(
     activated_group_idx: torch.Tensor,
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
-    gemm_block_size=(64, 16, 128),
+    gemm_block_size=(64, 32, 128),
     scale_block_size=(128, 128),
     num_stages=3,
     num_warps=4

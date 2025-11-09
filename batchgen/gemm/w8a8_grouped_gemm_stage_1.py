@@ -1053,7 +1053,7 @@ def fused_fp8_moe_stage_1_tma(
     group_start_indices: torch.Tensor,
     num_active_experts: torch.Tensor,
     num_groups: int,
-    gate_gemm_block_size=[64, 16, 128],
+    gate_gemm_block_size=[64, 32, 128],
     scale_block_size=128,
     num_stages=3,
     num_warps=4
