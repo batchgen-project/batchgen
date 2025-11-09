@@ -1886,8 +1886,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# )
 		
 		""" BF16 Weighting """
-		topk_weight = topk_weight.to(x.dtype)
-		global_results = moe_weighted_sum_triton_v2(global_results, topk_weight)
+		# topk_weight = topk_weight.to(x.dtype)
+		# global_results = moe_weighted_sum_triton_v2(global_results, topk_weight)
+		assert topk_weight.dtype == torch.float32
+		weighted_output = global_results.to(torch.float32) * topk_weight.unsqueeze(-1)
+		global_results = weighted_output.sum(dim=1)
+		global_results = scatter_weight_reduce_optimized(
+			res, global_indices, token_topk_pos, topk_weight,
+			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+		)
+		global_results = global_results.to(torch.bfloat16)
 		
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
