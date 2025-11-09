@@ -1607,7 +1607,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_allgather_allreduce_opt(hidden_states)
+		out = self.moe_infer_allgather_allreduce_bf16_acc(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
