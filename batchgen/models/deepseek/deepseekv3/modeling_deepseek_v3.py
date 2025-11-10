@@ -1681,8 +1681,81 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		final_x = final_x * final_wt.unsqueeze(-1)
 		final_x = final_x.view(num_tokens, K, -1)
 		final_x = final_x.sum(dim=1)  # sum over experts
+
 		return final_x.to(x.dtype)
 
+	@torch.inference_mode()
+	def moe_infer_alltoall_opt(self, x):
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size)) #API Comp
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids   = topk_idx.flatten()
+		flat_wts    = topk_weight.flatten()
+		expanded_x  = x.repeat_interleave(K, dim=0)
+		# token_idx   = torch.arange(num_tokens, device=device).repeat_interleave(K)
+
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x   = expanded_x[sort_idx]
+		# sorted_tok = token_idx[sort_idx]
+		sorted_wt  = flat_wts[sort_idx]
+
+		# ---- 2) fill the pre-allocated send_counts tensor ------------------
+		local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
+		sc = self.send_counts_buf               # alias for readability
+		rc = self.recv_counts_buf
+
+		reshaped_counts = local_counts.view(self.world_size, -1)
+		sc = reshaped_counts.sum(dim=1)
+
+		gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
+		# ---- 3) first all-to-all (counts) on its own stream ---------------
+		dist.all_gather(gathered_counts, sc)
+		gathered_tensor = torch.stack(gathered_counts)  # Shape: [world_size, world_size]
+		rc = gathered_tensor[:, self.rank]  # Extract column for this rank
+		recv_total = rc.sum()  # Keep as tensor until final use		
+		# sc_cpu = sc.to("cpu", non_blocking=True)
+		# rc_cpu = rc.to("cpu", non_blocking=True)
+
+		# ---- 4) allocate data buffers (variable size) ----------------------
+		send_x   = sorted_x
+		send_eid = sorted_eids
+		recv_x   = torch.empty(recv_total, hidden_size, device=device, dtype=x.dtype)
+		recv_eid = torch.empty(recv_total, device=device, dtype=sorted_eids.dtype)
+
+		# convert counts to python lists once – NCCL needs that
+		sc_list, rc_list = sc.tolist(), rc.tolist()
+		# torch.cuda.current_stream(device).synchronize()
+		# sc_list, rc_list = sc_cpu.tolist(), rc_cpu.tolist()
+
+		# ---- 5) main all-to-alls --------------------
+		dist.all_to_all_single(recv_x, send_x, rc_list, sc_list)
+		dist.all_to_all_single(recv_eid, send_eid, rc_list, sc_list)
+
+		if recv_total:
+			recv_eid_sorted, local_sort_idx = recv_eid.sort()
+			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
+			res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
+			recv_x[local_sort_idx] = res
+
+		# ---- 7) all-to-all (return) ---------------------------------------
+		out_sorted = torch.empty_like(sorted_x)
+		dist.all_to_all_single(out_sorted, recv_x, sc_list, rc_list)
+
+		# ---- 8) unsort, accumulate, normalise -----------------------------
+		unsort_idx = sort_idx.argsort()
+		final_x   = out_sorted[unsort_idx]
+		# final_tok = sorted_tok[unsort_idx]
+		final_wt  = sorted_wt[unsort_idx]
+
+		# out_acc = torch.zeros_like(x, dtype=torch.float32)
+		# out_acc.index_add_(0, final_tok, final_x.float() * final_wt.unsqueeze(-1))
+		final_x = final_x * final_wt.unsqueeze(-1)
+		final_x = final_x.view(num_tokens, K, -1)
+		final_x = final_x.sum(dim=1)  # sum over experts
+		return final_x.to(x.dtype)
+	
 	@torch.inference_mode()
 	def moe_infer_allgather_allreduce(self, x):
 		num_tokens, hidden_size = x.shape
