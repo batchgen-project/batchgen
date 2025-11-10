@@ -2093,16 +2093,30 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		# Quantize the recv_x tensor to fp8_e4m3
 		x, x_scale = act_quant(x)
-		intermediate = fused_fp8_moe_stage_1_optimized(
+		# intermediate = fused_fp8_moe_stage_1_optimized(
+		# 	x, x_scale, 
+		# 	self.gate_list, self.gate_ptrs_ptr,
+		# 	self.up_list, self.up_ptrs_ptr,
+		# 	self.gate_scale_list, self.gate_scale_ptrs_ptr,
+		# 	self.up_scale_list, self.up_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices, num_active_experts, self.experts_per_rank
+		# )	
+		intermediate = fused_fp8_moe_stage_1_tma(
 			x, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
 			self.gate_scale_list, self.gate_scale_ptrs_ptr,
 			self.up_scale_list, self.up_scale_ptrs_ptr,
 			group_size, activated_group_idx, group_start_indices, num_active_experts, self.experts_per_rank
-		)	
+		)
 		intermediate, intermediate_scale = act_quant(intermediate)
-		res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+		# res = fused_dequant_grouped_gemm_fp8_fp8_triton(
+		# 	intermediate, intermediate_scale, 
+		# 	self.down_list, self.down_ptrs_ptr,
+		# 	self.down_scale_list, self.down_scale_ptrs_ptr,
+		# 	group_size, activated_group_idx, group_start_indices, num_active_experts
+		# )
+		res = fused_dequant_grouped_gemm_fp8_tma(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
