@@ -1663,7 +1663,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		if recv_total:
 			recv_eid_sorted, local_sort_idx = recv_eid.sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
-			res = self.grouped_dequant_moe_fp8(recv_x[local_sort_idx], recv_eid_sorted)
+			res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
 			recv_x[local_sort_idx] = res
 
 		# ---- 7) all-to-all (return) ---------------------------------------
