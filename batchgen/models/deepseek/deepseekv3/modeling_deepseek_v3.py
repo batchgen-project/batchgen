@@ -1703,15 +1703,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		sorted_x = expanded_x[sort_idx]
 		sorted_wt = flat_wts[sort_idx]
 		
-		# ---- 2) Compute send counts per rank (ZERO CPU-GPU sync) ------------
-		# Method: Directly compute which rank each expert belongs to
+		# ---- 2) Compute send counts per rank --------------------------------
 		experts_per_rank = self.total_experts // self.world_size
 		rank_ids = sorted_eids // experts_per_rank
 		
 		# Send counts: how many tokens go to each rank
 		sc = torch.bincount(rank_ids, minlength=self.world_size).to(torch.int64)
 		
-		# ---- 3) Exchange counts via all-to-all (tensor-based, no .tolist()) -
+		# ---- 3) Exchange counts via all-to-all ------------------------------
 		rc = torch.empty_like(sc)
 		
 		# Single-element all-to-all for count exchange
@@ -1720,58 +1719,47 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		dist.all_to_all_single(rc_2d, sc_2d)
 		rc = rc_2d.squeeze(1)
 		
-		# Compute total receive size (stays on GPU)
+		# ---- CRITICAL: Single synchronized .tolist() call -------------------
+		# Convert to CPU tensors first, then to list (more efficient)
+		sc_cpu = sc.cpu()
+		rc_cpu = rc.cpu()
+		
+		# Compute recv_total on GPU (for allocation)
 		recv_total = rc.sum()
 		
-		# ---- 4) Allocate receive buffers (using symbolic size) --------------
-		# PyTorch 2.x handles symbolic tensor sizes efficiently
-		recv_x = torch.empty(recv_total, hidden_size, device=device, dtype=x.dtype)
-		recv_eid = torch.empty(recv_total, device=device, dtype=sorted_eids.dtype)
+		# Single sync point: get recv_total and convert lists
+		recv_total_int = recv_total.item()
+		sc_list = sc_cpu.tolist()
+		rc_list = rc_cpu.tolist()
 		
-		# ---- 5) Main all-to-alls (pure tensor API) --------------------------
-		dist.all_to_all_single(
-			recv_x, 
-			sorted_x, 
-			output_split_sizes=rc, 
-			input_split_sizes=sc
-		)
-		dist.all_to_all_single(
-			recv_eid, 
-			sorted_eids, 
-			output_split_sizes=rc, 
-			input_split_sizes=sc
-		)
+		# ---- 4) Allocate receive buffers ------------------------------------
+		recv_x = torch.empty(recv_total_int, hidden_size, device=device, dtype=x.dtype)
+		recv_eid = torch.empty(recv_total_int, device=device, dtype=sorted_eids.dtype)
+		
+		# ---- 5) Main all-to-alls --------------------------------------------
+		dist.all_to_all_single(recv_x, sorted_x, rc_list, sc_list)
+		dist.all_to_all_single(recv_eid, sorted_eids, rc_list, sc_list)
 		
 		# ---- 6) Local expert computation ------------------------------------
-		# Conditional execution without CPU sync
-		if recv_x.numel() > 0:  # Uses tensor metadata, no sync
+		if recv_total_int > 0:
 			recv_eid_sorted, local_sort_idx = recv_eid.sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
 			res = self.grouped_dequant_moe_fp8_bak(
 				recv_x[local_sort_idx], 
 				recv_eid_sorted
 			)
-			# In-place update to avoid extra allocation
-			recv_x.scatter_(0, local_sort_idx.unsqueeze(1).expand_as(res), res)
+			recv_x[local_sort_idx] = res
 		
 		# ---- 7) All-to-all return -------------------------------------------
 		out_sorted = torch.empty_like(sorted_x)
-		dist.all_to_all_single(
-			out_sorted, 
-			recv_x, 
-			output_split_sizes=sc,  # Swapped for return path
-			input_split_sizes=rc
-		)
+		dist.all_to_all_single(out_sorted, recv_x, sc_list, rc_list)
 		
-		# ---- 8) Unsort and aggregate (fused operations) ---------------------
+		# ---- 8) Unsort and aggregate ----------------------------------------
 		unsort_idx = sort_idx.argsort()
-		
-		# Fused unsort + weight multiplication + reshape
 		final_x = (out_sorted[unsort_idx] * sorted_wt[unsort_idx].unsqueeze(-1)).view(
 			num_tokens, K, hidden_size
 		)
 		
-		# Final reduction
 		return final_x.sum(dim=1).to(x.dtype)
 	
 	@torch.inference_mode()
