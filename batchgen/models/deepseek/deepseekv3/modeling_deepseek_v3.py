@@ -1641,11 +1641,51 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_allgather_alltoall(hidden_states)
+		out = self.moe_infer_alltoall_nvshmem(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
+	import torch.distributed._symmetric_memory as symm_mem
+	@torch.inference_mode()
+	def moe_infer_alltoall_nvshmem(self, x):
+		num_tokens, hidden_size = x.shape
+		symm_mem.set_backend("NVSHMEM")
+		group_name = dist.group_world.group_name
+		symm_mem.enable_symm_mem_for_group(group_name)
+		max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
+		max_out_len = max_inp_len * dist.get_world_size() # worst case.
+		inp = symm_mem.empty(max_inp_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
+		out = symm_mem.empty(max_out_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
+		out_splits_offsets = symm_mem.empty((2, self.total_experts), dtype=torch.int64, device=self.device)
+		# ---- 1) First all-to-all: distribute tokens to experts -------
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size)) #API Comp
+		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
+		# Sort the expanded_x according to topk_idx -> in_splits: (self.global_num_experts,)
+		flat_eids = topk_idx.flatten().to(torch.int32)
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x = expanded_x[sort_idx]
+		in_splits = torch.bincount(sorted_eids, minlength=self.total_experts)
+		inp[:sorted_x.shape[0]].copy_(sorted_x)
+		torch.ops.symm_mem.all_to_all_vdev_2d(inp, out, in_splits, out_splits_offsets, group_name)
 
+		# ---- 2) Process tokens assigned to local experts ------------------
+		# 'res' contains the output of local experts for the tokens routed to them.
+
+		res = self.grouped_dequant_moe_fp8(
+					out,          						# Oversized buffer of inputs for local experts
+					torch.arange(self.total_experts),   # Oversized buffer of expert IDs
+					out_splits_offsets[0],  			# [num_local_experts]
+					out_splits_offsets[1]    			# [num_local_experts + 1]
+		)
+
+		# ---- 3) Second all-to-all: gather results back to original tokens -------
+		out[:res.shape[0]].copy_(res)
+		torch.ops.symm_mem.all_to_all_vdev_2d_offset(out, inp, out_splits_offsets, in_splits, group_name)
+
+		# --- 4) Final weighted sum -------
+		final_out = moe_weighted_sum_triton_v2(inp[:sorted_x.shape[0]], topk_weight)
+
+		return final_out
 
 
 	@torch.inference_mode()
