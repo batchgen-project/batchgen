@@ -1641,10 +1641,124 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_alltoall_opt(hidden_states)
+		out = self.moe_infer_allgather_alltoall(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
+
+
+
+	@torch.inference_mode()
+	def moe_infer_allgather_alltoall(self, x):
+		"""
+		Implements the MoE forward pass using an All-Gather (for inputs)
+		and an All-to-All (for outputs) pattern.
+
+		1. All-Gather: Collect all tokens from all ranks.
+		2. Local Routing: Each rank computes routing for all global tokens.
+		3. Local Dispatch: Each rank dispatches tokens destined for its local experts.
+		4. Local Forward: Each rank processes tokens through its local experts.
+		5. Scatter: Local results are scattered into a sparse global output tensor.
+		6. All-to-All: Exchange slices of the global output tensor. Each rank 'R'
+		sends the portion of its results destined for rank 'S' to rank 'S',
+		and receives results for its own tokens from all other ranks.
+		7. Local Sum: Each rank sums the received contributions for its tokens.
+		"""
+		num_tokens, hidden_size = x.shape
+		device = x.device
+
+		# ---- 1) First all-gather: collect all tokens on all workers -------
+		# This tensor holds the full, padded, global batch
+		all_tokens = torch.zeros((self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
+									device=self.device, dtype=torch.bfloat16)
+
+		# Pad the local input 'x' if it's smaller than the expected num_tokens_per_rank
+		# This is common in the last batch of generation.
+		if x.shape[0] < self.num_tokens_per_rank:
+			padded_hidden_states = torch.zeros((self.num_tokens_per_rank, hidden_size), device=self.device, dtype=x.dtype)
+			padded_hidden_states[:x.shape[0]] = x
+		else:
+			padded_hidden_states = x
+
+		with self.comm.change_state(enable=True):
+			# Each rank gets the same 'all_tokens' tensor
+			self.comm.all_gather(all_tokens, padded_hidden_states, stream=torch.cuda.default_stream(self.device))
+
+		# ---- 2) Gate computation on global tokens --------------------------
+		# Since all ranks have all_tokens, they can all compute the global routing
+		# decisions independently, without communication.
+		global_x = all_tokens
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension
+		
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
+		assert topk_weight.dtype == torch.float32, f"topk_weight must be float32, got {topk_weight.dtype}"
+		global_x = global_x.squeeze(1)
+
+		# ---- 3) Dispatch tokens assigned to local experts ------------------
+		topk_idx = topk_idx.to(torch.int32)
+		
+		# This fused kernel identifies which tokens from 'global_x' are routed
+		# to the experts on *this* rank.
+		input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
+					global_x, topk_idx, self.token_idx, self.topk_pos,
+					self.routed_expert_start_idx, self.routed_expert_end_idx,
+				)
+
+		# ---- 4) Process tokens assigned to local experts ------------------
+		# 'res' contains the output of local experts for the tokens routed to them.
+		res = self.grouped_dequant_moe_fp8(
+					input_x,          # Oversized buffer of inputs for local experts
+					input_eids,       # Oversized buffer of expert IDs
+					expert_counts,    # [num_local_experts]
+					expert_offsets    # [num_local_experts + 1]
+				)
+
+		# ---- 5) Scatter local results into a sparse global tensor ---------
+		# 'global_results' is a sparse tensor of shape [W * N_per_rank, H].
+		# On rank 'R', it's non-zero *only* at indices corresponding to tokens
+		# processed by rank 'R's experts.
+		global_results = scatter_weight_reduce_optimized(
+			res, global_indices, token_topk_pos, topk_weight,
+			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+		)
+
+		# ---- 6) Replace All-Reduce with All-to-All ------------------------
+		# Instead of all-reducing the entire 'global_results' tensor, we split
+		# it into 'world_size' chunks.
+		# chunk 'S' contains the contributions from *this rank's* experts
+		# to *rank S's* tokens. We will send chunk 'S' to rank 'S'.
+
+		# Split the [W*N, H] tensor into a list of W tensors, each [N, H]
+		input_chunks = list(global_results.split(self.num_tokens_per_rank, dim=0))
+
+		# Prepare an output list of tensors to receive data.
+		# We will receive W chunks, each [N, H].
+		output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(self.world_size)]
+
+		with self.comm.change_state(enable=True):
+			# Perform the all-to-all operation.
+			# After this, on rank 'R', output_chunks[i] will be the chunk
+			# *from rank i* containing contributions for *rank R's tokens*.
+			dist.all_to_all(output_chunks, input_chunks, stream=torch.cuda.default_stream(self.device))
+
+		# ---- 7) Local Sum to aggregate results ----------------------------
+		# We now have all contributions for *our* local tokens.
+		# We stack them and sum them up.
+		
+		# Stack to [W, N_per_rank, H]
+		stacked_results = torch.stack(output_chunks) 
+		
+		# Sum along the world_size dimension to get the final [N_per_rank, H] tensor
+		summed_local_results = torch.sum(stacked_results, dim=0)
+
+		# ---- 8) Extract results for local tokens (unpad) ------------------
+		# 'summed_local_results' has shape [num_tokens_per_rank, H] (padded)
+		# We need to slice it down to the original 'num_tokens' from the input 'x'.
+		final_output = summed_local_results[:num_tokens]
+
+		return final_output.to(x.dtype)
+
+
 	@torch.inference_mode()
 	def moe_infer_alltoall(self, x):
 		num_tokens, hidden_size = x.shape
