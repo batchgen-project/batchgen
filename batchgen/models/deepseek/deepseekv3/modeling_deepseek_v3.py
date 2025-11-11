@@ -1735,12 +1735,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# We will receive W chunks, each [N, H].
 		output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(self.world_size)]
 
-		with self.comm.change_state(enable=True):
+		# with self.comm.change_state(enable=True):
 			# Perform the all-to-all operation.
 			# After this, on rank 'R', output_chunks[i] will be the chunk
 			# *from rank i* containing contributions for *rank R's tokens*.
 			# dist.all_to_all(output_chunks, input_chunks, stream=torch.cuda.default_stream(self.device))
-			dist.all_to_all(output_chunks, input_chunks)
+		dist.all_to_all(output_chunks, input_chunks)
 
 		# ---- 7) Local Sum to aggregate results ----------------------------
 		# We now have all contributions for *our* local tokens.
