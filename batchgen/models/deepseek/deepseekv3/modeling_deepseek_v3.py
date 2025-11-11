@@ -1565,7 +1565,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Pre-allocate persistent buffers (never reallocate!)
 		self.register_buffer(
 			'send_x_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, self.hidden_size, dtype=torch.float16)
+			torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
 		)
 		self.register_buffer(
 			'send_eid_buf',
@@ -1573,7 +1573,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		self.register_buffer(
 			'recv_x_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, self.hidden_size, dtype=torch.float16)
+			torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
 		)
 		self.register_buffer(
 			'recv_eid_buf',
@@ -1581,7 +1581,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		self.register_buffer(
 			'return_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, self.hidden_size, dtype=torch.float16)
+			torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
 		)
 		
 		# Fixed split sizes (same for all iterations)
