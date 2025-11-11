@@ -1554,6 +1554,40 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# --- Pre-allocate Buffers. --------------------------------
 		self.num_tokens_per_rank = None		# This is a placeholder, adjust as needed
 
+
+		# Pre-compute maximum possible tokens per rank (worst case: all tokens go to one rank)
+		self.max_tokens_per_batch = 1024  # Adjust based on your max batch size
+		self.max_tokens_total = self.max_tokens_per_batch * self.num_experts_per_tok
+		
+		# Fixed size for all-to-all: each rank reserves max space
+		self.fixed_send_size = (self.max_tokens_total + self.world_size - 1) // self.world_size
+		
+		# Pre-allocate persistent buffers (never reallocate!)
+		self.register_buffer(
+			'send_x_buf',
+			torch.zeros(self.world_size * self.fixed_send_size, self.hidden_size, dtype=torch.float16)
+		)
+		self.register_buffer(
+			'send_eid_buf',
+			torch.zeros(self.world_size * self.fixed_send_size, dtype=torch.int64)
+		)
+		self.register_buffer(
+			'recv_x_buf',
+			torch.zeros(self.world_size * self.fixed_send_size, self.hidden_size, dtype=torch.float16)
+		)
+		self.register_buffer(
+			'recv_eid_buf',
+			torch.zeros(self.world_size * self.fixed_send_size, dtype=torch.int64)
+		)
+		self.register_buffer(
+			'return_buf',
+			torch.zeros(self.world_size * self.fixed_send_size, self.hidden_size, dtype=torch.float16)
+		)
+		
+		# Fixed split sizes (same for all iterations)
+		self.fixed_splits = [self.fixed_send_size] * self.world_size
+
+
 	def init_num_tokens(self, num_tokens_per_rank):
 		self.num_tokens_per_rank = num_tokens_per_rank
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
@@ -1703,58 +1737,91 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		sorted_x = expanded_x[sort_idx]
 		sorted_wt = flat_wts[sort_idx]
 		
-		# ---- 2) Compute send counts per rank --------------------------------
+		# ---- 2) Compute send counts per rank (GPU only!) --------------------
 		experts_per_rank = self.total_experts // self.world_size
 		rank_ids = sorted_eids // experts_per_rank
 		
-		# Send counts: how many tokens go to each rank
+		# Bincount gives us counts per rank (stays on GPU!)
 		sc = torch.bincount(rank_ids, minlength=self.world_size).to(torch.int64)
 		
-		# ---- 3) Exchange counts via all-to-all ------------------------------
-		rc = torch.empty_like(sc)
+		# Compute cumulative offsets for scatter (GPU only!)
+		sc_cumsum = torch.cat([torch.zeros(1, device=device, dtype=torch.int64), sc.cumsum(0)])
 		
-		# Single-element all-to-all for count exchange
-		sc_2d = sc.unsqueeze(1).contiguous()
-		rc_2d = torch.empty_like(sc_2d)
-		dist.all_to_all_single(rc_2d, sc_2d)
-		rc = rc_2d.squeeze(1)
+		# ---- 3) Pack data into fixed-size send buffer -----------------------
+		# Zero out the send buffers (or use a validity mask)
+		total_send = sorted_x.shape[0]
 		
-		# ---- CRITICAL: Single synchronized .tolist() call -------------------
-		# Convert to CPU tensors first, then to list (more efficient)
-		sc_cpu = sc.cpu()
-		rc_cpu = rc.cpu()
+		# Copy data into pre-allocated buffer
+		self.send_x_buf[:total_send] = sorted_x
+		self.send_eid_buf[:total_send] = sorted_eids
 		
-		# Compute recv_total on GPU (for allocation)
-		recv_total = rc.sum()
+		# Pad the rest with zeros (or keep previous values, doesn't matter)
+		# The receiver will know how much is valid based on exchanged counts
 		
-		# Single sync point: get recv_total and convert lists
-		recv_total_int = recv_total.item()
-		sc_list = sc_cpu.tolist()
-		rc_list = rc_cpu.tolist()
+		# ---- 4) Exchange counts using all-gather (NO .tolist()!) ------------
+		# Use all-gather instead of all-to-all for counts
+		sc_gathered = [torch.zeros_like(sc) for _ in range(self.world_size)]
+		dist.all_gather(sc_gathered, sc)
 		
-		# ---- 4) Allocate receive buffers ------------------------------------
-		recv_x = torch.empty(recv_total_int, hidden_size, device=device, dtype=x.dtype)
-		recv_eid = torch.empty(recv_total_int, device=device, dtype=sorted_eids.dtype)
+		# Stack to get [world_size, world_size] matrix
+		count_matrix = torch.stack(sc_gathered)  # [world_size, world_size]
 		
-		# ---- 5) Main all-to-alls --------------------------------------------
-		dist.all_to_all_single(recv_x, sorted_x, rc_list, sc_list)
-		dist.all_to_all_single(recv_eid, sorted_eids, rc_list, sc_list)
+		# Extract receive counts for this rank (column extraction)
+		rc = count_matrix[:, self.rank]  # [world_size] - how much we receive from each rank
+		rc_cumsum = torch.cat([torch.zeros(1, device=device, dtype=torch.int64), rc.cumsum(0)])
 		
-		# ---- 6) Local expert computation ------------------------------------
-		if recv_total_int > 0:
+		# ---- 5) Fixed-size all-to-all (NO dynamic split sizes!) -------------
+		dist.all_to_all_single(
+			self.recv_x_buf,
+			self.send_x_buf,
+			self.fixed_splits,  # Fixed size, pre-computed in __init__
+			self.fixed_splits
+		)
+		dist.all_to_all_single(
+			self.recv_eid_buf,
+			self.send_eid_buf,
+			self.fixed_splits,
+			self.fixed_splits
+		)
+		
+		# ---- 6) Extract valid received data (GPU indexing) ------------------
+		# We know rc[i] tokens came from rank i, starting at offset rc_cumsum[i]
+		total_recv = rc_cumsum[-1]  # Total valid tokens received (GPU tensor!)
+		
+		# Create index tensor for valid received data
+		recv_indices = torch.arange(total_recv, device=device, dtype=torch.int64)
+		
+		# Extract only valid data
+		recv_x = self.recv_x_buf[recv_indices]
+		recv_eid = self.recv_eid_buf[recv_indices]
+		
+		# ---- 7) Local expert computation ------------------------------------
+		if total_recv.numel() > 0 and total_recv > 0:  # Check without .item()
 			recv_eid_sorted, local_sort_idx = recv_eid.sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
 			res = self.grouped_dequant_moe_fp8_bak(
 				recv_x[local_sort_idx], 
 				recv_eid_sorted
 			)
-			recv_x[local_sort_idx] = res
+			# Scatter back
+			recv_x = recv_x.scatter(0, local_sort_idx.unsqueeze(1).expand_as(res), res)
 		
-		# ---- 7) All-to-all return -------------------------------------------
-		out_sorted = torch.empty_like(sorted_x)
-		dist.all_to_all_single(out_sorted, recv_x, sc_list, rc_list)
+		# ---- 8) Pack results back into fixed-size buffer --------------------
+		self.return_buf[:total_recv] = recv_x
 		
-		# ---- 8) Unsort and aggregate ----------------------------------------
+		# ---- 9) Fixed-size all-to-all return --------------------------------
+		dist.all_to_all_single(
+			self.recv_x_buf,  # Reuse as output buffer
+			self.return_buf,
+			self.fixed_splits,
+			self.fixed_splits
+		)
+		
+		# ---- 10) Extract valid returned data --------------------------------
+		out_indices = torch.arange(total_send, device=device, dtype=torch.int64)
+		out_sorted = self.recv_x_buf[out_indices]
+		
+		# ---- 11) Unsort and aggregate ---------------------------------------
 		unsort_idx = sort_idx.argsort()
 		final_x = (out_sorted[unsort_idx] * sorted_wt[unsort_idx].unsqueeze(-1)).view(
 			num_tokens, K, hidden_size
