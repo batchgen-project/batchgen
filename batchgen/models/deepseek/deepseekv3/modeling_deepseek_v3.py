@@ -1556,36 +1556,36 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 
 		# Pre-compute maximum possible tokens per rank (worst case: all tokens go to one rank)
-		self.max_tokens_per_batch = 1024  # Adjust based on your max batch size
-		self.max_tokens_total = self.max_tokens_per_batch * self.num_experts_per_tok
+		# self.max_tokens_per_batch = 1024  # Adjust based on your max batch size
+		# self.max_tokens_total = self.max_tokens_per_batch * self.num_experts_per_tok
 		
-		# Fixed size for all-to-all: each rank reserves max space
-		self.fixed_send_size = (self.max_tokens_total + self.world_size - 1) // self.world_size
+		# # Fixed size for all-to-all: each rank reserves max space
+		# self.fixed_send_size = (self.max_tokens_total + self.world_size - 1) // self.world_size
 		
 		# Pre-allocate persistent buffers (never reallocate!)
-		self.register_buffer(
-			'send_x_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
-		)
-		self.register_buffer(
-			'send_eid_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, dtype=torch.int64)
-		)
-		self.register_buffer(
-			'recv_x_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
-		)
-		self.register_buffer(
-			'recv_eid_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, dtype=torch.int64)
-		)
-		self.register_buffer(
-			'return_buf',
-			torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
-		)
+		# self.register_buffer(
+		# 	'send_x_buf',
+		# 	torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
+		# )
+		# self.register_buffer(
+		# 	'send_eid_buf',
+		# 	torch.zeros(self.world_size * self.fixed_send_size, dtype=torch.int64)
+		# )
+		# self.register_buffer(
+		# 	'recv_x_buf',
+		# 	torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
+		# )
+		# self.register_buffer(
+		# 	'recv_eid_buf',
+		# 	torch.zeros(self.world_size * self.fixed_send_size, dtype=torch.int64)
+		# )
+		# self.register_buffer(
+		# 	'return_buf',
+		# 	torch.zeros(self.world_size * self.fixed_send_size, self.config.hidden_size, dtype=torch.float16)
+		# )
 		
 		# Fixed split sizes (same for all iterations)
-		self.fixed_splits = [self.fixed_send_size] * self.world_size
+		# self.fixed_splits = [self.fixed_send_size] * self.world_size
 
 
 	def init_num_tokens(self, num_tokens_per_rank):
