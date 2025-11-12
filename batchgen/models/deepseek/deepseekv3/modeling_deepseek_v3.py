@@ -1705,19 +1705,30 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 2) Process tokens assigned to local experts ------------------
 		# 'res' contains the output of local experts for the tokens routed to them.
 
+		# res = self.grouped_dequant_moe_fp8(
+		# 			self.out,          							# Oversized buffer of inputs for local experts
+		# 			torch.arange(self.total_experts),   		# Oversized buffer of expert IDs
+		# 			self.out_splits_offsets[0].to(torch.int32), # [num_local_experts], todo:type comp
+		# 			self.out_splits_offsets[1].to(torch.int32)  # [num_local_experts + 1]
+		# )
+		input_x = self.out.clone()
+		input_eids = torch.arange(self.total_experts, device=self.device, dtype=torch.int32)
+		expert_counts = self.out_splits_offsets[0].to(torch.int32)
+		expert_offsets = self.out_splits_offsets[1].to(torch.int32)
 		res = self.grouped_dequant_moe_fp8(
-					self.out,          							# Oversized buffer of inputs for local experts
-					torch.arange(self.total_experts),   	# Oversized buffer of expert IDs
-					self.out_splits_offsets[0].to(torch.int32),  # [num_local_experts], todo:type comp
-					self.out_splits_offsets[1].to(torch.int32)    # [num_local_experts + 1]
-		)
+				input_x,          # Oversized buffer of inputs for local experts
+				input_eids,       # Oversized buffer of expert IDs
+				expert_counts,    # [num_local_experts]
+				expert_offsets    # [num_local_experts + 1]
+			)
 
 		# ---- 3) Second all-to-all: gather results back to original tokens -------
 		self.out[:res.shape[0]].copy_(res)
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(self.out, self.inp, self.out_splits_offsets, self.in_splits, self.group_name)
 
 		# --- 4) Final weighted sum -------
-		final_out = moe_weighted_sum_triton_v2(self.inp[:sorted_x.shape[0]], topk_weight)
+
+		final_out = moe_weighted_sum_triton_v2(self.inp[:sorted_x.shape[0]].clone(), topk_weight)
 
 		return final_out
 
