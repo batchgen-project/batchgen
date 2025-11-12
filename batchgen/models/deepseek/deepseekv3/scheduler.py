@@ -63,6 +63,8 @@ class Scheduler:
 				int((available_gpu_mem - model_skeleton_size - cuda_page_table_default_size - expert_size - NCCL_default_buffer_usage) / self.per_seq_size)
 			)
 			logging.info(f"Max Available MoE decoding micro batch size: {self.config.Module_Batching_Config.MoE_decoding_micro_batch_size}")
+			# Constant peak mem usage for attn in decoding.
+			attn_decoding_micro_batch_size = self.config.Module_Batching_Config.MoE_decoding_micro_batch_size
 		if num_local_expert_per_layer == EXPERT_PER_RANK:
 			num_decoding_module_buffer_routed_expert = 0
 
