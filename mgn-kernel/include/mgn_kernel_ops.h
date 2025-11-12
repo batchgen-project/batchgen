@@ -89,6 +89,8 @@ std::vector<torch::Tensor> fused_moe_token_dispatch_cuda(
 std::vector<torch::Tensor> compact_expert_data_cuda(
     torch::Tensor expert_counts);
 
+torch::Tensor compute_expert_offsets_cuda(torch::Tensor expert_counts);
+
 /*
  * From csrc/elementwise
  */

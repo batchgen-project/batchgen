@@ -1756,7 +1756,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		assert res.shape[0] == total_recv_tokens, \
 			f"Result size mismatch: {res.shape[0]} != {total_recv_tokens}"
 
-		logger.info(f"Rank {self.rank} completed local expert processing, output shape: {res.shape}")
+		logger.info(f"Rank {self.rank} ocal_expert_counts {res.shape}")
 
 		# ---- 4) Scatter results back to interleaved layout -------
 		interleaved_res = self.scatter_results_to_interleaved(
@@ -2597,6 +2597,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		return res
 
+	def grouped_fp8_moe(self, x, eids, expert):
+		pass
+
 	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
 		# 'x' and 'eids' are the oversized tensors.
 		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
@@ -2630,6 +2633,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		group_size, activated_group_idx, group_start_indices, num_active_experts = compact_expert_data(
 					expert_counts
 		)
+		num_active = num_active_experts.item()
+		group_size = group_size[:num_active]
+		activated_group_idx = activated_group_idx[:num_active]
+		group_start_indices = group_start_indices[:num_active]
 		if self.rank == 0:
 			logger.info(f"Group size: {group_size}")
 			logger.info(f"Activated group idx: {activated_group_idx}")
