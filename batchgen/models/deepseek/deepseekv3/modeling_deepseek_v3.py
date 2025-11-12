@@ -1738,6 +1738,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			expert_offsets          # [num_local_experts + 1]
 		)
 
+		logger.info(f"Rank {self.rank} completed local expert processing")
+
 		# ---- 4) Scatter results back to interleaved layout -------
 		interleaved_res = self.scatter_results_to_interleaved(
 			res, splits, offsets, expert_offsets
@@ -1759,7 +1761,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Build 2-row tensor for all_to_all_vdev_2d_offset
 		self.symm_in_splits_offsets[0].copy_(self.symm_in_splits)  # Row 0: splits
 		self.symm_in_splits_offsets[1].copy_(in_offsets)           # Row 1: offsets
-		
+		logger.info(f"Rank {self.rank} prepared splits/offsets for second all-to-all")
 		# ---- 6) Second all-to-all: gather results back to original tokens -------
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
 			self.symm_out,                  # Input: interleaved expert outputs
@@ -1768,12 +1770,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.symm_in_splits_offsets,    # Output splits/offsets [2, total_experts]
 			self.group_name
 		)
-
+		logger.info(f"Rank {self.rank} completed second all-to-all")
 		# ---- 7) Final weighted sum -------
 		final_out = moe_weighted_sum_triton_v2(
 			self.symm_inp[:sorted_x.shape[0]], 
 			topk_weight
 		)
+		logger.info(f"Rank {self.rank} completed final weighted sum")
 
 		return final_out
 
