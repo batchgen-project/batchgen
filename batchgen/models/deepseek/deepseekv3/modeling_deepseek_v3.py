@@ -1700,6 +1700,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.symm_in_splits.copy_(bin_count)
 		self.symm_inp[:sorted_x.shape[0]].copy_(sorted_x)
 		
+		logger.info(f"Rank {self.rank} starting first all-to-all with {sorted_x.shape[0]} tokens")
+		
 		# First all-to-all: dispatch tokens to experts
 		torch.ops.symm_mem.all_to_all_vdev_2d(
 			self.symm_inp, 
@@ -1708,6 +1710,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.symm_out_splits_offsets, 
 			self.group_name
 		)
+		
+		logger.info(f"Rank {self.rank} completed first all-to-all")
 
 		# ---- 2) Reorder tokens to expert-contiguous layout -------
 		splits = self.symm_out_splits_offsets[0]
@@ -1721,9 +1725,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			local_expert_id = chunk_idx // self.world_size
 			local_expert_counts[local_expert_id] += splits[chunk_idx]
 		
+		# Get total received tokens
+		total_recv_tokens = splits.sum().item()
+		logger.info(f"Rank {self.rank} received {total_recv_tokens} tokens")
+		
 		# Reorder tokens to expert-contiguous layout
 		reordered_x, expert_offsets = self.reorder_tokens_to_expert_contiguous_vectorized(
-			self.symm_out, splits, offsets, local_expert_counts
+			self.symm_out[:total_recv_tokens],  # Only slice the valid received tokens
+			splits, 
+			offsets, 
+			local_expert_counts
 		)
 		
 		# ---- 3) Process tokens with local experts -------
@@ -1737,16 +1748,26 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			local_expert_counts,    # [num_local_experts]
 			expert_offsets          # [num_local_experts + 1]
 		)
+		
+		# CRITICAL: res should have the same length as total_recv_tokens
+		assert res.shape[0] == total_recv_tokens, \
+			f"Result size mismatch: {res.shape[0]} != {total_recv_tokens}"
 
-		logger.info(f"Rank {self.rank} completed local expert processing")
+		logger.info(f"Rank {self.rank} completed local expert processing, output shape: {res.shape}")
 
 		# ---- 4) Scatter results back to interleaved layout -------
 		interleaved_res = self.scatter_results_to_interleaved(
 			res, splits, offsets, expert_offsets
 		)
 		
-		# Copy back to symmetric memory buffer
-		self.symm_out[:interleaved_res.shape[0]].copy_(interleaved_res)
+		# CRITICAL: interleaved_res must have exactly total_recv_tokens
+		assert interleaved_res.shape[0] == total_recv_tokens, \
+			f"Interleaved result size mismatch: {interleaved_res.shape[0]} != {total_recv_tokens}"
+		
+		# Copy back to symmetric memory buffer - only the valid portion
+		self.symm_out[:total_recv_tokens].copy_(interleaved_res)
+		
+		logger.info(f"Rank {self.rank} scattered results back to interleaved layout")
 		
 		# ---- 5) Prepare input splits/offsets for second all-to-all -------
 		# Compute offsets from splits (prefix sum)
@@ -1761,21 +1782,43 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Build 2-row tensor for all_to_all_vdev_2d_offset
 		self.symm_in_splits_offsets[0].copy_(self.symm_in_splits)  # Row 0: splits
 		self.symm_in_splits_offsets[1].copy_(in_offsets)           # Row 1: offsets
+		
 		logger.info(f"Rank {self.rank} prepared splits/offsets for second all-to-all")
+		logger.info(f"Rank {self.rank} in_splits sum: {self.symm_in_splits.sum().item()}, out_splits sum: {splits.sum().item()}")
+		
 		# ---- 6) Second all-to-all: gather results back to original tokens -------
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
 			self.symm_out,                  # Input: interleaved expert outputs
-			self.symm_inp,                  # Output: tokens back in original order
+			self.symm_inp,                  # Output: tokens back in sorted order
 			self.symm_out_splits_offsets,   # Input splits/offsets [2, total_experts]
 			self.symm_in_splits_offsets,    # Output splits/offsets [2, total_experts]
 			self.group_name
 		)
+		
 		logger.info(f"Rank {self.rank} completed second all-to-all")
-		# ---- 7) Final weighted sum -------
+		
+		# ---- 7) Unsort to restore original token order -------
+		# symm_inp now contains results in sorted order (by expert ID)
+		# We need to unsort to get back to the original expanded_x order
+		sorted_results = self.symm_inp[:sorted_x.shape[0]]
+		
+		# Create inverse permutation
+		unsort_idx = torch.empty_like(sort_idx)
+		unsort_idx[sort_idx] = torch.arange(len(sort_idx), device=self.device)
+		
+		# Unsort the results
+		unsorted_results = sorted_results[unsort_idx]
+		
+		logger.info(f"Rank {self.rank} unsorted results")
+		
+		# ---- 8) Final weighted sum -------
+		# Now unsorted_results is in the same order as topk_idx and topk_weight
+		# Shape: [num_tokens * num_experts_per_tok, hidden_size]
 		final_out = moe_weighted_sum_triton_v2(
-			self.symm_inp[:sorted_x.shape[0]], 
+			unsorted_results,
 			topk_weight
 		)
+		
 		logger.info(f"Rank {self.rank} completed final weighted sum")
 
 		return final_out
