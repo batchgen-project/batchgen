@@ -1721,7 +1721,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			logger.info(f"Input x device{input_x.device}, input_eids device{input_eids.device}, expert_counts device{expert_counts.device}, expert_offsets device{expert_offsets.device}")
 			logger.info(f"Input x dtype{input_x.dtype}, input_eids dtype{input_eids.dtype}, expert_counts dtype{expert_counts.dtype}, expert_offsets dtype{expert_offsets.dtype}")
 			logger.info(f"expert_counts: {expert_counts}")
-			logger.ingo(f"expert_offsets: {expert_offsets}")
+			logger.info(f"expert_offsets: {expert_offsets}")
 		res = self.grouped_dequant_moe_fp8(
 				input_x,          # Oversized buffer of inputs for local experts
 				input_eids,       # Oversized buffer of expert IDs
