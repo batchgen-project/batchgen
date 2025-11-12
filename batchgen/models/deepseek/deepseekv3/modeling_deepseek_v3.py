@@ -1717,11 +1717,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		expert_offsets = self.out_splits_offsets[1].to(torch.int32)
 
 		if self.rank == 0:
-			logging.info(f"Input x shape{input_x.shape}, input_eids shape{input_eids.shape}, expert_counts shape{expert_counts.shape}, expert_offsets shape{expert_offsets.shape}")
-			logging.info(f"Input x device{input_x.device}, input_eids device{input_eids.device}, expert_counts device{expert_counts.device}, expert_offsets device{expert_offsets.device}")
-			logging.info(f"Input x dtype{input_x.dtype}, input_eids dtype{input_eids.dtype}, expert_counts dtype{expert_counts.dtype}, expert_offsets dtype{expert_offsets.dtype}")
-			logging.info(f"expert_counts: {expert_counts}")
-			logging.ingo(f"expert_offsets: {expert_offsets}")
+			logger.info(f"Input x shape{input_x.shape}, input_eids shape{input_eids.shape}, expert_counts shape{expert_counts.shape}, expert_offsets shape{expert_offsets.shape}")
+			logger.info(f"Input x device{input_x.device}, input_eids device{input_eids.device}, expert_counts device{expert_counts.device}, expert_offsets device{expert_offsets.device}")
+			logger.info(f"Input x dtype{input_x.dtype}, input_eids dtype{input_eids.dtype}, expert_counts dtype{expert_counts.dtype}, expert_offsets dtype{expert_offsets.dtype}")
+			logger.info(f"expert_counts: {expert_counts}")
+			logger.ingo(f"expert_offsets: {expert_offsets}")
 		res = self.grouped_dequant_moe_fp8(
 				input_x,          # Oversized buffer of inputs for local experts
 				input_eids,       # Oversized buffer of expert IDs
@@ -2438,11 +2438,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 					expert_counts
 		)
 		if self.rank == 0:
-			logging.info(f"Group size: {group_size}")
-			logging.info(f"Activated group idx: {activated_group_idx}")
-			logging.info(f"Group start indices: {group_start_indices}")
-			logging.info(f"Num active experts: {num_active_experts}")
-			logging.info(f"x shape: {x.shape}")
+			logger.info(f"Group size: {group_size}")
+			logger.info(f"Activated group idx: {activated_group_idx}")
+			logger.info(f"Group start indices: {group_start_indices}")
+			logger.info(f"Num active experts: {num_active_experts}")
+			logger.info(f"x shape: {x.shape}")
 		# --- End Replacement ---
 		
 		# 4. Perform dynamic slicing (async).
