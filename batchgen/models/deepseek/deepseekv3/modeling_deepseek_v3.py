@@ -1656,7 +1656,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	def moe_infer_alltoall_nvshmem(self, x):
 		num_tokens, hidden_size = x.shape
 		symm_mem.set_backend("NVSHMEM")
-		group_name = dist.group_world.group_name
+		group_name = dist.group.WORLD.group_name
 		symm_mem.enable_symm_mem_for_group(group_name)
 		max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
 		max_out_len = max_inp_len * dist.get_world_size() # worst case.
