@@ -1509,6 +1509,7 @@ def activation_gating(
 	
 	return output
 
+import torch.distributed._symmetric_memory as symm_mem
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1650,7 +1651,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
-	import torch.distributed._symmetric_memory as symm_mem
+
 	@torch.inference_mode()
 	def moe_infer_alltoall_nvshmem(self, x):
 		num_tokens, hidden_size = x.shape
