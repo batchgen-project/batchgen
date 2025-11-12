@@ -1715,6 +1715,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		input_eids = torch.arange(self.total_experts, device=self.device, dtype=torch.int32)
 		expert_counts = self.out_splits_offsets[0].to(torch.int32)
 		expert_offsets = self.out_splits_offsets[1].to(torch.int32)
+
+		if self.rank == 0:
+			logging.info(f"Input x shape{input_x.shape}, input_eids shape{input_eids.shape}, expert_counts shape{expert_counts.shape}, expert_offsets shape{expert_offsets.shape}")
+			logging.info(f"Input x device{input_x.device}, input_eids device{input_eids.device}, expert_counts device{expert_counts.device}, expert_offsets device{expert_offsets.device}")
+			logging.info(f"Input x dtype{input_x.dtype}, input_eids dtype{input_eids.dtype}, expert_counts dtype{expert_counts.dtype}, expert_offsets dtype{expert_offsets.dtype}")
+			logging.info(f"expert_counts: {expert_counts}")
+			logging.ingo(f"expert_offsets: {expert_offsets}")
 		res = self.grouped_dequant_moe_fp8(
 				input_x,          # Oversized buffer of inputs for local experts
 				input_eids,       # Oversized buffer of expert IDs
@@ -2429,9 +2436,15 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# num_active_experts = torch.count_nonzero(group_size) # 0-dim GPU tensor
 		group_size, activated_group_idx, group_start_indices, num_active_experts = compact_expert_data(
 					expert_counts
-		)		
+		)
+		if self.rank == 0:
+			logging.info(f"Group size: {group_size}")
+			logging.info(f"Activated group idx: {activated_group_idx}")
+			logging.info(f"Group start indices: {group_start_indices}")
+			logging.info(f"Num active experts: {num_active_experts}")
+			logging.info(f"x shape: {x.shape}")
 		# --- End Replacement ---
-
+		
 		# 4. Perform dynamic slicing (async).
 		# We slice the oversized 'x' tensor using the GPU-side 'actual_num_tokens' tensor.
 		# This creates a dynamically-sized view.
