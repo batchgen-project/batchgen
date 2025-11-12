@@ -1593,6 +1593,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Fixed split sizes (same for all iterations)
 		# self.fixed_splits = [self.fixed_send_size] * self.world_size
 
+
+	def init_num_tokens(self, num_tokens_per_rank):
+		self.num_tokens_per_rank = num_tokens_per_rank
+		global_num_tokens = self.num_tokens_per_rank * self.world_size
+		K = self.num_experts_per_tok
+		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
+		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
+		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
+
+		# TODO: temporally put these here.
 	    # Initialize symmetric memory once during model initialization
 		symm_mem.set_backend("NVSHMEM")
 		group_name = dist.group.WORLD.group_name
@@ -1617,15 +1627,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			(2, self.total_experts), dtype=torch.int64, device=self.device
 		)
 		self.group_name = group_name
-
-
-	def init_num_tokens(self, num_tokens_per_rank):
-		self.num_tokens_per_rank = num_tokens_per_rank
-		global_num_tokens = self.num_tokens_per_rank * self.world_size
-		K = self.num_experts_per_tok
-		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
-		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
-		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 
 	def init(self, num_tokens_per_rank):
 		# self.num_tokens_per_rank = num_tokens_per_rank
