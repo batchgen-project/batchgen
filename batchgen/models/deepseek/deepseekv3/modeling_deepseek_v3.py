@@ -1602,8 +1602,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
 		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 
-		# TODO: temporally put these here.
-	    # Initialize symmetric memory once during model initialization
+		# Initialize symmetric memory once during model initialization
 		symm_mem.set_backend("NVSHMEM")
 		group_name = dist.group.WORLD.group_name
 		symm_mem.enable_symm_mem_for_group(group_name)
@@ -1612,18 +1611,21 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
 		max_out_len = max_inp_len * dist.get_world_size()
 		
-		self.inp = symm_mem.empty(
+		self.symm_inp = symm_mem.empty(
 			max_inp_len, self.config.hidden_size, 
 			dtype=torch.bfloat16, device=self.device
 		)
-		self.out = symm_mem.empty(
+		self.symm_out = symm_mem.empty(
 			max_out_len, self.config.hidden_size, 
 			dtype=torch.bfloat16, device=self.device
 		)
-		self.in_splits = symm_mem.empty(
+		self.symm_in_splits = symm_mem.empty(
 			self.total_experts, dtype=torch.int64, device=self.device
 		)
-		self.out_splits_offsets = symm_mem.empty(
+		self.symm_out_splits_offsets = symm_mem.empty(
+			(2, self.total_experts), dtype=torch.int64, device=self.device
+		)
+		self.symm_in_splits_offsets = symm_mem.empty(
 			(2, self.total_experts), dtype=torch.int64, device=self.device
 		)
 		self.group_name = group_name
@@ -1681,64 +1683,206 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	@torch.inference_mode()
 	def moe_infer_alltoall_nvshmem(self, x):
 		num_tokens, hidden_size = x.shape
-		# symm_mem.set_backend("NVSHMEM")
-		# group_name = dist.group.WORLD.group_name
-		# symm_mem.enable_symm_mem_for_group(group_name)
-		# max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
-		# max_out_len = max_inp_len * dist.get_world_size() # worst case.
-		# inp = symm_mem.empty(max_inp_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
-		# out = symm_mem.empty(max_out_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
-		# in_splits = symm_mem.empty(self.total_experts, dtype=torch.int64, device=self.device)
-		# out_splits_offsets = symm_mem.empty((2, self.total_experts), dtype=torch.int64, device=self.device)
+		
 		# ---- 1) First all-to-all: distribute tokens to experts -------
-		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size)) #API Comp
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
+			x.view(num_tokens, 1, hidden_size)
+		)
 		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
-		# Sort the expanded_x according to topk_idx -> in_splits: (self.global_num_experts,)
+		
+		# Sort the expanded_x according to topk_idx
 		flat_eids = topk_idx.flatten().to(torch.int32)
 		sorted_eids, sort_idx = flat_eids.sort()
 		sorted_x = expanded_x[sort_idx]
+		
+		# Prepare input splits and copy data to symmetric buffer
 		bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
-		self.in_splits.copy_(bin_count)
-		self.inp[:sorted_x.shape[0]].copy_(sorted_x)
-		torch.ops.symm_mem.all_to_all_vdev_2d(self.inp, self.out, self.in_splits, self.out_splits_offsets, self.group_name)
+		self.symm_in_splits.copy_(bin_count)
+		self.symm_inp[:sorted_x.shape[0]].copy_(sorted_x)
+		
+		# First all-to-all: dispatch tokens to experts
+		torch.ops.symm_mem.all_to_all_vdev_2d(
+			self.symm_inp, 
+			self.symm_out, 
+			self.symm_in_splits, 
+			self.symm_out_splits_offsets, 
+			self.group_name
+		)
 
-		# ---- 2) Process tokens assigned to local experts ------------------
-		# 'res' contains the output of local experts for the tokens routed to them.
-
-		# res = self.grouped_dequant_moe_fp8(
-		# 			self.out,          							# Oversized buffer of inputs for local experts
-		# 			torch.arange(self.total_experts),   		# Oversized buffer of expert IDs
-		# 			self.out_splits_offsets[0].to(torch.int32), # [num_local_experts], todo:type comp
-		# 			self.out_splits_offsets[1].to(torch.int32)  # [num_local_experts + 1]
-		# )
-		input_x = self.out.clone()
-		input_eids = torch.arange(self.total_experts, device=self.device, dtype=torch.int32)
-		expert_counts = self.out_splits_offsets[0].to(torch.int32)
-		expert_offsets = self.out_splits_offsets[1].to(torch.int32)
-
-		if self.rank == 0:
-			logger.info(f"Input x shape{input_x.shape}, input_eids shape{input_eids.shape}, expert_counts shape{expert_counts.shape}, expert_offsets shape{expert_offsets.shape}")
-			logger.info(f"Input x device{input_x.device}, input_eids device{input_eids.device}, expert_counts device{expert_counts.device}, expert_offsets device{expert_offsets.device}")
-			logger.info(f"Input x dtype{input_x.dtype}, input_eids dtype{input_eids.dtype}, expert_counts dtype{expert_counts.dtype}, expert_offsets dtype{expert_offsets.dtype}")
-			logger.info(f"expert_counts: {expert_counts}")
-			logger.info(f"expert_offsets: {expert_offsets}")
+		# ---- 2) Reorder tokens to expert-contiguous layout -------
+		splits = self.symm_out_splits_offsets[0]
+		offsets = self.symm_out_splits_offsets[1]
+		
+		# Compute local expert counts
+		local_expert_counts = torch.zeros(
+			self.experts_per_rank, dtype=torch.int32, device=self.device
+		)
+		for chunk_idx in range(self.total_experts):
+			local_expert_id = chunk_idx // self.world_size
+			local_expert_counts[local_expert_id] += splits[chunk_idx]
+		
+		# Reorder tokens to expert-contiguous layout
+		reordered_x, expert_offsets = self.reorder_tokens_to_expert_contiguous_vectorized(
+			self.symm_out, splits, offsets, local_expert_counts
+		)
+		
+		# ---- 3) Process tokens with local experts -------
+		input_eids = torch.arange(
+			self.experts_per_rank, device=self.device, dtype=torch.int32
+		)
+		
 		res = self.grouped_dequant_moe_fp8(
-				input_x,          # Oversized buffer of inputs for local experts
-				input_eids,       # Oversized buffer of expert IDs
-				expert_counts,    # [num_local_experts]
-				expert_offsets    # [num_local_experts + 1]
-			)
+			reordered_x,
+			input_eids,
+			local_expert_counts,    # [num_local_experts]
+			expert_offsets          # [num_local_experts + 1]
+		)
 
-		# ---- 3) Second all-to-all: gather results back to original tokens -------
-		self.out[:res.shape[0]].copy_(res)
-		torch.ops.symm_mem.all_to_all_vdev_2d_offset(self.out, self.inp, self.out_splits_offsets, self.in_splits, self.group_name)
+		# ---- 4) Scatter results back to interleaved layout -------
+		interleaved_res = self.scatter_results_to_interleaved(
+			res, splits, offsets, expert_offsets
+		)
+		
+		# Copy back to symmetric memory buffer
+		self.symm_out[:interleaved_res.shape[0]].copy_(interleaved_res)
+		
+		# ---- 5) Prepare input splits/offsets for second all-to-all -------
+		# Compute offsets from splits (prefix sum)
+		in_offsets = torch.cumsum(
+			torch.cat([
+				torch.zeros(1, dtype=torch.int64, device=self.device),
+				self.symm_in_splits[:-1]
+			]),
+			dim=0
+		)
+		
+		# Build 2-row tensor for all_to_all_vdev_2d_offset
+		self.symm_in_splits_offsets[0].copy_(self.symm_in_splits)  # Row 0: splits
+		self.symm_in_splits_offsets[1].copy_(in_offsets)           # Row 1: offsets
+		
+		# ---- 6) Second all-to-all: gather results back to original tokens -------
+		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
+			self.symm_out,                  # Input: interleaved expert outputs
+			self.symm_inp,                  # Output: tokens back in original order
+			self.symm_out_splits_offsets,   # Input splits/offsets [2, total_experts]
+			self.symm_in_splits_offsets,    # Output splits/offsets [2, total_experts]
+			self.group_name
+		)
 
-		# --- 4) Final weighted sum -------
-
-		final_out = moe_weighted_sum_triton_v2(self.inp[:sorted_x.shape[0]].clone(), topk_weight)
+		# ---- 7) Final weighted sum -------
+		final_out = moe_weighted_sum_triton_v2(
+			self.symm_inp[:sorted_x.shape[0]], 
+			topk_weight
+		)
 
 		return final_out
 
+	def reorder_tokens_to_expert_contiguous_vectorized(self, input_x, splits, offsets, local_expert_counts):
+		"""
+		Vectorized version using advanced indexing.
+		"""
+		total_tokens = splits.sum().item()
+		
+		# Compute expert offsets
+		expert_offsets = torch.cumsum(
+			torch.cat([
+				torch.zeros(1, dtype=torch.int32, device=self.device),
+				local_expert_counts
+			]),
+			dim=0
+		)
+		
+		# Create mapping: for each token, which position should it go to?
+		chunk_expert_ids = torch.arange(self.total_experts, device=self.device) // self.world_size
+		
+		# Build source and destination indices for all tokens
+		src_indices = []
+		dst_indices = []
+		write_positions = expert_offsets[:-1].clone()
+		
+		for chunk_idx in range(self.total_experts):
+			chunk_size = splits[chunk_idx].item()
+			if chunk_size == 0:
+				continue
+			
+			local_expert_id = chunk_expert_ids[chunk_idx].item()
+			src_start = offsets[chunk_idx].item()
+			dst_start = write_positions[local_expert_id].item()
+			
+			src_indices.extend(range(src_start, src_start + chunk_size))
+			dst_indices.extend(range(dst_start, dst_start + chunk_size))
+			
+			write_positions[local_expert_id] += chunk_size
+		
+		# Convert to tensors
+		src_indices = torch.tensor(src_indices, dtype=torch.int64, device=self.device)
+		dst_indices = torch.tensor(dst_indices, dtype=torch.int64, device=self.device)
+		
+		# Perform reordering in one shot
+		reordered_x = torch.empty(
+			(total_tokens, input_x.shape[1]),
+			dtype=input_x.dtype,
+			device=input_x.device
+		)
+		reordered_x[dst_indices] = input_x[src_indices]
+		
+		return reordered_x, expert_offsets
+
+	def scatter_results_to_interleaved(self, res, splits, offsets, expert_offsets):
+		"""
+		Reverse of reorder_tokens_to_expert_contiguous.
+		
+		Input layout (from grouped GEMM):
+			[all_tokens_for_e0, all_tokens_for_e1, ...]
+			
+		Output layout (needed for all_to_all_vdev_2d_offset):
+			[r0_e0, r1_e0, ..., r7_e0,  <- interleaved by source rank
+			r0_e1, r1_e1, ..., r7_e1,
+			...]
+		
+		Args:
+			res: [total_tokens, hidden_size] - expert-contiguous output from GEMM
+			splits: [total_experts] - token count for each chunk
+			offsets: [total_experts] - offset of each chunk in interleaved buffer
+			expert_offsets: [experts_per_rank + 1] - offsets in res for each expert
+		
+		Returns:
+			interleaved_out: [total_tokens, hidden_size] - interleaved layout
+		"""
+		total_tokens = splits.sum()
+		interleaved_out = torch.empty(
+			(total_tokens, res.shape[1]),
+			dtype=res.dtype,
+			device=res.device
+		)
+		
+		# Track current read position for each local expert
+		read_positions = expert_offsets[:-1].clone()
+		
+		# Iterate through all chunks and copy from expert-contiguous position
+		for chunk_idx in range(self.total_experts):
+			chunk_size = splits[chunk_idx].item()
+			
+			if chunk_size == 0:
+				continue
+			
+			# Determine which local expert this chunk came from
+			local_expert_id = chunk_idx // self.world_size
+			
+			# Read from expert-contiguous position
+			src_start = read_positions[local_expert_id].item()
+			src_end = src_start + chunk_size
+			
+			# Write to interleaved position
+			dst_start = offsets[chunk_idx].item()
+			dst_end = dst_start + chunk_size
+			
+			interleaved_out[dst_start:dst_end] = res[src_start:src_end]
+			
+			# Update read position for this expert
+			read_positions[local_expert_id] += chunk_size
+		
+		return interleaved_out
 
 	@torch.inference_mode()
 	def moe_infer_allgather_alltoall(self, x):
