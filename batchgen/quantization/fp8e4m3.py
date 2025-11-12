@@ -1743,8 +1743,8 @@ def dequant_compressed_kv_per_token(
 		# result.fill_(1e10)
 
 		# Construct 3D triton grid: bsz, seq_len, num_blocks
-		BLOCK_SIZE_M = 256
-		BLOCK_SIZE_N = 128
+		BLOCK_SIZE_M = 64
+		BLOCK_SIZE_N = 64
 		num_blocks_m = ceil(bsz * padded_seq_len / BLOCK_SIZE_M)
 		num_blocks_n = ceil(dim / BLOCK_SIZE_N)
 		q = q.view(-1, dim)
