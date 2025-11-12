@@ -76,13 +76,15 @@ from transformers.utils.import_utils import is_torch_fx_available
 
 from .configuration_deepseek_v2 import DeepseekV2Config
 
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import (  # noqa
-        index_first_axis,
-        pad_input,
-        unpad_input,
-    )
+logger = logging.get_logger(__name__)
+is_flash_attn_2_available = False
+if is_flash_attn_2_available:
+	try:
+		from flash_attn import flash_attn_func, flash_attn_varlen_func
+		from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+	except Exception as e:
+		logger.warning(f"Unable to import flash_attn: {e}")
+		pass
 
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
@@ -96,7 +98,7 @@ if is_torch_fx_available():
     )
 
 
-logger = logging.get_logger(__name__)
+
 
 _CONFIG_FOR_DOC = "DeepseekV2Config"
 
