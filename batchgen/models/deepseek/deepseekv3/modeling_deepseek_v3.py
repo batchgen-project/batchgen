@@ -1662,6 +1662,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		max_out_len = max_inp_len * dist.get_world_size() # worst case.
 		inp = symm_mem.empty(max_inp_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
 		out = symm_mem.empty(max_out_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
+		in_splits = symm_mem.empty(self.total_experts, dtype=torch.int64, device=self.device)
 		out_splits_offsets = symm_mem.empty((2, self.total_experts), dtype=torch.int64, device=self.device)
 		# ---- 1) First all-to-all: distribute tokens to experts -------
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size)) #API Comp
@@ -1670,7 +1671,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		flat_eids = topk_idx.flatten().to(torch.int32)
 		sorted_eids, sort_idx = flat_eids.sort()
 		sorted_x = expanded_x[sort_idx]
-		in_splits = torch.bincount(sorted_eids, minlength=self.total_experts)
+		bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
+		in_splits.copy_(bin_count)
 		inp[:sorted_x.shape[0]].copy_(sorted_x)
 		torch.ops.symm_mem.all_to_all_vdev_2d(inp, out, in_splits, out_splits_offsets, group_name)
 
