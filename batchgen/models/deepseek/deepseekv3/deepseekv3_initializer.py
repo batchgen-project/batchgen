@@ -36,7 +36,9 @@ try:
     from batchgen.core_engine import batchgen as core_engine
 except ImportError:
     # jit compile
-    from core_engine import batchgen as core_engine
+    # from core_engine import batchgen as core_engine
+    from batchgen.models.engine_loader import core_engine as loader_module
+    core_engine = loader_module.batchgen
 
 from typing import Tuple
 from ....config.engine_config_parser import parse_config_from_json
