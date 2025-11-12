@@ -1663,7 +1663,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		inp = symm_mem.empty(max_inp_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
 		out = symm_mem.empty(max_out_len, self.config.hidden_size, dtype=torch.bfloat16, device=self.device)
 		in_splits = symm_mem.empty(self.total_experts, dtype=torch.int64, device=self.device)
-		out_splits_offsets = symm_mem.empty((2, self.total_experts), dtype=torch.int32, device=self.device)
+		out_splits_offsets = symm_mem.empty((2, self.total_experts), dtype=torch.int64, device=self.device)
 		# ---- 1) First all-to-all: distribute tokens to experts -------
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size)) #API Comp
 		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
@@ -1680,10 +1680,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 'res' contains the output of local experts for the tokens routed to them.
 
 		res = self.grouped_dequant_moe_fp8(
-					out,          						# Oversized buffer of inputs for local experts
-					torch.arange(self.total_experts),   # Oversized buffer of expert IDs
-					out_splits_offsets[0],  			# [num_local_experts]
-					out_splits_offsets[1]    			# [num_local_experts + 1]
+					out,          							# Oversized buffer of inputs for local experts
+					torch.arange(self.total_experts),   	# Oversized buffer of expert IDs
+					out_splits_offsets[0].to(torch.int32),  # [num_local_experts], todo:type comp
+					out_splits_offsets[1].to(torch.int32)    # [num_local_experts + 1]
 		)
 
 		# ---- 3) Second all-to-all: gather results back to original tokens -------
