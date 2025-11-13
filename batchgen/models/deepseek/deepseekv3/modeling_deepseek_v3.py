@@ -1603,7 +1603,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 
 		# Initialize symmetric memory once during model initialization
-		symm_mem.set_backend("NVSHMEM")
+		if not symm_mem.is_nvshmem_available():
+			logger.warn("NVSHMEM is not available. Symmetric memory features will be disabled.")
+			symm_mem.set_backend("NCCL")
+		else:
+			symm_mem.set_backend("NVSHMEM")
 		group_name = dist.group.WORLD.group_name
 		symm_mem.enable_symm_mem_for_group(group_name)
 		
