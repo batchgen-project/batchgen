@@ -1730,15 +1730,15 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		logger.info(f"Rank {self.rank} received {total_recv_tokens} tokens")
 		
 		# Reorder tokens to expert-contiguous layout
-		logger.info(f"Rank {self.rank} splits, offsets: {splits}, {offsets}")
-		reordered_x, expert_offsets = self.reorder_tokens_to_expert_contiguous_vectorized(
-			self.symm_out[:total_recv_tokens],  # Only slice the valid received tokens
-			splits, 
-			offsets, 
-			local_expert_counts
-		)
+		# logger.info(f"Rank {self.rank} splits, offsets: {splits}, {offsets}")
+		# reordered_x, expert_offsets = self.reorder_tokens_to_expert_contiguous_vectorized(
+		# 	self.symm_out[:total_recv_tokens],  # Only slice the valid received tokens
+		# 	splits, 
+		# 	offsets, 
+		# 	local_expert_counts
+		# )
 
-		logger.info(f"Rank {self.rank} reordered tokens to expert-contiguous layout, shape: {reordered_x.shape}")
+		# logger.info(f"Rank {self.rank} reordered tokens to expert-contiguous layout, shape: {reordered_x.shape}")
 		
 		# ---- 3) Process tokens with local experts -------
 		input_eids = torch.arange(
@@ -1746,8 +1746,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		logger.info(f"Rank {self.rank} reordered_x shape: {reordered_x.shape}, input_eids shape: {input_eids.shape}, local_expert_counts: {local_expert_counts}, expert_offsets: {expert_offsets}, local_expert_counts {local_expert_counts.shape}, expert_offsets {expert_offsets.shape}")
 		# exit()
+		expert_offsets = torch.cumsum(
+			torch.cat([local_expert_counts.new_zeros(1), local_expert_counts])
+		)
 		res = self.grouped_dequant_moe_fp8(
-			reordered_x,
+			self.symm_out,
 			input_eids,
 			local_expert_counts,    # [num_local_experts]
 			expert_offsets          # [num_local_experts + 1]
