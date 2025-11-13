@@ -1687,7 +1687,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 1) Gating -------
 		# [num_tokens, topk]
-		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
+		topk_idx, topk_weight = self.gate.forward(
 			x.view(num_tokens, 1, hidden_size)
 		)
 		
