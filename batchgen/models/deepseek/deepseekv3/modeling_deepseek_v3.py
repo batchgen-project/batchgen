@@ -1957,6 +1957,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		torch.cuda.synchronize(self.device)
 
 		# ---- 9) Combine (Reverse All-to-All) -------
+		self.symm_inp.zero_()
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
 			self.symm_out,                  
 			self.symm_inp,                  
