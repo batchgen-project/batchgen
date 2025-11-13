@@ -1682,27 +1682,43 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 	@torch.inference_mode()
 	def moe_infer_alltoall_nvshmem(self, x):
+		# x shape: [num_tokens, hidden_size]
 		num_tokens, hidden_size = x.shape
 		
-		# ---- 1) First all-to-all: distribute tokens to experts -------
+		# ---- 1) Gating -------
+		# [num_tokens, topk]
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
 			x.view(num_tokens, 1, hidden_size)
 		)
-		expanded_x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
 		
-		# Sort the expanded_x according to topk_idx
-		flat_eids = topk_idx.flatten().to(torch.int32)
+		# ---- 2) Efficient Sorting (Index Manipulation only) -------
+		# Flatten the expert IDs
+		flat_eids = topk_idx.view(-1).to(torch.int32)
+		
+		# Sort the expert IDs to group tokens by destination expert
 		sorted_eids, sort_idx = flat_eids.sort()
-		sorted_x = expanded_x[sort_idx]
 		
-		# Prepare input splits and copy data to symmetric buffer
+		# OPTIMIZATION: Instead of repeat_interleave -> sort data, 
+		# calculate the gather indices.
+		# We need to map the sorted slot back to the original token index (0..N).
+		# Floor division by k (num_experts_per_tok) gives the original row index.
+		sorted_token_ids = sort_idx // self.num_experts_per_tok
+		
+		# Gather data directly into the symmetric buffer
+		# We only copy the data once here.
+		self.symm_inp[:sorted_eids.shape[0]].copy_(x[sorted_token_ids])
+		
+		# ---- 3) Prepare Dispatch Metadata -------
+		# Count how many tokens go to each expert globally
 		bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
+		
+		# Copy counts to the symmetric metadata buffer
 		self.symm_in_splits.copy_(bin_count)
-		self.symm_inp[:sorted_x.shape[0]].copy_(sorted_x)
 		
-		logger.info(f"Rank {self.rank} starting first all-to-all with {sorted_x.shape[0]} tokens")
-		
-		# First all-to-all: dispatch tokens to experts
+		# ---- 4) Dispatch (All-to-All) -------
+		# Input: symm_inp (Sorted Data)
+		# Output: symm_out (Data grouped by Local Expert)
+		# Metadata Written: symm_out_splits_offsets (Layout of data in symm_out)
 		torch.ops.symm_mem.all_to_all_vdev_2d(
 			self.symm_inp, 
 			self.symm_out, 
@@ -1711,123 +1727,87 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.group_name
 		)
 		
-		logger.info(f"Rank {self.rank} completed first all-to-all")
-
-		# ---- 2) Reorder tokens to expert-contiguous layout -------
-		splits = self.symm_out_splits_offsets[0]
-		offsets = self.symm_out_splits_offsets[1]
+		# ---- 5) Prepare Expert Computation -------
+		# We need to know how many tokens each of OUR local experts received.
+		# symm_out_splits_offsets shape: [2, World_Size * Local_Experts]
+		# It is ordered: [Rank0->Exp0, Rank0->Exp1... Rank1->Exp0...]
 		
-		# Compute local expert counts
-		local_expert_counts = torch.zeros(
-			self.experts_per_rank, dtype=torch.int32, device=self.device
-		)
-		for chunk_idx in range(self.total_experts):
-			local_expert_id = chunk_idx // self.world_size
-			local_expert_counts[local_expert_id] += splits[chunk_idx]
+		out_splits = self.symm_out_splits_offsets[0] # Row 0 is counts
 		
-		# Get total received tokens
-		total_recv_tokens = splits.sum().item()
-		logger.info(f"Rank {self.rank} received {total_recv_tokens} tokens")
+		# View as [World_Size, Local_Experts] and sum over ranks
+		splits_matrix = out_splits.view(self.world_size, self.experts_per_rank)
+		tokens_per_local_expert = splits_matrix.sum(dim=0)
 		
-		# Reorder tokens to expert-contiguous layout
-		# logger.info(f"Rank {self.rank} splits, offsets: {splits}, {offsets}")
-		# reordered_x, expert_offsets = self.reorder_tokens_to_expert_contiguous_vectorized(
-		# 	self.symm_out[:total_recv_tokens],  # Only slice the valid received tokens
-		# 	splits, 
-		# 	offsets, 
-		# 	local_expert_counts
-		# )
-
-		# logger.info(f"Rank {self.rank} reordered tokens to expert-contiguous layout, shape: {reordered_x.shape}")
+		# Create offsets for the GEMM/Expert kernel
+		# Note: We explicitly start at 0.
+		zero = torch.zeros((1,), dtype=tokens_per_local_expert.dtype, device=self.device)
+		expert_offsets = torch.cat([zero, torch.cumsum(tokens_per_local_expert, dim=0)])
 		
-		# ---- 3) Process tokens with local experts -------
-		input_eids = torch.arange(
-			self.experts_per_rank, device=self.device, dtype=torch.int32
-		)
-		logger.info(f"Rank {self.rank} reordered_x shape: {reordered_x.shape}, input_eids shape: {input_eids.shape}, local_expert_counts: {local_expert_counts}, expert_offsets: {expert_offsets}, local_expert_counts {local_expert_counts.shape}, expert_offsets {expert_offsets.shape}")
-		# exit()
-		expert_offsets = torch.cumsum(
-			torch.cat([local_expert_counts.new_zeros(1), local_expert_counts])
-		)
+		# ---- 6) Local Expert Computation -------
+		# Input: self.symm_out (contains the dispatched tokens)
 		res = self.grouped_dequant_moe_fp8(
-			self.symm_out,
-			input_eids,
-			local_expert_counts,    # [num_local_experts]
-			expert_offsets          # [num_local_experts + 1]
+			self.symm_out,              # Input buffer
+			None,                       
+			tokens_per_local_expert,    
+			expert_offsets              
 		)
 		
-		# CRITICAL: res should have the same length as total_recv_tokens
-		assert res.shape[0] == total_recv_tokens, \
-			f"Result size mismatch: {res.shape[0]} != {total_recv_tokens}"
-
-		logger.info(f"Rank {self.rank} ocal_expert_counts {res.shape}")
-
-		# ---- 4) Scatter results back to interleaved layout -------
-		interleaved_res = self.scatter_results_to_interleaved(
-			res, splits, offsets, expert_offsets
-		)
+		# ---- 7) Prepare Combine (Reverse) Metadata -------
+		# A. Input Metadata for Combine = Output Metadata from Dispatch
+		# (Symmetry: We send back exactly from where we received)
+		combine_in_splits_offsets = self.symm_out_splits_offsets
 		
-		# CRITICAL: interleaved_res must have exactly total_recv_tokens
-		assert interleaved_res.shape[0] == total_recv_tokens, \
-			f"Interleaved result size mismatch: {interleaved_res.shape[0]} != {total_recv_tokens}"
+		# B. Output Metadata for Combine = Input Metadata from Dispatch (plus offsets)
+		# We need to tell the origin rank where to put the returning tokens.
+		# This requires [Splits, Offsets]
+		combine_out_splits = self.symm_in_splits
 		
-		# Copy back to symmetric memory buffer - only the valid portion
-		self.symm_out[:total_recv_tokens].copy_(interleaved_res)
+		# Calculate exclusive prefix sum for offsets
+		combine_out_offsets = torch.zeros_like(combine_out_splits)
+		combine_out_offsets[1:] = torch.cumsum(combine_out_splits[:-1], dim=0)
 		
-		logger.info(f"Rank {self.rank} scattered results back to interleaved layout")
+		# Stack them into the required [2, N] shape
+		self.symm_in_splits_offsets[0].copy_(combine_out_splits)
+		self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
 		
-		# ---- 5) Prepare input splits/offsets for second all-to-all -------
-		# Compute offsets from splits (prefix sum)
-		in_offsets = torch.cumsum(
-			torch.cat([
-				torch.zeros(1, dtype=torch.int64, device=self.device),
-				self.symm_in_splits[:-1]
-			]),
-			dim=0
-		)
+		# ---- 8) Prepare Buffer for Combine -------
+		# We can reuse symm_out to hold the RESULTS of the experts.
+		# We copy the result `res` back into `symm_out`.
+		# The layout is already perfect (Expert-Major) because `res` implies that order.
+		total_tokens_processed = expert_offsets[-1]
+		self.symm_out[:total_tokens_processed].copy_(res)
 		
-		# Build 2-row tensor for all_to_all_vdev_2d_offset
-		self.symm_in_splits_offsets[0].copy_(self.symm_in_splits)  # Row 0: splits
-		self.symm_in_splits_offsets[1].copy_(in_offsets)           # Row 1: offsets
-		
-		logger.info(f"Rank {self.rank} prepared splits/offsets for second all-to-all")
-		logger.info(f"Rank {self.rank} in_splits sum: {self.symm_in_splits.sum().item()}, out_splits sum: {splits.sum().item()}")
-		
-		# ---- 6) Second all-to-all: gather results back to original tokens -------
+		# ---- 9) Combine (Reverse All-to-All) -------
+		# Input: symm_out (Expert Results)
+		# Output: symm_inp (We reuse the input buffer to store received results)
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
-			self.symm_out,                  # Input: interleaved expert outputs
-			self.symm_inp,                  # Output: tokens back in sorted order
-			self.symm_out_splits_offsets,   # Input splits/offsets [2, total_experts]
-			self.symm_in_splits_offsets,    # Output splits/offsets [2, total_experts]
+			self.symm_out,                  
+			self.symm_inp,                  
+			combine_in_splits_offsets,   
+			self.symm_in_splits_offsets,    
 			self.group_name
 		)
 		
-		logger.info(f"Rank {self.rank} completed second all-to-all")
+		# ---- 10) Unsort and Weighted Sum -------
+		# symm_inp now contains processed tokens, but they are still sorted by Expert ID.
+		# We need to restore the original order (0_top1, 0_top2, 1_top1...)
 		
-		# ---- 7) Unsort to restore original token order -------
-		# symm_inp now contains results in sorted order (by expert ID)
-		# We need to unsort to get back to the original expanded_x order
-		sorted_results = self.symm_inp[:sorted_x.shape[0]]
+		# Invert the permutation
+		unsort_idx = torch.argsort(sort_idx)
 		
-		# Create inverse permutation
-		unsort_idx = torch.empty_like(sort_idx)
-		unsort_idx[sort_idx] = torch.arange(len(sort_idx), device=self.device)
+		# We only care about the valid data region
+		sorted_results = self.symm_inp[:flat_eids.shape[0]]
 		
-		# Unsort the results
+		# Shuffle back to [N*K, Hidden] order corresponding to topk_idx
 		unsorted_results = sorted_results[unsort_idx]
 		
-		logger.info(f"Rank {self.rank} unsorted results")
+		# Reshape for weighted sum: [Num_Tokens, K, Hidden]
+		unsorted_results = unsorted_results.view(num_tokens, self.num_experts_per_tok, hidden_size)
 		
-		# ---- 8) Final weighted sum -------
-		# Now unsorted_results is in the same order as topk_idx and topk_weight
-		# Shape: [num_tokens * num_experts_per_tok, hidden_size]
-		final_out = moe_weighted_sum_triton_v2(
-			unsorted_results,
-			topk_weight
-		)
+		# Weighted sum
+		# topk_weight: [Num_Tokens, K] -> [Num_Tokens, K, 1]
+		final_out = torch.sum(unsorted_results * topk_weight.unsqueeze(-1), dim=1)
 		
-		logger.info(f"Rank {self.rank} completed final weighted sum")
-
 		return final_out
 
 	# def reorder_tokens_to_expert_contiguous_vectorized(self, input_x, splits, offsets, local_expert_counts):
