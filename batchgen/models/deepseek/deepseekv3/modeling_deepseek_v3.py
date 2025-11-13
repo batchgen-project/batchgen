@@ -1882,11 +1882,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		"""
 		Reorder tokens from expert-major all-to-all output to contiguous local expert layout.
 		
-		After all_to_all_vdev_2d, tokens are in expert-major order:
-		[expert_0_from_rank_0, expert_0_from_rank_1, ..., expert_1_from_rank_0, expert_1_from_rank_1, ...]
+		Received buffer structure (expert-major order):
+		[e0_from_all_ranks | e1_from_all_ranks | ... | e255_from_all_ranks]
 		
-		We need to reorder to:
-		[all_tokens_for_local_expert_0, all_tokens_for_local_expert_1, ...]
+		where each expert's section has world_size chunks (one from each rank).
+		
+		We need to extract only the chunks for THIS rank's local experts and 
+		reorder them to be contiguous per local expert.
 		"""
 		total_tokens = splits.sum().item()
 		
@@ -1899,48 +1901,55 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			dim=0
 		)
 		
-		# Map each chunk to its corresponding local expert
-		# For world_size=2, experts_per_rank=2:
-		# global expert 0 → local expert 0 (rank 0)
-		# global expert 1 → local expert 1 (rank 0)  
-		# global expert 2 → local expert 0 (rank 1)
-		# global expert 3 → local expert 1 (rank 1)
-		# So chunk order after all-to-all on rank 0: [e0_r0, e0_r1, e1_r0, e1_r1]
-		# Chunks are grouped by expert: world_size consecutive chunks per expert
+		# Determine which global experts belong to this rank
+		# If this is rank R with experts_per_rank E, this rank owns global experts [R*E, (R+1)*E)
+		my_global_expert_start = self.rank * self.experts_per_rank
+		my_global_expert_end = my_global_expert_start + self.experts_per_rank
 		
 		src_indices = []
 		dst_indices = []
 		write_positions = expert_offsets[:-1].clone()
 		
-		# Iterate through chunks in the order they appear in the output buffer
+		# Process each chunk in the received buffer
 		for chunk_idx in range(self.total_experts):
 			chunk_size = splits[chunk_idx].item()
+			
 			if chunk_size == 0:
 				continue
 			
-			# Determine which local expert this chunk belongs to
-			# Chunks are grouped: first world_size chunks → local_expert_0,
-			#                     next world_size chunks → local_expert_1, etc.
-			local_expert_id = chunk_idx // self.world_size
+			# Determine which global expert this chunk belongs to
+			# Chunks are grouped: first world_size chunks are for expert 0,
+			#                     next world_size chunks are for expert 1, etc.
+			global_expert_id = chunk_idx // self.world_size
 			
-			# Source: where this chunk is in the received buffer
+			# Only process chunks for local experts on this rank
+			if not (my_global_expert_start <= global_expert_id < my_global_expert_end):
+				continue
+			
+			# Map to local expert ID
+			local_expert_id = global_expert_id - my_global_expert_start
+			
+			# Source position in received buffer
 			src_start = offsets[chunk_idx].item()
 			
-			# Destination: where to write in the reordered buffer
+			# Destination position in reordered buffer
 			dst_start = write_positions[local_expert_id].item()
 			
 			# Add indices for this chunk
 			src_indices.extend(range(src_start, src_start + chunk_size))
 			dst_indices.extend(range(dst_start, dst_start + chunk_size))
 			
-			# Update write position for this expert
+			# Advance write position for this local expert
 			write_positions[local_expert_id] += chunk_size
 		
-		# Sanity checks
+		# Validation
 		assert len(src_indices) == total_tokens, \
-			f"Expected {total_tokens} indices, got {len(src_indices)}"
-		assert max(src_indices) < input_x.shape[0], \
-			f"src_indices out of bounds: max={max(src_indices)}, input_x.shape[0]={input_x.shape[0]}"
+			f"Index count mismatch: {len(src_indices)} != {total_tokens}"
+		
+		if src_indices:
+			max_src_idx = max(src_indices)
+			assert max_src_idx < input_x.shape[0], \
+				f"Source index out of bounds: max_idx={max_src_idx}, buffer_size={input_x.shape[0]}"
 		
 		# Convert to tensors
 		src_indices = torch.tensor(src_indices, dtype=torch.int64, device=self.device)
