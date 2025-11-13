@@ -1730,6 +1730,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		logger.info(f"Rank {self.rank} received {total_recv_tokens} tokens")
 		
 		# Reorder tokens to expert-contiguous layout
+		logger.info(f"Rank {self.rank} splits, offsets: {splits}, {offsets}")
 		reordered_x, expert_offsets = self.reorder_tokens_to_expert_contiguous_vectorized(
 			self.symm_out[:total_recv_tokens],  # Only slice the valid received tokens
 			splits, 
