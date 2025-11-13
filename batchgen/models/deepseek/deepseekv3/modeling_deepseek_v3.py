@@ -1601,15 +1601,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
 		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
 		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
-
-		# Initialize symmetric memory once during model initialization
-		if not symm_mem.is_nvshmem_available():
-			logger.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
-			symm_mem.set_backend("NCCL")
-		else:
-			symm_mem.set_backend("NCCL")
-		group_name = dist.group.WORLD.group_name
-		symm_mem.enable_symm_mem_for_group(group_name)
 		
 		# Pre-allocate symmetric memory buffers
 		max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
