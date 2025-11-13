@@ -1607,7 +1607,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			logger.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
 			symm_mem.set_backend("NCCL")
 		else:
-			symm_mem.set_backend("NVSHMEM")
+			symm_mem.set_backend("NCCL")
 		group_name = dist.group.WORLD.group_name
 		symm_mem.enable_symm_mem_for_group(group_name)
 		
