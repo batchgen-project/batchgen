@@ -1628,7 +1628,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			(2, self.total_experts), dtype=torch.int64, device=self.device
 		)
 		symm_in_splits_offsets_hdl = symm_mem.rendezvous(self.symm_in_splits_offsets, dist.group.WORLD)
-		self.group_name = group_name
+		self.group_name = dist.group.WORLD.name
 
 	def init(self, num_tokens_per_rank):
 		# self.num_tokens_per_rank = num_tokens_per_rank
