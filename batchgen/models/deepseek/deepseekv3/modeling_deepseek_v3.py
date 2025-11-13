@@ -1603,32 +1603,32 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 
 		# Initialize symmetric memory once during model initialization
-		# symm_mem.set_backend("NVSHMEM")
-		# group_name = dist.group.WORLD.group_name
-		# symm_mem.enable_symm_mem_for_group(group_name)
+		symm_mem.set_backend("NVSHMEM")
+		group_name = dist.group.WORLD.group_name
+		symm_mem.enable_symm_mem_for_group(group_name)
 		
-		# # Pre-allocate symmetric memory buffers
-		# max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
-		# max_out_len = max_inp_len * dist.get_world_size()
+		# Pre-allocate symmetric memory buffers
+		max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
+		max_out_len = max_inp_len * dist.get_world_size()
 		
-		# self.symm_inp = symm_mem.empty(
-		# 	max_inp_len, self.config.hidden_size, 
-		# 	dtype=torch.bfloat16, device=self.device
-		# )
-		# self.symm_out = symm_mem.empty(
-		# 	max_out_len, self.config.hidden_size, 
-		# 	dtype=torch.bfloat16, device=self.device
-		# )
-		# self.symm_in_splits = symm_mem.empty(
-		# 	self.total_experts, dtype=torch.int64, device=self.device
-		# )
-		# self.symm_out_splits_offsets = symm_mem.empty(
-		# 	(2, self.total_experts), dtype=torch.int64, device=self.device
-		# )
-		# self.symm_in_splits_offsets = symm_mem.empty(
-		# 	(2, self.total_experts), dtype=torch.int64, device=self.device
-		# )
-		# self.group_name = group_name
+		self.symm_inp = symm_mem.empty(
+			max_inp_len, self.config.hidden_size, 
+			dtype=torch.bfloat16, device=self.device
+		)
+		self.symm_out = symm_mem.empty(
+			max_out_len, self.config.hidden_size, 
+			dtype=torch.bfloat16, device=self.device
+		)
+		self.symm_in_splits = symm_mem.empty(
+			self.total_experts, dtype=torch.int64, device=self.device
+		)
+		self.symm_out_splits_offsets = symm_mem.empty(
+			(2, self.total_experts), dtype=torch.int64, device=self.device
+		)
+		self.symm_in_splits_offsets = symm_mem.empty(
+			(2, self.total_experts), dtype=torch.int64, device=self.device
+		)
+		self.group_name = group_name
 
 	def init(self, num_tokens_per_rank):
 		# self.num_tokens_per_rank = num_tokens_per_rank
@@ -1675,7 +1675,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_allgather_allreduce_bf16_acc(hidden_states)
+		out = self.moe_infer_alltoall_nvshmem(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
