@@ -1832,7 +1832,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# ---- 1) Gating -------
 		logger.info(f"[Rank {self.rank}] Executing Gate Kernel...")
-		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
+		topk_idx, topk_weight = self.gate.forward(
 			x.view(num_tokens, 1, hidden_size)
 		)
 		torch.cuda.synchronize(self.device) # Wait for Gate to finish
