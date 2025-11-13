@@ -1806,7 +1806,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# Weighted sum
 		# topk_weight: [Num_Tokens, K] -> [Num_Tokens, K, 1]
-		final_out = torch.sum(unsorted_results * topk_weight.unsqueeze(-1), dim=1)
+		final_out = torch.sum(unsorted_results * topk_weight.unsqueeze(-1), dim=1).to(x.dtype)
 		
 		return final_out
 
