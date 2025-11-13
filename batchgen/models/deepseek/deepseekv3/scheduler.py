@@ -64,12 +64,12 @@ class Scheduler:
 			)
 			logging.info(f"Max Available MoE decoding micro batch size: {self.config.Module_Batching_Config.MoE_decoding_micro_batch_size}")
 			# Constant peak mem usage for attn in decoding.
-			attn_decoding_micro_batch_size = self.config.Module_Batching_Config.MoE_decoding_micro_batch_size
+			# attn_decoding_micro_batch_size = self.config.Module_Batching_Config.MoE_decoding_micro_batch_size
 		if num_local_expert_per_layer == EXPERT_PER_RANK:
 			num_decoding_module_buffer_routed_expert = 0
 
 		# Update the config with the computed values
-		# self.config.Module_Batching_Config.attn_decoding_micro_batch_size = attn_decoding_micro_batch_size
+		self.config.Module_Batching_Config.attn_decoding_micro_batch_size = attn_decoding_micro_batch_size
 		self.config.GPU_Buffer_Config.num_k_buffer = num_k_buffer
 		self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = num_decoding_module_buffer_routed_expert
 		self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
