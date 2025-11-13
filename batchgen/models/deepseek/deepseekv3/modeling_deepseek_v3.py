@@ -1813,36 +1813,92 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 	@torch.inference_mode()
 	def moe_infer_alltoall_nvshmem(self, x):
-		# DEBUG: Sync to ensure previous ops are done before we start logging
-		torch.cuda.synchronize()
+		# DEBUG: Start with a clean slate
+		torch.cuda.synchronize(self.device)
 		
 		num_tokens, hidden_size = x.shape
-		logger.info(f"[Rank {self.rank}] Start MoE. Input shape: {x.shape}")
+		logger.info(f"[Rank {self.rank}] Start MoE. Input: {x.shape}, dtype: {x.dtype}")
 		
+		# --- CHECK 1: Is Input Valid? ---
+		# If x has NaNs, the gate kernel might produce garbage indices or crash
+		if torch.isnan(x).any():
+			logger.error(f"[Rank {self.rank}] FATAL ERROR: Input 'x' contains NaNs!")
+			# Depending on your setup, you might want to crash here to stop propagation
+		
+		# Ensure x is contiguous. Custom kernels often segfault on non-contiguous strides.
+		if not x.is_contiguous():
+			logger.warning(f"[Rank {self.rank}] Input x is not contiguous. Fixing...")
+			x = x.contiguous()
+
 		# ---- 1) Gating -------
+		logger.info(f"[Rank {self.rank}] Executing Gate Kernel...")
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
 			x.view(num_tokens, 1, hidden_size)
 		)
+		torch.cuda.synchronize(self.device) # Wait for Gate to finish
+		logger.info(f"[Rank {self.rank}] Gate Kernel Complete.")
+
+		# --- CHECK 2: Validate Gate Output ---
+		# Often the gate kernel is the culprit. Let's inspect its output before using it.
 		
-		# ---- 2) Efficient Sorting -------
+		# Check for NaNs in weights
+		if torch.isnan(topk_weight).any():
+			logger.error(f"[Rank {self.rank}] FATAL: Gate weights contain NaNs")
+		
+		# Check for Invalid Indices (Out of Bounds)
+		# If an index is -1 or >= total_experts, bincount or copy will crash silently later.
+		min_id = topk_idx.min().item()
+		max_id = topk_idx.max().item()
+		logger.info(f"[Rank {self.rank}] Expert ID Range: min={min_id}, max={max_id}, Limit={self.total_experts}")
+		
+		if max_id >= self.total_experts or min_id < 0:
+			logger.error(f"[Rank {self.rank}] FATAL: Gate generated Invalid Expert IDs! Out of bounds.")
+			raise RuntimeError(f"Invalid Expert IDs: {min_id} to {max_id}")
+
+		# ---- 2) Sorting -------
+		logger.info(f"[Rank {self.rank}] Casting and Flattening IDs...")
 		flat_eids = topk_idx.view(-1).to(torch.int32)
-		sorted_eids, sort_idx = flat_eids.sort()
-		sorted_token_ids = sort_idx // self.num_experts_per_tok
 		
-		# Safety Check: Buffer Overflow
+		logger.info(f"[Rank {self.rank}] Sorting IDs...")
+		sorted_eids, sort_idx = flat_eids.sort()
+		torch.cuda.synchronize(self.device)
+		logger.info(f"[Rank {self.rank}] Sort Complete.")
+
+		# ---- 3) Index Calculation -------
+		logger.info(f"[Rank {self.rank}] Calculating Token IDs...")
+		sorted_token_ids = sort_idx // self.num_experts_per_tok
+		torch.cuda.synchronize(self.device)
+		
+		# Sanity check: Are we indexing x correctly?
+		if sorted_token_ids.numel() > 0 and sorted_token_ids.max() >= num_tokens:
+			 logger.error(f"[Rank {self.rank}] FATAL: sorted_token_ids out of bounds of input x!")
+		
+		# ---- 4) Buffer Checks -------
 		needed_size = sorted_eids.shape[0]
-		if needed_size > self.symm_inp.shape[0]:
-			logger.error(f"[Rank {self.rank}] BUFFER OVERFLOW! Needed {needed_size}, Capacity {self.symm_inp.shape[0]}")
+		buffer_cap = self.symm_inp.shape[0]
+		logger.info(f"[Rank {self.rank}] buffer_check: need {needed_size}, cap {buffer_cap}")
+		
+		if needed_size > buffer_cap:
+			logger.error(f"[Rank {self.rank}] BUFFER OVERFLOW! Needed {needed_size}, Capacity {buffer_cap}")
 			raise RuntimeError("Symmetric input buffer too small")
 
-		self.symm_inp[:needed_size].copy_(x[sorted_token_ids])
+		# ---- 5) Copying -------
+		logger.info(f"[Rank {self.rank}] Creating source slice (x[sorted_token_ids])...")
+		# We do this in two steps to see if the slicing or the copying is the issue
+		src_slice = x[sorted_token_ids]
 		
-		# ---- 3) Prepare Dispatch Metadata -------
+		logger.info(f"[Rank {self.rank}] Copying to symmetric buffer...")
+		self.symm_inp[:needed_size].copy_(src_slice)
+		torch.cuda.synchronize(self.device)
+		logger.info(f"[Rank {self.rank}] Copy Complete.")
+		
+		# ---- 6) Bincount -------
+		logger.info(f"[Rank {self.rank}] Running Bincount...")
 		bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
 		self.symm_in_splits.copy_(bin_count)
+		torch.cuda.synchronize(self.device)
 		
 		logger.info(f"[Rank {self.rank}] Ready for Dispatch (All2All-1). Total tokens to send: {needed_size}")
-		torch.cuda.synchronize() # Ensure copies are done
 
 		# ---- 4) Dispatch (All-to-All) -------
 		torch.ops.symm_mem.all_to_all_vdev_2d(
@@ -1853,7 +1909,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.group_name
 		)
 		
-		torch.cuda.synchronize() # Wait for Dispatch to finish
+		torch.cuda.synchronize(self.device) # Wait for Dispatch to finish
 		logger.info(f"[Rank {self.rank}] Dispatch Complete.")
 
 		# ---- 5) Prepare Expert Computation -------
@@ -1881,7 +1937,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			logger.warning(f"[Rank {self.rank}] No tokens received! Skipping compute.")
 			res = torch.empty((0, hidden_size), device=self.device, dtype=x.dtype) # Or appropriate shape
 
-		torch.cuda.synchronize() # Wait for Compute
+		torch.cuda.synchronize(self.device) # Wait for Compute
 		logger.info(f"[Rank {self.rank}] Compute Complete. Res shape: {res.shape}")
 
 		# ---- 7) Prepare Combine (Reverse) Metadata -------
@@ -1898,7 +1954,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.symm_out[:int(total_tokens_processed)].copy_(res)
 		
 		logger.info(f"[Rank {self.rank}] Ready for Combine (All2All-2).")
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(self.device)
 
 		# ---- 9) Combine (Reverse All-to-All) -------
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
@@ -1909,7 +1965,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.group_name
 		)
 		
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(self.device)
 		logger.info(f"[Rank {self.rank}] Combine Complete.")
 
 		# ---- 10) Unsort and Weighted Sum -------
@@ -4017,7 +4073,7 @@ class DeepseekV3Attention_FlashMLA_Decoding_CUDAGraph(nn.Module):
 		
 		# Warmup phase - critical for proper graph capture
 		print("Starting warmup for CUDA graph capture...")
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(self.device)
 		
 		# Use a specific stream for better control
 		stream = torch.cuda.Stream()
