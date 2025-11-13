@@ -1827,13 +1827,70 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		return final_out
 
+	# def reorder_tokens_to_expert_contiguous_vectorized(self, input_x, splits, offsets, local_expert_counts):
+	# 	"""
+	# 	Vectorized version using advanced indexing.
+	# 	"""
+	# 	total_tokens = splits.sum().item()
+		
+	# 	# Compute expert offsets
+	# 	expert_offsets = torch.cumsum(
+	# 		torch.cat([
+	# 			torch.zeros(1, dtype=torch.int32, device=self.device),
+	# 			local_expert_counts
+	# 		]),
+	# 		dim=0
+	# 	)
+		
+	# 	# Create mapping: for each token, which position should it go to?
+	# 	chunk_expert_ids = torch.arange(self.total_experts, device=self.device) // self.world_size
+		
+	# 	# Build source and destination indices for all tokens
+	# 	src_indices = []
+	# 	dst_indices = []
+	# 	write_positions = expert_offsets[:-1].clone()
+		
+	# 	for chunk_idx in range(self.total_experts):
+	# 		chunk_size = splits[chunk_idx].item()
+	# 		if chunk_size == 0:
+	# 			continue
+			
+	# 		local_expert_id = chunk_expert_ids[chunk_idx].item()
+	# 		src_start = offsets[chunk_idx].item()
+	# 		dst_start = write_positions[local_expert_id].item()
+			
+	# 		src_indices.extend(range(src_start, src_start + chunk_size))
+	# 		dst_indices.extend(range(dst_start, dst_start + chunk_size))
+			
+	# 		write_positions[local_expert_id] += chunk_size
+		
+	# 	# Convert to tensors
+	# 	src_indices = torch.tensor(src_indices, dtype=torch.int64, device=self.device)
+	# 	dst_indices = torch.tensor(dst_indices, dtype=torch.int64, device=self.device)
+		
+	# 	# Perform reordering in one shot
+	# 	reordered_x = torch.empty(
+	# 		(total_tokens, input_x.shape[1]),
+	# 		dtype=input_x.dtype,
+	# 		device=input_x.device
+	# 	)
+	# 	reordered_x[dst_indices] = input_x[src_indices]
+		
+	# 	return reordered_x, expert_offsets
+
 	def reorder_tokens_to_expert_contiguous_vectorized(self, input_x, splits, offsets, local_expert_counts):
 		"""
-		Vectorized version using advanced indexing.
+		Reorder tokens from expert-major all-to-all output to contiguous local expert layout.
+		
+		After all_to_all_vdev_2d, tokens are in expert-major order:
+		[expert_0_from_rank_0, expert_0_from_rank_1, ..., expert_1_from_rank_0, expert_1_from_rank_1, ...]
+		
+		We need to reorder to:
+		[all_tokens_for_local_expert_0, all_tokens_for_local_expert_1, ...]
 		"""
 		total_tokens = splits.sum().item()
 		
-		# Compute expert offsets
+		# Compute destination offsets for each local expert
 		expert_offsets = torch.cumsum(
 			torch.cat([
 				torch.zeros(1, dtype=torch.int32, device=self.device),
@@ -1842,33 +1899,54 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			dim=0
 		)
 		
-		# Create mapping: for each token, which position should it go to?
-		chunk_expert_ids = torch.arange(self.total_experts, device=self.device) // self.world_size
+		# Map each chunk to its corresponding local expert
+		# For world_size=2, experts_per_rank=2:
+		# global expert 0 → local expert 0 (rank 0)
+		# global expert 1 → local expert 1 (rank 0)  
+		# global expert 2 → local expert 0 (rank 1)
+		# global expert 3 → local expert 1 (rank 1)
+		# So chunk order after all-to-all on rank 0: [e0_r0, e0_r1, e1_r0, e1_r1]
+		# Chunks are grouped by expert: world_size consecutive chunks per expert
 		
-		# Build source and destination indices for all tokens
 		src_indices = []
 		dst_indices = []
 		write_positions = expert_offsets[:-1].clone()
 		
+		# Iterate through chunks in the order they appear in the output buffer
 		for chunk_idx in range(self.total_experts):
 			chunk_size = splits[chunk_idx].item()
 			if chunk_size == 0:
 				continue
 			
-			local_expert_id = chunk_expert_ids[chunk_idx].item()
+			# Determine which local expert this chunk belongs to
+			# Chunks are grouped: first world_size chunks → local_expert_0,
+			#                     next world_size chunks → local_expert_1, etc.
+			local_expert_id = chunk_idx // self.world_size
+			
+			# Source: where this chunk is in the received buffer
 			src_start = offsets[chunk_idx].item()
+			
+			# Destination: where to write in the reordered buffer
 			dst_start = write_positions[local_expert_id].item()
 			
+			# Add indices for this chunk
 			src_indices.extend(range(src_start, src_start + chunk_size))
 			dst_indices.extend(range(dst_start, dst_start + chunk_size))
 			
+			# Update write position for this expert
 			write_positions[local_expert_id] += chunk_size
+		
+		# Sanity checks
+		assert len(src_indices) == total_tokens, \
+			f"Expected {total_tokens} indices, got {len(src_indices)}"
+		assert max(src_indices) < input_x.shape[0], \
+			f"src_indices out of bounds: max={max(src_indices)}, input_x.shape[0]={input_x.shape[0]}"
 		
 		# Convert to tensors
 		src_indices = torch.tensor(src_indices, dtype=torch.int64, device=self.device)
 		dst_indices = torch.tensor(dst_indices, dtype=torch.int64, device=self.device)
 		
-		# Perform reordering in one shot
+		# Perform reordering
 		reordered_x = torch.empty(
 			(total_tokens, input_x.shape[1]),
 			dtype=input_x.dtype,
