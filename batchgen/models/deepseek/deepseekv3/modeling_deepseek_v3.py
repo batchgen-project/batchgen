@@ -1745,7 +1745,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.experts_per_rank, device=self.device, dtype=torch.int32
 		)
 		logger.info(f"Rank {self.rank} reordered_x shape: {reordered_x.shape}, input_eids shape: {input_eids.shape}, local_expert_counts: {local_expert_counts}, expert_offsets: {expert_offsets}, local_expert_counts {local_expert_counts.shape}, expert_offsets {expert_offsets.shape}")
-		exit()
+		# exit()
 		res = self.grouped_dequant_moe_fp8(
 			reordered_x,
 			input_eids,
