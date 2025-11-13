@@ -1761,39 +1761,58 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			expert_offsets              
 		)
 		
-		# ---- 7) Prepare Combine (Reverse) Metadata -------
-		# A. Input Metadata for Combine = Output Metadata from Dispatch
-		# (Symmetry: We send back exactly from where we received)
-		combine_in_splits_offsets = self.symm_out_splits_offsets
+		# # ---- 7) Prepare Combine (Reverse) Metadata -------
+		# # A. Input Metadata for Combine = Output Metadata from Dispatch
+		# # (Symmetry: We send back exactly from where we received)
+		# combine_in_splits_offsets = self.symm_out_splits_offsets
 		
-		# B. Output Metadata for Combine = Input Metadata from Dispatch (plus offsets)
-		# We need to tell the origin rank where to put the returning tokens.
-		# This requires [Splits, Offsets]
-		combine_out_splits = self.symm_in_splits
+		# # B. Output Metadata for Combine = Input Metadata from Dispatch (plus offsets)
+		# # We need to tell the origin rank where to put the returning tokens.
+		# # This requires [Splits, Offsets]
+		# combine_out_splits = self.symm_in_splits
 		
-		# Calculate exclusive prefix sum for offsets
-		combine_out_offsets = torch.zeros_like(combine_out_splits)
-		combine_out_offsets[1:] = torch.cumsum(combine_out_splits[:-1], dim=0)
+		# # Calculate exclusive prefix sum for offsets
+		# combine_out_offsets = torch.zeros_like(combine_out_splits)
+		# combine_out_offsets[1:] = torch.cumsum(combine_out_splits[:-1], dim=0)
 		
-		# Stack them into the required [2, N] shape
-		self.symm_in_splits_offsets[0].copy_(combine_out_splits)
-		self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
+		# # Stack them into the required [2, N] shape
+		# self.symm_in_splits_offsets[0].copy_(combine_out_splits)
+		# self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
 		
-		# ---- 8) Prepare Buffer for Combine -------
-		# We can reuse symm_out to hold the RESULTS of the experts.
-		# We copy the result `res` back into `symm_out`.
-		# The layout is already perfect (Expert-Major) because `res` implies that order.
-		total_tokens_processed = expert_offsets[-1]
-		self.symm_out[:total_tokens_processed].copy_(res)
+		# # ---- 8) Prepare Buffer for Combine -------
+		# # We can reuse symm_out to hold the RESULTS of the experts.
+		# # We copy the result `res` back into `symm_out`.
+		# # The layout is already perfect (Expert-Major) because `res` implies that order.
+		# total_tokens_processed = expert_offsets[-1]
+		# self.symm_out[:total_tokens_processed].copy_(res)
+		
+		# ---- Fix for Step 7/8 ----
+
+		# 1. Get the counts (the splits are correct)
+		combine_in_splits = self.symm_out_splits_offsets[0] 
+		
+		# 2. RECALCULATE offsets to match your tight .copy_(res)
+		# Do NOT use the offsets from symm_out_splits_offsets[1], 
+		# because those might include padding/alignment you don't have anymore.
+		combine_in_offsets = torch.zeros_like(combine_in_splits)
+		combine_in_offsets[1:] = torch.cumsum(combine_in_splits[:-1], dim=0)
+		
+		# 3. Stack them for the kernel
+		# This metadata now accurately describes your TIGHT symm_out buffer
+		# combine_in_splits_offsets = torch.stack(
+		# 	 [combine_in_splits, combine_in_offsets], dim=0
+		# )
+		self.symm_out_splits_offsets[0].copy_(combine_in_splits)
+		self.symm_out_splits_offsets[1].copy_(combine_in_offsets)
 		
 		# ---- 9) Combine (Reverse All-to-All) -------
 		# Input: symm_out (Expert Results)
 		# Output: symm_inp (We reuse the input buffer to store received results)
-		self.symm_inp.zero_()
+		# self.symm_inp.zero_()
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
 			self.symm_out,                  
 			self.symm_inp,                  
-			combine_in_splits_offsets,   
+			self.symm_out_splits_offsets,   
 			self.symm_in_splits_offsets,    
 			self.group_name
 		)
