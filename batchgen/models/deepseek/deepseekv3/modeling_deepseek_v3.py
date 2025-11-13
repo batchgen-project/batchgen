@@ -1743,8 +1743,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		input_eids = torch.arange(
 			self.experts_per_rank, device=self.device, dtype=torch.int32
 		)
-		logger.info(f"Rank {self.rank} reordered_x shape: {reordered_x.shape}, input_eids shape: {input_eids.shape}, local_expert_counts: {local_expert_counts.tolist()}, expert_offsets: {expert_offsets.tolist()}")
-		logger.info(f"Rank {self.rank} local_expert_counts {local_expert_counts}, expert_offsets {expert_offsets}")
+		logger.info(f"Rank {self.rank} reordered_x shape: {reordered_x.shape}, input_eids shape: {input_eids.shape}, local_expert_counts: {local_expert_counts}, expert_offsets: {expert_offsets}, local_expert_counts {local_expert_counts.shape}, expert_offsets {expert_offsets.shape}")
+		exit()
 		res = self.grouped_dequant_moe_fp8(
 			reordered_x,
 			input_eids,
@@ -2502,8 +2502,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		# res = self.grouped_dequant_moe_fp8_(input_x, input_eids)
-		logger.info(f"Rank {self.rank}: input_x shape: {input_x.shape}, input_eids shape: {input_eids.shape}, expert_counts shape: {expert_counts.shape}, expert_offsets shape: {expert_offsets.shape}, expert_counts: {expert_counts}, expert_offsets: {expert_offsets}")
-		exit()
+		# logger.info(f"Rank {self.rank}: input_x shape: {input_x.shape}, input_eids shape: {input_eids.shape}, expert_counts shape: {expert_counts.shape}, expert_offsets shape: {expert_offsets.shape}, expert_counts: {expert_counts}, expert_offsets: {expert_offsets}")
 		res = self.grouped_dequant_moe_fp8(
 					input_x,          # Oversized
 					input_eids,         # Oversized
