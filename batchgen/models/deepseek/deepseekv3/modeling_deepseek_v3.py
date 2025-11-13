@@ -1603,32 +1603,32 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 		
 		# Pre-allocate symmetric memory buffers
-		max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
-		max_out_len = max_inp_len * dist.get_world_size()
+		# max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
+		# max_out_len = max_inp_len * dist.get_world_size()
 		
-		self.symm_inp = symm_mem.empty(
-			max_inp_len, self.config.hidden_size, 
-			dtype=torch.bfloat16, device=self.device
-		)
-		symm_inp_hdl = symm_mem.rendezvous(self.symm_inp, dist.group.WORLD)
-		self.symm_out = symm_mem.empty(
-			max_out_len, self.config.hidden_size, 
-			dtype=torch.bfloat16, device=self.device
-		)
-		symm_out_hdl = symm_mem.rendezvous(self.symm_out, dist.group.WORLD)
-		self.symm_in_splits = symm_mem.empty(
-			self.total_experts, dtype=torch.int64, device=self.device
-		)
-		symm_in_splits_hdl = symm_mem.rendezvous(self.symm_in_splits, dist.group.WORLD)
-		self.symm_out_splits_offsets = symm_mem.empty(
-			(2, self.total_experts), dtype=torch.int64, device=self.device
-		)
-		symm_out_splits_offsets_hdl = symm_mem.rendezvous(self.symm_out_splits_offsets, dist.group.WORLD)
-		self.symm_in_splits_offsets = symm_mem.empty(
-			(2, self.total_experts), dtype=torch.int64, device=self.device
-		)
-		symm_in_splits_offsets_hdl = symm_mem.rendezvous(self.symm_in_splits_offsets, dist.group.WORLD)
-		self.group_name = dist.group.WORLD.group_name
+		# self.symm_inp = symm_mem.empty(
+		# 	max_inp_len, self.config.hidden_size, 
+		# 	dtype=torch.bfloat16, device=self.device
+		# )
+		# symm_inp_hdl = symm_mem.rendezvous(self.symm_inp, dist.group.WORLD)
+		# self.symm_out = symm_mem.empty(
+		# 	max_out_len, self.config.hidden_size, 
+		# 	dtype=torch.bfloat16, device=self.device
+		# )
+		# symm_out_hdl = symm_mem.rendezvous(self.symm_out, dist.group.WORLD)
+		# self.symm_in_splits = symm_mem.empty(
+		# 	self.total_experts, dtype=torch.int64, device=self.device
+		# )
+		# symm_in_splits_hdl = symm_mem.rendezvous(self.symm_in_splits, dist.group.WORLD)
+		# self.symm_out_splits_offsets = symm_mem.empty(
+		# 	(2, self.total_experts), dtype=torch.int64, device=self.device
+		# )
+		# symm_out_splits_offsets_hdl = symm_mem.rendezvous(self.symm_out_splits_offsets, dist.group.WORLD)
+		# self.symm_in_splits_offsets = symm_mem.empty(
+		# 	(2, self.total_experts), dtype=torch.int64, device=self.device
+		# )
+		# symm_in_splits_offsets_hdl = symm_mem.rendezvous(self.symm_in_splits_offsets, dist.group.WORLD)
+		# self.group_name = dist.group.WORLD.group_name
 
 	def init(self, num_tokens_per_rank):
 		# self.num_tokens_per_rank = num_tokens_per_rank
@@ -1675,7 +1675,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_alltoall_nvshmem(hidden_states)
+		out = self.moe_infer_allgather_alltoall(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
@@ -1775,8 +1775,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# # We can reuse symm_out to hold the RESULTS of the experts.
 		# # We copy the result `res` back into `symm_out`.
 		# # The layout is already perfect (Expert-Major) because `res` implies that order.
-		# total_tokens_processed = expert_offsets[-1]
-		# self.symm_out[:total_tokens_processed].copy_(res)
+		total_tokens_processed = expert_offsets[-1]
+		self.symm_out[:total_tokens_processed].copy_(res)
 		
 		# ---- Fix for Step 7/8 ----
 
@@ -1831,375 +1831,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		return final_out
 
-
-	# @torch.inference_mode()
-	# def moe_infer_alltoall_nvshmem(self, x):
-	# 	# DEBUG: Start with a clean slate
-	# 	torch.cuda.synchronize(self.device)
-		
-	# 	num_tokens, hidden_size = x.shape
-	# 	logger.info(f"[Rank {self.rank}] Start MoE. Input: {x.shape}, dtype: {x.dtype}")
-		
-	# 	# --- CHECK 1: Is Input Valid? ---
-	# 	# If x has NaNs, the gate kernel might produce garbage indices or crash
-	# 	if torch.isnan(x).any():
-	# 		logger.error(f"[Rank {self.rank}] FATAL ERROR: Input 'x' contains NaNs!")
-	# 		# Depending on your setup, you might want to crash here to stop propagation
-		
-	# 	# Ensure x is contiguous. Custom kernels often segfault on non-contiguous strides.
-	# 	if not x.is_contiguous():
-	# 		logger.warning(f"[Rank {self.rank}] Input x is not contiguous. Fixing...")
-	# 		x = x.contiguous()
-
-	# 	# ---- 1) Gating -------
-	# 	logger.info(f"[Rank {self.rank}] Executing Gate Kernel...")
-	# 	topk_idx, topk_weight = self.gate.forward(
-	# 		x.view(num_tokens, 1, hidden_size)
-	# 	)
-	# 	torch.cuda.synchronize(self.device) # Wait for Gate to finish
-	# 	logger.info(f"[Rank {self.rank}] Gate Kernel Complete.")
-
-	# 	# --- CHECK 2: Validate Gate Output ---
-	# 	# Often the gate kernel is the culprit. Let's inspect its output before using it.
-		
-	# 	# Check for NaNs in weights
-	# 	if torch.isnan(topk_weight).any():
-	# 		logger.error(f"[Rank {self.rank}] FATAL: Gate weights contain NaNs")
-		
-	# 	# Check for Invalid Indices (Out of Bounds)
-	# 	# If an index is -1 or >= total_experts, bincount or copy will crash silently later.
-	# 	min_id = topk_idx.min().item()
-	# 	max_id = topk_idx.max().item()
-	# 	logger.info(f"[Rank {self.rank}] Expert ID Range: min={min_id}, max={max_id}, Limit={self.total_experts}")
-		
-	# 	if max_id >= self.total_experts or min_id < 0:
-	# 		logger.error(f"[Rank {self.rank}] FATAL: Gate generated Invalid Expert IDs! Out of bounds.")
-	# 		raise RuntimeError(f"Invalid Expert IDs: {min_id} to {max_id}")
-
-	# 	# ---- 2) Sorting -------
-	# 	logger.info(f"[Rank {self.rank}] Casting and Flattening IDs...")
-	# 	flat_eids = topk_idx.view(-1).to(torch.int32)
-		
-	# 	logger.info(f"[Rank {self.rank}] Sorting IDs...")
-	# 	sorted_eids, sort_idx = flat_eids.sort()
-	# 	torch.cuda.synchronize(self.device)
-	# 	logger.info(f"[Rank {self.rank}] Sort Complete.")
-
-	# 	# ---- 3) Index Calculation -------
-	# 	logger.info(f"[Rank {self.rank}] Calculating Token IDs...")
-	# 	sorted_token_ids = sort_idx // self.num_experts_per_tok
-	# 	torch.cuda.synchronize(self.device)
-		
-	# 	# Sanity check: Are we indexing x correctly?
-	# 	if sorted_token_ids.numel() > 0 and sorted_token_ids.max() >= num_tokens:
-	# 		 logger.error(f"[Rank {self.rank}] FATAL: sorted_token_ids out of bounds of input x!")
-		
-	# 	# ---- 4) Buffer Checks -------
-	# 	needed_size = sorted_eids.shape[0]
-	# 	buffer_cap = self.symm_inp.shape[0]
-	# 	logger.info(f"[Rank {self.rank}] buffer_check: need {needed_size}, cap {buffer_cap}")
-		
-	# 	if needed_size > buffer_cap:
-	# 		logger.error(f"[Rank {self.rank}] BUFFER OVERFLOW! Needed {needed_size}, Capacity {buffer_cap}")
-	# 		raise RuntimeError("Symmetric input buffer too small")
-
-	# 	# ---- 5) Copying -------
-	# 	logger.info(f"[Rank {self.rank}] Creating source slice (x[sorted_token_ids])...")
-	# 	# We do this in two steps to see if the slicing or the copying is the issue
-	# 	src_slice = x[sorted_token_ids]
-		
-	# 	logger.info(f"[Rank {self.rank}] Copying to symmetric buffer...")
-	# 	self.symm_inp[:needed_size].copy_(src_slice)
-	# 	torch.cuda.synchronize(self.device)
-	# 	logger.info(f"[Rank {self.rank}] Copy Complete.")
-		
-	# 	# ---- 6) Bincount -------
-	# 	logger.info(f"[Rank {self.rank}] Running Bincount...")
-	# 	bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
-	# 	self.symm_in_splits.copy_(bin_count)
-	# 	torch.cuda.synchronize(self.device)
-		
-	# 	logger.info(f"[Rank {self.rank}] Ready for Dispatch (All2All-1). Total tokens to send: {needed_size}")
-
-	# 	# ---- 4) Dispatch (All-to-All) -------
-	# 	torch.ops.symm_mem.all_to_all_vdev_2d(
-	# 		self.symm_inp, 
-	# 		self.symm_out, 
-	# 		self.symm_in_splits, 
-	# 		self.symm_out_splits_offsets, 
-	# 		self.group_name
-	# 	)
-		
-	# 	torch.cuda.synchronize(self.device) # Wait for Dispatch to finish
-	# 	logger.info(f"[Rank {self.rank}] Dispatch Complete.")
-
-	# 	# ---- 5) Prepare Expert Computation -------
-	# 	out_splits = self.symm_out_splits_offsets[0]
-	# 	splits_matrix = out_splits.view(self.world_size, self.experts_per_rank)
-	# 	tokens_per_local_expert = splits_matrix.sum(dim=0)
-		
-	# 	zero = torch.zeros((1,), dtype=tokens_per_local_expert.dtype, device=self.device)
-	# 	expert_offsets = torch.cat([zero, torch.cumsum(tokens_per_local_expert, dim=0)])
-		
-	# 	total_tokens_processed = expert_offsets[-1].item()
-	# 	logger.info(f"[Rank {self.rank}] Ready for Compute. Total local tokens: {total_tokens_processed}")
-
-	# 	# ---- 6) Local Expert Computation -------
-	# 	if total_tokens_processed > 0:
-	# 		# Input: self.symm_out (contains the dispatched tokens)
-	# 		res = self.grouped_dequant_moe_fp8(
-	# 			self.symm_out,              
-	# 			None,                       
-	# 			tokens_per_local_expert,    
-	# 			expert_offsets              
-	# 		)
-	# 	else:
-	# 		# Edge Case Handling: No tokens received for any expert
-	# 		logger.warning(f"[Rank {self.rank}] No tokens received! Skipping compute.")
-	# 		res = torch.empty((0, hidden_size), device=self.device, dtype=x.dtype) # Or appropriate shape
-
-	# 	torch.cuda.synchronize(self.device) # Wait for Compute
-	# 	logger.info(f"[Rank {self.rank}] Compute Complete. Res shape: {res.shape}")
-
-	# 	# ---- 7) Prepare Combine (Reverse) Metadata -------
-	# 	combine_in_splits_offsets = self.symm_out_splits_offsets
-	# 	combine_out_splits = self.symm_in_splits
-		
-	# 	combine_out_offsets = torch.zeros_like(combine_out_splits)
-	# 	combine_out_offsets[1:] = torch.cumsum(combine_out_splits[:-1], dim=0)
-		
-	# 	self.symm_in_splits_offsets[0].copy_(combine_out_splits)
-	# 	self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
-		
-	# 	# ---- 8) Prepare Buffer for Combine -------
-	# 	self.symm_out[:int(total_tokens_processed)].copy_(res)
-		
-	# 	logger.info(f"[Rank {self.rank}] Ready for Combine (All2All-2).")
-	# 	torch.cuda.synchronize(self.device)
-
-	# 	# ---- 9) Combine (Reverse All-to-All) -------
-	# 	self.symm_inp.zero_()
-	# 	torch.ops.symm_mem.all_to_all_vdev_2d_offset(
-	# 		self.symm_out,                  
-	# 		self.symm_inp,                  
-	# 		combine_in_splits_offsets,   
-	# 		self.symm_in_splits_offsets,    
-	# 		self.group_name
-	# 	)
-		
-	# 	torch.cuda.synchronize(self.device)
-	# 	logger.info(f"[Rank {self.rank}] Combine Complete.")
-
-	# 	# ---- 10) Unsort and Weighted Sum -------
-	# 	unsort_idx = torch.argsort(sort_idx)
-		
-	# 	# Check bounds
-	# 	if flat_eids.shape[0] > self.symm_inp.shape[0]:
-	# 		 logger.error(f"[Rank {self.rank}] Return buffer size mismatch!")
-		
-	# 	sorted_results = self.symm_inp[:flat_eids.shape[0]]
-	# 	unsorted_results = sorted_results[unsort_idx]
-		
-	# 	unsorted_results = unsorted_results.view(num_tokens, self.num_experts_per_tok, hidden_size)
-		
-	# 	final_out = torch.sum(unsorted_results * topk_weight.unsqueeze(-1), dim=1).to(x.dtype)
-		
-	# 	logger.info(f"[Rank {self.rank}] Step Complete.")
-	# 	return final_out
-
-	# def reorder_tokens_to_expert_contiguous_vectorized(self, input_x, splits, offsets, local_expert_counts):
-	# 	"""
-	# 	Vectorized version using advanced indexing.
-	# 	"""
-	# 	total_tokens = splits.sum().item()
-		
-	# 	# Compute expert offsets
-	# 	expert_offsets = torch.cumsum(
-	# 		torch.cat([
-	# 			torch.zeros(1, dtype=torch.int32, device=self.device),
-	# 			local_expert_counts
-	# 		]),
-	# 		dim=0
-	# 	)
-		
-	# 	# Create mapping: for each token, which position should it go to?
-	# 	chunk_expert_ids = torch.arange(self.total_experts, device=self.device) // self.world_size
-		
-	# 	# Build source and destination indices for all tokens
-	# 	src_indices = []
-	# 	dst_indices = []
-	# 	write_positions = expert_offsets[:-1].clone()
-		
-	# 	for chunk_idx in range(self.total_experts):
-	# 		chunk_size = splits[chunk_idx].item()
-	# 		if chunk_size == 0:
-	# 			continue
-			
-	# 		local_expert_id = chunk_expert_ids[chunk_idx].item()
-	# 		src_start = offsets[chunk_idx].item()
-	# 		dst_start = write_positions[local_expert_id].item()
-			
-	# 		src_indices.extend(range(src_start, src_start + chunk_size))
-	# 		dst_indices.extend(range(dst_start, dst_start + chunk_size))
-			
-	# 		write_positions[local_expert_id] += chunk_size
-		
-	# 	# Convert to tensors
-	# 	src_indices = torch.tensor(src_indices, dtype=torch.int64, device=self.device)
-	# 	dst_indices = torch.tensor(dst_indices, dtype=torch.int64, device=self.device)
-		
-	# 	# Perform reordering in one shot
-	# 	reordered_x = torch.empty(
-	# 		(total_tokens, input_x.shape[1]),
-	# 		dtype=input_x.dtype,
-	# 		device=input_x.device
-	# 	)
-	# 	reordered_x[dst_indices] = input_x[src_indices]
-		
-	# 	return reordered_x, expert_offsets
-
-	def reorder_tokens_to_expert_contiguous_vectorized(self, input_x, splits, offsets, local_expert_counts):
-		"""
-		Reorder tokens from expert-major all-to-all output to contiguous local expert layout.
-		
-		Received buffer structure (expert-major order):
-		[e0_from_all_ranks | e1_from_all_ranks | ... | e255_from_all_ranks]
-		
-		where each expert's section has world_size chunks (one from each rank).
-		
-		We need to extract only the chunks for THIS rank's local experts and 
-		reorder them to be contiguous per local expert.
-		"""
-		total_tokens = splits.sum().item()
-		
-		# Compute destination offsets for each local expert
-		expert_offsets = torch.cumsum(
-			torch.cat([
-				torch.zeros(1, dtype=torch.int32, device=self.device),
-				local_expert_counts
-			]),
-			dim=0
-		)
-		
-		# Determine which global experts belong to this rank
-		# If this is rank R with experts_per_rank E, this rank owns global experts [R*E, (R+1)*E)
-		my_global_expert_start = self.rank * self.experts_per_rank
-		my_global_expert_end = my_global_expert_start + self.experts_per_rank
-		
-		src_indices = []
-		dst_indices = []
-		write_positions = expert_offsets[:-1].clone()
-		
-		# Process each chunk in the received buffer
-		for chunk_idx in range(self.total_experts):
-			chunk_size = splits[chunk_idx].item()
-			
-			if chunk_size == 0:
-				continue
-			
-			# Determine which global expert this chunk belongs to
-			# Chunks are grouped: first world_size chunks are for expert 0,
-			#                     next world_size chunks are for expert 1, etc.
-			global_expert_id = chunk_idx // self.world_size
-			
-			# Only process chunks for local experts on this rank
-			if not (my_global_expert_start <= global_expert_id < my_global_expert_end):
-				continue
-			
-			# Map to local expert ID
-			local_expert_id = global_expert_id - my_global_expert_start
-			
-			# Source position in received buffer
-			src_start = offsets[chunk_idx].item()
-			
-			# Destination position in reordered buffer
-			dst_start = write_positions[local_expert_id].item()
-			
-			# Add indices for this chunk
-			src_indices.extend(range(src_start, src_start + chunk_size))
-			dst_indices.extend(range(dst_start, dst_start + chunk_size))
-			
-			# Advance write position for this local expert
-			write_positions[local_expert_id] += chunk_size
-		
-		# Validation
-		assert len(src_indices) == total_tokens, \
-			f"Index count mismatch: {len(src_indices)} != {total_tokens}"
-		
-		if src_indices:
-			max_src_idx = max(src_indices)
-			assert max_src_idx < input_x.shape[0], \
-				f"Source index out of bounds: max_idx={max_src_idx}, buffer_size={input_x.shape[0]}"
-		
-		# Convert to tensors
-		src_indices = torch.tensor(src_indices, dtype=torch.int64, device=self.device)
-		dst_indices = torch.tensor(dst_indices, dtype=torch.int64, device=self.device)
-		
-		# Perform reordering
-		reordered_x = torch.empty(
-			(total_tokens, input_x.shape[1]),
-			dtype=input_x.dtype,
-			device=input_x.device
-		)
-		reordered_x[dst_indices] = input_x[src_indices]
-		
-		return reordered_x, expert_offsets
-
-	def scatter_results_to_interleaved(self, res, splits, offsets, expert_offsets):
-		"""
-		Reverse of reorder_tokens_to_expert_contiguous.
-		
-		Input layout (from grouped GEMM):
-			[all_tokens_for_e0, all_tokens_for_e1, ...]
-			
-		Output layout (needed for all_to_all_vdev_2d_offset):
-			[r0_e0, r1_e0, ..., r7_e0,  <- interleaved by source rank
-			r0_e1, r1_e1, ..., r7_e1,
-			...]
-		
-		Args:
-			res: [total_tokens, hidden_size] - expert-contiguous output from GEMM
-			splits: [total_experts] - token count for each chunk
-			offsets: [total_experts] - offset of each chunk in interleaved buffer
-			expert_offsets: [experts_per_rank + 1] - offsets in res for each expert
-		
-		Returns:
-			interleaved_out: [total_tokens, hidden_size] - interleaved layout
-		"""
-		total_tokens = splits.sum()
-		interleaved_out = torch.empty(
-			(total_tokens, res.shape[1]),
-			dtype=res.dtype,
-			device=res.device
-		)
-		
-		# Track current read position for each local expert
-		read_positions = expert_offsets[:-1].clone()
-		
-		# Iterate through all chunks and copy from expert-contiguous position
-		for chunk_idx in range(self.total_experts):
-			chunk_size = splits[chunk_idx].item()
-			
-			if chunk_size == 0:
-				continue
-			
-			# Determine which local expert this chunk came from
-			local_expert_id = chunk_idx // self.world_size
-			
-			# Read from expert-contiguous position
-			src_start = read_positions[local_expert_id].item()
-			src_end = src_start + chunk_size
-			
-			# Write to interleaved position
-			dst_start = offsets[chunk_idx].item()
-			dst_end = dst_start + chunk_size
-			
-			interleaved_out[dst_start:dst_end] = res[src_start:src_end]
-			
-			# Update read position for this expert
-			read_positions[local_expert_id] += chunk_size
-		
-		return interleaved_out
 
 	@torch.inference_mode()
 	def moe_infer_allgather_alltoall(self, x):
