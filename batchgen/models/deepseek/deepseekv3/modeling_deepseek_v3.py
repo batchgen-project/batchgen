@@ -1684,6 +1684,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	def moe_infer_alltoall_nvshmem(self, x):
 		# x shape: [num_tokens, hidden_size]
 		num_tokens, hidden_size = x.shape
+		assert dist.get_world_size() == 16, "This implementation assumes world size of 16"
 		
 		# ---- 1) Gating -------
 		# [num_tokens, topk]
