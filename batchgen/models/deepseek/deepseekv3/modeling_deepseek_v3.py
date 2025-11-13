@@ -1680,227 +1680,45 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return out.view(*orig_shape)
 	
 
-	# @torch.inference_mode()
-	# def moe_infer_alltoall_nvshmem(self, x):
-	# 	# x shape: [num_tokens, hidden_size]
-	# 	num_tokens, hidden_size = x.shape
-		
-	# 	# ---- 1) Gating -------
-	# 	# [num_tokens, topk]
-	# 	topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
-	# 		x.view(num_tokens, 1, hidden_size)
-	# 	)
-		
-	# 	# ---- 2) Efficient Sorting (Index Manipulation only) -------
-	# 	# Flatten the expert IDs
-	# 	flat_eids = topk_idx.view(-1).to(torch.int32)
-		
-	# 	# Sort the expert IDs to group tokens by destination expert
-	# 	sorted_eids, sort_idx = flat_eids.sort()
-		
-	# 	# OPTIMIZATION: Instead of repeat_interleave -> sort data, 
-	# 	# calculate the gather indices.
-	# 	# We need to map the sorted slot back to the original token index (0..N).
-	# 	# Floor division by k (num_experts_per_tok) gives the original row index.
-	# 	sorted_token_ids = sort_idx // self.num_experts_per_tok
-		
-	# 	# Gather data directly into the symmetric buffer
-	# 	# We only copy the data once here.
-	# 	self.symm_inp[:sorted_eids.shape[0]].copy_(x[sorted_token_ids])
-		
-	# 	# ---- 3) Prepare Dispatch Metadata -------
-	# 	# Count how many tokens go to each expert globally
-	# 	bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
-		
-	# 	# Copy counts to the symmetric metadata buffer
-	# 	self.symm_in_splits.copy_(bin_count)
-		
-	# 	# ---- 4) Dispatch (All-to-All) -------
-	# 	# Input: symm_inp (Sorted Data)
-	# 	# Output: symm_out (Data grouped by Local Expert)
-	# 	# Metadata Written: symm_out_splits_offsets (Layout of data in symm_out)
-	# 	torch.ops.symm_mem.all_to_all_vdev_2d(
-	# 		self.symm_inp, 
-	# 		self.symm_out, 
-	# 		self.symm_in_splits, 
-	# 		self.symm_out_splits_offsets, 
-	# 		self.group_name
-	# 	)
-		
-	# 	# ---- 5) Prepare Expert Computation -------
-	# 	# We need to know how many tokens each of OUR local experts received.
-	# 	# symm_out_splits_offsets shape: [2, World_Size * Local_Experts]
-	# 	# It is ordered: [Rank0->Exp0, Rank0->Exp1... Rank1->Exp0...]
-		
-	# 	out_splits = self.symm_out_splits_offsets[0] # Row 0 is counts
-		
-	# 	# View as [World_Size, Local_Experts] and sum over ranks
-	# 	splits_matrix = out_splits.view(self.world_size, self.experts_per_rank)
-	# 	tokens_per_local_expert = splits_matrix.sum(dim=0)
-		
-	# 	# Create offsets for the GEMM/Expert kernel
-	# 	# Note: We explicitly start at 0.
-	# 	zero = torch.zeros((1,), dtype=tokens_per_local_expert.dtype, device=self.device)
-	# 	expert_offsets = torch.cat([zero, torch.cumsum(tokens_per_local_expert, dim=0)])
-		
-	# 	# ---- 6) Local Expert Computation -------
-	# 	# Input: self.symm_out (contains the dispatched tokens)
-	# 	res = self.grouped_dequant_moe_fp8(
-	# 		self.symm_out,              # Input buffer
-	# 		None,                       
-	# 		tokens_per_local_expert,    
-	# 		expert_offsets              
-	# 	)
-		
-	# 	# ---- 7) Prepare Combine (Reverse) Metadata -------
-	# 	# A. Input Metadata for Combine = Output Metadata from Dispatch
-	# 	# (Symmetry: We send back exactly from where we received)
-	# 	combine_in_splits_offsets = self.symm_out_splits_offsets
-		
-	# 	# B. Output Metadata for Combine = Input Metadata from Dispatch (plus offsets)
-	# 	# We need to tell the origin rank where to put the returning tokens.
-	# 	# This requires [Splits, Offsets]
-	# 	combine_out_splits = self.symm_in_splits
-		
-	# 	# Calculate exclusive prefix sum for offsets
-	# 	combine_out_offsets = torch.zeros_like(combine_out_splits)
-	# 	combine_out_offsets[1:] = torch.cumsum(combine_out_splits[:-1], dim=0)
-		
-	# 	# Stack them into the required [2, N] shape
-	# 	self.symm_in_splits_offsets[0].copy_(combine_out_splits)
-	# 	self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
-		
-	# 	# ---- 8) Prepare Buffer for Combine -------
-	# 	# We can reuse symm_out to hold the RESULTS of the experts.
-	# 	# We copy the result `res` back into `symm_out`.
-	# 	# The layout is already perfect (Expert-Major) because `res` implies that order.
-	# 	total_tokens_processed = expert_offsets[-1]
-	# 	self.symm_out[:total_tokens_processed].copy_(res)
-		
-	# 	# ---- 9) Combine (Reverse All-to-All) -------
-	# 	# Input: symm_out (Expert Results)
-	# 	# Output: symm_inp (We reuse the input buffer to store received results)
-	# 	torch.ops.symm_mem.all_to_all_vdev_2d_offset(
-	# 		self.symm_out,                  
-	# 		self.symm_inp,                  
-	# 		combine_in_splits_offsets,   
-	# 		self.symm_in_splits_offsets,    
-	# 		self.group_name
-	# 	)
-		
-	# 	# ---- 10) Unsort and Weighted Sum -------
-	# 	# symm_inp now contains processed tokens, but they are still sorted by Expert ID.
-	# 	# We need to restore the original order (0_top1, 0_top2, 1_top1...)
-		
-	# 	# Invert the permutation
-	# 	unsort_idx = torch.argsort(sort_idx)
-		
-	# 	# We only care about the valid data region
-	# 	sorted_results = self.symm_inp[:flat_eids.shape[0]]
-		
-	# 	# Shuffle back to [N*K, Hidden] order corresponding to topk_idx
-	# 	unsorted_results = sorted_results[unsort_idx]
-		
-	# 	# Reshape for weighted sum: [Num_Tokens, K, Hidden]
-	# 	unsorted_results = unsorted_results.view(num_tokens, self.num_experts_per_tok, hidden_size)
-		
-	# 	# Weighted sum
-	# 	# topk_weight: [Num_Tokens, K] -> [Num_Tokens, K, 1]
-	# 	final_out = torch.sum(unsorted_results * topk_weight.unsqueeze(-1), dim=1).to(x.dtype)
-		
-	# 	return final_out
-
-
 	@torch.inference_mode()
 	def moe_infer_alltoall_nvshmem(self, x):
-		# DEBUG: Start with a clean slate
-		torch.cuda.synchronize(self.device)
-		
+		# x shape: [num_tokens, hidden_size]
 		num_tokens, hidden_size = x.shape
-		logger.info(f"[Rank {self.rank}] Start MoE. Input: {x.shape}, dtype: {x.dtype}")
 		
-		# --- CHECK 1: Is Input Valid? ---
-		# If x has NaNs, the gate kernel might produce garbage indices or crash
-		if torch.isnan(x).any():
-			logger.error(f"[Rank {self.rank}] FATAL ERROR: Input 'x' contains NaNs!")
-			# Depending on your setup, you might want to crash here to stop propagation
-		
-		# Ensure x is contiguous. Custom kernels often segfault on non-contiguous strides.
-		if not x.is_contiguous():
-			logger.warning(f"[Rank {self.rank}] Input x is not contiguous. Fixing...")
-			x = x.contiguous()
-
 		# ---- 1) Gating -------
-		logger.info(f"[Rank {self.rank}] Executing Gate Kernel...")
-		topk_idx, topk_weight = self.gate.forward(
+		# [num_tokens, topk]
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
 			x.view(num_tokens, 1, hidden_size)
 		)
-		torch.cuda.synchronize(self.device) # Wait for Gate to finish
-		logger.info(f"[Rank {self.rank}] Gate Kernel Complete.")
-
-		# --- CHECK 2: Validate Gate Output ---
-		# Often the gate kernel is the culprit. Let's inspect its output before using it.
 		
-		# Check for NaNs in weights
-		if torch.isnan(topk_weight).any():
-			logger.error(f"[Rank {self.rank}] FATAL: Gate weights contain NaNs")
-		
-		# Check for Invalid Indices (Out of Bounds)
-		# If an index is -1 or >= total_experts, bincount or copy will crash silently later.
-		min_id = topk_idx.min().item()
-		max_id = topk_idx.max().item()
-		logger.info(f"[Rank {self.rank}] Expert ID Range: min={min_id}, max={max_id}, Limit={self.total_experts}")
-		
-		if max_id >= self.total_experts or min_id < 0:
-			logger.error(f"[Rank {self.rank}] FATAL: Gate generated Invalid Expert IDs! Out of bounds.")
-			raise RuntimeError(f"Invalid Expert IDs: {min_id} to {max_id}")
-
-		# ---- 2) Sorting -------
-		logger.info(f"[Rank {self.rank}] Casting and Flattening IDs...")
+		# ---- 2) Efficient Sorting (Index Manipulation only) -------
+		# Flatten the expert IDs
 		flat_eids = topk_idx.view(-1).to(torch.int32)
 		
-		logger.info(f"[Rank {self.rank}] Sorting IDs...")
+		# Sort the expert IDs to group tokens by destination expert
 		sorted_eids, sort_idx = flat_eids.sort()
-		torch.cuda.synchronize(self.device)
-		logger.info(f"[Rank {self.rank}] Sort Complete.")
-
-		# ---- 3) Index Calculation -------
-		logger.info(f"[Rank {self.rank}] Calculating Token IDs...")
+		
+		# OPTIMIZATION: Instead of repeat_interleave -> sort data, 
+		# calculate the gather indices.
+		# We need to map the sorted slot back to the original token index (0..N).
+		# Floor division by k (num_experts_per_tok) gives the original row index.
 		sorted_token_ids = sort_idx // self.num_experts_per_tok
-		torch.cuda.synchronize(self.device)
 		
-		# Sanity check: Are we indexing x correctly?
-		if sorted_token_ids.numel() > 0 and sorted_token_ids.max() >= num_tokens:
-			 logger.error(f"[Rank {self.rank}] FATAL: sorted_token_ids out of bounds of input x!")
+		# Gather data directly into the symmetric buffer
+		# We only copy the data once here.
+		self.symm_inp[:sorted_eids.shape[0]].copy_(x[sorted_token_ids])
 		
-		# ---- 4) Buffer Checks -------
-		needed_size = sorted_eids.shape[0]
-		buffer_cap = self.symm_inp.shape[0]
-		logger.info(f"[Rank {self.rank}] buffer_check: need {needed_size}, cap {buffer_cap}")
-		
-		if needed_size > buffer_cap:
-			logger.error(f"[Rank {self.rank}] BUFFER OVERFLOW! Needed {needed_size}, Capacity {buffer_cap}")
-			raise RuntimeError("Symmetric input buffer too small")
-
-		# ---- 5) Copying -------
-		logger.info(f"[Rank {self.rank}] Creating source slice (x[sorted_token_ids])...")
-		# We do this in two steps to see if the slicing or the copying is the issue
-		src_slice = x[sorted_token_ids]
-		
-		logger.info(f"[Rank {self.rank}] Copying to symmetric buffer...")
-		self.symm_inp[:needed_size].copy_(src_slice)
-		torch.cuda.synchronize(self.device)
-		logger.info(f"[Rank {self.rank}] Copy Complete.")
-		
-		# ---- 6) Bincount -------
-		logger.info(f"[Rank {self.rank}] Running Bincount...")
+		# ---- 3) Prepare Dispatch Metadata -------
+		# Count how many tokens go to each expert globally
 		bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
-		self.symm_in_splits.copy_(bin_count)
-		torch.cuda.synchronize(self.device)
 		
-		logger.info(f"[Rank {self.rank}] Ready for Dispatch (All2All-1). Total tokens to send: {needed_size}")
-
+		# Copy counts to the symmetric metadata buffer
+		self.symm_in_splits.copy_(bin_count)
+		
 		# ---- 4) Dispatch (All-to-All) -------
+		# Input: symm_inp (Sorted Data)
+		# Output: symm_out (Data grouped by Local Expert)
+		# Metadata Written: symm_out_splits_offsets (Layout of data in symm_out)
 		torch.ops.symm_mem.all_to_all_vdev_2d(
 			self.symm_inp, 
 			self.symm_out, 
@@ -1909,54 +1727,59 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.group_name
 		)
 		
-		torch.cuda.synchronize(self.device) # Wait for Dispatch to finish
-		logger.info(f"[Rank {self.rank}] Dispatch Complete.")
-
 		# ---- 5) Prepare Expert Computation -------
-		out_splits = self.symm_out_splits_offsets[0]
+		# We need to know how many tokens each of OUR local experts received.
+		# symm_out_splits_offsets shape: [2, World_Size * Local_Experts]
+		# It is ordered: [Rank0->Exp0, Rank0->Exp1... Rank1->Exp0...]
+		
+		out_splits = self.symm_out_splits_offsets[0] # Row 0 is counts
+		
+		# View as [World_Size, Local_Experts] and sum over ranks
 		splits_matrix = out_splits.view(self.world_size, self.experts_per_rank)
 		tokens_per_local_expert = splits_matrix.sum(dim=0)
 		
+		# Create offsets for the GEMM/Expert kernel
+		# Note: We explicitly start at 0.
 		zero = torch.zeros((1,), dtype=tokens_per_local_expert.dtype, device=self.device)
 		expert_offsets = torch.cat([zero, torch.cumsum(tokens_per_local_expert, dim=0)])
 		
-		total_tokens_processed = expert_offsets[-1].item()
-		logger.info(f"[Rank {self.rank}] Ready for Compute. Total local tokens: {total_tokens_processed}")
-
 		# ---- 6) Local Expert Computation -------
-		if total_tokens_processed > 0:
-			# Input: self.symm_out (contains the dispatched tokens)
-			res = self.grouped_dequant_moe_fp8(
-				self.symm_out,              
-				None,                       
-				tokens_per_local_expert,    
-				expert_offsets              
-			)
-		else:
-			# Edge Case Handling: No tokens received for any expert
-			logger.warning(f"[Rank {self.rank}] No tokens received! Skipping compute.")
-			res = torch.empty((0, hidden_size), device=self.device, dtype=x.dtype) # Or appropriate shape
-
-		torch.cuda.synchronize(self.device) # Wait for Compute
-		logger.info(f"[Rank {self.rank}] Compute Complete. Res shape: {res.shape}")
-
+		# Input: self.symm_out (contains the dispatched tokens)
+		res = self.grouped_dequant_moe_fp8(
+			self.symm_out,              # Input buffer
+			None,                       
+			tokens_per_local_expert,    
+			expert_offsets              
+		)
+		
 		# ---- 7) Prepare Combine (Reverse) Metadata -------
+		# A. Input Metadata for Combine = Output Metadata from Dispatch
+		# (Symmetry: We send back exactly from where we received)
 		combine_in_splits_offsets = self.symm_out_splits_offsets
+		
+		# B. Output Metadata for Combine = Input Metadata from Dispatch (plus offsets)
+		# We need to tell the origin rank where to put the returning tokens.
+		# This requires [Splits, Offsets]
 		combine_out_splits = self.symm_in_splits
 		
+		# Calculate exclusive prefix sum for offsets
 		combine_out_offsets = torch.zeros_like(combine_out_splits)
 		combine_out_offsets[1:] = torch.cumsum(combine_out_splits[:-1], dim=0)
 		
+		# Stack them into the required [2, N] shape
 		self.symm_in_splits_offsets[0].copy_(combine_out_splits)
 		self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
 		
 		# ---- 8) Prepare Buffer for Combine -------
-		self.symm_out[:int(total_tokens_processed)].copy_(res)
+		# We can reuse symm_out to hold the RESULTS of the experts.
+		# We copy the result `res` back into `symm_out`.
+		# The layout is already perfect (Expert-Major) because `res` implies that order.
+		total_tokens_processed = expert_offsets[-1]
+		self.symm_out[:total_tokens_processed].copy_(res)
 		
-		logger.info(f"[Rank {self.rank}] Ready for Combine (All2All-2).")
-		torch.cuda.synchronize(self.device)
-
 		# ---- 9) Combine (Reverse All-to-All) -------
+		# Input: symm_out (Expert Results)
+		# Output: symm_inp (We reuse the input buffer to store received results)
 		self.symm_inp.zero_()
 		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
 			self.symm_out,                  
@@ -1966,25 +1789,203 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.group_name
 		)
 		
-		torch.cuda.synchronize(self.device)
-		logger.info(f"[Rank {self.rank}] Combine Complete.")
-
 		# ---- 10) Unsort and Weighted Sum -------
+		# symm_inp now contains processed tokens, but they are still sorted by Expert ID.
+		# We need to restore the original order (0_top1, 0_top2, 1_top1...)
+		
+		# Invert the permutation
 		unsort_idx = torch.argsort(sort_idx)
 		
-		# Check bounds
-		if flat_eids.shape[0] > self.symm_inp.shape[0]:
-			 logger.error(f"[Rank {self.rank}] Return buffer size mismatch!")
-		
+		# We only care about the valid data region
 		sorted_results = self.symm_inp[:flat_eids.shape[0]]
+		
+		# Shuffle back to [N*K, Hidden] order corresponding to topk_idx
 		unsorted_results = sorted_results[unsort_idx]
 		
+		# Reshape for weighted sum: [Num_Tokens, K, Hidden]
 		unsorted_results = unsorted_results.view(num_tokens, self.num_experts_per_tok, hidden_size)
 		
+		# Weighted sum
+		# topk_weight: [Num_Tokens, K] -> [Num_Tokens, K, 1]
 		final_out = torch.sum(unsorted_results * topk_weight.unsqueeze(-1), dim=1).to(x.dtype)
 		
-		logger.info(f"[Rank {self.rank}] Step Complete.")
 		return final_out
+
+
+	# @torch.inference_mode()
+	# def moe_infer_alltoall_nvshmem(self, x):
+	# 	# DEBUG: Start with a clean slate
+	# 	torch.cuda.synchronize(self.device)
+		
+	# 	num_tokens, hidden_size = x.shape
+	# 	logger.info(f"[Rank {self.rank}] Start MoE. Input: {x.shape}, dtype: {x.dtype}")
+		
+	# 	# --- CHECK 1: Is Input Valid? ---
+	# 	# If x has NaNs, the gate kernel might produce garbage indices or crash
+	# 	if torch.isnan(x).any():
+	# 		logger.error(f"[Rank {self.rank}] FATAL ERROR: Input 'x' contains NaNs!")
+	# 		# Depending on your setup, you might want to crash here to stop propagation
+		
+	# 	# Ensure x is contiguous. Custom kernels often segfault on non-contiguous strides.
+	# 	if not x.is_contiguous():
+	# 		logger.warning(f"[Rank {self.rank}] Input x is not contiguous. Fixing...")
+	# 		x = x.contiguous()
+
+	# 	# ---- 1) Gating -------
+	# 	logger.info(f"[Rank {self.rank}] Executing Gate Kernel...")
+	# 	topk_idx, topk_weight = self.gate.forward(
+	# 		x.view(num_tokens, 1, hidden_size)
+	# 	)
+	# 	torch.cuda.synchronize(self.device) # Wait for Gate to finish
+	# 	logger.info(f"[Rank {self.rank}] Gate Kernel Complete.")
+
+	# 	# --- CHECK 2: Validate Gate Output ---
+	# 	# Often the gate kernel is the culprit. Let's inspect its output before using it.
+		
+	# 	# Check for NaNs in weights
+	# 	if torch.isnan(topk_weight).any():
+	# 		logger.error(f"[Rank {self.rank}] FATAL: Gate weights contain NaNs")
+		
+	# 	# Check for Invalid Indices (Out of Bounds)
+	# 	# If an index is -1 or >= total_experts, bincount or copy will crash silently later.
+	# 	min_id = topk_idx.min().item()
+	# 	max_id = topk_idx.max().item()
+	# 	logger.info(f"[Rank {self.rank}] Expert ID Range: min={min_id}, max={max_id}, Limit={self.total_experts}")
+		
+	# 	if max_id >= self.total_experts or min_id < 0:
+	# 		logger.error(f"[Rank {self.rank}] FATAL: Gate generated Invalid Expert IDs! Out of bounds.")
+	# 		raise RuntimeError(f"Invalid Expert IDs: {min_id} to {max_id}")
+
+	# 	# ---- 2) Sorting -------
+	# 	logger.info(f"[Rank {self.rank}] Casting and Flattening IDs...")
+	# 	flat_eids = topk_idx.view(-1).to(torch.int32)
+		
+	# 	logger.info(f"[Rank {self.rank}] Sorting IDs...")
+	# 	sorted_eids, sort_idx = flat_eids.sort()
+	# 	torch.cuda.synchronize(self.device)
+	# 	logger.info(f"[Rank {self.rank}] Sort Complete.")
+
+	# 	# ---- 3) Index Calculation -------
+	# 	logger.info(f"[Rank {self.rank}] Calculating Token IDs...")
+	# 	sorted_token_ids = sort_idx // self.num_experts_per_tok
+	# 	torch.cuda.synchronize(self.device)
+		
+	# 	# Sanity check: Are we indexing x correctly?
+	# 	if sorted_token_ids.numel() > 0 and sorted_token_ids.max() >= num_tokens:
+	# 		 logger.error(f"[Rank {self.rank}] FATAL: sorted_token_ids out of bounds of input x!")
+		
+	# 	# ---- 4) Buffer Checks -------
+	# 	needed_size = sorted_eids.shape[0]
+	# 	buffer_cap = self.symm_inp.shape[0]
+	# 	logger.info(f"[Rank {self.rank}] buffer_check: need {needed_size}, cap {buffer_cap}")
+		
+	# 	if needed_size > buffer_cap:
+	# 		logger.error(f"[Rank {self.rank}] BUFFER OVERFLOW! Needed {needed_size}, Capacity {buffer_cap}")
+	# 		raise RuntimeError("Symmetric input buffer too small")
+
+	# 	# ---- 5) Copying -------
+	# 	logger.info(f"[Rank {self.rank}] Creating source slice (x[sorted_token_ids])...")
+	# 	# We do this in two steps to see if the slicing or the copying is the issue
+	# 	src_slice = x[sorted_token_ids]
+		
+	# 	logger.info(f"[Rank {self.rank}] Copying to symmetric buffer...")
+	# 	self.symm_inp[:needed_size].copy_(src_slice)
+	# 	torch.cuda.synchronize(self.device)
+	# 	logger.info(f"[Rank {self.rank}] Copy Complete.")
+		
+	# 	# ---- 6) Bincount -------
+	# 	logger.info(f"[Rank {self.rank}] Running Bincount...")
+	# 	bin_count = torch.bincount(sorted_eids, minlength=self.total_experts)
+	# 	self.symm_in_splits.copy_(bin_count)
+	# 	torch.cuda.synchronize(self.device)
+		
+	# 	logger.info(f"[Rank {self.rank}] Ready for Dispatch (All2All-1). Total tokens to send: {needed_size}")
+
+	# 	# ---- 4) Dispatch (All-to-All) -------
+	# 	torch.ops.symm_mem.all_to_all_vdev_2d(
+	# 		self.symm_inp, 
+	# 		self.symm_out, 
+	# 		self.symm_in_splits, 
+	# 		self.symm_out_splits_offsets, 
+	# 		self.group_name
+	# 	)
+		
+	# 	torch.cuda.synchronize(self.device) # Wait for Dispatch to finish
+	# 	logger.info(f"[Rank {self.rank}] Dispatch Complete.")
+
+	# 	# ---- 5) Prepare Expert Computation -------
+	# 	out_splits = self.symm_out_splits_offsets[0]
+	# 	splits_matrix = out_splits.view(self.world_size, self.experts_per_rank)
+	# 	tokens_per_local_expert = splits_matrix.sum(dim=0)
+		
+	# 	zero = torch.zeros((1,), dtype=tokens_per_local_expert.dtype, device=self.device)
+	# 	expert_offsets = torch.cat([zero, torch.cumsum(tokens_per_local_expert, dim=0)])
+		
+	# 	total_tokens_processed = expert_offsets[-1].item()
+	# 	logger.info(f"[Rank {self.rank}] Ready for Compute. Total local tokens: {total_tokens_processed}")
+
+	# 	# ---- 6) Local Expert Computation -------
+	# 	if total_tokens_processed > 0:
+	# 		# Input: self.symm_out (contains the dispatched tokens)
+	# 		res = self.grouped_dequant_moe_fp8(
+	# 			self.symm_out,              
+	# 			None,                       
+	# 			tokens_per_local_expert,    
+	# 			expert_offsets              
+	# 		)
+	# 	else:
+	# 		# Edge Case Handling: No tokens received for any expert
+	# 		logger.warning(f"[Rank {self.rank}] No tokens received! Skipping compute.")
+	# 		res = torch.empty((0, hidden_size), device=self.device, dtype=x.dtype) # Or appropriate shape
+
+	# 	torch.cuda.synchronize(self.device) # Wait for Compute
+	# 	logger.info(f"[Rank {self.rank}] Compute Complete. Res shape: {res.shape}")
+
+	# 	# ---- 7) Prepare Combine (Reverse) Metadata -------
+	# 	combine_in_splits_offsets = self.symm_out_splits_offsets
+	# 	combine_out_splits = self.symm_in_splits
+		
+	# 	combine_out_offsets = torch.zeros_like(combine_out_splits)
+	# 	combine_out_offsets[1:] = torch.cumsum(combine_out_splits[:-1], dim=0)
+		
+	# 	self.symm_in_splits_offsets[0].copy_(combine_out_splits)
+	# 	self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
+		
+	# 	# ---- 8) Prepare Buffer for Combine -------
+	# 	self.symm_out[:int(total_tokens_processed)].copy_(res)
+		
+	# 	logger.info(f"[Rank {self.rank}] Ready for Combine (All2All-2).")
+	# 	torch.cuda.synchronize(self.device)
+
+	# 	# ---- 9) Combine (Reverse All-to-All) -------
+	# 	self.symm_inp.zero_()
+	# 	torch.ops.symm_mem.all_to_all_vdev_2d_offset(
+	# 		self.symm_out,                  
+	# 		self.symm_inp,                  
+	# 		combine_in_splits_offsets,   
+	# 		self.symm_in_splits_offsets,    
+	# 		self.group_name
+	# 	)
+		
+	# 	torch.cuda.synchronize(self.device)
+	# 	logger.info(f"[Rank {self.rank}] Combine Complete.")
+
+	# 	# ---- 10) Unsort and Weighted Sum -------
+	# 	unsort_idx = torch.argsort(sort_idx)
+		
+	# 	# Check bounds
+	# 	if flat_eids.shape[0] > self.symm_inp.shape[0]:
+	# 		 logger.error(f"[Rank {self.rank}] Return buffer size mismatch!")
+		
+	# 	sorted_results = self.symm_inp[:flat_eids.shape[0]]
+	# 	unsorted_results = sorted_results[unsort_idx]
+		
+	# 	unsorted_results = unsorted_results.view(num_tokens, self.num_experts_per_tok, hidden_size)
+		
+	# 	final_out = torch.sum(unsorted_results * topk_weight.unsqueeze(-1), dim=1).to(x.dtype)
+		
+	# 	logger.info(f"[Rank {self.rank}] Step Complete.")
+	# 	return final_out
 
 	# def reorder_tokens_to_expert_contiguous_vectorized(self, input_x, splits, offsets, local_expert_counts):
 	# 	"""
