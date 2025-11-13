@@ -2502,6 +2502,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# ---- 3) Process tokens assigned to local experts ------------------
 		# res = self.grouped_dequant_moe_fp8_(input_x, input_eids)
+		logger.info(f"Rank {self.rank}: input_x shape: {input_x.shape}, input_eids shape: {input_eids.shape}, expert_counts shape: {expert_counts.shape}, expert_offsets shape: {expert_offsets.shape}, expert_counts: {expert_counts}, expert_offsets: {expert_offsets}")
+		exit()
 		res = self.grouped_dequant_moe_fp8(
 					input_x,          # Oversized
 					input_eids,         # Oversized
