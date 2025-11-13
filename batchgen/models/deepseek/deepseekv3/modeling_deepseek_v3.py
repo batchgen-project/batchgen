@@ -1615,19 +1615,24 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			max_inp_len, self.config.hidden_size, 
 			dtype=torch.bfloat16, device=self.device
 		)
+		symm_inp_hdl = symm_mem.rendezvous(self.symm_inp, dist.group.WORLD)
 		self.symm_out = symm_mem.empty(
 			max_out_len, self.config.hidden_size, 
 			dtype=torch.bfloat16, device=self.device
 		)
+		symm_out_hdl = symm_mem.rendezvous(self.symm_out, dist.group.WORLD)
 		self.symm_in_splits = symm_mem.empty(
 			self.total_experts, dtype=torch.int64, device=self.device
 		)
+		symm_in_splits_hdl = symm_mem.rendezvous(self.symm_in_splits, dist.group.WORLD)
 		self.symm_out_splits_offsets = symm_mem.empty(
 			(2, self.total_experts), dtype=torch.int64, device=self.device
 		)
+		symm_out_splits_offsets_hdl = symm_mem.rendezvous(self.symm_out_splits_offsets, dist.group.WORLD)
 		self.symm_in_splits_offsets = symm_mem.empty(
 			(2, self.total_experts), dtype=torch.int64, device=self.device
 		)
+		symm_in_splits_offsets_hdl = symm_mem.rendezvous(self.symm_in_splits_offsets, dist.group.WORLD)
 		self.group_name = group_name
 
 	def init(self, num_tokens_per_rank):
@@ -2857,42 +2862,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# This is the last element of the prefix sum. NO sync.
 		actual_num_tokens = expert_offsets[-1]
 
-		# 2. Remove the synchronizing 'if' check.
-		# We assume downstream kernels (act_quant, fused_moe)
-		# can handle 0-sized inputs, which is standard for robust ops.
-		# if(len(eids) == 0):  <--- REMOVE
-		#     assert len(x) == 0
-		#     return x
-
-		# 3. ELIMINATE REDUNDANT bincount.
-		# You already have this data from the dispatch kernel.
-		# 
-		# --- REMOVE THIS ---
-		# group_size, activated_group_idx, group_start_indices, num_active_experts = expert_bincount(
-		#     eids, self.routed_expert_start_idx, self.experts_per_rank, self.device
-		# )
-		
-		# --- REPLACE WITH THIS (all async) ---
-		# group_size = expert_counts
-		# group_start_indices = expert_offsets # Check if kernel needs expert_offsets[:-1]
-		
-		# These ops are async and return tensors on the GPU
-		# activated_group_idx = torch.nonzero(group_size > 0, as_tuple=True)[0].to(torch.int32)
-		# num_active_experts = torch.count_nonzero(group_size) # 0-dim GPU tensor
 		expert_counts = expert_counts.to(torch.int32)
 		group_size, activated_group_idx, group_start_indices, num_active_experts = compact_expert_data(
 					expert_counts
 		)
-		# num_active = num_active_experts.item()
-		# group_size = group_size[:num_active]
-		# activated_group_idx = activated_group_idx[:num_active]
-		# group_start_indices = group_start_indices[:num_active]
-		# if self.rank == 0:
-		# 	logger.info(f"Group size: {group_size}")
-		# 	logger.info(f"Activated group idx: {activated_group_idx}")
-		# 	logger.info(f"Group start indices: {group_start_indices}")
-		# 	logger.info(f"Num active experts: {num_active_experts}")
-		# 	logger.info(f"x shape: {x.shape}")
 		# --- End Replacement ---
 		
 		# 4. Perform dynamic slicing (async).
@@ -2903,9 +2876,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 5. Quantize only the valid data.
 		# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
 		x_quant, x_scale = act_quant(x_sliced)
-		# fused_fp8_moe_stage_1_persistent_v2
-		# fused_fp8_moe_stage_1_tma
-		# fused_fp8_moe_stage_1_optimized
 		intermediate = fused_fp8_moe_stage_1_tma(
 			x_quant, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
@@ -2919,9 +2889,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# 'intermediate' is also dynamically shaped
 		intermediate, intermediate_scale = act_quant(intermediate)
-		# fp8_grouped_gemm_persistent_tma
-		# fused_dequant_grouped_gemm_fp8_fp8_triton
-		# fused_dequant_grouped_gemm_fp8_tma
 		res = fused_dequant_grouped_gemm_fp8_tma(
 			intermediate, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
