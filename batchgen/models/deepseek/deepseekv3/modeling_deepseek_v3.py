@@ -1604,7 +1604,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# Initialize symmetric memory once during model initialization
 		if not symm_mem.is_nvshmem_available():
-			logger.warn("NVSHMEM is not available. Symmetric memory features will be disabled.")
+			logger.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
 			symm_mem.set_backend("NCCL")
 		else:
 			symm_mem.set_backend("NVSHMEM")
