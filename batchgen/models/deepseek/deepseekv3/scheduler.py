@@ -26,7 +26,7 @@ class Scheduler:
 		"""
 		DEFAULT_MEM_FRAC = 0.80
 		# MAGIC_NUM = self.compute_profiler.profile(attn_decoding_module)
-		MAGIC_NUM = 224000 * 2
+		MAGIC_NUM = 224000 * 3
 		EXPERT_PER_RANK = 256 // self.world_size
 		assert EXPERT_PER_RANK > 0, "EXPERT_PER_RANK must be greater than 0"
 		if self.world_size > 8:
@@ -69,7 +69,7 @@ class Scheduler:
 			num_decoding_module_buffer_routed_expert = 0
 
 		# Update the config with the computed values
-		self.config.Module_Batching_Config.attn_decoding_micro_batch_size = attn_decoding_micro_batch_size
+		# self.config.Module_Batching_Config.attn_decoding_micro_batch_size = attn_decoding_micro_batch_size
 		self.config.GPU_Buffer_Config.num_k_buffer = num_k_buffer
 		self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = num_decoding_module_buffer_routed_expert
 		self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
