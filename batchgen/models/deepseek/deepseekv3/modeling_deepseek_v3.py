@@ -2702,6 +2702,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# These ops are async and return tensors on the GPU
 		# activated_group_idx = torch.nonzero(group_size > 0, as_tuple=True)[0].to(torch.int32)
 		# num_active_experts = torch.count_nonzero(group_size) # 0-dim GPU tensor
+		expert_counts = expert_counts.to(torch.int32)
 		group_size, activated_group_idx, group_start_indices, num_active_experts = compact_expert_data(
 					expert_counts
 		)
