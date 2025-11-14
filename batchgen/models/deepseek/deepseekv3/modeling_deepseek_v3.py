@@ -2055,12 +2055,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		send_offsets = torch.cumsum(torch.cat([torch.tensor([0], device=device), sc[:-1]]), dim=0)
 		recv_offsets = torch.cumsum(torch.cat([torch.tensor([0], device=device), rc[:-1]]), dim=0)
 		
-		stream = torch.cuda.current_stream(device)
+		stream = torch.cuda.default_stream(self.device)
 		
 		# ---- 6) NCCL send/recv for data (x) --------------------------------
 		with self.comm.change_state(enable=True):
 			# Group all communication
-			# self.comm.group_start()
+			self.comm.group_start()
 			
 			# Post all recvs first (important for avoiding deadlock)
 			for rank in range(self.world_size):
@@ -2074,11 +2074,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 					send_slice = send_x[send_offsets[rank]:send_offsets[rank] + sc[rank]]
 					self.comm.send(send_slice, dst=rank, stream=stream)
 			
-			# self.comm.group_end()
+			self.comm.group_end()
 		
 		# ---- 7) NCCL send/recv for expert IDs (eid) ------------------------
 		with self.comm.change_state(enable=True):
-			# self.comm.group_start()
+			self.comm.group_start()
 			
 			for rank in range(self.world_size):
 				if rc[rank] > 0:
@@ -2090,7 +2090,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 					send_slice = send_eid[send_offsets[rank]:send_offsets[rank] + sc[rank]]
 					self.comm.send(send_slice, dst=rank, stream=stream)
 			
-			# self.comm.group_end()
+			self.comm.group_end()
 		
 		# ---- 8) local computation ------------------------------------------
 		if recv_total > 0:
@@ -2104,7 +2104,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# 注意：返回时send/recv的方向反过来
 		with self.comm.change_state(enable=True):
-			# self.comm.group_start()
+			self.comm.group_start()
 			
 			# Post recvs (now receiving back from where we sent)
 			for rank in range(self.world_size):
@@ -2118,7 +2118,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 					send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
 					self.comm.send(send_slice, dst=rank, stream=stream)
 			
-			# self.comm.group_end()
+			self.comm.group_end()
 		
 		# ---- 10) unsort, accumulate, normalise -----------------------------
 		unsort_idx = sort_idx.argsort()
