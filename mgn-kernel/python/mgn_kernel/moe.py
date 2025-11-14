@@ -113,18 +113,18 @@ def compact_expert_data(
         expert_counts
     )
 
-def compute_expert_offsets(
-    expert_counts: torch.Tensor,
-):
-    """
-    Compute expert offsets based on expert counts.
+# def compute_expert_offsets(
+#     expert_counts: torch.Tensor,
+# ):
+#     """
+#     Compute expert offsets based on expert counts.
 
-    Args:
-        expert_counts (torch.Tensor): Tensor containing counts of tokens per expert.
+#     Args:
+#         expert_counts (torch.Tensor): Tensor containing counts of tokens per expert.
 
-    Returns:
-        torch.Tensor: Tensor containing offsets for each expert.
-    """
-    return torch.ops.mgn_kernel.compute_expert_offsets.default(
-        expert_counts
-    )   
+#     Returns:
+#         torch.Tensor: Tensor containing offsets for each expert.
+#     """
+#     return torch.ops.mgn_kernel.compute_expert_offsets.default(
+#         expert_counts
+#     )   

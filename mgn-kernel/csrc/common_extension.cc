@@ -44,9 +44,9 @@ TORCH_LIBRARY_FRAGMENT(mgn_kernel, m) {
         "compact_expert_data(Tensor expert_counts) -> (Tensor[])");
     m.impl("compact_expert_data", torch::kCUDA, &compact_expert_data_cuda);
 
-    m.def(
-        "compute_expert_offsets(Tensor expert_counts) -> (Tensor[])");
-    m.impl("compute_expert_offsets", torch::kCUDA, &compute_expert_offsets_cuda);
+    // m.def(
+    //     "compute_expert_offsets(Tensor expert_counts) -> (Tensor[])");
+    // m.impl("compute_expert_offsets", torch::kCUDA, &compute_expert_offsets_cuda);
 
     /*
      * From csrc/elementwise
