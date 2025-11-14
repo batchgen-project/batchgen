@@ -1675,7 +1675,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_allgather_alltoall(hidden_states)
+		out = self.moe_infer_alltoall(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
@@ -1949,7 +1949,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		num_tokens, hidden_size = x.shape
 		K = self.num_experts_per_tok
 		device = x.device
-		topk_idx, topk_weight = self.gate.decoding_forward(x.view(num_tokens, 1, hidden_size)) #API Comp
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size)) #API Comp
 		# ---- 1) flatten, sort by expert ------------------------------------
 		flat_eids   = topk_idx.flatten()
 		flat_wts    = topk_weight.flatten()
