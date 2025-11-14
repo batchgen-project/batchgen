@@ -2017,6 +2017,120 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		return final_x.to(x.dtype)
 
+	# @torch.inference_mode()
+	# def moe_infer_alltoall_sendrecv(self, x):
+	# 	num_tokens, hidden_size = x.shape
+	# 	K = self.num_experts_per_tok
+	# 	device = x.device
+	# 	topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size))
+		
+	# 	# ---- 1) flatten, sort by expert ------------------------------------
+	# 	flat_eids = topk_idx.flatten()
+	# 	flat_wts = topk_weight.flatten()
+	# 	expanded_x = x.repeat_interleave(K, dim=0)
+		
+	# 	sorted_eids, sort_idx = flat_eids.sort()
+	# 	sorted_x = expanded_x[sort_idx]
+	# 	sorted_wt = flat_wts[sort_idx]
+		
+	# 	# ---- 2) compute send/recv counts -----------------------------------
+	# 	local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
+	# 	reshaped_counts = local_counts.view(self.world_size, -1)
+	# 	sc = reshaped_counts.sum(dim=1)  # [world_size], send to each rank
+		
+	# 	# ---- 3) exchange counts (still need allgather for this) -----------
+	# 	gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
+	# 	dist.all_gather(gathered_counts, sc)
+	# 	gathered_tensor = torch.stack(gathered_counts)  # [world_size, world_size]
+	# 	rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
+	# 	recv_total = rc.sum()
+		
+	# 	# ---- 4) allocate buffers -------------------------------------------
+	# 	send_x = sorted_x
+	# 	send_eid = sorted_eids
+	# 	recv_x = torch.empty(recv_total, hidden_size, device=device, dtype=x.dtype)
+	# 	recv_eid = torch.empty(recv_total, device=device, dtype=sorted_eids.dtype)
+		
+	# 	# ---- 5) compute send/recv offsets (on GPU) -------------------------
+	# 	send_offsets = torch.cumsum(torch.cat([torch.tensor([0], device=device), sc[:-1]]), dim=0)
+	# 	recv_offsets = torch.cumsum(torch.cat([torch.tensor([0], device=device), rc[:-1]]), dim=0)
+		
+	# 	stream = torch.cuda.default_stream(self.device)
+		
+	# 	# ---- 6) NCCL send/recv for data (x) --------------------------------
+	# 	with self.comm.change_state(enable=True):
+	# 		# Group all communication
+	# 		self.comm.group_start()
+			
+	# 		# Post all recvs first (important for avoiding deadlock)
+	# 		for rank in range(self.world_size):
+	# 			if rc[rank] > 0:
+	# 				recv_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+	# 				self.comm.recv(recv_slice, src=rank, stream=stream)
+			
+	# 		# Then post all sends
+	# 		for rank in range(self.world_size):
+	# 			if sc[rank] > 0:
+	# 				send_slice = send_x[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+	# 				self.comm.send(send_slice, dst=rank, stream=stream)
+			
+	# 		self.comm.group_end()
+		
+	# 	# ---- 7) NCCL send/recv for expert IDs (eid) ------------------------
+	# 	with self.comm.change_state(enable=True):
+	# 		self.comm.group_start()
+			
+	# 		for rank in range(self.world_size):
+	# 			if rc[rank] > 0:
+	# 				recv_slice = recv_eid[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+	# 				self.comm.recv(recv_slice, src=rank, stream=stream)
+			
+	# 		for rank in range(self.world_size):
+	# 			if sc[rank] > 0:
+	# 				send_slice = send_eid[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+	# 				self.comm.send(send_slice, dst=rank, stream=stream)
+			
+	# 		self.comm.group_end()
+		
+	# 	# ---- 8) local computation ------------------------------------------
+	# 	if recv_total > 0:
+	# 		recv_eid_sorted, local_sort_idx = recv_eid.sort()
+	# 		recv_eid_sorted = recv_eid_sorted.to(torch.int32)
+	# 		res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
+	# 		recv_x[local_sort_idx] = res
+		
+	# 	# ---- 9) NCCL send/recv for return ----------------------------------
+	# 	out_sorted = torch.empty_like(sorted_x)
+		
+	# 	# 注意：返回时send/recv的方向反过来
+	# 	with self.comm.change_state(enable=True):
+	# 		self.comm.group_start()
+			
+	# 		# Post recvs (now receiving back from where we sent)
+	# 		for rank in range(self.world_size):
+	# 			if sc[rank] > 0:  # 注意这里用sc，因为方向反了
+	# 				recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+	# 				self.comm.recv(recv_slice, src=rank, stream=stream)
+			
+	# 		# Post sends (now sending to where we received from)
+	# 		for rank in range(self.world_size):
+	# 			if rc[rank] > 0:  # 注意这里用rc
+	# 				send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+	# 				self.comm.send(send_slice, dst=rank, stream=stream)
+			
+	# 		self.comm.group_end()
+		
+	# 	# ---- 10) unsort, accumulate, normalise -----------------------------
+	# 	unsort_idx = sort_idx.argsort()
+	# 	final_x = out_sorted[unsort_idx]
+	# 	final_wt = sorted_wt[unsort_idx]
+		
+	# 	final_x = final_x * final_wt.unsqueeze(-1)
+	# 	final_x = final_x.view(num_tokens, K, -1)
+	# 	final_x = final_x.sum(dim=1)
+		
+	# 	return final_x.to(x.dtype)
+
 	@torch.inference_mode()
 	def moe_infer_alltoall_sendrecv(self, x):
 		num_tokens, hidden_size = x.shape
@@ -2057,42 +2171,47 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		stream = torch.cuda.default_stream(self.device)
 		
-		# ---- 6) NCCL send/recv for data (x) --------------------------------
+		# ---- 6) MERGED: NCCL send/recv for data (x) AND expert IDs (eid) ---
+		#
+		# REVISION: Steps 6 and 7 are merged into a single communication
+		# group. This is more efficient (one barrier, not two) and
+		# avoids potential state-related deadlocks from starting a
+		# new, identical communication group immediately after one finishes.
+		#
 		with self.comm.change_state(enable=True):
 			# Group all communication
 			self.comm.group_start()
 			
-			# Post all recvs first (important for avoiding deadlock)
+			# Post all recvs first (for both x and eid)
 			for rank in range(self.world_size):
 				if rc[rank] > 0:
-					recv_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
-					self.comm.recv(recv_slice, src=rank, stream=stream)
+					# Recv token data
+					recv_slice_x = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+					self.comm.recv(recv_slice_x, src=rank, stream=stream)
+					
+					# Recv expert IDs
+					recv_slice_eid = recv_eid[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+					self.comm.recv(recv_slice_eid, src=rank, stream=stream)
 			
-			# Then post all sends
+			# Then post all sends (for both x and eid)
 			for rank in range(self.world_size):
 				if sc[rank] > 0:
-					send_slice = send_x[send_offsets[rank]:send_offsets[rank] + sc[rank]]
-					self.comm.send(send_slice, dst=rank, stream=stream)
+					# Send token data
+					send_slice_x = send_x[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+					self.comm.send(send_slice_x, dst=rank, stream=stream)
+					
+					# Send expert IDs
+					send_slice_eid = send_eid[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+					self.comm.send(send_slice_eid, dst=rank, stream=stream)
 			
+			# This blocks until ALL sends/recvs for both x and eid are complete
 			self.comm.group_end()
 		
-		# ---- 7) NCCL send/recv for expert IDs (eid) ------------------------
-		with self.comm.change_state(enable=True):
-			self.comm.group_start()
-			
-			for rank in range(self.world_size):
-				if rc[rank] > 0:
-					recv_slice = recv_eid[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
-					self.comm.recv(recv_slice, src=rank, stream=stream)
-			
-			for rank in range(self.world_size):
-				if sc[rank] > 0:
-					send_slice = send_eid[send_offsets[rank]:send_offsets[rank] + sc[rank]]
-					self.comm.send(send_slice, dst=rank, stream=stream)
-			
-			self.comm.group_end()
+		# ---- 7) (Removed, merged into Step 6) ------------------------------
 		
 		# ---- 8) local computation ------------------------------------------
+		# This code only runs after the group_end() above completes,
+		# so we are guaranteed to have received both recv_x and recv_eid.
 		if recv_total > 0:
 			recv_eid_sorted, local_sort_idx = recv_eid.sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
@@ -2102,19 +2221,21 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 9) NCCL send/recv for return ----------------------------------
 		out_sorted = torch.empty_like(sorted_x)
 		
-		# 注意：返回时send/recv的方向反过来
+		# This communication (the return "AlltoAll") is logically
+		# separate and MUST be in its own group, after local compute.
+		# This part of your logic was correct.
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
 			
 			# Post recvs (now receiving back from where we sent)
 			for rank in range(self.world_size):
-				if sc[rank] > 0:  # 注意这里用sc，因为方向反了
+				if sc[rank] > 0:  # Use sc (original send counts) for recv
 					recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + sc[rank]]
 					self.comm.recv(recv_slice, src=rank, stream=stream)
 			
 			# Post sends (now sending to where we received from)
 			for rank in range(self.world_size):
-				if rc[rank] > 0:  # 注意这里用rc
+				if rc[rank] > 0:  # Use rc (original recv counts) for send
 					send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
 					self.comm.send(send_slice, dst=rank, stream=stream)
 			
