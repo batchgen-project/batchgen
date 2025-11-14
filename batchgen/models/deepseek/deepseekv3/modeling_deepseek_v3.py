@@ -2256,7 +2256,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 9) NCCL send/recv for return (reverse direction) -------------
 		logger.info(f"[Rank {self.rank}] Step 9: Starting return communication")
 		out_sorted = torch.empty_like(sorted_x)
-		
+
 		# Handle self-communication
 		if sc[self.rank] > 0:
 			logger.info(f"[Rank {self.rank}] Step 9a: Handling self-communication for return")
@@ -2264,7 +2264,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			recv_slice = out_sorted[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
 			recv_slice.copy_(send_slice)
 			logger.info(f"[Rank {self.rank}] Step 9a: Self-communication for return completed")
-		
+
+		# Log what we expect to send and receive in return phase
+		logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will recv from ranks where sc>0: {[(r, sc[r].item()) for r in range(self.world_size) if r != self.rank and sc[r] > 0]}")
+		logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will send to ranks where rc>0: {[(r, rc[r].item()) for r in range(self.world_size) if r != self.rank and rc[r] > 0]}")
+		logger.info(f"[Rank {self.rank}] Step 8d: Verifying communication symmetry")
+		logger.info(f"[Rank {self.rank}] Step 8d: Forward phase - sent to: {[(r, sc[r].item()) for r in range(self.world_size) if sc[r] > 0]}")
+		logger.info(f"[Rank {self.rank}] Step 8d: Forward phase - recv from: {[(r, rc[r].item()) for r in range(self.world_size) if rc[r] > 0]}")
 		# NCCL group for return communication
 		logger.info(f"[Rank {self.rank}] Step 9b: Entering NCCL group for return communication")
 		with self.comm.change_state(enable=True):
@@ -2273,6 +2279,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			
 			# Post recvs (receiving back from where we sent)
 			logger.info(f"[Rank {self.rank}] Step 9c: Posting all recvs for return")
+			recv_count = 0
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
@@ -2280,23 +2287,28 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				if sc[rank] > 0:
 					recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + sc[rank]]
 					self.comm.recv(recv_slice, src=rank, stream=stream)
-					logger.info(f"[Rank {self.rank}] Step 9c: Posted recv from rank {rank} for return (count={sc[rank].item()})")
+					recv_count += 1
+					logger.info(f"[Rank {self.rank}] Step 9c: Posted recv #{recv_count} from rank {rank} for return (count={sc[rank].item()})")
 			
+			logger.info(f"[Rank {self.rank}] Step 9c: Total {recv_count} recvs posted for return")
 			logger.info(f"[Rank {self.rank}] Step 9d: All recvs posted for return, now posting sends")
+		
+		# Post sends (sending to where we received from)
+		send_count = 0
+		for rank in range(self.world_size):
+			if rank == self.rank:
+				continue
 			
-			# Post sends (sending to where we received from)
-			for rank in range(self.world_size):
-				if rank == self.rank:
-					continue
-				
-				if rc[rank] > 0:
-					send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
-					self.comm.send(send_slice, dst=rank, stream=stream)
-					logger.info(f"[Rank {self.rank}] Step 9d: Posted send to rank {rank} for return (count={rc[rank].item()})")
-			
-			logger.info(f"[Rank {self.rank}] Step 9e: All sends posted for return, calling group_end")
-			self.comm.group_end()
-			logger.info(f"[Rank {self.rank}] Step 9e: NCCL group_end completed - return communication done")
+			if rc[rank] > 0:
+				send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+				self.comm.send(send_slice, dst=rank, stream=stream)
+				send_count += 1
+				logger.info(f"[Rank {self.rank}] Step 9d: Posted send #{send_count} to rank {rank} for return (count={rc[rank].item()})")
+		
+		logger.info(f"[Rank {self.rank}] Step 9d: Total {send_count} sends posted for return")
+		logger.info(f"[Rank {self.rank}] Step 9e: All sends posted for return, calling group_end")
+		self.comm.group_end()
+		logger.info(f"[Rank {self.rank}] Step 9e: NCCL group_end completed - return communication done")
 		
 		# ---- 10) unsort, accumulate, normalise -----------------------------
 		logger.info(f"[Rank {self.rank}] Step 10: Starting unsort and accumulation")
