@@ -2785,16 +2785,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 4) assign buffers (Optimized with Action 1) ------------------
 		
-		# *** CHANGE START (Action 1) ***
-		# We no longer dynamically allocate buffers using rc.sum().item().
-		# Instead, we use the pre-allocated buffers.
-		
 		# We compute the required size *on the GPU*
 		required_recv_size = rc.sum()
 		
-		# Add a runtime check to ensure our buffer is large enough.
-		# This check *does* sync, but it's an error condition, not
-		# part of the main execution path.
+		# Runtime check (this syncs, but only on error)
 		if required_recv_size > self.max_moe_buffer_tokens:
 			raise ValueError(
 				f"Rank {self.rank}: Required MoE receive buffer size "
@@ -2806,26 +2800,15 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		send_x = sorted_x
 		send_eid = sorted_eids
 		
-		# Use the pre-allocated buffers.
-		# Note: We are using the *full* buffers here. The slicing in
-		# steps 6 and 8 will select the correct portions.
+		# Use the pre-allocated buffers
 		recv_x = self.recv_x_buffer
 		recv_eid = self.recv_eid_buffer
-		
-		# We have removed:
-		# recv_total_val = rc.sum().item()
-		# recv_total_val = max(recv_total_val, 1)
-		# recv_x = torch.empty(...)
-		# recv_eid = torch.empty(...)
-		
-		# *** CHANGE END (Action 1) ***
 		
 		# ---- 5) compute send/recv offsets (on GPU) -------------------------
 		send_offsets = torch.cat([torch.zeros(1, device=device, dtype=sc.dtype), sc.cumsum(0)[:-1]])
 		recv_offsets = torch.cat([torch.zeros(1, device=device, dtype=rc.dtype), rc.cumsum(0)[:-1]])
 		
 		# Convert counts and offsets to CPU once for slicing operations
-		# This is much faster than multiple .item() calls in loops
 		sc_cpu = sc.cpu()
 		rc_cpu = rc.cpu()
 		send_offsets_cpu = send_offsets.cpu()
@@ -2842,13 +2825,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			
 			send_slice_x = send_x[send_start:send_start + self_count]
 			send_slice_eid = send_eid[send_start:send_start + self_count]
-			
-			# *** CHANGE (Action 1) ***
-			# We must slice the pre-allocated buffer
 			recv_slice_x = recv_x[recv_start:recv_start + self_count]
 			recv_slice_eid = recv_eid[recv_start:recv_start + self_count]
-			# *** END CHANGE ***
-			
 			recv_slice_x.copy_(send_slice_x)
 			recv_slice_eid.copy_(send_slice_eid)
 		
@@ -2856,7 +2834,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
 			
-			# Post all recvs first - ALWAYS post for all ranks to maintain symmetry
+			# Post all recvs first - ALWAYS post for all ranks
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
@@ -2864,20 +2842,18 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				count = rc_cpu[rank].item()
 				recv_start = recv_offsets_cpu[rank].item()
 				
-				if count > 0:
-					# *** CHANGE (Action 1) ***
-					# We must slice the pre-allocated buffer
-					recv_slice_x = recv_x[recv_start:recv_start + count]
-					recv_slice_eid = recv_eid[recv_start:recv_start + count]
-					# *** END CHANGE ***
-				else:
-					recv_slice_x = recv_x[0:0]
-					recv_slice_eid = recv_eid[0:0]
+				# *** DEADLOCK FIX START ***
+				# This slicing works for count > 0 AND count == 0.
+				# If count=0, it creates a 0-sized slice at the
+				# correct offset, which is required by NCCL.
+				recv_slice_x = recv_x[recv_start:recv_start + count]
+				recv_slice_eid = recv_eid[recv_start:recv_start + count]
+				# *** DEADLOCK FIX END ***
 				
 				self.comm.recv(recv_slice_x, src=rank, stream=stream)
 				self.comm.recv(recv_slice_eid, src=rank, stream=stream)
 			
-			# Then post all sends - ALWAYS post for all ranks to maintain symmetry
+			# Then post all sends - ALWAYS post for all ranks
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
@@ -2885,12 +2861,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				count = sc_cpu[rank].item()
 				send_start = send_offsets_cpu[rank].item()
 				
-				if count > 0:
-					send_slice_x = send_x[send_start:send_start + count]
-					send_slice_eid = send_eid[send_start:send_start + count]
-				else:
-					send_slice_x = send_x[0:0]
-					send_slice_eid = send_eid[0:0]
+				# *** DEADLOCK FIX START ***
+				# This slicing works for count > 0 AND count == 0.
+				send_slice_x = send_x[send_start:send_start + count]
+				send_slice_eid = send_eid[send_start:send_start + count]
+				# *** DEADLOCK FIX END ***
 				
 				self.comm.send(send_slice_x, dst=rank, stream=stream)
 				self.comm.send(send_slice_eid, dst=rank, stream=stream)
@@ -2898,32 +2873,19 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.comm.group_end()
 		
 		# ---- 8) local computation ------------------------------------------
-		
-		# *** CHANGE START (Action 1) ***
-		# The `if recv_total_val > 1:` check is removed, as `recv_total_val`
-		# (which came from a sync) no longer exists.
-		# The sync for `actual_recv` is still here (this is Action 2).
-		
+		# (Using the safer slicing from the previous revision)
 		actual_recv = rc.sum().item()
 		if actual_recv > 0:
-			# We must slice the buffer to only sort the valid data
 			recv_eid_active = recv_eid[:actual_recv]
 			recv_x_active = recv_x[:actual_recv]
 			
 			recv_eid_sorted, local_sort_idx = recv_eid_active.sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
 			
-			# Use the sorted indices to gather from the active data
 			res = self.grouped_dequant_moe_fp8_bak(recv_x_active[local_sort_idx], recv_eid_sorted)
 			
-			# Scatter the results back into the active data slice
 			recv_x_active[local_sort_idx] = res
-			
-			# (Note: The original code recv_x[local_sort_idx] = res
-			# was correct if recv_x was already sliced, but this is safer)
-			
-		# *** CHANGE END (Action 1) ***
-
+		
 		# ---- 9) NCCL send/recv for return (reverse direction) -------------
 		out_sorted = torch.empty_like(sorted_x)
 
@@ -2932,11 +2894,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			send_start = recv_offsets_cpu[self.rank].item()
 			recv_start = send_offsets_cpu[self.rank].item()
 			
-			# *** CHANGE (Action 1) ***
-			# We must slice the pre-allocated buffer for sending
 			send_slice = recv_x[send_start:send_start + self_count]
-			# *** END CHANGE ***
-			
 			recv_slice = out_sorted[recv_start:recv_start + self_count]
 			recv_slice.copy_(send_slice)
 
@@ -2944,7 +2902,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
 			
-			# Post recvs (receiving back from where we sent) - ALWAYS post for all ranks
+			# Post recvs (receiving back from where we sent)
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
@@ -2952,14 +2910,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				count = sc_cpu[rank].item()
 				recv_start = send_offsets_cpu[rank].item()
 				
-				if count > 0:
-					recv_slice = out_sorted[recv_start:recv_start + count]
-				else:
-					recv_slice = out_sorted[0:0]
+				# *** DEADLOCK FIX START ***
+				recv_slice = out_sorted[recv_start:recv_start + count]
+				# *** DEADLOCK FIX END ***
 				
 				self.comm.recv(recv_slice, src=rank, stream=stream)
 			
-			# Post sends (sending to where we received from) - ALWAYS post for all ranks
+			# Post sends (sending to where we received from)
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
@@ -2967,13 +2924,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				count = rc_cpu[rank].item()
 				send_start = recv_offsets_cpu[rank].item()
 				
-				if count > 0:
-					# *** CHANGE (Action 1) ***
-					# We must slice the pre-allocated buffer for sending
-					send_slice = recv_x[send_start:send_start + count]
-					# *** END CHANGE ***
-				else:
-					send_slice = recv_x[0:0]
+				# *** DEADLOCK FIX START ***
+				send_slice = recv_x[send_start:send_start + count]
+				# *** DEADLOCK FIX END ***
 				
 				self.comm.send(send_slice, dst=rank, stream=stream)
 			
