@@ -1560,6 +1560,41 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# --- Pre-allocate Buffers. --------------------------------
 		self.num_tokens_per_rank = None		# This is a placeholder, adjust as needed
 
+		# --- Pre-allocate Buffers (Action 1) --------------------------------
+		# Define a max capacity for the receive buffers to avoid DtoH sync
+		# on rc.sum().item() for dynamic allocation.
+		# This value must be >= max(rc.sum()) across all ranks and all
+		# possible inputs (e.g., max_batch_size * max_seq_len * K)
+		# We'll use getattr to provide a reasonable default.
+		self.max_moe_buffer_tokens = getattr(config, 'max_moe_buffer_tokens', 1024)
+		
+		# We need hidden_size and dtype. We assume they are in the config
+		# as they are required for the DeepseekV3MLP module.
+		hidden_size = config.hidden_size
+		dtype = torch.bfloat16
+		
+		# We assume the expert ID dtype is int64, as this is the default
+		# output of .sort() and .bincount().
+		eid_dtype = torch.int64
+		
+		self.register_buffer(
+			"recv_x_buffer",
+			torch.empty(
+				self.max_moe_buffer_tokens,
+				hidden_size,
+				device=self.device,
+				dtype=dtype
+			)
+		)
+		self.register_buffer(
+			"recv_eid_buffer",
+			torch.empty(
+				self.max_moe_buffer_tokens,
+				device=self.device,
+				dtype=eid_dtype
+			)
+		)
+
 
 		# Pre-compute maximum possible tokens per rank (worst case: all tokens go to one rank)
 		# self.max_tokens_per_batch = 1024  # Adjust based on your max batch size
@@ -2545,7 +2580,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	# 	return final_x.to(x.dtype)
 
 	@torch.inference_mode()
-	def moe_infer_alltoall_sendrecv(self, x):
+	def moe_infer_alltoall_sendrecv_v1(self, x):
 		num_tokens, hidden_size = x.shape
 		K = self.num_experts_per_tok
 		device = x.device
@@ -2701,6 +2736,242 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				
 				if count > 0:
 					send_slice = recv_x[send_start:send_start + count]
+				else:
+					send_slice = recv_x[0:0]
+				
+				self.comm.send(send_slice, dst=rank, stream=stream)
+			
+			self.comm.group_end()
+		
+		# ---- 10) unsort, accumulate, normalise -----------------------------
+		unsort_idx = sort_idx.argsort()
+		final_x = out_sorted[unsort_idx]
+		final_wt = sorted_wt[unsort_idx]
+		
+		final_x = final_x * final_wt.unsqueeze(-1)
+		final_x = final_x.view(num_tokens, K, -1)
+		final_x = final_x.sum(dim=1)
+		
+		return final_x.to(x.dtype)
+
+
+	@torch.inference_mode()
+	def moe_infer_alltoall_sendrecv(self, x):
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+		
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size))
+		
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids = topk_idx.flatten()
+		flat_wts = topk_weight.flatten()
+		expanded_x = x.repeat_interleave(K, dim=0)
+		
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x = expanded_x[sort_idx]
+		sorted_wt = flat_wts[sort_idx]
+		
+		# ---- 2) compute send/recv counts -----------------------------------
+		local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
+		reshaped_counts = local_counts.view(self.world_size, -1)
+		sc = reshaped_counts.sum(dim=1)  # [world_size], send to each rank
+		
+		# ---- 3) exchange counts --------------------------------------------
+		gathered_tensor = torch.zeros((self.world_size, self.world_size), device=device, dtype=sc.dtype)
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(gathered_tensor, sc, stream=torch.cuda.default_stream(self.device))
+		rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
+		
+		# ---- 4) assign buffers (Optimized with Action 1) ------------------
+		
+		# *** CHANGE START (Action 1) ***
+		# We no longer dynamically allocate buffers using rc.sum().item().
+		# Instead, we use the pre-allocated buffers.
+		
+		# We compute the required size *on the GPU*
+		required_recv_size = rc.sum()
+		
+		# Add a runtime check to ensure our buffer is large enough.
+		# This check *does* sync, but it's an error condition, not
+		# part of the main execution path.
+		if required_recv_size > self.max_moe_buffer_tokens:
+			raise ValueError(
+				f"Rank {self.rank}: Required MoE receive buffer size "
+				f"({required_recv_size.item()}) exceeds pre-allocated "
+				f"limit ({self.max_moe_buffer_tokens}). "
+				"Increase config.max_moe_buffer_tokens."
+			)
+
+		send_x = sorted_x
+		send_eid = sorted_eids
+		
+		# Use the pre-allocated buffers.
+		# Note: We are using the *full* buffers here. The slicing in
+		# steps 6 and 8 will select the correct portions.
+		recv_x = self.recv_x_buffer
+		recv_eid = self.recv_eid_buffer
+		
+		# We have removed:
+		# recv_total_val = rc.sum().item()
+		# recv_total_val = max(recv_total_val, 1)
+		# recv_x = torch.empty(...)
+		# recv_eid = torch.empty(...)
+		
+		# *** CHANGE END (Action 1) ***
+		
+		# ---- 5) compute send/recv offsets (on GPU) -------------------------
+		send_offsets = torch.cat([torch.zeros(1, device=device, dtype=sc.dtype), sc.cumsum(0)[:-1]])
+		recv_offsets = torch.cat([torch.zeros(1, device=device, dtype=rc.dtype), rc.cumsum(0)[:-1]])
+		
+		# Convert counts and offsets to CPU once for slicing operations
+		# This is much faster than multiple .item() calls in loops
+		sc_cpu = sc.cpu()
+		rc_cpu = rc.cpu()
+		send_offsets_cpu = send_offsets.cpu()
+		recv_offsets_cpu = recv_offsets.cpu()
+		
+		stream = torch.cuda.default_stream(self.device)
+		
+		# ---- 6) NCCL send/recv for data (x) AND expert IDs (eid) ----------
+		# Handle self-communication separately (direct copy, no NCCL)
+		self_count = sc_cpu[self.rank].item()
+		if self_count > 0:
+			send_start = send_offsets_cpu[self.rank].item()
+			recv_start = recv_offsets_cpu[self.rank].item()
+			
+			send_slice_x = send_x[send_start:send_start + self_count]
+			send_slice_eid = send_eid[send_start:send_start + self_count]
+			
+			# *** CHANGE (Action 1) ***
+			# We must slice the pre-allocated buffer
+			recv_slice_x = recv_x[recv_start:recv_start + self_count]
+			recv_slice_eid = recv_eid[recv_start:recv_start + self_count]
+			# *** END CHANGE ***
+			
+			recv_slice_x.copy_(send_slice_x)
+			recv_slice_eid.copy_(send_slice_eid)
+		
+		# NCCL group for all other ranks
+		with self.comm.change_state(enable=True):
+			self.comm.group_start()
+			
+			# Post all recvs first - ALWAYS post for all ranks to maintain symmetry
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				
+				count = rc_cpu[rank].item()
+				recv_start = recv_offsets_cpu[rank].item()
+				
+				if count > 0:
+					# *** CHANGE (Action 1) ***
+					# We must slice the pre-allocated buffer
+					recv_slice_x = recv_x[recv_start:recv_start + count]
+					recv_slice_eid = recv_eid[recv_start:recv_start + count]
+					# *** END CHANGE ***
+				else:
+					recv_slice_x = recv_x[0:0]
+					recv_slice_eid = recv_eid[0:0]
+				
+				self.comm.recv(recv_slice_x, src=rank, stream=stream)
+				self.comm.recv(recv_slice_eid, src=rank, stream=stream)
+			
+			# Then post all sends - ALWAYS post for all ranks to maintain symmetry
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				
+				count = sc_cpu[rank].item()
+				send_start = send_offsets_cpu[rank].item()
+				
+				if count > 0:
+					send_slice_x = send_x[send_start:send_start + count]
+					send_slice_eid = send_eid[send_start:send_start + count]
+				else:
+					send_slice_x = send_x[0:0]
+					send_slice_eid = send_eid[0:0]
+				
+				self.comm.send(send_slice_x, dst=rank, stream=stream)
+				self.comm.send(send_slice_eid, dst=rank, stream=stream)
+			
+			self.comm.group_end()
+		
+		# ---- 8) local computation ------------------------------------------
+		
+		# *** CHANGE START (Action 1) ***
+		# The `if recv_total_val > 1:` check is removed, as `recv_total_val`
+		# (which came from a sync) no longer exists.
+		# The sync for `actual_recv` is still here (this is Action 2).
+		
+		actual_recv = rc.sum().item()
+		if actual_recv > 0:
+			# We must slice the buffer to only sort the valid data
+			recv_eid_active = recv_eid[:actual_recv]
+			recv_x_active = recv_x[:actual_recv]
+			
+			recv_eid_sorted, local_sort_idx = recv_eid_active.sort()
+			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
+			
+			# Use the sorted indices to gather from the active data
+			res = self.grouped_dequant_moe_fp8_bak(recv_x_active[local_sort_idx], recv_eid_sorted)
+			
+			# Scatter the results back into the active data slice
+			recv_x_active[local_sort_idx] = res
+			
+			# (Note: The original code recv_x[local_sort_idx] = res
+			# was correct if recv_x was already sliced, but this is safer)
+			
+		# *** CHANGE END (Action 1) ***
+
+		# ---- 9) NCCL send/recv for return (reverse direction) -------------
+		out_sorted = torch.empty_like(sorted_x)
+
+		# Handle self-communication
+		if self_count > 0:
+			send_start = recv_offsets_cpu[self.rank].item()
+			recv_start = send_offsets_cpu[self.rank].item()
+			
+			# *** CHANGE (Action 1) ***
+			# We must slice the pre-allocated buffer for sending
+			send_slice = recv_x[send_start:send_start + self_count]
+			# *** END CHANGE ***
+			
+			recv_slice = out_sorted[recv_start:recv_start + self_count]
+			recv_slice.copy_(send_slice)
+
+		# NCCL group for return communication
+		with self.comm.change_state(enable=True):
+			self.comm.group_start()
+			
+			# Post recvs (receiving back from where we sent) - ALWAYS post for all ranks
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				
+				count = sc_cpu[rank].item()
+				recv_start = send_offsets_cpu[rank].item()
+				
+				if count > 0:
+					recv_slice = out_sorted[recv_start:recv_start + count]
+				else:
+					recv_slice = out_sorted[0:0]
+				
+				self.comm.recv(recv_slice, src=rank, stream=stream)
+			
+			# Post sends (sending to where we received from) - ALWAYS post for all ranks
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				
+				count = rc_cpu[rank].item()
+				send_start = recv_offsets_cpu[rank].item()
+				
+				if count > 0:
+					# *** CHANGE (Action 1) ***
+					# We must slice the pre-allocated buffer for sending
+					send_slice = recv_x[send_start:send_start + count]
+					# *** END CHANGE ***
 				else:
 					send_slice = recv_x[0:0]
 				
