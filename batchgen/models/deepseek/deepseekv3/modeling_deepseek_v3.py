@@ -2754,6 +2754,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		return final_x.to(x.dtype)
 
+
 	@torch.inference_mode()
 	def moe_infer_alltoall_sendrecv(self, x):
 		num_tokens, hidden_size = x.shape
@@ -2782,134 +2783,75 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.comm.all_gather(gathered_tensor, sc, stream=torch.cuda.default_stream(self.device))
 		rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
 		
-		# ---- 4) assign buffers (Optimized with Action 1) ------------------
+		# ---- 4) allocate buffers -------------------------------------------
+		# OPTIMIZED: Single DtoH transfer, cache the result
+		recv_total = rc.sum().item()
+		recv_buffer_size = max(recv_total, 1)  # Ensure at least size 1 for empty buffer
 		
-		# *** CHANGE (Action 1) ***
-		# Compute required size on GPU. This removes the .item() sync.
-		required_recv_size = rc.sum()
-		
-		# Runtime check (this syncs, but only on error)
-		if required_recv_size > self.max_moe_buffer_tokens:
-			raise ValueError(
-				f"Rank {self.rank}: Required MoE receive buffer size "
-				f"({required_recv_size.item()}) exceeds pre-allocated "
-				f"limit ({self.max_moe_buffer_tokens}). "
-				"Increase config.max_moe_buffer_tokens."
-			)
-
 		send_x = sorted_x
 		send_eid = sorted_eids
+		recv_x = torch.empty(recv_buffer_size, hidden_size, device=device, dtype=x.dtype)
+		recv_eid = torch.empty(recv_buffer_size, device=device, dtype=sorted_eids.dtype)
 		
-		# Use the pre-allocated buffers.
-		recv_x = self.recv_x_buffer
-		recv_eid = self.recv_eid_buffer
+		# ---- 5) OPTIMIZED: Use torch.split() instead of loop slicing -------
+		# Single DtoH transfer for split sizes
+		sc_list = sc.tolist()
+		rc_list = rc.tolist()
 		
-		# *** END CHANGE (Action 1) ***
+		send_chunks_x = torch.split(send_x, sc_list)
+		send_chunks_eid = torch.split(send_eid, sc_list)
 		
-		# ---- 5) compute send/recv offsets (on GPU) -------------------------
-		send_offsets = torch.cat([torch.zeros(1, device=device, dtype=sc.dtype), sc.cumsum(0)[:-1]])
-		recv_offsets = torch.cat([torch.zeros(1, device=device, dtype=rc.dtype), rc.cumsum(0)[:-1]])
-		
-		# Convert counts and offsets to CPU once for slicing operations
-		sc_cpu = sc.cpu()
-		rc_cpu = rc.cpu()
-		send_offsets_cpu = send_offsets.cpu()
-		recv_offsets_cpu = recv_offsets.cpu()
+		# Pre-allocate recv chunks using split on empty tensor
+		recv_chunks_x = torch.split(recv_x[:recv_total] if recv_total > 0 else recv_x[:0], rc_list)
+		recv_chunks_eid = torch.split(recv_eid[:recv_total] if recv_total > 0 else recv_eid[:0], rc_list)
 		
 		stream = torch.cuda.default_stream(self.device)
 		
 		# ---- 6) NCCL send/recv for data (x) AND expert IDs (eid) ----------
 		# Handle self-communication separately (direct copy, no NCCL)
-		self_count = sc_cpu[self.rank].item()
-		if self_count > 0:
-			send_start = send_offsets_cpu[self.rank].item()
-			recv_start = recv_offsets_cpu[self.rank].item()
-			
-			send_slice_x = send_x[send_start:send_start + self_count]
-			send_slice_eid = send_eid[send_start:send_start + self_count]
-			
-			# Slice the pre-allocated buffer
-			recv_slice_x = recv_x[recv_start:recv_start + self_count]
-			recv_slice_eid = recv_eid[recv_start:recv_start + self_count]
-			
-			recv_slice_x.copy_(send_slice_x)
-			recv_slice_eid.copy_(send_slice_eid)
+		if sc_list[self.rank] > 0:
+			recv_chunks_x[self.rank].copy_(send_chunks_x[self.rank])
+			recv_chunks_eid[self.rank].copy_(send_chunks_eid[self.rank])
 		
 		# NCCL group for all other ranks
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
 			
-			# Post all recvs first - ALWAYS post for all ranks
+			# Post all recvs first - maintain symmetry for all ranks
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				
-				count = rc_cpu[rank].item()
-				recv_start = recv_offsets_cpu[rank].item()
-				
-				# *** DEADLOCK FIX ***
-				# Removed the `if count > 0:` condition for slicing.
-				# This unconditional slice works for count=0 by creating
-				# a [N:N] slice at the correct offset, which is
-				# required by NCCL. The old `else: [0:0]` was the bug.
-				recv_slice_x = recv_x[recv_start:recv_start + count]
-				recv_slice_eid = recv_eid[recv_start:recv_start + count]
-				# *** END DEADLOCK FIX ***
-				
-				self.comm.recv(recv_slice_x, src=rank, stream=stream)
-				self.comm.recv(recv_slice_eid, src=rank, stream=stream)
+				# Use pre-split chunks - handles empty tensors automatically
+				self.comm.recv(recv_chunks_x[rank], src=rank, stream=stream)
+				self.comm.recv(recv_chunks_eid[rank], src=rank, stream=stream)
 			
-			# Then post all sends - ALWAYS post for all ranks
+			# Then post all sends - maintain symmetry for all ranks
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				
-				count = sc_cpu[rank].item()
-				send_start = send_offsets_cpu[rank].item()
-				
-				# *** DEADLOCK FIX ***
-				# Unconditional slicing for send as well.
-				send_slice_x = send_x[send_start:send_start + count]
-				send_slice_eid = send_eid[send_start:send_start + count]
-				# *** END DEADLOCK FIX ***
-				
-				self.comm.send(send_slice_x, dst=rank, stream=stream)
-				self.comm.send(send_slice_eid, dst=rank, stream=stream)
+				# Use pre-split chunks - handles empty tensors automatically
+				self.comm.send(send_chunks_x[rank], dst=rank, stream=stream)
+				self.comm.send(send_chunks_eid[rank], dst=rank, stream=stream)
 			
 			self.comm.group_end()
 		
 		# ---- 8) local computation ------------------------------------------
-		# NOTE: This part *still* has a sync (rc.sum().item()).
-		# This will be removed in Action 2.
-		
-		# We also fix the original code's `> 1` bug.
-		actual_recv = rc.sum().item()
-		if actual_recv > 0:
-			# We must slice the buffer to only sort the valid data
-			recv_eid_active = recv_eid[:actual_recv]
-			recv_x_active = recv_x[:actual_recv]
-			
-			recv_eid_sorted, local_sort_idx = recv_eid_active.sort()
+		if recv_total > 0:  # Use cached value instead of recomputing
+			recv_eid_sorted, local_sort_idx = recv_eid[:recv_total].sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
-			
-			# Gather from the active data
-			res = self.grouped_dequant_moe_fp8_bak(recv_x_active[local_sort_idx], recv_eid_sorted)
-			
-			# Scatter back into the active data slice
-			recv_x_active[local_sort_idx] = res
+			res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
+			recv_x[local_sort_idx] = res
 		
 		# ---- 9) NCCL send/recv for return (reverse direction) -------------
 		out_sorted = torch.empty_like(sorted_x)
-
+		
+		# Use split for output as well
+		out_chunks = torch.split(out_sorted, sc_list)
+		
 		# Handle self-communication
-		if self_count > 0:
-			send_start = recv_offsets_cpu[self.rank].item()
-			recv_start = send_offsets_cpu[self.rank].item()
-			
-			send_slice = recv_x[send_start:send_start + self_count]
-			recv_slice = out_sorted[recv_start:recv_start + self_count]
-			recv_slice.copy_(send_slice)
-
+		if sc_list[self.rank] > 0:
+			out_chunks[self.rank].copy_(recv_chunks_x[self.rank])
+		
 		# NCCL group for return communication
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
@@ -2918,29 +2860,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				
-				count = sc_cpu[rank].item()
-				recv_start = send_offsets_cpu[rank].item()
-				
-				# *** DEADLOCK FIX ***
-				recv_slice = out_sorted[recv_start:recv_start + count]
-				# *** END DEADLOCK FIX ***
-				
-				self.comm.recv(recv_slice, src=rank, stream=stream)
+				self.comm.recv(out_chunks[rank], src=rank, stream=stream)
 			
 			# Post sends (sending to where we received from)
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				
-				count = rc_cpu[rank].item()
-				send_start = recv_offsets_cpu[rank].item()
-				
-				# *** DEADLOCK FIX ***
-				send_slice = recv_x[send_start:send_start + count]
-				# *** END DEADLOCK FIX ***
-				
-				self.comm.send(send_slice, dst=rank, stream=stream)
+				self.comm.send(recv_chunks_x[rank], dst=rank, stream=stream)
 			
 			self.comm.group_end()
 		
