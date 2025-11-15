@@ -2162,7 +2162,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 3) exchange counts (still need allgather for this) -----------
 		logger.info(f"[Rank {self.rank}] Step 3: Starting allgather for count exchange")
 		gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
-		dist.all_gather(gathered_counts, sc)
+		# dist.all_gather(gathered_counts, sc)
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(gathered_counts, sc, stream=torch.cuda.default_stream(self.device))
 		gathered_tensor = torch.stack(gathered_counts)  # [world_size, world_size]
 		rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
 		recv_total = rc.sum()
@@ -2255,26 +2257,16 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 9) NCCL send/recv for return (reverse direction) -------------
 		logger.info(f"[Rank {self.rank}] Step 9: Starting return communication")
-		
-		# First, ensure this rank's local compute (Step 8) is finished
-		torch.cuda.current_stream(device).synchronize()
-
-		# Allocate the output buffer
+		# torch.cuda.current_stream(device).synchronize()
 		out_sorted = torch.empty_like(sorted_x)
 
-		# Handle self-communication (Step 9a) *before* the barrier
+		# Handle self-communication
 		if sc[self.rank] > 0:
 			logger.info(f"[Rank {self.rank}] Step 9a: Handling self-communication for return")
 			send_slice = recv_x[recv_offsets[self.rank]:recv_offsets[self.rank] + rc[self.rank]]
 			recv_slice = out_sorted[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
 			recv_slice.copy_(send_slice)
 			logger.info(f"[Rank {self.rank}] Step 9a: Self-communication for return completed")
-
-		# --- DEADLOCK FIX ---
-		# Wait for ALL ranks to finish both compute (Step 8) AND self-copy (Step 9a)
-		# before any rank starts the NCCL communication group.
-		logger.info(f"[Rank {self.rank}] Step 9b: Synchronizing all ranks (dist.barrier)...")
-		dist.barrier()
 
 		# Log what we expect to send and receive in return phase
 		logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will recv from ranks where sc>0: {[(r, sc[r].item()) for r in range(self.world_size) if r != self.rank and sc[r] > 0]}")
@@ -2294,7 +2286,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			recv_count = 0
 			for rank in range(self.world_size):
 				if rank == self.rank:
-					continue  # Self-communication was already handled
+					continue
 				
 				if sc[rank] > 0:
 					recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + sc[rank]]
@@ -2309,7 +2301,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			send_count = 0
 			for rank in range(self.world_size):
 				if rank == self.rank:
-					continue  # Self-communication was already handled
+					continue
 				
 				if rc[rank] > 0:
 					send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
