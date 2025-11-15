@@ -2161,11 +2161,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 3) exchange counts (still need allgather for this) -----------
 		logger.info(f"[Rank {self.rank}] Step 3: Starting allgather for count exchange")
-		gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
+		# gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
+		gathered_tensor = torch.zeros((self.world_size, self.world_size), device=device, dtype=sc.dtype)
 		# dist.all_gather(gathered_counts, sc)
 		with self.comm.change_state(enable=True):
-			self.comm.all_gather(gathered_counts, sc, stream=torch.cuda.default_stream(self.device))
-		gathered_tensor = torch.stack(gathered_counts)  # [world_size, world_size]
+			self.comm.all_gather(gathered_tensor, sc, stream=torch.cuda.default_stream(self.device))
+		# gathered_tensor = torch.stack(gathered_counts)  # [world_size, world_size]
 		rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
 		recv_total = rc.sum()
 		logger.info(f"[Rank {self.rank}] Step 3: Allgather completed. Recv counts: {rc.tolist()}, total={recv_total}")
