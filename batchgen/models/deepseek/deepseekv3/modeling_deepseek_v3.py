@@ -2386,7 +2386,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Handle self-communication separately (direct copy, no NCCL)
 		if sc[self.rank] > 0:
 			assert rc[self.rank] == sc[self.rank], "Self send/recv counts must match"
-			logger.info(f"[Rank {self.rank}] Step 6a: Handling self-communication (count={sc[self.rank].item()})")
+			# logger.info(f"[Rank {self.rank}] Step 6a: Handling self-communication (count={sc[self.rank].item()})")
 			send_slice_x = send_x[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
 			send_slice_eid = send_eid[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
 			recv_slice_x = recv_x[recv_offsets[self.rank]:recv_offsets[self.rank] + rc[self.rank]]
