@@ -2131,6 +2131,204 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 	# 	return final_x.to(x.dtype)
 
+	# @torch.inference_mode()
+	# def moe_infer_alltoall_sendrecv(self, x):
+	# 	logger.info(f"[Rank {self.rank}] Starting moe_infer_alltoall_sendrecv")
+		
+	# 	num_tokens, hidden_size = x.shape
+	# 	K = self.num_experts_per_tok
+	# 	device = x.device
+	# 	logger.info(f"[Rank {self.rank}] Input shape: {x.shape}, K={K}")
+		
+	# 	topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size))
+	# 	logger.info(f"[Rank {self.rank}] Step 0: Gate forward completed")
+		
+	# 	# ---- 1) flatten, sort by expert ------------------------------------
+	# 	flat_eids = topk_idx.flatten()
+	# 	flat_wts = topk_weight.flatten()
+	# 	expanded_x = x.repeat_interleave(K, dim=0)
+		
+	# 	sorted_eids, sort_idx = flat_eids.sort()
+	# 	sorted_x = expanded_x[sort_idx]
+	# 	sorted_wt = flat_wts[sort_idx]
+	# 	logger.info(f"[Rank {self.rank}] Step 1: Flatten and sort by expert completed")
+		
+	# 	# ---- 2) compute send/recv counts -----------------------------------
+	# 	local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
+	# 	reshaped_counts = local_counts.view(self.world_size, -1)
+	# 	sc = reshaped_counts.sum(dim=1)  # [world_size], send to each rank
+	# 	logger.info(f"[Rank {self.rank}] Step 2: Computed send counts: {sc.tolist()}")
+		
+	# 	# ---- 3) exchange counts (still need allgather for this) -----------
+	# 	logger.info(f"[Rank {self.rank}] Step 3: Starting allgather for count exchange")
+	# 	# gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
+	# 	gathered_tensor = torch.zeros((self.world_size, self.world_size), device=device, dtype=sc.dtype)
+	# 	# dist.all_gather(gathered_counts, sc)
+	# 	with self.comm.change_state(enable=True):
+	# 		self.comm.all_gather(gathered_tensor, sc, stream=torch.cuda.default_stream(self.device))
+	# 	# gathered_tensor = torch.stack(gathered_counts)  # [world_size, world_size]
+	# 	rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
+	# 	recv_total = rc.sum()
+	# 	logger.info(f"[Rank {self.rank}] Step 3: Allgather completed. Recv counts: {rc.tolist()}, total={recv_total}")
+		
+	# 	# ---- 4) allocate buffers -------------------------------------------
+	# 	send_x = sorted_x
+	# 	send_eid = sorted_eids
+	# 	recv_x = torch.empty(recv_total, hidden_size, device=device, dtype=x.dtype)
+	# 	recv_eid = torch.empty(recv_total, device=device, dtype=sorted_eids.dtype)
+	# 	logger.info(f"[Rank {self.rank}] Step 4: Allocated buffers (recv_total={recv_total})")
+		
+	# 	# ---- 5) compute send/recv offsets (on GPU) -------------------------
+	# 	send_offsets = torch.cumsum(torch.cat([torch.tensor([0], device=device), sc[:-1]]), dim=0)
+	# 	recv_offsets = torch.cumsum(torch.cat([torch.tensor([0], device=device), rc[:-1]]), dim=0)
+	# 	logger.info(f"[Rank {self.rank}] Step 5: Computed offsets. Send offsets: {send_offsets.tolist()}, Recv offsets: {recv_offsets.tolist()}")
+		
+	# 	stream = torch.cuda.default_stream(self.device)
+		
+	# 	# ---- 6) NCCL send/recv for data (x) AND expert IDs (eid) ----------
+	# 	logger.info(f"[Rank {self.rank}] Step 6: Starting forward communication")
+		
+	# 	# Handle self-communication separately (direct copy, no NCCL)
+	# 	if sc[self.rank] > 0:
+	# 		assert rc[self.rank] == sc[self.rank], "Self send/recv counts must match"
+	# 		logger.info(f"[Rank {self.rank}] Step 6a: Handling self-communication (count={sc[self.rank].item()})")
+	# 		send_slice_x = send_x[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
+	# 		send_slice_eid = send_eid[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
+	# 		recv_slice_x = recv_x[recv_offsets[self.rank]:recv_offsets[self.rank] + rc[self.rank]]
+	# 		recv_slice_eid = recv_eid[recv_offsets[self.rank]:recv_offsets[self.rank] + rc[self.rank]]
+	# 		recv_slice_x.copy_(send_slice_x)
+	# 		recv_slice_eid.copy_(send_slice_eid)
+	# 		logger.info(f"[Rank {self.rank}] Step 6a: Self-communication completed")
+		
+	# 	# NCCL group for all other ranks
+	# 	logger.info(f"[Rank {self.rank}] Step 6b: Entering NCCL group for forward communication")
+	# 	with self.comm.change_state(enable=True):
+	# 		self.comm.group_start()
+	# 		logger.info(f"[Rank {self.rank}] Step 6b: NCCL group_start completed")
+			
+	# 		# Post all recvs first (standard pattern, order doesn't matter in group)
+	# 		logger.info(f"[Rank {self.rank}] Step 6c: Posting all recvs")
+	# 		for rank in range(self.world_size):
+	# 			if rank == self.rank:
+	# 				continue  # Skip self
+				
+	# 			if rc[rank] > 0:
+	# 				# Recv token data
+	# 				recv_slice_x = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+	# 				self.comm.recv(recv_slice_x, src=rank, stream=stream)
+					
+	# 				# Recv expert IDs
+	# 				recv_slice_eid = recv_eid[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+	# 				self.comm.recv(recv_slice_eid, src=rank, stream=stream)
+	# 				logger.info(f"[Rank {self.rank}] Step 6c: Posted recv from rank {rank} (count={rc[rank].item()})")
+			
+	# 		logger.info(f"[Rank {self.rank}] Step 6d: All recvs posted, now posting sends")
+			
+	# 		# Then post all sends
+	# 		for rank in range(self.world_size):
+	# 			if rank == self.rank:
+	# 				continue  # Skip self
+				
+	# 			if sc[rank] > 0:
+	# 				# Send token data
+	# 				send_slice_x = send_x[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+	# 				self.comm.send(send_slice_x, dst=rank, stream=stream)
+					
+	# 				# Send expert IDs
+	# 				send_slice_eid = send_eid[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+	# 				self.comm.send(send_slice_eid, dst=rank, stream=stream)
+	# 				logger.info(f"[Rank {self.rank}] Step 6d: Posted send to rank {rank} (count={sc[rank].item()})")
+			
+	# 		logger.info(f"[Rank {self.rank}] Step 6e: All sends posted, calling group_end")
+	# 		# All operations complete after group_end()
+	# 		self.comm.group_end()
+	# 		logger.info(f"[Rank {self.rank}] Step 6e: NCCL group_end completed - forward communication done")
+		
+	# 	# ---- 8) local computation ------------------------------------------
+	# 	logger.info(f"[Rank {self.rank}] Step 8: Starting local computation")
+	# 	if recv_total > 0:
+	# 		recv_eid_sorted, local_sort_idx = recv_eid.sort()
+	# 		recv_eid_sorted = recv_eid_sorted.to(torch.int32)
+	# 		logger.info(f"[Rank {self.rank}] Step 8a: Sorted received expert IDs")
+	# 		res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
+	# 		logger.info(f"[Rank {self.rank}] Step 8b: Expert computation completed")
+	# 		recv_x[local_sort_idx] = res
+	# 		logger.info(f"[Rank {self.rank}] Step 8c: Results written back")
+	# 	logger.info(f"[Rank {self.rank}] Step 8: Local computation completed")
+		
+	# 	# ---- 9) NCCL send/recv for return (reverse direction) -------------
+	# 	logger.info(f"[Rank {self.rank}] Step 9: Starting return communication")
+	# 	# torch.cuda.current_stream(device).synchronize()
+	# 	out_sorted = torch.empty_like(sorted_x)
+
+	# 	# Handle self-communication
+	# 	if sc[self.rank] > 0:
+	# 		logger.info(f"[Rank {self.rank}] Step 9a: Handling self-communication for return")
+	# 		send_slice = recv_x[recv_offsets[self.rank]:recv_offsets[self.rank] + rc[self.rank]]
+	# 		recv_slice = out_sorted[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
+	# 		recv_slice.copy_(send_slice)
+	# 		logger.info(f"[Rank {self.rank}] Step 9a: Self-communication for return completed")
+
+	# 	# Log what we expect to send and receive in return phase
+	# 	logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will recv from ranks where sc>0: {[(r, sc[r].item()) for r in range(self.world_size) if r != self.rank and sc[r] > 0]}")
+	# 	logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will send to ranks where rc>0: {[(r, rc[r].item()) for r in range(self.world_size) if r != self.rank and rc[r] > 0]}")
+	# 	logger.info(f"[Rank {self.rank}] Step 8d: Verifying communication symmetry")
+	# 	logger.info(f"[Rank {self.rank}] Step 8d: Forward phase - sent to: {[(r, sc[r].item()) for r in range(self.world_size) if sc[r] > 0]}")
+	# 	logger.info(f"[Rank {self.rank}] Step 8d: Forward phase - recv from: {[(r, rc[r].item()) for r in range(self.world_size) if rc[r] > 0]}")
+
+	# 	# NCCL group for return communication
+	# 	logger.info(f"[Rank {self.rank}] Step 9b: Entering NCCL group for return communication")
+	# 	with self.comm.change_state(enable=True):
+	# 		self.comm.group_start()
+	# 		logger.info(f"[Rank {self.rank}] Step 9b: NCCL group_start completed for return")
+			
+	# 		# Post recvs (receiving back from where we sent)
+	# 		logger.info(f"[Rank {self.rank}] Step 9c: Posting all recvs for return")
+	# 		recv_count = 0
+	# 		for rank in range(self.world_size):
+	# 			if rank == self.rank:
+	# 				continue
+				
+	# 			if sc[rank] > 0:
+	# 				recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+	# 				self.comm.recv(recv_slice, src=rank, stream=stream)
+	# 				recv_count += 1
+	# 				logger.info(f"[Rank {self.rank}] Step 9c: Posted recv #{recv_count} from rank {rank} for return (count={sc[rank].item()})")
+			
+	# 		logger.info(f"[Rank {self.rank}] Step 9c: Total {recv_count} recvs posted for return")
+	# 		logger.info(f"[Rank {self.rank}] Step 9d: All recvs posted for return, now posting sends")
+			
+	# 		# Post sends (sending to where we received from)
+	# 		send_count = 0
+	# 		for rank in range(self.world_size):
+	# 			if rank == self.rank:
+	# 				continue
+				
+	# 			if rc[rank] > 0:
+	# 				send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+	# 				self.comm.send(send_slice, dst=rank, stream=stream)
+	# 				send_count += 1
+	# 				logger.info(f"[Rank {self.rank}] Step 9d: Posted send #{send_count} to rank {rank} for return (count={rc[rank].item()})")
+			
+	# 		logger.info(f"[Rank {self.rank}] Step 9d: Total {send_count} sends posted for return")
+	# 		logger.info(f"[Rank {self.rank}] Step 9e: All sends posted for return, calling group_end")
+	# 		self.comm.group_end()
+	# 		logger.info(f"[Rank {self.rank}] Step 9e: NCCL group_end completed - return communication done")
+		
+	# 	# ---- 10) unsort, accumulate, normalise -----------------------------
+	# 	logger.info(f"[Rank {self.rank}] Step 10: Starting unsort and accumulation")
+	# 	unsort_idx = sort_idx.argsort()
+	# 	final_x = out_sorted[unsort_idx]
+	# 	final_wt = sorted_wt[unsort_idx]
+		
+	# 	final_x = final_x * final_wt.unsqueeze(-1)
+	# 	final_x = final_x.view(num_tokens, K, -1)
+	# 	final_x = final_x.sum(dim=1)
+	# 	logger.info(f"[Rank {self.rank}] Step 10: Unsort and accumulation completed")
+		
+	# 	logger.info(f"[Rank {self.rank}] Completed moe_infer_alltoall_sendrecv successfully")
+	# 	return final_x.to(x.dtype)
+
 	@torch.inference_mode()
 	def moe_infer_alltoall_sendrecv(self, x):
 		logger.info(f"[Rank {self.rank}] Starting moe_infer_alltoall_sendrecv")
@@ -2161,12 +2359,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 3) exchange counts (still need allgather for this) -----------
 		logger.info(f"[Rank {self.rank}] Step 3: Starting allgather for count exchange")
-		# gathered_counts = [torch.zeros_like(sc) for _ in range(self.world_size)]
 		gathered_tensor = torch.zeros((self.world_size, self.world_size), device=device, dtype=sc.dtype)
-		# dist.all_gather(gathered_counts, sc)
 		with self.comm.change_state(enable=True):
 			self.comm.all_gather(gathered_tensor, sc, stream=torch.cuda.default_stream(self.device))
-		# gathered_tensor = torch.stack(gathered_counts)  # [world_size, world_size]
 		rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
 		recv_total = rc.sum()
 		logger.info(f"[Rank {self.rank}] Step 3: Allgather completed. Recv counts: {rc.tolist()}, total={recv_total}")
@@ -2174,8 +2369,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 4) allocate buffers -------------------------------------------
 		send_x = sorted_x
 		send_eid = sorted_eids
-		recv_x = torch.empty(recv_total, hidden_size, device=device, dtype=x.dtype)
-		recv_eid = torch.empty(recv_total, device=device, dtype=sorted_eids.dtype)
+		recv_x = torch.empty(max(recv_total, 1), hidden_size, device=device, dtype=x.dtype)
+		recv_eid = torch.empty(max(recv_total, 1), device=device, dtype=sorted_eids.dtype)
 		logger.info(f"[Rank {self.rank}] Step 4: Allocated buffers (recv_total={recv_total})")
 		
 		# ---- 5) compute send/recv offsets (on GPU) -------------------------
@@ -2206,38 +2401,56 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.comm.group_start()
 			logger.info(f"[Rank {self.rank}] Step 6b: NCCL group_start completed")
 			
-			# Post all recvs first (standard pattern, order doesn't matter in group)
+			# Post all recvs first - ALWAYS post for all ranks to maintain symmetry
 			logger.info(f"[Rank {self.rank}] Step 6c: Posting all recvs")
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue  # Skip self
 				
-				if rc[rank] > 0:
+				count = rc[rank].item()
+				if count > 0:
 					# Recv token data
-					recv_slice_x = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+					recv_slice_x = recv_x[recv_offsets[rank]:recv_offsets[rank] + count]
 					self.comm.recv(recv_slice_x, src=rank, stream=stream)
 					
 					# Recv expert IDs
-					recv_slice_eid = recv_eid[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+					recv_slice_eid = recv_eid[recv_offsets[rank]:recv_offsets[rank] + count]
 					self.comm.recv(recv_slice_eid, src=rank, stream=stream)
-					logger.info(f"[Rank {self.rank}] Step 6c: Posted recv from rank {rank} (count={rc[rank].item()})")
+					logger.info(f"[Rank {self.rank}] Step 6c: Posted recv from rank {rank} (count={count})")
+				else:
+					# Post empty recv to maintain group symmetry
+					recv_slice_x = recv_x[0:0]
+					self.comm.recv(recv_slice_x, src=rank, stream=stream)
+					
+					recv_slice_eid = recv_eid[0:0]
+					self.comm.recv(recv_slice_eid, src=rank, stream=stream)
+					logger.info(f"[Rank {self.rank}] Step 6c: Posted empty recv from rank {rank} (count=0)")
 			
 			logger.info(f"[Rank {self.rank}] Step 6d: All recvs posted, now posting sends")
 			
-			# Then post all sends
+			# Then post all sends - ALWAYS post for all ranks to maintain symmetry
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue  # Skip self
 				
-				if sc[rank] > 0:
+				count = sc[rank].item()
+				if count > 0:
 					# Send token data
-					send_slice_x = send_x[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+					send_slice_x = send_x[send_offsets[rank]:send_offsets[rank] + count]
 					self.comm.send(send_slice_x, dst=rank, stream=stream)
 					
 					# Send expert IDs
-					send_slice_eid = send_eid[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+					send_slice_eid = send_eid[send_offsets[rank]:send_offsets[rank] + count]
 					self.comm.send(send_slice_eid, dst=rank, stream=stream)
-					logger.info(f"[Rank {self.rank}] Step 6d: Posted send to rank {rank} (count={sc[rank].item()})")
+					logger.info(f"[Rank {self.rank}] Step 6d: Posted send to rank {rank} (count={count})")
+				else:
+					# Post empty send to maintain group symmetry
+					send_slice_x = send_x[0:0]
+					self.comm.send(send_slice_x, dst=rank, stream=stream)
+					
+					send_slice_eid = send_eid[0:0]
+					self.comm.send(send_slice_eid, dst=rank, stream=stream)
+					logger.info(f"[Rank {self.rank}] Step 6d: Posted empty send to rank {rank} (count=0)")
 			
 			logger.info(f"[Rank {self.rank}] Step 6e: All sends posted, calling group_end")
 			# All operations complete after group_end()
@@ -2247,7 +2460,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 8) local computation ------------------------------------------
 		logger.info(f"[Rank {self.rank}] Step 8: Starting local computation")
 		if recv_total > 0:
-			recv_eid_sorted, local_sort_idx = recv_eid.sort()
+			recv_eid_sorted, local_sort_idx = recv_eid[:recv_total].sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
 			logger.info(f"[Rank {self.rank}] Step 8a: Sorted received expert IDs")
 			res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
@@ -2258,7 +2471,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 9) NCCL send/recv for return (reverse direction) -------------
 		logger.info(f"[Rank {self.rank}] Step 9: Starting return communication")
-		# torch.cuda.current_stream(device).synchronize()
 		out_sorted = torch.empty_like(sorted_x)
 
 		# Handle self-communication
@@ -2272,9 +2484,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Log what we expect to send and receive in return phase
 		logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will recv from ranks where sc>0: {[(r, sc[r].item()) for r in range(self.world_size) if r != self.rank and sc[r] > 0]}")
 		logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will send to ranks where rc>0: {[(r, rc[r].item()) for r in range(self.world_size) if r != self.rank and rc[r] > 0]}")
-		logger.info(f"[Rank {self.rank}] Step 8d: Verifying communication symmetry")
-		logger.info(f"[Rank {self.rank}] Step 8d: Forward phase - sent to: {[(r, sc[r].item()) for r in range(self.world_size) if sc[r] > 0]}")
-		logger.info(f"[Rank {self.rank}] Step 8d: Forward phase - recv from: {[(r, rc[r].item()) for r in range(self.world_size) if rc[r] > 0]}")
 
 		# NCCL group for return communication
 		logger.info(f"[Rank {self.rank}] Step 9b: Entering NCCL group for return communication")
@@ -2282,35 +2491,41 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.comm.group_start()
 			logger.info(f"[Rank {self.rank}] Step 9b: NCCL group_start completed for return")
 			
-			# Post recvs (receiving back from where we sent)
+			# Post recvs (receiving back from where we sent) - ALWAYS post for all ranks
 			logger.info(f"[Rank {self.rank}] Step 9c: Posting all recvs for return")
-			recv_count = 0
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
 				
-				if sc[rank] > 0:
-					recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + sc[rank]]
+				count = sc[rank].item()
+				if count > 0:
+					recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + count]
 					self.comm.recv(recv_slice, src=rank, stream=stream)
-					recv_count += 1
-					logger.info(f"[Rank {self.rank}] Step 9c: Posted recv #{recv_count} from rank {rank} for return (count={sc[rank].item()})")
+					logger.info(f"[Rank {self.rank}] Step 9c: Posted recv from rank {rank} for return (count={count})")
+				else:
+					# Post empty recv to maintain group symmetry
+					recv_slice = out_sorted[0:0]
+					self.comm.recv(recv_slice, src=rank, stream=stream)
+					logger.info(f"[Rank {self.rank}] Step 9c: Posted empty recv from rank {rank} for return (count=0)")
 			
-			logger.info(f"[Rank {self.rank}] Step 9c: Total {recv_count} recvs posted for return")
 			logger.info(f"[Rank {self.rank}] Step 9d: All recvs posted for return, now posting sends")
 			
-			# Post sends (sending to where we received from)
-			send_count = 0
+			# Post sends (sending to where we received from) - ALWAYS post for all ranks
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
 				
-				if rc[rank] > 0:
-					send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
+				count = rc[rank].item()
+				if count > 0:
+					send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + count]
 					self.comm.send(send_slice, dst=rank, stream=stream)
-					send_count += 1
-					logger.info(f"[Rank {self.rank}] Step 9d: Posted send #{send_count} to rank {rank} for return (count={rc[rank].item()})")
+					logger.info(f"[Rank {self.rank}] Step 9d: Posted send to rank {rank} for return (count={count})")
+				else:
+					# Post empty send to maintain group symmetry
+					send_slice = recv_x[0:0]
+					self.comm.send(send_slice, dst=rank, stream=stream)
+					logger.info(f"[Rank {self.rank}] Step 9d: Posted empty send to rank {rank} for return (count=0)")
 			
-			logger.info(f"[Rank {self.rank}] Step 9d: Total {send_count} sends posted for return")
 			logger.info(f"[Rank {self.rank}] Step 9e: All sends posted for return, calling group_end")
 			self.comm.group_end()
 			logger.info(f"[Rank {self.rank}] Step 9e: NCCL group_end completed - return communication done")
