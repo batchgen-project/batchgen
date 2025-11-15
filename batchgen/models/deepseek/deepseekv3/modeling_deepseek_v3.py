@@ -2256,6 +2256,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# ---- 9) NCCL send/recv for return (reverse direction) -------------
 		logger.info(f"[Rank {self.rank}] Step 9: Starting return communication")
 		torch.cuda.current_stream(device).synchronize()
+		dist.barrier()
 		out_sorted = torch.empty_like(sorted_x)
 
 		# Handle self-communication
