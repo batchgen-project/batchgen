@@ -2255,17 +2255,26 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 9) NCCL send/recv for return (reverse direction) -------------
 		logger.info(f"[Rank {self.rank}] Step 9: Starting return communication")
+		
+		# First, ensure this rank's local compute (Step 8) is finished
 		torch.cuda.current_stream(device).synchronize()
-		dist.barrier()
+
+		# Allocate the output buffer
 		out_sorted = torch.empty_like(sorted_x)
 
-		# Handle self-communication
+		# Handle self-communication (Step 9a) *before* the barrier
 		if sc[self.rank] > 0:
 			logger.info(f"[Rank {self.rank}] Step 9a: Handling self-communication for return")
 			send_slice = recv_x[recv_offsets[self.rank]:recv_offsets[self.rank] + rc[self.rank]]
 			recv_slice = out_sorted[send_offsets[self.rank]:send_offsets[self.rank] + sc[self.rank]]
 			recv_slice.copy_(send_slice)
 			logger.info(f"[Rank {self.rank}] Step 9a: Self-communication for return completed")
+
+		# --- DEADLOCK FIX ---
+		# Wait for ALL ranks to finish both compute (Step 8) AND self-copy (Step 9a)
+		# before any rank starts the NCCL communication group.
+		logger.info(f"[Rank {self.rank}] Step 9b: Synchronizing all ranks (dist.barrier)...")
+		dist.barrier()
 
 		# Log what we expect to send and receive in return phase
 		logger.info(f"[Rank {self.rank}] Step 9b: Return phase - will recv from ranks where sc>0: {[(r, sc[r].item()) for r in range(self.world_size) if r != self.rank and sc[r] > 0]}")
@@ -2285,7 +2294,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			recv_count = 0
 			for rank in range(self.world_size):
 				if rank == self.rank:
-					continue
+					continue  # Self-communication was already handled
 				
 				if sc[rank] > 0:
 					recv_slice = out_sorted[send_offsets[rank]:send_offsets[rank] + sc[rank]]
@@ -2300,7 +2309,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			send_count = 0
 			for rank in range(self.world_size):
 				if rank == self.rank:
-					continue
+					continue  # Self-communication was already handled
 				
 				if rc[rank] > 0:
 					send_slice = recv_x[recv_offsets[rank]:recv_offsets[rank] + rc[rank]]
