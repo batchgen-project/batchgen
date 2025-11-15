@@ -1710,7 +1710,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_alltoall_sendrecv(hidden_states)
+		out = self.moe_infer_alltoall_sendrecv_v2(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
@@ -2756,7 +2756,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 
 	@torch.inference_mode()
-	def moe_infer_alltoall_sendrecv(self, x):
+	def moe_infer_alltoall_sendrecv_v2(self, x):
 		num_tokens, hidden_size = x.shape
 		K = self.num_experts_per_tok
 		device = x.device
