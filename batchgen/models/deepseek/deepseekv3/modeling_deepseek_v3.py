@@ -2913,8 +2913,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
 		
 		# ---- 4) Pre-allocate buffers (first call only) ---------------------
-		recv_total_tensor = rc.sum()  # Keep on GPU
-		
 		if self.recv_x_buffer is None:
 			# One-time setup: compute worst-case buffer size
 			worst_case_local = torch.tensor(sorted_x.shape[0], device=device, dtype=torch.int64)
@@ -2931,20 +2929,21 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			mem_mb = self.max_recv_tokens * hidden_size * x.element_size() / 1e6
 			print(f"[Rank {self.rank}] Pre-allocated recv buffers: {self.max_recv_tokens} tokens ({mem_mb:.1f} MB)")
 		
-		# ---- 5) Get actual receive views (NO .item() - use GPU tensor!) ----
-		recv_x = self.recv_x_buffer[:recv_total_tensor]
-		recv_eid = self.recv_eid_buffer[:recv_total_tensor]
-		
-		# ---- 6) Prepare for communication using torch.split ---------------
-		# Single batched DtoH transfer for split sizes
+		# ---- 5) Single batched DtoH transfer ------------------------------
+		# Get counts as CPU list AND compute recv total in one go
 		sc_list = sc.tolist()
 		rc_list = rc.tolist()
+		recv_total = sum(rc_list)  # Compute on CPU from already-transferred data
+		
+		# ---- 6) Prepare buffers and chunks ---------------------------------
+		# Use CPU integer for slicing - consistent with rc_list
+		recv_x = self.recv_x_buffer[:recv_total]
+		recv_eid = self.recv_eid_buffer[:recv_total]
 		
 		send_chunks_x = torch.split(sorted_x, sc_list)
 		send_chunks_eid = torch.split(sorted_eids, sc_list)
 		
-		# FIX: Always use torch.split, it handles empty tensors correctly
-		# torch.split with all-zero sizes returns separate empty tensor objects
+		# Now split sizes match exactly
 		recv_chunks_x = torch.split(recv_x, rc_list)
 		recv_chunks_eid = torch.split(recv_eid, rc_list)
 		
@@ -2960,14 +2959,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
 			
-			# Post all recvs first
+			# Post all recvs first - ALWAYS for all ranks to maintain symmetry
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
 				self.comm.recv(recv_chunks_x[rank], src=rank, stream=stream)
 				self.comm.recv(recv_chunks_eid[rank], src=rank, stream=stream)
 			
-			# Post all sends
+			# Post all sends - ALWAYS for all ranks to maintain symmetry
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
@@ -2977,8 +2976,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.comm.group_end()
 		
 		# ---- 8) local computation ------------------------------------------
-		# Only process if we received data
-		if recv_total_tensor > 0:
+		if recv_total > 0:  # Use CPU integer
 			recv_eid_sorted, local_sort_idx = recv_eid.sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
 			res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
