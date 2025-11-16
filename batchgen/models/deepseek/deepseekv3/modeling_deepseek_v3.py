@@ -2917,7 +2917,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		if self.recv_x_buffer is None:
 			# One-time setup: compute worst-case buffer size
-			# Worst case: all tokens from all ranks
 			worst_case_local = torch.tensor(sorted_x.shape[0], device=device, dtype=torch.int64)
 			worst_case_global = torch.empty_like(worst_case_local)
 			
@@ -2944,9 +2943,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		send_chunks_x = torch.split(sorted_x, sc_list)
 		send_chunks_eid = torch.split(sorted_eids, sc_list)
 		
-		# Split actual receive buffers (empty if recv_total is 0)
-		recv_chunks_x = torch.split(recv_x, rc_list) if recv_total_tensor > 0 else [recv_x[0:0]] * self.world_size
-		recv_chunks_eid = torch.split(recv_eid, rc_list) if recv_total_tensor > 0 else [recv_eid[0:0]] * self.world_size
+		# FIX: Always use torch.split, it handles empty tensors correctly
+		# torch.split with all-zero sizes returns separate empty tensor objects
+		recv_chunks_x = torch.split(recv_x, rc_list)
+		recv_chunks_eid = torch.split(recv_eid, rc_list)
 		
 		stream = torch.cuda.default_stream(self.device)
 		
@@ -2977,7 +2977,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.comm.group_end()
 		
 		# ---- 8) local computation ------------------------------------------
-		# Only process if we received data (recv_total_tensor is GPU tensor)
+		# Only process if we received data
 		if recv_total_tensor > 0:
 			recv_eid_sorted, local_sort_idx = recv_eid.sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
