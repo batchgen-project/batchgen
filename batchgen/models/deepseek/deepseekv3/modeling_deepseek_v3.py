@@ -1712,7 +1712,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_alltoall_nvshmem(hidden_states)
+		out = self.moe_infer_alltoall_sendrecv_v2(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
