@@ -27,15 +27,20 @@ from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausal
 from tqdm import trange
 import gc
 from datetime import timedelta
+from dataclasses import dataclass
+import torch.distributed._symmetric_memory as symm_mem
+
+
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
-from dataclasses import dataclass
+from batchgen.kv_cache.gpu_paged_kv_manager import GPUKVCacheManager
+
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
-	format="%(asctime)s - %(levelname)s - %(message)s",  # Include timestamp
+	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 	datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
 )
 
@@ -162,7 +167,9 @@ class BatchGenWorker:
 
 		if(self.rank == 0):
 			print(self.engine_config)
-		
+		if not self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens:
+			logging.warning(f"kv_buffer_num_tokens is set to {self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens}")
+			# exit()
 		self.device = device
 		self.torch_device = torch.device(f"cuda:{device}")
 		self.host_kv_cache_size = host_kv_cache_size
@@ -636,15 +643,21 @@ class BatchGenWorker:
 		except Exception as e:
 			logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 			raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		generation_start_time = time.perf_counter()
 		prefill_time = 0
 		decoding_time = 0
+		phase_switching_time = 0
+		config_prefill_time = 0
+		config_decode_time = 0
 		for model_batch_idx in tqdm(
 			range(len(self.model_batches)), desc="Model Batch"
 		):
 			dist.barrier()
-			if self.rank == 0:
-				logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
+			# if self.rank == 0:
+			# 	logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
+			tmp_start = time.perf_counter()
 			self._config_prefill()
+			config_prefill_time += time.perf_counter() - tmp_start
 			prefill_start_time = time.perf_counter()
 			if len(self.model_batches[model_batch_idx]) > 0:
 				with torch.inference_mode():
@@ -670,12 +683,42 @@ class BatchGenWorker:
 			# self.core_engine.create_fake_kv_storage()
 			# self.core_engine.start_h2d_worker()
 			# time.sleep(2)
-				
+			
+			tmp_start = time.perf_counter()
+			torch.cuda.empty_cache()
+			# Log memory usage before decode phase configuration:
+			free_memory, total_memory = torch.cuda.mem_get_info()
+			free_memory = free_memory / 1024 / 1024 / 1024
+			total_memory = total_memory / 1024 / 1024 / 1024
+			logging.info(
+				f"Rank: {self.rank} Device torch memory usage before decode phase: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+			)
+			logging.info(
+				f"Rank: {self.rank} Device torch free memory before decode phase: {free_memory} GB / {total_memory} GB"
+			)
 			self._config_decoding(len(new_token), self.comm)
 			# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 			if self.engine_config.Basic_Config.attn_mode == 3:
 				# FULL GPU DECODING MODE.
+				# Need to instantiate GPU KV-Cache Here. 
+				# gpu_kv_cache = GPUKVCacheManager(self.engine_config).init(self.core_engine)
+				# for query_idx in self.model_batches[model_batch_idx]:
+				# 	gpu_kv_cache.allocate_pages(query_idx, self.max_input_length + self.max_decoding_length)
+				# 	gpu_kv_cache.load_offloaded_context(query_idx, self.max_input_length) # Load offloaded context kv-cache to gpu.
+
 				if self.model_config.model_type == "deepseek_v3":
+					# show rank 0 gpu memory usage before getting past key values
+					free_memory, total_memory = torch.cuda.mem_get_info()
+					free_memory = free_memory / 1024 / 1024 / 1024
+					total_memory = total_memory / 1024 / 1024 / 1024
+					logging.info(
+						f"Rank: {self.rank} Device torch memory usage before getting past key values: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+					)
+					logging.info(
+						f"Rank: {self.rank} Device torch free memory before getting past key values: {free_memory} GB / {total_memory} GB"
+					)
+
+
 					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 					# Pad the kv cache to be multiple of 64
 					bsz, kv_seqlen, _ = past_key_states[0].size()
@@ -696,12 +739,16 @@ class BatchGenWorker:
 					
 			
 				else:
-					# TODO:
+					# TODO: we do
 					pass
-			
-			
+
+			else:
+				past_key_states = None
+				past_value_states = None
+				scale_dict = None
+			config_decode_time += time.perf_counter() - tmp_start
 			dist.barrier()
-			torch.cuda.empty_cache()
+			# torch.cuda.empty_cache()
 			decoding_start_time = time.perf_counter()
 			with torch.inference_mode():
 				logging.info(
@@ -714,7 +761,7 @@ class BatchGenWorker:
 			self.deep_free_model_memory()
 			del past_key_states
 			del scale_dict
-			gc.collect()
+			# gc.collect()
 			dist.barrier()
 		
 		
@@ -745,13 +792,19 @@ class BatchGenWorker:
 
 
 		
-		dist.barrier()
-		self.model = None 
-		torch.cuda.empty_cache()
+		# dist.barrier()
+		generation_time = time.perf_counter() - generation_start_time
 
+		self.model = None 
+		# torch.cuda.empty_cache()
+		phase_switching_time = (config_prefill_time + config_decode_time)
 		logging.info(
 			f"Rank {self.rank} Prefill total time: {prefill_time:.1f} seconds,\n"
 			f"Decoding total time: {decoding_time:.1f} seconds,\n"
+			f"Generation total time: {generation_time:.1f} seconds."
+			f"Phase switching time: {phase_switching_time:.1f} seconds.\n"
+			f"Config prefill time: {config_prefill_time:.1f} seconds.\n"
+			f"Config decoding time: {config_decode_time:.1f} seconds.\n"
 			f"Waiting for process clean up..."
 		)
 
@@ -855,19 +908,76 @@ class BatchGenWorker:
 						+ str(expert_idx)
 					)
 
+	# def _config_prefill(self):
+	# 	self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+	# 	self.set_phase("prefill")
+	# 	self.core_engine.stop_h2d_worker()
+	# 	self.core_engine.clear_weight_copy_queue()
+	# 	self.core_engine.reset_prefill_buffer()
+	# 	self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+	# 	self.core_engine.clear_kv_storage()
+	# 	self.core_engine.start_h2d_worker()
+
+
 	def _config_prefill(self):
+		start_time = time.perf_counter()
+		logging.info("Starting _config_prefill")
+		
+		# Step 1: Configure prefill
+		step_start = time.perf_counter()
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+		logging.info(f"configure_prefill took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 2: Set phase
+		step_start = time.perf_counter()
 		self.set_phase("prefill")
+		logging.info(f"set_phase took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 3: Stop H2D worker
+		step_start = time.perf_counter()
 		self.core_engine.stop_h2d_worker()
+		logging.info(f"stop_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 4: Clear weight copy queue
+		step_start = time.perf_counter()
 		self.core_engine.clear_weight_copy_queue()
+		logging.info(f"clear_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 5: Reset prefill buffer
+		step_start = time.perf_counter()
 		self.core_engine.reset_prefill_buffer()
+		logging.info(f"reset_prefill_buffer took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 6: Set weight copy queue
+		step_start = time.perf_counter()
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+		logging.info(f"set_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 7: Clear KV storage
+		step_start = time.perf_counter()
 		self.core_engine.clear_kv_storage()
+		logging.info(f"clear_kv_storage took {time.perf_counter() - step_start:.4f}s")
+		
+		# Step 8: Start H2D worker
+		step_start = time.perf_counter()
 		self.core_engine.start_h2d_worker()
+		logging.info(f"start_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+		
+		total_time = time.perf_counter() - start_time
+		logging.info(f"_config_prefill completed in {total_time:.4f}s")
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
+		
+		# Initialize symmetric memory once during model initialization
+		if not symm_mem.is_nvshmem_available():
+			logging.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
+			symm_mem.set_backend("NCCL")
+		else:
+			symm_mem.set_backend("NVSHMEM")
+		group_name = dist.group.WORLD.group_name
+		symm_mem.enable_symm_mem_for_group(group_name)
 
 
 		# Get number of sequences for each rank 
@@ -881,7 +991,7 @@ class BatchGenWorker:
 		# TODO:
 		if self.world_size <= 8:
 			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-			self.set_phase("decoding")
+			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()
@@ -892,7 +1002,7 @@ class BatchGenWorker:
 		else:
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
 
-			self.set_phase("decoding")
+			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()
@@ -900,6 +1010,121 @@ class BatchGenWorker:
 			self.core_engine.reset_decoding_buffer()
 
 		logging.info(f"{self.rank} End Config Decoding")
+
+	# def _config_decoding(self, num_seq, comm=None):
+	# 	start_time = time.perf_counter()
+	# 	logging.info(f"Rank {self.rank}: Starting _config_decoding with num_seq={num_seq}")
+		
+	# 	# Step 1: Deep free model memory
+	# 	step_start = time.perf_counter()
+	# 	self.deep_free_model_memory()
+	# 	logging.info(f"Rank {self.rank}: deep_free_model_memory took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Step 2: Prepare num_seq_per_rank tensor
+	# 	step_start = time.perf_counter()
+	# 	num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
+	# 	num_seq_per_rank[self.rank] = num_seq
+	# 	logging.info(f"Rank {self.rank}: tensor preparation took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Step 3: All-reduce to gather sequence counts
+	# 	step_start = time.perf_counter()
+	# 	dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
+	# 	logging.info(f"Rank {self.rank}: all_reduce took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Step 4: Get max number of sequences
+	# 	step_start = time.perf_counter()
+	# 	max_num_seq = int(num_seq_per_rank.max().item())
+	# 	logging.info(f"Rank {self.rank}: max_num_seq={max_num_seq}, computation took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	# Branch based on world size
+	# 	if self.world_size <= 8:
+	# 		logging.info(f"Rank {self.rank}: Taking world_size <= 8 branch")
+			
+	# 		# Step 5a: Configure decoding
+	# 		step_start = time.perf_counter()
+	# 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+	# 		logging.info(f"Rank {self.rank}: configure_decoding took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 6a: Set phase
+	# 		step_start = time.perf_counter()
+	# 		self.set_phase("decode")
+	# 		logging.info(f"Rank {self.rank}: set_phase took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 7a: Stop H2D worker
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.stop_h2d_worker()
+	# 		logging.info(f"Rank {self.rank}: stop_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 8a: Clear KV copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 9a: Clear KV buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_buffer()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_buffer took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 10a: Clear weight copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_weight_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 11a: Reset decoding buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.reset_decoding_buffer()
+	# 		logging.info(f"Rank {self.rank}: reset_decoding_buffer took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 12a: Set weight copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+	# 		logging.info(f"Rank {self.rank}: set_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 13a: Start H2D worker
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.start_h2d_worker()
+	# 		logging.info(f"Rank {self.rank}: start_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+			
+	# 	else:
+	# 		logging.info(f"Rank {self.rank}: Taking world_size > 8 branch (pure GPU decoding)")
+			
+	# 		# Step 5b: Pure GPU decoding
+	# 		step_start = time.perf_counter()
+	# 		self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
+	# 		logging.info(f"Rank {self.rank}: pure_gpu_decoding took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 6b: Set phase
+	# 		step_start = time.perf_counter()
+	# 		self.set_phase("decode")
+	# 		logging.info(f"Rank {self.rank}: set_phase took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 7b: Stop H2D worker
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.stop_h2d_worker()
+	# 		logging.info(f"Rank {self.rank}: stop_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 8b: Clear KV copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 9b: Clear KV buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_kv_buffer()
+	# 		logging.info(f"Rank {self.rank}: clear_kv_buffer took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 10b: Clear weight copy queue
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.clear_weight_copy_queue()
+	# 		logging.info(f"Rank {self.rank}: clear_weight_copy_queue took {time.perf_counter() - step_start:.4f}s")
+			
+	# 		# Step 11b: Reset decoding buffer
+	# 		step_start = time.perf_counter()
+	# 		self.core_engine.reset_decoding_buffer()
+	# 		logging.info(f"Rank {self.rank}: reset_decoding_buffer took {time.perf_counter() - step_start:.4f}s")
+		
+	# 	total_time = time.perf_counter() - start_time
+	# 	logging.info(f"Rank {self.rank}: _config_decoding completed in {total_time:.4f}s")
 
 	def prefill(self, batch: list[int]):
 		"""
@@ -1483,8 +1708,8 @@ class BatchGenWorker:
 				raise ValueError("No 0 found in the attention mask.")
 
 	def _init_torch_dist(self):
-		timeout = timedelta(minutes=5)
-		# os.environ['GLOO_SOCKET_IFNAME'] = 'eth0'
+		timeout = timedelta(minutes=15)
+		# os.environ['GLOO_SOCKET_IFNAME'] = 'bond1'
 		try:
 			dist.init_process_group(
 				backend="nccl",

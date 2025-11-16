@@ -274,3 +274,166 @@ std::vector<torch::Tensor> expert_bincount_cuda_sliced(
     return {group_size, activated_group_idx, group_start_indices};
 }
 
+
+__global__ void compact_expert_data_dense_kernel(
+    const int32_t* expert_counts,      // [experts_per_rank]
+    int32_t* activated_group_idx,      // [experts_per_rank] - OUTPUT: dense, no gaps
+    int32_t* group_size,               // [experts_per_rank] - OUTPUT: same as input but reordered
+    int32_t* group_start_indices,      // [experts_per_rank] - OUTPUT: prefix sum
+    int32_t* num_active_experts,       // [1] - OUTPUT: count of non-zero experts
+    const int32_t experts_per_rank
+) {
+    __shared__ int32_t s_active_count;
+    __shared__ int32_t s_prefix_sum[512];  // Assuming max 512 experts per rank
+    
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    if (tid == 0) {
+        s_active_count = 0;
+    }
+    __syncthreads();
+    
+    // Phase 1: Identify active experts and compute their positions
+    for (int i = tid; i < experts_per_rank; i += num_threads) {
+        int count = expert_counts[i];
+        if (count > 0) {
+            int pos = atomicAdd(&s_active_count, 1);
+            s_prefix_sum[pos] = i;  // Store which expert is at this position
+        }
+    }
+    __syncthreads();
+    
+    int num_active = s_active_count;
+    
+    // Phase 2: Build dense output arrays
+    // Active experts go first (indices 0 to num_active-1)
+    for (int i = tid; i < num_active; i += num_threads) {
+        int expert_id = s_prefix_sum[i];
+        activated_group_idx[i] = expert_id;
+        group_size[i] = expert_counts[expert_id];
+    }
+    
+    // Inactive experts fill the rest (indices num_active to experts_per_rank-1)
+    // Set them to have size 0 so kernel can safely skip them
+    for (int i = num_active + tid; i < experts_per_rank; i += num_threads) {
+        activated_group_idx[i] = 0;  // Doesn't matter, won't be used
+        group_size[i] = 0;           // Zero size = kernel will skip
+    }
+    __syncthreads();
+    
+    // Phase 3: Compute prefix sum for start indices
+    if (tid == 0) {
+        int cumsum = 0;
+        for (int i = 0; i < experts_per_rank; i++) {
+            group_start_indices[i] = cumsum;
+            cumsum += group_size[i];
+        }
+        *num_active_experts = num_active;
+    }
+}
+
+// -----------------------------------------------------------------
+// NEW WRAPPER FUNCTION
+// -----------------------------------------------------------------
+// This function replaces torch.nonzero() and torch.count_nonzero()
+// It takes the expert_counts (already computed) and finds the
+// active expert indices and metadata.
+std::vector<torch::Tensor> compact_expert_data_cuda(
+    torch::Tensor expert_counts) {
+    
+    // Get dimensions and device
+    const auto experts_per_rank = expert_counts.size(0);
+    const auto device = expert_counts.device();
+
+    TORCH_CHECK(expert_counts.is_cuda(), "expert_counts must be a CUDA tensor");
+    TORCH_CHECK(expert_counts.dtype() == torch::kInt32, "expert_counts must be int32");
+
+    // Step 1: Allocate output tensors (oversized)
+    auto activated_group_idx = torch::empty({experts_per_rank}, 
+                                           torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto group_size = torch::empty({experts_per_rank}, 
+                                  torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto group_start_indices = torch::empty({experts_per_rank}, 
+                                           torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto num_active_experts = torch::zeros({1}, 
+                                          torch::TensorOptions().dtype(torch::kInt32).device(device));
+
+    // Step 2: Compact active experts and compute start indices (logic from your file)
+    if (experts_per_rank <= 512) {
+        // Use optimized single-block kernel
+        const int threads = 256; // Or whatever is best for this kernel
+        compact_active_experts_single_block_kernel<<<1, threads>>>(
+            expert_counts.data_ptr<int32_t>(),
+            activated_group_idx.data_ptr<int32_t>(),
+            group_size.data_ptr<int32_t>(),
+            group_start_indices.data_ptr<int32_t>(),
+            num_active_experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(experts_per_rank)
+        );
+    } else {
+        // Use two-pass approach
+        const int threads = 256;
+        const int compact_blocks = (experts_per_rank + threads - 1) / threads;
+        
+        compact_active_experts_parallel_kernel<<<compact_blocks, threads>>>(
+            expert_counts.data_ptr<int32_t>(),
+            activated_group_idx.data_ptr<int32_t>(),
+            group_size.data_ptr<int32_t>(),
+            group_start_indices.data_ptr<int32_t>(),
+            num_active_experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(experts_per_rank)
+        );
+        
+        compute_start_indices_kernel<<<1, 256>>>(
+            group_size.data_ptr<int32_t>(),
+            group_start_indices.data_ptr<int32_t>(),
+            num_active_experts.data_ptr<int32_t>(),
+            static_cast<int32_t>(experts_per_rank)
+        );
+    }
+    
+    // Return all computed tensors. They are async.
+    // NOTE: These are oversized, and need to be sliced in Python
+    // using the num_active_experts tensor.
+    return {group_size, activated_group_idx, group_start_indices, num_active_experts};
+}
+
+
+// __global__ void compute_expert_offsets_kernel(
+//     const int32_t* expert_counts,      // [num_local_experts]
+//     int32_t* expert_offsets,           // [num_local_experts] - OUTPUT: prefix sum
+//     const int32_t num_local_experts
+// ) {
+//     // Simple prefix sum computation
+//     int tid = threadIdx.x;
+    
+//     if (tid == 0) {
+//         int cumsum = 0;
+//         for (int i = 0; i < num_local_experts; i++) {
+//             expert_offsets[i] = cumsum;
+//             cumsum += expert_counts[i];
+//         }
+//     }
+// }
+
+// torch::Tensor compute_expert_offsets_cuda(torch::Tensor expert_counts) {
+    
+//     const auto num_local_experts = expert_counts.size(0);
+//     const auto device = expert_counts.device();
+
+//     TORCH_CHECK(expert_counts.is_cuda(), "expert_counts must be a CUDA tensor");
+//     TORCH_CHECK(expert_counts.dtype() == torch::kInt32, "expert_counts must be int32");
+
+//     // Just compute prefix sum
+//     auto expert_offsets = torch::empty({num_local_experts}, 
+//                                        torch::TensorOptions().dtype(torch::kInt32).device(device));
+
+//     compute_expert_offsets_kernel<<<1, 1>>>(
+//         expert_counts.data_ptr<int32_t>(),
+//         expert_offsets.data_ptr<int32_t>(),
+//         static_cast<int32_t>(num_local_experts)
+//     );
+
+//     return expert_offsets;
+// }

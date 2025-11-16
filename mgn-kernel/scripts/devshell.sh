@@ -52,7 +52,7 @@ ensure_deps() {
   fi
 
   "${PYROOT}/bin/pip" install --no-cache-dir \
-    torch==2.7.0 ${TORCH_EXTRA} \
+    torch==2.9.0 ${TORCH_EXTRA} \
     ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core
 
   # CUDA stub lib

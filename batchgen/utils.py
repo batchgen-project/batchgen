@@ -119,3 +119,38 @@ def create_position_ids_from_attention_mask(
 	position_ids = position_ids * attention_mask
 	position_ids = position_ids + (attention_mask.eq(0) * (-1))
 	return position_ids
+
+
+def deep_free_model_memory(model):
+	"""Deep cleanup of model and all its submodules"""	
+	# Step 1: Set model to eval and disable gradients
+	model.eval()
+	with torch.no_grad():
+		# Step 2: Recursively clear all module parameters and buffers
+		def clear_module(module):
+			# Clear parameters
+			for param in module.parameters():
+				param.data = torch.empty(0)
+				if param.grad is not None:
+					param.grad.data = torch.empty(0)
+					param.grad = None
+			
+			# Clear buffers
+			for buffer in module.buffers():
+				buffer.data = torch.empty(0)
+			
+			# Clear module hooks
+			module._forward_hooks.clear()
+			module._forward_pre_hooks.clear()
+			module._backward_hooks.clear()
+			
+			# Recursively clear submodules
+			for submodule in module.children():
+				clear_module(submodule)
+		
+		clear_module(model)
+	
+	# Step 3: Move to CPU and delete
+	model.to('cpu')
+	del model
+	return None

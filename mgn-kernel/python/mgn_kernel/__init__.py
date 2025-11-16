@@ -15,6 +15,8 @@ from .moe import (
     moe_fused_gate,
     expert_bincount,
     fused_moe_token_dispatch,
+    compact_expert_data,
+    # compute_expert_offsets,
 )
 
 from .elementwise import fused_rmsnorm

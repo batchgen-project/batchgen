@@ -40,6 +40,14 @@ TORCH_LIBRARY_FRAGMENT(mgn_kernel, m) {
     m.impl("fused_moe_token_dispatch", torch::kCUDA,
            &fused_moe_token_dispatch_cuda);
 
+    m.def(
+        "compact_expert_data(Tensor expert_counts) -> (Tensor[])");
+    m.impl("compact_expert_data", torch::kCUDA, &compact_expert_data_cuda);
+
+    // m.def(
+    //     "compute_expert_offsets(Tensor expert_counts) -> (Tensor[])");
+    // m.impl("compute_expert_offsets", torch::kCUDA, &compute_expert_offsets_cuda);
+
     /*
      * From csrc/elementwise
      */

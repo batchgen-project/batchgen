@@ -37,7 +37,8 @@ try:
     from batchgen.core_engine import Parameter_Server
 except ImportError:
     from batchgen.models.engine_loader import core_engine  # noqa
-    from core_engine import Parameter_Server  # noqa
+    # from core_engine import Parameter_Server  # noqa
+    Parameter_Server = core_engine.Parameter_Server         # noqa
 
 
 class DeepSeek_Parameter_Server:

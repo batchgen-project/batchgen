@@ -208,15 +208,24 @@ if __name__ == "__main__":
 	"""
 		Step 4: Print responses to the prompts.
 	"""
-	def decode_to_eos(tokenizer, tokens):
+	def decode_to_eos(tokenizer, tokens, min_tokens=5):
 		tokens_array = np.array(tokens)
 		eos_positions = np.where(tokens_array == tokenizer.eos_token_id)[0]
-		end_pos = eos_positions[0] if len(eos_positions) > 0 else len(tokens_array)
-		return tokenizer.decode(tokens[:end_pos], skip_special_tokens=True)
+		
+		# Filter out EOS positions that are too early
+		valid_eos_positions = eos_positions[eos_positions >= min_tokens]
+		
+		end_pos = valid_eos_positions[0] if len(valid_eos_positions) > 0 else len(tokens_array)
+		return tokenizer.decode(tokens[:end_pos], skip_special_tokens=False)
 
 	print_result = True
+	# print(answer_set[4].tolist())
 	if print_result:
 		for idx in range(len(answer_set)):
-			tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist()[0])
+			tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
+			# print(f"Prompt {idx}: {queries[idx][:args.max_input_length]}")
+			print("==================================================================")
+			print(f"Query {idx}: {queries[idx][:args.max_input_length]}")
+			print("\n\n")
 			print(f"Answer {idx}: {tmp_answer}")
 			print("\n\n")

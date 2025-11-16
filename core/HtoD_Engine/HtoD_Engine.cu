@@ -343,11 +343,58 @@ void HtoD_Engine::HtoD_Worker() {
                     // int64_t v_offset = 0;
                     int64_t k_byte_size = byte_size; // TODO:
                     // int64_t v_byte_size = byte_size;
+
                     this->logger_->debug(
                         "copying micro_batch_idx: {}, layer_idx: {}, "
                         "byte_size: {}",
                         micro_batch_idx, layer_idx, k_byte_size);
+                    // for (int64_t i = 0; i < cur_batch.size(); i++) {
+                    //     CUDA_CHECK(cudaMemcpyAsync(
+                    //         dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,
+                    //         cudaMemcpyHostToDevice, this->HtoD_stream));
+                    //     k_offset += k_byte_size;
+                    // }
                     for (int64_t i = 0; i < cur_batch.size(); i++) {
+                        // Validation checks
+                        if (dst_k_ptr == nullptr) {
+                            this->logger_->error("dst_k_ptr is NULL!");
+                            throw std::runtime_error("Invalid dst_k_ptr");
+                        }
+                        
+                        if (host_k_ptrs[i] == nullptr) {
+                            this->logger_->error("host_k_ptrs[{}] is NULL!", i);
+                            throw std::runtime_error("Invalid host_k_ptrs at index " + std::to_string(i));
+                        }
+                        
+                        if (k_byte_size <= 0) {
+                            this->logger_->error("Invalid k_byte_size: {}", k_byte_size);
+                            throw std::runtime_error("Invalid k_byte_size");
+                        }
+                        
+                        // Check if destination pointer is valid CUDA memory
+                        cudaPointerAttributes dst_attrs;
+                        cudaError_t dst_err = cudaPointerGetAttributes(&dst_attrs, dst_k_ptr + k_offset);
+                        if (dst_err != cudaSuccess) {
+                            this->logger_->error("dst_k_ptr + {} offset is not valid CUDA memory: {}", 
+                                            k_offset, cudaGetErrorString(dst_err));
+                            cudaGetLastError(); // Clear the error
+                        }
+                        
+                        // Check if source pointer is valid host memory
+                        cudaPointerAttributes src_attrs;
+                        cudaError_t src_err = cudaPointerGetAttributes(&src_attrs, host_k_ptrs[i]);
+                        if (src_err != cudaSuccess) {
+                            this->logger_->error("host_k_ptrs[{}] is not valid memory: {}", 
+                                            i, cudaGetErrorString(src_err));
+                            cudaGetLastError(); // Clear the error
+                        }
+                        
+
+                        this->logger_->debug("Copying batch[{}]: dst_offset={}, size={}, "
+                                            "dst_ptr={}, src_ptr={}", 
+                                            i, k_offset, k_byte_size, 
+                                            (void*)(dst_k_ptr + k_offset), (void*)host_k_ptrs[i]);
+                        
                         CUDA_CHECK(cudaMemcpyAsync(
                             dst_k_ptr + k_offset, host_k_ptrs[i], k_byte_size,
                             cudaMemcpyHostToDevice, this->HtoD_stream));
@@ -437,3 +484,58 @@ void HtoD_Engine::stop_h2d_worker() {
         this->HtoD_worker_.join();
     }
 }
+
+// Forward declaration of CUDA kernel
+__global__ void batched_page_copy_kernel(
+    uint8_t** src_ptrs, 
+    uint8_t** dst_ptrs, 
+    size_t page_size, 
+    int num_pages
+);
+void HtoD_Engine::batched_page_copy(const std::vector<void*>& gpu_ptrs,
+                                    const std::vector<void*>& host_ptrs,
+                                    int64_t page_byte_size) {
+    CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
+    int num_pages = host_ptrs.size();
+
+    // Convert void* vectors to uint8_t* for the kernel
+    std::vector<uint8_t*> src_ptrs(num_pages);
+    std::vector<uint8_t*> dst_ptrs(num_pages);
+    for (int i = 0; i < num_pages; ++i) {
+        src_ptrs[i] = static_cast<uint8_t*>(host_ptrs[i]);
+        dst_ptrs[i] = static_cast<uint8_t*>(gpu_ptrs[i]);
+    }
+
+    // Allocate device memory for pointer arrays
+    uint8_t** d_src_ptrs;
+    uint8_t** d_dst_ptrs;
+    CUDA_CHECK(cudaMalloc(&d_src_ptrs, num_pages * sizeof(uint8_t*)));
+    CUDA_CHECK(cudaMalloc(&d_dst_ptrs, num_pages * sizeof(uint8_t*)));
+
+    // Copy pointer arrays to device (this is the only cudaMemcpy needed)
+    CUDA_CHECK(cudaMemcpyAsync(d_src_ptrs, src_ptrs.data(), 
+                               num_pages * sizeof(uint8_t*), 
+                               cudaMemcpyHostToDevice, 
+                               this->HtoD_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_dst_ptrs, dst_ptrs.data(), 
+                               num_pages * sizeof(uint8_t*), 
+                               cudaMemcpyHostToDevice, 
+                               this->HtoD_stream));
+    // Launch the batched copy kernel to do the actual data transfer
+    // One block per page, 256 threads per block
+    constexpr int THREADS_PER_BLOCK = 256;
+    batched_page_copy_kernel<<<num_pages, THREADS_PER_BLOCK, 0, this->HtoD_stream>>>(
+        d_src_ptrs, d_dst_ptrs, page_byte_size, num_pages
+    );
+
+    // Check for kernel launch errors
+    CUDA_CHECK(cudaGetLastError());
+
+    // Synchronize to ensure copy is complete (blocking behavior like blocking_copy_)
+    CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+
+    // Clean up device pointer arrays
+    CUDA_CHECK(cudaFree(d_src_ptrs));
+    CUDA_CHECK(cudaFree(d_dst_ptrs));
+    
+};

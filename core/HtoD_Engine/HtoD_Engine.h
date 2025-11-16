@@ -71,6 +71,9 @@ class HtoD_Engine {
         std::unordered_map<std::string, std::vector<std::string>>&
             weight_copy_tasks);
     void stop_h2d_worker();
+    void batched_page_copy(const std::vector<void*>& gpu_ptrs,
+                           const std::vector<void*>& host_ptrs,
+                           int64_t page_byte_size);
     
 
    private:

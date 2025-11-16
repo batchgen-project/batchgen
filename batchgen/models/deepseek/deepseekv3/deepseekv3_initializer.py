@@ -36,7 +36,9 @@ try:
     from batchgen.core_engine import batchgen as core_engine
 except ImportError:
     # jit compile
-    from core_engine import batchgen as core_engine
+    # from core_engine import batchgen as core_engine
+    from batchgen.models.engine_loader import core_engine as loader_module
+    core_engine = loader_module.batchgen
 
 from typing import Tuple
 from ....config.engine_config_parser import parse_config_from_json
@@ -157,6 +159,9 @@ class DeepseekV3Initializer:
         self._default_engine_config()
         self.scheduler = Scheduler()
         self.engine_config = self.scheduler.generate_config(self.engine_config)
+        if self.global_rank == 0:
+            logging.info(f"Engine config after scheduling: {self.engine_config}")
+
 
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name

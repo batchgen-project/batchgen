@@ -4,10 +4,110 @@ import logging
 import tqdm
 from typing import Optional, List, Dict
 import torch.distributed as dist
+from dataclasses import dataclass
 
 from batchgen.models.Wrapper import Attn_Wrapper
 from batchgen.utils import create_position_ids_from_attention_mask
 from batchgen.sampling import sample_with_temperature_top_p, greedy_decode
+from batchgen.sequence import SequenceBatch
+
+@dataclass
+class DecodeInput:
+	"""
+	DecodeRequest holds the input data for model forward pass in decode stage.
+	"""
+	sequence_uuids: List[int]
+	input_tokens: torch.Tensor  # (batch_size, 1) - current tokens to decode
+	attention_mask: torch.Tensor # 
+	position_ids: torch.Tensor  # (batch_size, seq_len)
+	
+	@property
+	def batch_size(self):
+		return len(self.sequence_uuids)
+
+@dataclass
+class DecodeOutput:
+    """
+    DecodeStepResult encapsulates the output from a single decode step.
+    """
+    sequence_uuids: List[int]
+    new_tokens: torch.Tensor  # (batch_size, 1)
+    # finished_uuids: List[int]  # Sequences that reached EOS or max length
+
+
+class DecodeExecutor:
+	"""
+	DecodeExecutor manages the decoding process with a preset number of steps(e.g. 1 or page size). 
+	It only handles the core logic of decoding. 
+	I.e. decoding the input batch for a few steps and update the status of each sequence.
+	"""
+	def __init__(self, model_config, engine_config, inference_runtime, 
+			  		decode_batch: SequenceBatch, decode_steps=1):
+		self.model_config = model_config
+		self.engine_config = engine_config
+		self.inference_runtime = inference_runtime
+		self.decode_batch = decode_batch # A view from global batch.
+		self.decode_step = decode_steps 
+		# Number of decode steps in one execute() call. This determines the granularity of pd scheduling.
+
+		self.rank = self.engine_config.Basic_Config.rank
+		self.world_size = self.engine_config.Basic_Config.world_size
+		self.torch_device = self.engine_config.Basic_Config.device_torch
+
+		self.decode_input = self._prepare_forward_input(decode_batch)
+
+	def _prepare_forward_input(self, decode_batch: SequenceBatch) -> DecodeInput:
+		"""
+		Prepare the input dictionary for model forward pass.
+		1. Gather current tokens from decode_batch.
+		2. Create attention masks and position ids if needed.
+		3. Return a dictionary with all necessary inputs for the model.
+		"""
+		attention_mask = decode_batch.get_attention_mask()
+		return DecodeInput(
+			sequence_uuids=decode_batch.get_sequence_uuids(),
+			input_tokens=decode_batch.get_last_tokens(),
+			attention_mask=attention_mask,
+			position_ids=create_position_ids_from_attention_mask(attention_mask)
+		)
+
+	def _decode_one_step(self) -> DecodeOutput:
+		"""
+		Perform a single decode step for the given DecodeRequest.
+		1. Run model forward pass.
+		2. Process the output to get new tokens.
+		3. Identify finished sequences.
+		4. Return DecodeStepResult with new tokens and finished sequence UUIDs.
+		"""
+		return self.inference_runtime.decode(self.decode_input)
+		
+
+	def _update_sequences(self, decode_result:DecodeOutput):
+		"""
+		Update the sequences in decode_batch based on the DecodeStepResult.
+		1. Append new tokens to each sequence.
+		2. Update sequence status (ACTIVE, COMPLETED).
+		3. Handle context window overflow if necessary.
+		"""
+		self.decode_batch.update_result(decode_result.sequence_uuids, decode_result.new_tokens)
+
+	def execute(self):	
+		"""
+		Decode the current decode_batch for a preset number of steps.
+		1. Prepare the input DecodeRequest.
+		2. Run model forward.
+		3. Process the output DecodeStepResult.
+		4. Return the finished sequences and the number of active sequences remaining.
+		"""
+		assert self.inference_runtime.get_current_phase() == "decode", "DecodeExecutor can only run in decode phase."
+		cur_step = 0
+		while cur_step < self.decode_step:
+			cur_decode_result = self._decode_one_step(self.decode_batch)
+			self._update_sequences(cur_decode_result)
+			cur_step += 1
+
+
+
 
 class Decode():
 	def __init__(self, model_config, engine_config, core_engine, parallel_manager, comm):
@@ -37,7 +137,7 @@ class Decode():
 		# TODO:
 		if self.world_size <= 8:
 			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-			self.set_phase("decoding")
+			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()
@@ -48,7 +148,7 @@ class Decode():
 		else:
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
 
-			self.set_phase("decoding")
+			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()
@@ -86,7 +186,7 @@ class Decode():
 
 		if RUNTIME_ATTN_MODE == 3:
 			"""
-				KV ACCUMULATION IN GPU.
+				KV ACCUMULATION IN GPU.`
 			"""
 			Attn_Wrapper.scale = scale_dict
 			Attn_Wrapper.past_key_states = past_key_states

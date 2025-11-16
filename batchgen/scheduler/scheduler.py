@@ -36,6 +36,8 @@ class Scheduler:
 		# num_k_buffer = self.compute_profiler.profile(MoE_module) // est_kv_cp_t_per_micro_batch + 2
 		num_k_buffer = 6
 		k_buffer_size = num_k_buffer * attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) * kv_element_size # in GB
+		self.config.GPU_Buffer_Config.kv_buffer_num_tokens = attn_decoding_micro_batch_size * self.Max_Context_Length
+		logging.info(f"kv buffer num tokens: {self.config.GPU_Buffer_Config.kv_buffer_num_tokens}")
 
 
 		available_gpu_mem = 96 * DEFAULT_MEM_FRAC  # Assuming 96GB GPU memory
@@ -74,6 +76,7 @@ class Scheduler:
 			self.config.GPU_Buffer_Config.num_decoding_module_buffer["shared_expert"] = 0
 			
 			self.config.GPU_Buffer_Config.num_k_buffer = 0
+			self.config.GPU_Buffer_Config.kv_buffer_num_tokens = 0
 
 
 

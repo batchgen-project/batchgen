@@ -24,9 +24,9 @@ class Scheduler:
 		"""
 			Configure the rest.
 		"""
-		DEFAULT_MEM_FRAC = 0.75
+		DEFAULT_MEM_FRAC = 0.80
 		# MAGIC_NUM = self.compute_profiler.profile(attn_decoding_module)
-		MAGIC_NUM = 224000
+		MAGIC_NUM = 224000 * 3
 		EXPERT_PER_RANK = 256 // self.world_size
 		assert EXPERT_PER_RANK > 0, "EXPERT_PER_RANK must be greater than 0"
 		if self.world_size > 8:
@@ -42,6 +42,7 @@ class Scheduler:
 		# num_k_buffer = self.compute_profiler.profile(MoE_module) // est_kv_cp_t_per_micro_batch + 2
 		num_k_buffer = 6
 		k_buffer_size = num_k_buffer * attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) * kv_element_size # in GB
+		self.config.GPU_Buffer_Config.kv_buffer_num_tokens = attn_decoding_micro_batch_size * self.Max_Context_Length
 
 
 		available_gpu_mem = 96 * DEFAULT_MEM_FRAC  # Assuming 96GB GPU memory
@@ -62,6 +63,8 @@ class Scheduler:
 				int((available_gpu_mem - model_skeleton_size - cuda_page_table_default_size - expert_size - NCCL_default_buffer_usage) / self.per_seq_size)
 			)
 			logging.info(f"Max Available MoE decoding micro batch size: {self.config.Module_Batching_Config.MoE_decoding_micro_batch_size}")
+			# Constant peak mem usage for attn in decoding.
+			# attn_decoding_micro_batch_size = self.config.Module_Batching_Config.MoE_decoding_micro_batch_size
 		if num_local_expert_per_layer == EXPERT_PER_RANK:
 			num_decoding_module_buffer_routed_expert = 0
 
@@ -79,6 +82,7 @@ class Scheduler:
 			self.config.GPU_Buffer_Config.num_decoding_module_buffer["shared_expert"] = 0
 			
 			self.config.GPU_Buffer_Config.num_k_buffer = 0
+			self.config.GPU_Buffer_Config.kv_buffer_num_tokens = 0
 
 
 

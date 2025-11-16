@@ -18,10 +18,9 @@ from .config.config import EngineConfig
 from batchgen.parameter_server_client import ParameterServerClient
 from .utils import config_torch_module_initializer
 from batchgen.batchgen_worker import BatchGenWorker
-
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
-	format="%(asctime)s - %(levelname)s - %(message)s",  # Include timestamp
+	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 	datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
 )
 

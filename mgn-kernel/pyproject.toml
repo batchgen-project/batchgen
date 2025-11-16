@@ -1,7 +1,7 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch>=2.7.0",
+  "torch>=2.9.0",
   "wheel",
 ]
 # Specifies the function that the build frontend (like pip) will call.

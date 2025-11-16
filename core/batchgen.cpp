@@ -159,7 +159,7 @@ void BatchGen::set_batching_plan(
 
 void BatchGen::set_phase(std::string phase) {
     this->phase_ = phase;
-    if (phase == "decoding") {
+    if (phase == "decode") {
         this->gpu_kv_buffer_.init_kv_buffer();
         this->gpu_weight_buffer_.resize_buffer();
     }

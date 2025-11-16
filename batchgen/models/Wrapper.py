@@ -462,7 +462,7 @@ class Attn_Wrapper(torch.nn.Module):
 
 			return attn_output, None, None
 
-		elif Attn_Wrapper.phase == "decoding":
+		elif Attn_Wrapper.phase == "decode":
 			# TODO: FIX
 			rank = dist.get_rank() 
 			world_size = dist.get_world_size()
@@ -586,23 +586,38 @@ class Attn_Wrapper(torch.nn.Module):
 						past_key_states[start_ids:end_ids].copy_(kv)
 						kv_scale[start_ids:end_ids].copy_(scale)
 						Attn_Wrapper.scale[self.layer_idx] = kv_scale
+						final_attn_result[start_ids:end_ids] = attn_result
 					elif self.engine_config.Basic_Config.kv_dtype == "bfloat16":
-						attn_result, kv = self.module.decoding_attn_mode_3_bf16(
+						# attn_result, kv = self.module.decoding_attn_mode_3_bf16(
+						# 	hidden_states[start_ids:end_ids],
+						# 	past_key_states[start_ids:end_ids],
+						# 	past_value_states[start_ids:end_ids] if past_value_states is not None else None,
+						# 	attention_mask[start_ids:end_ids],
+						# 	position_ids[start_ids:end_ids],
+						# 	Attn_Wrapper.cache_seqlens[start_ids:end_ids],
+						# 	Attn_Wrapper.max_seqlen,
+						# 	weight_scale = self.weight_dequant_scale
+						# )
+						attn_result = self.module.decoding_attn_mode_3_bf16(
 							hidden_states[start_ids:end_ids],
-							past_key_states[start_ids:end_ids],
-							past_value_states[start_ids:end_ids] if past_value_states is not None else None,
+							past_key_states,  # Pass FULL tensor
+							past_value_states,
+							# final_attn_result,
 							attention_mask[start_ids:end_ids],
 							position_ids[start_ids:end_ids],
 							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
 							Attn_Wrapper.max_seqlen,
-							weight_scale = self.weight_dequant_scale
+							batch_start_idx=start_ids,  # Pass indices
+							batch_end_idx=end_ids,
+							weight_scale=self.weight_dequant_scale
 						)
-						scale = None
-						past_key_states[start_ids:end_ids].copy_(kv)
+						# scale = None
+						# past_key_states[start_ids:end_ids].copy_(kv)
+						final_attn_result[start_ids:end_ids].copy_(attn_result)
 					else:
 						raise NotImplementedError
 
-					final_attn_result[start_ids:end_ids] = attn_result
+					
 
 
 				Attn_Wrapper.past_key_states[self.layer_idx] = past_key_states
@@ -617,12 +632,13 @@ class Attn_Wrapper(torch.nn.Module):
 						0.0, dtype=param.data.dtype, device=param.data.device
 					)
 			else:
-				torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-				self.module.q_a_proj.weight.data = self.fp8_q_a_proj
-				self.module.q_b_proj.weight.data = self.fp8_q_b_proj
-				self.module.kv_a_proj_with_mqa.weight.data = self.fp8_kv_a_proj_with_mqa
-				self.module.kv_b_proj.weight.data = self.fp8_kv_b_proj
-				self.module.o_proj.weight.data = self.fp8_o_proj
+				# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
+				# self.module.q_a_proj.weight.data = self.fp8_q_a_proj
+				# self.module.q_b_proj.weight.data = self.fp8_q_b_proj
+				# self.module.kv_a_proj_with_mqa.weight.data = self.fp8_kv_a_proj_with_mqa
+				# self.module.kv_b_proj.weight.data = self.fp8_kv_b_proj
+				# self.module.o_proj.weight.data = self.fp8_o_proj
+				pass
 			logging.debug(
 				f"[Rank: {dist.get_rank()} Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
 			)
@@ -760,16 +776,13 @@ class Expert_Wrapper(torch.nn.Module):
 			if Attn_Wrapper.phase == "prefill":
 				"""deepgemm kernel"""
 				result[start:end] = self.module.deepgemm_forward(micro_batch, self.weight_dequant_scale)
-				# hidden_states[start:end] = self.module.deepgemm_forward(
-				# 	hidden_states[start:end], self.weight_dequant_scale
-				# )
 			else:
 				"""Triton kernel""" 
-				# offset = start * result.shape[-1] if hidden_states.dim() == 2 else start * result.shape[-1] * result.shape[-2]
-				# self.module.fused_fp8_forward(micro_batch, self.weight_dequant_scale, result, offset)
-				result[start:end] = self.module.fused_fp8_forward(
-					micro_batch, self.weight_dequant_scale
-				)
+				# result[start:end] = self.module.fused_fp8_forward(
+				# 	micro_batch, self.weight_dequant_scale
+				# )
+				"""deepgemm kernel"""
+				result[start:end] = self.module.deepgemm_forward(micro_batch, self.weight_dequant_scale)
 
 		# Step 3: Clean up
 		if self.get_weights:

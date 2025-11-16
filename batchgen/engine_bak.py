@@ -1713,7 +1713,7 @@ class BatchGen:
 		# TODO:
 		if self.world_size <= 8:
 			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-			self.set_phase("decoding")
+			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()
@@ -1724,7 +1724,7 @@ class BatchGen:
 		else:
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
 
-			self.set_phase("decoding")
+			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()

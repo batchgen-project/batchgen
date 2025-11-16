@@ -258,7 +258,16 @@ class PyNcclCommunicator:
             self.comm,
             cudaStream_t(stream.cuda_stream),
         )
+    def group_start(self):
+        if self.disabled:
+            return
+        self.nccl.ncclGroupStart()
 
+    def group_end(self):
+        if self.disabled:
+            return
+        self.nccl.ncclGroupEnd()
+        
     @contextmanager
     def change_state(
         self, enable: Optional[bool] = None, stream: Optional[torch.cuda.Stream] = None
