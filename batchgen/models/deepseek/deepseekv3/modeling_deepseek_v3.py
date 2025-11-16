@@ -2922,7 +2922,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 								stream=torch.cuda.default_stream(self.device))
 			
 			self.max_recv_tokens = worst_case_global.item()
-			# CRITICAL: Ensure at least size 1, just like original!
 			self.max_recv_tokens = max(self.max_recv_tokens, 1)
 			
 			self.recv_x_buffer = torch.empty(self.max_recv_tokens, hidden_size, device=device, dtype=x.dtype)
@@ -2935,76 +2934,133 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		sc_list = sc.tolist()
 		rc_list = rc.tolist()
 		recv_total = sum(rc_list)
-		recv_total = max(recv_total, 1)  # ← MATCH ORIGINAL: Always at least 1!
+		recv_total = max(recv_total, 1)  # Clamp to at least 1
 		
-		# ---- 6) Prepare buffers and chunks ---------------------------------
+		# ---- 6) Compute offsets on CPU (from already-transferred data) -----
+		send_offsets_list = [0]
+		recv_offsets_list = [0]
+		for i in range(self.world_size - 1):
+			send_offsets_list.append(send_offsets_list[-1] + sc_list[i])
+			recv_offsets_list.append(recv_offsets_list[-1] + rc_list[i])
+		
+		# ---- 7) Prepare buffers --------------------------------------------
 		send_x = sorted_x
 		send_eid = sorted_eids
-		recv_x = self.recv_x_buffer[:recv_total]  # Now always at least size 1
+		recv_x = self.recv_x_buffer[:recv_total]
 		recv_eid = self.recv_eid_buffer[:recv_total]
-		
-		send_chunks_x = torch.split(send_x, sc_list)
-		send_chunks_eid = torch.split(send_eid, sc_list)
-		recv_chunks_x = torch.split(recv_x, rc_list)
-		recv_chunks_eid = torch.split(recv_eid, rc_list)
 		
 		stream = torch.cuda.default_stream(self.device)
 		
-		# ---- 7) Forward NCCL send/recv -------------------------------------
+		# ---- 8) Forward NCCL send/recv (EXACTLY like original) -------------
+		# Handle self-communication
 		if sc_list[self.rank] > 0:
-			recv_chunks_x[self.rank].copy_(send_chunks_x[self.rank])
-			recv_chunks_eid[self.rank].copy_(send_chunks_eid[self.rank])
+			send_start = send_offsets_list[self.rank]
+			recv_start = recv_offsets_list[self.rank]
+			count = sc_list[self.rank]
+			
+			recv_x[recv_start:recv_start + count].copy_(send_x[send_start:send_start + count])
+			recv_eid[recv_start:recv_start + count].copy_(send_eid[send_start:send_start + count])
 		
+		# NCCL group
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
 			
-			# ALWAYS post for ALL ranks to maintain symmetry
+			# Post all recvs - ALWAYS for all ranks
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				self.comm.recv(recv_chunks_x[rank], src=rank, stream=stream)
-				self.comm.recv(recv_chunks_eid[rank], src=rank, stream=stream)
+				
+				count = rc_list[rank]
+				recv_start = recv_offsets_list[rank]
+				
+				# MATCH ORIGINAL: Create slices for each rank, even if empty
+				if count > 0:
+					recv_slice_x = recv_x[recv_start:recv_start + count]
+					recv_slice_eid = recv_eid[recv_start:recv_start + count]
+				else:
+					recv_slice_x = recv_x[0:0]
+					recv_slice_eid = recv_eid[0:0]
+				
+				self.comm.recv(recv_slice_x, src=rank, stream=stream)
+				self.comm.recv(recv_slice_eid, src=rank, stream=stream)
 			
+			# Post all sends - ALWAYS for all ranks
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				self.comm.send(send_chunks_x[rank], dst=rank, stream=stream)
-				self.comm.send(send_chunks_eid[rank], dst=rank, stream=stream)
+				
+				count = sc_list[rank]
+				send_start = send_offsets_list[rank]
+				
+				# MATCH ORIGINAL: Create slices for each rank, even if empty
+				if count > 0:
+					send_slice_x = send_x[send_start:send_start + count]
+					send_slice_eid = send_eid[send_start:send_start + count]
+				else:
+					send_slice_x = send_x[0:0]
+					send_slice_eid = send_eid[0:0]
+				
+				self.comm.send(send_slice_x, dst=rank, stream=stream)
+				self.comm.send(send_slice_eid, dst=rank, stream=stream)
 			
 			self.comm.group_end()
 		
-		# ---- 8) local computation ------------------------------------------
-		# Match original logic: check if > 1 because we allocated max(recv_total, 1)
-		actual_recv = sum(rc_list)  # The REAL receive count
+		# ---- 9) local computation ------------------------------------------
+		actual_recv = sum(rc_list)
 		if actual_recv > 0:
 			recv_eid_sorted, local_sort_idx = recv_eid[:actual_recv].sort()
 			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
 			res = self.grouped_dequant_moe_fp8_bak(recv_x[:actual_recv][local_sort_idx], recv_eid_sorted)
 			recv_x[:actual_recv][local_sort_idx] = res
 		
-		# ---- 9) Reverse NCCL send/recv -------------------------------------
+		# ---- 10) Reverse NCCL send/recv ------------------------------------
 		out_sorted = torch.empty_like(sorted_x)
-		out_chunks = torch.split(out_sorted, sc_list)
 		
+		# Handle self-communication
 		if sc_list[self.rank] > 0:
-			out_chunks[self.rank].copy_(recv_chunks_x[self.rank])
+			send_start = recv_offsets_list[self.rank]
+			recv_start = send_offsets_list[self.rank]
+			count = sc_list[self.rank]
+			
+			out_sorted[recv_start:recv_start + count].copy_(recv_x[send_start:send_start + count])
 		
+		# NCCL group for return
 		with self.comm.change_state(enable=True):
 			self.comm.group_start()
 			
+			# Post recvs
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				self.comm.recv(out_chunks[rank], src=rank, stream=stream)
+				
+				count = sc_list[rank]
+				recv_start = send_offsets_list[rank]
+				
+				if count > 0:
+					recv_slice = out_sorted[recv_start:recv_start + count]
+				else:
+					recv_slice = out_sorted[0:0]
+				
+				self.comm.recv(recv_slice, src=rank, stream=stream)
 			
+			# Post sends
 			for rank in range(self.world_size):
 				if rank == self.rank:
 					continue
-				self.comm.send(recv_chunks_x[rank], dst=rank, stream=stream)
+				
+				count = rc_list[rank]
+				send_start = recv_offsets_list[rank]
+				
+				if count > 0:
+					send_slice = recv_x[send_start:send_start + count]
+				else:
+					send_slice = recv_x[0:0]
+				
+				self.comm.send(send_slice, dst=rank, stream=stream)
 			
 			self.comm.group_end()
 		
-		# ---- 10) unsort, accumulate, normalise -----------------------------
+		# ---- 11) unsort, accumulate, normalise -----------------------------
 		unsort_idx = sort_idx.argsort()
 		final_x = out_sorted[unsort_idx]
 		final_wt = sorted_wt[unsort_idx]
