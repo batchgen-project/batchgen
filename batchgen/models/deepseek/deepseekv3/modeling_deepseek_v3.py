@@ -1566,7 +1566,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# This value must be >= max(rc.sum()) across all ranks and all
 		# possible inputs (e.g., max_batch_size * max_seq_len * K)
 		# We'll use getattr to provide a reasonable default.
-		self.max_moe_buffer_tokens = getattr(config, 'max_moe_buffer_tokens', 1024)
+		# self.max_moe_buffer_tokens = getattr(config, 'max_moe_buffer_tokens', 1024)
+		self.max_recv_tokens = getattr(config, 'max_moe_buffer_tokens', 1024)
 		
 		# We need hidden_size and dtype. We assume they are in the config
 		# as they are required for the DeepseekV3MLP module.
@@ -1580,7 +1581,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.register_buffer(
 			"recv_x_buffer",
 			torch.empty(
-				self.max_moe_buffer_tokens,
+				self.max_recv_tokens,
 				hidden_size,
 				device=self.device,
 				dtype=dtype
@@ -1589,11 +1590,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.register_buffer(
 			"recv_eid_buffer",
 			torch.empty(
-				self.max_moe_buffer_tokens,
+				self.max_recv_tokens,
 				device=self.device,
 				dtype=eid_dtype
 			)
 		)
+
 
 
 		# Pre-compute maximum possible tokens per rank (worst case: all tokens go to one rank)
@@ -1710,7 +1712,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_alltoall_sendrecv_v2(hidden_states)
+		out = self.moe_infer_alltoall_sendrecv_v3(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
@@ -2776,6 +2778,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
 		reshaped_counts = local_counts.view(self.world_size, -1)
 		sc = reshaped_counts.sum(dim=1)  # [world_size], send to each rank
+
 		
 		# ---- 3) exchange counts --------------------------------------------
 		gathered_tensor = torch.zeros((self.world_size, self.world_size), device=device, dtype=sc.dtype)
@@ -2881,6 +2884,142 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		return final_x.to(x.dtype)
 
+	@torch.inference_mode()
+	def moe_infer_alltoall_sendrecv_v3(self, x):
+		num_tokens, hidden_size = x.shape
+		K = self.num_experts_per_tok
+		device = x.device
+		
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(x.view(num_tokens, 1, hidden_size))
+		
+		# ---- 1) flatten, sort by expert ------------------------------------
+		flat_eids = topk_idx.flatten()
+		flat_wts = topk_weight.flatten()
+		expanded_x = x.repeat_interleave(K, dim=0)
+		
+		sorted_eids, sort_idx = flat_eids.sort()
+		sorted_x = expanded_x[sort_idx]
+		sorted_wt = flat_wts[sort_idx]
+		
+		# ---- 2) compute send/recv counts -----------------------------------
+		local_counts = torch.bincount(sorted_eids, minlength=self.total_experts)
+		reshaped_counts = local_counts.view(self.world_size, -1)
+		sc = reshaped_counts.sum(dim=1)  # [world_size], send to each rank
+		
+		# ---- 3) exchange counts --------------------------------------------
+		gathered_tensor = torch.zeros((self.world_size, self.world_size), device=device, dtype=sc.dtype)
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(gathered_tensor, sc, stream=torch.cuda.default_stream(self.device))
+		rc = gathered_tensor[:, self.rank]  # what we'll receive from each rank
+		
+		# ---- 4) Pre-allocate buffers (first call only) ---------------------
+		recv_total_tensor = rc.sum()  # Keep on GPU
+		
+		if self.recv_x_buffer is None:
+			# One-time setup: compute worst-case buffer size
+			# Worst case: all tokens from all ranks
+			worst_case_local = torch.tensor(sorted_x.shape[0], device=device, dtype=torch.int64)
+			worst_case_global = torch.empty_like(worst_case_local)
+			
+			with self.comm.change_state(enable=True):
+				self.comm.all_reduce(worst_case_global, worst_case_local, op='sum', 
+								stream=torch.cuda.default_stream(self.device))
+			
+			self.max_recv_tokens = worst_case_global.item()  # ONE-TIME .item() at init
+			self.recv_x_buffer = torch.empty(self.max_recv_tokens, hidden_size, device=device, dtype=x.dtype)
+			self.recv_eid_buffer = torch.empty(self.max_recv_tokens, device=device, dtype=sorted_eids.dtype)
+			
+			mem_mb = self.max_recv_tokens * hidden_size * x.element_size() / 1e6
+			print(f"[Rank {self.rank}] Pre-allocated recv buffers: {self.max_recv_tokens} tokens ({mem_mb:.1f} MB)")
+		
+		# ---- 5) Get actual receive views (NO .item() - use GPU tensor!) ----
+		recv_x = self.recv_x_buffer[:recv_total_tensor]
+		recv_eid = self.recv_eid_buffer[:recv_total_tensor]
+		
+		# ---- 6) Prepare for communication using torch.split ---------------
+		# Single batched DtoH transfer for split sizes
+		sc_list = sc.tolist()
+		rc_list = rc.tolist()
+		
+		send_chunks_x = torch.split(sorted_x, sc_list)
+		send_chunks_eid = torch.split(sorted_eids, sc_list)
+		
+		# Split actual receive buffers (empty if recv_total is 0)
+		recv_chunks_x = torch.split(recv_x, rc_list) if recv_total_tensor > 0 else [recv_x[0:0]] * self.world_size
+		recv_chunks_eid = torch.split(recv_eid, rc_list) if recv_total_tensor > 0 else [recv_eid[0:0]] * self.world_size
+		
+		stream = torch.cuda.default_stream(self.device)
+		
+		# ---- 7) Forward NCCL send/recv -------------------------------------
+		# Handle self-communication (direct copy, no NCCL)
+		if sc_list[self.rank] > 0:
+			recv_chunks_x[self.rank].copy_(send_chunks_x[self.rank])
+			recv_chunks_eid[self.rank].copy_(send_chunks_eid[self.rank])
+		
+		# NCCL group for all other ranks
+		with self.comm.change_state(enable=True):
+			self.comm.group_start()
+			
+			# Post all recvs first
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				self.comm.recv(recv_chunks_x[rank], src=rank, stream=stream)
+				self.comm.recv(recv_chunks_eid[rank], src=rank, stream=stream)
+			
+			# Post all sends
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				self.comm.send(send_chunks_x[rank], dst=rank, stream=stream)
+				self.comm.send(send_chunks_eid[rank], dst=rank, stream=stream)
+			
+			self.comm.group_end()
+		
+		# ---- 8) local computation ------------------------------------------
+		# Only process if we received data (recv_total_tensor is GPU tensor)
+		if recv_total_tensor > 0:
+			recv_eid_sorted, local_sort_idx = recv_eid.sort()
+			recv_eid_sorted = recv_eid_sorted.to(torch.int32)
+			res = self.grouped_dequant_moe_fp8_bak(recv_x[local_sort_idx], recv_eid_sorted)
+			recv_x[local_sort_idx] = res
+		
+		# ---- 9) Reverse NCCL send/recv -------------------------------------
+		out_sorted = torch.empty_like(sorted_x)
+		out_chunks = torch.split(out_sorted, sc_list)
+		
+		# Handle self-communication
+		if sc_list[self.rank] > 0:
+			out_chunks[self.rank].copy_(recv_chunks_x[self.rank])
+		
+		# NCCL group for return communication
+		with self.comm.change_state(enable=True):
+			self.comm.group_start()
+			
+			# Post recvs (receiving back from where we sent)
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				self.comm.recv(out_chunks[rank], src=rank, stream=stream)
+			
+			# Post sends (sending to where we received from)
+			for rank in range(self.world_size):
+				if rank == self.rank:
+					continue
+				self.comm.send(recv_chunks_x[rank], dst=rank, stream=stream)
+			
+			self.comm.group_end()
+		
+		# ---- 10) unsort, accumulate, normalise -----------------------------
+		unsort_idx = sort_idx.argsort()
+		final_x = out_sorted[unsort_idx]
+		final_wt = sorted_wt[unsort_idx]
+		
+		final_x = final_x * final_wt.unsqueeze(-1)
+		final_x = final_x.view(num_tokens, K, -1)
+		final_x = final_x.sum(dim=1)
+		
+		return final_x.to(x.dtype)
 
 
 	@torch.inference_mode()
