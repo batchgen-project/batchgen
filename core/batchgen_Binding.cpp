@@ -18,28 +18,152 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include "KV_Storage/host_paged_kv_manager.h"
+#include "KV_Storage/host_paged_kv_worker_view.h"
 #include "batchgen.h"
 #include "allocator.h"
+#include "data_structures.h"
 #include <ATen/cuda/CachingHostAllocator.h>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
 namespace py = pybind11;
-torch::Tensor pass_tensor(py::handle py_tensor) {
-    // Borrow the tensor without increasing the reference count
-    py::object borrowed_tensor = py::reinterpret_borrow<py::object>(py_tensor);
+namespace kv = batchgen::kv;
 
-    // Cast to torch::Tensor
-    auto tensor = borrowed_tensor.cast<torch::Tensor>();
+namespace {
 
-    // Log tensor shape (for demonstration purposes)
-    // spdlog::info("Tensor shape: {}", tensor.sizes());
-
-    return tensor;  // Optionally return the tensor if needed
+template <typename Manager>
+void BindHostPagedManager(py::module& m, const char* name) {
+    py::class_<Manager>(m, name)
+        .def(py::init<EngineConfig, ModelConfig>())
+        .def(py::init<kv::HostPagedKVConfig>())
+        .def("initialize", &Manager::Initialize, py::arg("create_region"))
+        .def("allocate_pages",
+             [](Manager& self, std::int64_t sequence_id,
+                std::size_t num_tokens) {
+                 return self.AllocatePages(sequence_id, num_tokens);
+             },
+             py::arg("sequence_id"), py::arg("num_tokens"))
+       .def("free_sequence", &Manager::FreeSequence,
+           py::arg("sequence_id"))
+       .def("free_sequences", &Manager::FreeSequences,
+           py::arg("sequence_ids"))
+        .def("build_page_table", &Manager::BuildPageTable,
+             py::arg("sequence_ids"))
+        .def("get_stats", &Manager::GetStats)
+       .def("__repr__",
+           [](const Manager& self) { return self.DebugString(); })
+        .def("get_sequence_layer_page_pointers",
+             [](Manager& self, std::int64_t sequence_id,
+                std::size_t layer_idx,
+                std::optional<std::size_t> max_tokens) {
+                 auto result = self.GetSequenceLayerPagePointers(
+                     sequence_id, layer_idx, max_tokens);
+                 py::list k_ptrs;
+                 for (void* ptr : result.first) {
+                     k_ptrs.append(py::int_(
+                         reinterpret_cast<std::uintptr_t>(ptr)));
+                 }
+                 py::object v_ptrs = py::none();
+                 if (result.second.has_value()) {
+                     py::list v_list;
+                     for (void* ptr : result.second.value()) {
+                         v_list.append(py::int_(
+                             reinterpret_cast<std::uintptr_t>(ptr)));
+                     }
+                     v_ptrs = std::move(v_list);
+                 }
+                 return py::make_tuple(std::move(k_ptrs), v_ptrs);
+             },
+             py::arg("sequence_id"), py::arg("layer_idx"),
+             py::arg("max_tokens") = py::none());
 }
+
+template <typename WorkerView>
+void BindHostPagedWorkerView(py::module& m, const char* name) {
+    py::class_<WorkerView>(m, name)
+        .def(py::init<kv::HostPagedKVConfig>(), py::arg("config"))
+        .def("initialize", &WorkerView::Initialize,
+             py::arg("device_index"),
+             py::arg("create_region") = false)
+        .def("shutdown", &WorkerView::Shutdown)
+        .def("data_base_address",
+             [](WorkerView& self) -> std::uintptr_t {
+                 return reinterpret_cast<std::uintptr_t>(self.DataBase());
+             })
+        .def("k_page_ptr",
+             [](WorkerView& self, std::size_t layer_idx,
+                std::int32_t page_idx) -> std::uintptr_t {
+                 return reinterpret_cast<std::uintptr_t>(
+                     self.KPagePtr(layer_idx, page_idx));
+             },
+             py::arg("layer_idx"), py::arg("page_idx"))
+        .def(
+            "v_page_ptr",
+            [](WorkerView& self, std::size_t layer_idx,
+               std::int32_t page_idx) -> std::uintptr_t {
+                if constexpr (WorkerView::kHasVCache) {
+                    return reinterpret_cast<std::uintptr_t>(
+                        self.VPagePtr(layer_idx, page_idx));
+                }
+                throw std::runtime_error(
+                    "V cache is disabled for this worker view");
+            },
+            py::arg("layer_idx"), py::arg("page_idx"))
+        .def("get_stats", &WorkerView::GetStats)
+       .def("build_page_table",
+           [](WorkerView& self,
+             const std::vector<std::int64_t>& sequence_ids) {
+              return self.BuildPageTable(sequence_ids);
+           },
+           py::arg("sequence_ids"))
+       .def("register_sequences", &WorkerView::RegisterSequences,
+           py::arg("sequence_ids"))
+       .def("unregister_sequence", &WorkerView::UnregisterSequence,
+           py::arg("sequence_id"))
+       .def("unregister_sequences", &WorkerView::UnregisterSequences,
+           py::arg("sequence_ids"))
+       .def("async_offload_layer_kv_to_host",
+           &WorkerView::AsyncOffloadLayerKVToHost,
+           py::arg("layer_idx"), py::arg("sequence_ids"),
+           py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+           py::arg("sequence_lengths"))
+       .def("async_append_decode_kv_to_host",
+           &WorkerView::AsyncAppendDecodeKVToHost,
+           py::arg("layer_idx"), py::arg("sequence_ids"),
+           py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+           py::arg("sequence_lengths"))
+        .def("__repr__",
+             [](const WorkerView& self) { return self.DebugString(); })
+        .def(
+            "allocate_pages_for_sequences",
+            [](WorkerView& self,
+               const std::vector<std::pair<std::int64_t, std::size_t>>&
+                   requests) {
+                std::vector<std::int64_t> sequence_ids;
+                std::vector<std::size_t> num_tokens;
+                sequence_ids.reserve(requests.size());
+                num_tokens.reserve(requests.size());
+                for (const auto& request : requests) {
+                    sequence_ids.push_back(request.first);
+                    num_tokens.push_back(request.second);
+                }
+                return self.AllocatePagesForSequences(sequence_ids,
+                                                      num_tokens);
+            })
+        .def_property_readonly("device_index", &WorkerView::device_index)
+        .def_property_readonly_static(
+            "has_v_cache",
+            [](py::object /* cls */) { return WorkerView::kHasVCache; });
+}
+
+}  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<BatchGen>(m, "batchgen")
@@ -87,7 +211,62 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 &BatchGen::get_past_key_states,
                 "Get the past key states for the given query global indices and max sequence length.");
 
-             
+    py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
+        .def(py::init<>())
+        .def_readwrite("shm_name", &kv::HostPagedKVConfig::shm_name)
+        .def_readwrite("num_layers", &kv::HostPagedKVConfig::num_layers)
+        .def_readwrite("num_pages", &kv::HostPagedKVConfig::num_pages)
+        .def_readwrite("page_size_tokens",
+                       &kv::HostPagedKVConfig::page_size_tokens)
+        .def_readwrite("num_k_heads", &kv::HostPagedKVConfig::num_k_heads)
+        .def_readwrite("k_head_dim", &kv::HostPagedKVConfig::k_head_dim)
+        .def_readwrite("num_v_heads", &kv::HostPagedKVConfig::num_v_heads)
+        .def_readwrite("v_head_dim", &kv::HostPagedKVConfig::v_head_dim)
+        .def_readwrite("k_element_size_bytes",
+                       &kv::HostPagedKVConfig::k_element_size_bytes)
+        .def_readwrite("v_element_size_bytes",
+                       &kv::HostPagedKVConfig::v_element_size_bytes)
+        .def_readwrite("sequence_table_capacity",
+                       &kv::HostPagedKVConfig::sequence_table_capacity)
+        .def_readwrite("alignment_bytes",
+                       &kv::HostPagedKVConfig::alignment_bytes)
+        .def("__repr__",
+             [](const kv::HostPagedKVConfig& self) {
+                 return kv::ToString(self);
+             });
+
+    py::class_<kv::HostPagedKVStats>(m, "HostPagedKVStats")
+        .def(py::init<>())
+        .def_readwrite("num_total_pages", &kv::HostPagedKVStats::num_total_pages)
+        .def_readwrite("num_free_pages", &kv::HostPagedKVStats::num_free_pages)
+        .def_readwrite("num_used_pages", &kv::HostPagedKVStats::num_used_pages)
+        .def_readwrite("num_active_sequences",
+                       &kv::HostPagedKVStats::num_active_sequences)
+        .def_readwrite("sequence_table_capacity",
+                       &kv::HostPagedKVStats::sequence_table_capacity)
+        .def_readwrite("total_bytes", &kv::HostPagedKVStats::total_bytes)
+        .def("__repr__",
+             [](const kv::HostPagedKVStats& self) {
+                 return kv::ToString(self);
+             });
+
+    py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
+        .def_property_readonly("id", &kv::KVAsyncTask::id)
+        .def("wait", &kv::KVAsyncTask::wait)
+        .def("done", &kv::KVAsyncTask::done)
+        .def("result", &kv::KVAsyncTask::result);
+
+    BindHostPagedManager<kv::DefaultHostPagedKVManager>(
+        m, "DefaultHostPagedKVManager");
+    BindHostPagedManager<kv::MHAHostPagedKVManager>(
+        m, "MHAHostPagedKVManager");
+    BindHostPagedManager<kv::MLAHostPagedKVManager>(
+        m, "MLAHostPagedKVManager");
+    BindHostPagedWorkerView<kv::DefaultHostPagedKVWorkerView>(
+        m, "DefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::MLAHostPagedKVWorkerView>(
+        m, "MLAHostPagedKVWorkerView");
+
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool>())
         .def("Init", &Parameter_Server::Init)

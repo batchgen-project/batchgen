@@ -107,6 +107,15 @@ struct GPU_Buffer_Config {
     int64_t kv_buffer_num_tokens;  // Size of the buffer in tokens.
 };
 
+struct HostPagedKVConfig {
+    std::string shm_name;
+    std::size_t num_pages = 0;
+    std::size_t page_size_tokens = 0;
+    std::size_t k_element_size_bytes = 0;
+    std::size_t v_element_size_bytes = 0;
+    std::size_t sequence_table_capacity = 0;
+};
+
 struct Basic_Config {
     std::string log_level;
     int64_t device;
@@ -142,6 +151,7 @@ struct EngineConfig {
     // Weights_Storage_Config weights_storage_config;
     GPU_Buffer_Config gpu_buffer_config;
     Module_Batching_Config module_batching_config;
+    HostPagedKVConfig host_paged_kv_config;
 };
 
 struct ModelConfig {
