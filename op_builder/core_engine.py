@@ -28,8 +28,6 @@ class CoreEngineBuilder(CUDAOpBuilder):
             f"{BATCHGEN_CORE_ROOT}/Parameter_Server/posix_shm.cpp",
             f"{BATCHGEN_CORE_ROOT}/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp",
             f"{BATCHGEN_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
-            f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
-            f"{BATCHGEN_CORE_ROOT}/allocator.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_manager.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_backend.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_worker_view.cpp",
