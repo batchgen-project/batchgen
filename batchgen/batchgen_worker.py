@@ -28,6 +28,7 @@ from tqdm import trange
 import gc
 from datetime import timedelta
 from dataclasses import dataclass
+import torch.distributed._symmetric_memory as symm_mem
 
 
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
@@ -968,6 +969,15 @@ class BatchGenWorker:
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
+		
+		# Initialize symmetric memory once during model initialization
+		if not symm_mem.is_nvshmem_available():
+			logging.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
+			symm_mem.set_backend("NCCL")
+		else:
+			symm_mem.set_backend("NVSHMEM")
+		group_name = dist.group.WORLD.group_name
+		symm_mem.enable_symm_mem_for_group(group_name)
 
 
 		# Get number of sequences for each rank 

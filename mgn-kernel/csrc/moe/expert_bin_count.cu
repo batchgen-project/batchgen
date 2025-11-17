@@ -400,40 +400,40 @@ std::vector<torch::Tensor> compact_expert_data_cuda(
 }
 
 
-__global__ void compute_expert_offsets_kernel(
-    const int32_t* expert_counts,      // [num_local_experts]
-    int32_t* expert_offsets,           // [num_local_experts] - OUTPUT: prefix sum
-    const int32_t num_local_experts
-) {
-    // Simple prefix sum computation
-    int tid = threadIdx.x;
+// __global__ void compute_expert_offsets_kernel(
+//     const int32_t* expert_counts,      // [num_local_experts]
+//     int32_t* expert_offsets,           // [num_local_experts] - OUTPUT: prefix sum
+//     const int32_t num_local_experts
+// ) {
+//     // Simple prefix sum computation
+//     int tid = threadIdx.x;
     
-    if (tid == 0) {
-        int cumsum = 0;
-        for (int i = 0; i < num_local_experts; i++) {
-            expert_offsets[i] = cumsum;
-            cumsum += expert_counts[i];
-        }
-    }
-}
+//     if (tid == 0) {
+//         int cumsum = 0;
+//         for (int i = 0; i < num_local_experts; i++) {
+//             expert_offsets[i] = cumsum;
+//             cumsum += expert_counts[i];
+//         }
+//     }
+// }
 
-torch::Tensor compute_expert_offsets_cuda(torch::Tensor expert_counts) {
+// torch::Tensor compute_expert_offsets_cuda(torch::Tensor expert_counts) {
     
-    const auto num_local_experts = expert_counts.size(0);
-    const auto device = expert_counts.device();
+//     const auto num_local_experts = expert_counts.size(0);
+//     const auto device = expert_counts.device();
 
-    TORCH_CHECK(expert_counts.is_cuda(), "expert_counts must be a CUDA tensor");
-    TORCH_CHECK(expert_counts.dtype() == torch::kInt32, "expert_counts must be int32");
+//     TORCH_CHECK(expert_counts.is_cuda(), "expert_counts must be a CUDA tensor");
+//     TORCH_CHECK(expert_counts.dtype() == torch::kInt32, "expert_counts must be int32");
 
-    // Just compute prefix sum
-    auto expert_offsets = torch::empty({num_local_experts}, 
-                                       torch::TensorOptions().dtype(torch::kInt32).device(device));
+//     // Just compute prefix sum
+//     auto expert_offsets = torch::empty({num_local_experts}, 
+//                                        torch::TensorOptions().dtype(torch::kInt32).device(device));
 
-    compute_expert_offsets_kernel<<<1, 1>>>(
-        expert_counts.data_ptr<int32_t>(),
-        expert_offsets.data_ptr<int32_t>(),
-        static_cast<int32_t>(num_local_experts)
-    );
+//     compute_expert_offsets_kernel<<<1, 1>>>(
+//         expert_counts.data_ptr<int32_t>(),
+//         expert_offsets.data_ptr<int32_t>(),
+//         static_cast<int32_t>(num_local_experts)
+//     );
 
-    return expert_offsets;
-}
+//     return expert_offsets;
+// }
