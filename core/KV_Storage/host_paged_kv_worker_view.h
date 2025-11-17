@@ -252,16 +252,18 @@ class HostPagedKVWorkerView {
         }
     }
 
-    std::vector<std::int32_t> GrowSequencePages(std::int64_t sequence_id,
-                                                std::size_t additional_pages) {
-        EnsureDeviceReady();
-        EnsureSequenceRegistered(sequence_id);
-        if (additional_pages == 0) {
-            return {};
+    void UnregisterSequence(std::int64_t sequence_id) {
+        page_table_.Remove(sequence_id);
+    }
+
+    void UnregisterSequences(const std::vector<std::int64_t>& sequence_ids) {
+        if (sequence_ids.empty()) {
+            return;
         }
-        auto new_pages = backend_.AcquirePages(sequence_id, additional_pages);
-        page_table_.AppendPages(sequence_id, new_pages);
-        return new_pages;
+        std::for_each(sequence_ids.begin(), sequence_ids.end(),
+                      [this](std::int64_t sequence_id) {
+                          UnregisterSequence(sequence_id);
+                      });
     }
 
     KVAsyncTask AsyncOffloadLayerKVToHost(
