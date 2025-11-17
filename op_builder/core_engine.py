@@ -1,6 +1,6 @@
 from .builder import CUDAOpBuilder
 
-batchgen_CORE_ROOT = "core/"
+BATCHGEN_CORE_ROOT = "core/"
 
 
 class CoreEngineBuilder(CUDAOpBuilder):
@@ -15,21 +15,27 @@ class CoreEngineBuilder(CUDAOpBuilder):
 
     def sources(self):
         return [
-            f"{batchgen_CORE_ROOT}/utils.cpp",
-            f"{batchgen_CORE_ROOT}/batchgen_Binding.cpp",
-            f"{batchgen_CORE_ROOT}/batchgen.cpp",
-            f"{batchgen_CORE_ROOT}/DtoH_Engine/DtoH_Engine.cpp",
-            f"{batchgen_CORE_ROOT}/Hetero_Attn/Hetero_Attn.cpp",
-            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cu",
-            f"{batchgen_CORE_ROOT}/HtoD_Engine/HtoD_Engine_Kernels.cu",  # Your CUDA kernel
-            f"{batchgen_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
-            f"{batchgen_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
-            f"{batchgen_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
-            f"{batchgen_CORE_ROOT}/Parameter_Server/posix_shm.cpp",
-            f"{batchgen_CORE_ROOT}/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp",
-            f"{batchgen_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
-            f"{batchgen_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
-            f"{batchgen_CORE_ROOT}/allocator.cpp",
+            f"{BATCHGEN_CORE_ROOT}/utils.cpp",
+            f"{BATCHGEN_CORE_ROOT}/batchgen_Binding.cpp",
+            f"{BATCHGEN_CORE_ROOT}/batchgen.cpp",
+            f"{BATCHGEN_CORE_ROOT}/DtoH_Engine/DtoH_Engine.cpp",
+            f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/Hetero_Attn.cpp",
+            f"{BATCHGEN_CORE_ROOT}/HtoD_Engine/HtoD_Engine.cu",
+            f"{BATCHGEN_CORE_ROOT}/HtoD_Engine/HtoD_Engine_Kernels.cu",  # Your CUDA kernel
+            f"{BATCHGEN_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
+            f"{BATCHGEN_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
+            f"{BATCHGEN_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
+            f"{BATCHGEN_CORE_ROOT}/Parameter_Server/posix_shm.cpp",
+            f"{BATCHGEN_CORE_ROOT}/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp",
+            f"{BATCHGEN_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
+            f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
+            f"{BATCHGEN_CORE_ROOT}/allocator.cpp",
+            f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_manager.cpp",
+            f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_backend.cpp",
+            f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_worker_view.cpp",
+            f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_kv_page_table.cpp",
+
+
         ]
 
     def include_paths(self):

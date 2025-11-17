@@ -38,9 +38,13 @@
 #include <memory>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <algorithm>
+#include <array>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <torch/cuda.h>
 #include <torch/extension.h>
 #include <torch/torch.h>
@@ -100,6 +104,10 @@ std::string get_tensor_shape(
     const torch::Tensor& t,
     bool include_dtype = true,
     bool include_device = true);
+
+double BytesToKilobytes(std::size_t bytes);
+double BytesToMegabytes(std::size_t bytes);
+double BytesToGigabytes(std::size_t bytes);
 
 template <typename T>
 constexpr T ceil_div(T numerator, T denominator) {

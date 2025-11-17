@@ -21,16 +21,20 @@
 #include "spdlog/spdlog.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAEvent.h>
+#include <algorithm>
+#include <array>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Exception.h>
 #include <condition_variable>
+#include <iomanip>
 #include <memory>
 #include <pybind11/embed.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <torch/cuda.h>
 #include <torch/extension.h>
@@ -268,4 +272,24 @@ std::string get_tensor_shape(const torch::Tensor& tensor,
     }
     
     return shape_str.str();
+}
+
+namespace {
+
+constexpr double kKilobyte = 1024.0;
+constexpr double kMegabyte = kKilobyte * 1024.0;
+constexpr double kGigabyte = kMegabyte * 1024.0;
+
+}  // namespace
+
+double BytesToKilobytes(std::size_t bytes) {
+    return static_cast<double>(bytes) / kKilobyte;
+}
+
+double BytesToMegabytes(std::size_t bytes) {
+    return static_cast<double>(bytes) / kMegabyte;
+}
+
+double BytesToGigabytes(std::size_t bytes) {
+    return static_cast<double>(bytes) / kGigabyte;
 }
