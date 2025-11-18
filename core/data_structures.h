@@ -116,6 +116,13 @@ struct HostPagedKVConfig {
     std::size_t sequence_table_capacity = 0;
 };
 
+struct GPUPagedKVConfig {
+    std::size_t num_pages = 0;
+    std::size_t page_size_tokens = 0;
+    std::size_t k_element_size_bytes = 0;
+    std::size_t v_element_size_bytes = 0;
+};
+
 struct Basic_Config {
     std::string log_level;
     int64_t device;

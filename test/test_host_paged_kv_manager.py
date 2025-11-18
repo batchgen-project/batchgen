@@ -260,7 +260,8 @@ def _worker_proc_copy_prefill(shm_name, device_index, requests):
         device=f"cuda:{device_index}"
     )
 
-    time.sleep(10)
+    torch.cuda.synchronize(device_index)
+
 
     start = time.time()
     task = worker.async_offload_layer_kv_to_host(
@@ -298,6 +299,8 @@ def _worker_proc_copy_decode(shm_name, device_index, requests):
     )
     for idx, sequence_id in enumerate(seq_ids):
         device_tensor[idx].fill_(float(sequence_id + 1))
+
+    torch.cuda.synchronize(device_index)
 
     start = time.time()
 
@@ -417,14 +420,14 @@ def test_kv_copy_prefill_d2h():
 
 
 def test_kv_copy_decode_d2h():
-    PAGE_NUM_PER_SEQ = 4
-    NUM_WORKERS = 4
-
+    PAGE_NUM_PER_SEQ = 10
+    NUM_WORKERS = 8
+    SEQ_NUM_PER_WORKER = 10
     shm_name = _random_shm_name()
     cfg = _make_deepseek_r1_config(shm_name)
     manager = bg.MLAHostPagedKVManager(cfg)
 
-    sequence_ids = [i for i in range(0, NUM_WORKERS * 6)]
+    sequence_ids = [i for i in range(0, NUM_WORKERS * SEQ_NUM_PER_WORKER)]
     capacity_tokens = cfg.page_size_tokens * PAGE_NUM_PER_SEQ
     max_start_token = capacity_tokens - 1
     decode_positions = {
@@ -493,5 +496,5 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     # test_batch_allocate_and_free_sequences()
     # test_parallel_worker_allocate_sequences()
-    # test_kv_copy_prefill_d2h()
-    test_kv_copy_decode_d2h()
+    test_kv_copy_prefill_d2h()
+    # test_kv_copy_decode_d2h()

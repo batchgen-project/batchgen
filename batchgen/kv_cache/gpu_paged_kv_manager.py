@@ -1,762 +1,571 @@
-import torch
+from __future__ import annotations
+
 import logging
-import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import torch
+
+
+def _require_positive(value: Optional[int], field_name: str) -> int:
+    """Ensures that ``value`` is a strictly positive integer."""
+    if value is None or value <= 0:
+        raise ValueError(f"{field_name} must be > 0, got {value}")
+    return int(value)
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    if divisor <= 0:
+        raise ValueError("divisor must be positive")
+    return -(-value // divisor)
+
+
+def _as_int_tensor(values: Iterable[int]) -> torch.Tensor:
+    return torch.as_tensor(list(values), dtype=torch.int32)
+
+
+@dataclass(frozen=True)
+class GPUPagedKVStats:
+    num_total_pages: int
+    num_free_pages: int
+    num_used_pages: int
+    num_total_pages_allocated: int
+
+
+@dataclass(frozen=True)
+class GPUPagedKVConfig:
+    num_layers: int
+    num_pages: int
+    page_size_tokens: int
+    num_k_heads: int
+    k_head_dim: int
+    num_v_heads: Optional[int]
+    v_head_dim: Optional[int]
+    kv_dtype: torch.dtype
+    alignment_bytes: int = 64
+
+    @classmethod
+    def from_engine(cls, engine_config) -> "GPUPagedKVConfig":  # noqa: D401
+        cfg = engine_config.gpu_kv_config
+        num_layers = _require_positive(
+            getattr(cfg, "num_layers", None), "num_layers"
+        )
+        num_pages = _require_positive(
+            getattr(cfg, "num_gpu_pages", None), "num_gpu_pages"
+        )
+        page_size = _require_positive(
+            getattr(cfg, "page_size_tokens", None), "page_size_tokens"
+        )
+        num_k_heads = _require_positive(
+            getattr(cfg, "num_k_heads", None), "num_k_heads"
+        )
+        k_head_dim = _require_positive(
+            getattr(cfg, "k_head_dim", None), "k_head_dim"
+        )
+        kv_dtype = getattr(cfg, "kv_dtype_torch", None)
+        if kv_dtype is None:
+            raise ValueError("gpu_kv_config.kv_dtype_torch must be defined")
+        num_v_heads = getattr(cfg, "num_v_heads", None)
+        v_head_dim = getattr(cfg, "v_head_dim", None)
+        if num_v_heads is not None and num_v_heads > 0:
+            v_head_dim = _require_positive(v_head_dim, "v_head_dim")
+        else:
+            num_v_heads = 0
+            v_head_dim = 0
+        alignment = getattr(cfg, "alignment_bytes", 64) or 64
+        return cls(
+            num_layers=num_layers,
+            num_pages=num_pages,
+            page_size_tokens=page_size,
+            num_k_heads=num_k_heads,
+            k_head_dim=k_head_dim,
+            num_v_heads=num_v_heads,
+            v_head_dim=v_head_dim,
+            kv_dtype=kv_dtype,
+            alignment_bytes=alignment,
+        )
+
+    @property
+    def has_v_cache(self) -> bool:
+        return bool(self.num_v_heads and self.v_head_dim)
+
+
+class _TensorStack:
+    """A lightweight stack backed by a tensor for deterministic page allocation."""
+
+    def __init__(self, capacity: int):
+        self._buffer = torch.empty(capacity, dtype=torch.int32)
+        self._size = 0
+        if capacity > 0:
+            self.push(torch.arange(capacity - 1, -1, -1, dtype=torch.int32))
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def capacity(self) -> int:
+        return self._buffer.numel()
+
+    def push(self, values: torch.Tensor | Iterable[int]) -> None:
+        tensor = torch.as_tensor(values, dtype=torch.int32)
+        count = int(tensor.numel())
+        if self._size + count > self.capacity:
+            raise RuntimeError("TensorStack overflow")
+        self._buffer[self._size : self._size + count] = tensor
+        self._size += count
+
+    def pop(self, count: int) -> torch.Tensor:
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        if count > self._size:
+            raise RuntimeError("Insufficient elements in TensorStack")
+        start = self._size - count
+        result = self._buffer[start : self._size].clone()
+        self._size = start
+        return result
+
 
 @dataclass
-class GPUPagedKVStats:
-	num_total_pages: int
-	num_free_pages: int
-	num_used_pages: int
-	num_total_pages_allocated: int
+class _SequenceState:
+    pages: torch.Tensor
+    length_tokens: int = 0
+
+    def capacity_tokens(self, page_size_tokens: int) -> int:
+        return int(self.pages.numel()) * page_size_tokens
+
+    def append_pages(self, new_pages: torch.Tensor) -> None:
+        if self.pages.numel() == 0:
+            self.pages = new_pages.clone()
+        else:
+            self.pages = torch.cat([self.pages, new_pages], dim=0)
+
+
+class GPUPagedKVGeometry:
+    """Utility helpers mirroring the host geometry checks."""
+
+    def __init__(self, config: GPUPagedKVConfig):
+        self._config = config
+
+    @property
+    def config(self) -> GPUPagedKVConfig:
+        return self._config
+
+    def ensure_layer_bounds(self, layer_idx: int, context: str) -> None:
+        if layer_idx < 0 or layer_idx >= self._config.num_layers:
+            raise IndexError(f"{context}: layer_idx {layer_idx} out of range")
+
+    def ensure_positive_tokens(self, num_tokens: int, context: str) -> None:
+        if num_tokens <= 0:
+            raise ValueError(
+                f"{context}: num_tokens must be > 0, got {num_tokens}"
+            )
+
+    def required_pages(self, num_tokens: int) -> int:
+        self.ensure_positive_tokens(num_tokens, "required_pages")
+        return _ceil_div(num_tokens, self._config.page_size_tokens)
+
+
+class GPUPagedKVLayout:
+    """Computes tensor shapes and byte sizes similar to the host layout."""
+
+    def __init__(self, config: GPUPagedKVConfig):
+        self._config = config
+        element_size = torch.tensor([], dtype=config.kv_dtype).element_size()
+        self._k_page_bytes = (
+            config.page_size_tokens
+            * config.num_k_heads
+            * config.k_head_dim
+            * element_size
+        )
+        if config.has_v_cache:
+            self._v_page_bytes = (
+                config.page_size_tokens
+                * config.num_v_heads
+                * config.v_head_dim
+                * element_size
+            )
+        else:
+            self._v_page_bytes = 0
+
+    @property
+    def k_page_bytes(self) -> int:
+        return self._k_page_bytes
+
+    @property
+    def v_page_bytes(self) -> int:
+        return self._v_page_bytes
+
 
 class GPUKVCacheManager:
-	"""
-	Manages a GPU-paged key-value cache.
-	It executes low-level page allocation and copy commands.
-	Not include any high-level scheduling logic.
-	This class supports GQA, MQA, and MLA-style layouts throught its configuration.
+    """Per-GPU paged KV cache manager inspired by the host implementation."""
 
-	Main APIs:
-		- init(): Instantiate GPU KV cache tensors and allocator states.
-		- allocate_pages(sequence_id: int, num_tokens: int) -> List[int]:
-			Allocates pages for a sequence based on number of tokens.
-		- free_sequence(sequence_id: int):
-			Frees all pages associated with a sequence.
-		- get_layer_kv_with_page_table(layer_idx: int, sequence_ids: List[int]) 
-			-> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-			Returns KV cache tensors for a layer along with the page table for a batch.
-	"""
-	def __init__(self, engine_config):
-		self.config = engine_config.gpu_kv_config
-		self.device = torch.device(engine_config.basic_config.gpu_device_id)
+    def __init__(self, engine_config):
+        self._engine_config = engine_config
+        self.config = GPUPagedKVConfig.from_engine(engine_config)
+        self._geometry = GPUPagedKVGeometry(self.config)
+        self._layout = GPUPagedKVLayout(self.config)
+        self.device = torch.device(engine_config.basic_config.gpu_device_id)
+        self._logger = logging.getLogger(self.__class__.__name__)
+        self._core_engine = None
 
-		self.k_cache_gpu: Optional[torch.Tensor] = None
-		self.v_cache_gpu: Optional[torch.Tensor] = None
+        self._k_cache: Optional[torch.Tensor] = None
+        self._v_cache: Optional[torch.Tensor] = None
+        self._free_pages = _TensorStack(self.config.num_pages)
+        self._sequences: Dict[int, _SequenceState] = {}
 
-		self.num_total_pages: int = 0
-		self.free_pages: List[int] = []
-		self.page_table: Dict[int, List[int]] = {} # sequence_id -> List[page_indices]
-		self.sequence_lengths: Dict[int, int] = {}  # sequence_id -> current sequence length
+    # ------------------------------------------------------------------
+    # Public APIs
+    # ------------------------------------------------------------------
+    def initialize(self, core_engine) -> None:
+        """Instantiates GPU tensors and prepares allocator state."""
 
-		self.logger = logging.getLogger(self.__class__.__name__)
-		self.core_engine = None # To be set in init()
+        self._core_engine = core_engine
+        shape = (
+            self.config.num_layers,
+            self.config.num_pages,
+            self.config.page_size_tokens,
+            self.config.num_k_heads,
+            self.config.k_head_dim,
+        )
+        self._k_cache = torch.empty(
+            shape, dtype=self.config.kv_dtype, device=self.device
+        )
+        self._logger.info("Initialized K cache %s", tuple(self._k_cache.shape))
 
-	"""Public APIs"""
-	def init(self, core_engine):
-		"""Instantiate GPU KV tensors and allocator states"""
-		self.core_engine = core_engine
-		# --- 1. Instantiate K-Cache ---
-		# Shape: [num_layers, num_gpu_pages, page_size, num_k_heads, k_head_dim]
-		# For MLA of DeepSeek-V3, this would be num_k_heads=1, k_head_dim=576.
-		self.k_cache_gpu = torch.empty(
-			(
-				self.config.num_layers,
-				self.config.num_gpu_pages,
-				self.config.page_size_tokens,
-				self.config.num_k_heads,
-				self.config.k_head_dim
-			),
-			dtype=self.config.kv_dtype_torch,
-			device=self.device
-		)
-		self.logger.info(f"Initialized K-Cache with shape {self.k_cache_gpu.shape}")
-		# --- 2. Instantiate V-Cache (Optional) ---
+        if self.config.has_v_cache:
+            v_shape = (
+                self.config.num_layers,
+                self.config.num_pages,
+                self.config.page_size_tokens,
+                self.config.num_v_heads,
+                self.config.v_head_dim,
+            )
+            self._v_cache = torch.empty(
+                v_shape, dtype=self.config.kv_dtype, device=self.device
+            )
+            self._logger.info(
+                "Initialized V cache %s", tuple(self._v_cache.shape)
+            )
+        else:
+            self._v_cache = None
+            self._logger.info("Initialized in K-only mode (no V cache)")
 
-		if self.config.num_v_heads is not None and self.config.num_v_heads > 0 and \
-			self.config.v_head_dim is not None and self.config.v_head_dim > 0:
-			self.v_cache_gpu = torch.empty(
-				(
-					self.config.num_layers,
-					self.config.num_gpu_pages,
-					self.config.page_size_tokens,
-					self.config.num_v_heads,
-					self.config.v_head_dim
-				),
-				dtype=self.config.kv_dtype_torch,
-				device=self.device
-			)
-			self.logger.info(f"Initialized V-Cache with shape {self.v_cache_gpu.shape}")
-		else:
-			self.logger.info("Initialized with no V-Cache (K-Cache only mode).")
+    def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
+        """Allocates enough pages to hold ``num_tokens`` for ``sequence_id``."""
 
-		# --- 3. GPU Page Allocator State ---
-		self.num_total_pages = self.config.num_gpu_pages
-		self.free_pages: List[int] = list(range(self.num_total_pages))
-		self.page_table: Dict[int, List[int]] = {}  # sequence_id -> List of allocated page IDs
-	
-	# --- 1. Page Management Primitives ---
-	def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
-		"""
-		Allocates pages from the free list for a sequence based on the number of tokens.
-		
-		This method automatically calculates the number of pages needed based on
-		the page size and number of tokens. It assumes the caller (upper-level scheduler)
-		has already ensured there are enough free pages.
+        self._ensure_initialized()
+        required_pages = self._geometry.required_pages(num_tokens)
+        state = self._sequences.get(sequence_id)
+        current_pages = state.pages.numel() if state else 0
+        missing = max(0, required_pages - current_pages)
+        if missing == 0:
+            return []
+        if missing > self._free_pages.size:
+            raise RuntimeError(
+                f"Insufficient free pages: need {missing}, have {self._free_pages.size}"
+            )
+        new_pages = self._free_pages.pop(missing)
+        if state is None:
+            state = _SequenceState(pages=new_pages)
+            self._sequences[sequence_id] = state
+        else:
+            state.append_pages(new_pages)
+        self._logger.debug(
+            "Allocated %d pages for seq %s -> %s",
+            missing,
+            sequence_id,
+            new_pages.tolist(),
+        )
+        return new_pages.tolist()
 
-		Args:
-			sequence_id (int): Unique identifier for the sequence.
-			num_tokens (int): Number of tokens that need to be stored for this sequence.
-		
-		Returns:
-			List[int]: List of allocated page indices.
+    def allocate_pages_for_sequences(self, sequence_ids: Sequence[int], num_tokens: int) -> Dict[int, List[int]]:
+        """Allocates enough pages to hold ``num_tokens`` for each sequence in ``sequence_ids``."""
+        self._ensure_initialized()
+        required_pages = self._geometry.required_pages(num_tokens)
+        allocations: Dict[int, List[int]] = {}
 
-		Raises:
-			ValueError: If num_tokens is invalid (≤ 0).
-			RuntimeError: If not enough free pages are available, indicating a scheduler logic error.
+        for sequence_id in sequence_ids:
+            state = self._sequences.get(sequence_id)
+            current_pages = state.pages.numel() if state else 0
+            missing = max(0, required_pages - current_pages)
+            if missing == 0:
+                allocations[sequence_id] = []
+                continue
+            if missing > self._free_pages.size:
+                raise RuntimeError(
+                    f"Insufficient free pages: need {missing} for seq {sequence_id}, have {self._free_pages.size}"
+                )
+            new_pages = self._free_pages.pop(missing)
+            if state is None:
+                state = _SequenceState(pages=new_pages)
+                self._sequences[sequence_id] = state
+            else:
+                state.append_pages(new_pages)
+            allocations[sequence_id] = new_pages.tolist()
+            self._logger.debug(
+                "Allocated %d pages for seq %s -> %s",
+                missing,
+                sequence_id,
+                new_pages.tolist(),
+            )
 
-		Example:
-			>>> # Allocate pages for a sequence with 150 tokens
-			>>> # If page_size_tokens=64, this will allocate 3 pages (ceil(150/64)=3)
-			>>> allocated = manager.allocate_pages(sequence_id=42, num_tokens=150)
-			>>> # allocated = [5, 7, 2]  # Example page indices
-		"""
-		# Validate input
-		if num_tokens <= 0:
-			raise ValueError(
-				f"{self.__class__.__name__}: num_tokens must be positive, got {num_tokens}"
-			)
-		
-		# Calculate number of pages needed
-		num_pages = math.ceil(num_tokens / self.config.page_size_tokens)
-		
-		self.logger.debug(
-			f"Sequence {sequence_id} requires {num_pages} pages "
-			f"for {num_tokens} tokens (page_size={self.config.page_size_tokens})"
-		)
-		
-		# Check if enough free pages available
-		if len(self.free_pages) < num_pages:
-			self.logger.error(
-				f"Not enough free pages to allocate {num_pages} pages for sequence {sequence_id}. "
-				f"Required: {num_pages}, Available: {len(self.free_pages)}. "
-				f"This indicates a scheduler logic error."
-			)
-			raise RuntimeError(
-				f"{self.__class__.__name__}: Insufficient free pages for allocation. "
-				f"Need {num_pages} pages for {num_tokens} tokens, only {len(self.free_pages)} available."
-			)
+        return allocations
 
-		# Pop pages from the free list (LIFO)
-		new_pages = [self.free_pages.pop() for _ in range(num_pages)]
+    def free_sequence(self, sequence_id: int) -> None:
+        """Returns all pages associated with ``sequence_id`` to the free list."""
 
-		# Add to the page table
-		if sequence_id not in self.page_table:
-			self.page_table[sequence_id] = []
-		self.page_table[sequence_id].extend(new_pages)
-		
-		# Track sequence length
-		if hasattr(self, 'sequence_lengths'):
-			self.sequence_lengths[sequence_id] = num_tokens
-		
-		self.logger.debug(
-			f"Allocated {num_pages} pages for seq {sequence_id} "
-			f"({num_tokens} tokens): {new_pages}"
-		)
-		
-		return new_pages
+        state = self._sequences.pop(sequence_id, None)
+        if state is None:
+            raise RuntimeError(f"Sequence {sequence_id} not registered on GPU")
+        self._free_pages.push(state.pages)
+        self._logger.debug(
+            "Freed %d pages for seq %s", state.pages.numel(), sequence_id
+        )
 
-	def load_offloaded_context(self, sequence_id: int, context_length: int):
-		"""
-		Load offloaded context KV cache from CPU to GPU for a sequence.
+    def load_offloaded_context(
+        self, sequence_id: int, context_length: int
+    ) -> None:
+        """Loads CPU-resident KV context for ``sequence_id`` onto the GPU."""
 
-		Args:
-			sequence_id (int): Unique identifier for the sequence.
-			context_length (int): Number of tokens in the context to load.
+        self._ensure_initialized()
+        state = self._get_sequence_state(sequence_id)
+        required_pages = self._geometry.required_pages(context_length)
+        if state.pages.numel() < required_pages:
+            raise ValueError(
+                f"Sequence {sequence_id} has {state.pages.numel()} pages, requires {required_pages}"
+            )
+        if self._core_engine is None:
+            raise RuntimeError("Core engine must be set before loading context")
 
-		Note: the pages should have already been allocated for this sequence.
-		"""
-		# --- 1. Verify Sufficient Pages Allocated ---
-		required_pages = math.ceil(context_length / self.config.page_size_tokens)
-		allocated_pages = len(self.page_table[sequence_id])
-		if allocated_pages < required_pages:
-			raise ValueError(
-				f"{self.__class__.__name__}: Insufficient pages for sequence {sequence_id}. "
-				f"Required: {required_pages} pages for {context_length} tokens, "
-				f"Allocated: {allocated_pages} pages. "
-				f"Allocate more pages before loading context."
-			)		
-		self.logger.debug(
-			f"Loading {context_length} tokens for sequence {sequence_id} "
-			f"from CPU to GPU ({required_pages} pages)"
-		)
+        for layer_idx in range(self.config.num_layers):
+            gpu_k_ptrs, gpu_v_ptrs = self.get_context_kv_page_ptrs(
+                sequence_id, layer_idx, context_length
+            )
+            cpu_k_ptrs, cpu_v_ptrs = self._core_engine.get_context_kv_page_ptrs(
+                sequence_id, layer_idx, context_length
+            )
+            self._core_engine.blocking_h2d_kv_page_copy(
+                cpu_k_ptrs, gpu_k_ptrs, self._layout.k_page_bytes
+            )
+            if gpu_v_ptrs is not None and cpu_v_ptrs is not None:
+                self._core_engine.blocking_h2d_kv_page_copy(
+                    cpu_v_ptrs, gpu_v_ptrs, self._layout.v_page_bytes
+                )
 
-		# --- 2. Get Page Pointers ---
-		try:
-			# Get GPU page pointers for this sequence
-			gpu_k_page_ptrs, gpu_v_page_ptrs = self.get_context_kv_page_ptrs(
-				sequence_id, context_length
-			)
-			
-			# Get CPU page pointers from the core engine (CPU KV cache manager)
-			cpu_k_page_ptrs, cpu_v_page_ptrs = self.core_engine.get_context_kv_page_ptrs(
-				sequence_id, context_length
-			)
-		except Exception as e:
-			self.logger.error(
-				f"Failed to get page pointers for sequence {sequence_id}: {e}"
-			)
-			raise RuntimeError(
-				f"{self.__class__.__name__}: Failed to retrieve page pointers for swap-in"
-			) from e
-	
-		# --- 3. Perform Blocking Copy (K Cache) ---
-		try:
-			self.logger.debug(
-				f"Copying K cache: {len(cpu_k_page_ptrs)} pages "
-				f"({len(cpu_k_page_ptrs) * self.config.k_page_byte_size} bytes)"
-			)
-			
-			self.core_engine.blocking_h2d_kv_page_copy(
-				cpu_k_page_ptrs, 
-				gpu_k_page_ptrs, 
-				self.config.k_page_byte_size
-			)
-			
-		except Exception as e:
-			self.logger.error(
-				f"Failed to copy K cache for sequence {sequence_id}: {e}"
-			)
-			raise RuntimeError(
-				f"{self.__class__.__name__}: K cache copy failed during swap-in"
-			) from e
-		
-		# --- 4. Perform Blocking Copy (V Cache, if applicable) ---
-		if gpu_v_page_ptrs is not None and cpu_v_page_ptrs is not None:
-			try:
-				self.logger.debug(
-					f"Copying V cache: {len(cpu_v_page_ptrs)} pages "
-					f"({len(cpu_v_page_ptrs) * self.config.v_page_byte_size} bytes)"
-				)
-				
-				self.core_engine.blocking_h2d_kv_page_copy(
-					cpu_v_page_ptrs, 
-					gpu_v_page_ptrs, 
-					self.config.v_page_byte_size
-				)
-				
-			except Exception as e:
-				self.logger.error(
-					f"Failed to copy V cache for sequence {sequence_id}: {e}"
-				)
-				raise RuntimeError(
-					f"{self.__class__.__name__}: V cache copy failed during swap-in"
-				) from e
+        state.length_tokens = context_length
 
-		# --- 5. Update Bookkeeping ---
-		self.sequence_lengths[sequence_id] = context_length
+    def get_context_kv_page_ptrs(
+        self, sequence_id: int, layer_idx: int, context_length: int
+    ) -> Tuple[List[int], Optional[List[int]]]:
+        """Returns contiguous GPU page pointers for context loading."""
 
-	def get_context_kv_page_ptrs(self, sequence_id: int, layer_idx: int, context_length: int) \
-			-> Tuple[List[int], Optional[List[int]]]:
-		"""
-		Get GPU page pointers for a specific layer for loading context.
-		
-		This is a helper method that retrieves page pointers for a single layer
-		for a given sequence and context length.
-		
-		Args:
-			sequence_id: Unique identifier for the sequence
-			layer_idx: Which layer to get pointers for (0-indexed)
-			context_length: Number of tokens in the context
-		
-		Returns:
-			Tuple of (k_page_ptrs, v_page_ptrs) where:
-			- k_page_ptrs: List of K cache page pointers for this layer [page0, page1, ...]
-			- v_page_ptrs: List of V cache page pointers for this layer, or None if not applicable
-		
-		Raises:
-			ValueError: If sequence not found, layer invalid, or insufficient pages
-		
-		Example:
-			>>> # Get pointers for layer 0 to load 150 tokens
-			>>> k_ptrs, v_ptrs = manager.get_context_kv_page_ptrs(42, layer_idx=0, context_length=150)
-			>>> # If page_size=64, k_ptrs will have 3 pointers (ceil(150/64)=3 pages)
-		"""
+        self._ensure_initialized()
+        self._geometry.ensure_layer_bounds(
+            layer_idx, "get_context_kv_page_ptrs"
+        )
+        state = self._get_sequence_state(sequence_id)
+        required_pages = self._geometry.required_pages(context_length)
+        if required_pages > state.pages.numel():
+            raise ValueError(
+                f"Sequence {sequence_id} requires {required_pages} pages, only {state.pages.numel()} allocated"
+            )
+        page_indices = state.pages[:required_pages].tolist()
+        k_ptrs = [
+            self._k_cache[layer_idx, idx].data_ptr() for idx in page_indices
+        ]
+        v_ptrs = None
+        if self._v_cache is not None:
+            v_ptrs = [
+                self._v_cache[layer_idx, idx].data_ptr() for idx in page_indices
+            ]
+        return k_ptrs, v_ptrs
 
-		# --- 1. Input Validation ---
-		if sequence_id not in self.page_table:
-			raise ValueError(
-				f"{self.__class__.__name__}: Sequence {sequence_id} not found in page table"
-			)
-		
-		if layer_idx < 0 or layer_idx >= self.config.num_layers:
-			raise ValueError(
-				f"{self.__class__.__name__}: Invalid layer_idx {layer_idx}. "
-				f"Must be in range [0, {self.config.num_layers})"
-			)
-		
-		if context_length <= 0:
-			raise ValueError(
-				f"{self.__class__.__name__}: context_length must be positive, got {context_length}"
-			)
-		
-		# Calculate required pages
-		required_pages = math.ceil(context_length / self.config.page_size_tokens)
-		allocated_pages = len(self.page_table[sequence_id])
-		
-		if required_pages > allocated_pages:
-			raise ValueError(
-				f"{self.__class__.__name__}: Insufficient pages for sequence {sequence_id}. "
-				f"Need {required_pages} pages for {context_length} tokens, "
-				f"have {allocated_pages} pages allocated"
-			)
-		
-		# --- 2. Gather Page Pointers for This Layer ---
-		# Get the page indices allocated to this sequence (only what we need)
-		page_indices = self.page_table[sequence_id][:required_pages]
-		
-		# Collect K cache page pointers for this layer
-		k_page_ptrs = []
-		for page_idx in page_indices:
-			# Get the page tensor for this layer and page
-			# Shape: [page_size_tokens, num_k_heads, k_head_dim]
-			k_page = self.k_cache_gpu[layer_idx, page_idx]
-			
-			# Validate contiguity
-			if not k_page.is_contiguous():
-				raise RuntimeError(
-					f"{self.__class__.__name__}: K cache page {page_idx} at layer {layer_idx} "
-					"is not contiguous"
-				)
-			
-			k_page_ptrs.append(k_page.data_ptr())
-		
-		# Collect V cache page pointers (if applicable)
-		v_page_ptrs = None
-		if self.v_cache_gpu is not None:
-			v_page_ptrs = []
-			for page_idx in page_indices:
-				# Shape: [page_size_tokens, num_v_heads, v_head_dim]
-				v_page = self.v_cache_gpu[layer_idx, page_idx]
-				
-				# Validate contiguity
-				if not v_page.is_contiguous():
-					raise RuntimeError(
-						f"{self.__class__.__name__}: V cache page {page_idx} at layer {layer_idx} "
-						"is not contiguous"
-					)
-				
-				v_page_ptrs.append(v_page.data_ptr())
-		
-		self.logger.debug(
-			f"Retrieved {len(k_page_ptrs)} page pointers for sequence {sequence_id}, "
-			f"layer {layer_idx}, context_length {context_length}"
-		)
-		
-		return (k_page_ptrs, v_page_ptrs)
-		
+    def get_sequence_layer_page_pointers(
+        self, sequence_id: int, layer_idx: int
+    ) -> Tuple[List[int], Optional[List[int]]]:
+        """Returns page pointers for copy operations between host and device."""
 
+        self._ensure_initialized()
+        self._geometry.ensure_layer_bounds(
+            layer_idx, "get_sequence_layer_page_pointers"
+        )
+        state = self._get_sequence_state(sequence_id)
+        page_indices = state.pages.tolist()
+        k_ptrs = [
+            self._k_cache[layer_idx, idx].data_ptr() for idx in page_indices
+        ]
+        if self._v_cache is None:
+            return k_ptrs, None
+        v_ptrs = [
+            self._v_cache[layer_idx, idx].data_ptr() for idx in page_indices
+        ]
+        return k_ptrs, v_ptrs
 
+    def update_new_token(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: Optional[torch.Tensor],
+        sequence_ids: Sequence[int],
+        layer_idx: int,
+    ) -> None:
+        """Writes new KV tokens into the cache for ``layer_idx``."""
 
-	def free_sequence(self, sequence_id: int):
-		"""
-		Frees all GPU pages associated with a sequence and
-		returns them to the free pool.
-		"""
-		# Atomically remove the sequence and get its pages
-		freed_pages = self.page_table.pop(sequence_id, None)
+        self._ensure_initialized()
+        self._geometry.ensure_layer_bounds(layer_idx, "update_new_token")
+        self._validate_token_inputs(k_tensor, v_tensor, sequence_ids)
+        batch_size, seq_len, _, _ = k_tensor.shape
 
-		if freed_pages:
-			self.free_pages.extend(freed_pages)
-			self.logger.debug(f"Freed pages for seq {sequence_id}: {freed_pages}")
-		else:
-			self.logger.error(f"Attempted to free pages for unknown sequence {sequence_id}.")
-			raise RuntimeError(f"{self.__class__.__name__}: Sequence ID {sequence_id} not found.")
-	
-	# --- 2. Kernel Support Primitives ---
+        for batch_idx in range(batch_size):
+            seq_id = sequence_ids[batch_idx]
+            state = self._get_sequence_state(seq_id)
+            required_pages = self._geometry.required_pages(
+                state.length_tokens + seq_len
+            )
+            if required_pages > state.pages.numel():
+                raise RuntimeError(
+                    f"Sequence {seq_id} requires {required_pages} pages but only has {state.pages.numel()}"
+                )
 
-	def _build_page_table(self, sequence_ids: List[int]) -> torch.Tensor:
-		"""
-		Builds the 2D page table(aka. block table) for attention kernel launch.
-		The shape is [batch_size, max_pages_in_batch]
+            tokens_written = 0
+            while tokens_written < seq_len:
+                absolute = state.length_tokens + tokens_written
+                page_idx = absolute // self.config.page_size_tokens
+                offset = absolute % self.config.page_size_tokens
+                tokens_this_page = min(
+                    self.config.page_size_tokens - offset,
+                    seq_len - tokens_written,
+                )
 
-		Args:
-			sequence_ids: The list of sequence IDs, in batch order.
+                gpu_page = int(state.pages[page_idx].item())
+                k_source = k_tensor[
+                    batch_idx,
+                    tokens_written : tokens_written + tokens_this_page,
+                ]
+                self._k_cache[
+                    layer_idx, gpu_page, offset : offset + tokens_this_page
+                ].copy_(k_source)
 
-		Returns:
-			A 2D torch.Tensor on the device, padded with -1.
-		"""
-		if not sequence_ids:
-			return torch.empty((0, 0), dtype=torch.int32, device=self.device)
+                if v_tensor is not None and self._v_cache is not None:
+                    v_source = v_tensor[
+                        batch_idx,
+                        tokens_written : tokens_written + tokens_this_page,
+                    ]
+                    self._v_cache[
+                        layer_idx, gpu_page, offset : offset + tokens_this_page
+                    ].copy_(v_source)
 
-		# Find the max number of pages allocated among sequences in this batch.
-		max_pages_in_batch = 0
-		for seq_id in sequence_ids:
-			if seq_id in self.page_table:
-				max_pages_in_batch = max(max_pages_in_batch, len(self.page_table[seq_id]))	
+                tokens_written += tokens_this_page
 
-		num_sequences = len(sequence_ids)
+            state.length_tokens += seq_len
+            self._logger.debug(
+                "Layer %d sequence %s extended to %d tokens",
+                layer_idx,
+                seq_id,
+                state.length_tokens,
+            )
 
-		# Initialize with -1 (a common padding value for kernels)
-		block_table = torch.full(
-			(num_sequences, max_pages_in_batch),
-			-1,
-			dtype=torch.int32,
-			device=self.device
-		)
+    def get_layer_kv_with_page_table(
+        self, layer_idx: int, sequence_ids: Sequence[int]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Returns layer tensors alongside a placeholder for the page table."""
 
-		# Fill the table
-		for i, seq_id in enumerate(sequence_ids):
-			if seq_id not in self.page_table:
-				# This sequence is in the batch but has no GPU pages
-				self.logger.warning(f"Sequence ID {seq_id} is not in GPU, this should not hapen in normal cases.")
-				continue
-			
-			pages = self.page_table[seq_id]
-			block_table[i, :len(pages)] = torch.tensor(
-				pages, dtype=torch.int32, device=self.device
-			)
-		return block_table
+        self._ensure_initialized()
+        self._geometry.ensure_layer_bounds(
+            layer_idx, "get_layer_kv_with_page_table"
+        )
+        page_table: Optional[torch.Tensor]
+        try:
+            page_table = self._build_page_table(sequence_ids)
+        except NotImplementedError:
+            page_table = None
+        return (
+            self._k_cache[layer_idx],
+            None if self._v_cache is None else self._v_cache[layer_idx],
+            page_table,
+        )
 
-	def get_layer_kv_with_page_table(self, layer_idx: int, sequence_ids: List[int]) \
-			-> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-		"""
-		Return KV cache tensor for a specific layer along with the page table.
+    def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Exposes the raw K/V cache tensors."""
 
-		Args: 
-			layer_idx: which layer to get KV-Cache for (0-indexed).
-			sequence_ids: List of sequence IDs(UUID) in the current batch order.
+        self._ensure_initialized()
+        return self._k_cache, self._v_cache
 
-		Returns:
-			Tuple of (K-Cache Tensor, V-Cache Tensor or None, page table for current batch.
-		"""
-		if self.k_cache_gpu is None:
-			raise RuntimeError("GPUKVCacheManager not initialized.")
-		if layer_idx < 0 or layer_idx >= self.config.num_layers:
-			raise RuntimeError(f"Invalid layer index {layer_idx} for GPU KV-Cache.")
-		
-		k_layer = self.k_cache_gpu[layer_idx]  # Shape: [num_gpu_pages, page_size, num_k_heads, k_head_dim]
-		v_layer = self.v_cache_gpu[layer_idx] if self.v_cache_gpu is not None else None
-		page_table = self._build_page_table(sequence_ids)  # Shape: [batch_size, max_pages_in_batch]
+    def get_stats(self) -> GPUPagedKVStats:
+        """Returns allocator statistics for observability."""
 
-		return k_layer, v_layer, page_table
+        num_used = self.config.num_pages - self._free_pages.size
+        return GPUPagedKVStats(
+            num_total_pages=self.config.num_pages,
+            num_free_pages=self._free_pages.size,
+            num_used_pages=num_used,
+            num_total_pages_allocated=num_used,
+        )
 
-	def get_sequence_layer_page_pointers(
-		self, 
-		sequence_id: int, 
-		layer_idx: int
-	) -> Tuple[List[int], Optional[List[int]]]:
-		"""
-		Returns the page pointers (memory addresses) for a specific sequence and layer.
-		
-		This method is used to get raw memory pointers for copy operations between
-		CPU and GPU KV caches. The returned pointers can be passed directly to the
-		copy engine for efficient batched transfers.
-		
-		Args:
-			sequence_id: Unique identifier for the sequence.
-			layer_idx: Layer index to get page pointers for (0-indexed).
-		
-		Returns:
-			Tuple of (k_page_ptrs, v_page_ptrs) where:
-			- k_page_ptrs: List of memory addresses (as integers) for K cache pages
-			- v_page_ptrs: List of memory addresses (as integers) for V cache pages,
-						or None if V cache is not allocated (e.g., MLA mode)
-		
-		Raises:
-			ValueError: If sequence_id is not found or layer_idx is invalid.
-			RuntimeError: If GPU KV cache is not initialized.
-		
-		Example:
-			>>> k_ptrs, v_ptrs = manager.get_sequence_layer_page_pointers(seq_id=42, layer_idx=0)
-			>>> # k_ptrs = [140234567890, 140234668900, ...]  # Memory addresses
-			>>> copy_engine.blocking_page_copy(cpu_ptrs, k_ptrs, page_sizes)
-		"""
-		# Validate initialization
-		if self.k_cache_gpu is None:
-			raise RuntimeError(
-				f"{self.__class__.__name__}: GPU KV cache not initialized. "
-				"Call init() first."
-			)
-		
-		# Validate sequence exists
-		if sequence_id not in self.page_table:
-			raise ValueError(
-				f"{self.__class__.__name__}: Sequence {sequence_id} not found in page table. "
-				f"Available sequences: {list(self.page_table.keys())}"
-			)
-		
-		# Validate layer index
-		if layer_idx < 0 or layer_idx >= self.config.num_layers:
-			raise ValueError(
-				f"{self.__class__.__name__}: Invalid layer_idx {layer_idx}. "
-				f"Must be in range [0, {self.config.num_layers})"
-			)
-		
-		# Get the page indices allocated to this sequence
-		page_indices = self.page_table[sequence_id]
-		
-		if not page_indices:
-			self.logger.warning(
-				f"Sequence {sequence_id} has no pages allocated. "
-				"Returning empty pointer lists."
-			)
-			return ([], None if self.v_cache_gpu is None else [])
-		
-		# Extract K cache page pointers
-		k_page_ptrs = []
-		for page_idx in page_indices:
-			# Get the page tensor slice for this layer and page
-			# Shape: [page_size_tokens, num_k_heads, k_head_dim]
-			k_page = self.k_cache_gpu[layer_idx, page_idx]
-			
-			# Get the raw memory address
-			k_page_ptrs.append(k_page.data_ptr())
-		
-		# Extract V cache page pointers (if V cache exists)
-		v_page_ptrs = None
-		if self.v_cache_gpu is not None:
-			v_page_ptrs = []
-			for page_idx in page_indices:
-				# Shape: [page_size_tokens, num_v_heads, v_head_dim]
-				v_page = self.v_cache_gpu[layer_idx, page_idx]
-				v_page_ptrs.append(v_page.data_ptr())
-		
-		self.logger.debug(
-			f"Retrieved {len(k_page_ptrs)} page pointers for sequence {sequence_id}, "
-			f"layer {layer_idx}"
-		)
-		
-		return (k_page_ptrs, v_page_ptrs)
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _ensure_initialized(self) -> None:
+        if self._k_cache is None:
+            raise RuntimeError(
+                "GPUKVCacheManager.init must be called before use"
+            )
 
-	def update_new_token(
-		self, 
-		k_tensor: torch.Tensor, 
-		v_tensor: Optional[torch.Tensor], 
-		sequence_ids: List[int], 
-		layer_idx: int
-	):
-		"""
-		Appends new KV cache data for newly generated tokens to their correct page(s).
-		
-		This function is called during the decode phase to write new KV pairs to the cache.
-		It handles both single-token (typical autoregressive) and multi-token (speculative
-		decoding, Medusa) generation scenarios.
-		
-		Expected k_tensor shape: [batch_size, seq_len, num_k_heads, k_head_dim]
-		Expected v_tensor shape: [batch_size, seq_len, num_v_heads, v_head_dim] or None
-		
-		Note: seq_len normally equals 1 for autoregressive generation but could be >1
-		in multi-token prediction scenarios.
-		
-		Args:
-			k_tensor: K cache tensor for new tokens [batch_size, seq_len, num_k_heads, k_head_dim]
-			v_tensor: V cache tensor for new tokens (optional, for non-MLA models)
-			sequence_ids: List of sequence IDs, length must match batch_size
-			layer_idx: Which layer to update (0-indexed)
-		
-		Raises:
-			ValueError: If input validation fails
-			RuntimeError: If cache not initialized or insufficient pages allocated
-		
-		Example:
-			>>> # Single token generation (batch_size=2, seq_len=1)
-			>>> k_new = torch.randn(2, 1, 8, 128, device='cuda')
-			>>> v_new = torch.randn(2, 1, 8, 128, device='cuda')
-			>>> manager.update_new_token(k_new, v_new, sequence_ids=[42, 43], layer_idx=0)
-			
-			>>> # Multi-token generation (batch_size=1, seq_len=3)
-			>>> k_new = torch.randn(1, 3, 8, 128, device='cuda')
-			>>> manager.update_new_token(k_new, None, sequence_ids=[42], layer_idx=0)
-		"""
-		# --- 1. Validate Inputs ---
-		if self.k_cache_gpu is None:
-			raise RuntimeError(
-				f"{self.__class__.__name__}: GPU KV cache not initialized. Call init() first."
-			)
-		
-		if layer_idx < 0 or layer_idx >= self.config.num_layers:
-			raise ValueError(
-				f"{self.__class__.__name__}: Invalid layer_idx {layer_idx}. "
-				f"Must be in range [0, {self.config.num_layers})"
-			)
-		
-		# Validate tensor dimensions
-		if k_tensor.dim() != 4:
-			raise ValueError(
-				f"{self.__class__.__name__}: Expected k_tensor to have 4 dimensions "
-				f"[batch_size, seq_len, num_k_heads, k_head_dim], got shape {k_tensor.shape}"
-			)
-		
-		batch_size, seq_len, num_k_heads, k_head_dim = k_tensor.shape
-		
-		# Validate batch size matches sequence_ids
-		if len(sequence_ids) != batch_size:
-			raise ValueError(
-				f"{self.__class__.__name__}: Batch size mismatch. "
-				f"k_tensor batch_size={batch_size}, len(sequence_ids)={len(sequence_ids)}"
-			)
-		
-		# Validate K tensor dimensions match config
-		if num_k_heads != self.config.num_k_heads or k_head_dim != self.config.k_head_dim:
-			raise ValueError(
-				f"{self.__class__.__name__}: K tensor dimension mismatch. "
-				f"Expected (num_k_heads={self.config.num_k_heads}, k_head_dim={self.config.k_head_dim}), "
-				f"got ({num_k_heads}, {k_head_dim})"
-			)
-		
-		# Validate V tensor if provided
-		if v_tensor is not None:
-			if self.v_cache_gpu is None:
-				raise ValueError(
-					f"{self.__class__.__name__}: V tensor provided but V cache not initialized "
-					"(running in K-only mode, e.g., MLA)"
-				)
-			
-			if v_tensor.dim() != 4:
-				raise ValueError(
-					f"{self.__class__.__name__}: Expected v_tensor to have 4 dimensions, "
-					f"got shape {v_tensor.shape}"
-				)
-			
-			v_batch_size, v_seq_len, num_v_heads, v_head_dim = v_tensor.shape
-			
-			if v_batch_size != batch_size or v_seq_len != seq_len:
-				raise ValueError(
-					f"{self.__class__.__name__}: V tensor shape mismatch. "
-					f"Expected batch_size={batch_size}, seq_len={seq_len}, "
-					f"got batch_size={v_batch_size}, seq_len={v_seq_len}"
-				)
-			
-			if num_v_heads != self.config.num_v_heads or v_head_dim != self.config.v_head_dim:
-				raise ValueError(
-					f"{self.__class__.__name__}: V tensor dimension mismatch. "
-					f"Expected (num_v_heads={self.config.num_v_heads}, v_head_dim={self.config.v_head_dim}), "
-					f"got ({num_v_heads}, {v_head_dim})"
-				)
-		elif self.v_cache_gpu is not None:
-			# V cache exists but no tensor provided - this might be intentional (MLA mode)
-			# Just log a debug message
-			self.logger.debug(
-				f"V cache exists but v_tensor is None for layer {layer_idx}. "
-				"Assuming K-only update."
-			)
-		
-		# Validate device
-		if k_tensor.device != self.device:
-			raise ValueError(
-				f"{self.__class__.__name__}: K tensor on wrong device. "
-				f"Expected {self.device}, got {k_tensor.device}"
-			)
-		
-		if v_tensor is not None and v_tensor.device != self.device:
-			raise ValueError(
-				f"{self.__class__.__name__}: V tensor on wrong device. "
-				f"Expected {self.device}, got {v_tensor.device}"
-			)
-		
-		# Validate all sequences exist and have pages allocated
-		for seq_id in sequence_ids:
-			if seq_id not in self.page_table:
-				raise ValueError(
-					f"{self.__class__.__name__}: Sequence {seq_id} not found in page table"
-				)
-			
-			if not self.page_table[seq_id]:
-				raise ValueError(
-					f"{self.__class__.__name__}: Sequence {seq_id} has no pages allocated"
-				)
-		
-		# --- 2. Update Cache for Each Sequence in Batch ---
-		for batch_idx, seq_id in enumerate(sequence_ids):
-			# Get current token count for this sequence
-			current_tokens = self.sequence_lengths.get(seq_id, 0)
-			
-			# Extract K and V tensors for this sequence
-			# Shape: [seq_len, num_k_heads, k_head_dim]
-			k_seq = k_tensor[batch_idx]
-			v_seq = v_tensor[batch_idx] if v_tensor is not None else None
-			
-			# Get allocated pages for this sequence
-			page_indices = self.page_table[seq_id]
-			
-			# Calculate current capacity
-			current_capacity = len(page_indices) * self.config.page_size_tokens
-			
-			# Check if we need more pages
-			new_total_tokens = current_tokens + seq_len
-			required_pages = math.ceil(new_total_tokens / self.config.page_size_tokens)
-			
-			if required_pages > len(page_indices):
-				raise RuntimeError(
-					f"{self.__class__.__name__}: Insufficient pages for sequence {seq_id}. "
-					f"Current pages: {len(page_indices)}, Required: {required_pages}. "
-					f"Current tokens: {current_tokens}, New tokens: {seq_len}. "
-					f"Call append_tokens() or allocate_pages() before update_new_token()."
-				)
-			
-			# --- 3. Write Tokens to Pages ---
-			tokens_written = 0
-			
-			for token_idx in range(seq_len):
-				# Calculate absolute token position in the sequence
-				absolute_token_pos = current_tokens + token_idx
-				
-				# Determine which page and offset within that page
-				page_idx_in_seq = absolute_token_pos // self.config.page_size_tokens
-				offset_in_page = absolute_token_pos % self.config.page_size_tokens
-				
-				# Get the actual GPU page index
-				gpu_page_idx = page_indices[page_idx_in_seq]
-				
-				# Write K cache
-				# Source: k_seq[token_idx] has shape [num_k_heads, k_head_dim]
-				# Destination: self.k_cache_gpu[layer_idx, gpu_page_idx, offset_in_page]
-				self.k_cache_gpu[layer_idx, gpu_page_idx, offset_in_page].copy_(
-					k_seq[token_idx]
-				)
-				
-				# Write V cache if applicable
-				if v_seq is not None and self.v_cache_gpu is not None:
-					self.v_cache_gpu[layer_idx, gpu_page_idx, offset_in_page].copy_(
-						v_seq[token_idx]
-					)
-				
-				tokens_written += 1
-			
-			# --- 4. Update Bookkeeping ---
-			# Update sequence length tracking
-			self.sequence_lengths[seq_id] = new_total_tokens
-			
-			self.logger.debug(
-				f"Updated {tokens_written} tokens for seq {seq_id} at layer {layer_idx}. "
-				f"Token range: [{current_tokens}, {new_total_tokens}), "
-				f"Pages used: {page_idx_in_seq + 1}/{len(page_indices)}"
-			)
-		
-		self.logger.debug(
-			f"Batch update complete for layer {layer_idx}: "
-			f"{batch_size} sequences, {seq_len} tokens each"
-		)
+    def _get_sequence_state(self, sequence_id: int) -> _SequenceState:
+        state = self._sequences.get(sequence_id)
+        if state is None:
+            raise KeyError(f"Sequence {sequence_id} not registered on GPU")
+        return state
 
+    def _validate_token_inputs(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: Optional[torch.Tensor],
+        sequence_ids: Sequence[int],
+    ) -> None:
+        if k_tensor.dim() != 4:
+            raise ValueError(
+                "k_tensor must have shape [batch, seq, heads, dim]"
+            )
+        batch_size, _, num_k_heads, k_head_dim = k_tensor.shape
+        if len(sequence_ids) != batch_size:
+            raise ValueError("sequence_ids length must equal batch size")
+        if (
+            num_k_heads != self.config.num_k_heads
+            or k_head_dim != self.config.k_head_dim
+        ):
+            raise ValueError("k_tensor head shape mismatch with configuration")
+        if k_tensor.device != self.device:
+            raise ValueError(f"k_tensor must be on device {self.device}")
+        if v_tensor is None:
+            if self.config.has_v_cache:
+                self._logger.debug(
+                    "V cache enabled but v_tensor missing; skipping V updates"
+                )
+            return
+        if not self.config.has_v_cache:
+            raise ValueError("V tensor provided but V cache disabled")
+        if v_tensor.dim() != 4:
+            raise ValueError(
+                "v_tensor must have shape [batch, seq, heads, dim]"
+            )
+        if v_tensor.shape[:2] != k_tensor.shape[:2]:
+            raise ValueError(
+                "k_tensor and v_tensor must share batch/seq dimensions"
+            )
+        _, _, num_v_heads, v_head_dim = v_tensor.shape
+        if (
+            num_v_heads != self.config.num_v_heads
+            or v_head_dim != self.config.v_head_dim
+        ):
+            raise ValueError("v_tensor head shape mismatch with configuration")
+        if v_tensor.device != self.device:
+            raise ValueError(f"v_tensor must be on device {self.device}")
 
-	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-			"""
-			Returns the handles to the full K and V cache tensors.
-			The V-cache may be None (e.g., in MLA mode).
-			"""
-			if self.k_cache_gpu is None:
-				raise RuntimeError("GPUKVCacheManager not initialized. Call init() first.")
-				
-			return self.k_cache_gpu, self.v_cache_gpu
+    def _build_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
+        """Placeholder for caller-provided page table implementation."""
 
-	def get_stats(self) -> GPUPagedKVStats:
-			"""Returns current GPU KV-Cache statistics."""
-			num_free = len(self.free_pages)
-			num_used = self.num_total_pages - num_free
-			
-			# num_total_pages_allocated is just num_used, but we
-			# can calculate it from the page_table for a sanity check.
-			# allocated_check = sum(len(pages) for pages in self.page_table.values())
-			# assert num_used == allocated_check, "GPU page accounting mismatch!"
-
-			return GPUPagedKVStats(
-				num_total_pages=self.num_total_pages,
-				num_free_pages=num_free,
-				num_used_pages=num_used,
-				num_total_pages_allocated=num_used
-			)
-
-		
-
+        raise NotImplementedError(
+            "Page table construction is intentionally left blank. "
+            "Provide your own implementation via subclassing or composition."
+        )

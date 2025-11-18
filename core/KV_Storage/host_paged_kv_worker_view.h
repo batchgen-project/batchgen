@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -39,6 +40,93 @@ void RegisterPinnedRange(void* base, std::size_t bytes, int device_index,
                          const std::shared_ptr<spdlog::logger>& logger);
 void UnregisterPinnedRange(void* base, int device_index,
                            const std::shared_ptr<spdlog::logger>& logger);
+
+template <typename T>
+class DeviceBuffer {
+   public:
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(std::size_t count) { Allocate(count); }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    DeviceBuffer(DeviceBuffer&& other) noexcept { Swap(other); }
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            Swap(other);
+        }
+        return *this;
+    }
+
+    ~DeviceBuffer() { Reset(); }
+
+    void Allocate(std::size_t count) {
+        Reset();
+        if (count == 0) {
+            return;
+        }
+        CUDA_CHECK(
+            cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)));
+        size_ = count;
+    }
+
+    void Reset() noexcept {
+        if (data_ == nullptr) {
+            return;
+        }
+        cudaFree(data_);
+        data_ = nullptr;
+        size_ = 0;
+    }
+
+    [[nodiscard]] T* get() const noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+   private:
+    void Swap(DeviceBuffer& other) noexcept {
+        using std::swap;
+        swap(data_, other.data_);
+        swap(size_, other.size_);
+    }
+
+    T* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+class ScopedCudaEvent final {
+   public:
+    explicit ScopedCudaEvent(std::shared_ptr<spdlog::logger> logger,
+                             unsigned int flags = cudaEventDisableTiming)
+        : logger_(std::move(logger)) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
+    }
+
+    ScopedCudaEvent(const ScopedCudaEvent&) = delete;
+    ScopedCudaEvent& operator=(const ScopedCudaEvent&) = delete;
+    ScopedCudaEvent(ScopedCudaEvent&&) = delete;
+    ScopedCudaEvent& operator=(ScopedCudaEvent&&) = delete;
+
+    ~ScopedCudaEvent() {
+        if (event_ == nullptr) {
+            return;
+        }
+        const auto status = cudaEventDestroy(event_);
+        if (status != cudaSuccess && logger_ != nullptr) {
+            logger_->error("Failed to destroy CUDA event: {}",
+                           cudaGetErrorString(status));
+        }
+    }
+
+    [[nodiscard]] cudaEvent_t get() const { return event_; }
+
+   private:
+    cudaEvent_t event_ = nullptr;
+    std::shared_ptr<spdlog::logger> logger_;
+};
+
+void LaunchUvaPageCopyKernel(uint8_t** src_ptrs, uint8_t** dst_ptrs,
+                             std::size_t page_size_bytes, int num_pages,
+                             cudaStream_t stream);
 }  // namespace worker_detail
 
 struct KVAsyncTask {
@@ -46,19 +134,22 @@ struct KVAsyncTask {
     KVAsyncTask(std::uint64_t id, std::shared_future<void> future)
         : id_(id), future_(std::move(future)) {}
 
-    std::uint64_t id() const { return id_; }
-    bool done() const {
+    [[nodiscard]] std::uint64_t id() const { return id_; }
+
+    [[nodiscard]] bool done() const {
         if (!future_.valid()) {
             return true;
         }
         return future_.wait_for(std::chrono::seconds(0)) ==
                std::future_status::ready;
     }
+
     void wait() const {
         if (future_.valid()) {
             future_.wait();
         }
     }
+
     void result() const {
         if (future_.valid()) {
             future_.get();
@@ -73,6 +164,16 @@ struct KVAsyncTask {
 using SequenceLengthMap = std::unordered_map<std::int64_t, std::size_t>;
 using SequenceLengthVector = std::vector<std::size_t>;
 using SequenceLengths = std::variant<SequenceLengthMap, SequenceLengthVector>;
+
+struct DevicePageCopyRequest {
+    std::size_t layer_idx = 0;
+    std::int32_t page_idx = 0;
+    std::uintptr_t device_ptr = 0;
+};
+
+using SequenceLengthMap = batchgen::kv::SequenceLengthMap;
+using SequenceLengthVector = batchgen::kv::SequenceLengthVector;
+using SequenceLengths = batchgen::kv::SequenceLengths;
 
 template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>>
 class HostPagedKVWorkerView {
@@ -165,6 +266,58 @@ class HostPagedKVWorkerView {
         ResetCopyStreams();
         UnregisterPinnedMemory();
         page_table_.Clear();
+    }
+
+    KVAsyncTask AsyncLoadLayerKVToDevice(
+        std::vector<DevicePageCopyRequest> requests) {
+        EnsureDeviceReady();
+        constexpr std::string_view kOpName = "AsyncLoadLayerKVToDevice";
+        ValidateDevicePageCopyRequests(requests, kOpName);
+        if (requests.empty()) {
+            return LaunchAsyncTask([] {});
+        }
+        return LaunchAsyncTask([this, requests = std::move(requests)]() {
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+            const std::size_t page_bytes = layout_.KPageBytes();
+            if (page_bytes == 0) {
+                return;
+            }
+
+            const std::size_t n = requests.size();
+            std::vector<uint8_t*> host_sources(n);
+            std::vector<uint8_t*> device_dests(n);
+
+#pragma omp parallel for
+            for (std::int64_t i = 0; i < static_cast<std::int64_t>(n); ++i) {
+                const auto& request = requests[i];
+                auto* src = static_cast<uint8_t*>(
+                    KPagePtr(request.layer_idx, request.page_idx));
+                auto* dst = reinterpret_cast<uint8_t*>(request.device_ptr);
+                host_sources[i] = src;
+                device_dests[i] = dst;
+            }
+
+            worker_detail::DeviceBuffer<uint8_t*> device_src_ptrs(
+                requests.size());
+            worker_detail::DeviceBuffer<uint8_t*> device_dst_ptrs(
+                requests.size());
+
+            const std::size_t ptr_bytes = requests.size() * sizeof(uint8_t*);
+            EnqueueCopy(reinterpret_cast<const std::byte*>(host_sources.data()),
+                        reinterpret_cast<std::byte*>(device_src_ptrs.get()),
+                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+            EnqueueCopy(reinterpret_cast<const std::byte*>(device_dests.data()),
+                        reinterpret_cast<std::byte*>(device_dst_ptrs.get()),
+                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+
+            const auto num_pages = static_cast<int>(requests.size());
+            worker_detail::LaunchUvaPageCopyKernel(
+                device_src_ptrs.get(), device_dst_ptrs.get(), page_bytes,
+                num_pages, cuda_stream);
+
+            this->SynchronizeWithEvent(cuda_stream);
+        });
     }
 
     std::byte* DataBase() { return backend_.DataBase(); }
@@ -676,6 +829,61 @@ class HostPagedKVWorkerView {
         }
     }
 
+    void LogDecodeNeighborhood(std::size_t layer_idx,
+                               const std::vector<std::int64_t>& sequence_ids,
+                               const SequenceLengths& sequence_lengths,
+                               std::byte* host_base,
+                               std::size_t neighborhood = 1) const {
+        if (host_base == nullptr) {
+            logger_->warn("LogDecodeNeighborhood: host_base is null, skipping");
+            return;
+        }
+
+        const std::size_t k_token_bytes = geometry_.KTokenBytes();
+
+        for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
+             ++batch_idx) {
+            const std::int64_t sequence_id = sequence_ids[batch_idx];
+            const std::size_t start_token =
+                ResolveSequenceLength(sequence_lengths, batch_idx, sequence_id,
+                                      std::nullopt, "LogDecodeNeighborhood");
+
+            const auto pages = page_table_.Pages(sequence_id);
+
+            const std::size_t begin =
+                (start_token > neighborhood) ? start_token - neighborhood : 0;
+            const std::size_t end = start_token + neighborhood;
+
+            for (std::size_t token_idx = begin; token_idx <= end; ++token_idx) {
+                try {
+                    geometry_.ValidatePageCapacity(pages, token_idx + 1,
+                                                   "LogDecodeNeighborhood");
+                } catch (const std::exception& ex) {
+                    logger_->warn(
+                        "LogDecodeNeighborhood: layer={} seq={} token_idx={} "
+                        "exceeds capacity: {}",
+                        layer_idx, sequence_id, token_idx, ex.what());
+                    continue;
+                }
+
+                const auto location = ResolvePageLocation(
+                    pages, sequence_id, token_idx, "LogDecodeNeighborhood");
+
+                const std::byte* token_ptr =
+                    layout_.KPageAddress(host_base, layer_idx,
+                                         location.page_idx) +
+                    location.page_offset_tokens * k_token_bytes;
+
+                logger_->info(
+                    "DecodeDebug layer={} seq={} token_idx={} "
+                    "(page_idx={}, page_offset={}) first_token_bytes={}",
+                    layer_idx, sequence_id, token_idx, location.page_idx,
+                    location.page_offset_tokens,
+                    geometry_.DescribeBytes(token_ptr, k_token_bytes));
+            }
+        }
+    }
+
     bool PageContainsTokens(std::size_t page_slot, std::size_t tokens_available,
                             std::size_t tokens_per_page) const {
         const std::size_t page_start_token = page_slot * tokens_per_page;
@@ -760,6 +968,28 @@ class HostPagedKVWorkerView {
                 << sequence_id << " (length=" << length
                 << ", capacity=" << max_tokens.value() << ")";
             throw std::out_of_range(oss.str());
+        }
+    }
+
+    void ValidateDevicePageCopyRequests(
+        const std::vector<DevicePageCopyRequest>& requests,
+        std::string_view op_name) const {
+        const auto max_pages =
+            static_cast<std::size_t>(std::numeric_limits<int>::max());
+        if (requests.size() > max_pages) {
+            std::ostringstream oss;
+            oss << op_name << ": num_pages=" << requests.size()
+                << " exceeds kernel limit=" << max_pages;
+            throw std::invalid_argument(oss.str());
+        }
+        for (const auto& request : requests) {
+            geometry_.EnsureLayerBounds(request.layer_idx, op_name);
+            geometry_.EnsurePageBounds(request.page_idx, op_name);
+            if (request.device_ptr == 0) {
+                std::ostringstream oss;
+                oss << op_name << ": device_ptr must not be null";
+                throw std::invalid_argument(oss.str());
+            }
         }
     }
 
@@ -876,41 +1106,10 @@ class HostPagedKVWorkerView {
     }
 
     void SynchronizeWithEvent(cudaStream_t stream) const {
-        ScopedCudaEvent event(logger_);
+        worker_detail::ScopedCudaEvent event(logger_);
         CUDA_CHECK(cudaEventRecord(event.get(), stream));
         CUDA_CHECK(cudaEventSynchronize(event.get()));
     }
-
-    class ScopedCudaEvent final {
-       public:
-        explicit ScopedCudaEvent(std::shared_ptr<spdlog::logger> logger,
-                                 unsigned int flags = cudaEventDisableTiming)
-            : logger_(std::move(logger)) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
-        }
-
-        ScopedCudaEvent(const ScopedCudaEvent&) = delete;
-        ScopedCudaEvent& operator=(const ScopedCudaEvent&) = delete;
-        ScopedCudaEvent(ScopedCudaEvent&&) = delete;
-        ScopedCudaEvent& operator=(ScopedCudaEvent&&) = delete;
-
-        ~ScopedCudaEvent() {
-            if (event_ == nullptr) {
-                return;
-            }
-            const auto status = cudaEventDestroy(event_);
-            if (status != cudaSuccess && logger_ != nullptr) {
-                logger_->error("Failed to destroy CUDA event: {}",
-                               cudaGetErrorString(status));
-            }
-        }
-
-        cudaEvent_t get() const { return event_; }
-
-       private:
-        cudaEvent_t event_ = nullptr;
-        std::shared_ptr<spdlog::logger> logger_;
-    };
 
     HostPagedKVConfig config_;
     HostPagedKVGeometry geometry_;
