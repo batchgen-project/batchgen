@@ -115,7 +115,8 @@ def fused_fp8_moe_parallel_experts_kernel_tma_3d(
             # Ptr = Base(Expert) + Row * stride_m + K_blk * stride_k
             lhs_scale_ptrs = cur_lhs_scale_ptr + (rel_row_indices[:, None] * stride_lhs_scale_m + 
                                                   scale_k_idx * stride_lhs_scale_k)
-            lhs_scale = tl.load(lhs_scale_ptrs, mask=m_mask[:, None], other=1.0)
+            # lhs_scale = tl.load(lhs_scale_ptrs, mask=m_mask[:, None], other=1.0)
+            lhs_scale = tl.load(lhs_scale_ptrs, mask=m_base_mask[:, None], other=1.0)
             
             # Load LHS Data (3D addressing)
             lhs_ptrs = cur_lhs_ptr + (rel_row_indices[:, None] * stride_lhs_m + offsets_k[None, :] * stride_lhs_k)
@@ -223,7 +224,9 @@ def fused_dequant_grouped_gemm_fp8_tma_3d_kernel(
                     # Load Scales
                     lhs_scale_k = k_idx * GEMM_BLOCK_SIZE_K // 128
                     l_scale_ptr = cur_lhs_scale_ptr + (rel_row_indices[:, None] * stride_lhs_scale_m + lhs_scale_k * stride_lhs_scale_k)
-                    lhs_scale = tl.load(l_scale_ptr, mask=(rel_row_indices[:, None] < M_max), other=1.0, cache_modifier='.cg')
+                    # lhs_scale = tl.load(l_scale_ptr, mask=(rel_row_indices[:, None] < M_max), other=1.0, cache_modifier='.cg')
+                    scale_mask = (rel_row_indices[:, None] < M_max) & (offsets_m[:, None] < valid_rows_this_block)
+                    lhs_scale = tl.load(l_scale_ptr, mask=scale_mask, other=1.0, cache_modifier='.cg')
                     
                     scale_k = k_idx * GEMM_BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
                     scale_ptr = rhs_scale_base_ptr + (scale_n * num_scale_k + scale_k)
