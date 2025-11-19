@@ -1,4 +1,4 @@
-import torch
+cpimport torch
 import math
 import logging
 import tqdm
