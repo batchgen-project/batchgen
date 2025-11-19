@@ -982,7 +982,7 @@ class BatchGenWorker:
 		# Ensure NVSHMEM_SYMMETRIC_SIZE is set in env vars before this runs
 		dev = Device(local_rank)
 		dev.set_current()
-		
+		dist.barrier()
 		nvshmem_init(
 			global_rank=rank,
 			local_rank=local_rank,
