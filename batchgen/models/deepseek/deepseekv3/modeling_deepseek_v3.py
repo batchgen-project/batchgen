@@ -1510,6 +1510,7 @@ def activation_gating(
 	return output
 
 import torch.distributed._symmetric_memory as symm_mem
+from pplx_kernels.all_to_all import AllToAll
 class DeepseekV3MoE_Decoding_FP8(nn.Module): 
 	"""
 		EP with two ALL-to-ALLs.
@@ -1561,6 +1562,32 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.num_tokens_per_rank = None		# This is a placeholder, adjust as needed
 
 
+        # 2. NVSHMEM Initialization
+        # ------------------------------------------------------------------
+        # NOTE: Ideally, this should be done once in your engine's main worker loop.
+        # We guard it here to prevent double-init if the class is instantiated twice.
+        import nvshmem.core as nvshmem
+        from cuda.core.experimental import Device
+        from pplx_kernels import nvshmem_init
+
+        if not nvshmem.is_initialized():
+            # Attempt to guess local_rank (safe for standard 1-GPU-per-process setups)
+            local_rank = int(os.environ.get("LOCAL_RANK", self.rank % torch.cuda.device_count()))
+            
+            # Create the internal Device handle required by nvshmem_init
+            dev = Device(local_rank)
+            dev.set_current()
+            
+            # Initialize the symmetric heap
+            nvshmem_init(
+                global_rank=self.rank,
+                local_rank=local_rank,
+                world_size=self.world_size,
+                device=dev
+            )
+        # ------------------------------------------------------------------
+
+
 	def init_num_tokens(self, num_tokens_per_rank):
 		self.num_tokens_per_rank = num_tokens_per_rank
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
@@ -1570,32 +1597,79 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 		
 		# Pre-allocate symmetric memory buffers
-		max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
-		max_out_len = max_inp_len * dist.get_world_size()
+		# max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
+		# max_out_len = max_inp_len * dist.get_world_size()
 		
-		self.symm_inp = symm_mem.empty(
-			max_inp_len, self.config.hidden_size, 
-			dtype=torch.bfloat16, device=self.device
+		# self.symm_inp = symm_mem.empty(
+		# 	max_inp_len, self.config.hidden_size, 
+		# 	dtype=torch.bfloat16, device=self.device
+		# )
+		# # symm_inp_hdl = symm_mem.rendezvous(self.symm_inp, dist.group.WORLD)
+		# self.symm_out = symm_mem.empty(
+		# 	max_out_len, self.config.hidden_size, 
+		# 	dtype=torch.bfloat16, device=self.device
+		# )
+		# # symm_out_hdl = symm_mem.rendezvous(self.symm_out, dist.group.WORLD)
+		# self.symm_in_splits = symm_mem.empty(
+		# 	self.total_experts, dtype=torch.int64, device=self.device
+		# )
+		# # symm_in_splits_hdl = symm_mem.rendezvous(self.symm_in_splits, dist.group.WORLD)
+		# self.symm_out_splits_offsets = symm_mem.empty(
+		# 	(2, self.total_experts), dtype=torch.int64, device=self.device
+		# )
+		# # symm_out_splits_offsets_hdl = symm_mem.rendezvous(self.symm_out_splits_offsets, dist.group.WORLD)
+		# self.symm_in_splits_offsets = symm_mem.empty(
+		# 	(2, self.total_experts), dtype=torch.int64, device=self.device
+		# )
+		# # symm_in_splits_offsets_hdl = symm_mem.rendezvous(self.symm_in_splits_offsets, dist.group.WORLD)
+		# self.group_name = dist.group.WORLD.group_name
+		in_type = torch.bfloat16
+		dp_size = 1
+		num_dp = self.world_size // dp_size
+		ata = AllToAll.internode(
+			max_num_tokens = self.num_tokens_per_rank,
+			num_experts = self.total_experts,
+			experts_per_token = self.num_experts_per_tok,
+			rank = self.rank,
+			world_size = self.world_size,
+			dp_size = dp_size,
+			hidden_dim = self.config.hidden_size,
+			hidden_dim_bytes = self.config.hidden_size * in_type.element_size(),
+			hidden_dim_scale_bytes = 0
 		)
-		# symm_inp_hdl = symm_mem.rendezvous(self.symm_inp, dist.group.WORLD)
-		self.symm_out = symm_mem.empty(
-			max_out_len, self.config.hidden_size, 
-			dtype=torch.bfloat16, device=self.device
+		self.ata = ata
+		
+		self.expert_num_tokens = torch.empty(self.experts_per_rank, dtype=torch.int32, device=self.device)
+		self.expert_x = torch.empty(
+			(self.experts_per_rank, self.num_tokens_per_rank * num_dp, self.config.hidden_size),
+			dtype=in_type,
+			device=self.device
 		)
-		# symm_out_hdl = symm_mem.rendezvous(self.symm_out, dist.group.WORLD)
-		self.symm_in_splits = symm_mem.empty(
-			self.total_experts, dtype=torch.int64, device=self.device
+		self.expert_x_scale = None
+		self.expert_y = torch.empty_like(self.expert_x)
+		self.indices = torch.empty(
+			(self.num_tokens_per_rank, self.num_experts_per_tok),
+			dtype=torch.uint32,
+			device=self.device
 		)
-		# symm_in_splits_hdl = symm_mem.rendezvous(self.symm_in_splits, dist.group.WORLD)
-		self.symm_out_splits_offsets = symm_mem.empty(
-			(2, self.total_experts), dtype=torch.int64, device=self.device
+		self.weights = torch.empty(
+			(self.num_tokens_per_rank, self.num_experts_per_tok),
+			dtype=torch.float32,
+			device=self.device
 		)
-		# symm_out_splits_offsets_hdl = symm_mem.rendezvous(self.symm_out_splits_offsets, dist.group.WORLD)
-		self.symm_in_splits_offsets = symm_mem.empty(
-			(2, self.total_experts), dtype=torch.int64, device=self.device
+		self.y = torch.empty(
+			(self.num_tokens_per_rank, self.config.hidden_size),
+			dtype=in_type,
+			device=self.device
 		)
-		# symm_in_splits_offsets_hdl = symm_mem.rendezvous(self.symm_in_splits_offsets, dist.group.WORLD)
-		self.group_name = dist.group.WORLD.group_name
+		self.dp_x = torch.empty(
+			(self.num_tokens_per_rank, self.config.hidden_size),
+			dtype=in_type,
+			device=self.device
+		)
+		self.dp_x_scale = None
+		
+
 
 	def init(self, num_tokens_per_rank):
 		# self.num_tokens_per_rank = num_tokens_per_rank
@@ -1646,9 +1720,56 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
+	@torch.inference_mode()
+	def moe_infer_pplx_a2a(self,x):
+		num_tokens, hidden_size = x.shape
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
+			x.view(num_tokens, 1, hidden_size)
+		)
+		
+		# ---- Prepare Dispatch Metadata -------
+		self.dp_x.copy_(x)
+		self.indices.copy_(topk_idx.to(torch.uint32))
+		self.weights.copy_(topk_weight.to(torch.float32))
+		bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
+		ata.dispatch(
+			out_expert_num_tokens = self.expert_num_tokens,
+			out_expert_x = self.expert_x,
+			out_expert_x_scale = self.expert_x_scale,
+			dp_x = x,
+			dp_x_scale = None,
+			indices=self.indices,
+			bound_m=bound_m,
+		)
+
+        # 2. Dispatch
+        # (Removed prints for accurate timing)
+        self.ata.dispatch(
+            out_expert_num_tokens=self.expert_num_tokens,
+            out_expert_x=self.expert_x,
+            out_expert_x_scale=self.expert_x_scale,
+            dp_x=self.dp_x,
+            dp_x_scale=None,
+            indices=self.indices,
+            bound_m=bound_m,
+        )
+
+        # 3. Local Expert Computation (Identity)
+        self.expert_y.copy_(self.expert_x)
+
+        # 4. Combine
+        self.ata.combine(
+            out_tokens=self.y,
+            indices=self.indices,
+            weights=self.weights,
+            expert_y=self.expert_y,
+            bound_m=bound_m,
+        )
+        
+        return self.y[:num_tokens].to(x.dtype)
+
 
 	@torch.inference_mode()
-	@torch.compile(fullgraph=True, disable=True)
 	def moe_infer_alltoall_nvshmem(self, x):
 		# x shape: [num_tokens, hidden_size]
 		num_tokens, hidden_size = x.shape
@@ -1658,7 +1779,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		topk_idx, topk_weight = self.gate.forward(
 			x.view(num_tokens, 1, hidden_size)
 		)
-		
 		# ---- 2) Efficient Sorting (Index Manipulation only) -------
 		# Flatten the expert IDs
 		flat_eids = topk_idx.view(-1).to(torch.int32)
