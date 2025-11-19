@@ -968,7 +968,7 @@ class BatchGenWorker:
 
 
 
-	def setup_distributed_environment():
+	def setup_distributed_environment(self):
 		import nvshmem.core as nvshmem
 		from cuda.core.experimental import Device	
 		from pplx_kernels import nvshmem_init
@@ -994,7 +994,7 @@ class BatchGenWorker:
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
-		setup_distributed_environment()
+		self.setup_distributed_environment()
 		
 		# Initialize symmetric memory once during model initialization
 		if not symm_mem.is_nvshmem_available():
