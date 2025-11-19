@@ -1732,15 +1732,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.indices.copy_(topk_idx.to(torch.uint32))
 		self.weights.copy_(topk_weight.to(torch.float32))
 		bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
-		ata.dispatch(
-			out_expert_num_tokens = self.expert_num_tokens,
-			out_expert_x = self.expert_x,
-			out_expert_x_scale = self.expert_x_scale,
-			dp_x = x,
-			dp_x_scale = None,
-			indices=self.indices,
-			bound_m=bound_m,
-		)
 
 		# 2. Dispatch
 		# (Removed prints for accurate timing)
