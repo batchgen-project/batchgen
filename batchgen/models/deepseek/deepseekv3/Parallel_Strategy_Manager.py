@@ -615,7 +615,7 @@ class DeepseekV3ParallelStrategyManager:
 		dp_size = 1
 		world_size = self.world_size
 		num_dp = world_size // dp_size	
-		hidden_size = self.model_config.hidden_size
+		hidden_size = 7168
 		self.device = self.engine_config.Basic_Config.device_torch
 
 		self.experts_per_rank = 256 // world_size
