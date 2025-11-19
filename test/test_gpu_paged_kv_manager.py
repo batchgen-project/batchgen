@@ -45,7 +45,9 @@ def _shm_unlink(name: str) -> None:
             raise OSError(err, f"shm_unlink({name}) failed")
 
 
-def _make_deepseek_r1_config(shm_name: str) -> EngineConfig:  # type: ignore
+def _make_deepseek_r1_config(
+    shm_name: str, device_index: int = 0
+) -> EngineConfig:  # type: ignore
     cfg = GPUPagedKVConfig(
         num_layers=61,
         num_pages=10000,
@@ -59,7 +61,7 @@ def _make_deepseek_r1_config(shm_name: str) -> EngineConfig:  # type: ignore
 
     engine_config = EngineConfig()
     engine_config.gpu_kv_config = cfg
-    engine_config.Basic_Config.device = 6
+    engine_config.Basic_Config.device = device_index
     return engine_config
 
 
@@ -200,6 +202,49 @@ def test_update_new_token(shm_name: str) -> None:
     print("update_new_token test passed ✓")
 
 
+def _host_transfer_worker(
+    shm_name: str,  
+    device_index: int,
+    sequence_ids: list[int],
+):
+    cfg = _make_deepseek_r1_host_config(shm_name)
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+    worker.initialize(device_index, False)
+
+    worker.register_sequences(sequence_ids)
+    capacity_tokens = cfg.page_size_tokens * 10
+    requests = [(seq_id, capacity_tokens) for seq_id in sequence_ids]
+    worker.allocate_pages_for_sequences(requests)
+
+
+    # offload kv from device to host
+    for i in range(cfg.num_layers):
+        device_tensor = torch.full(
+            (
+                SEQ_NUM_PER_WORKER,
+                capacity_tokens,
+                cfg.num_k_heads,
+                cfg.k_head_dim,
+            ),
+            i + 1,
+            device="cuda:6",
+            dtype=torch.bfloat16,
+        )
+
+        requests = [(seq_id, capacity_tokens) for seq_id in sequence_ids]
+        task = worker.async_offload_layer_kv_to_host(
+            layer_idx=i,
+            sequence_ids=sequence_ids,
+            k_tensor=device_tensor,
+            v_tensor=None,
+            sequence_lengths=[length for (_, length) in requests],
+        )
+
+        task.wait()
+
+
+
+
 def test_host_transfer_layer(shm_name):
     PAGE_NUM_PER_SEQ = 10
     NUM_WORKERS = 8
@@ -218,7 +263,8 @@ def test_host_transfer_layer(shm_name):
     worker.initialize(6, False)
 
     worker.register_sequences(sequence_ids)
-    worker.allocate_pages_for_sequences(capacities)
+    requests = [(seq_id, capacity_tokens) for seq_id in sequence_ids]
+    worker.allocate_pages_for_sequences(requests)
 
     # offload kv from device to host
     for i in range(cfg.num_layers):
@@ -260,8 +306,9 @@ def test_host_transfer_layer(shm_name):
 
     # transfer kv from host to device
     tasks = []
+    
     for seq in sequence_ids:
-        pages = device_manager._get_sequence_state(seq).tolist()
+        pages = device_manager._get_sequence_state(seq).pages.tolist()
         layer_page_pointer_batch = (
             device_manager.build_layer_page_pointer_batch(
                 page_indices=pages,
@@ -279,6 +326,32 @@ def test_host_transfer_layer(shm_name):
     for task in tasks:
         task.wait()
 
+    # check gpu data correctness
+    torch.cuda.set_device(device_manager.device)
+    k_cache = device_manager._k_cache
+    if k_cache is None:
+        raise AssertionError("K cache must be initialized for verification")
+
+    for layer_idx in range(cfg.num_layers):
+        layer_tensor = k_cache[layer_idx]
+        expected_value = float(layer_idx + 1)
+        for seq_id in sequence_ids:
+            state = device_manager._get_sequence_state(seq_id)
+            page_indices = state.pages.to(
+                device_manager.device, dtype=torch.long
+            )
+            gathered = layer_tensor.index_select(0, page_indices)
+            print(f"Layer {layer_idx}, Seq {seq_id}, Gathered: {gathered}")
+            expected = torch.full_like(gathered, expected_value)
+            if not torch.equal(gathered, expected):
+                raise AssertionError(
+                    "Host→device copy mismatch for layer "
+                    f"{layer_idx}, seq {seq_id}"
+                )
+
+    print("Host to device transfer complete")
+
+    # device_manager.free_pages_for_sequences(sequence_ids)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -287,6 +360,7 @@ if __name__ == "__main__":
     shm_name = _random_shm_name()
     try:
         # test_alloc_page(shm_name)
-        test_update_new_token(shm_name)
+        # test_update_new_token(shm_name)
+        test_host_transfer_layer(shm_name)
     finally:
         _shm_unlink(shm_name)

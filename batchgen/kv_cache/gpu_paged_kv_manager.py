@@ -411,7 +411,7 @@ class GPUPagedKVCacheManager:
         self._free_pages = _TensorStack(self.config.num_pages)
         self._sequences: Dict[int, _SequenceState] = {}
         self._layer_index_template = torch.arange(
-            self.config.num_layers, dtype=torch.int32
+            self.config.num_layers, dtype=torch.int64
         )
         # GPU-side page table manager (lazy updated in allocate_pages_for_sequences)
         max_pages_per_seq = _ceil_div(
@@ -674,8 +674,9 @@ class GPUPagedKVCacheManager:
                 "call allocate_pages_for_sequences before updating tokens"
             )
 
-        # all the tensors are continous
-        slot_indices = self._gpu_page_table_manager.get_slot_index_tensor()
+        # all the tensors are continuous
+        # slot_indices = self._gpu_page_table_manager.get_slot_index_tensor()
+        slot_indices = self._gpu_page_table_manager._slot_index_tensor
         token_indices = sequence_lengths
 
         page_table_view = page_table
@@ -973,7 +974,7 @@ class GPUPagedKVCacheManager:
         layer_ids = self._layer_index_template.repeat_interleave(
             page_tensor.numel()
         )
-        repeated_pages = page_tensor.repeat(self.config.num_layers)
+        repeated_pages = page_tensor.repeat(self.config.num_layers).to(torch.int64)
 
         k_ptrs = self._get_page_ptr_table(is_value=False).index_select(
             1, index_tensor
