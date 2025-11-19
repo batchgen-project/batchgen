@@ -1634,7 +1634,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			world_size = self.world_size,
 			dp_size = dp_size,
 			hidden_dim = self.config.hidden_size,
-			hidden_dim_bytes = self.config.hidden_size * in_type.element_size(),
+			hidden_dim_bytes = self.config.hidden_size * in_type.itemsize,
 			hidden_dim_scale_bytes = 0
 		)
 		self.ata = ata
