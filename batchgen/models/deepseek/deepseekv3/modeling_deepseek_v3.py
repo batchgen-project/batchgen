@@ -1779,7 +1779,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return self.y[:num_tokens].to(x.dtype)
 
 
-	def grouped_dequant_moe_fp8(
+	def grouped_dequant_moe_fp8_ata(
 		self, 
 		x,                  # 3D Tensor (Experts, MaxTokens, Hidden)
 		expert_token_counts,# Tensor [Experts] (Int32 counts per expert)
