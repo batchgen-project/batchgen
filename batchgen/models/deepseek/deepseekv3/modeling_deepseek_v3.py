@@ -1791,7 +1791,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		"""
 		# Quantize the whole 3D tensor. 
 		# act_quant preserves layout (E, T, H) -> (E, T, H) and (E, T, 1)
-		x_quant, x_scale = self.act_quant(x) 
+		x_quant, x_scale = act_quant(x) 
 		
 		# Stage 1: Output is (E, T, Intermediate)
 		intermediate = fused_fp8_moe_stage_1_tma_wrapper(
@@ -1804,7 +1804,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			experts_per_rank    
 		)
 		
-		intermediate_quant, intermediate_scale = self.act_quant(intermediate)
+		intermediate_quant, intermediate_scale = act_quant(intermediate)
 		
 		# Stage 2: Output is (E, T, Hidden)
 		res = fused_dequant_grouped_gemm_fp8_tma_wrapper(
