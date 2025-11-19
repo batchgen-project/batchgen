@@ -1562,30 +1562,30 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.num_tokens_per_rank = None		# This is a placeholder, adjust as needed
 
 
-		# 2. NVSHMEM Initialization
-		# ------------------------------------------------------------------
-		# NOTE: Ideally, this should be done once in your engine's main worker loop.
-		# We guard it here to prevent double-init if the class is instantiated twice.
-		import nvshmem.core as nvshmem
-		from cuda.core.experimental import Device
-		from pplx_kernels import nvshmem_init
+		# # 2. NVSHMEM Initialization
+		# # ------------------------------------------------------------------
+		# # NOTE: Ideally, this should be done once in your engine's main worker loop.
+		# # We guard it here to prevent double-init if the class is instantiated twice.
+		# import nvshmem.core as nvshmem
+		# from cuda.core.experimental import Device
+		# from pplx_kernels import nvshmem_init
 
-		if not nvshmem.is_initialized():
-			# Attempt to guess local_rank (safe for standard 1-GPU-per-process setups)
-			local_rank = int(os.environ.get("LOCAL_RANK", self.rank % torch.cuda.device_count()))
+		# if not nvshmem.is_initialized():
+		# 	# Attempt to guess local_rank (safe for standard 1-GPU-per-process setups)
+		# 	local_rank = int(os.environ.get("LOCAL_RANK", self.rank % torch.cuda.device_count()))
 			
-			# Create the internal Device handle required by nvshmem_init
-			dev = Device(local_rank)
-			dev.set_current()
+		# 	# Create the internal Device handle required by nvshmem_init
+		# 	dev = Device(local_rank)
+		# 	dev.set_current()
 			
-			# Initialize the symmetric heap
-			nvshmem_init(
-				global_rank=self.rank,
-				local_rank=local_rank,
-				world_size=self.world_size,
-				device=dev
-			)
-		# ------------------------------------------------------------------
+		# 	# Initialize the symmetric heap
+		# 	nvshmem_init(
+		# 		global_rank=self.rank,
+		# 		local_rank=local_rank,
+		# 		world_size=self.world_size,
+		# 		device=dev
+		# 	)
+		# # ------------------------------------------------------------------
 
 
 	def init_num_tokens(self, num_tokens_per_rank):
