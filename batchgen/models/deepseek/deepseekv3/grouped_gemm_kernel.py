@@ -201,72 +201,118 @@ def fused_dequant_grouped_gemm_fp8_tma_offset_kernel(
         end_idx = tl.load(expert_offsets_ptr + g + 1).to(tl.int32)
         gm = end_idx - start_idx
         
-        # Skip empty experts
-        if gm == 0:
-            continue
-        
-        num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
-        
-        # Get RHS pointers for this expert (g is the index)
-        rhs_base_ptr = tl.load(rhs_ptrs_ptr + g * stride_rhs_ptrs).to(tl.pointer_type(rhs_dtype))
-        rhs_scale_base_ptr = tl.load(rhs_scale_ptrs_ptr + g * stride_rhs_scale_ptrs).to(tl.pointer_type(tl.float32))
-        
-        # Create TMA descriptor for RHS
-        rhs_desc = tl.make_tensor_descriptor(
-            rhs_base_ptr,
-            shape=[N, K],
-            strides=[stride_rhs_n, stride_rhs_k],
-            block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K],
-        )
-        
-        # Process all M-tiles for this expert
-        for sub_group_idx in range(num_sub_groups):
-            # Absolute index calculation using offsets
-            sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
-            current_block_start_rel = sub_group_idx * GEMM_BLOCK_SIZE_M
-            valid_rows_this_block = tl.minimum(GEMM_BLOCK_SIZE_M, gm - current_block_start_rel)
+        # REVISION: Removed 'continue' for Triton compatibility
+        if gm > 0:
+            num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
             
-            offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
-            abs_row_indices = sub_group_start_idx + offsets_m
+            # Get RHS pointers for this expert (g is the index)
+            rhs_base_ptr = tl.load(rhs_ptrs_ptr + g * stride_rhs_ptrs).to(tl.pointer_type(rhs_dtype))
+            rhs_scale_base_ptr = tl.load(rhs_scale_ptrs_ptr + g * stride_rhs_scale_ptrs).to(tl.pointer_type(tl.float32))
             
-            # Accumulator
-            acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
+            # Create TMA descriptor for RHS
+            rhs_desc = tl.make_tensor_descriptor(
+                rhs_base_ptr,
+                shape=[N, K],
+                strides=[stride_rhs_n, stride_rhs_k],
+                block_shape=[GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K],
+            )
             
-            # K-dimension loop
-            for k_idx in range(0, tl.cdiv(K, GEMM_BLOCK_SIZE_K)):
-                offsets_k = k_idx * GEMM_BLOCK_SIZE_K + tl.arange(0, GEMM_BLOCK_SIZE_K)
+            # Process all M-tiles for this expert
+            for sub_group_idx in range(num_sub_groups):
+                # Absolute index calculation using offsets
+                sub_group_start_idx = start_idx + sub_group_idx * GEMM_BLOCK_SIZE_M
+                current_block_start_rel = sub_group_idx * GEMM_BLOCK_SIZE_M
+                valid_rows_this_block = tl.minimum(GEMM_BLOCK_SIZE_M, gm - current_block_start_rel)
                 
-                # Load LHS (standard)
-                lhs_ptrs = lhs_ptr + (abs_row_indices[:, None] * stride_lhs_m + offsets_k[None, :] * stride_lhs_k)
-                lhs_mask = (abs_row_indices[:, None] < M) & (offsets_k[None, :] < K) & (offsets_m[:, None] < valid_rows_this_block)
-                lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+                offsets_m = tl.arange(0, GEMM_BLOCK_SIZE_M)
+                abs_row_indices = sub_group_start_idx + offsets_m
                 
-                # Load RHS with TMA
-                offs_k = k_idx * GEMM_BLOCK_SIZE_K
-                rhs_fp8 = rhs_desc.load([pid * GEMM_BLOCK_SIZE_N, offs_k])
+                # Accumulator
+                acc = tl.zeros((GEMM_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_N), dtype=tl.float32)
                 
-                # Load LHS scale
-                lhs_scale_k = k_idx * GEMM_BLOCK_SIZE_K // 128
-                l_scale_ptr = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + lhs_scale_k * stride_lhs_scale_k)
-                lhs_scale = tl.load(l_scale_ptr, mask=(abs_row_indices[:, None] < M), other=1.0, cache_modifier='.cg')
+                # K-dimension loop
+                for k_idx in range(0, tl.cdiv(K, GEMM_BLOCK_SIZE_K)):
+                    offsets_k = k_idx * GEMM_BLOCK_SIZE_K + tl.arange(0, GEMM_BLOCK_SIZE_K)
+                    
+                    # Load LHS (standard)
+                    lhs_ptrs = lhs_ptr + (abs_row_indices[:, None] * stride_lhs_m + offsets_k[None, :] * stride_lhs_k)
+                    lhs_mask = (abs_row_indices[:, None] < M) & (offsets_k[None, :] < K) & (offsets_m[:, None] < valid_rows_this_block)
+                    lhs = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
+                    
+                    # Load RHS with TMA
+                    offs_k = k_idx * GEMM_BLOCK_SIZE_K
+                    rhs_fp8 = rhs_desc.load([pid * GEMM_BLOCK_SIZE_N, offs_k])
+                    
+                    # Load LHS scale
+                    lhs_scale_k = k_idx * GEMM_BLOCK_SIZE_K // 128
+                    l_scale_ptr = lhs_scale_ptr + (abs_row_indices[:, None] * stride_lhs_scale_m + lhs_scale_k * stride_lhs_scale_k)
+                    lhs_scale = tl.load(l_scale_ptr, mask=(abs_row_indices[:, None] < M), other=1.0, cache_modifier='.cg')
+                    
+                    # Load RHS scale
+                    scale_k = k_idx * GEMM_BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
+                    scale_ptr = rhs_scale_base_ptr + (scale_n * num_scale_k + scale_k)
+                    rhs_scale = tl.load(scale_ptr)
+                    
+                    # Fused dequantization and matmul
+                    acc += tl.dot(lhs, tl.trans(rhs_fp8)) * lhs_scale * rhs_scale
                 
-                # Load RHS scale
-                scale_k = k_idx * GEMM_BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
-                scale_ptr = rhs_scale_base_ptr + (scale_n * num_scale_k + scale_k)
-                rhs_scale = tl.load(scale_ptr)
+                # Store result
+                offs_output_m = sub_group_start_idx + tl.arange(0, GEMM_BLOCK_SIZE_M)
+                offs_output_n = pid * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
+                output_ptrs = output_ptr + (offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n)
                 
-                # Fused dequantization and matmul
-                acc += tl.dot(lhs, tl.trans(rhs_fp8)) * lhs_scale * rhs_scale
-            
-            # Store result
-            offs_output_m = sub_group_start_idx + tl.arange(0, GEMM_BLOCK_SIZE_M)
-            offs_output_n = pid * GEMM_BLOCK_SIZE_N + tl.arange(0, GEMM_BLOCK_SIZE_N)
-            output_ptrs = output_ptr + (offs_output_m[:, None] * stride_output_m + offs_output_n[None, :] * stride_output_n)
-            
-            output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & (offsets_m[:, None] < valid_rows_this_block)
-            
-            output = tl.cast(acc, lhs_dtype)
-            tl.store(output_ptrs, output, mask=output_mask)
+                output_mask = (offs_output_m[:, None] < M) & (offs_output_n[None, :] < N) & (offsets_m[:, None] < valid_rows_this_block)
+                
+                output = tl.cast(acc, lhs_dtype)
+                tl.store(output_ptrs, output, mask=output_mask)
+
+
+# -----------------------------------------------------------------------------
+# Python Wrapper
+# -----------------------------------------------------------------------------
+
+def grouped_dequant_moe_fp8(
+    self, 
+    x,                  
+    expert_offsets,     
+    experts_per_rank,
+    out=None            # <--- ADDED: Output buffer argument
+):
+    """
+    Optimized wrapper that writes directly to 'out' (self.expert_y) using offsets.
+    """
+    
+    actual_num_tokens = expert_offsets[-1].item()
+    
+    # Dynamic slicing (views, no allocation)
+    x_valid = x[:actual_num_tokens]
+    x_quant, x_scale = self.act_quant(x_valid) 
+    
+    # Stage 1: Allocate intermediate (or use a buffer if you add one to __init__)
+    # Note: Intermediate size is [tokens, intermediate_size], usually larger than hidden
+    intermediate = fused_fp8_moe_stage_1_tma_wrapper(
+        x_quant, x_scale, 
+        self.gate_list, self.gate_ptrs_ptr,
+        self.up_list, self.up_ptrs_ptr,
+        self.gate_scale_list, self.gate_scale_ptrs_ptr,
+        self.up_scale_list, self.up_scale_ptrs_ptr,
+        expert_offsets,     
+        experts_per_rank    
+    )
+    
+    intermediate_quant, intermediate_scale = self.act_quant(intermediate)
+    
+    # Stage 2: Write directly to 'out' (self.expert_y)
+    res = fused_dequant_grouped_gemm_fp8_tma_wrapper(
+        intermediate_quant, intermediate_scale, 
+        self.down_list, self.down_ptrs_ptr,
+        self.down_scale_list, self.down_scale_ptrs_ptr,
+        expert_offsets,     
+        experts_per_rank,
+        out=out             # <--- Pass to wrapper
+    )
+    
+    return res
 
 
 # -----------------------------------------------------------------------------
@@ -279,33 +325,35 @@ def fused_fp8_moe_stage_1_tma_wrapper(
     up_weight_list, up_ptrs_ptr,
     gate_scale_list, gate_scale_ptrs_ptr,
     up_scale_list, up_scale_ptrs_ptr,
-    expert_offsets,     # Changed input
-    num_local_experts,  # Changed input
+    expert_offsets,    
+    num_local_experts, 
     gate_gemm_block_size=[64, 32, 128],
     scale_block_size=128,
     num_stages=3,
-    num_warps=4
+    num_warps=4,
+    out=None           # <--- Added arg (future proofing)
 ):
     device = hidden_states.device
-    M = hidden_states.shape[0] # This is actual_num_tokens based on slice
+    M = hidden_states.shape[0] 
     N = gate_weight_list[0].shape[0]
     K = hidden_states.shape[1]
     
-    # Output buffer
-    output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
-    
+    if out is None:
+        output = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    else:
+        output = out[:M, :N] # View into pre-allocated buffer
+
     def alloc_fn(size: int, alignment: int, stream: Optional[int]):
         return torch.empty(size, device="cuda", dtype=torch.int8)
     triton.set_allocator(alloc_fn)
     
-    # Grid: (experts_per_rank, N_blocks)
     grid = (num_local_experts, triton.cdiv(N, gate_gemm_block_size[1]))
     
     fused_fp8_moe_parallel_experts_kernel_tma_offset[grid](
         hidden_states, hidden_states_scale,
         gate_ptrs_ptr, up_ptrs_ptr,
         gate_scale_ptrs_ptr, up_scale_ptrs_ptr,
-        expert_offsets,      # <--- Passing offsets
+        expert_offsets,
         output,
         M, N, K,
         hidden_states.stride(0), hidden_states.stride(1),
@@ -328,20 +376,30 @@ def fused_dequant_grouped_gemm_fp8_tma_wrapper(
     lhs, lhs_scale,
     rhs_list, rhs_ptrs_ptr,
     rhs_scale_list, rhs_scale_ptrs_ptr,
-    expert_offsets,      # Changed input
-    num_local_experts,   # Changed input
+    expert_offsets,     
+    num_local_experts,   
     gemm_block_size=(64, 32, 128),
     scale_block_size=(128, 128),
     num_stages=3,
-    num_warps=4
+    num_warps=4,
+    out=None            # <--- Added arg
 ):
     device = lhs.device
     M = lhs.shape[0]
     N = rhs_list[0].shape[0]
     K = lhs.shape[1]
     
-    # Output matching input layout
-    output = torch.zeros((M, N), dtype=torch.bfloat16, device=device)
+    if out is None:
+        # Default behavior (alloc new)
+        output = torch.zeros((M, N), dtype=torch.bfloat16, device=device)
+    else:
+        # Use pre-allocated buffer
+        # IMPORTANT: Slice it to match current batch size 'M' so kernel guards work
+        output = out[:M, :N]
+
+        # We don't need to zero 'out' here because the kernel writes strictly 
+        # to the rows defined by 'expert_offsets', effectively overwriting valid data.
+        # Garbage data in invalid rows (beyond M) is ignored by the Combine kernel.
     
     grid = (triton.cdiv(N, gemm_block_size[1]),)
     
@@ -352,8 +410,8 @@ def fused_dequant_grouped_gemm_fp8_tma_wrapper(
     fused_dequant_grouped_gemm_fp8_tma_offset_kernel[grid](
         lhs, lhs_scale,
         rhs_ptrs_ptr, rhs_scale_ptrs_ptr,
-        expert_offsets,    # <--- Passing offsets
-        num_local_experts, # <--- Loop bound
+        expert_offsets,    
+        num_local_experts, 
         output,
         M, N, K,
         lhs.stride(0), lhs.stride(1),
