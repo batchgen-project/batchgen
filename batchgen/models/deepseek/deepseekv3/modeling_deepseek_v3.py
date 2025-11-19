@@ -1759,10 +1759,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Cumulative sum to get offsets
 		expert_offsets[1:] = torch.cumsum(self.expert_num_tokens, dim=0)
 
-		self.expert_y = self.grouped_dequant_moe_fp8_ata(
+		self.grouped_dequant_moe_fp8_ata(
 			self.expert_x,
 			expert_offsets,
-			self.experts_per_rank
+			self.experts_per_rank,
+			self.expert_y
 		)
 
 		# 4. Combine
@@ -1778,66 +1779,42 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return self.y[:num_tokens].to(x.dtype)
 
 
-	# -----------------------------------------------------------------------------
-	# Python Wrapper
-	# -----------------------------------------------------------------------------
-	def grouped_dequant_moe_fp8_ata(
+	def grouped_dequant_moe_fp8(
 		self, 
-		x,                  # The symmetric input buffer (already filled)
-		expert_offsets,     # Tensor [num_local_experts + 1]
-		experts_per_rank    # Integer
+		x,                  # 3D Tensor (Experts, MaxTokens, Hidden)
+		expert_token_counts,# Tensor [Experts] (Int32 counts per expert)
+		experts_per_rank,
+		out=None            # 3D Tensor (Experts, MaxTokens, Hidden)
 	):
 		"""
-		Optimized wrapper that writes directly to self.expert_y using offsets.
-		Skipped: compact_expert_data, explicit slicing.
+		Optimized wrapper for 3D inputs.
 		"""
+		# Quantize the whole 3D tensor. 
+		# act_quant preserves layout (E, T, H) -> (E, T, H) and (E, T, 1)
+		x_quant, x_scale = self.act_quant(x) 
 		
-		# 1. Get the actual total token count from the last offset
-		# This determines the valid range of 'x' we care about
-		actual_num_tokens = expert_offsets[-1].item()
-		
-		# 2. Quantize input (dynamic slice)
-		# Even though x is large, we only need to quantize up to valid tokens
-		# Note: act_quant usually handles its own kernel, assumed compatible here.
-		x_valid = x[:actual_num_tokens]
-		x_quant, x_scale = act_quant(x_valid) 
-		
-		# 3. Run Stage 1 (Gate + Up Proj)
-		# Output will be valid only up to actual_num_tokens, but stored in 'intermediate' buffer
-		# We likely need a temporary buffer for Stage 1 output. 
-		# Assuming we allocate it dynamically or use a pre-allocated buffer.
-		# For this snippet, let's assume we return a new tensor for intermediate.
-		
+		# Stage 1: Output is (E, T, Intermediate)
 		intermediate = fused_fp8_moe_stage_1_tma_wrapper(
 			x_quant, x_scale, 
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
 			self.gate_scale_list, self.gate_scale_ptrs_ptr,
 			self.up_scale_list, self.up_scale_ptrs_ptr,
-			expert_offsets,     # <--- Passing offsets directly
-			experts_per_rank    # <--- Grid size
+			expert_token_counts,     
+			experts_per_rank    
 		)
 		
-		# 4. Quantize Intermediate
-		intermediate_quant, intermediate_scale = act_quant(intermediate)
+		intermediate_quant, intermediate_scale = self.act_quant(intermediate)
 		
-		# 5. Run Stage 2 (Down Proj) -> Write to self.expert_y
-		# We assume self.expert_y is available. If this function needs to return it,
-		# we might need to pass it in or slice it from self.expert_y.
-		# Here we write to a result tensor matching the layout.
-		
+		# Stage 2: Output is (E, T, Hidden)
 		res = fused_dequant_grouped_gemm_fp8_tma_wrapper(
 			intermediate_quant, intermediate_scale, 
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
-			expert_offsets,     # <--- Passing offsets directly
-			experts_per_rank
+			expert_token_counts,     
+			experts_per_rank,
+			out=out 
 		)
-		
-		# Writes have happened directly to 'res' (which mimics expert_y layout)
-		# We can return res directly.
-		# If self.expert_y needs to be updated in place, passed 'out=self.expert_y' logic
-		# needs to be inside the wrapper below.
 		
 		return res
 
