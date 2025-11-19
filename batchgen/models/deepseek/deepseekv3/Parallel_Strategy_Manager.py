@@ -660,8 +660,8 @@ class DeepseekV3ParallelStrategyManager:
 			rank = self.rank,
 			world_size = self.world_size,
 			dp_size = dp_size,
-			hidden_dim = hidden_dim,
-			hidden_dim_bytes = hidden_dim * in_type.itemsize,
+			hidden_dim = hidden_size,
+			hidden_dim_bytes = hidden_size * in_type.itemsize,
 			hidden_dim_scale_bytes = 0
 		)
 
