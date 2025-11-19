@@ -1772,17 +1772,17 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# 3. Local Expert Computation (Identity)
 		# self.expert_y.copy_(self.expert_x)
-		expert_offsets = torch.zeros(
-			self.experts_per_rank + 1, 
-			dtype=torch.int32, 
-			device=self.device
-		)
-		# Cumulative sum to get offsets
-		expert_offsets[1:] = torch.cumsum(self.expert_num_tokens, dim=0)
+		# expert_offsets = torch.zeros(
+		# 	self.experts_per_rank + 1, 
+		# 	dtype=torch.int32, 
+		# 	device=self.device
+		# )
+		# # Cumulative sum to get offsets
+		# expert_offsets[1:] = torch.cumsum(self.expert_num_tokens, dim=0)
 
 		self.grouped_dequant_moe_fp8_ata(
 			self.expert_x,
-			expert_offsets,
+			self.expert_num_tokens,
 			self.experts_per_rank,
 			self.expert_y
 		)
