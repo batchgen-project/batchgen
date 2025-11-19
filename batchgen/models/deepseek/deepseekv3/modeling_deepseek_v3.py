@@ -1800,7 +1800,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# Even though x is large, we only need to quantize up to valid tokens
 		# Note: act_quant usually handles its own kernel, assumed compatible here.
 		x_valid = x[:actual_num_tokens]
-		x_quant, x_scale = self.act_quant(x_valid) 
+		x_quant, x_scale = act_quant(x_valid) 
 		
 		# 3. Run Stage 1 (Gate + Up Proj)
 		# Output will be valid only up to actual_num_tokens, but stored in 'intermediate' buffer
@@ -1819,7 +1819,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		
 		# 4. Quantize Intermediate
-		intermediate_quant, intermediate_scale = self.act_quant(intermediate)
+		intermediate_quant, intermediate_scale = act_quant(intermediate)
 		
 		# 5. Run Stage 2 (Down Proj) -> Write to self.expert_y
 		# We assume self.expert_y is available. If this function needs to return it,
