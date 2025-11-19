@@ -652,6 +652,18 @@ class DeepseekV3ParallelStrategyManager:
 		)
 		self.dp_x_scale = None
 
+		self.ata = AllToAll.internode(
+			max_num_tokens = self.num_tokens_per_rank,
+			num_experts = 256,
+			experts_per_token = self.num_experts_per_tok,
+			rank = self.rank,
+			world_size = self.world_size,
+			dp_size = dp_size,
+			hidden_dim = hidden_dim,
+			hidden_dim_bytes = hidden_dim * in_type.itemsize,
+			hidden_dim_scale_bytes = 0
+		)
+
 		for layer_idx in range(
 			self.hf_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
@@ -668,7 +680,8 @@ class DeepseekV3ParallelStrategyManager:
 					self.weights,
 					self.y,
 					self.dp_x,
-					self.dp_x_scale
+					self.dp_x_scale,
+					self.ata
 				)
 
 	def _init_mode_decoding(self):

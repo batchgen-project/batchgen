@@ -1602,7 +1602,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			weights,
 			y,
 			dp_x,
-			dp_x_scale):
+			dp_x_scale,
+			ata):
 		self.num_tokens_per_rank = num_tokens_per_rank
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
@@ -1637,20 +1638,20 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# )
 		# # symm_in_splits_offsets_hdl = symm_mem.rendezvous(self.symm_in_splits_offsets, dist.group.WORLD)
 		# self.group_name = dist.group.WORLD.group_name
-		in_type = torch.bfloat16
-		dp_size = 1
-		num_dp = self.world_size // dp_size
-		ata = AllToAll.internode(
-			max_num_tokens = self.num_tokens_per_rank,
-			num_experts = self.total_experts,
-			experts_per_token = self.num_experts_per_tok,
-			rank = self.rank,
-			world_size = self.world_size,
-			dp_size = dp_size,
-			hidden_dim = self.config.hidden_size,
-			hidden_dim_bytes = self.config.hidden_size * in_type.itemsize,
-			hidden_dim_scale_bytes = 0
-		)
+		# in_type = torch.bfloat16
+		# dp_size = 1
+		# num_dp = self.world_size // dp_size
+		# ata = AllToAll.internode(
+		# 	max_num_tokens = self.num_tokens_per_rank,
+		# 	num_experts = self.total_experts,
+		# 	experts_per_token = self.num_experts_per_tok,
+		# 	rank = self.rank,
+		# 	world_size = self.world_size,
+		# 	dp_size = dp_size,
+		# 	hidden_dim = self.config.hidden_size,
+		# 	hidden_dim_bytes = self.config.hidden_size * in_type.itemsize,
+		# 	hidden_dim_scale_bytes = 0
+		# )
 		self.ata = ata
 		
 		# self.expert_num_tokens = torch.empty(self.experts_per_rank, dtype=torch.int32, device=self.device)
