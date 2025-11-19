@@ -3,7 +3,9 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/core/ScalarType.h>
 #include <cuda_runtime_api.h>
+#include <torch/torch.h>
 
 #include <algorithm>
 #include <atomic>
@@ -165,12 +167,6 @@ using SequenceLengthMap = std::unordered_map<std::int64_t, std::size_t>;
 using SequenceLengthVector = std::vector<std::size_t>;
 using SequenceLengths = std::variant<SequenceLengthMap, SequenceLengthVector>;
 
-struct DevicePageCopyRequest {
-    std::size_t layer_idx = 0;
-    std::int32_t page_idx = 0;
-    std::uintptr_t device_ptr = 0;
-};
-
 using SequenceLengthMap = batchgen::kv::SequenceLengthMap;
 using SequenceLengthVector = batchgen::kv::SequenceLengthVector;
 using SequenceLengths = batchgen::kv::SequenceLengths;
@@ -269,52 +265,113 @@ class HostPagedKVWorkerView {
     }
 
     KVAsyncTask AsyncLoadLayerKVToDevice(
-        std::vector<DevicePageCopyRequest> requests) {
+        torch::Tensor layer_indices, torch::Tensor page_indices,
+        torch::Tensor k_device_ptrs,
+        std::optional<torch::Tensor> v_device_ptrs = std::nullopt) {
         EnsureDeviceReady();
         constexpr std::string_view kOpName = "AsyncLoadLayerKVToDevice";
-        ValidateDevicePageCopyRequests(requests, kOpName);
-        if (requests.empty()) {
+        auto tensors = PrepareDevicePageCopyTensors(
+            std::move(layer_indices), std::move(page_indices),
+            std::move(k_device_ptrs), std::move(v_device_ptrs), kOpName);
+        if (tensors.layer_indices.numel() == 0) {
             return LaunchAsyncTask([] {});
         }
-        return LaunchAsyncTask([this, requests = std::move(requests)]() {
+        return LaunchAsyncTask([this, tensors = std::move(tensors)]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
-            const std::size_t page_bytes = layout_.KPageBytes();
-            if (page_bytes == 0) {
+            const std::size_t k_page_bytes = layout_.KPageBytes();
+            if (k_page_bytes == 0) {
                 return;
             }
 
-            const std::size_t n = requests.size();
-            std::vector<uint8_t*> host_sources(n);
-            std::vector<uint8_t*> device_dests(n);
+            const auto n =
+                static_cast<std::size_t>(tensors.layer_indices.size(0));
+            std::vector<uint8_t*> host_k_sources(n);
+            std::vector<uint8_t*> device_k_dests(n);
+            std::vector<uint8_t*> host_v_sources;
+            std::vector<uint8_t*> device_v_dests;
+
+            auto* layer_ptr =
+                tensors.layer_indices.template data_ptr<std::int64_t>();
+            auto* page_ptr =
+                tensors.page_indices.template data_ptr<std::int64_t>();
+            auto* k_dest_ptr =
+                tensors.k_device_ptrs.template data_ptr<std::int64_t>();
+            auto* v_dest_ptr = tensors.v_device_ptrs.has_value()
+                                    ? tensors.v_device_ptrs->template data_ptr<
+                                          std::int64_t>()
+                                    : nullptr;
+            if constexpr (kHasVCache) {
+                if (v_dest_ptr != nullptr) {
+                    host_v_sources.resize(n);
+                    device_v_dests.resize(n);
+                }
+            }
 
 #pragma omp parallel for
             for (std::int64_t i = 0; i < static_cast<std::int64_t>(n); ++i) {
-                const auto& request = requests[i];
-                auto* src = static_cast<uint8_t*>(
-                    KPagePtr(request.layer_idx, request.page_idx));
-                auto* dst = reinterpret_cast<uint8_t*>(request.device_ptr);
-                host_sources[i] = src;
-                device_dests[i] = dst;
+                const auto layer_idx = static_cast<std::size_t>(layer_ptr[i]);
+                const auto page_idx = static_cast<std::int32_t>(page_ptr[i]);
+                auto* k_src =
+                    static_cast<uint8_t*>(KPagePtr(layer_idx, page_idx));
+                auto* k_dst = reinterpret_cast<uint8_t*>(
+                    static_cast<std::uintptr_t>(k_dest_ptr[i]));
+                host_k_sources[i] = k_src;
+                device_k_dests[i] = k_dst;
+                if (v_dest_ptr != nullptr) {
+                    if constexpr (kHasVCache) {
+                        auto* v_src = static_cast<uint8_t*>(
+                            this->template VPagePtr<>(layer_idx, page_idx));
+                        auto* v_dst = reinterpret_cast<uint8_t*>(
+                            static_cast<std::uintptr_t>(v_dest_ptr[i]));
+                        host_v_sources[i] = v_src;
+                        device_v_dests[i] = v_dst;
+                    }
+                }
             }
 
-            worker_detail::DeviceBuffer<uint8_t*> device_src_ptrs(
-                requests.size());
-            worker_detail::DeviceBuffer<uint8_t*> device_dst_ptrs(
-                requests.size());
+            worker_detail::DeviceBuffer<uint8_t*> k_device_src_ptrs(n);
+            worker_detail::DeviceBuffer<uint8_t*> k_device_dst_ptrs(n);
+            worker_detail::DeviceBuffer<uint8_t*> v_device_src_ptrs(
+                v_dest_ptr != nullptr ? n : 0);
+            worker_detail::DeviceBuffer<uint8_t*> v_device_dst_ptrs(
+                v_dest_ptr != nullptr ? n : 0);
 
-            const std::size_t ptr_bytes = requests.size() * sizeof(uint8_t*);
-            EnqueueCopy(reinterpret_cast<const std::byte*>(host_sources.data()),
-                        reinterpret_cast<std::byte*>(device_src_ptrs.get()),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-            EnqueueCopy(reinterpret_cast<const std::byte*>(device_dests.data()),
-                        reinterpret_cast<std::byte*>(device_dst_ptrs.get()),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+            auto enqueue_page_copy = [&](auto& host_sources, auto& device_dests,
+                                         auto& dev_src_ptrs,
+                                         auto& dev_dst_ptrs,
+                                         std::size_t page_bytes) {
+                if (host_sources.empty() || page_bytes == 0) {
+                    return;
+                }
+                const std::size_t ptr_bytes =
+                    host_sources.size() * sizeof(uint8_t*);
+                EnqueueCopy(
+                    reinterpret_cast<const std::byte*>(host_sources.data()),
+                    reinterpret_cast<std::byte*>(dev_src_ptrs.get()),
+                    ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+                EnqueueCopy(
+                    reinterpret_cast<const std::byte*>(device_dests.data()),
+                    reinterpret_cast<std::byte*>(dev_dst_ptrs.get()),
+                    ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
 
-            const auto num_pages = static_cast<int>(requests.size());
-            worker_detail::LaunchUvaPageCopyKernel(
-                device_src_ptrs.get(), device_dst_ptrs.get(), page_bytes,
-                num_pages, cuda_stream);
+                worker_detail::LaunchUvaPageCopyKernel(
+                    dev_src_ptrs.get(), dev_dst_ptrs.get(), page_bytes,
+                    static_cast<int>(host_sources.size()), cuda_stream);
+            };
+
+            enqueue_page_copy(host_k_sources, device_k_dests,
+                              k_device_src_ptrs, k_device_dst_ptrs,
+                              k_page_bytes);
+
+            if constexpr (kHasVCache) {
+                if (v_dest_ptr != nullptr) {
+                    const std::size_t v_page_bytes = layout_.VPageBytes();
+                    enqueue_page_copy(host_v_sources, device_v_dests,
+                                      v_device_src_ptrs, v_device_dst_ptrs,
+                                      v_page_bytes);
+                }
+            }
 
             this->SynchronizeWithEvent(cuda_stream);
         });
@@ -635,6 +692,13 @@ class HostPagedKVWorkerView {
     struct PageLocation {
         std::int32_t page_idx = -1;
         std::size_t page_offset_tokens = 0;
+    };
+
+    struct PageCopyTensors {
+        torch::Tensor layer_indices;
+        torch::Tensor page_indices;
+        torch::Tensor k_device_ptrs;
+        std::optional<torch::Tensor> v_device_ptrs;
     };
 
     static inline constexpr std::string_view kClassTag =
@@ -971,26 +1035,131 @@ class HostPagedKVWorkerView {
         }
     }
 
-    void ValidateDevicePageCopyRequests(
-        const std::vector<DevicePageCopyRequest>& requests,
+    PageCopyTensors PrepareDevicePageCopyTensors(
+        torch::Tensor layer_indices, torch::Tensor page_indices,
+        torch::Tensor k_device_ptrs,
+        std::optional<torch::Tensor> v_device_ptrs,
         std::string_view op_name) const {
-        const auto max_pages =
-            static_cast<std::size_t>(std::numeric_limits<int>::max());
-        if (requests.size() > max_pages) {
-            std::ostringstream oss;
-            oss << op_name << ": num_pages=" << requests.size()
-                << " exceeds kernel limit=" << max_pages;
-            throw std::invalid_argument(oss.str());
-        }
-        for (const auto& request : requests) {
-            geometry_.EnsureLayerBounds(request.layer_idx, op_name);
-            geometry_.EnsurePageBounds(request.page_idx, op_name);
-            if (request.device_ptr == 0) {
-                std::ostringstream oss;
-                oss << op_name << ": device_ptr must not be null";
-                throw std::invalid_argument(oss.str());
+        PageCopyTensors tensors;
+        tensors.layer_indices = ValidateCpuTensor1D(
+            std::move(layer_indices), torch::kInt64, "layer_indices",
+            op_name);
+        tensors.page_indices = ValidateCpuTensor1D(
+            std::move(page_indices), torch::kInt64, "page_indices",
+            op_name);
+        tensors.k_device_ptrs = ValidateCpuTensor1D(
+            std::move(k_device_ptrs), torch::kInt64, "k_device_ptrs",
+            op_name);
+        if (v_device_ptrs.has_value()) {
+            if constexpr (!kHasVCache) {
+                throw std::invalid_argument(
+                    std::string(op_name) +
+                    ": v_device_ptrs provided but V cache is disabled");
+            } else {
+                tensors.v_device_ptrs = ValidateCpuTensor1D(
+                    std::move(*v_device_ptrs), torch::kInt64,
+                    "v_device_ptrs", op_name);
             }
         }
+
+        const auto num_entries = tensors.layer_indices.size(0);
+        const auto check_length = [&](const torch::Tensor& tensor,
+                                      std::string_view name) {
+            if (tensor.size(0) != num_entries) {
+                std::ostringstream oss;
+                oss << op_name << ": " << name
+                    << " must match layer_indices length (layers="
+                    << num_entries << ", " << name << '=' << tensor.size(0)
+                    << ')';
+                throw std::invalid_argument(oss.str());
+            }
+        };
+        check_length(tensors.page_indices, "page_indices");
+        check_length(tensors.k_device_ptrs, "k_device_ptrs");
+        if (tensors.v_device_ptrs.has_value()) {
+            check_length(*tensors.v_device_ptrs, "v_device_ptrs");
+        }
+
+        const auto kernel_limit =
+            static_cast<std::size_t>(std::numeric_limits<int>::max());
+        if (static_cast<std::size_t>(num_entries) > kernel_limit) {
+            std::ostringstream oss;
+            oss << op_name << ": num_pages=" << num_entries
+                << " exceeds kernel limit=" << kernel_limit;
+            throw std::invalid_argument(oss.str());
+        }
+
+        if (num_entries == 0) {
+            return tensors;
+        }
+
+        const auto min_layer =
+            tensors.layer_indices.min().template item<std::int64_t>();
+        const auto max_layer =
+            tensors.layer_indices.max().template item<std::int64_t>();
+        if (min_layer < 0 ||
+            max_layer >= static_cast<std::int64_t>(config_.num_layers)) {
+            std::ostringstream oss;
+            oss << op_name << ": layer_indices must be within [0, num_layers)";
+            throw std::out_of_range(oss.str());
+        }
+
+        const auto min_page =
+            tensors.page_indices.min().template item<std::int64_t>();
+        const auto max_page =
+            tensors.page_indices.max().template item<std::int64_t>();
+        if (min_page < 0 ||
+            max_page >= static_cast<std::int64_t>(config_.num_pages)) {
+            std::ostringstream oss;
+            oss << op_name << ": page_indices must be within [0, num_pages)";
+            throw std::out_of_range(oss.str());
+        }
+
+        if (tensors.k_device_ptrs.le(0).any().template item<bool>()) {
+            std::ostringstream oss;
+            oss << op_name << ": k_device_ptrs must be non-zero";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensors.v_device_ptrs.has_value() &&
+            tensors.v_device_ptrs->le(0).any().template item<bool>()) {
+            std::ostringstream oss;
+            oss << op_name << ": v_device_ptrs must be non-zero";
+            throw std::invalid_argument(oss.str());
+        }
+
+        return tensors;
+    }
+
+    torch::Tensor ValidateCpuTensor1D(torch::Tensor tensor,
+                                      torch::ScalarType dtype,
+                                      std::string_view tensor_name,
+                                      std::string_view op_name) const {
+        if (tensor.device().type() != torch::kCPU) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must be on CPU (got device "
+                << tensor.device().str() << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.dim() != 1) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name << " must be 1-D";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.scalar_type() != dtype) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must have dtype " << c10::toString(dtype)
+                << " (got " << c10::toString(tensor.scalar_type()) << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        if (!tensor.is_contiguous()) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must be contiguous";
+            throw std::invalid_argument(oss.str());
+        }
+        return tensor;
     }
 
     std::size_t ValidateKTensorShape(const torch::Tensor& tensor,

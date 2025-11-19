@@ -141,29 +141,16 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            py::arg("sequence_lengths"))
         .def(
             "async_load_layer_kv_to_device",
-            [](WorkerView& self, py::sequence request_triplets) {
-                std::vector<kv::DevicePageCopyRequest> requests;
-                requests.reserve(static_cast<std::size_t>(
-                    py::len(request_triplets)));
-                for (const py::handle request : request_triplets) {
-                    const py::tuple triple = py::cast<py::tuple>(request);
-                    if (py::len(triple) != 3) {
-                        throw std::invalid_argument(
-                            "Each request must be a tuple "
-                            "(layer_idx, page_idx, device_ptr)");
-                    }
-                    kv::DevicePageCopyRequest parsed_request;
-                    parsed_request.layer_idx =
-                        py::cast<std::size_t>(triple[0]);
-                    parsed_request.page_idx =
-                        py::cast<std::int32_t>(triple[1]);
-                    parsed_request.device_ptr =
-                        py::cast<std::uintptr_t>(triple[2]);
-                    requests.emplace_back(parsed_request);
-                }
-                return self.AsyncLoadLayerKVToDevice(std::move(requests));
+            [](WorkerView& self, torch::Tensor layer_indices,
+               torch::Tensor page_indices, torch::Tensor k_device_ptrs,
+               std::optional<torch::Tensor> v_device_ptrs) {
+                return self.AsyncLoadLayerKVToDevice(
+                    std::move(layer_indices), std::move(page_indices),
+                    std::move(k_device_ptrs), std::move(v_device_ptrs));
             },
-            py::arg("requests"),
+            py::arg("layer_indices"), py::arg("page_indices"),
+            py::arg("k_device_ptrs"),
+            py::arg("v_device_ptrs") = py::none(),
             "Schedule host-paged KV pages to be loaded onto device memory "
             "using pre-allocated GPU destinations.")
         .def("__repr__",
