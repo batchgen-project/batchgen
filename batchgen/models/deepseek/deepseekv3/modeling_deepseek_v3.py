@@ -1592,13 +1592,23 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# # ------------------------------------------------------------------
 
 
-	def init_num_tokens(self, num_tokens_per_rank):
+	def init_num_tokens(self, 
+			num_tokens_per_rank, 
+			expert_num_tokens,
+			expert_x,
+			expert_x_scale,
+			expert_y,
+			indices,
+			weights,
+			y,
+			dp_x,
+			dp_x_scale):
 		self.num_tokens_per_rank = num_tokens_per_rank
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
 		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
 		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
-		self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
+		# self.gate_bias = torch.zeros(self.config.n_routed_experts, device=self.device, dtype=torch.bfloat16)
 		
 		# Pre-allocate symmetric memory buffers
 		# max_inp_len = self.num_tokens_per_rank * self.num_experts_per_tok
@@ -1643,35 +1653,45 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		self.ata = ata
 		
-		self.expert_num_tokens = torch.empty(self.experts_per_rank, dtype=torch.int32, device=self.device)
-		self.expert_x = torch.empty(
-			(self.experts_per_rank, self.num_tokens_per_rank * num_dp, self.config.hidden_size),
-			dtype=in_type,
-			device=self.device
-		)
-		self.expert_x_scale = None
-		self.expert_y = torch.empty_like(self.expert_x)
-		self.indices = torch.empty(
-			(self.num_tokens_per_rank, self.num_experts_per_tok),
-			dtype=torch.uint32,
-			device=self.device
-		)
-		self.weights = torch.empty(
-			(self.num_tokens_per_rank, self.num_experts_per_tok),
-			dtype=torch.float32,
-			device=self.device
-		)
-		self.y = torch.empty(
-			(self.num_tokens_per_rank, self.config.hidden_size),
-			dtype=in_type,
-			device=self.device
-		)
-		self.dp_x = torch.empty(
-			(self.num_tokens_per_rank, self.config.hidden_size),
-			dtype=in_type,
-			device=self.device
-		)
-		self.dp_x_scale = None
+		# self.expert_num_tokens = torch.empty(self.experts_per_rank, dtype=torch.int32, device=self.device)
+		# self.expert_x = torch.empty(
+		# 	(self.experts_per_rank, self.num_tokens_per_rank * num_dp, self.config.hidden_size),
+		# 	dtype=in_type,
+		# 	device=self.device
+		# )
+		# self.expert_x_scale = None
+		# self.expert_y = torch.empty_like(self.expert_x)
+		# self.indices = torch.empty(
+		# 	(self.num_tokens_per_rank, self.num_experts_per_tok),
+		# 	dtype=torch.uint32,
+		# 	device=self.device
+		# )
+		# self.weights = torch.empty(
+		# 	(self.num_tokens_per_rank, self.num_experts_per_tok),
+		# 	dtype=torch.float32,
+		# 	device=self.device
+		# )
+		# self.y = torch.empty(
+		# 	(self.num_tokens_per_rank, self.config.hidden_size),
+		# 	dtype=in_type,
+		# 	device=self.device
+		# )
+		# self.dp_x = torch.empty(
+		# 	(self.num_tokens_per_rank, self.config.hidden_size),
+		# 	dtype=in_type,
+		# 	device=self.device
+		# )
+		# self.dp_x_scale = None
+		self.expert_num_tokens = expert_num_tokens
+		self.expert_x = expert_x
+		self.expert_x_scale = expert_x_scale
+		self.expert_y = expert_y
+		self.indices = indices
+		self.weights = weights
+		self.y = y
+		self.dp_x = dp_x
+		self.dp_x_scale = dp_x_scale
+		
 		
 
 
