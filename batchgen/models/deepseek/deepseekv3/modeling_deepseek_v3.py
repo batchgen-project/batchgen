@@ -1509,6 +1509,116 @@ def activation_gating(
 	
 	return output
 
+
+@triton.jit
+def act_quant_kernel_3d_sparse(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    expert_tokens_ptr,  # [E] - token counts per expert
+    E, M_max, N,
+    stride_x_e, stride_x_m, stride_x_n,
+    stride_y_e, stride_y_m, stride_y_n,
+    stride_scale_e, stride_scale_m, stride_scale_n,
+    eps: tl.constexpr,
+    fp8_max: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    """
+    3D Sparse Block Quantization Kernel.
+    Only quantizes valid tokens per expert, skipping padding.
+    """
+    expert_idx = tl.program_id(axis=0)
+    block_n_idx = tl.program_id(axis=1)
+    
+    # Load valid token count for this expert
+    valid_tokens = tl.load(expert_tokens_ptr + expert_idx).to(tl.int32)
+    
+    # Early exit if no valid tokens
+    if valid_tokens == 0:
+        return
+    
+    # Base pointers for this expert
+    x_expert_base = x_ptr + expert_idx * stride_x_e
+    y_expert_base = y_ptr + expert_idx * stride_y_e
+    scale_expert_base = scale_ptr + expert_idx * stride_scale_e
+    
+    # Block offset along N dimension
+    block_start_n = block_n_idx * BLOCK_SIZE
+    offsets_n = block_start_n + tl.arange(0, BLOCK_SIZE)
+    mask_n = offsets_n < N
+    
+    # Process each valid token (row) for this expert
+    for token_idx in range(valid_tokens):
+        # Load the block for this token
+        x_ptrs = x_expert_base + token_idx * stride_x_m + offsets_n * stride_x_n
+        x = tl.load(x_ptrs, mask=mask_n, other=0.0).to(tl.float32)
+        
+        # Compute scale (absmax of this block)
+        absmax = tl.max(tl.abs(x), axis=0)
+        scale = tl.maximum(absmax, eps) / fp8_max
+        
+        # Quantize
+        x_scaled = x / scale
+        x_scaled = tl.minimum(x_scaled, fp8_max)
+        x_scaled = tl.maximum(x_scaled, -fp8_max)
+        
+        # Store quantized data
+        y = x_scaled.to(y_ptr.dtype.element_ty)
+        y_ptrs = y_expert_base + token_idx * stride_y_m + offsets_n * stride_y_n
+        tl.store(y_ptrs, y, mask=mask_n)
+        
+        # Store scale
+        scale_ptr_offset = scale_expert_base + token_idx * stride_scale_m + block_n_idx * stride_scale_n
+        tl.store(scale_ptr_offset, scale)
+
+
+def act_quant_3d(
+    x: torch.Tensor,
+    expert_token_counts: torch.Tensor,  # [E] - counts per expert
+    block_size: int = 128,
+    eps: float = 1e-12
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Optimized FP8 quantization that only processes valid tokens.
+    
+    Args:
+        x: Input tensor [E, M_max, H] 
+        expert_token_counts: Valid token count per expert [E]
+        block_size: Quantization block size along H dimension
+        eps: Minimum scale value
+    
+    Returns:
+        y: Quantized tensor [E, M_max, H] in fp8
+        scale: Scale factors [E, M_max, H//block_size] in fp32
+    """
+    assert x.is_contiguous(), 'Input must be contiguous'
+    assert x.ndim == 3, 'Input must be 3D [E, M_max, H]'
+    
+    fp8_max = 448.0
+    E, M_max, H = x.shape
+    num_blocks = (H + block_size - 1) // block_size
+    
+    # Allocate outputs (full buffer size)
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.empty((E, M_max, num_blocks), dtype=torch.float32, device=x.device)
+    
+    # Grid: (num_experts, num_blocks_per_token)
+    grid = (E, num_blocks)
+    
+    act_quant_kernel_3d_sparse[grid](
+        x, y, scale,
+        expert_token_counts,
+        E, M_max, H,
+        x.stride(0), x.stride(1), x.stride(2),
+        y.stride(0), y.stride(1), y.stride(2),
+        scale.stride(0), scale.stride(1), scale.stride(2),
+        eps=eps,
+        fp8_max=fp8_max,
+        BLOCK_SIZE=block_size
+    )
+    
+    return y, scale
 import torch.distributed._symmetric_memory as symm_mem
 from pplx_kernels.all_to_all import AllToAll
 from .grouped_gemm_kernel import (
@@ -1812,7 +1922,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		"""
 		# Quantize the whole 3D tensor. 
 		# act_quant preserves layout (E, T, H) -> (E, T, H) and (E, T, 1)
-		x_quant, x_scale = act_quant(x) 
+		x_quant, x_scale = act_quant_3d(x, expert_token_counts)
 		
 		# Stage 1: Output is (E, T, Intermediate)
 		intermediate = fused_fp8_moe_stage_1_tma_wrapper(
@@ -1825,7 +1935,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			experts_per_rank    
 		)
 		
-		intermediate_quant, intermediate_scale = act_quant(intermediate)
+		intermediate_quant, intermediate_scale = act_quant_3d(intermediate, expert_token_counts)
 		
 		# Stage 2: Output is (E, T, Hidden)
 		res = fused_dequant_grouped_gemm_fp8_tma_wrapper(
