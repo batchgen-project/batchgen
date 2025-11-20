@@ -607,17 +607,95 @@ class DeepseekV3ParallelStrategyManager:
 		
 		return self.model, self.weight_copy_task
 	
+	# def _init_decoding_padding_bsz(self, padding_bsz):
+	# 	"""
+	# 	Initialize the padding batch size for decoding.
+	# 	This is used to set the padding size for the input sequences.
+	# 	"""
+	# 	in_type = torch.bfloat16
+	# 	dp_size = 1
+	# 	world_size = self.world_size
+	# 	num_dp = world_size // dp_size	
+	# 	hidden_size = 7168
+	# 	self.device = self.engine_config.Basic_Config.device_torch
+
+	# 	self.experts_per_rank = 256 // world_size
+	# 	self.num_experts_per_tok = 8
+	# 	self.num_tokens_per_rank = padding_bsz
+
+	# 	self.expert_num_tokens = torch.empty(self.experts_per_rank, dtype=torch.int32, device=self.device)
+	# 	self.expert_x = torch.empty(
+	# 		(self.experts_per_rank, self.num_tokens_per_rank * num_dp, hidden_size),
+	# 		dtype=in_type,
+	# 		device=self.device
+	# 	)
+	# 	self.expert_x_scale = None
+	# 	self.expert_y = torch.empty_like(self.expert_x)
+	# 	self.indices = torch.empty(
+	# 		(self.num_tokens_per_rank, self.num_experts_per_tok),
+	# 		dtype=torch.uint32,
+	# 		device=self.device
+	# 	)
+	# 	self.weights = torch.empty(
+	# 		(self.num_tokens_per_rank, self.num_experts_per_tok),
+	# 		dtype=torch.float32,
+	# 		device=self.device
+	# 	)
+	# 	self.y = torch.empty(
+	# 		(self.num_tokens_per_rank, hidden_size),
+	# 		dtype=in_type,
+	# 		device=self.device
+	# 	)
+	# 	self.dp_x = torch.empty(
+	# 		(self.num_tokens_per_rank, hidden_size),
+	# 		dtype=in_type,
+	# 		device=self.device
+	# 	)
+	# 	self.dp_x_scale = None
+
+	# 	self.ata = AllToAll.internode(
+	# 		max_num_tokens = self.num_tokens_per_rank,
+	# 		num_experts = 256,
+	# 		experts_per_token = self.num_experts_per_tok,
+	# 		rank = self.rank,
+	# 		world_size = self.world_size,
+	# 		dp_size = dp_size,
+	# 		hidden_dim = hidden_size,
+	# 		hidden_dim_bytes = hidden_size * in_type.itemsize,
+	# 		hidden_dim_scale_bytes = 0
+	# 	)
+
+	# 	for layer_idx in range(
+	# 		self.hf_model_config.first_k_dense_replace,
+	# 		self.model_config.num_hidden_layers,
+	# 	):
+	# 		layer = self.model.model.layers[layer_idx].mlp
+	# 		if hasattr(layer, "init_num_tokens"):
+	# 			layer.init_num_tokens(
+	# 				padding_bsz, 
+	# 				self.expert_num_tokens,
+	# 				self.expert_x,
+	# 				self.expert_x_scale,
+	# 				self.expert_y,
+	# 				self.indices,
+	# 				self.weights,
+	# 				self.y,
+	# 				self.dp_x,
+	# 				self.dp_x_scale,
+	# 				self.ata
+	# 			)
 	def _init_decoding_padding_bsz(self, padding_bsz):
 		"""
 		Initialize the padding batch size for decoding.
 		This is used to set the padding size for the input sequences.
 		"""
-		in_type = torch.bfloat16
+		in_type = torch.float8_e4m3fn
 		dp_size = 1
 		world_size = self.world_size
 		num_dp = world_size // dp_size	
 		hidden_size = 7168
 		self.device = self.engine_config.Basic_Config.device_torch
+		block_size = 128
 
 		self.experts_per_rank = 256 // world_size
 		self.num_experts_per_tok = 8
@@ -629,7 +707,11 @@ class DeepseekV3ParallelStrategyManager:
 			dtype=in_type,
 			device=self.device
 		)
-		self.expert_x_scale = None
+		self.expert_x_scale = torch.empty(
+			(self.experts_per_rank, self.expert_x.size(1), (self.expert_x.size(2) + block_size -1)//block_size),
+			dtype=torch.float32,
+			device=self.device
+		)
 		self.expert_y = torch.empty_like(self.expert_x)
 		self.indices = torch.empty(
 			(self.num_tokens_per_rank, self.num_experts_per_tok),
@@ -651,7 +733,11 @@ class DeepseekV3ParallelStrategyManager:
 			dtype=in_type,
 			device=self.device
 		)
-		self.dp_x_scale = None
+		self.dp_x_scale = torch.empty(
+			(self.dp_x.size(0), (self.dp_x.size(1) + block_size -1)//block_size),
+			dtype=torch.float32,
+			device=self.device
+		)
 
 		self.ata = AllToAll.internode(
 			max_num_tokens = self.num_tokens_per_rank,
@@ -662,7 +748,7 @@ class DeepseekV3ParallelStrategyManager:
 			dp_size = dp_size,
 			hidden_dim = hidden_size,
 			hidden_dim_bytes = hidden_size * in_type.itemsize,
-			hidden_dim_scale_bytes = 0
+			hidden_dim_scale_bytes = (hidden_size + block_size -1) // block_size * torch.float32().itemsize
 		)
 
 		for layer_idx in range(
