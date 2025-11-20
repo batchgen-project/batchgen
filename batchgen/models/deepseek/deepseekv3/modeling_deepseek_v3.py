@@ -1674,6 +1674,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# --- Pre-allocate Buffers. --------------------------------
 		self.num_tokens_per_rank = None		# This is a placeholder, adjust as needed
+		self.bound_m = torch.zeros(1, dtype=torch.uint32, device=self.device)
 
 
 		# # 2. NVSHMEM Initialization
@@ -1866,7 +1867,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.dp_x.copy_(x)
 		self.indices.copy_(topk_idx.to(torch.uint32))
 		self.weights.copy_(topk_weight.to(torch.float32))
-		bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
+		# bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
+		self.bound_m.fill_(num_tokens)
 
 		# 2. Dispatch
 		self.ata.dispatch(
