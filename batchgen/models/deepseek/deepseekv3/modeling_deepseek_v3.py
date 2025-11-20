@@ -1927,7 +1927,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# 3. Local Expert Computation (Identity)
 		self.grouped_dequant_moe_fp8_ata_fp8(
-			(self.expert_x, self.expert_x_scale)
+			(self.expert_x, self.expert_x_scale),
 			self.expert_num_tokens,
 			self.experts_per_rank,
 			self.expert_y
