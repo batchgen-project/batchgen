@@ -968,7 +968,7 @@ class BatchGenWorker:
 
 
 
-	def setup_distributed_environment(self):
+	def init_nvshmem(self):
 		import nvshmem.core as nvshmem
 		from cuda.core.experimental import Device	
 		from pplx_kernels import nvshmem_init
@@ -994,16 +994,16 @@ class BatchGenWorker:
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
-		self.setup_distributed_environment()
+		self.init_nvshmem()
 		
 		# Initialize symmetric memory once during model initialization
-		if not symm_mem.is_nvshmem_available():
-			logging.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
-			symm_mem.set_backend("NCCL")
-		else:
-			symm_mem.set_backend("NVSHMEM")
-		group_name = dist.group.WORLD.group_name
-		symm_mem.enable_symm_mem_for_group(group_name)
+		# if not symm_mem.is_nvshmem_available():
+		# 	logging.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
+		# 	symm_mem.set_backend("NCCL")
+		# else:
+		# 	symm_mem.set_backend("NVSHMEM")
+		# group_name = dist.group.WORLD.group_name
+		# symm_mem.enable_symm_mem_for_group(group_name)
 
 
 		# Get number of sequences for each rank 
