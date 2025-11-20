@@ -1762,7 +1762,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL","0") == "1":
-			moe_infer_fn = self.moe_infer_pplx_a2a_bf16_dispatch
+			moe_infer_fn = self.moe_infer_pplx_a2a_fp8_dispatch
 		else:
 			moe_infer_fn = self.moe_infer_allgather_allreduce_bf16_acc
 		out = moe_infer_fn(hidden_states)
@@ -1791,7 +1791,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			dp_x=self.dp_x,
 			dp_x_scale=None,
 			indices=self.indices,
-			bound_m=bound_m,
+			bound_m=self.bound_m,
 		)
 
 		# 3. Local Expert Computation (Identity)
@@ -1809,7 +1809,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			indices=self.indices,
 			weights=self.weights,
 			expert_y=self.expert_y,
-			bound_m=bound_m,
+			bound_m=self.bound_m,
 		)
 		
 		return self.y[:num_tokens].to(x.dtype)
@@ -1827,7 +1827,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.dp_x_scale.copy_(dp_x_scale)
 		self.indices.copy_(topk_idx.to(torch.uint32))
 		self.weights.copy_(topk_weight.to(torch.float32))
-		bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
+		# bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
+		self.bound_m.fill_(num_tokens)
 
 		# 2. Dispatch
 		self.ata.dispatch(
@@ -1837,7 +1838,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			dp_x=self.dp_x,
 			dp_x_scale=self.dp_x_scale,
 			indices=self.indices,
-			bound_m=bound_m,
+			bound_m=self.bound_m,
 		)
 
 		# 3. Local Expert Computation (Identity)
@@ -1855,7 +1856,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			indices=self.indices,
 			weights=self.weights,
 			expert_y=self.expert_y,
-			bound_m=bound_m,
+			bound_m=self.bound_m,
 		)
 		
 		return self.y[:num_tokens].to(x.dtype)
