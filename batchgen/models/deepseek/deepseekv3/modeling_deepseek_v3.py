@@ -1851,7 +1851,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_pplx_a2a(hidden_states)
+		out = self.moe_infer_pplx_a2a_fp8(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
@@ -1869,7 +1869,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
 
 		# 2. Dispatch
-		# (Removed prints for accurate timing)
 		self.ata.dispatch(
 			out_expert_num_tokens=self.expert_num_tokens,
 			out_expert_x=self.expert_x,
@@ -1881,15 +1880,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 
 		# 3. Local Expert Computation (Identity)
-		# self.expert_y.copy_(self.expert_x)
-		# expert_offsets = torch.zeros(
-		# 	self.experts_per_rank + 1, 
-		# 	dtype=torch.int32, 
-		# 	device=self.device
-		# )
-		# # Cumulative sum to get offsets
-		# expert_offsets[1:] = torch.cumsum(self.expert_num_tokens, dim=0)
-
 		self.grouped_dequant_moe_fp8_ata(
 			self.expert_x,
 			self.expert_num_tokens,
@@ -1909,6 +1899,82 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		return self.y[:num_tokens].to(x.dtype)
 
+	@torch.inference_mode()
+	def moe_infer_pplx_a2a_fp8(self,x):
+		num_tokens, hidden_size = x.shape
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
+			x.view(num_tokens, 1, hidden_size)
+		)
+		
+		# ---- Prepare Dispatch Metadata -------
+		dp_x_fp8, dp_x_scale = act_quant(x)
+		self.dp_x.copy_(x)
+		self.dp_x_scale.copy_(dp_x_scale)
+		self.indices.copy_(topk_idx.to(torch.uint32))
+		self.weights.copy_(topk_weight.to(torch.float32))
+		bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
+
+		# 2. Dispatch
+		self.ata.dispatch(
+			out_expert_num_tokens=self.expert_num_tokens,
+			out_expert_x=self.expert_x,
+			out_expert_x_scale=self.expert_x_scale,
+			dp_x=self.dp_x,
+			dp_x_scale=self.dp_x_scale,
+			indices=self.indices,
+			bound_m=bound_m,
+		)
+
+		# 3. Local Expert Computation (Identity)
+		self.grouped_dequant_moe_fp8_ata_fp8(
+			(self.expert_x, self.expert_x_scale)
+			self.expert_num_tokens,
+			self.experts_per_rank,
+			self.expert_y
+		)
+
+		# 4. Combine
+		self.y.zero_() 
+		self.ata.combine(
+			out_tokens=self.y,
+			indices=self.indices,
+			weights=self.weights,
+			expert_y=self.expert_y,
+			bound_m=bound_m,
+		)
+		
+		return self.y[:num_tokens].to(x.dtype)
+		
+	def grouped_dequant_moe_fp8_ata_fp8(self, x, expert_token_counts, experts_per_rank, out=None):
+		"""
+		Optimized wrapper for 3D inputs in FP8.
+		"""
+		x_quant, x_scale = x
+		
+		# Stage 1: Output is (E, T, Intermediate)
+		intermediate = fused_fp8_moe_stage_1_tma_wrapper(
+			x_quant, x_scale, 
+			self.gate_list, self.gate_ptrs_ptr,
+			self.up_list, self.up_ptrs_ptr,
+			self.gate_scale_list, self.gate_scale_ptrs_ptr,
+			self.up_scale_list, self.up_scale_ptrs_ptr,
+			expert_token_counts,     
+			experts_per_rank    
+		)
+		
+		intermediate_quant, intermediate_scale = act_quant_3d(intermediate, expert_token_counts)
+		
+		# Stage 2: Output is (E, T, Hidden)
+		res = fused_dequant_grouped_gemm_fp8_tma_wrapper(
+			intermediate_quant, intermediate_scale, 
+			self.down_list, self.down_ptrs_ptr,
+			self.down_scale_list, self.down_scale_ptrs_ptr,
+			expert_token_counts,     
+			experts_per_rank,
+			out=out 
+		)
+		
+		return res
 
 	def grouped_dequant_moe_fp8_ata(
 		self, 
