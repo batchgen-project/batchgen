@@ -228,6 +228,99 @@ from triton import Config
 # 	tl.store(scale_ptr + pid, scale)
 
 
+""" for 2d input """
+# @triton.jit
+# def act_quant_kernel_2d(
+#     x_ptr,
+#     y_ptr,
+#     scale_ptr,
+#     M, N,
+#     eps: tl.constexpr,
+#     fp8_max: tl.constexpr,
+#     BLOCK_SIZE: tl.constexpr
+# ):
+#     """
+#     2D version for better efficiency with matrices.
+#     Quantizes along the last dimension (row-wise).
+#     """
+#     pid_m = tl.program_id(axis=0)
+#     pid_n = tl.program_id(axis=1)
+	
+#     # Each program handles one block in a row
+#     row_start = x_ptr + pid_m * N
+#     block_start = pid_n * BLOCK_SIZE
+#     offsets = block_start + tl.arange(0, BLOCK_SIZE)
+#     mask = offsets < N
+	
+#     # Load block
+#     x = tl.load(row_start + offsets, mask=mask, other=0.0).to(tl.float32)
+	
+#     # Compute scale (absmax)
+#     absmax = tl.max(tl.abs(x), axis=0)
+#     scale = tl.maximum(absmax, eps) / fp8_max
+	
+#     # Quantize
+#     x_scaled = x / scale
+#     x_scaled = tl.minimum(x_scaled, fp8_max)
+#     x_scaled = tl.maximum(x_scaled, -fp8_max)
+	
+#     # Store
+#     y = x_scaled.to(y_ptr.dtype.element_ty)
+#     y_row_start = y_ptr + pid_m * N
+#     tl.store(y_row_start + offsets, y, mask=mask)
+	
+#     # Store scale (one per block)
+#     scale_offset = pid_m * ((N + BLOCK_SIZE - 1) // BLOCK_SIZE) + pid_n
+#     tl.store(scale_ptr + scale_offset, scale)
+
+
+# def act_quant(
+# 	x: torch.Tensor, 
+# 	block_size: int = 128,
+# 	eps: float = 1e-12
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+# 	"""
+# 	Industry standard BF16 to FP8 E4M3 block quantization.
+	
+# 	Args:
+# 		x: Input tensor in BF16/FP16/FP32
+# 		block_size: Block size for quantization (typically 128 or 256)
+# 		eps: Epsilon for numerical stability (1e-12 is standard)
+	
+# 	Returns:
+# 		y: Quantized tensor in FP8 E4M3
+# 		scale: Per-block scaling factors
+# 	"""
+# 	assert x.is_contiguous(), 'Input must be contiguous'
+	
+# 	# FP8 E4M3 characteristics
+# 	fp8_max = 448.0
+	
+# 	# Flatten all dimensions except last for block processing
+# 	original_shape = x.shape
+# 	x_flat = x.view(-1, x.shape[-1])
+# 	M, N = x_flat.shape
+	
+# 	# Allocate outputs
+# 	y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
+# 	num_blocks = (N + block_size - 1) // block_size
+# 	scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
+	
+# 	# Launch kernel
+# 	grid = (M, num_blocks)
+# 	act_quant_kernel_2d[grid](
+# 		x_flat, y, scale,
+# 		M, N,
+# 		eps=eps,
+# 		fp8_max=fp8_max,
+# 		BLOCK_SIZE=block_size
+# 	)
+	
+# 	# Restore original shape
+# 	y = y.view(original_shape)
+	
+# 	return y, scale
+
 @triton.jit
 def act_quant_kernel_2d(
     x_ptr,
@@ -239,86 +332,88 @@ def act_quant_kernel_2d(
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    2D version for better efficiency with matrices.
-    Quantizes along the last dimension (row-wise).
+    2D Block Quantization Kernel.
+    Treats input as (Rows, Cols) -> Quantizes row segments of size BLOCK_SIZE.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-	
-    # Each program handles one block in a row
+    
+    # Calculate offsets
     row_start = x_ptr + pid_m * N
     block_start = pid_n * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
-	
+    
     # Load block
     x = tl.load(row_start + offsets, mask=mask, other=0.0).to(tl.float32)
-	
+    
     # Compute scale (absmax)
     absmax = tl.max(tl.abs(x), axis=0)
     scale = tl.maximum(absmax, eps) / fp8_max
-	
+    
     # Quantize
     x_scaled = x / scale
     x_scaled = tl.minimum(x_scaled, fp8_max)
     x_scaled = tl.maximum(x_scaled, -fp8_max)
-	
-    # Store
+    
+    # Store Quantized Data
     y = x_scaled.to(y_ptr.dtype.element_ty)
     y_row_start = y_ptr + pid_m * N
     tl.store(y_row_start + offsets, y, mask=mask)
-	
-    # Store scale (one per block)
-    scale_offset = pid_m * ((N + BLOCK_SIZE - 1) // BLOCK_SIZE) + pid_n
+    
+    # Store Scale
+    # Layout: (Rows, NumBlocks)
+    num_blocks_n = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+    scale_offset = pid_m * num_blocks_n + pid_n
     tl.store(scale_ptr + scale_offset, scale)
 
 
 def act_quant(
-	x: torch.Tensor, 
-	block_size: int = 128,
-	eps: float = 1e-12
+    x: torch.Tensor, 
+    block_size: int = 128,
+    eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-	"""
-	Industry standard BF16 to FP8 E4M3 block quantization.
-	
-	Args:
-		x: Input tensor in BF16/FP16/FP32
-		block_size: Block size for quantization (typically 128 or 256)
-		eps: Epsilon for numerical stability (1e-12 is standard)
-	
-	Returns:
-		y: Quantized tensor in FP8 E4M3
-		scale: Per-block scaling factors
-	"""
-	assert x.is_contiguous(), 'Input must be contiguous'
-	
-	# FP8 E4M3 characteristics
-	fp8_max = 448.0
-	
-	# Flatten all dimensions except last for block processing
-	original_shape = x.shape
-	x_flat = x.view(-1, x.shape[-1])
-	M, N = x_flat.shape
-	
-	# Allocate outputs
-	y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
-	num_blocks = (N + block_size - 1) // block_size
-	scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
-	
-	# Launch kernel
-	grid = (M, num_blocks)
-	act_quant_kernel_2d[grid](
-		x_flat, y, scale,
-		M, N,
-		eps=eps,
-		fp8_max=fp8_max,
-		BLOCK_SIZE=block_size
-	)
-	
-	# Restore original shape
-	y = y.view(original_shape)
-	
-	return y, scale
+    """
+    Applies FP8 quantization. Handles arbitrary tensor shapes by flattening dims 0..-2.
+    """
+    assert x.is_contiguous(), 'Input must be contiguous'
+    
+    fp8_max = 448.0
+    original_shape = x.shape
+    
+    # 1. View as 2D (Rows, Hidden)
+    x_flat = x.view(-1, original_shape[-1])
+    M, N = x_flat.shape
+    
+    # 2. Allocate Outputs
+    y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
+    num_blocks = (N + block_size - 1) // block_size
+    
+    # Scale shape: (Rows, NumBlocks)
+    scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
+    
+    # 3. Launch Kernel
+    grid = (M, num_blocks)
+    act_quant_kernel_2d[grid](
+        x_flat, y, scale,
+        M, N,
+        eps=eps,
+        fp8_max=fp8_max,
+        BLOCK_SIZE=block_size
+    )
+    
+    # 4. Restore Shapes
+    # Reshape Y back to (E, T, H)
+    y = y.view(original_shape)
+    
+    # CRITICAL: Reshape Scale back to (E, T, NumBlocks)
+    # This allows downstream kernels to calculate strides correctly.
+    scale_shape = list(original_shape[:-1]) + [num_blocks]
+    scale = scale.view(*scale_shape)
+    
+    return y, scale
+
+
 
 # @triton.jit
 # def act_quant_kernel_2d(

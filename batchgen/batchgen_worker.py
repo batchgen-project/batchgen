@@ -965,19 +965,45 @@ class BatchGenWorker:
 		
 		total_time = time.perf_counter() - start_time
 		logging.info(f"_config_prefill completed in {total_time:.4f}s")
+
+
+
+	def init_nvshmem(self):
+		import nvshmem.core as nvshmem
+		from cuda.core.experimental import Device	
+		from pplx_kernels import nvshmem_init
+		# 1. Standard Torch Distributed Init
+		rank = dist.get_rank()
+		world_size = dist.get_world_size()
+		local_rank = rank % torch.cuda.device_count()
+		torch.cuda.set_device(local_rank)
+
+		# 2. NVSHMEM Init (Allocates the Symmetric Heap here)
+		# Ensure NVSHMEM_SYMMETRIC_SIZE is set in env vars before this runs
+		dev = Device(local_rank)
+		dev.set_current()
+		dist.barrier()
+		nvshmem_init(
+			global_rank=rank,
+			local_rank=local_rank,
+			world_size=world_size,
+			device=dev
+		)
+		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
+		self.init_nvshmem()
 		
 		# Initialize symmetric memory once during model initialization
-		if not symm_mem.is_nvshmem_available():
-			logging.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
-			symm_mem.set_backend("NCCL")
-		else:
-			symm_mem.set_backend("NVSHMEM")
-		group_name = dist.group.WORLD.group_name
-		symm_mem.enable_symm_mem_for_group(group_name)
+		# if not symm_mem.is_nvshmem_available():
+		# 	logging.warning("NVSHMEM is not available. Symmetric memory features will be disabled.")
+		# 	symm_mem.set_backend("NCCL")
+		# else:
+		# 	symm_mem.set_backend("NVSHMEM")
+		# group_name = dist.group.WORLD.group_name
+		# symm_mem.enable_symm_mem_for_group(group_name)
 
 
 		# Get number of sequences for each rank 
