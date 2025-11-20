@@ -46,13 +46,6 @@ class GPUPagedKVStats:
 
 
 @dataclass(frozen=True)
-class LayerPagePointerBatch:
-    layer_ids: torch.Tensor
-    k_ptrs: torch.Tensor
-    v_ptrs: Optional[torch.Tensor] = None
-
-
-@dataclass(frozen=True)
 class GPUPagedKVConfig:
     num_layers: int
     num_pages: int
@@ -409,9 +402,6 @@ class GPUPagedKVCacheManager:
         self._v_page_ptr_table: Optional[torch.Tensor] = None
         self._free_pages = _TensorStack(self.config.num_pages)
         self._sequences: Dict[int, _SequenceState] = {}
-        self._layer_index_template = torch.arange(
-            self.config.num_layers, dtype=torch.int64
-        )
         # GPU-side page table manager (lazy updated in allocate_pages_for_sequences)
         max_pages_per_seq = _ceil_div(
             DEFAULT_INITIAL_TOKEN_CAPACITY, self.config.page_size_tokens
@@ -942,52 +932,27 @@ class GPUPagedKVCacheManager:
 
         return pointer_table
 
-    def build_layer_page_pointer_batch(
-        self, page_indices: Sequence[int] | torch.Tensor
-    ) -> LayerPagePointerBatch:
-        """Returns layer-major tensors of K/V page pointers for ``page_indices``.
+    def export_layer_page_pointer_table(
+        self,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Materializes layer-major device pointer tensors using current slots.
 
-        The returned tensors live on CPU and are laid out as ``[num_layers *
-        len(page_indices)]`` for direct consumption by CUDA kernels without
-        Python-side loops.
+        The returned tensors are CPU-resident matrices shaped ``[num_layers,
+        total_pages]`` where ``total_pages`` is the sum of pages allocated for
+        the sequences tracked by ``_gpu_page_table_manager`` in slot order. The
+        optional second tensor is present only when the V cache is enabled.
         """
 
         self._ensure_initialized()
-        page_tensor = torch.as_tensor(
-            page_indices, dtype=torch.int32, device="cpu"
-        ).reshape(-1)
-        if page_tensor.numel() == 0:
-            empty_i32 = torch.empty(0, dtype=torch.int32)
-            empty_i64 = torch.empty(0, dtype=torch.int64)
-            return LayerPagePointerBatch(empty_i32, empty_i64, None)
-
-        invalid_mask = (page_tensor < 0) | (
-            page_tensor >= self.config.num_pages
-        )
-        if torch.any(invalid_mask):
-            raise ValueError(
-                "page_indices contain values outside [0, num_pages)"
-            )
-
-        index_tensor = page_tensor.to(torch.long)
-        layer_ids = self._layer_index_template.repeat_interleave(
-            page_tensor.numel()
-        )
-        repeated_pages = page_tensor.repeat(self.config.num_layers).to(torch.int64)
-
-        k_ptrs = self._get_page_ptr_table(is_value=False).index_select(
-            1, index_tensor
-        )
-        k_ptrs = k_ptrs.reshape(-1).contiguous()
+        k_table = self._get_page_ptr_table(is_value=False)
+        k_ptrs = k_table
 
         v_ptrs: Optional[torch.Tensor] = None
         if self.config.has_v_cache:
             v_table = self._get_page_ptr_table(is_value=True)
-            v_ptrs = (
-                v_table.index_select(1, index_tensor).reshape(-1).contiguous()
-            )
+            v_ptrs = v_table
 
-        return LayerPagePointerBatch(layer_ids, k_ptrs, v_ptrs)
+        return k_ptrs, v_ptrs
 
     def _get_page_ptr_table(self, *, is_value: bool) -> torch.Tensor:
         """Returns the cached pointer table for the requested cache kind."""

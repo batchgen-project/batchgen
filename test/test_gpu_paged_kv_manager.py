@@ -210,6 +210,7 @@ def _host_transfer_worker(spec: dict) -> dict:
     page_num_per_seq: int = spec["page_num_per_seq"]
     sequence_lengths: list[int] = spec["sequence_lengths"]
 
+    barrier = spec.get("barrier")
 
     print(f"[worker {device_index}] sequence lengths: {sequence_lengths}")
 
@@ -218,25 +219,25 @@ def _host_transfer_worker(spec: dict) -> dict:
     host_cfg = _make_deepseek_r1_host_config(shm_name)
     capacity_tokens = host_cfg.page_size_tokens * page_num_per_seq
     if any(length > capacity_tokens for length in sequence_lengths):
-        raise ValueError(
-            "sequence length exceeds allocated capacity in worker"
-        )
+        raise ValueError("sequence length exceeds allocated capacity in worker")
 
     worker = bg.MLAHostPagedKVWorkerView(host_cfg)
     worker.initialize(device_index, False)
     worker.register_sequences(sequence_ids)
     requests = [(seq_id, capacity_tokens) for seq_id in sequence_ids]
     allocations = worker.allocate_pages_for_sequences(requests)
-    host_page_map = {seq_id: pages for seq_id, pages in zip(sequence_ids, allocations)}
-    logging.info(
-        f"[worker {device_index}] allocated pages: {allocations}"
-    )
+    logging.info(f"[worker {device_index}] allocated pages: {allocations}")
 
-    time.sleep(10)
+    if barrier is not None:
+        logging.info(
+            f"[worker {device_index}] Waiting at barrier before loading back..."
+        )
+        barrier.wait()
+        logging.info(
+            f"[worker {device_index}] Barrier passed! Starting load task."
+        )
 
-    logging.info(
-        f"[worker {device_index}] passed barrier, starting offload."
-    )
+    logging.info(f"[worker {device_index}] passed barrier, starting offload.")
 
     device_cfg = _make_deepseek_r1_config(shm_name)
     device_cfg.Basic_Config.device = device_index
@@ -272,7 +273,7 @@ def _host_transfer_worker(spec: dict) -> dict:
             device=f"cuda:{device_index}",
         )
         torch.cuda.synchronize(device_index)
-        print(f"Worker {device_index} offloading layer {layer_idx} to host. Sequence IDs: {sequence_ids}")
+        # print(f"Worker {device_index} offloading layer {layer_idx} to host. Sequence IDs: {sequence_ids}")
         task = worker.async_offload_layer_kv_to_host(
             layer_idx=layer_idx,
             sequence_ids=sequence_ids,
@@ -284,15 +285,15 @@ def _host_transfer_worker(spec: dict) -> dict:
 
     time.sleep(10)
 
-    logging.info(
-        f"[worker {device_index}] offloaded all layers to host."
-    )
+    logging.info(f"[worker {device_index}] offloaded all layers to host.")
     verify_host_content = False
 
     if verify_host_content:
         for layer_idx in range(kv_cfg.num_layers):
             for sid in sequence_ids:
-                pointers = worker.get_sequence_layer_page_pointers(sid, layer_idx)
+                pointers = worker.get_sequence_layer_page_pointers(
+                    sid, layer_idx
+                )
                 k_ptrs, v_ptrs = pointers
                 expected = float(device_index * 100 + layer_idx + 1)
                 for i, ptr in enumerate(k_ptrs):
@@ -305,9 +306,9 @@ def _host_transfer_worker(spec: dict) -> dict:
 
                     mask = bf16 != expected
                     if torch.any(mask):
-                        bad_indices = torch.nonzero(mask, as_tuple=False).squeeze(
-                            -1
-                        )
+                        bad_indices = torch.nonzero(
+                            mask, as_tuple=False
+                        ).squeeze(-1)
                         # mismatch 对应的值
                         bad_values = bf16[mask]
 
@@ -327,43 +328,43 @@ def _host_transfer_worker(spec: dict) -> dict:
                             f"ptr={hex(ptr)}\n"
                         )
 
-    logging.info(
-        f"[worker {device_index}] host storage content verified."
-    )
+    logging.info(f"[worker {device_index}] host storage content verified.")
 
     torch.cuda.synchronize(device_index)
 
     # Load tensors back to GPU cache (host -> device)
     start = time.perf_counter()
-    load_tasks = []
-    for seq_id in sequence_ids:
-        state = gpu_manager._get_sequence_state(seq_id)
-        pages = state.pages.tolist()
-        page_batch = gpu_manager.build_layer_page_pointer_batch(
-            page_indices=pages
-        )
-        host_pages = host_page_map[seq_id]
-        host_pages_tensor = torch.tensor(host_pages, dtype=torch.int64, device='cpu')
-        host_page_indices_flat = host_pages_tensor.repeat(kv_cfg.num_layers)
-        load_tasks.append(
-            worker.async_load_layer_kv_to_device(
-                layer_indices=page_batch.layer_ids,
-                page_indices=host_page_indices_flat,
-                k_device_ptrs=page_batch.k_ptrs,
-                v_device_ptrs=page_batch.v_ptrs,
-            )
-        )
+    start_get_gpu = time.time()
+    sequence_tensor = torch.tensor(
+        sequence_ids, dtype=torch.int64, device="cpu"
+    )
+    k_ptrs, v_ptrs = gpu_manager.export_layer_page_pointer_table()
+    end_get_gpu = time.time()
+    logging.info(
+        f"[worker {device_index}] get GPU pointers took {end_get_gpu - start_get_gpu:.6f} seconds."
+    )
 
-    for task in load_tasks:
-        task.wait()
-
-    time.sleep(10)
+    if barrier is not None:
+        logging.info(
+            f"[worker {device_index}] Waiting at barrier before loading back..."
+        )
+        barrier.wait()
+        logging.info(
+            f"[worker {device_index}] Barrier passed! Starting load task."
+        )
+    load_task = worker.async_load_layer_kv_to_device(
+        sequence_ids=sequence_tensor,
+        k_device_ptrs=k_ptrs,
+        v_device_ptrs=v_ptrs,
+    )
+    load_task.wait()
 
     logging.info(
-        f"[worker {device_index}] loaded back to device from host."
+        f"[worker {device_index}] loaded back to device from host. throughput: {len(sequence_ids) * kv_cfg.page_size_tokens * kv_cfg.num_layers} tokens."
     )
     torch.cuda.synchronize(device_index)
     elapsed = time.perf_counter() - start
+    time.sleep(10)
 
     # Verify device cache content per worker / per layer
     k_cache = gpu_manager._k_cache
@@ -378,9 +379,7 @@ def _host_transfer_worker(spec: dict) -> dict:
         layer_tensor = k_cache[layer_idx]
         for seq_id in sequence_ids:
             state = gpu_manager._get_sequence_state(seq_id)
-            page_indices = state.pages.to(
-                gpu_manager.device, dtype=torch.long
-            )
+            page_indices = state.pages.to(gpu_manager.device, dtype=torch.long)
             gathered = layer_tensor.index_select(0, page_indices)
             expected = torch.full_like(gathered, expected_value)
             if not torch.equal(gathered, expected):
@@ -389,20 +388,14 @@ def _host_transfer_worker(spec: dict) -> dict:
                     "Host -> device copy mismatch for layer "
                     f"{layer_idx}, seq {seq_id} on device {device_index}"
                 )
-    logging.info(
-        f"[worker {device_index}] device cache content verified."
-    )
+    logging.info(f"[worker {device_index}] device cache content verified.")
 
     bytes_per_token = (
-        kv_cfg.num_k_heads
-        * kv_cfg.k_head_dim
-        * host_cfg.k_element_size_bytes
+        kv_cfg.num_k_heads * kv_cfg.k_head_dim * host_cfg.k_element_size_bytes
     )
     total_tokens = sum(sequence_lengths) * kv_cfg.num_layers
     bytes_transferred = bytes_per_token * total_tokens
-    bandwidth_gbps = (
-        (bytes_transferred / elapsed) / 1e9 if elapsed > 0 else 0.0
-    )
+    bandwidth_gbps = (bytes_transferred / elapsed) / 1e9 if elapsed > 0 else 0.0
 
     return {
         "device_index": device_index,
@@ -413,8 +406,6 @@ def _host_transfer_worker(spec: dict) -> dict:
         "bandwidth_gbps": bandwidth_gbps,
         "verified": True,
     }
-
-
 
 
 def test_host_transfer_layer(shm_name):
@@ -446,9 +437,7 @@ def test_host_transfer_layer(shm_name):
         #     rng.randint(max(1, capacity_tokens // 4), capacity_tokens)
         #     for _ in sequence_ids
         # ]
-        seq_lengths = [
-            capacity_tokens for _ in sequence_ids
-        ]
+        seq_lengths = [capacity_tokens for _ in sequence_ids]
         worker_specs.append(
             {
                 "shm_name": shm_name,
@@ -463,38 +452,46 @@ def test_host_transfer_layer(shm_name):
         raise SkipTest("No workers configured for host transfer test")
 
     ctx = mp.get_context("spawn")
-    with ProcessPoolExecutor(
-        max_workers=len(worker_specs), mp_context=ctx
-    ) as executor:
-        futures = [
-            executor.submit(_host_transfer_worker, spec)
-            for spec in worker_specs
-        ]
-        results = [future.result() for future in futures]
+    with ctx.Manager() as manager:
+        sync_barrier = manager.Barrier(len(worker_specs))
 
-    for result in results:
-        assert result["verified"], f"Worker {result} verification failed"
-        assert (
-            result["bytes_transferred"] > 0
-        ), "Bytes transferred must be positive"
-        assert (
-            result["host_to_device_seconds"] > 0
-        ), "Host→device transfer time must be positive"
+        # 3. 将 barrier 放入参数中
+        for spec in worker_specs:
+            spec["barrier"] = sync_barrier
+
+        with ProcessPoolExecutor(
+            max_workers=len(worker_specs), mp_context=ctx
+        ) as executor:
+            futures = [
+                executor.submit(_host_transfer_worker, spec)
+                for spec in worker_specs
+            ]
+            results = [future.result() for future in futures]
+
+        for result in results:
+            assert result["verified"], f"Worker {result} verification failed"
+            assert result["bytes_transferred"] > 0, (
+                "Bytes transferred must be positive"
+            )
+            assert result["host_to_device_seconds"] > 0, (
+                "Host→device transfer time must be positive"
+            )
+            logging.info(
+                "Device %d transferred %.2f MB in %.3f s (%.2f GB/s)",
+                result["device_index"],
+                result["bytes_transferred"] / (1024 * 1024),
+                result["host_to_device_seconds"],
+                result["bandwidth_gbps"],
+            )
+
+        total_bytes = sum(result["bytes_transferred"] for result in results)
+        total_time = sum(result["host_to_device_seconds"] for result in results)
         logging.info(
-            "Device %d transferred %.2f MB in %.3f s (%.2f GB/s)",
-            result["device_index"],
-            result["bytes_transferred"] / (1024 * 1024),
-            result["host_to_device_seconds"],
-            result["bandwidth_gbps"],
+            "Aggregated host→device transfer: %.2f MB in %.3f s",
+            total_bytes / (1024 * 1024),
+            total_time,
         )
 
-    total_bytes = sum(result["bytes_transferred"] for result in results)
-    total_time = sum(result["host_to_device_seconds"] for result in results)
-    logging.info(
-        "Aggregated host→device transfer: %.2f MB in %.3f s",
-        total_bytes / (1024 * 1024),
-        total_time,
-    )
 
 # ---------------------------------------------------------------------------
 # Main
