@@ -174,7 +174,31 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
         .def_property_readonly("device_index", &WorkerView::device_index)
         .def_property_readonly_static(
             "has_v_cache",
-            [](py::object /* cls */) { return WorkerView::kHasVCache; });
+            [](py::object /* cls */) { return WorkerView::kHasVCache; })
+        .def("get_sequence_layer_page_pointers",
+             [](WorkerView& self, std::int64_t sequence_id,
+                std::size_t layer_idx,
+                std::optional<std::size_t> max_tokens) {
+                 auto result = self.GetSequenceLayerPagePointers(
+                     sequence_id, layer_idx, max_tokens);
+                 py::list k_ptrs;
+                 for (void* ptr : result.first) {
+                     k_ptrs.append(py::int_(
+                         reinterpret_cast<std::uintptr_t>(ptr)));
+                 }
+                 py::object v_ptrs = py::none();
+                 if (result.second.has_value()) {
+                     py::list v_list;
+                     for (void* ptr : result.second.value()) {
+                         v_list.append(py::int_(
+                             reinterpret_cast<std::uintptr_t>(ptr)));
+                     }
+                     v_ptrs = std::move(v_list);
+                 }
+                 return py::make_tuple(std::move(k_ptrs), v_ptrs);
+             },
+             py::arg("sequence_id"), py::arg("layer_idx"),
+             py::arg("max_tokens") = py::none());;
 }
 
 }  // namespace

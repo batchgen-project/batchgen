@@ -308,7 +308,6 @@ class HostPagedKVWorkerView {
                 }
             }
 
-#pragma omp parallel for
             for (std::int64_t i = 0; i < static_cast<std::int64_t>(n); ++i) {
                 const auto layer_idx = static_cast<std::size_t>(layer_ptr[i]);
                 const auto page_idx = static_cast<std::int32_t>(page_ptr[i]);
@@ -354,7 +353,7 @@ class HostPagedKVWorkerView {
                     reinterpret_cast<const std::byte*>(device_dests.data()),
                     reinterpret_cast<std::byte*>(dev_dst_ptrs.get()),
                     ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-
+                // init cuda event to enable timing
                 worker_detail::LaunchUvaPageCopyKernel(
                     dev_src_ptrs.get(), dev_dst_ptrs.get(), page_bytes,
                     static_cast<int>(host_sources.size()), cuda_stream);
@@ -372,7 +371,10 @@ class HostPagedKVWorkerView {
                                       v_page_bytes);
                 }
             }
-
+            this->logger_->info(
+                "AsyncLoadLayerKVToDevice completed (num_pages={}, "
+                "k_page_bytes={})",
+                n, k_page_bytes);
             this->SynchronizeWithEvent(cuda_stream);
         });
     }
@@ -445,6 +447,42 @@ class HostPagedKVWorkerView {
             }
         }
         return table;
+    }
+
+    std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
+    GetSequenceLayerPagePointers(
+        std::int64_t sequence_id, std::size_t layer_idx,
+        std::optional<std::size_t> max_tokens = std::nullopt) const {
+        geometry_.EnsureLayerBounds(
+            layer_idx, "HostPagedKVWorkerView::GetSequenceLayerPagePointers");
+        std::optional<std::size_t> max_pages;
+        if (max_tokens.has_value()) {
+            max_pages = geometry_.RequiredPages(max_tokens.value());
+        }
+        auto page_indices = backend_.SequencePages(sequence_id, max_pages);
+        std::vector<void*> k_ptrs;
+        k_ptrs.reserve(page_indices.size());
+        std::optional<std::vector<void*>> v_ptrs;
+        if constexpr (Layout::kHasVCache) {
+            v_ptrs.emplace();
+            v_ptrs->reserve(page_indices.size());
+        }
+        std::byte* base = const_cast<std::byte*>(backend_.DataBase());
+        for (std::int32_t page : page_indices) {
+            void* k_ptr =
+                static_cast<void*>(layout_.KPageAddress(base, layer_idx, page));
+            k_ptrs.emplace_back(k_ptr);
+            // LogPageBytes("K", layer_idx, sequence_id, page, k_ptr,
+            //              geometry_.KTokenBytes());
+            if constexpr (Layout::kHasVCache) {
+                void* v_ptr = static_cast<void*>(
+                    layout_.VPageAddress(base, layer_idx, page));
+                v_ptrs->emplace_back(v_ptr);
+                // LogPageBytes("V", layer_idx, sequence_id, page, v_ptr,
+                //              geometry_.template VTokenBytes<true>());
+            }
+        }
+        return {std::move(k_ptrs), std::move(v_ptrs)};
     }
 
     void RegisterSequences(const std::vector<std::int64_t>& sequence_ids) {
@@ -946,6 +984,20 @@ class HostPagedKVWorkerView {
                     geometry_.DescribeBytes(token_ptr, k_token_bytes));
             }
         }
+    }
+
+    void LogPageBytes(const char* tag, std::size_t layer_idx,
+                      std::int64_t sequence_id, std::int32_t page_idx,
+                      const void* ptr, std::size_t token_bytes) const {
+        if (logger_ == nullptr || ptr == nullptr || token_bytes == 0) {
+            return;
+        }
+        const auto bytes = geometry_.DescribeBytes(
+            static_cast<const std::byte*>(ptr), token_bytes);
+        logger_->info(
+            "GetSequenceLayerPagePointers {} layer={} seq={} page={} "
+            "first_bytes={}",
+            tag, layer_idx, sequence_id, page_idx, bytes);
     }
 
     bool PageContainsTokens(std::size_t page_slot, std::size_t tokens_available,

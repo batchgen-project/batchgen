@@ -48,7 +48,6 @@ class GPUPagedKVStats:
 @dataclass(frozen=True)
 class LayerPagePointerBatch:
     layer_ids: torch.Tensor
-    page_indices: torch.Tensor
     k_ptrs: torch.Tensor
     v_ptrs: Optional[torch.Tensor] = None
 
@@ -960,7 +959,7 @@ class GPUPagedKVCacheManager:
         if page_tensor.numel() == 0:
             empty_i32 = torch.empty(0, dtype=torch.int32)
             empty_i64 = torch.empty(0, dtype=torch.int64)
-            return LayerPagePointerBatch(empty_i32, empty_i32, empty_i64, None)
+            return LayerPagePointerBatch(empty_i32, empty_i64, None)
 
         invalid_mask = (page_tensor < 0) | (
             page_tensor >= self.config.num_pages
@@ -988,7 +987,7 @@ class GPUPagedKVCacheManager:
                 v_table.index_select(1, index_tensor).reshape(-1).contiguous()
             )
 
-        return LayerPagePointerBatch(layer_ids, repeated_pages, k_ptrs, v_ptrs)
+        return LayerPagePointerBatch(layer_ids, k_ptrs, v_ptrs)
 
     def _get_page_ptr_table(self, *, is_value: bool) -> torch.Tensor:
         """Returns the cached pointer table for the requested cache kind."""
