@@ -690,6 +690,7 @@ class DeepseekV3ParallelStrategyManager:
 		This is used to set the padding size for the input sequences.
 		"""
 		in_type = torch.float8_e4m3fn
+		out_type = torch.bfloat16
 		dp_size = 1
 		world_size = self.world_size
 		num_dp = world_size // dp_size	
@@ -712,7 +713,7 @@ class DeepseekV3ParallelStrategyManager:
 			dtype=torch.float32,
 			device=self.device
 		)
-		self.expert_y = torch.empty_like(self.expert_x)
+		self.expert_y = torch.empty_like(self.expert_x, dtype=out_type)
 		self.indices = torch.empty(
 			(self.num_tokens_per_rank, self.num_experts_per_tok),
 			dtype=torch.uint32,
@@ -725,7 +726,7 @@ class DeepseekV3ParallelStrategyManager:
 		)
 		self.y = torch.empty(
 			(self.num_tokens_per_rank, hidden_size),
-			dtype=in_type,
+			dtype=out_type,
 			device=self.device
 		)
 		self.dp_x = torch.empty(
