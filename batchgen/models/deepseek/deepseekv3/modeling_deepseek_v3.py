@@ -1761,7 +1761,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		out = self.moe_infer_pplx_a2a_fp8_dispatch(hidden_states)
+		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL","0") == "1":
+			moe_infer_fn = self.moe_infer_pplx_a2a_bf16_dispatch
+		else:
+			moe_infer_fn = self.moe_infer_allgather_allreduce_bf16_acc
+		out = moe_infer_fn(hidden_states)
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
 	
