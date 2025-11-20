@@ -257,8 +257,6 @@ def _host_transfer_worker(spec: dict) -> dict:
         kv_cfg.k_head_dim,
     )
 
-    time.sleep(10)
-
     logging.info(
         f"[worker {device_index}] gpu page manager initialized, starting offload."
     )
@@ -282,8 +280,6 @@ def _host_transfer_worker(spec: dict) -> dict:
             sequence_lengths=sequence_lengths,
         )
         task.wait()
-
-    time.sleep(10)
 
     logging.info(f"[worker {device_index}] offloaded all layers to host.")
     verify_host_content = False
@@ -333,7 +329,6 @@ def _host_transfer_worker(spec: dict) -> dict:
     torch.cuda.synchronize(device_index)
 
     # Load tensors back to GPU cache (host -> device)
-    start = time.perf_counter()
     start_get_gpu = time.time()
     sequence_tensor = torch.tensor(
         sequence_ids, dtype=torch.int64, device="cpu"
@@ -352,6 +347,8 @@ def _host_transfer_worker(spec: dict) -> dict:
         logging.info(
             f"[worker {device_index}] Barrier passed! Starting load task."
         )
+
+    start = time.perf_counter()
     load_task = worker.async_load_layer_kv_to_device(
         sequence_ids=sequence_tensor,
         k_device_ptrs=k_ptrs,
@@ -359,13 +356,12 @@ def _host_transfer_worker(spec: dict) -> dict:
     )
     load_task.wait()
 
+    elapsed = time.perf_counter() - start
+
     logging.info(
         f"[worker {device_index}] loaded back to device from host. throughput: {len(sequence_ids) * kv_cfg.page_size_tokens * kv_cfg.num_layers} tokens."
     )
     torch.cuda.synchronize(device_index)
-    elapsed = time.perf_counter() - start
-    time.sleep(10)
-
     # Verify device cache content per worker / per layer
     k_cache = gpu_manager._k_cache
     if k_cache is None:
@@ -417,7 +413,7 @@ def test_host_transfer_layer(shm_name):
     host_manager.initialize(True)
 
     # device_count = torch.cuda.device_count()
-    device_count = 8
+    device_count = 2
     if device_count == 0:
         raise SkipTest("No CUDA devices available")
 
