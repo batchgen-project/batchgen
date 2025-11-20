@@ -748,7 +748,7 @@ class DeepseekV3ParallelStrategyManager:
 			dp_size = dp_size,
 			hidden_dim = hidden_size,
 			hidden_dim_bytes = hidden_size * in_type.itemsize,
-			hidden_dim_scale_bytes = (hidden_size + block_size -1) // block_size * torch.float32().itemsize
+			hidden_dim_scale_bytes = (hidden_size + block_size -1) // block_size * torch.float32.itemsize
 		)
 
 		for layer_idx in range(
