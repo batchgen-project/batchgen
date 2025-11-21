@@ -49,13 +49,13 @@ from .scheduler.scheduler import Scheduler
 # if nvtx:
 # 	nvidia_dlprof_pytorch_nvtx.init()
 import sys
-import pynvml
-def print_gpu_memory(tag):
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    logging.info(f"[{tag}] Global Used Memory: {info.used / 1024**2:.2f} MB")
-    pynvml.nvmlShutdown()
+# import pynvml
+# def print_gpu_memory(tag):
+#     pynvml.nvmlInit()
+#     handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+#     info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+#     logging.info(f"[{tag}] Global Used Memory: {info.used / 1024**2:.2f} MB")
+#     pynvml.nvmlShutdown()
 
 class query:
 	def __init__(
@@ -205,11 +205,7 @@ class BatchGenWorker:
 		torch.cuda.set_device(self.device)
 		COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
-		print_gpu_memory(f"Rank{self.global_rank} before init")
 		self._init_torch_dist()
-		dist.barrier()
-		print_gpu_memory(f"Rank{self.global_rank} after init")
-		exit()
 
 		torch.cuda.reset_peak_memory_stats()
 		logging.info(self.hf_cache_dir)
