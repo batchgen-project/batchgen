@@ -489,7 +489,7 @@ class DeepseekV3ParallelStrategyManager:
 		free_memory = free_memory / 1024 / 1024 / 1024
 		total_memory = total_memory / 1024 / 1024 / 1024
 		logging.info(
-			f"Rank: {self.rank} Device torch memory usage before copy model instance to device: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+			f"Rank: {self.rank} Device torch memory usage before copy model instance to device: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
 		)
 		logging.info(
 			f"Rank: {self.rank} Device torch free memory before copy model instance to device: {free_memory} GB / {total_memory} GB"
@@ -499,7 +499,7 @@ class DeepseekV3ParallelStrategyManager:
 		free_memory = free_memory / 1024 / 1024 / 1024
 		total_memory = total_memory / 1024 / 1024 / 1024
 		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after copy model instance to device: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+			f"Rank: {self.rank} Device torch memory usage after copy model instance to device: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
 		)
 		logging.info(
 			f"Rank: {self.rank} Device torch free memory after copy model instance to device: {free_memory} GB / {total_memory} GB"

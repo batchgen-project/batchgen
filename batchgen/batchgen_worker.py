@@ -682,10 +682,25 @@ class BatchGenWorker:
 			range(len(self.model_batches)), desc="Model Batch"
 		):
 			dist.barrier()
-			# if self.rank == 0:
-			# 	logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
+			free_memory, total_memory = torch.cuda.mem_get_info()
+			free_memory = free_memory / 1024 / 1024 / 1024
+			total_memory = total_memory / 1024 / 1024 / 1024
+			logging.info(
+				f"Rank: {self.rank} Device torch memory usage before config prefill: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+			)
+			logging.info(
+				f"Rank: {self.rank} Device torch free memory before config prefill: {free_memory} GB / {total_memory} GB"
+			)
 			tmp_start = time.perf_counter()
 			self._config_prefill()
+			free_memory, total_memory = torch.cuda.mem_get_info()
+			free_memory = free_memory / 1024 / 1024 / 1024
+			total_memory = total_memory / 1024 / 1024 / 1024
+			logging.info(
+				f"Rank: {self.rank} Device torch memory usage after config prefill: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+			)
+			logging.info(
+				f"Rank: {self.rank} Device torch free memory after config prefill: {free_memory} GB / {total_memory} GB"
 			config_prefill_time += time.perf_counter() - tmp_start
 			prefill_start_time = time.perf_counter()
 			if len(self.model_batches[model_batch_idx]) > 0:
