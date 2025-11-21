@@ -1,9 +1,11 @@
 #ifndef HOST_PAGED_KV_WORKER_VIEW_H_
 #define HOST_PAGED_KV_WORKER_VIEW_H_
 
+#include <c10/core/ScalarType.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
+#include <torch/torch.h>
 
 #include <algorithm>
 #include <atomic>
@@ -12,7 +14,9 @@
 #include <cstdint>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -39,6 +43,93 @@ void RegisterPinnedRange(void* base, std::size_t bytes, int device_index,
                          const std::shared_ptr<spdlog::logger>& logger);
 void UnregisterPinnedRange(void* base, int device_index,
                            const std::shared_ptr<spdlog::logger>& logger);
+
+template <typename T>
+class DeviceBuffer {
+   public:
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(std::size_t count) { Allocate(count); }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    DeviceBuffer(DeviceBuffer&& other) noexcept { Swap(other); }
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            Swap(other);
+        }
+        return *this;
+    }
+
+    ~DeviceBuffer() { Reset(); }
+
+    void Allocate(std::size_t count) {
+        Reset();
+        if (count == 0) {
+            return;
+        }
+        CUDA_CHECK(
+            cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)));
+        size_ = count;
+    }
+
+    void Reset() noexcept {
+        if (data_ == nullptr) {
+            return;
+        }
+        cudaFree(data_);
+        data_ = nullptr;
+        size_ = 0;
+    }
+
+    [[nodiscard]] T* get() const noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+   private:
+    void Swap(DeviceBuffer& other) noexcept {
+        using std::swap;
+        swap(data_, other.data_);
+        swap(size_, other.size_);
+    }
+
+    T* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+class ScopedCudaEvent final {
+   public:
+    explicit ScopedCudaEvent(std::shared_ptr<spdlog::logger> logger,
+                             unsigned int flags = cudaEventDisableTiming)
+        : logger_(std::move(logger)) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
+    }
+
+    ScopedCudaEvent(const ScopedCudaEvent&) = delete;
+    ScopedCudaEvent& operator=(const ScopedCudaEvent&) = delete;
+    ScopedCudaEvent(ScopedCudaEvent&&) = delete;
+    ScopedCudaEvent& operator=(ScopedCudaEvent&&) = delete;
+
+    ~ScopedCudaEvent() {
+        if (event_ == nullptr) {
+            return;
+        }
+        const auto status = cudaEventDestroy(event_);
+        if (status != cudaSuccess && logger_ != nullptr) {
+            logger_->error("Failed to destroy CUDA event: {}",
+                           cudaGetErrorString(status));
+        }
+    }
+
+    [[nodiscard]] cudaEvent_t get() const { return event_; }
+
+   private:
+    cudaEvent_t event_ = nullptr;
+    std::shared_ptr<spdlog::logger> logger_;
+};
+
+void LaunchUvaPageCopyKernel(uint8_t** src_ptrs, uint8_t** dst_ptrs,
+                             std::size_t page_size_bytes, int num_pages,
+                             cudaStream_t stream);
 }  // namespace worker_detail
 
 struct KVAsyncTask {
@@ -46,19 +137,22 @@ struct KVAsyncTask {
     KVAsyncTask(std::uint64_t id, std::shared_future<void> future)
         : id_(id), future_(std::move(future)) {}
 
-    std::uint64_t id() const { return id_; }
-    bool done() const {
+    [[nodiscard]] std::uint64_t id() const { return id_; }
+
+    [[nodiscard]] bool done() const {
         if (!future_.valid()) {
             return true;
         }
         return future_.wait_for(std::chrono::seconds(0)) ==
                std::future_status::ready;
     }
+
     void wait() const {
         if (future_.valid()) {
             future_.wait();
         }
     }
+
     void result() const {
         if (future_.valid()) {
             future_.get();
@@ -73,6 +167,10 @@ struct KVAsyncTask {
 using SequenceLengthMap = std::unordered_map<std::int64_t, std::size_t>;
 using SequenceLengthVector = std::vector<std::size_t>;
 using SequenceLengths = std::variant<SequenceLengthMap, SequenceLengthVector>;
+
+using SequenceLengthMap = batchgen::kv::SequenceLengthMap;
+using SequenceLengthVector = batchgen::kv::SequenceLengthVector;
+using SequenceLengths = batchgen::kv::SequenceLengths;
 
 template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>>
 class HostPagedKVWorkerView {
@@ -167,6 +265,174 @@ class HostPagedKVWorkerView {
         page_table_.Clear();
     }
 
+    KVAsyncTask AsyncLoadLayerKVToDevice(
+        torch::Tensor sequence_ids, torch::Tensor k_device_ptrs,
+        std::optional<torch::Tensor> v_device_ptrs = std::nullopt) {
+        EnsureDeviceReady();
+        constexpr std::string_view kOpName = "AsyncLoadLayerKVToDevice";
+        auto batch = PrepareDevicePointerBatch(
+            std::move(sequence_ids), std::move(k_device_ptrs),
+            std::move(v_device_ptrs), kOpName);
+        const auto sequence_vector = TensorToInt64Vector(batch.sequence_ids);
+        EnsureSequencesRegistered(sequence_vector);
+        const auto page_table = BuildPageTable(sequence_vector);
+        const auto start = std::chrono::high_resolution_clock::now();
+        const std::size_t total_pages = std::accumulate(
+            page_table.begin(), page_table.end(), static_cast<std::size_t>(0),
+            [](std::size_t sum, const std::vector<std::int32_t>& pages) {
+                return sum + pages.size();
+            });
+        const auto pointer_columns =
+            static_cast<std::size_t>(batch.k_device_ptrs.size(1));
+        if (pointer_columns != total_pages) {
+            std::ostringstream oss;
+            oss << kOpName << ": pointer tensor columns (" << pointer_columns
+                << ") must equal total host pages (" << total_pages << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        std::vector<std::size_t> sequence_offsets(page_table.size(), 0);
+        std::size_t running_offset = 0;
+        for (std::size_t seq_idx = 0; seq_idx < page_table.size(); ++seq_idx) {
+            sequence_offsets[seq_idx] = running_offset;
+            running_offset += page_table[seq_idx].size();
+        }
+        if (running_offset != total_pages) {
+            throw std::logic_error(
+                "AsyncLoadLayerKVToDevice: mismatch computing page offsets");
+        }
+        const std::size_t num_layers = config_.num_layers;
+        const std::size_t copy_entries = num_layers * total_pages;
+        if (copy_entries == 0) {
+            return LaunchAsyncTask([] {});
+        }
+        const auto kernel_limit =
+            static_cast<std::size_t>(std::numeric_limits<int>::max());
+        if (copy_entries > kernel_limit) {
+            std::ostringstream oss;
+            oss << kOpName << ": num_pages=" << copy_entries
+                << " exceeds kernel limit=" << kernel_limit;
+            throw std::invalid_argument(oss.str());
+        }
+        const auto end = std::chrono::high_resolution_clock::now();
+        double prep_ms =
+            std::chrono::duration_cast<
+                std::chrono::duration<double, std::milli>>(end - start)
+                .count();
+        logger_->info(
+            "Prepared AsyncLoadLayerKVToDevice (num_layers={}, total_pages={}, "
+            "prep_time_ms={:.3f})",
+            num_layers, total_pages, prep_ms);
+        return LaunchAsyncTask([this, batch = std::move(batch),
+                                page_table = std::move(page_table),
+                                sequence_offsets = std::move(sequence_offsets),
+                                total_pages, num_layers, pointer_columns,
+                                copy_entries]() mutable {
+            const auto start = std::chrono::high_resolution_clock::now();
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+            const std::size_t k_page_bytes = layout_.KPageBytes();
+            if (k_page_bytes == 0) {
+                return;
+            }
+
+            auto* k_dest_ptr =
+                batch.k_device_ptrs.template data_ptr<std::int64_t>();
+            const std::int64_t* v_dest_ptr =
+                batch.v_device_ptrs.has_value()
+                    ? batch.v_device_ptrs->template data_ptr<std::int64_t>()
+                    : nullptr;
+            const auto row_stride = pointer_columns;
+            auto build_plan = [&](const std::int64_t* dest_ptrs,
+                                  auto&& host_ptr_provider) {
+                return this->BuildPageCopyPlan(
+                    page_table, sequence_offsets, num_layers, row_stride,
+                    copy_entries, dest_ptrs,
+                    std::forward<decltype(host_ptr_provider)>(
+                        host_ptr_provider),
+                    kOpName);
+            };
+
+            const auto k_plan = build_plan(
+                k_dest_ptr,
+                [this](std::size_t layer_idx, std::int32_t page_idx) -> void* {
+                    return this->KPagePtr(layer_idx, page_idx);
+                });
+            const auto end = std::chrono::high_resolution_clock::now();
+            double plan_ms =
+                std::chrono::duration_cast<
+                    std::chrono::duration<double, std::milli>>(end - start)
+                    .count();
+            logger_->info(
+                "Built K page copy plan (num_layers={}, total_pages={}, "
+                "plan_time_ms={:.3f})",
+                num_layers, total_pages, plan_ms);
+
+            std::optional<PageCopyPlan> v_plan;
+            if constexpr (kHasVCache) {
+                if (v_dest_ptr != nullptr) {
+                    v_plan = build_plan(v_dest_ptr,
+                                        [this](std::size_t layer_idx,
+                                               std::int32_t page_idx) -> void* {
+                                            return this->template VPagePtr<>(
+                                                layer_idx, page_idx);
+                                        });
+                }
+            }
+
+            worker_detail::DeviceBuffer<uint8_t*> k_device_src_ptrs(
+                copy_entries);
+            worker_detail::DeviceBuffer<uint8_t*> k_device_dst_ptrs(
+                copy_entries);
+            worker_detail::DeviceBuffer<uint8_t*> v_device_src_ptrs(
+                v_plan.has_value() ? copy_entries : 0);
+            worker_detail::DeviceBuffer<uint8_t*> v_device_dst_ptrs(
+                v_plan.has_value() ? copy_entries : 0);
+
+            auto enqueue_plan =
+                [&](const PageCopyPlan& plan,
+                    worker_detail::DeviceBuffer<uint8_t*>& dev_src_ptrs,
+                    worker_detail::DeviceBuffer<uint8_t*>& dev_dst_ptrs,
+                    std::size_t page_bytes) {
+                    if (plan.host_sources.empty() || page_bytes == 0) {
+                        return;
+                    }
+                    const std::size_t ptr_bytes =
+                        plan.host_sources.size() * sizeof(uint8_t*);
+                    EnqueueCopy(
+                        reinterpret_cast<const std::byte*>(
+                            plan.host_sources.data()),
+                        reinterpret_cast<std::byte*>(dev_src_ptrs.get()),
+                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+                    EnqueueCopy(
+                        reinterpret_cast<const std::byte*>(
+                            plan.device_dests.data()),
+                        reinterpret_cast<std::byte*>(dev_dst_ptrs.get()),
+                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+                    worker_detail::LaunchUvaPageCopyKernel(
+                        dev_src_ptrs.get(), dev_dst_ptrs.get(), page_bytes,
+                        static_cast<int>(plan.host_sources.size()),
+                        cuda_stream);
+                };
+
+            enqueue_plan(k_plan, k_device_src_ptrs, k_device_dst_ptrs,
+                         k_page_bytes);
+
+            if constexpr (kHasVCache) {
+                if (v_plan.has_value()) {
+                    const std::size_t v_page_bytes = layout_.VPageBytes();
+                    enqueue_plan(*v_plan, v_device_src_ptrs, v_device_dst_ptrs,
+                                 v_page_bytes);
+                }
+            }
+            this->logger_->info(
+                "AsyncLoadLayerKVToDevice completed (num_layers={}, "
+                "total_pages={}, "
+                "k_page_bytes={})",
+                num_layers, total_pages, k_page_bytes);
+            this->SynchronizeWithEvent(cuda_stream);
+        });
+    }
+
     std::byte* DataBase() { return backend_.DataBase(); }
     const std::byte* DataBase() const { return backend_.DataBase(); }
 
@@ -226,15 +492,52 @@ class HostPagedKVWorkerView {
     std::vector<std::vector<std::int32_t>> BuildPageTable(
         const std::vector<std::int64_t>& sequence_ids) const {
         std::vector<std::vector<std::int32_t>> table;
-        table.reserve(sequence_ids.size());
-        for (std::int64_t seq_id : sequence_ids) {
+        table.resize(sequence_ids.size());
+#pragma omp parallel for
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            std::int64_t seq_id = sequence_ids[i];
             try {
-                table.emplace_back(page_table_.Pages(seq_id));
+                table[i] = page_table_.Pages(seq_id);
             } catch (const std::out_of_range&) {
-                table.emplace_back();
             }
         }
         return table;
+    }
+
+    std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
+    GetSequenceLayerPagePointers(
+        std::int64_t sequence_id, std::size_t layer_idx,
+        std::optional<std::size_t> max_tokens = std::nullopt) const {
+        geometry_.EnsureLayerBounds(
+            layer_idx, "HostPagedKVWorkerView::GetSequenceLayerPagePointers");
+        std::optional<std::size_t> max_pages;
+        if (max_tokens.has_value()) {
+            max_pages = geometry_.RequiredPages(max_tokens.value());
+        }
+        auto page_indices = backend_.SequencePages(sequence_id, max_pages);
+        std::vector<void*> k_ptrs;
+        k_ptrs.reserve(page_indices.size());
+        std::optional<std::vector<void*>> v_ptrs;
+        if constexpr (Layout::kHasVCache) {
+            v_ptrs.emplace();
+            v_ptrs->reserve(page_indices.size());
+        }
+        std::byte* base = const_cast<std::byte*>(backend_.DataBase());
+        for (std::int32_t page : page_indices) {
+            void* k_ptr =
+                static_cast<void*>(layout_.KPageAddress(base, layer_idx, page));
+            k_ptrs.emplace_back(k_ptr);
+            // LogPageBytes("K", layer_idx, sequence_id, page, k_ptr,
+            //              geometry_.KTokenBytes());
+            if constexpr (Layout::kHasVCache) {
+                void* v_ptr = static_cast<void*>(
+                    layout_.VPageAddress(base, layer_idx, page));
+                v_ptrs->emplace_back(v_ptr);
+                // LogPageBytes("V", layer_idx, sequence_id, page, v_ptr,
+                //              geometry_.template VTokenBytes<true>());
+            }
+        }
+        return {std::move(k_ptrs), std::move(v_ptrs)};
     }
 
     void RegisterSequences(const std::vector<std::int64_t>& sequence_ids) {
@@ -484,6 +787,17 @@ class HostPagedKVWorkerView {
         std::size_t page_offset_tokens = 0;
     };
 
+    struct DevicePointerBatch {
+        torch::Tensor sequence_ids;
+        torch::Tensor k_device_ptrs;
+        std::optional<torch::Tensor> v_device_ptrs;
+    };
+
+    struct PageCopyPlan {
+        std::vector<uint8_t*> host_sources;
+        std::vector<uint8_t*> device_dests;
+    };
+
     static inline constexpr std::string_view kClassTag =
         "HostPagedKVWorkerView";
 
@@ -676,6 +990,75 @@ class HostPagedKVWorkerView {
         }
     }
 
+    void LogDecodeNeighborhood(std::size_t layer_idx,
+                               const std::vector<std::int64_t>& sequence_ids,
+                               const SequenceLengths& sequence_lengths,
+                               std::byte* host_base,
+                               std::size_t neighborhood = 1) const {
+        if (host_base == nullptr) {
+            logger_->warn("LogDecodeNeighborhood: host_base is null, skipping");
+            return;
+        }
+
+        const std::size_t k_token_bytes = geometry_.KTokenBytes();
+
+        for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
+             ++batch_idx) {
+            const std::int64_t sequence_id = sequence_ids[batch_idx];
+            const std::size_t start_token =
+                ResolveSequenceLength(sequence_lengths, batch_idx, sequence_id,
+                                      std::nullopt, "LogDecodeNeighborhood");
+
+            const auto pages = page_table_.Pages(sequence_id);
+
+            const std::size_t begin =
+                (start_token > neighborhood) ? start_token - neighborhood : 0;
+            const std::size_t end = start_token + neighborhood;
+
+            for (std::size_t token_idx = begin; token_idx <= end; ++token_idx) {
+                try {
+                    geometry_.ValidatePageCapacity(pages, token_idx + 1,
+                                                   "LogDecodeNeighborhood");
+                } catch (const std::exception& ex) {
+                    logger_->warn(
+                        "LogDecodeNeighborhood: layer={} seq={} token_idx={} "
+                        "exceeds capacity: {}",
+                        layer_idx, sequence_id, token_idx, ex.what());
+                    continue;
+                }
+
+                const auto location = ResolvePageLocation(
+                    pages, sequence_id, token_idx, "LogDecodeNeighborhood");
+
+                const std::byte* token_ptr =
+                    layout_.KPageAddress(host_base, layer_idx,
+                                         location.page_idx) +
+                    location.page_offset_tokens * k_token_bytes;
+
+                logger_->info(
+                    "DecodeDebug layer={} seq={} token_idx={} "
+                    "(page_idx={}, page_offset={}) first_token_bytes={}",
+                    layer_idx, sequence_id, token_idx, location.page_idx,
+                    location.page_offset_tokens,
+                    geometry_.DescribeBytes(token_ptr, k_token_bytes));
+            }
+        }
+    }
+
+    void LogPageBytes(const char* tag, std::size_t layer_idx,
+                      std::int64_t sequence_id, std::int32_t page_idx,
+                      const void* ptr, std::size_t token_bytes) const {
+        if (logger_ == nullptr || ptr == nullptr || token_bytes == 0) {
+            return;
+        }
+        const auto bytes = geometry_.DescribeBytes(
+            static_cast<const std::byte*>(ptr), token_bytes);
+        logger_->info(
+            "GetSequenceLayerPagePointers {} layer={} seq={} page={} "
+            "first_bytes={}",
+            tag, layer_idx, sequence_id, page_idx, bytes);
+    }
+
     bool PageContainsTokens(std::size_t page_slot, std::size_t tokens_available,
                             std::size_t tokens_per_page) const {
         const std::size_t page_start_token = page_slot * tokens_per_page;
@@ -761,6 +1144,195 @@ class HostPagedKVWorkerView {
                 << ", capacity=" << max_tokens.value() << ")";
             throw std::out_of_range(oss.str());
         }
+    }
+
+    DevicePointerBatch PrepareDevicePointerBatch(
+        torch::Tensor sequence_ids, torch::Tensor k_device_ptrs,
+        std::optional<torch::Tensor> v_device_ptrs,
+        std::string_view op_name) const {
+        DevicePointerBatch batch;
+        batch.sequence_ids = ValidateCpuTensor1D(
+            std::move(sequence_ids), torch::kInt64, "sequence_ids", op_name);
+        batch.k_device_ptrs = ValidatePointerMatrix(std::move(k_device_ptrs),
+                                                    "k_device_ptrs", op_name);
+        if (v_device_ptrs.has_value()) {
+            if constexpr (!kHasVCache) {
+                throw std::invalid_argument(
+                    std::string(op_name) +
+                    ": v_device_ptrs provided but V cache is disabled");
+            }
+            auto validated = ValidatePointerMatrix(std::move(*v_device_ptrs),
+                                                   "v_device_ptrs", op_name);
+            if (validated.sizes() != batch.k_device_ptrs.sizes()) {
+                std::ostringstream oss;
+                oss << op_name
+                    << ": v_device_ptrs must match k_device_ptrs shape";
+                throw std::invalid_argument(oss.str());
+            }
+            batch.v_device_ptrs = std::move(validated);
+        }
+
+        if (batch.k_device_ptrs.numel() > 0 &&
+            batch.k_device_ptrs.le(0).any().template item<bool>()) {
+            std::ostringstream oss;
+            oss << op_name << ": k_device_ptrs must be non-zero";
+            throw std::invalid_argument(oss.str());
+        }
+        if (batch.v_device_ptrs.has_value() &&
+            batch.v_device_ptrs->numel() > 0 &&
+            batch.v_device_ptrs->le(0).any().template item<bool>()) {
+            std::ostringstream oss;
+            oss << op_name << ": v_device_ptrs must be non-zero";
+            throw std::invalid_argument(oss.str());
+        }
+
+        return batch;
+    }
+
+    template <typename HostPtrProvider>
+    PageCopyPlan BuildPageCopyPlan(
+        const std::vector<std::vector<std::int32_t>>& page_table,
+        const std::vector<std::size_t>& sequence_offsets,
+        std::size_t num_layers, std::size_t row_stride,
+        std::size_t total_entries, const std::int64_t* device_ptr_matrix,
+        HostPtrProvider&& host_ptr_provider, std::string_view op_name) const {
+        if (device_ptr_matrix == nullptr) {
+            throw std::invalid_argument(std::string(op_name) +
+                                        ": device pointer tensor is null");
+        }
+        PageCopyPlan plan;
+        plan.host_sources.resize(total_entries);
+        plan.device_dests.resize(total_entries);
+        auto&& provider = std::forward<HostPtrProvider>(host_ptr_provider);
+        std::size_t cursor = 0;
+        for (std::size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+            const std::size_t layer_offset = layer_idx * row_stride;
+            for (std::size_t seq_idx = 0; seq_idx < page_table.size();
+                 ++seq_idx) {
+                const auto& pages = page_table[seq_idx];
+                const std::size_t seq_offset = sequence_offsets[seq_idx];
+                for (std::size_t slot = 0; slot < pages.size(); ++slot) {
+                    const std::int32_t page_idx = pages[slot];
+                    if (page_idx < 0) {
+                        std::ostringstream oss;
+                        oss << op_name << ": negative page index=" << page_idx;
+                        throw std::out_of_range(oss.str());
+                    }
+                    const std::size_t column = seq_offset + slot;
+                    if (column >= row_stride) {
+                        std::ostringstream oss;
+                        oss << op_name
+                            << ": pointer tensor columns insufficient for "
+                               "sequence slot (column="
+                            << column << ")";
+                        throw std::out_of_range(oss.str());
+                    }
+                    const auto dest_raw =
+                        device_ptr_matrix[layer_offset + column];
+                    if (dest_raw == 0) {
+                        std::ostringstream oss;
+                        oss << op_name
+                            << ": missing device pointer for sequence slot"
+                            << " (column=" << column << ")";
+                        throw std::runtime_error(oss.str());
+                    }
+                    auto* host_ptr =
+                        static_cast<uint8_t*>(provider(layer_idx, page_idx));
+                    auto* device_ptr = reinterpret_cast<uint8_t*>(
+                        static_cast<std::uintptr_t>(dest_raw));
+                    plan.host_sources[cursor] = host_ptr;
+                    plan.device_dests[cursor] = device_ptr;
+                    ++cursor;
+                }
+            }
+        }
+        if (cursor != total_entries) {
+            std::ostringstream oss;
+            oss << op_name << ": expected " << total_entries
+                << " entries but prepared " << cursor;
+            throw std::logic_error(oss.str());
+        }
+        return plan;
+    }
+
+    torch::Tensor ValidateCpuTensor1D(torch::Tensor tensor,
+                                      torch::ScalarType dtype,
+                                      std::string_view tensor_name,
+                                      std::string_view op_name) const {
+        if (tensor.device().type() != torch::kCPU) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must be on CPU (got device " << tensor.device().str()
+                << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.dim() != 1) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name << " must be 1-D";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.scalar_type() != dtype) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name << " must have dtype "
+                << c10::toString(dtype) << " (got "
+                << c10::toString(tensor.scalar_type()) << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        if (!tensor.is_contiguous()) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name << " must be contiguous";
+            throw std::invalid_argument(oss.str());
+        }
+        return tensor;
+    }
+
+    torch::Tensor ValidatePointerMatrix(torch::Tensor tensor,
+                                        std::string_view tensor_name,
+                                        std::string_view op_name) const {
+        if (tensor.device().type() != torch::kCPU) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name << " must reside on CPU (got "
+                << tensor.device().str() << ')';
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.scalar_type() != torch::kInt64) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must have dtype int64 (got "
+                << c10::toString(tensor.scalar_type()) << ')';
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.dim() != 2) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must be 2-D (got dim=" << tensor.dim() << ')';
+            throw std::invalid_argument(oss.str());
+        }
+        if (!tensor.is_contiguous()) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name << " must be contiguous";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.size(0) != static_cast<long>(config_.num_layers)) {
+            std::ostringstream oss;
+            oss << op_name << ": first dimension of " << tensor_name
+                << " must equal num_layers (" << tensor.size(0)
+                << " != " << config_.num_layers << ')';
+            throw std::out_of_range(oss.str());
+        }
+        return tensor;
+    }
+
+    std::vector<std::int64_t> TensorToInt64Vector(
+        const torch::Tensor& tensor) const {
+        const auto length = static_cast<std::size_t>(tensor.size(0));
+        std::vector<std::int64_t> values(length);
+        if (length == 0) {
+            return values;
+        }
+        const auto* data = tensor.data_ptr<std::int64_t>();
+        std::copy(data, data + length, values.begin());
+        return values;
     }
 
     std::size_t ValidateKTensorShape(const torch::Tensor& tensor,
@@ -876,41 +1448,10 @@ class HostPagedKVWorkerView {
     }
 
     void SynchronizeWithEvent(cudaStream_t stream) const {
-        ScopedCudaEvent event(logger_);
+        worker_detail::ScopedCudaEvent event(logger_);
         CUDA_CHECK(cudaEventRecord(event.get(), stream));
         CUDA_CHECK(cudaEventSynchronize(event.get()));
     }
-
-    class ScopedCudaEvent final {
-       public:
-        explicit ScopedCudaEvent(std::shared_ptr<spdlog::logger> logger,
-                                 unsigned int flags = cudaEventDisableTiming)
-            : logger_(std::move(logger)) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&event_, flags));
-        }
-
-        ScopedCudaEvent(const ScopedCudaEvent&) = delete;
-        ScopedCudaEvent& operator=(const ScopedCudaEvent&) = delete;
-        ScopedCudaEvent(ScopedCudaEvent&&) = delete;
-        ScopedCudaEvent& operator=(ScopedCudaEvent&&) = delete;
-
-        ~ScopedCudaEvent() {
-            if (event_ == nullptr) {
-                return;
-            }
-            const auto status = cudaEventDestroy(event_);
-            if (status != cudaSuccess && logger_ != nullptr) {
-                logger_->error("Failed to destroy CUDA event: {}",
-                               cudaGetErrorString(status));
-            }
-        }
-
-        cudaEvent_t get() const { return event_; }
-
-       private:
-        cudaEvent_t event_ = nullptr;
-        std::shared_ptr<spdlog::logger> logger_;
-    };
 
     HostPagedKVConfig config_;
     HostPagedKVGeometry geometry_;

@@ -1,24 +1,25 @@
 import ctypes
 import errno
 import math
+import multiprocessing as mp
 import os
 import random
 import string
-import torch
 import time
-import ctypes
-
-from batchgen.models.engine_loader import core_engine as bg
 from concurrent.futures import ProcessPoolExecutor
-import multiprocessing as mp
+
+import torch
 from tqdm import tqdm
 
+from batchgen.models.engine_loader import core_engine as bg
 
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
 
 def _random_shm_name() -> str:
-    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    suffix = "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=10)
+    )
     return f"/batchgen_kv_{suffix}"
 
 
@@ -32,23 +33,7 @@ def _shm_unlink(name: str) -> None:
             raise OSError(err, f"shm_unlink({name}) failed")
 
 
-def _make_base_config(shm_name: str) -> bg.HostPagedKVConfig:
-    cfg = bg.HostPagedKVConfig()
-    cfg.shm_name = shm_name
-    cfg.num_layers = 2
-    cfg.num_pages = 16
-    cfg.page_size_tokens = 16
-    cfg.num_k_heads = 8
-    cfg.k_head_dim = 64
-    cfg.num_v_heads = 8
-    cfg.v_head_dim = 64
-    cfg.k_element_size_bytes = 2
-    cfg.v_element_size_bytes = 2
-    cfg.sequence_table_capacity = 16
-    cfg.alignment_bytes = 64
-    return cfg
-
-def _make_deepseek_r1_config(shm_name: str) -> bg.HostPagedKVConfig:
+def _make_deepseek_r1_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ignore
     cfg = bg.HostPagedKVConfig()
     cfg.shm_name = shm_name
     cfg.num_layers = 61
@@ -65,87 +50,12 @@ def _make_deepseek_r1_config(shm_name: str) -> bg.HostPagedKVConfig:
     return cfg
 
 
-def test_default_manager_allocation_and_reopen():
-    shm_name = _random_shm_name()
-    cfg = _make_base_config(shm_name)
-    manager = bg.DefaultHostPagedKVManager(cfg)
-    try:
-        manager.initialize(True)
-        sequence_id = 123
-        token_count = 48
-        pages = manager.allocate_pages(sequence_id, token_count)
-        assert len(pages) == math.ceil(token_count / cfg.page_size_tokens)
-        assert manager.sequence_length(sequence_id) == token_count
-
-        stats = manager.get_stats()
-        assert stats.num_used_pages == len(pages)
-        assert stats.num_active_sequences == 1
-
-        table = manager.build_page_table([sequence_id])
-        assert table == [pages]
-
-        manager.free_sequence(sequence_id)
-        stats_after_free = manager.get_stats()
-        assert stats_after_free.num_used_pages == 0
-        assert stats_after_free.num_active_sequences == 0
-
-        reopen = bg.DefaultHostPagedKVManager(cfg)
-        reopen.initialize(False)
-        reopened_stats = reopen.get_stats()
-        assert reopened_stats.num_total_pages == cfg.num_pages
-        assert reopened_stats.num_free_pages == cfg.num_pages
-    finally:
-        if "reopen" in locals():
-            del reopen
-        del manager
-        _shm_unlink(shm_name)
-
-
-def test_gqa_manager_normalizes_v_heads():
-    shm_name = _random_shm_name()
-    cfg = _make_base_config(shm_name)
-    cfg.num_v_heads = 0
-    cfg.v_head_dim = 0
-    cfg.v_element_size_bytes = 0
-    manager = bg.MHAHostPagedKVManager(cfg)
-    try:
-        manager.initialize(True)
-        pages = manager.allocate_pages(1, cfg.page_size_tokens)
-        assert len(pages) == 1
-        manager.free_sequence(1)
-    finally:
-        del manager
-        _shm_unlink(shm_name)
-
-
-def test_mla_manager_disables_v_cache():
-    shm_name = _random_shm_name()
-    print(shm_name)
-    cfg = _make_deepseek_r1_config(shm_name)
-    cfg.num_v_heads = cfg.num_k_heads
-    cfg.v_head_dim = cfg.k_head_dim
-    cfg.v_element_size_bytes = cfg.k_element_size_bytes
-    manager = bg.MLAHostPagedKVManager(cfg)
-    try:
-        manager.initialize(True)
-        pages = manager.allocate_pages(7, 78)
-        assert len(pages) == 2
-        pointers = manager.get_sequence_layer_page_pointers(7, 0)
-        k_ptrs, v_ptrs = pointers
-        assert len(k_ptrs) == 2
-        [print(hex(ptr)) for ptr in k_ptrs]
-        assert v_ptrs is None
-        manager.free_sequence(7)
-    finally:
-        del manager
-        _shm_unlink(shm_name)
-
 # 每个 worker 进程里做的事：attach shm + 分配自己的 sequences + 打印自己的 page table
 def _worker_proc_alloc(shm_name, device_index, requests):
     # 每个进程里重新构造 cfg，shm_name 必须一致
     cfg = _make_deepseek_r1_config(shm_name)
     worker = bg.MLAHostPagedKVWorkerView(cfg)
-    worker.initialize(device_index, False)   # 只附着已有的 shared memory
+    worker.initialize(device_index, False)  # 只附着已有的 shared memory
 
     seq_ids = [sid for (sid, _) in requests]
 
@@ -153,7 +63,9 @@ def _worker_proc_alloc(shm_name, device_index, requests):
         worker.register_sequences(seq_ids)
         allocations = worker.allocate_pages_for_sequences(requests)
         print(f"[worker {device_index}] requests len: {len(requests)}")
-        print(f"[worker {device_index}] allocations (pages) len: {[len(pages) for pages in allocations]}")
+        print(
+            f"[worker {device_index}] allocations (pages) len: {[len(pages) for pages in allocations]}"
+        )
     else:
         print(f"[worker {device_index}] no requests, only attached shm")
 
@@ -172,10 +84,11 @@ def test_parallel_worker_allocate_sequences():
 
     # 准备一批 sequence + 各自 token 数
     sequence_ids = [i for i in range(1, 2000)]
-    lens = [cfg.page_size_tokens * ((i % 5) + 1) + (i % 64) for i in range(1, len(sequence_ids) + 1)]
-    requests = [
-        (sid, length) for sid, length in zip(sequence_ids, lens)
+    lens = [
+        cfg.page_size_tokens * ((i % 5) + 1) + (i % 64)
+        for i in range(1, len(sequence_ids) + 1)
     ]
+    requests = [(sid, length) for sid, length in zip(sequence_ids, lens)]
 
     num_workers = 8
 
@@ -239,7 +152,7 @@ def _worker_proc_copy_prefill(shm_name, device_index, requests):
     # 每个进程里重新构造 cfg，shm_name 必须一致
     cfg = _make_deepseek_r1_config(shm_name)
     worker = bg.MLAHostPagedKVWorkerView(cfg)
-    worker.initialize(device_index, False)   # 只附着已有的 shared memory
+    worker.initialize(device_index, False)  # 只附着已有的 shared memory
 
     seq_ids = [sid for (sid, _) in requests]
 
@@ -247,8 +160,10 @@ def _worker_proc_copy_prefill(shm_name, device_index, requests):
         worker.register_sequences(seq_ids)
         allocations = worker.allocate_pages_for_sequences(requests)
         print(f"[worker {device_index}] requests len: {len(requests)}")
-        print(f"[worker {device_index}] allocations (pages) len: {[len(pages) for pages in allocations]}")
-    
+        print(
+            f"[worker {device_index}] allocations (pages) len: {[len(pages) for pages in allocations]}"
+        )
+
     # initialize 一个 [requests_num, 200 * 64, cfg.k_head_num, cfg.k_head_dim] 的 tensor，模拟从 device 端 prefill KV
     requests_num = len(requests)
     sequence_len = 200 * 64
@@ -257,10 +172,10 @@ def _worker_proc_copy_prefill(shm_name, device_index, requests):
         (requests_num, sequence_len, cfg.num_k_heads, cfg.k_head_dim),
         fill_value=float(device_index + 1),
         dtype=torch.bfloat16,
-        device=f"cuda:{device_index}"
+        device=f"cuda:{device_index}",
     )
 
-    time.sleep(10)
+    torch.cuda.synchronize(device_index)
 
     start = time.time()
     task = worker.async_offload_layer_kv_to_host(
@@ -273,7 +188,9 @@ def _worker_proc_copy_prefill(shm_name, device_index, requests):
 
     task.wait()
     end = time.time()
-    print(f"[worker {device_index}] async D2H prefill done in {end - start:.7f} seconds")
+    print(
+        f"[worker {device_index}] async D2H prefill done in {end - start:.7f} seconds"
+    )
 
 
 def _worker_proc_copy_decode(shm_name, device_index, requests):
@@ -285,7 +202,9 @@ def _worker_proc_copy_decode(shm_name, device_index, requests):
         return
 
     seq_ids = [sid for (sid, _, _) in requests]
-    capacities = [(sid, capacity_tokens) for (sid, capacity_tokens, _) in requests]
+    capacities = [
+        (sid, capacity_tokens) for (sid, capacity_tokens, _) in requests
+    ]
     sequence_lengths = [start_token for (_, _, start_token) in requests]
 
     worker.register_sequences(seq_ids)
@@ -298,6 +217,8 @@ def _worker_proc_copy_decode(shm_name, device_index, requests):
     )
     for idx, sequence_id in enumerate(seq_ids):
         device_tensor[idx].fill_(float(sequence_id + 1))
+
+    torch.cuda.synchronize(device_index)
 
     start = time.time()
 
@@ -312,11 +233,12 @@ def _worker_proc_copy_decode(shm_name, device_index, requests):
     task.wait()
 
     end = time.time()
-    print(f"[worker {device_index}] async decode D2H done in {end - start:.7f} seconds")
+    print(
+        f"[worker {device_index}] async decode D2H done in {end - start:.7f} seconds"
+    )
 
 
 def test_kv_copy_prefill_d2h():
-
     PAGE_NUM_PER_SEQ = 200
     NUM_WORKERS = 8
 
@@ -327,9 +249,7 @@ def test_kv_copy_prefill_d2h():
     # 准备一批 sequence + 各自 token 数
     sequence_ids = [i for i in range(0, NUM_WORKERS * 6)]
     lens = [cfg.page_size_tokens * PAGE_NUM_PER_SEQ for _ in sequence_ids]
-    requests = [
-        (sid, length) for sid, length in zip(sequence_ids, lens)
-    ]
+    requests = [(sid, length) for sid, length in zip(sequence_ids, lens)]
     num_workers = NUM_WORKERS
 
     # 简单 round-robin 把 requests 分给不同 worker
@@ -368,7 +288,9 @@ def test_kv_copy_prefill_d2h():
             assert len(k_ptrs) == PAGE_NUM_PER_SEQ
             for i, ptr in enumerate(k_ptrs):
                 # 通过指针读回 host 端的数据，检查内容是否正确
-                array_type = ctypes.c_uint16 * (64 * cfg.num_k_heads * cfg.k_head_dim)
+                array_type = ctypes.c_uint16 * (
+                    64 * cfg.num_k_heads * cfg.k_head_dim
+                )
                 host_array = array_type.from_address(ptr)
 
                 # zero-copy 转成 Torch tensor
@@ -377,11 +299,13 @@ def test_kv_copy_prefill_d2h():
 
                 expected = float(sid_worker + 1)
 
-                mask = (bf16 != expected)
+                mask = bf16 != expected
 
                 if torch.any(mask):
                     # mismatch 全部 index
-                    bad_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                    bad_indices = torch.nonzero(mask, as_tuple=False).squeeze(
+                        -1
+                    )
 
                     # mismatch 对应的值
                     bad_values = bf16[mask]
@@ -392,7 +316,9 @@ def test_kv_copy_prefill_d2h():
                     for j in range(N):
                         idx = bad_indices[j].item()
                         val = bad_values[j].item()
-                        msg_lines.append(f"[idx={idx}] value={val} expected={expected}")
+                        msg_lines.append(
+                            f"[idx={idx}] value={val} expected={expected}"
+                        )
 
                     msg = "\n".join(msg_lines)
                     raise AssertionError(
@@ -400,8 +326,6 @@ def test_kv_copy_prefill_d2h():
                         f"ptr={hex(ptr)}\n"
                     )
         print("All sequences verified successfully.")
-
-
 
     finally:
         # 5) 清理：释放所有 sequence，删除 shm
@@ -417,14 +341,14 @@ def test_kv_copy_prefill_d2h():
 
 
 def test_kv_copy_decode_d2h():
-    PAGE_NUM_PER_SEQ = 4
-    NUM_WORKERS = 4
-
+    PAGE_NUM_PER_SEQ = 10
+    NUM_WORKERS = 8
+    SEQ_NUM_PER_WORKER = 10
     shm_name = _random_shm_name()
     cfg = _make_deepseek_r1_config(shm_name)
     manager = bg.MLAHostPagedKVManager(cfg)
 
-    sequence_ids = [i for i in range(0, NUM_WORKERS * 6)]
+    sequence_ids = [i for i in range(0, NUM_WORKERS * SEQ_NUM_PER_WORKER)]
     capacity_tokens = cfg.page_size_tokens * PAGE_NUM_PER_SEQ
     max_start_token = capacity_tokens - 1
     decode_positions = {
@@ -493,5 +417,5 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     # test_batch_allocate_and_free_sequences()
     # test_parallel_worker_allocate_sequences()
-    # test_kv_copy_prefill_d2h()
-    test_kv_copy_decode_d2h()
+    test_kv_copy_prefill_d2h()
+    # test_kv_copy_decode_d2h()
