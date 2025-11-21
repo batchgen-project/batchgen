@@ -457,6 +457,15 @@ class DeepseekV3ParallelStrategyManager:
 					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 				)
 
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage before configure wrapper: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory before configure wrapper: {free_memory} GB / {total_memory} GB"
+		)
 
 		self._extract_dequantize_scale()
 		self._load_model_skeleton()
@@ -476,7 +485,25 @@ class DeepseekV3ParallelStrategyManager:
 		used_memory_gb = used_memory / (1024**3)
 		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
 		self.model.eval()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage before copy model instance to device: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory before copy model instance to device: {free_memory} GB / {total_memory} GB"
+		)
 		self.model.to(self.engine_config.Basic_Config.device_torch)
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after copy model instance to device: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after copy model instance to device: {free_memory} GB / {total_memory} GB"
+		)
 		self._warmup()
 		return self.model, self.weight_copy_task
 
