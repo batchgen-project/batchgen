@@ -701,6 +701,7 @@ class BatchGenWorker:
 			)
 			logging.info(
 				f"Rank: {self.rank} Device torch free memory after config prefill: {free_memory} GB / {total_memory} GB"
+			)
 			config_prefill_time += time.perf_counter() - tmp_start
 			prefill_start_time = time.perf_counter()
 			if len(self.model_batches[model_batch_idx]) > 0:
