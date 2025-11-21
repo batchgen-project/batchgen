@@ -207,7 +207,9 @@ class BatchGenWorker:
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
 		print_gpu_memory(f"Rank{self.global_rank} before init")
 		self._init_torch_dist()
+		dist.barrier()
 		print_gpu_memory(f"Rank{self.global_rank} after init")
+		exit()
 
 		torch.cuda.reset_peak_memory_stats()
 		logging.info(self.hf_cache_dir)
@@ -630,31 +632,32 @@ class BatchGenWorker:
 		logging.debug("Initial batching done.")
 
 	def generate(self):
-		from batchgen.distributed.utils import StatelessProcessGroup
-		from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
-		self.rank = dist.get_rank()
-		self.world_size = dist.get_world_size()
-		device = torch.device("cuda", self.rank % torch.cuda.device_count())
-		comm_master_addr = os.getenv("COMM_MASTER_ADDR")
 		self.comm = None
-		print_gpu_memory(f"Rank{self.global_rank} before self.comm init")
-		try:
-			group = StatelessProcessGroup.create(
-				host=comm_master_addr,
-				port=20003,
-				rank=self.rank,
-				world_size=self.world_size,
-				data_expiration_seconds=6000,
-			)
-			self.comm = PyNcclCommunicator(
-				group=group,
-				device=device
-			)		
-		except Exception as e:
-			logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-			raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-		print_gpu_memory(f"Rank{self.global_rank} after self.comm init")
-		exit()
+		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL","0") == "0":
+			from batchgen.distributed.utils import StatelessProcessGroup
+			from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+			device = torch.device("cuda", self.rank % torch.cuda.device_count())
+			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+			
+			try:
+				group = StatelessProcessGroup.create(
+					host=comm_master_addr,
+					port=20003,
+					rank=self.rank,
+					world_size=self.world_size,
+					data_expiration_seconds=6000,
+				)
+				self.comm = PyNcclCommunicator(
+					group=group,
+					device=device
+				)		
+			except Exception as e:
+				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+
+
 		generation_start_time = time.perf_counter()
 		prefill_time = 0
 		decoding_time = 0
@@ -1747,10 +1750,10 @@ class BatchGenWorker:
 
 	def _init_torch_dist(self):
 		timeout = timedelta(minutes=15)
-		# os.environ['GLOO_SOCKET_IFNAME'] = 'bond1'
+		os.environ['GLOO_SOCKET_IFNAME'] = 'bond0'
 		try:
 			dist.init_process_group(
-				backend="nccl",
+				backend="gloo",
 				# backend="gloo",
 				init_method="tcp://" + self.dist_init_addr,
 				world_size=self.world_size,
