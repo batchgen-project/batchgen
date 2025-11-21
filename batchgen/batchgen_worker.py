@@ -1004,7 +1004,7 @@ class BatchGenWorker:
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
-		self.deep_free_model_memory()
+		self.deep_free_model_memory(
 		self.init_nvshmem()
 		
 		# Initialize symmetric memory once during model initialization
@@ -1746,10 +1746,10 @@ class BatchGenWorker:
 
 	def _init_torch_dist(self):
 		timeout = timedelta(minutes=15)
-		os.environ['GLOO_SOCKET_IFNAME'] = 'bond0'
+		# os.environ['GLOO_SOCKET_IFNAME'] = 'bond0'
 		try:
 			dist.init_process_group(
-				backend="gloo",
+				backend="nccl",
 				# backend="gloo",
 				init_method="tcp://" + self.dist_init_addr,
 				world_size=self.world_size,
