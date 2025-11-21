@@ -207,9 +207,7 @@ class BatchGenWorker:
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
 		print_gpu_memory(f"Rank{self.global_rank} before init")
 		self._init_torch_dist()
-		dist.barrier()
 		print_gpu_memory(f"Rank{self.global_rank} after init")
-		exit()
 
 		torch.cuda.reset_peak_memory_stats()
 		logging.info(self.hf_cache_dir)
@@ -639,6 +637,7 @@ class BatchGenWorker:
 		device = torch.device("cuda", self.rank % torch.cuda.device_count())
 		comm_master_addr = os.getenv("COMM_MASTER_ADDR")
 		self.comm = None
+		print_gpu_memory(f"Rank{self.global_rank} before self.comm init")
 		try:
 			group = StatelessProcessGroup.create(
 				host=comm_master_addr,
@@ -654,6 +653,8 @@ class BatchGenWorker:
 		except Exception as e:
 			logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 			raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+		print_gpu_memory(f"Rank{self.global_rank} after self.comm init")
+		exit()
 		generation_start_time = time.perf_counter()
 		prefill_time = 0
 		decoding_time = 0
