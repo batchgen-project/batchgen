@@ -749,6 +749,17 @@ class BatchGenWorker:
 
 
 					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+
+					free_memory, total_memory = torch.cuda.mem_get_info()
+					free_memory = free_memory / 1024 / 1024 / 1024
+					total_memory = total_memory / 1024 / 1024 / 1024
+					logging.info(
+						f"Rank: {self.rank} Device torch memory usage after getting past key values: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+					)
+					logging.info(
+						f"Rank: {self.rank} Device torch free memory after getting past key values: {free_memory} GB / {total_memory} GB"
+					)
+
 					# Pad the kv cache to be multiple of 64
 					bsz, kv_seqlen, _ = past_key_states[0].size()
 					if self.engine_config.Basic_Config.kv_dtype == "bfloat16":
