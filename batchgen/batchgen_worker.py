@@ -54,7 +54,7 @@ def print_gpu_memory(tag):
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(0)
     info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    print(f"[{tag}] Global Used Memory: {info.used / 1024**2:.2f} MB")
+    logging.info(f"[{tag}] Global Used Memory: {info.used / 1024**2:.2f} MB")
     pynvml.nvmlShutdown()
 
 class query:
