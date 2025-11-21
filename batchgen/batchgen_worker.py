@@ -1004,7 +1004,7 @@ class BatchGenWorker:
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
-		self.deep_free_model_memory(
+		self.deep_free_model_memory()
 		self.init_nvshmem()
 		
 		# Initialize symmetric memory once during model initialization
