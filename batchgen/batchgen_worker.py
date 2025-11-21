@@ -207,6 +207,7 @@ class BatchGenWorker:
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
 		print_gpu_memory(f"Rank{self.global_rank} before init")
 		self._init_torch_dist()
+		dist.barrier()
 		print_gpu_memory(f"Rank{self.global_rank} after init")
 		exit()
 
