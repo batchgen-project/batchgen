@@ -284,11 +284,10 @@ class HostPagedKVWorkerView {
             });
         const auto pointer_columns =
             static_cast<std::size_t>(batch.k_device_ptrs.size(1));
-        if (pointer_columns < total_pages) {
+        if (pointer_columns != total_pages) {
             std::ostringstream oss;
             oss << kOpName << ": pointer tensor columns (" << pointer_columns
-                << ") must be at least total host pages (" << total_pages
-                << ")";
+                << ") must equal total host pages (" << total_pages << ")";
             throw std::invalid_argument(oss.str());
         }
         std::vector<std::size_t> sequence_offsets(page_table.size(), 0);

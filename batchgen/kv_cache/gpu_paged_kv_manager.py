@@ -257,6 +257,8 @@ class _GPUPageTableManager:
         self._slot_index_tensor: Optional[torch.Tensor] = None
         # Cached tensor mirroring slot_to_seq_id on device for downstream consumers.
         self._slot_to_seq_id_tensor: Optional[torch.Tensor] = None
+        # Flattened list of active page indices ordered by slot_to_seq_id.
+        self._active_page_indices_cpu: Optional[torch.Tensor] = None
 
     def rebuild(
         self,
@@ -287,6 +289,9 @@ class _GPUPageTableManager:
         new_max = max(self.max_pages_per_sequence, desired_pages)
 
         num_slots = len(wanted_order)
+        flat_pages_cpu = self._build_flat_page_index_tensor(
+            wanted_order, sequences
+        )
 
         # Fast-path: if an existing GPU table already matches the exact
         # shape we need and the order is identical, return a view into it.
@@ -300,6 +305,7 @@ class _GPUPageTableManager:
             self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
                 wanted_order
             )
+            self._active_page_indices_cpu = flat_pages_cpu
             # If table has more columns than needed, return a view with
             # the requested number of rows and the existing columns.
             return self.gpu_table[:num_slots, :]
@@ -342,6 +348,7 @@ class _GPUPageTableManager:
         self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
             self.slot_to_seq_id
         )
+        self._active_page_indices_cpu = flat_pages_cpu
         return table
 
     def get_slot_index_tensor(self) -> torch.Tensor:
@@ -352,6 +359,13 @@ class _GPUPageTableManager:
             )
         tensor = self._slot_index_tensor
         return tensor
+
+    def get_active_page_indices(self) -> torch.Tensor:
+        if self._active_page_indices_cpu is None:
+            raise RuntimeError(
+                "Active page indices unavailable; call rebuild() first"
+            )
+        return self._active_page_indices_cpu
 
     def get_slot_to_seq_id_tensor(
         self, batch_size: Optional[int] = None
@@ -382,6 +396,19 @@ class _GPUPageTableManager:
             sequence_ids, dtype=torch.int64, device=self.device
         )
 
+    def _build_flat_page_index_tensor(
+        self, sequence_ids: Sequence[int], sequences: Dict[int, _SequenceState]
+    ) -> torch.Tensor:
+        buffers: List[torch.Tensor] = []
+        for seq_id in sequence_ids:
+            state = sequences.get(seq_id)
+            if state is None or state.pages.numel() == 0:
+                continue
+            buffers.append(state.pages.to("cpu", dtype=torch.int64))
+        if not buffers:
+            return torch.empty(0, dtype=torch.int64)
+        return torch.cat(buffers, dim=0)
+
 
 class GPUPagedKVCacheManager:
     """Per-GPU paged KV cache manager inspired by the host implementation."""
@@ -400,6 +427,9 @@ class GPUPagedKVCacheManager:
             None  # [layer_id, num_pages]
         )
         self._v_page_ptr_table: Optional[torch.Tensor] = None
+        self._active_page_indices: Optional[torch.Tensor] = None
+        self._k_active_page_ptr_table: Optional[torch.Tensor] = None
+        self._v_active_page_ptr_table: Optional[torch.Tensor] = None
         self._free_pages = _TensorStack(self.config.num_pages)
         self._sequences: Dict[int, _SequenceState] = {}
         # GPU-side page table manager (lazy updated in allocate_pages_for_sequences)
@@ -555,9 +585,11 @@ class GPUPagedKVCacheManager:
                 + ", ".join(str(seq_id) for seq_id in missing)
             )
 
-        return self._gpu_page_table_manager.rebuild(
+        table = self._gpu_page_table_manager.rebuild(
             ordered_ids, self._sequences
         )
+        self._update_active_page_pointer_tables()
+        return table
 
     def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> None:
         """Batch version of :meth:`free_sequence` for releasing multiple IDs."""
@@ -583,6 +615,8 @@ class GPUPagedKVCacheManager:
         if reclaimed:
             concatenated = torch.cat(reclaimed, dim=0)
             self._free_pages.push(concatenated)
+        if reclaimed:
+            self._clear_active_page_pointer_tables()
 
     def get_context_kv_page_ptrs(
         self, sequence_id: int, layer_idx: int, context_length: int
@@ -889,6 +923,7 @@ class GPUPagedKVCacheManager:
             )
         else:
             self._v_page_ptr_table = None
+        self._clear_active_page_pointer_tables()
 
     def _build_page_pointer_table(
         self, cache_tensor: torch.Tensor, page_bytes: int
@@ -932,6 +967,54 @@ class GPUPagedKVCacheManager:
 
         return pointer_table
 
+    def _update_active_page_pointer_tables(self) -> None:
+        active_indices = self._gpu_page_table_manager.get_active_page_indices()
+        self._active_page_indices = active_indices
+        self._k_active_page_ptr_table = self._select_active_page_columns(
+            self._k_page_ptr_table, active_indices
+        )
+        if self.config.has_v_cache:
+            self._v_active_page_ptr_table = self._select_active_page_columns(
+                self._v_page_ptr_table, active_indices
+            )
+        else:
+            self._v_active_page_ptr_table = None
+
+    def _clear_active_page_pointer_tables(self) -> None:
+        self._active_page_indices = None
+        self._k_active_page_ptr_table = None
+        self._v_active_page_ptr_table = None
+
+    def _select_active_page_columns(
+        self,
+        base_table: Optional[torch.Tensor],
+        page_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if base_table is None:
+            raise RuntimeError(
+                "Base page pointer table unavailable; ensure initialize() was called"
+            )
+        if page_indices.numel() == 0:
+            num_layers = base_table.shape[0]
+            return base_table.new_empty((num_layers, 0))
+        index = page_indices
+        if index.device != base_table.device or index.dtype != torch.long:
+            index = index.to(device=base_table.device, dtype=torch.long)
+        return torch.index_select(base_table, dim=1, index=index)
+
+    def _get_active_page_ptr_table(self, *, is_value: bool) -> torch.Tensor:
+        table = (
+            self._v_active_page_ptr_table
+            if is_value
+            else self._k_active_page_ptr_table
+        )
+        if table is None:
+            cache_name = "V" if is_value else "K"
+            raise RuntimeError(
+                f"{cache_name} page pointer table unavailable; call rebuild_page_table() first"
+            )
+        return table
+
     def export_layer_page_pointer_table(
         self,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -944,23 +1027,10 @@ class GPUPagedKVCacheManager:
         """
 
         self._ensure_initialized()
-        k_table = self._get_page_ptr_table(is_value=False)
-        k_ptrs = k_table
+        k_ptrs = self._get_active_page_ptr_table(is_value=False)
 
         v_ptrs: Optional[torch.Tensor] = None
         if self.config.has_v_cache:
-            v_table = self._get_page_ptr_table(is_value=True)
-            v_ptrs = v_table
+            v_ptrs = self._get_active_page_ptr_table(is_value=True)
 
         return k_ptrs, v_ptrs
-
-    def _get_page_ptr_table(self, *, is_value: bool) -> torch.Tensor:
-        """Returns the cached pointer table for the requested cache kind."""
-
-        table = self._v_page_ptr_table if is_value else self._k_page_ptr_table
-        if table is None:
-            cache_name = "V" if is_value else "K"
-            raise RuntimeError(
-                f"{cache_name} page pointer table is unavailable; ensure initialize() was called"
-            )
-        return table

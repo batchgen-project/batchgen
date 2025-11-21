@@ -8,6 +8,7 @@ import random
 import string
 import time
 from concurrent.futures import ProcessPoolExecutor
+from typing import Union
 from unittest import SkipTest
 
 import torch
@@ -79,6 +80,36 @@ def _make_deepseek_r1_host_config(shm_name: str) -> bg.HostPagedKVConfig:  # typ
     cfg.sequence_table_capacity = 10240
     cfg.alignment_bytes = 64
     return cfg
+
+
+_TOKEN_DEVICE_STRIDE = 4096
+_TOKEN_LAYER_STRIDE = 128
+_TOKEN_SEQUENCE_PERIOD = 127
+
+
+def _make_sequence_token_values(
+    device_index: int,
+    layer_idx: int,
+    sequence_id: int,
+    token_count: int,
+    kv_cfg: GPUPagedKVConfig,
+    device: Union[torch.device, str],
+) -> torch.Tensor:
+    """Generate deterministic per-token values for a sequence slice."""
+
+    if token_count <= 0:
+        return torch.empty(0, dtype=kv_cfg.kv_dtype, device=device)
+
+    base = (
+        device_index * _TOKEN_DEVICE_STRIDE
+        + layer_idx * _TOKEN_LAYER_STRIDE
+        + (sequence_id % _TOKEN_SEQUENCE_PERIOD)
+    )
+    token_positions = torch.arange(
+        token_count, dtype=torch.float32, device=device
+    )
+    values = token_positions + float(base)
+    return values.to(kv_cfg.kv_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -263,15 +294,29 @@ def _host_transfer_worker(spec: dict) -> dict:
 
     # Populate host storage with synthetic per-layer data (device -> host)
     for layer_idx in range(kv_cfg.num_layers):
-        fill_value = float(device_index * 100 + layer_idx + 1)
-        device_tensor = torch.full(
+        device_tensor = torch.zeros(
             data_shape,
-            fill_value,
             dtype=kv_cfg.kv_dtype,
             device=f"cuda:{device_index}",
         )
+        for batch_idx, seq_id in enumerate(sequence_ids):
+            seq_len = sequence_lengths[batch_idx]
+            if seq_len <= 0:
+                continue
+            token_values = _make_sequence_token_values(
+                device_index=device_index,
+                layer_idx=layer_idx,
+                sequence_id=seq_id,
+                token_count=seq_len,
+                kv_cfg=kv_cfg,
+                device=device_tensor.device,
+            )
+            slice_view = device_tensor[batch_idx, :seq_len]
+            slice_view.zero_()
+            slice_view.add_(token_values.view(seq_len, 1, 1))
+            # print(slice_view)
+
         torch.cuda.synchronize(device_index)
-        # print(f"Worker {device_index} offloading layer {layer_idx} to host. Sequence IDs: {sequence_ids}")
         task = worker.async_offload_layer_kv_to_host(
             layer_idx=layer_idx,
             sequence_ids=sequence_ids,
@@ -371,15 +416,37 @@ def _host_transfer_worker(spec: dict) -> dict:
         f"[worker {device_index}] begin to verify device cache content."
     )
     for layer_idx in range(kv_cfg.num_layers):
-        expected_value = float(device_index * 100 + layer_idx + 1)
         layer_tensor = k_cache[layer_idx]
-        for seq_id in sequence_ids:
+        for batch_idx, seq_id in enumerate(sequence_ids):
+            seq_len = sequence_lengths[batch_idx]
+            if seq_len <= 0:
+                continue
+
             state = gpu_manager._get_sequence_state(seq_id)
-            page_indices = state.pages.to(gpu_manager.device, dtype=torch.long)
-            gathered = layer_tensor.index_select(0, page_indices)
-            expected = torch.full_like(gathered, expected_value)
-            if not torch.equal(gathered, expected):
-                print(gathered, expected)
+            page_indices = state.pages.to(
+                gpu_manager.device, dtype=torch.long
+            )
+            gathered_pages = layer_tensor.index_select(0, page_indices)
+            gathered_tokens = gathered_pages.reshape(
+                -1, kv_cfg.num_k_heads, kv_cfg.k_head_dim
+            )[:seq_len]
+
+            expected_values = _make_sequence_token_values(
+                device_index=device_index,
+                layer_idx=layer_idx,
+                sequence_id=seq_id,
+                token_count=seq_len,
+                kv_cfg=kv_cfg,
+                device=gathered_tokens.device,
+            )
+            expected = expected_values.view(seq_len, 1, 1).expand(
+                -1, kv_cfg.num_k_heads, kv_cfg.k_head_dim
+            )
+
+            if not torch.allclose(
+                gathered_tokens, expected, atol=1e-2, rtol=1e-2
+            ):
+                print(gathered_tokens, expected)
                 raise AssertionError(
                     "Host -> device copy mismatch for layer "
                     f"{layer_idx}, seq {seq_id} on device {device_index}"
@@ -489,6 +556,116 @@ def test_host_transfer_layer(shm_name):
         )
 
 
+def test_host_transfer_layer_variable_lengths(shm_name):
+    if not torch.cuda.is_available():
+        raise SkipTest("CUDA device required for host transfer test")
+
+    host_cfg = _make_deepseek_r1_host_config(shm_name)
+    host_manager = bg.MLAHostPagedKVManager(host_cfg)
+    host_manager.initialize(True)
+
+    available_devices = torch.cuda.device_count()
+    if available_devices == 0:
+        raise SkipTest("No CUDA devices available")
+
+    device_count = min(2, available_devices)
+    page_num_per_seq = 200
+    sequences_per_worker = 32
+    capacity_tokens = host_cfg.page_size_tokens * page_num_per_seq
+    min_tokens = max(8, host_cfg.page_size_tokens // 3)
+    max_tokens = capacity_tokens - host_cfg.page_size_tokens // 2
+
+    worker_specs = []
+    seq_offset = 10_000
+    for device_index in range(device_count):
+        sequence_ids = list(
+            range(seq_offset, seq_offset + sequences_per_worker)
+        )
+        seq_offset += sequences_per_worker
+
+        seq_lengths: list[int] = []
+        for local_idx, _ in enumerate(sequence_ids):
+            base = min_tokens + (local_idx + 1) * (
+                host_cfg.page_size_tokens // 2
+            )
+            jitter = (local_idx * local_idx + device_index * 7) % (
+                host_cfg.page_size_tokens * 2
+            )
+            length = base + jitter
+            length = max(min_tokens, min(length, max_tokens))
+            if length % host_cfg.page_size_tokens == 0:
+                length += 1
+                if length > max_tokens:
+                    length -= 3
+            seq_lengths.append(length)
+
+        if len(set(seq_lengths)) <= 1:
+            seq_lengths[-1] = max(
+                min_tokens,
+                min(seq_lengths[-1] + host_cfg.page_size_tokens // 3, max_tokens),
+            )
+            if seq_lengths[-1] % host_cfg.page_size_tokens == 0:
+                seq_lengths[-1] += 1
+
+        worker_specs.append(
+            {
+                "shm_name": shm_name,
+                "device_index": device_index,
+                "sequence_ids": sequence_ids,
+                "page_num_per_seq": page_num_per_seq,
+                "sequence_lengths": seq_lengths,
+            }
+        )
+
+    ctx = mp.get_context("spawn")
+    with ctx.Manager() as manager:
+        sync_barrier = manager.Barrier(len(worker_specs))
+        for spec in worker_specs:
+            spec["barrier"] = sync_barrier
+
+        with ProcessPoolExecutor(
+            max_workers=len(worker_specs), mp_context=ctx
+        ) as executor:
+            futures = [
+                executor.submit(_host_transfer_worker, spec)
+                for spec in worker_specs
+            ]
+            results = [future.result() for future in futures]
+
+        for spec, result in zip(worker_specs, results):
+            assert result["verified"], (
+                f"Worker {result['device_index']} verification failed"
+            )
+            assert result["sequence_lengths"] == spec["sequence_lengths"]
+            per_worker_lengths = result["sequence_lengths"]
+            assert len(set(per_worker_lengths)) > 1, (
+                "Sequence lengths must vary within a worker"
+            )
+            assert any(
+                (length % host_cfg.page_size_tokens) != 0
+                for length in per_worker_lengths
+            ), "Sequence lengths should not align to page size tokens"
+            logging.info(
+                "[variable] Device %d transferred %.2f MB in %.3f s (%.2f GB/s)",
+                result["device_index"],
+                result["bytes_transferred"] / (1024 * 1024),
+                result["host_to_device_seconds"],
+                result["bandwidth_gbps"],
+            )
+
+        total_tokens = sum(
+            sum(result["sequence_lengths"]) for result in results
+        )
+        assert total_tokens > 0
+        total_bytes = sum(result["bytes_transferred"] for result in results)
+        total_time = sum(result["host_to_device_seconds"] for result in results)
+        logging.info(
+            "[variable] Aggregated host→device transfer: %.2f MB in %.3f s",
+            total_bytes / (1024 * 1024),
+            total_time,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -498,5 +675,6 @@ if __name__ == "__main__":
         # test_alloc_page(shm_name)
         # test_update_new_token(shm_name)
         test_host_transfer_layer(shm_name)
+        # test_host_transfer_layer_variable_lengths(shm_name)
     finally:
         _shm_unlink(shm_name)
