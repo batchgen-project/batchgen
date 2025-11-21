@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -10,12 +11,12 @@ namespace {
 // each block copies one page. page_idx = blockIdx.x
 // src_ptrs:
 //     A device-resident array of uint8_t* pointers.
-//     Each pointer refers to **host pinned memory** (allocated with cudaHostAlloc or
-//     registered with cudaHostRegister),
-//     that is **UVA-mapped into the device address space**.
-//     Because of UVA (Unified Virtual Addressing), these host pointers are
-//     valid device pointers as well, so the GPU can directly load from them
-//     using global memory instructions (zero-copy access).
+//     Each pointer refers to **host pinned memory** (allocated with
+//     cudaHostAlloc or registered with cudaHostRegister), that is **UVA-mapped
+//     into the device address space**. Because of UVA (Unified Virtual
+//     Addressing), these host pointers are valid device pointers as well, so
+//     the GPU can directly load from them using global memory instructions
+//     (zero-copy access).
 //
 // dst_ptrs:
 //     A device-resident array of uint8_t* pointers to normal GPU global memory.
@@ -69,8 +70,7 @@ void LaunchUvaPageCopyKernel(uint8_t** src_ptrs, uint8_t** dst_ptrs,
     const dim3 grid(static_cast<unsigned int>(num_pages));
     const dim3 block(kThreadsPerBlock);
     UvaPageCopyKernel<<<grid, block, 0, stream>>>(src_ptrs, dst_ptrs,
-                                                  page_size_bytes,
-                                                  num_pages);
+                                                  page_size_bytes, num_pages);
     CUDA_CHECK(cudaGetLastError());
 }
 
