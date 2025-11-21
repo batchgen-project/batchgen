@@ -13,7 +13,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
-from .config.config import EngineConfig
+# from .config.config import EngineConfig
 
 from batchgen.parameter_server_client import ParameterServerClient
 from .utils import config_torch_module_initializer
