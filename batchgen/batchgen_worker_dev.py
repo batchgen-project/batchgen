@@ -128,6 +128,58 @@ class BatchGenWorkerArgs:
 	kv_dtype: str
 	gpu_arch: str
 
+
+class BatchGenWorker:
+	"""
+	Inference Runtime.
+	
+	"""
+	def __init__(self, args: BatchGenWorkerArgs):
+		self.args = args
+		if (args.hf_cache_dir is None) and (args.cache_dir is not None):
+			self.hf_cache_dir = args.cache_dir
+		self.model_name = args.model_name
+		self.cache_dir = args.cache_dir
+
+		"""
+		Instantiate CPU-Weight-Manager
+		"""
+
+		
+
+
+
+	def Init(self):
+		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
+		config_torch_module_initializer()
+		
+
+		
+
+
+	def process_new_batch(self, batch: List(str)):
+		"""
+		Future API.
+		"""
+		pass
+
+	def generate(self):
+		pass
+
+	def prefill(self):
+		pass
+
+	def decode(self):
+		pass
+
+	def config_prefill(self):
+		pass
+
+	def config_decode(self):
+		pass
+
+
+
 class BatchGenWorker:
 	def __init__(
 		self,

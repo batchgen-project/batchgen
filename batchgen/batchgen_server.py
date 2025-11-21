@@ -2,7 +2,7 @@ import os
 import torch
 import logging
 import argparse
-import torch.multiprocessing as mp
+import multiprocessing as mp
 from typing import Dict, Any, List, Union
 import threading
 import signal
@@ -13,8 +13,9 @@ import struct
 import pickle  # Used for both Request and Response now
 
 # Mock imports for the sake of structure (Keep your original imports here)
-from batchgen.server_worker_main_loop import server_worker_main, BatchGenWorkerArgs
+from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
+from batchgen.batchgen_worker import BatchGenWorkerArgs
 
 # Configure logging
 logging.basicConfig(
@@ -140,6 +141,9 @@ class BatchGenServer:
 			kv_dtype=self.args.kv_dtype,
 			dist_init_addr=self.args.dist_init_addr,
 			world_size=self.args.world_size,
+			nnode_rank=self.args.node_rank,
+			nnodes=self.args.nnodes,
+			gpu_arch=self.args.gpu_arch,
 
 			# Place holder
 			local_rank=-1,

@@ -1794,6 +1794,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			bound_m=self.bound_m,
 		)
 
+<<<<<<< Updated upstream
 		# 3. Local Expert Computation (Identity)
 		self.grouped_dequant_moe_fp8_ata(
 			self.expert_x,
@@ -1888,6 +1889,44 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			expert_token_counts,     
 			experts_per_rank,
 			out=out 
+=======
+		# ---- 2) Reorder tokens to expert-contiguous layout -------
+		out_splits = self.symm_out_splits_offsets[0]
+		out_offsets = self.symm_out_splits_offsets[1]
+		splits_matrix = out_splits.view(self.world_size, self.experts_per_rank)
+		tokens_per_local_expert = splits_matrix.sum(dim=0)
+		
+		# ---- 3) Process tokens with local experts -------
+		expert_offsets = torch.cumsum(
+			torch.cat([tokens_per_local_expert.new_zeros(1), tokens_per_local_expert])
+		)
+		res = self.grouped_dequant_moe_fp8(
+			self.symm_out,
+			None, 						# Placeholder
+			tokens_per_local_expert,    # [num_local_experts]
+			expert_offsets          	# [num_local_experts + 1]
+		)
+		
+		logger.info(f"Rank {self.rank} local_expert_counts {res.shape}")
+
+		# ---- 4) Scatter results back to interleaved layout ------
+		self.symm_out[:expert_offsets[-1]].copy_(res)
+		logger.info(f"Rank {self.rank} scattered results back to interleaved layout")
+		
+		# ---- 5) Prepare input splits/offsets for second all-to-all -------
+		combine_out_splits = self.symm_in_splits
+		combine_out_offsets = torch.cumsum(combine_out_splits, dim=0) - combine_out_splits
+		self.symm_in_splits_offsets[0].copy_(self.symm_in_splits)
+		self.symm_in_splits_offsets[1].copy_(combine_out_offsets)
+		
+		# ---- 6) Second all-to-all: gather results back to original tokens -------
+		torch.ops.symm_mem.all_to_all_vdev_2d_offset(
+			self.symm_out,                  # Input: interleaved expert outputs
+			self.symm_inp,                  # Output: tokens back in sorted order
+			self.symm_out_splits_offsets,   # Input splits/offsets [2, total_experts]
+			self.symm_in_splits_offsets,    # Output splits/offsets [2, total_experts]
+			self.group_name
+>>>>>>> Stashed changes
 		)
 		
 		return res
