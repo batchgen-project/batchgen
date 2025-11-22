@@ -936,6 +936,7 @@ class DeepseekV3ParallelStrategyManager:
 						self.skeleton_state_dict[key],
 						self.dequant_scale[dequant_key],
 					)
+					logging.info(f"Parameter {key} device: {param.data.device}, dtype: {param.data.dtype}")
 				else:
 					param.data = self.skeleton_state_dict[key]
 
