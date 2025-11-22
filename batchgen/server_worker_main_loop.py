@@ -26,7 +26,7 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
 # Import your existing worker class
-from batchgen.batchgen_worker import BatchGenWorker
+from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
 
 """
 class BatchGenWorker:
@@ -53,20 +53,7 @@ class BatchGenWorker:
 		gpu_arch: str = "hooper"
 	):
 """
-@dataclass
-class BatchGenWorkerArgs:
-	local_rank: int
-	global_rank: int
-	world_size: int
-	dist_init_addr: str
 
-	model_name: str
-	hf_cache_dir: Optional[str]
-	cache_dir: Optional[str]
-	pt_ckpt_dir: Optional[str]
-
-	device: int
-	kv_dtype: str
 
 
 # -- DP Worker Logic --
@@ -83,7 +70,7 @@ def server_worker_main(
 	# Step 0: Hydrate the rank of this process
 	num_gpus_per_node = torch.cuda.device_count() 
 	args.local_rank = rank_idx
-	args.global_rank = num_gpus_per_node * args.node_rank + rank_idx
+	args.global_rank = num_gpus_per_node * args.nnode_rank + rank_idx
 	args.device = args.local_rank
 
 
@@ -105,7 +92,7 @@ def server_worker_main(
 	torch.cuda.set_device(args.local_rank)
 
 	# 2. Instantiate the BatchGenWorker
-	worker = BatchGenWorker(args) # TODO:
+	worker = BatchGenWorker(args)
 
 	# 3. Long-lived server loop
 	global_rank = args.global_rank

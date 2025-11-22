@@ -1793,7 +1793,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			indices=self.indices,
 			bound_m=self.bound_m,
 		)
-
 		# 3. Local Expert Computation (Identity)
 		self.grouped_dequant_moe_fp8_ata(
 			self.expert_x,
