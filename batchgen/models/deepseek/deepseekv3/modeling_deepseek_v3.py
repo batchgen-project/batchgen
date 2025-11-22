@@ -135,7 +135,7 @@ from mgn_kernel import fused_rmsnorm
 
 class DeepseekV3RMSNorm(nn.Module):
 	def __init__(self, hidden_size, eps=1e-6):
-		"""
+		"""==
 		DeepseekV3RMSNorm is equivalent to T5LayerNorm
 		"""
 		super().__init__()
