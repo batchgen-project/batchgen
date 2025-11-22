@@ -1055,7 +1055,8 @@ class BatchGenWorker:
 			world_size=world_size,
 			device=dev
 		)
-		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
+		# print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
+		logging.info(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
