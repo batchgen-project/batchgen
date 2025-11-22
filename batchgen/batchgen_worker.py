@@ -983,6 +983,16 @@ class BatchGenWorker:
 		step_start = time.perf_counter()
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		logging.info(f"configure_prefill took {time.perf_counter() - step_start:.4f}s")
+
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after self.parallel_manager.configure_prefill(): {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after self.parallel_manager.configure_prefill(): {free_memory} GB / {total_memory} GB"
+		)
 		
 		# Step 2: Set phase
 		step_start = time.perf_counter()
@@ -1050,7 +1060,25 @@ class BatchGenWorker:
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage before init nvshmem: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory before init nvshmem: {free_memory} GB / {total_memory} GB"
+		)
 		self.init_nvshmem()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after init nvshmem: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after init nvshmem: {free_memory} GB / {total_memory} GB"
+		)
 		
 		# Initialize symmetric memory once during model initialization
 		# if not symm_mem.is_nvshmem_available():
@@ -1830,6 +1858,7 @@ class BatchGenWorker:
 		
 		# Step 1: Set model to eval and disable gradients
 		self.model.eval()
+		self.model.to('cpu')
 		with torch.no_grad():
 			# Step 2: Recursively clear all module parameters and buffers
 			def clear_module(module):
