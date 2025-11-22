@@ -146,6 +146,29 @@ class EPConfig:
             f"  num_local_expert_per_layer: {self.num_local_expert_per_layer}"
         )
 
+@dataclass
+class HostPagedKVConfig:
+    total_byte_size: int = 0 # Total byte size of the shared memory need to be allocated by the host paged kv manager instance.
+    num_layers: int = 0
+    num_pages_per_layer: int = 0
+    page_size: int = 64  # Number of tokens per page. 
+    num_k_heads: int = 0
+    k_head_dim: int = 0
+    num_v_heads: int = 0 # Zero for MLA.
+    v_head_dim: int = 0
+    kv_dtype: str = "bfloat16" # "bfloat16 or float8_e4m3fn"
+
+@dataclass
+class DevicePagedKVConfig:
+    num_layers: int = 0
+    num_pages_per_layer: int = 0
+    page_size: int = 64  # Number of tokens per page. 
+    num_k_heads: int = 0
+    k_head_dim: int = 0
+    num_v_heads: int = 0 # Zero for MLA.
+    v_head_dim: int = 0
+    kv_dtype: str = "bfloat16" # "bfloat16 or float8_e4m3fn"
+
 
 # Main engine configuration class
 @dataclass
@@ -155,7 +178,8 @@ class EngineConfig:
     GPU_Buffer_Config: GPUBufferConfig = field(default_factory=GPUBufferConfig)
     KV_Storage_Config: KVStorageConfig = field(default_factory=KVStorageConfig)
     EP_Config: EPConfig = field(default_factory=EPConfig)
-
+    Host_Paged_KV_Config: HostPagedKVConfig = field(default_factory=HostPagedKVConfig)
+    Device_Paged_KV_Config: DevicePagedKVConfig = field(default_factory=DevicePagedKVConfig)
 
     def __str__(self) -> str:
         sections = [
