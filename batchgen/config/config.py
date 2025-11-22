@@ -148,6 +148,7 @@ class EPConfig:
 
 @dataclass
 class HostPagedKVConfig:
+    shm_name: str = ""  # Name of the shared memory segment.
     total_byte_size: int = 0 # Total byte size of the shared memory need to be allocated by the host paged kv manager instance.
     num_layers: int = 0
     num_pages_per_layer: int = 0
