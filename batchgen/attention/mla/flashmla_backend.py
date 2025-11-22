@@ -165,58 +165,108 @@ def dequant_per_token(q, scale):
 	return x_bf16
 
 
+# @triton.jit
+# def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+# 	"""
+# 	Dequantizes weights using the provided scaling factors and stores the result.
+
+# 	Args:
+# 		x_ptr (tl.pointer): Pointer to the quantized weights.
+# 		s_ptr (tl.pointer): Pointer to the scaling factors.
+# 		y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+# 		M (int): Number of rows in the weight matrix.
+# 		N (int): Number of columns in the weight matrix.
+# 		BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+# 	Returns:
+# 		None
+# 	"""
+# 	pid_m = tl.program_id(axis=0)
+# 	pid_n = tl.program_id(axis=1)
+# 	n = tl.cdiv(N, BLOCK_SIZE)
+# 	offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+# 	offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+# 	offs = offs_m[:, None] * N + offs_n[None, :]
+# 	mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+# 	x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+# 	s = tl.load(s_ptr + pid_m * n + pid_n)
+# 	y = x * s
+# 	tl.store(y_ptr + offs, y, mask=mask)
 @triton.jit
-def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
-	"""
-	Dequantizes weights using the provided scaling factors and stores the result.
+def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, 
+                          stride_sm, stride_sn,  # <--- Add these arguments
+                          BLOCK_SIZE: tl.constexpr):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    # 1. Calculate offsets for X (Weights)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
-	Args:
-		x_ptr (tl.pointer): Pointer to the quantized weights.
-		s_ptr (tl.pointer): Pointer to the scaling factors.
-		y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
-		M (int): Number of rows in the weight matrix.
-		N (int): Number of columns in the weight matrix.
-		BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+    # 2. Load X
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
 
-	Returns:
-		None
-	"""
-	pid_m = tl.program_id(axis=0)
-	pid_n = tl.program_id(axis=1)
-	n = tl.cdiv(N, BLOCK_SIZE)
-	offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-	offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-	offs = offs_m[:, None] * N + offs_n[None, :]
-	mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-	x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-	s = tl.load(s_ptr + pid_m * n + pid_n)
-	y = x * s
-	tl.store(y_ptr + offs, y, mask=mask)
+    # 3. Load S (Scales) using explicit strides
+    # We assume s is shape (Ceil(M/B), Ceil(N/B))
+    # No mask needed here IF s is sized to match the grid (using cdiv).
+    # If s is sized using floor div, you are missing data for the edges.
+    s_offset = pid_m * stride_sm + pid_n * stride_sn
+    s = tl.load(s_ptr + s_offset)
 
+    # 4. Compute and Store
+    y = x * s
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+# def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+# 	"""
+# 	Dequantizes the given weight tensor using the provided scale tensor.
+
+# 	Args:
+# 		x (torch.Tensor): The quantized weight tensor of shape (M, N).
+# 		s (torch.Tensor): The scale tensor of shape (M//block_size, N//block_size).
+# 		block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+# 	Returns:
+# 		torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+# 	Raises:
+# 		AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+# 	"""
+# 	assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
+# 	assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions but got {} and {}'.format(x.shape, s.shape)
+# 	M, N = x.size()
+# 	y = torch.empty_like(x, dtype=torch.bfloat16)
+# 	grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
+# 	weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+# 	return y
 
 def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
-	"""
-	Dequantizes the given weight tensor using the provided scale tensor.
+    assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
+    assert x.dim() == 2 and s.dim() == 2
+    
+    M, N = x.size()
+    
+    # VALIDATION: Ensure s is large enough to cover the ceil division
+    expected_s_m = (M + block_size - 1) // block_size
+    expected_s_n = (N + block_size - 1) // block_size
+    
+    assert s.shape[0] == expected_s_m and s.shape[1] == expected_s_n, \
+        f"Scale tensor shape mismatch. Expected ({expected_s_m}, {expected_s_n}), got {s.shape}"
 
-	Args:
-		x (torch.Tensor): The quantized weight tensor of shape (M, N).
-		s (torch.Tensor): The scale tensor of shape (M//block_size, N//block_size).
-		block_size (int, optional): The block size to use for dequantization. Defaults to 128.
-
-	Returns:
-		torch.Tensor: The dequantized weight tensor of the same shape as `x`.
-
-	Raises:
-		AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
-	"""
-	assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
-	assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions but got {} and {}'.format(x.shape, s.shape)
-	M, N = x.size()
-	y = torch.empty_like(x, dtype=torch.bfloat16)
-	grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
-	weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
-	return y
-
+    y = torch.empty_like(x, dtype=torch.bfloat16)
+    
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
+    
+    weight_dequant_kernel[grid](
+        x, s, y, 
+        M, N, 
+        s.stride(0), s.stride(1), # <--- Pass strides explicitly
+        BLOCK_SIZE=block_size
+    )
+    return y
 
 @torch.inference_mode()
 def mla_decoding_flashmla_(
