@@ -469,13 +469,76 @@ class DeepseekV3ParallelStrategyManager:
 
 		self._extract_dequantize_scale()
 		self._load_model_skeleton()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after load model skeleton {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after load model skeleton: {free_memory} GB / {total_memory} GB"
+		)
 		self._load_local_routed_experts()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after load local experts{torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after load local experts: {free_memory} GB / {total_memory} GB"
+		)
 		self._load_attn_module()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after load attn: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after load attn: {free_memory} GB / {total_memory} GB"
+		)
 		self._load_shared_expert_module()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after load shared experts{torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after load shared experts: {free_memory} GB / {total_memory} GB"
+		)
 		self._config_attn_module()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after config attn{torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after config attn: {free_memory} GB / {total_memory} GB"
+		)
 		self._config_expert_module()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after _config_expert_module: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after _config_expert_module: {free_memory} GB / {total_memory} GB"
+		)
 		self._config_lm_head_hook()
 		self._init_mode_decoding()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after _init_mode_decoding: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after _init_mode_decoding: {free_memory} GB / {total_memory} GB"
+		)		
 		self._init_decoding_padding_bsz(padding_bsz)
 		
 		enable_ata = os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0")
@@ -860,7 +923,7 @@ class DeepseekV3ParallelStrategyManager:
 			self.model.model.layers[layer_idx].mlp.experts[expert_idx].down_proj.weight.data = tensors["down_proj.weight"].to(
 				self.engine_config.Basic_Config.device_torch
 			)
-			del tensors
+			# del tensors
 		logging.debug(f"Local routed experts loaded")
 
 	def _load_model_skeleton(self):
@@ -868,6 +931,7 @@ class DeepseekV3ParallelStrategyManager:
 			if key in self.skeleton_state_dict:
 				dequant_key = key + "_scale_inv"
 				if dequant_key in self.dequant_scale:
+					logging.info(f"Dequantizing and loading parameter: {key}")
 					param.data = deepseek_v3_dequantization(
 						self.skeleton_state_dict[key],
 						self.dequant_scale[dequant_key],
