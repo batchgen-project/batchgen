@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 #include <queue>
+#include <string>
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -109,18 +110,26 @@ struct GPU_Buffer_Config {
 
 struct HostPagedKVConfig {
     std::string shm_name;
-    std::size_t num_pages = 0;
-    std::size_t page_size_tokens = 0;
-    std::size_t k_element_size_bytes = 0;
-    std::size_t v_element_size_bytes = 0;
-    std::size_t sequence_table_capacity = 0;
+    std::size_t total_byte_size = 0;
+    std::size_t num_layers = 0;
+    std::size_t num_pages_per_layer = 0;
+    std::size_t page_size = 0;
+    std::size_t num_k_heads = 0;
+    std::size_t k_head_dim = 0;
+    std::size_t num_v_heads = 0;
+    std::size_t v_head_dim = 0;
+    std::string kv_dtype = "bfloat16";
 };
 
-struct GPUPagedKVConfig {
-    std::size_t num_pages = 0;
-    std::size_t page_size_tokens = 0;
-    std::size_t k_element_size_bytes = 0;
-    std::size_t v_element_size_bytes = 0;
+struct DevicePagedKVConfig {
+    std::size_t num_layers = 0;
+    std::size_t num_pages_per_layer = 0;
+    std::size_t page_size = 0;
+    std::size_t num_k_heads = 0;
+    std::size_t k_head_dim = 0;
+    std::size_t num_v_heads = 0;
+    std::size_t v_head_dim = 0;
+    std::string kv_dtype = "bfloat16";
 };
 
 struct Basic_Config {
@@ -159,6 +168,7 @@ struct EngineConfig {
     GPU_Buffer_Config gpu_buffer_config;
     Module_Batching_Config module_batching_config;
     HostPagedKVConfig host_paged_kv_config;
+    DevicePagedKVConfig device_paged_kv_config;
 };
 
 struct ModelConfig {

@@ -166,6 +166,90 @@ Module_Batching_Config parse_module_batching_config(
     return module_batching_config;
 };
 
+namespace {
+
+std::size_t CheckedSize(long long value, std::string_view field_name) {
+    if (value < 0) {
+        std::ostringstream oss;
+        oss << field_name << " must be non-negative (got " << value << ')';
+        throw std::invalid_argument(oss.str());
+    }
+    return static_cast<std::size_t>(value);
+}
+
+HostPagedKVConfig parse_host_paged_kv_config(
+    const py::object& engine_config) {
+    HostPagedKVConfig config;
+    if (!py::hasattr(engine_config, "Host_Paged_KV_Config")) {
+        return config;
+    }
+    const py::object cfg = engine_config.attr("Host_Paged_KV_Config");
+    config.shm_name = cfg.attr("shm_name").cast<std::string>();
+    config.total_byte_size = CheckedSize(
+        cfg.attr("total_byte_size").cast<long long>(),
+        "Host_Paged_KV_Config.total_byte_size");
+    config.num_layers = CheckedSize(
+        cfg.attr("num_layers").cast<long long>(),
+        "Host_Paged_KV_Config.num_layers");
+    config.num_pages_per_layer = CheckedSize(
+        cfg.attr("num_pages_per_layer").cast<long long>(),
+        "Host_Paged_KV_Config.num_pages_per_layer");
+    config.page_size = CheckedSize(cfg.attr("page_size").cast<long long>(),
+                                   "Host_Paged_KV_Config.page_size");
+    config.num_k_heads = CheckedSize(
+        cfg.attr("num_k_heads").cast<long long>(),
+        "Host_Paged_KV_Config.num_k_heads");
+    config.k_head_dim = CheckedSize(
+        cfg.attr("k_head_dim").cast<long long>(),
+        "Host_Paged_KV_Config.k_head_dim");
+    config.num_v_heads = CheckedSize(
+        cfg.attr("num_v_heads").cast<long long>(),
+        "Host_Paged_KV_Config.num_v_heads");
+    config.v_head_dim = CheckedSize(
+        cfg.attr("v_head_dim").cast<long long>(),
+        "Host_Paged_KV_Config.v_head_dim");
+    config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
+    return config;
+}
+
+DevicePagedKVConfig parse_device_paged_kv_config(
+    const py::object& engine_config) {
+    DevicePagedKVConfig config;
+    if (!py::hasattr(engine_config, "Device_Paged_KV_Config")) {
+        return config;
+    }
+    const py::object cfg = engine_config.attr("Device_Paged_KV_Config");
+    config.num_layers = CheckedSize(
+        cfg.attr("num_layers").cast<long long>(),
+        "Device_Paged_KV_Config.num_layers");
+    config.num_pages_per_layer = CheckedSize(
+        cfg.attr("num_pages_per_layer").cast<long long>(),
+        "Device_Paged_KV_Config.num_pages_per_layer");
+    config.page_size = CheckedSize(
+        cfg.attr("page_size").cast<long long>(),
+        "Device_Paged_KV_Config.page_size");
+    config.num_k_heads = CheckedSize(
+        cfg.attr("num_k_heads").cast<long long>(),
+        "Device_Paged_KV_Config.num_k_heads");
+    config.k_head_dim = CheckedSize(
+        cfg.attr("k_head_dim").cast<long long>(),
+        "Device_Paged_KV_Config.k_head_dim");
+    config.num_v_heads = CheckedSize(
+        cfg.attr("num_v_heads").cast<long long>(),
+        "Device_Paged_KV_Config.num_v_heads");
+    config.v_head_dim = CheckedSize(
+        cfg.attr("v_head_dim").cast<long long>(),
+        "Device_Paged_KV_Config.v_head_dim");
+    config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
+    return config;
+}
+
+constexpr double kKilobyte = 1024.0;
+constexpr double kMegabyte = kKilobyte * 1024.0;
+constexpr double kGigabyte = kMegabyte * 1024.0;
+
+}  // namespace
+
 EngineConfig parse_engine_config(const py::object& engine_config) {
     // std::cerr << "Parsing EngineConfig" << std::endl;
     EngineConfig config;
@@ -177,6 +261,10 @@ EngineConfig parse_engine_config(const py::object& engine_config) {
     // std::cerr << "GPU Buffer Config Done" << std::endl;
     config.module_batching_config = parse_module_batching_config(engine_config);
     // std::cerr << "Module Batching Config Done" << std::endl;
+    config.host_paged_kv_config =
+        parse_host_paged_kv_config(engine_config);
+    config.device_paged_kv_config =
+        parse_device_paged_kv_config(engine_config);
     return config;
 };
 
@@ -273,14 +361,6 @@ std::string get_tensor_shape(const torch::Tensor& tensor,
     
     return shape_str.str();
 }
-
-namespace {
-
-constexpr double kKilobyte = 1024.0;
-constexpr double kMegabyte = kKilobyte * 1024.0;
-constexpr double kGigabyte = kMegabyte * 1024.0;
-
-}  // namespace
 
 double BytesToKilobytes(std::size_t bytes) {
     return static_cast<double>(bytes) / kKilobyte;

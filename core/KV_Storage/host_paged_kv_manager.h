@@ -6,11 +6,13 @@
 #include <cstdint>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -35,36 +37,67 @@ std::size_t RequirePositive(T value, const char* field_name) {
     return static_cast<std::size_t>(value);
 }
 
+inline std::size_t ResolveElementSizeBytes(std::string_view kv_dtype) {
+    const std::string dtype =
+        kv_dtype.empty() ? "bfloat16" : std::string(kv_dtype);
+    if (dtype == "bfloat16" || dtype == "float16") {
+        return 2;
+    }
+    if (dtype == "float32") {
+        return 4;
+    }
+    if (dtype == "float8_e4m3fn" || dtype == "float8_e5m2") {
+        return 1;
+    }
+    std::ostringstream oss;
+    oss << "Unsupported kv_dtype='" << dtype << "'";
+    throw std::invalid_argument(oss.str());
+}
+
+inline std::size_t DetermineSequenceTableCapacity(
+    const KV_Storage_Config& storage_config, std::size_t fallback) {
+    if (storage_config.num_host_slots > 0) {
+        return static_cast<std::size_t>(storage_config.num_host_slots);
+    }
+    return fallback;
+}
+
 inline HostPagedKVConfig BuildHostPagedKVConfig(
     const EngineConfig& engine_config, const ModelConfig& model_config) {
     HostPagedKVConfig config;
     const ::HostPagedKVConfig& external = engine_config.host_paged_kv_config;
+    static_cast<void>(model_config);
 
     config.shm_name = external.shm_name;
-    config.num_layers = RequirePositive(model_config.num_hidden_layers,
-                                        "model_config.num_hidden_layers");
-    config.num_pages = RequirePositive(
-        external.num_pages, "engine_config.host_paged_kv_config.num_pages");
+    config.num_layers =
+        RequirePositive(external.num_layers, "Host_Paged_KV_Config.num_layers");
+    const std::size_t pages_per_layer =
+        RequirePositive(external.num_pages_per_layer,
+                        "Host_Paged_KV_Config.num_pages_per_layer");
+    config.num_pages = pages_per_layer;
     config.page_size_tokens =
-        RequirePositive(external.page_size_tokens,
-                        "engine_config.host_paged_kv_config.page_size_tokens");
+        RequirePositive(external.page_size, "Host_Paged_KV_Config.page_size");
 
-    const std::int64_t kv_heads = model_config.num_key_value_heads > 0
-                                      ? model_config.num_key_value_heads
-                                      : model_config.num_attention_heads;
-    config.num_k_heads = RequirePositive(
-        kv_heads, "model_config.num_key_value_heads_or_attention_heads");
-
+    config.num_k_heads = RequirePositive(external.num_k_heads,
+                                         "Host_Paged_KV_Config.num_k_heads");
     config.k_head_dim =
-        RequirePositive(model_config.head_dim, "model_config.head_dim");
-    config.num_v_heads = config.num_k_heads;
-    config.v_head_dim = config.k_head_dim;
+        RequirePositive(external.k_head_dim, "Host_Paged_KV_Config.k_head_dim");
 
-    config.k_element_size_bytes = RequirePositive(
-        external.k_element_size_bytes,
-        "engine_config.host_paged_kv_config.k_element_size_bytes");
-    config.v_element_size_bytes = external.v_element_size_bytes;
-    config.sequence_table_capacity = external.sequence_table_capacity;
+    config.num_v_heads = external.num_v_heads;
+    if (config.num_v_heads == 0) {
+        config.v_head_dim = 0;
+    } else {
+        config.v_head_dim = RequirePositive(external.v_head_dim,
+                                            "Host_Paged_KV_Config.v_head_dim");
+    }
+
+    const std::size_t element_size_bytes =
+        ResolveElementSizeBytes(external.kv_dtype);
+    config.k_element_size_bytes = element_size_bytes;
+    config.v_element_size_bytes =
+        config.num_v_heads == 0 ? 0 : element_size_bytes;
+    config.sequence_table_capacity = DetermineSequenceTableCapacity(
+        engine_config.kv_storage_config, config.num_pages);
     config.alignment_bytes = 64;
     return config;
 }

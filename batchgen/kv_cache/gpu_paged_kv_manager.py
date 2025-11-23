@@ -8,7 +8,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from batchgen.config.config import EngineConfig
+from batchgen.config.config import (
+    DevicePagedKVConfig,
+    EngineConfig,
+    ModelConfig,
+)
 from batchgen.kv_cache.gpu_kv_kernels import (
     run_paged_kv_token_update,
     run_paged_kv_token_update_fused,
@@ -37,6 +41,54 @@ def _as_int_tensor(values: Iterable[int]) -> torch.Tensor:
     return torch.as_tensor(list(values), dtype=torch.int32)
 
 
+def _positive_or_none(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if value > 0:
+        return int(value)
+    return None
+
+
+def _resolve_positive(
+    primary: Optional[int], fallback: Optional[int], field_name: str
+) -> int:
+    for candidate in (primary, fallback):
+        if candidate is not None and candidate > 0:
+            return int(candidate)
+    raise ValueError(f"{field_name} must be > 0")
+
+
+def _normalize_device(
+    device_like: Union[torch.device, str, int],
+) -> torch.device:
+    if isinstance(device_like, torch.device):
+        return device_like
+    if isinstance(device_like, str):
+        return torch.device(device_like)
+    if isinstance(device_like, int):
+        return torch.device(f"cuda:{device_like}")
+    raise ValueError(f"Unsupported device specification: {device_like}")
+
+
+class _DtypeResolver:
+    _DTYPE_MAP: Dict[str, torch.dtype] = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+        "float8_e5m2": torch.float8_e5m2,
+    }
+
+    @classmethod
+    def from_string(cls, dtype_str: Optional[str]) -> torch.dtype:
+        if dtype_str is None:
+            return torch.bfloat16
+        normalized = dtype_str.lower().replace("torch.", "")
+        if normalized not in cls._DTYPE_MAP:
+            raise ValueError(f"Unsupported kv dtype '{dtype_str}'")
+        return cls._DTYPE_MAP[normalized]
+
+
 @dataclass(frozen=True)
 class GPUPagedKVStats:
     num_total_pages: int
@@ -57,42 +109,83 @@ class GPUPagedKVConfig:
     kv_dtype: torch.dtype
 
     @classmethod
-    def from_engine(cls, engine_config) -> "GPUPagedKVConfig":  # noqa: D401
-        cfg = engine_config.gpu_kv_config
-        num_layers = _require_positive(
-            getattr(cfg, "num_layers", None), "num_layers"
+    def from_device_config(
+        cls,
+        *,
+        device_config: DevicePagedKVConfig,
+        model_config: ModelConfig,
+        kv_dtype: Optional[torch.dtype] = None,
+    ) -> "GPUPagedKVConfig":
+        num_layers = _resolve_positive(
+            _positive_or_none(device_config.num_layers),
+            _positive_or_none(model_config.num_hidden_layers),
+            "Device_Paged_KV_Config.num_layers",
         )
-        num_pages = _require_positive(
-            getattr(cfg, "num_pages", None), "num_pages"
+        pages_per_layer = _require_positive(
+            device_config.num_pages_per_layer,
+            "Device_Paged_KV_Config.num_pages_per_layer",
         )
         page_size = _require_positive(
-            getattr(cfg, "page_size_tokens", None), "page_size_tokens"
+            device_config.page_size, "Device_Paged_KV_Config.page_size"
         )
-        num_k_heads = _require_positive(
-            getattr(cfg, "num_k_heads", None), "num_k_heads"
+        model_heads = _positive_or_none(
+            model_config.num_key_value_heads
+        ) or _positive_or_none(model_config.num_attention_heads)
+        num_k_heads = _resolve_positive(
+            _positive_or_none(device_config.num_k_heads),
+            model_heads,
+            "Device_Paged_KV_Config.num_k_heads",
         )
-        k_head_dim = _require_positive(
-            getattr(cfg, "k_head_dim", None), "k_head_dim"
+        num_kv_dim = _resolve_positive(
+            _positive_or_none(device_config.k_head_dim),
+            _positive_or_none(model_config.head_dim),
+            "Device_Paged_KV_Config.k_head_dim",
         )
-        kv_dtype = getattr(cfg, "kv_dtype", None)
-        if kv_dtype is None:
-            raise ValueError("gpu_kv_config.kv_dtype must be defined")
-        num_v_heads = getattr(cfg, "num_v_heads", None)
-        v_head_dim = getattr(cfg, "v_head_dim", None)
-        if num_v_heads is not None and num_v_heads > 0:
-            v_head_dim = _require_positive(v_head_dim, "v_head_dim")
+        raw_v_heads = device_config.num_v_heads
+        if raw_v_heads is None or raw_v_heads < 0:
+            raise ValueError("Device_Paged_KV_Config.num_v_heads must be >= 0")
+        if raw_v_heads == 0:
+            resolved_v_heads = 0
+            resolved_v_dim = 0
         else:
-            num_v_heads = 0
-            v_head_dim = 0
+            resolved_v_heads = _resolve_positive(
+                _positive_or_none(raw_v_heads),
+                num_k_heads,
+                "Device_Paged_KV_Config.num_v_heads",
+            )
+            resolved_v_dim = _resolve_positive(
+                _positive_or_none(device_config.v_head_dim),
+                num_kv_dim,
+                "Device_Paged_KV_Config.v_head_dim",
+            )
+
+        dtype = kv_dtype
+        if dtype is None:
+            dtype = _DtypeResolver.from_string(device_config.kv_dtype)
+
         return cls(
             num_layers=num_layers,
-            num_pages=num_pages,
+            num_pages=pages_per_layer,
             page_size_tokens=page_size,
             num_k_heads=num_k_heads,
-            k_head_dim=k_head_dim,
-            num_v_heads=num_v_heads,
-            v_head_dim=v_head_dim,
-            kv_dtype=kv_dtype,
+            k_head_dim=num_kv_dim,
+            num_v_heads=resolved_v_heads,
+            v_head_dim=resolved_v_dim,
+            kv_dtype=dtype,
+        )
+
+    @classmethod
+    def from_engine(
+        cls, *, engine_config: EngineConfig, model_config: ModelConfig
+    ) -> "GPUPagedKVConfig":
+        basic = engine_config.Basic_Config
+        dtype = getattr(basic, "kv_dtype_torch", None)
+        if dtype is None:
+            dtype = _DtypeResolver.from_string(getattr(basic, "kv_dtype", None))
+        return cls.from_device_config(
+            device_config=engine_config.Device_Paged_KV_Config,
+            model_config=model_config,
+            kv_dtype=dtype,
         )
 
     @property
@@ -413,13 +506,47 @@ class _GPUPageTableManager:
 class GPUPagedKVCacheManager:
     """Per-GPU paged KV cache manager inspired by the host implementation."""
 
-    def __init__(self, engine_config: EngineConfig):
+    def __init__(
+        self,
+        engine_config: Optional[EngineConfig] = None,
+        model_config: Optional[ModelConfig] = None,
+        *,
+        config: Optional[GPUPagedKVConfig] = None,
+        device: Optional[Union[str, int, torch.device]] = None,
+    ):
+        if config is not None and (
+            engine_config is not None or model_config is not None
+        ):
+            raise ValueError(
+                "Pass either `config` or (`engine_config`, `model_config`), not both"
+            )
+
+        if config is None:
+            if engine_config is None or model_config is None:
+                raise ValueError(
+                    "engine_config and model_config must be provided when config is absent"
+                )
+            config = GPUPagedKVConfig.from_engine(
+                engine_config=engine_config, model_config=model_config
+            )
+            device_handle = engine_config.Basic_Config.device
+            if device_handle is None:
+                raise ValueError(
+                    "engine_config.Basic_Config.device must be specified for GPU KV manager"
+                )
+            resolved_device = _normalize_device(device_handle)
+        else:
+            if device is None:
+                raise ValueError(
+                    "device must be provided when initializing with GPUPagedKVConfig"
+                )
+            resolved_device = _normalize_device(device)
+
         self._engine_config = engine_config
-        self.config = GPUPagedKVConfig.from_engine(engine_config)
+        self.config = config
         self._geometry = GPUPagedKVGeometry(self.config)
         self._layout = GPUPagedKVLayout(self.config)
-        self.device = torch.device(engine_config.Basic_Config.device)
-        self._core_engine = None
+        self.device = resolved_device
 
         self._k_cache: Optional[torch.Tensor] = None
         self._v_cache: Optional[torch.Tensor] = None
@@ -445,11 +572,10 @@ class GPUPagedKVCacheManager:
     # ------------------------------------------------------------------
     # Public APIs
     # ------------------------------------------------------------------
-    def initialize(self, core_engine) -> None:
+    def initialize(self) -> None:
         """Instantiates GPU tensors and prepares allocator state."""
 
         self._set_device()
-        self._core_engine = core_engine
         shape = (
             self.config.num_layers,
             self.config.num_pages,

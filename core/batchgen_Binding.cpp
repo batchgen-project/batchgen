@@ -129,6 +129,8 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            py::arg("sequence_id"))
        .def("unregister_sequences", &WorkerView::UnregisterSequences,
            py::arg("sequence_ids"))
+       .def("release_sequence_pages", &WorkerView::ReleaseSequencePages,
+            py::arg("sequence_ids"))
        .def("async_offload_layer_kv_to_host",
            &WorkerView::AsyncOffloadLayerKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),

@@ -24,6 +24,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -318,7 +319,7 @@ class HostPagedKVWorkerView {
             std::chrono::duration_cast<
                 std::chrono::duration<double, std::milli>>(end - start)
                 .count();
-        logger_->info(
+        logger_->debug(
             "Prepared AsyncLoadLayerKVToDevice (num_layers={}, total_pages={}, "
             "prep_time_ms={:.3f})",
             num_layers, total_pages, prep_ms);
@@ -362,7 +363,7 @@ class HostPagedKVWorkerView {
                 std::chrono::duration_cast<
                     std::chrono::duration<double, std::milli>>(end - start)
                     .count();
-            logger_->info(
+            logger_->debug(
                 "Built K page copy plan (num_layers={}, total_pages={}, "
                 "plan_time_ms={:.3f})",
                 num_layers, total_pages, plan_ms);
@@ -424,7 +425,7 @@ class HostPagedKVWorkerView {
                                  v_page_bytes);
                 }
             }
-            this->logger_->info(
+            this->logger_->debug(
                 "AsyncLoadLayerKVToDevice completed (num_layers={}, "
                 "total_pages={}, "
                 "k_page_bytes={})",
@@ -567,6 +568,25 @@ class HostPagedKVWorkerView {
                       [this](std::int64_t sequence_id) {
                           UnregisterSequence(sequence_id);
                       });
+    }
+
+    void ReleaseSequencePages(const std::vector<std::int64_t>& sequence_ids) {
+        if (sequence_ids.empty()) {
+            return;
+        }
+        std::unordered_set<std::int64_t> seen_ids;
+        seen_ids.reserve(sequence_ids.size());
+        for (std::int64_t sequence_id : sequence_ids) {
+            if (!seen_ids.insert(sequence_id).second) {
+                std::ostringstream oss;
+                oss << "ReleaseSequencePages: duplicate sequence_id="
+                    << sequence_id;
+                throw std::runtime_error(oss.str());
+            }
+        }
+        EnsureSequencesRegistered(sequence_ids);
+        backend_.ReleaseSequences(sequence_ids);
+        UnregisterSequences(sequence_ids);
     }
 
     KVAsyncTask AsyncOffloadLayerKVToHost(
