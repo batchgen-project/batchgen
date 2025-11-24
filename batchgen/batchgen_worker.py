@@ -366,7 +366,7 @@ class BatchGenWorker:
 		logging.info(f"=" * 60)
 		return model_batches
 
-	def process_new_batch(self, batch: List(str), num_global_queries: int):
+	def process_new_batch(self, batch: List[str], num_global_queries: int):
 		"""
 		Future API.
 		"""
