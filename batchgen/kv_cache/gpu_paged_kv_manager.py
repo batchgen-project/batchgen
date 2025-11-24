@@ -600,14 +600,19 @@ class GPUPagedKVCacheManager:
             total_bytes / (1024**3),
         )
 
-    def destroy(self, *, empty_cuda_cache: bool = True) -> None:
-        """Releases GPU buffers and resets allocator state for reuse.
+    def destroy(self, *, empty_cuda_cache: bool = False) -> None:
+        """
+        Releases GPU buffers and resets the allocator state so it can be reused.
 
         Args:
-            empty_cuda_cache: When ``True`` (default), clears PyTorch's CUDA
-                caching allocator after dropping all tensor references to
-                return reserved memory to the driver. Disable to keep the
-                allocator warm for subsequent allocations.
+            empty_cuda_cache: If ``True``, clears PyTorch’s CUDA caching allocator
+                after all tensor references have been dropped, allowing reserved
+                memory to be returned to the driver. The default is ``False``.
+
+                This is typically used only when transitioning from the decode
+                stage to the prefill stage. During the prefill stage, the GPU will
+                continue to rely on the caching allocator’s memory, so clearing the
+                cache is usually unnecessary.
         """
 
         self._reset_runtime_state()
@@ -1096,7 +1101,7 @@ class GPUPagedKVCacheManager:
         self._k_active_page_ptr_table = None
         self._v_active_page_ptr_table = None
         self._free_pages = _TensorStack(self.config.num_pages)
-        self._sequences = {}
+        self._sequences: Dict[int, _SequenceState] = {}
         max_pages_per_seq = _ceil_div(
             DEFAULT_INITIAL_TOKEN_CAPACITY, self.config.page_size_tokens
         )
