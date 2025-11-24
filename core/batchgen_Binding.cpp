@@ -209,7 +209,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Get the quantization scale for KV storage.")
         .def("get_past_key_states",
                 &BatchGen::get_past_key_states,
-                "Get the past key states for the given query global indices and max sequence length.");
+                "Get the past key states for the given query global indices and max sequence length.")
         .def("init_weight_storage", &BatchGen::init_weight_storage);
 
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
