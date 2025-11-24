@@ -94,10 +94,10 @@ class BatchGenServer:
 		# (This part relies on your specific implementation modules)
 		if "deepseek" in self.args.model.lower():
 			from batchgen.models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
-			ps = DeepSeek_Parameter_Server(self.args.model, model_path, pt_ckpt_dir, self.args.enable_hugetlbfs)
+			ps = DeepSeek_Parameter_Server(self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs)
 		elif "Mixtral" in self.args.model:
 			from batchgen.models.mixtral.mixtral_parameter_server import Mixtral_Parameter_Server
-			ps = Mixtral_Parameter_Server(self.args.model, model_path, pt_ckpt_dir)
+			ps = Mixtral_Parameter_Server(self.args.model, self.args.cache_dir, pt_ckpt_dir)
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")
 
