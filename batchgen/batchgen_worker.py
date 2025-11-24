@@ -7,7 +7,7 @@ import math
 import os
 import sys
 import time
-from typing import Callable, Dict, List, Optional, list
+from typing import Callable, Dict, List, Optional
 
 import torch
 import torch.multiprocessing as mp
@@ -366,7 +366,7 @@ class BatchGenWorker:
 		logging.info(f"=" * 60)
 		return model_batches
 
-	def process_new_batch(self, batch: list(str), num_global_queries: int):
+	def process_new_batch(self, batch: List(str), num_global_queries: int):
 		"""
 		Future API.
 		"""
