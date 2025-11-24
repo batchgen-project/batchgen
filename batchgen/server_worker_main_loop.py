@@ -106,6 +106,7 @@ def server_worker_main(
 		if global_rank == 0:
 			# Blocking wait for data from Mother Process
 			full_batch = request_queue.get()
+			global_batch_size = len(full_batch)
 
 			# Check Shundown
 			if full_batch is None:
@@ -144,7 +145,8 @@ def server_worker_main(
 			# Run Inference on the specific chunk this GPU received
 			# my_batch is a list of strings (or dicts)
 			if len(my_batch) > 0:
-				local_results = worker.process_new_batch(my_batch)
+				worker.Init()
+				local_results = worker.process_new_batch(my_batch, global_batch_size)
 			else:
 				local_results = []
 		except Exception as e:
