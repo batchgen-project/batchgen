@@ -1,15 +1,21 @@
 
 import json
-from typing import Dict, Any
-from .config import (
-	EngineConfig,
-	BasicConfig,
-	ModuleBatchingConfig,
-	GPUBufferConfig,
-	KVStorageConfig,
-	EPConfig
-)
+from typing import Any, Dict
+
 import torch
+
+from .config import (
+    BasicConfig,
+    DevicePagedKVConfig,
+    EngineConfig,
+    EPConfig,
+    GPUBufferConfig,
+    HostPagedKVConfig,
+    KVStorageConfig,
+    ModuleBatchingConfig,
+)
+
+
 def parse_config_from_json(config_path: str) -> EngineConfig:
     """
     Parse a JSON configuration file into an EngineConfig instance.
@@ -65,6 +71,18 @@ def parse_config_from_json(config_path: str) -> EngineConfig:
         _parse_ep_config(engine_config.EP_Config, config_dict["EP_Config"])
     # else:
     #     raise ValueError("Missing 'EP_Config' section in config file")
+
+    if "Host_Paged_KV_Config" in config_dict:
+        _parse_host_paged_kv_config(
+            engine_config.Host_Paged_KV_Config,
+            config_dict["Host_Paged_KV_Config"],
+        )
+
+    if "Device_Paged_KV_Config" in config_dict:
+        _parse_device_paged_kv_config(
+            engine_config.Device_Paged_KV_Config,
+            config_dict["Device_Paged_KV_Config"],
+        )
     
     return engine_config
 
@@ -181,3 +199,23 @@ def _parse_ep_config(ep_config: EPConfig, config_dict: Dict[str, Any]) -> None:
             raise ValueError(f"Unknown key in EP_Config: {key}")
         
         setattr(ep_config, key, value)
+
+
+def _parse_host_paged_kv_config(
+    host_config: HostPagedKVConfig, config_dict: Dict[str, Any]
+) -> None:
+    valid_fields = {f.name for f in host_config.__dataclass_fields__.values()}
+    for key, value in config_dict.items():
+        if key not in valid_fields:
+            raise ValueError(f"Unknown key in Host_Paged_KV_Config: {key}")
+        setattr(host_config, key, value)
+
+
+def _parse_device_paged_kv_config(
+    device_config: DevicePagedKVConfig, config_dict: Dict[str, Any]
+) -> None:
+    valid_fields = {f.name for f in device_config.__dataclass_fields__.values()}
+    for key, value in config_dict.items():
+        if key not in valid_fields:
+            raise ValueError(f"Unknown key in Device_Paged_KV_Config: {key}")
+        setattr(device_config, key, value)
