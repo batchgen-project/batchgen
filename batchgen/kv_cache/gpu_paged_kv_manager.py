@@ -600,10 +600,19 @@ class GPUPagedKVCacheManager:
             total_bytes / (1024**3),
         )
 
-    def destroy(self) -> None:
-        """Releases GPU buffers and resets allocator state for reuse."""
+    def destroy(self, *, empty_cuda_cache: bool = True) -> None:
+        """Releases GPU buffers and resets allocator state for reuse.
+
+        Args:
+            empty_cuda_cache: When ``True`` (default), clears PyTorch's CUDA
+                caching allocator after dropping all tensor references to
+                return reserved memory to the driver. Disable to keep the
+                allocator warm for subsequent allocations.
+        """
 
         self._reset_runtime_state()
+        if empty_cuda_cache:
+            self._release_cached_cuda_memory()
 
     def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
         """Allocates enough pages to hold ``num_tokens`` for ``sequence_id``."""
@@ -1094,6 +1103,13 @@ class GPUPagedKVCacheManager:
         self._gpu_page_table_manager = _GPUPageTableManager(
             device=self.device, max_pages_per_sequence=max_pages_per_seq
         )
+
+    def _release_cached_cuda_memory(self) -> None:
+        if self.device.type != "cuda":
+            return
+        self._set_device()
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
 
     def _update_active_page_pointer_tables(self) -> None:
         active_indices = self._gpu_page_table_manager.get_active_page_indices()
