@@ -14,7 +14,7 @@ from unittest import SkipTest
 import torch
 from tqdm import tqdm
 
-from batchgen.config.config import EngineConfig
+from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVCacheManager,
     GPUPagedKVConfig,
@@ -47,24 +47,43 @@ def _shm_unlink(name: str) -> None:
             raise OSError(err, f"shm_unlink({name}) failed")
 
 
-def _make_deepseek_r1_config(
-    shm_name: str, *, kv_dtype: torch.dtype = torch.bfloat16
-) -> EngineConfig:  # type: ignore
-    cfg = GPUPagedKVConfig(
-        num_layers=61,
-        num_pages=10000,
-        page_size_tokens=64,
-        num_k_heads=1,
-        k_head_dim=512 + 64,
-        num_v_heads=0,
-        v_head_dim=0,
-        kv_dtype=kv_dtype,
-    )
+def _dtype_to_str(value: torch.dtype) -> str:
+    return str(value).split(".")[-1]
 
+
+def _make_deepseek_r1_config(
+    shm_name: str,
+    *,
+    kv_dtype: torch.dtype = torch.bfloat16,
+    device_index: int = 0,
+) -> tuple[EngineConfig, ModelConfig]:  # type: ignore
     engine_config = EngineConfig()
-    engine_config.gpu_kv_config = cfg
-    engine_config.Basic_Config.device = 6
-    return engine_config
+    engine_config.Basic_Config.device = f"cuda:{device_index}"
+    engine_config.Basic_Config.device_torch = torch.device(
+        f"cuda:{device_index}"
+    )
+    engine_config.Basic_Config.kv_dtype = _dtype_to_str(kv_dtype)
+    engine_config.Basic_Config.kv_dtype_torch = kv_dtype
+
+    device_cfg = engine_config.Device_Paged_KV_Config
+    device_cfg.num_layers = 61
+    device_cfg.num_pages_per_layer = 10000
+    device_cfg.page_size = 64
+    device_cfg.num_k_heads = 1
+    device_cfg.k_head_dim = 512 + 64
+    device_cfg.num_v_heads = 0
+    device_cfg.v_head_dim = 0
+    device_cfg.kv_dtype = _dtype_to_str(kv_dtype)
+
+    model_config = ModelConfig()
+    model_config.model_type = "deepseek_r1"
+    model_config.num_hidden_layers = 61
+    model_config.num_local_experts = 0
+    model_config.num_attention_heads = 1
+    model_config.num_key_value_heads = 1
+    model_config.head_dim = 512 + 64
+
+    return engine_config, model_config
 
 
 def _make_deepseek_r1_host_config(
@@ -155,10 +174,12 @@ def _assert_token_block_equal(
 # Test: allocate pages
 # ---------------------------------------------------------------------------
 def test_alloc_page(shm_name):
-    cfg = _make_deepseek_r1_config(shm_name)
-    kv_manager = GPUPagedKVCacheManager(cfg)
+    engine_cfg, model_cfg = _make_deepseek_r1_config(shm_name)
+    kv_manager = GPUPagedKVCacheManager(
+        engine_config=engine_cfg, model_config=model_cfg
+    )
 
-    kv_manager.initialize(None)
+    kv_manager.initialize()
 
     seq_ids = [i for i in range(10)]
     num_tokens = [1000 + i * 100 for i in range(10)]
@@ -173,11 +194,13 @@ def test_alloc_page(shm_name):
 # Test: update_new_token
 # ---------------------------------------------------------------------------
 def test_update_new_token(shm_name: str) -> None:
-    engine_cfg = _make_deepseek_r1_config(shm_name)
-    kv_manager = GPUPagedKVCacheManager(engine_cfg)
-    kv_manager.initialize(core_engine=None)
+    engine_cfg, model_cfg = _make_deepseek_r1_config(shm_name)
+    kv_manager = GPUPagedKVCacheManager(
+        engine_config=engine_cfg, model_config=model_cfg
+    )
+    kv_manager.initialize()
 
-    kv_cfg = engine_cfg.gpu_kv_config
+    kv_cfg = kv_manager.config
     layer_idx = 3
 
     # ---- choose token positions to cover不同场景 ----
@@ -313,12 +336,17 @@ def _host_transfer_worker(spec: dict) -> dict:
 
     logging.info(f"[worker {device_index}] passed barrier, starting offload.")
 
-    device_cfg = _make_deepseek_r1_config(shm_name, kv_dtype=kv_dtype)
-    device_cfg.Basic_Config.device = device_index
-    gpu_manager = GPUPagedKVCacheManager(device_cfg)
-    gpu_manager.initialize(core_engine=None)
+    engine_cfg, model_cfg = _make_deepseek_r1_config(
+        shm_name, kv_dtype=kv_dtype
+    )
+    engine_cfg.Basic_Config.device = f"cuda:{device_index}"
+    engine_cfg.Basic_Config.device_torch = torch.device(f"cuda:{device_index}")
+    gpu_manager = GPUPagedKVCacheManager(
+        engine_config=engine_cfg, model_config=model_cfg
+    )
+    gpu_manager.initialize()
 
-    kv_cfg = device_cfg.gpu_kv_config
+    kv_cfg = gpu_manager.config
     gpu_manager.allocate_pages_for_sequences(
         sequence_ids, [capacity_tokens] * len(sequence_ids)
     )
@@ -517,7 +545,7 @@ def test_host_transfer_layer(shm_name):
     host_manager.initialize(True)
 
     # device_count = torch.cuda.device_count()
-    device_count = 2
+    device_count = 8
     if device_count == 0:
         raise SkipTest("No CUDA devices available")
 
@@ -895,9 +923,9 @@ if __name__ == "__main__":
     try:
         # test_alloc_page(shm_name)
         # test_update_new_token(shm_name)
-        # test_host_transfer_layer(shm_name)
+        test_host_transfer_layer(shm_name)
         # test_host_transfer_layer_variable_lengths(shm_name)
-        test_host_transfer_layer_variable_lengths_byte_kv(shm_name)
+        # test_host_transfer_layer_variable_lengths_byte_kv(shm_name)
         # test_host_transfer_layer_byte_kv(shm_name)
     finally:
         _shm_unlink(shm_name)

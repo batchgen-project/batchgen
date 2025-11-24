@@ -547,27 +547,7 @@ class GPUPagedKVCacheManager:
         self._geometry = GPUPagedKVGeometry(self.config)
         self._layout = GPUPagedKVLayout(self.config)
         self.device = resolved_device
-
-        self._k_cache: Optional[torch.Tensor] = None
-        self._v_cache: Optional[torch.Tensor] = None
-        self._k_page_ptr_table: Optional[torch.Tensor] = (
-            None  # [layer_id, num_pages]
-        )
-        self._v_page_ptr_table: Optional[torch.Tensor] = None
-        self._active_page_indices: Optional[torch.Tensor] = None
-        self._k_active_page_ptr_table: Optional[torch.Tensor] = None
-        self._v_active_page_ptr_table: Optional[torch.Tensor] = None
-        self._free_pages = _TensorStack(self.config.num_pages)
-        self._sequences: Dict[int, _SequenceState] = {}
-        # GPU-side page table manager (lazy updated in allocate_pages_for_sequences)
-        max_pages_per_seq = _ceil_div(
-            DEFAULT_INITIAL_TOKEN_CAPACITY, self.config.page_size_tokens
-        )
-        self._gpu_page_table_manager: _GPUPageTableManager = (
-            _GPUPageTableManager(
-                device=self.device, max_pages_per_sequence=max_pages_per_seq
-            )
-        )
+        self._reset_runtime_state()
 
     # ------------------------------------------------------------------
     # Public APIs
@@ -619,6 +599,11 @@ class GPUPagedKVCacheManager:
             total_bytes,
             total_bytes / (1024**3),
         )
+
+    def destroy(self) -> None:
+        """Releases GPU buffers and resets allocator state for reuse."""
+
+        self._reset_runtime_state()
 
     def allocate_pages(self, sequence_id: int, num_tokens: int) -> List[int]:
         """Allocates enough pages to hold ``num_tokens`` for ``sequence_id``."""
@@ -1092,6 +1077,23 @@ class GPUPagedKVCacheManager:
         )
 
         return pointer_table
+
+    def _reset_runtime_state(self) -> None:
+        self._k_cache = None
+        self._v_cache = None
+        self._k_page_ptr_table = None
+        self._v_page_ptr_table = None
+        self._active_page_indices = None
+        self._k_active_page_ptr_table = None
+        self._v_active_page_ptr_table = None
+        self._free_pages = _TensorStack(self.config.num_pages)
+        self._sequences = {}
+        max_pages_per_seq = _ceil_div(
+            DEFAULT_INITIAL_TOKEN_CAPACITY, self.config.page_size_tokens
+        )
+        self._gpu_page_table_manager = _GPUPageTableManager(
+            device=self.device, max_pages_per_sequence=max_pages_per_seq
+        )
 
     def _update_active_page_pointer_tables(self) -> None:
         active_indices = self._gpu_page_table_manager.get_active_page_indices()
