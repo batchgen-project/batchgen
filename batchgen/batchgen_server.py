@@ -150,6 +150,9 @@ class BatchGenServer:
 			nnodes=self.args.nnodes,
 			gpu_arch=self.args.gpu_arch,
 
+			shm_name=self.model_info['shm_name'],
+			tensor_meta_shm_name=self.model_info['tensor_meta_shm_name'],
+
 			# Place holder
 			local_rank=-1,
 			global_rank=-1,
