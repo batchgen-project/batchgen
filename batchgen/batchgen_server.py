@@ -2,7 +2,7 @@ import os
 import torch
 import logging
 import argparse
-import multiprocessing as mp
+import torch.multiprocessing as mp
 from typing import Dict, Any, List, Union
 import threading
 import signal
