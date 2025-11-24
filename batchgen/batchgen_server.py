@@ -75,15 +75,20 @@ class BatchGenServer:
 		hf_cache_dir = self.args.hf_cache_dir or os.path.expanduser("~/.cache/huggingface")
 		pt_ckpt_dir = self.args.pt_ckpt_dir or os.path.join(self.args.cache_dir or ".", "pt_ckpt")
 		
-		from huggingface_hub import snapshot_download
-		try:
-			 model_path = snapshot_download(
-				self.args.model,
-				cache_dir=hf_cache_dir,
-				ignore_patterns=["flax*", "tf*"],
-			)
-		except Exception as e:
-			raise RuntimeError(f"Failed to download model: {e}")
+		if self.args.cache_dir is None:
+			logging.info("Downloading model from Hugging Face")
+			from huggingface_hub import snapshot_download
+			try:
+				model_path = snapshot_download(
+					self.args.model,
+					cache_dir=hf_cache_dir,
+					ignore_patterns=["flax*", "tf*"],
+				)
+				self.args.cache_dir = model_path
+			except Exception as e:
+				raise RuntimeError(f"Failed to download model: {e}")
+
+			
 
 		# --- Initialize Parameter Server Logic ---
 		# (This part relies on your specific implementation modules)
