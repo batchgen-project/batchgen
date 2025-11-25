@@ -363,73 +363,192 @@ def yarn_linear_ramp_mask(min, max, dim):
 	return ramp_func
 
 
+# class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
+
+# 	def __init__(
+# 		self,
+# 		dim,
+# 		max_position_embeddings=2048,
+# 		base=10000,
+# 		device=None,
+# 		scaling_factor=1.0,
+# 		original_max_position_embeddings=4096,
+# 		beta_fast=32,
+# 		beta_slow=1,
+# 		mscale=1,
+# 		mscale_all_dim=0,
+# 	):
+# 		self.scaling_factor = scaling_factor
+# 		self.original_max_position_embeddings = original_max_position_embeddings
+# 		self.beta_fast = beta_fast
+# 		self.beta_slow = beta_slow
+# 		self.mscale = mscale
+# 		self.mscale_all_dim = mscale_all_dim
+# 		super().__init__(dim, max_position_embeddings, base, device)
+
+# 	def _set_cos_sin_cache(self, seq_len, device, dtype):
+# 		# logger.warning(f"Recomputing cos/sin cache for yarn rotary embedding. THIS SHOULD NOT HAPPEN. seq_len: {seq_len}")
+# 		self.max_seq_len_cached = seq_len
+# 		dim = self.dim
+
+# 		freq_extra = 1.0 / (
+# 			self.base
+# 			** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+# 		)
+# 		freq_inter = 1.0 / (
+# 			self.scaling_factor
+# 			* self.base
+# 			** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+# 		)
+
+# 		low, high = yarn_find_correction_range(
+# 			self.beta_fast,
+# 			self.beta_slow,
+# 			dim,
+# 			self.base,
+# 			self.original_max_position_embeddings,
+# 		)
+# 		inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
+# 			device=device, dtype=torch.float32
+# 		)
+# 		inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+# 		self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+# 		t = torch.arange(seq_len, device=device, dtype=torch.float32)
+
+# 		freqs = torch.outer(t, inv_freq)
+
+# 		_mscale = float(
+# 			yarn_get_mscale(self.scaling_factor, self.mscale)
+# 			/ yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+# 		)
+
+# 		emb = torch.cat((freqs, freqs), dim=-1)
+# 		self.register_buffer(
+# 			"cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False
+# 		)
+# 		self.register_buffer(
+# 			"sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False
+# 		)
+
 class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
+    # 1. Define a class-level cache to share tensors across instances
+    # Key: (device, dtype) -> Value: (cos_cached, sin_cached, current_max_len)
+    _SHARED_CACHE = {}
 
-	def __init__(
-		self,
-		dim,
-		max_position_embeddings=2048,
-		base=10000,
-		device=None,
-		scaling_factor=1.0,
-		original_max_position_embeddings=4096,
-		beta_fast=32,
-		beta_slow=1,
-		mscale=1,
-		mscale_all_dim=0,
-	):
-		self.scaling_factor = scaling_factor
-		self.original_max_position_embeddings = original_max_position_embeddings
-		self.beta_fast = beta_fast
-		self.beta_slow = beta_slow
-		self.mscale = mscale
-		self.mscale_all_dim = mscale_all_dim
-		super().__init__(dim, max_position_embeddings, base, device)
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1,
+        mscale_all_dim=0,
+    ):
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
+        
+        # Initialize parent. 
+        # IMPORTANT: Ensure parent does NOT eagerly init GPU if device is None.
+        # You might need to patch the parent class as discussed in the previous turn
+        # to default to 'cpu' if you want to avoid initial GPU spike.
+        super().__init__(dim, max_position_embeddings, base, device)
 
-	def _set_cos_sin_cache(self, seq_len, device, dtype):
-		# logger.warning(f"Recomputing cos/sin cache for yarn rotary embedding. THIS SHOULD NOT HAPPEN. seq_len: {seq_len}")
-		self.max_seq_len_cached = seq_len
-		dim = self.dim
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        
+        # Create a unique key for the cache based on device and dtype
+        # This allows Layers on GPU0 to share a cache, and Layers on GPU1 to share a different cache.
+        cache_key = (device, dtype)
 
-		freq_extra = 1.0 / (
-			self.base
-			** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-		)
-		freq_inter = 1.0 / (
-			self.scaling_factor
-			* self.base
-			** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-		)
+        # 2. Check if we already have a valid cache for this device
+        if cache_key in self._SHARED_CACHE:
+            cached_cos, cached_sin, cached_len = self._SHARED_CACHE[cache_key]
+            
+            # If the cached length is sufficient, just register references to it
+            if cached_len >= seq_len:
+                # Using slice to ensure shape matches if we want a subset, 
+                # though typically we register the whole buffer.
+                # register_buffer DOES NOT copy memory, it just tracks the tensor.
+                self.register_buffer("cos_cached", cached_cos, persistent=False)
+                self.register_buffer("sin_cached", cached_sin, persistent=False)
+                return
 
-		low, high = yarn_find_correction_range(
-			self.beta_fast,
-			self.beta_slow,
-			dim,
-			self.base,
-			self.original_max_position_embeddings,
-		)
-		inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
-			device=device, dtype=torch.float32
-		)
-		inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-		self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # --- COMPUTE (Only happens once per device) ---
+        # logger.info(f"Allocating Yarn RoPE cache for {device} (Size: {seq_len})")
+        
+        dim = self.dim
+        
+        # ... [Your Original Yarn Calculation Logic] ...
+        freq_extra = 1.0 / (
+            self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        freq_inter = 1.0 / (
+            self.scaling_factor
+            * self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
 
-		t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            dim,
+            self.base,
+            self.original_max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
+            device=device, dtype=torch.float32
+        )
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        
+        # We don't need to register inv_freq as a buffer if we only use it for generation here
+        # But if you need it persistent, register it.
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-		freqs = torch.outer(t, inv_freq)
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
 
-		_mscale = float(
-			yarn_get_mscale(self.scaling_factor, self.mscale)
-			/ yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
-		)
+        _mscale = float(
+            yarn_get_mscale(self.scaling_factor, self.mscale)
+            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        )
 
-		emb = torch.cat((freqs, freqs), dim=-1)
-		self.register_buffer(
-			"cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False
-		)
-		self.register_buffer(
-			"sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False
-		)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # Create the tensors
+        cos_new = (emb.cos() * _mscale).to(dtype)
+        sin_new = (emb.sin() * _mscale).to(dtype)
+
+        # 3. Update the Class-Level Cache
+        self._SHARED_CACHE[cache_key] = (cos_new, sin_new, seq_len)
+
+        # 4. Register the buffers for this instance
+        self.register_buffer("cos_cached", cos_new, persistent=False)
+        self.register_buffer("sin_cached", sin_new, persistent=False)
+
+    def forward(self, x, seq_len=None):
+        if seq_len is None:
+            seq_len = x.size(-2)
+            
+        # Check if we need to recompute/resize
+        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+             # This will update the global cache if the new length is larger
+             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        
+        # Standard forward
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
