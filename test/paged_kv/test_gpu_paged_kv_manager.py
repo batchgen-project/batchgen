@@ -191,9 +191,9 @@ def test_alloc_page(shm_name):
 
 
 # ---------------------------------------------------------------------------
-# Test: update_new_token
+# Test: update_layer_decode_new_token
 # ---------------------------------------------------------------------------
-def test_update_new_token(shm_name: str) -> None:
+def test_update_layer_decode_new_token(shm_name: str) -> None:
     engine_cfg, model_cfg = _make_deepseek_r1_config(shm_name)
     kv_manager = GPUPagedKVCacheManager(
         engine_config=engine_cfg, model_config=model_cfg
@@ -238,10 +238,10 @@ def test_update_new_token(shm_name: str) -> None:
         device=kv_manager.device,
     )
 
-    # ---- call update_new_token ----
+    # ---- call update_layer_decode_new_token ----
     torch.cuda.set_device(kv_manager.device)
     for i in range(100):
-        kv_manager.update_new_token(
+        kv_manager.update_layer_decode_new_token(
             k_tensor=k_tensor,
             v_tensor=None,
             sequence_lengths=seq_lens_tensor,
@@ -251,7 +251,7 @@ def test_update_new_token(shm_name: str) -> None:
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for i in range(10):
-        kv_manager.update_new_token(
+        kv_manager.update_layer_decode_new_token(
             k_tensor=k_tensor,
             v_tensor=None,
             sequence_lengths=seq_lens_tensor,
@@ -261,7 +261,7 @@ def test_update_new_token(shm_name: str) -> None:
     end_event.record()
     torch.cuda.synchronize()
     elapsed = start_event.elapsed_time(end_event)  # milliseconds
-    print(f"update_new_token took {elapsed:.6f} ms")
+    print(f"update_layer_decode_new_token took {elapsed:.6f} ms")
 
     block_k, _, page_table = kv_manager.get_layer_kv_with_page_table(layer_idx)
 
@@ -278,7 +278,7 @@ def test_update_new_token(shm_name: str) -> None:
             state,
             sequence_id=seq_id,
             token_index=token_index,
-            context="test_update_new_token",
+            context="test_update_layer_decode_new_token",
         )
 
         cached = kv_manager._k_cache[layer_idx, gpu_page, offset]
@@ -286,12 +286,12 @@ def test_update_new_token(shm_name: str) -> None:
 
         # copy_ 是逐元素拷贝，这里用 equal 就行
         assert torch.equal(cached, src), (
-            f"update_new_token wrote wrong data for "
+            f"update_layer_decode_new_token wrote wrong data for "
             f"seq={seq_id}, token_index={token_index}, "
             f"page={gpu_page}, offset={offset}"
         )
 
-    print("update_new_token test passed ✓")
+    print("update_layer_decode_new_token test passed ✓")
 
 
 def _host_transfer_worker(spec: dict) -> dict:
@@ -922,7 +922,7 @@ if __name__ == "__main__":
     shm_name = _random_shm_name()
     try:
         # test_alloc_page(shm_name)
-        # test_update_new_token(shm_name)
+        # test_update_layer_decode_new_token(shm_name)
         test_host_transfer_layer(shm_name)
         # test_host_transfer_layer_variable_lengths(shm_name)
         # test_host_transfer_layer_variable_lengths_byte_kv(shm_name)
