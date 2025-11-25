@@ -76,7 +76,7 @@ def server_worker_main(
 
 	
 	# 1. Initialize Process Group
-	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
+	logging.info(f"Initializing process group for rank {args.global_rank} / {args.world_size}, local rank {args.local_rank}, init addr {args.dist_init_addr}")
 	try:
 		dist.init_process_group(
 			backend="nccl",  # Use NCCL for CUDA devices
@@ -89,6 +89,8 @@ def server_worker_main(
 	except Exception as e:
 		logging.error(f"Failed to initialize process group: {e}")
 		sys.exit(1)
+
+	logging.info(f"Process group initialized for rank {args.global_rank}.")
 	torch.cuda.set_device(args.local_rank)
 
 	# 2. Instantiate the BatchGenWorker
