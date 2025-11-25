@@ -808,7 +808,6 @@ class GPUPagedKVCacheManager:
         # self._ensure_initialized()
         # self._geometry.ensure_layer_bounds(layer_idx, op_name)
         # self._validate_token_inputs(k_tensor, v_tensor)
-        start = time.time()
         batch_size, seq_len, _, _ = k_tensor.shape
         if seq_len != 1:
             raise ValueError(
@@ -840,9 +839,6 @@ class GPUPagedKVCacheManager:
         v_cache_layer = None
         if self._v_cache is not None:
             v_cache_layer = self._v_cache[layer_idx]
-
-        end = time.time()
-        print(f"Preprocessing time: {(end - start) * 1000:.6f} ms")
 
         run_paged_kv_token_update_fused(
             k_cache=k_cache_layer,

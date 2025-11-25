@@ -922,8 +922,8 @@ if __name__ == "__main__":
     shm_name = _random_shm_name()
     try:
         # test_alloc_page(shm_name)
-        # test_update_layer_decode_new_token(shm_name)
-        test_host_transfer_layer(shm_name)
+        test_update_layer_decode_new_token(shm_name)
+        # test_host_transfer_layer(shm_name)
         # test_host_transfer_layer_variable_lengths(shm_name)
         # test_host_transfer_layer_variable_lengths_byte_kv(shm_name)
         # test_host_transfer_layer_byte_kv(shm_name)
