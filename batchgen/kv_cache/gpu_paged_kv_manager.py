@@ -790,7 +790,7 @@ class GPUPagedKVCacheManager:
         ]
         return k_ptrs, v_ptrs
 
-    def update_new_token(
+    def update_layer_decode_new_token(
         self,
         k_tensor: torch.Tensor,
         v_tensor: Optional[torch.Tensor],
@@ -804,7 +804,7 @@ class GPUPagedKVCacheManager:
         the sequence ordering used when ``allocate_pages_for_sequences`` last
         triggered a rebuild of the GPU page table.
         """
-        # op_name = "update_new_token"
+        # op_name = "update_layer_decode_new_token"
         # self._ensure_initialized()
         # self._geometry.ensure_layer_bounds(layer_idx, op_name)
         # self._validate_token_inputs(k_tensor, v_tensor)
@@ -812,13 +812,14 @@ class GPUPagedKVCacheManager:
         batch_size, seq_len, _, _ = k_tensor.shape
         if seq_len != 1:
             raise ValueError(
-                f"update_new_token: k_tensor must have sequence dimension 1, got {seq_len}"
+                "update_layer_decode_new_token: k_tensor must have sequence dimension 1, "
+                f"got {seq_len}"
             )
 
         page_table = self._gpu_page_table_manager.gpu_table
         if page_table is None:
             raise RuntimeError(
-                f"update_new_token: GPU page table is not initialized; "
+                f"update_layer_decode_new_token: GPU page table is not initialized; "
                 "call allocate_pages_for_sequences before updating tokens"
             )
 
