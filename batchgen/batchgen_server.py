@@ -16,6 +16,10 @@ import pickle  # Used for both Request and Response now
 from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
 from batchgen.batchgen_worker import BatchGenWorkerArgs
+from batchgen.models.engine_loader import core_engine as bg_lib
+
+from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
+
 
 # Configure logging
 logging.basicConfig(
@@ -133,6 +137,16 @@ class BatchGenServer:
 
 		logging.info(f"Model Loaded. SHM: {shm_name}")
 
+	def allocate_host_kv_cache(self, host_kv_cache_size_gb: int):
+		"""Allocates shared host kv cache."""
+		config = build_host_kv_config(
+			host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
+			model_name=self.args.model
+		)
+		host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+		host_paged_kv_manager.initialize()
+		return host_paged_kv_manager
+
 	def spawn_workers(self):
 		"""Spawns DDP Workers via mp.spawn."""
 		local_device_count = torch.cuda.device_count()
@@ -160,6 +174,7 @@ class BatchGenServer:
 			enable_hugetlbfs=self.args.enable_hugetlbfs,
 			weight_byte_size=self.model_info['parameter_server_size'],
 			host_kv_cache_size=self.args_dict['host_kv_cache_size_per_rank'],
+			global_host_kv_cache_size=self.args.host_kv_cache_size,
 			skeleton_state_dict=self.skeleton_state_dict,
 
 			# Place holder
@@ -189,7 +204,8 @@ class BatchGenServer:
 			# Initialize custom torch modules if needed
 			config_torch_module_initializer()
 			
-			# 1. Load Model & Spawn Workers
+			# 1. Allocate KV & Load Model & Spawn Workers
+			self.allocate_host_kv_cache(self.args.host_kv_cache_size)
 			self.load_model_resources()
 			self.spawn_workers()
 			

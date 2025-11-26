@@ -32,6 +32,7 @@
 #include "../utils.h"
 #include "host_kv_page_table.h"
 #include "host_paged_kv_backend.h"
+#include "host_paged_kv_config_utils.h"
 #include "host_paged_kv_geometry.h"
 #include "host_paged_kv_layout.h"
 #include "spdlog/spdlog.h"
@@ -179,6 +180,11 @@ class HostPagedKVWorkerView {
     using ModeTraits = HostKVModeTraits<Mode>;
     static constexpr HostKVMode kMode = Mode;
     static constexpr bool kHasVCache = Layout::kHasVCache;
+
+        explicit HostPagedKVWorkerView(const EngineConfig& engine_config,
+                                                                     const ModelConfig& model_config)
+                : HostPagedKVWorkerView(config::BuildHostPagedKVConfig(
+                            engine_config, model_config)) {}
 
     explicit HostPagedKVWorkerView(const HostPagedKVConfig& config)
         : config_(detail::SanitizeConfig(ModeTraits::Adjust(config))),

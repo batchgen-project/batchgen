@@ -411,6 +411,27 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
     const std::size_t page_size = GetSystemPageSize();
     total_bytes = AlignUp(total_bytes_unaligned, page_size);
 
+    auto resize_region = [&](std::size_t bytes) {
+        if (ftruncate(shm_fd, static_cast<off_t>(bytes)) == -1) {
+            const int err = errno;
+            close(shm_fd);
+            shm_fd = -1;
+            throw std::system_error(err, std::generic_category(),
+                                    "ftruncate failed");
+        }
+    };
+
+    auto reset_region = [&]() {
+        if (ftruncate(shm_fd, 0) == -1) {
+            const int err = errno;
+            close(shm_fd);
+            shm_fd = -1;
+            throw std::system_error(err, std::generic_category(),
+                                    "ftruncate reset failed");
+        }
+        resize_region(total_bytes);
+    };
+
     int flags = O_RDWR;
     if (create_region) {
         flags |= O_CREAT;
@@ -423,12 +444,21 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
     }
 
     if (create_region) {
-        if (ftruncate(shm_fd, static_cast<off_t>(total_bytes)) == -1) {
+        struct stat stat_buffer {};
+        if (fstat(shm_fd, &stat_buffer) == -1) {
             const int err = errno;
             close(shm_fd);
             shm_fd = -1;
             throw std::system_error(err, std::generic_category(),
-                                    "ftruncate failed");
+                                    "fstat failed");
+        }
+
+        const std::size_t current_size =
+            static_cast<std::size_t>(stat_buffer.st_size);
+        if (current_size == total_bytes && current_size != 0) {
+            reset_region();
+        } else {
+            resize_region(total_bytes);
         }
         created_region = true;
     } else {

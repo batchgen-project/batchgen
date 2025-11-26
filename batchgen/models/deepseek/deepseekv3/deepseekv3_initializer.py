@@ -45,6 +45,8 @@ from ....config.engine_config_parser import parse_config_from_json
 from .set_basic_config import set_basic_config
 from .scheduler import Scheduler
 
+from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
+
 def ceil_div(x: int, y: int) -> int:
     """
     Perform ceiling division of two integers.
@@ -144,6 +146,7 @@ class DeepseekV3Initializer:
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
+        self.global_kv_cache_size_gb = input_arguments.global_host_kv_cache_size_gb
 
         self.local_rank = input_arguments.local_rank
         self.global_rank = input_arguments.global_rank
@@ -245,6 +248,12 @@ class DeepseekV3Initializer:
             self.core_engine = core_engine(
                 self.engine_config, self.model_config, weights_storage
             )
+
+            worker_kv_config = build_host_kv_config(
+                model_name=self.hf_model_config._name_or_path,
+                host_kv_cache_size=self.global_kv_cache_size_gb * (1024**3),
+            )
+            self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
             logging.info("Core engine created")
             logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
             if (
@@ -261,7 +270,10 @@ class DeepseekV3Initializer:
             #     param_byte_size,
             #     self.enable_hugetlbfs
             # )
+            self.host_paged_kv_worker_view.initialize()
+            logging.info("Host KV manager view initialized")
             self.core_engine.Init()
+            self.core_engine.set_host_paged_kv_manager_view(self.host_paged_kv_worker_view)
             logging.info("Core engine initialized")
         except Exception as e:
             logging.error(f"Error: {e}")

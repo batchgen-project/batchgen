@@ -89,6 +89,7 @@ void BindHostPagedManager(py::module& m, const char* name) {
 template <typename WorkerView>
 void BindHostPagedWorkerView(py::module& m, const char* name) {
     py::class_<WorkerView>(m, name)
+        .def(py::init<EngineConfig, ModelConfig>())
         .def(py::init<kv::HostPagedKVConfig>(), py::arg("config"))
         .def("initialize", &WorkerView::Initialize,
              py::arg("device_index"),
@@ -250,7 +251,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_past_key_states",
                 &BatchGen::get_past_key_states,
                 "Get the past key states for the given query global indices and max sequence length.")
-        .def("init_weight_storage", &BatchGen::init_weight_storage);
+           .def("init_weight_storage", &BatchGen::init_weight_storage)
+           .def_property(
+              "host_paged_kv_worker_view",
+              &BatchGen::host_paged_kv_worker_view,
+              &BatchGen::set_host_paged_kv_worker_view,
+              "Reference to the bound HostPagedKVWorkerView instance.");
     
     py::class_<Weights_Storage>(m, "Weights_Storage")
         // Updated Constructor Binding

@@ -10,6 +10,12 @@ from batchgen.models.Wrapper import Attn_Wrapper
 from batchgen.utils import create_position_ids_from_attention_mask
 from batchgen.sampling import sample_with_temperature_top_p, greedy_decode
 from batchgen.sequence import SequenceBatch
+from batchgen.models.engine_loader import core_engine as bg
+from batchgen.config.config import EngineConfig, ModelConfig
+
+from batchgen.kv_cache.gpu_paged_kv_manager import (
+    GPUPagedKVCacheManager,
+)
 
 @dataclass
 class DecodeInput:
@@ -41,13 +47,13 @@ class DecodeExecutor:
 	It only handles the core logic of decoding. 
 	I.e. decoding the input batch for a few steps and update the status of each sequence.
 	"""
-	def __init__(self, model_config, engine_config, inference_runtime, 
+	def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, inference_runtime, 
 			  		decode_batch: SequenceBatch, decode_steps=1):
 		self.model_config = model_config
 		self.engine_config = engine_config
 		self.inference_runtime = inference_runtime
 		self.decode_batch = decode_batch # A view from global batch.
-		self.decode_step = decode_steps 
+		self.decode_step = decode_steps
 		# Number of decode steps in one execute() call. This determines the granularity of pd scheduling.
 
 		self.rank = self.engine_config.Basic_Config.rank
@@ -110,7 +116,7 @@ class DecodeExecutor:
 
 
 class Decode():
-	def __init__(self, model_config, engine_config, core_engine, parallel_manager, comm):
+	def __init__(self, model_config: ModelConfig, engine_config: EngineConfig, core_engine, parallel_manager, comm):
 		self.model_config = model_config
 		self.engine_config = engine_config
 		self.parallel_manager = parallel_manager
@@ -121,10 +127,14 @@ class Decode():
 		self.world_size = self.engine_config.Basic_Config.world_size
 		self.torch_device = self.engine_config.Basic_Config.device_torch
 
+		# self.gpu_paged_kv_manager = GPUPagedKVCacheManager(self.engine_config)
+
+
 	def config_decode(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
 
+		# self.gpu_paged_kv_manager.initialize()
 
 		# Get number of sequences for each rank 
 		num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)

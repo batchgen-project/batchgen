@@ -22,6 +22,7 @@
 #include <ATen/cuda/CachingHostAllocator.h>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <string>
@@ -375,6 +376,18 @@ void BatchGen::reset_decoding_buffer() {
 
 void BatchGen::stop_h2d_worker() {
     this->h2d_engine_.stop_h2d_worker();
+}
+
+void BatchGen::set_host_paged_kv_worker_view(py::object worker_view) {
+    if (worker_view.is_none()) {
+        throw std::invalid_argument(
+            "host_paged_kv_worker_view must not be None");
+    }
+    host_paged_kv_worker_view_ = std::move(worker_view);
+}
+
+py::object BatchGen::host_paged_kv_worker_view() const {
+    return host_paged_kv_worker_view_;
 }
 
 

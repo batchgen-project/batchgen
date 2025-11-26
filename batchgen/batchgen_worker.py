@@ -88,6 +88,7 @@ class InputArguments:
 	tensor_meta_shm_name: Optional[str] = None
 	engine_config_json_dir: Optional[str] = None
 	host_kv_cache_size: Optional[int] = None
+	global_host_kv_cache_size_gb: Optional[int] = None
 	kv_dtype: str = "bfloat16"
 	dist_init_addr: Optional[str] = None
 	local_rank: int = 0
@@ -126,6 +127,7 @@ class BatchGenWorkerArgs:
 	cache_dir: Optional[str]
 	pt_ckpt_dir: Optional[str]
 	host_kv_cache_size: int
+	global_host_kv_cache_size_gb: int
 
 	shm_name: str
 	tensor_meta_shm_name: str
@@ -225,6 +227,7 @@ class BatchGenWorker:
 		self.device = self.args.device
 		self.torch_device = torch.device(f"cuda:{self.args.device}")
 		self.host_kv_cache_size = self.args.host_kv_cache_size
+		self.global_host_kv_cache_size_gb = self.args.global_host_kv_cache_size_gb
 
 		self.attn_mode = None
 		self.query_book = None
@@ -249,6 +252,7 @@ class BatchGenWorker:
 			"tensor_meta_shm_name": self.tensor_meta_shm_name,
 			"engine_config_json_dir": None,
 			"host_kv_cache_size": self.host_kv_cache_size,
+			"global_host_kv_cache_size_gb": self.global_host_kv_cache_size_gb,
 			"kv_dtype": self.kv_dtype,
 			# "num_queries": len(self.queries),
 			"dist_init_addr": self.dist_init_addr,

@@ -120,6 +120,12 @@ class BatchGen {
     void reset_decoding_buffer();
     void stop_h2d_worker();
 
+    // Binds a Python-owned HostPagedKVWorkerView instance for reuse.
+    void set_host_paged_kv_worker_view(py::object worker_view);
+
+    // Returns the bound HostPagedKVWorkerView. Raises if unset.
+    py::object host_paged_kv_worker_view() const;
+
     void copy_kv_to_worker(std::vector<int64_t> query_global_idx, int64_t context_length) {
         this->kv_storage_.copy_kv_to_worker(query_global_idx, context_length);
     }
@@ -157,4 +163,6 @@ class BatchGen {
     py::object parameter_server_;
 
     Hetero_Attn hetero_attn_;
+
+    py::object host_paged_kv_worker_view_{py::none()};
 };

@@ -1,5 +1,10 @@
-from batchgen.config.config import EngineConfig
 import logging
+import math
+
+from batchgen.config.config import EngineConfig
+from batchgen.kv_cache.host_kv_mananger_config import HOST_KV_SHM_NAME
+
+
 class Scheduler:
 	def __version__(self):
 		""" 
@@ -13,7 +18,7 @@ class Scheduler:
 		pass
 
 	def generate_config(self, config) -> EngineConfig:
-		self.config = config
+		self.config: EngineConfig = config
 		self.Max_Prompt_Length = config.Basic_Config.padding_length
 		self.Max_Response_Length = config.Basic_Config.max_decoding_length
 		self.Max_Context_Length = self.Max_Prompt_Length + self.Max_Response_Length
@@ -97,6 +102,11 @@ class Scheduler:
 			factor = self.Max_Prompt_Length / 14000
 			self.config.Module_Batching_Config.attn_prefill_micro_batch_size = min(32, int(self.config.Module_Batching_Config.attn_prefill_micro_batch_size / factor))
 			self.config.Module_Batching_Config.MoE_prefill_micro_batch_size = min(32, int(self.config.Module_Batching_Config.MoE_prefill_micro_batch_size / factor))
+
+		# # Host and device kv cache config
+		# self._configure_host_paged_kv(attn_decoding_micro_batch_size)
+		# self._configure_device_paged_kv(attn_decoding_micro_batch_size)
+		
 
 		
 

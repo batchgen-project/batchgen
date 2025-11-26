@@ -440,8 +440,17 @@ class Attn_Wrapper(torch.nn.Module):
 				#         dim=0,
 				#     )
 				# torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
-				self.core_engine.kv_offload(
-					self.layer_idx, cur_attn_batch, key_cache, value_cache, cur_attention_mask
+				# self.core_engine.kv_offload(
+				# 	self.layer_idx, cur_attn_batch, key_cache, value_cache, cur_attention_mask
+				# )
+
+				# attention_mask is shape [bsz, seq_len]
+				
+				self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+					layer_idx=self.layer_idx,
+					sequence_ids=cur_attn_batch,
+					k_tensor=key_cache,
+					v_tensor=value_cache,
 				)
 				# Sync
 				# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
