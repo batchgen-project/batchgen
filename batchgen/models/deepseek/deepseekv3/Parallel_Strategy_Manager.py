@@ -16,7 +16,10 @@ import torch
 import gc
 import os
 from batchgen.utils import torch_gpu_mem_usage
-from pplx_kernels.all_to_all import AllToAll
+if os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL") == "1":
+	from pplx_kernels.all_to_all import AllToAll
+else:
+	AllToAll = None  # Optional dependency
 	
 class DeepseekV3ParallelStrategyManager:
 	def __init__(

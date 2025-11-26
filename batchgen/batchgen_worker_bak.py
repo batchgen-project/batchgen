@@ -37,6 +37,16 @@ from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUKVCacheManager
 
+BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
+if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
+	try:
+		from pplx_kernels import nvshmem_init
+	except ImportError as exc:
+		logging.warning("Failed to import pplx_kernels.nvshmem_init: %s", exc)
+		nvshmem_init = None
+else:
+	nvshmem_init = None  # Optional dependency for NVSHMEM features
+
 
 logging.basicConfig(
 	level=logging.INFO,  # Set to the lowest level to capture all messages
@@ -1035,9 +1045,11 @@ class BatchGenWorker:
 
 
 	def init_nvshmem(self):
+		if BATCHGEN_ENABLE_ALL_TO_ALL != "1" or nvshmem_init is None:
+			logging.info("Skipping NVSHMEM initialization; BATCHGEN_ENABLE_ALL_TO_ALL is disabled or nvshmem_init missing")
+			return
 		import nvshmem.core as nvshmem
 		from cuda.core.experimental import Device	
-		from pplx_kernels import nvshmem_init
 		# 1. Standard Torch Distributed Init
 		rank = dist.get_rank()
 		world_size = dist.get_world_size()
