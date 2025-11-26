@@ -255,12 +255,13 @@ class DeepseekV3Initializer:
                 param_byte_size = 675 * 1024 * 1024 * 1024
             else:
                 raise ValueError("Unknown huggingface model card")
-            self.core_engine.Init(
-                self.shm_name,
-                self.tensor_meta_shm_name,
-                param_byte_size,
-                self.enable_hugetlbfs
-            )
+            # self.core_engine.Init(
+            #     self.shm_name,
+            #     self.tensor_meta_shm_name,
+            #     param_byte_size,
+            #     self.enable_hugetlbfs
+            # )
+            self.core_engine.Init()
             logging.info("Core engine initialized")
         except Exception as e:
             logging.error(f"Error: {e}")
