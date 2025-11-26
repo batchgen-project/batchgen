@@ -357,9 +357,9 @@ class BatchGenWorker:
 		for batch_idx in range(max_num_batches):
 			# Calculate the local batch range for this rank
 			local_batch_start = batch_idx * model_batch_size
-			local_batch_end = min((batch_idx + 1) * model_batch_size, num_local_queries)
+			local_batch_end = min((batch_idx + 1) * model_batch_size, self.num_local_queries)
 			
-			if local_batch_start < num_local_queries:
+			if local_batch_start < self.num_local_queries:
 				# This rank has sequences in this batch
 				local_indices = list(range(local_batch_start, local_batch_end))
 				model_batches.append(local_indices)
@@ -371,7 +371,7 @@ class BatchGenWorker:
 		logging.info(f"=" * 60)
 		logging.info(f"Rank {rank} Batching Summary:")
 		logging.info(f"  Total global queries: {self.num_global_queries}")
-		logging.info(f"  Local query count: {num_local_queries}")
+		logging.info(f"  Local query count: {self.num_local_queries}")
 		logging.info(f"  Model batch size: {model_batch_size}")
 		logging.info(f"  Max local queries per rank: {max_local_queries}")
 		logging.info(f"  Total batches (all ranks): {len(model_batches)}")
