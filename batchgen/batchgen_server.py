@@ -142,7 +142,7 @@ class BatchGenServer:
 			global_rank=-1,
 			device=-1,
 		)
-		logging.info(f"host KV cache size per rank: {self.batchgen_worker_args.host_kv_cache_size} bytes")
+		logging.info(f"host KV cache size per rank: {self.batchgen_worker_args.host_kv_cache_size} GB")
 		self.worker_process = mp.spawn(
 			server_worker_main,
 			args=(
