@@ -174,7 +174,7 @@ class BatchGenServer:
 			enable_hugetlbfs=self.args.enable_hugetlbfs,
 			weight_byte_size=self.model_info['parameter_server_size'],
 			host_kv_cache_size=self.args_dict['host_kv_cache_size_per_rank'],
-			global_host_kv_cache_size=self.args.host_kv_cache_size,
+			global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
 			skeleton_state_dict=self.skeleton_state_dict,
 
 			# Place holder
