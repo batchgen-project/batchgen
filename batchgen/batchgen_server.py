@@ -248,7 +248,7 @@ class BatchGenServer:
 					break
 
 				# 4. Process Logic
-				print(request)
+				# print(request)
 				response = self.process_request(request)
 				
 				# 5. Send Response (Pickled)
