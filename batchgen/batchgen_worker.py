@@ -36,13 +36,14 @@ from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUKVCacheManager
+from batchgen.models.engine_loader import core_engine
 
 
-logging.basicConfig(
-	level=logging.INFO,  # Set to the lowest level to capture all messages
-	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-	datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
-)
+# logging.basicConfig(
+# 	level=logging.INFO,  # Set to the lowest level to capture all messages
+# 	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+# 	datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
+# )
 
 from .scheduler.scheduler import Scheduler
 # nvtx = False
@@ -127,6 +128,8 @@ class BatchGenWorkerArgs:
 
 	shm_name: str
 	tensor_meta_shm_name: str
+	enable_hugetlbfs: bool
+	weight_byte_size: int
 
 	device: int
 	kv_dtype: str
@@ -139,17 +142,19 @@ class BatchGenWorker:
 	
 	"""
 	def __init__(self, args: BatchGenWorkerArgs):
+		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
+		self.args = args
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
 		# hf_cache_dir will be deprecated in the future.
-		if (hf_cache_dir is None) and (cache_dir is not None):
-			self.hf_cache_dir = cache_dir
+		if (args.hf_cache_dir is None) and (args.cache_dir is not None):
+			self.hf_cache_dir = args.cache_dir
 		self.huggingface_ckpt_name = args.model_name
-		self.cache_dir = args.ache_dir
+		self.cache_dir = args.cache_dir
 		self.pt_ckpt_dir = args.pt_ckpt_dir
 		# self.max_input_length = max_input_length
 		# self.max_decoding_length = max_decoding_length
-		self.skeleton_state_dict = skeleton_state_dict
+		# self.skeleton_state_dict = args.skeleton_state_dict
 		# self.rank = rank
 		self.dist_init_addr = args.dist_init_addr
 		self.local_rank = args.local_rank
@@ -160,7 +165,41 @@ class BatchGenWorker:
 		# self.engine_config_json_dir = engine_config_json_dir
 		self.kv_dtype = args.kv_dtype
 
+		self.shm_name = args.shm_name
+		self.tensor_meta_shm_name = args.tensor_meta_shm_name
+		logging.info(f"Rank {self.rank}: Initializing shared memory segments.")
+		logging.info(f"Rank {self.rank}: shm_name: {self.shm_name}, tensor_meta_shm_name: {self.tensor_meta_shm_name}, weight_byte_size: {self.args.weight_byte_size}, enable_hugetlbfs: {self.args.enable_hugetlbfs}")
+		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
+		# self.core_engine.init_weight_storage(self.shm_name, self.tensor_meta_shm_name,
+		# 			self.args.weight_byte_size, 
+		# 			self.args.enable_hugetlbfs)
+		self.weights_storage.Init(self.shm_name, self.args.weight_byte_size, 
+					self.tensor_meta_shm_name,
+					self.args.enable_hugetlbfs)	
+		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
 
+
+
+	def Init(self, max_input_length, max_output_length):
+		self.max_input_length = max_input_length
+		self.max_decoding_length = max_output_length
+		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
+		config_torch_module_initializer()
+		self.model_config = AutoConfig.from_pretrained(
+			self.hf_cache_dir,
+			trust_remote_code=True,
+			local_files_only=True,
+		)
+		self.tokenizer = AutoTokenizer.from_pretrained(
+			# self.huggingface_ckpt_name,
+			self.hf_cache_dir,
+			# cache_dir=self.hf_cache_dir,
+			trust_remote_code=True,
+			local_files_only=True,
+		)
+		self.tokenizer.padding_side = "right"
+
+		logging.info(f"Rank {self.rank}: Start initializing engine config.")
 		config_scheduler = Scheduler(max_input_length, max_decoding_length, world_size)
 		self.engine_config = config_scheduler.generate_config()
 		# self.engine_config = parse_config_from_json(engine_config_json_dir)
@@ -194,31 +233,6 @@ class BatchGenWorker:
 			50 * (1024**3) / 32 / 2048
 		)  # 50G k cache, 50G v cache. 192G test-bed.
 
-		self.shm_name = args.shm_name
-		self.tensor_meta_shm_name = args.tensor_meta_shm_name
-		self.core_engine.init_weight_storage(self.shm_name, self.tensor_meta_shm_name,
-					self.engine_config.Basic_Config.weight_byte_size, 
-					self.engine_config.Basic_Config.enable_hugetlbfs)
-
-
-
-	def Init(self):
-		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
-		config_torch_module_initializer()
-		self.model_config = AutoConfig.from_pretrained(
-			self.hf_cache_dir,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
-		self.tokenizer = AutoTokenizer.from_pretrained(
-			# self.huggingface_ckpt_name,
-			self.hf_cache_dir,
-			# cache_dir=self.hf_cache_dir,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
-		self.tokenizer.padding_side = "right"
-
 		input_arguments = {
 			"huggingface_ckpt_name": self.huggingface_ckpt_name,
 			"hf_cache_dir": self.hf_cache_dir,
@@ -228,7 +242,7 @@ class BatchGenWorker:
 			"padding_length": self.max_input_length,
 			"max_decoding_length": self.max_decoding_length,
 			"device": self.device,
-			"skeleton_state_dict": self.skeleton_state_dict,
+			"skeleton_state_dict": None, # deprecated
 			"shm_name": self.shm_name,
 			"tensor_meta_shm_name": self.tensor_meta_shm_name,
 			"engine_config_json_dir": self.engine_config_json_dir,
@@ -247,7 +261,7 @@ class BatchGenWorker:
 		self.initializer = get_initializer(self.huggingface_ckpt_name)
 		self.initializer = self.initializer(self.input_arguments)
 		self.core_engine, self.engine_config, self.model_config, self.hf_model_config = (
-			self.initializer.Init()
+			self.initializer.Init(self.weights_storage)
 		)
 		self.queries, self.model_batches = self.vanilla_batching(
 			self.global_queries, self.global_rank, self.world_size)

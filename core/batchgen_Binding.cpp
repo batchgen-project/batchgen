@@ -21,6 +21,7 @@
 #include "KV_Storage/host_paged_kv_manager.h"
 #include "KV_Storage/host_paged_kv_worker_view.h"
 #include "batchgen.h"
+#include "Weights_Storage/Weights_Storage.h" 
 #include "allocator.h"
 #include "data_structures.h"
 #include <ATen/cuda/CachingHostAllocator.h>
@@ -167,7 +168,7 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<BatchGen>(m, "batchgen")
-        .def(py::init<py::object, py::object>())
+        .def(py::init<py::object, py::object, Weights_Storage&>())
         .def("Init", &BatchGen::Init)
         .def("terminate", &BatchGen::Terminate)
         // .def("set_batching_plan", &BatchGen::set_batching_plan)
@@ -211,7 +212,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 &BatchGen::get_past_key_states,
                 "Get the past key states for the given query global indices and max sequence length.")
         .def("init_weight_storage", &BatchGen::init_weight_storage);
-
+    
+    py::class_<Weights_Storage>(m, "Weights_Storage")
+        // Updated Constructor Binding
+        .def(py::init<int>(), py::arg("device_id")) 
+        
+        .def("Init", &Weights_Storage::Init,
+            py::arg("shm_name"),
+            py::arg("byte_size"),
+            py::arg("module_weights_shm"),
+            py::arg("enable_hugetlbfs") = false)
+        .def("get_tensor", &Weights_Storage::get_tensor,
+            py::arg("module_key"));
+    
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
         .def(py::init<>())
         .def_readwrite("shm_name", &kv::HostPagedKVConfig::shm_name)

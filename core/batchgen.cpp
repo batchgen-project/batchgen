@@ -46,30 +46,76 @@
 namespace py = pybind11;
 // namespace fs = std::filesystem;
 
-BatchGen::BatchGen(py::object engine_config, py::object model_config)
-    : engine_config_(parse_engine_config(engine_config)),
+// weight_storage = WeightStorage()
+
+// core_engine = CoreEngine(weight_storage)
+
+
+// CoreEngine(weight_storage){
+//     this->weight_storage_ = weight_storage;
+//     this->h2d_engine_ = HtoDEngine(weight_storage_);
+// }
+// BatchGen::BatchGen(py::object engine_config, py::object model_config)
+//     : engine_config_(parse_engine_config(engine_config)),
+//       model_config_(parse_model_config(model_config)),
+//       weights_storage_(engine_config_, model_config_),
+//       gpu_weight_buffer_(engine_config_, model_config_),
+//       gpu_kv_buffer_(engine_config_, model_config_),
+//       d2h_engine_(engine_config_),
+//       kv_storage_(engine_config_, model_config_, d2h_engine_),
+//       h2d_engine_(engine_config_, model_config_, weights_storage_, kv_storage_,
+//                   gpu_weight_buffer_, gpu_kv_buffer_),
+//       hetero_attn_(engine_config_, model_config_, kv_storage_, gpu_kv_buffer_,
+//                    h2d_engine_, d2h_engine_) {
+//     this->logger = init_logger(
+//         this->engine_config_.basic_config.log_level,
+//         "BatchGen" + std::to_string(this->engine_config_.basic_config.device));
+//     if (!this->logger) {
+//         throw std::runtime_error("Logger initialization failed.");
+//     }
+// }
+// BatchGen.cpp
+
+BatchGen::BatchGen(py::object engine_config, py::object model_config, Weights_Storage& weights_storage)
+    : 
+      // 1. Parse Configs first
+      engine_config_(parse_engine_config(engine_config)),
       model_config_(parse_model_config(model_config)),
-      weights_storage_(engine_config_, model_config_),
+      
+      // 2. Store the pointer to weights (so you can access it later if needed)
+      weights_storage_(weights_storage),
+
+      // 3. Initialize Direct Objects (Order matches Header file)
       gpu_weight_buffer_(engine_config_, model_config_),
+      
       gpu_kv_buffer_(engine_config_, model_config_),
+      
       d2h_engine_(engine_config_),
+      
+      // Pass the *initialized* d2h_engine_ to kv_storage
       kv_storage_(engine_config_, model_config_, d2h_engine_),
-      h2d_engine_(engine_config_, model_config_, weights_storage_, kv_storage_,
-                  gpu_weight_buffer_, gpu_kv_buffer_),
-      hetero_attn_(engine_config_, model_config_, kv_storage_, gpu_kv_buffer_,
-                   h2d_engine_, d2h_engine_) {
+
+      // 4. The Complex One: H2D Engine
+      // We pass the ARGUMENT 'weights_storage' directly here.
+      // We pass the MEMBERS (kv_storage_, etc.) which are already initialized above.
+      h2d_engine_(engine_config_, model_config_, 
+                  weights_storage, // <--- Passing the argument reference
+                  kv_storage_, 
+                  gpu_weight_buffer_, 
+                  gpu_kv_buffer_),
+
+      // 5. Hetero Attn
+      hetero_attn_(engine_config_, model_config_, 
+                   kv_storage_, 
+                   gpu_kv_buffer_, 
+                   h2d_engine_, 
+                   d2h_engine_) 
+{
+    // Body: Just logging setup now
     this->logger = init_logger(
         this->engine_config_.basic_config.log_level,
-        "BatchGen" + std::to_string(this->engine_config_.basic_config.device));
-    if (!this->logger) {
-        throw std::runtime_error("Logger initialization failed.");
-    }
-    // struct bitmask* nodemask = numa_allocate_nodemask();
-    // numa_bitmask_clearall(nodemask);
-    // numa_bitmask_setbit(nodemask, 1);
-
-    // numa_set_preferred(1);
-    // this->weights_storage_.Init();
+        "BatchGen_" + std::to_string(this->engine_config_.basic_config.device));
+    this->logger->info("BatchGen Instantiated.");
 }
 
 BatchGen::~BatchGen() { this->Terminate(); }
@@ -114,11 +160,11 @@ void BatchGen::init_weight_storage(std::string& shm_name, std::string& tensor_me
     this->logger->info("model type: {}", this->model_config_.model_type);
     this->shm_name_ = shm_name;
     this->tensor_meta_shm_name_ = tensor_meta_shm_name;
-    auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
+    // auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
     this->logger->info("weights_map deserialized.");
     this->logger->info("shm_name: {}", shm_name);
     this->logger->info("byte_size: {}", byte_size);
-    this->weights_storage_.Init(shm_name, byte_size, weights_map, enable_hugetlbfs);
+    this->weights_storage_.Init(shm_name, byte_size, tensor_meta_shm_name, enable_hugetlbfs);
     this->logger->info("weights_storage initialized.");
 }
 

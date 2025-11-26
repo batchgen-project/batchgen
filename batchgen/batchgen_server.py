@@ -112,7 +112,7 @@ class BatchGenServer:
 			'pt_ckpt_dir': pt_ckpt_dir,
 			'parameter_server_size': ps_size,
 		}
-		
+		logging.info(self.model_info)
 		# Calculate Host Memory for Workers
 		import psutil
 		mem = psutil.virtual_memory()
@@ -152,6 +152,8 @@ class BatchGenServer:
 
 			shm_name=self.model_info['shm_name'],
 			tensor_meta_shm_name=self.model_info['tensor_meta_shm_name'],
+			enable_hugetlbfs=self.args.enable_hugetlbfs,
+			weight_byte_size=self.model_info['parameter_server_size'],
 
 			# Place holder
 			local_rank=-1,
@@ -261,26 +263,29 @@ class BatchGenServer:
 		finally:
 			conn.close()
 
+	# In BatchGenServer class
 	def process_request(self, request: Any) -> Dict:
-		"""
-		Handles the logic. Supports both:
-		1. A raw list: ['prompt1', 'prompt2'] -> treated as inference
-		2. A dict: {'command': 'ping'}
-		"""
 		command = None
 		queries = []
+		
+		# Defaults
+		max_input_len = 1024
+		max_output_len = 128
 
-		# Logic to handle "List of str or dict" input
+		# --- LOGIC UPDATE START ---
 		if isinstance(request, list):
+			# Backwards compatibility for raw lists
 			command = 'submit_inference'
 			queries = request
 		elif isinstance(request, dict):
 			command = request.get('command')
 			queries = request.get('queries', [])
+			# Extract params from client request
+			max_input_len = request.get('max_input_len', 1024)
+			max_output_len = request.get('max_output_len', 128)
+		# --- LOGIC UPDATE END ---
 		else:
-			return {'status': 'error', 'message': 'Invalid input type. Expected List or Dict.'}
-		
-		# --- Commands ---
+			return {'status': 'error', 'message': 'Invalid input type.'}
 		
 		if command == 'ping':
 			return {'status': 'success', 'message': 'pong'}
@@ -291,17 +296,20 @@ class BatchGenServer:
 
 			logging.info(f"Processing batch of {len(queries)} items.")
 			
-			# Locking ensures First-In-First-Out batch processing logic
 			with self.inference_lock:
 				start_t = time.perf_counter()
 				
-				# Send to Rank 0 Worker
-				self.request_queue.put(queries)
+				# --- CRITICAL FIX: Wrap data into the Dict expected by Worker ---
+				worker_payload = {
+					"prompts": queries,         # Remap 'queries' to 'prompts'
+					"max_input_len": max_input_len,
+					"max_output_len": max_output_len
+				}
 				
-				# Wait for response from Rank 0 Worker
-				# Note: This blocks the thread until inference is done
+				self.request_queue.put(worker_payload)
+				# ---------------------------------------------------------------
+				
 				result = self.response_queue.get()
-				
 				dur = time.perf_counter() - start_t
 				logging.info(f"Batch finished in {dur:.2f}s")
 				

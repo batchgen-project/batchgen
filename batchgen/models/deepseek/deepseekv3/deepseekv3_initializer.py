@@ -237,13 +237,13 @@ class DeepseekV3Initializer:
         model_config.compressed_kv_dim = 576
         return model_config
 
-    def Init(self):
+    def Init(self, weights_storage):
         try:
             torch.cuda.set_device(self.local_rank)
             if self.global_rank == 0:
                 logging.info(f"Engine config: {self.engine_config}")    
             self.core_engine = core_engine(
-                self.engine_config, self.model_config
+                self.engine_config, self.model_config, weights_storage
             )
             logging.info("Core engine created")
             logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
