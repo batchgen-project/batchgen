@@ -348,7 +348,7 @@ class BatchGenWorker:
 		
 		# Step 4: Calculate the maximum number of batches based on the rank with most queries
 		# The rank with the most queries determines how many batches all ranks need
-		max_local_queries = math.ceil(self.num_global_queries / num_devices)
+		max_local_queries = math.ceil(self.num_global_queries / self.world_size)
 		max_num_batches = math.ceil(max_local_queries / model_batch_size)
 		
 		# Step 5: Create model batches for this rank's local queries
