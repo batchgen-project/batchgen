@@ -259,8 +259,8 @@ class BatchGenWorker:
 			"gpu_arch": self.gpu_arch
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
-		if self.global_rank == 0:
-			logging.info(f"Input Arguments for Initializer: {input_arguments}")
+		# if self.global_rank == 0:
+		# 	logging.info(f"Input Arguments for Initializer: {input_arguments}")
 			
 		self.input_arguments = InputArguments(**input_arguments)
 		self.initializer = get_initializer(self.huggingface_ckpt_name)
