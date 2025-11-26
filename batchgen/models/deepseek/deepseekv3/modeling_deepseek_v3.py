@@ -1739,7 +1739,10 @@ def act_quant_3d(
     
     return y, scale
 import torch.distributed._symmetric_memory as symm_mem
-from pplx_kernels.all_to_all import AllToAll
+if os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL") == "1":
+	from pplx_kernels.all_to_all import AllToAll
+else:
+	AllToAll = None  # AllToAll unavailable unless explicitly enabled
 from .grouped_gemm_kernel import (
 	fused_fp8_moe_stage_1_tma_wrapper,
 	fused_dequant_grouped_gemm_fp8_tma_wrapper,
