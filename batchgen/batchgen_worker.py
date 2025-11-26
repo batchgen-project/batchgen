@@ -246,7 +246,7 @@ class BatchGenWorker:
 			"skeleton_state_dict": None, # deprecated
 			"shm_name": self.shm_name,
 			"tensor_meta_shm_name": self.tensor_meta_shm_name,
-			"engine_config_json_dir": self.engine_config_json_dir,
+			"engine_config_json_dir": None,
 			"host_kv_cache_size": self.host_kv_cache_size,
 			"kv_dtype": self.kv_dtype,
 			# "num_queries": len(self.queries),
