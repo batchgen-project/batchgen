@@ -180,9 +180,9 @@ class BatchGenWorker:
 
 
 
-	def Init(self, max_input_length, max_output_length):
+	def Init(self, max_input_length, max_decoding_length):
 		self.max_input_length = max_input_length
-		self.max_decoding_length = max_output_length
+		self.max_decoding_length = max_decoding_length
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
 		config_torch_module_initializer()
 		self.model_config = AutoConfig.from_pretrained(
@@ -200,7 +200,7 @@ class BatchGenWorker:
 		self.tokenizer.padding_side = "right"
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
-		config_scheduler = Scheduler(max_input_length, max_decoding_length, world_size)
+		config_scheduler = Scheduler(self.max_input_length, self.max_decoding_length, world_size)
 		self.engine_config = config_scheduler.generate_config()
 		# self.engine_config = parse_config_from_json(engine_config_json_dir)
 		self.engine_config.Basic_Config.device = device
