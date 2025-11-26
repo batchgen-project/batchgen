@@ -125,6 +125,7 @@ class BatchGenWorkerArgs:
 	hf_cache_dir: Optional[str]
 	cache_dir: Optional[str]
 	pt_ckpt_dir: Optional[str]
+	host_kv_cache_size: int
 
 	shm_name: str
 	tensor_meta_shm_name: str
@@ -180,7 +181,7 @@ class BatchGenWorker:
 
 
 
-	def Init(self, max_input_length, max_decoding_length):
+	def Init(self, max_input_length, max_decoding_length, num_queries):
 		self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
@@ -200,29 +201,29 @@ class BatchGenWorker:
 		self.tokenizer.padding_side = "right"
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
-		config_scheduler = Scheduler(self.max_input_length, self.max_decoding_length, world_size)
+		config_scheduler = Scheduler(self.max_input_length, self.max_decoding_length, self.args.world_size)
 		self.engine_config = config_scheduler.generate_config()
 		# self.engine_config = parse_config_from_json(engine_config_json_dir)
-		self.engine_config.Basic_Config.device = device
+		self.engine_config.Basic_Config.device = self.args.device
 		self.engine_config.Basic_Config.device_torch = torch.device(
-			f"cuda:{device}"
+			f"cuda:{self.args.device}"
 		)
 		self.engine_config.Basic_Config.max_decoding_length = (
 			max_decoding_length
 		)
-		self.engine_config.Basic_Config.padding_length = max_input_length
+		self.engine_config.Basic_Config.padding_length = self.max_input_length
 		# self.engine_config.Basic_Config.num_queries = self.num_queries
 		self.engine_config.Basic_Config.rank = self.global_rank
-		self.engine_config.Basic_Config.world_size = world_size
+		self.engine_config.Basic_Config.world_size = self.world_size
 
 		if(self.rank == 0):
 			print(self.engine_config)
 		if not self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens:
 			logging.warning(f"kv_buffer_num_tokens is set to {self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens}")
 			# exit()
-		self.device = device
-		self.torch_device = torch.device(f"cuda:{device}")
-		self.host_kv_cache_size = host_kv_cache_size
+		self.device = self.args.device
+		self.torch_device = torch.device(f"cuda:{self.args.device}")
+		self.host_kv_cache_size = self.args.host_kv_cache_size
 
 		self.attn_mode = None
 		self.query_book = None
@@ -263,11 +264,11 @@ class BatchGenWorker:
 		self.core_engine, self.engine_config, self.model_config, self.hf_model_config = (
 			self.initializer.Init(self.weights_storage)
 		)
-		self.queries, self.model_batches = self.vanilla_batching(
-			self.global_queries, self.global_rank, self.world_size)
-		self.num_queries = len(self.queries)
+		# self.queries, self.model_batches = self.vanilla_batching(
+		# 	self.global_queries, self.global_rank, self.world_size)
+		# self.num_queries = len(self.queries)
 		# TODO: Move to centralized config later.
-		self.engine_config.Basic_Config.num_queries = self.num_queries
+		self.engine_config.Basic_Config.num_queries = num_queries
 		
 		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
 		self.parallel_manager = self.parallel_manager(
@@ -275,7 +276,8 @@ class BatchGenWorker:
 			self.engine_config,
 			self.model_config,
 			self.core_engine,
-			self.skeleton_state_dict,
+			# self.skeleton_state_dict,
+			None,
 			self.local_rank,
 			self.global_rank,
 			self.world_size

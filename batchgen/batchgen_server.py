@@ -154,13 +154,14 @@ class BatchGenServer:
 			tensor_meta_shm_name=self.model_info['tensor_meta_shm_name'],
 			enable_hugetlbfs=self.args.enable_hugetlbfs,
 			weight_byte_size=self.model_info['parameter_server_size'],
+			host_kv_cache_size=self.args_dict['host_kv_cache_size_per_rank'],
 
 			# Place holder
 			local_rank=-1,
 			global_rank=-1,
 			device=-1,
 		)
-			
+		logging.info(f"host KV cache size per rank: {self.batchgen_worker_args.host_kv_cache_size} bytes")
 		self.worker_process = mp.spawn(
 			server_worker_main,
 			args=(

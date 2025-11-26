@@ -328,7 +328,7 @@ def server_worker_main(
 			if len(my_prompts) > 0:
 				# Initialize worker with the lengths specific to this request
 				# This ensures the KV cache or buffers are sized correctly for this specific run
-				worker.Init(current_max_input, current_max_output)
+				worker.Init(current_max_input, current_max_output, len(my_prompts))
 				
 				# Run Inference
 				local_results = worker.process_new_batch(my_prompts, current_global_bs)
