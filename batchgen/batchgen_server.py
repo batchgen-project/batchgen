@@ -1,22 +1,30 @@
-import os
-import torch
-import logging
 import argparse
-import torch.multiprocessing as mp
-from typing import Dict, Any, List, Union
-import threading
+import logging
+import os
+import pickle  # Used for both Request and Response now
 import signal
-import subprocess
-import time
 import socket
 import struct
-import pickle  # Used for both Request and Response now
+import subprocess
+import threading
+import time
+from typing import Any, Dict, List, Union
+
+import torch
+import torch.multiprocessing as mp
 
 # Mock imports for the sake of structure (Keep your original imports here)
 from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
 from batchgen.batchgen_worker import BatchGenWorkerArgs
 from batchgen.models.engine_loader import core_engine as bg_lib
+from batchgen.models.deepseek.deepseek_parameter_server import (
+	DeepSeek_Parameter_Server,
+)
+from batchgen.models.mixtral.mixtral_parameter_server import (
+	Mixtral_Parameter_Server,
+)
+from batchgen.parameter_server_client import ParameterServerClient
 
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 
@@ -26,6 +34,8 @@ logging.basicConfig(
 	level=logging.INFO,
 	format='%(asctime)s - [BatchGenServer] - %(levelname)s - %(message)s'
 )
+
+PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 
 class BatchGenServer:
 	def __init__(self, args):
@@ -73,69 +83,24 @@ class BatchGenServer:
 			logging.warning(f"Hugepages configuration failed: {e}")
 	
 	def load_model_resources(self):
-		"""Loads model into Parameter Server (Shared Memory)."""
-		logging.info(f"Loading model: {self.args.model}")
-		
+		"""Loads model weights via local or external parameter server."""
+		logging.info("Loading model resources for %s", self.args.model)
+		endpoint = os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
 		hf_cache_dir = self.args.hf_cache_dir or os.path.expanduser("~/.cache/huggingface")
+		self.args.hf_cache_dir = hf_cache_dir
 		pt_ckpt_dir = self.args.pt_ckpt_dir or os.path.join(self.args.cache_dir or ".", "pt_ckpt")
-		
-		if self.args.cache_dir is None:
-			logging.info("Downloading model from Hugging Face")
-			from huggingface_hub import snapshot_download
-			try:
-				model_path = snapshot_download(
-					self.args.model,
-					cache_dir=hf_cache_dir,
-					ignore_patterns=["flax*", "tf*"],
-				)
-				self.args.cache_dir = model_path
-			except Exception as e:
-				raise RuntimeError(f"Failed to download model: {e}")
+		self.args.pt_ckpt_dir = pt_ckpt_dir
 
-			
+		if not endpoint and self.args.cache_dir is None:
+			self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
 
-		# --- Initialize Parameter Server Logic ---
-		# (This part relies on your specific implementation modules)
-		if "deepseek" in self.args.model.lower():
-			from batchgen.models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
-			ps = DeepSeek_Parameter_Server(self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs)
-		elif "Mixtral" in self.args.model:
-			from batchgen.models.mixtral.mixtral_parameter_server import Mixtral_Parameter_Server
-			ps = Mixtral_Parameter_Server(self.args.model, self.args.cache_dir, pt_ckpt_dir)
+		if endpoint:
+			self._load_model_from_remote_server(endpoint, hf_cache_dir, pt_ckpt_dir)
 		else:
-			raise NotImplementedError(f"Model type for {self.args.model} not supported")
+			self._load_model_locally(hf_cache_dir, pt_ckpt_dir)
 
-		shm_name, tensor_meta_shm_name = ps.Init()
-		ps_size = ps.parameter_server.byte_size()
-		self.skeleton_state_dict = ps.parameter_server.get_skeleton_state_dict()
-		
-		self.parameter_server_instance = ps
-		self.model_info = {
-			'huggingface_ckpt_name': self.args.model,
-			'shm_name': shm_name,
-			'tensor_meta_shm_name': tensor_meta_shm_name,
-			'pt_ckpt_dir': pt_ckpt_dir,
-			'parameter_server_size': ps_size,
-		}
-		logging.info(self.model_info)
-		
-		if self.args.host_kv_cache_size is not None:
-			available_mem = self.args.host_kv_cache_size
-		else:
-			# Calculate Host Memory for Workers
-			import psutil
-			mem = psutil.virtual_memory()
-			# Reserve 20GB for OS/PS overhead
-			available_mem = (mem.total - (20 * 1024**3)) // (1024**3) 
-			
-		num_devices = torch.cuda.device_count()
-		self.args_dict = vars(self.args)
-		if num_devices > 0:
-			self.args_dict['host_kv_cache_size_per_rank'] = available_mem // num_devices
-		else:
-			self.args_dict['host_kv_cache_size_per_rank'] = available_mem
-
-		logging.info(f"Model Loaded. SHM: {shm_name}")
+		self._configure_host_kv_cache_budget()
+		logging.info("Model Loaded. SHM: %s", self.model_info['shm_name'])
 
 	def allocate_host_kv_cache(self, host_kv_cache_size_gb: int):
 		"""Allocates shared host kv cache."""
@@ -358,6 +323,119 @@ class BatchGenServer:
 		if self.server_socket:
 			try: self.server_socket.close()
 			except: pass
+
+	def _download_model_snapshot(self, hf_cache_dir: str) -> str:
+		logging.info("Downloading model artifacts to %s", hf_cache_dir)
+		from huggingface_hub import snapshot_download
+		try:
+			return snapshot_download(
+				self.args.model,
+				cache_dir=hf_cache_dir,
+				ignore_patterns=["flax*", "tf*"],
+			)
+		except Exception as exc:  # pragma: no cover - network failure message
+			raise RuntimeError(f"Failed to download model: {exc}") from exc
+
+	def _load_model_locally(self, _hf_cache_dir: str, pt_ckpt_dir: str) -> None:
+		if "deepseek" in self.args.model.lower():
+			ps = DeepSeek_Parameter_Server(
+				self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs
+			)
+		elif "mixtral" in self.args.model.lower():
+			ps = Mixtral_Parameter_Server(
+				self.args.model, self.args.cache_dir, pt_ckpt_dir
+			)
+		else:
+			raise NotImplementedError(f"Model type for {self.args.model} not supported")
+
+		shm_name, tensor_meta_shm_name = ps.Init()
+		ps_size = ps.parameter_server.byte_size()
+		self.skeleton_state_dict = ps.parameter_server.get_skeleton_state_dict()
+		self.parameter_server_instance = ps
+		self.model_info = {
+			"huggingface_ckpt_name": self.args.model,
+			"shm_name": shm_name,
+			"tensor_meta_shm_name": tensor_meta_shm_name,
+			"pt_ckpt_dir": pt_ckpt_dir,
+			"parameter_server_size": ps_size,
+		}
+		logging.info("Local parameter server initialized: %s", self.model_info)
+
+	def _load_model_from_remote_server(
+		self, endpoint: str, hf_cache_dir: str, pt_ckpt_dir: str
+	) -> None:
+		host, port = self._parse_parameter_server_endpoint(endpoint)
+		logging.info(
+			"Using external parameter server at %s:%d", host, port
+		)
+		client = ParameterServerClient(host=host, port=port)
+		client.load_model(
+			huggingface_ckpt_name=self.args.model,
+			hf_cache_dir=hf_cache_dir,
+			cache_dir=self.args.cache_dir,
+			pt_ckpt_dir=pt_ckpt_dir,
+		)
+		info = client.get_model_info()
+		for required in ("shm_name", "tensor_meta_shm_name", "parameter_server_size"):
+			if required not in info:
+				raise RuntimeError(
+					f"Remote parameter server response missing '{required}'"
+				)
+		skeleton = info.get("skeleton_state_dict")
+		if skeleton is None:
+			raise RuntimeError(
+				"Remote parameter server did not return a skeleton_state_dict"
+			)
+		self.skeleton_state_dict = skeleton
+		self.parameter_server_instance = None
+		self.model_info = {
+			"huggingface_ckpt_name": info.get(
+				"huggingface_ckpt_name", self.args.model
+			),
+			"shm_name": info["shm_name"],
+			"tensor_meta_shm_name": info["tensor_meta_shm_name"],
+			"pt_ckpt_dir": info.get("pt_ckpt_dir", pt_ckpt_dir),
+			"parameter_server_size": info["parameter_server_size"],
+		}
+		self.args.pt_ckpt_dir = self.model_info["pt_ckpt_dir"]
+		if not self.args.cache_dir:
+			self.args.cache_dir = info.get("cache_dir") or self.args.pt_ckpt_dir
+		logging.info("Fetched shared memory handles from remote parameter server")
+
+	def _configure_host_kv_cache_budget(self) -> None:
+		if self.args.host_kv_cache_size is not None:
+			available_mem = self.args.host_kv_cache_size
+		else:
+			import psutil
+			mem = psutil.virtual_memory()
+			available_mem = (mem.total - (20 * 1024**3)) // (1024**3)
+		if available_mem <= 0:
+			raise RuntimeError("Unable to determine host KV cache budget")
+		num_devices = torch.cuda.device_count()
+		self.args_dict = vars(self.args)
+		if num_devices > 0:
+			self.args_dict["host_kv_cache_size_per_rank"] = available_mem // num_devices
+		else:
+			self.args_dict["host_kv_cache_size_per_rank"] = available_mem
+
+	@staticmethod
+	def _parse_parameter_server_endpoint(endpoint: str) -> tuple[str, int]:
+		value = (endpoint or "").strip()
+		if not value:
+			raise ValueError("BATCHGEN_PARAMETER_SERVER_ENDPOINT is empty")
+		if ":" in value:
+			host, port_str = value.rsplit(":", 1)
+			host = host or "localhost"
+			try:
+				port = int(port_str)
+			except ValueError as exc:
+				raise ValueError(
+					f"Invalid port in parameter server endpoint: {value}"
+				) from exc
+		else:
+			host = value
+			port = 10900
+		return host, port
 
 # --- Entry Point ---
 
