@@ -113,13 +113,17 @@ class BatchGenServer:
 			'parameter_server_size': ps_size,
 		}
 		logging.info(self.model_info)
-		# Calculate Host Memory for Workers
-		import psutil
-		mem = psutil.virtual_memory()
-		# Reserve 20GB for OS/PS overhead
-		available_mem = mem.total - (20 * 1024**3) 
-		num_devices = torch.cuda.device_count()
 		
+		if self.args.host_kv_cache_size is not None:
+			available_mem = self.args.host_kv_cache_size
+		else:
+			# Calculate Host Memory for Workers
+			import psutil
+			mem = psutil.virtual_memory()
+			# Reserve 20GB for OS/PS overhead
+			available_mem = (mem.total - (20 * 1024**3)) // (1024**3) 
+			
+		num_devices = torch.cuda.device_count()
 		self.args_dict = vars(self.args)
 		if num_devices > 0:
 			self.args_dict['host_kv_cache_size_per_rank'] = available_mem // num_devices
