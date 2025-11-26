@@ -94,7 +94,7 @@ class InputArguments:
 	rank: int = 0
 	global_rank: int = 0
 	world_size: int = 1
-	gpu_arch: str = "hooper"
+	gpu_arch: str = "hopper"
 
 	def get(self, key, default=None):
 		"""Get attribute value with a default fallback"""

@@ -92,7 +92,7 @@ class InputArguments:
 	rank: int = 0
 	global_rank: int = 0
 	world_size: int = 1
-	gpu_arch: str = "hooper"
+	gpu_arch: str = "hopper"
 
 	def get(self, key, default=None):
 		"""Get attribute value with a default fallback"""
@@ -149,7 +149,7 @@ class BatchGenWorker:
 		local_rank: Optional[int] = 0,
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
-		gpu_arch: str = "hooper"
+		gpu_arch: str = "hopper"
 	):
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir

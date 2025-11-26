@@ -50,7 +50,7 @@
 # 		local_rank: Optional[int] = 0,
 # 		global_rank: Optional[int] = 0,
 # 		world_size: Optional[int] = 1,
-# 		gpu_arch: str = "hooper"
+# 		gpu_arch: str = "hopper"
 # 	):
 # """
 

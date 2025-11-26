@@ -110,7 +110,7 @@ class Scheduler:
 		# self.config.Basic_Config.kv_dtype = "float8_e4m3fn"
 		# self.config.Basic_Config.activation_dtype = "bfloat16"
 		# self.config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
-		# self.config.Basic_Config.gpu_arch = "hooper"
+		# self.config.Basic_Config.gpu_arch = "hopper"
 		
 		
 		""" Default Module Batching Config """

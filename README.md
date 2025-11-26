@@ -34,7 +34,7 @@ BatchGen is an efficient serving engine optimized specifically for **Mixture-of-
 - **DeepSeek-R1/V3-671B. FULL Precision.**
 
 # Supported Hardware
-Hooper and Ampere archtecture are supported. 
+Hopper and Ampere archtecture are supported. 
 
 Recommended configurations for 8xH20, 8xA100 and 8xA5000 node are included in ./batchgen/configurations/
 
@@ -67,20 +67,20 @@ pip install torch==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu12
 ```bash
 pip install flash-attn --no-build-isolation
 ```
-For Hooper user, please install flash-attention 3 beta release refer to https://github.com/Dao-AILab/flash-attention
+For Hopper user, please install flash-attention 3 beta release refer to https://github.com/Dao-AILab/flash-attention
 ```bash
 git clone git@github.com:Dao-AILab/flash-attention.git
 cd ./flash-attention/hopper/
 python setup.py install
 ```
-For Hooper user, please install FlashMLA refer to https://github.com/deepseek-ai/FlashMLA/tree/main
+For Hopper user, please install FlashMLA refer to https://github.com/deepseek-ai/FlashMLA/tree/main
 ```bash
 git clone git@github.com:deepseek-ai/FlashMLA.git
 cd FlashMLA
 python setup.py install
 ```
 
-For Hooper user, please install DeepGEMM refer to https://github.com/deepseek-ai/DeepGEMM
+For Hopper user, please install DeepGEMM refer to https://github.com/deepseek-ai/DeepGEMM
 ```bash
 git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
 cd DeepGEMM

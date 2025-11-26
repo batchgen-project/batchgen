@@ -360,7 +360,7 @@ class BatchGenServer:
 		local_rank: Optional[int] = 0,
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
-		gpu_arch: str = "hooper"
+		gpu_arch: str = "hopper"
 	):
 
 
@@ -378,7 +378,7 @@ def parse_args():
 	parser.add_argument("--dist-init-addr", type=str)
 	parser.add_argument("--kv-dtype", type=str, default="bfloat16")
 	parser.add_argument("--host-kv-cache-size", type=int, default=None)
-	parser.add_argument("--gpu-arch", type=str, default=None)
+	parser.add_argument("--gpu-arch", type=str)
 	parser.add_argument("--nnodes", type=int, default=1)
 	parser.add_argument("--node-rank", type=int, default=0)
 	parser.add_argument("--world-size", type=int, default=1)
