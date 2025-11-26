@@ -240,7 +240,7 @@ class DeepseekV3Initializer:
     def Init(self, weights_storage):
         try:
             torch.cuda.set_device(self.local_rank)
-            if self.global_rank == 0:
+            if self.global_rank == 3:
                 logging.info(f"Engine config: {self.engine_config}")    
             self.core_engine = core_engine(
                 self.engine_config, self.model_config, weights_storage

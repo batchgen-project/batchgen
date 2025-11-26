@@ -216,8 +216,8 @@ class BatchGenWorker:
 		self.engine_config.Basic_Config.rank = self.global_rank
 		self.engine_config.Basic_Config.world_size = self.world_size
 
-		if(self.rank == 0):
-			print(self.engine_config)
+		# if(self.rank == 0):
+		# 	print(self.engine_config)
 		if not self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens:
 			logging.warning(f"kv_buffer_num_tokens is set to {self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens}")
 			# exit()
