@@ -131,6 +131,7 @@ class BatchGenWorkerArgs:
 	tensor_meta_shm_name: str
 	enable_hugetlbfs: bool
 	weight_byte_size: int
+	skeleton_state_dict: Optional[Dict]
 
 	device: int
 	kv_dtype: str
@@ -155,7 +156,7 @@ class BatchGenWorker:
 		self.pt_ckpt_dir = args.pt_ckpt_dir
 		# self.max_input_length = max_input_length
 		# self.max_decoding_length = max_decoding_length
-		# self.skeleton_state_dict = args.skeleton_state_dict
+		self.skeleton_state_dict = args.skeleton_state_dict
 		# self.rank = rank
 		self.dist_init_addr = args.dist_init_addr
 		self.local_rank = args.local_rank
@@ -243,7 +244,7 @@ class BatchGenWorker:
 			"padding_length": self.max_input_length,
 			"max_decoding_length": self.max_decoding_length,
 			"device": self.device,
-			"skeleton_state_dict": None, # deprecated
+			"skeleton_state_dict": self.skeleton_state_dict,
 			"shm_name": self.shm_name,
 			"tensor_meta_shm_name": self.tensor_meta_shm_name,
 			"engine_config_json_dir": None,
@@ -279,8 +280,8 @@ class BatchGenWorker:
 			self.engine_config,
 			self.model_config,
 			self.core_engine,
-			# self.skeleton_state_dict,
-			None,
+			self.skeleton_state_dict,
+			# None,
 			self.local_rank,
 			self.global_rank,
 			self.world_size

@@ -103,6 +103,7 @@ class BatchGenServer:
 
 		shm_name, tensor_meta_shm_name = ps.Init()
 		ps_size = ps.parameter_server.byte_size()
+		self.skeleton_state_dict = ps.get_skeleton_state_dict()
 		
 		self.parameter_server_instance = ps
 		self.model_info = {
@@ -159,6 +160,7 @@ class BatchGenServer:
 			enable_hugetlbfs=self.args.enable_hugetlbfs,
 			weight_byte_size=self.model_info['parameter_server_size'],
 			host_kv_cache_size=self.args_dict['host_kv_cache_size_per_rank'],
+			skeleton_state_dict=self.skeleton_state_dict,
 
 			# Place holder
 			local_rank=-1,
