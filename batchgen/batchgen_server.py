@@ -18,12 +18,7 @@ from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
 from batchgen.batchgen_worker import BatchGenWorkerArgs
 from batchgen.models.engine_loader import core_engine as bg_lib
-from batchgen.models.deepseek.deepseek_parameter_server import (
-	DeepSeek_Parameter_Server,
-)
-from batchgen.models.mixtral.mixtral_parameter_server import (
-	Mixtral_Parameter_Server,
-)
+
 from batchgen.parameter_server_client import ParameterServerClient
 
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
@@ -337,11 +332,18 @@ class BatchGenServer:
 			raise RuntimeError(f"Failed to download model: {exc}") from exc
 
 	def _load_model_locally(self, _hf_cache_dir: str, pt_ckpt_dir: str) -> None:
+		
 		if "deepseek" in self.args.model.lower():
+			from batchgen.models.deepseek.deepseek_parameter_server import (
+				DeepSeek_Parameter_Server,
+			)
 			ps = DeepSeek_Parameter_Server(
 				self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs
 			)
 		elif "mixtral" in self.args.model.lower():
+			from batchgen.models.mixtral.mixtral_parameter_server import (
+				Mixtral_Parameter_Server,
+			)
 			ps = Mixtral_Parameter_Server(
 				self.args.model, self.args.cache_dir, pt_ckpt_dir
 			)
