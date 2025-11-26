@@ -369,7 +369,7 @@ class BatchGenWorker:
 		
 		# Verification logging
 		logging.info(f"=" * 60)
-		logging.info(f"Rank {rank} Batching Summary:")
+		logging.info(f"Rank {self.rank} Batching Summary:")
 		logging.info(f"  Total global queries: {self.num_global_queries}")
 		logging.info(f"  Local query count: {self.num_local_queries}")
 		logging.info(f"  Model batch size: {model_batch_size}")
