@@ -103,7 +103,7 @@ class BatchGenServer:
 
 		shm_name, tensor_meta_shm_name = ps.Init()
 		ps_size = ps.parameter_server.byte_size()
-		self.skeleton_state_dict = ps.get_skeleton_state_dict()
+		self.skeleton_state_dict = ps.parameter_server.get_skeleton_state_dict()
 		
 		self.parameter_server_instance = ps
 		self.model_info = {
