@@ -1513,6 +1513,7 @@ class BatchGenWorker:
 		
 		# Step 1: Set model to eval and disable gradients
 		self.model.eval()
+		self.model.to('cpu')
 		with torch.no_grad():
 			# Step 2: Recursively clear all module parameters and buffers
 			def clear_module(module):
