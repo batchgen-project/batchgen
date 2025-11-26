@@ -251,24 +251,9 @@ def server_worker_main(
 	torch.cuda.set_device(args.local_rank)
 	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
 
+	# 2. Instantiate the BatchGenWorker
+	worker = BatchGenWorker(args)
 	
-	# 1. Initialize Process Group
-	logging.info(f"Initializing process group for rank {args.global_rank} / {args.world_size}, local rank {args.local_rank}, init addr {args.dist_init_addr}")
-	try:
-		dist.init_process_group(
-			backend="nccl",  # Use NCCL for CUDA devices
-			init_method="tcp://" + args.dist_init_addr,
-			world_size=args.world_size,
-			rank=args.global_rank,
-			device_id=args.local_rank,
-			timeout=torch.distributed.timedelta(seconds=3600),
-		)
-	except Exception as e:
-		logging.error(f"Failed to initialize process group: {e}")
-		sys.exit(1)
-
-	logging.info(f"Process group initialized for rank {args.global_rank}.")
-	torch.cuda.set_device(args.local_rank)
 
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
