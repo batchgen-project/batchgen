@@ -2,7 +2,7 @@ import os
 import torch
 import logging
 import argparse
-import multiprocessing as mp
+import torch.multiprocessing as mp
 from typing import Dict, Any, List, Union
 import threading
 import signal
@@ -75,29 +75,35 @@ class BatchGenServer:
 		hf_cache_dir = self.args.hf_cache_dir or os.path.expanduser("~/.cache/huggingface")
 		pt_ckpt_dir = self.args.pt_ckpt_dir or os.path.join(self.args.cache_dir or ".", "pt_ckpt")
 		
-		from huggingface_hub import snapshot_download
-		try:
-			 model_path = snapshot_download(
-				self.args.model,
-				cache_dir=hf_cache_dir,
-				ignore_patterns=["flax*", "tf*"],
-			)
-		except Exception as e:
-			raise RuntimeError(f"Failed to download model: {e}")
+		if self.args.cache_dir is None:
+			logging.info("Downloading model from Hugging Face")
+			from huggingface_hub import snapshot_download
+			try:
+				model_path = snapshot_download(
+					self.args.model,
+					cache_dir=hf_cache_dir,
+					ignore_patterns=["flax*", "tf*"],
+				)
+				self.args.cache_dir = model_path
+			except Exception as e:
+				raise RuntimeError(f"Failed to download model: {e}")
+
+			
 
 		# --- Initialize Parameter Server Logic ---
 		# (This part relies on your specific implementation modules)
 		if "deepseek" in self.args.model.lower():
 			from batchgen.models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
-			ps = DeepSeek_Parameter_Server(self.args.model, model_path, pt_ckpt_dir, self.args.enable_hugetlbfs)
+			ps = DeepSeek_Parameter_Server(self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs)
 		elif "Mixtral" in self.args.model:
 			from batchgen.models.mixtral.mixtral_parameter_server import Mixtral_Parameter_Server
-			ps = Mixtral_Parameter_Server(self.args.model, model_path, pt_ckpt_dir)
+			ps = Mixtral_Parameter_Server(self.args.model, self.args.cache_dir, pt_ckpt_dir)
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")
 
 		shm_name, tensor_meta_shm_name = ps.Init()
 		ps_size = ps.parameter_server.byte_size()
+		self.skeleton_state_dict = ps.parameter_server.get_skeleton_state_dict()
 		
 		self.parameter_server_instance = ps
 		self.model_info = {
@@ -107,14 +113,18 @@ class BatchGenServer:
 			'pt_ckpt_dir': pt_ckpt_dir,
 			'parameter_server_size': ps_size,
 		}
+		logging.info(self.model_info)
 		
-		# Calculate Host Memory for Workers
-		import psutil
-		mem = psutil.virtual_memory()
-		# Reserve 20GB for OS/PS overhead
-		available_mem = mem.total - (20 * 1024**3) 
+		if self.args.host_kv_cache_size is not None:
+			available_mem = self.args.host_kv_cache_size
+		else:
+			# Calculate Host Memory for Workers
+			import psutil
+			mem = psutil.virtual_memory()
+			# Reserve 20GB for OS/PS overhead
+			available_mem = (mem.total - (20 * 1024**3)) // (1024**3) 
+			
 		num_devices = torch.cuda.device_count()
-		
 		self.args_dict = vars(self.args)
 		if num_devices > 0:
 			self.args_dict['host_kv_cache_size_per_rank'] = available_mem // num_devices
@@ -145,12 +155,19 @@ class BatchGenServer:
 			nnodes=self.args.nnodes,
 			gpu_arch=self.args.gpu_arch,
 
+			shm_name=self.model_info['shm_name'],
+			tensor_meta_shm_name=self.model_info['tensor_meta_shm_name'],
+			enable_hugetlbfs=self.args.enable_hugetlbfs,
+			weight_byte_size=self.model_info['parameter_server_size'],
+			host_kv_cache_size=self.args_dict['host_kv_cache_size_per_rank'],
+			skeleton_state_dict=self.skeleton_state_dict,
+
 			# Place holder
 			local_rank=-1,
 			global_rank=-1,
 			device=-1,
 		)
-			
+		logging.info(f"host KV cache size per rank: {self.batchgen_worker_args.host_kv_cache_size} bytes")
 		self.worker_process = mp.spawn(
 			server_worker_main,
 			args=(
@@ -238,7 +255,7 @@ class BatchGenServer:
 					break
 
 				# 4. Process Logic
-				print(request)
+				# print(request)
 				response = self.process_request(request)
 				
 				# 5. Send Response (Pickled)
@@ -253,26 +270,29 @@ class BatchGenServer:
 		finally:
 			conn.close()
 
+	# In BatchGenServer class
 	def process_request(self, request: Any) -> Dict:
-		"""
-		Handles the logic. Supports both:
-		1. A raw list: ['prompt1', 'prompt2'] -> treated as inference
-		2. A dict: {'command': 'ping'}
-		"""
 		command = None
 		queries = []
+		
+		# Defaults
+		max_input_len = 1024
+		max_output_len = 128
 
-		# Logic to handle "List of str or dict" input
+		# --- LOGIC UPDATE START ---
 		if isinstance(request, list):
+			# Backwards compatibility for raw lists
 			command = 'submit_inference'
 			queries = request
 		elif isinstance(request, dict):
 			command = request.get('command')
 			queries = request.get('queries', [])
+			# Extract params from client request
+			max_input_len = request.get('max_input_len', 1024)
+			max_output_len = request.get('max_output_len', 128)
+		# --- LOGIC UPDATE END ---
 		else:
-			return {'status': 'error', 'message': 'Invalid input type. Expected List or Dict.'}
-		
-		# --- Commands ---
+			return {'status': 'error', 'message': 'Invalid input type.'}
 		
 		if command == 'ping':
 			return {'status': 'success', 'message': 'pong'}
@@ -283,17 +303,20 @@ class BatchGenServer:
 
 			logging.info(f"Processing batch of {len(queries)} items.")
 			
-			# Locking ensures First-In-First-Out batch processing logic
 			with self.inference_lock:
 				start_t = time.perf_counter()
 				
-				# Send to Rank 0 Worker
-				self.request_queue.put(queries)
+				# --- CRITICAL FIX: Wrap data into the Dict expected by Worker ---
+				worker_payload = {
+					"prompts": queries,         # Remap 'queries' to 'prompts'
+					"max_input_len": max_input_len,
+					"max_output_len": max_output_len
+				}
 				
-				# Wait for response from Rank 0 Worker
-				# Note: This blocks the thread until inference is done
+				self.request_queue.put(worker_payload)
+				# ---------------------------------------------------------------
+				
 				result = self.response_queue.get()
-				
 				dur = time.perf_counter() - start_t
 				logging.info(f"Batch finished in {dur:.2f}s")
 				
@@ -343,7 +366,7 @@ class BatchGenServer:
 		local_rank: Optional[int] = 0,
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
-		gpu_arch: str = "hooper"
+		gpu_arch: str = "hopper"
 	):
 
 
@@ -361,9 +384,10 @@ def parse_args():
 	parser.add_argument("--dist-init-addr", type=str)
 	parser.add_argument("--kv-dtype", type=str, default="bfloat16")
 	parser.add_argument("--host-kv-cache-size", type=int, default=None)
-	parser.add_argument("--gpu-arch", type=str, default=None)
+	parser.add_argument("--gpu-arch", type=str)
 	parser.add_argument("--nnodes", type=int, default=1)
 	parser.add_argument("--node-rank", type=int, default=0)
+	parser.add_argument("--world-size", type=int, default=1)
 	
 	return parser.parse_args()
 

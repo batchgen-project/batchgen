@@ -237,13 +237,13 @@ class DeepseekV3Initializer:
         model_config.compressed_kv_dim = 576
         return model_config
 
-    def Init(self):
+    def Init(self, weights_storage):
         try:
             torch.cuda.set_device(self.local_rank)
-            if self.global_rank == 0:
+            if self.global_rank == 3:
                 logging.info(f"Engine config: {self.engine_config}")    
             self.core_engine = core_engine(
-                self.engine_config, self.model_config
+                self.engine_config, self.model_config, weights_storage
             )
             logging.info("Core engine created")
             logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
@@ -255,12 +255,13 @@ class DeepseekV3Initializer:
                 param_byte_size = 675 * 1024 * 1024 * 1024
             else:
                 raise ValueError("Unknown huggingface model card")
-            self.core_engine.Init(
-                self.shm_name,
-                self.tensor_meta_shm_name,
-                param_byte_size,
-                self.enable_hugetlbfs
-            )
+            # self.core_engine.Init(
+            #     self.shm_name,
+            #     self.tensor_meta_shm_name,
+            #     param_byte_size,
+            #     self.enable_hugetlbfs
+            # )
+            self.core_engine.Init()
             logging.info("Core engine initialized")
         except Exception as e:
             logging.error(f"Error: {e}")

@@ -92,7 +92,7 @@ class InputArguments:
 	rank: int = 0
 	global_rank: int = 0
 	world_size: int = 1
-	gpu_arch: str = "hooper"
+	gpu_arch: str = "hopper"
 
 	def get(self, key, default=None):
 		"""Get attribute value with a default fallback"""
@@ -128,58 +128,6 @@ class BatchGenWorkerArgs:
 	kv_dtype: str
 	gpu_arch: str
 
-
-class BatchGenWorker:
-	"""
-	Inference Runtime.
-	
-	"""
-	def __init__(self, args: BatchGenWorkerArgs):
-		self.args = args
-		if (args.hf_cache_dir is None) and (args.cache_dir is not None):
-			self.hf_cache_dir = args.cache_dir
-		self.model_name = args.model_name
-		self.cache_dir = args.cache_dir
-
-		"""
-		Instantiate CPU-Weight-Manager
-		"""
-
-		
-
-
-
-	def Init(self):
-		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
-		config_torch_module_initializer()
-		
-
-		
-
-
-	def process_new_batch(self, batch: List(str)):
-		"""
-		Future API.
-		"""
-		pass
-
-	def generate(self):
-		pass
-
-	def prefill(self):
-		pass
-
-	def decode(self):
-		pass
-
-	def config_prefill(self):
-		pass
-
-	def config_decode(self):
-		pass
-
-
-
 class BatchGenWorker:
 	def __init__(
 		self,
@@ -201,7 +149,7 @@ class BatchGenWorker:
 		local_rank: Optional[int] = 0,
 		global_rank: Optional[int] = 0,
 		world_size: Optional[int] = 1,
-		gpu_arch: str = "hooper"
+		gpu_arch: str = "hopper"
 	):
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
@@ -734,10 +682,26 @@ class BatchGenWorker:
 			range(len(self.model_batches)), desc="Model Batch"
 		):
 			dist.barrier()
-			# if self.rank == 0:
-			# 	logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
+			free_memory, total_memory = torch.cuda.mem_get_info()
+			free_memory = free_memory / 1024 / 1024 / 1024
+			total_memory = total_memory / 1024 / 1024 / 1024
+			logging.info(
+				f"Rank: {self.rank} Device torch memory usage before config prefill: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+			)
+			logging.info(
+				f"Rank: {self.rank} Device torch free memory before config prefill: {free_memory} GB / {total_memory} GB"
+			)
 			tmp_start = time.perf_counter()
 			self._config_prefill()
+			free_memory, total_memory = torch.cuda.mem_get_info()
+			free_memory = free_memory / 1024 / 1024 / 1024
+			total_memory = total_memory / 1024 / 1024 / 1024
+			logging.info(
+				f"Rank: {self.rank} Device torch memory usage after config prefill: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+			)
+			logging.info(
+				f"Rank: {self.rank} Device torch free memory after config prefill: {free_memory} GB / {total_memory} GB"
+			)
 			config_prefill_time += time.perf_counter() - tmp_start
 			prefill_start_time = time.perf_counter()
 			if len(self.model_batches[model_batch_idx]) > 0:
@@ -801,6 +765,17 @@ class BatchGenWorker:
 
 
 					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+
+					free_memory, total_memory = torch.cuda.mem_get_info()
+					free_memory = free_memory / 1024 / 1024 / 1024
+					total_memory = total_memory / 1024 / 1024 / 1024
+					logging.info(
+						f"Rank: {self.rank} Device torch memory usage after getting past key values: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+					)
+					logging.info(
+						f"Rank: {self.rank} Device torch free memory after getting past key values: {free_memory} GB / {total_memory} GB"
+					)
+
 					# Pad the kv cache to be multiple of 64
 					bsz, kv_seqlen, _ = past_key_states[0].size()
 					if self.engine_config.Basic_Config.kv_dtype == "bfloat16":
@@ -1008,6 +983,16 @@ class BatchGenWorker:
 		step_start = time.perf_counter()
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		logging.info(f"configure_prefill took {time.perf_counter() - step_start:.4f}s")
+
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after self.parallel_manager.configure_prefill(): {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after self.parallel_manager.configure_prefill(): {free_memory} GB / {total_memory} GB"
+		)
 		
 		# Step 2: Set phase
 		step_start = time.perf_counter()
@@ -1070,12 +1055,31 @@ class BatchGenWorker:
 			world_size=world_size,
 			device=dev
 		)
-		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
+		# print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
+		logging.info(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage before init nvshmem: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory before init nvshmem: {free_memory} GB / {total_memory} GB"
+		)
 		self.init_nvshmem()
+		free_memory, total_memory = torch.cuda.mem_get_info()
+		free_memory = free_memory / 1024 / 1024 / 1024
+		total_memory = total_memory / 1024 / 1024 / 1024
+		logging.info(
+			f"Rank: {self.rank} Device torch memory usage after init nvshmem: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
+		)
+		logging.info(
+			f"Rank: {self.rank} Device torch free memory after init nvshmem: {free_memory} GB / {total_memory} GB"
+		)
 		
 		# Initialize symmetric memory once during model initialization
 		# if not symm_mem.is_nvshmem_available():
@@ -1855,6 +1859,7 @@ class BatchGenWorker:
 		
 		# Step 1: Set model to eval and disable gradients
 		self.model.eval()
+		self.model.to('cpu')
 		with torch.no_grad():
 			# Step 2: Recursively clear all module parameters and buffers
 			def clear_module(module):

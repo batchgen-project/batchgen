@@ -1,5 +1,5 @@
 """
-	For Hooper GPU.
+	For Hopper GPU.
 	- prefill_fa3()
 """
 import torch
@@ -23,7 +23,7 @@ def mla_prefill_flashattention3(
 	position_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
-		MLA prefifill on hooper device.
+		MLA prefifill on hopper device.
 		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
 	"""
 	bsz, seq_len, _ = hidden_states.shape
@@ -547,7 +547,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
-		MLA prefifill on hooper device.
+		MLA prefifill on hopper device.
 		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
 	"""
 	bsz, seq_len, _ = hidden_states.shape
@@ -688,7 +688,7 @@ def mla_prefill_w8a16_deepgemm(
 
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
-		MLA prefifill on hooper device.
+		MLA prefifill on hopper device.
 		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
 	"""
 	bsz, seq_len, _ = hidden_states.shape
@@ -790,7 +790,7 @@ def mla_prefill_flashattention3_fused_dequant(
 
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
-		MLA prefifill on hooper device.
+		MLA prefifill on hopper device.
 		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
 	"""
 	# logging.info(f"Rank {dist.get_rank()} start")

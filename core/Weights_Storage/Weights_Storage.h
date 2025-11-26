@@ -1,20 +1,20 @@
 // clang-format off
 /* ----------------------------------------------------------------------------  *
- *  BatchGen                                                                      *
- *  copyright (c) EfficientMoE team 2025                                             *
- *                                                                               *
- *  licensed under the apache license, version 2.0 (the "license");              *
- *  you may not use this file except in compliance with the license.             *
- *                                                                               *
- *  you may obtain a copy of the license at                                      *
- *                                                                               *
- *                  http://www.apache.org/licenses/license-2.0                   *
- *                                                                               *
- *  unless required by applicable law or agreed to in writing, software          *
- *  distributed under the license is distributed on an "as is" basis,            *
- *  without warranties or conditions of any kind, either express or implied.     *
- *  see the license for the specific language governing permissions and          *
- *  limitations under the license.                                               *
+ * BatchGen                                                                      *
+ * copyright (c) EfficientMoE team 2025                                             *
+ * *
+ * licensed under the apache license, version 2.0 (the "license");              *
+ * you may not use this file except in compliance with the license.             *
+ * *
+ * you may obtain a copy of the license at                                      *
+ * *
+ * http://www.apache.org/licenses/license-2.0                   *
+ * *
+ * unless required by applicable law or agreed to in writing, software          *
+ * distributed under the license is distributed on an "as is" basis,            *
+ * without warranties or conditions of any kind, either express or implied.     *
+ * see the license for the specific language governing permissions and          *
+ * limitations under the license.                                               *
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
@@ -35,7 +35,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
-#include <torch/extension.h>
 
 namespace py = pybind11;
 
@@ -56,29 +55,28 @@ struct tensor_buffer {
 
 class Weights_Storage {
    public:
-    Weights_Storage(const EngineConfig& engine_config,
-                    const ModelConfig& model_config);
+    // Simplified Constructor: takes device_id directly
+    Weights_Storage(int device_id);
+    
     ~Weights_Storage();
+    
     void Init(std::string& shm_name, int64_t byte_size,
-              std::unordered_map<std::string,
-                                 std::unordered_map<std::string, tensor_meta>>
-                  module_weights_shm, bool enable_hugetlbfs);
+                std::string& tensor_meta_shm_name, bool enable_hugetlbfs);
+                  
     std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
         std::string module_key);
 
-    // std::unordered_map<std::string, torch::Tensor> get_tensor(
-    //     std::string module_key);
+    // Returns Python Dictionary for Pybind11
     py::dict get_tensor(std::string module_key);
 
    private:
-    /* Template */
-    const EngineConfig& engine_config_;
-    const ModelConfig& model_config_;
+    int device_id_; // Stored device ID
     std::shared_ptr<spdlog::logger> logger;
 
     std::string shm_name;
     void* weight_ptr_;
     int64_t byte_size_;
+    
     /* "attn_0" -> "o_proj" -> ptr */
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_buffer>>

@@ -38,7 +38,7 @@ class Scheduler:
 		attn_decoding_micro_batch_size = MAGIC_NUM // self.Max_Prompt_Length
 		# Down round attn_decoding_micro_batch_size to nearest expon of 2
 		attn_decoding_micro_batch_size = 2 ** (attn_decoding_micro_batch_size.bit_length() - 1)
-		est_kv_cp_t_per_micro_batch = attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) / 52 * 1000 # in ms
+		# est_kv_cp_t_per_micro_batch = attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) / 52 * 1000 # in ms
 		# num_k_buffer = self.compute_profiler.profile(MoE_module) // est_kv_cp_t_per_micro_batch + 2
 		num_k_buffer = 6
 		k_buffer_size = num_k_buffer * attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) * kv_element_size # in GB
@@ -110,7 +110,7 @@ class Scheduler:
 		# self.config.Basic_Config.kv_dtype = "float8_e4m3fn"
 		# self.config.Basic_Config.activation_dtype = "bfloat16"
 		# self.config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
-		# self.config.Basic_Config.gpu_arch = "hooper"
+		# self.config.Basic_Config.gpu_arch = "hopper"
 		
 		
 		""" Default Module Batching Config """

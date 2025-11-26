@@ -65,82 +65,187 @@ torch::ScalarType str_to_torch_dtype(const std::string& dtype_str) {
     return torch::kFloat32;
 }
 
+// Basic_Config parse_basic_config(const py::object& engine_config) {
+//     Basic_Config basic_config;
+//     py::object basic_config_obj = engine_config.attr("Basic_Config");
+//     basic_config.log_level =
+//         basic_config_obj.attr("log_level").cast<std::string>();
+//     basic_config.device = basic_config_obj.attr("device").cast<int64_t>();
+//     basic_config.device_torch =
+//         torch::Device(torch::kCUDA, basic_config.device);
+//     // basic_config.dtype_str =
+//     //     basic_config_obj.attr("dtype_str").cast<std::string>();
+//     basic_config.weight_dtype =
+//         basic_config_obj.attr("weight_dtype").cast<std::string>();
+//     basic_config.weight_dtype_torch =
+//         str_to_torch_dtype(basic_config.weight_dtype);
+//     basic_config.kv_dtype = 
+//         basic_config_obj.attr("kv_dtype").cast<std::string>();
+//     basic_config.kv_dtype_torch =
+//         str_to_torch_dtype(basic_config.kv_dtype);
+//     basic_config.activation_dtype =
+//         basic_config_obj.attr("activation_dtype").cast<std::string>();
+//     basic_config.activation_dtype_torch =
+//         str_to_torch_dtype(basic_config.activation_dtype);
+
+//     basic_config.attn_mode = basic_config_obj.attr("attn_mode").cast<int64_t>();
+//     basic_config.num_threads =
+//         basic_config_obj.attr("num_threads").cast<int64_t>();
+//     basic_config.module_types =
+//         basic_config_obj.attr("module_types").cast<std::vector<std::string>>();
+//     basic_config.rank = 
+//         basic_config_obj.attr("rank").cast<int64_t>();
+//     basic_config.world_size = 
+//         basic_config_obj.attr("world_size").cast<int64_t>();    
+//     return basic_config;
+// };
+
 Basic_Config parse_basic_config(const py::object& engine_config) {
+    std::cout << "DEBUG: Parsing Basic_Config..." << std::endl;
     Basic_Config basic_config;
     py::object basic_config_obj = engine_config.attr("Basic_Config");
-    basic_config.log_level =
-        basic_config_obj.attr("log_level").cast<std::string>();
+    
+    std::cout << "DEBUG: Parsing log_level" << std::endl;
+    basic_config.log_level = basic_config_obj.attr("log_level").cast<std::string>();
+    
+    std::cout << "DEBUG: Parsing device" << std::endl;
     basic_config.device = basic_config_obj.attr("device").cast<int64_t>();
-    basic_config.device_torch =
-        torch::Device(torch::kCUDA, basic_config.device);
-    // basic_config.dtype_str =
-    //     basic_config_obj.attr("dtype_str").cast<std::string>();
-    basic_config.weight_dtype =
-        basic_config_obj.attr("weight_dtype").cast<std::string>();
-    basic_config.weight_dtype_torch =
-        str_to_torch_dtype(basic_config.weight_dtype);
-    basic_config.kv_dtype = 
-        basic_config_obj.attr("kv_dtype").cast<std::string>();
-    basic_config.kv_dtype_torch =
-        str_to_torch_dtype(basic_config.kv_dtype);
-    basic_config.activation_dtype =
-        basic_config_obj.attr("activation_dtype").cast<std::string>();
-    basic_config.activation_dtype_torch =
-        str_to_torch_dtype(basic_config.activation_dtype);
+    basic_config.device_torch = torch::Device(torch::kCUDA, basic_config.device);
+    
+    std::cout << "DEBUG: Parsing weight_dtype" << std::endl;
+    basic_config.weight_dtype = basic_config_obj.attr("weight_dtype").cast<std::string>();
+    basic_config.weight_dtype_torch = str_to_torch_dtype(basic_config.weight_dtype);
+    
+    std::cout << "DEBUG: Parsing kv_dtype" << std::endl;
+    basic_config.kv_dtype = basic_config_obj.attr("kv_dtype").cast<std::string>();
+    basic_config.kv_dtype_torch = str_to_torch_dtype(basic_config.kv_dtype);
+    
+    std::cout << "DEBUG: Parsing activation_dtype" << std::endl;
+    basic_config.activation_dtype = basic_config_obj.attr("activation_dtype").cast<std::string>();
+    basic_config.activation_dtype_torch = str_to_torch_dtype(basic_config.activation_dtype);
 
+    std::cout << "DEBUG: Parsing attn_mode" << std::endl;
     basic_config.attn_mode = basic_config_obj.attr("attn_mode").cast<int64_t>();
-    basic_config.num_threads =
-        basic_config_obj.attr("num_threads").cast<int64_t>();
-    basic_config.module_types =
-        basic_config_obj.attr("module_types").cast<std::vector<std::string>>();
-    basic_config.rank = 
-        basic_config_obj.attr("rank").cast<int64_t>();
-    basic_config.world_size = 
-        basic_config_obj.attr("world_size").cast<int64_t>();    
+    
+    std::cout << "DEBUG: Parsing num_threads" << std::endl;
+    basic_config.num_threads = basic_config_obj.attr("num_threads").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing module_types" << std::endl;
+    basic_config.module_types = basic_config_obj.attr("module_types").cast<std::vector<std::string>>();
+    
+    std::cout << "DEBUG: Parsing rank" << std::endl;
+    basic_config.rank = basic_config_obj.attr("rank").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing world_size" << std::endl;
+    basic_config.world_size = basic_config_obj.attr("world_size").cast<int64_t>();    
+    
     return basic_config;
 };
 
+// KV_Storage_Config parse_kv_storage_config(const py::object& engine_config) {
+//     KV_Storage_Config kv_storage_config;
+//     py::object kv_storage_config_obj = engine_config.attr("KV_Storage_Config");
+//     kv_storage_config.num_host_slots =
+//         kv_storage_config_obj.attr("num_host_slots").cast<int64_t>();
+//     kv_storage_config.reserved_length =
+//         kv_storage_config_obj.attr("reserved_length").cast<int64_t>();
+//     kv_storage_config.slot_byte_size =
+//         kv_storage_config_obj.attr("slot_byte_size").cast<int64_t>();
+//     kv_storage_config.storage_byte_size =
+//         kv_storage_config_obj.attr("storage_byte_size").cast<int64_t>();
+//     return kv_storage_config;
+// };
+
 KV_Storage_Config parse_kv_storage_config(const py::object& engine_config) {
+    std::cout << "DEBUG: Parsing KV_Storage_Config..." << std::endl;
     KV_Storage_Config kv_storage_config;
     py::object kv_storage_config_obj = engine_config.attr("KV_Storage_Config");
-    kv_storage_config.num_host_slots =
-        kv_storage_config_obj.attr("num_host_slots").cast<int64_t>();
-    kv_storage_config.reserved_length =
-        kv_storage_config_obj.attr("reserved_length").cast<int64_t>();
-    kv_storage_config.slot_byte_size =
-        kv_storage_config_obj.attr("slot_byte_size").cast<int64_t>();
-    kv_storage_config.storage_byte_size =
-        kv_storage_config_obj.attr("storage_byte_size").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing num_host_slots" << std::endl;
+    kv_storage_config.num_host_slots = kv_storage_config_obj.attr("num_host_slots").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing reserved_length" << std::endl;
+    kv_storage_config.reserved_length = kv_storage_config_obj.attr("reserved_length").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing slot_byte_size" << std::endl;
+    kv_storage_config.slot_byte_size = kv_storage_config_obj.attr("slot_byte_size").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing storage_byte_size" << std::endl;
+    kv_storage_config.storage_byte_size = kv_storage_config_obj.attr("storage_byte_size").cast<int64_t>();
+    
     return kv_storage_config;
 };
 
+// GPU_Buffer_Config parse_gpu_buffer_config(const py::object& engine_config) {
+//     GPU_Buffer_Config gpu_buffer_config;
+//     const py::object& gpu_buffer_config_obj =
+//         engine_config.attr("GPU_Buffer_Config");
+//     gpu_buffer_config.num_prefill_module_buffer =
+//         gpu_buffer_config_obj.attr("num_prefill_module_buffer")
+//             .cast<std::unordered_map<std::string, int64_t>>();
+//     gpu_buffer_config.num_decoding_module_buffer =
+//         gpu_buffer_config_obj.attr("num_decoding_module_buffer")
+//             .cast<std::unordered_map<std::string, int64_t>>();
+//     gpu_buffer_config.num_k_buffer =
+//         gpu_buffer_config_obj.attr("num_k_buffer").cast<int64_t>();
+//     gpu_buffer_config.num_v_buffer =
+//         gpu_buffer_config_obj.attr("num_v_buffer").cast<int64_t>();
+
+//     gpu_buffer_config.kv_buffer_num_tokens =
+//         gpu_buffer_config_obj.attr("kv_buffer_num_tokens").cast<int64_t>();
+//     py::dict module_shapes_py =
+//         gpu_buffer_config_obj.attr("module_shapes").cast<py::dict>();
+//     for (auto item : module_shapes_py) {
+//         std::string module_type = item.first.cast<std::string>();
+//         py::dict module_shape_dict = item.second.cast<py::dict>();
+//         std::unordered_map<std::string, std::vector<int64_t>> module_shape;
+//         for (auto item : module_shape_dict) {
+//             std::string module_name = item.first.cast<std::string>();
+//             std::vector<int64_t> shape =
+//                 item.second.cast<std::vector<int64_t>>();
+//             module_shape[module_name] = shape;
+//         }
+//         gpu_buffer_config.module_shapes[module_type] = module_shape;
+//     }
+//     return gpu_buffer_config;
+// };
+
 GPU_Buffer_Config parse_gpu_buffer_config(const py::object& engine_config) {
+    std::cout << "DEBUG: Parsing GPU_Buffer_Config..." << std::endl;
     GPU_Buffer_Config gpu_buffer_config;
-    const py::object& gpu_buffer_config_obj =
-        engine_config.attr("GPU_Buffer_Config");
+    const py::object& gpu_buffer_config_obj = engine_config.attr("GPU_Buffer_Config");
+
+    std::cout << "DEBUG: Parsing num_prefill_module_buffer" << std::endl;
     gpu_buffer_config.num_prefill_module_buffer =
         gpu_buffer_config_obj.attr("num_prefill_module_buffer")
             .cast<std::unordered_map<std::string, int64_t>>();
+            
+    std::cout << "DEBUG: Parsing num_decoding_module_buffer" << std::endl;
     gpu_buffer_config.num_decoding_module_buffer =
         gpu_buffer_config_obj.attr("num_decoding_module_buffer")
             .cast<std::unordered_map<std::string, int64_t>>();
-    gpu_buffer_config.num_k_buffer =
-        gpu_buffer_config_obj.attr("num_k_buffer").cast<int64_t>();
-    gpu_buffer_config.num_v_buffer =
-        gpu_buffer_config_obj.attr("num_v_buffer").cast<int64_t>();
+            
+    std::cout << "DEBUG: Parsing num_k_buffer" << std::endl;
+    gpu_buffer_config.num_k_buffer = gpu_buffer_config_obj.attr("num_k_buffer").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing num_v_buffer" << std::endl;
+    gpu_buffer_config.num_v_buffer = gpu_buffer_config_obj.attr("num_v_buffer").cast<int64_t>();
 
-    gpu_buffer_config.kv_buffer_num_tokens =
-        gpu_buffer_config_obj.attr("kv_buffer_num_tokens").cast<int64_t>();
-    py::dict module_shapes_py =
-        gpu_buffer_config_obj.attr("module_shapes").cast<py::dict>();
+    std::cout << "DEBUG: Parsing kv_buffer_num_tokens" << std::endl;
+    gpu_buffer_config.kv_buffer_num_tokens = gpu_buffer_config_obj.attr("kv_buffer_num_tokens").cast<int64_t>();
+    
+    std::cout << "DEBUG: Parsing module_shapes" << std::endl;
+    py::dict module_shapes_py = gpu_buffer_config_obj.attr("module_shapes").cast<py::dict>();
+    
     for (auto item : module_shapes_py) {
         std::string module_type = item.first.cast<std::string>();
         py::dict module_shape_dict = item.second.cast<py::dict>();
         std::unordered_map<std::string, std::vector<int64_t>> module_shape;
-        for (auto item : module_shape_dict) {
-            std::string module_name = item.first.cast<std::string>();
-            std::vector<int64_t> shape =
-                item.second.cast<std::vector<int64_t>>();
+        for (auto inner_item : module_shape_dict) { // Renamed to avoid shadowing
+            std::string module_name = inner_item.first.cast<std::string>();
+            // This line is a common failure point if Python passes a single int instead of a list
+            std::cout << "DEBUG: Parsing shape for " << module_name << std::endl;
+            std::vector<int64_t> shape = inner_item.second.cast<std::vector<int64_t>>();
             module_shape[module_name] = shape;
         }
         gpu_buffer_config.module_shapes[module_type] = module_shape;
@@ -162,7 +267,7 @@ Module_Batching_Config parse_module_batching_config(
     // module_batching_config_obj.attr("expert_prefill_batch_size_upper_bound").cast<int64_t>();
     // module_batching_config.expert_decoding_batch_size_upper_bound =
     // module_batching_config_obj.attr("expert_decoding_batch_size_upper_bound").cast<int64_t>();
-    // std::cerr << "Parsing Module_Batching_Config Done" << std::endl;
+    std::cout << "Parsing Module_Batching_Config Done" << std::endl;
     return module_batching_config;
 };
 

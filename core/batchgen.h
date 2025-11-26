@@ -44,12 +44,13 @@ namespace py = pybind11;
 
 class BatchGen {
    public:
-    BatchGen(py::object engine_config, py::object model_config);
+    BatchGen(py::object engine_config, py::object model_config, Weights_Storage& weights_storage);
 
     ~BatchGen();
 
-    void Init(std::string& shm_name, std::string& tensor_meta_shm_name,
-            int64_t byte_size, bool enable_hugetlbfs);
+    void Init();
+    void init_weight_storage(std::string& shm_name, std::string& tensor_meta_shm_name,
+                    int64_t byte_size, bool enable_hugetlbfs);
     void Terminate();
 
     /*
@@ -146,11 +147,13 @@ class BatchGen {
     std::string shm_name_;
     std::string tensor_meta_shm_name_;
     KV_Storage kv_storage_;
-    Weights_Storage weights_storage_;
+    // Weights_Storage* weights_storage_ptr_;
+    Weights_Storage& weights_storage_;
     HtoD_Engine h2d_engine_;
     DtoH_Engine d2h_engine_;
     GPU_Weight_Buffer gpu_weight_buffer_;
     GPU_KV_Buffer gpu_kv_buffer_;
+
     py::object parameter_server_;
 
     Hetero_Attn hetero_attn_;

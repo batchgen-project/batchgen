@@ -68,30 +68,48 @@ class BatchGenClient:
 if __name__ == "__main__":
     # Configuration
     HOST = 'localhost'
-    PORT = 32000
+    PORT = 10900  # Matches your Server default
 
     client = BatchGenClient(HOST, PORT)
     client.connect()
 
     if client.sock:
-        # --- TEST 1: List of Strings ---
-        print("\n--- Test 1: Sending List of Strings ---")
-        str_payload = [
-            "Tell me a joke about AI.",
-            "What is the capital of France?",
-            "Explain quantum physics in 5 words."
-        ]
-        response = client.send_request(str_payload)
-        print(f"Response type: {type(response)}")
+        # --- TEST 1: Standard Inference Request ---
+        print("\n--- Test 1: Sending Structured Inference Request ---")
+        
+        # New Payload Structure
+        payload = {
+            "command": "submit_inference",
+            "queries": [
+                "Tell me a joke about AI.",
+                "What is the capital of France?",
+                "Explain quantum physics in 5 words."
+            ],
+            # Params required by the new worker logic
+            "max_input_len": 512, 
+            "max_output_len": 64
+        }
+        
+        start_t = time.perf_counter()
+        response = client.send_request(payload)
+        dur = time.perf_counter() - start_t
+        
+        print(f"Time taken: {dur:.4f}s")
         print(f"Result: {response}")
 
-        # --- TEST 2: List of Dictionaries (Advanced) ---
-        print("\n--- Test 2: Sending List of Dicts ---")
-        dict_payload = [
-            {"role": "user", "content": "Hello!"},
-            {"role": "user", "content": "Translate this to Spanish."}
-        ]
-        response = client.send_request(dict_payload)
+        # --- TEST 2: Long Context Request (Different Params) ---
+        print("\n--- Test 2: Sending Long Context Request ---")
+        
+        payload_long = {
+            "command": "submit_inference",
+            "queries": [
+                "Write a short poem about rust.",
+            ],
+            "max_input_len": 2048, 
+            "max_output_len": 256 # Requesting longer output
+        }
+        
+        response = client.send_request(payload_long)
         print(f"Result: {response}")
 
         # --- TEST 3: Server Command (Ping) ---

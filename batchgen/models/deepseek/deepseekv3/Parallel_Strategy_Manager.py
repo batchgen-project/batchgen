@@ -765,7 +765,7 @@ class DeepseekV3ParallelStrategyManager:
 		start_time = time.perf_counter()
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
-			if self.engine_config.Basic_Config.gpu_arch == "hooper":
+			if self.engine_config.Basic_Config.gpu_arch == "hopper":
 				from ....attention.mla.fa3_backend import (
 					mla_prefill_flashattention3, 
 					mla_prefill_flashattention3_w8a16_deepgemm,

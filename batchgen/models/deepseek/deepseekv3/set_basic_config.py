@@ -110,8 +110,8 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 	if not input_arguments.get('gpu_arch', None):
 		raise ValueError("GPU architecture must be specified")
 	else:
-		if input_arguments.gpu_arch.lower() not in ['hooper', 'ampere']:
-			raise ValueError("Currently gpu_arch must be 'hooper', or 'ampere'")
+		if input_arguments.gpu_arch.lower() not in ['hopper', 'ampere']:
+			raise ValueError("Currently gpu_arch must be 'hopper', or 'ampere'")
 		engine_config.Basic_Config.gpu_arch = input_arguments.gpu_arch.lower()
 
 

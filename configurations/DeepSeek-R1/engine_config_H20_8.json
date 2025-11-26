@@ -5,7 +5,7 @@
 	  "kv_dtype": "float8_e4m3fn",
 	  "activation_dtype": "bfloat16",
 	  "module_types": ["attn", "routed_expert", "shared_expert"],
-	  "gpu_arch": "hooper"
+	  "gpu_arch": "hopper"
 	},
 
 	"Module_Batching_Config": {

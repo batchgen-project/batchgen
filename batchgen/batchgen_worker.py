@@ -36,13 +36,14 @@ from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUKVCacheManager
+from batchgen.models.engine_loader import core_engine
 
 
-logging.basicConfig(
-	level=logging.INFO,  # Set to the lowest level to capture all messages
-	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-	datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
-)
+# logging.basicConfig(
+# 	level=logging.INFO,  # Set to the lowest level to capture all messages
+# 	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+# 	datefmt="%Y-%m-%d %H:%M:%S",  # Customize timestamp format
+# )
 
 from .scheduler.scheduler import Scheduler
 # nvtx = False
@@ -69,6 +70,7 @@ class query:
 		self.decoded_tokens = decoded_tokens
 
 
+
 @dataclass
 class InputArguments:
 	"""Input arguments as a dataclass with type hints"""
@@ -92,7 +94,7 @@ class InputArguments:
 	rank: int = 0
 	global_rank: int = 0
 	world_size: int = 1
-	gpu_arch: str = "hooper"
+	gpu_arch: str = "hopper"
 
 	def get(self, key, default=None):
 		"""Get attribute value with a default fallback"""
@@ -123,81 +125,106 @@ class BatchGenWorkerArgs:
 	hf_cache_dir: Optional[str]
 	cache_dir: Optional[str]
 	pt_ckpt_dir: Optional[str]
+	host_kv_cache_size: int
+
+	shm_name: str
+	tensor_meta_shm_name: str
+	enable_hugetlbfs: bool
+	weight_byte_size: int
+	skeleton_state_dict: Optional[Dict]
 
 	device: int
 	kv_dtype: str
 	gpu_arch: str
 
+
 class BatchGenWorker:
-	def __init__(
-		self,
-		huggingface_ckpt_name: str,
-		hf_cache_dir: Optional[str],
-		cache_dir: Optional[str],
-		pt_ckpt_dir: Optional[str],
-		queries: List[str],
-		max_input_length: int,
-		max_decoding_length: int,
-		device: int,
-		skeleton_state_dict,
-		shm_name,
-		tensor_meta_shm_name,
-		engine_config_json_dir = None, # Will be deprecated in the future
-		host_kv_cache_size: Optional[int] = None,
-		kv_dtype: str = "bfloat16",
-		dist_init_addr: str = "localhost:12355",
-		local_rank: Optional[int] = 0,
-		global_rank: Optional[int] = 0,
-		world_size: Optional[int] = 1,
-		gpu_arch: str = "hooper"
-	):
+	"""
+	Inference Runtime.
+	
+	"""
+	def __init__(self, args: BatchGenWorkerArgs):
+		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
+		self.args = args
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
 		# hf_cache_dir will be deprecated in the future.
-		if (hf_cache_dir is None) and (cache_dir is not None):
-			self.hf_cache_dir = cache_dir
-		self.huggingface_ckpt_name = huggingface_ckpt_name
-		self.cache_dir = cache_dir
-		self.pt_ckpt_dir = pt_ckpt_dir
-		self.global_queries = queries
-		# self.num_queries = len(queries)
+		if (args.hf_cache_dir is None) and (args.cache_dir is not None):
+			self.hf_cache_dir = args.cache_dir
+		self.huggingface_ckpt_name = args.model_name
+		self.cache_dir = args.cache_dir
+		self.pt_ckpt_dir = args.pt_ckpt_dir
+		# self.max_input_length = max_input_length
+		# self.max_decoding_length = max_decoding_length
+		self.skeleton_state_dict = args.skeleton_state_dict
+		# self.rank = rank
+		self.dist_init_addr = args.dist_init_addr
+		self.local_rank = args.local_rank
+		self.global_rank = args.global_rank
+		self.rank = args.global_rank
+		self.world_size = args.world_size
+		self.gpu_arch = args.gpu_arch
+		# self.engine_config_json_dir = engine_config_json_dir
+		self.kv_dtype = args.kv_dtype
+
+		self.shm_name = args.shm_name
+		self.tensor_meta_shm_name = args.tensor_meta_shm_name
+		logging.info(f"Rank {self.rank}: Initializing shared memory segments.")
+		logging.info(f"Rank {self.rank}: shm_name: {self.shm_name}, tensor_meta_shm_name: {self.tensor_meta_shm_name}, weight_byte_size: {self.args.weight_byte_size}, enable_hugetlbfs: {self.args.enable_hugetlbfs}")
+		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
+		# self.core_engine.init_weight_storage(self.shm_name, self.tensor_meta_shm_name,
+		# 			self.args.weight_byte_size, 
+		# 			self.args.enable_hugetlbfs)
+		self.weights_storage.Init(self.shm_name, self.args.weight_byte_size, 
+					self.tensor_meta_shm_name,
+					self.args.enable_hugetlbfs)	
+		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
+
+
+
+	def Init(self, max_input_length, max_decoding_length, num_queries):
 		self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
-		self.skeleton_state_dict = skeleton_state_dict
-		# self.rank = rank
-		self.dist_init_addr = dist_init_addr
-		self.local_rank = local_rank
-		self.global_rank = global_rank
-		self.rank = global_rank
-		self.world_size = world_size
-		self.gpu_arch = gpu_arch
-		self.engine_config_json_dir = engine_config_json_dir
-		self.kv_dtype = kv_dtype
+		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
+		config_torch_module_initializer()
+		self.model_config = AutoConfig.from_pretrained(
+			self.hf_cache_dir,
+			trust_remote_code=True,
+			local_files_only=True,
+		)
+		self.tokenizer = AutoTokenizer.from_pretrained(
+			# self.huggingface_ckpt_name,
+			self.hf_cache_dir,
+			# cache_dir=self.hf_cache_dir,
+			trust_remote_code=True,
+			local_files_only=True,
+		)
+		self.tokenizer.padding_side = "right"
 
-
-		config_scheduler = Scheduler(max_input_length, max_decoding_length, world_size)
+		logging.info(f"Rank {self.rank}: Start initializing engine config.")
+		config_scheduler = Scheduler(self.max_input_length, self.max_decoding_length, self.args.world_size)
 		self.engine_config = config_scheduler.generate_config()
 		# self.engine_config = parse_config_from_json(engine_config_json_dir)
-		self.engine_config.Basic_Config.device = device
+		self.engine_config.Basic_Config.device = self.args.device
 		self.engine_config.Basic_Config.device_torch = torch.device(
-			f"cuda:{device}"
+			f"cuda:{self.args.device}"
 		)
 		self.engine_config.Basic_Config.max_decoding_length = (
 			max_decoding_length
 		)
-		self.engine_config.Basic_Config.padding_length = max_input_length
+		self.engine_config.Basic_Config.padding_length = self.max_input_length
 		# self.engine_config.Basic_Config.num_queries = self.num_queries
 		self.engine_config.Basic_Config.rank = self.global_rank
-		self.engine_config.Basic_Config.world_size = world_size
+		self.engine_config.Basic_Config.world_size = self.world_size
 
-		if(self.rank == 0):
-			print(self.engine_config)
+		# if(self.rank == 0):
+		# 	print(self.engine_config)
 		if not self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens:
 			logging.warning(f"kv_buffer_num_tokens is set to {self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens}")
 			# exit()
-		self.device = device
-		self.torch_device = torch.device(f"cuda:{device}")
-		self.host_kv_cache_size = host_kv_cache_size
+		self.device = self.args.device
+		self.torch_device = torch.device(f"cuda:{self.args.device}")
+		self.host_kv_cache_size = self.args.host_kv_cache_size
 
 		self.attn_mode = None
 		self.query_book = None
@@ -208,46 +235,6 @@ class BatchGenWorker:
 			50 * (1024**3) / 32 / 2048
 		)  # 50G k cache, 50G v cache. 192G test-bed.
 
-		self.shm_name = shm_name
-		self.tensor_meta_shm_name = tensor_meta_shm_name
-
-		# free_memory, total_memory = torch.cuda.mem_get_info()
-		# gpu0_memory = free_memory / 1024 / 1024 / 1024
-		# total_memory = total_memory / 1024 / 1024 / 1024
-		# logging.info(f"GPU 0 free memory moegen instantiate: {gpu0_memory} GB / {total_memory} GB")
-
-
-
-	def Init(self):
-		logging.info(f"Initializing batchgen with global rank {self.global_rank} and world size {self.world_size} with PID: {os.getpid()}")
-		torch.cuda.set_device(self.device)
-		COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
-		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
-		self._init_torch_dist()
-
-		torch.cuda.reset_peak_memory_stats()
-		logging.info(self.hf_cache_dir)
-		self.model_config = AutoConfig.from_pretrained(
-			self.hf_cache_dir,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
-		config_torch_module_initializer()
-		self.tokenizer = AutoTokenizer.from_pretrained(
-			# self.huggingface_ckpt_name,
-			self.hf_cache_dir,
-			# cache_dir=self.hf_cache_dir,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
-		# Use flash_attn by default thus right padding.
-		self.tokenizer.padding_side = "right"
-
-		# self.queries, self.model_batches = self.vanilla_batching(
-		# 	self.global_queries, self.global_rank, self.world_size)
-		# self.num_queries = len(self.queries)
-		# # TODO: Move to centralized config later.
-		# self.engine_config.Basic_Config.num_queries = self.num_queries
 		input_arguments = {
 			"huggingface_ckpt_name": self.huggingface_ckpt_name,
 			"hf_cache_dir": self.hf_cache_dir,
@@ -260,7 +247,7 @@ class BatchGenWorker:
 			"skeleton_state_dict": self.skeleton_state_dict,
 			"shm_name": self.shm_name,
 			"tensor_meta_shm_name": self.tensor_meta_shm_name,
-			"engine_config_json_dir": self.engine_config_json_dir,
+			"engine_config_json_dir": None,
 			"host_kv_cache_size": self.host_kv_cache_size,
 			"kv_dtype": self.kv_dtype,
 			# "num_queries": len(self.queries),
@@ -272,17 +259,20 @@ class BatchGenWorker:
 			"gpu_arch": self.gpu_arch
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
+		# if self.global_rank == 0:
+		# 	logging.info(f"Input Arguments for Initializer: {input_arguments}")
+			
 		self.input_arguments = InputArguments(**input_arguments)
 		self.initializer = get_initializer(self.huggingface_ckpt_name)
 		self.initializer = self.initializer(self.input_arguments)
 		self.core_engine, self.engine_config, self.model_config, self.hf_model_config = (
-			self.initializer.Init()
+			self.initializer.Init(self.weights_storage)
 		)
-		self.queries, self.model_batches = self.vanilla_batching(
-			self.global_queries, self.global_rank, self.world_size)
-		self.num_queries = len(self.queries)
+		# self.queries, self.model_batches = self.vanilla_batching(
+		# 	self.global_queries, self.global_rank, self.world_size)
+		# self.num_queries = len(self.queries)
 		# TODO: Move to centralized config later.
-		self.engine_config.Basic_Config.num_queries = self.num_queries
+		self.engine_config.Basic_Config.num_queries = num_queries
 		
 		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
 		self.parallel_manager = self.parallel_manager(
@@ -291,6 +281,7 @@ class BatchGenWorker:
 			self.model_config,
 			self.core_engine,
 			self.skeleton_state_dict,
+			# None,
 			self.local_rank,
 			self.global_rank,
 			self.world_size
@@ -298,182 +289,14 @@ class BatchGenWorker:
 				
 		logging.info(f"Engine on device {self.device} initialized.")
 
-	# def distribute_sequences(self, num_sequences, num_devices):
-	# 	"""
-	# 	Distributes sequences across devices ensuring each device gets at least one sequence when possible,
-	# 	and the distribution is as even as possible.
-		
-	# 	Args:
-	# 		num_sequences: Number of sequences to distribute
-	# 		num_devices: Number of available devices
-		
-	# 	Returns:
-	# 		List of (start_idx, end_idx) tuples for each device
-	# 	"""
-	# 	# If we have fewer sequences than devices, only use as many devices as we have sequences
-	# 	active_devices = min(num_sequences, num_devices)
-		
-	# 	# Calculate base sequences per device and remainder
-	# 	base_per_device = num_sequences // active_devices
-	# 	remainder = num_sequences % active_devices
-		
-	# 	distribution = []
-	# 	current_idx = 0
-		
-	# 	for device_idx in range(num_devices):
-	# 		if device_idx < active_devices:
-	# 			# This device gets work
-	# 			# Add one extra sequence for the first 'remainder' devices
-	# 			device_sequences = base_per_device + (1 if device_idx < remainder else 0)
-				
-	# 			start_idx = current_idx
-	# 			end_idx = start_idx + device_sequences
-	# 			current_idx = end_idx
-				
-	# 			distribution.append((start_idx, end_idx))
-	# 		else:
-	# 			# This device gets no work
-	# 			distribution.append((0, 0))  # Empty range
-		
-	# 	return distribution
 
-	# def vanilla_batching(self):
-	# 	"""
-	# 	For the input dataset, batch it to fill the host memory.
-	# 	"""
-	# 	# Step 0: Create mapping from query idx to query.
-	# 	self.query_book = {
-	# 		query_idx: query(
-	# 			text=text,
-	# 			decoded_tokens=torch.zeros(
-	# 				1, self.max_decoding_length, dtype=torch.int64
-	# 			),
-	# 		)
-	# 		for query_idx, text in enumerate(self.queries)
-	# 	}
-	# 	# Step 1: Tokenize full dataset and pad to mad_input_length.
-	# 	for query_idx, query_instance in self.query_book.items():
-	# 		tokenized_query = self.tokenizer(
-	# 			query_instance.text,
-	# 			return_tensors="pt",
-	# 			max_length=self.max_input_length,
-	# 			truncation=True,
-	# 			padding="max_length",
-	# 		)
-	# 		query_instance.encoded = tokenized_query
-	# 		extended_size = self.max_input_length + self.max_decoding_length
-	# 		input_ids_extended = torch.zeros(
-	# 			(1, extended_size), dtype=tokenized_query["input_ids"].dtype
-	# 		)
-	# 		attention_mask_extended = torch.zeros(
-	# 			(1, extended_size),
-	# 			dtype=tokenized_query["attention_mask"].dtype,
-	# 		)
-
-	# 		seq_len = tokenized_query["input_ids"].size(1)
-	# 		input_ids_extended[0, :seq_len] = tokenized_query["input_ids"][0, :]
-	# 		attention_mask_extended[0, :seq_len] = tokenized_query[
-	# 			"attention_mask"
-	# 		][0, :]
-
-	# 		tokenized_query["input_ids"] = input_ids_extended
-	# 		tokenized_query["attention_mask"] = attention_mask_extended
-	# 		query_instance.encoded = tokenized_query
-
-	# 	# Step 2: Create model batches. Batch size = self.engine_config.KV_Storage_Config.num_host_slots
-	# 	self.model_batches = []
-	# 	if self.engine_config.Basic_Config.attn_mode != 3:
-	# 		model_batch_size = self.engine_config.KV_Storage_Config.num_host_slots
-	# 	else:
-	# 		model_batch_size = min(self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size, self.engine_config.KV_Storage_Config.num_host_slots)
-		
-	# 	num_model_batch = math.ceil(
-	# 		self.num_queries
-	# 		/ model_batch_size
-	# 	)
-	# 	for model_batch_idx in range(num_model_batch):
-	# 		self.model_batches.append(
-	# 			list(
-	# 				range(
-	# 					model_batch_idx
-	# 					* model_batch_size,
-	# 					min(
-	# 						(model_batch_idx + 1)
-	# 						* model_batch_size,
-	# 						self.num_queries,
-	# 					),
-	# 				)
-	# 			)
-	# 		)
-
-	# 	logging.info(
-	# 		f"Number of model level batches: {len(self.model_batches)}"
-	# 	)
-	# 	logging.info(
-	# 		f"Model level batch size: {model_batch_size}"
-	# 	)
-
-	def distribute_sequences(self, num_sequences, num_devices):
+	def _tokenization(self, local_batch: List[str]):
 		"""
-		Distributes sequences across ALL devices as evenly as possible.
-		Some devices may get zero sequences if num_sequences < num_devices.
+		Handle tokenization of input sequences. 
+		Input: 
+		Output: 
 		
-		Args:
-			num_sequences: Number of sequences to distribute
-			num_devices: Number of available devices (all will be used)
-		
-		Returns:
-			List of (start_idx, end_idx) tuples for each device
 		"""
-		# Calculate base sequences per device and remainder
-		base_per_device = num_sequences // num_devices
-		remainder = num_sequences % num_devices
-		
-		distribution = []
-		current_idx = 0
-		
-		for device_idx in range(num_devices):
-			# Each device gets base_per_device sequences
-			# The first 'remainder' devices get one extra sequence
-			device_sequences = base_per_device + (1 if device_idx < remainder else 0)
-			
-			start_idx = current_idx
-			end_idx = start_idx + device_sequences
-			current_idx = end_idx
-			
-			distribution.append((start_idx, end_idx))
-		
-		return distribution
-
-	def vanilla_batching(self, global_queries, rank, num_devices):
-		"""
-		Distributes and batches queries for distributed inference.
-		Each rank gets its local slice of queries and creates batches.
-		All ranks will have the same number of batches, with empty lists where needed.
-		
-		Args:
-			global_queries: List of all queries across all devices
-			rank: Current device rank
-			num_devices: Total number of devices
-		
-		Returns:
-			tuple: (local_queries, model_batches)
-				- local_queries: List of queries assigned to this rank
-				- model_batches: List of batch lists, where each batch contains local query indices
-		"""
-		# Step 0: Distribute global queries to get local queries for this rank
-		num_global_queries = len(global_queries)
-		
-		# Distribute all queries across ALL ranks (all ranks are active)
-		distribution = self.distribute_sequences(num_global_queries, num_devices)
-		start_idx, end_idx = distribution[rank]
-		
-		# Extract local queries for this rank
-		local_queries = global_queries[start_idx:end_idx]
-		num_local_queries = len(local_queries)
-		
-		logging.info(f"Rank {rank}: Assigned global query range [{start_idx}, {end_idx}), local query count: {num_local_queries}")
-		
 		# Step 1: Create mapping from LOCAL query idx to query.
 		self.query_book = {
 			query_idx: query(
@@ -482,9 +305,9 @@ class BatchGenWorker:
 					1, self.max_decoding_length, dtype=torch.int64
 				),
 			)
-			for query_idx, text in enumerate(local_queries)
+			for query_idx, text in enumerate(local_batch)
 		}
-		
+
 		# Step 2: Tokenize local queries and pad to max_input_length.
 		for query_idx, query_instance in self.query_book.items():
 			tokenized_query = self.tokenizer(
@@ -514,6 +337,7 @@ class BatchGenWorker:
 			tokenized_query["attention_mask"] = attention_mask_extended
 			query_instance.encoded = tokenized_query
 
+	def _local_batching(self):
 		# Step 3: Determine batch size
 		if self.engine_config.Basic_Config.attn_mode != 3:
 			model_batch_size = self.engine_config.KV_Storage_Config.num_host_slots
@@ -525,7 +349,7 @@ class BatchGenWorker:
 		
 		# Step 4: Calculate the maximum number of batches based on the rank with most queries
 		# The rank with the most queries determines how many batches all ranks need
-		max_local_queries = math.ceil(num_global_queries / num_devices)
+		max_local_queries = math.ceil(self.num_global_queries / self.world_size)
 		max_num_batches = math.ceil(max_local_queries / model_batch_size)
 		
 		# Step 5: Create model batches for this rank's local queries
@@ -534,9 +358,9 @@ class BatchGenWorker:
 		for batch_idx in range(max_num_batches):
 			# Calculate the local batch range for this rank
 			local_batch_start = batch_idx * model_batch_size
-			local_batch_end = min((batch_idx + 1) * model_batch_size, num_local_queries)
+			local_batch_end = min((batch_idx + 1) * model_batch_size, self.num_local_queries)
 			
-			if local_batch_start < num_local_queries:
+			if local_batch_start < self.num_local_queries:
 				# This rank has sequences in this batch
 				local_indices = list(range(local_batch_start, local_batch_end))
 				model_batches.append(local_indices)
@@ -546,10 +370,9 @@ class BatchGenWorker:
 		
 		# Verification logging
 		logging.info(f"=" * 60)
-		logging.info(f"Rank {rank} Batching Summary:")
-		logging.info(f"  Total global queries: {num_global_queries}")
-		logging.info(f"  Assigned global range: [{start_idx}, {end_idx})")
-		logging.info(f"  Local query count: {num_local_queries}")
+		logging.info(f"Rank {self.rank} Batching Summary:")
+		logging.info(f"  Total global queries: {self.num_global_queries}")
+		logging.info(f"  Local query count: {self.num_local_queries}")
 		logging.info(f"  Model batch size: {model_batch_size}")
 		logging.info(f"  Max local queries per rank: {max_local_queries}")
 		logging.info(f"  Total batches (all ranks): {len(model_batches)}")
@@ -561,89 +384,18 @@ class BatchGenWorker:
 			else:
 				logging.info(f"    Batch {idx}: [] (empty)")
 		logging.info(f"=" * 60)
-		
-		return local_queries, model_batches
-			
+		return model_batches
 
-	def initial_batching(self):
+	def process_new_batch(self, batch: List[str], num_global_queries: int):
 		"""
-		For the input dataset, batch it to fill the host memory.
+		Future API.
 		"""
-		# Step 0: Create mapping from query idx to query.
-		self.query_book = {
-			query_idx: query(
-				text=text,
-				decoded_tokens=torch.zeros(
-					1, self.max_decoding_length, dtype=torch.int64
-				),
-			)
-			for query_idx, text in enumerate(self.queries)
-		}
+		self.num_global_queries = num_global_queries
+		self.num_local_queries = len(batch)
+		self._tokenization(batch)
+		self.model_batches = self._local_batching()
+		self.generate()
 
-		# Step 1: Tokenize full dataset.
-		tokenized_length = []
-		for query_idx, query_instance in self.query_book.items():
-			tokenized_query = self.tokenizer(
-				query_instance.text,
-				return_tensors="pt",
-				max_length=self.max_input_length,
-				truncation=True,
-				padding=False,
-			)
-			query_instance.encoded = tokenized_query
-			tokenized_length.append(
-				(query_idx, tokenized_query["input_ids"].shape[1])
-			)
-
-		# Step 2: Sort the tokenized queries by length
-		tokenized_length = sorted(
-			tokenized_length, key=lambda x: x[1], reverse=True
-		)
-
-		# Step 3: Create batches based on memory constraints
-		self.model_batches = []
-		current_query_num = 0
-		batch_idx = 0
-		while True:
-			current_batch = []
-			current_batch_padding_length = (
-				tokenized_length[0][1] + self.max_decoding_length
-			)
-			num_sequences = math.floor(
-				self.num_k_storage_tokens / current_batch_padding_length
-			)
-			if current_query_num + num_sequences > self.num_queries:
-				current_batch = tokenized_length[current_query_num:]
-			else:
-				current_batch = tokenized_length[
-					current_query_num : current_query_num + num_sequences
-				]
-			self.model_batches.append(current_batch)
-			self.model_batch_book[batch_idx] = {
-				"input_length": current_batch_padding_length,
-				"num_new_tokens": 0,
-			}
-			current_query_num += num_sequences
-			batch_idx += 1
-			if current_query_num >= self.num_queries:
-				break
-
-		# Step 4: Complete query instances for each sequences by padding to the same length.
-		for batch in self.model_batches:
-			max_length = batch[0][1]
-			for query_idx, _ in batch:
-				self.query_book[query_idx].encoded = self.tokenizer.pad(
-					self.query_book[query_idx].encoded,
-					max_length=max_length,
-					padding="max_length",
-				)
-
-		# Step 5: clearn model_batches as list of query idx.
-		self.model_batches = [
-			[query_idx for query_idx, _ in batch]
-			for batch in self.model_batches
-		]
-		logging.debug("Initial batching done.")
 
 	def generate(self):
 		self.comm = None
@@ -682,26 +434,10 @@ class BatchGenWorker:
 			range(len(self.model_batches)), desc="Model Batch"
 		):
 			dist.barrier()
-			free_memory, total_memory = torch.cuda.mem_get_info()
-			free_memory = free_memory / 1024 / 1024 / 1024
-			total_memory = total_memory / 1024 / 1024 / 1024
-			logging.info(
-				f"Rank: {self.rank} Device torch memory usage before config prefill: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-			)
-			logging.info(
-				f"Rank: {self.rank} Device torch free memory before config prefill: {free_memory} GB / {total_memory} GB"
-			)
+			# if self.rank == 0:
+			# 	logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
 			tmp_start = time.perf_counter()
 			self._config_prefill()
-			free_memory, total_memory = torch.cuda.mem_get_info()
-			free_memory = free_memory / 1024 / 1024 / 1024
-			total_memory = total_memory / 1024 / 1024 / 1024
-			logging.info(
-				f"Rank: {self.rank} Device torch memory usage after config prefill: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-			)
-			logging.info(
-				f"Rank: {self.rank} Device torch free memory after config prefill: {free_memory} GB / {total_memory} GB"
-			)
 			config_prefill_time += time.perf_counter() - tmp_start
 			prefill_start_time = time.perf_counter()
 			if len(self.model_batches[model_batch_idx]) > 0:
@@ -713,21 +449,6 @@ class BatchGenWorker:
 			prefill_time += time.perf_counter() - prefill_start_time
 			self._unregister_fp8_weights()
 			dist.barrier()
-
-
-			# Random create new token.
-			# new_token = torch.randint(
-			#     0,
-			#     1000,
-			#     # 129280, # self.model_config.vocab_size,
-			#     (len(self.model_batches[model_batch_idx]), 1),
-			#     device=self.torch_device,
-			# )
-			# self.update_new_token(new_token, self.model_batches[model_batch_idx], 0)
-			# logging.info("Entering kv_storage creation...")
-			# self.core_engine.create_fake_kv_storage()
-			# self.core_engine.start_h2d_worker()
-			# time.sleep(2)
 			
 			tmp_start = time.perf_counter()
 			torch.cuda.empty_cache()
@@ -765,17 +486,6 @@ class BatchGenWorker:
 
 
 					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
-
-					free_memory, total_memory = torch.cuda.mem_get_info()
-					free_memory = free_memory / 1024 / 1024 / 1024
-					total_memory = total_memory / 1024 / 1024 / 1024
-					logging.info(
-						f"Rank: {self.rank} Device torch memory usage after getting past key values: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
-					)
-					logging.info(
-						f"Rank: {self.rank} Device torch free memory after getting past key values: {free_memory} GB / {total_memory} GB"
-					)
-
 					# Pad the kv cache to be multiple of 64
 					bsz, kv_seqlen, _ = past_key_states[0].size()
 					if self.engine_config.Basic_Config.kv_dtype == "bfloat16":
@@ -820,34 +530,7 @@ class BatchGenWorker:
 			# gc.collect()
 			dist.barrier()
 		
-		
-		# else:
-		# 	# For small input batch, some worker might do not have any input.
-		# 	# In this case, it only participate in the decoding phase.
-		# 	# Todo: 
-		# 	self._config_decoding(0)
-
-		# 	# Log used memory before decoding
-		# 	if self.rank == 0:
-		# 		free_memory, total_memory = torch.cuda.mem_get_info()
-		# 		free_memory = free_memory / 1024 / 1024 / 1024
-		# 		total_memory = total_memory / 1024 / 1024 / 1024
-		# 		logging.info(
-		# 			f"Rank: {self.rank} Device torch memory usage before decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
-		# 		)
-		# 		logging.info(
-		# 			f"Rank: {self.rank} Device torch free memory before decoding: {free_memory} GB / {total_memory} GB"
-		# 		)
-		# 	dist.barrier()
-		# 	torch.cuda.empty_cache()
-		# 	decoding_start_time = time.perf_counter()
-		# 	with torch.inference_mode():
-		# 		self.decoding(None, None)
-		# 	decoding_time += time.perf_counter() - decoding_start_time
-		# 	self.core_engine.clear_kv_storage()
-
-
-		
+	
 		# dist.barrier()
 		generation_time = time.perf_counter() - generation_start_time
 
@@ -983,16 +666,6 @@ class BatchGenWorker:
 		step_start = time.perf_counter()
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		logging.info(f"configure_prefill took {time.perf_counter() - step_start:.4f}s")
-
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after self.parallel_manager.configure_prefill(): {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after self.parallel_manager.configure_prefill(): {free_memory} GB / {total_memory} GB"
-		)
 		
 		# Step 2: Set phase
 		step_start = time.perf_counter()
@@ -1055,31 +728,12 @@ class BatchGenWorker:
 			world_size=world_size,
 			device=dev
 		)
-		# print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
-		logging.info(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
+		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
 	
 	def _config_decoding(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage before init nvshmem: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory before init nvshmem: {free_memory} GB / {total_memory} GB"
-		)
 		self.init_nvshmem()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after init nvshmem: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after init nvshmem: {free_memory} GB / {total_memory} GB"
-		)
 		
 		# Initialize symmetric memory once during model initialization
 		# if not symm_mem.is_nvshmem_available():
@@ -1905,3 +1559,5 @@ class BatchGenWorker:
 			gc.collect()
 			if torch.cuda.is_available():
 				torch.cuda.empty_cache()
+
+
