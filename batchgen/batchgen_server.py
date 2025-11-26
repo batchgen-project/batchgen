@@ -144,7 +144,7 @@ class BatchGenServer:
 			model_name=self.args.model
 		)
 		host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
-		host_paged_kv_manager.initialize()
+		host_paged_kv_manager.initialize(True)
 		return host_paged_kv_manager
 
 	def spawn_workers(self):
