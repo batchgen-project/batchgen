@@ -199,7 +199,8 @@ class BatchGenWorker:
 					self.args.enable_hugetlbfs)	
 		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
         
-		self.host_paged_kv_worker_view.initialize()
+		logging.info(f"Rank {self.rank}: Initializing core engine.")
+		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
 
 
