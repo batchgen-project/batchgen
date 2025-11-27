@@ -490,6 +490,7 @@ class BatchGenWorker:
 		"""Copy prefetched host KV pages into the GPU cache."""
 		if not global_sequence_ids:
 			return
+		copy_start = time.perf_counter()
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
 			raise RuntimeError("Host paged KV worker view is not bound to the core engine")
@@ -502,8 +503,12 @@ class BatchGenWorker:
 		)
 		load_task.wait()
 		torch.cuda.synchronize(self.torch_device)
+		load_duration = time.perf_counter() - copy_start
 		logging.info(
-			f"Rank {self.rank} Loaded host KV for {len(global_sequence_ids)} sequences into GPU cache"
+			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
+			self.rank,
+			len(global_sequence_ids),
+			load_duration,
 		)
 
 	def _release_gpu_kv_pages(self, sequence_ids: List[int]) -> None:
@@ -770,7 +775,6 @@ class BatchGenWorker:
 		# logging.info(f"Rank {self.rank} res: {res}")
 		all_results = [None] * self.world_size
 		dist.all_gather_object(all_results, res)
-		dist.destroy_process_group()
 		all_results = [item for sublist in all_results for item in sublist]
 		# logging.info(f"Size of all_results: {len(all_results)}")
 		# Concat to a single tensor and copy to cpu
