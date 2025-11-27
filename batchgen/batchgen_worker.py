@@ -189,7 +189,7 @@ class BatchGenWorker:
 
 		worker_kv_config = build_host_kv_config(
 			model_name=args.model_name,
-			host_kv_cache_size=self.global_host_kv_cache_size_gb * (1024**3),
+			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
         )
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
 		
