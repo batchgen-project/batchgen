@@ -256,7 +256,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               "host_paged_kv_worker_view",
               &BatchGen::host_paged_kv_worker_view,
               &BatchGen::set_host_paged_kv_worker_view,
-              "Reference to the bound HostPagedKVWorkerView instance.");
+              "Reference to the bound HostPagedKVWorkerView instance.")
+          .def_property(
+              "gpu_paged_kv_manager",
+              &BatchGen::gpu_paged_kv_manager,
+              &BatchGen::set_gpu_paged_kv_manager,
+              "Python GPU paged KV manager bound to this engine.");
     
     py::class_<Weights_Storage>(m, "Weights_Storage")
         // Updated Constructor Binding

@@ -38,7 +38,10 @@ from batchgen.utils import config_torch_module_initializer
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 
-from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
+from batchgen.kv_cache.host_kv_mananger_config import (
+	build_gpu_kv_config,
+	build_host_kv_config,
+)
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
@@ -427,6 +430,100 @@ class BatchGenWorker:
 		)
 		worker_view.release_sequence_pages(global_sequence_ids)
 		worker_view.unregister_sequences(global_sequence_ids)
+		self._release_gpu_kv_pages(sequence_ids)
+
+	def _ensure_gpu_paged_kv_manager(
+		self, sequence_tokens: Sequence[int]
+	) -> GPUPagedKVCacheManager:
+		"""Instantiate or resize the GPU paged KV manager for the batch."""
+		gpu_config = build_gpu_kv_config(
+			model_name=self.huggingface_ckpt_name,
+			sequence_tokens=sequence_tokens,
+		)
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is not None:
+			current_pages = getattr(manager, "config", None)
+			current_pages = getattr(current_pages, "num_pages", 0)
+			if current_pages >= gpu_config.num_pages:
+				return manager
+			logging.info(
+				"Rank %s Reinitializing GPUPagedKVCacheManager for %d pages (prev=%d)",
+				self.rank,
+				gpu_config.num_pages,
+				current_pages,
+			)
+			manager.destroy()
+
+		manager = GPUPagedKVCacheManager(config=gpu_config)
+		manager.initialize()
+		self.gpu_paged_kv_cache_manager = manager
+		if hasattr(self.core_engine, "gpu_paged_kv_manager"):
+			self.core_engine.gpu_paged_kv_manager = manager
+		logging.info(
+			"Rank %s Initialized GPUPagedKVCacheManager on %s with %d pages",
+			self.rank,
+			manager.device,
+			gpu_config.num_pages,
+		)
+		return manager
+
+	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
+		"""Allocate GPU KV pages and load host-resident KV for the batch."""
+		if not local_sequence_ids:
+			return
+		sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
+		manager = self._ensure_gpu_paged_kv_manager(sequence_tokens)
+		global_sequence_ids = self._build_global_sequence_ids(local_sequence_ids)
+		logging.info(
+			f"Rank {self.rank} Allocating GPU KV pages (local->global): "
+			f"{self._format_sequence_ids_for_log(local_sequence_ids)}"
+		)
+		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
+		manager.rebuild_page_table(global_sequence_ids)
+		self._load_host_kv_to_gpu(manager, global_sequence_ids)
+
+	def _load_host_kv_to_gpu(
+		self,
+		manager: GPUPagedKVCacheManager,
+		global_sequence_ids: List[int],
+	) -> None:
+		"""Copy prefetched host KV pages into the GPU cache."""
+		if not global_sequence_ids:
+			return
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			raise RuntimeError("Host paged KV worker view is not bound to the core engine")
+		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
+		k_ptrs, v_ptrs = manager.export_layer_page_pointer_table()
+		load_task = worker_view.async_load_layer_kv_to_device(
+			sequence_ids=sequence_tensor,
+			k_device_ptrs=k_ptrs,
+			v_device_ptrs=v_ptrs,
+		)
+		load_task.wait()
+		torch.cuda.synchronize(self.torch_device)
+		logging.info(
+			f"Rank {self.rank} Loaded host KV for {len(global_sequence_ids)} sequences into GPU cache"
+		)
+
+	def _release_gpu_kv_pages(self, sequence_ids: List[int]) -> None:
+		"""Return GPU KV pages associated with the provided local sequence ids."""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None or not sequence_ids:
+			return
+		global_sequence_ids = self._build_global_sequence_ids(sequence_ids)
+		try:
+			manager.free_pages_for_sequences(global_sequence_ids)
+			logging.info(
+				f"Rank {self.rank} Released GPU KV pages for global ids: {global_sequence_ids}"
+			)
+		except KeyError as exc:
+			logging.warning(
+				"Rank %s failed to release GPU KV pages for %s: %s",
+				self.rank,
+				global_sequence_ids,
+				exc,
+			)
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
 		"""Invoke the GPU paged KV cache manager destroy hook if available."""
@@ -434,7 +531,7 @@ class BatchGenWorker:
 		if manager is None:
 			manager = getattr(self.core_engine, "gpu_paged_kv_cache_manager", None)
 		if manager is None:
-			logging.debug("No GPU paged KV manager bound; skipping destroy call")
+			logging.info("No GPU paged KV manager bound; skipping destroy call")
 			return
 		destroy_fn = getattr(manager, "destroy", None)
 		if destroy_fn is None:
@@ -571,7 +668,7 @@ class BatchGenWorker:
 			logging.info(
 				f"Rank: {self.rank} Device torch free memory before decode phase: {free_memory} GB / {total_memory} GB"
 			)
-			self._config_decoding(len(new_token), self.comm)
+			self._config_decoding(len(new_token), model_batch_idx, self.comm)
 			# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 			if self.engine_config.Basic_Config.attn_mode == 3:
 				# FULL GPU DECODING MODE.
@@ -875,7 +972,7 @@ class BatchGenWorker:
 		)
 		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
 	
-	def _config_decoding(self, num_seq, comm=None):
+	def _config_decoding(self, num_seq, model_batch_idx: int, comm=None):
 		logging.info(f"Start Config Decoding")
 		self.deep_free_model_memory()
 		self.init_nvshmem()
@@ -897,7 +994,6 @@ class BatchGenWorker:
 		# Get the maximum number of sequences across all ranks
 		max_num_seq = int(num_seq_per_rank.max().item())
 
-
 		# TODO:
 		if self.world_size <= 8:
 			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
@@ -910,6 +1006,8 @@ class BatchGenWorker:
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 		else:
+			sequence_ids = self.model_batches[model_batch_idx]
+			self._prepare_gpu_paged_kv_cache(sequence_ids)
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
 
 			self.set_phase("decode")

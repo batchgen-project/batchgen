@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 
+import torch
+
+from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 from batchgen.models.engine_loader import core_engine as bg_lib
 
 HOST_KV_SHM_NAME = "batchgen_host_kv_cache"
 
-__all__ = ["build_host_kv_config", "HOST_KV_SHM_NAME"]
+__all__ = [
+    "build_host_kv_config",
+    "build_gpu_kv_config",
+    "HOST_KV_SHM_NAME",
+]
 
 
 def _dtype_size_bytes(dtype: str) -> int:
@@ -21,6 +28,20 @@ def _dtype_size_bytes(dtype: str) -> int:
     if normalized in {"float8_e4m3fn", "float8_e5m2"}:
         return 1
     raise ValueError(f"Unsupported kv dtype '{dtype}'")
+
+
+def _torch_dtype_from_string(dtype: str) -> torch.dtype:
+    mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+        "float8_e5m2": torch.float8_e5m2,
+    }
+    key = dtype.strip().lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported kv dtype '{dtype}' for torch")
+    return mapping[key]
 
 
 @dataclass(frozen=True)
@@ -130,3 +151,56 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
     )
     config.alignment_bytes = profile.alignment_bytes
     return config
+
+
+def _normalize_sequence_tokens(sequence_tokens: Sequence[int]) -> list[int]:
+    if not sequence_tokens:
+        raise ValueError("sequence_tokens must contain at least one element")
+    normalized: list[int] = []
+    for idx, value in enumerate(sequence_tokens):
+        try:
+            token_count = int(value)
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:  # pragma: no cover - defensive branch
+            raise ValueError(
+                f"sequence_tokens[{idx}] must be an integer, got {value!r}"
+            ) from exc
+        if token_count <= 0:
+            raise ValueError(
+                f"sequence_tokens[{idx}] must be > 0, got {token_count}"
+            )
+        normalized.append(token_count)
+    return normalized
+
+
+def _compute_gpu_page_capacity(
+    sequence_tokens: Sequence[int], page_size_tokens: int
+) -> int:
+    normalized = _normalize_sequence_tokens(sequence_tokens)
+    total_pages = 0
+    for token_count in normalized:
+        total_pages += (token_count // page_size_tokens) + 1
+    if total_pages <= 0:
+        raise ValueError("Computed GPU page capacity must be positive")
+    return total_pages
+
+
+def build_gpu_kv_config(
+    model_name: str, sequence_tokens: Sequence[int]
+) -> GPUPagedKVConfig:
+    """Builds a GPUPagedKVConfig sized for the provided sequence lengths."""
+
+    profile = _resolve_profile(model_name)
+    num_pages = _compute_gpu_page_capacity(sequence_tokens, profile.page_size)
+    return GPUPagedKVConfig(
+        num_layers=profile.num_layers,
+        num_pages=num_pages,
+        page_size_tokens=profile.page_size,
+        num_k_heads=profile.num_k_heads,
+        k_head_dim=profile.k_head_dim,
+        num_v_heads=profile.num_v_heads,
+        v_head_dim=profile.v_head_dim,
+        kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
+    )

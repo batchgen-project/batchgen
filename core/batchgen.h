@@ -126,6 +126,12 @@ class BatchGen {
     // Returns the bound HostPagedKVWorkerView. Raises if unset.
     py::object host_paged_kv_worker_view() const;
 
+    // Attach a Python GPU paged KV manager instance shared with BatchGen.
+    void set_gpu_paged_kv_manager(py::object manager);
+
+    // Returns the attached GPU paged KV manager.
+    py::object gpu_paged_kv_manager() const;
+
     void copy_kv_to_worker(std::vector<int64_t> query_global_idx, int64_t context_length) {
         this->kv_storage_.copy_kv_to_worker(query_global_idx, context_length);
     }
@@ -165,4 +171,5 @@ class BatchGen {
     Hetero_Attn hetero_attn_;
 
     py::object host_paged_kv_worker_view_{py::none()};
+    py::object gpu_paged_kv_manager_{py::none()};
 };

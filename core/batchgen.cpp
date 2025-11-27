@@ -390,6 +390,18 @@ py::object BatchGen::host_paged_kv_worker_view() const {
     return host_paged_kv_worker_view_;
 }
 
+void BatchGen::set_gpu_paged_kv_manager(py::object manager) {
+    if (manager.is_none()) {
+        throw std::invalid_argument(
+            "gpu_paged_kv_manager must not be None");
+    }
+    gpu_paged_kv_manager_ = std::move(manager);
+}
+
+py::object BatchGen::gpu_paged_kv_manager() const {
+    return gpu_paged_kv_manager_;
+}
+
 
 
 #include <signal.h>
