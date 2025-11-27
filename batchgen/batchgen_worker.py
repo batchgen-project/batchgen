@@ -297,7 +297,7 @@ class BatchGenWorker:
 			self.initializer.Init(self.weights_storage)
 		)
 
-		self.core_engine.set_host_paged_kv_worker_view(self.host_paged_kv_worker_view)
+		self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		# self.queries, self.model_batches = self.vanilla_batching(
 		# 	self.global_queries, self.global_rank, self.world_size)
 		# self.num_queries = len(self.queries)
@@ -848,7 +848,7 @@ class BatchGenWorker:
 			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_kv_buffer()
+			# self.core_engine.clear_kv_buffer()
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_decoding_buffer()
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
@@ -859,7 +859,7 @@ class BatchGenWorker:
 			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_kv_buffer()
+			# self.core_engine.clear_kv_buffer()
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_decoding_buffer()
 

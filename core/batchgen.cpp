@@ -187,7 +187,7 @@ void BatchGen::Init()
     // this->weights_storage_.Init(shm_name, byte_size, weights_map, enable_hugetlbfs);
     // this->logger->info("weights_storage initialized.");
     
-    this->gpu_kv_buffer_.Init();
+    // this->gpu_kv_buffer_.Init();
     this->gpu_weight_buffer_.Init();
     this->kv_storage_.Init();
     this->h2d_engine_.Init();
@@ -221,7 +221,7 @@ void BatchGen::set_batching_plan(
 void BatchGen::set_phase(std::string phase) {
     this->phase_ = phase;
     if (phase == "decode") {
-        this->gpu_kv_buffer_.init_kv_buffer();
+        // this->gpu_kv_buffer_.init_kv_buffer();
         this->gpu_weight_buffer_.resize_buffer();
     }
 }
