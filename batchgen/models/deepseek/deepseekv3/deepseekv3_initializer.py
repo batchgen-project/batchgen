@@ -249,11 +249,6 @@ class DeepseekV3Initializer:
                 self.engine_config, self.model_config, weights_storage
             )
 
-            worker_kv_config = build_host_kv_config(
-                model_name=self.hf_model_config._name_or_path,
-                host_kv_cache_size=self.global_kv_cache_size_gb * (1024**3),
-            )
-            self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
             logging.info("Core engine created")
             logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
             if (
@@ -270,10 +265,7 @@ class DeepseekV3Initializer:
             #     param_byte_size,
             #     self.enable_hugetlbfs
             # )
-            self.host_paged_kv_worker_view.initialize()
-            logging.info("Host KV manager view initialized")
             self.core_engine.Init()
-            self.core_engine.set_host_paged_kv_manager_view(self.host_paged_kv_worker_view)
             logging.info("Core engine initialized")
         except Exception as e:
             logging.error(f"Error: {e}")
