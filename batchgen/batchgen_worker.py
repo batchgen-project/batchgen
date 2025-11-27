@@ -213,13 +213,13 @@ class BatchGenWorker:
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
 		config_torch_module_initializer()
 		self.model_config = AutoConfig.from_pretrained(
-			self.hf_cache_dir,
+			self.cache_dir,
 			trust_remote_code=True,
 			local_files_only=True,
 		)
 		self.tokenizer = AutoTokenizer.from_pretrained(
 			# self.huggingface_ckpt_name,
-			self.hf_cache_dir,
+			self.cache_dir,
 			# cache_dir=self.hf_cache_dir,
 			trust_remote_code=True,
 			local_files_only=True,
