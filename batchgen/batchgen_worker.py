@@ -297,7 +297,7 @@ class BatchGenWorker:
 			self.initializer.Init(self.weights_storage)
 		)
 
-		self.core_engine.set_host_paged_kv_manager_view(self.host_paged_kv_worker_view)
+		self.core_engine.set_host_paged_kv_worker_view(self.host_paged_kv_worker_view)
 		# self.queries, self.model_batches = self.vanilla_batching(
 		# 	self.global_queries, self.global_rank, self.world_size)
 		# self.num_queries = len(self.queries)
@@ -770,6 +770,7 @@ class BatchGenWorker:
 		logging.info(f"start_h2d_worker took {time.perf_counter() - step_start:.4f}s")
 
 		# Step 9: Allocate Pages for Sequences
+		step_start = time.perf_counter()
 		sequence_ids = self.model_batches[model_batch_idx]
 
 		if sequence_ids:
@@ -782,6 +783,11 @@ class BatchGenWorker:
 			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
 				list(zip(sequence_ids, sequence_tokens))
 			)
+		logging.info(f"allocate_pages_for_sequences took {time.perf_counter() - step_start:.4f}s")
+
+		
+		# Step 10: Clear all the pages in GPU
+
 		
 		total_time = time.perf_counter() - start_time
 		logging.info(f"_config_prefill completed in {total_time:.4f}s")
