@@ -574,7 +574,6 @@ class Attn_Wrapper(torch.nn.Module):
 			else:
 				# FULL GPU DECODING.
 				# Single Batch. 
-				past_key_states = Attn_Wrapper.past_key_states[self.layer_idx]
 				# past_value_states = Attn_Wrapper.past_value_states[self.layer_idx]
 				if self.model_config.model_type == "deepseek_v3":
 					past_value_states = None
@@ -602,6 +601,7 @@ class Attn_Wrapper(torch.nn.Module):
 						* self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
 					)
 					if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
+						past_key_states = Attn_Wrapper.past_key_states[self.layer_idx]
 						kv_scale = Attn_Wrapper.scale[self.layer_idx]
 						attn_result, kv, scale = self.module.decoding_attn_mode_3_fp8(
 							hidden_states[start_ids:end_ids],
@@ -635,7 +635,8 @@ class Attn_Wrapper(torch.nn.Module):
 							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
 							Attn_Wrapper.max_seqlen,
 							weight_scale=self.weight_dequant_scale,
-							gpu_paged_kv_manager=Attn_Wrapper.gpu_paged_kv_manager
+							gpu_paged_kv_manager=Attn_Wrapper.gpu_paged_kv_manager,
+							layer_idx=self.layer_idx,
 						)
 						# scale = None
 						# past_key_states[start_ids:end_ids].copy_(kv)
@@ -645,8 +646,6 @@ class Attn_Wrapper(torch.nn.Module):
 
 					
 
-
-				Attn_Wrapper.past_key_states[self.layer_idx] = past_key_states
 				
 
 			# Step 4: Clean up

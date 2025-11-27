@@ -1954,6 +1954,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	max_seqlen: int,
 	weight_scale: Optional[dict] = None,
 	gpu_paged_kv_manager: Optional[GPUPagedKVCacheManager] = None,
+	layer_idx: int = 0,
 ) -> torch.Tensor:
 	"""Variant of the BF16 decoder that writes KV tokens via GPUPagedKVCacheManager."""
 	if gpu_paged_kv_manager is None:
@@ -2005,11 +2006,11 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		k_tensor=k_tensor,
 		v_tensor=None,
 		sequence_lengths=sequence_lengths,
-		layer_idx=getattr(self, "layer_idx", 0),
+		layer_idx=layer_idx,
 	)
 
 	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
-		getattr(self, "layer_idx", 0)
+		layer_idx=layer_idx
 	)
 
 	kv_b_proj = deepseek_v3_dequantization(
