@@ -605,7 +605,7 @@ class BatchGenWorker:
 		self.num_local_queries = len(batch)
 		self._tokenization(batch)
 		self.model_batches = self._local_batching()
-		self.generate()
+		return self.generate()
 
 
 	def generate(self):
