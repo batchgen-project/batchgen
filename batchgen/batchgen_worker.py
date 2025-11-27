@@ -454,7 +454,7 @@ class BatchGenWorker:
 			)
 			manager.destroy()
 
-		manager = GPUPagedKVCacheManager(config=gpu_config)
+		manager = GPUPagedKVCacheManager(config=gpu_config, device=self.local_rank)
 		manager.initialize()
 		self.gpu_paged_kv_cache_manager = manager
 		if hasattr(self.core_engine, "gpu_paged_kv_manager"):
