@@ -191,7 +191,7 @@ class BatchGenWorker:
 		worker_kv_config = build_host_kv_config(
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
-        )
+		)
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
 		self.gpu_paged_kv_cache_manager = None
 		
@@ -202,7 +202,7 @@ class BatchGenWorker:
 					self.tensor_meta_shm_name,
 					self.args.enable_hugetlbfs)	
 		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
-        
+		
 		logging.info(f"Rank {self.rank}: Initializing core engine.")
 		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
@@ -659,14 +659,15 @@ class BatchGenWorker:
 
 		res = [
 			self.query_book[query_idx].decoded_tokens
-			for query_idx in range(self.num_queries)
+			# for query_idx in range(self.num_queries)
+			for query_idx in range(self.num_local_queries)
 		]
 
 		# Print first 5 sequences
-		# for query_idx in range(5):
-		#     logging.info(
-		#         f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
-		#     )
+		for query_idx in range(5):
+			logging.info(
+				f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
+			)
 
 		# Gather results from all rank to rank 0
 		# logging.info(f"Rank {self.rank} res: {res}")
