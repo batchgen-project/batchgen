@@ -445,11 +445,20 @@ class Attn_Wrapper(torch.nn.Module):
 				# )
 
 				sequence_lens = cur_attention_mask.sum(dim=1).tolist()
+				B, T, D = key_cache.shape
+				key_cache_with_num_head_dim = key_cache.view(
+					B, T, 1, D
+				)
+				value_cache_with_num_head_dim = None
+				if value_cache is not None:
+					value_cache_with_num_head_dim = value_cache.view(
+						B, T, 1, D
+					)
 				self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
 					layer_idx=self.layer_idx,
 					sequence_ids=cur_attn_batch,
-					k_tensor=key_cache,
-					v_tensor=value_cache,
+					k_tensor=key_cache_with_num_head_dim,
+					v_tensor=value_cache_with_num_head_dim,
 					sequence_lengths=sequence_lens,
 				)
 				# Sync

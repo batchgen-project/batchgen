@@ -193,6 +193,7 @@ class BatchGenWorker:
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
         )
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		self.gpu_paged_kv_cache_manager = None
 		
 		# self.core_engine.init_weight_storage(self.shm_name, self.tensor_meta_shm_name,
 		# 			self.args.weight_byte_size, 
@@ -402,6 +403,24 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank} Releasing host KV pages for sequences: {sequence_ids}")
 		worker_view.release_sequence_pages(list(sequence_ids))
 		worker_view.unregister_sequences(list(sequence_ids))
+
+	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
+		"""Invoke the GPU paged KV cache manager destroy hook if available."""
+		manager = getattr(self, "gpu_paged_kv_cache_manager", None)
+		if manager is None:
+			manager = getattr(self.core_engine, "gpu_paged_kv_cache_manager", None)
+		if manager is None:
+			logging.debug("No GPU paged KV manager bound; skipping destroy call")
+			return
+		destroy_fn = getattr(manager, "destroy", None)
+		if destroy_fn is None:
+			logging.warning("GPU paged KV manager does not expose a destroy() method")
+			return
+		try:
+			destroy_fn(empty_cuda_cache=empty_cuda_cache)
+			logging.info("GPU paged KV cache destroyed successfully")
+		except Exception as exc:  # pragma: no cover - defensive logging
+			logging.error("Failed to destroy GPU paged KV cache: %s", exc)
 
 	def _local_batching(self):
 		# Step 3: Determine batch size
@@ -769,7 +788,12 @@ class BatchGenWorker:
 		self.core_engine.start_h2d_worker()
 		logging.info(f"start_h2d_worker took {time.perf_counter() - step_start:.4f}s")
 
-		# Step 9: Allocate Pages for Sequences
+		# Step 9: Destroy GPU paged KV cache state
+		step_start = time.perf_counter()
+		self._destroy_gpu_paged_kv_cache()
+		logging.info(f"destroy_gpu_paged_kv_cache took {time.perf_counter() - step_start:.4f}s")
+
+		# Step 10: Allocate Pages for Sequences
 		step_start = time.perf_counter()
 		sequence_ids = self.model_batches[model_batch_idx]
 
@@ -784,9 +808,6 @@ class BatchGenWorker:
 				list(zip(sequence_ids, sequence_tokens))
 			)
 		logging.info(f"allocate_pages_for_sequences took {time.perf_counter() - step_start:.4f}s")
-
-		
-		# Step 10: Clear all the pages in GPU
 
 		
 		total_time = time.perf_counter() - start_time
