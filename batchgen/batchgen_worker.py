@@ -366,6 +366,42 @@ class BatchGenWorker:
 			tokenized_query["attention_mask"] = attention_mask_extended
 			query_instance.encoded = tokenized_query
 
+	def _compute_host_kv_sequence_tokens(
+		self, sequence_ids: List[int]
+	) -> List[int]:
+		"""Estimate total tokens (prefill + decode) per sequence for KV allocation."""
+		if not hasattr(self, "query_book") or self.query_book is None:
+			raise RuntimeError("query_book is not initialized before KV allocation")
+		token_requirements: List[int] = []
+		for sequence_id in sequence_ids:
+			query_entry = self.query_book.get(sequence_id)
+			if query_entry is None or query_entry.encoded is None:
+				raise KeyError(f"Missing query entry for sequence {sequence_id}")
+			attention_mask = query_entry.encoded.get("attention_mask")
+			if attention_mask is None:
+				raise KeyError(
+					f"No attention_mask available for sequence {sequence_id}"
+				)
+			mask_row = attention_mask[0] if attention_mask.dim() > 1 else attention_mask
+			input_tokens = int(mask_row[: self.max_input_length].sum().item())
+			total_tokens = input_tokens + self.max_decoding_length
+			token_requirements.append(total_tokens)
+		return token_requirements
+
+	def _release_host_kv_pages(self, sequence_ids: List[int]) -> None:
+		"""Release host-paged KV pages and unregister finished sequences."""
+		if not sequence_ids:
+			return
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			logging.warning(
+				"Host paged KV worker view is unavailable; skip releasing sequences",
+			)
+			return
+		logging.info(f"Rank {self.rank} Releasing host KV pages for sequences: {sequence_ids}")
+		worker_view.release_sequence_pages(list(sequence_ids))
+		worker_view.unregister_sequences(list(sequence_ids))
+
 	def _local_batching(self):
 		# Step 3: Determine batch size
 		if self.engine_config.Basic_Config.attn_mode != 3:
@@ -466,7 +502,7 @@ class BatchGenWorker:
 			# if self.rank == 0:
 			# 	logging.info(f"Rank: {self.rank} pre-prefill barrier done.")
 			tmp_start = time.perf_counter()
-			self._config_prefill()
+			self._config_prefill(model_batch_idx)
 			config_prefill_time += time.perf_counter() - tmp_start
 			prefill_start_time = time.perf_counter()
 			if len(self.model_batches[model_batch_idx]) > 0:
@@ -551,7 +587,8 @@ class BatchGenWorker:
 				)
 				self.decoding(new_token, self.model_batches[model_batch_idx], past_key_states, past_value_states, scale_dict)
 			decoding_time += time.perf_counter() - decoding_start_time
-			self.core_engine.clear_kv_storage()
+			# self.core_engine.clear_kv_storage()
+			self._release_host_kv_pages(self.model_batches[model_batch_idx])
 			self._unregister_fp8_weights()
 			self.deep_free_model_memory()
 			del past_key_states
@@ -687,7 +724,7 @@ class BatchGenWorker:
 	# 	self.core_engine.start_h2d_worker()
 
 
-	def _config_prefill(self):
+	def _config_prefill(self, model_batch_idx: int):
 		start_time = time.perf_counter()
 		logging.info("Starting _config_prefill")
 		
@@ -723,13 +760,27 @@ class BatchGenWorker:
 		
 		# Step 7: Clear KV storage
 		step_start = time.perf_counter()
-		self.core_engine.clear_kv_storage()
+		# self.core_engine.clear_kv_storage()
 		logging.info(f"clear_kv_storage took {time.perf_counter() - step_start:.4f}s")
 		
 		# Step 8: Start H2D worker
 		step_start = time.perf_counter()
 		self.core_engine.start_h2d_worker()
 		logging.info(f"start_h2d_worker took {time.perf_counter() - step_start:.4f}s")
+
+		# Step 9: Allocate Pages for Sequences
+		sequence_ids = self.model_batches[model_batch_idx]
+
+		if sequence_ids:
+			logging.info(f"Rank {self.rank} Allocating host KV pages for sequences: {sequence_ids}")
+			self.core_engine.host_paged_kv_worker_view.register_sequences(
+				list(sequence_ids)
+			)
+
+			sequence_tokens = self._compute_host_kv_sequence_tokens(sequence_ids)
+			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
+				list(zip(sequence_ids, sequence_tokens))
+			)
 		
 		total_time = time.perf_counter() - start_time
 		logging.info(f"_config_prefill completed in {total_time:.4f}s")
