@@ -835,6 +835,12 @@ class BatchGenWorker:
 			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
 				list(zip(global_sequence_ids, sequence_tokens))
 			)
+
+			kv_stats = self.core_engine.host_paged_kv_worker_view.get_tats()
+			logging.info(
+				f"Rank {self.rank} Host KV Cache Stats after allocation: {kv_stats}"
+			)
+
 		logging.info(f"allocate_pages_for_sequences took {time.perf_counter() - step_start:.4f}s")
 
 		
