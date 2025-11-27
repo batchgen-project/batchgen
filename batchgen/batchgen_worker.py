@@ -189,7 +189,7 @@ class BatchGenWorker:
 			model_name=self.hf_model_config._name_or_path,
 			host_kv_cache_size=self.global_kv_cache_size_gb * (1024**3),
         )
-        self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
 		
 		# self.core_engine.init_weight_storage(self.shm_name, self.tensor_meta_shm_name,
 		# 			self.args.weight_byte_size, 
@@ -198,9 +198,9 @@ class BatchGenWorker:
 					self.tensor_meta_shm_name,
 					self.args.enable_hugetlbfs)	
 		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
-
+        
 		self.host_paged_kv_worker_view.initialize()
-        logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
+		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
 
 
 
@@ -293,7 +293,7 @@ class BatchGenWorker:
 			self.initializer.Init(self.weights_storage)
 		)
 
-        self.core_engine.set_host_paged_kv_manager_view(self.host_paged_kv_worker_view)
+		self.core_engine.set_host_paged_kv_manager_view(self.host_paged_kv_worker_view)
 		# self.queries, self.model_batches = self.vanilla_batching(
 		# 	self.global_queries, self.global_rank, self.world_size)
 		# self.num_queries = len(self.queries)
