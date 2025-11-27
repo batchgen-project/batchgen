@@ -163,8 +163,9 @@ class BatchGenWorker:
 		self.model = None
 		# self.hf_cache_dir = hf_cache_dir
 		# hf_cache_dir will be deprecated in the future.
-		if (args.hf_cache_dir is None) and (args.cache_dir is not None):
-			self.hf_cache_dir = args.cache_dir
+		# if (args.hf_cache_dir is None) and (args.cache_dir is not None):
+		# 	self.hf_cache_dir = args.cache_dir
+		self.hf_cache_dir = args.cache_dir
 		self.huggingface_ckpt_name = args.model_name
 		self.cache_dir = args.cache_dir
 		self.pt_ckpt_dir = args.pt_ckpt_dir
