@@ -449,16 +449,12 @@ class Attn_Wrapper(torch.nn.Module):
 				key_cache_with_num_head_dim = key_cache.view(
 					B, T, 1, D
 				)
-				value_cache_with_num_head_dim = None
-				if value_cache is not None:
-					value_cache_with_num_head_dim = value_cache.view(
-						B, T, 1, D
-					)
+				logging.info(f"[Rank {dist.get_rank()} Layer {self.layer_idx} type of current attn batch: {type(cur_attn_batch)} cur_attn_batch: {cur_attn_batch}")
 				self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
 					layer_idx=self.layer_idx,
 					sequence_ids=cur_attn_batch,
 					k_tensor=key_cache_with_num_head_dim,
-					v_tensor=value_cache_with_num_head_dim,
+					v_tensor=None, # for DeepSeek-R1
 					sequence_lengths=sequence_lens,
 				)
 				# Sync

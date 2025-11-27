@@ -7,7 +7,7 @@ import math
 import os
 import sys
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 import torch.multiprocessing as mp
@@ -390,6 +390,26 @@ class BatchGenWorker:
 			token_requirements.append(total_tokens)
 		return token_requirements
 
+	def _to_global_sequence_id(self, local_sequence_id: int) -> int:
+		"""Encode global rank and local id into a unique 64-bit identifier."""
+		return (int(self.global_rank) << 32) | (int(local_sequence_id) & 0xFFFFFFFF)
+
+	def _build_global_sequence_ids(
+		self, sequence_ids: Sequence[int]
+	) -> List[int]:
+		"""Vectorized helper that maps local ids to their global counterparts."""
+		return [self._to_global_sequence_id(seq_id) for seq_id in sequence_ids]
+
+	def _format_sequence_ids_for_log(self, sequence_ids: Sequence[int]) -> str:
+		"""Return a concise local->global mapping string for logging."""
+		if not sequence_ids:
+			return "[]"
+		pairs = (
+			f"{local_id}->{self._to_global_sequence_id(local_id)}"
+			for local_id in sequence_ids
+		)
+		return ", ".join(pairs)
+
 	def _release_host_kv_pages(self, sequence_ids: List[int]) -> None:
 		"""Release host-paged KV pages and unregister finished sequences."""
 		if not sequence_ids:
@@ -400,9 +420,13 @@ class BatchGenWorker:
 				"Host paged KV worker view is unavailable; skip releasing sequences",
 			)
 			return
-		logging.info(f"Rank {self.rank} Releasing host KV pages for sequences: {sequence_ids}")
-		worker_view.release_sequence_pages(list(sequence_ids))
-		worker_view.unregister_sequences(list(sequence_ids))
+		global_sequence_ids = self._build_global_sequence_ids(sequence_ids)
+		logging.info(
+			f"Rank {self.rank} Releasing host KV pages (local->global): "
+			f"{self._format_sequence_ids_for_log(sequence_ids)}"
+		)
+		worker_view.release_sequence_pages(global_sequence_ids)
+		worker_view.unregister_sequences(global_sequence_ids)
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
 		"""Invoke the GPU paged KV cache manager destroy hook if available."""
@@ -798,14 +822,18 @@ class BatchGenWorker:
 		sequence_ids = self.model_batches[model_batch_idx]
 
 		if sequence_ids:
-			logging.info(f"Rank {self.rank} Allocating host KV pages for sequences: {sequence_ids}")
+			global_sequence_ids = self._build_global_sequence_ids(sequence_ids)
+			logging.info(
+				f"Rank {self.rank} Allocating host KV pages (local->global): "
+				f"{self._format_sequence_ids_for_log(sequence_ids)}"
+			)
 			self.core_engine.host_paged_kv_worker_view.register_sequences(
-				list(sequence_ids)
+				global_sequence_ids
 			)
 
 			sequence_tokens = self._compute_host_kv_sequence_tokens(sequence_ids)
 			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
-				list(zip(sequence_ids, sequence_tokens))
+				list(zip(global_sequence_ids, sequence_tokens))
 			)
 		logging.info(f"allocate_pages_for_sequences took {time.perf_counter() - step_start:.4f}s")
 
