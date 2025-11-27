@@ -316,96 +316,130 @@ def fused_rmsnorm_rope_cache_update_with_q_kernel(
     Loads cos/sin once per block, uses for both KV and all Q heads.
     """
     batch_idx = tl.program_id(0)
-    
+
     total_dim = kv_lora_rank + qk_rope_head_dim
     input_offset = batch_idx * total_dim
     pos_id = tl.load(position_ids_ptr + batch_idx)
     output_offset = batch_idx * max_seq_len * total_dim + pos_id * total_dim
-    
+
     # ==================== Part 1: RMSNorm on KV ====================
-    
+
     sum_sq_fp32 = 0.0
-    
+
     for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < kv_lora_rank
-        
-        data_bf16 = tl.load(new_compressed_kv_ptr + input_offset + offsets, mask=mask, other=0.0)
+
+        data_bf16 = tl.load(
+            new_compressed_kv_ptr + input_offset + offsets,
+            mask=mask,
+            other=0.0,
+        )
         data_fp32 = data_bf16.to(tl.float32)
         sum_sq_fp32 += tl.sum(data_fp32 * data_fp32)
-    
+
     variance = sum_sq_fp32 / kv_lora_rank
     inv_rms = 1.0 / tl.sqrt(variance + variance_epsilon)
-    
+
     for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < kv_lora_rank
-        
-        data_bf16 = tl.load(new_compressed_kv_ptr + input_offset + offsets, mask=mask, other=0.0)
+
+        data_bf16 = tl.load(
+            new_compressed_kv_ptr + input_offset + offsets,
+            mask=mask,
+            other=0.0,
+        )
         weight = tl.load(norm_weight_ptr + offsets, mask=mask, other=1.0)
-        
+
         data_fp32 = data_bf16.to(tl.float32)
         weight_fp32 = weight.to(tl.float32)
         normalized_fp32 = data_fp32 * inv_rms * weight_fp32
-        
-        tl.store(past_key_states_ptr + output_offset + offsets, 
-                 normalized_fp32.to(data_bf16.dtype), mask=mask)
-    
+
+        tl.store(
+            past_key_states_ptr + output_offset + offsets,
+            normalized_fp32.to(data_bf16.dtype),
+            mask=mask,
+        )
+
     # ==================== Part 2 & 3: RoPE on KV and Q with TRUE reuse ====================
-    
+
     input_rope_offset = input_offset + kv_lora_rank
     output_rope_offset = output_offset + kv_lora_rank
     half_dim = qk_rope_head_dim // 2
     cos_sin_base = pos_id * qk_rope_head_dim
-    
+
     # q_pe strides
     q_pe_batch_stride = num_heads * qk_rope_head_dim
     q_pe_head_stride = qk_rope_head_dim
-    
+
     # Process in blocks - load cos/sin ONCE per block, use for KV + all Q heads
     for block_start in range(0, half_dim, BLOCK_SIZE):
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < half_dim
-        
+
         # ===== LOAD COS/SIN ONCE (into registers) =====
         cos_first = tl.load(cos_ptr + cos_sin_base + offsets, mask=mask, other=1.0)
         sin_first = tl.load(sin_ptr + cos_sin_base + offsets, mask=mask, other=0.0)
-        cos_second = tl.load(cos_ptr + cos_sin_base + half_dim + offsets, mask=mask, other=1.0)
-        sin_second = tl.load(sin_ptr + cos_sin_base + half_dim + offsets, mask=mask, other=0.0)
-        
+        cos_second = tl.load(
+            cos_ptr + cos_sin_base + half_dim + offsets,
+            mask=mask,
+            other=1.0,
+        )
+        sin_second = tl.load(
+            sin_ptr + cos_sin_base + half_dim + offsets,
+            mask=mask,
+            other=0.0,
+        )
+
         # ===== Apply to KV =====
         even_indices = offsets * 2
-        kv_even = tl.load(new_compressed_kv_ptr + input_rope_offset + even_indices, 
-                          mask=mask, other=0.0)
-        
+        kv_even = tl.load(
+            new_compressed_kv_ptr + input_rope_offset + even_indices,
+            mask=mask,
+            other=0.0,
+        )
+
         odd_indices = offsets * 2 + 1
-        kv_odd = tl.load(new_compressed_kv_ptr + input_rope_offset + odd_indices, 
-                         mask=mask, other=0.0)
-        
+        kv_odd = tl.load(
+            new_compressed_kv_ptr + input_rope_offset + odd_indices,
+            mask=mask,
+            other=0.0,
+        )
+
         kv_out_first = kv_even * cos_first + (-kv_odd) * sin_first
         kv_out_second = kv_odd * cos_second + kv_even * sin_second
-        
+
         tl.store(past_key_states_ptr + output_rope_offset + offsets, kv_out_first, mask=mask)
-        tl.store(past_key_states_ptr + output_rope_offset + half_dim + offsets, kv_out_second, mask=mask)
-        
+        tl.store(
+            past_key_states_ptr + output_rope_offset + half_dim + offsets,
+            kv_out_second,
+            mask=mask,
+        )
+
         # ===== Apply to ALL Q heads using SAME cos/sin (already in registers!) =====
         for head_idx in range(num_heads):
             q_pe_base_offset = batch_idx * q_pe_batch_stride + head_idx * q_pe_head_stride
-            
+
             # Load Q data
-            q_even = tl.load(q_pe_ptr + q_pe_base_offset + even_indices, 
-                            mask=mask, other=0.0)
-            q_odd = tl.load(q_pe_ptr + q_pe_base_offset + odd_indices, 
-                           mask=mask, other=0.0)
-            
+            q_even = tl.load(
+                q_pe_ptr + q_pe_base_offset + even_indices,
+                mask=mask,
+                other=0.0,
+            )
+            q_odd = tl.load(
+                q_pe_ptr + q_pe_base_offset + odd_indices,
+                mask=mask,
+                other=0.0,
+            )
+
             # Apply RoPE using cos/sin from registers (no memory load!)
             q_out_first = q_even * cos_first + (-q_odd) * sin_first
             q_out_second = q_odd * cos_second + q_even * sin_second
-            
+
             # Write back
             tl.store(q_pe_ptr + q_pe_base_offset + offsets, q_out_first, mask=mask)
             tl.store(q_pe_ptr + q_pe_base_offset + half_dim + offsets, q_out_second, mask=mask)
-
 
 def fused_rmsnorm_rope_cache_update_with_q(
     new_compressed_kv: torch.Tensor,      # [bsz, 1, total_dim]
@@ -454,6 +488,183 @@ def fused_rmsnorm_rope_cache_update_with_q(
         eps,
         BLOCK_SIZE=64,
     )
+
+@triton.jit
+def fused_rmsnorm_rope_with_q_kernel(
+    new_compressed_kv_ptr,
+    processed_kv_ptr,
+    q_pe_ptr,
+    cos_ptr,
+    sin_ptr,
+    position_ids_ptr,
+    norm_weight_ptr,
+    bsz,
+    num_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    variance_epsilon: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Standalone fused RMSNorm + RoPE kernel that omits cache writes."""
+    batch_idx = tl.program_id(0)
+    total_dim = kv_lora_rank + qk_rope_head_dim
+    input_offset = batch_idx * total_dim
+    output_offset = batch_idx * total_dim
+    pos_id = tl.load(position_ids_ptr + batch_idx)
+
+    # ==================== RMSNorm on KV Lora slice ====================
+    sum_sq_fp32 = 0.0
+    for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < kv_lora_rank
+        data_bf16 = tl.load(
+            new_compressed_kv_ptr + input_offset + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        data_fp32 = data_bf16.to(tl.float32)
+        sum_sq_fp32 += tl.sum(data_fp32 * data_fp32)
+
+    variance = sum_sq_fp32 / kv_lora_rank
+    inv_rms = 1.0 / tl.sqrt(variance + variance_epsilon)
+
+    for block_start in range(0, kv_lora_rank, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < kv_lora_rank
+        data_bf16 = tl.load(
+            new_compressed_kv_ptr + input_offset + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        weight = tl.load(norm_weight_ptr + offsets, mask=mask, other=1.0)
+        data_fp32 = data_bf16.to(tl.float32)
+        normalized_fp32 = data_fp32 * inv_rms * weight.to(tl.float32)
+        tl.store(
+            processed_kv_ptr + output_offset + offsets,
+            normalized_fp32.to(data_bf16.dtype),
+            mask=mask,
+        )
+
+    # ==================== RoPE for KV + Q ====================
+    input_rope_offset = input_offset + kv_lora_rank
+    processed_rope_offset = output_offset + kv_lora_rank
+    half_dim = qk_rope_head_dim // 2
+    cos_sin_base = pos_id * qk_rope_head_dim
+    q_pe_batch_stride = num_heads * qk_rope_head_dim
+    q_pe_head_stride = qk_rope_head_dim
+
+    for block_start in range(0, half_dim, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < half_dim
+
+        cos_first = tl.load(cos_ptr + cos_sin_base + offsets, mask=mask, other=1.0)
+        sin_first = tl.load(sin_ptr + cos_sin_base + offsets, mask=mask, other=0.0)
+        cos_second = tl.load(
+            cos_ptr + cos_sin_base + half_dim + offsets,
+            mask=mask,
+            other=1.0,
+        )
+        sin_second = tl.load(
+            sin_ptr + cos_sin_base + half_dim + offsets,
+            mask=mask,
+            other=0.0,
+        )
+
+        even_indices = offsets * 2
+        odd_indices = offsets * 2 + 1
+        kv_even = tl.load(
+            new_compressed_kv_ptr + input_rope_offset + even_indices,
+            mask=mask,
+            other=0.0,
+        )
+        kv_odd = tl.load(
+            new_compressed_kv_ptr + input_rope_offset + odd_indices,
+            mask=mask,
+            other=0.0,
+        )
+
+        kv_out_first = kv_even * cos_first + (-kv_odd) * sin_first
+        kv_out_second = kv_odd * cos_second + kv_even * sin_second
+
+        tl.store(
+            processed_kv_ptr + processed_rope_offset + offsets,
+            kv_out_first,
+            mask=mask,
+        )
+        tl.store(
+            processed_kv_ptr + processed_rope_offset + half_dim + offsets,
+            kv_out_second,
+            mask=mask,
+        )
+
+        for head_idx in range(num_heads):
+            q_pe_base_offset = batch_idx * q_pe_batch_stride + head_idx * q_pe_head_stride
+            q_even = tl.load(
+                q_pe_ptr + q_pe_base_offset + even_indices,
+                mask=mask,
+                other=0.0,
+            )
+            q_odd = tl.load(
+                q_pe_ptr + q_pe_base_offset + odd_indices,
+                mask=mask,
+                other=0.0,
+            )
+            q_out_first = q_even * cos_first + (-q_odd) * sin_first
+            q_out_second = q_odd * cos_second + q_even * sin_second
+            tl.store(
+                q_pe_ptr + q_pe_base_offset + offsets,
+                q_out_first,
+                mask=mask,
+            )
+            tl.store(
+                q_pe_ptr + q_pe_base_offset + half_dim + offsets,
+                q_out_second,
+                mask=mask,
+            )
+
+
+def fused_rmsnorm_rope_with_q(
+    new_compressed_kv: torch.Tensor,
+    q_pe: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+    norm_weight: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Apply fused RMSNorm + RoPE to KV and Q without cache updates."""
+    bsz, q_len, total_dim = new_compressed_kv.shape
+    assert q_len == 1, "This kernel assumes q_len = 1 for decoding"
+    assert total_dim == kv_lora_rank + qk_rope_head_dim
+    assert qk_rope_head_dim % 2 == 0
+    assert q_pe.is_contiguous(), "q_pe must be contiguous"
+    assert position_ids.shape == (bsz, 1)
+
+    num_heads = q_pe.shape[1]
+    assert q_pe.shape == (bsz, num_heads, 1, qk_rope_head_dim)
+
+    processed_kv = torch.empty_like(new_compressed_kv)
+    grid = (bsz,)
+
+    fused_rmsnorm_rope_with_q_kernel[grid](
+        new_compressed_kv,
+        processed_kv,
+        q_pe,
+        cos,
+        sin,
+        position_ids,
+        norm_weight,
+        bsz,
+        num_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        eps,
+        BLOCK_SIZE=64,
+    )
+
+    return processed_kv
 
 @triton.jit
 def fused_rmsnorm_rope_cache_update_with_q_return_new_kv_kernel(

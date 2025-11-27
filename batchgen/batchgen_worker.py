@@ -696,17 +696,18 @@ class BatchGenWorker:
 					)
 
 
-					past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+					# past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
+					past_key_states = None # Now we donot need this
 					# Pad the kv cache to be multiple of 64
-					bsz, kv_seqlen, _ = past_key_states[0].size()
-					if self.engine_config.Basic_Config.kv_dtype == "bfloat16":
-						if kv_seqlen % 64 != 0:
-							pad_len = 64 - (kv_seqlen % 64)
-							for i in range(len(past_key_states)):
-								past_key_states[i] = torch.cat([
-									past_key_states[i], 
-									torch.zeros((bsz, pad_len, past_key_states[i].size(-1)), device=past_key_states[i].device, dtype=past_key_states[i].dtype)
-								], dim=1)
+					# bsz, kv_seqlen, _ = past_key_states[0].size()
+					# if self.engine_config.Basic_Config.kv_dtype == "bfloat16":
+					# 	if kv_seqlen % 64 != 0:
+					# 		pad_len = 64 - (kv_seqlen % 64)
+					# 		for i in range(len(past_key_states)):
+					# 			past_key_states[i] = torch.cat([
+					# 				past_key_states[i], 
+					# 				torch.zeros((bsz, pad_len, past_key_states[i].size(-1)), device=past_key_states[i].device, dtype=past_key_states[i].dtype)
+					# 			], dim=1)
 					past_value_states = None
 					scale_dict = None
 					if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
@@ -1263,6 +1264,15 @@ class BatchGenWorker:
 			"""
 				KV ACCUMULATION IN GPU.
 			"""
+			gpu_manager = getattr(self, "gpu_paged_kv_cache_manager", None)
+			if gpu_manager is None:
+				gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+			Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
+			Attn_Wrapper.host_paged_kv_worker_view = getattr(
+				self.core_engine,
+				"host_paged_kv_worker_view",
+				None,
+			)
 			Attn_Wrapper.scale = scale_dict
 			Attn_Wrapper.past_key_states = past_key_states
 			Attn_Wrapper.past_value_states = past_value_states
@@ -1329,6 +1339,8 @@ class BatchGenWorker:
 			Attn_Wrapper.scale = None
 			Attn_Wrapper.past_key_states = None
 			Attn_Wrapper.past_value_states = None
+			Attn_Wrapper.gpu_paged_kv_manager = None
+			Attn_Wrapper.host_paged_kv_worker_view = None
 		
 		
 		else:

@@ -780,6 +780,7 @@ class DeepseekV3ParallelStrategyManager:
 					fused_get_query_states_triton,
 					# mla_decoding_flashmla_attn_mode_3,
 					mla_decoding_flashmla_attn_mode_3_bf16,
+					mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv,
 					mla_decoding_flashmla_attn_mode_3_dequant_fusion,
 					mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn
 				)
@@ -818,7 +819,8 @@ class DeepseekV3ParallelStrategyManager:
 					attn_module,
 					"decoding_attn_mode_3_bf16",
 					types.MethodType(
-						mla_decoding_flashmla_attn_mode_3_bf16, attn_module
+						# mla_decoding_flashmla_attn_mode_3_bf16, attn_module
+						mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv, attn_module
 					),
 				)
 

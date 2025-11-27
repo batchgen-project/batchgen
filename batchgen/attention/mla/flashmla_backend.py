@@ -20,7 +20,7 @@ from ...quantization.fp8e4m3 import (
 	dequant_compressed_kv_per_token
 )
 
-from typing import Tuple
+from typing import Optional, Tuple
 import math
 
 def quant_per_token(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -944,9 +944,13 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 
 # from .fused_kv_kernel import fused_kv_update_and_rope
 from .fused_rmsnorm_rope import (
-	fused_rmsnorm_rope, fused_rmsnorm_rope_cache_update,fused_rmsnorm_rope_cache_update_with_q,
-	fused_rmsnorm_rope_cache_update_with_q_return_new_kv
+	fused_rmsnorm_rope,
+	fused_rmsnorm_rope_cache_update,
+	fused_rmsnorm_rope_cache_update_with_q,
+	fused_rmsnorm_rope_cache_update_with_q_return_new_kv,
+	fused_rmsnorm_rope_with_q,
 )
+from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 @triton.jit
 def quantize_and_scatter_kernel(
@@ -1938,6 +1942,134 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	
 	# past_key_states is already updated in-place (it's a view of past_key_states_full)
 	# No need to return it!
+	return attn_output
+
+
+@torch.inference_mode()
+def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
+	self,
+	hidden_states: torch.Tensor,
+	q_position_ids: torch.Tensor,
+	cache_seqlens: torch.Tensor,
+	max_seqlen: int,
+	weight_scale: Optional[dict] = None,
+	gpu_paged_kv_manager: Optional[GPUPagedKVCacheManager] = None,
+) -> torch.Tensor:
+	"""Variant of the BF16 decoder that writes KV tokens via GPUPagedKVCacheManager."""
+	if gpu_paged_kv_manager is None:
+		raise ValueError(
+			"gpu_paged_kv_manager must be provided for page-KV decoding backend",
+		)
+	bsz, q_len, _ = hidden_states.size()
+	if q_len != 1:
+		raise ValueError("mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv only supports q_len=1")
+
+	hidden_states = hidden_states.squeeze(1)
+	hidden_states, hidden_states_scale = act_quant(hidden_states)
+	q = w8a8_deepgemm(
+		hidden_states,
+		hidden_states_scale,
+		self.q_a_proj.weight,
+		weight_scale["q_a_proj.weight_scale_inv"],
+	)
+	new_compressed_kv = w8a8_deepgemm(
+		hidden_states,
+		hidden_states_scale,
+		self.kv_a_proj_with_mqa.weight,
+		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+	).view(bsz, 1, -1)
+	q = self.q_a_layernorm(q)
+	q, q_scale = act_quant(q)
+	q = w8a8_deepgemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
+
+	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+	q_pe = q_pe.contiguous()
+	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
+
+	offload_kv = fused_rmsnorm_rope_with_q(
+		new_compressed_kv,
+		q_pe,
+		cos,
+		sin,
+		q_position_ids,
+		self.kv_a_layernorm.weight,
+		self.kv_lora_rank,
+		self.qk_rope_head_dim,
+	)
+
+	manager_device = gpu_paged_kv_manager.device
+	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
+	sequence_lengths = q_position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
+	gpu_paged_kv_manager.update_layer_decode_new_token(
+		k_tensor=k_tensor,
+		v_tensor=None,
+		sequence_lengths=sequence_lengths,
+		layer_idx=getattr(self, "layer_idx", 0),
+	)
+
+	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
+		getattr(self, "layer_idx", 0)
+	)
+
+	kv_b_proj = deepseek_v3_dequantization(
+		self.kv_b_proj.weight.data,
+		weight_scale["kv_b_proj.weight_scale_inv"],
+	).view(self.num_heads, -1, self.kv_lora_rank)
+	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+	query_states = torch.empty(
+		bsz,
+		self.num_heads,
+		1,
+		qk_head_dim,
+		dtype=blocked_k.dtype,
+		device=blocked_k.device,
+	)
+	q_nope = q_nope.squeeze(2)
+	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum(
+		"bhd,hdc->bhc",
+		q_nope,
+		q_absorb,
+	).view(bsz, self.num_heads, 1, self.kv_lora_rank)
+	query_states[:, :, :, self.kv_lora_rank :] = q_pe
+	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
+
+	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+
+	try:
+		attn_out, _ = flash_mla_with_kvcache(
+			query_states,
+			blocked_k,
+			block_table,
+			cache_seqlens,
+			512,
+			tile_scheduler_metadata,
+			num_splits,
+			self.softmax_scale,
+			True,
+		)
+	except Exception as exc:  # pragma: no cover - debugging aid
+		logging.error("Error in flash_mla_with_kvcache (pagekv): %s", exc)
+		raise
+
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+		raise ValueError(
+			f"`attn_output` should be {(bsz, self.num_heads, q_len, self.v_head_dim)}, got {attn_output.size()}"
+		)
+	attn_output = attn_output.transpose(1, 2).contiguous()
+	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
+	attn_output_fp8, attn_output_scale = act_quant(attn_output)
+	attn_output = w8a8_deepgemm(
+		attn_output_fp8,
+		attn_output_scale,
+		self.o_proj.weight,
+		weight_scale["o_proj.weight_scale_inv"],
+	)
+	attn_output = attn_output.view(bsz, 1, -1)
 	return attn_output
 
 # @torch.inference_mode()

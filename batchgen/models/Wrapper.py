@@ -631,16 +631,11 @@ class Attn_Wrapper(torch.nn.Module):
 						# )
 						attn_result = self.module.decoding_attn_mode_3_bf16(
 							hidden_states[start_ids:end_ids],
-							past_key_states,  # Pass FULL tensor
-							past_value_states,
-							# final_attn_result,
-							attention_mask[start_ids:end_ids],
 							position_ids[start_ids:end_ids],
 							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
 							Attn_Wrapper.max_seqlen,
-							batch_start_idx=start_ids,  # Pass indices
-							batch_end_idx=end_ids,
-							weight_scale=self.weight_dequant_scale
+							weight_scale=self.weight_dequant_scale,
+							gpu_paged_kv_manager=Attn_Wrapper.gpu_paged_kv_manager
 						)
 						# scale = None
 						# past_key_states[start_ids:end_ids].copy_(kv)
