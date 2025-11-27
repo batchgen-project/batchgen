@@ -18,12 +18,13 @@
 
 import logging
 import math
+from typing import List, Sequence
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 from transformers.cache_utils import DynamicCache
-import torch.distributed as dist
 from ..quantization.fp8e4m3 import (
 	compressed_kv_bf16_to_fp8_per_token,
 	compressed_kv_fp8_to_bf16_per_token
@@ -275,6 +276,7 @@ class Attn_Wrapper(torch.nn.Module):
 	attn_mode = 0
 	cur_batch = None
 	kv_quantization_factor = None
+	_global_rank: int | None = None
 
 	def __init__(
 		self,
@@ -296,6 +298,20 @@ class Attn_Wrapper(torch.nn.Module):
 		self.attn_module_id = "attn" + "_" + str(self.layer_idx)
 		self.weight_dequant_scale = weight_dequant_scale
 
+	@classmethod
+	def _get_global_rank(cls) -> int:
+		if cls._global_rank is None:
+			cls._global_rank = int(dist.get_rank())
+		return cls._global_rank
+
+	@classmethod
+	def _to_global_sequence_id(cls, local_sequence_id: int) -> int:
+		rank = cls._get_global_rank()
+		return (rank << 32) | (int(local_sequence_id) & 0xFFFFFFFF)
+
+	@classmethod
+	def _build_global_sequence_ids(cls, sequence_ids: Sequence[int]) -> List[int]:
+		return [cls._to_global_sequence_id(seq_id) for seq_id in sequence_ids]
 
 	def forward(self, *args, **kwargs):
 		logging.debug(
@@ -449,10 +465,11 @@ class Attn_Wrapper(torch.nn.Module):
 				key_cache_with_num_head_dim = key_cache.view(
 					B, T, 1, D
 				)
-				logging.info(f"[Rank {dist.get_rank()} Layer {self.layer_idx} type of current attn batch: {type(cur_attn_batch)} cur_attn_batch: {cur_attn_batch}")
+				global_sequence_ids = Attn_Wrapper._build_global_sequence_ids(cur_attn_batch)
+				logging.info(f"[Rank {dist.get_rank()} Layer {self.layer_idx} type of current attn batch: {type(cur_attn_batch)} cur_attn_batch: {cur_attn_batch} global_sequence_ids: {global_sequence_ids}")
 				self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
 					layer_idx=self.layer_idx,
-					sequence_ids=cur_attn_batch,
+					sequence_ids=global_sequence_ids,
 					k_tensor=key_cache_with_num_head_dim,
 					v_tensor=None, # for DeepSeek-R1
 					sequence_lengths=sequence_lens,
