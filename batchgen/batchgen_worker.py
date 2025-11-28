@@ -35,7 +35,7 @@ from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
-from batchgen.kv_cache.gpu_paged_kv_manager import GPUKVCacheManager
+from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 
 
 logging.basicConfig(
