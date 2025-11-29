@@ -79,10 +79,12 @@ class query:
 		text: str = None,
 		encoded: Dict[str, torch.Tensor] = None,
 		decoded_tokens: torch.Tensor = None,
+		kv_token_budget: Optional[int] = None,
 	):
 		self.text = text
 		self.encoded = encoded
 		self.decoded_tokens = decoded_tokens
+		self.kv_token_budget = kv_token_budget
 
 
 
@@ -371,27 +373,31 @@ class BatchGenWorker:
 			tokenized_query["attention_mask"] = attention_mask_extended
 			query_instance.encoded = tokenized_query
 
+	def _get_sequence_token_budget(self, sequence_id: int) -> int:
+		"""Return cached host allocation tokens for a sequence, computing once."""
+		if not hasattr(self, "query_book") or self.query_book is None:
+			raise RuntimeError("query_book is not initialized before KV allocation")
+		query_entry = self.query_book.get(sequence_id)
+		if query_entry is None or query_entry.encoded is None:
+			raise KeyError(f"Missing query entry for sequence {sequence_id}")
+		if query_entry.kv_token_budget is not None:
+			return query_entry.kv_token_budget
+		attention_mask = query_entry.encoded.get("attention_mask")
+		if attention_mask is None:
+			raise KeyError(
+				f"No attention_mask available for sequence {sequence_id}"
+			)
+		mask_row = attention_mask[0] if attention_mask.dim() > 1 else attention_mask
+		input_tokens = int(mask_row[: self.max_input_length].sum().item())
+		total_tokens = input_tokens + self.max_decoding_length
+		query_entry.kv_token_budget = total_tokens
+		return total_tokens
+
 	def _compute_host_kv_sequence_tokens(
 		self, sequence_ids: List[int]
 	) -> List[int]:
-		"""Estimate total tokens (prefill + decode) per sequence for KV allocation."""
-		if not hasattr(self, "query_book") or self.query_book is None:
-			raise RuntimeError("query_book is not initialized before KV allocation")
-		token_requirements: List[int] = []
-		for sequence_id in sequence_ids:
-			query_entry = self.query_book.get(sequence_id)
-			if query_entry is None or query_entry.encoded is None:
-				raise KeyError(f"Missing query entry for sequence {sequence_id}")
-			attention_mask = query_entry.encoded.get("attention_mask")
-			if attention_mask is None:
-				raise KeyError(
-					f"No attention_mask available for sequence {sequence_id}"
-				)
-			mask_row = attention_mask[0] if attention_mask.dim() > 1 else attention_mask
-			input_tokens = int(mask_row[: self.max_input_length].sum().item())
-			total_tokens = input_tokens + self.max_decoding_length
-			token_requirements.append(total_tokens)
-		return token_requirements
+		"""Reuse cached token budgets so host/GPU allocations stay consistent."""
+		return [self._get_sequence_token_budget(sequence_id) for sequence_id in sequence_ids]
 
 	def _to_global_sequence_id(self, local_sequence_id: int) -> int:
 		"""Encode global rank and local id into a unique 64-bit identifier."""
