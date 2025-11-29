@@ -448,17 +448,24 @@ class BatchGenWorker:
 		)
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is not None:
-			current_pages = getattr(manager, "config", None)
-			current_pages = getattr(current_pages, "num_pages", 0)
-			if current_pages >= gpu_config.num_pages:
+			current_config = getattr(manager, "config", None)
+			current_pages = getattr(current_config, "num_pages", 0)
+			if current_pages < gpu_config.num_pages:
+				logging.info(
+					"Rank %s Recreating GPUPagedKVCacheManager for %d pages (prev=%d)",
+					self.rank,
+					gpu_config.num_pages,
+					current_pages,
+				)
+				manager.destroy()
+				manager = None
+				self.gpu_paged_kv_cache_manager = None
+				if hasattr(self.core_engine, "gpu_paged_kv_manager"):
+					self.core_engine.gpu_paged_kv_manager = None
+			else:
+				if not manager.is_initialized:
+					manager.initialize()
 				return manager
-			logging.info(
-				"Rank %s Reinitializing GPUPagedKVCacheManager for %d pages (prev=%d)",
-				self.rank,
-				gpu_config.num_pages,
-				current_pages,
-			)
-			manager.destroy()
 
 		manager = GPUPagedKVCacheManager(config=gpu_config, device=self.local_rank)
 		manager.initialize()
@@ -537,22 +544,11 @@ class BatchGenWorker:
 			)
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
-		"""Invoke the GPU paged KV cache manager destroy hook if available."""
-		manager = getattr(self, "gpu_paged_kv_cache_manager", None)
+		"""Destroy the GPU paged KV cache manager if it is present."""
+		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
-			manager = getattr(self.core_engine, "gpu_paged_kv_cache_manager", None)
-		if manager is None:
-			logging.info("No GPU paged KV manager bound; skipping destroy call")
 			return
-		destroy_fn = getattr(manager, "destroy", None)
-		if destroy_fn is None:
-			logging.warning("GPU paged KV manager does not expose a destroy() method")
-			return
-		try:
-			destroy_fn(empty_cuda_cache=empty_cuda_cache)
-			logging.info("GPU paged KV cache destroyed successfully")
-		except Exception as exc:  # pragma: no cover - defensive logging
-			logging.error("Failed to destroy GPU paged KV cache: %s", exc)
+		manager.destroy(empty_cuda_cache=empty_cuda_cache)
 
 	def _local_batching(self):
 		# Step 3: Determine batch size

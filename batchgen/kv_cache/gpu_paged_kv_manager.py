@@ -555,6 +555,12 @@ class GPUPagedKVCacheManager:
     def initialize(self) -> None:
         """Instantiates GPU tensors and prepares allocator state."""
 
+        if self._is_initialized:
+            logging.warning(
+                "GPUPagedKVCacheManager.initialize called while already initialized; skipping"
+            )
+            return
+
         self._set_device()
         shape = (
             self.config.num_layers,
@@ -599,6 +605,7 @@ class GPUPagedKVCacheManager:
             total_bytes,
             total_bytes / (1024**3),
         )
+        self._is_initialized = True
 
     def destroy(self, *, empty_cuda_cache: bool = False) -> None:
         """
@@ -614,6 +621,12 @@ class GPUPagedKVCacheManager:
                 continue to rely on the caching allocator’s memory, so clearing the
                 cache is usually unnecessary.
         """
+
+        if not self._is_initialized:
+            logging.warning(
+                "GPUPagedKVCacheManager.destroy called while uninitialized; skipping"
+            )
+            return
 
         self._reset_runtime_state()
         if empty_cuda_cache:
@@ -899,10 +912,14 @@ class GPUPagedKVCacheManager:
             torch.cuda.set_device(self.device)
 
     def _ensure_initialized(self) -> None:
-        if self._k_cache is None:
+        if not self._is_initialized:
             raise RuntimeError(
                 "GPUPagedKVCacheManager.initialize must be called before use"
             )
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._is_initialized
 
     def _get_sequence_state(self, sequence_id: int) -> _SequenceState:
         state = self._sequences.get(sequence_id)
@@ -1105,6 +1122,7 @@ class GPUPagedKVCacheManager:
         self._gpu_page_table_manager = _GPUPageTableManager(
             device=self.device, max_pages_per_sequence=max_pages_per_seq
         )
+        self._is_initialized = False
 
     def _release_cached_cuda_memory(self) -> None:
         if self.device.type != "cuda":
