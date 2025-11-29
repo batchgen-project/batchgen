@@ -131,5 +131,4 @@ class KV_Storage {
                         torch::Tensor v,
                         torch::Tensor k_quantize_scale);
     
-    void verify_numa_placement(void* ptr, size_t size, int expected_node);
 };
