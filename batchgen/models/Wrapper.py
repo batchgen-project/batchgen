@@ -408,6 +408,7 @@ class Attn_Wrapper(torch.nn.Module):
 						# logging.debug(f"Cur attention mask{cur_attention_mask[0].tolist()}")
 						# exit()
 						logging.debug(f"Rank {dist.get_rank()} - Entering prefill attention")
+						# logging.info(f"{self.layer_idx=}, {cur_hidden_states.shape=}, {cur_hidden_states=} {cur_attention_mask=}, {position_ids=}")
 						output = self.module.prefill_attn_w8a16(
 							cur_hidden_states,
 							cur_attention_mask.to(cur_hidden_states.device),
@@ -466,7 +467,9 @@ class Attn_Wrapper(torch.nn.Module):
 					B, T, 1, D
 				)
 				global_sequence_ids = Attn_Wrapper._build_global_sequence_ids(cur_attn_batch)
-				logging.info(f"[Rank {dist.get_rank()} Layer {self.layer_idx} type of current attn batch: {type(cur_attn_batch)} cur_attn_batch: {cur_attn_batch} global_sequence_ids: {global_sequence_ids}")
+				# logging.info(f"[Rank {dist.get_rank()} Layer {self.layer_idx} type of current attn batch: {type(cur_attn_batch)} cur_attn_batch: {cur_attn_batch} global_sequence_ids: {global_sequence_ids}")
+
+				torch.cuda.current_stream().synchronize() # make sure kv is ready
 				self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
 					layer_idx=self.layer_idx,
 					sequence_ids=global_sequence_ids,
@@ -490,7 +493,7 @@ class Attn_Wrapper(torch.nn.Module):
 				f"[Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
 			)
 	
-
+			# logging.info(f"{self.layer_idx=}, {attn_output.device}, {attn_output.shape=}, {attn_output=}")
 			return attn_output, None, None
 
 		elif Attn_Wrapper.phase == "decode":
@@ -629,6 +632,7 @@ class Attn_Wrapper(torch.nn.Module):
 						# 	Attn_Wrapper.max_seqlen,
 						# 	weight_scale = self.weight_dequant_scale
 						# )
+						# logging.info(f"{self.layer_idx=}, {hidden_states.device}, {hidden_states[start_ids:end_ids]=}")
 						attn_result = self.module.decoding_attn_mode_3_bf16(
 							hidden_states[start_ids:end_ids],
 							position_ids[start_ids:end_ids],
@@ -638,6 +642,7 @@ class Attn_Wrapper(torch.nn.Module):
 							gpu_paged_kv_manager=Attn_Wrapper.gpu_paged_kv_manager,
 							layer_idx=self.layer_idx,
 						)
+						# logging.info(f"{self.layer_idx=}, {hidden_states.device}, {attn_result=}")
 						# scale = None
 						# past_key_states[start_ids:end_ids].copy_(kv)
 						final_attn_result[start_ids:end_ids].copy_(attn_result)

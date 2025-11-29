@@ -767,7 +767,7 @@ class BatchGenWorker:
 		]
 
 		# Print first 5 sequences
-		for query_idx in range(5):
+		for query_idx in range(max(0, self.num_local_queries - 5), self.num_local_queries):
 			logging.info(
 				f"Decoded tokens: {res[query_idx].squeeze().tolist()}"
 			)
