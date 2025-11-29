@@ -438,42 +438,56 @@ class BatchGenWorker:
 		worker_view.unregister_sequences(global_sequence_ids)
 		self._release_gpu_kv_pages(sequence_ids)
 
+	def _bind_gpu_paged_kv_manager(
+		self, manager: GPUPagedKVCacheManager
+	) -> None:
+		"""Bind GPU KV manager to both worker and core_engine."""
+		self.gpu_paged_kv_cache_manager = manager
+		if hasattr(self.core_engine, "gpu_paged_kv_manager"):
+			# Note: do not set None here because in C++ side it will lead to runtime error.
+			self.core_engine.gpu_paged_kv_manager = manager
+
+
 	def _ensure_gpu_paged_kv_manager(
 		self, sequence_tokens: Sequence[int]
 	) -> GPUPagedKVCacheManager:
-		"""Instantiate or resize the GPU paged KV manager for the batch."""
+		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`."""
 		gpu_config = build_gpu_kv_config(
 			model_name=self.huggingface_ckpt_name,
 			sequence_tokens=sequence_tokens,
 		)
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is not None:
-			current_config = getattr(manager, "config", None)
-			current_pages = getattr(current_config, "num_pages", 0)
-			if current_pages < gpu_config.num_pages:
-				logging.info(
-					"Rank %s Recreating GPUPagedKVCacheManager for %d pages (prev=%d)",
-					self.rank,
-					gpu_config.num_pages,
-					current_pages,
-				)
-				manager.destroy()
-				manager = None
-				self.gpu_paged_kv_cache_manager = None
-				if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-					self.core_engine.gpu_paged_kv_manager = None
-			else:
-				if not manager.is_initialized:
-					manager.initialize()
-				return manager
 
-		manager = GPUPagedKVCacheManager(config=gpu_config, device=self.local_rank)
-		manager.initialize()
-		self.gpu_paged_kv_cache_manager = manager
-		if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-			self.core_engine.gpu_paged_kv_manager = manager
+		manager = self.gpu_paged_kv_cache_manager
+		required_pages = gpu_config.num_pages
+		current_pages = (
+			getattr(getattr(manager, "config", None), "num_pages", 0)
+			if manager is not None
+			else 0
+		)
+
+		if manager is not None and current_pages >= required_pages:
+			manager.initialize()
+			self._bind_gpu_paged_kv_manager(manager)
+			return manager
+
+		if manager is not None:
+			manager.destroy()
+		
 		logging.info(
-			"Rank %s Initialized GPUPagedKVCacheManager on %s with %d pages",
+			"Rank %s creating GPUPagedKVCacheManager on %s: "
+			"current pages=%d, required pages=%d",
+			self.rank, self.local_rank, current_pages, required_pages
+		)
+
+		manager = GPUPagedKVCacheManager(
+			config=gpu_config,
+			device=self.local_rank,
+		)
+		manager.initialize()
+		self._bind_gpu_paged_kv_manager(manager)
+
+		logging.info(
+			"Rank %s initialized GPUPagedKVCacheManager on %s with %d pages",
 			self.rank,
 			manager.device,
 			gpu_config.num_pages,
