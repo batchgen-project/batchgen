@@ -1243,9 +1243,9 @@ class BatchGenWorker:
 				cur_batch_size = prefill_micro_batch_input_ids[micro_batch_idx].shape[0]
 				cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
 				
-				# CRITICAL: Convert local indices to global_idx for KV cache operations
-				cur_batch_global = self._local_indices_to_global_seq_ids(cur_batch_local)
-				Attn_Wrapper.cur_batch = cur_batch_global
+				# [FIX] Do NOT convert to global IDs. Pass local indices as in original code.
+				# The Attn_Wrapper/C++ layer likely adds the rank offset internally.
+				Attn_Wrapper.cur_batch = cur_batch_local 
 				
 				cur_batch_start += cur_batch_size
 				assert len(cur_batch_local) == cur_batch_size
@@ -1298,8 +1298,8 @@ class BatchGenWorker:
 			
 			# CRITICAL: Set cur_batch to global indices for KV cache operations
 			if batch:
-				global_batch = self._local_indices_to_global_seq_ids(batch)
-				Attn_Wrapper.cur_batch = global_batch
+				# global_batch = self._local_indices_to_global_seq_ids(batch)
+				Attn_Wrapper.cur_batch = batch
 			else:
 				Attn_Wrapper.cur_batch = []
 			
