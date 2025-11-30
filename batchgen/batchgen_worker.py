@@ -430,10 +430,10 @@ class BatchGenWorker:
 			)
 			return
 		global_sequence_ids = self._build_global_sequence_ids(sequence_ids)
-		logging.info(
-			f"Rank {self.rank} Releasing host KV pages (local->global): "
-			f"{self._format_sequence_ids_for_log(sequence_ids)}"
-		)
+		# logging.info(
+		# 	f"Rank {self.rank} Releasing host KV pages (local->global): "
+		# 	f"{self._format_sequence_ids_for_log(sequence_ids)}"
+		# )
 		worker_view.release_sequence_pages(global_sequence_ids)
 		worker_view.unregister_sequences(global_sequence_ids)
 		self._release_gpu_kv_pages(sequence_ids)
