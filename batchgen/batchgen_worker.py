@@ -981,7 +981,7 @@ class BatchGenWorker:
 				cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
 				
 				# Pass local indices - the C++ layer handles rank offset internally
-				Attn_Wrapper.cur_batch = cur_batch_local
+				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
 				
 				cur_batch_start += cur_batch_size
 				assert len(cur_batch_local) == cur_batch_size
@@ -1032,7 +1032,7 @@ class BatchGenWorker:
 			Attn_Wrapper.past_value_states = past_value_states
 			
 			# Pass local indices - C++ layer handles conversion
-			Attn_Wrapper.cur_batch = batch if batch else []
+			Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 			
 			while new_token_idx < self.max_decoding_length:
 				if self.rank == 0 and new_token_idx % 50 == 0:

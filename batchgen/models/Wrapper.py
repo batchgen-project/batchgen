@@ -466,7 +466,8 @@ class Attn_Wrapper(torch.nn.Module):
 				key_cache_with_num_head_dim = key_cache.view(
 					B, T, 1, D
 				)
-				global_sequence_ids = Attn_Wrapper._build_global_sequence_ids(cur_attn_batch)
+				# global_sequence_ids = Attn_Wrapper._build_global_sequence_ids(cur_attn_batch)
+				global_sequence_ids = cur_attn_batch
 				# logging.info(f"[Rank {dist.get_rank()} Layer {self.layer_idx} type of current attn batch: {type(cur_attn_batch)} cur_attn_batch: {cur_attn_batch} global_sequence_ids: {global_sequence_ids}")
 
 				torch.cuda.current_stream().synchronize() # make sure kv is ready
