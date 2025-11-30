@@ -404,44 +404,6 @@ class BatchGenWorker:
 		"""Reuse cached token budgets so host/GPU allocations stay consistent."""
 		return [self._get_sequence_token_budget(sequence_id) for sequence_id in sequence_ids]
 
-	def _to_global_sequence_id(self, local_sequence_id: int) -> int:
-		"""Encode global rank and local id into a unique 64-bit identifier."""
-		return (int(self.global_rank) << 32) | (int(local_sequence_id) & 0xFFFFFFFF)
-
-	def _build_global_sequence_ids(
-		self, sequence_ids: Sequence[int]
-	) -> List[int]:
-		"""Vectorized helper that maps local ids to their global counterparts."""
-		return [self._to_global_sequence_id(seq_id) for seq_id in sequence_ids]
-
-	def _format_sequence_ids_for_log(self, sequence_ids: Sequence[int]) -> str:
-		"""Return a concise local->global mapping string for logging."""
-		if not sequence_ids:
-			return "[]"
-		pairs = (
-			f"{local_id}->{self._to_global_sequence_id(local_id)}"
-			for local_id in sequence_ids
-		)
-		return ", ".join(pairs)
-
-	def _release_host_kv_pages(self, sequence_ids: List[int]) -> None:
-		"""Release host-paged KV pages and unregister finished sequences."""
-		if not sequence_ids:
-			return
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			logging.warning(
-				"Host paged KV worker view is unavailable; skip releasing sequences",
-			)
-			return
-		global_sequence_ids = self._build_global_sequence_ids(sequence_ids)
-		# logging.info(
-		# 	f"Rank {self.rank} Releasing host KV pages (local->global): "
-		# 	f"{self._format_sequence_ids_for_log(sequence_ids)}"
-		# )
-		worker_view.release_sequence_pages(global_sequence_ids)
-		worker_view.unregister_sequences(global_sequence_ids)
-		self._release_gpu_kv_pages(sequence_ids)
 
 	def _bind_gpu_paged_kv_manager(
 		self, manager: GPUPagedKVCacheManager
@@ -2023,20 +1985,18 @@ class BatchGenWorker:
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
 		Select sequences for prefill based on host KV cache capacity.
-		Assigns QUEUEING sequences until host KV cache cannot hold another full sequence.
-		All ranks execute this identically to maintain consistent global state.
+		All ranks execute this identically to get the same global prefill batch.
 		
-		Returns:
-			List of UUIDs to prefill (global batch, not rank-specific)
+		The host KV cache is SHARED - we compute total capacity and select
+		sequences that fit. Each rank will then only allocate for its own subset.
 		"""
-		# Get all QUEUEING sequences sorted by global_idx for deterministic ordering
 		queueing_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)
 		queueing_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
 		
 		if not queueing_uuids:
 			return []
 		
-		# Get available host pages
+		# Total available pages in the SHARED host KV cache
 		available_pages = self._get_host_kv_free_pages()
 		
 		prefill_batch = []
@@ -2050,7 +2010,6 @@ class BatchGenWorker:
 				prefill_batch.append(uuid)
 				pages_allocated += seq_pages
 			else:
-				# Can't fit this sequence, stop filling
 				break
 		
 		logging.info(
@@ -2313,21 +2272,20 @@ class BatchGenWorker:
 		# Destroy GPU paged KV cache
 		self._destroy_gpu_paged_kv_cache()
 		
-		# Allocate host KV pages for ALL sequences in the batch (not just this rank's)
-		if prefill_uuids:
-			# Build global sequence IDs for all sequences in batch
+		# Only allocate host KV pages for THIS RANK's sequences in the prefill batch
+		my_prefill_uuids = [uuid for uuid in prefill_uuids if uuid in self._uuid_to_local_map]
+		
+		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
 			
-			for uuid in prefill_uuids:
+			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
-				# Use global_idx as the unique identifier across ranks
-				global_seq_id = seq.global_idx
-				global_sequence_ids.append(global_seq_id)
+				global_sequence_ids.append(seq.global_idx)
 				sequence_tokens.append(seq.kv_token_budget)
 			
 			logging.info(
-				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV"
+				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV: {global_sequence_ids}"
 			)
 			
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
@@ -2339,6 +2297,7 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: Host KV Stats after allocation: {kv_stats}")
 		
 		logging.info(f"Rank {self.rank}: _config_prefill_for_batch completed in {time.perf_counter() - start_time:.4f}s")
+
 
 	def _config_decoding_for_batch(
 		self, 
@@ -2382,7 +2341,7 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: _config_decoding_for_batch completed")
 
 	def _release_host_kv_pages_for_batch(self, uuids: List[str]) -> None:
-		"""Release host KV pages for a batch of completed sequences."""
+		"""Release host KV pages for completed sequences owned by this rank."""
 		if not uuids:
 			return
 		
@@ -2391,21 +2350,24 @@ class BatchGenWorker:
 			logging.warning("Host paged KV worker view is unavailable")
 			return
 		
-		# Build global sequence IDs (using global_idx, consistent with registration)
-		global_sequence_ids = [
-			self.global_batch.get_sequence(uuid).global_idx
-			for uuid in uuids
-		]
+		# Only release for THIS RANK's sequences
+		my_uuids = [uuid for uuid in uuids if uuid in self._uuid_to_local_map]
 		
-		logging.info(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
-		
-		worker_view.release_sequence_pages(global_sequence_ids)
-		worker_view.unregister_sequences(global_sequence_ids)
-		
-		# Also release GPU KV pages for local sequences
-		local_indices = self._get_local_indices_for_uuids(uuids)
-		if local_indices:
-			self._release_gpu_kv_pages(local_indices)
+		if my_uuids:
+			global_sequence_ids = [
+				self.global_batch.get_sequence(uuid).global_idx
+				for uuid in my_uuids
+			]
+			
+			logging.info(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
+			
+			worker_view.release_sequence_pages(global_sequence_ids)
+			worker_view.unregister_sequences(global_sequence_ids)
+			
+			# Also release GPU KV pages
+			local_indices = self._get_local_indices_for_uuids(my_uuids)
+			if local_indices:
+				self._release_gpu_kv_pages(local_indices)
 
 	def _local_indices_to_global_seq_ids(self, local_indices: List[int]) -> List[int]:
 		"""Convert local indices to global sequence IDs (global_idx from SequenceEntry)."""
