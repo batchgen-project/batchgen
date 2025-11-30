@@ -641,7 +641,7 @@ class BatchGenWorker:
 		self.global_batch = SequenceBatch()
 		for idx, text in enumerate(global_prompts):
 			seq = SequenceEntry(
-				uuid=f"seq_{idx}",  # Simple UUID based on index
+				uuid=f"seq_{idx}",
 				global_idx=idx,
 				prompt_length=0,  # Will be set after tokenization
 				max_decode_length=self.max_decoding_length,
@@ -652,7 +652,7 @@ class BatchGenWorker:
 		# Step 2: Tokenize all sequences (all ranks do this identically)
 		self._tokenize_global_batch()
 
-		# Step 3: Assign sequences to ranks
+		# Step 3: Assign sequences to ranks (round-robin)
 		self._assign_sequences_to_ranks()
 
 		# Step 4: Build query_book for backward compatibility
@@ -662,10 +662,7 @@ class BatchGenWorker:
 		self.num_global_queries = len(global_prompts)
 		self.num_local_queries = len(self.global_batch.get_sequences_for_rank(self.rank))
 
-		# Step 6: Create model batches (using existing logic for now)
-		self.model_batches = self._local_batching()
-
-		# Step 7: Run generation
+		# Step 6: Run generation with new KV-driven scheduling
 		return self.generate()
 
 	# Helper methods for UUID <-> local index conversion
@@ -680,7 +677,7 @@ class BatchGenWorker:
 		return self.global_batch.get_sequences_for_rank_with_status(self.rank, status)
 
 
-	def generate(self):
+	def generate_bak(self):
 		self.comm = None
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL","0") == "0":
 			from batchgen.distributed.utils import StatelessProcessGroup
@@ -1992,4 +1989,396 @@ class BatchGenWorker:
  
 		logging.info(
 			f"Rank {self.rank}: Built local query_book with {len(self.query_book)} entries"
-		)		
+		)	
+
+	def _get_host_kv_free_pages(self) -> int:
+		"""Get current free pages from host KV cache."""
+		stats = self.host_paged_kv_worker_view.get_stats()
+		return stats.num_free_pages
+
+	def _prepare_prefill_batch(self) -> List[str]:
+		"""
+		Select sequences for prefill based on host KV cache capacity.
+		Assigns QUEUEING sequences until host KV cache cannot hold another full sequence.
+		All ranks execute this identically to maintain consistent global state.
+		
+		Returns:
+			List of UUIDs to prefill (global batch, not rank-specific)
+		"""
+		# Get all QUEUEING sequences sorted by global_idx for deterministic ordering
+		queueing_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)
+		queueing_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
+		
+		if not queueing_uuids:
+			return []
+		
+		# Get available host pages
+		available_pages = self._get_host_kv_free_pages()
+		
+		prefill_batch = []
+		pages_allocated = 0
+		
+		for uuid in queueing_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			seq_pages = seq.get_pages_required()
+			
+			if pages_allocated + seq_pages <= available_pages:
+				prefill_batch.append(uuid)
+				pages_allocated += seq_pages
+			else:
+				# Can't fit this sequence, stop filling
+				break
+		
+		logging.info(
+			f"Rank {self.rank}: Prepared prefill batch with {len(prefill_batch)} sequences, "
+			f"using {pages_allocated}/{available_pages} pages"
+		)
+		
+		return prefill_batch
+
+	def _prepare_decode_batch(self) -> List[str]:
+		"""
+		Select sequences for decode phase from PREFILLED sequences.
+		Limited by decode batch size.
+		All ranks execute this identically to maintain consistent global state.
+		
+		Returns:
+			List of UUIDs to decode (global batch, not rank-specific)
+		"""
+		# Get all PREFILLED sequences sorted by global_idx
+		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+		prefilled_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
+		
+		if not prefilled_uuids:
+			return []
+		
+		# Limit by decode batch size
+		decode_batch_size = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
+		decode_batch = prefilled_uuids[:decode_batch_size]
+		
+		logging.info(
+			f"Rank {self.rank}: Prepared decode batch with {len(decode_batch)} sequences "
+			f"(max batch size: {decode_batch_size})"
+		)
+		
+		return decode_batch
+
+	def _get_local_indices_for_uuids(self, uuids: List[str]) -> List[int]:
+		"""
+		Convert global UUIDs to local indices for sequences assigned to this rank.
+		Only includes sequences that belong to this rank.
+		"""
+		local_indices = []
+		for uuid in uuids:
+			if uuid in self._uuid_to_local_map:
+				local_indices.append(self._uuid_to_local_map[uuid])
+		return local_indices
+
+	def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus) -> None:
+		"""Update status for all sequences in a batch."""
+		for uuid in uuids:
+			self.global_batch.update_status(uuid, new_status)	
+
+	def generate(self):
+		"""
+		Main generation loop with KV-cache-driven scheduling.
+		
+		Flow:
+		1. Prefill until host KV cache is full
+		2. Decode all prefilled sequences
+		3. Release KV pages for completed sequences
+		4. Repeat until all sequences completed
+		"""
+		# Initialize communicator
+		self.comm = None
+		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
+			from batchgen.distributed.utils import StatelessProcessGroup
+			from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
+			self.rank = dist.get_rank()
+			self.world_size = dist.get_world_size()
+			device = torch.device("cuda", self.rank % torch.cuda.device_count())
+			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+			
+			try:
+				group = StatelessProcessGroup.create(
+					host=comm_master_addr,
+					port=20003,
+					rank=self.rank,
+					world_size=self.world_size,
+					data_expiration_seconds=6000,
+				)
+				self.comm = PyNcclCommunicator(group=group, device=device)
+			except Exception as e:
+				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+
+		# Timing stats
+		generation_start_time = time.perf_counter()
+		prefill_time = 0
+		decoding_time = 0
+		config_prefill_time = 0
+		config_decode_time = 0
+		
+		iteration = 0
+		
+		# Main loop: continue until all sequences are completed
+		while not self.global_batch.all_completed():
+			iteration += 1
+			logging.info(f"{'='*60}")
+			logging.info(f"Rank {self.rank}: Starting iteration {iteration}")
+			logging.info(
+				f"  QUEUEING: {self.global_batch.count_by_status(SequenceStatus.QUEUEING)}, "
+				f"PREFILLED: {self.global_batch.count_by_status(SequenceStatus.PREFILLED)}, "
+				f"COMPLETED: {self.global_batch.count_by_status(SequenceStatus.COMPLETED)}"
+			)
+			
+			# ============ PREFILL PHASE ============
+			# Only prefill if there are queueing sequences and we have capacity
+			if self.global_batch.has_queueing():
+				dist.barrier()
+				
+				# Prepare prefill batch (all ranks compute same batch)
+				prefill_uuids = self._prepare_prefill_batch()
+				
+				if prefill_uuids:
+					# Update status: QUEUEING -> IN_PREFILL
+					self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL)
+					
+					# Get local indices for this rank's sequences
+					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
+					
+					# Config prefill
+					tmp_start = time.perf_counter()
+					self._config_prefill_for_batch(prefill_uuids)
+					config_prefill_time += time.perf_counter() - tmp_start
+					
+					# Execute prefill
+					prefill_start_time = time.perf_counter()
+					if local_prefill_indices:
+						with torch.inference_mode():
+							new_token = self.prefill(local_prefill_indices)
+					else:
+						new_token = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
+						logging.info(f"Rank {self.rank}: No local sequences to prefill")
+					prefill_time += time.perf_counter() - prefill_start_time
+					
+					self._unregister_fp8_weights()
+					
+					# Update status: IN_PREFILL -> PREFILLED
+					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
+					
+					dist.barrier()
+			
+			# ============ DECODE PHASE ============
+			# Decode all prefilled sequences in batches
+			while self.global_batch.has_prefilled():
+				dist.barrier()
+				
+				# Prepare decode batch (all ranks compute same batch)
+				decode_uuids = self._prepare_decode_batch()
+				
+				if not decode_uuids:
+					break
+				
+				# Update status: PREFILLED -> IN_DECODE
+				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
+				
+				# Get local indices for this rank's sequences
+				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
+				
+				# Config decoding
+				tmp_start = time.perf_counter()
+				torch.cuda.empty_cache()
+				self._config_decoding_for_batch(decode_uuids, local_decode_indices, self.comm)
+				
+				# Prepare KV states
+				past_key_states = None
+				past_value_states = None
+				scale_dict = None
+				
+				if self.engine_config.Basic_Config.attn_mode == 3:
+					if self.model_config.model_type == "deepseek_v3":
+						if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
+							if local_decode_indices:
+								scale_dict = self.core_engine.get_kv_scale(
+									local_decode_indices,
+									self.max_input_length + self.max_decoding_length
+								)
+				
+				config_decode_time += time.perf_counter() - tmp_start
+				
+				dist.barrier()
+				
+				# Execute decoding
+				decoding_start_time = time.perf_counter()
+				with torch.inference_mode():
+					logging.info(f"Rank {self.rank}: Decoding batch size: {len(local_decode_indices)}")
+					# Get the new tokens from prefill for this batch
+					if local_decode_indices:
+						# Collect the first decoded token for each sequence
+						new_tokens = torch.cat([
+							self.query_book[idx].decoded_tokens[:, 0:1]
+							for idx in local_decode_indices
+						], dim=0).to(self.torch_device)
+					else:
+						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
+					
+					self.decoding(new_tokens, local_decode_indices, past_key_states, past_value_states, scale_dict)
+				decoding_time += time.perf_counter() - decoding_start_time
+				
+				# Update status: IN_DECODE -> COMPLETED
+				self._update_batch_status(decode_uuids, SequenceStatus.COMPLETED)
+				
+				# Release KV pages for completed sequences
+				self._release_host_kv_pages_for_batch(decode_uuids)
+				
+				self._unregister_fp8_weights()
+				self.deep_free_model_memory()
+				
+				del past_key_states
+				del scale_dict
+				
+				dist.barrier()
+		
+		# Log timing stats
+		generation_time = time.perf_counter() - generation_start_time
+		phase_switching_time = config_prefill_time + config_decode_time
+		
+		logging.info(
+			f"Rank {self.rank} Generation completed:\n"
+			f"  Prefill total time: {prefill_time:.1f}s\n"
+			f"  Decoding total time: {decoding_time:.1f}s\n"
+			f"  Generation total time: {generation_time:.1f}s\n"
+			f"  Phase switching time: {phase_switching_time:.1f}s\n"
+			f"  Config prefill time: {config_prefill_time:.1f}s\n"
+			f"  Config decoding time: {config_decode_time:.1f}s"
+		)
+		
+		# Gather results
+		res = [
+			self.query_book[query_idx].decoded_tokens
+			for query_idx in range(self.num_local_queries)
+		]
+		
+		all_results = [None] * self.world_size
+		dist.all_gather_object(all_results, res)
+		all_results = [item for sublist in all_results for item in sublist]
+		res_tensor = torch.cat(all_results, dim=0).cpu()
+		
+		if self.rank == 0:
+			return [res_tensor]
+		else:
+			return []
+
+	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
+		"""Configure prefill phase for a batch of sequences."""
+		start_time = time.perf_counter()
+		logging.info(f"Rank {self.rank}: Starting _config_prefill_for_batch")
+		
+		# Configure model for prefill
+		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+		self.set_phase("prefill")
+		
+		# Reset engine state
+		self.core_engine.stop_h2d_worker()
+		self.core_engine.clear_weight_copy_queue()
+		self.core_engine.reset_prefill_buffer()
+		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+		self.core_engine.start_h2d_worker()
+		
+		# Destroy GPU paged KV cache
+		self._destroy_gpu_paged_kv_cache()
+		
+		# Allocate host KV pages for ALL sequences in the batch (not just this rank's)
+		if prefill_uuids:
+			# Build global sequence IDs for all sequences in batch
+			global_sequence_ids = []
+			sequence_tokens = []
+			
+			for uuid in prefill_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				# Use global_idx as the unique identifier across ranks
+				global_seq_id = seq.global_idx
+				global_sequence_ids.append(global_seq_id)
+				sequence_tokens.append(seq.kv_token_budget)
+			
+			logging.info(
+				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV"
+			)
+			
+			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
+			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
+				list(zip(global_sequence_ids, sequence_tokens))
+			)
+			
+			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
+			logging.info(f"Rank {self.rank}: Host KV Stats after allocation: {kv_stats}")
+		
+		logging.info(f"Rank {self.rank}: _config_prefill_for_batch completed in {time.perf_counter() - start_time:.4f}s")
+
+	def _config_decoding_for_batch(
+		self, 
+		decode_uuids: List[str], 
+		local_decode_indices: List[int],
+		comm=None
+	) -> None:
+		"""Configure decoding phase for a batch of sequences."""
+		logging.info(f"Rank {self.rank}: Starting _config_decoding_for_batch")
+		
+		self.deep_free_model_memory()
+		self.init_nvshmem()
+		
+		# Get number of sequences for each rank
+		num_local_seq = len(local_decode_indices)
+		num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
+		num_seq_per_rank[self.rank] = num_local_seq
+		dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
+		max_num_seq = int(num_seq_per_rank.max().item())
+		
+		if self.world_size <= 8:
+			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+			self.set_phase("decode")
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_kv_copy_queue()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+			self.core_engine.start_h2d_worker()
+		else:
+			# Prepare GPU paged KV cache for local sequences
+			self._prepare_gpu_paged_kv_cache(local_decode_indices)
+			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
+			
+			self.set_phase("decode")
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_kv_copy_queue()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+		
+		logging.info(f"Rank {self.rank}: _config_decoding_for_batch completed")
+
+	def _release_host_kv_pages_for_batch(self, uuids: List[str]) -> None:
+		"""Release host KV pages for a batch of completed sequences."""
+		if not uuids:
+			return
+		
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			logging.warning("Host paged KV worker view is unavailable")
+			return
+		
+		# Build global sequence IDs
+		global_sequence_ids = [
+			self.global_batch.get_sequence(uuid).global_idx
+			for uuid in uuids
+		]
+		
+		logging.info(f"Rank {self.rank}: Releasing host KV pages for {len(global_sequence_ids)} sequences")
+		
+		worker_view.release_sequence_pages(global_sequence_ids)
+		worker_view.unregister_sequences(global_sequence_ids)
+		
+		# Also release GPU KV pages for local sequences
+		local_indices = self._get_local_indices_for_uuids(uuids)
+		if local_indices:
+			self._release_gpu_kv_pages(local_indices)
