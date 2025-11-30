@@ -1197,95 +1197,71 @@ class BatchGenWorker:
 	def prefill(self, batch: list[int]):
 		"""
 		Handle the prefill for a full model batch.
+		batch: list of local indices
 		"""
-
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
 		input_ids = torch.cat(
 			[
-				self.query_book[query_idx].encoded["input_ids"][
-					:, : self.max_input_length
-				]
+				self.query_book[query_idx].encoded["input_ids"][:, : self.max_input_length]
 				for query_idx in batch
 			],
 			dim=0,
 		)
 		attention_masks = torch.cat(
 			[
-				self.query_book[query_idx].encoded["attention_mask"][
-					:, : self.max_input_length
-				]
+				self.query_book[query_idx].encoded["attention_mask"][:, : self.max_input_length]
 				for query_idx in batch
 			],
 			dim=0,
 		)
 
 		num_prefill_micro_batches = math.ceil(
-			len(batch)
-			/ self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+			len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
 		)
 		prefill_micro_batch_input_ids = torch.split(
 			input_ids,
 			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
 		)
-		Prefill_micro_batch_attention_masks = torch.split(
+		prefill_micro_batch_attention_masks = torch.split(
 			attention_masks,
 			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
 		)
-		logging.info(
-			f"Number of prefill micro batches: {num_prefill_micro_batches}"
-		)
+		logging.info(f"Number of prefill micro batches: {num_prefill_micro_batches}")
+		
 		cur_batch_start = 0
 		output_tokens = []
-		for micro_batch_idx in tqdm(
-			range(num_prefill_micro_batches), desc="Prefill Micro Batch"
-		):
+		
+		for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
 			with torch.inference_mode():
-				Attn_Wrapper.attention_mask = (
-					Prefill_micro_batch_attention_masks[micro_batch_idx]
+				Attn_Wrapper.attention_mask = prefill_micro_batch_attention_masks[micro_batch_idx]
+				Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
+					prefill_micro_batch_attention_masks[micro_batch_idx]
 				)
-				if "deepseek" in self.model_config.model_type:
-					Attn_Wrapper.position_ids = (
-						create_position_ids_from_attention_mask(
-							Prefill_micro_batch_attention_masks[micro_batch_idx]
-						)
-					)
-				else:
-					Attn_Wrapper.position_ids = (
-						create_position_ids_from_attention_mask(
-							Prefill_micro_batch_attention_masks[micro_batch_idx]
-						)
-					)
-				cur_batch_size = prefill_micro_batch_input_ids[
-					micro_batch_idx
-				].shape[0]
-				cur_batch = batch[
-					cur_batch_start : cur_batch_start + cur_batch_size
-				]
-				Attn_Wrapper.cur_batch = cur_batch
+				
+				cur_batch_size = prefill_micro_batch_input_ids[micro_batch_idx].shape[0]
+				cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
+				
+				# CRITICAL: Convert local indices to global_idx for KV cache operations
+				cur_batch_global = self._local_indices_to_global_seq_ids(cur_batch_local)
+				Attn_Wrapper.cur_batch = cur_batch_global
+				
 				cur_batch_start += cur_batch_size
-				assert len(cur_batch) == cur_batch_size
+				assert len(cur_batch_local) == cur_batch_size
 
 				outputs = self.model(
-					prefill_micro_batch_input_ids[micro_batch_idx].to(
-						self.torch_device
-					),
-					attention_mask=Prefill_micro_batch_attention_masks[
-						micro_batch_idx
-					].to(self.torch_device),
-					# position_ids=micro_batch_position_ids[micro_batch_idx].to(self.torch_device),
+					prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device),
+					attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
 					use_cache=False,
 				)
-				# Greedy
-				new_tokens = torch.argmax(
-					outputs.logits[:, -1, :], dim=-1
-				).view(-1, 1)
+				new_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1).view(-1, 1)
 				output_tokens.append(new_tokens)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
 		self.update_new_token(new_tokens, batch, 0)
 		return new_tokens
+
 
 	def decoding(
 		self, 
@@ -1297,84 +1273,61 @@ class BatchGenWorker:
 	):
 		"""
 		Handle the decoding for a full model batch.
-		All the queries reach <EOS> or the max decoding length.
-
-		return
-				- answer_set: dict[query_idx, decoded_tokens]
+		batch: list of local indices
 		"""
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
+		
 		new_token_idx = 1
-		# attention_mask = torch.cat([self.query_book[query_idx].encoded["attention_mask"][:,:self.max_max_input_length + new_token_idx] for query_idx in batch], dim=0)
-		# if attention_mask.dim() == 2 and (self.model_config.model_type not in ["Qwen2"]):
-		#  	attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-		# 	attention_mask = torch.where(attention_mask == 0, torch.finfo(torch.bfloat16).min, torch.tensor(0.0, dtype=torch.bfloat16, device=attention_mask.device))
-		# Attn_Wrapper.attention_mask = attention_mask
-
 		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
-		# Log device memory usage
 		logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
 		if RUNTIME_ATTN_MODE == 3:
-			"""
-				KV ACCUMULATION IN GPU.
-			"""
+			"""KV ACCUMULATION IN GPU."""
 			gpu_manager = getattr(self, "gpu_paged_kv_cache_manager", None)
 			if gpu_manager is None:
 				gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+			
 			Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
 			Attn_Wrapper.host_paged_kv_worker_view = getattr(
-				self.core_engine,
-				"host_paged_kv_worker_view",
-				None,
+				self.core_engine, "host_paged_kv_worker_view", None
 			)
 			Attn_Wrapper.scale = scale_dict
 			Attn_Wrapper.past_key_states = past_key_states
 			Attn_Wrapper.past_value_states = past_value_states
+			
+			# CRITICAL: Set cur_batch to global indices for KV cache operations
+			if batch:
+				global_batch = self._local_indices_to_global_seq_ids(batch)
+				Attn_Wrapper.cur_batch = global_batch
+			else:
+				Attn_Wrapper.cur_batch = []
+			
 			while new_token_idx < self.max_decoding_length:
-				# Log for every 50 tokens.
 				if self.rank == 0 and new_token_idx % 50 == 0:
 					logging.info(f"Decoding new token idx: {new_token_idx}")
 				
-				
-				# micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
-				# num_micro_batches = math.ceil(len(batch) / micro_batch_size)
-				# micro_batches = [
-				#     batch[
-				#         micro_batch_idx * micro_batch_size : (
-				#             micro_batch_idx + 1
-				#         )
-				#         * micro_batch_size
-				#     ]
-				#     for micro_batch_idx in range(num_micro_batches)
-				# ]
-				# Attn_Wrapper.cur_batch = micro_batches
 				with torch.inference_mode():
 					if len(batch) != 0:
 						attention_mask = torch.cat(
 							[
-								self.query_book[query_idx].encoded[
-									"attention_mask"
-								][:, : self.max_input_length + new_token_idx]
+								self.query_book[query_idx].encoded["attention_mask"][
+									:, : self.max_input_length + new_token_idx
+								]
 								for query_idx in batch
 							],
 							dim=0,
 						).to(self.torch_device)
-					# if "deepseek" in self.model_config.model_type:
-					#     position_ids = create_position_ids_from_attention_mask(
-					#         attention_mask
-					#     )
-					# else:
-					#     position_ids = create_position_ids_from_attention_mask(
-					#         attention_mask
-					#     )[:, -1].unsqueeze(-1)
-
+						
 						Attn_Wrapper.attention_mask = attention_mask
 						Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
 						Attn_Wrapper.cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
 						Attn_Wrapper.max_seqlen = Attn_Wrapper.cache_seqlens.max().item()
 					else:
-						attention_mask = torch.zeros((0, self.max_input_length + new_token_idx), dtype=torch.int64, device=self.torch_device)
+						attention_mask = torch.zeros(
+							(0, self.max_input_length + new_token_idx),
+							dtype=torch.int64, device=self.torch_device
+						)
 						Attn_Wrapper.attention_mask = attention_mask
 						Attn_Wrapper.position_ids = attention_mask
 						Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
@@ -1383,22 +1336,26 @@ class BatchGenWorker:
 					new_tokens = self.model(
 						new_tokens.to(self.torch_device),
 						attention_mask=attention_mask,
-						# position_ids=position_ids.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-						-1, 1
-					)
+					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(-1, 1)
 					self.update_new_token(new_tokens, batch, new_token_idx)
+				
 				new_token_idx += 1
+			
+			# Clear wrapper state
 			Attn_Wrapper.scale = None
 			Attn_Wrapper.past_key_states = None
 			Attn_Wrapper.past_value_states = None
 			Attn_Wrapper.gpu_paged_kv_manager = None
 			Attn_Wrapper.host_paged_kv_worker_view = None
-		
+			Attn_Wrapper.cur_batch = None
 		
 		else:
+			# ... (modes 0, 1, 2 - also need cur_batch fix if used)
+			# For modes 0, 1, 2, convert batch to global indices similarly
+			global_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+ 
 			while new_token_idx < self.max_decoding_length:
 				if self.rank == 0:
 					logging.info(f"Decoding new token idx: {new_token_idx}")
