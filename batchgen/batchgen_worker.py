@@ -42,6 +42,7 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
 	build_host_kv_config,
 )
+from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
@@ -211,6 +212,10 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: Initializing core engine.")
 		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
+
+
+		# Global batch state
+		self.global_batch: Optional[SequenceBatch] = None
 
 
 
@@ -613,7 +618,7 @@ class BatchGenWorker:
 		logging.info(f"=" * 60)
 		return model_batches
 
-	def process_new_batch(self, batch: List[str], num_global_queries: int):
+	def process_new_batch_bak(self, batch: List[str], num_global_queries: int):
 		"""
 		Future API.
 		"""
@@ -622,6 +627,57 @@ class BatchGenWorker:
 		self._tokenization(batch)
 		self.model_batches = self._local_batching()
 		return self.generate()
+
+	def process_new_batch(self, global_prompts: List[str]) -> List[torch.Tensor]:
+		"""
+		Process a global batch of prompts.
+		All ranks receive the same global_prompts and maintain consistent state.
+		"""
+		logging.info(
+			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
+		)
+
+		# Step 1: Initialize global batch
+		self.global_batch = SequenceBatch()
+		for idx, text in enumerate(global_prompts):
+			seq = SequenceEntry(
+				uuid=f"seq_{idx}",  # Simple UUID based on index
+				global_idx=idx,
+				prompt_length=0,  # Will be set after tokenization
+				max_decode_length=self.max_decoding_length,
+				text=text,
+			)
+			self.global_batch.add_sequence(seq)
+
+		# Step 2: Tokenize all sequences (all ranks do this identically)
+		self._tokenize_global_batch()
+
+		# Step 3: Assign sequences to ranks
+		self._assign_sequences_to_ranks()
+
+		# Step 4: Build query_book for backward compatibility
+		self._build_local_query_book()
+
+		# Step 5: Set counts for compatibility
+		self.num_global_queries = len(global_prompts)
+		self.num_local_queries = len(self.global_batch.get_sequences_for_rank(self.rank))
+
+		# Step 6: Create model batches (using existing logic for now)
+		self.model_batches = self._local_batching()
+
+		# Step 7: Run generation
+		return self.generate()
+
+	# Helper methods for UUID <-> local index conversion
+	def _local_to_uuid(self, local_idx: int) -> str:
+		return self._local_to_uuid_map.get(local_idx, "")
+
+	def _uuid_to_local(self, uuid: str) -> int:
+		return self._uuid_to_local_map.get(uuid, -1)
+
+	def _get_my_sequences_by_status(self, status: SequenceStatus) -> List[str]:
+		"""Get UUIDs of sequences assigned to this rank with given status."""
+		return self.global_batch.get_sequences_for_rank_with_status(self.rank, status)
 
 
 	def generate(self):
@@ -1835,4 +1891,105 @@ class BatchGenWorker:
 			if torch.cuda.is_available():
 				torch.cuda.empty_cache()
 
+	
+	def _tokenize_global_batch(self) -> None:
+		"""
+		Tokenize all sequences in the global batch.
+		All ranks execute this identically to maintain consistent state.
+		"""
+		if self.global_batch is None:
+			raise RuntimeError("Global batch not initialized")
 
+		for seq in self.global_batch:
+			tokenized = self.tokenizer(
+				seq.text,
+				return_tensors="pt",
+				max_length=self.max_input_length,
+				truncation=True,
+				padding="max_length",
+			)
+
+			# Extend for decoding space
+			extended_size = self.max_input_length + self.max_decoding_length
+			input_ids_extended = torch.zeros(
+				(1, extended_size), dtype=tokenized["input_ids"].dtype
+			)
+			attention_mask_extended = torch.zeros(
+				(1, extended_size), dtype=tokenized["attention_mask"].dtype
+			)
+
+			seq_len = tokenized["input_ids"].size(1)
+			input_ids_extended[0, :seq_len] = tokenized["input_ids"][0, :]
+			attention_mask_extended[0, :seq_len] = tokenized["attention_mask"][0, :]
+
+			seq.input_ids = input_ids_extended
+			seq.attention_mask = attention_mask_extended
+			seq.decoded_tokens = torch.zeros(
+				1, self.max_decoding_length, dtype=torch.int64
+			)
+
+			# Update actual prompt length and KV budget
+			actual_prompt_len = int(
+				tokenized["attention_mask"][0, :self.max_input_length].sum().item()
+			)
+			seq.prompt_length = actual_prompt_len
+			seq.current_context_length = actual_prompt_len
+			seq.kv_token_budget = actual_prompt_len + self.max_decoding_length
+
+		logging.info(
+			f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences"
+		)
+
+	def _assign_sequences_to_ranks(self) -> None:
+		"""
+		Assign sequences to ranks using round-robin distribution.
+		All ranks execute this identically to maintain consistent assignment.
+		"""
+		if self.global_batch is None:
+			raise RuntimeError("Global batch not initialized")
+
+		# Round-robin assignment based on global_idx
+		for seq in self.global_batch:
+			assigned_rank = seq.global_idx % self.world_size
+			self.global_batch.assign_rank(seq.uuid, assigned_rank)
+
+		# Log assignment summary
+		my_seqs = self.global_batch.get_sequences_for_rank(self.rank)
+		logging.info(
+			f"Rank {self.rank}: Assigned {len(my_seqs)} sequences: {my_seqs}"
+		)
+
+	def _build_local_query_book(self) -> None:
+		"""
+		Build query_book from global_batch for sequences assigned to this rank.
+		Maps local indices (0, 1, 2, ...) to sequence data for backward compatibility.
+		"""
+		my_uuids = sorted(
+			self.global_batch.get_sequences_for_rank(self.rank),
+			key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx
+		)
+
+		self.query_book = {}
+		self._local_to_uuid_map: Dict[int, str] = {}
+		self._uuid_to_local_map: Dict[str, int] = {}
+
+		for local_idx, uuid in enumerate(my_uuids):
+			seq = self.global_batch.get_sequence(uuid)
+
+			# Create query object for backward compatibility
+			self.query_book[local_idx] = query(
+				text=seq.text,
+				encoded={
+					"input_ids": seq.input_ids,
+					"attention_mask": seq.attention_mask,
+				},
+				decoded_tokens=seq.decoded_tokens,
+				kv_token_budget=seq.kv_token_budget,
+			)
+
+			self._local_to_uuid_map[local_idx] = uuid
+			self._uuid_to_local_map[uuid] = local_idx
+ 
+		logging.info(
+			f"Rank {self.rank}: Built local query_book with {len(self.query_book)} entries"
+		)		
