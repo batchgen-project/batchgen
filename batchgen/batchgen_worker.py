@@ -871,10 +871,49 @@ class BatchGenWorker:
 		
 		return updated_uuids, updated_local_indices
 
+	# def _allocate_and_load_gpu_kv_for_new_sequences(self, local_sequence_ids: List[int]) -> None:
+	# 	"""
+	# 	Allocate GPU KV pages and load host KV for newly added sequences during continuous batching.
+	# 	This is different from _prepare_gpu_paged_kv_cache which may recreate the manager.
+	# 	"""
+	# 	if not local_sequence_ids:
+	# 		return
+		
+	# 	manager = self.gpu_paged_kv_cache_manager
+	# 	if manager is None:
+	# 		logging.warning("GPU KV manager not initialized, cannot load new sequences")
+	# 		return
+		
+	# 	# Convert local indices to global sequence IDs
+	# 	global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+	# 	sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
+		
+	# 	logging.info(
+	# 		f"Rank {self.rank}: Allocating GPU KV pages for new sequences: {global_sequence_ids}"
+	# 	)
+		
+	# 	# Allocate pages for the new sequences
+	# 	manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
+		
+	# 	# Rebuild page table to include new sequences
+	# 	# Get all currently active sequences (existing + new)
+	# 	all_active_global_ids = []
+	# 	for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
+	# 		if uuid in self._uuid_to_local_map:
+	# 			seq = self.global_batch.get_sequence(uuid)
+	# 			all_active_global_ids.append(seq.global_idx)
+		
+	# 	# Sort for deterministic ordering
+	# 	all_active_global_ids.sort()
+		
+	# 	if all_active_global_ids:
+	# 		manager.rebuild_page_table(all_active_global_ids)
+		
+	# 	# Load host KV to GPU for the new sequences
+	# 	self._load_host_kv_to_gpu(manager, global_sequence_ids)
 	def _allocate_and_load_gpu_kv_for_new_sequences(self, local_sequence_ids: List[int]) -> None:
 		"""
 		Allocate GPU KV pages and load host KV for newly added sequences during continuous batching.
-		This is different from _prepare_gpu_paged_kv_cache which may recreate the manager.
 		"""
 		if not local_sequence_ids:
 			return
@@ -895,22 +934,33 @@ class BatchGenWorker:
 		# Allocate pages for the new sequences
 		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
 		
-		# Rebuild page table to include new sequences
-		# Get all currently active sequences (existing + new)
+		# IMPORTANT: Build page table with ONLY the new sequences first
+		# This ensures export_layer_page_pointer_table() returns pointers matching these sequences
+		manager.rebuild_page_table(global_sequence_ids)
+		
+		# Load host KV to GPU (now the pointer tensor will match the new sequences)
+		self._load_host_kv_to_gpu(manager, global_sequence_ids)
+		
+		# NOW rebuild page table with ALL active sequences (existing + new)
 		all_active_global_ids = []
 		for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				all_active_global_ids.append(seq.global_idx)
 		
+		# Add the new sequences (they're not IN_DECODE yet, but will be after this method)
+		for gid in global_sequence_ids:
+			if gid not in all_active_global_ids:
+				all_active_global_ids.append(gid)
+		
 		# Sort for deterministic ordering
 		all_active_global_ids.sort()
 		
 		if all_active_global_ids:
 			manager.rebuild_page_table(all_active_global_ids)
-		
-		# Load host KV to GPU for the new sequences
-		self._load_host_kv_to_gpu(manager, global_sequence_ids)
+			logging.info(
+				f"Rank {self.rank}: Rebuilt page table with {len(all_active_global_ids)} sequences"
+			)
 
 	# ============ Main Generation Loop ============
 
