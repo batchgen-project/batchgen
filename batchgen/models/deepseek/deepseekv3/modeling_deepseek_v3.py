@@ -1936,7 +1936,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return self.y[:num_tokens].to(x.dtype)
 
 	@torch.inference_mode()
-	def moe_infer_pplx_a2a_fp8_dispatch(self,x):
+	def moe_infer_pplx_a2a_fp8_dispatch_bak(self,x):
 		num_tokens, hidden_size = x.shape
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
 			x.view(num_tokens, 1, hidden_size)
@@ -1950,6 +1950,94 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.weights.copy_(topk_weight.to(torch.float32))
 		# bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
 		self.bound_m.fill_(num_tokens)
+
+		# 2. Dispatch
+		self.ata.dispatch(
+			out_expert_num_tokens=self.expert_num_tokens,
+			out_expert_x=self.expert_x,
+			out_expert_x_scale=self.expert_x_scale,
+			dp_x=self.dp_x,
+			dp_x_scale=self.dp_x_scale,
+			indices=self.indices,
+			bound_m=self.bound_m,
+		)
+
+		# 3. Local Expert Computation (Identity)
+		self.grouped_dequant_moe_fp8_ata_fp8(
+			(self.expert_x, self.expert_x_scale),
+			self.expert_num_tokens,
+			self.experts_per_rank,
+			self.expert_y
+		)
+
+		# 4. Combine
+		self.y.zero_() 
+		self.ata.combine(
+			out_tokens=self.y,
+			indices=self.indices,
+			weights=self.weights,
+			expert_y=self.expert_y,
+			bound_m=self.bound_m,
+		)
+		
+		return self.y[:num_tokens].to(x.dtype)
+
+	@torch.inference_mode()
+	def moe_infer_pplx_a2a_fp8_dispatch(self,x):
+		num_tokens, hidden_size = x.shape
+		# Handle empty input - still must participate in all-to-all
+		if num_tokens == 0:
+			empty_indices = torch.empty((0, self.num_experts_per_tok), dtype=torch.uint32, device=self.device)
+			empty_weights = torch.empty((0, self.num_experts_per_tok), dtype=torch.float32, device=self.device)
+			empty_x_fp8 = torch.empty((0, hidden_size), dtype=torch.float8_e4m3fn, device=self.device)
+			empty_x_scale = torch.empty((0,), dtype=torch.float32, device=self.device)
+			
+			self.bound_m.fill_(0)
+			
+			self.ata.dispatch(
+				out_expert_num_tokens=self.expert_num_tokens,
+				out_expert_x=self.expert_x,
+				out_expert_x_scale=self.expert_x_scale,
+				dp_x=empty_x_fp8,
+				dp_x_scale=empty_x_scale,
+				indices=empty_indices,
+				bound_m=self.bound_m,
+			)
+			
+			self.grouped_dequant_moe_fp8_ata_fp8(
+				(self.expert_x, self.expert_x_scale),
+				self.expert_num_tokens,
+				self.experts_per_rank,
+				self.expert_y
+			)
+			
+			empty_y = torch.zeros((0, hidden_size), dtype=x.dtype, device=self.device)
+			self.ata.combine(
+				out_tokens=empty_y,
+				indices=empty_indices,
+				weights=empty_weights,
+				expert_y=self.expert_y,
+				bound_m=self.bound_m,
+			)
+			
+			return empty_y
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
+			x.view(num_tokens, 1, hidden_size)
+		)
+		
+		# ---- Prepare Dispatch Metadata -------
+		dp_x_fp8, dp_x_scale = act_quant(x)
+		self.dp_x.copy_(dp_x_fp8)
+		self.dp_x_scale.copy_(dp_x_scale)
+		self.indices.copy_(topk_idx.to(torch.uint32))
+		self.weights.copy_(topk_weight.to(torch.float32))
+		# bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
+		self.bound_m.fill_(num_tokens)
+		# self.dp_x[:num_tokens].copy_(dp_x_fp8)
+		# self.dp_x_scale[:num_tokens].copy_(dp_x_scale)
+		# self.indices[:num_tokens].copy_(topk_idx.to(torch.uint32))
+		# self.weights[:num_tokens].copy_(topk_weight.to(torch.float32))
+		# self.bound_m.fill_(num_tokens)
 
 		# 2. Dispatch
 		self.ata.dispatch(
