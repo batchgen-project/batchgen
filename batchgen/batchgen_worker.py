@@ -498,7 +498,7 @@ class BatchGenWorker:
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
 			return 0
-		return manager.get_free_pages_count()
+		return manager.get_stats().num_free_pages
 
 	# ============ Main Entry Point ============
 
