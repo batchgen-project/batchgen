@@ -630,7 +630,7 @@ class BatchGenWorker:
 	def _prepare_decode_batch(self) -> List[str]:
 		"""
 		Select sequences for decode phase from PREFILLED sequences.
-		Limited by decode batch size.
+		Limited by MoE_decoding_micro_batch_size PER RANK.
 		"""
 		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		prefilled_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
@@ -638,16 +638,27 @@ class BatchGenWorker:
 		if not prefilled_uuids:
 			return []
 		
-		decode_batch_size = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
-		decode_batch = prefilled_uuids[:decode_batch_size]
+		# MoE_decoding_micro_batch_size is PER RANK limit
+		max_seqs_per_rank = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
+		
+		# Count sequences per rank and enforce per-rank limit
+		rank_counts = [0] * self.world_size
+		decode_batch = []
+		
+		for uuid in prefilled_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			assigned_rank = seq.assigned_rank
+			
+			if rank_counts[assigned_rank] < max_seqs_per_rank:
+				decode_batch.append(uuid)
+				rank_counts[assigned_rank] += 1
 		
 		logging.info(
-			f"Rank {self.rank}: Prepared decode batch with {len(decode_batch)} sequences "
-			f"(max batch size: {decode_batch_size})"
+			f"Rank {self.rank}: Prepared decode batch with {len(decode_batch)} global sequences "
+			f"(per-rank limit: {max_seqs_per_rank}, counts: {rank_counts})"
 		)
 		
 		return decode_batch
-
 	# ============ Main Generation Loop ============
 
 	def generate(self):
