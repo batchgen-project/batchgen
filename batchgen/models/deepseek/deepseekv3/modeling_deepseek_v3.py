@@ -2027,17 +2027,17 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- Prepare Dispatch Metadata -------
 		dp_x_fp8, dp_x_scale = act_quant(x)
-		self.dp_x.copy_(dp_x_fp8)
-		self.dp_x_scale.copy_(dp_x_scale)
-		self.indices.copy_(topk_idx.to(torch.uint32))
-		self.weights.copy_(topk_weight.to(torch.float32))
-		# bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
-		self.bound_m.fill_(num_tokens)
-		# self.dp_x[:num_tokens].copy_(dp_x_fp8)
-		# self.dp_x_scale[:num_tokens].copy_(dp_x_scale)
-		# self.indices[:num_tokens].copy_(topk_idx.to(torch.uint32))
-		# self.weights[:num_tokens].copy_(topk_weight.to(torch.float32))
+		# self.dp_x.copy_(dp_x_fp8)
+		# self.dp_x_scale.copy_(dp_x_scale)
+		# self.indices.copy_(topk_idx.to(torch.uint32))
+		# self.weights.copy_(topk_weight.to(torch.float32))
+		# # bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
 		# self.bound_m.fill_(num_tokens)
+		self.dp_x[:num_tokens].copy_(dp_x_fp8)
+		self.dp_x_scale[:num_tokens].copy_(dp_x_scale)
+		self.indices[:num_tokens].copy_(topk_idx.to(torch.uint32))
+		self.weights[:num_tokens].copy_(topk_weight.to(torch.float32))
+		self.bound_m.fill_(num_tokens)
 
 		# 2. Dispatch
 		self.ata.dispatch(
