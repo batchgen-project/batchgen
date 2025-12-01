@@ -1528,14 +1528,21 @@ class BatchGenWorker:
 				
 				new_token_idx += 1
 			
-			# Final completion check for any remaining sequences
+			# When loop exits, ALL remaining sequences should be marked COMPLETED
+			# (they either hit max_decoding_length or EOS - no need to check individual states
+			# since each rank only tracks its own sequences' decoded_length)
 			if decode_uuids:
-				decode_uuids, batch, completed_uuids = self._check_and_handle_completions(
-					decode_uuids, batch, new_token_idx
+				logging.info(
+					f"Rank {self.rank}: Decode loop finished at token {new_token_idx}, "
+					f"marking {len(decode_uuids)} remaining sequences as COMPLETED"
 				)
-				if completed_uuids:
-					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
-					self._release_host_kv_pages_for_batch(completed_uuids)
+				# Mark ALL remaining sequences as completed
+				self._update_batch_status(decode_uuids, SequenceStatus.COMPLETED)
+				
+				# Release host KV pages only for THIS RANK's sequences
+				my_completed_uuids = [uuid for uuid in decode_uuids if uuid in self._uuid_to_local_map]
+				if my_completed_uuids:
+					self._release_host_kv_pages_for_batch(my_completed_uuids)
 			
 			# Clear wrapper state
 			Attn_Wrapper.scale = None
