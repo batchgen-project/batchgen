@@ -314,6 +314,7 @@ HostPagedKVConfig parse_host_paged_kv_config(
         cfg.attr("v_head_dim").cast<long long>(),
         "Host_Paged_KV_Config.v_head_dim");
     config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
+    std::cout << "Host Paged KV Config Parsed Successfully" << std::endl;
     return config;
 }
 
@@ -346,6 +347,7 @@ DevicePagedKVConfig parse_device_paged_kv_config(
         cfg.attr("v_head_dim").cast<long long>(),
         "Device_Paged_KV_Config.v_head_dim");
     config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
+    std::cout << "Device Paged KV Config Parsed Successfully" << std::endl;
     return config;
 }
 
@@ -366,10 +368,11 @@ EngineConfig parse_engine_config(const py::object& engine_config) {
     // std::cerr << "GPU Buffer Config Done" << std::endl;
     config.module_batching_config = parse_module_batching_config(engine_config);
     // std::cerr << "Module Batching Config Done" << std::endl;
-    config.host_paged_kv_config =
-        parse_host_paged_kv_config(engine_config);
-    config.device_paged_kv_config =
-        parse_device_paged_kv_config(engine_config);
+    // config.host_paged_kv_config =
+    //     parse_host_paged_kv_config(engine_config);
+    // config.device_paged_kv_config =
+    //     parse_device_paged_kv_config(engine_config);
+    std::cout<<"Engine Config Parsed Successfully" << std::endl;
     return config;
 };
 
