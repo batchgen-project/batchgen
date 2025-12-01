@@ -1124,3 +1124,639 @@ class BatchGenWorker:
 		self.init_nvshmem()
 		
 		num_local_seq = len(local_decode_indices)
+		num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
+		num_seq_per_rank[self.rank] = num_local_seq
+		dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
+		max_num_seq = int(num_seq_per_rank.max().item())
+		
+		if self.world_size <= 8:
+			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+			self.set_phase("decode")
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_kv_copy_queue()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+			self.core_engine.start_h2d_worker()
+		else:
+			self._prepare_gpu_paged_kv_cache(local_decode_indices)
+			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
+			
+			self.set_phase("decode")
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_kv_copy_queue()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+		
+		logging.info(f"Rank {self.rank}: _config_decoding_for_batch completed")
+
+	def _release_host_kv_pages_for_batch(self, uuids: List[str]) -> None:
+		"""Release host KV pages for completed sequences owned by this rank."""
+		if not uuids:
+			return
+		
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			logging.warning("Host paged KV worker view is unavailable")
+			return
+		
+		my_uuids = [uuid for uuid in uuids if uuid in self._uuid_to_local_map]
+		
+		if my_uuids:
+			global_sequence_ids = [
+				self.global_batch.get_sequence(uuid).global_idx
+				for uuid in my_uuids
+			]
+			
+			logging.info(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
+			
+			worker_view.release_sequence_pages(global_sequence_ids)
+			worker_view.unregister_sequences(global_sequence_ids)
+			
+			local_indices = self._get_local_indices_for_uuids(my_uuids)
+			if local_indices:
+				self._release_gpu_kv_pages(local_indices)
+
+	# ============ Prefill and Decode ============
+
+	def prefill(self, batch: list[int]):
+		"""
+		Handle the prefill for a batch.
+		batch: list of local indices
+		"""
+		if "deepseek" in self.model_config.model_type:
+			self.model.model._use_flash_attention_2 = False
+
+		input_ids = torch.cat(
+			[
+				self.query_book[query_idx].encoded["input_ids"][:, : self.max_input_length]
+				for query_idx in batch
+			],
+			dim=0,
+		)
+		attention_masks = torch.cat(
+			[
+				self.query_book[query_idx].encoded["attention_mask"][:, : self.max_input_length]
+				for query_idx in batch
+			],
+			dim=0,
+		)
+
+		num_prefill_micro_batches = math.ceil(
+			len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+		)
+		prefill_micro_batch_input_ids = torch.split(
+			input_ids,
+			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
+		)
+		prefill_micro_batch_attention_masks = torch.split(
+			attention_masks,
+			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
+		)
+		logging.info(f"Number of prefill micro batches: {num_prefill_micro_batches}")
+		
+		cur_batch_start = 0
+		output_tokens = []
+		
+		for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
+			with torch.inference_mode():
+				Attn_Wrapper.attention_mask = prefill_micro_batch_attention_masks[micro_batch_idx]
+				Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
+					prefill_micro_batch_attention_masks[micro_batch_idx]
+				)
+				
+				cur_batch_size = prefill_micro_batch_input_ids[micro_batch_idx].shape[0]
+				cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
+				
+				# Pass local indices - the C++ layer handles rank offset internally
+				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
+				
+				cur_batch_start += cur_batch_size
+				assert len(cur_batch_local) == cur_batch_size
+
+				outputs = self.model(
+					prefill_micro_batch_input_ids[micro_batch_idx].to(self.torch_device),
+					attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
+					use_cache=False,
+				)
+				new_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1).view(-1, 1)
+				output_tokens.append(new_tokens)
+
+		new_tokens = torch.cat(output_tokens, dim=0)
+		self.update_new_token(new_tokens, batch, 0)
+		
+		# Update sequence state after prefill
+		for i, local_idx in enumerate(batch):
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			seq.decoded_length = 1
+			seq.current_context_length = seq.prompt_length + 1
+			
+			# Check for EOS in first token
+			if new_tokens[i].item() == self.eos_token_id:
+				seq.eos_reached = True
+		
+		return new_tokens
+
+	def decoding_continuous(
+		self, 
+		new_tokens: torch.Tensor, 
+		decode_uuids: List[str],
+		batch: List[int],
+		past_key_states: Optional[torch.Tensor] = None,
+		past_value_states: Optional[torch.Tensor] = None,
+		scale_dict: Optional[dict] = None,
+	) -> Tuple[List[str], List[int]]:
+		"""
+		Handle continuous decoding with page-boundary completion checks.
+		Returns the final active decode_uuids and local indices.
+		"""
+		if "deepseek" in self.model_config.model_type:
+			self.model.model._use_flash_attention_2 = True
+		
+		new_token_idx = 1
+		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
+		logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
+
+		if RUNTIME_ATTN_MODE == 3:
+			"""KV ACCUMULATION IN GPU with continuous batching."""
+			gpu_manager = getattr(self, "gpu_paged_kv_cache_manager", None)
+			if gpu_manager is None:
+				gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+			
+			Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
+			Attn_Wrapper.host_paged_kv_worker_view = getattr(
+				self.core_engine, "host_paged_kv_worker_view", None
+			)
+			Attn_Wrapper.scale = scale_dict
+			Attn_Wrapper.past_key_states = past_key_states
+			Attn_Wrapper.past_value_states = past_value_states
+			
+			# Pass local indices - C++ layer handles conversion
+			Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+			
+			while new_token_idx < self.max_decoding_length and (decode_uuids or batch):
+				if self.rank == 0 and new_token_idx % 50 == 0:
+					logging.info(f"Decoding new token idx: {new_token_idx}")
+				
+				# ============ PAGE BOUNDARY CHECK (every PAGE_SIZE tokens) ============
+				if new_token_idx > 0 and new_token_idx % self.PAGE_SIZE == 0:
+					# Synchronize all ranks before checking completions
+					dist.barrier()
+					
+					# Check for completed sequences
+					decode_uuids, batch, completed_uuids = self._check_and_handle_completions(
+						decode_uuids, batch, new_token_idx
+					)
+					
+					if completed_uuids:
+						# Mark completed and release resources
+						self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+						self._release_host_kv_pages_for_batch(completed_uuids)
+						
+						logging.info(
+							f"Rank {self.rank}: Completed {len(completed_uuids)} sequences at page boundary "
+							f"(token {new_token_idx}), {len(decode_uuids)} remaining"
+						)
+					
+					# Try to load new sequences into freed slots
+					if decode_uuids:  # Only if we still have active sequences
+						decode_uuids, batch = self._try_load_new_sequences(decode_uuids, batch)
+						# Update Attn_Wrapper with new batch
+						Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+					
+					dist.barrier()
+					
+					# If no more sequences to decode, exit
+					if not decode_uuids:
+						break
+				
+				with torch.inference_mode():
+					if len(batch) != 0:
+						attention_mask = torch.cat(
+							[
+								self.query_book[query_idx].encoded["attention_mask"][
+									:, : self.max_input_length + new_token_idx
+								]
+								for query_idx in batch
+							],
+							dim=0,
+						).to(self.torch_device)
+						
+						Attn_Wrapper.attention_mask = attention_mask
+						Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+						Attn_Wrapper.cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+						Attn_Wrapper.max_seqlen = Attn_Wrapper.cache_seqlens.max().item()
+					else:
+						attention_mask = torch.zeros(
+							(0, self.max_input_length + new_token_idx),
+							dtype=torch.int64, device=self.torch_device
+						)
+						Attn_Wrapper.attention_mask = attention_mask
+						Attn_Wrapper.position_ids = attention_mask
+						Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
+						Attn_Wrapper.max_seqlen = 0
+
+					new_tokens = self.model(
+						new_tokens.to(self.torch_device),
+						attention_mask=attention_mask,
+						use_cache=False,
+					)
+					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(-1, 1)
+					self.update_new_token(new_tokens, batch, new_token_idx)
+					
+					# Update sequence state and check for EOS
+					for i, local_idx in enumerate(batch):
+						uuid = self._local_to_uuid_map[local_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						seq.decoded_length = new_token_idx + 1
+						seq.current_context_length = seq.prompt_length + new_token_idx + 1
+						
+						# Check for EOS token
+						if new_tokens[i].item() == self.eos_token_id:
+							seq.eos_reached = True
+				
+				new_token_idx += 1
+			
+			# Final completion check for any remaining sequences
+			if decode_uuids:
+				decode_uuids, batch, completed_uuids = self._check_and_handle_completions(
+					decode_uuids, batch, new_token_idx
+				)
+				if completed_uuids:
+					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+					self._release_host_kv_pages_for_batch(completed_uuids)
+			
+			# Clear wrapper state
+			Attn_Wrapper.scale = None
+			Attn_Wrapper.past_key_states = None
+			Attn_Wrapper.past_value_states = None
+			Attn_Wrapper.gpu_paged_kv_manager = None
+			Attn_Wrapper.host_paged_kv_worker_view = None
+			Attn_Wrapper.cur_batch = None
+		
+		else:
+			# Modes 0, 1, 2 - use original decoding logic with completion checks
+			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, new_token_idx)
+		
+		return decode_uuids, batch
+
+	def _decoding_legacy_modes(
+		self,
+		new_tokens: torch.Tensor,
+		decode_uuids: List[str],
+		batch: List[int],
+		start_token_idx: int
+	) -> None:
+		"""Legacy decoding for modes 0, 1, 2 with continuous batching support."""
+		new_token_idx = start_token_idx
+		
+		while new_token_idx < self.max_decoding_length and (decode_uuids or batch):
+			if self.rank == 0:
+				logging.info(f"Decoding new token idx: {new_token_idx}")
+			
+			# Page boundary check
+			if new_token_idx > 0 and new_token_idx % self.PAGE_SIZE == 0:
+				dist.barrier()
+				decode_uuids, batch, completed_uuids = self._check_and_handle_completions(
+					decode_uuids, batch, new_token_idx
+				)
+				if completed_uuids:
+					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+					self._release_host_kv_pages_for_batch(completed_uuids)
+				
+				if decode_uuids:
+					decode_uuids, batch = self._try_load_new_sequences(decode_uuids, batch)
+				
+				dist.barrier()
+				
+				if not decode_uuids:
+					break
+			
+			RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
+
+			if RUNTIME_ATTN_MODE == 0:
+				"""CPU ATTN MODE - NO ATTN MICRO BATCH"""
+				with torch.inference_mode():
+					Attn_Wrapper.cur_batch = [batch]
+					attention_mask = torch.cat(
+						[
+							self.query_book[query_idx].encoded["attention_mask"][
+								:, : self.max_input_length + new_token_idx
+							]
+							for query_idx in batch
+						],
+						dim=0,
+					)
+					if "deepseek" not in self.model_config.model_type:
+						position_ids = create_position_ids_from_attention_mask(
+							attention_mask
+						)[:, -1].unsqueeze(-1)
+					else:
+						position_ids = create_position_ids_from_attention_mask(attention_mask)
+
+					Attn_Wrapper.attention_mask = attention_mask
+					Attn_Wrapper.position_ids = position_ids
+					new_tokens = self.model(
+						new_tokens.to(self.torch_device),
+						attention_mask=attention_mask.to(self.torch_device),
+						use_cache=False,
+					)
+					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(-1, 1)
+					self.update_new_token(new_tokens, batch, new_token_idx)
+					
+					# Update sequence state
+					for i, local_idx in enumerate(batch):
+						uuid = self._local_to_uuid_map[local_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						seq.decoded_length = new_token_idx + 1
+						seq.current_context_length = seq.prompt_length + new_token_idx + 1
+						if new_tokens[i].item() == self.eos_token_id:
+							seq.eos_reached = True
+				new_token_idx += 1
+
+			elif RUNTIME_ATTN_MODE == 1:
+				"""GPU ATTN MODE - ATTN MICRO BATCH"""
+				micro_batch_size = self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
+				num_micro_batches = math.ceil(len(batch) / micro_batch_size)
+				micro_batches = [
+					batch[micro_batch_idx * micro_batch_size : (micro_batch_idx + 1) * micro_batch_size]
+					for micro_batch_idx in range(num_micro_batches)
+				]
+				Attn_Wrapper.cur_batch = micro_batches
+				
+				if (new_token_idx - 1) % 32 == 0:
+					for idx in range(new_token_idx - 1, new_token_idx + 31):
+						if "deepseek" in self.model_config.model_type:
+							past_kv_byte_size = (
+								(self.max_input_length + idx + 1)
+								* self.model_config.compressed_kv_dim
+							)
+						elif "mixtral" in self.model_config.model_type:
+							past_kv_byte_size = (
+								(self.max_input_length + idx)
+								* self.model_config.num_key_value_heads
+								* self.model_config.head_dim
+								* 2
+							)
+						else:
+							raise ValueError(f"Model architecture {self.model_config.model_type} not supported yet.")
+
+						for layer_idx in range(self.model_config.num_hidden_layers):
+							for micro_batch_idx in range(num_micro_batches):
+								cur_batch = micro_batches[micro_batch_idx]
+								self.core_engine.submit_to_KV_queue(
+									cur_batch, micro_batch_idx, layer_idx, past_kv_byte_size,
+								)
+
+				with torch.inference_mode():
+					attention_mask = torch.cat(
+						[
+							self.query_book[query_idx].encoded["attention_mask"][
+								:, : self.max_input_length + new_token_idx
+							]
+							for query_idx in batch
+						],
+						dim=0,
+					).to(self.torch_device)
+					if "deepseek" in self.model_config.model_type:
+						position_ids = create_position_ids_from_attention_mask(attention_mask)
+					else:
+						position_ids = create_position_ids_from_attention_mask(attention_mask)[:, -1].unsqueeze(-1)
+
+					Attn_Wrapper.attention_mask = attention_mask
+					Attn_Wrapper.position_ids = position_ids
+					new_tokens = self.model(
+						new_tokens.to(self.torch_device),
+						attention_mask=attention_mask.to(self.torch_device),
+						use_cache=False,
+					)
+					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(-1, 1)
+					self.update_new_token(new_tokens, batch, new_token_idx)
+					
+					# Update sequence state
+					for i, local_idx in enumerate(batch):
+						uuid = self._local_to_uuid_map[local_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						seq.decoded_length = new_token_idx + 1
+						seq.current_context_length = seq.prompt_length + new_token_idx + 1
+						if new_tokens[i].item() == self.eos_token_id:
+							seq.eos_reached = True
+				new_token_idx += 1
+
+			elif RUNTIME_ATTN_MODE == 2:
+				"""CPU-GPU Parallel ATTN - Deprecated"""
+				logging.warning("RUNTIME_ATTN_MODE 2 is deprecated")
+				new_token_idx += 1
+
+	# ============ Utility Methods ============
+
+	def set_phase(self, phase: str):
+		"""Control different behavior of the engine in different phases."""
+		torch.cuda.empty_cache()
+		self.core_engine.set_phase(phase)
+		Attn_Wrapper.phase = phase
+		Expert_Wrapper.phase = phase
+
+	def update_new_token(
+		self, new_tokens: torch.Tensor, query_idx: List[int], new_token_idx: int
+	):
+		new_tokens = new_tokens.to("cpu")
+		for idx, q_idx in enumerate(query_idx):
+			self.query_book[q_idx].decoded_tokens[:, new_token_idx] = new_tokens[idx]
+			
+			attention_mask = self.query_book[q_idx].encoded["attention_mask"][0]
+			zeros_positions = (attention_mask == 0).nonzero(as_tuple=True)[0]
+			if len(zeros_positions) > 0:
+				first_zero_pos = zeros_positions[0].item()
+				self.query_book[q_idx].encoded["attention_mask"][0, first_zero_pos] = torch.tensor(1, dtype=attention_mask.dtype)
+			else:
+				raise ValueError("No 0 found in the attention mask.")
+
+	def init_nvshmem(self):
+		"""Initialize NVSHMEM only once per batch, not per decode iteration."""
+		if BATCHGEN_ENABLE_ALL_TO_ALL != "1" or nvshmem_init is None:
+			logging.info("Skipping NVSHMEM initialization; BATCHGEN_ENABLE_ALL_TO_ALL is disabled or nvshmem_init missing")
+			return
+		
+		# Check if already initialized this run
+		if getattr(self, '_nvshmem_initialized_this_run', False):
+			logging.debug(f"Rank {self.rank}: NVSHMEM already initialized this run, skipping")
+			return
+			
+		import nvshmem.core as nvshmem
+		from cuda.core.experimental import Device    
+		rank = dist.get_rank()
+		world_size = dist.get_world_size()
+		local_rank = rank % torch.cuda.device_count()
+		torch.cuda.set_device(local_rank)
+
+		dev = Device(local_rank)
+		dev.set_current()
+		dist.barrier()
+		nvshmem_init(
+			global_rank=rank,
+			local_rank=local_rank,
+			world_size=world_size,
+			device=dev
+		)
+		self._nvshmem_initialized_this_run = True
+		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
+
+	def _finalize_nvshmem(self) -> None:
+		"""Finalize NVSHMEM if it was initialized."""
+		if not getattr(self, '_nvshmem_initialized_this_run', False):
+			return
+			
+		if BATCHGEN_ENABLE_ALL_TO_ALL != "1":
+			return
+			
+		try:
+			import nvshmem.core as nvshmem
+			# Check if nvshmem has a finalize method
+			if hasattr(nvshmem, 'finalize'):
+				nvshmem.finalize()
+				logging.info(f"Rank {self.rank}: NVSHMEM finalized")
+		except Exception as e:
+			logging.warning(f"Rank {self.rank}: Failed to finalize NVSHMEM: {e}")
+		
+		self._nvshmem_initialized_this_run = False
+
+	def _init_torch_dist(self):
+		timeout = timedelta(minutes=15)
+		try:
+			dist.init_process_group(
+				backend="nccl",
+				init_method="tcp://" + self.dist_init_addr,
+				world_size=self.world_size,
+				rank=self.global_rank,
+				device_id=torch.device(f"cuda:{self.local_rank}"),
+				timeout=timeout,
+			)
+		except RuntimeError as e:
+			logging.error(f"Failed to initialize torch distributed: {e}")
+			raise
+
+	def _unregister_fp8_weights(self):
+		for layer_idx in range(len(self.model.model.layers)):
+			attn_module = self.model.model.layers[layer_idx].self_attn
+			attn_module._unregister_fp8_weights()
+			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+				if hasattr(self.model.model.layers[layer_idx].mlp.shared_experts, '_unregister_fp8_weights'):
+					self.model.model.layers[layer_idx].mlp.shared_experts._unregister_fp8_weights()
+				for routed_expert_idx in range(self.model_config.num_local_experts):
+					if hasattr(self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx], '_unregister_fp8_weights'):
+						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
+				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
+					self.model.model.layers[layer_idx].mlp.cleanup()
+
+	def deep_free_model_memory(self):
+		"""Deep cleanup of model and all its submodules"""
+		if not hasattr(self, 'model') or self.model is None:
+			return
+		
+		self.model.eval()
+		self.model.to('cpu')
+		with torch.no_grad():
+			def clear_module(module):
+				for param in module.parameters():
+					param.data = torch.empty(0)
+					if param.grad is not None:
+						param.grad.data = torch.empty(0)
+						param.grad = None
+				for buffer in module.buffers():
+					buffer.data = torch.empty(0)
+				module._forward_hooks.clear()
+				module._forward_pre_hooks.clear()
+				module._backward_hooks.clear()
+				for submodule in module.children():
+					clear_module(submodule)
+			
+			clear_module(self.model)
+		
+		self.model.to('cpu')
+		del self.model
+		self.model = None
+		
+		if hasattr(self, 'optimizer'):
+			self.optimizer.zero_grad(set_to_none=True)
+			del self.optimizer
+		
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+			torch.cuda.synchronize()
+		
+		for _ in range(3):
+			gc.collect()
+			if torch.cuda.is_available():
+				torch.cuda.empty_cache()
+
+	def _reset_for_new_batch(self) -> None:
+		"""
+		Reset batch-specific state to prepare for a new batch.
+		Does NOT reinitialize core_engine, parallel_manager, or other heavy components.
+		"""
+		logging.info(f"Rank {self.rank}: Resetting state for new batch")
+		
+		# Synchronize all ranks before cleanup
+		dist.barrier()
+		
+		# 1. Cleanup communicator from previous batch
+		if hasattr(self, 'comm') and self.comm is not None:
+			try:
+				del self.comm
+				self.comm = None
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Failed to cleanup comm: {e}")
+		
+		# 2. Release any remaining host KV pages
+		if hasattr(self, 'global_batch') and self.global_batch is not None:
+			try:
+				worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+				if worker_view is not None and hasattr(self, '_uuid_to_local_map'):
+					for uuid in self._uuid_to_local_map.keys():
+						seq = self.global_batch.get_sequence(uuid)
+						if seq is not None:
+							try:
+								worker_view.release_sequence_pages([seq.global_idx])
+								worker_view.unregister_sequences([seq.global_idx])
+							except Exception:
+								pass  # Ignore errors for already-released pages
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Failed to cleanup host KV: {e}")
+		
+		# 3. Destroy GPU KV cache (but keep the manager reference for reuse)
+		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
+		self.gpu_paged_kv_cache_manager = None
+		
+		# 4. Reset global batch state
+		self.global_batch = None
+		
+		# 5. Reset query book and mappings
+		self.query_book = None
+		self._local_to_uuid_map = {}
+		self._uuid_to_local_map = {}
+		
+		# 6. Reset counters
+		self.num_global_queries = 0
+		self.num_local_queries = 0
+		
+		# 7. Clean up model weights (but NOT core_engine or parallel_manager)
+		if hasattr(self, 'model') and self.model is not None:
+			try:
+				self.deep_free_model_memory()
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Failed to cleanup model: {e}")
+		self.model = None
+		
+		# 8. Clear CUDA cache
+		torch.cuda.empty_cache()
+		torch.cuda.synchronize()
+		
+		# 9. Force garbage collection
+		gc.collect()
+		
+		# Synchronize all ranks after cleanup
+		dist.barrier()
+		
+		logging.info(f"Rank {self.rank}: State reset completed")
