@@ -185,6 +185,8 @@ class BatchGenWorker:
 		self.global_batch: Optional[SequenceBatch] = None
 
 	def Init(self, max_input_length, max_decoding_length, num_queries):
+	    if hasattr(self, 'global_batch') and self.global_batch is not None:
+        	self._reset_for_new_batch()
 		self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
@@ -436,10 +438,6 @@ class BatchGenWorker:
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
 		
-		# Reset state if this is not the first batch
-		if hasattr(self, 'global_batch') and self.global_batch is not None:
-			self._reset_for_new_batch()
-
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
 		for idx, text in enumerate(global_prompts):
@@ -841,6 +839,9 @@ class BatchGenWorker:
 		
 		# Final synchronization before returning
 		dist.barrier()
+		
+		# Mark batch as completed for reset detection
+		self._batch_completed = True
 		
 		if self.rank == 0:
 			return [res_tensor]
