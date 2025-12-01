@@ -814,16 +814,29 @@ class BatchGenWorker:
 			f"  Config decoding time: {config_decode_time:.1f}s"
 		)
 		
-		# Gather results
-		res = [
-			self.query_book[query_idx].decoded_tokens
-			for query_idx in range(self.num_local_queries)
-		]
+		# ============ Gather Results in Original Order ============
 		
+		# Collect results with their global_idx for proper ordering
+		res_with_idx = []
+		for local_idx in range(self.num_local_queries):
+			uuid = self._local_to_uuid_map[local_idx]
+			global_idx = self.global_batch.get_sequence(uuid).global_idx
+			decoded_tokens = self.query_book[local_idx].decoded_tokens
+			res_with_idx.append((global_idx, decoded_tokens))
+		
+		# Gather from all ranks
 		all_results = [None] * self.world_size
-		dist.all_gather_object(all_results, res)
+		dist.all_gather_object(all_results, res_with_idx)
+		
+		# Flatten: [(global_idx, tokens), (global_idx, tokens), ...]
 		all_results = [item for sublist in all_results for item in sublist]
-		res_tensor = torch.cat(all_results, dim=0).cpu()
+		
+		# Sort by global_idx to restore original input order
+		all_results.sort(key=lambda x: x[0])
+		
+		# Extract tokens in sorted order
+		sorted_tokens = [item[1] for item in all_results]
+		res_tensor = torch.cat(sorted_tokens, dim=0).cpu()
 		
 		if self.rank == 0:
 			return [res_tensor]
