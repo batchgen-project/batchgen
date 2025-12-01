@@ -1,0 +1,356 @@
+import argparse
+import logging
+import os
+import pickle
+import random
+import re
+import socket
+import struct
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoTokenizer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class BatchGenClient:
+    """TCP client mirroring client_v2 behavior for inference API calls."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.sock: Optional[socket.socket] = None
+
+    def connect(self) -> None:
+        try:
+            logger.info(
+                f"Connecting to BatchGen Server at {self.host}:{self.port}..."
+            )
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.connect((self.host, self.port))
+            logger.info("Successfully connected.")
+        except Exception as exc:
+            logger.error(f"Connection failed: {exc}")
+            self.sock = None
+            raise
+
+    def send_request(self, data: Any) -> Any:
+        if not self.sock:
+            raise ConnectionError("Socket not connected.")
+
+        try:
+            payload = pickle.dumps(data)
+            self.sock.sendall(struct.pack("!I", len(payload)))
+            self.sock.sendall(payload)
+
+            size_bytes = self.sock.recv(4)
+            if not size_bytes:
+                raise ConnectionResetError(
+                    "Server closed connection before sending a response."
+                )
+            resp_size = struct.unpack("!I", size_bytes)[0]
+
+            resp_data = bytearray()
+            while len(resp_data) < resp_size:
+                chunk = self.sock.recv(min(4096, resp_size - len(resp_data)))
+                if not chunk:
+                    break
+                resp_data.extend(chunk)
+
+            return pickle.loads(resp_data)
+        except Exception as exc:
+            logger.error(f"Communication error: {exc}")
+            self.close()
+            return []
+
+    def close(self) -> None:
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+
+def form_options(options: List[str]) -> str:
+    option_str = "Options are:\n"
+    opts = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    for opt, letter in zip(options, opts):
+        option_str += f"({letter}): {opt}\n"
+    return option_str
+
+
+def decode_to_eos(
+    tokenizer: AutoTokenizer, tokens: List[int], min_tokens: int = 5
+) -> str:
+    tokens_array = np.array(tokens)
+    eos_positions = np.where(tokens_array == tokenizer.eos_token_id)[0]
+    valid_eos_positions = eos_positions[eos_positions >= min_tokens]
+    end_pos = (
+        valid_eos_positions[0]
+        if len(valid_eos_positions) > 0
+        else len(tokens_array)
+    )
+    return tokenizer.decode(tokens[:end_pos], skip_special_tokens=True)
+
+
+def extract_prediction(model_output: str) -> Tuple[Optional[str], bool]:
+    """Extract the predicted letter answer from a model output string."""
+    think_end_pos = model_output.find("</think>")
+    think_tag_found = think_end_pos != -1
+    search_text = (
+        model_output[think_end_pos + len("</think>") :]
+        if think_tag_found
+        else model_output
+    )
+    pattern = r"answer is \(?([ABCDEFGHIJ])\)?"
+    match = re.search(pattern, search_text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper(), think_tag_found
+    return None, think_tag_found
+
+
+def _tensorize_sequence(token_ids: Any) -> torch.Tensor:
+    if torch.is_tensor(token_ids):
+        return token_ids.detach().cpu()
+    if hasattr(token_ids, "tolist"):
+        return torch.tensor(token_ids.tolist(), dtype=torch.int64)
+    if isinstance(token_ids, np.ndarray):
+        return torch.tensor(token_ids.tolist(), dtype=torch.int64)
+    return torch.tensor(list(token_ids), dtype=torch.int64)
+
+
+def run_inference_via_api(
+    queries: List[str],
+    max_input_length: int,
+    max_decoding_length: int,
+    server_host: str,
+    server_port: int,
+) -> List[torch.Tensor]:
+    client = BatchGenClient(server_host, server_port)
+    client.connect()
+    payload: Dict[str, Any] = {
+        "command": "submit_inference",
+        "queries": queries,
+        "max_input_len": max_input_length,
+        "max_output_len": max_decoding_length,
+    }
+    start_time = pd.Timestamp.now()
+    response = client.send_request(payload)
+    latency = (pd.Timestamp.now() - start_time).total_seconds()
+    logger.info(f"Inference round-trip completed in {latency:.2f}s")
+    client.close()
+    if not isinstance(response, dict) or "results" not in response:
+        raise RuntimeError(f"Invalid response from server: {response}")
+    sequences = response["results"]
+    if not sequences:
+        raise RuntimeError("Server returned empty results.")
+    return [_tensorize_sequence(tokens) for tokens in sequences[0]]
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hugging_face_checkpoint", type=str)
+    parser.add_argument("--max_prompts", type=int, default=0)
+    parser.add_argument("--max_input_length", type=int)
+    parser.add_argument("--max_decoding_length", type=int)
+    parser.add_argument("--hf_cache_dir", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default=None)
+    parser.add_argument("--server_host", type=str, default="localhost")
+    parser.add_argument("--server_port", type=int, default=10900)
+    args = parser.parse_args()
+
+    hugging_face_checkpoint = args.hugging_face_checkpoint
+    benchmark_name = "TIGER-Lab/MMLU-Pro"
+    logger.info(f"Loading dataset {benchmark_name}")
+    dataset = pd.read_parquet(
+        os.path.join(os.path.dirname(__file__), "mmlu_pro_test.parquet")
+    )
+    if args.max_prompts != 0:
+        dataset = dataset.head(args.max_prompts)
+
+    validation_set = pd.read_parquet(
+        os.path.join(os.path.dirname(__file__), "mmlu_pro_validation.parquet")
+    )
+    categories = [
+        "computer science",
+        "math",
+        "chemistry",
+        "engineering",
+        "law",
+        "biology",
+        "health",
+        "physics",
+        "business",
+        "philosophy",
+        "economics",
+        "other",
+        "psychology",
+        "history",
+    ]
+    prompts = {c: "" for c in categories}
+    for _, row in validation_set.iterrows():
+        prompts[row["category"]] += (
+            "Q:"
+            + " "
+            + row["question"]
+            + "\n"
+            + form_options(row["options"])
+            + "\n"
+            + row["cot_content"]
+            + "\n\n"
+        )
+
+    queries: List[str] = []
+    for _, entry in dataset.iterrows():
+        prefix = prompts[entry["category"]]
+        prompt = (
+            "Please read the following 5 examples: \n"
+            + prefix
+            + "Please answer the following question: \n"
+            + "Q: "
+            + entry["question"]
+            + "\n"
+            + form_options(entry["options"])
+            + "\n"
+        )
+        queries.append(prompt)
+
+    tokenizer_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+    if args.hf_cache_dir:
+        tokenizer_kwargs["cache_dir"] = args.hf_cache_dir
+    tokenizer = AutoTokenizer.from_pretrained(
+        hugging_face_checkpoint, **tokenizer_kwargs
+    )
+    for prompt_idx in range(len(queries)):
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an knowledge expert, you are supposed to answer the multi-choice question to derive your final answer as `The answer is ...`. Please follow the following examples and strictly give the answer with format 'the answer is (A/B/C/D/E/F/G/H/I/J)'.",
+            },
+            {"role": "user", "content": queries[prompt_idx]},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        queries[prompt_idx] = text
+
+    logger.info(f"Loaded {len(queries)} samples from the dataset.")
+    tokenized = tokenizer(
+        queries,
+        add_special_tokens=True,
+        padding=False,
+        truncation=False,
+        max_length=args.max_input_length,
+    )
+    logger.info(
+        f"Longest query length: {max([len(t) for t in tokenized['input_ids']])} tokens"
+    )
+
+    if torch.cuda.is_available():
+        gpu0_memory = torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024
+        logger.info(f"GPU 0 memory usage before API call: {gpu0_memory} GB")
+    else:
+        logger.info("CUDA not available; skipping GPU memory log.")
+
+    answer_set = run_inference_via_api(
+        queries=queries,
+        max_input_length=args.max_input_length,
+        max_decoding_length=args.max_decoding_length,
+        server_host=args.server_host,
+        server_port=args.server_port,
+    )
+
+    print_result = True
+    if print_result:
+        for idx in range(len(answer_set)):
+            tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
+            print(
+                "=================================================================="
+            )
+            print(f"Query {idx}: {queries[idx]}")
+            print("\n\n")
+            print(f"Answer {idx}: {tmp_answer}")
+            print(
+                "=================================================================="
+            )
+            print("\n\n")
+
+    success = 0
+    extraction_failures = 0
+    no_think_tag_count = 0
+    predictions: List[str] = []
+    ground_truths = dataset["answer"].tolist()
+    total_samples = len(answer_set)
+    incorrect_samples: List[Dict[str, Any]] = []
+
+    for i in range(total_samples):
+        model_output = decode_to_eos(tokenizer, answer_set[i].tolist())
+        extracted_answer, think_tag_found = extract_prediction(model_output)
+        if not think_tag_found:
+            no_think_tag_count += 1
+            logger.warning(f"Sample {i}: No </think> tag found.")
+        if extracted_answer:
+            prediction = extracted_answer
+        else:
+            extraction_failures += 1
+            logger.warning(
+                f"Sample {i}: Could not extract answer. Marking as incorrect."
+            )
+            prediction = "Z"
+        predictions.append(prediction)
+        if prediction == ground_truths[i]:
+            success += 1
+        else:
+            incorrect_samples.append(
+                {
+                    "id": i,
+                    "extracted": prediction,
+                    "ground_truth": ground_truths[i],
+                    "extraction_failed": extracted_answer is None,
+                    "no_think_tag": not think_tag_found,
+                }
+            )
+
+    accuracy = success / total_samples if total_samples > 0 else 0
+    print("\n--- ✅ Evaluation Summary ---")
+    print(f"Total Samples: {total_samples}")
+    print(f"✅ Correct: {success}")
+    print(f"❌ Incorrect: {total_samples - success}")
+    print("-" * 30)
+    print(f"🎯 Accuracy: {accuracy:.2%}")
+    print("-" * 30)
+    print(
+        f"⚠️ Outputs missing '</think>' tag: {no_think_tag_count} ({no_think_tag_count / total_samples:.2%})"
+    )
+    print(
+        f"❓ Extraction Failures (random guess used): {extraction_failures} ({extraction_failures / total_samples:.2%})"
+    )
+    print("---------------------------------\n")
+
+    if incorrect_samples:
+        print("\n" + "=" * 80)
+        print("🔍 DETAILED ERROR ANALYSIS - Incorrect Predictions")
+        print("=" * 80)
+        print(f"\nTotal Incorrect: {len(incorrect_samples)}\n")
+        for idx, error in enumerate(incorrect_samples, 1):
+            print(f"Error #{idx}:")
+            print(f"  Question ID: {error['id']}")
+            print(f"  Extracted Answer: {error['extracted']}")
+            print(f"  Ground Truth: {error['ground_truth']}")
+            flags = []
+            if error["extraction_failed"]:
+                flags.append("⚠️ EXTRACTION FAILED")
+            if error["no_think_tag"]:
+                flags.append("⚠️ NO </think> TAG")
+            if flags:
+                print(f"  Flags: {' | '.join(flags)}")
+            print("-" * 40)
+        print("=" * 80 + "\n")
+    else:
+        print("\n🎉 Perfect Score! No incorrect predictions.\n")
+
+    assert accuracy >= 0.80, (
+        f"Test Failed: Accuracy of {accuracy:.2%} is below the 80% threshold."
+    )
