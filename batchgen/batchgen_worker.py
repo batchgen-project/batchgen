@@ -573,9 +573,23 @@ class BatchGenWorker:
 				local_indices.append(self._uuid_to_local_map[uuid])
 		return local_indices
 
-	def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus) -> None:
-		"""Update status for all sequences in a batch."""
+	# def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus) -> None:
+	# 	"""Update status for all sequences in a batch."""
+	# 	for uuid in uuids:
+	# 		self.global_batch.update_status(uuid, new_status)
+	def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus):
+		"""Update status for sequences, skipping if already in target status."""
+		if isinstance(uuids, str):
+			uuids = [uuids]
 		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch")
+				continue
+			if seq.status == new_status:
+				continue  # Skip redundant transition
+			if seq.status == SequenceStatus.COMPLETED:
+				continue  # Don't change completed sequences
 			self.global_batch.update_status(uuid, new_status)
 
 	# ============ Tokenization and Assignment ============
