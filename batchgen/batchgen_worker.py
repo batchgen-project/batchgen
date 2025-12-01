@@ -435,6 +435,10 @@ class BatchGenWorker:
 		logging.info(
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
+		
+		# Reset state if this is not the first batch
+		if hasattr(self, 'global_batch') and self.global_batch is not None:
+			self._reset_for_new_batch()
 
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
@@ -664,14 +668,8 @@ class BatchGenWorker:
 	def generate(self):
 		"""
 		Main generation loop with KV-cache-driven scheduling.
-		
-		Flow:
-		1. Prefill until host KV cache is full
-		2. Decode all prefilled sequences
-		3. Release KV pages for completed sequences
-		4. Repeat until all sequences completed
 		"""
-		# Initialize communicator
+		# Initialize communicator ONCE per generate() call
 		self.comm = None
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
 			from batchgen.distributed.utils import StatelessProcessGroup
@@ -693,6 +691,9 @@ class BatchGenWorker:
 			except Exception as e:
 				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+
+		# Track if NVSHMEM was initialized this run (for cleanup)
+		self._nvshmem_initialized_this_run = False
 
 		# Timing stats
 		generation_start_time = time.perf_counter()
@@ -837,6 +838,9 @@ class BatchGenWorker:
 		# Extract tokens in sorted order
 		sorted_tokens = [item[1] for item in all_results]
 		res_tensor = torch.cat(sorted_tokens, dim=0).cpu()
+		
+		# Final synchronization before returning
+		dist.barrier()
 		
 		if self.rank == 0:
 			return [res_tensor]
@@ -1235,11 +1239,18 @@ class BatchGenWorker:
 				raise ValueError("No 0 found in the attention mask.")
 
 	def init_nvshmem(self):
+		"""Initialize NVSHMEM only once per batch, not per decode iteration."""
 		if BATCHGEN_ENABLE_ALL_TO_ALL != "1" or nvshmem_init is None:
 			logging.info("Skipping NVSHMEM initialization; BATCHGEN_ENABLE_ALL_TO_ALL is disabled or nvshmem_init missing")
 			return
+		
+		# Check if already initialized this run
+		if getattr(self, '_nvshmem_initialized_this_run', False):
+			logging.debug(f"Rank {self.rank}: NVSHMEM already initialized this run, skipping")
+			return
+			
 		import nvshmem.core as nvshmem
-		from cuda.core.experimental import Device	
+		from cuda.core.experimental import Device    
 		rank = dist.get_rank()
 		world_size = dist.get_world_size()
 		local_rank = rank % torch.cuda.device_count()
@@ -1254,7 +1265,27 @@ class BatchGenWorker:
 			world_size=world_size,
 			device=dev
 		)
+		self._nvshmem_initialized_this_run = True
 		print(f"Rank {rank}: NVSHMEM initialized and Symmetric Heap allocated.")
+
+	def _finalize_nvshmem(self) -> None:
+		"""Finalize NVSHMEM if it was initialized."""
+		if not getattr(self, '_nvshmem_initialized_this_run', False):
+			return
+			
+		if BATCHGEN_ENABLE_ALL_TO_ALL != "1":
+			return
+			
+		try:
+			import nvshmem.core as nvshmem
+			# Check if nvshmem has a finalize method
+			if hasattr(nvshmem, 'finalize'):
+				nvshmem.finalize()
+				logging.info(f"Rank {self.rank}: NVSHMEM finalized")
+		except Exception as e:
+			logging.warning(f"Rank {self.rank}: Failed to finalize NVSHMEM: {e}")
+		
+		self._nvshmem_initialized_this_run = False
 
 	def _init_torch_dist(self):
 		timeout = timedelta(minutes=15)
@@ -1325,3 +1356,75 @@ class BatchGenWorker:
 			gc.collect()
 			if torch.cuda.is_available():
 				torch.cuda.empty_cache()
+
+	def _reset_for_new_batch(self) -> None:
+		"""
+		Reset all state to prepare for a new batch.
+		Must be called before processing each new batch (except the first).
+		"""
+		logging.info(f"Rank {self.rank}: Resetting state for new batch")
+		
+		# Synchronize all ranks before cleanup
+		dist.barrier()
+		
+		# 1. Cleanup communicator from previous batch
+		if hasattr(self, 'comm') and self.comm is not None:
+			try:
+				# PyNcclCommunicator might need explicit cleanup
+				del self.comm
+				self.comm = None
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Failed to cleanup comm: {e}")
+		
+		# 2. Release any remaining host KV pages
+		if hasattr(self, 'global_batch') and self.global_batch is not None:
+			try:
+				worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+				if worker_view is not None:
+					# Get all sequences owned by this rank
+					if hasattr(self, '_uuid_to_local_map'):
+						for uuid in self._uuid_to_local_map.keys():
+							seq = self.global_batch.get_sequence(uuid)
+							if seq is not None:
+								try:
+									worker_view.release_sequence_pages([seq.global_idx])
+									worker_view.unregister_sequences([seq.global_idx])
+								except Exception:
+									pass  # Ignore errors for already-released pages
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Failed to cleanup host KV: {e}")
+		
+		# 3. Destroy GPU KV cache
+		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
+		
+		# 4. Reset global batch state
+		self.global_batch = None
+		
+		# 5. Reset query book and mappings
+		self.query_book = None
+		self._local_to_uuid_map = {}
+		self._uuid_to_local_map = {}
+		
+		# 6. Reset counters
+		self.num_global_queries = 0
+		self.num_local_queries = 0
+		
+		# 7. Clean up model if it exists
+		if hasattr(self, 'model') and self.model is not None:
+			try:
+				self.deep_free_model_memory()
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Failed to cleanup model: {e}")
+		
+		# 8. Clear CUDA cache
+		torch.cuda.empty_cache()
+		torch.cuda.synchronize()
+		
+		# 9. Force garbage collection
+		import gc
+		gc.collect()
+		
+		# Synchronize all ranks after cleanup
+		dist.barrier()
+		
+		logging.info(f"Rank {self.rank}: State reset completed")
