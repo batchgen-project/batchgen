@@ -430,6 +430,7 @@ class BatchGenWorker:
 			f"Rank {self.rank} Allocating GPU KV pages for global_idx: {global_sequence_ids}"
 		)
 		
+		# allocate_pages_for_sequences implicitly registers the sequences
 		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
 		manager.rebuild_page_table(global_sequence_ids)
 		self._load_host_kv_to_gpu(manager, global_sequence_ids)
@@ -462,13 +463,16 @@ class BatchGenWorker:
 			self.rank, len(global_sequence_ids), load_duration,
 		)
 
-	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
+	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:	
 		"""Return GPU KV pages associated with the provided local sequence ids."""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not local_sequence_ids:
 			return
 		
 		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+		
+		if not global_sequence_ids:
+			return
 		
 		try:
 			manager.free_pages_for_sequences(global_sequence_ids)
@@ -834,10 +838,10 @@ class BatchGenWorker:
 		if not new_uuids:
 			return current_decode_uuids, current_local_indices
 		
-		# Allocate GPU KV pages for new sequences
+		# Allocate GPU KV pages for new sequences (only for this rank's sequences)
 		new_local_indices = self._get_local_indices_for_uuids(new_uuids)
 		if new_local_indices:
-			self._prepare_gpu_paged_kv_cache(new_local_indices)
+			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
 		
 		# Update status to IN_DECODE
 		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
@@ -852,6 +856,47 @@ class BatchGenWorker:
 		)
 		
 		return updated_uuids, updated_local_indices
+
+	def _allocate_and_load_gpu_kv_for_new_sequences(self, local_sequence_ids: List[int]) -> None:
+		"""
+		Allocate GPU KV pages and load host KV for newly added sequences during continuous batching.
+		This is different from _prepare_gpu_paged_kv_cache which may recreate the manager.
+		"""
+		if not local_sequence_ids:
+			return
+		
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			logging.warning("GPU KV manager not initialized, cannot load new sequences")
+			return
+		
+		# Convert local indices to global sequence IDs
+		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+		sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
+		
+		logging.info(
+			f"Rank {self.rank}: Allocating GPU KV pages for new sequences: {global_sequence_ids}"
+		)
+		
+		# Allocate pages for the new sequences
+		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
+		
+		# Rebuild page table to include new sequences
+		# Get all currently active sequences (existing + new)
+		all_active_global_ids = []
+		for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
+			if uuid in self._uuid_to_local_map:
+				seq = self.global_batch.get_sequence(uuid)
+				all_active_global_ids.append(seq.global_idx)
+		
+		# Sort for deterministic ordering
+		all_active_global_ids.sort()
+		
+		if all_active_global_ids:
+			manager.rebuild_page_table(all_active_global_ids)
+		
+		# Load host KV to GPU for the new sequences
+		self._load_host_kv_to_gpu(manager, global_sequence_ids)
 
 	# ============ Main Generation Loop ============
 
@@ -1170,12 +1215,28 @@ class BatchGenWorker:
 			
 			logging.info(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
 			
-			worker_view.release_sequence_pages(global_sequence_ids)
-			worker_view.unregister_sequences(global_sequence_ids)
-			
+			# Release GPU KV pages first
 			local_indices = self._get_local_indices_for_uuids(my_uuids)
 			if local_indices:
 				self._release_gpu_kv_pages(local_indices)
+			
+			# Then release host KV pages
+			worker_view.release_sequence_pages(global_sequence_ids)
+			worker_view.unregister_sequences(global_sequence_ids)
+			
+			# Rebuild GPU page table with remaining active sequences
+			manager = self.gpu_paged_kv_cache_manager
+			if manager is not None and manager.is_initialized:
+				remaining_in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+				remaining_global_ids = []
+				for uuid in remaining_in_decode:
+					if uuid in self._uuid_to_local_map and uuid not in my_uuids:
+						seq = self.global_batch.get_sequence(uuid)
+						remaining_global_ids.append(seq.global_idx)
+				
+				if remaining_global_ids:
+					remaining_global_ids.sort()
+					manager.rebuild_page_table(remaining_global_ids)
 
 	# ============ Prefill and Decode ============
 
