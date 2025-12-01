@@ -183,14 +183,45 @@ class BatchGenWorker:
 
 		# Global batch state
 		self.global_batch: Optional[SequenceBatch] = None
+		
+		# Track if one-time initialization has been done
+		self._core_initialized = False
 
 	def Init(self, max_input_length, max_decoding_length, num_queries):
-		if hasattr(self, 'global_batch') and self.global_batch is not None:
+		"""
+		Initialize/reconfigure for a new batch.
+		- First call: performs full initialization of core_engine, parallel_manager, etc.
+		- Subsequent calls: only updates batch parameters and resets state.
+		"""
+		# Check if we need to reset state from previous batch
+		if self._core_initialized and self.global_batch is not None:
 			self._reset_for_new_batch()
+		
+		# Update batch-specific parameters
 		self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
+		
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
+		
+		# One-time initialization (only on first call)
+		if not self._core_initialized:
+			self._initialize_core_components(num_queries)
+			self._core_initialized = True
+		else:
+			# Just update the num_queries and batch-related config
+			self._update_batch_config(num_queries)
+		
+		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
+
+	def _initialize_core_components(self, num_queries: int) -> None:
+		"""
+		One-time initialization of heavy components.
+		Called only on the first Init() call.
+		"""
+		logging.info(f"Rank {self.rank}: Performing one-time core initialization")
+		
 		config_torch_module_initializer()
+		
 		self.model_config = AutoConfig.from_pretrained(
 			self.cache_dir,
 			trust_remote_code=True,
@@ -210,7 +241,7 @@ class BatchGenWorker:
 		self.engine_config.Basic_Config.device_torch = torch.device(
 			f"cuda:{self.args.device}"
 		)
-		self.engine_config.Basic_Config.max_decoding_length = max_decoding_length
+		self.engine_config.Basic_Config.max_decoding_length = self.max_decoding_length
 		self.engine_config.Basic_Config.padding_length = self.max_input_length
 		self.engine_config.Basic_Config.rank = self.global_rank
 		self.engine_config.Basic_Config.world_size = self.world_size
@@ -273,10 +304,33 @@ class BatchGenWorker:
 			self.local_rank,
 			self.global_rank,
 			self.world_size
-		)        
-				
-		logging.info(f"Engine on device {self.device} initialized.")
+		)
+		
+		logging.info(f"Rank {self.rank}: One-time core initialization completed")
 
+	def _update_batch_config(self, num_queries: int) -> None:
+		"""
+		Update configuration for a new batch without reinitializing heavy components.
+		Called on subsequent Init() calls after the first.
+		"""
+		logging.info(f"Rank {self.rank}: Updating batch config for new batch")
+		
+		# Update engine config with new batch parameters
+		self.engine_config.Basic_Config.max_decoding_length = self.max_decoding_length
+		self.engine_config.Basic_Config.padding_length = self.max_input_length
+		self.engine_config.Basic_Config.num_queries = num_queries
+		
+		# Update input_arguments for any components that might reference them
+		if hasattr(self, 'input_arguments'):
+			self.input_arguments.padding_length = self.max_input_length
+			self.input_arguments.max_decoding_length = self.max_decoding_length
+			self.input_arguments.num_queries = num_queries
+		
+		# Reset per-batch state
+		self.query_book = None
+		self.model_batch_book = {}
+		
+		logging.info(f"Rank {self.rank}: Batch config updated (max_input={self.max_input_length}, max_decode={self.max_decoding_length}, num_queries={num_queries})")
 	# ============ KV Cache Helper Methods ============
 
 	def _get_sequence_token_budget(self, sequence_id: int) -> int:
@@ -1360,8 +1414,8 @@ class BatchGenWorker:
 
 	def _reset_for_new_batch(self) -> None:
 		"""
-		Reset all state to prepare for a new batch.
-		Must be called before processing each new batch (except the first).
+		Reset batch-specific state to prepare for a new batch.
+		Does NOT reinitialize core_engine, parallel_manager, or other heavy components.
 		"""
 		logging.info(f"Rank {self.rank}: Resetting state for new batch")
 		
@@ -1371,7 +1425,6 @@ class BatchGenWorker:
 		# 1. Cleanup communicator from previous batch
 		if hasattr(self, 'comm') and self.comm is not None:
 			try:
-				# PyNcclCommunicator might need explicit cleanup
 				del self.comm
 				self.comm = None
 			except Exception as e:
@@ -1381,22 +1434,21 @@ class BatchGenWorker:
 		if hasattr(self, 'global_batch') and self.global_batch is not None:
 			try:
 				worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-				if worker_view is not None:
-					# Get all sequences owned by this rank
-					if hasattr(self, '_uuid_to_local_map'):
-						for uuid in self._uuid_to_local_map.keys():
-							seq = self.global_batch.get_sequence(uuid)
-							if seq is not None:
-								try:
-									worker_view.release_sequence_pages([seq.global_idx])
-									worker_view.unregister_sequences([seq.global_idx])
-								except Exception:
-									pass  # Ignore errors for already-released pages
+				if worker_view is not None and hasattr(self, '_uuid_to_local_map'):
+					for uuid in self._uuid_to_local_map.keys():
+						seq = self.global_batch.get_sequence(uuid)
+						if seq is not None:
+							try:
+								worker_view.release_sequence_pages([seq.global_idx])
+								worker_view.unregister_sequences([seq.global_idx])
+							except Exception:
+								pass  # Ignore errors for already-released pages
 			except Exception as e:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup host KV: {e}")
 		
-		# 3. Destroy GPU KV cache
+		# 3. Destroy GPU KV cache (but keep the manager reference for reuse)
 		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
+		self.gpu_paged_kv_cache_manager = None
 		
 		# 4. Reset global batch state
 		self.global_batch = None
@@ -1410,19 +1462,19 @@ class BatchGenWorker:
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		
-		# 7. Clean up model if it exists
+		# 7. Clean up model weights (but NOT core_engine or parallel_manager)
 		if hasattr(self, 'model') and self.model is not None:
 			try:
 				self.deep_free_model_memory()
 			except Exception as e:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup model: {e}")
+		self.model = None
 		
 		# 8. Clear CUDA cache
 		torch.cuda.empty_cache()
 		torch.cuda.synchronize()
 		
 		# 9. Force garbage collection
-		import gc
 		gc.collect()
 		
 		# Synchronize all ranks after cleanup
