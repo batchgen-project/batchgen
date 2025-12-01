@@ -1353,7 +1353,7 @@ class BatchGenWorker:
 			Attn_Wrapper.past_key_states = past_key_states
 			Attn_Wrapper.past_value_states = past_value_states
 			
-			# Pass local indices - C++ layer handles conversion
+			# Pass global sequence IDs
 			Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 			
 			while new_token_idx < self.max_decoding_length and (decode_uuids or batch):
@@ -1364,6 +1364,10 @@ class BatchGenWorker:
 				if new_token_idx > 0 and new_token_idx % self.PAGE_SIZE == 0:
 					# Synchronize all ranks before checking completions
 					dist.barrier()
+					
+					# Store original batch size for filtering
+					original_batch_size = len(batch)
+					original_batch = list(batch)  # Copy for index mapping
 					
 					# Check for completed sequences
 					decode_uuids, batch, completed_uuids = self._check_and_handle_completions(
@@ -1379,10 +1383,61 @@ class BatchGenWorker:
 							f"Rank {self.rank}: Completed {len(completed_uuids)} sequences at page boundary "
 							f"(token {new_token_idx}), {len(decode_uuids)} remaining"
 						)
+						
+						# **CRITICAL: Filter new_tokens to match remaining batch**
+						if batch and original_batch_size > 0:
+							# Find which indices in original batch are still active
+							keep_indices = []
+							for i, orig_local_idx in enumerate(original_batch):
+								if orig_local_idx in batch:
+									keep_indices.append(i)
+							
+							if keep_indices and new_tokens.shape[0] > 0:
+								keep_tensor = torch.tensor(keep_indices, dtype=torch.long, device=new_tokens.device)
+								new_tokens = new_tokens.index_select(0, keep_tensor)
+							elif not keep_indices:
+								new_tokens = torch.empty((0, 1), dtype=new_tokens.dtype, device=new_tokens.device)
+						elif not batch:
+							new_tokens = torch.empty((0, 1), dtype=new_tokens.dtype, device=new_tokens.device)
+						
+						# Update Attn_Wrapper.cur_batch
+						Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+						
+						# Rebuild GPU page table for remaining sequences
+						if batch and gpu_manager is not None and gpu_manager.is_initialized:
+							remaining_global_ids = self._local_indices_to_global_seq_ids(batch)
+							if remaining_global_ids:
+								remaining_global_ids.sort()
+								gpu_manager.rebuild_page_table(remaining_global_ids)
 					
 					# Try to load new sequences into freed slots
 					if decode_uuids:  # Only if we still have active sequences
+						prev_batch_size = len(batch)
 						decode_uuids, batch = self._try_load_new_sequences(decode_uuids, batch)
+						
+						if len(batch) > prev_batch_size:
+							# New sequences were added - need to expand new_tokens
+							# The new sequences need their first decode token
+							new_seq_count = len(batch) - prev_batch_size
+							new_local_indices = batch[prev_batch_size:]
+							
+							# Get the first decoded token for new sequences
+							new_seq_tokens = torch.cat([
+								self.query_book[idx].decoded_tokens[:, 0:1]
+								for idx in new_local_indices
+							], dim=0).to(self.torch_device)
+							
+							# Concatenate with existing tokens
+							if new_tokens.shape[0] > 0:
+								new_tokens = torch.cat([new_tokens, new_seq_tokens], dim=0)
+							else:
+								new_tokens = new_seq_tokens
+							
+							logging.info(
+								f"Rank {self.rank}: Added {new_seq_count} new sequences, "
+								f"new_tokens shape: {new_tokens.shape}"
+							)
+						
 						# Update Attn_Wrapper with new batch
 						Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 					
@@ -1392,6 +1447,7 @@ class BatchGenWorker:
 					if not decode_uuids:
 						break
 				
+				# ============ FORWARD PASS ============
 				with torch.inference_mode():
 					if len(batch) != 0:
 						attention_mask = torch.cat(
@@ -1414,9 +1470,24 @@ class BatchGenWorker:
 							dtype=torch.int64, device=self.torch_device
 						)
 						Attn_Wrapper.attention_mask = attention_mask
-						Attn_Wrapper.position_ids = attention_mask
+						Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
 						Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
 						Attn_Wrapper.max_seqlen = 0
+
+					# Validate tensor shapes before forward pass
+					if new_tokens.shape[0] != len(batch):
+						logging.error(
+							f"Rank {self.rank}: Shape mismatch! new_tokens: {new_tokens.shape[0]}, "
+							f"batch: {len(batch)}, position_ids: {Attn_Wrapper.position_ids.shape}"
+						)
+						# Attempt recovery by rebuilding new_tokens
+						if batch:
+							new_tokens = torch.cat([
+								self.query_book[idx].decoded_tokens[:, new_token_idx-1:new_token_idx]
+								for idx in batch
+							], dim=0).to(self.torch_device)
+						else:
+							new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 
 					new_tokens = self.model(
 						new_tokens.to(self.torch_device),
