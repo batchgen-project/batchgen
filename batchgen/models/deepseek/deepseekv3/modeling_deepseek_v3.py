@@ -432,123 +432,123 @@ def yarn_linear_ramp_mask(min, max, dim):
 # 		)
 
 class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
-    # 1. Define a class-level cache to share tensors across instances
-    # Key: (device, dtype) -> Value: (cos_cached, sin_cached, current_max_len)
-    _SHARED_CACHE = {}
+	# 1. Define a class-level cache to share tensors across instances
+	# Key: (device, dtype) -> Value: (cos_cached, sin_cached, current_max_len)
+	_SHARED_CACHE = {}
 
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        device=None,
-        scaling_factor=1.0,
-        original_max_position_embeddings=4096,
-        beta_fast=32,
-        beta_slow=1,
-        mscale=1,
-        mscale_all_dim=0,
-    ):
-        self.scaling_factor = scaling_factor
-        self.original_max_position_embeddings = original_max_position_embeddings
-        self.beta_fast = beta_fast
-        self.beta_slow = beta_slow
-        self.mscale = mscale
-        self.mscale_all_dim = mscale_all_dim
-        
-        # Initialize parent. 
-        # IMPORTANT: Ensure parent does NOT eagerly init GPU if device is None.
-        # You might need to patch the parent class as discussed in the previous turn
-        # to default to 'cpu' if you want to avoid initial GPU spike.
-        super().__init__(dim, max_position_embeddings, base, device)
+	def __init__(
+		self,
+		dim,
+		max_position_embeddings=2048,
+		base=10000,
+		device=None,
+		scaling_factor=1.0,
+		original_max_position_embeddings=4096,
+		beta_fast=32,
+		beta_slow=1,
+		mscale=1,
+		mscale_all_dim=0,
+	):
+		self.scaling_factor = scaling_factor
+		self.original_max_position_embeddings = original_max_position_embeddings
+		self.beta_fast = beta_fast
+		self.beta_slow = beta_slow
+		self.mscale = mscale
+		self.mscale_all_dim = mscale_all_dim
+		
+		# Initialize parent. 
+		# IMPORTANT: Ensure parent does NOT eagerly init GPU if device is None.
+		# You might need to patch the parent class as discussed in the previous turn
+		# to default to 'cpu' if you want to avoid initial GPU spike.
+		super().__init__(dim, max_position_embeddings, base, device)
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        
-        # Create a unique key for the cache based on device and dtype
-        # This allows Layers on GPU0 to share a cache, and Layers on GPU1 to share a different cache.
-        cache_key = (device, dtype)
+	def _set_cos_sin_cache(self, seq_len, device, dtype):
+		self.max_seq_len_cached = seq_len
+		
+		# Create a unique key for the cache based on device and dtype
+		# This allows Layers on GPU0 to share a cache, and Layers on GPU1 to share a different cache.
+		cache_key = (device, dtype)
 
-        # 2. Check if we already have a valid cache for this device
-        if cache_key in self._SHARED_CACHE:
-            cached_cos, cached_sin, cached_len = self._SHARED_CACHE[cache_key]
-            
-            # If the cached length is sufficient, just register references to it
-            if cached_len >= seq_len:
-                # Using slice to ensure shape matches if we want a subset, 
-                # though typically we register the whole buffer.
-                # register_buffer DOES NOT copy memory, it just tracks the tensor.
-                self.register_buffer("cos_cached", cached_cos, persistent=False)
-                self.register_buffer("sin_cached", cached_sin, persistent=False)
-                return
+		# 2. Check if we already have a valid cache for this device
+		if cache_key in self._SHARED_CACHE:
+			cached_cos, cached_sin, cached_len = self._SHARED_CACHE[cache_key]
+			
+			# If the cached length is sufficient, just register references to it
+			if cached_len >= seq_len:
+				# Using slice to ensure shape matches if we want a subset, 
+				# though typically we register the whole buffer.
+				# register_buffer DOES NOT copy memory, it just tracks the tensor.
+				self.register_buffer("cos_cached", cached_cos, persistent=False)
+				self.register_buffer("sin_cached", cached_sin, persistent=False)
+				return
 
-        # --- COMPUTE (Only happens once per device) ---
-        # logger.info(f"Allocating Yarn RoPE cache for {device} (Size: {seq_len})")
-        
-        dim = self.dim
-        
-        # ... [Your Original Yarn Calculation Logic] ...
-        freq_extra = 1.0 / (
-            self.base
-            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-        )
-        freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.base
-            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-        )
+		# --- COMPUTE (Only happens once per device) ---
+		# logger.info(f"Allocating Yarn RoPE cache for {device} (Size: {seq_len})")
+		
+		dim = self.dim
+		
+		# ... [Your Original Yarn Calculation Logic] ...
+		freq_extra = 1.0 / (
+			self.base
+			** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+		)
+		freq_inter = 1.0 / (
+			self.scaling_factor
+			* self.base
+			** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+		)
 
-        low, high = yarn_find_correction_range(
-            self.beta_fast,
-            self.beta_slow,
-            dim,
-            self.base,
-            self.original_max_position_embeddings,
-        )
-        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
-            device=device, dtype=torch.float32
-        )
-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        
-        # We don't need to register inv_freq as a buffer if we only use it for generation here
-        # But if you need it persistent, register it.
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+		low, high = yarn_find_correction_range(
+			self.beta_fast,
+			self.beta_slow,
+			dim,
+			self.base,
+			self.original_max_position_embeddings,
+		)
+		inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
+			device=device, dtype=torch.float32
+		)
+		inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+		
+		# We don't need to register inv_freq as a buffer if we only use it for generation here
+		# But if you need it persistent, register it.
+		self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+		t = torch.arange(seq_len, device=device, dtype=torch.float32)
+		freqs = torch.outer(t, inv_freq)
 
-        _mscale = float(
-            yarn_get_mscale(self.scaling_factor, self.mscale)
-            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
-        )
+		_mscale = float(
+			yarn_get_mscale(self.scaling_factor, self.mscale)
+			/ yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+		)
 
-        emb = torch.cat((freqs, freqs), dim=-1)
-        
-        # Create the tensors
-        cos_new = (emb.cos() * _mscale).to(dtype)
-        sin_new = (emb.sin() * _mscale).to(dtype)
+		emb = torch.cat((freqs, freqs), dim=-1)
+		
+		# Create the tensors
+		cos_new = (emb.cos() * _mscale).to(dtype)
+		sin_new = (emb.sin() * _mscale).to(dtype)
 
-        # 3. Update the Class-Level Cache
-        self._SHARED_CACHE[cache_key] = (cos_new, sin_new, seq_len)
+		# 3. Update the Class-Level Cache
+		self._SHARED_CACHE[cache_key] = (cos_new, sin_new, seq_len)
 
-        # 4. Register the buffers for this instance
-        self.register_buffer("cos_cached", cos_new, persistent=False)
-        self.register_buffer("sin_cached", sin_new, persistent=False)
+		# 4. Register the buffers for this instance
+		self.register_buffer("cos_cached", cos_new, persistent=False)
+		self.register_buffer("sin_cached", sin_new, persistent=False)
 
-    def forward(self, x, seq_len=None):
-        if seq_len is None:
-            seq_len = x.size(-2)
-            
-        # Check if we need to recompute/resize
-        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
-             # This will update the global cache if the new length is larger
-             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-        
-        # Standard forward
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
+	def forward(self, x, seq_len=None):
+		if seq_len is None:
+			seq_len = x.size(-2)
+			
+		# Check if we need to recompute/resize
+		if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+			 # This will update the global cache if the new length is larger
+			 self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+		
+		# Standard forward
+		return (
+			self.cos_cached[:seq_len].to(dtype=x.dtype),
+			self.sin_cached[:seq_len].to(dtype=x.dtype),
+		)
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
@@ -1631,113 +1631,113 @@ def activation_gating(
 
 @triton.jit
 def act_quant_kernel_3d_sparse(
-    x_ptr,
-    y_ptr,
-    scale_ptr,
-    expert_tokens_ptr,  # [E] - token counts per expert
-    E, M_max, N,
-    stride_x_e, stride_x_m, stride_x_n,
-    stride_y_e, stride_y_m, stride_y_n,
-    stride_scale_e, stride_scale_m, stride_scale_n,
-    eps: tl.constexpr,
-    fp8_max: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+	x_ptr,
+	y_ptr,
+	scale_ptr,
+	expert_tokens_ptr,  # [E] - token counts per expert
+	E, M_max, N,
+	stride_x_e, stride_x_m, stride_x_n,
+	stride_y_e, stride_y_m, stride_y_n,
+	stride_scale_e, stride_scale_m, stride_scale_n,
+	eps: tl.constexpr,
+	fp8_max: tl.constexpr,
+	BLOCK_SIZE: tl.constexpr
 ):
-    """
-    3D Sparse Block Quantization Kernel.
-    Only quantizes valid tokens per expert, skipping padding.
-    """
-    expert_idx = tl.program_id(axis=0)
-    block_n_idx = tl.program_id(axis=1)
-    
-    # Load valid token count for this expert
-    valid_tokens = tl.load(expert_tokens_ptr + expert_idx).to(tl.int32)
-    
-    # Early exit if no valid tokens
-    if valid_tokens == 0:
-        return
-    
-    # Base pointers for this expert
-    x_expert_base = x_ptr + expert_idx * stride_x_e
-    y_expert_base = y_ptr + expert_idx * stride_y_e
-    scale_expert_base = scale_ptr + expert_idx * stride_scale_e
-    
-    # Block offset along N dimension
-    block_start_n = block_n_idx * BLOCK_SIZE
-    offsets_n = block_start_n + tl.arange(0, BLOCK_SIZE)
-    mask_n = offsets_n < N
-    
-    # Process each valid token (row) for this expert
-    for token_idx in range(valid_tokens):
-        # Load the block for this token
-        x_ptrs = x_expert_base + token_idx * stride_x_m + offsets_n * stride_x_n
-        x = tl.load(x_ptrs, mask=mask_n, other=0.0).to(tl.float32)
-        
-        # Compute scale (absmax of this block)
-        absmax = tl.max(tl.abs(x), axis=0)
-        scale = tl.maximum(absmax, eps) / fp8_max
-        
-        # Quantize
-        x_scaled = x / scale
-        x_scaled = tl.minimum(x_scaled, fp8_max)
-        x_scaled = tl.maximum(x_scaled, -fp8_max)
-        
-        # Store quantized data
-        y = x_scaled.to(y_ptr.dtype.element_ty)
-        y_ptrs = y_expert_base + token_idx * stride_y_m + offsets_n * stride_y_n
-        tl.store(y_ptrs, y, mask=mask_n)
-        
-        # Store scale
-        scale_ptr_offset = scale_expert_base + token_idx * stride_scale_m + block_n_idx * stride_scale_n
-        tl.store(scale_ptr_offset, scale)
+	"""
+	3D Sparse Block Quantization Kernel.
+	Only quantizes valid tokens per expert, skipping padding.
+	"""
+	expert_idx = tl.program_id(axis=0)
+	block_n_idx = tl.program_id(axis=1)
+	
+	# Load valid token count for this expert
+	valid_tokens = tl.load(expert_tokens_ptr + expert_idx).to(tl.int32)
+	
+	# Early exit if no valid tokens
+	if valid_tokens == 0:
+		return
+	
+	# Base pointers for this expert
+	x_expert_base = x_ptr + expert_idx * stride_x_e
+	y_expert_base = y_ptr + expert_idx * stride_y_e
+	scale_expert_base = scale_ptr + expert_idx * stride_scale_e
+	
+	# Block offset along N dimension
+	block_start_n = block_n_idx * BLOCK_SIZE
+	offsets_n = block_start_n + tl.arange(0, BLOCK_SIZE)
+	mask_n = offsets_n < N
+	
+	# Process each valid token (row) for this expert
+	for token_idx in range(valid_tokens):
+		# Load the block for this token
+		x_ptrs = x_expert_base + token_idx * stride_x_m + offsets_n * stride_x_n
+		x = tl.load(x_ptrs, mask=mask_n, other=0.0).to(tl.float32)
+		
+		# Compute scale (absmax of this block)
+		absmax = tl.max(tl.abs(x), axis=0)
+		scale = tl.maximum(absmax, eps) / fp8_max
+		
+		# Quantize
+		x_scaled = x / scale
+		x_scaled = tl.minimum(x_scaled, fp8_max)
+		x_scaled = tl.maximum(x_scaled, -fp8_max)
+		
+		# Store quantized data
+		y = x_scaled.to(y_ptr.dtype.element_ty)
+		y_ptrs = y_expert_base + token_idx * stride_y_m + offsets_n * stride_y_n
+		tl.store(y_ptrs, y, mask=mask_n)
+		
+		# Store scale
+		scale_ptr_offset = scale_expert_base + token_idx * stride_scale_m + block_n_idx * stride_scale_n
+		tl.store(scale_ptr_offset, scale)
 
 
 def act_quant_3d(
-    x: torch.Tensor,
-    expert_token_counts: torch.Tensor,  # [E] - counts per expert
-    block_size: int = 128,
-    eps: float = 1e-12
+	x: torch.Tensor,
+	expert_token_counts: torch.Tensor,  # [E] - counts per expert
+	block_size: int = 128,
+	eps: float = 1e-12
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Optimized FP8 quantization that only processes valid tokens.
-    
-    Args:
-        x: Input tensor [E, M_max, H] 
-        expert_token_counts: Valid token count per expert [E]
-        block_size: Quantization block size along H dimension
-        eps: Minimum scale value
-    
-    Returns:
-        y: Quantized tensor [E, M_max, H] in fp8
-        scale: Scale factors [E, M_max, H//block_size] in fp32
-    """
-    assert x.is_contiguous(), 'Input must be contiguous'
-    assert x.ndim == 3, 'Input must be 3D [E, M_max, H]'
-    
-    fp8_max = 448.0
-    E, M_max, H = x.shape
-    num_blocks = (H + block_size - 1) // block_size
-    
-    # Allocate outputs (full buffer size)
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    scale = torch.empty((E, M_max, num_blocks), dtype=torch.float32, device=x.device)
-    
-    # Grid: (num_experts, num_blocks_per_token)
-    grid = (E, num_blocks)
-    
-    act_quant_kernel_3d_sparse[grid](
-        x, y, scale,
-        expert_token_counts,
-        E, M_max, H,
-        x.stride(0), x.stride(1), x.stride(2),
-        y.stride(0), y.stride(1), y.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        eps=eps,
-        fp8_max=fp8_max,
-        BLOCK_SIZE=block_size
-    )
-    
-    return y, scale
+	"""
+	Optimized FP8 quantization that only processes valid tokens.
+	
+	Args:
+		x: Input tensor [E, M_max, H] 
+		expert_token_counts: Valid token count per expert [E]
+		block_size: Quantization block size along H dimension
+		eps: Minimum scale value
+	
+	Returns:
+		y: Quantized tensor [E, M_max, H] in fp8
+		scale: Scale factors [E, M_max, H//block_size] in fp32
+	"""
+	assert x.is_contiguous(), 'Input must be contiguous'
+	assert x.ndim == 3, 'Input must be 3D [E, M_max, H]'
+	
+	fp8_max = 448.0
+	E, M_max, H = x.shape
+	num_blocks = (H + block_size - 1) // block_size
+	
+	# Allocate outputs (full buffer size)
+	y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+	scale = torch.empty((E, M_max, num_blocks), dtype=torch.float32, device=x.device)
+	
+	# Grid: (num_experts, num_blocks_per_token)
+	grid = (E, num_blocks)
+	
+	act_quant_kernel_3d_sparse[grid](
+		x, y, scale,
+		expert_token_counts,
+		E, M_max, H,
+		x.stride(0), x.stride(1), x.stride(2),
+		y.stride(0), y.stride(1), y.stride(2),
+		scale.stride(0), scale.stride(1), scale.stride(2),
+		eps=eps,
+		fp8_max=fp8_max,
+		BLOCK_SIZE=block_size
+	)
+	
+	return y, scale
 import torch.distributed._symmetric_memory as symm_mem
 if os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL") == "1":
 	from pplx_kernels.all_to_all import AllToAll
@@ -1983,14 +1983,25 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		return self.y[:num_tokens].to(x.dtype)
 
 	@torch.inference_mode()
-	def moe_infer_pplx_a2a_fp8_dispatch(self,x):
+	def moe_infer_pplx_a2a_fp8_dispatch(self, x):
 		num_tokens, hidden_size = x.shape
+		
 		# Handle empty input - still must participate in all-to-all
 		if num_tokens == 0:
+			logging.warning(
+				f"moe_infer_pplx_a2a_fp8_dispatch called with 0 tokens on device {self.device}. "
+				f"This rank has no sequences in current batch."
+			)
+			
+			# Calculate num_blocks to match act_quant's scale shape (block_size=128)
+			block_size = 128
+			num_blocks = (hidden_size + block_size - 1) // block_size
+			
 			empty_indices = torch.empty((0, self.num_experts_per_tok), dtype=torch.uint32, device=self.device)
 			empty_weights = torch.empty((0, self.num_experts_per_tok), dtype=torch.float32, device=self.device)
 			empty_x_fp8 = torch.empty((0, hidden_size), dtype=torch.float8_e4m3fn, device=self.device)
-			empty_x_scale = torch.empty((0,), dtype=torch.float32, device=self.device)
+			# CRITICAL FIX: dp_x_scale must be 2D with shape (num_tokens, num_blocks)
+			empty_x_scale = torch.empty((0, num_blocks), dtype=torch.float32, device=self.device)
 			
 			self.bound_m.fill_(0)
 			
@@ -2021,6 +2032,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			)
 			
 			return empty_y
+		
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(
 			x.view(num_tokens, 1, hidden_size)
 		)
