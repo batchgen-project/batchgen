@@ -1001,9 +1001,6 @@ class BatchGenWorker:
 				# Get initial decode batch (from PREFILLED sequences)
 				decode_uuids = self._prepare_decode_batch()
 				
-				if not decode_uuids and not self.global_batch.has_in_decode():
-					break
-				
 				# If we have sequences already IN_DECODE, include them
 				in_decode_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
 				if in_decode_uuids:
@@ -1014,7 +1011,9 @@ class BatchGenWorker:
 							in_decode_uuids.append(uuid)
 					decode_uuids = in_decode_uuids
 				
+				# **CRITICAL: Exit if no sequences to decode**
 				if not decode_uuids:
+					logging.info(f"Rank {self.rank}: No sequences to decode, exiting decode loop")
 					break
 				
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
@@ -1036,7 +1035,7 @@ class BatchGenWorker:
 									local_decode_indices,
 									self.max_input_length + self.max_decoding_length
 								)
-				
+					
 				config_decode_time += time.perf_counter() - tmp_start
 				
 				dist.barrier()
@@ -1063,19 +1062,24 @@ class BatchGenWorker:
 					)
 				decoding_time += time.perf_counter() - decoding_start_time
 				
-				# Any remaining IN_DECODE sequences that weren't completed should be put ON_HOLD
-				# if we need to do more prefill
+				# **FIXED: Only put sequences ON_HOLD if they're still IN_DECODE AND we need more prefill**
 				remaining_in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
 				if remaining_in_decode and self.global_batch.has_queueing():
 					self._update_batch_status(remaining_in_decode, SequenceStatus.ON_HOLD)
+					logging.info(f"Rank {self.rank}: Put {len(remaining_in_decode)} sequences ON_HOLD for more prefill")
 				
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
 				
 				del past_key_states
 				del scale_dict
-				
+			
 				dist.barrier()
+			
+				# **ADDED: Check if all sequences are completed after this decode iteration**
+				if self.global_batch.all_completed():
+					logging.info(f"Rank {self.rank}: All sequences completed, exiting decode loop")
+					break
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
