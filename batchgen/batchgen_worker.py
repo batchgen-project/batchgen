@@ -1145,7 +1145,7 @@ class BatchGenWorker:
 
 				# B. Config Decode
 				config_start = time.perf_counter()
-				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
+				self._config_decoding_for_batch(decode_uuids, local_decode_indices, self.comm)
 				config_decode_time += time.perf_counter() - config_start
 
 				# C. Execute Continuous Decode
