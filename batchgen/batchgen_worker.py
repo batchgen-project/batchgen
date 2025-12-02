@@ -740,10 +740,24 @@ class BatchGenWorker:
 
 	# ============ KV-Driven Batch Preparation ============
 
+	def _get_node_for_rank(self, rank: int) -> int:
+		"""Get node ID for a rank. Assumes uniform GPUs per node."""
+		gpus_per_node = torch.cuda.device_count()
+		return rank // gpus_per_node
+
+	def _get_num_nodes(self) -> int:
+		"""Get total number of nodes."""
+		gpus_per_node = torch.cuda.device_count()
+		return self.world_size // gpus_per_node
+
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
-		Select sequences for prefill based on host KV cache capacity.
-		All ranks execute this identically to get the same global prefill batch.
+		Select sequences for prefill based on HOST KV cache capacity.
+		
+		Key constraint: Host KV cache is PER NODE.
+		- Each node has its own host KV capacity
+		- Sequences assigned to ranks on node N use node N's host KV
+		- Must check per-node capacity, not global
 		"""
 		queueing_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)
 		queueing_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
@@ -751,27 +765,55 @@ class BatchGenWorker:
 		if not queueing_uuids:
 			return []
 		
-		available_pages = self._get_host_kv_free_pages()
+		gpus_per_node = torch.cuda.device_count()
+		num_nodes = self._get_num_nodes()
+		my_node = self._get_node_for_rank(self.rank)
 		
+		# Step 1: Get this node's host KV free pages
+		local_host_free = self._get_host_kv_free_pages()
+		
+		# Step 2: Gather host KV free pages from first rank on each node
+		# Only rank 0, 8, 16, ... (first on each node) reports actual value
+		if self.rank % gpus_per_node == 0:
+			report_free = local_host_free
+		else:
+			report_free = 0  # Non-first ranks report 0
+		
+		free_tensor = torch.tensor([report_free], dtype=torch.int64, device=self.torch_device)
+		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
+		dist.all_gather(gathered, free_tensor)
+		
+		# Extract per-node host KV free pages
+		per_node_host_free = []
+		for node in range(num_nodes):
+			first_rank = node * gpus_per_node
+			per_node_host_free.append(int(gathered[first_rank].item()))
+		
+		if self.rank == 0:
+			logging.info(f"Per-node host KV free pages: {per_node_host_free}")
+		
+		# Step 3: Select sequences considering per-node host KV capacity
+		node_pages_used = [0] * num_nodes
 		prefill_batch = []
-		pages_allocated = 0
 		
 		for uuid in queueing_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			seq_pages = seq.get_pages_required()
+			assigned_rank = seq.assigned_rank
+			seq_node = self._get_node_for_rank(assigned_rank)
 			
-			if pages_allocated + seq_pages <= available_pages:
+			req_pages = seq.get_pages_required()
+			
+			if node_pages_used[seq_node] + req_pages <= per_node_host_free[seq_node]:
 				prefill_batch.append(uuid)
-				pages_allocated += seq_pages
-			else:
-				break
+				node_pages_used[seq_node] += req_pages
 		
 		logging.info(
-			f"Rank {self.rank}: Prepared prefill batch with {len(prefill_batch)} sequences, "
-			f"using {pages_allocated}/{available_pages} pages"
+			f"Rank {self.rank}: Prefill batch: {len(prefill_batch)} sequences, "
+			f"per-node pages used: {node_pages_used}"
 		)
 		
 		return prefill_batch
+
 
 	def _prepare_decode_batch(self) -> List[str]:
 		"""
@@ -1645,71 +1687,105 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[int]]:
 		"""
 		Load PREFILLED sequences to GPU at page boundaries.
-		Uses get_stats().num_free_pages for capacity check.
+		
+		Architecture:
+		- Host KV cache is PER NODE
+		- GPU KV cache is PER RANK
+		- A sequence prefilled by rank R has host KV on node (R // gpus_per_node)
+		- Only ranks on THAT node can load this sequence to their GPU
+		
+		Sync strategy:
+		1. All-gather free GPU pages from all ranks
+		2. All ranks compute IDENTICAL loading decision
+		3. Each rank only loads sequences assigned to it
+		4. All ranks update decode_uuids identically
 		"""
-		# Get free GPU pages
+		gpus_per_node = torch.cuda.device_count()
+		my_node = self._get_node_for_rank(self.rank)
+		
+		# Step 1: All-gather free GPU pages from ALL ranks
 		manager = self.gpu_paged_kv_cache_manager
-		if manager is None or not manager.is_initialized:
-			return current_decode_uuids, current_batch
+		local_free = manager.get_stats().num_free_pages if manager and manager.is_initialized else 0
 		
-		free_pages = manager.get_stats().num_free_pages
-		if free_pages <= 0:
-			return current_decode_uuids, current_batch
+		free_tensor = torch.tensor([local_free], dtype=torch.int64, device=self.torch_device)
+		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
+		dist.all_gather(gathered, free_tensor)
+		per_rank_free = [int(t.item()) for t in gathered]
 		
-		# Get candidates
+		if self.rank == 0:
+			logging.info(f"Per-rank GPU free pages: {per_rank_free}")
+		
+		# Step 2: Get PREFILLED candidates (all ranks see identical list)
 		candidates = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		candidates.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 		
 		if not candidates:
 			return current_decode_uuids, current_batch
 		
-		# Per-rank limit
+		# Step 3: Current per-rank state
 		max_per_rank = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
-		
-		# Current per-rank counts
-		rank_counts = [0] * self.world_size
+		rank_seq_counts = [0] * self.world_size
 		for uuid in current_decode_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			rank_counts[seq.assigned_rank] += 1
+			rank_seq_counts[seq.assigned_rank] += 1
 		
-		# Select sequences to load
+		rank_pages_used = [0] * self.world_size
+		
+		# Step 4: Select sequences (IDENTICAL computation on all ranks)
 		new_uuids = []
-		pages_needed = 0
 		
 		for uuid in candidates:
 			seq = self.global_batch.get_sequence(uuid)
+			assigned_rank = seq.assigned_rank
+			seq_node = self._get_node_for_rank(assigned_rank)
 			
-			# Per-rank limit
-			if rank_counts[seq.assigned_rank] >= max_per_rank:
+			# Host KV constraint: sequence's host KV is on seq_node
+			# Only assigned_rank (which is on seq_node) will load it
+			# This is implicitly enforced by using assigned_rank
+			
+			# Check per-rank sequence limit
+			if rank_seq_counts[assigned_rank] >= max_per_rank:
 				continue
 			
-			# GPU page limit
-			req = seq.get_pages_required()
-			if pages_needed + req > free_pages:
-				break
+			# Check GPU page capacity on assigned rank
+			req_pages = seq.get_pages_required()
+			if rank_pages_used[assigned_rank] + req_pages > per_rank_free[assigned_rank]:
+				continue
 			
+			# Accept this sequence
 			new_uuids.append(uuid)
-			pages_needed += req
-			rank_counts[seq.assigned_rank] += 1
+			rank_pages_used[assigned_rank] += req_pages
+			rank_seq_counts[assigned_rank] += 1
 		
 		if not new_uuids:
 			return current_decode_uuids, current_batch
 		
-		logging.info(
-			f"Rank {self.rank}: Loading {len(new_uuids)} sequences, "
-			f"{pages_needed}/{free_pages} pages"
-		)
+		# Step 5: Load GPU KV for THIS RANK's new sequences only
+		my_new_uuids = [u for u in new_uuids 
+					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
+		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
 		
-		# Allocate and load GPU KV for local sequences
-		new_local = self._get_local_indices_for_uuids(new_uuids)
-		if new_local:
-			self._allocate_and_load_gpu_kv_for_new_sequences(new_local)
+		if new_local_indices:
+			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
+			logging.info(
+				f"Rank {self.rank} (node {my_node}): Loaded {len(my_new_uuids)} sequences, "
+				f"{rank_pages_used[self.rank]}/{per_rank_free[self.rank]} GPU pages"
+			)
 		
-		# Update status (all ranks do this identically)
+		# Step 6: Update status globally (all ranks do this identically)
 		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
 		
-		# Return merged lists
-		return current_decode_uuids + new_uuids, current_batch + new_local
+		# Step 7: Return updated lists
+		updated_decode_uuids = current_decode_uuids + new_uuids
+		updated_batch = current_batch + new_local_indices
+		
+		logging.info(
+			f"Rank {self.rank}: Loaded {len(new_uuids)} sequences globally "
+			f"(decode: {len(current_decode_uuids)}->{len(updated_decode_uuids)}, "
+			f"local: {len(current_batch)}->{len(updated_batch)})"
+		)
+		
+		return updated_decode_uuids, updated_batch
 
 
 	def _rebuild_input_tokens(self, batch: List[int]) -> torch.Tensor:
