@@ -145,29 +145,105 @@ class BatchGenWorker:
 	PAGE_SIZE = 64  # Alignment for page boundary checks
 
 	def __init__(self, args: BatchGenWorkerArgs):
-		# ... [Initialization code remains same as context] ...
+		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
+		
+		# 1. Store Arguments & Rank Information
 		self.args = args
-		self.rank = args.global_rank
-		self.world_size = args.world_size
 		self.local_rank = args.local_rank
+		self.global_rank = args.global_rank
+		self.rank = args.global_rank # Alias for compatibility
+		self.world_size = args.world_size
+		self.gpu_arch = args.gpu_arch
+		self.kv_dtype = args.kv_dtype
+		self.device = args.device
 		self.torch_device = torch.device(f"cuda:{args.device}")
+
+		# 2. Set Device immediately
+		torch.cuda.set_device(self.local_rank)
+
+		# 3. Path & Model Configurations
+		self.model_name = args.model_name
+		self.huggingface_ckpt_name = args.model_name
+		self.hf_cache_dir = args.hf_cache_dir
+		self.cache_dir = args.cache_dir
+		self.pt_ckpt_dir = args.pt_ckpt_dir
+		self.skeleton_state_dict = args.skeleton_state_dict
 		
-		# Core Engine & Weights Storage Init
+		# 4. Initialize Shared Memory for Weights (Crucial for multiprocess)
+		self.shm_name = args.shm_name
+		self.tensor_meta_shm_name = args.tensor_meta_shm_name
+		self.weight_byte_size = args.weight_byte_size
+		self.enable_hugetlbfs = args.enable_hugetlbfs
+		
+		logging.info(f"Rank {self.rank}: Initializing shared memory segments.")
+		logging.info(
+			f"Rank {self.rank}: shm_name: {self.shm_name}, "
+			f"tensor_meta_shm_name: {self.tensor_meta_shm_name}, "
+			f"weight_byte_size: {self.weight_byte_size}, "
+			f"enable_hugetlbfs: {self.enable_hugetlbfs}"
+		)
+
 		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
-		self.weights_storage.Init(args.shm_name, args.weight_byte_size, 
-								  args.tensor_meta_shm_name, args.enable_hugetlbfs)
+		self.weights_storage.Init(
+			self.shm_name, 
+			self.weight_byte_size, 
+			self.tensor_meta_shm_name,
+			self.enable_hugetlbfs
+		)
+		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
+
+		# 5. Initialize Host KV Cache Manager View
+		# This allows the worker to map to the host memory allocated by the main process
+		self.host_kv_cache_size = args.host_kv_cache_size
+		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 		
-		# Host KV View Init
 		worker_kv_config = build_host_kv_config(
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
 		)
-		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
-		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 		
+		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
+		# create_region=False because the main process created it; we just attach
+		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
+
+		# 6. Initialize Placeholders for Core Components
+		# These are populated later in Init() / _initialize_core_components
 		self.gpu_paged_kv_cache_manager = None
-		self._core_initialized = False
+		self.model = None
+		self.model_config = None
+		self.hf_model_config = None
+		self.engine_config = None
+		self.core_engine = None
+		self.tokenizer = None
+		self.initializer = None
+		self.parallel_manager = None
+		
+		# 7. Batch State Placeholders
 		self.global_batch: Optional[SequenceBatch] = None
+		self.query_book: Optional[Dict] = None
+		self.model_batch_book: Dict = {}
+		self._local_to_uuid_map: Dict[int, str] = {}
+		self._uuid_to_local_map: Dict[str, int] = {}
+		
+		# 8. Runtime State
+		self.eos_token_id: Optional[int] = None
+		self.max_input_length = 0
+		self.max_decoding_length = 0
+		self.num_global_queries = 0
+		self.num_local_queries = 0
+		
+		# 9. Initialization Flags
+		self._core_initialized = False
+		self._batch_completed = False
+		self._nvshmem_initialized_this_run = False
+		
+		# 10. Distributed Communication Info
+		self.dist_init_addr = args.dist_init_addr
+		self.comm = None # Initialized lazily or in Init()
+
+		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
 	def Init(self, max_input_length, max_decoding_length, num_queries):
 		"""
