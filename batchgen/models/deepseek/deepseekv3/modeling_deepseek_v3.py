@@ -1988,7 +1988,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# Handle empty input - still must participate in all-to-all
 		if num_tokens == 0:
-			logging.warning(
+			logger.info(
 				f"moe_infer_pplx_a2a_fp8_dispatch called with 0 tokens on device {self.device}. "
 				f"This rank has no sequences in current batch."
 			)
