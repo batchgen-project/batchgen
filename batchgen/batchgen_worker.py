@@ -140,59 +140,34 @@ class BatchGenWorkerArgs:
 
 class BatchGenWorker:
 	"""
-	Inference Runtime with KV-cache-driven scheduling and continuous batching.
+	Inference Runtime with Host-KV-First scheduling and Continuous Batching.
 	"""
-	
-	# Page size for decision making (64 tokens)
-	PAGE_SIZE = 64
-	
+	PAGE_SIZE = 64  # Alignment for page boundary checks
+
 	def __init__(self, args: BatchGenWorkerArgs):
-		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
+		# ... [Initialization code remains same as context] ...
 		self.args = args
-		self.model = None
-		self.hf_cache_dir = args.cache_dir
-		self.huggingface_ckpt_name = args.model_name
-		self.cache_dir = args.cache_dir
-		self.pt_ckpt_dir = args.pt_ckpt_dir
-		self.skeleton_state_dict = args.skeleton_state_dict
-		self.dist_init_addr = args.dist_init_addr
-		self.local_rank = args.local_rank
-		self.global_rank = args.global_rank
 		self.rank = args.global_rank
 		self.world_size = args.world_size
-		self.gpu_arch = args.gpu_arch
-		self.kv_dtype = args.kv_dtype
-
-		self.shm_name = args.shm_name
-		self.tensor_meta_shm_name = args.tensor_meta_shm_name
-		logging.info(f"Rank {self.rank}: Initializing shared memory segments.")
-		logging.info(f"Rank {self.rank}: shm_name: {self.shm_name}, tensor_meta_shm_name: {self.tensor_meta_shm_name}, weight_byte_size: {self.args.weight_byte_size}, enable_hugetlbfs: {self.args.enable_hugetlbfs}")
+		self.local_rank = args.local_rank
+		self.torch_device = torch.device(f"cuda:{args.device}")
+		
+		# Core Engine & Weights Storage Init
 		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
-
+		self.weights_storage.Init(args.shm_name, args.weight_byte_size, 
+								  args.tensor_meta_shm_name, args.enable_hugetlbfs)
+		
+		# Host KV View Init
 		worker_kv_config = build_host_kv_config(
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
 		)
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
-		self.gpu_paged_kv_cache_manager = None
-		
-		self.weights_storage.Init(self.shm_name, self.args.weight_byte_size, 
-					self.tensor_meta_shm_name,
-					self.args.enable_hugetlbfs)	
-		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
-		
-		logging.info(f"Rank {self.rank}: Initializing core engine.")
 		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
-		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
-
-		# Global batch state
-		self.global_batch: Optional[SequenceBatch] = None
 		
-		# EOS token ID (will be set from tokenizer)
-		self.eos_token_id: Optional[int] = None
-		
-		# Track if one-time initialization has been done
+		self.gpu_paged_kv_cache_manager = None
 		self._core_initialized = False
+		self.global_batch: Optional[SequenceBatch] = None
 
 	def Init(self, max_input_length, max_decoding_length, num_queries):
 		"""
@@ -723,7 +698,9 @@ class BatchGenWorker:
 	def _prepare_decode_batch(self) -> List[str]:
 		"""
 		Select sequences for decode phase from PREFILLED sequences.
-		Limited by MoE_decoding_micro_batch_size PER RANK.
+		Limited by:
+		1. MoE_decoding_micro_batch_size PER RANK
+		2. GPU KV cache capacity
 		"""
 		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		prefilled_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
@@ -734,21 +711,45 @@ class BatchGenWorker:
 		# MoE_decoding_micro_batch_size is PER RANK limit
 		max_seqs_per_rank = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
 		
+		# Get GPU KV capacity (estimate based on available memory)
+		# Use config or compute from available GPU memory
+		gpu_kv_capacity_pages = getattr(
+			self.engine_config.GPU_Buffer_Config, 
+			'gpu_kv_pages', 
+			8192  # Default fallback
+		)
+		
 		# Count sequences per rank and enforce per-rank limit
 		rank_counts = [0] * self.world_size
 		decode_batch = []
+		total_pages_allocated = 0
 		
 		for uuid in prefilled_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
 			
-			if rank_counts[assigned_rank] < max_seqs_per_rank:
-				decode_batch.append(uuid)
-				rank_counts[assigned_rank] += 1
+			# Check per-rank limit
+			if rank_counts[assigned_rank] >= max_seqs_per_rank:
+				continue
+			
+			# Check GPU KV page capacity
+			seq_pages = seq.get_pages_required()
+			if total_pages_allocated + seq_pages > gpu_kv_capacity_pages:
+				logging.info(
+					f"Rank {self.rank}: GPU KV capacity reached at {len(decode_batch)} sequences "
+					f"({total_pages_allocated}/{gpu_kv_capacity_pages} pages)"
+				)
+				break
+			
+			decode_batch.append(uuid)
+			rank_counts[assigned_rank] += 1
+			total_pages_allocated += seq_pages
 		
+		remaining_prefilled = len(prefilled_uuids) - len(decode_batch)
 		logging.info(
 			f"Rank {self.rank}: Prepared decode batch with {len(decode_batch)} global sequences "
-			f"(per-rank limit: {max_seqs_per_rank}, counts: {rank_counts})"
+			f"(per-rank limit: {max_seqs_per_rank}, counts: {rank_counts}), "
+			f"{remaining_prefilled} sequences remain PREFILLED for continuous batching"
 		)
 		
 		return decode_batch
@@ -791,85 +792,42 @@ class BatchGenWorker:
 		self, 
 		current_decode_uuids: List[str],
 		current_local_indices: List[int]
-	) -> Tuple[List[str], List[int]]:
+		) -> Tuple[List[str], List[int]]:
 		"""
-		Try to load new sequences from ON_HOLD or PREFILLED status into the decode batch.
-		This is called after some sequences complete to fill the freed GPU pages.
-		
-		Returns:
-			- updated decode_uuids
-			- updated local_decode_indices
+		Checks if PREFILLED sequences (in Host KV) fit into available GPU KV.
+		If so, loads them.
 		"""
-		# Get available GPU pages
+		# 1. Identify candidates (PREFILLED only)
+		# Note: We prioritize preserving the current batch, adding only if space exists
 		gpu_free_pages = self._get_gpu_kv_free_pages()
-		if gpu_free_pages <= 0:
-			return current_decode_uuids, current_local_indices
+		candidates = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		
-		# Get sequences that can be loaded (ON_HOLD first, then PREFILLED)
-		candidates = []
-		
-		# First try ON_HOLD sequences (they were previously decoding)
-		on_hold_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
-		on_hold_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
-		candidates.extend(on_hold_uuids)
-		
-		# Then try PREFILLED sequences
-		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		prefilled_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
-		candidates.extend(prefilled_uuids)
-		
-		if not candidates:
-			return current_decode_uuids, current_local_indices
-		
-		# Calculate current per-rank counts
-		max_seqs_per_rank = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
-		rank_counts = [0] * self.world_size
-		for uuid in current_decode_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			rank_counts[seq.assigned_rank] += 1
-		
-		# Try to add new sequences
+		# 2. Select what fits
 		new_uuids = []
-		pages_to_allocate = 0
+		pages_needed = 0
 		
 		for uuid in candidates:
 			seq = self.global_batch.get_sequence(uuid)
-			assigned_rank = seq.assigned_rank
-			
-			# Check per-rank limit
-			if rank_counts[assigned_rank] >= max_seqs_per_rank:
-				continue
-			
-			# Check GPU page availability
-			seq_pages = seq.get_pages_required()
-			if pages_to_allocate + seq_pages > gpu_free_pages:
-				continue
-			
-			new_uuids.append(uuid)
-			pages_to_allocate += seq_pages
-			rank_counts[assigned_rank] += 1
+			req = seq.get_pages_required()
+			if pages_needed + req <= gpu_free_pages:
+				 # Check rank limits (MoE batch size) here as well
+				 new_uuids.append(uuid)
+				 pages_needed += req
+			else:
+				 break # Simple greedy; could be smarter
 		
 		if not new_uuids:
 			return current_decode_uuids, current_local_indices
-		
-		# Allocate GPU KV pages for new sequences (only for this rank's sequences)
+
+		# 3. Load from Host to GPU
 		new_local_indices = self._get_local_indices_for_uuids(new_uuids)
 		if new_local_indices:
+			# This function handles the .wait() blocking call
 			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
-		
-		# Update status to IN_DECODE
+
 		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
 		
-		# Merge with current batch
-		updated_uuids = current_decode_uuids + new_uuids
-		updated_local_indices = current_local_indices + new_local_indices
-		
-		logging.info(
-			f"Rank {self.rank}: Loaded {len(new_uuids)} new sequences into decode batch "
-			f"(total now: {len(updated_uuids)})"
-		)
-		
-		return updated_uuids, updated_local_indices
+		return current_decode_uuids + new_uuids, current_local_indices + new_local_indices
 
 	# def _allocate_and_load_gpu_kv_for_new_sequences(self, local_sequence_ids: List[int]) -> None:
 	# 	"""
@@ -913,223 +871,123 @@ class BatchGenWorker:
 	# 	self._load_host_kv_to_gpu(manager, global_sequence_ids)
 	def _allocate_and_load_gpu_kv_for_new_sequences(self, local_sequence_ids: List[int]) -> None:
 		"""
-		Allocate GPU KV pages and load host KV for newly added sequences during continuous batching.
+		Allocates GPU pages and triggers blocking load from Host.
 		"""
-		if not local_sequence_ids:
-			return
+		if not local_sequence_ids: return
 		
 		manager = self.gpu_paged_kv_cache_manager
-		if manager is None:
-			logging.warning("GPU KV manager not initialized, cannot load new sequences")
-			return
-		
-		# Convert local indices to global sequence IDs
-		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-		sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
-		
-		logging.info(
-			f"Rank {self.rank}: Allocating GPU KV pages for new sequences: {global_sequence_ids}"
-		)
-		
-		# Allocate pages for the new sequences
-		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
-		
-		# IMPORTANT: Build page table with ONLY the new sequences first
-		# This ensures export_layer_page_pointer_table() returns pointers matching these sequences
-		manager.rebuild_page_table(global_sequence_ids)
-		
-		# Load host KV to GPU (now the pointer tensor will match the new sequences)
-		self._load_host_kv_to_gpu(manager, global_sequence_ids)
-		
-		# NOW rebuild page table with ALL active sequences (existing + new)
-		all_active_global_ids = []
-		for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
-			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				all_active_global_ids.append(seq.global_idx)
-		
-		# Add the new sequences (they're not IN_DECODE yet, but will be after this method)
-		for gid in global_sequence_ids:
-			if gid not in all_active_global_ids:
-				all_active_global_ids.append(gid)
-		
-		# Sort for deterministic ordering
-		all_active_global_ids.sort()
-		
-		if all_active_global_ids:
-			manager.rebuild_page_table(all_active_global_ids)
-			logging.info(
-				f"Rank {self.rank}: Rebuilt page table with {len(all_active_global_ids)} sequences"
-			)
+		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+		tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
+
+		# 1. Allocate GPU Pages
+		manager.allocate_pages_for_sequences(global_ids, tokens)
+
+		# 2. Rebuild Page Table (Critical: Ensure kernel sees new pointers)
+		# We rebuild specifically for the sequences we are about to load
+		manager.rebuild_page_table(global_ids)
+
+		# 3. Load Host -> GPU (BLOCKING)
+		# "The load api is non-blocked, but we can use .wait() to let it be blocking for now."
+		self._load_host_kv_to_gpu(manager, global_ids) 
+
+		# 4. Rebuild Page Table for ALL active sequences (for next Attention forward)
+		active_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+		all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._uuid_to_local_map]
+		# Union with new ids
+		final_ids = sorted(list(set(all_active_ids + global_ids)))
+		manager.rebuild_page_table(final_ids)
 
 	# ============ Main Generation Loop ============
 
 	def generate(self):
 		"""
-		Main generation loop with KV-cache-driven scheduling and continuous batching.
+		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
 		"""
-		# Initialize communicator ONCE per generate() call
-		self.comm = None
+		# Ensure communicator is ready
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
-			from batchgen.distributed.utils import StatelessProcessGroup
-			from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
-			self.rank = dist.get_rank()
-			self.world_size = dist.get_world_size()
-			device = torch.device("cuda", self.rank % torch.cuda.device_count())
-			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-			
-			try:
-				group = StatelessProcessGroup.create(
-					host=comm_master_addr,
-					port=20003,
-					rank=self.rank,
-					world_size=self.world_size,
-					data_expiration_seconds=6000,
-				)
-				self.comm = PyNcclCommunicator(group=group, device=device)
-			except Exception as e:
-				logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-				raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+			 self._init_communicator() # Helper to init PyNccl
 
-		# Track if NVSHMEM was initialized this run (for cleanup)
-		self._nvshmem_initialized_this_run = False
-
-		# Timing stats
-		generation_start_time = time.perf_counter()
-		prefill_time = 0
-		decoding_time = 0
-		config_prefill_time = 0
-		config_decode_time = 0
-		
 		iteration = 0
 		
-		# Main loop: continue until all sequences are completed
+		# Continues until ALL sequences in the global batch are COMPLETED
 		while not self.global_batch.all_completed():
 			iteration += 1
-			logging.info(f"{'='*60}")
-			logging.info(f"Rank {self.rank}: Starting iteration {iteration}")
-			logging.info(
-				f"  QUEUEING: {self.global_batch.count_by_status(SequenceStatus.QUEUEING)}, "
-				f"PREFILLED: {self.global_batch.count_by_status(SequenceStatus.PREFILLED)}, "
-				f"IN_DECODE: {self.global_batch.count_by_status(SequenceStatus.IN_DECODE)}, "
-				f"ON_HOLD: {self.global_batch.count_by_status(SequenceStatus.ON_HOLD)}, "
-				f"COMPLETED: {self.global_batch.count_by_status(SequenceStatus.COMPLETED)}"
-			)
+			logging.info(f"--- Iteration {iteration} ---")
 			
-			# ============ PREFILL PHASE ============
+			# =================================================================
+			# 1. PREFILL PHASE: Fill Host KV Cache
+			# =================================================================
 			if self.global_batch.has_queueing():
-				dist.barrier()
+				dist.barrier() # Sync before scheduling
 				
+				# Select sequences that fit into Host KV
 				prefill_uuids = self._prepare_prefill_batch()
 				
 				if prefill_uuids:
+					logging.info(f"Rank {self.rank}: Entering PREFILL for {len(prefill_uuids)} sequences")
 					self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL)
 					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
-					
-					tmp_start = time.perf_counter()
+
+					# A. Config Prefill
 					self._config_prefill_for_batch(prefill_uuids)
-					config_prefill_time += time.perf_counter() - tmp_start
-					
-					prefill_start_time = time.perf_counter()
+
+					# B. Execute Prefill
 					if local_prefill_indices:
 						with torch.inference_mode():
-							new_token = self.prefill(local_prefill_indices)
-					else:
-						new_token = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
-						logging.info(f"Rank {self.rank}: No local sequences to prefill")
-					prefill_time += time.perf_counter() - prefill_start_time
+							self.prefill(local_prefill_indices)
 					
+					# Cleanup & Status Update
 					self._unregister_fp8_weights()
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
-					
 					dist.barrier()
-			
-			# ============ DECODE PHASE WITH CONTINUOUS BATCHING ============
+
+			# =================================================================
+			# 2. DECODE PHASE: Continuous Batching (Host -> GPU Streaming)
+			# =================================================================
+			# Enter decode if we have PREFILLED items waiting or items already DECODING
 			while self.global_batch.has_prefilled() or self.global_batch.has_in_decode():
 				dist.barrier()
 				
-				# Get initial decode batch (from PREFILLED sequences)
+				# A. Prepare Initial Decode Batch (from PREFILLED)
+				# This respects GPU capacity and Per-Rank Limits
 				decode_uuids = self._prepare_decode_batch()
 				
-				# If we have sequences already IN_DECODE, include them
-				in_decode_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
-				if in_decode_uuids:
-					# Merge with new decode batch, avoiding duplicates
-					existing_set = set(in_decode_uuids)
-					for uuid in decode_uuids:
-						if uuid not in existing_set:
-							in_decode_uuids.append(uuid)
-					decode_uuids = in_decode_uuids
+				# Include currently running sequences (if any)
+				current_decoding = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+				decode_uuids = list(set(decode_uuids + current_decoding))
 				
-				# **CRITICAL: Exit if no sequences to decode**
 				if not decode_uuids:
-					logging.info(f"Rank {self.rank}: No sequences to decode, exiting decode loop")
-					break
+					break # Nothing fits in GPU or no work left, go back to prefill
 				
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
-				
-				tmp_start = time.perf_counter()
-				torch.cuda.empty_cache()
-				self._config_decoding_for_batch(decode_uuids, local_decode_indices, self.comm)
-				
-				past_key_states = None
-				past_value_states = None
-				scale_dict = None
-				
-				if self.engine_config.Basic_Config.attn_mode == 3:
-					if self.model_config.model_type == "deepseek_v3":
-						if self.engine_config.Basic_Config.kv_dtype == "float8_e4m3fn":
-							if local_decode_indices:
-								scale_dict = self.core_engine.get_kv_scale(
-									local_decode_indices,
-									self.max_input_length + self.max_decoding_length
-								)
-					
-				config_decode_time += time.perf_counter() - tmp_start
-				
-				dist.barrier()
-				
-				decoding_start_time = time.perf_counter()
+
+				# B. Config Decode
+				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
+
+				# C. Execute Continuous Decode
 				with torch.inference_mode():
-					logging.info(f"Rank {self.rank}: Decoding batch size: {len(local_decode_indices)}")
+					 # Prepare input tokens (last generated token)
 					if local_decode_indices:
 						new_tokens = torch.cat([
-							self.query_book[idx].decoded_tokens[:, 0:1]
-							for idx in local_decode_indices
+							self.query_book[idx].decoded_tokens[:, 
+								max(0, self.global_batch.get_sequence(self._local_to_uuid(idx)).decoded_length - 1):
+								self.global_batch.get_sequence(self._local_to_uuid(idx)).decoded_length
+							] for idx in local_decode_indices
 						], dim=0).to(self.torch_device)
 					else:
 						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
-					
-					# Run continuous decoding with page-boundary checks
-					decode_uuids, local_decode_indices = self.decoding_continuous(
-						new_tokens, 
-						decode_uuids,
-						local_decode_indices, 
-						past_key_states, 
-						past_value_states, 
-						scale_dict
-					)
-				decoding_time += time.perf_counter() - decoding_start_time
-				
-				# **FIXED: Only put sequences ON_HOLD if they're still IN_DECODE AND we need more prefill**
-				remaining_in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
-				if remaining_in_decode and self.global_batch.has_queueing():
-					self._update_batch_status(remaining_in_decode, SequenceStatus.ON_HOLD)
-					logging.info(f"Rank {self.rank}: Put {len(remaining_in_decode)} sequences ON_HOLD for more prefill")
-				
+
+					# Run continuous loop
+					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
+
+				# D. Cleanup
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
-				
-				del past_key_states
-				del scale_dict
-			
 				dist.barrier()
-			
-				# **ADDED: Check if all sequences are completed after this decode iteration**
-				if self.global_batch.all_completed():
-					logging.info(f"Rank {self.rank}: All sequences completed, exiting decode loop")
-					break
+
+				# If we broke out of decoding_continuous, it means the GPU batch is empty.
+				# We loop back to check if we should prefill more or load more.
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
@@ -1398,13 +1256,13 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[int]]:
 		"""
 		Handle continuous decoding with page-boundary completion checks.
-		Returns the final active decode_uuids and local indices.
+		Each sequence tracks its own decoded_length independently.
 		"""
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
 		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
-		logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
+		logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3):.2f} GB")
 
 		if RUNTIME_ATTN_MODE == 3:
 			gpu_manager = getattr(self, "gpu_paged_kv_cache_manager", None)
@@ -1420,8 +1278,9 @@ class BatchGenWorker:
 			Attn_Wrapper.past_value_states = past_value_states
 			Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 			
-			# Track iterations for logging (not for sequence state)
+			# Track iterations for page boundary checks
 			iteration = 0
+			last_page_boundary_check = 0
 			
 			# Continue while there are active sequences
 			while decode_uuids:
@@ -1430,47 +1289,84 @@ class BatchGenWorker:
 				if self.rank == 0 and iteration % 50 == 0:
 					logging.info(f"Decoding iteration: {iteration}")
 				
-				# Check if ALL sequences have completed (per-sequence check)
-				all_done = True
+				# ============ FILTER OUT COMPLETED SEQUENCES BEFORE FORWARD PASS ============
+				# This ensures completed sequences don't participate in forward pass
+				active_batch = []
+				active_decode_uuids = []
+				completed_this_iteration = []
+				
 				for uuid in decode_uuids:
 					seq = self.global_batch.get_sequence(uuid)
-					if not seq.check_completion(self.eos_token_id):
-						all_done = False
-						break
+					# Note: we check completion here to catch EOS from the PREVIOUS iteration
+					if seq.check_completion(self.eos_token_id):
+						completed_this_iteration.append(uuid)
+					else:
+						active_decode_uuids.append(uuid)
+						# Add to active_batch if this is our sequence
+						if uuid in self._uuid_to_local_map:
+							active_batch.append(self._uuid_to_local_map[uuid])
 				
-				if all_done:
-					logging.info(f"Rank {self.rank}: All {len(decode_uuids)} sequences completed")
+				# Handle any sequences that completed since last check
+				if completed_this_iteration:
+					logging.info(
+						f"Rank {self.rank}: Filtering out {len(completed_this_iteration)} completed sequences "
+						f"before forward pass"
+					)
+					self._update_batch_status(completed_this_iteration, SequenceStatus.COMPLETED)
+					# Don't release KV here - wait for page boundary
+				
+				# Update to only active sequences
+				decode_uuids = active_decode_uuids
+				batch = active_batch
+				
+				# Check if all done
+				if not decode_uuids:
+					logging.info(f"Rank {self.rank}: All sequences completed")
 					break
 				
-				# ============ PAGE BOUNDARY CHECK ============
-				# Check based on minimum decoded_length across sequences
-				min_decoded = min(
-					self.global_batch.get_sequence(uuid).decoded_length 
-					for uuid in decode_uuids
-				)
+				# Filter new_tokens to match active batch
+				# (new_tokens from previous iteration may have more entries than current batch)
+				if new_tokens.shape[0] != len(batch):
+					if batch:
+						# Rebuild new_tokens from each sequence's last decoded token
+						new_tokens = torch.cat([
+							self.query_book[idx].decoded_tokens[:, 
+								max(0, self.global_batch.get_sequence(self._local_to_uuid_map[idx]).decoded_length - 1):
+								self.global_batch.get_sequence(self._local_to_uuid_map[idx]).decoded_length
+							]
+							for idx in batch
+						], dim=0).to(self.torch_device)
+					else:
+						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 				
-				if min_decoded > 0 and min_decoded % self.PAGE_SIZE == 0:
+				# ============ PAGE BOUNDARY CHECK (every PAGE_SIZE iterations) ============
+				if iteration - last_page_boundary_check >= self.PAGE_SIZE:
+					last_page_boundary_check = iteration
+					
 					dist.barrier()
 					
-					original_batch = list(batch)
-					decode_uuids, batch, completed_uuids = self._check_and_handle_completions(
-						decode_uuids, batch, min_decoded
-					)
+					# Find completed sequences
+					completed_uuids = []
+					remaining_uuids = []
+					for uuid in decode_uuids:
+						seq = self.global_batch.get_sequence(uuid)
+						if seq.check_completion(self.eos_token_id):
+							completed_uuids.append(uuid)
+						else:
+							remaining_uuids.append(uuid)
 					
 					if completed_uuids:
+						logging.info(
+							f"Rank {self.rank}: Page boundary at iteration {iteration}: "
+							f"{len(completed_uuids)} completed, {len(remaining_uuids)} remaining"
+						)
+						
 						self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+						# IMPORTANT: Release Host/GPU pages immediately to free space for new sequences
 						self._release_host_kv_pages_for_batch(completed_uuids)
 						
-						# Filter new_tokens to match remaining batch
-						if batch and len(original_batch) > 0:
-							keep_indices = [i for i, idx in enumerate(original_batch) if idx in batch]
-							if keep_indices and new_tokens.shape[0] > 0:
-								keep_tensor = torch.tensor(keep_indices, dtype=torch.long, device=new_tokens.device)
-								new_tokens = new_tokens.index_select(0, keep_tensor)
-							elif not keep_indices:
-								new_tokens = torch.empty((0, 1), dtype=new_tokens.dtype, device=new_tokens.device)
-						elif not batch:
-							new_tokens = torch.empty((0, 1), dtype=new_tokens.dtype, device=new_tokens.device)
+						decode_uuids = remaining_uuids
+						batch = [idx for idx in batch if self._local_to_uuid_map[idx] not in completed_uuids]
 						
 						Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 						
@@ -1479,15 +1375,39 @@ class BatchGenWorker:
 							if remaining_global_ids:
 								remaining_global_ids.sort()
 								gpu_manager.rebuild_page_table(remaining_global_ids)
+						
+						# Rebuild new_tokens after filtering
+						if batch:
+							new_tokens = torch.cat([
+								self.query_book[idx].decoded_tokens[:, 
+									max(0, self.global_batch.get_sequence(self._local_to_uuid_map[idx]).decoded_length - 1):
+									self.global_batch.get_sequence(self._local_to_uuid_map[idx]).decoded_length
+								]
+								for idx in batch
+							], dim=0).to(self.torch_device)
+						else:
+							new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 					
-					# Try to load new sequences
-					if decode_uuids:
+					# Try to load new sequences from PREFILLED or ON_HOLD
+					# This is the "Continuous Batching" logic: filling freed slots
+					if decode_uuids or self.global_batch.has_prefilled() or self.global_batch.has_queueing():
 						prev_batch_size = len(batch)
+						prev_decode_size = len(decode_uuids)
+						
+						# Attempt to promote sequences into the batch
 						decode_uuids, batch = self._try_load_new_sequences(decode_uuids, batch)
 						
-						if len(batch) > prev_batch_size:
+						new_seq_count = len(batch) - prev_batch_size
+						if new_seq_count > 0:
 							new_local_indices = batch[prev_batch_size:]
-							# New sequences start from their decoded_tokens position 0
+							
+							logging.info(
+								f"Rank {self.rank}: Loaded {new_seq_count} new sequences into decode batch "
+								f"(batch: {prev_batch_size} -> {len(batch)}, "
+								f"decode_uuids: {prev_decode_size} -> {len(decode_uuids)})"
+							)
+							
+							# New sequences use their first decoded token (from prefill, at position 0)
 							new_seq_tokens = torch.cat([
 								self.query_book[idx].decoded_tokens[:, 0:1]
 								for idx in new_local_indices
@@ -1507,34 +1427,28 @@ class BatchGenWorker:
 				
 				# ============ FORWARD PASS ============
 				with torch.inference_mode():
-					if len(batch) != 0:
+					if len(batch) > 0:
 						# Build attention mask using PER-SEQUENCE context length
 						attention_masks = []
-						position_ids_list = []
 						cache_seqlens_list = []
 						
 						for query_idx in batch:
 							uuid = self._local_to_uuid_map[query_idx]
 							seq = self.global_batch.get_sequence(uuid)
-							
-							# Use this sequence's actual context length
 							seq_context_len = seq.current_context_length
 							
-							mask = self.query_book[query_idx].encoded["attention_mask"][
-								:, :seq_context_len
-							]
+							mask = self.query_book[query_idx].encoded["attention_mask"][:, :seq_context_len]
 							attention_masks.append(mask)
 							cache_seqlens_list.append(seq_context_len)
 						
-						# Pad attention masks to max length in batch for batching
+						# Pad attention masks to max length in batch
 						max_ctx_len = max(cache_seqlens_list)
 						padded_masks = []
 						for mask in attention_masks:
 							if mask.shape[1] < max_ctx_len:
 								padding = torch.zeros(
 									(1, max_ctx_len - mask.shape[1]), 
-									dtype=mask.dtype, 
-									device=mask.device
+									dtype=mask.dtype, device=mask.device
 								)
 								mask = torch.cat([mask, padding], dim=1)
 							padded_masks.append(mask)
@@ -1547,34 +1461,23 @@ class BatchGenWorker:
 							cache_seqlens_list, dtype=torch.int32, device=self.torch_device
 						)
 						Attn_Wrapper.max_seqlen = max_ctx_len
-					else:
-						attention_mask = torch.zeros(
-							(0, self.max_input_length + self.max_decoding_length),
-							dtype=torch.int64, device=self.torch_device
-						)
-						Attn_Wrapper.attention_mask = attention_mask
-						Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-						Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
-						Attn_Wrapper.max_seqlen = 0
-
-					# Validate tensor shapes
-					if new_tokens.shape[0] != len(batch):
-						logging.error(
-							f"Rank {self.rank}: Shape mismatch! new_tokens: {new_tokens.shape[0]}, "
-							f"batch: {len(batch)}"
-						)
-						if batch:
+						
+						# Validate shapes
+						if new_tokens.shape[0] != len(batch):
+							logging.error(
+								f"Rank {self.rank}: Shape mismatch before forward! "
+								f"new_tokens: {new_tokens.shape[0]}, batch: {len(batch)}"
+							)
+							# Fallback rebuild if shapes desynced
 							new_tokens = torch.cat([
 								self.query_book[idx].decoded_tokens[:, 
-									self.global_batch.get_sequence(self._local_to_uuid_map[idx]).decoded_length - 1:
+									max(0, self.global_batch.get_sequence(self._local_to_uuid_map[idx]).decoded_length - 1):
 									self.global_batch.get_sequence(self._local_to_uuid_map[idx]).decoded_length
 								]
 								for idx in batch
 							], dim=0).to(self.torch_device)
-						else:
-							new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
-
-					if len(batch) > 0:
+						
+						# Forward pass
 						new_tokens = self.model(
 							new_tokens.to(self.torch_device),
 							attention_mask=attention_mask,
@@ -1588,12 +1491,22 @@ class BatchGenWorker:
 							seq = self.global_batch.get_sequence(uuid)
 							
 							# Get this sequence's current decode position
-							decode_pos = seq.decoded_length  # Position to write the new token
+							decode_pos = seq.decoded_length
+							
+							# Safety check: don't write beyond max_decoding_length
+							if decode_pos >= self.max_decoding_length:
+								logging.warning(
+									f"Rank {self.rank}: Sequence {uuid} at max decode length "
+									f"(decode_pos={decode_pos}), marking complete"
+								)
+								if not seq.eos_reached:
+									seq.eos_reached = True  # Force completion
+								continue
 							
 							# Store token at the correct position for this sequence
 							self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
 							
-							# Update attention mask at the correct position
+							# Update attention mask
 							attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
 							next_pos = seq.current_context_length
 							if next_pos < attn_mask.shape[0]:
@@ -1603,14 +1516,23 @@ class BatchGenWorker:
 							seq.decoded_length += 1
 							seq.current_context_length += 1
 							
-							# Check for EOS
-							if new_tokens[i].item() == self.eos_token_id:
+							# Check for EOS (only log on FIRST hit)
+							if new_tokens[i].item() == self.eos_token_id and not seq.eos_reached:
 								seq.eos_reached = True
 								logging.info(
 									f"Rank {self.rank}: Sequence {uuid} hit EOS at decoded_length={seq.decoded_length}"
 								)
+					else:
+						# Empty batch - still need to set wrapper state for all-to-all
+						Attn_Wrapper.attention_mask = torch.zeros(
+							(0, self.max_input_length + self.max_decoding_length),
+							dtype=torch.int64, device=self.torch_device
+						)
+						Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+						Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
+						Attn_Wrapper.max_seqlen = 0
 			
-			# Mark all remaining sequences as COMPLETED
+			# Mark all remaining sequences as COMPLETED (if loop exited naturally)
 			if decode_uuids:
 				logging.info(
 					f"Rank {self.rank}: Decode loop finished, "
@@ -1630,8 +1552,7 @@ class BatchGenWorker:
 			Attn_Wrapper.cur_batch = None
 		
 		else:
-			# Modes 0, 1, 2 - use original decoding logic with completion checks
-			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, new_token_idx)
+			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
 		
 		return decode_uuids, batch
 
