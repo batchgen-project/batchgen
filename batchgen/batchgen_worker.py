@@ -245,6 +245,9 @@ class BatchGenWorker:
 		self.dist_init_addr = args.dist_init_addr
 		self.comm = None # Initialized lazily or in Init()
 
+		COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
+		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
+
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
 	def Init(self, max_input_length, max_decoding_length, num_queries):
