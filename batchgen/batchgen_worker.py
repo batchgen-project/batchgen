@@ -1038,7 +1038,7 @@ class BatchGenWorker:
 		# all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._uuid_to_local_map]
 		# # Union with new ids
 		# final_ids = sorted(list(set(all_active_ids + global_ids)))
-		# manager.rebuild_page_table(final_ids)
+		# manager.rebuild_page_table(final_ids) t
 
 	# ============ Main Generation Loop ============
 
