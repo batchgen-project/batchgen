@@ -613,7 +613,7 @@ class HostPagedKVWorkerView {
                 return;
             }
 
-            auto* k_dest_ptr = k_tensor.data_ptr<std::int64_t>();
+            auto* k_dest_ptr = k_tensor.template data_ptr<std::int64_t>();
             const std::int64_t* v_dest_ptr =
                 v_tensor.has_value()
                     ? v_tensor->data_ptr<std::int64_t>()
