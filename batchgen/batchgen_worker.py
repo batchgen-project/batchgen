@@ -787,9 +787,12 @@ class BatchGenWorker:
 			raise RuntimeError("Host paged KV worker view is not bound to the core engine")
 		
 		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
-		k_ptrs, v_ptrs = manager.export_layer_page_pointer_table()
-		load_task = worker_view.async_load_layer_kv_to_device(
+		# k_ptrs, v_ptrs = manager.export_layer_page_pointer_table()
+		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
+		active_sequence_page_counts = manager.export_active_sequence_page_counts()
+		load_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
+			active_page_counts=active_sequence_page_counts,
 			k_device_ptrs=k_ptrs,
 			v_device_ptrs=v_ptrs,
 		)
