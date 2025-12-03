@@ -145,7 +145,7 @@ class BatchGenWorker:
 	Inference Runtime with Host-KV-First scheduling and Continuous Batching.
 	"""
 	PAGE_SIZE = 64  # Alignment for page boundary checks
-	GPU_KV_CACHE_SIZE_GB = 20.0  # Default GPU KV cache size
+	GPU_KV_CACHE_SIZE_GB = 24.0  # Default GPU KV cache size
 
 	def __init__(self, args: BatchGenWorkerArgs):
 		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
