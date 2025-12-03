@@ -1625,8 +1625,17 @@ class BatchGenWorker:
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 		else:
-			# Use two-page buffer allocation
-			self._allocate_gpu_kv_two_page_buffer(local_decode_indices)
+			# CHANGE: Use full budget for initial load (to match host allocation)
+			# Two-page buffer will be used for page extensions later
+			self._prepare_gpu_paged_kv_cache(local_decode_indices)
+			
+			# Track GPU pages for two-page buffer logic
+			for local_idx in local_decode_indices:
+				uuid = self._local_to_uuid_map[local_idx]
+				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = seq.get_pages_required()
+				self._sequences_with_gpu_kv.add(uuid)
+			
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
 			
 			self.set_phase("decode")
