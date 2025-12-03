@@ -380,6 +380,7 @@ class _GPUPageTableManager:
         # Ensure at least one extra page margin.
         desired_pages = max_required + 1
         new_max = max(self.max_pages_per_sequence, desired_pages)
+        # new_max = desired_pages
 
         num_slots = len(wanted_order)
         flat_pages_cpu = self._build_flat_page_index_tensor(
@@ -652,6 +653,7 @@ class GPUPagedKVCacheManager:
             self._sequences[sequence_id] = state
         else:
             state.append_pages(new_pages)
+        self._clear_active_page_pointer_tables()
         return new_pages.tolist()
 
     def allocate_pages_for_sequences(
@@ -669,6 +671,7 @@ class GPUPagedKVCacheManager:
 
         required_pages = self._geometry.required_pages(num_tokens).tolist()
         allocations: Dict[int, List[int]] = {}
+        any_changes = False
 
         for seq_id, required in zip(sequence_ids, required_pages):
             required_int = int(required)
@@ -695,6 +698,64 @@ class GPUPagedKVCacheManager:
             else:
                 state.append_pages(new_pages)
             allocations[seq_id] = new_pages.tolist()
+            any_changes = True
+        if any_changes:
+            self._clear_active_page_pointer_tables()
+        return allocations
+
+    def grow_sequence_pages(
+        self, sequence_id: int, num_pages: int
+    ) -> List[int]:
+        """Appends ``num_pages`` new pages to an already allocated sequence."""
+
+        allocations = self.grow_pages_for_sequences([sequence_id], [num_pages])
+        return allocations.get(sequence_id, [])
+
+    def grow_pages_for_sequences(
+        self, sequence_ids: Sequence[int], num_pages: Sequence[int]
+    ) -> Dict[int, List[int]]:
+        """Appends explicit page counts for the provided ``sequence_ids``."""
+
+        self._ensure_initialized()
+        if len(sequence_ids) != len(num_pages):
+            raise ValueError(
+                "grow_pages_for_sequences: sequence_ids and num_pages must be the same length"
+            )
+        if not sequence_ids:
+            return {}
+
+        missing = [
+            seq_id for seq_id in sequence_ids if seq_id not in self._sequences
+        ]
+        if missing:
+            raise KeyError(
+                "grow_pages_for_sequences: sequences not allocated: "
+                + ", ".join(str(seq_id) for seq_id in missing)
+            )
+
+        available = self._free_pages.size
+        normalized_counts: List[int] = []
+        for seq_id, count in zip(sequence_ids, num_pages):
+            if count <= 0:
+                raise ValueError(
+                    f"grow_pages_for_sequences: num_pages must be positive for seq {seq_id}, got {count}"
+                )
+            if count > available:
+                raise RuntimeError(
+                    f"grow_pages_for_sequences: insufficient free pages for seq {seq_id}: need {count}, free {available}"
+                )
+            available -= count
+            normalized_counts.append(int(count))
+
+        allocations: Dict[int, List[int]] = {}
+        for seq_id, count in zip(sequence_ids, normalized_counts):
+            new_pages = self._free_pages.pop(count)
+            state = self._sequences[seq_id]
+            state.append_pages(new_pages)
+            allocations[seq_id] = new_pages.tolist()
+
+        if allocations:
+            self._clear_active_page_pointer_tables()
         return allocations
 
     def rebuild_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
@@ -1179,6 +1240,61 @@ class GPUPagedKVCacheManager:
             )
         return table
 
+    def _materialize_layer_pointer_tensor(
+        self,
+        *,
+        pointer_table: torch.Tensor,
+        page_counts: Sequence[int],
+    ) -> torch.Tensor:
+        num_layers, total_pages = pointer_table.shape
+        seq_count = len(page_counts)
+        max_pages = max(page_counts, default=0)
+        if seq_count == 0:
+            raise RuntimeError(
+                "_materialize_layer_pointer_tensor: no active sequences available"
+            )
+        result = pointer_table.new_zeros((num_layers, seq_count, max_pages))
+        cursor = 0
+        for seq_idx, count in enumerate(page_counts):
+            if count < 0:
+                raise ValueError(
+                    "_materialize_layer_pointer_tensor: page counts must be non-negative"
+                )
+            if count == 0:
+                continue
+            next_cursor = cursor + count
+            if next_cursor > total_pages:
+                raise RuntimeError(
+                    "_materialize_layer_pointer_tensor: page count prefix exceeds available columns"
+                )
+            result[:, seq_idx, :count] = pointer_table[:, cursor:next_cursor]
+            cursor = next_cursor
+        if cursor != total_pages:
+            raise RuntimeError(
+                "_materialize_layer_pointer_tensor: page counts do not sum to available columns"
+            )
+        return result
+
+    def _require_active_slot_order(self, *, op_name: str) -> List[int]:
+        if self._active_page_indices is None:
+            raise RuntimeError(
+                f"{op_name}: active page tables unavailable; call rebuild_page_table() first"
+            )
+        slot_order = self._gpu_page_table_manager.slot_to_seq_id
+        if not slot_order:
+            raise RuntimeError(
+                f"{op_name}: no active sequences tracked; call rebuild_page_table() with active sequences"
+            )
+        return slot_order
+
+    def _build_sequence_page_counts(
+        self, slot_order: Sequence[int]
+    ) -> List[int]:
+        return [
+            int(self._get_sequence_state(seq_id).pages.numel())
+            for seq_id in slot_order
+        ]
+
     def export_layer_page_pointer_table(
         self,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1198,3 +1314,49 @@ class GPUPagedKVCacheManager:
             v_ptrs = self._get_active_page_ptr_table(is_value=True)
 
         return k_ptrs, v_ptrs
+
+    def export_active_sequence_page_counts(self) -> torch.Tensor:
+        """Returns active per-sequence page counts in slot order.
+
+        The order matches ``export_layer_page_pointer_table`` by mirroring the
+        slot ordering maintained within ``_gpu_page_table_manager``. The result
+        is a CPU ``int32`` tensor of shape ``[num_active_sequences]``.
+        """
+
+        self._ensure_initialized()
+        slot_order = self._require_active_slot_order(
+            op_name="export_active_sequence_page_counts"
+        )
+        page_counts = self._build_sequence_page_counts(slot_order)
+        return torch.tensor(page_counts, dtype=torch.int32, device="cpu")
+
+    def get_padded_3d_page_pointers(
+        self,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Returns layer-major pointer tensors grouped by sequence and page.
+
+        Returns:
+            k_tensor: Shape [num_layers, num_active_sequences, max_pages]
+            v_tensor: Shape [num_layers, num_active_sequences, max_pages] (if enabled)
+        """
+
+        self._ensure_initialized()
+        slot_order = self._require_active_slot_order(
+            op_name="get_padded_3d_page_pointers"
+        )
+        page_counts = self._build_sequence_page_counts(slot_order)
+
+        k_tensor = self._materialize_layer_pointer_tensor(
+            pointer_table=self._get_active_page_ptr_table(is_value=False),
+            page_counts=page_counts,
+        )
+
+        v_tensor: Optional[torch.Tensor] = None
+        if self.config.has_v_cache:
+            v_tensor = self._materialize_layer_pointer_tensor(
+                pointer_table=self._get_active_page_ptr_table(is_value=True),
+                page_counts=page_counts,
+            )
+
+        return k_tensor, v_tensor
