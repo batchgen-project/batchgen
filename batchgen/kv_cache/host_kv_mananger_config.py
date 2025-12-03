@@ -244,9 +244,12 @@ def build_gpu_kv_config_fixed_size(
 	num_pages = total_bytes // bytes_per_page_all_layers
 	
 	return GPUPagedKVConfig(
+		num_layers=profile.num_layers,
 		num_pages=num_pages,
-		page_size_tokens=page_size_tokens,
-		num_layers=num_layers,
-		kv_dim=kv_dim,
-		dtype_bytes=dtype_bytes,
+		page_size_tokens=profile.page_size,
+		num_k_heads=profile.num_k_heads,
+		k_head_dim=profile.k_head_dim,
+		num_v_heads=profile.num_v_heads,
+		v_head_dim=profile.v_head_dim,
+		kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
 	)
