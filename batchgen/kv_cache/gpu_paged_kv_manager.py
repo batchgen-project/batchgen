@@ -1199,3 +1199,29 @@ class GPUPagedKVCacheManager:
 			v_ptrs = self._get_active_page_ptr_table(is_value=True)
 
 		return k_ptrs, v_ptrs
+
+	# In gpu_paged_kv_manager.py
+	def extend_pages_for_sequence(self, sequence_id: int, new_total_tokens: int) -> int:
+		self._ensure_initialized()
+		
+		state = self._sequences.get(sequence_id)
+		current_pages = state.pages.numel() if state else 0
+		required_pages = self._geometry.required_pages(new_total_tokens)
+		additional_pages = max(0, required_pages - current_pages)
+		
+		if additional_pages <= 0:
+			return 0
+		
+		if additional_pages > self._free_pages.size:
+			raise RuntimeError(
+				f"Insufficient free pages: need {additional_pages}, have {self._free_pages.size}"
+			)
+		
+		new_pages = self._free_pages.pop(additional_pages)
+		
+		if state is None:
+			self._sequences[sequence_id] = _SequenceState(pages=new_pages)
+		else:
+			state.append_pages(new_pages)
+		
+		return additional_pages

@@ -2071,7 +2071,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		weight_scale["o_proj.weight_scale_inv"],
 	)
 	attn_output = attn_output.view(bsz, 1, -1)
-	return attn_output
+	return attn_output, k_tensor
 
 # @torch.inference_mode()
 # def mla_decoding_flashmla_attn_mode_3_bf16_without_inplace_cache_update(

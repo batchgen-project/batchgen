@@ -84,79 +84,79 @@ from ..quantization.fp8e4m3 import (
 
 @triton.jit
 def weight_dequant_kernel(
-    x_ptr, s_ptr, y_ptr, 
-    M, N, 
-    BLOCK_SIZE: tl.constexpr
+	x_ptr, s_ptr, y_ptr, 
+	M, N, 
+	BLOCK_SIZE: tl.constexpr
 ):
-    """
-    Dequantizes FP8 weights to BF16 using block-wise scaling factors.
-    """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    
-    # Calculate offsets for this block
-    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    
-    # Create 2D offset and mask
-    offs = offs_m[:, None] * N + offs_n[None, :]
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    
-    # Load FP8 data and convert to float32 for computation
-    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-    x = x.to(tl.float32)
-    
-    # Load the scale factor for this block
-    # Scale tensor is (M//BLOCK_SIZE, N//BLOCK_SIZE)
-    num_blocks_n = tl.cdiv(N, BLOCK_SIZE)
-    s_idx = pid_m * num_blocks_n + pid_n
-    s = tl.load(s_ptr + s_idx).to(tl.float32)
-    
-    # Apply scaling
-    y = x * s
-    
-    # Convert to BF16 and store
-    tl.store(y_ptr + offs, y.to(tl.bfloat16), mask=mask)
+	"""
+	Dequantizes FP8 weights to BF16 using block-wise scaling factors.
+	"""
+	pid_m = tl.program_id(axis=0)
+	pid_n = tl.program_id(axis=1)
+	
+	# Calculate offsets for this block
+	offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+	offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+	
+	# Create 2D offset and mask
+	offs = offs_m[:, None] * N + offs_n[None, :]
+	mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+	
+	# Load FP8 data and convert to float32 for computation
+	x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+	x = x.to(tl.float32)
+	
+	# Load the scale factor for this block
+	# Scale tensor is (M//BLOCK_SIZE, N//BLOCK_SIZE)
+	num_blocks_n = tl.cdiv(N, BLOCK_SIZE)
+	s_idx = pid_m * num_blocks_n + pid_n
+	s = tl.load(s_ptr + s_idx).to(tl.float32)
+	
+	# Apply scaling
+	y = x * s
+	
+	# Convert to BF16 and store
+	tl.store(y_ptr + offs, y.to(tl.bfloat16), mask=mask)
 
 
 def deepseek_v3_dequantization(
-    x: torch.Tensor, 
-    s: torch.Tensor, 
-    block_size: int = 128
+	x: torch.Tensor, 
+	s: torch.Tensor, 
+	block_size: int = 128
 ) -> torch.Tensor:
-    """
-    Dequantizes FP8 weights to BF16 using block-wise scaling.
-    """
-    assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
-    assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
-    
-    M, N = x.size()
-    
-    # Validate scale tensor dimensions
-    expected_s_shape = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    assert s.shape == expected_s_shape, \
-        f"Scale shape {s.shape} doesn't match expected {expected_s_shape}"
-    
-    # Ensure input is FP8
-    assert x.dtype == torch.float8_e4m3fn or x.dtype == torch.float8_e5m2, \
-        f"Input should be FP8 but got {x.dtype}"
-    
-    # Create output tensor
-    y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
-    
-    # Launch kernel
-    grid = lambda meta: (
-        triton.cdiv(M, meta['BLOCK_SIZE']), 
-        triton.cdiv(N, meta['BLOCK_SIZE'])
-    )
-    
-    weight_dequant_kernel[grid](
-        x, s, y, 
-        M, N, 
-        BLOCK_SIZE=block_size
-    )
-    
-    return y
+	"""
+	Dequantizes FP8 weights to BF16 using block-wise scaling.
+	"""
+	assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
+	assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
+	
+	M, N = x.size()
+	
+	# Validate scale tensor dimensions
+	expected_s_shape = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+	assert s.shape == expected_s_shape, \
+		f"Scale shape {s.shape} doesn't match expected {expected_s_shape}"
+	
+	# Ensure input is FP8
+	assert x.dtype == torch.float8_e4m3fn or x.dtype == torch.float8_e5m2, \
+		f"Input should be FP8 but got {x.dtype}"
+	
+	# Create output tensor
+	y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+	
+	# Launch kernel
+	grid = lambda meta: (
+		triton.cdiv(M, meta['BLOCK_SIZE']), 
+		triton.cdiv(N, meta['BLOCK_SIZE'])
+	)
+	
+	weight_dequant_kernel[grid](
+		x, s, y, 
+		M, N, 
+		BLOCK_SIZE=block_size
+	)
+	
+	return y
 
 
 
@@ -277,6 +277,7 @@ class Attn_Wrapper(torch.nn.Module):
 	cur_batch = None
 	kv_quantization_factor = None
 	_global_rank: int | None = None
+	kv_append_callback = None 
 
 	def __init__(
 		self,
@@ -634,7 +635,7 @@ class Attn_Wrapper(torch.nn.Module):
 						# 	weight_scale = self.weight_dequant_scale
 						# )
 						# logging.info(f"{self.layer_idx=}, {hidden_states.device}, {hidden_states[start_ids:end_ids]=}")
-						attn_result = self.module.decoding_attn_mode_3_bf16(
+						attn_result, k_tensor = self.module.decoding_attn_mode_3_bf16(
 							hidden_states[start_ids:end_ids],
 							position_ids[start_ids:end_ids],
 							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
@@ -646,9 +647,16 @@ class Attn_Wrapper(torch.nn.Module):
 						# logging.info(f"{self.layer_idx=}, {hidden_states.device}, {attn_result=}")
 						# scale = None
 						# past_key_states[start_ids:end_ids].copy_(kv)
+						# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 						final_attn_result[start_ids:end_ids].copy_(attn_result)
+					
+						# # Store task for later sync (after MoE)
+						# if hasattr(self, '_kv_append_task'):
+						# 	self._kv_append_task = task
 					else:
 						raise NotImplementedError
+				task = Attn_Wrapper.kv_append_callback(self.layer_idx, k_tensor)
+				task.wait()
 
 					
 
