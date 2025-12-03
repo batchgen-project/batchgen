@@ -156,6 +156,20 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
             py::arg("v_device_ptrs") = py::none(),
             "Schedule host-paged KV pages to be loaded onto device memory "
             "using pre-allocated GPU destinations.")
+        .def(
+            "async_load_layer_paged_kv_to_device",
+            [](WorkerView& self, torch::Tensor sequence_ids,
+               torch::Tensor active_page_counts,
+               torch::Tensor k_device_ptrs,
+               std::optional<torch::Tensor> v_device_ptrs) {
+                return self.AsyncLoadLayerPagedKVToDevice(
+                    std::move(sequence_ids), std::move(active_page_counts),
+                    std::move(k_device_ptrs), std::move(v_device_ptrs));
+            },
+            py::arg("sequence_ids"), py::arg("active_page_counts"),
+            py::arg("k_device_ptrs"),
+            py::arg("v_device_ptrs") = py::none(),
+            "Load only the active per-sequence KV pages using padded page tables.")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(
@@ -173,6 +187,28 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                 }
                 return self.AllocatePagesForSequences(sequence_ids,
                                                       num_tokens);
+            })
+        .def("grow_sequence_pages",
+             [](WorkerView& self, std::int64_t sequence_id,
+                std::size_t num_pages) {
+                 return self.GrowSequencePages(sequence_id, num_pages);
+             },
+             py::arg("sequence_id"), py::arg("num_pages"))
+        .def(
+            "grow_pages_for_sequences",
+            [](WorkerView& self,
+               const std::vector<std::pair<std::int64_t, std::size_t>>&
+                   requests) {
+                std::vector<std::int64_t> sequence_ids;
+                std::vector<std::size_t> page_counts;
+                sequence_ids.reserve(requests.size());
+                page_counts.reserve(requests.size());
+                for (const auto& request : requests) {
+                    sequence_ids.push_back(request.first);
+                    page_counts.push_back(request.second);
+                }
+                return self.GrowPagesForSequences(sequence_ids,
+                                                   page_counts);
             })
         .def_property_readonly("device_index", &WorkerView::device_index)
         .def_property_readonly_static(
