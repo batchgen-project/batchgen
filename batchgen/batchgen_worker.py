@@ -1034,11 +1034,11 @@ class BatchGenWorker:
 		self._load_host_kv_to_gpu(manager, global_ids) 
 
 		# 4. Rebuild Page Table for ALL active sequences (for next Attention forward)
-		active_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
-		all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._uuid_to_local_map]
-		# Union with new ids
-		final_ids = sorted(list(set(all_active_ids + global_ids)))
-		manager.rebuild_page_table(final_ids)
+		# active_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+		# all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._uuid_to_local_map]
+		# # Union with new ids
+		# final_ids = sorted(list(set(all_active_ids + global_ids)))
+		# manager.rebuild_page_table(final_ids)
 
 	# ============ Main Generation Loop ============
 
@@ -1508,7 +1508,7 @@ class BatchGenWorker:
 				if gpu_manager is not None and gpu_manager.is_initialized:
 					if batch:
 						global_ids = self._local_indices_to_global_seq_ids(batch)
-						global_ids.sort()
+						# global_ids.sort()
 						gpu_manager.rebuild_page_table(global_ids)
 						Attn_Wrapper.cur_batch = global_ids
 					else:
