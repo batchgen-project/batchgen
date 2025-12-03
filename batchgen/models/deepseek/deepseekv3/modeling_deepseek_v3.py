@@ -2747,7 +2747,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 
 	@torch.inference_mode()
-	def moe_infer_allgather_allreduce_bf16_acc(self, x):
+	def moe_infer_allgather_allreduce_bf16_acc_bak(self, x):
 		num_tokens, hidden_size = x.shape
 		device = x.device
 		# ---- 1) First all-gather: collect all tokens on all workers -------
@@ -2814,6 +2814,137 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		final_output = global_results[start_token_ids:end_token_ids]
 		return final_output.to(x.dtype)
 	
+	@torch.inference_mode()
+	def moe_infer_allgather_allreduce_bf16_acc(self, x):
+		num_tokens, hidden_size = x.shape
+		device = x.device
+		
+		# Handle zero-token case early
+		if num_tokens == 0:
+			# Still need to participate in collectives with padded data
+			padded_hidden_states = torch.zeros(
+				(self.num_tokens_per_rank, hidden_size), 
+				device=self.device, 
+				dtype=x.dtype
+			)
+			all_tokens = torch.zeros(
+				(self.world_size * self.num_tokens_per_rank, hidden_size),
+				device=self.device, 
+				dtype=torch.bfloat16
+			)
+			
+			# Participate in all-gather
+			with self.comm.change_state(enable=True):
+				self.comm.all_gather(
+					all_tokens, 
+					padded_hidden_states, 
+					stream=torch.cuda.default_stream(self.device)
+				)
+			
+			# Gate computation on global tokens (from other ranks)
+			global_x = all_tokens
+			global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])
+			topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
+			global_x = global_x.squeeze(1)
+			
+			topk_idx = topk_idx.to(torch.int32)
+			input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
+				global_x, topk_idx, self.token_idx, self.topk_pos,
+				self.routed_expert_start_idx, self.routed_expert_end_idx,
+			)
+			
+			# Process tokens (may still have tokens from other ranks routed to this rank's experts)
+			res = self.grouped_dequant_moe_fp8(
+				input_x,
+				input_eids,
+				expert_counts,
+				expert_offsets
+			)
+			
+			global_results = scatter_weight_reduce_optimized(
+				res, global_indices, token_topk_pos, topk_weight,
+				self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+			)
+			global_results = global_results.to(torch.bfloat16)
+			
+			# Participate in all-reduce
+			with self.comm.change_state(enable=True):
+				self.comm.all_reduce(
+					global_results, 
+					op=dist.ReduceOp.SUM, 
+					stream=torch.cuda.default_stream(self.device)
+				)
+			
+			# Return empty tensor with correct shape
+			return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
+		
+		# ---- Original logic for non-zero tokens ----
+		all_tokens = torch.zeros(
+			(self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
+			device=self.device, 
+			dtype=torch.bfloat16
+		)
+		
+		if x.shape[0] < self.num_tokens_per_rank:
+			padded_hidden_states = torch.zeros(
+				(self.num_tokens_per_rank, hidden_size), 
+				device=self.device, 
+				dtype=x.dtype
+			)
+			padded_hidden_states[:x.shape[0]] = x
+		else:
+			padded_hidden_states = x
+		
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(
+				all_tokens, 
+				padded_hidden_states, 
+				stream=torch.cuda.default_stream(self.device)
+			)
+		
+		# ---- 2) Gate computation on global tokens --------------------------
+		global_x = all_tokens
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
+		assert topk_weight.dtype == torch.float32, f"topk_weight must be float32, got {topk_weight.dtype}"
+		global_x = global_x.squeeze(1)
+		
+		# ---- 3) Process tokens assigned to local experts ------------------
+		topk_idx = topk_idx.to(torch.int32)
+		input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
+			global_x, topk_idx, self.token_idx, self.topk_pos,
+			self.routed_expert_start_idx, self.routed_expert_end_idx,
+		)
+		
+		res = self.grouped_dequant_moe_fp8(
+			input_x,
+			input_eids,
+			expert_counts,
+			expert_offsets
+		)
+		
+		assert topk_weight.dtype == torch.float32
+		global_results = scatter_weight_reduce_optimized(
+			res, global_indices, token_topk_pos, topk_weight,
+			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+		)
+		global_results = global_results.to(torch.bfloat16)
+		
+		# ---- 3.3) All-reduce to combine results from all workers ------------
+		with self.comm.change_state(enable=True):
+			self.comm.all_reduce(
+				global_results, 
+				op=dist.ReduceOp.SUM, 
+				stream=torch.cuda.default_stream(self.device)
+			)
+		
+		# ---- 3.4) Extract results for local tokens and aggregate ------------
+		start_token_ids = self.rank * self.num_tokens_per_rank
+		end_token_ids = start_token_ids + num_tokens
+		
+		final_output = global_results[start_token_ids:end_token_ids]
+		return final_output.to(x.dtype)
+	
 	# def expert_bincount(self, eids, routed_expert_start_idx, experts_per_rank, device):
 	# 	eids_adjusted = eids - routed_expert_start_idx  
 	# 	counts = torch.bincount(eids_adjusted, minlength=experts_per_rank)
@@ -2873,49 +3004,112 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		return res
 
+	# def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
+	# 	# 'x' and 'eids' are the oversized tensors.
+	# 	# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
+
+	# 	# 1. Get the actual token count as a 0-dim *tensor* on the GPU.
+	# 	# This is the last element of the prefix sum. NO sync.
+	# 	actual_num_tokens = expert_offsets[-1]
+
+	# 	expert_counts = expert_counts.to(torch.int32)
+	# 	group_size, activated_group_idx, group_start_indices, num_active_experts = compact_expert_data(
+	# 				expert_counts
+	# 	)
+	# 	# --- End Replacement ---
+		
+	# 	# 4. Perform dynamic slicing (async).
+	# 	# We slice the oversized 'x' tensor using the GPU-side 'actual_num_tokens' tensor.
+	# 	# This creates a dynamically-sized view.
+	# 	x_sliced = x[:actual_num_tokens]
+
+	# 	# 5. Quantize only the valid data.
+	# 	# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
+	# 	x_quant, x_scale = act_quant(x_sliced)
+	# 	intermediate = fused_fp8_moe_stage_1_tma(
+	# 		x_quant, x_scale, 
+	# 		self.gate_list, self.gate_ptrs_ptr,
+	# 		self.up_list, self.up_ptrs_ptr,
+	# 		self.gate_scale_list, self.gate_scale_ptrs_ptr,
+	# 		self.up_scale_list, self.up_scale_ptrs_ptr,
+	# 		group_size, activated_group_idx, group_start_indices, 
+	# 		num_active_experts, # Pass the 0-dim *tensor*
+	# 		self.experts_per_rank
+	# 	)
+		
+	# 	# 'intermediate' is also dynamically shaped
+	# 	intermediate, intermediate_scale = act_quant(intermediate)
+	# 	res = fused_dequant_grouped_gemm_fp8_tma(
+	# 		intermediate, intermediate_scale, 
+	# 		self.down_list, self.down_ptrs_ptr,
+	# 		self.down_scale_list, self.down_scale_ptrs_ptr,
+	# 		group_size, activated_group_idx, group_start_indices, 
+	# 		num_active_experts, # Pass the 0-dim *tensor*
+	# 		# self.experts_per_rank
+	# 	)
+	# 	return res
+
 	def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
-		# 'x' and 'eids' are the oversized tensors.
-		# 'expert_counts' and 'expert_offsets' are metadata tensors on the GPU.
-
-		# 1. Get the actual token count as a 0-dim *tensor* on the GPU.
-		# This is the last element of the prefix sum. NO sync.
+		"""
+		Process tokens through MoE experts with FP8 quantization.
+		Handles zero-token case gracefully.
+		"""
+		# Get actual token count
 		actual_num_tokens = expert_offsets[-1]
-
+		
+		# Handle zero tokens case
+		if isinstance(actual_num_tokens, torch.Tensor):
+			actual_num_tokens_val = actual_num_tokens.item()
+		else:
+			actual_num_tokens_val = int(actual_num_tokens)
+		
+		if actual_num_tokens_val == 0:
+			# Return empty tensor with correct shape
+			return torch.empty((0, x.shape[1] if x.dim() > 1 else self.config.hidden_size), 
+							device=x.device, dtype=torch.bfloat16)
+		
 		expert_counts = expert_counts.to(torch.int32)
 		group_size, activated_group_idx, group_start_indices, num_active_experts = compact_expert_data(
-					expert_counts
+			expert_counts
 		)
-		# --- End Replacement ---
 		
-		# 4. Perform dynamic slicing (async).
-		# We slice the oversized 'x' tensor using the GPU-side 'actual_num_tokens' tensor.
-		# This creates a dynamically-sized view.
-		x_sliced = x[:actual_num_tokens]
-
-		# 5. Quantize only the valid data.
-		# 'x_quant' will now have a dynamic shape of [actual_num_tokens, hidden_size]
+		# Handle case where no experts are activated
+		if isinstance(num_active_experts, torch.Tensor):
+			num_active_val = num_active_experts.item()
+		else:
+			num_active_val = int(num_active_experts)
+		
+		if num_active_val == 0:
+			return torch.empty((0, x.shape[1] if x.dim() > 1 else self.config.hidden_size),
+							device=x.device, dtype=torch.bfloat16)
+		
+		# Slice to actual tokens (use integer for slicing)
+		x_sliced = x[:actual_num_tokens_val]
+		
+		# Quantize only the valid data
 		x_quant, x_scale = act_quant(x_sliced)
+		
 		intermediate = fused_fp8_moe_stage_1_tma(
-			x_quant, x_scale, 
+			x_quant, x_scale,
 			self.gate_list, self.gate_ptrs_ptr,
 			self.up_list, self.up_ptrs_ptr,
 			self.gate_scale_list, self.gate_scale_ptrs_ptr,
 			self.up_scale_list, self.up_scale_ptrs_ptr,
-			group_size, activated_group_idx, group_start_indices, 
-			num_active_experts, # Pass the 0-dim *tensor*
+			group_size, activated_group_idx, group_start_indices,
+			num_active_experts,
 			self.experts_per_rank
 		)
 		
-		# 'intermediate' is also dynamically shaped
 		intermediate, intermediate_scale = act_quant(intermediate)
+		
 		res = fused_dequant_grouped_gemm_fp8_tma(
-			intermediate, intermediate_scale, 
+			intermediate, intermediate_scale,
 			self.down_list, self.down_ptrs_ptr,
 			self.down_scale_list, self.down_scale_ptrs_ptr,
-			group_size, activated_group_idx, group_start_indices, 
-			num_active_experts, # Pass the 0-dim *tensor*
-			# self.experts_per_rank
+			group_size, activated_group_idx, group_start_indices,
+			num_active_experts,
 		)
+		
 		return res
 
 	def grouped_dequant_moe_fp8_v2(self, x, eids):
