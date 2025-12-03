@@ -1191,11 +1191,11 @@ class BatchGenWorker:
 			if uuid not in self._uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
-			additional = seq.get_additional_pages_needed()
+			additional = seq.get_additional_gpu_pages_needed()  # FIX: was get_additional_pages_needed()
 			if additional > 0:
 				extensions_by_uuid[uuid] = additional
 				total_additional_needed += additional
-		
+			
 		free_pages = manager.get_stats().num_free_pages
 		
 		# If enough pages, extend all
