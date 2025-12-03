@@ -242,7 +242,7 @@ def build_gpu_kv_config_fixed_size(
 	# Calculate total pages from memory budget
 	total_bytes = int(gpu_kv_cache_size_gb * (1024 ** 3))
 	num_pages = total_bytes // bytes_per_page_all_layers
-	
+	profile = _resolve_profile(model_name)
 	return GPUPagedKVConfig(
 		num_layers=profile.num_layers,
 		num_pages=num_pages,
