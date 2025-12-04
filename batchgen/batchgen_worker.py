@@ -348,45 +348,54 @@ class BatchGenWorker:
 		local_sequence_ids: List[int],
 		load_from_host: bool = True
 	) -> None:
-		"""
-		Allocate GPU KV pages using two-page buffer strategy.
-		Only allocates current_context_length + 2*PAGE_SIZE tokens.
-		"""
+		"""Allocate GPU KV pages - use FULL allocation when loading from host."""
 		if not local_sequence_ids:
 			return
 		
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
-			logging.warning("GPU KV manager not initialized")
 			return
 		
 		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
 		
-		# Calculate pages for two-page buffer
 		pages_per_seq = []
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			pages = seq.get_gpu_pages_for_two_page_buffer()
-			pages_per_seq.append(pages * self.PAGE_SIZE)  # Convert to tokens
+			
+			if load_from_host:
+				# FIX: When loading from host, allocate FULL pages to match host
+				pages = seq.get_pages_required()
+			else:
+				pages = seq.get_gpu_pages_for_two_page_buffer()
+			
+			pages_per_seq.append(pages * self.PAGE_SIZE)
 			seq.gpu_pages_allocated = pages
 		
-		# Allocate
 		manager.allocate_pages_for_sequences(global_ids, pages_per_seq)
-		manager.rebuild_page_table(global_ids)
 		
-		# Load from host if requested
+		# FIX: Rebuild page table with ALL active sequences, not just new ones
+		all_active_global_ids = []
+		for uuid in self._sequences_with_gpu_kv:
+			if uuid in self._uuid_to_local_map:
+				seq = self.global_batch.get_sequence(uuid)
+				all_active_global_ids.append(seq.global_idx)
+		# Add new sequences
+		for gid in global_ids:
+			if gid not in all_active_global_ids:
+				all_active_global_ids.append(gid)
+		all_active_global_ids.sort()
+		
+		manager.rebuild_page_table(all_active_global_ids)
+		
 		if load_from_host:
 			self._load_host_kv_to_gpu(manager, global_ids)
 		
-		# Track
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			self._sequences_with_gpu_kv.add(uuid)
-		
-		logging.info(
-			f"Rank {self.rank}: Allocated two-page buffer GPU KV for {len(global_ids)} sequences"
-		)
+
+
 	def _extend_gpu_kv_allocation(self, uuids: List[str]) -> bool:
 		"""
 		Extend GPU KV allocation for sequences that need more pages.
@@ -477,16 +486,13 @@ class BatchGenWorker:
 		return onhold_uuids
 
 	def _put_sequences_onhold(self, uuids: List[str]) -> None:
-		"""
-		Put sequences ON_HOLD: release GPU KV pages, keep host KV.
-		"""
+		"""Put sequences ON_HOLD: release GPU KV pages, keep host KV."""
 		if not uuids:
 			return
 		
 		my_uuids = [u for u in uuids if u in self._uuid_to_local_map]
 		
 		if my_uuids:
-			# Release GPU KV pages
 			local_indices = self._get_local_indices_for_uuids(my_uuids)
 			global_ids = self._local_indices_to_global_seq_ids(local_indices)
 			
@@ -494,18 +500,21 @@ class BatchGenWorker:
 			if manager is not None:
 				manager.free_pages_for_sequences(global_ids)
 			
-			# Update tracking
 			for uuid in my_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
 				self._sequences_with_gpu_kv.discard(uuid)
 		
-		# Update status (all ranks)
 		self._update_batch_status(uuids, SequenceStatus.ON_HOLD)
 		
-		logging.info(
-			f"Rank {self.rank}: Put {len(uuids)} sequences ON_HOLD"
-		)
+		# FIX: Rebuild page table with remaining active sequences
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is not None and manager.is_initialized:
+			remaining_uuids = [u for u in self._sequences_with_gpu_kv if u not in set(uuids)]
+			if remaining_uuids:
+				remaining_local = self._get_local_indices_for_uuids(remaining_uuids)
+				remaining_global = self._local_indices_to_global_seq_ids(remaining_local)
+				manager.rebuild_page_table(remaining_global)`
 
 	def _append_decode_kv_to_host(
 		self,
