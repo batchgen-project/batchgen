@@ -655,12 +655,12 @@ class Attn_Wrapper(torch.nn.Module):
 						# 	self._kv_append_task = task
 					else:
 						raise NotImplementedError
-				task = Attn_Wrapper.kv_append_callback(self.layer_idx, k_tensor)
-				task.wait()
+				# task = Attn_Wrapper.kv_append_callback(self.layer_idx, k_tensor)
+				# task.wait()
+				if Attn_Wrapper.kv_append_callback is not None:
+					Attn_Wrapper.kv_append_callback(self.layer_idx, k_tensor)
 
 					
-
-				
 
 			# Step 4: Clean up
 			if self.get_weights:
