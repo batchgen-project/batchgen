@@ -363,11 +363,13 @@ class BatchGenWorker:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			
-			if load_from_host:
-				# FIX: When loading from host, allocate FULL pages to match host
-				pages = seq.get_pages_required()
-			else:
-				pages = seq.get_gpu_pages_for_two_page_buffer()
+			# if load_from_host:
+			# 	# FIX: When loading from host, allocate FULL pages to match host
+			# 	pages = seq.get_pages_required()
+			# else:
+			# 	pages = seq.get_gpu_pages_for_two_page_buffer()
+
+			pages = seq.get_gpu_pages_for_two_page_buffer()
 			
 			pages_per_seq.append(pages * self.PAGE_SIZE)
 			seq.gpu_pages_allocated = pages
