@@ -514,7 +514,7 @@ class BatchGenWorker:
 			if remaining_uuids:
 				remaining_local = self._get_local_indices_for_uuids(remaining_uuids)
 				remaining_global = self._local_indices_to_global_seq_ids(remaining_local)
-				manager.rebuild_page_table(remaining_global)`
+				manager.rebuild_page_table(remaining_global)
 
 	def _append_decode_kv_to_host(
 		self,
