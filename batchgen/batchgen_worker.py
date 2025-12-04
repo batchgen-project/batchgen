@@ -373,6 +373,16 @@ class BatchGenWorker:
 			seq.gpu_pages_allocated = pages
 		
 		manager.allocate_pages_for_sequences(global_ids, pages_per_seq)
+
+		manager.rebuild_page_table(global_ids)	
+		# Load from host if requested
+		if load_from_host:
+			self._load_host_kv_to_gpu(manager, global_ids)
+		
+		# Track
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map[local_idx]
+			self._sequences_with_gpu_kv.add(uuid)
 		
 		# FIX: Rebuild page table with ALL active sequences, not just new ones
 		all_active_global_ids = []
@@ -388,13 +398,9 @@ class BatchGenWorker:
 		
 		manager.rebuild_page_table(all_active_global_ids)
 		
-		if load_from_host:
-			self._load_host_kv_to_gpu(manager, global_ids)
-		
-		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
-			self._sequences_with_gpu_kv.add(uuid)
-
+		logging.info(
+			f"Rank {self.rank}: Allocated two-page buffer GPU KV for {len(global_ids)} sequences"
+		)
 
 	def _extend_gpu_kv_allocation(self, uuids: List[str]) -> bool:
 		"""
