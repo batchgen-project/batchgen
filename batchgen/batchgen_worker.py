@@ -829,6 +829,13 @@ class BatchGenWorker:
 			logging.info(
 				f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
 			)
+			
+			# FIX: Remove from tracking set
+			for local_idx in local_sequence_ids:
+				uuid = self._local_to_uuid_map.get(local_idx)
+				if uuid:
+					self._sequences_with_gpu_kv.discard(uuid)
+					
 		except KeyError as exc:
 			logging.warning(
 				"Rank %s failed to release GPU KV pages for %s: %s",
