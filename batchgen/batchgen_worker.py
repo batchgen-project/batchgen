@@ -1178,7 +1178,7 @@ class BatchGenWorker:
 		decode_uuids: List[str],
 		batch: List[int]
 	) -> Tuple[List[str], List[int], List[str]]:
-		"""Check buffer and synchronize ON_HOLD decisions across ranks."""
+		"""Each rank handles its own shortfall, then sync ON_HOLD decisions."""
 		if not decode_uuids:
 			return [], [], []
 		
@@ -1186,76 +1186,73 @@ class BatchGenWorker:
 		if manager is None:
 			return decode_uuids, batch, []
 		
-		# Step 1: Each rank calculates its local extension needs
-		local_additional_needed = 0
+		# Step 1: Calculate LOCAL shortfall (only for MY sequences)
+		local_additional = 0
 		for uuid in decode_uuids:
 			if uuid not in self._uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			additional = seq.get_additional_gpu_pages_needed()
 			if additional > 0:
-				local_additional_needed += additional
+				local_additional += additional
 		
 		local_free = manager.get_stats().num_free_pages
-		local_shortfall = max(0, local_additional_needed - local_free)
+		local_shortfall = max(0, local_additional - local_free)
 		
-		# Step 2: All-gather shortfalls to make global decision
-		shortfall_tensor = torch.tensor([local_shortfall], dtype=torch.int64, device=self.torch_device)
-		gathered = [torch.zeros_like(shortfall_tensor) for _ in range(self.world_size)]
-		dist.all_gather(gathered, shortfall_tensor)
-		per_rank_shortfall = [int(t.item()) for t in gathered]
+		# Step 2: Check if ANY rank has shortfall
+		has_shortfall = torch.tensor([1 if local_shortfall > 0 else 0], 
+									dtype=torch.int32, device=self.torch_device)
+		dist.all_reduce(has_shortfall, op=dist.ReduceOp.MAX)
 		
-		# Step 3: If ANY rank has shortfall, we need coordinated ON_HOLD selection
-		total_shortfall = sum(per_rank_shortfall)
-		
-		if total_shortfall == 0:
-			# No shortfall - extend all locally
+		if has_shortfall.item() == 0:
+			# No rank has shortfall - just extend locally
 			my_uuids = [u for u in decode_uuids if u in self._uuid_to_local_map]
 			self._extend_gpu_kv_allocation(my_uuids)
 			return decode_uuids, batch, []
 		
-		# Step 4: Coordinated ON_HOLD selection (all ranks compute identically)
-		# Sort by decoded_length descending, select enough to cover worst-case shortfall
-		candidates = []
+		# Step 3: Each rank selects its OWN sequences to put ON_HOLD
+		my_candidates = []
 		for uuid in decode_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			candidates.append((uuid, seq.decoded_length, seq.gpu_pages_allocated, seq.assigned_rank))
-		
-		# Sort by progress (most progress first - closest to completion)
-		candidates.sort(key=lambda x: x[1], reverse=True)
-		
-		onhold_uuids = []
-		freed_per_rank = [0] * self.world_size
-		
-		for uuid, _, pages, assigned_rank in candidates:
-			# Check if this rank's shortfall is covered
-			if freed_per_rank[assigned_rank] >= per_rank_shortfall[assigned_rank]:
+			if uuid not in self._uuid_to_local_map:
 				continue
-			onhold_uuids.append(uuid)
-			freed_per_rank[assigned_rank] += pages
-			
-			# Check if all shortfalls are covered
-			if all(freed_per_rank[r] >= per_rank_shortfall[r] for r in range(self.world_size)):
+			seq = self.global_batch.get_sequence(uuid)
+			my_candidates.append((uuid, seq.decoded_length, seq.gpu_pages_allocated))
+		
+		# Sort by progress (most complete first - they have more KV in host already)
+		my_candidates.sort(key=lambda x: x[1], reverse=True)
+		
+		my_onhold = []
+		freed = 0
+		for uuid, _, pages in my_candidates:
+			if freed >= local_shortfall:
 				break
+			my_onhold.append(uuid)
+			freed += pages
 		
-		# Step 5: Each rank puts its own sequences ON_HOLD
-		if onhold_uuids:
-			my_onhold = [u for u in onhold_uuids if u in self._uuid_to_local_map]
-			if my_onhold:
-				self._put_sequences_onhold(my_onhold)
+		# Step 4: All-gather ON_HOLD selections (small list of UUIDs)
+		all_onhold = [None] * self.world_size
+		dist.all_gather_object(all_onhold, my_onhold)
 		
-		# Step 6: Update global status (all ranks do this identically)
-		self._update_batch_status(onhold_uuids, SequenceStatus.ON_HOLD)
+		global_onhold = []
+		for rank_onhold in all_onhold:
+			global_onhold.extend(rank_onhold)
 		
-		# Step 7: Extend remaining sequences locally
-		onhold_set = set(onhold_uuids)
+		# Step 5: Release GPU pages for MY ON_HOLD sequences
+		if my_onhold:
+			self._put_sequences_onhold(my_onhold)
+		
+		# Step 6: Update status globally (all ranks do this identically)
+		self._update_batch_status(global_onhold, SequenceStatus.ON_HOLD)
+		
+		# Step 7: Extend remaining MY sequences
+		onhold_set = set(global_onhold)
 		active_uuids = [u for u in decode_uuids if u not in onhold_set]
 		my_active = [u for u in active_uuids if u in self._uuid_to_local_map]
 		self._extend_gpu_kv_allocation(my_active)
 		
 		active_batch = self._get_local_indices_for_uuids(active_uuids)
 		
-		return active_uuids, active_batch, onhold_uuids
+		return active_uuids, active_batch, global_onhold
 
 	def _check_and_handle_completions(
 		self, 
