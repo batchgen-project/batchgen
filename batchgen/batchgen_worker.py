@@ -513,7 +513,7 @@ class BatchGenWorker:
 				seq.gpu_pages_allocated = 0
 				self._sequences_with_gpu_kv.discard(uuid)
 		
-		self._update_batch_status(uuids, SequenceStatus.ON_HOLD)
+		# self._update_batch_status(uuids, SequenceStatus.ON_HOLD)
 		
 		# FIX: Rebuild page table with remaining active sequences
 		manager = self.gpu_paged_kv_cache_manager
@@ -1130,13 +1130,7 @@ class BatchGenWorker:
 	def _prepare_decode_batch(self) -> List[str]:
 		"""
 		Select sequences for decode phase from PREFILLED sequences.
-		
-		For INITIAL decode batch (before GPU KV manager exists):
-		- Use per-rank MoE limit as the constraint
-		- GPU KV manager will be sized appropriately in _config_decoding_for_batch
-		
-		For CONTINUOUS batching (GPU KV manager exists):
-		- Use get_stats().num_free_pages
+		Greedily fill GPU KV cache to ~90% capacity.
 		"""
 		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		prefilled_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
@@ -1144,49 +1138,37 @@ class BatchGenWorker:
 		if not prefilled_uuids:
 			return []
 		
-		# Per-rank sequence limit from MoE config
-		max_seqs_per_rank = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
-		
-		# Check if GPU KV manager exists (continuous batching case)
-		gpu_free_pages = 0
+		# Get GPU page capacity
 		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
-			gpu_free_pages = self.gpu_paged_kv_cache_manager.get_stats().num_free_pages
-			logging.info(f"Rank {self.rank}: GPU KV has {gpu_free_pages} free pages")
+			total_pages = self.gpu_paged_kv_cache_manager.get_stats().num_total_pages
 		else:
-			# Initial batch - GPU manager doesn't exist yet
-			# Use a large number; actual limit will be per-rank MoE limit
-			gpu_free_pages = float('inf')
+			# Initial batch: estimate from config
+			from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config_fixed_size
+			config = build_gpu_kv_config_fixed_size(
+				model_name=self.huggingface_ckpt_name,
+				gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
+			)
+			total_pages = config.num_pages
 		
-		# Count sequences per rank and enforce limits
-		rank_counts = [0] * self.world_size
+		# 90% watermark
+		capacity_per_rank = int(total_pages * 0.9)
+		
+		# Greedily fill
+		rank_pages_used = [0] * self.world_size
 		decode_batch = []
-		total_pages_needed = 0
 		
 		for uuid in prefilled_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
+			req_pages = seq.get_gpu_pages_for_two_page_buffer()
 			
-			# Check per-rank limit
-			if rank_counts[assigned_rank] >= max_seqs_per_rank:
-				continue
-			
-			# Check GPU KV page capacity (for continuous batching)
-			seq_pages = seq.get_pages_required()
-			if total_pages_needed + seq_pages > gpu_free_pages:
-				logging.info(
-					f"Rank {self.rank}: GPU KV capacity reached at {len(decode_batch)} sequences "
-					f"({total_pages_needed}/{gpu_free_pages} pages)"
-				)
-				break
-			
-			decode_batch.append(uuid)
-			rank_counts[assigned_rank] += 1
-			total_pages_needed += seq_pages
+			if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
+				decode_batch.append(uuid)
+				rank_pages_used[assigned_rank] += req_pages
 		
-		remaining = len(prefilled_uuids) - len(decode_batch)
 		logging.info(
 			f"Rank {self.rank}: Prepared decode batch: {len(decode_batch)} sequences, "
-			f"{total_pages_needed} pages. {remaining} remain PREFILLED."
+			f"pages per rank: {rank_pages_used}"
 		)
 		
 		return decode_batch
@@ -1196,13 +1178,7 @@ class BatchGenWorker:
 		decode_uuids: List[str],
 		batch: List[int]
 	) -> Tuple[List[str], List[int], List[str]]:
-		"""
-		Check if two-page buffer can be maintained for all sequences.
-		Put sequences ON_HOLD if insufficient GPU pages.
-		
-		Returns:
-			(active_uuids, active_batch, onhold_uuids)
-		"""
+		"""Check buffer and synchronize ON_HOLD decisions across ranks."""
 		if not decode_uuids:
 			return [], [], []
 		
@@ -1210,45 +1186,74 @@ class BatchGenWorker:
 		if manager is None:
 			return decode_uuids, batch, []
 		
-		# Calculate total additional pages needed for all sequences
-		total_additional_needed = 0
-		extensions_by_uuid = {}
-		
+		# Step 1: Each rank calculates its local extension needs
+		local_additional_needed = 0
 		for uuid in decode_uuids:
 			if uuid not in self._uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
-			additional = seq.get_additional_gpu_pages_needed()  # FIX: was get_additional_pages_needed()
+			additional = seq.get_additional_gpu_pages_needed()
 			if additional > 0:
-				extensions_by_uuid[uuid] = additional
-				total_additional_needed += additional
-			
-		free_pages = manager.get_stats().num_free_pages
+				local_additional_needed += additional
 		
-		# If enough pages, extend all
-		if total_additional_needed <= free_pages:
-			if extensions_by_uuid:
-				self._extend_gpu_kv_allocation(list(extensions_by_uuid.keys()))
+		local_free = manager.get_stats().num_free_pages
+		local_shortfall = max(0, local_additional_needed - local_free)
+		
+		# Step 2: All-gather shortfalls to make global decision
+		shortfall_tensor = torch.tensor([local_shortfall], dtype=torch.int64, device=self.torch_device)
+		gathered = [torch.zeros_like(shortfall_tensor) for _ in range(self.world_size)]
+		dist.all_gather(gathered, shortfall_tensor)
+		per_rank_shortfall = [int(t.item()) for t in gathered]
+		
+		# Step 3: If ANY rank has shortfall, we need coordinated ON_HOLD selection
+		total_shortfall = sum(per_rank_shortfall)
+		
+		if total_shortfall == 0:
+			# No shortfall - extend all locally
+			my_uuids = [u for u in decode_uuids if u in self._uuid_to_local_map]
+			self._extend_gpu_kv_allocation(my_uuids)
 			return decode_uuids, batch, []
 		
-		# Need to put some sequences ON_HOLD
-		onhold_uuids = self._select_sequences_for_onhold(
-			decode_uuids, 
-			total_additional_needed
-		)
+		# Step 4: Coordinated ON_HOLD selection (all ranks compute identically)
+		# Sort by decoded_length descending, select enough to cover worst-case shortfall
+		candidates = []
+		for uuid in decode_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			candidates.append((uuid, seq.decoded_length, seq.gpu_pages_allocated, seq.assigned_rank))
 		
+		# Sort by progress (most progress first - closest to completion)
+		candidates.sort(key=lambda x: x[1], reverse=True)
+		
+		onhold_uuids = []
+		freed_per_rank = [0] * self.world_size
+		
+		for uuid, _, pages, assigned_rank in candidates:
+			# Check if this rank's shortfall is covered
+			if freed_per_rank[assigned_rank] >= per_rank_shortfall[assigned_rank]:
+				continue
+			onhold_uuids.append(uuid)
+			freed_per_rank[assigned_rank] += pages
+			
+			# Check if all shortfalls are covered
+			if all(freed_per_rank[r] >= per_rank_shortfall[r] for r in range(self.world_size)):
+				break
+		
+		# Step 5: Each rank puts its own sequences ON_HOLD
 		if onhold_uuids:
-			self._put_sequences_onhold(onhold_uuids)
+			my_onhold = [u for u in onhold_uuids if u in self._uuid_to_local_map]
+			if my_onhold:
+				self._put_sequences_onhold(my_onhold)
 		
-		# Update lists
+		# Step 6: Update global status (all ranks do this identically)
+		self._update_batch_status(onhold_uuids, SequenceStatus.ON_HOLD)
+		
+		# Step 7: Extend remaining sequences locally
 		onhold_set = set(onhold_uuids)
 		active_uuids = [u for u in decode_uuids if u not in onhold_set]
-		active_batch = self._get_local_indices_for_uuids(active_uuids)
+		my_active = [u for u in active_uuids if u in self._uuid_to_local_map]
+		self._extend_gpu_kv_allocation(my_active)
 		
-		# Now extend remaining sequences
-		remaining_extensions = {u: p for u, p in extensions_by_uuid.items() if u not in onhold_set}
-		if remaining_extensions:
-			self._extend_gpu_kv_allocation(list(remaining_extensions.keys()))
+		active_batch = self._get_local_indices_for_uuids(active_uuids)
 		
 		return active_uuids, active_batch, onhold_uuids
 
@@ -1652,15 +1657,14 @@ class BatchGenWorker:
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 		else:
-			# CHANGE: Use full budget for initial load (to match host allocation)
-			# Two-page buffer will be used for page extensions later
-			self._prepare_gpu_paged_kv_cache(local_decode_indices)
+			# Use two-page buffer allocation, NOT _prepare_gpu_paged_kv_cache
+			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
 			
-			# Track GPU pages for two-page buffer logic
+			# Track correctly
 			for local_idx in local_decode_indices:
 				uuid = self._local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
-				seq.gpu_pages_allocated = seq.get_pages_required()
+				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 				self._sequences_with_gpu_kv.add(uuid)
 			
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
@@ -1730,11 +1734,8 @@ class BatchGenWorker:
 		current_batch: List[int]
 	) -> Tuple[List[str], List[int]]:
 		"""
-		Load sequences at page boundary with two-page buffer design.
-		Considers PREFILLED and ON_HOLD sequences.
+		Load sequences at page boundary. Greedily fill available GPU pages.
 		"""
-		gpus_per_node = torch.cuda.device_count()
-		
 		# Step 1: All-gather free GPU pages
 		manager = self.gpu_paged_kv_cache_manager
 		local_free = manager.get_stats().num_free_pages if manager and manager.is_initialized else 0
@@ -1744,7 +1745,7 @@ class BatchGenWorker:
 		dist.all_gather(gathered, free_tensor)
 		per_rank_free = [int(t.item()) for t in gathered]
 		
-		# Step 2: Get candidates (PREFILLED + ON_HOLD)
+		# Step 2: Get candidates
 		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		onhold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
 		candidates = prefilled + onhold
@@ -1753,51 +1754,39 @@ class BatchGenWorker:
 		if not candidates:
 			return current_decode_uuids, current_batch
 		
-		# Step 3: Current state
-		max_per_rank = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
-		rank_seq_counts = [0] * self.world_size
-		for uuid in current_decode_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			rank_seq_counts[seq.assigned_rank] += 1
-		
+		# Step 3: Greedily select based on available pages
 		rank_pages_used = [0] * self.world_size
-		
-		# Step 4: Select sequences (two-page buffer)
 		new_uuids = []
 		
 		for uuid in candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
-			
-			if rank_seq_counts[assigned_rank] >= max_per_rank:
-				continue
-			
-			# Two-page buffer pages
 			req_pages = seq.get_gpu_pages_for_two_page_buffer()
 			
-			if rank_pages_used[assigned_rank] + req_pages > per_rank_free[assigned_rank]:
-				continue
-			
-			new_uuids.append(uuid)
-			rank_pages_used[assigned_rank] += req_pages
-			rank_seq_counts[assigned_rank] += 1
+			if rank_pages_used[assigned_rank] + req_pages <= per_rank_free[assigned_rank]:
+				new_uuids.append(uuid)
+				rank_pages_used[assigned_rank] += req_pages
 		
 		if not new_uuids:
 			return current_decode_uuids, current_batch
 		
-		# Step 5: Load for THIS RANK
+		# Step 4: Load for THIS RANK
 		my_new_uuids = [u for u in new_uuids 
-					   if self.global_batch.get_sequence(u).assigned_rank == self.rank]
+					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
 		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
 		
 		if new_local_indices:
 			self._allocate_gpu_kv_two_page_buffer(new_local_indices, load_from_host=True)
 		
-		# Step 6: Update status
+		# Step 5: Update status
 		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
 		
 		updated_decode_uuids = current_decode_uuids + new_uuids
 		updated_batch = current_batch + new_local_indices
+		
+		logging.info(
+			f"Rank {self.rank}: Loaded {len(new_uuids)} new sequences"
+		)
 		
 		return updated_decode_uuids, updated_batch
 
