@@ -592,6 +592,7 @@ class Attn_Wrapper(torch.nn.Module):
 					/ self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
 				)
 				final_attn_result = torch.empty_like(hidden_states)
+				all_k_tensors = []
 				for i in range(num_micro_batch):
 					start_ids = (
 						i
@@ -649,7 +650,7 @@ class Attn_Wrapper(torch.nn.Module):
 						# past_key_states[start_ids:end_ids].copy_(kv)
 						# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 						final_attn_result[start_ids:end_ids].copy_(attn_result)
-					
+						all_k_tensors.append(k_tensor)
 						# # Store task for later sync (after MoE)
 						# if hasattr(self, '_kv_append_task'):
 						# 	self._kv_append_task = task
@@ -658,7 +659,8 @@ class Attn_Wrapper(torch.nn.Module):
 				# task = Attn_Wrapper.kv_append_callback(self.layer_idx, k_tensor)
 				# task.wait()
 				if Attn_Wrapper.kv_append_callback is not None:
-					Attn_Wrapper.kv_append_callback(self.layer_idx, k_tensor)
+					full_k_tensor = torch.cat(all_k_tensors, dim=0)
+					Attn_Wrapper.kv_append_callback(self.layer_idx, full_k_tensor)
 
 					
 

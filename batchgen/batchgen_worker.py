@@ -58,6 +58,64 @@ else:
 
 from .scheduler.scheduler import Scheduler
 
+@dataclass
+class BoundaryTimingStats:
+	"""Timing statistics for page boundary operations."""
+	# Phase 1: Sync
+	wait_kv_append_ms: float = 0.0
+	finalize_async_load_ms: float = 0.0
+	rebuild_after_integration_ms: float = 0.0
+	barrier_after_sync_ms: float = 0.0
+	
+	# Phase 2: Eviction
+	sync_completion_ms: float = 0.0
+	release_completed_ms: float = 0.0
+	rebuild_after_eviction_ms: float = 0.0
+	
+	# Phase 3: Extension
+	extend_page_buffer_ms: float = 0.0
+	rebuild_after_extension_ms: float = 0.0
+	
+	# Phase 4: Async Load Launch
+	allgather_free_pages_ms: float = 0.0
+	select_candidates_ms: float = 0.0
+	allocate_pages_ms: float = 0.0
+	launch_async_load_ms: float = 0.0
+	restore_page_table_ms: float = 0.0
+	
+	# Overall
+	total_boundary_ms: float = 0.0
+	barrier_final_ms: float = 0.0
+	
+	# Counts
+	num_completed: int = 0
+	num_onhold: int = 0
+	num_loaded: int = 0
+	
+	def __str__(self) -> str:
+		return (
+			f"Boundary Timing (total={self.total_boundary_ms:.2f}ms):\n"
+			f"  Phase 1 SYNC:\n"
+			f"    wait_kv_append={self.wait_kv_append_ms:.2f}ms\n"
+			f"    finalize_load={self.finalize_async_load_ms:.2f}ms\n"
+			f"    rebuild_integration={self.rebuild_after_integration_ms:.2f}ms\n"
+			f"    barrier={self.barrier_after_sync_ms:.2f}ms\n"
+			f"  Phase 2 EVICTION ({self.num_completed} completed):\n"
+			f"    sync_completion={self.sync_completion_ms:.2f}ms\n"
+			f"    release={self.release_completed_ms:.2f}ms\n"
+			f"    rebuild={self.rebuild_after_eviction_ms:.2f}ms\n"
+			f"  Phase 3 EXTENSION ({self.num_onhold} on_hold):\n"
+			f"    extend={self.extend_page_buffer_ms:.2f}ms\n"
+			f"    rebuild={self.rebuild_after_extension_ms:.2f}ms\n"
+			f"  Phase 4 ASYNC LOAD ({self.num_loaded} new):\n"
+			f"    allgather={self.allgather_free_pages_ms:.2f}ms\n"
+			f"    select={self.select_candidates_ms:.2f}ms\n"
+			f"    allocate={self.allocate_pages_ms:.2f}ms\n"
+			f"    launch={self.launch_async_load_ms:.2f}ms\n"
+			f"    restore_pt={self.restore_page_table_ms:.2f}ms\n"
+			f"  Final barrier={self.barrier_final_ms:.2f}ms"
+		)
+
 
 class query:
 	def __init__(
@@ -1921,23 +1979,21 @@ class BatchGenWorker:
 		scale_dict: Optional[dict] = None,
 	) -> Tuple[List[str], List[int]]:
 		"""
-		Continuous decoding with async optimizations:
+		Continuous decoding with async optimizations and detailed timing.
 		
-		1. KV append to host: fire-and-forget, wait only at page boundaries
+		Key Optimizations:
+		1. KV append: fire-and-forget, wait only at page boundaries
 		2. Load new sequences: async, overlap with next page's decoding
+		3. Consolidated page table rebuilds
+		4. Reduced barriers
 		
-		Page Boundary Flow:
-			PHASE 1: SYNC - Wait pending ops, integrate previous load, rebuild page table
-			PHASE 2: EVICTION - Sync completion, release completed sequences
-			PHASE 3: EXTENSION - Extend page buffers, put sequences ON_HOLD if needed
-			PHASE 4: LAUNCH ASYNC LOAD - Start loading new sequences for next boundary
+		Timing instrumentation added for performance analysis.
 		"""
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
 		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
 		
-		# Legacy modes don't support async optimizations
 		if RUNTIME_ATTN_MODE != 3:
 			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
 			return decode_uuids, batch
@@ -1951,7 +2007,6 @@ class BatchGenWorker:
 		
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		
-		# Bind to Attn_Wrapper for forward pass
 		Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
 		Attn_Wrapper.host_paged_kv_worker_view = worker_view
 		Attn_Wrapper.scale = scale_dict
@@ -1962,14 +2017,16 @@ class BatchGenWorker:
 		# =========================================
 		# ASYNC STATE TRACKING
 		# =========================================
-		# KV append tasks from current page (waited at next page boundary)
 		self._pending_kv_append_tasks: List = []
 		
-		# Async load state: load launched at page N, integrated at page N+1
 		pending_async_load_task = None
-		pending_load_uuids: List[str] = []           # Global UUIDs being loaded
-		pending_load_local_indices: List[int] = []   # Local indices for THIS rank
-		pending_load_global_ids: List[int] = []      # Global sequence IDs for THIS rank
+		pending_load_uuids: List[str] = []
+		pending_load_local_indices: List[int] = []
+		pending_load_global_ids: List[int] = []
+		
+		# Timing accumulator
+		boundary_timings: List[BoundaryTimingStats] = []
+		forward_times_ms: List[float] = []
 		
 		iteration = 0
 		last_page_boundary_check = 0
@@ -1982,24 +2039,31 @@ class BatchGenWorker:
 			
 			if self.rank == 0 and iteration % 100 == 0:
 				logging.info(
-					f"Decode iteration {iteration}, {len(decode_uuids)} active sequences, "
+					f"Decode iteration {iteration}, {len(decode_uuids)} active, "
 					f"{len(batch)} local"
 				)
 			
 			# =============================================================
-			# PAGE BOUNDARY LOGIC
+			# PAGE BOUNDARY LOGIC (with detailed timing)
 			# =============================================================
 			if iteration - last_page_boundary_check >= self.PAGE_SIZE:
 				last_page_boundary_check = iteration
 				
+				timing = BoundaryTimingStats()
+				boundary_start = time.perf_counter()
+				
 				# --------------------------------------------------------
 				# PHASE 1: SYNC ALL PENDING OPERATIONS
 				# --------------------------------------------------------
-				# 1a. Wait for KV append tasks from THIS page
-				#     Host KV must be consistent before any eviction/load decisions
-				self._wait_pending_kv_append_tasks()
 				
-				# 1b. Integrate PREVIOUS async load (launched at page N-1)
+				# 1a. Wait for KV append tasks
+				t0 = time.perf_counter()
+				self._wait_pending_kv_append_tasks()
+				torch.cuda.synchronize(self.torch_device)  # Ensure complete
+				timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
+				
+				# 1b. Integrate PREVIOUS async load
+				t0 = time.perf_counter()
 				if pending_async_load_task is not None:
 					decode_uuids, batch = self._finalize_async_load(
 						pending_async_load_task,
@@ -2010,119 +2074,116 @@ class BatchGenWorker:
 						batch,
 						gpu_manager
 					)
-					# Clear pending state
 					pending_async_load_task = None
 					pending_load_uuids = []
 					pending_load_local_indices = []
 					pending_load_global_ids = []
+				timing.finalize_async_load_ms = (time.perf_counter() - t0) * 1000
 				
-				# 1c. IMMEDIATELY rebuild page table after integration
-				#     This ensures consistent state for all subsequent operations
-				if gpu_manager is not None and gpu_manager.is_initialized and batch:
-					global_ids = self._local_indices_to_global_seq_ids(batch)
-					gpu_manager.rebuild_page_table(global_ids)
-					Attn_Wrapper.cur_batch = global_ids
-				else:
-					Attn_Wrapper.cur_batch = []
+				# 1c. Rebuild page table ONCE after integration
+				t0 = time.perf_counter()
+				self._rebuild_page_table_for_batch(batch, gpu_manager)
+				timing.rebuild_after_integration_ms = (time.perf_counter() - t0) * 1000
 				
+				# 1d. Barrier for global consistency
+				t0 = time.perf_counter()
 				dist.barrier()
+				timing.barrier_after_sync_ms = (time.perf_counter() - t0) * 1000
 				
 				# --------------------------------------------------------
 				# PHASE 2: EVICTION (Completed Sequences)
 				# --------------------------------------------------------
-				# 2a. Sync completion status across all ranks
+				
+				# 2a. Sync completion status
+				t0 = time.perf_counter()
 				decode_uuids, completed_uuids = self._sync_completion_status_at_boundary(decode_uuids)
+				timing.sync_completion_ms = (time.perf_counter() - t0) * 1000
+				timing.num_completed = len(completed_uuids)
 				
 				# 2b. Evict completed sequences
+				t0 = time.perf_counter()
+				need_rebuild_after_eviction = False
 				if completed_uuids:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
-					
-					# Release host and GPU KV pages for MY completed sequences
 					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 					if my_completed:
 						self._release_host_kv_pages_for_batch(my_completed)
-					
-					# Update local batch
+						need_rebuild_after_eviction = True
 					batch = self._get_local_indices_for_uuids(decode_uuids)
-					
-					# Rebuild page table without evicted sequences
-					if gpu_manager is not None and gpu_manager.is_initialized and batch:
-						global_ids = self._local_indices_to_global_seq_ids(batch)
-						gpu_manager.rebuild_page_table(global_ids)
-						Attn_Wrapper.cur_batch = global_ids
-					else:
-						Attn_Wrapper.cur_batch = []
-					
-					logging.info(
-						f"Rank {self.rank}: Evicted {len(completed_uuids)} completed sequences, "
-						f"{len(decode_uuids)} remaining"
-					)
 				else:
 					batch = self._get_local_indices_for_uuids(decode_uuids)
+				timing.release_completed_ms = (time.perf_counter() - t0) * 1000
+				
+				# 2c. Rebuild only if we evicted
+				t0 = time.perf_counter()
+				if need_rebuild_after_eviction:
+					self._rebuild_page_table_for_batch(batch, gpu_manager)
+				timing.rebuild_after_eviction_ms = (time.perf_counter() - t0) * 1000
 				
 				# --------------------------------------------------------
 				# PHASE 3: EXTENSION (Grow Page Buffers)
 				# --------------------------------------------------------
-				# Check if any sequences need more GPU pages
-				# May put some sequences ON_HOLD to free up space
+				t0 = time.perf_counter()
 				decode_uuids, batch, onhold_uuids = self._check_and_extend_page_buffer(
 					decode_uuids, batch
 				)
+				timing.extend_page_buffer_ms = (time.perf_counter() - t0) * 1000
+				timing.num_onhold = len(onhold_uuids)
 				
+				# Rebuild only if we put sequences ON_HOLD
+				t0 = time.perf_counter()
 				if onhold_uuids:
-					logging.info(
-						f"Rank {self.rank}: Put {len(onhold_uuids)} sequences ON_HOLD "
-						f"to free GPU pages"
-					)
-					# Rebuild page table after ON_HOLD eviction
-					if gpu_manager is not None and gpu_manager.is_initialized and batch:
-						global_ids = self._local_indices_to_global_seq_ids(batch)
-						gpu_manager.rebuild_page_table(global_ids)
-						Attn_Wrapper.cur_batch = global_ids
-					else:
-						Attn_Wrapper.cur_batch = []
+					self._rebuild_page_table_for_batch(batch, gpu_manager)
+				timing.rebuild_after_extension_ms = (time.perf_counter() - t0) * 1000
 				
 				# --------------------------------------------------------
 				# PHASE 4: LAUNCH ASYNC LOAD FOR NEW SEQUENCES
 				# --------------------------------------------------------
-				# Launch async load - will be integrated at NEXT page boundary
-				# This overlaps loading with the next page's decode operations
+				t0 = time.perf_counter()
 				(pending_async_load_task, 
 				pending_load_uuids, 
 				pending_load_local_indices,
-				pending_load_global_ids) = self._launch_async_load_new_sequences(
+				pending_load_global_ids,
+				load_timing) = self._launch_async_load_new_sequences_timed(
 					decode_uuids, batch, gpu_manager
 				)
+				launch_total_ms = (time.perf_counter() - t0) * 1000
 				
-				if pending_async_load_task is not None:
-					logging.info(
-						f"Rank {self.rank}: Launched async load for {len(pending_load_uuids)} sequences, "
-						f"will integrate at next boundary"
-					)
-				
-				# Note: _launch_async_load_new_sequences internally:
-				#   1. Temporarily rebuilds page table with NEW sequences to get pointers
-				#   2. Launches async load
-				#   3. Restores page table with EXISTING sequences for attention
+				# Unpack sub-timings
+				timing.allgather_free_pages_ms = load_timing.get('allgather_ms', 0)
+				timing.select_candidates_ms = load_timing.get('select_ms', 0)
+				timing.allocate_pages_ms = load_timing.get('allocate_ms', 0)
+				timing.launch_async_load_ms = load_timing.get('launch_ms', 0)
+				timing.restore_page_table_ms = load_timing.get('restore_ms', 0)
+				timing.num_loaded = len(pending_load_uuids)
 				
 				# --------------------------------------------------------
 				# PREPARE FOR NEXT PAGE
 				# --------------------------------------------------------
 				new_tokens = self._rebuild_input_tokens(batch)
 				
+				t0 = time.perf_counter()
 				dist.barrier()
+				timing.barrier_final_ms = (time.perf_counter() - t0) * 1000
 				
-				# Check if we're done
+				timing.total_boundary_ms = (time.perf_counter() - boundary_start) * 1000
+				boundary_timings.append(timing)
+				
+				# Log timing for this boundary
+				if self.rank == 0:
+					logging.info(f"Page boundary {len(boundary_timings)}:\n{timing}")
+				
 				if not decode_uuids:
-					# Wait for any pending load before exit
 					if pending_async_load_task is not None:
 						pending_async_load_task.wait()
 						torch.cuda.synchronize(self.torch_device)
 					break
 			
 			# =============================================================
-			# FORWARD PASS
+			# FORWARD PASS (with timing)
 			# =============================================================
+			forward_start = time.perf_counter()
+			
 			with torch.inference_mode():
 				if batch:
 					# Build attention metadata
@@ -2138,7 +2199,6 @@ class BatchGenWorker:
 						attention_masks.append(mask)
 						cache_seqlens.append(ctx_len)
 					
-					# Pad attention masks to max context length
 					max_ctx = max(cache_seqlens)
 					padded_masks = []
 					for mask in attention_masks:
@@ -2153,7 +2213,6 @@ class BatchGenWorker:
 					
 					attention_mask = torch.cat(padded_masks, dim=0).to(self.torch_device)
 					
-					# Set Attn_Wrapper state
 					Attn_Wrapper.attention_mask = attention_mask
 					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
 					Attn_Wrapper.cache_seqlens = torch.tensor(
@@ -2161,11 +2220,9 @@ class BatchGenWorker:
 					)
 					Attn_Wrapper.max_seqlen = max_ctx
 					
-					# Ensure token tensor matches batch size
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
 				else:
-					# Empty batch (this rank has no sequences)
 					Attn_Wrapper.attention_mask = torch.zeros(
 						(0, 1), dtype=torch.int64, device=self.torch_device
 					)
@@ -2179,32 +2236,23 @@ class BatchGenWorker:
 					Attn_Wrapper.cur_batch = []
 					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
 				
-				# --------------------------------------------------------
-				# KV APPEND CALLBACK (Fire-and-Forget)
-				# --------------------------------------------------------
-				# Tasks are LAUNCHED but NOT WAITED
-				# They will be waited at the next page boundary
+				# KV append callback - FIRE AND FORGET
+				# Capture batch by value to avoid closure issues
+				current_batch = list(batch)
 				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor):
-					self._append_decode_kv_to_host_async(layer_idx, batch, k_tensor)
-					# Returns None - no blocking wait
+					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor)
+					# Returns None - NO BLOCKING WAIT
 				
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				
-				# --------------------------------------------------------
-				# MODEL FORWARD PASS
-				# --------------------------------------------------------
+				# Forward pass
 				outputs = self.model(
 					new_tokens,
 					attention_mask=Attn_Wrapper.attention_mask,
 					use_cache=False,
 				)
 				
-				# NOTE: NO waiting for KV append tasks here!
-				# Host writes don't race with GPU reads (different memory spaces)
-				
-				# --------------------------------------------------------
-				# UPDATE LOCAL SEQUENCES
-				# --------------------------------------------------------
+				# Update sequences
 				if batch:
 					new_tokens = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
 					
@@ -2212,52 +2260,44 @@ class BatchGenWorker:
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						
-						# Skip already completed sequences
 						if seq.eos_reached:
 							continue
 						
 						decode_pos = seq.decoded_length
 						
-						# Check max decode length
 						if decode_pos >= self.max_decoding_length:
 							seq.eos_reached = True
 							continue
 						
-						# Store decoded token
 						self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
 						
-						# Update attention mask for next iteration
 						attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
 						next_pos = seq.current_context_length
 						if next_pos < attn_mask.shape[0]:
 							attn_mask[next_pos] = 1
 						
-						# Update sequence state
 						seq.decoded_length += 1
 						seq.current_context_length += 1
 						
-						# Check EOS
 						if new_tokens[i].item() == self.eos_token_id:
 							seq.eos_reached = True
 						
-						# Check max decode length again
 						if seq.decoded_length >= self.max_decoding_length:
 							seq.eos_reached = True
 				else:
 					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+			
+			forward_times_ms.append((time.perf_counter() - forward_start) * 1000)
 		
 		# =========================================
 		# FINAL CLEANUP
 		# =========================================
-		# Wait for any remaining KV append tasks
 		self._wait_pending_kv_append_tasks()
 		
-		# Wait for any pending async load
 		if pending_async_load_task is not None:
 			pending_async_load_task.wait()
 			torch.cuda.synchronize(self.torch_device)
 		
-		# Clear Attn_Wrapper state
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
 		Attn_Wrapper.past_key_states = None
@@ -2266,16 +2306,80 @@ class BatchGenWorker:
 		Attn_Wrapper.host_paged_kv_worker_view = None
 		Attn_Wrapper.cur_batch = None
 		
+		# =========================================
+		# TIMING SUMMARY
+		# =========================================
+		if self.rank == 0 and boundary_timings:
+			avg_forward = sum(forward_times_ms) / len(forward_times_ms) if forward_times_ms else 0
+			avg_boundary = sum(t.total_boundary_ms for t in boundary_timings) / len(boundary_timings)
+			
+			# Aggregate sub-timings
+			avg_wait_kv = sum(t.wait_kv_append_ms for t in boundary_timings) / len(boundary_timings)
+			avg_finalize = sum(t.finalize_async_load_ms for t in boundary_timings) / len(boundary_timings)
+			avg_sync_completion = sum(t.sync_completion_ms for t in boundary_timings) / len(boundary_timings)
+			avg_allgather = sum(t.allgather_free_pages_ms for t in boundary_timings) / len(boundary_timings)
+			avg_barriers = sum(t.barrier_after_sync_ms + t.barrier_final_ms for t in boundary_timings) / len(boundary_timings)
+			avg_rebuilds = sum(
+				t.rebuild_after_integration_ms + t.rebuild_after_eviction_ms + 
+				t.rebuild_after_extension_ms + t.restore_page_table_ms 
+				for t in boundary_timings
+			) / len(boundary_timings)
+			
+			logging.info(
+				f"\n{'='*60}\n"
+				f"TIMING SUMMARY (Rank 0)\n"
+				f"{'='*60}\n"
+				f"Total iterations: {iteration}\n"
+				f"Total boundaries: {len(boundary_timings)}\n"
+				f"Avg forward pass: {avg_forward:.2f}ms\n"
+				f"Avg boundary total: {avg_boundary:.2f}ms\n"
+				f"  - wait_kv_append: {avg_wait_kv:.2f}ms\n"
+				f"  - finalize_load: {avg_finalize:.2f}ms\n"
+				f"  - sync_completion: {avg_sync_completion:.2f}ms\n"
+				f"  - allgather: {avg_allgather:.2f}ms\n"
+				f"  - barriers: {avg_barriers:.2f}ms\n"
+				f"  - page_table_rebuilds: {avg_rebuilds:.2f}ms\n"
+				f"Boundary overhead per token: {avg_boundary / self.PAGE_SIZE:.2f}ms\n"
+				f"{'='*60}"
+			)
+		
 		logging.info(f"Rank {self.rank}: decoding_continuous completed after {iteration} iterations")
 		
 		return decode_uuids, batch
 
+	# def _wait_pending_kv_append_tasks(self):
+	# 	"""Wait for all pending KV append tasks at page boundary."""
+	# 	for task in self._pending_kv_append_tasks:
+	# 		if task is not None:
+	# 			task.wait()
+	# 	self._pending_kv_append_tasks.clear()
+
 	def _wait_pending_kv_append_tasks(self):
 		"""Wait for all pending KV append tasks at page boundary."""
+		if not hasattr(self, '_pending_kv_append_tasks'):
+			return
 		for task in self._pending_kv_append_tasks:
 			if task is not None:
 				task.wait()
 		self._pending_kv_append_tasks.clear()
+
+	def _rebuild_page_table_for_batch(
+		self,
+		batch: List[int],
+		gpu_manager: GPUPagedKVCacheManager
+	) -> None:
+		"""Consolidated page table rebuild - single place to rebuild."""
+		if gpu_manager is None or not gpu_manager.is_initialized:
+			Attn_Wrapper.cur_batch = []
+			return
+		
+		if not batch:
+			Attn_Wrapper.cur_batch = []
+			return
+		
+		global_ids = self._local_indices_to_global_seq_ids(batch)
+		gpu_manager.rebuild_page_table(global_ids)
+		Attn_Wrapper.cur_batch = global_ids
 
 	def _append_decode_kv_to_host_async(
 		self,
@@ -2449,6 +2553,111 @@ class BatchGenWorker:
 			gpu_manager.rebuild_page_table(existing_global_ids)
 		
 		return async_task, new_uuids, new_local_indices, new_global_ids
+
+
+	def _launch_async_load_new_sequences_timed(
+		self,
+		current_decode_uuids: List[str],
+		current_batch: List[int],
+		gpu_manager: GPUPagedKVCacheManager
+	) -> Tuple[Optional[object], List[str], List[int], List[int], Dict[str, float]]:
+		"""
+		Launch async load with detailed timing.
+		
+		Returns:
+			(async_task, new_uuids, new_local_indices, new_global_ids, timing_dict)
+		"""
+		timing = {}
+		
+		if gpu_manager is None or not gpu_manager.is_initialized:
+			return None, [], [], [], timing
+		
+		# Step 1: All-gather free GPU pages
+		t0 = time.perf_counter()
+		local_free = gpu_manager.get_stats().num_free_pages
+		free_tensor = torch.tensor([local_free], dtype=torch.int64, device=self.torch_device)
+		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
+		dist.all_gather(gathered, free_tensor)
+		per_rank_free = [int(t.item()) for t in gathered]
+		timing['allgather_ms'] = (time.perf_counter() - t0) * 1000
+		
+		# Step 2: Get and select candidates
+		t0 = time.perf_counter()
+		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+		onhold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+		candidates = prefilled + onhold
+		candidates.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+		
+		if not candidates:
+			timing['select_ms'] = (time.perf_counter() - t0) * 1000
+			return None, [], [], [], timing
+		
+		# Greedy selection
+		rank_pages_used = [0] * self.world_size
+		new_uuids = []
+		
+		for uuid in candidates:
+			seq = self.global_batch.get_sequence(uuid)
+			assigned_rank = seq.assigned_rank
+			req_pages = seq.get_gpu_pages_for_two_page_buffer()
+			
+			if rank_pages_used[assigned_rank] + req_pages <= per_rank_free[assigned_rank]:
+				new_uuids.append(uuid)
+				rank_pages_used[assigned_rank] += req_pages
+		
+		timing['select_ms'] = (time.perf_counter() - t0) * 1000
+		
+		if not new_uuids:
+			return None, [], [], [], timing
+		
+		# Step 3: Get THIS RANK's sequences
+		my_new_uuids = [u for u in new_uuids 
+					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
+		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
+		
+		if not new_local_indices:
+			return None, new_uuids, [], [], timing
+		
+		new_global_ids = self._local_indices_to_global_seq_ids(new_local_indices)
+		tokens = self._compute_host_kv_sequence_tokens(new_local_indices)
+		
+		# Step 4: Allocate GPU pages
+		t0 = time.perf_counter()
+		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
+		timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
+		
+		# Step 5: Temp rebuild and launch
+		t0 = time.perf_counter()
+		gpu_manager.rebuild_page_table(new_global_ids)
+		k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+		active_page_counts = gpu_manager.export_active_sequence_page_counts()
+		
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
+			if existing_global_ids:
+				gpu_manager.rebuild_page_table(existing_global_ids)
+			timing['launch_ms'] = (time.perf_counter() - t0) * 1000
+			return None, new_uuids, new_local_indices, new_global_ids, timing
+		
+		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
+		
+		async_task = worker_view.async_load_layer_paged_kv_to_device(
+			sequence_ids=sequence_tensor,
+			active_page_counts=active_page_counts,
+			k_device_ptrs=k_ptrs,
+			v_device_ptrs=v_ptrs,
+		)
+		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
+		
+		# Step 6: Restore page table
+		t0 = time.perf_counter()
+		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
+		if existing_global_ids:
+			gpu_manager.rebuild_page_table(existing_global_ids)
+		timing['restore_ms'] = (time.perf_counter() - t0) * 1000
+		
+		return async_task, new_uuids, new_local_indices, new_global_ids, timing
 
 	def _finalize_async_load(
 		self,
