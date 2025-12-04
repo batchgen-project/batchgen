@@ -389,24 +389,19 @@ class _GPUPageTableManager:
 
 		# Fast-path: if an existing GPU table already matches the exact
 		# shape we need and the order is identical, return a view into it.
-		if (
+		reuse_existing = (
 			self.gpu_table is not None
 			and self.gpu_table.shape[0] == num_slots
 			and self.gpu_table.shape[1] >= new_max
 			and self.slot_to_seq_id == wanted_order
-		):
-			self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
-			self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
-				wanted_order
-			)
-			self._active_page_indices_cpu = flat_pages_cpu
-			# If table has more columns than needed, return a view with
-			# the requested number of rows and the existing columns.
-			return self.gpu_table[:num_slots, :]
+		)
 
-		# Build a fresh GPU table with the computed new_max columns.
-		table = torch.full(
-			(num_slots, new_max), -1, dtype=torch.int32, device=self.device
+		table = (
+			self.gpu_table
+			if reuse_existing
+			else torch.full(
+				(num_slots, new_max), -1, dtype=torch.int32, device=self.device
+			)
 		)
 
 		# Replace mappings with exactly the requested order. This keeps
@@ -416,6 +411,8 @@ class _GPUPageTableManager:
 		}
 		self.slot_to_seq_id = list(wanted_order)
 		self.max_pages_per_sequence = int(new_max)
+
+		fill_region = table[:num_slots, :new_max]
 
 		# Fill table rows from sequence state pages.
 		for slot, seq_id in enumerate(wanted_order):
@@ -435,15 +432,18 @@ class _GPUPageTableManager:
 				)
 				count = new_max
 				pages = pages[:count]
-			table[slot, :count] = pages[:count]
+			fill_region[slot, :count] = pages[:count]
 
-		self.gpu_table = table
+		if not reuse_existing:
+			self.gpu_table = table
 		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
 		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
 			self.slot_to_seq_id
 		)
 		self._active_page_indices_cpu = flat_pages_cpu
-		return table
+		# If table has more columns than needed, return a view with
+		# the requested number of rows and the existing columns.
+		return table[:num_slots, :]
 
 	def get_slot_index_tensor(self) -> torch.Tensor:
 		"""Returns a cached 1-D tensor mapping logical batch order to slots."""
@@ -497,7 +497,7 @@ class _GPUPageTableManager:
 		for seq_id in sequence_ids:
 			state = sequences.get(seq_id)
 			if state is None or state.pages.numel() == 0:
-				continue
+				continue  
 			buffers.append(state.pages.to("cpu", dtype=torch.int64))
 		if not buffers:
 			return torch.empty(0, dtype=torch.int64)
