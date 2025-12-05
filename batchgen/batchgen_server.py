@@ -246,7 +246,6 @@ class BatchGenServer:
 		finally:
 			conn.close()
 
-	# In BatchGenServer class
 	def process_request(self, request: Any) -> Dict:
 		command = None
 		queries = []
@@ -254,8 +253,8 @@ class BatchGenServer:
 		# Defaults
 		max_input_len = 1024
 		max_output_len = 128
+		ignore_eos = False  # NEW: Default to respecting EOS
 
-		# --- LOGIC UPDATE START ---
 		if isinstance(request, list):
 			# Backwards compatibility for raw lists
 			command = 'submit_inference'
@@ -266,7 +265,7 @@ class BatchGenServer:
 			# Extract params from client request
 			max_input_len = request.get('max_input_len', 1024)
 			max_output_len = request.get('max_output_len', 128)
-		# --- LOGIC UPDATE END ---
+			ignore_eos = request.get('ignore_eos', False)  # NEW: Extract ignore_eos
 		else:
 			return {'status': 'error', 'message': 'Invalid input type.'}
 		
@@ -277,20 +276,23 @@ class BatchGenServer:
 			if not queries:
 				return {'status': 'error', 'message': 'Empty queries list'}
 
-			logging.info(f"Processing batch of {len(queries)} items.")
+			logging.info(
+				f"Processing batch of {len(queries)} items "
+				f"(ignore_eos={ignore_eos}, max_output_len={max_output_len})"
+			)
 			
 			with self.inference_lock:
 				start_t = time.perf_counter()
 				
-				# --- CRITICAL FIX: Wrap data into the Dict expected by Worker ---
+				# Pass ignore_eos to worker
 				worker_payload = {
-					"prompts": queries,         # Remap 'queries' to 'prompts'
+					"prompts": queries,
 					"max_input_len": max_input_len,
-					"max_output_len": max_output_len
+					"max_output_len": max_output_len,
+					"ignore_eos": ignore_eos,  # NEW: Pass to worker
 				}
 				
 				self.request_queue.put(worker_payload)
-				# ---------------------------------------------------------------
 				
 				result = self.response_queue.get()
 				dur = time.perf_counter() - start_t

@@ -294,6 +294,7 @@ class BatchGenWorker:
 		self.max_decoding_length = 0
 		self.num_global_queries = 0
 		self.num_local_queries = 0
+		self._ignore_eos: bool = False
 		
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -366,6 +367,47 @@ class BatchGenWorker:
 		)
 		
 		return manager
+		
+	def set_ignore_eos(self, ignore_eos: bool) -> None:
+		"""
+		Set whether to ignore EOS tokens during decoding.
+		
+		When True, sequences will decode to max_decoding_length regardless of EOS.
+		Useful for benchmarking to ensure consistent workload across all sequences.
+		
+		Args:
+			ignore_eos: If True, ignore EOS tokens
+		"""
+		self._ignore_eos = ignore_eos
+		logging.info(f"Rank {self.rank}: ignore_eos set to {ignore_eos}")
+
+	def _should_stop_at_eos(self, token_id: int) -> bool:
+		"""
+		Check if we should stop at this token.
+		
+		Returns True if token is EOS AND we're not ignoring EOS.
+		"""
+		if self._ignore_eos:
+			return False
+		return token_id == self.eos_token_id
+
+	def _is_sequence_completed(self, seq) -> bool:
+		"""
+		Unified completion check that respects ignore_eos.
+		
+		A sequence is completed if:
+		1. It reached max_decoding_length (always checked), OR
+		2. It hit EOS AND ignore_eos is False
+		"""
+		# Always complete at max length
+		if seq.decoded_length >= self.max_decoding_length:
+			return True
+		
+		# Only complete at EOS if not ignoring EOS
+		if seq.eos_reached and not self._ignore_eos:
+			return True
+		
+		return False
 
 	def _compute_two_page_buffer_allocation(
 		self, 
@@ -1319,10 +1361,7 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[int], List[str]]:
 		"""
 		Check for completed sequences at page boundaries.
-		Returns:
-			- updated decode_uuids (active sequences)
-			- updated local_decode_indices (active local indices)
-			- completed_uuids (sequences that completed)
+		FIXED: Respects ignore_eos flag.
 		"""
 		completed_uuids = []
 		active_uuids = []
@@ -1331,12 +1370,13 @@ class BatchGenWorker:
 		for uuid in decode_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			
-			# Check if sequence should be completed
-			if seq.check_completion(self.eos_token_id):
+			# FIXED: Use unified completion check
+			if self._is_sequence_completed(seq):
 				completed_uuids.append(uuid)
 				logging.info(
 					f"Rank {self.rank}: Sequence {uuid} completed at token {new_token_idx} "
-					f"(decoded_length={seq.decoded_length}, eos_reached={seq.eos_reached})"
+					f"(decoded_length={seq.decoded_length}, eos_reached={seq.eos_reached}, "
+					f"ignore_eos={self._ignore_eos})"
 				)
 			else:
 				active_uuids.append(uuid)
@@ -1963,8 +2003,8 @@ class BatchGenWorker:
 			seq.decoded_length = 1
 			seq.current_context_length = seq.prompt_length + 1
 			
-			# Check for EOS in first token
-			if new_tokens[i].item() == self.eos_token_id:
+			# MODIFIED: Check for EOS respecting ignore_eos flag
+			if self._should_stop_at_eos(new_tokens[i].item()):
 				seq.eos_reached = True
 		
 		return new_tokens
@@ -2253,39 +2293,46 @@ class BatchGenWorker:
 				)
 				
 				# Update sequences
-				if batch:
-					new_tokens = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
+				new_tokens = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
+				
+				for i, local_idx in enumerate(batch):
+					uuid = self._local_to_uuid_map[local_idx]
+					seq = self.global_batch.get_sequence(uuid)
 					
-					for i, local_idx in enumerate(batch):
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
-						
-						if seq.eos_reached:
-							continue
-						
-						decode_pos = seq.decoded_length
-						
-						if decode_pos >= self.max_decoding_length:
-							seq.eos_reached = True
-							continue
-						
-						self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
-						
-						attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
-						next_pos = seq.current_context_length
-						if next_pos < attn_mask.shape[0]:
-							attn_mask[next_pos] = 1
-						
-						seq.decoded_length += 1
-						seq.current_context_length += 1
-						
-						if new_tokens[i].item() == self.eos_token_id:
-							seq.eos_reached = True
-						
-						if seq.decoded_length >= self.max_decoding_length:
-							seq.eos_reached = True
-				else:
-					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+					# FIXED: Check if sequence is already completed
+					# Use _is_sequence_completed to properly respect ignore_eos
+					if self._is_sequence_completed(seq):
+						continue
+					
+					decode_pos = seq.decoded_length
+					
+					# Store token
+					self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
+					
+					# Update attention mask
+					attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
+					next_pos = seq.current_context_length
+					if next_pos < attn_mask.shape[0]:
+						attn_mask[next_pos] = 1
+					
+					# Update sequence state
+					seq.decoded_length += 1
+					seq.current_context_length += 1
+					
+					# FIXED: Check EOS respecting ignore_eos flag
+					# Only set eos_reached if we should stop at this EOS
+					if self._should_stop_at_eos(new_tokens[i].item()):
+						seq.eos_reached = True
+						logging.debug(
+							f"Rank {self.rank}: Sequence {uuid} hit EOS at position {decode_pos}"
+						)
+					
+					# Check max length (always enforced)
+					if seq.decoded_length >= self.max_decoding_length:
+						seq.eos_reached = True  # Mark as done
+						logging.debug(
+							f"Rank {self.rank}: Sequence {uuid} reached max_decoding_length"
+						)
 			
 			forward_times_ms.append((time.perf_counter() - forward_start) * 1000)
 		
@@ -2744,39 +2791,31 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[str]]:
 		"""
 		Efficient completion sync at page boundaries using all_reduce.
-		
-		Each sequence is owned by exactly one rank. Only the owner knows
-		if it hit EOS. We use all_reduce(MAX) to broadcast completion status.
-		
-		Returns: (active_uuids, completed_uuids)
+		FIXED: Correctly respects ignore_eos.
 		"""
 		if not decode_uuids:
 			return [], []
 		
 		n = len(decode_uuids)
-		
-		# Build completion tensor - each rank marks its owned sequences
 		completion = torch.zeros(n, dtype=torch.int32, device=self.torch_device)
 		
 		for i, uuid in enumerate(decode_uuids):
-			# Only mark if this rank owns the sequence
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
-				if seq.eos_reached or seq.decoded_length >= self.max_decoding_length:
+				# FIXED: Use unified completion check
+				if self._is_sequence_completed(seq):
 					completion[i] = 1
 		
-		# All-reduce MAX: completed on ANY rank means globally completed
 		dist.all_reduce(completion, op=dist.ReduceOp.MAX)
 		
-		# Split based on result
 		active = []
 		completed = []
 		
 		for i, uuid in enumerate(decode_uuids):
 			if completion[i].item() == 1:
 				completed.append(uuid)
-				# Ensure local state is consistent
 				seq = self.global_batch.get_sequence(uuid)
+				# Mark as completed (for consistency)
 				seq.eos_reached = True
 			else:
 				active.append(uuid)
@@ -2913,25 +2952,22 @@ class BatchGenWorker:
 	) -> Tuple[List[str], List[str]]:
 		"""
 		Synchronize completion status across all ranks using all-reduce.
-		Returns (active_uuids, completed_uuids).
+		FIXED: Respects ignore_eos flag.
 		"""
 		if not decode_uuids:
 			return [], []
 		
-		# Build completion mask
 		completion_mask = torch.zeros(len(decode_uuids), dtype=torch.int32, device=self.torch_device)
 		
 		for i, uuid in enumerate(decode_uuids):
 			if uuid in self._uuid_to_local_map:
-				# This rank owns this sequence - check actual state
 				seq = self.global_batch.get_sequence(uuid)
-				if seq.eos_reached or seq.decoded_length >= self.max_decoding_length:
+				# FIXED: Use unified completion check
+				if self._is_sequence_completed(seq):
 					completion_mask[i] = 1
 		
-		# All-reduce MAX: if ANY rank says complete, it's complete
 		dist.all_reduce(completion_mask, op=dist.ReduceOp.MAX)
 		
-		# Split into active and completed
 		active_uuids = []
 		completed_uuids = []
 		
@@ -2939,7 +2975,6 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if completion_mask[i].item() == 1:
 				completed_uuids.append(uuid)
-				# Update local state for consistency
 				seq.eos_reached = True
 			else:
 				active_uuids.append(uuid)
@@ -2964,9 +2999,12 @@ class BatchGenWorker:
 			# Page boundary check
 			if new_token_idx > 0 and new_token_idx % self.PAGE_SIZE == 0:
 				dist.barrier()
+				
+				# FIXED: Use updated _check_and_handle_completions
 				decode_uuids, batch, completed_uuids = self._check_and_handle_completions(
 					decode_uuids, batch, new_token_idx
 				)
+				
 				if completed_uuids:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 					self._release_host_kv_pages_for_batch(completed_uuids)
@@ -3017,8 +3055,15 @@ class BatchGenWorker:
 						seq = self.global_batch.get_sequence(uuid)
 						seq.decoded_length = new_token_idx + 1
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
-						if new_tokens[i].item() == self.eos_token_id:
+						
+						# Only mark eos_reached if we should stop at EOS
+						if self._should_stop_at_eos(new_tokens[i].item()):
 							seq.eos_reached = True
+						
+						# Always check max length
+						if seq.decoded_length >= self.max_decoding_length:
+							seq.eos_reached = True
+
 				new_token_idx += 1
 
 			elif RUNTIME_ATTN_MODE == 1:
@@ -3086,8 +3131,15 @@ class BatchGenWorker:
 						seq = self.global_batch.get_sequence(uuid)
 						seq.decoded_length = new_token_idx + 1
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
-						if new_tokens[i].item() == self.eos_token_id:
+						
+						# Only mark eos_reached if we should stop at EOS
+						if self._should_stop_at_eos(new_tokens[i].item()):
 							seq.eos_reached = True
+						
+						# Always check max length
+						if seq.decoded_length >= self.max_decoding_length:
+							seq.eos_reached = True
+
 				new_token_idx += 1
 
 			elif RUNTIME_ATTN_MODE == 2:
@@ -3246,7 +3298,8 @@ class BatchGenWorker:
 		
 		# Synchronize all ranks before cleanup
 		dist.barrier()
-		
+		self._ignore_eos = False
+
 		# 1. Cleanup communicator from previous batch
 		if hasattr(self, 'comm') and self.comm is not None:
 			try:
