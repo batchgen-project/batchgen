@@ -2139,6 +2139,7 @@ class BatchGenWorker:
 				if pending_load_uuids:
 					if pending_async_load_task is not None:
 						pending_async_load_task.wait()  # Only ranks with tasks wait
+					dist.barrier()
 					decode_uuids, batch = self._finalize_async_load(
 						pending_async_load_task,
 						pending_load_uuids,
@@ -2251,6 +2252,7 @@ class BatchGenWorker:
 					if pending_load_uuids:  # Global check - all ranks enter
 						if pending_async_load_task is not None:
 							pending_async_load_task.wait()
+						dist.barrier()
 						
 						# MOVE OUTSIDE the task check:
 						decode_uuids, batch = self._finalize_async_load(
@@ -2637,12 +2639,27 @@ class BatchGenWorker:
 		gpu_manager: GPUPagedKVCacheManager
 	) -> Tuple[Optional[object], List[str], List[int], List[int], Dict[str, float]]:
 		"""
-		Launch async load with detailed timing - FIXED version.
+		Launch async load with detailed timing.
+		
+		CRITICAL FIXES:
+		1. Rebuild page table BEFORE launching async task (not after)
+		2. Store tensor references to prevent GC
+		3. Get worker_view at start
+		4. Return new_uuids even on guard failure for global consistency
+		
+		Returns:
+			(async_task, new_uuids, new_local_indices, new_global_ids, timing)
+			
+		Note: new_uuids is the GLOBAL list (all ranks compute same list).
+		new_local_indices/new_global_ids are THIS RANK's sequences only.
 		"""
 		timing = {}
 		
 		if gpu_manager is None or not gpu_manager.is_initialized:
 			return None, [], [], [], timing
+		
+		# Get worker_view at the start
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		
 		# Step 1: All-gather free GPU pages
 		t0 = time.perf_counter()
@@ -2653,7 +2670,7 @@ class BatchGenWorker:
 		per_rank_free = [int(t.item()) for t in gathered]
 		timing['allgather_ms'] = (time.perf_counter() - t0) * 1000
 		
-		# Step 2: Get and select candidates
+		# Step 2: Get and select candidates (GLOBALLY CONSISTENT - all ranks compute identical result)
 		t0 = time.perf_counter()
 		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		onhold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
@@ -2664,7 +2681,7 @@ class BatchGenWorker:
 			timing['select_ms'] = (time.perf_counter() - t0) * 1000
 			return None, [], [], [], timing
 		
-		# Greedy selection using TWO-PAGE BUFFER
+		# Greedy selection (all ranks compute identical new_uuids)
 		rank_pages_used = [0] * self.world_size
 		new_uuids = []
 		
@@ -2687,12 +2704,12 @@ class BatchGenWorker:
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
 		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
 		
+		# If this rank has no sequences to load, return early
+		# IMPORTANT: Still return new_uuids for global consistency
 		if not new_local_indices:
 			return None, new_uuids, [], [], timing
 		
 		new_global_ids = self._local_indices_to_global_seq_ids(new_local_indices)
-		
-		# FIXED: Use two-page buffer tokens
 		tokens = self._compute_two_page_buffer_tokens(new_local_indices)
 		
 		# Step 4: Allocate with guard
@@ -2706,26 +2723,42 @@ class BatchGenWorker:
 				f"only {current_free} free"
 			)
 			timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
+			# Return new_uuids to maintain global consistency
 			return None, new_uuids, [], [], timing
 		
 		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
 		timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
 		
-		# Step 5: Temp rebuild and launch
+		# Step 5: Prepare page table and pointers
 		t0 = time.perf_counter()
+		
+		# Get existing sequence IDs BEFORE any page table modifications
+		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
+		
+		# Temporarily rebuild page table for ONLY new sequences to get correct pointers
 		gpu_manager.rebuild_page_table(new_global_ids)
 		k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
 		active_page_counts = gpu_manager.export_active_sequence_page_counts()
+		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
 		
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		# CRITICAL: Rebuild page table with ALL sequences BEFORE launching async task
+		# This ensures stable state during async execution
+		all_global_ids = existing_global_ids + new_global_ids
+		all_global_ids.sort()
+		if all_global_ids:
+			gpu_manager.rebuild_page_table(all_global_ids)
+		
+		timing['prepare_ms'] = (time.perf_counter() - t0) * 1000
+		
+		# Step 6: Launch async task (page table is now stable)
+		t0 = time.perf_counter()
+		
 		if worker_view is None:
-			existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
-			if existing_global_ids:
-				gpu_manager.rebuild_page_table(existing_global_ids)
+			logging.warning(f"Rank {self.rank}: worker_view is None, cannot launch async load")
 			timing['launch_ms'] = (time.perf_counter() - t0) * 1000
+			timing['restore_ms'] = 0.0
 			return None, new_uuids, new_local_indices, new_global_ids, timing
 		
-		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
 		async_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_page_counts,
@@ -2734,12 +2767,17 @@ class BatchGenWorker:
 		)
 		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 		
-		# Step 6: Restore page table
-		t0 = time.perf_counter()
-		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
-		if existing_global_ids:
-			gpu_manager.rebuild_page_table(existing_global_ids)
-		timing['restore_ms'] = (time.perf_counter() - t0) * 1000
+		# Store tensor references to prevent GC while async task is running
+		# These will be cleared in _finalize_async_load after task completes
+		self._async_load_tensors = {
+			'k_ptrs': k_ptrs,
+			'v_ptrs': v_ptrs,
+			'sequence_tensor': sequence_tensor,
+			'active_page_counts': active_page_counts,
+		}
+		
+		# No restore step needed - page table already includes all sequences
+		timing['restore_ms'] = 0.0
 		
 		return async_task, new_uuids, new_local_indices, new_global_ids, timing
 
@@ -2754,51 +2792,36 @@ class BatchGenWorker:
 		gpu_manager: GPUPagedKVCacheManager
 	) -> Tuple[List[str], List[int]]:
 		"""
-		Wait for async load to complete and integrate new sequences.
+		Integrate new sequences after async load completes.
 		
-		Called at page boundary AFTER the page where load was launched.
-		
-		NOTE: Does NOT rebuild page table. Caller must rebuild after this returns
-			to ensure consistent state.
-		
-		Returns:
-			(updated_decode_uuids, updated_batch)
+		NOTE: Caller is responsible for waiting on async_task before calling this.
+		NOTE: Does NOT rebuild page table - caller must rebuild after.
 		"""
-		# --------------------------------------------------------
-		# Step 1: Wait for async load to complete
-		# --------------------------------------------------------
-		if async_task is not None:
-			async_task.wait()
-			# torch.cuda.synchronize(self.torch_device)
-			
+		# Clear tensor references (task is complete)
+		if hasattr(self, '_async_load_tensors'):
+			self._async_load_tensors = None
+		
+		# Log completion
+		if pending_global_ids:
 			logging.info(
 				f"Rank {self.rank}: Async load completed for {len(pending_global_ids)} sequences"
 			)
 		
-		# --------------------------------------------------------
-		# Step 2: Update status for ALL new sequences (globally consistent)
-		# All ranks do this identically
-		# --------------------------------------------------------
+		# Update status for ALL new sequences (globally consistent)
 		self._update_batch_status(pending_uuids, SequenceStatus.IN_DECODE)
 		
-		# --------------------------------------------------------
-		# Step 3: Update tracking for THIS RANK's sequences
-		# --------------------------------------------------------
+		# Update tracking for THIS RANK's sequences
 		for local_idx in pending_local_indices:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 			self._sequences_with_gpu_kv.add(uuid)
 		
-		# --------------------------------------------------------
-		# Step 4: Merge into decode batch with deterministic ordering
-		# --------------------------------------------------------
+		# Merge into decode batch with deterministic ordering
 		updated_uuids = current_decode_uuids + pending_uuids
 		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 		
-		# --------------------------------------------------------
-		# Step 5: Derive updated local batch
-		# --------------------------------------------------------
+		# Derive updated local batch
 		uuid_to_local = {}
 		for idx in current_batch:
 			uuid = self._local_to_uuid_map.get(idx)
@@ -2809,7 +2832,6 @@ class BatchGenWorker:
 			if uuid:
 				uuid_to_local[uuid] = idx
 		
-		# Build batch in same order as updated_uuids
 		updated_batch = [uuid_to_local[u] for u in updated_uuids if u in uuid_to_local]
 		
 		logging.info(
@@ -2818,8 +2840,6 @@ class BatchGenWorker:
 			f"local batch: {len(current_batch)} -> {len(updated_batch)}"
 		)
 		
-		# NOTE: Page table rebuild is caller's responsibility
-		# This ensures the caller has full control over when the rebuild happens
 		return updated_uuids, updated_batch
 
 	def _sync_completion_status_at_boundary(
