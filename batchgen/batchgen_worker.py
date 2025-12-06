@@ -2826,10 +2826,11 @@ class BatchGenWorker:
 		active_page_counts = gpu_manager.export_active_sequence_page_counts()
 		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
 		
-		# Rebuild with ALL sequences for kernel consistency
-		all_global_ids = sorted(set(existing_global_ids + new_global_ids))
-		if all_global_ids:
-			gpu_manager.rebuild_page_table(all_global_ids)
+		# FIX: Restore page table to ONLY existing sequences (not all)
+		# New sequences are being loaded async and NOT part of current forward pass
+		if existing_global_ids:
+			gpu_manager.rebuild_page_table(existing_global_ids)
+		# If no existing sequences, page table will be rebuilt when batch becomes non-empty
 		
 		timing['prepare_ms'] = (time.perf_counter() - t0) * 1000
 		
