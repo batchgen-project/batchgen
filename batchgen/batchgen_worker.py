@@ -898,16 +898,27 @@ class BatchGenWorker:
 			raise RuntimeError("Host paged KV worker view is not bound to the core engine")
 		
 		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
-		# k_ptrs, v_ptrs = manager.export_layer_page_pointer_table()
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
+		
+		logging.info(
+			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
+			f"{len(global_sequence_ids)} sequences..."
+		)
+		
 		load_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_sequence_page_counts,
 			k_device_ptrs=k_ptrs,
 			v_device_ptrs=v_ptrs,
 		)
+		
+		logging.info(f"Rank {self.rank}: _load_host_kv_to_gpu calling load_task.wait()...")
+		t_wait = time.perf_counter()
 		load_task.wait()
+		wait_ms = (time.perf_counter() - t_wait) * 1000
+		logging.info(f"Rank {self.rank}: _load_host_kv_to_gpu load_task.wait() completed in {wait_ms:.2f}ms")
+		
 		torch.cuda.synchronize(self.torch_device)
 		load_duration = time.perf_counter() - copy_start
 		logging.info(
@@ -2139,9 +2150,28 @@ class BatchGenWorker:
 				# 1b. Integrate PREVIOUS async load
 				t0 = time.perf_counter()
 				if pending_load_uuids:
+					logging.info(
+						f"Rank {self.rank}: Phase 1b - Integrating {len(pending_load_uuids)} pending sequences, "
+						f"has_task={pending_async_load_task is not None}, "
+						f"my_pending_local={len(pending_load_local_indices)}, "
+						f"my_pending_global={pending_load_global_ids}"
+					)
+					
 					if pending_async_load_task is not None:
-						pending_async_load_task.wait()  # Only ranks with tasks wait
+						logging.info(f"Rank {self.rank}: Phase 1b - Calling async_load_task.wait()...")
+						t_wait = time.perf_counter()
+						pending_async_load_task.wait()
+						wait_ms = (time.perf_counter() - t_wait) * 1000
+						logging.info(f"Rank {self.rank}: Phase 1b - async_load_task.wait() completed in {wait_ms:.2f}ms")
+					else:
+						logging.info(f"Rank {self.rank}: Phase 1b - No async task to wait for (this rank has no sequences to load)")
+					
+					logging.info(f"Rank {self.rank}: Phase 1b - Entering barrier after wait...")
+					t_barrier = time.perf_counter()
 					dist.barrier()
+					barrier_ms = (time.perf_counter() - t_barrier) * 1000
+					logging.info(f"Rank {self.rank}: Phase 1b - Barrier completed in {barrier_ms:.2f}ms")
+					
 					decode_uuids, batch = self._finalize_async_load(
 						pending_async_load_task,
 						pending_load_uuids,
@@ -2156,7 +2186,6 @@ class BatchGenWorker:
 					pending_load_local_indices = []
 					pending_load_global_ids = []
 				timing.finalize_async_load_ms = (time.perf_counter() - t0) * 1000
-				
 				# 1c. Rebuild page table ONCE after integration
 				t0 = time.perf_counter()
 				self._rebuild_page_table_for_batch(batch, gpu_manager)
@@ -2460,6 +2489,8 @@ class BatchGenWorker:
 
 	# def _wait_pending_kv_append_tasks(self):
 	# 	"""Wait for all pending KV append tasks at page boundary."""
+	# 	if not hasattr(self, '_pending_kv_append_tasks'):
+	# 		return
 	# 	for task in self._pending_kv_append_tasks:
 	# 		if task is not None:
 	# 			task.wait()
@@ -2469,9 +2500,22 @@ class BatchGenWorker:
 		"""Wait for all pending KV append tasks at page boundary."""
 		if not hasattr(self, '_pending_kv_append_tasks'):
 			return
-		for task in self._pending_kv_append_tasks:
+		
+		num_tasks = len(self._pending_kv_append_tasks)
+		if num_tasks > 0:
+			logging.info(f"Rank {self.rank}: Waiting for {num_tasks} KV append tasks...")
+		
+		for i, task in enumerate(self._pending_kv_append_tasks):
 			if task is not None:
+				logging.info(f"Rank {self.rank}: Waiting for KV append task {i+1}/{num_tasks}")
+				t0 = time.perf_counter()
 				task.wait()
+				elapsed = (time.perf_counter() - t0) * 1000
+				logging.info(f"Rank {self.rank}: KV append task {i+1}/{num_tasks} completed in {elapsed:.2f}ms")
+		
+		if num_tasks > 0:
+			logging.info(f"Rank {self.rank}: All {num_tasks} KV append tasks completed")
+		
 		self._pending_kv_append_tasks.clear()
 
 	def _rebuild_page_table_for_batch(
@@ -2767,6 +2811,14 @@ class BatchGenWorker:
 			k_device_ptrs=k_ptrs,
 			v_device_ptrs=v_ptrs,
 		)
+		if async_task is not None:
+			logging.info(
+				f"Rank {self.rank}: Launched async load task for {len(new_global_ids)} sequences: {new_global_ids}"
+			)
+		else:
+			logging.info(
+				f"Rank {self.rank}: No async task launched (worker_view={worker_view is not None})"
+			)
 		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 		
 		# Store tensor references to prevent GC while async task is running
