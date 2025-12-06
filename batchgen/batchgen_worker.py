@@ -1296,6 +1296,9 @@ class BatchGenWorker:
 		Ensure all active sequences maintain two-page buffer invariant.
 		
 		CRITICAL: All decisions must be globally consistent.
+		
+		FIXED: All-gather extension requirements upfront to ensure all ranks
+		use identical state when making extension/eviction decisions.
 		"""
 		if not decode_uuids:
 			return [], [], []
@@ -1304,68 +1307,79 @@ class BatchGenWorker:
 		if manager is None:
 			return decode_uuids, batch, []
 		
-		# ============ Step 1: Gather extension requirements from all ranks ============
-		my_sequences = []
+		# ============ Step 1: Each rank reports extension needs for sequences it owns ============
+		local_ext_info = {}
 		for uuid in decode_uuids:
-			if uuid not in self._uuid_to_local_map:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			additional = seq.get_additional_gpu_pages_needed()
-			my_sequences.append({
-				'uuid': uuid,
-				'global_idx': seq.global_idx,
-				'decoded_length': seq.decoded_length,
-				'gpu_pages_allocated': seq.gpu_pages_allocated,
-				'additional_needed': additional,
-			})
+			if uuid in self._uuid_to_local_map:
+				seq = self.global_batch.get_sequence(uuid)
+				local_ext_info[uuid] = {
+					'global_idx': seq.global_idx,
+					'decoded_length': seq.decoded_length,
+					'gpu_pages_allocated': seq.gpu_pages_allocated,
+					'additional_needed': seq.get_additional_gpu_pages_needed(),
+				}
 		
-		local_free = manager.get_stats().num_free_pages
-		total_additional = sum(s['additional_needed'] for s in my_sequences)
+		# ============ Step 2: ALL-GATHER extension info (CRITICAL FIX) ============
+		# This ensures all ranks have identical, fresh state for all sequences
+		all_ext_info = [None] * self.world_size
+		dist.all_gather_object(all_ext_info, local_ext_info)
 		
-		# ============ Step 2: All ranks check if extension is possible ============
-		local_ok = 1 if total_additional <= local_free else 0
-		ok_tensor = torch.tensor([local_ok], dtype=torch.int32, device=self.torch_device)
-		dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
-		
-		if ok_tensor.item() == 1:
-			# All ranks can extend - proceed
-			my_uuids = [s['uuid'] for s in my_sequences if s['additional_needed'] > 0]
-			if my_uuids:
-				success = self._extend_gpu_kv_allocation(my_uuids)
-				if not success:
-					# Should not happen given the check, but handle gracefully
-					logging.error(f"Rank {self.rank}: Extension failed unexpectedly after check passed")
-			return decode_uuids, batch, []
-		
-		# ============ Step 3: Need eviction - compute GLOBALLY CONSISTENT decision ============
-		all_seq_info = [None] * self.world_size
-		dist.all_gather_object(all_seq_info, my_sequences)
-		
-		# Flatten (each uuid appears exactly once since assigned to one rank)
+		# Merge: each uuid appears exactly once (owned by one rank)
 		global_seq_info = {}
-		for rank_info in all_seq_info:
+		for rank_info in all_ext_info:
 			if rank_info:
-				for s in rank_info:
-					global_seq_info[s['uuid']] = s
+				global_seq_info.update(rank_info)
 		
-		# All-gather free pages per rank
+		# ============ Step 3: All-gather free pages per rank ============
+		local_free = manager.get_stats().num_free_pages
 		free_tensor = torch.tensor([local_free], dtype=torch.int64, device=self.torch_device)
 		gathered_free = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered_free, free_tensor)
 		per_rank_free = {r: int(gathered_free[r].item()) for r in range(self.world_size)}
 		
-		# ============ Step 4: Greedy eviction (all ranks compute identical result) ============
+		# ============ Step 4: Compute per-rank extension needs using GATHERED state ============
 		# Group sequences by assigned rank
 		seqs_by_rank = {r: [] for r in range(self.world_size)}
-		for uuid, info in global_seq_info.items():
+		for uuid in decode_uuids:
+			if uuid not in global_seq_info:
+				logging.warning(f"Rank {self.rank}: No extension info for {uuid}, skipping")
+				continue
 			seq = self.global_batch.get_sequence(uuid)
-			seqs_by_rank[seq.assigned_rank].append(info)
+			info = global_seq_info[uuid]
+			seqs_by_rank[seq.assigned_rank].append({
+				'uuid': uuid,
+				**info
+			})
 		
+		# Check if all ranks can extend without eviction
+		all_can_extend = True
+		for r in range(self.world_size):
+			rank_additional = sum(s['additional_needed'] for s in seqs_by_rank[r])
+			if rank_additional > per_rank_free[r]:
+				all_can_extend = False
+				break
+		
+		# ============ Step 5: Extension without eviction (all ranks can extend) ============
+		if all_can_extend:
+			# Extend sequences owned by THIS rank
+			my_uuids_needing_extension = [
+				uuid for uuid in decode_uuids
+				if uuid in self._uuid_to_local_map and global_seq_info.get(uuid, {}).get('additional_needed', 0) > 0
+			]
+			
+			if my_uuids_needing_extension:
+				success = self._extend_gpu_kv_allocation(my_uuids_needing_extension)
+				if not success:
+					logging.error(f"Rank {self.rank}: Extension failed unexpectedly after global check passed")
+			
+			return decode_uuids, batch, []
+		
+		# ============ Step 6: Need eviction - compute GLOBALLY CONSISTENT decision ============
 		# Sort each rank's sequences by decoded_length descending (evict most progress first)
 		for r in seqs_by_rank:
 			seqs_by_rank[r].sort(key=lambda x: x['decoded_length'], reverse=True)
 		
-		# Compute per-rank eviction needs
+		# Compute per-rank eviction needs (all ranks compute identical result)
 		global_onhold = []
 		for r in range(self.world_size):
 			rank_seqs = seqs_by_rank[r]
@@ -1386,7 +1400,7 @@ class BatchGenWorker:
 				global_onhold.append(s['uuid'])
 				pages_freed += s['gpu_pages_allocated']
 		
-		# ============ Step 5: Execute eviction (each rank handles its own) ============
+		# ============ Step 7: Execute eviction (each rank handles its own) ============
 		onhold_set = set(global_onhold)
 		my_onhold = [u for u in global_onhold if u in self._uuid_to_local_map]
 		
@@ -1413,18 +1427,23 @@ class BatchGenWorker:
 		for uuid in global_onhold:
 			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 		
-		# ============ Step 6: Extend remaining sequences ============
-		remaining_uuids = [s['uuid'] for s in my_sequences if s['uuid'] not in onhold_set]
-		remaining_needing_extension = [u for u in remaining_uuids 
-									if global_seq_info[u]['additional_needed'] > 0]
-		if remaining_needing_extension:
-			self._extend_gpu_kv_allocation(remaining_needing_extension)
+		# ============ Step 8: Extend remaining sequences ============
+		# Only extend sequences owned by THIS rank that weren't evicted
+		my_remaining_needing_extension = [
+			uuid for uuid in decode_uuids
+			if uuid in self._uuid_to_local_map 
+			and uuid not in onhold_set
+			and global_seq_info.get(uuid, {}).get('additional_needed', 0) > 0
+		]
+		
+		if my_remaining_needing_extension:
+			self._extend_gpu_kv_allocation(my_remaining_needing_extension)
 		
 		# Build updated active lists (globally consistent)
 		active_uuids = [u for u in decode_uuids if u not in onhold_set]
 		active_batch = self._get_local_indices_for_uuids(active_uuids)
 		
-		# NOTE: Do NOT rebuild page table here - caller will do it once
+		# NOTE: Caller MUST rebuild page table after this function returns
 		
 		return active_uuids, active_batch, global_onhold
 
@@ -2267,8 +2286,9 @@ class BatchGenWorker:
 				
 				# Rebuild only if we put sequences ON_HOLD
 				t0 = time.perf_counter()
-				if onhold_uuids:
-					self._rebuild_page_table_for_batch(batch, gpu_manager)
+				# if onhold_uuids:
+				# 	self._rebuild_page_table_for_batch(batch, gpu_manager)
+				self._rebuild_page_table_for_batch(batch, gpu_manager)
 				timing.rebuild_after_extension_ms = (time.perf_counter() - t0) * 1000
 				
 				# --------------------------------------------------------

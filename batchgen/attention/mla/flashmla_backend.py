@@ -194,30 +194,30 @@ def dequant_per_token(q, scale):
 # 	tl.store(y_ptr + offs, y, mask=mask)
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, 
-                          stride_sm, stride_sn,  # <--- Add these arguments
-                          BLOCK_SIZE: tl.constexpr):
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    
-    # 1. Calculate offsets for X (Weights)
-    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs = offs_m[:, None] * N + offs_n[None, :]
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+						  stride_sm, stride_sn,  # <--- Add these arguments
+						  BLOCK_SIZE: tl.constexpr):
+	pid_m = tl.program_id(axis=0)
+	pid_n = tl.program_id(axis=1)
+	
+	# 1. Calculate offsets for X (Weights)
+	offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+	offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+	offs = offs_m[:, None] * N + offs_n[None, :]
+	mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
-    # 2. Load X
-    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+	# 2. Load X
+	x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
 
-    # 3. Load S (Scales) using explicit strides
-    # We assume s is shape (Ceil(M/B), Ceil(N/B))
-    # No mask needed here IF s is sized to match the grid (using cdiv).
-    # If s is sized using floor div, you are missing data for the edges.
-    s_offset = pid_m * stride_sm + pid_n * stride_sn
-    s = tl.load(s_ptr + s_offset)
+	# 3. Load S (Scales) using explicit strides
+	# We assume s is shape (Ceil(M/B), Ceil(N/B))
+	# No mask needed here IF s is sized to match the grid (using cdiv).
+	# If s is sized using floor div, you are missing data for the edges.
+	s_offset = pid_m * stride_sm + pid_n * stride_sn
+	s = tl.load(s_ptr + s_offset)
 
-    # 4. Compute and Store
-    y = x * s
-    tl.store(y_ptr + offs, y, mask=mask)
+	# 4. Compute and Store
+	y = x * s
+	tl.store(y_ptr + offs, y, mask=mask)
 
 
 # def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
@@ -244,29 +244,29 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N,
 # 	return y
 
 def deepseek_v3_dequantization(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
-    assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
-    assert x.dim() == 2 and s.dim() == 2
-    
-    M, N = x.size()
-    
-    # VALIDATION: Ensure s is large enough to cover the ceil division
-    expected_s_m = (M + block_size - 1) // block_size
-    expected_s_n = (N + block_size - 1) // block_size
-    
-    assert s.shape[0] == expected_s_m and s.shape[1] == expected_s_n, \
-        f"Scale tensor shape mismatch. Expected ({expected_s_m}, {expected_s_n}), got {s.shape}"
+	assert x.is_contiguous() and s.is_contiguous(), 'Input tensors must be contiguous'
+	assert x.dim() == 2 and s.dim() == 2
+	
+	M, N = x.size()
+	
+	# VALIDATION: Ensure s is large enough to cover the ceil division
+	expected_s_m = (M + block_size - 1) // block_size
+	expected_s_n = (N + block_size - 1) // block_size
+	
+	assert s.shape[0] == expected_s_m and s.shape[1] == expected_s_n, \
+		f"Scale tensor shape mismatch. Expected ({expected_s_m}, {expected_s_n}), got {s.shape}"
 
-    y = torch.empty_like(x, dtype=torch.bfloat16)
-    
-    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
-    
-    weight_dequant_kernel[grid](
-        x, s, y, 
-        M, N, 
-        s.stride(0), s.stride(1), # <--- Pass strides explicitly
-        BLOCK_SIZE=block_size
-    )
-    return y
+	y = torch.empty_like(x, dtype=torch.bfloat16)
+	
+	grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
+	
+	weight_dequant_kernel[grid](
+		x, s, y, 
+		M, N, 
+		s.stride(0), s.stride(1), # <--- Pass strides explicitly
+		BLOCK_SIZE=block_size
+	)
+	return y
 
 @torch.inference_mode()
 def mla_decoding_flashmla_(
@@ -954,102 +954,102 @@ from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 @triton.jit
 def quantize_and_scatter_kernel(
-    input_bf16_ptr,           # [bsz, 1, total_dim] - input
-    output_fp8_ptr,           # [bsz, max_seq_len, total_dim] - output
-    scale_ptr,                # [bsz, max_seq_len, num_blocks] - output
-    position_ids_ptr,         # [bsz, 1]
-    bsz,
-    max_seq_len,
-    total_dim,
-    quant_block_size: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+	input_bf16_ptr,           # [bsz, 1, total_dim] - input
+	output_fp8_ptr,           # [bsz, max_seq_len, total_dim] - output
+	scale_ptr,                # [bsz, max_seq_len, num_blocks] - output
+	position_ids_ptr,         # [bsz, 1]
+	bsz,
+	max_seq_len,
+	total_dim,
+	quant_block_size: tl.constexpr,
+	BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    Quantize bf16 input to fp8 and write directly to target position in cache.
-    Eliminates fancy indexing overhead.
-    """
-    batch_idx = tl.program_id(0)
-    quant_block_idx = tl.program_id(1)
-    
-    # Constants
-    FP8_SAFE_MAX: tl.constexpr = 440.0
-    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
-    EPSILON: tl.constexpr = 1e-12
-    
-    pos_id = tl.load(position_ids_ptr + batch_idx)
-    
-    # Input offset: [bsz, 1, total_dim] with seq_dim=1
-    input_offset = batch_idx * total_dim
-    
-    # Output offset: [bsz, max_seq_len, total_dim]
-    output_offset = batch_idx * max_seq_len * total_dim + pos_id * total_dim
-    
-    # This quantization block's range
-    block_start = quant_block_idx * quant_block_size
-    block_end = tl.minimum(block_start + quant_block_size, total_dim)
-    
-    # Find amax for this block
-    amax = 0.0
-    for i in range(block_start, block_end, BLOCK_SIZE):
-        offsets = i + tl.arange(0, BLOCK_SIZE)
-        mask = (offsets >= block_start) & (offsets < block_end)
-        
-        data = tl.load(input_bf16_ptr + input_offset + offsets, mask=mask, other=0.0)
-        data_fp32 = data.to(tl.float32)
-        amax = tl.maximum(amax, tl.max(tl.abs(data_fp32)))
-    
-    # Compute scale
-    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
-    scale = tl.maximum(amax / FP8_SAFE_MAX, EPSILON)
-    
-    # Store scale
-    num_blocks = (total_dim + quant_block_size - 1) // quant_block_size
-    scale_offset = batch_idx * max_seq_len * num_blocks + pos_id * num_blocks + quant_block_idx
-    tl.store(scale_ptr + scale_offset, scale)
-    
-    # Quantize and store
-    for i in range(block_start, block_end, BLOCK_SIZE):
-        offsets = i + tl.arange(0, BLOCK_SIZE)
-        mask = (offsets >= block_start) & (offsets < block_end)
-        
-        data = tl.load(input_bf16_ptr + input_offset + offsets, mask=mask, other=0.0)
-        data_fp32 = data.to(tl.float32)
-        
-        # Quantize
-        data_scaled = data_fp32 / scale
-        data_scaled = tl.minimum(data_scaled, FP8_SAFE_MAX)
-        data_scaled = tl.maximum(data_scaled, -FP8_SAFE_MAX)
-        data_fp8 = data_scaled.to(tl.float8e4nv)
-        
-        # Write directly to target position
-        tl.store(output_fp8_ptr + output_offset + offsets, data_fp8, mask=mask)
+	"""
+	Quantize bf16 input to fp8 and write directly to target position in cache.
+	Eliminates fancy indexing overhead.
+	"""
+	batch_idx = tl.program_id(0)
+	quant_block_idx = tl.program_id(1)
+	
+	# Constants
+	FP8_SAFE_MAX: tl.constexpr = 440.0
+	FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
+	EPSILON: tl.constexpr = 1e-12
+	
+	pos_id = tl.load(position_ids_ptr + batch_idx)
+	
+	# Input offset: [bsz, 1, total_dim] with seq_dim=1
+	input_offset = batch_idx * total_dim
+	
+	# Output offset: [bsz, max_seq_len, total_dim]
+	output_offset = batch_idx * max_seq_len * total_dim + pos_id * total_dim
+	
+	# This quantization block's range
+	block_start = quant_block_idx * quant_block_size
+	block_end = tl.minimum(block_start + quant_block_size, total_dim)
+	
+	# Find amax for this block
+	amax = 0.0
+	for i in range(block_start, block_end, BLOCK_SIZE):
+		offsets = i + tl.arange(0, BLOCK_SIZE)
+		mask = (offsets >= block_start) & (offsets < block_end)
+		
+		data = tl.load(input_bf16_ptr + input_offset + offsets, mask=mask, other=0.0)
+		data_fp32 = data.to(tl.float32)
+		amax = tl.maximum(amax, tl.max(tl.abs(data_fp32)))
+	
+	# Compute scale
+	amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
+	scale = tl.maximum(amax / FP8_SAFE_MAX, EPSILON)
+	
+	# Store scale
+	num_blocks = (total_dim + quant_block_size - 1) // quant_block_size
+	scale_offset = batch_idx * max_seq_len * num_blocks + pos_id * num_blocks + quant_block_idx
+	tl.store(scale_ptr + scale_offset, scale)
+	
+	# Quantize and store
+	for i in range(block_start, block_end, BLOCK_SIZE):
+		offsets = i + tl.arange(0, BLOCK_SIZE)
+		mask = (offsets >= block_start) & (offsets < block_end)
+		
+		data = tl.load(input_bf16_ptr + input_offset + offsets, mask=mask, other=0.0)
+		data_fp32 = data.to(tl.float32)
+		
+		# Quantize
+		data_scaled = data_fp32 / scale
+		data_scaled = tl.minimum(data_scaled, FP8_SAFE_MAX)
+		data_scaled = tl.maximum(data_scaled, -FP8_SAFE_MAX)
+		data_fp8 = data_scaled.to(tl.float8e4nv)
+		
+		# Write directly to target position
+		tl.store(output_fp8_ptr + output_offset + offsets, data_fp8, mask=mask)
 
 
 def quantize_and_scatter_write(
-    input_bf16: torch.Tensor,       # [bsz, 1, total_dim]
-    output_fp8: torch.Tensor,       # [bsz, max_seq_len, total_dim]
-    scale: torch.Tensor,            # [bsz, max_seq_len, num_blocks]
-    position_ids: torch.Tensor,     # [bsz, 1]
-    quant_block_size: int = 128,
+	input_bf16: torch.Tensor,       # [bsz, 1, total_dim]
+	output_fp8: torch.Tensor,       # [bsz, max_seq_len, total_dim]
+	scale: torch.Tensor,            # [bsz, max_seq_len, num_blocks]
+	position_ids: torch.Tensor,     # [bsz, 1]
+	quant_block_size: int = 128,
 ):
-    """Quantize and write directly to cache, eliminating fancy indexing."""
-    bsz, _, total_dim = input_bf16.shape
-    max_seq_len = output_fp8.shape[1]
-    num_blocks = (total_dim + quant_block_size - 1) // quant_block_size
-    
-    grid = (bsz, num_blocks)
-    
-    quantize_and_scatter_kernel[grid](
-        input_bf16,
-        output_fp8,
-        scale,
-        position_ids,
-        bsz,
-        max_seq_len,
-        total_dim,
-        quant_block_size,
-        BLOCK_SIZE=64,
-    )
+	"""Quantize and write directly to cache, eliminating fancy indexing."""
+	bsz, _, total_dim = input_bf16.shape
+	max_seq_len = output_fp8.shape[1]
+	num_blocks = (total_dim + quant_block_size - 1) // quant_block_size
+	
+	grid = (bsz, num_blocks)
+	
+	quantize_and_scatter_kernel[grid](
+		input_bf16,
+		output_fp8,
+		scale,
+		position_ids,
+		bsz,
+		max_seq_len,
+		total_dim,
+		quant_block_size,
+		BLOCK_SIZE=64,
+	)
 @torch.inference_mode()
 def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	self,
@@ -1987,7 +1987,10 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
-
+	# assert if q_position_ids are within cos/sin range
+	if torch.any(q_position_ids >= cos.size(1)):
+		logging.error(f"q_position_ids {q_position_ids} exceed cos/sin size {cos.size(1)}")
+		raise ValueError("q_position_ids exceed the maximum sequence length for RoPE")
 	offload_kv = fused_rmsnorm_rope_with_q(
 		new_compressed_kv,
 		q_pe,
