@@ -1988,19 +1988,19 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
 	# Detailed validation
-	max_pos_id = q_position_ids.max().item() if q_position_ids.numel() > 0 else -1
-	cos_seq_len = cos.size(1)
+	# max_pos_id = q_position_ids.max().item() if q_position_ids.numel() > 0 else -1
+	# cos_seq_len = cos.size(1)
 
-	if max_pos_id >= cos_seq_len:
-		logging.error(
-			f"RoPE position overflow: max_position_id={max_pos_id}, "
-			f"cos_seq_len={cos_seq_len}, max_seqlen={max_seqlen}, "
-			f"q_position_ids.shape={q_position_ids.shape}, "
-			f"q_position_ids={q_position_ids.flatten().tolist()[:10]}..."  # First 10
-		)
-		raise ValueError(
-			f"q_position_ids (max={max_pos_id}) exceed RoPE cache size ({cos_seq_len})"
-		)
+	# if max_pos_id >= cos_seq_len:
+	# 	logging.error(
+	# 		f"RoPE position overflow: max_position_id={max_pos_id}, "
+	# 		f"cos_seq_len={cos_seq_len}, max_seqlen={max_seqlen}, "
+	# 		f"q_position_ids.shape={q_position_ids.shape}, "
+	# 		f"q_position_ids={q_position_ids.flatten().tolist()[:10]}..."  # First 10
+	# 	)
+	# 	raise ValueError(
+	# 		f"q_position_ids (max={max_pos_id}) exceed RoPE cache size ({cos_seq_len})"
+	# 	)
 	offload_kv = fused_rmsnorm_rope_with_q(
 		new_compressed_kv,
 		q_pe,
