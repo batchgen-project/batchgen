@@ -426,22 +426,15 @@ class BatchGenWorker:
 			allocations[uuid] = pages_needed
 		return allocations
 
-	def _compute_two_page_buffer_allocation(
-		self, 
-		uuids: List[str]
-	) -> Dict[str, int]:
-		"""
-		Compute GPU page allocation for two-page buffer design.
-		
-		Returns:
-			Dict mapping uuid -> pages_to_allocate
-		"""
-		allocations = {}
-		for uuid in uuids:
+	def _compute_two_page_buffer_tokens(self, local_indices: List[int]) -> List[int]:
+		"""Compute tokens for two-page buffer GPU allocation (NOT full context)."""
+		tokens = []
+		for local_idx in local_indices:
+			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			pages_needed = seq.get_gpu_pages_for_two_page_buffer()
-			allocations[uuid] = pages_needed
-		return allocations
+			pages = seq.get_gpu_pages_for_two_page_buffer()
+			tokens.append(pages * self.PAGE_SIZE)
+		return tokens
 
 	def _allocate_gpu_kv_two_page_buffer(
 		self, 
@@ -1232,9 +1225,14 @@ class BatchGenWorker:
 		Greedily fill GPU KV cache to ~90% capacity.
 		"""
 		prefilled_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		prefilled_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
+		onhold_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
 		
-		if not prefilled_uuids:
+		# Combine and sort for deterministic ordering
+		all_candidates = prefilled_uuids + onhold_uuids
+		all_candidates.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
+		
+  
+		if not all_candidates:
 			return []
 		
 		# Get GPU page capacity
@@ -1256,7 +1254,7 @@ class BatchGenWorker:
 		rank_pages_used = [0] * self.world_size
 		decode_batch = []
 		
-		for uuid in prefilled_uuids:
+		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
 			req_pages = seq.get_gpu_pages_for_two_page_buffer()
@@ -1277,7 +1275,13 @@ class BatchGenWorker:
 		decode_uuids: List[str],
 		batch: List[int]
 	) -> Tuple[List[str], List[int], List[str]]:
-		"""Each rank handles its own shortfall, then sync ON_HOLD decisions."""
+		"""
+		Ensure all active sequences maintain two-page buffer invariant.
+		
+		INVARIANT: Every active sequence MUST have at least 2 pages of buffer.
+		If not possible, evict sequences with MOST progress first (they have
+		more KV synced to host, so reloading them later wastes less work).
+		"""
 		if not decode_uuids:
 			return [], [], []
 		
@@ -1285,70 +1289,97 @@ class BatchGenWorker:
 		if manager is None:
 			return decode_uuids, batch, []
 		
-		# Step 1: Calculate LOCAL shortfall (only for MY sequences)
-		local_additional = 0
+		# Build local sequence state
+		my_sequences = []
 		for uuid in decode_uuids:
 			if uuid not in self._uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			additional = seq.get_additional_gpu_pages_needed()
-			if additional > 0:
-				local_additional += additional
+			my_sequences.append({
+				'uuid': uuid,
+				'decoded_length': seq.decoded_length,
+				'gpu_pages_allocated': seq.gpu_pages_allocated,
+				'additional_needed': additional,
+			})
 		
 		local_free = manager.get_stats().num_free_pages
-		local_shortfall = max(0, local_additional - local_free)
+		total_additional = sum(s['additional_needed'] for s in my_sequences)
 		
-		# Step 2: Check if ANY rank has shortfall
-		has_shortfall = torch.tensor([1 if local_shortfall > 0 else 0], 
-									dtype=torch.int32, device=self.torch_device)
-		dist.all_reduce(has_shortfall, op=dist.ReduceOp.MAX)
+		# Check if extension possible without eviction
+		local_ok = 1 if total_additional <= local_free else 0
+		ok_tensor = torch.tensor([local_ok], dtype=torch.int32, device=self.torch_device)
+		dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
 		
-		if has_shortfall.item() == 0:
-			# No rank has shortfall - just extend locally
-			my_uuids = [u for u in decode_uuids if u in self._uuid_to_local_map]
+		if ok_tensor.item() == 1:
+			my_uuids = [s['uuid'] for s in my_sequences]
 			self._extend_gpu_kv_allocation(my_uuids)
 			return decode_uuids, batch, []
 		
-		# Step 3: Each rank selects its OWN sequences to put ON_HOLD
-		my_candidates = []
-		for uuid in decode_uuids:
-			if uuid not in self._uuid_to_local_map:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			my_candidates.append((uuid, seq.decoded_length, seq.gpu_pages_allocated))
-		
-		# Sort by progress (most complete first - they have more KV in host already)
-		my_candidates.sort(key=lambda x: x[1], reverse=True)
+		# ============================================================
+		# FIX: Evict MOST progress first (not least progress)
+		# Sort by decoded_length DESCENDING
+		# ============================================================
+		my_sequences.sort(key=lambda x: x['decoded_length'], reverse=True)
 		
 		my_onhold = []
-		freed = 0
-		for uuid, _, pages in my_candidates:
-			if freed >= local_shortfall:
-				break
-			my_onhold.append(uuid)
-			freed += pages
+		my_remaining = list(my_sequences)
+		pages_freed = 0
 		
-		# Step 4: All-gather ON_HOLD selections (small list of UUIDs)
+		# Evict from front (most progress) until remaining can be extended
+		while my_remaining:
+			remaining_demand = sum(s['additional_needed'] for s in my_remaining)
+			available = local_free + pages_freed
+			
+			if remaining_demand <= available:
+				break  # Can extend all remaining
+			
+			# Evict the first (most progress)
+			to_evict = my_remaining.pop(0)
+			my_onhold.append(to_evict)
+			pages_freed += to_evict['gpu_pages_allocated']
+		
+		# Edge case: even after evicting all, still not enough
+		if my_remaining:
+			final_demand = sum(s['additional_needed'] for s in my_remaining)
+			if final_demand > local_free + pages_freed:
+				logging.warning(
+					f"Rank {self.rank}: Cannot satisfy two-page buffer. "
+					f"Evicting all {len(my_remaining)} remaining sequences."
+				)
+				my_onhold.extend(my_remaining)
+				my_remaining = []
+		
+		# All-gather ON_HOLD decisions
+		onhold_uuids = [s['uuid'] for s in my_onhold]
 		all_onhold = [None] * self.world_size
-		dist.all_gather_object(all_onhold, my_onhold)
+		dist.all_gather_object(all_onhold, onhold_uuids)
 		
 		global_onhold = []
 		for rank_onhold in all_onhold:
-			global_onhold.extend(rank_onhold)
+			if rank_onhold:
+				global_onhold.extend(rank_onhold)
 		
-		# Step 5: Release GPU pages for MY ON_HOLD sequences
-		if my_onhold:
-			self._put_sequences_onhold(my_onhold)
+		# Execute eviction
+		if onhold_uuids:
+			self._put_sequences_onhold(onhold_uuids)
+			logging.info(
+				f"Rank {self.rank}: Evicted {len(onhold_uuids)} sequences "
+				f"(most progress first), freed {pages_freed} pages"
+			)
 		
-		# Step 6: Update status globally (all ranks do this identically)
-		self._update_batch_status(global_onhold, SequenceStatus.ON_HOLD)
+		# Update status globally
+		if global_onhold:
+			self._update_batch_status(global_onhold, SequenceStatus.ON_HOLD)
 		
-		# Step 7: Extend remaining MY sequences
+		# Extend remaining
+		remaining_uuids = [s['uuid'] for s in my_remaining]
+		if remaining_uuids:
+			self._extend_gpu_kv_allocation(remaining_uuids)
+		
+		# Build updated active lists
 		onhold_set = set(global_onhold)
 		active_uuids = [u for u in decode_uuids if u not in onhold_set]
-		my_active = [u for u in active_uuids if u in self._uuid_to_local_map]
-		self._extend_gpu_kv_allocation(my_active)
-		
 		active_batch = self._get_local_indices_for_uuids(active_uuids)
 		
 		return active_uuids, active_batch, global_onhold
@@ -1441,73 +1472,72 @@ class BatchGenWorker:
 		
 		return updated_uuids, updated_batch
 
+
 	# def _allocate_and_load_gpu_kv_for_new_sequences(self, local_sequence_ids: List[int]) -> None:
 	# 	"""
-	# 	Allocate GPU KV pages and load host KV for newly added sequences during continuous batching.
-	# 	This is different from _prepare_gpu_paged_kv_cache which may recreate the manager.
+	# 	Allocates GPU pages and triggers blocking load from Host.
 	# 	"""
-	# 	if not local_sequence_ids:
-	# 		return
+	# 	if not local_sequence_ids: return
 		
 	# 	manager = self.gpu_paged_kv_cache_manager
-	# 	if manager is None:
-	# 		logging.warning("GPU KV manager not initialized, cannot load new sequences")
-	# 		return
-		
-	# 	# Convert local indices to global sequence IDs
-	# 	global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-	# 	sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
-		
-	# 	logging.info(
-	# 		f"Rank {self.rank}: Allocating GPU KV pages for new sequences: {global_sequence_ids}"
-	# 	)
-		
-	# 	# Allocate pages for the new sequences
-	# 	manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
-		
-	# 	# Rebuild page table to include new sequences
-	# 	# Get all currently active sequences (existing + new)
-	# 	all_active_global_ids = []
-	# 	for uuid in self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE):
-	# 		if uuid in self._uuid_to_local_map:
-	# 			seq = self.global_batch.get_sequence(uuid)
-	# 			all_active_global_ids.append(seq.global_idx)
-		
-	# 	# Sort for deterministic ordering
-	# 	all_active_global_ids.sort()
-		
-	# 	if all_active_global_ids:
-	# 		manager.rebuild_page_table(all_active_global_ids)
-		
-	# 	# Load host KV to GPU for the new sequences
-	# 	self._load_host_kv_to_gpu(manager, global_sequence_ids)
+	# 	global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+	# 	tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
+
+	# 	# 1. Allocate GPU Pages
+	# 	manager.allocate_pages_for_sequences(global_ids, tokens)
+
+	# 	# 2. Rebuild Page Table (Critical: Ensure kernel sees new pointers)
+	# 	# We rebuild specifically for the sequences we are about to load
+	# 	manager.rebuild_page_table(global_ids)
+
+	# 	# 3. Load Host -> GPU (BLOCKING)
+	# 	# "The load api is non-blocked, but we can use .wait() to let it be blocking for now."
+	# 	self._load_host_kv_to_gpu(manager, global_ids) 
+
+	# 	# 4. Rebuild Page Table for ALL active sequences (for next Attention forward)
+	# 	# active_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+	# 	# all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._uuid_to_local_map]
+	# 	# # Union with new ids
+	# 	# final_ids = sorted(list(set(all_active_ids + global_ids)))
+	# 	# manager.rebuild_page_table(final_ids) t
+
+
 	def _allocate_and_load_gpu_kv_for_new_sequences(self, local_sequence_ids: List[int]) -> None:
 		"""
-		Allocates GPU pages and triggers blocking load from Host.
+		Allocates GPU pages using TWO-PAGE BUFFER strategy and triggers blocking load from Host.
 		"""
-		if not local_sequence_ids: return
+		if not local_sequence_ids:
+			return
 		
 		manager = self.gpu_paged_kv_cache_manager
+		if manager is None:
+			logging.warning("GPU KV manager not initialized, cannot load new sequences")
+			return
+		
 		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
-		tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
-
+		
+		# FIX: Use two-page buffer tokens, NOT full context tokens
+		# OLD: tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
+		tokens = self._compute_two_page_buffer_tokens(local_sequence_ids)
+		
+		# FIX: Add guard before allocation
+		total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
+		free_pages = manager.get_stats().num_free_pages
+		if total_pages_needed > free_pages:
+			logging.error(
+				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages_needed} pages, "
+				f"only {free_pages} free. Skipping load for {len(global_ids)} sequences."
+			)
+			return
+		
 		# 1. Allocate GPU Pages
 		manager.allocate_pages_for_sequences(global_ids, tokens)
 
-		# 2. Rebuild Page Table (Critical: Ensure kernel sees new pointers)
-		# We rebuild specifically for the sequences we are about to load
+		# 2. Rebuild Page Table
 		manager.rebuild_page_table(global_ids)
 
 		# 3. Load Host -> GPU (BLOCKING)
-		# "The load api is non-blocked, but we can use .wait() to let it be blocking for now."
-		self._load_host_kv_to_gpu(manager, global_ids) 
-
-		# 4. Rebuild Page Table for ALL active sequences (for next Attention forward)
-		# active_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
-		# all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._uuid_to_local_map]
-		# # Union with new ids
-		# final_ids = sorted(list(set(all_active_ids + global_ids)))
-		# manager.rebuild_page_table(final_ids) t
+		self._load_host_kv_to_gpu(manager, global_ids)
 
 	# ============ Main Generation Loop ============
 
@@ -1592,7 +1622,9 @@ class BatchGenWorker:
 			# =================================================================
 			# 2. DECODE PHASE: Continuous Batching (Host -> GPU Streaming)
 			# =================================================================
-			while self.global_batch.has_prefilled() or self.global_batch.has_in_decode():
+			while (self.global_batch.has_prefilled() or 
+			   self.global_batch.has_in_decode() or 
+			   self.global_batch.has_onhold()):
 				dist.barrier()
 				
 				# A. Prepare Initial Decode Batch (from PREFILLED)
@@ -2104,7 +2136,9 @@ class BatchGenWorker:
 				
 				# 1b. Integrate PREVIOUS async load
 				t0 = time.perf_counter()
-				if pending_async_load_task is not None:
+				if pending_load_uuids:
+					if pending_async_load_task is not None:
+						pending_async_load_task.wait()  # Only ranks with tasks wait
 					decode_uuids, batch = self._finalize_async_load(
 						pending_async_load_task,
 						pending_load_uuids,
@@ -2212,11 +2246,37 @@ class BatchGenWorker:
 				# Log timing for this boundary
 				if self.rank == 0:
 					logging.info(f"Page boundary {len(boundary_timings)}:\n{timing}")
-				
+								
 				if not decode_uuids:
-					if pending_async_load_task is not None:
-						pending_async_load_task.wait()
-						# torch.cuda.synchronize(self.torch_device)
+					if pending_load_uuids:  # Global check - all ranks enter
+						if pending_async_load_task is not None:
+							pending_async_load_task.wait()
+						
+						# MOVE OUTSIDE the task check:
+						decode_uuids, batch = self._finalize_async_load(
+							pending_async_load_task,  # Can be None - handled correctly inside
+							pending_load_uuids,
+							pending_load_local_indices,
+							pending_load_global_ids,
+							decode_uuids,
+							batch,
+							gpu_manager
+						)
+						
+						pending_async_load_task = None
+						pending_load_uuids = []
+						pending_load_local_indices = []
+						pending_load_global_ids = []
+						
+						self._rebuild_page_table_for_batch(batch, gpu_manager)
+						
+						if batch:
+							new_tokens = self._rebuild_input_tokens(batch)
+						
+						if decode_uuids:
+							logging.info(...)
+							continue
+					
 					break
 			
 			# =============================================================
@@ -2475,59 +2535,38 @@ class BatchGenWorker:
 		gpu_manager: GPUPagedKVCacheManager
 	) -> Tuple[Optional[object], List[str], List[int], List[int]]:
 		"""
-		Launch async load for new sequences. Returns immediately.
+		Launch async load for new sequences using TWO-PAGE BUFFER strategy.
 		
-		The load runs in background while next page decodes.
-		Integration happens at the NEXT page boundary via _finalize_async_load().
-		
-		Page table contract:
-			ENTRY: Page table has current_batch sequences
-			EXIT: Page table has current_batch sequences (restored for attention)
-			INTERNALLY: Temporarily rebuilt for new sequences to get pointers
-		
-		Returns:
-			(async_task, new_uuids, new_local_indices, new_global_ids)
-			- async_task: Task handle to wait on (or None if nothing to load)
-			- new_uuids: ALL new UUIDs selected globally
-			- new_local_indices: Local indices for THIS RANK's new sequences
-			- new_global_ids: Global sequence IDs for THIS RANK's new sequences
+		FIXED: Uses two-page buffer tokens, not full context.
+		FIXED: Adds pre-allocation guard.
 		"""
 		if gpu_manager is None or not gpu_manager.is_initialized:
 			return None, [], [], []
 		
-		# --------------------------------------------------------
-		# Step 1: All-gather free GPU pages from ALL ranks
-		# --------------------------------------------------------
+		# Step 1: All-gather free GPU pages
 		local_free = gpu_manager.get_stats().num_free_pages
-		
 		free_tensor = torch.tensor([local_free], dtype=torch.int64, device=self.torch_device)
 		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered, free_tensor)
 		per_rank_free = [int(t.item()) for t in gathered]
 		
-		# --------------------------------------------------------
-		# Step 2: Get candidates (PREFILLED and ON_HOLD)
-		# --------------------------------------------------------
+		# Step 2: Get candidates
 		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		onhold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
 		candidates = prefilled + onhold
-		
-		# Sort for deterministic ordering across all ranks
 		candidates.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 		
 		if not candidates:
 			return None, [], [], []
 		
-		# --------------------------------------------------------
-		# Step 3: Greedy selection based on per-rank free pages
-		# All ranks compute IDENTICAL selection
-		# --------------------------------------------------------
+		# Step 3: Greedy selection using TWO-PAGE BUFFER pages
 		rank_pages_used = [0] * self.world_size
 		new_uuids = []
 		
 		for uuid in candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
+			# FIXED: Use two-page buffer calculation
 			req_pages = seq.get_gpu_pages_for_two_page_buffer()
 			
 			if rank_pages_used[assigned_rank] + req_pages <= per_rank_free[assigned_rank]:
@@ -2537,48 +2576,46 @@ class BatchGenWorker:
 		if not new_uuids:
 			return None, [], [], []
 		
-		# --------------------------------------------------------
-		# Step 4: Get THIS RANK's new sequences
-		# --------------------------------------------------------
+		# Step 4: Get THIS RANK's sequences
 		my_new_uuids = [u for u in new_uuids 
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
 		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
 		
 		if not new_local_indices:
-			# Other ranks have sequences to load, but not this rank
-			# Still return new_uuids for global status update later
 			return None, new_uuids, [], []
 		
 		new_global_ids = self._local_indices_to_global_seq_ids(new_local_indices)
-		tokens = self._compute_host_kv_sequence_tokens(new_local_indices)
 		
-		# --------------------------------------------------------
-		# Step 5: Allocate GPU pages for new sequences
-		# --------------------------------------------------------
+		# FIXED: Use two-page buffer tokens, NOT full context
+		tokens = self._compute_two_page_buffer_tokens(new_local_indices)
+		
+		# FIXED: Guard before allocation
+		total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
+		current_free = gpu_manager.get_stats().num_free_pages
+		if total_pages_needed > current_free:
+			logging.warning(
+				f"Rank {self.rank}: Skipping async load - need {total_pages_needed} pages, "
+				f"only {current_free} free"
+			)
+			return None, [], [], []
+		
+		# Step 5: Allocate GPU pages
 		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
 		
-		# --------------------------------------------------------
-		# Step 6: TEMPORARILY rebuild page table with NEW sequences
-		# This is needed to get the correct device pointers for the load
-		# --------------------------------------------------------
+		# Step 6: Temp rebuild for pointers
 		gpu_manager.rebuild_page_table(new_global_ids)
 		k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
 		active_page_counts = gpu_manager.export_active_sequence_page_counts()
 		
-		# --------------------------------------------------------
-		# Step 7: Launch async load (DON'T WAIT)
-		# --------------------------------------------------------
+		# Step 7: Launch async load
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
-			logging.warning(f"Rank {self.rank}: No host KV worker view for async load")
-			# Restore page table before returning
 			existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
 			if existing_global_ids:
 				gpu_manager.rebuild_page_table(existing_global_ids)
 			return None, new_uuids, new_local_indices, new_global_ids
 		
 		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
-		
 		async_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_page_counts,
@@ -2586,21 +2623,12 @@ class BatchGenWorker:
 			v_device_ptrs=v_ptrs,
 		)
 		
-		logging.info(
-			f"Rank {self.rank}: Launched async load for {len(new_global_ids)} sequences "
-			f"(global_ids: {new_global_ids[:3]}{'...' if len(new_global_ids) > 3 else ''})"
-		)
-		
-		# --------------------------------------------------------
-		# Step 8: RESTORE page table with EXISTING sequences
-		# This is critical for the current page's attention operations
-		# --------------------------------------------------------
+		# Step 8: Restore page table
 		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
 		if existing_global_ids:
 			gpu_manager.rebuild_page_table(existing_global_ids)
 		
 		return async_task, new_uuids, new_local_indices, new_global_ids
-
 
 	def _launch_async_load_new_sequences_timed(
 		self,
@@ -2609,10 +2637,7 @@ class BatchGenWorker:
 		gpu_manager: GPUPagedKVCacheManager
 	) -> Tuple[Optional[object], List[str], List[int], List[int], Dict[str, float]]:
 		"""
-		Launch async load with detailed timing.
-		
-		Returns:
-			(async_task, new_uuids, new_local_indices, new_global_ids, timing_dict)
+		Launch async load with detailed timing - FIXED version.
 		"""
 		timing = {}
 		
@@ -2639,7 +2664,7 @@ class BatchGenWorker:
 			timing['select_ms'] = (time.perf_counter() - t0) * 1000
 			return None, [], [], [], timing
 		
-		# Greedy selection
+		# Greedy selection using TWO-PAGE BUFFER
 		rank_pages_used = [0] * self.world_size
 		new_uuids = []
 		
@@ -2666,10 +2691,23 @@ class BatchGenWorker:
 			return None, new_uuids, [], [], timing
 		
 		new_global_ids = self._local_indices_to_global_seq_ids(new_local_indices)
-		tokens = self._compute_host_kv_sequence_tokens(new_local_indices)
 		
-		# Step 4: Allocate GPU pages
+		# FIXED: Use two-page buffer tokens
+		tokens = self._compute_two_page_buffer_tokens(new_local_indices)
+		
+		# Step 4: Allocate with guard
 		t0 = time.perf_counter()
+		total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
+		current_free = gpu_manager.get_stats().num_free_pages
+		
+		if total_pages_needed > current_free:
+			logging.warning(
+				f"Rank {self.rank}: Skipping load - need {total_pages_needed} pages, "
+				f"only {current_free} free"
+			)
+			timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
+			return None, [], [], [], timing
+		
 		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
 		timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
 		
@@ -2688,7 +2726,6 @@ class BatchGenWorker:
 			return None, new_uuids, new_local_indices, new_global_ids, timing
 		
 		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
-		
 		async_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_page_counts,
