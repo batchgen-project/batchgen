@@ -2696,15 +2696,8 @@ class BatchGenWorker:
 		"""
 		Launch async load with detailed timing.
 		
-		CRITICAL INVARIANT: All ranks must return identical `new_uuids` for global consistency.
-		This ensures `pending_load_uuids` is identical across all ranks, preventing
-		deadlock in conditional barrier entry.
-		
-		Protocol:
-		1. All-gather free pages (collective)
-		2. All ranks compute identical candidate selection (deterministic)
-		3. All ranks participate in allocation consensus (collective)
-		4. Only then can ranks diverge on local work
+		CRITICAL FIX: All-gather sequence state before selection to ensure
+		all ranks compute identical new_uuids.
 		"""
 		timing = {}
 		
@@ -2722,45 +2715,64 @@ class BatchGenWorker:
 		per_rank_free = [int(t.item()) for t in gathered]
 		timing['allgather_ms'] = (time.perf_counter() - t0) * 1000
 		
-		# ============ PHASE 2: Deterministic candidate selection ============
-		# All ranks compute IDENTICAL new_uuids using same algorithm and data
+		# ============ PHASE 2: Get candidates and gather their state ============
 		t0 = time.perf_counter()
 		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		onhold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
 		candidates = prefilled + onhold
-		# CRITICAL: Sort ensures all ranks see same order
 		candidates.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 		
 		if not candidates:
 			timing['select_ms'] = (time.perf_counter() - t0) * 1000
 			return None, [], [], [], timing
 		
-		# Greedy selection - all ranks compute identical result
+		# ============ PHASE 2b: ALL-GATHER SEQUENCE STATE (CRITICAL FIX) ============
+		# Each rank reports state for sequences it owns
+		local_seq_state = {}
+		for uuid in candidates:
+			if uuid in self._uuid_to_local_map:
+				seq = self.global_batch.get_sequence(uuid)
+				local_seq_state[uuid] = seq.get_gpu_pages_for_two_page_buffer()
+		
+		all_seq_state = [None] * self.world_size
+		dist.all_gather_object(all_seq_state, local_seq_state)
+		
+		# Merge: each uuid appears exactly once (owned by one rank)
+		global_pages_needed = {}
+		for rank_state in all_seq_state:
+			if rank_state:
+				global_pages_needed.update(rank_state)
+		
+		# ============ PHASE 3: Deterministic selection using GATHERED state ============
 		rank_pages_used = [0] * self.world_size
 		new_uuids = []
 		
 		for uuid in candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
-			req_pages = seq.get_gpu_pages_for_two_page_buffer()
+			
+			# CRITICAL: Use gathered page count, not local (potentially stale) value
+			req_pages = global_pages_needed.get(uuid)
+			if req_pages is None:
+				logging.warning(f"Rank {self.rank}: No page count for {uuid}, skipping")
+				continue
 			
 			if rank_pages_used[assigned_rank] + req_pages <= per_rank_free[assigned_rank]:
 				new_uuids.append(uuid)
 				rank_pages_used[assigned_rank] += req_pages
 		
 		timing['select_ms'] = (time.perf_counter() - t0) * 1000
-		
+
 		if not new_uuids:
 			return None, [], [], [], timing
-		
-		# ============ PHASE 3: Compute local allocation needs ============
-		# Each rank determines its own sequences and allocation requirements
+
+		# ============ PHASE 3b: Get THIS RANK's sequences ============
+		t0 = time.perf_counter()
+
 		my_new_uuids = [u for u in new_uuids 
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
 		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
-		
-		t0 = time.perf_counter()
-		
+
 		if new_local_indices:
 			new_global_ids = self._local_indices_to_global_seq_ids(new_local_indices)
 			tokens = self._compute_two_page_buffer_tokens(new_local_indices)
@@ -2768,12 +2780,12 @@ class BatchGenWorker:
 			current_free = gpu_manager.get_stats().num_free_pages
 			local_can_allocate = 1 if total_pages_needed <= current_free else 0
 		else:
-			# This rank has no sequences to load - reports success (no allocation needed)
 			new_global_ids = []
 			tokens = []
 			total_pages_needed = 0
-			local_can_allocate = 1
-		
+			current_free = 0
+			local_can_allocate = 1  # No allocation needed = success
+			
 		# ============ PHASE 4: Global consensus on allocation (COLLECTIVE) ============
 		# CRITICAL: ALL ranks must participate BEFORE any early return
 		can_allocate_tensor = torch.tensor([local_can_allocate], dtype=torch.int32, device=self.torch_device)
