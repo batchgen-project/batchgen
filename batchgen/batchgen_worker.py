@@ -1477,15 +1477,35 @@ class BatchGenWorker:
 		active_uuids = [u for u in decode_uuids if u not in onhold_set]
 		active_batch = self._get_local_indices_for_uuids(active_uuids)
 
-		# ============ CRITICAL VALIDATION ============
+		# ============ CRITICAL VALIDATION WITH REMOVAL ============
+		valid_active_batch = []
+		invalid_uuids = []
+
 		for local_idx in active_batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
+			
+			is_valid = True
+			
 			if seq.gpu_pages_allocated == 0:
-				logging.error(f"Rank {self.rank}: BUG! uuid={uuid} in active_batch but gpu_pages_allocated=0")
+				logging.error(f"Rank {self.rank}: REMOVING uuid={uuid} - gpu_pages_allocated=0")
+				is_valid = False
+			
 			if uuid not in self._sequences_with_gpu_kv:
-				logging.error(f"Rank {self.rank}: BUG! uuid={uuid} in active_batch but not in _sequences_with_gpu_kv")
+				logging.error(f"Rank {self.rank}: REMOVING uuid={uuid} - not in _sequences_with_gpu_kv")
+				is_valid = False
+			
+			if is_valid:
+				valid_active_batch.append(local_idx)
+			else:
+				invalid_uuids.append(uuid)
+				onhold_set.add(uuid)
+				if uuid not in global_onhold:
+					global_onhold.append(uuid)
+				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
+		active_batch = valid_active_batch
+		active_uuids = [u for u in active_uuids if u not in set(invalid_uuids)]
 		# ============ ALL-REDUCE VALIDATION (COLLECTIVE #4) ============
 		local_active_count = torch.tensor([len(active_uuids)], dtype=torch.int64, device=self.torch_device)
 		all_active_counts = [torch.zeros_like(local_active_count) for _ in range(self.world_size)]
