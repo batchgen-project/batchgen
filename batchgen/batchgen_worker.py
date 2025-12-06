@@ -1295,7 +1295,8 @@ class BatchGenWorker:
 		"""
 		Ensure all active sequences maintain two-page buffer invariant.
 		
-		CRITICAL: All decisions must be globally consistent.
+		CRITICAL: All ranks MUST participate in ALL collective operations.
+		No early returns before the final collective sync.
 		"""
 		if not decode_uuids:
 			return [], [], []
@@ -1304,7 +1305,6 @@ class BatchGenWorker:
 		if manager is None:
 			return decode_uuids, batch, []
 		
-		# ============ DETAILED LOGGING ============
 		logging.info(
 			f"Rank {self.rank}: _check_and_extend ENTER: "
 			f"decode_uuids={len(decode_uuids)}, batch={len(batch)}"
@@ -1323,7 +1323,7 @@ class BatchGenWorker:
 					'current_context_length': seq.current_context_length,
 				}
 		
-		# ============ Step 2: ALL-GATHER extension info ============
+		# ============ Step 2: ALL-GATHER extension info (COLLECTIVE #1) ============
 		all_ext_info = [None] * self.world_size
 		dist.all_gather_object(all_ext_info, local_ext_info)
 		
@@ -1334,7 +1334,7 @@ class BatchGenWorker:
 					global_seq_info[uuid] = info
 					global_seq_info[uuid]['owning_rank'] = rank_idx
 		
-		# ============ Step 3: All-gather free pages per rank ============
+		# ============ Step 3: All-gather free pages per rank (COLLECTIVE #2) ============
 		local_free = manager.get_stats().num_free_pages
 		free_tensor = torch.tensor([local_free], dtype=torch.int64, device=self.torch_device)
 		gathered_free = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
@@ -1354,7 +1354,7 @@ class BatchGenWorker:
 				**info
 			})
 		
-		# Check if all ranks can extend
+		# Check if all ranks can extend (MUST BE COMPUTED IDENTICALLY ON ALL RANKS)
 		all_can_extend = True
 		for r in range(self.world_size):
 			rank_additional = sum(s['additional_needed'] for s in seqs_by_rank[r])
@@ -1362,8 +1362,14 @@ class BatchGenWorker:
 				all_can_extend = False
 				break
 		
-		# ============ Step 5: Extension without eviction ============
+		# ============ Initialize eviction state ============
+		global_onhold = []
+		onhold_set = set()
+		local_extension_failed = []
+		
+		# ============ Step 5-8: Extension or Eviction (conditional logic) ============
 		if all_can_extend:
+			# No eviction needed - just extend locally
 			my_uuids_needing_extension = [
 				uuid for uuid in decode_uuids
 				if uuid in self._uuid_to_local_map 
@@ -1371,93 +1377,91 @@ class BatchGenWorker:
 			]
 			
 			if my_uuids_needing_extension:
-				self._extend_gpu_kv_allocation(my_uuids_needing_extension)
+				success = self._extend_gpu_kv_allocation(my_uuids_needing_extension)
+				if not success:
+					logging.error(f"Rank {self.rank}: Extension FAILED unexpectedly in no-eviction path")
+					local_extension_failed = my_uuids_needing_extension
 			
 			logging.info(
-				f"Rank {self.rank}: _check_and_extend EXIT (no eviction): "
-				f"returning {len(decode_uuids)} uuids, {len(batch)} batch"
+				f"Rank {self.rank}: _check_and_extend (no eviction path): "
+				f"{len(decode_uuids)} uuids, {len(batch)} batch"
 			)
-			return decode_uuids, batch, []
-		
-		# ============ Step 6: Need eviction ============
-		logging.info(f"Rank {self.rank}: EVICTION REQUIRED")
-		
-		# Sort by decoded_length descending
-		for r in seqs_by_rank:
-			seqs_by_rank[r].sort(key=lambda x: x['decoded_length'], reverse=True)
-		
-		# Compute eviction list (GLOBALLY CONSISTENT)
-		global_onhold = []
-		for r in range(self.world_size):
-			rank_seqs = seqs_by_rank[r]
-			rank_free = per_rank_free[r]
-			rank_additional = sum(s['additional_needed'] for s in rank_seqs)
+			# DO NOT RETURN - must participate in collective #3 below
 			
-			if rank_additional <= rank_free:
-				continue
+		else:
+			# ============ Step 6: Need eviction ============
+			logging.info(f"Rank {self.rank}: EVICTION REQUIRED")
 			
-			pages_to_free = rank_additional - rank_free
-			pages_freed = 0
+			# Sort by decoded_length descending
+			for r in seqs_by_rank:
+				seqs_by_rank[r].sort(key=lambda x: x['decoded_length'], reverse=True)
 			
-			for s in rank_seqs:
-				if pages_freed >= pages_to_free:
-					break
-				global_onhold.append(s['uuid'])
-				pages_freed += s['gpu_pages_allocated']
-		
-		logging.info(
-			f"Rank {self.rank}: global_onhold={len(global_onhold)} sequences"
-		)
-		
-		# ============ Step 7: Execute eviction ============
-		onhold_set = set(global_onhold)
-		my_onhold = [u for u in global_onhold if u in self._uuid_to_local_map]
-		
-		if my_onhold:
-			local_indices = self._get_local_indices_for_uuids(my_onhold)
-			global_ids = self._local_indices_to_global_seq_ids(local_indices)
-			
-			if global_ids:
-				manager.free_pages_for_sequences(global_ids)
-			
-			for uuid in my_onhold:
-				seq = self.global_batch.get_sequence(uuid)
-				seq.gpu_pages_allocated = 0
-				self._sequences_with_gpu_kv.discard(uuid)
-			
-			logging.info(
-				f"Rank {self.rank}: Evicted {len(my_onhold)} local sequences"
-			)
-		
-		# Update status globally
-		for uuid in global_onhold:
-			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
-		
-		# ============ Step 8: Extend remaining sequences ============
-		my_remaining_needing_extension = [
-			uuid for uuid in decode_uuids
-			if uuid in self._uuid_to_local_map 
-			and uuid not in onhold_set
-			and global_seq_info.get(uuid, {}).get('additional_needed', 0) > 0
-		]
-
-		local_extension_failed = []
-		if my_remaining_needing_extension:
-			success = self._extend_gpu_kv_allocation(my_remaining_needing_extension)
-			if not success:
-				logging.error(f"Rank {self.rank}: Extension FAILED - putting sequences ON_HOLD")
-				local_extension_failed = my_remaining_needing_extension
+			# Compute eviction list (GLOBALLY CONSISTENT)
+			for r in range(self.world_size):
+				rank_seqs = seqs_by_rank[r]
+				rank_free = per_rank_free[r]
+				rank_additional = sum(s['additional_needed'] for s in rank_seqs)
 				
-				# Release their GPU allocation
-				for uuid in local_extension_failed:
+				if rank_additional <= rank_free:
+					continue
+				
+				pages_to_free = rank_additional - rank_free
+				pages_freed = 0
+				
+				for s in rank_seqs:
+					if pages_freed >= pages_to_free:
+						break
+					global_onhold.append(s['uuid'])
+					pages_freed += s['gpu_pages_allocated']
+			
+			logging.info(f"Rank {self.rank}: global_onhold={len(global_onhold)} sequences")
+			
+			# ============ Step 7: Execute eviction ============
+			onhold_set = set(global_onhold)
+			my_onhold = [u for u in global_onhold if u in self._uuid_to_local_map]
+			
+			if my_onhold:
+				local_indices = self._get_local_indices_for_uuids(my_onhold)
+				global_ids = self._local_indices_to_global_seq_ids(local_indices)
+				
+				if global_ids:
+					manager.free_pages_for_sequences(global_ids)
+				
+				for uuid in my_onhold:
 					seq = self.global_batch.get_sequence(uuid)
-					if seq.gpu_pages_allocated > 0:
-						global_id = seq.global_idx
-						manager.free_pages_for_sequences([global_id])
 					seq.gpu_pages_allocated = 0
 					self._sequences_with_gpu_kv.discard(uuid)
+				
+				logging.info(f"Rank {self.rank}: Evicted {len(my_onhold)} local sequences")
+			
+			# Update status globally
+			for uuid in global_onhold:
+				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+			
+			# ============ Step 8: Extend remaining sequences ============
+			my_remaining_needing_extension = [
+				uuid for uuid in decode_uuids
+				if uuid in self._uuid_to_local_map 
+				and uuid not in onhold_set
+				and global_seq_info.get(uuid, {}).get('additional_needed', 0) > 0
+			]
 
-		# ============ ALL-GATHER extension failures (ALWAYS - COLLECTIVE) ============
+			if my_remaining_needing_extension:
+				success = self._extend_gpu_kv_allocation(my_remaining_needing_extension)
+				if not success:
+					logging.error(f"Rank {self.rank}: Extension FAILED - putting sequences ON_HOLD")
+					local_extension_failed = my_remaining_needing_extension
+					
+					# Release their GPU allocation
+					for uuid in local_extension_failed:
+						seq = self.global_batch.get_sequence(uuid)
+						if seq.gpu_pages_allocated > 0:
+							global_id = seq.global_idx
+							manager.free_pages_for_sequences([global_id])
+						seq.gpu_pages_allocated = 0
+						self._sequences_with_gpu_kv.discard(uuid)
+
+		# ============ ALL-GATHER extension failures (COLLECTIVE #3 - ALL RANKS MUST CALL) ============
 		all_failed = [None] * self.world_size
 		dist.all_gather_object(all_failed, local_extension_failed)
 
@@ -1482,7 +1486,7 @@ class BatchGenWorker:
 			if uuid not in self._sequences_with_gpu_kv:
 				logging.error(f"Rank {self.rank}: BUG! uuid={uuid} in active_batch but not in _sequences_with_gpu_kv")
 
-		# ============ ALL-REDUCE VALIDATION ============
+		# ============ ALL-REDUCE VALIDATION (COLLECTIVE #4) ============
 		local_active_count = torch.tensor([len(active_uuids)], dtype=torch.int64, device=self.torch_device)
 		all_active_counts = [torch.zeros_like(local_active_count) for _ in range(self.world_size)]
 		dist.all_gather(all_active_counts, local_active_count)
@@ -1492,12 +1496,12 @@ class BatchGenWorker:
 			logging.error(f"Rank {self.rank}: DIVERGENCE! active_uuids counts differ across ranks: {counts}")
 
 		logging.info(
-			f"Rank {self.rank}: _check_and_extend EXIT (with eviction): "
+			f"Rank {self.rank}: _check_and_extend EXIT: "
 			f"active_uuids={len(active_uuids)}, active_batch={len(active_batch)}, "
-			f"onhold={len(global_onhold)}"
+			f"onhold={len(global_onhold)}, all_can_extend={all_can_extend}"
 		)
 
-		return active_uuids, active_batch, global_onhold  # ← ALWAYS return
+		return active_uuids, active_batch, global_onhold
 
 	def _check_and_handle_completions(
 		self, 
