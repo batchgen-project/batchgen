@@ -2172,68 +2172,58 @@ class BatchGenWorker:
 				timing = BoundaryTimingStats()
 				boundary_start = time.perf_counter()
 				
+				# --------------------------------------------------------
+				# PHASE 1: SYNC ALL PENDING OPERATIONS
+				# --------------------------------------------------------
 				
-				# =============================================================
-				# PAGE BOUNDARY LOGIC
-				# =============================================================
-				if iteration - last_page_boundary_check >= self.PAGE_SIZE:
-					last_page_boundary_check = iteration
+				# 1a. Wait for KV append tasks (local operation)
+				t0 = time.perf_counter()
+				self._wait_pending_kv_append_tasks()
+				timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
+				
+				# 1b. Integrate PREVIOUS async load
+				# CRITICAL: Check pending_load_uuids (globally consistent) not pending_async_load_task
+				t0 = time.perf_counter()
+				if pending_load_uuids:  # ALL ranks have identical value
+					logging.info(
+						f"Rank {self.rank}: Phase 1b - Integrating {len(pending_load_uuids)} pending sequences"
+					)
 					
-					timing = BoundaryTimingStats()
-					boundary_start = time.perf_counter()
+					# Wait for async task if THIS rank has one
+					if pending_async_load_task is not None:
+						pending_async_load_task.wait()
 					
-					# --------------------------------------------------------
-					# PHASE 1: SYNC ALL PENDING OPERATIONS
-					# --------------------------------------------------------
-					
-					# 1a. Wait for KV append tasks (local operation)
-					t0 = time.perf_counter()
-					self._wait_pending_kv_append_tasks()
-					timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
-					
-					# 1b. Integrate PREVIOUS async load
-					# CRITICAL: Check pending_load_uuids (globally consistent) not pending_async_load_task
-					t0 = time.perf_counter()
-					if pending_load_uuids:  # ALL ranks have identical value
-						logging.info(
-							f"Rank {self.rank}: Phase 1b - Integrating {len(pending_load_uuids)} pending sequences"
-						)
-						
-						# Wait for async task if THIS rank has one
-						if pending_async_load_task is not None:
-							pending_async_load_task.wait()
-						
-						# COLLECTIVE: All ranks synchronize here
-						dist.barrier()
-						
-						# Finalize integration (updates tracking, merges batches)
-						decode_uuids, batch = self._finalize_async_load(
-							pending_async_load_task,  # Can be None for ranks with no local sequences
-							pending_load_uuids,
-							pending_load_local_indices,
-							pending_load_global_ids,
-							decode_uuids,
-							batch,
-							gpu_manager
-						)
-						
-						# Clear pending state
-						pending_async_load_task = None
-						pending_load_uuids = []
-						pending_load_local_indices = []
-						pending_load_global_ids = []
-					
-					timing.finalize_async_load_ms = (time.perf_counter() - t0) * 1000
-					
-					# 1c. Rebuild page table ONCE after integration
-					t0 = time.perf_counter()
-					self._rebuild_page_table_for_batch(batch, gpu_manager)
-					timing.rebuild_after_integration_ms = (time.perf_counter() - t0) * 1000
-					
-					# 1d. COLLECTIVE: Ensure all ranks synchronized
-					t0 = time.perf_counter()
+					# COLLECTIVE: All ranks synchronize here
 					dist.barrier()
-					timing.barrier_after_sync_ms = (time.perf_counter() - t0) * 1000
+					
+					# Finalize integration (updates tracking, merges batches)
+					decode_uuids, batch = self._finalize_async_load(
+						pending_async_load_task,  # Can be None for ranks with no local sequences
+						pending_load_uuids,
+						pending_load_local_indices,
+						pending_load_global_ids,
+						decode_uuids,
+						batch,
+						gpu_manager
+					)
+					
+					# Clear pending state
+					pending_async_load_task = None
+					pending_load_uuids = []
+					pending_load_local_indices = []
+					pending_load_global_ids = []
+				
+				timing.finalize_async_load_ms = (time.perf_counter() - t0) * 1000
+				
+				# 1c. Rebuild page table ONCE after integration
+				t0 = time.perf_counter()
+				self._rebuild_page_table_for_batch(batch, gpu_manager)
+				timing.rebuild_after_integration_ms = (time.perf_counter() - t0) * 1000
+				
+				# 1d. COLLECTIVE: Ensure all ranks synchronized
+				t0 = time.perf_counter()
+				dist.barrier()
+				timing.barrier_after_sync_ms = (time.perf_counter() - t0) * 1000
 				
 				# --------------------------------------------------------
 				# PHASE 2: EVICTION (Completed Sequences)
