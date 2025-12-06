@@ -2597,7 +2597,7 @@ class BatchGenWorker:
 				f"Rank {self.rank}: Skipping async load - need {total_pages_needed} pages, "
 				f"only {current_free} free"
 			)
-			return None, [], [], []
+			return None, new_uuids, [], []
 		
 		# Step 5: Allocate GPU pages
 		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
@@ -2706,7 +2706,7 @@ class BatchGenWorker:
 				f"only {current_free} free"
 			)
 			timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
-			return None, [], [], [], timing
+			return None, new_uuids, [], [], timing
 		
 		gpu_manager.allocate_pages_for_sequences(new_global_ids, tokens)
 		timing['allocate_ms'] = (time.perf_counter() - t0) * 1000
