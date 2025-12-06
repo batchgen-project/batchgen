@@ -908,7 +908,7 @@ class BatchGenWorker:
 			v_device_ptrs=v_ptrs,
 		)
 		load_task.wait()
-		# torch.cuda.synchronize(self.torch_device)
+		torch.cuda.synchronize(self.torch_device)
 		load_duration = time.perf_counter() - copy_start
 		logging.info(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
@@ -2407,7 +2407,7 @@ class BatchGenWorker:
 		
 		if pending_async_load_task is not None:
 			pending_async_load_task.wait()
-			# torch.cuda.synchronize(self.torch_device)
+			torch.cuda.synchronize(self.torch_device)
 		
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
