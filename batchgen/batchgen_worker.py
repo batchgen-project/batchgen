@@ -3119,9 +3119,16 @@ class BatchGenWorker:
 			v_device_ptrs=v_ptrs,
 		)
 		
-		# Set flag AND store task to trigger sync in attention wrapper during forward passes
-		Attn_Wrapper.async_kv_load_active = True
-		Attn_Wrapper.async_kv_load_task = async_task  # Store task so Wrapper can wait for it
+		# SYNCHRONOUS MODE: Wait immediately after launch to debug async race condition
+		# TODO: Revert to async once bug is fixed
+		logging.info(f"Rank {self.rank}: Waiting for async KV load to complete (sync mode)...")
+		async_task.wait()
+		torch.cuda.synchronize()
+		logging.info(f"Rank {self.rank}: Async KV load completed (sync mode)")
+		
+		# Don't set async flags since we've already waited
+		Attn_Wrapper.async_kv_load_active = False
+		Attn_Wrapper.async_kv_load_task = None
 		
 		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 		
