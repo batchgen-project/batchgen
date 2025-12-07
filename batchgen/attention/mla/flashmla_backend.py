@@ -2068,6 +2068,13 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		layer_idx=layer_idx
 	)
 
+	# Validate block_table batch dimension matches input
+	assert block_table.shape[0] == bsz, (
+		f"[Layer {layer_idx}] block_table batch mismatch: "
+		f"block_table.shape[0]={block_table.shape[0]} != bsz={bsz}. "
+		f"This indicates GPU page table is out of sync with the current batch."
+	)
+
 	kv_b_proj = deepseek_v3_dequantization(
 		self.kv_b_proj.weight.data,
 		weight_scale["kv_b_proj.weight_scale_inv"],
