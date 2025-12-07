@@ -3119,8 +3119,9 @@ class BatchGenWorker:
 			v_device_ptrs=v_ptrs,
 		)
 		
-		# Set flag to trigger sync in attention wrapper during forward passes
+		# Set flag AND store task to trigger sync in attention wrapper during forward passes
 		Attn_Wrapper.async_kv_load_active = True
+		Attn_Wrapper.async_kv_load_task = async_task  # Store task so Wrapper can wait for it
 		
 		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 		
@@ -3150,8 +3151,9 @@ class BatchGenWorker:
 		NOTE: Caller is responsible for waiting on async_task before calling this.
 		NOTE: Does NOT rebuild page table - caller must rebuild after.
 		"""
-		# Clear async load flag - load is complete
+		# Clear async load flag and task reference - load is complete
 		Attn_Wrapper.async_kv_load_active = False
+		Attn_Wrapper.async_kv_load_task = None
 		
 		# Clear tensor references (task is complete)
 		if hasattr(self, '_async_load_tensors'):

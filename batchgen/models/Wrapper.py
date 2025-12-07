@@ -280,6 +280,8 @@ class Attn_Wrapper(torch.nn.Module):
 	kv_append_callback = None
 	# Flag to indicate async KV load is in progress - triggers sync before attention
 	async_kv_load_active = False
+	# Store the async task object so we can wait for it
+	async_kv_load_task = None
 
 	def __init__(
 		self,
@@ -561,6 +563,12 @@ class Attn_Wrapper(torch.nn.Module):
 			# CRITICAL: Sync GPU if async KV load is active to prevent memory races
 			# Only sync on layer 0 to avoid redundant syncs per layer
 			if Attn_Wrapper.async_kv_load_active and self.layer_idx == 0:
+				# Wait for the C++ async task to complete (this waits for its internal CUDA stream)
+				if Attn_Wrapper.async_kv_load_task is not None:
+					Attn_Wrapper.async_kv_load_task.wait()
+					Attn_Wrapper.async_kv_load_task = None  # Clear after waiting
+					Attn_Wrapper.async_kv_load_active = False  # Clear flag too
+				# Also sync PyTorch's view of CUDA to be safe
 				torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
 				
 			hidden_states = kwargs["hidden_states"]
