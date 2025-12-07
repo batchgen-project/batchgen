@@ -2637,6 +2637,46 @@ class BatchGenWorker:
 				
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				
+				# ============ PRE-FORWARD VALIDATION ============
+				if len(batch) > 0:
+					# Validate tensor shapes match batch size
+					expected_bsz = len(batch)
+					actual_token_bsz = new_tokens.shape[0]
+					actual_mask_bsz = Attn_Wrapper.attention_mask.shape[0]
+					actual_pos_bsz = Attn_Wrapper.position_ids.shape[0]
+					actual_seqlen_bsz = Attn_Wrapper.cache_seqlens.shape[0]
+					
+					if actual_token_bsz != expected_bsz:
+						logging.error(
+							f"Rank {self.rank}: BATCH SIZE MISMATCH! "
+							f"expected={expected_bsz}, new_tokens.shape[0]={actual_token_bsz}"
+						)
+					if actual_mask_bsz != expected_bsz:
+						logging.error(
+							f"Rank {self.rank}: ATTENTION MASK MISMATCH! "
+							f"expected={expected_bsz}, attention_mask.shape[0]={actual_mask_bsz}"
+						)
+					if actual_pos_bsz != expected_bsz:
+						logging.error(
+							f"Rank {self.rank}: POSITION_IDS MISMATCH! "
+							f"expected={expected_bsz}, position_ids.shape[0]={actual_pos_bsz}"
+						)
+					if actual_seqlen_bsz != expected_bsz:
+						logging.error(
+							f"Rank {self.rank}: CACHE_SEQLENS MISMATCH! "
+							f"expected={expected_bsz}, cache_seqlens.shape[0]={actual_seqlen_bsz}"
+						)
+					
+					# Log summary for debugging
+					logging.debug(
+						f"Rank {self.rank}: Forward pass: batch={expected_bsz}, "
+						f"new_tokens={new_tokens.shape}, "
+						f"attention_mask={Attn_Wrapper.attention_mask.shape}, "
+						f"position_ids={Attn_Wrapper.position_ids.shape}, "
+						f"cache_seqlens={Attn_Wrapper.cache_seqlens.shape}, "
+						f"max_seqlen={Attn_Wrapper.max_seqlen}"
+					)
+				
 				# Forward pass
 				outputs = self.model(
 					new_tokens,

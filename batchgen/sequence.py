@@ -234,19 +234,9 @@ class SequenceBatch:
         
         seq = self.sequences[uuid]
         old_status = seq.status
+        seq.status_transition(new_status)  # Validates transition
         
-        # Skip if already in target status (idempotent)
-        if old_status == new_status:
-            return
-        
-        # Skip if already completed (terminal state)
-        if old_status == SequenceStatus.COMPLETED:
-            return
-        
-        # Validate and perform transition
-        seq.status_transition(new_status)  # May raise ValueError
-        
-        # Update index only AFTER successful transition
+        # Update index
         self._status_index[old_status].discard(uuid)
         self._status_index[new_status].add(uuid)
 

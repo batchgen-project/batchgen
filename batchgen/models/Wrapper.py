@@ -642,10 +642,44 @@ class Attn_Wrapper(torch.nn.Module):
 						# 	weight_scale = self.weight_dequant_scale
 						# )
 						# logging.info(f"{self.layer_idx=}, {hidden_states.device}, {hidden_states[start_ids:end_ids]=}")
+						
+						# ============ PRE-ATTENTION VALIDATION ============
+						micro_hidden = hidden_states[start_ids:end_ids]
+						micro_position_ids = position_ids[start_ids:end_ids]
+						micro_cache_seqlens = Attn_Wrapper.cache_seqlens[start_ids:end_ids]
+						
+						if self.layer_idx == 0:
+							# Only log on layer 0 to avoid spam
+							logging.debug(
+								f"[Rank {dist.get_rank()} Layer {self.layer_idx}] "
+								f"micro_batch {i}: hidden.shape={micro_hidden.shape}, "
+								f"position_ids.shape={micro_position_ids.shape}, "
+								f"cache_seqlens.shape={micro_cache_seqlens.shape}"
+							)
+						
+						if micro_hidden.shape[0] == 0:
+							logging.warning(
+								f"[Rank {dist.get_rank()} Layer {self.layer_idx}] "
+								f"SKIPPING empty micro_batch {i}: start={start_ids}, end={end_ids}"
+							)
+							continue
+						
+						if micro_position_ids.numel() == 0:
+							logging.error(
+								f"[Rank {dist.get_rank()} Layer {self.layer_idx}] "
+								f"EMPTY position_ids for micro_batch {i}! "
+								f"position_ids.shape={position_ids.shape}, "
+								f"start={start_ids}, end={end_ids}"
+							)
+							raise RuntimeError(
+								f"Empty position_ids slice: position_ids.shape={position_ids.shape}, "
+								f"slice=[{start_ids}:{end_ids}]"
+							)
+						
 						attn_result, k_tensor = self.module.decoding_attn_mode_3_bf16(
-							hidden_states[start_ids:end_ids],
-							position_ids[start_ids:end_ids],
-							Attn_Wrapper.cache_seqlens[start_ids:end_ids],
+							micro_hidden,
+							micro_position_ids,
+							micro_cache_seqlens,
 							Attn_Wrapper.max_seqlen,
 							weight_scale=self.weight_dequant_scale,
 							gpu_paged_kv_manager=Attn_Wrapper.gpu_paged_kv_manager,

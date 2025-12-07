@@ -1961,9 +1961,37 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		raise ValueError(
 			"gpu_paged_kv_manager must be provided for page-KV decoding backend",
 		)
-	bsz, q_len, _ = hidden_states.size()
+	
+	# ============ INPUT VALIDATION ============
+	assert hidden_states is not None, "hidden_states is None"
+	assert hidden_states.dim() == 3, f"hidden_states must be 3D, got {hidden_states.dim()}D with shape {hidden_states.shape}"
+	
+	bsz, q_len, hidden_dim = hidden_states.size()
+	
+	# Early return for empty batch - this is valid when all sequences are filtered out
+	if bsz == 0:
+		logging.debug(f"[Layer {layer_idx}] Empty batch (bsz=0), returning empty tensor")
+		# Return empty tensor with correct shape: (0, 1, hidden_dim)
+		return hidden_states, torch.empty(0, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim, 
+										   dtype=hidden_states.dtype, device=hidden_states.device)
+	
 	if q_len != 1:
 		raise ValueError("mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv only supports q_len=1")
+	
+	# Validate q_position_ids
+	assert q_position_ids is not None, "q_position_ids is None"
+	
+	# Shape consistency check (only for non-empty batches)
+	if q_position_ids.shape[0] != bsz:
+		logging.error(
+			f"[Layer {layer_idx}] SHAPE MISMATCH: "
+			f"q_position_ids.shape[0]={q_position_ids.shape[0]} != bsz={bsz}, "
+			f"hidden_states.shape={hidden_states.shape}"
+		)
+		raise ValueError(
+			f"q_position_ids batch dimension ({q_position_ids.shape[0]}) "
+			f"doesn't match hidden_states batch ({bsz})"
+		)
 
 	hidden_states = hidden_states.squeeze(1)
 	hidden_states, hidden_states_scale = act_quant(hidden_states)
@@ -1988,8 +2016,21 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
 	
-	max_pos_id = q_position_ids.max().item() if q_position_ids.numel() > 0 else -1
-	cos_seq_len = cos.size(0)  # ← FIX: dimension 0, not 1
+	# Compute max position ID for RoPE validation
+	# Note: bsz > 0 is guaranteed here (empty batch returns early above)
+	try:
+		max_pos_id = q_position_ids.max().item()
+	except Exception as e:
+		logging.error(
+			f"[Layer {layer_idx}] FAILED to compute q_position_ids.max(): {e}. "
+			f"q_position_ids.shape={q_position_ids.shape}, "
+			f"q_position_ids.device={q_position_ids.device}, "
+			f"q_position_ids.dtype={q_position_ids.dtype}, "
+			f"bsz={bsz}"
+		)
+		raise
+	
+	cos_seq_len = cos.size(0)
 
 	if max_pos_id >= cos_seq_len:
 		logging.error(
