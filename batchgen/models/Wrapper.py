@@ -277,7 +277,9 @@ class Attn_Wrapper(torch.nn.Module):
 	cur_batch = None
 	kv_quantization_factor = None
 	_global_rank: int | None = None
-	kv_append_callback = None 
+	kv_append_callback = None
+	# Flag to indicate async KV load is in progress - triggers sync before attention
+	async_kv_load_active = False
 
 	def __init__(
 		self,
@@ -555,7 +557,11 @@ class Attn_Wrapper(torch.nn.Module):
 				# for name, param in self.module.named_parameters():
 				# 	param.data = weights_dict[name]
 				pass
-				
+			
+			# CRITICAL: Sync GPU if async KV load is active to prevent memory races
+			# Only sync on layer 0 to avoid redundant syncs per layer
+			if Attn_Wrapper.async_kv_load_active and self.layer_idx == 0:
+				torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
 				
 			hidden_states = kwargs["hidden_states"]
 			if hidden_states.shape[0] == 0:

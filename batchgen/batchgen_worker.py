@@ -951,6 +951,8 @@ class BatchGenWorker:
 		
 		try:
 			manager.free_pages_for_sequences(global_sequence_ids)
+			# CRITICAL: Ensure GPU page release completes before continuing
+			torch.cuda.synchronize(self.torch_device)
 			logging.info(
 				f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
 			)
@@ -1496,6 +1498,8 @@ class BatchGenWorker:
 				
 				if global_ids:
 					manager.free_pages_for_sequences(global_ids)
+					# CRITICAL: Ensure GPU page release completes before continuing
+					torch.cuda.synchronize(self.torch_device)
 				
 				for uuid in my_onhold:
 					seq = self.global_batch.get_sequence(uuid)
@@ -1549,7 +1553,7 @@ class BatchGenWorker:
 
 		# ============ CRITICAL VALIDATION WITH REMOVAL ============
 		valid_active_batch = []
-		invalid_uuids = []
+		local_invalid_uuids = []
 
 		for local_idx in active_batch:
 			uuid = self._local_to_uuid_map[local_idx]
@@ -1568,14 +1572,28 @@ class BatchGenWorker:
 			if is_valid:
 				valid_active_batch.append(local_idx)
 			else:
-				invalid_uuids.append(uuid)
-				onhold_set.add(uuid)
-				if uuid not in global_onhold:
-					global_onhold.append(uuid)
-				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+				local_invalid_uuids.append(uuid)
+
+		# ============ SYNCHRONIZE INVALID SEQUENCES ACROSS RANKS (COLLECTIVE) ============
+		# CRITICAL FIX: Each rank only validates its LOCAL sequences, so we must sync
+		# invalid sequences globally to ensure all ranks have consistent active_uuids
+		all_invalid = [None] * self.world_size
+		dist.all_gather_object(all_invalid, local_invalid_uuids)
+		
+		global_invalid_set = set()
+		for rank_invalid in all_invalid:
+			if rank_invalid:
+				for uuid in rank_invalid:
+					global_invalid_set.add(uuid)
+					onhold_set.add(uuid)
+					if uuid not in global_onhold:
+						global_onhold.append(uuid)
+					# Update status on all ranks
+					self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
 		active_batch = valid_active_batch
-		active_uuids = [u for u in active_uuids if u not in set(invalid_uuids)]
+		active_uuids = [u for u in active_uuids if u not in global_invalid_set]
+		
 		# ============ ALL-REDUCE VALIDATION (COLLECTIVE #4) ============
 		local_active_count = torch.tensor([len(active_uuids)], dtype=torch.int64, device=self.torch_device)
 		all_active_counts = [torch.zeros_like(local_active_count) for _ in range(self.world_size)]
@@ -2384,6 +2402,8 @@ class BatchGenWorker:
 					# Wait for async task if THIS rank has one
 					if pending_async_load_task is not None:
 						pending_async_load_task.wait()
+						# CRITICAL: Synchronize GPU to ensure async load data is ready
+						torch.cuda.synchronize(self.torch_device)
 					
 					# COLLECTIVE: All ranks synchronize here
 					dist.barrier()
@@ -2493,6 +2513,11 @@ class BatchGenWorker:
 				# --------------------------------------------------------
 				new_tokens = self._rebuild_input_tokens(batch)
 				
+				# CRITICAL: Synchronize GPU before continuing to next iteration
+				# This ensures all page table rebuilds and GPU operations complete
+				# before we start the next forward pass
+				torch.cuda.synchronize(self.torch_device)
+				
 				t0 = time.perf_counter()
 				dist.barrier()
 				timing.barrier_final_ms = (time.perf_counter() - t0) * 1000
@@ -2508,6 +2533,8 @@ class BatchGenWorker:
 					if pending_load_uuids:  # Global check - all ranks enter
 						if pending_async_load_task is not None:
 							pending_async_load_task.wait()
+							# CRITICAL: Sync GPU after async load completes
+							torch.cuda.synchronize(self.torch_device)
 						dist.barrier()
 						
 						# MOVE OUTSIDE the task check:
@@ -2527,6 +2554,8 @@ class BatchGenWorker:
 						pending_load_global_ids = []
 						
 						self._rebuild_page_table_for_batch(batch, gpu_manager)
+						# CRITICAL: Sync GPU after page table rebuild
+						torch.cuda.synchronize(self.torch_device)
 						
 						if batch:
 							new_tokens = self._rebuild_input_tokens(batch)
@@ -3050,6 +3079,9 @@ class BatchGenWorker:
 			v_device_ptrs=v_ptrs,
 		)
 		
+		# Set flag to trigger sync in attention wrapper during forward passes
+		Attn_Wrapper.async_kv_load_active = True
+		
 		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 		
 		# Store tensor references to prevent GC during async operation
@@ -3078,6 +3110,9 @@ class BatchGenWorker:
 		NOTE: Caller is responsible for waiting on async_task before calling this.
 		NOTE: Does NOT rebuild page table - caller must rebuild after.
 		"""
+		# Clear async load flag - load is complete
+		Attn_Wrapper.async_kv_load_active = False
+		
 		# Clear tensor references (task is complete)
 		if hasattr(self, '_async_load_tensors'):
 			self._async_load_tensors = None
