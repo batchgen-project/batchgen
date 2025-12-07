@@ -1767,7 +1767,7 @@ class BatchGenWorker:
 			# =================================================================
 			while (self.global_batch.has_prefilled() or 
 			   self.global_batch.has_in_decode() or 
-			   self.global_batch.has_onhold()):
+			   self.global_batch.has_on_hold()):
 				dist.barrier()
 				
 				# A. Prepare Initial Decode Batch (from PREFILLED)
