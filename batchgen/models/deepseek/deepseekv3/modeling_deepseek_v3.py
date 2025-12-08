@@ -1988,13 +1988,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# Handle empty input - still must participate in all-to-all
 		if num_tokens == 0:
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				import logging
-				logging.info(
-					f"[EMPTY INPUT] moe_infer_pplx_a2a_fp8_dispatch called with 0 tokens on device {self.device}. "
-					f"This rank has no sequences in current batch."
-				)
-			
 			# Calculate num_blocks to match act_quant's scale shape (block_size=128)
 			block_size = 128
 			num_blocks = (hidden_size + block_size - 1) // block_size
@@ -2002,13 +1995,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			empty_indices = torch.empty((0, self.num_experts_per_tok), dtype=torch.uint32, device=self.device)
 			empty_weights = torch.empty((0, self.num_experts_per_tok), dtype=torch.float32, device=self.device)
 			empty_x_fp8 = torch.empty((0, hidden_size), dtype=torch.float8_e4m3fn, device=self.device)
-			# CRITICAL FIX: dp_x_scale must be 2D with shape (num_tokens, num_blocks)
 			empty_x_scale = torch.empty((0, num_blocks), dtype=torch.float32, device=self.device)
 			
 			self.bound_m.fill_(0)
 
-			# DEBUG SYNC: Check for errors before dispatch (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
+			# PPLX SYNC: Only sync before pplx dispatch
+			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
 				torch.cuda.synchronize(self.device)
 			
 			self.ata.dispatch(
@@ -2021,8 +2013,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				bound_m=self.bound_m,
 			)
 			
-			# DEBUG SYNC: Check for errors after dispatch (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
+			# PPLX SYNC: After dispatch
+			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
 				torch.cuda.synchronize(self.device)
 			
 			self.grouped_dequant_moe_fp8_ata_fp8(
@@ -2032,11 +2024,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				self.expert_y
 			)
 			
-			# DEBUG SYNC: Check for errors after expert compute (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
+			empty_y = torch.zeros((0, hidden_size), dtype=x.dtype, device=self.device)
+			
+			# PPLX SYNC: Before combine
+			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
 				torch.cuda.synchronize(self.device)
 			
-			empty_y = torch.zeros((0, hidden_size), dtype=x.dtype, device=self.device)
 			self.ata.combine(
 				out_tokens=empty_y,
 				indices=empty_indices,
@@ -2045,8 +2038,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				bound_m=self.bound_m,
 			)
 			
-			# DEBUG SYNC: Check for errors after combine (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
+			# PPLX SYNC: After combine
+			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
 				torch.cuda.synchronize(self.device)
 			
 			return empty_y
@@ -2072,24 +2065,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				f"MoE buffer overflow: num_tokens={num_tokens} > buffer_size={buffer_size}"
 			)
 		
-		# DEBUG SYNC: Check for errors after gate computation
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
-		
-		# self.dp_x.copy_(dp_x_fp8)
-		# self.dp_x_scale.copy_(dp_x_scale)
-		# self.indices.copy_(topk_idx.to(torch.uint32))
-		# self.weights.copy_(topk_weight.to(torch.float32))
-		# # bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
-		# self.bound_m.fill_(num_tokens)
 		self.dp_x[:num_tokens].copy_(dp_x_fp8)
 		self.dp_x_scale[:num_tokens].copy_(dp_x_scale)
 		self.indices[:num_tokens].copy_(topk_idx.to(torch.uint32))
 		self.weights[:num_tokens].copy_(topk_weight.to(torch.float32))
 		self.bound_m.fill_(num_tokens)
 
-		# DEBUG SYNC: Check for errors after copy operations
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
+		# PPLX SYNC: Only sync before pplx dispatch
+		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
 			torch.cuda.synchronize(self.device)
 
 		# 2. Dispatch
@@ -2103,21 +2086,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			bound_m=self.bound_m,
 		)
 
-		# DEBUG SYNC: Check for errors after dispatch
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
+		# PPLX SYNC: After dispatch
+		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
 			torch.cuda.synchronize(self.device)
-			# Also check expert_num_tokens for overflow
-			max_tokens_per_expert = self.expert_x.shape[1]  # Shape is (E, T, H)
-			max_expert_tokens = self.expert_num_tokens.max().item()
-			if max_expert_tokens > max_tokens_per_expert:
-				import logging
-				logging.error(
-					f"[MoE EXPERT OVERFLOW] max_expert_tokens={max_expert_tokens} > "
-					f"max_tokens_per_expert={max_tokens_per_expert}. "
-					f"expert_num_tokens={self.expert_num_tokens.tolist()}"
-				)
 
-		# 3. Local Expert Computation (Identity)
+		# 3. Local Expert Computation
 		self.grouped_dequant_moe_fp8_ata_fp8(
 			(self.expert_x, self.expert_x_scale),
 			self.expert_num_tokens,
@@ -2125,12 +2098,13 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.expert_y
 		)
 
-		# DEBUG SYNC: Check for errors after expert computation
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
-
 		# 4. Combine
-		self.y.zero_() 
+		self.y.zero_()
+		
+		# PPLX SYNC: Before combine
+		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
+			torch.cuda.synchronize(self.device)
+		
 		self.ata.combine(
 			out_tokens=self.y,
 			indices=self.indices,
@@ -2139,8 +2113,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			bound_m=self.bound_m,
 		)
 		
-		# DEBUG SYNC: Check for errors after combine
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
+		# PPLX SYNC: After combine
+		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
 			torch.cuda.synchronize(self.device)
 		
 		return self.y[:num_tokens].to(x.dtype)
@@ -2150,13 +2124,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		Optimized wrapper for 3D inputs in FP8.
 		"""
 		x_quant, x_scale = x
-		
-		# DEBUG: Log expert token counts for debugging empty inputs
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			total_tokens = expert_token_counts.sum().item()
-			if total_tokens == 0:
-				import logging
-				logging.info(f"[MoE Expert Compute] All experts have 0 tokens on device {self.device}")
 		
 		# Stage 1: Output is (E, T, Intermediate)
 		intermediate = fused_fp8_moe_stage_1_tma_wrapper(
@@ -2169,15 +2136,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			experts_per_rank    
 		)
 		
-		# DEBUG SYNC: Check for errors after stage 1
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
-		
 		intermediate_quant, intermediate_scale = act_quant_3d(intermediate, expert_token_counts)
-		
-		# DEBUG SYNC: Check for errors after act_quant_3d
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
 		
 		# Stage 2: Output is (E, T, Hidden)
 		res = fused_dequant_grouped_gemm_fp8_tma_wrapper(
@@ -2188,10 +2147,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			experts_per_rank,
 			out=out 
 		)
-		
-		# DEBUG SYNC: Check for errors after stage 2
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
 		
 		return res
 
@@ -2906,24 +2861,14 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			import logging
 			logging.error(
 				f"[MoE AllGather BUFFER OVERFLOW] num_tokens={num_tokens} exceeds "
-				f"num_tokens_per_rank={self.num_tokens_per_rank}. This will cause issues! "
-				f"Truncating to avoid crash, but results may be incorrect."
+				f"num_tokens_per_rank={self.num_tokens_per_rank}. This will cause issues!"
 			)
-			# Option 1: Raise error (safer)
 			raise RuntimeError(
 				f"MoE buffer overflow: num_tokens={num_tokens} > num_tokens_per_rank={self.num_tokens_per_rank}"
 			)
-			# Option 2: Truncate (allows continued execution but wrong results)
-			# x = x[:self.num_tokens_per_rank]
-			# num_tokens = self.num_tokens_per_rank
 		
 		# Handle zero-token case early
 		if num_tokens == 0:
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				import logging
-				logging.info(
-					f"[EMPTY INPUT] moe_infer_allgather_allreduce_bf16_acc called with 0 tokens on device {self.device}."
-				)
 			# Still need to participate in collectives with padded data
 			padded_hidden_states = torch.zeros(
 				(self.num_tokens_per_rank, hidden_size), 
@@ -2944,29 +2889,17 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 					stream=torch.cuda.default_stream(self.device)
 				)
 			
-			# DEBUG SYNC: Check for errors after all_gather (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
-			
 			# Gate computation on global tokens (from other ranks)
 			global_x = all_tokens
 			global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])
 			topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
 			global_x = global_x.squeeze(1)
 			
-			# DEBUG SYNC: Check for errors after gate (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
-			
 			topk_idx = topk_idx.to(torch.int32)
 			input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
 				global_x, topk_idx, self.token_idx, self.topk_pos,
 				self.routed_expert_start_idx, self.routed_expert_end_idx,
 			)
-			
-			# DEBUG SYNC: Check for errors after token dispatch (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
 			
 			# Process tokens (may still have tokens from other ranks routed to this rank's experts)
 			res = self.grouped_dequant_moe_fp8(
@@ -2976,19 +2909,11 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				expert_offsets
 			)
 			
-			# DEBUG SYNC: Check for errors after expert compute (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
-			
 			global_results = scatter_weight_reduce_optimized(
 				res, global_indices, token_topk_pos, topk_weight,
 				self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
 			)
 			global_results = global_results.to(torch.bfloat16)
-			
-			# DEBUG SYNC: Check for errors after scatter (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
 			
 			# Participate in all-reduce
 			with self.comm.change_state(enable=True):
@@ -2997,10 +2922,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 					op=dist.ReduceOp.SUM, 
 					stream=torch.cuda.default_stream(self.device)
 				)
-			
-			# DEBUG SYNC: Check for errors after all_reduce (empty path)
-			if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
 			
 			# Return empty tensor with correct shape
 			return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
@@ -3029,20 +2950,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				stream=torch.cuda.default_stream(self.device)
 			)
 		
-		# DEBUG SYNC: Check for errors after all_gather
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
-		
 		# ---- 2) Gate computation on global tokens --------------------------
 		global_x = all_tokens
 		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
 		assert topk_weight.dtype == torch.float32, f"topk_weight must be float32, got {topk_weight.dtype}"
 		global_x = global_x.squeeze(1)
-		
-		# DEBUG SYNC: Check for errors after gate
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
 		
 		# ---- 3) Process tokens assigned to local experts ------------------
 		topk_idx = topk_idx.to(torch.int32)
@@ -3051,20 +2964,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.routed_expert_start_idx, self.routed_expert_end_idx,
 		)
 		
-		# DEBUG SYNC: Check for errors after token dispatch
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
-		
 		res = self.grouped_dequant_moe_fp8(
 			input_x,
 			input_eids,
 			expert_counts,
 			expert_offsets
 		)
-		
-		# DEBUG SYNC: Check for errors after expert compute
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
 		
 		assert topk_weight.dtype == torch.float32
 		global_results = scatter_weight_reduce_optimized(
@@ -3073,10 +2978,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		)
 		global_results = global_results.to(torch.bfloat16)
 		
-		# DEBUG SYNC: Check for errors after scatter
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
-		
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(
@@ -3084,10 +2985,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				op=dist.ReduceOp.SUM, 
 				stream=torch.cuda.default_stream(self.device)
 			)
-		
-		# DEBUG SYNC: Check for errors after all_reduce
-		if os.environ.get("BATCHGEN_DEBUG_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
 		
 		# ---- 3.4) Extract results for local tokens and aggregate ------------
 		start_token_ids = self.rank * self.num_tokens_per_rank
@@ -4172,16 +4069,8 @@ class DeepseekV3DecoderLayer(nn.Module):
 			)
 		residual = hidden_states
 
-		# DEBUG: Sync checkpoint - before layernorm
-		import torch
-		_device = hidden_states.device
-		torch.cuda.synchronize(_device)
-
 		# logger.warning(f"Input layernorm weight dtype: {self.input_layernorm.weight.dtype}")
 		hidden_states = self.input_layernorm(hidden_states)
-
-		# DEBUG: Sync checkpoint - after layernorm, before attention  
-		torch.cuda.synchronize(_device)
 
 		# Self Attention
 		hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -4195,21 +4084,12 @@ class DeepseekV3DecoderLayer(nn.Module):
 		)
 		hidden_states = residual + hidden_states
 
-		# DEBUG: Sync checkpoint - after attention
-		torch.cuda.synchronize(_device)
-
 		# Fully Connected
 		residual = hidden_states
 		# logger.warning(f"Post attention layernorm weight dtype: {self.post_attention_layernorm.weight.dtype}")
 		hidden_states = self.post_attention_layernorm(hidden_states)
 
-		# DEBUG: Sync checkpoint - after post_attention_layernorm
-		torch.cuda.synchronize(_device)
-
 		hidden_states = self.mlp(hidden_states)
-
-		# DEBUG: Sync checkpoint - after MLP/MoE
-		torch.cuda.synchronize(_device)
 
 		hidden_states = residual + hidden_states
 

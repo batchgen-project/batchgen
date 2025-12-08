@@ -1994,15 +1994,8 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		)
 
 	hidden_states = hidden_states.squeeze(1)
-	_device = hidden_states.device
-	
-	# DEBUG: Sync checkpoint 1 - after squeeze
-	torch.cuda.synchronize(_device)
 	
 	hidden_states, hidden_states_scale = act_quant(hidden_states)
-	
-	# DEBUG: Sync checkpoint 2 - after act_quant
-	torch.cuda.synchronize(_device)
 	
 	q = w8a8_deepgemm(
 		hidden_states,
@@ -2011,9 +2004,6 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		weight_scale["q_a_proj.weight_scale_inv"],
 	)
 	
-	# DEBUG: Sync checkpoint 3 - after q_a_proj
-	torch.cuda.synchronize(_device)
-	
 	new_compressed_kv = w8a8_deepgemm(
 		hidden_states,
 		hidden_states_scale,
@@ -2021,23 +2011,14 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
 	).view(bsz, 1, -1)
 	
-	# DEBUG: Sync checkpoint 4 - after kv_a_proj
-	torch.cuda.synchronize(_device)
-	
 	q = self.q_a_layernorm(q)
 	q, q_scale = act_quant(q)
 	q = w8a8_deepgemm(q, q_scale, self.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"])
-
-	# DEBUG: Sync checkpoint 5 - after q_b_proj
-	torch.cuda.synchronize(_device)
 
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
-	
-	# DEBUG: Sync checkpoint 6 - after rotary_emb
-	torch.cuda.synchronize(_device)
 	
 	# Compute max position ID for RoPE validation
 	# Note: bsz > 0 is guaranteed here (empty batch returns early above)

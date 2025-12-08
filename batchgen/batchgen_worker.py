@@ -2167,7 +2167,11 @@ class BatchGenWorker:
 
 
 	def _release_host_kv_pages_for_batch(self, uuids: List[str]) -> None:
-		"""Release host KV pages for completed sequences owned by this rank."""
+		"""Release host KV pages for completed sequences owned by this rank.
+		
+		NOTE: This function only releases HOST KV pages. GPU KV pages should be
+		released separately by calling _release_gpu_kv_pages() BEFORE this function.
+		"""
 		if not uuids:
 			return
 		
@@ -2186,12 +2190,10 @@ class BatchGenWorker:
 			
 			logging.info(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
 			
-			# Release GPU KV pages first
-			local_indices = self._get_local_indices_for_uuids(my_uuids)
-			if local_indices:
-				self._release_gpu_kv_pages(local_indices)
+			# NOTE: GPU KV pages should already be released by caller
+			# Do NOT call _release_gpu_kv_pages here to avoid double-free
 			
-			# Then release host KV pages
+			# Release host KV pages
 			worker_view.release_sequence_pages(global_sequence_ids)
 			worker_view.unregister_sequences(global_sequence_ids)
 			
