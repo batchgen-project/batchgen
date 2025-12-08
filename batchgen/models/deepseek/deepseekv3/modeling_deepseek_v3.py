@@ -1905,6 +1905,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
 		self.bound_m.fill_(num_tokens)
 
+		# CRITICAL: Sync default stream before dispatch
+		torch.cuda.current_stream(self.device).synchronize()
+
 		# 2. Dispatch
 		self.ata.dispatch(
 			out_expert_num_tokens=self.expert_num_tokens,
@@ -1915,6 +1918,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			indices=self.indices,
 			bound_m=self.bound_m,
 		)
+		
+		torch.cuda.current_stream(self.device).synchronize()
 		# 3. Local Expert Computation (Identity)
 		self.grouped_dequant_moe_fp8_ata(
 			self.expert_x,
@@ -1925,6 +1930,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 		# 4. Combine
 		self.y.zero_() 
+		
+		# CRITICAL: Sync default stream before combine
+		torch.cuda.current_stream(self.device).synchronize()
+		
 		self.ata.combine(
 			out_tokens=self.y,
 			indices=self.indices,
@@ -1932,7 +1941,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			expert_y=self.expert_y,
 			bound_m=self.bound_m,
 		)
-		
+		torch.cuda.current_stream(self.device).synchronize()
 		return self.y[:num_tokens].to(x.dtype)
 
 	@torch.inference_mode()
@@ -1999,9 +2008,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			
 			self.bound_m.fill_(0)
 
-			# PPLX SYNC: Only sync before pplx dispatch
-			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
+			# CRITICAL: Sync default stream before dispatch
+			torch.cuda.current_stream(self.device).synchronize()
 			
 			self.ata.dispatch(
 				out_expert_num_tokens=self.expert_num_tokens,
@@ -2013,10 +2021,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				bound_m=self.bound_m,
 			)
 			
-			# PPLX SYNC: After dispatch
-			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
-			
 			self.grouped_dequant_moe_fp8_ata_fp8(
 				(self.expert_x, self.expert_x_scale),
 				self.expert_num_tokens,
@@ -2026,9 +2030,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			
 			empty_y = torch.zeros((0, hidden_size), dtype=x.dtype, device=self.device)
 			
-			# PPLX SYNC: Before combine
-			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
+			# CRITICAL: Sync default stream before combine
+			torch.cuda.current_stream(self.device).synchronize()
 			
 			self.ata.combine(
 				out_tokens=empty_y,
@@ -2037,10 +2040,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 				expert_y=self.expert_y,
 				bound_m=self.bound_m,
 			)
-			
-			# PPLX SYNC: After combine
-			if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-				torch.cuda.synchronize(self.device)
 			
 			return empty_y
 		
@@ -2071,9 +2070,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.weights[:num_tokens].copy_(topk_weight.to(torch.float32))
 		self.bound_m.fill_(num_tokens)
 
-		# PPLX SYNC: Only sync before pplx dispatch
-		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
+		# CRITICAL: Sync default stream before dispatch to ensure tensor copies complete
+		# PPLX dispatch may use different stream/communicator
+		torch.cuda.current_stream(self.device).synchronize()
 
 		# 2. Dispatch
 		self.ata.dispatch(
@@ -2086,10 +2085,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			bound_m=self.bound_m,
 		)
 
-		# PPLX SYNC: After dispatch
-		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
-
 		# 3. Local Expert Computation
 		self.grouped_dequant_moe_fp8_ata_fp8(
 			(self.expert_x, self.expert_x_scale),
@@ -2101,9 +2096,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 4. Combine
 		self.y.zero_()
 		
-		# PPLX SYNC: Before combine
-		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
+		# CRITICAL: Sync default stream before combine to ensure expert computation completes
+		torch.cuda.current_stream(self.device).synchronize()
 		
 		self.ata.combine(
 			out_tokens=self.y,
@@ -2112,10 +2106,6 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			expert_y=self.expert_y,
 			bound_m=self.bound_m,
 		)
-		
-		# PPLX SYNC: After combine
-		if os.environ.get("BATCHGEN_PPLX_SYNC") == "1":
-			torch.cuda.synchronize(self.device)
 		
 		return self.y[:num_tokens].to(x.dtype)
 		

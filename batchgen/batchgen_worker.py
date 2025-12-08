@@ -922,7 +922,7 @@ class BatchGenWorker:
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
 		
-		logging.info(
+		logging.debug(
 			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
 			f"{len(global_sequence_ids)} sequences..."
 		)
@@ -934,15 +934,12 @@ class BatchGenWorker:
 			v_device_ptrs=v_ptrs,
 		)
 		
-		logging.info(f"Rank {self.rank}: _load_host_kv_to_gpu calling load_task.wait()...")
-		t_wait = time.perf_counter()
+		# Wait for load to complete (this is synchronous load path used during prefill)
 		load_task.wait()
-		wait_ms = (time.perf_counter() - t_wait) * 1000
-		logging.info(f"Rank {self.rank}: _load_host_kv_to_gpu load_task.wait() completed in {wait_ms:.2f}ms")
 		
-		torch.cuda.synchronize(self.torch_device)
+		# NOTE: No cuda sync needed - load_task.wait() ensures data is ready
 		load_duration = time.perf_counter() - copy_start
-		logging.info(
+		logging.debug(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
@@ -960,9 +957,8 @@ class BatchGenWorker:
 		
 		try:
 			manager.free_pages_for_sequences(global_sequence_ids)
-			# CRITICAL: Ensure GPU page release completes before continuing
-			torch.cuda.synchronize(self.torch_device)
-			logging.info(
+			# NOTE: No sync needed - page deallocation is synchronous to the allocator
+			logging.debug(
 				f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
 			)
 			
@@ -1592,8 +1588,7 @@ class BatchGenWorker:
 				
 				if global_ids:
 					manager.free_pages_for_sequences(global_ids)
-					# CRITICAL: Ensure GPU page release completes before continuing
-					torch.cuda.synchronize(self.torch_device)
+					# NOTE: No sync needed - page operations are synchronous
 				
 				for uuid in my_onhold:
 					seq = self.global_batch.get_sequence(uuid)
@@ -2570,14 +2565,14 @@ class BatchGenWorker:
 				# CRITICAL: Check pending_load_uuids (globally consistent) not pending_async_load_task
 				t0 = time.perf_counter()
 				if pending_load_uuids:  # ALL ranks have identical value
-					logging.info(
+					logging.debug(
 						f"Rank {self.rank}: Phase 1b - Integrating {len(pending_load_uuids)} pending sequences"
 					)
 					
 					# Wait for async task if THIS rank has one
 					if pending_async_load_task is not None:
 						pending_async_load_task.wait()
-						# CRITICAL: Synchronize GPU to ensure async load data is ready
+						# Sync GPU to ensure async DMA completes before using the data
 						torch.cuda.synchronize(self.torch_device)
 					
 					# COLLECTIVE: All ranks synchronize here
@@ -2688,10 +2683,8 @@ class BatchGenWorker:
 				# --------------------------------------------------------
 				new_tokens = self._rebuild_input_tokens(batch)
 				
-				# CRITICAL: Synchronize GPU before continuing to next iteration
-				# This ensures all page table rebuilds and GPU operations complete
-				# before we start the next forward pass
-				torch.cuda.synchronize(self.torch_device)
+				# NOTE: No cuda sync needed here - barrier provides synchronization
+				# and page table rebuilds are immediate GPU operations
 				
 				t0 = time.perf_counter()
 				dist.barrier()
@@ -2708,7 +2701,7 @@ class BatchGenWorker:
 					if pending_load_uuids:  # Global check - all ranks enter
 						if pending_async_load_task is not None:
 							pending_async_load_task.wait()
-							# CRITICAL: Sync GPU after async load completes
+							# NOTE: Sync only when there was actual async work
 							torch.cuda.synchronize(self.torch_device)
 						dist.barrier()
 						
@@ -2729,14 +2722,13 @@ class BatchGenWorker:
 						pending_load_global_ids = []
 						
 						self._rebuild_page_table_for_batch(batch, gpu_manager)
-						# CRITICAL: Sync GPU after page table rebuild
-						torch.cuda.synchronize(self.torch_device)
+						# NOTE: No sync needed - page table rebuild is immediate
 						
 						if batch:
 							new_tokens = self._rebuild_input_tokens(batch)
 						
 						if decode_uuids:
-							logging.info(...)
+							logging.debug(f"Rank {self.rank}: Resuming decode with {len(decode_uuids)} sequences")
 							continue
 					
 					break
@@ -3308,16 +3300,10 @@ class BatchGenWorker:
 			v_device_ptrs=v_ptrs,
 		)
 		
-		# SYNCHRONOUS MODE: Wait immediately after launch to debug async race condition
-		# TODO: Revert to async once bug is fixed
-		logging.info(f"Rank {self.rank}: Waiting for async KV load to complete (sync mode)...")
-		async_task.wait()
-		torch.cuda.synchronize()
-		logging.info(f"Rank {self.rank}: Async KV load completed (sync mode)")
-		
-		# Don't set async flags since we've already waited
-		Attn_Wrapper.async_kv_load_active = False
-		Attn_Wrapper.async_kv_load_task = None
+		# ASYNC MODE: Return task without waiting - wait happens at page boundary
+		# The async load overlaps with the next page's decoding iterations
+		Attn_Wrapper.async_kv_load_active = True
+		Attn_Wrapper.async_kv_load_task = async_task
 		
 		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 		
