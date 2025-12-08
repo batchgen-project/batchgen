@@ -4021,8 +4021,15 @@ class DeepseekV3DecoderLayer(nn.Module):
 			)
 		residual = hidden_states
 
+		# DEBUG: Sync checkpoint - before layernorm
+		import torch
+		torch.cuda.synchronize()
+
 		# logger.warning(f"Input layernorm weight dtype: {self.input_layernorm.weight.dtype}")
 		hidden_states = self.input_layernorm(hidden_states)
+
+		# DEBUG: Sync checkpoint - after layernorm, before attention  
+		torch.cuda.synchronize()
 
 		# Self Attention
 		hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -4036,11 +4043,22 @@ class DeepseekV3DecoderLayer(nn.Module):
 		)
 		hidden_states = residual + hidden_states
 
+		# DEBUG: Sync checkpoint - after attention
+		torch.cuda.synchronize()
+
 		# Fully Connected
 		residual = hidden_states
 		# logger.warning(f"Post attention layernorm weight dtype: {self.post_attention_layernorm.weight.dtype}")
 		hidden_states = self.post_attention_layernorm(hidden_states)
+
+		# DEBUG: Sync checkpoint - after post_attention_layernorm
+		torch.cuda.synchronize()
+
 		hidden_states = self.mlp(hidden_states)
+
+		# DEBUG: Sync checkpoint - after MLP/MoE
+		torch.cuda.synchronize()
+
 		hidden_states = residual + hidden_states
 
 		outputs = (hidden_states,)
