@@ -1026,6 +1026,20 @@ class BatchGenWorker:
 			)
 			self.global_batch.add_sequence(seq)
 
+		# VALIDATION: All ranks must have same global batch size
+		local_batch_size = torch.tensor([len(self.global_batch)], dtype=torch.int64, device=self.torch_device)
+		all_sizes = [torch.zeros_like(local_batch_size) for _ in range(self.world_size)]
+		dist.all_gather(all_sizes, local_batch_size)
+		all_sizes_list = [int(t.item()) for t in all_sizes]
+		if len(set(all_sizes_list)) > 1:
+			logging.error(
+				f"Rank {self.rank}: CRITICAL - global_batch sizes DIFFER across ranks! "
+				f"Sizes: {all_sizes_list}"
+			)
+			raise RuntimeError(f"Global batch size mismatch: {all_sizes_list}")
+		
+		logging.info(f"Rank {self.rank}: All ranks have {all_sizes_list[0]} sequences in global_batch")
+
 		# Step 2: Tokenize all sequences (all ranks do this identically)
 		self._tokenize_global_batch()
 
@@ -1226,8 +1240,23 @@ class BatchGenWorker:
 
 			self._local_to_uuid_map[local_idx] = uuid
 			self._uuid_to_local_map[uuid] = local_idx
- 
-		logging.info(f"Rank {self.rank}: Built local query_book with {len(self.query_book)} entries")
+		
+		# Validation: Check that we have all sequences assigned to this rank
+		expected_count = 0
+		for seq in self.global_batch:
+			if seq.global_idx % self.world_size == self.rank:
+				expected_count += 1
+		
+		if len(my_uuids) != expected_count:
+			logging.error(
+				f"Rank {self.rank}: CRITICAL MISMATCH - expected {expected_count} sequences "
+				f"but got {len(my_uuids)} from get_sequences_for_rank!"
+			)
+		
+		logging.info(
+			f"Rank {self.rank}: Built local query_book with {len(self.query_book)} entries "
+			f"(expected {expected_count}, global_batch has {len(self.global_batch)} sequences)"
+		)
 
 	# ============ KV-Driven Batch Preparation ============
 
@@ -1375,6 +1404,21 @@ class BatchGenWorker:
 		if manager is None:
 			return decode_uuids, batch, []
 		
+		# VALIDATION: Check that all decode_uuids exist in global_batch with valid assigned_rank
+		invalid_uuids = []
+		for uuid in decode_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				invalid_uuids.append((uuid, "NOT_IN_GLOBAL_BATCH", None))
+			elif seq.assigned_rank is None:
+				invalid_uuids.append((uuid, "NO_ASSIGNED_RANK", seq.global_idx))
+		
+		if invalid_uuids:
+			logging.error(
+				f"Rank {self.rank}: VALIDATION FAILED - {len(invalid_uuids)} invalid sequences in decode_uuids! "
+				f"First 10: {invalid_uuids[:10]}"
+			)
+		
 		logging.info(
 			f"Rank {self.rank}: _check_and_extend ENTER: "
 			f"decode_uuids={len(decode_uuids)}, batch={len(batch)}"
@@ -1382,9 +1426,15 @@ class BatchGenWorker:
 		
 		# ============ Step 1: Each rank reports extension needs ============
 		local_ext_info = {}
+		# DEBUG: Track which sequences SHOULD be mine but aren't in map
+		should_be_mine_but_missing = []
 		for uuid in decode_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			expected_owner = seq.global_idx % self.world_size
+			if expected_owner == self.rank and uuid not in self._uuid_to_local_map:
+				should_be_mine_but_missing.append((uuid, seq.global_idx, seq.assigned_rank))
+			
 			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
 				local_ext_info[uuid] = {
 					'global_idx': seq.global_idx,
 					'decoded_length': seq.decoded_length,
@@ -1393,9 +1443,20 @@ class BatchGenWorker:
 					'current_context_length': seq.current_context_length,
 				}
 		
+		if should_be_mine_but_missing:
+			logging.error(
+				f"Rank {self.rank}: OWNERSHIP BUG - {len(should_be_mine_but_missing)} sequences "
+				f"should be mine but not in _uuid_to_local_map! First 5: {should_be_mine_but_missing[:5]}"
+			)
+			logging.error(f"Rank {self.rank}: _uuid_to_local_map has {len(self._uuid_to_local_map)} entries")
+		
 		# ============ Step 2: ALL-GATHER extension info (COLLECTIVE #1) ============
 		all_ext_info = [None] * self.world_size
 		dist.all_gather_object(all_ext_info, local_ext_info)
+		
+		# DEBUG: Log what each rank reported
+		per_rank_reported = [len(r) if r else 0 for r in all_ext_info]
+		logging.info(f"Rank {self.rank}: Per-rank reported sequences: {per_rank_reported}, total decode_uuids={len(decode_uuids)}")
 		
 		global_seq_info = {}
 		for rank_idx, rank_info in enumerate(all_ext_info):
@@ -1403,6 +1464,24 @@ class BatchGenWorker:
 				for uuid, info in rank_info.items():
 					global_seq_info[uuid] = info
 					global_seq_info[uuid]['owning_rank'] = rank_idx
+		
+		# DEBUG: Check for missing sequences
+		missing_uuids = [u for u in decode_uuids if u not in global_seq_info]
+		if missing_uuids:
+			logging.error(
+				f"Rank {self.rank}: After gather, {len(missing_uuids)} sequences MISSING from global_seq_info. "
+				f"First 10: {missing_uuids[:10]}"
+			)
+			# Check which rank SHOULD own them
+			missing_by_expected_owner = {}
+			for uuid in missing_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				expected_owner = seq.global_idx % self.world_size
+				actual_assigned = seq.assigned_rank
+				if expected_owner not in missing_by_expected_owner:
+					missing_by_expected_owner[expected_owner] = []
+				missing_by_expected_owner[expected_owner].append((uuid, seq.global_idx, actual_assigned))
+			logging.error(f"Rank {self.rank}: Missing sequences by expected owner: {[(k, len(v)) for k, v in missing_by_expected_owner.items()]}")
 		
 		# ============ FIX Bug 5-6: Update local SequenceEntry with gathered info ============
 		# This ensures all ranks have consistent view of sequence state
@@ -1424,9 +1503,11 @@ class BatchGenWorker:
 		
 		# ============ Step 4: Group sequences by assigned rank ============
 		seqs_by_rank = {r: [] for r in range(self.world_size)}
+		missing_from_global_info = []  # Track sequences with no metadata
 		for uuid in decode_uuids:
 			if uuid not in global_seq_info:
 				logging.error(f"Rank {self.rank}: MISSING uuid={uuid} from global_seq_info")
+				missing_from_global_info.append(uuid)
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			info = global_seq_info[uuid]
@@ -1434,6 +1515,10 @@ class BatchGenWorker:
 				'uuid': uuid,
 				**info
 			})
+		
+		# CRITICAL: Sequences with no metadata are unsafe to process
+		# Add them to onhold_set to exclude from active batch
+		missing_set = set(missing_from_global_info)
 		
 		# Check if all ranks can extend (MUST BE COMPUTED IDENTICALLY ON ALL RANKS)
 		all_can_extend = True
@@ -1445,7 +1530,7 @@ class BatchGenWorker:
 		
 		# ============ Initialize eviction state ============
 		global_onhold = []
-		onhold_set = set()
+		onhold_set = set(missing_from_global_info)  # Include missing sequences in onhold
 		local_extension_failed = []
 		
 		# ============ Step 5-8: Extension or Eviction (conditional logic) ============
@@ -1555,6 +1640,18 @@ class BatchGenWorker:
 					if uuid not in global_onhold:
 						global_onhold.append(uuid)
 					self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+
+		# Also mark missing sequences as ON_HOLD (they had no metadata reported)
+		for uuid in missing_from_global_info:
+			if uuid not in global_onhold:
+				global_onhold.append(uuid)
+			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+		
+		if missing_from_global_info:
+			logging.warning(
+				f"Rank {self.rank}: Put {len(missing_from_global_info)} sequences ON_HOLD "
+				f"because no rank reported metadata for them"
+			)
 
 		# ============ Step 9: Build GLOBALLY CONSISTENT active lists ============
 		active_uuids = [u for u in decode_uuids if u not in onhold_set]
@@ -1880,6 +1977,72 @@ class BatchGenWorker:
 				
 				# Sort for deterministic cross-rank ordering
 				decode_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+				
+				# CRITICAL FIX: Synchronize decode_uuids AND completion status across all ranks
+				# Each rank reports its local view including completion status
+				local_seq_status = {}
+				for uuid in decode_uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					local_seq_status[uuid] = {
+						'completed': seq.status == SequenceStatus.COMPLETED or seq.eos_reached,
+						'global_idx': seq.global_idx,
+					}
+				
+				all_seq_status = [None] * self.world_size
+				dist.all_gather_object(all_seq_status, local_seq_status)
+				
+				# Build global view: a sequence is COMPLETED if ANY rank marks it so
+				global_completed = set()
+				global_decode_candidates = set()
+				
+				for rank_status in all_seq_status:
+					if rank_status:
+						for uuid, info in rank_status.items():
+							global_decode_candidates.add(uuid)
+							if info['completed']:
+								global_completed.add(uuid)
+				
+				# Also check local COMPLETED/eos_reached in case sequence wasn't in decode_uuids
+				for seq in self.global_batch:
+					if seq.status == SequenceStatus.COMPLETED or seq.eos_reached:
+						global_completed.add(seq.uuid)
+				
+				# Sync global_completed across ranks to ensure consistency
+				all_completed = [None] * self.world_size
+				dist.all_gather_object(all_completed, list(global_completed))
+				for rank_completed in all_completed:
+					if rank_completed:
+						global_completed.update(rank_completed)
+				
+				# Update local completion status to match global view
+				for uuid in global_completed:
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is not None:
+						seq.eos_reached = True
+						if seq.status != SequenceStatus.COMPLETED:
+							try:
+								self.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
+							except ValueError:
+								pass  # Already in incompatible state
+				
+				# Build final decode_uuids excluding completed sequences
+				decode_uuids = []
+				for uuid in sorted(global_decode_candidates):
+					if uuid not in global_completed:
+						seq = self.global_batch.get_sequence(uuid)
+						if seq is not None:
+							decode_uuids.append(uuid)
+				
+				# Re-sort for deterministic ordering
+				decode_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+				
+				# Verify all ranks have same decode_uuids count
+				local_count = torch.tensor([len(decode_uuids)], dtype=torch.int64, device=self.torch_device)
+				all_counts = [torch.zeros_like(local_count) for _ in range(self.world_size)]
+				dist.all_gather(all_counts, local_count)
+				counts = [int(t.item()) for t in all_counts]
+				if len(set(counts)) > 1:
+					logging.error(f"Rank {self.rank}: decode_uuids STILL divergent after sync! counts={counts}")
 				
 				if not decode_uuids:
 					break
