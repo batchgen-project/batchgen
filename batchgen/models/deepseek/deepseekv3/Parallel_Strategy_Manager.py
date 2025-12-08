@@ -602,7 +602,24 @@ class DeepseekV3ParallelStrategyManager:
 
 		self.experts_per_rank = 256 // world_size
 		self.num_experts_per_tok = 8
-		self.num_tokens_per_rank = padding_bsz
+		
+		# Use BATCHGEN_MAX_RANK_BSZ environment variable if set, otherwise use padding_bsz
+		# This allows pre-setting a large enough buffer size for continuous batching
+		env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
+		if env_max_bsz is not None:
+			max_rank_bsz = int(env_max_bsz)
+			logging.info(
+				f"Rank {self.rank}: _init_ata_comms - Using BATCHGEN_MAX_RANK_BSZ={max_rank_bsz} "
+				f"(padding_bsz from comms was {padding_bsz})"
+			)
+		else:
+			max_rank_bsz = padding_bsz
+			logging.info(
+				f"Rank {self.rank}: _init_ata_comms - Using padding_bsz={padding_bsz} from comms "
+				f"(BATCHGEN_MAX_RANK_BSZ not set)"
+			)
+		
+		self.num_tokens_per_rank = max_rank_bsz
 
 		self.expert_num_tokens = torch.empty(self.experts_per_rank, dtype=torch.int32, device=self.device)
 		self.expert_x = torch.empty(

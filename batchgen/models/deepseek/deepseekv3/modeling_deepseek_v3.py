@@ -2039,6 +2039,21 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- Prepare Dispatch Metadata -------
 		dp_x_fp8, dp_x_scale = act_quant(x)
+		
+		# BOUNDS CHECK: Ensure num_tokens doesn't exceed buffer size
+		buffer_size = self.dp_x.shape[0]
+		if num_tokens > buffer_size:
+			import logging
+			logging.error(
+				f"[MoE BUFFER OVERFLOW] num_tokens={num_tokens} exceeds "
+				f"buffer_size={buffer_size}. This will cause illegal memory access! "
+				f"dp_x.shape={self.dp_x.shape}, indices.shape={self.indices.shape}, "
+				f"y.shape={self.y.shape}"
+			)
+			raise RuntimeError(
+				f"MoE buffer overflow: num_tokens={num_tokens} > buffer_size={buffer_size}"
+			)
+		
 		# self.dp_x.copy_(dp_x_fp8)
 		# self.dp_x_scale.copy_(dp_x_scale)
 		# self.indices.copy_(topk_idx.to(torch.uint32))
@@ -4023,13 +4038,14 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 		# DEBUG: Sync checkpoint - before layernorm
 		import torch
-		torch.cuda.synchronize()
+		_device = hidden_states.device
+		torch.cuda.synchronize(_device)
 
 		# logger.warning(f"Input layernorm weight dtype: {self.input_layernorm.weight.dtype}")
 		hidden_states = self.input_layernorm(hidden_states)
 
 		# DEBUG: Sync checkpoint - after layernorm, before attention  
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(_device)
 
 		# Self Attention
 		hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -4044,7 +4060,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 		hidden_states = residual + hidden_states
 
 		# DEBUG: Sync checkpoint - after attention
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(_device)
 
 		# Fully Connected
 		residual = hidden_states
@@ -4052,12 +4068,12 @@ class DeepseekV3DecoderLayer(nn.Module):
 		hidden_states = self.post_attention_layernorm(hidden_states)
 
 		# DEBUG: Sync checkpoint - after post_attention_layernorm
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(_device)
 
 		hidden_states = self.mlp(hidden_states)
 
 		# DEBUG: Sync checkpoint - after MLP/MoE
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(_device)
 
 		hidden_states = residual + hidden_states
 
