@@ -204,7 +204,7 @@ class BatchGenWorker:
 	"""
 	PAGE_SIZE = 64  # Alignment for page boundary checks
 	# GPU_KV_CACHE_SIZE_GB = 20.0  # Default GPU KV cache size
-	GPU_KV_CACHE_SIZE_GB = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB", 20.0)
+	GPU_KV_CACHE_SIZE_GB = float(os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB", "20.0"))
 
 
 	def __init__(self, args: BatchGenWorkerArgs):
@@ -3455,6 +3455,11 @@ class BatchGenWorker:
 				
 				if completed_uuids:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+					# FIX: Must release GPU KV pages BEFORE releasing host KV pages
+					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+					if my_completed:
+						my_completed_local_indices = self._get_local_indices_for_uuids(my_completed)
+						self._release_gpu_kv_pages(my_completed_local_indices)
 					self._release_host_kv_pages_for_batch(completed_uuids)
 				
 				if decode_uuids:
