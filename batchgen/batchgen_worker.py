@@ -644,6 +644,10 @@ class BatchGenWorker:
 		Tasks are waited at page boundary via _wait_pending_kv_append_tasks().
 		
 		Safety: Host writes don't race with GPU reads (different memory spaces).
+		
+		CRITICAL: Must keep tensor references alive until async operation completes!
+		PyTorch's CUDA caching allocator can reuse memory if tensor is dereferenced
+		while async operation is still reading from it.
 		"""
 		if not batch:
 			return
@@ -675,6 +679,11 @@ class BatchGenWorker:
 			v_tensor=None,  # MLA doesn't have separate V
 			sequence_lengths=sequence_lengths,
 		)
+		
+		# CRITICAL FIX: Store tensor reference alongside task to prevent GC
+		if not hasattr(self, '_pending_kv_append_tensors'):
+			self._pending_kv_append_tensors = []
+		self._pending_kv_append_tensors.append(k_tensor)
 		
 		# Add to pending list - will be waited at page boundary
 		if task is not None:
@@ -2330,6 +2339,7 @@ class BatchGenWorker:
 		# ASYNC STATE TRACKING
 		# =========================================
 		self._pending_kv_append_tasks: List = []
+		self._pending_kv_append_tensors: List = []  # Keep tensor refs alive during async ops
 		
 		pending_async_load_task = None
 		pending_load_uuids: List[str] = []
@@ -2796,6 +2806,11 @@ class BatchGenWorker:
 				task.wait()
 		
 		self._pending_kv_append_tasks.clear()
+		
+		# CRITICAL: Clear tensor references AFTER tasks complete
+		# Tensors can now be safely garbage collected / memory reused
+		if hasattr(self, '_pending_kv_append_tensors'):
+			self._pending_kv_append_tensors.clear()
 
 	def _rebuild_page_table_for_batch(
 		self,
@@ -2823,6 +2838,8 @@ class BatchGenWorker:
 	) -> None:  # Returns None, not the task
 		"""
 		Async append - adds task to pending list, does NOT wait.
+		
+		CRITICAL: Must keep tensor references alive until async operation completes!
 		"""
 		if not batch:
 			return
@@ -2850,6 +2867,13 @@ class BatchGenWorker:
 			v_tensor=None,
 			sequence_lengths=sequence_lengths,
 		)
+		
+		# CRITICAL FIX: Store tensor reference alongside task to prevent GC
+		# PyTorch's CUDA caching allocator can reuse memory if tensor is dereferenced
+		# while async operation is still reading from it!
+		if not hasattr(self, '_pending_kv_append_tensors'):
+			self._pending_kv_append_tensors = []
+		self._pending_kv_append_tensors.append(k_tensor)
 		
 		# Add to pending list - will be waited at page boundary
 		self._pending_kv_append_tasks.append(task)
