@@ -579,14 +579,32 @@ class DeepseekV3ParallelStrategyManager:
 		"""
 		Initialize the padding batch size for decoding.
 		This is used to set the padding size for the input sequences.
+		
+		Uses BATCHGEN_MAX_RANK_BSZ environment variable if set, to pre-allocate
+		large enough buffers for continuous batching scenarios.
 		"""
+		# Use BATCHGEN_MAX_RANK_BSZ environment variable if set, otherwise use padding_bsz
+		env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
+		if env_max_bsz is not None:
+			max_rank_bsz = int(env_max_bsz)
+			logging.info(
+				f"Rank {self.rank}: _init_decoding_padding_bsz - Using BATCHGEN_MAX_RANK_BSZ={max_rank_bsz} "
+				f"(padding_bsz was {padding_bsz})"
+			)
+		else:
+			max_rank_bsz = padding_bsz
+			logging.info(
+				f"Rank {self.rank}: _init_decoding_padding_bsz - Using padding_bsz={padding_bsz} "
+				f"(BATCHGEN_MAX_RANK_BSZ not set)"
+			)
+		
 		for layer_idx in range(
 			self.hf_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
 			layer = self.model.model.layers[layer_idx].mlp
 			if hasattr(layer, "init_num_tokens"):
-				layer.init_num_tokens(padding_bsz)
+				layer.init_num_tokens(max_rank_bsz)
 
 	def _init_ata_comms(self, padding_bsz):
 		# Current default ata impl is perplexity all-to-all dispatch and combine.
