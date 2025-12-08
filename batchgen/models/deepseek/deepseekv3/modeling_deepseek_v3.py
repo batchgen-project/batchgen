@@ -2084,6 +2084,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			indices=self.indices,
 			bound_m=self.bound_m,
 		)
+		torch.cuda.synchronize(self.device)
 
 		# 3. Local Expert Computation
 		self.grouped_dequant_moe_fp8_ata_fp8(
@@ -2107,7 +2108,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			expert_y=self.expert_y,
 			bound_m=self.bound_m,
 		)
-		
+		torch.cuda.synchronize(self.device)
 		return self.y[:num_tokens].to(x.dtype)
 		
 	def grouped_dequant_moe_fp8_ata_fp8(self, x, expert_token_counts, experts_per_rank, out=None):
