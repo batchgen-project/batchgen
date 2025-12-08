@@ -1905,8 +1905,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=self.device)
 		self.bound_m.fill_(num_tokens)
 
-		# CRITICAL: Sync default stream before dispatch
-		torch.cuda.current_stream(self.device).synchronize()
+		# CRITICAL: Sync all CUDA streams before dispatch
+		torch.cuda.synchronize(self.device)
 
 		# 2. Dispatch
 		self.ata.dispatch(
@@ -1918,8 +1918,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			indices=self.indices,
 			bound_m=self.bound_m,
 		)
-		
-		torch.cuda.current_stream(self.device).synchronize()
+
+		torch.cuda.synchronize(self.device)
 		# 3. Local Expert Computation (Identity)
 		self.grouped_dequant_moe_fp8_ata(
 			self.expert_x,
@@ -1931,8 +1931,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 4. Combine
 		self.y.zero_() 
 		
-		# CRITICAL: Sync default stream before combine
-		torch.cuda.current_stream(self.device).synchronize()
+		# CRITICAL: Sync all CUDA streams before combine
+		torch.cuda.synchronize(self.device)
 		
 		self.ata.combine(
 			out_tokens=self.y,
@@ -1941,7 +1941,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			expert_y=self.expert_y,
 			bound_m=self.bound_m,
 		)
-		torch.cuda.current_stream(self.device).synchronize()
+		torch.cuda.synchronize(self.device)
 		return self.y[:num_tokens].to(x.dtype)
 
 	@torch.inference_mode()
@@ -2008,8 +2008,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			
 			self.bound_m.fill_(0)
 
-			# CRITICAL: Sync default stream before dispatch
-			torch.cuda.current_stream(self.device).synchronize()
+			# CRITICAL: Sync all CUDA streams before dispatch
+			torch.cuda.synchronize(self.device)
 			
 			self.ata.dispatch(
 				out_expert_num_tokens=self.expert_num_tokens,
@@ -2030,8 +2030,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			
 			empty_y = torch.zeros((0, hidden_size), dtype=x.dtype, device=self.device)
 			
-			# CRITICAL: Sync default stream before combine
-			torch.cuda.current_stream(self.device).synchronize()
+			# CRITICAL: Sync all CUDA streams before combine
+			torch.cuda.synchronize(self.device)
 			
 			self.ata.combine(
 				out_tokens=empty_y,
@@ -2070,9 +2070,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.weights[:num_tokens].copy_(topk_weight.to(torch.float32))
 		self.bound_m.fill_(num_tokens)
 
-		# CRITICAL: Sync default stream before dispatch to ensure tensor copies complete
-		# PPLX dispatch may use different stream/communicator
-		torch.cuda.current_stream(self.device).synchronize()
+		# CRITICAL: Sync all CUDA streams before dispatch to ensure tensor copies complete
+		# PPLX dispatch uses NCCL which may have its own streams
+		torch.cuda.synchronize(self.device)
 
 		# 2. Dispatch
 		self.ata.dispatch(
@@ -2096,8 +2096,9 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 4. Combine
 		self.y.zero_()
 		
-		# CRITICAL: Sync default stream before combine to ensure expert computation completes
-		torch.cuda.current_stream(self.device).synchronize()
+		# CRITICAL: Sync all CUDA streams before combine to ensure expert computation completes
+		# PPLX combine uses NCCL which may have its own streams
+		torch.cuda.synchronize(self.device)
 		
 		self.ata.combine(
 			out_tokens=self.y,
