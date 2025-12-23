@@ -119,11 +119,52 @@ class BoundaryTimingStats:
 
 @dataclass
 class FastBoundaryTimingStats:
-	"""Lightweight timing for optimized page boundary."""
+	"""Detailed timing for optimized page boundary."""
 	total_ms: float = 0.0
+	# Phase 0: Async wait
+	wait_kv_append_ms: float = 0.0
+	num_kv_append_tasks: int = 0  # Track number of tasks waited
+	wait_async_load_ms: float = 0.0
+	finalize_load_ms: float = 0.0
+	# Phase 1: Gather
 	gather_ms: float = 0.0
+	# Phase 2: Process
 	process_ms: float = 0.0
+	extension_ms: float = 0.0
+	# Phase 3: Async load launch
+	load_select_ms: float = 0.0
+	load_alloc_ms: float = 0.0
+	load_launch_ms: float = 0.0
+	# Phase 4: Rebuild + barrier
 	rebuild_ms: float = 0.0
+	barrier_ms: float = 0.0
+	# Counts
+	num_completed: int = 0
+	num_onhold: int = 0
+	num_loaded: int = 0
+	# Status counts
+	total_active: int = 0
+	total_prefilled: int = 0
+	total_completed_cumulative: int = 0
+
+
+@dataclass
+class PageTimingStats:
+	"""
+	CUDA event-based timing for precise GPU measurements.
+	Captures timing for one page (64 iterations) of decoding.
+	"""
+	page_idx: int = 0
+	# Forward pass timing (CUDA events - precise GPU time)
+	forward_gpu_ms: float = 0.0  # Total GPU time for 64 forward passes
+	# Boundary timing (wall clock - includes CPU work and sync)
+	boundary_total_ms: float = 0.0
+	# Breakdown
+	boundary_wait_kv_ms: float = 0.0
+	boundary_sync_ms: float = 0.0  # all_gather + barrier
+	boundary_gpu_work_ms: float = 0.0  # page table rebuild, allocation
+	# Counts
+	num_sequences: int = 0
 	num_completed: int = 0
 	num_loaded: int = 0
 
@@ -2477,6 +2518,7 @@ class BatchGenWorker:
 		pending_load_uuids: List[str],
 		pending_load_local_indices: List[int],
 		pending_load_global_ids: List[int],
+		cumulative_completed: int = 0,  # Track total completed so far
 	) -> Tuple[List[str], List[int], Optional[object], List[str], List[int], List[int], FastBoundaryTimingStats]:
 		"""
 		OPTIMIZED page boundary with consolidated collective operations.
@@ -2496,21 +2538,23 @@ class BatchGenWorker:
 		timing = FastBoundaryTimingStats()
 		boundary_start = time.perf_counter()
 		
-		# ========== PHASE 0: Wait for pending async operations (LOCAL) ==========
-		# CRITICAL: pending_load_uuids is GLOBALLY CONSISTENT from previous boundary
-		# All ranks enter this block together or not at all
-		self._wait_pending_kv_append_tasks()
+		# ========== PHASE 0: Wait for pending async operations ==========
+		t0 = time.perf_counter()
+		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks()
+		timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
 		
 		# Integrate previous async load if any
 		if pending_load_uuids:  # ALL ranks have identical pending_load_uuids
+			t0 = time.perf_counter()
 			if pending_async_load_task is not None:
 				pending_async_load_task.wait()
 				torch.cuda.synchronize(self.torch_device)
+			timing.wait_async_load_ms = (time.perf_counter() - t0) * 1000
 			
 			# CRITICAL: barrier ensures all ranks finish async load before continuing
 			dist.barrier()
 			
-			# Finalize integration
+			t0 = time.perf_counter()
 			decode_uuids, batch = self._finalize_async_load_minimal(
 				pending_async_load_task,
 				pending_load_uuids,
@@ -2520,13 +2564,13 @@ class BatchGenWorker:
 				batch,
 				gpu_manager
 			)
+			timing.finalize_load_ms = (time.perf_counter() - t0) * 1000
 		
 		if not decode_uuids:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing
 		
 		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
-		# Consolidate all per-rank info into one dict
 		t0 = time.perf_counter()
 		
 		local_free_pages = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
@@ -2638,12 +2682,14 @@ class BatchGenWorker:
 		decode_uuids = active_uuids
 		batch = self._get_local_indices_for_uuids(decode_uuids)
 		
+		timing.process_ms = (time.perf_counter() - t0) * 1000
+		
 		if not decode_uuids:
-			timing.process_ms = (time.perf_counter() - t0) * 1000
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing
 		
 		# ========== CHECK/EXTEND PAGE BUFFERS (DETERMINISTIC) ==========
+		t0 = time.perf_counter()
 		# CRITICAL: Use gathered 'assigned_rank' to ensure all ranks agree
 		seqs_needing_extension = []
 		total_additional_by_rank = [0] * self.world_size
@@ -2717,16 +2763,11 @@ class BatchGenWorker:
 			if remaining_needing_ext:
 				self._extend_gpu_kv_allocation(remaining_needing_ext)
 		
-		# ========== RECALCULATE FREE PAGES AFTER EXTENSION ==========
-		# CRITICAL: per_rank_free is now STALE - we need to account for changes
-		# Released pages from completed sequences: +freed
-		# Extended pages for remaining sequences: -extended
-		# For simplicity, recalculate from local manager for THIS rank only
-		# Other ranks' free pages don't matter for local allocation decisions
-		
-		timing.process_ms = (time.perf_counter() - t0) * 1000
+		timing.num_onhold = len(onhold_uuids)
+		timing.extension_ms = (time.perf_counter() - t0) * 1000
 		
 		# ========== PHASE 3: SELECT AND LAUNCH ASYNC LOAD (DETERMINISTIC) ==========
+		t0 = time.perf_counter()
 		new_async_task = None
 		new_load_uuids = []
 		new_load_local = []
@@ -2762,6 +2803,8 @@ class BatchGenWorker:
 					used_for_extension = total_additional_by_rank[r] if all_can_extend else 0
 					adjusted_per_rank_free[r] = per_rank_free[r] + freed_from_completed + freed_from_onhold - used_for_extension
 			
+			timing.load_select_ms = (time.perf_counter() - t0) * 1000
+			
 			# Select candidates that fit in ADJUSTED available GPU pages
 			rank_pages_used = [0] * self.world_size
 			for uuid in load_candidates:
@@ -2779,6 +2822,7 @@ class BatchGenWorker:
 					new_load_uuids.append(uuid)
 					rank_pages_used[assigned_rank] += req_pages
 			
+			t_alloc = time.perf_counter()
 			if new_load_uuids:
 				# Get this rank's sequences to load
 				my_new_uuids = [u for u in new_load_uuids 
@@ -2791,8 +2835,10 @@ class BatchGenWorker:
 					
 					# Allocate pages
 					gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+					timing.load_alloc_ms = (time.perf_counter() - t_alloc) * 1000
 					
 					# Get pointers and launch async load
+					t_launch = time.perf_counter()
 					worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 					if worker_view is not None:
 						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
@@ -2818,6 +2864,7 @@ class BatchGenWorker:
 							'sequence_tensor': sequence_tensor,
 							'active_page_counts': active_page_counts,
 						}
+					timing.load_launch_ms = (time.perf_counter() - t_launch) * 1000
 		
 		timing.num_loaded = len(new_load_uuids)
 		
@@ -2827,7 +2874,24 @@ class BatchGenWorker:
 		timing.rebuild_ms = (time.perf_counter() - t0) * 1000
 		
 		# ========== SINGLE FINAL BARRIER ==========
+		t0 = time.perf_counter()
 		dist.barrier()
+		timing.barrier_ms = (time.perf_counter() - t0) * 1000
+		
+		# ========== COLLECT STATUS COUNTS ==========
+		timing.total_active = len(decode_uuids)
+		timing.total_prefilled = len(self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED))
+		timing.total_completed_cumulative = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
+		
+		# ========== VERIFY BATCH CONSISTENCY ==========
+		# CRITICAL: Ensure batch matches decode_uuids for THIS rank
+		expected_local = self._get_local_indices_for_uuids(decode_uuids)
+		if set(batch) != set(expected_local):
+			logging.error(
+				f"Rank {self.rank}: BATCH MISMATCH after boundary! "
+				f"batch={sorted(batch)}, expected={sorted(expected_local)}"
+			)
+			batch = expected_local  # Fix it
 		
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 		
@@ -2933,8 +2997,18 @@ class BatchGenWorker:
 		iteration = 0
 		last_boundary = 0
 		total_boundary_ms = 0.0
-		total_forward_ms = 0.0
+		total_forward_gpu_ms = 0.0  # CUDA event measured
 		num_boundaries = 0
+		initial_batch_size = len(decode_uuids)
+		
+		# CUDA events for precise GPU timing
+		page_start_event = torch.cuda.Event(enable_timing=True)
+		page_end_event = torch.cuda.Event(enable_timing=True)
+		page_timing_list: List[PageTimingStats] = []
+		
+		# Record start of first page
+		page_start_event.record(torch.cuda.current_stream(self.torch_device))
+		current_page_seqs = len(batch)
 		
 		# Main decode loop
 		while decode_uuids:
@@ -2942,7 +3016,15 @@ class BatchGenWorker:
 			
 			# Page boundary check
 			if iteration - last_boundary >= self.PAGE_SIZE:
+				# Record end of page forward passes (before boundary work)
+				page_end_event.record(torch.cuda.current_stream(self.torch_device))
+				page_end_event.synchronize()  # Need to sync to get elapsed time
+				page_forward_ms = page_start_event.elapsed_time(page_end_event)
+				
 				last_boundary = iteration
+				
+				# Boundary work (wall clock timing - includes CPU sync)
+				boundary_start = time.perf_counter()
 				
 				(decode_uuids, batch, 
 				 pending_async_task, pending_load_uuids, 
@@ -2953,15 +3035,47 @@ class BatchGenWorker:
 					pending_load_local, pending_load_global
 				)
 				
-				total_boundary_ms += timing.total_ms
+				boundary_ms = (time.perf_counter() - boundary_start) * 1000
+				
+				# Store page timing
+				page_stats = PageTimingStats(
+					page_idx=num_boundaries,
+					forward_gpu_ms=page_forward_ms,
+					boundary_total_ms=boundary_ms,
+					boundary_wait_kv_ms=timing.wait_kv_append_ms,
+					boundary_sync_ms=timing.gather_ms + timing.barrier_ms,
+					boundary_gpu_work_ms=timing.rebuild_ms + timing.load_alloc_ms + timing.extension_ms,
+					num_sequences=current_page_seqs,
+					num_completed=timing.num_completed,
+					num_loaded=timing.num_loaded,
+				)
+				page_timing_list.append(page_stats)
+				
+				total_forward_gpu_ms += page_forward_ms
+				total_boundary_ms += boundary_ms
 				num_boundaries += 1
 				
-				if self.rank == 0 and num_boundaries % 4 == 0:
+				# Record start of next page
+				page_start_event.record(torch.cuda.current_stream(self.torch_device))
+				current_page_seqs = len(batch)
+				
+				# Detailed logging at every boundary (only rank 0)
+				if self.rank == 0:
+					# Get status counts
+					num_onhold = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
+					num_prefilled = timing.total_prefilled
+					num_completed_total = timing.total_completed_cumulative
+					num_in_decode = timing.total_active
+					
 					logging.info(
-						f"Boundary {num_boundaries}: {timing.total_ms:.1f}ms "
-						f"(gather={timing.gather_ms:.1f}, proc={timing.process_ms:.1f}, "
-						f"rebuild={timing.rebuild_ms:.1f}), "
-						f"completed={timing.num_completed}, loaded={timing.num_loaded}"
+						f"[Page {num_boundaries}] "
+						f"fwd_gpu={page_stats.forward_gpu_ms:.1f}ms ({page_stats.num_sequences} seqs), "
+						f"boundary={boundary_ms:.1f}ms | "
+						f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
+						f"sync={page_stats.boundary_sync_ms:.1f}, "
+						f"gpu_work={page_stats.boundary_gpu_work_ms:.1f}ms | "
+						f"active={num_in_decode}, done={num_completed_total}/{initial_batch_size}, "
+						f"+completed={timing.num_completed}, +loaded={timing.num_loaded}"
 					)
 				
 				if not decode_uuids:
@@ -2988,14 +3102,15 @@ class BatchGenWorker:
 						pending_load_global = []
 						
 						if decode_uuids:
+							# Record start of new page after load
+							page_start_event.record(torch.cuda.current_stream(self.torch_device))
+							current_page_seqs = len(batch)
 							continue
 					break
 				
 				new_tokens = self._rebuild_input_tokens(batch)
 			
-			# Forward pass
-			forward_start = time.perf_counter()
-			
+			# Forward pass (no per-iteration timing - CUDA events handle page-level)
 			with torch.inference_mode():
 				if batch:
 					# Build attention metadata
@@ -3049,7 +3164,7 @@ class BatchGenWorker:
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
 				new_tokens = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
 				
-				# Update sequences
+				# Update sequences (lightweight - no sync)
 				for i, local_idx in enumerate(batch):
 					uuid = self._local_to_uuid_map[local_idx]
 					seq = self.global_batch.get_sequence(uuid)
@@ -3073,8 +3188,6 @@ class BatchGenWorker:
 					
 					if seq.decoded_length >= self.max_decoding_length:
 						seq.eos_reached = True
-			
-			total_forward_ms += (time.perf_counter() - forward_start) * 1000
 		
 		# Cleanup
 		self._wait_pending_kv_append_tasks()
@@ -3090,20 +3203,47 @@ class BatchGenWorker:
 		Attn_Wrapper.host_paged_kv_worker_view = None
 		Attn_Wrapper.cur_batch = None
 		
-		# Summary
+		# Summary with CUDA event timing
 		if self.rank == 0 and num_boundaries > 0:
-			avg_forward = total_forward_ms / iteration if iteration > 0 else 0
+			avg_forward_gpu = total_forward_gpu_ms / num_boundaries
 			avg_boundary = total_boundary_ms / num_boundaries
+			total_decode_time = total_forward_gpu_ms + total_boundary_ms
+			boundary_overhead_pct = (total_boundary_ms / total_decode_time * 100) if total_decode_time > 0 else 0
+			
 			logging.info(
-				f"\n{'='*50}\n"
-				f"FAST DECODE SUMMARY (Rank 0)\n"
-				f"{'='*50}\n"
-				f"Iterations: {iteration}, Boundaries: {num_boundaries}\n"
-				f"Avg forward: {avg_forward:.2f}ms\n"
-				f"Avg boundary: {avg_boundary:.2f}ms\n"
-				f"Boundary overhead/token: {avg_boundary / self.PAGE_SIZE:.3f}ms\n"
-				f"{'='*50}"
+				f"\n{'='*60}\n"
+				f"FAST DECODE SUMMARY (Rank {self.rank}) - CUDA Event Timing\n"
+				f"{'='*60}\n"
+				f"Pages: {num_boundaries}, Iterations: {iteration}, PAGE_SIZE: {self.PAGE_SIZE}\n"
+				f"{'='*60}\n"
+				f"FORWARD (GPU time, 64 tokens/page):\n"
+				f"  Total: {total_forward_gpu_ms:.1f}ms\n"
+				f"  Avg per page: {avg_forward_gpu:.1f}ms\n"
+				f"  Avg per token: {avg_forward_gpu / self.PAGE_SIZE:.2f}ms\n"
+				f"{'='*60}\n"
+				f"BOUNDARY (wall clock):\n"
+				f"  Total: {total_boundary_ms:.1f}ms\n"
+				f"  Avg per boundary: {avg_boundary:.1f}ms\n"
+				f"  Overhead per token: {avg_boundary / self.PAGE_SIZE:.2f}ms\n"
+				f"{'='*60}\n"
+				f"EFFICIENCY:\n"
+				f"  Forward: {100 - boundary_overhead_pct:.1f}%\n"
+				f"  Boundary overhead: {boundary_overhead_pct:.1f}%\n"
+				f"  Effective tokens/sec: {iteration / (total_decode_time / 1000):.1f}\n"
+				f"{'='*60}"
 			)
+			
+			# Per-page breakdown for first few pages
+			if page_timing_list:
+				logging.info(f"\nPer-page breakdown (first 5 pages):")
+				for pt in page_timing_list[:5]:
+					logging.info(
+						f"  Page {pt.page_idx}: fwd={pt.forward_gpu_ms:.1f}ms, "
+						f"boundary={pt.boundary_total_ms:.1f}ms "
+						f"(wait_kv={pt.boundary_wait_kv_ms:.1f}, sync={pt.boundary_sync_ms:.1f}, "
+						f"gpu={pt.boundary_gpu_work_ms:.1f}), "
+						f"seqs={pt.num_sequences}, +done={pt.num_completed}, +load={pt.num_loaded}"
+					)
 		
 		return decode_uuids, batch
 
@@ -3610,11 +3750,15 @@ class BatchGenWorker:
 		
 		return decode_uuids, batch
 
-	def _wait_pending_kv_append_tasks(self):
-		"""Wait for all pending KV append tasks at page boundary."""
+	def _wait_pending_kv_append_tasks(self) -> int:
+		"""
+		Wait for all pending KV append tasks at page boundary.
+		Returns the number of tasks that were waited for.
+		"""
 		if not hasattr(self, '_pending_kv_append_tasks'):
-			return
+			return 0
 		
+		num_tasks = len(self._pending_kv_append_tasks)
 		for task in self._pending_kv_append_tasks:
 			if task is not None:
 				task.wait()
@@ -3625,6 +3769,8 @@ class BatchGenWorker:
 		# Tensors can now be safely garbage collected / memory reused
 		if hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors.clear()
+		
+		return num_tasks
 
 	def _rebuild_page_table_for_batch(
 		self,
