@@ -606,6 +606,22 @@ class DeepseekV3ParallelStrategyManager:
 			if hasattr(layer, "init_num_tokens"):
 				layer.init_num_tokens(max_rank_bsz)
 
+	def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
+		"""
+		Dynamically update num_tokens_per_rank for all MoE layers.
+		Called at page boundaries to reduce all-gather/all-reduce communication.
+		
+		Args:
+			num_tokens_per_rank: The max batch size across all ranks for this page
+		"""
+		for layer_idx in range(
+			self.hf_model_config.first_k_dense_replace,
+			self.model_config.num_hidden_layers,
+		):
+			layer = self.model.model.layers[layer_idx].mlp
+			if hasattr(layer, "set_num_tokens_per_rank"):
+				layer.set_num_tokens_per_rank(num_tokens_per_rank)
+
 	def _init_ata_comms(self, padding_bsz):
 		# Current default ata impl is perplexity all-to-all dispatch and combine.
 		# USe fp8e4m3 dispatch by default.

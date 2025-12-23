@@ -1801,6 +1801,34 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 	def init_num_tokens(self, num_tokens_per_rank):
 		self.num_tokens_per_rank = num_tokens_per_rank
+		self.max_num_tokens_per_rank = num_tokens_per_rank  # Store max for bounds checking
+		global_num_tokens = self.num_tokens_per_rank * self.world_size
+		K = self.num_experts_per_tok
+		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
+		self.topk_pos = torch.arange(K, dtype=torch.int32, device=self.device).repeat(global_num_tokens)
+
+	def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
+		"""
+		Dynamically update num_tokens_per_rank for reduced communication.
+		Called at page boundaries when actual batch size is smaller than max buffer.
+		
+		This updates:
+		- self.num_tokens_per_rank: Used by moe_infer_allgather_allreduce_bf16_acc
+		- self.token_idx, self.topk_pos: Index arrays for token dispatch
+		
+		Args:
+			num_tokens_per_rank: The max batch size across all ranks for this page
+		"""
+		if num_tokens_per_rank == self.num_tokens_per_rank:
+			return  # No change needed
+		
+		# Safety check - don't exceed the pre-allocated max
+		if hasattr(self, 'max_num_tokens_per_rank') and num_tokens_per_rank > self.max_num_tokens_per_rank:
+			raise ValueError(
+				f"num_tokens_per_rank={num_tokens_per_rank} exceeds max_num_tokens_per_rank={self.max_num_tokens_per_rank}"
+			)
+		
+		self.num_tokens_per_rank = num_tokens_per_rank
 		global_num_tokens = self.num_tokens_per_rank * self.world_size
 		K = self.num_experts_per_tok
 		self.token_idx = torch.arange(global_num_tokens, dtype=torch.int32, device=self.device).repeat_interleave(K)
