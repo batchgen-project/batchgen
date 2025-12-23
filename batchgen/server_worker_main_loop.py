@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import time
 import traceback
 from typing import Any, List
 
@@ -9,6 +10,25 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
+
+
+def _setup_nccl_env():
+	"""
+	Set up NCCL environment variables for better reliability in multi-node setups.
+	These should be set before any NCCL operations.
+	"""
+	# Increase connection timeout and retry attempts
+	# NCCL_SOCKET_TIMEOUT: timeout in milliseconds for socket operations (default: varies)
+	if "NCCL_SOCKET_TIMEOUT" not in os.environ:
+		os.environ["NCCL_SOCKET_TIMEOUT"] = "300000"  # 5 minutes in ms
+	
+	# NCCL_NET_RETRY_COUNT: number of retries for network operations
+	if "NCCL_NET_RETRY_COUNT" not in os.environ:
+		os.environ["NCCL_NET_RETRY_COUNT"] = "100"  # More retries (default is ~10)
+	
+	# Enable async error handling for better error reporting
+	if "NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
+		os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 
 
 def server_worker_main(
@@ -43,13 +63,16 @@ def _server_worker_main_impl(
 	Rank 0 acts as the coordinator, reading from the master process queue.
 	All ranks receive the full global batch for coordinated scheduling.
 	"""
-	# Step 0: Hydrate the rank of this process
+	# Step 0: Set up NCCL environment for reliability
+	_setup_nccl_env()
+	
+	# Step 1: Hydrate the rank of this process
 	num_gpus_per_node = torch.cuda.device_count()
 	args.local_rank = rank_idx
 	args.global_rank = num_gpus_per_node * args.nnode_rank + rank_idx
 	args.device = args.local_rank
 
-	# 1. Initialize Process Group
+	# 2. Initialize Process Group
 	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
 
 	try:
@@ -67,6 +90,46 @@ def _server_worker_main_impl(
 
 	torch.cuda.set_device(args.local_rank)
 	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
+
+	# CRITICAL: Warmup NCCL connections before entering server loop
+	# This ensures all inter-node NCCL connections are fully established
+	# before any application-level communication happens.
+	# Without this, the first collective may fail with "Connection refused"
+	# if remote ranks haven't fully initialized their NCCL listeners.
+	try:
+		logging.info(f"Rank {args.global_rank}: Starting NCCL connection warmup...")
+		
+		# Step 1: Simple barrier to ensure all ranks have reached this point
+		dist.barrier()
+		logging.info(f"Rank {args.global_rank}: Barrier 1 passed")
+		
+		# Step 2: Small all_reduce to establish actual NCCL connections
+		# NCCL lazily establishes connections, so we force it here
+		warmup_tensor = torch.ones(1, device=f"cuda:{args.local_rank}")
+		dist.all_reduce(warmup_tensor, op=dist.ReduceOp.SUM)
+		torch.cuda.synchronize()
+		
+		expected = float(args.world_size)
+		if abs(warmup_tensor.item() - expected) > 1e-6:
+			raise RuntimeError(f"NCCL warmup failed: expected {expected}, got {warmup_tensor.item()}")
+		logging.info(f"Rank {args.global_rank}: all_reduce warmup passed")
+		
+		# Step 3: Test broadcast_object_list specifically since that's what fails
+		test_obj = [args.global_rank] if args.global_rank == 0 else [None]
+		dist.broadcast_object_list(test_obj, src=0)
+		if test_obj[0] != 0:
+			raise RuntimeError(f"broadcast_object_list warmup failed: got {test_obj[0]}")
+		logging.info(f"Rank {args.global_rank}: broadcast_object_list warmup passed")
+		
+		# Final barrier to ensure all warmup is complete
+		dist.barrier()
+		logging.info(f"Rank {args.global_rank}: NCCL warmup complete, all connections established")
+		
+	except Exception as e:
+		logging.error(f"Rank {args.global_rank}: NCCL warmup failed: {e}")
+		logging.error(f"This usually indicates a network issue or startup race condition.")
+		logging.error(f"Try restarting the server or check network connectivity between nodes.")
+		sys.exit(1)
 
 	# 2. Instantiate the BatchGenWorker
 	worker = BatchGenWorker(args)
