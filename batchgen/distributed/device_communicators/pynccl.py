@@ -122,6 +122,29 @@ class PyNcclCommunicator:
         # when we are using CUDA graph.
         self.disabled = True
 
+    def destroy(self):
+        """Explicitly destroy the NCCL communicator and release resources."""
+        if hasattr(self, 'comm') and self.comm is not None:
+            try:
+                # Synchronize any pending operations
+                if self.stream is not None:
+                    self.stream.synchronize()
+                # Destroy the NCCL communicator
+                self.nccl.ncclCommDestroy(self.comm)
+                self.comm = None
+                logger.info(f"Rank {self.rank}: NCCL communicator destroyed successfully")
+            except Exception as e:
+                logger.warning(f"Rank {self.rank}: Failed to destroy NCCL communicator: {e}")
+        self.available = False
+        self.disabled = True
+
+    def __del__(self):
+        """Destructor to clean up NCCL resources."""
+        try:
+            self.destroy()
+        except Exception:
+            pass  # Ignore errors during garbage collection
+
     def all_reduce(
         self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
     ):

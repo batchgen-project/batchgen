@@ -1916,6 +1916,15 @@ class BatchGenWorker:
 		config_prefill_time = 0.0
 		config_decode_time = 0.0
 		
+		# Health check: ensure distributed connections are alive before starting
+		# This handles the case where server has been idle for a long time
+		logging.info(f"Rank {self.rank}: Running distributed health checks before batch...")
+		if not self._check_and_reinit_distributed():
+			raise RuntimeError(f"Rank {self.rank}: Failed to ensure healthy torch.distributed connection")
+		if not self._check_and_reinit_pynccl():
+			raise RuntimeError(f"Rank {self.rank}: Failed to ensure healthy PyNccl communicator")
+		logging.info(f"Rank {self.rank}: Distributed health checks passed")
+		
 		# Ensure communicator is ready
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
 			# Verify rank consistency
@@ -1923,28 +1932,30 @@ class BatchGenWorker:
 				assert self.rank == dist.get_rank(), \
 					f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
 			
-			device = torch.device("cuda", self.local_rank)
-			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-			self.comm = None
-			
-			if comm_master_addr is None:
-				logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
-			elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
-				try:
-					group = StatelessProcessGroup.create(
-						host=comm_master_addr,
-						port=20003,
-						rank=self.rank,
-						world_size=self.world_size,
-						data_expiration_seconds=6000,
-					)
-					self.comm = PyNcclCommunicator(
-						group=group,
-						device=device
-					)
-				except Exception as e:
-					logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-					raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+			# Only initialize communicator if not already initialized (reuse across batches)
+			if self.comm is None:
+				device = torch.device("cuda", self.local_rank)
+				comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+				
+				if comm_master_addr is None:
+					logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
+				elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
+					try:
+						group = StatelessProcessGroup.create(
+							host=comm_master_addr,
+							port=20003,
+							rank=self.rank,
+							world_size=self.world_size,
+							data_expiration_seconds=36000,  # 10 hours - long enough for server idle time
+						)
+						self.comm = PyNcclCommunicator(
+							group=group,
+							device=device
+						)
+						logging.info(f"Rank {self.rank}: PyNccl communicator initialized successfully")
+					except Exception as e:
+						logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+						raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 
 		iteration = 0
 		
@@ -4565,7 +4576,10 @@ class BatchGenWorker:
 		self._nvshmem_initialized_this_run = False
 
 	def _init_torch_dist(self):
-		timeout = timedelta(minutes=15)
+		# Use maximum timeout (about 24 days) to handle long server idle periods
+		# timedelta max is about 999999999 days, but NCCL has internal limits
+		# 35791 minutes ≈ 24.8 days, which is close to the max NCCL supports
+		timeout = timedelta(days=24)
 		try:
 			dist.init_process_group(
 				backend="nccl",
@@ -4575,9 +4589,104 @@ class BatchGenWorker:
 				device_id=torch.device(f"cuda:{self.local_rank}"),
 				timeout=timeout,
 			)
+			logging.info(f"Rank {self.rank}: torch.distributed initialized with timeout={timeout}")
 		except RuntimeError as e:
 			logging.error(f"Failed to initialize torch distributed: {e}")
 			raise
+	
+	def _check_and_reinit_distributed(self) -> bool:
+		"""
+		Check if torch.distributed is healthy. If not, attempt to reinitialize.
+		Returns True if distributed is healthy (or was successfully reinitialized).
+		Returns False if reinitialization failed.
+		"""
+		if not dist.is_initialized():
+			logging.warning(f"Rank {self.rank}: torch.distributed not initialized, attempting to initialize...")
+			try:
+				self._init_torch_dist()
+				return True
+			except Exception as e:
+				logging.error(f"Rank {self.rank}: Failed to initialize torch.distributed: {e}")
+				return False
+		
+		# Perform a quick health check with a short timeout
+		try:
+			# Use a simple all_reduce as a health check
+			health_tensor = torch.ones(1, device=self.torch_device)
+			
+			# Create a new process group with short timeout for health check
+			# This avoids blocking forever if the connection is stale
+			work = dist.all_reduce(health_tensor, op=dist.ReduceOp.SUM, async_op=True)
+			
+			# Wait with a short timeout (30 seconds)
+			success = work.wait(timeout=timedelta(seconds=30))
+			
+			if not success:
+				raise RuntimeError("Health check timed out")
+			
+			# Verify the result
+			expected = float(self.world_size)
+			if abs(health_tensor.item() - expected) > 1e-6:
+				raise RuntimeError(f"Health check result mismatch: got {health_tensor.item()}, expected {expected}")
+			
+			logging.debug(f"Rank {self.rank}: Distributed health check passed")
+			return True
+			
+		except Exception as e:
+			logging.warning(f"Rank {self.rank}: Distributed health check failed: {e}")
+			logging.info(f"Rank {self.rank}: Attempting to reinitialize torch.distributed...")
+			
+			# Destroy and reinitialize
+			try:
+				dist.destroy_process_group()
+			except Exception as destroy_e:
+				logging.warning(f"Rank {self.rank}: Error destroying process group: {destroy_e}")
+			
+			try:
+				self._init_torch_dist()
+				logging.info(f"Rank {self.rank}: Successfully reinitialized torch.distributed")
+				return True
+			except Exception as reinit_e:
+				logging.error(f"Rank {self.rank}: Failed to reinitialize torch.distributed: {reinit_e}")
+				return False
+	
+	def _check_and_reinit_pynccl(self) -> bool:
+		"""
+		Check if PyNccl communicator is healthy. If not, attempt to reinitialize.
+		Returns True if communicator is healthy (or was successfully reinitialized).
+		"""
+		if self.comm is None:
+			# Will be lazily initialized in generate()
+			return True
+		
+		try:
+			# Quick health check using PyNccl all_reduce
+			health_tensor = torch.ones(1, device=self.torch_device, dtype=torch.float32)
+			self.comm.all_reduce(health_tensor, op=dist.ReduceOp.SUM, stream=torch.cuda.current_stream())
+			torch.cuda.synchronize()
+			
+			expected = float(self.world_size)
+			if abs(health_tensor.item() - expected) > 1e-6:
+				raise RuntimeError(f"PyNccl health check mismatch: got {health_tensor.item()}, expected {expected}")
+			
+			logging.debug(f"Rank {self.rank}: PyNccl health check passed")
+			return True
+			
+		except Exception as e:
+			logging.warning(f"Rank {self.rank}: PyNccl health check failed: {e}")
+			logging.info(f"Rank {self.rank}: Attempting to reinitialize PyNccl communicator...")
+			
+			# Destroy old communicator
+			try:
+				if self.comm is not None:
+					self.comm.destroy()
+					self.comm = None
+			except Exception as destroy_e:
+				logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {destroy_e}")
+				self.comm = None
+			
+			# Will be reinitialized lazily in generate()
+			return True
 
 	def _unregister_fp8_weights(self):
 		for layer_idx in range(len(self.model.model.layers)):
@@ -4637,6 +4746,7 @@ class BatchGenWorker:
 		"""
 		Reset batch-specific state to prepare for a new batch.
 		Does NOT reinitialize core_engine, parallel_manager, or other heavy components.
+		NOTE: We keep self.comm (PyNcclCommunicator) alive across batches to avoid re-initialization overhead.
 		"""
 		logging.info(f"Rank {self.rank}: Resetting state for new batch")
 		
@@ -4644,15 +4754,13 @@ class BatchGenWorker:
 		dist.barrier()
 		self._ignore_eos = False
 
-		# 1. Cleanup communicator from previous batch
-		if hasattr(self, 'comm') and self.comm is not None:
-			try:
-				del self.comm
-				self.comm = None
-			except Exception as e:
-				logging.warning(f"Rank {self.rank}: Failed to cleanup comm: {e}")
+		# NOTE: We intentionally do NOT destroy self.comm here.
+		# PyNccl communicator is reused across batches to avoid:
+		# 1. NCCL re-initialization overhead
+		# 2. TCPStore port binding issues
+		# The communicator is only destroyed when the worker is shut down.
 		
-		# 2. Release any remaining host KV pages
+		# 1. Release any remaining host KV pages
 		if hasattr(self, 'global_batch') and self.global_batch is not None:
 			try:
 				worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
