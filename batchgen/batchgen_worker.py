@@ -117,6 +117,17 @@ class BoundaryTimingStats:
 		)
 
 
+@dataclass
+class FastBoundaryTimingStats:
+	"""Lightweight timing for optimized page boundary."""
+	total_ms: float = 0.0
+	gather_ms: float = 0.0
+	process_ms: float = 0.0
+	rebuild_ms: float = 0.0
+	num_completed: int = 0
+	num_loaded: int = 0
+
+
 class query:
 	def __init__(
 		self,
@@ -2058,7 +2069,12 @@ class BatchGenWorker:
 					else:
 						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 
-					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
+					# Use optimized decoding by default, set BATCHGEN_LEGACY_DECODE=1 for old version
+					use_legacy = os.environ.get("BATCHGEN_LEGACY_DECODE", "0") == "1"
+					if use_legacy:
+						self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
+					else:
+						self.decoding_continuous_fast(new_tokens, decode_uuids, local_decode_indices)
 				decoding_time += time.perf_counter() - decode_start
 
 				# D. Cleanup
@@ -2449,6 +2465,647 @@ class BatchGenWorker:
 				seq.eos_reached = True
 		
 		return new_tokens
+
+	# ============ OPTIMIZED PAGE BOUNDARY (Consolidated Collectives) ============
+
+	def _page_boundary_fast(
+		self,
+		decode_uuids: List[str],
+		batch: List[int],
+		gpu_manager: GPUPagedKVCacheManager,
+		pending_async_load_task: Optional[object],
+		pending_load_uuids: List[str],
+		pending_load_local_indices: List[int],
+		pending_load_global_ids: List[int],
+	) -> Tuple[List[str], List[int], Optional[object], List[str], List[int], List[int], FastBoundaryTimingStats]:
+		"""
+		OPTIMIZED page boundary with consolidated collective operations.
+		
+		Reduces 10+ collectives to 2-3 by batching:
+		1. Single all_gather_object for: sequence metadata + completion status + extension info + free pages
+		2. One final barrier
+		
+		CRITICAL INVARIANTS FOR RANK ALIGNMENT:
+		- All ranks must compute IDENTICAL decode_uuids, completed_uuids, onhold_uuids, new_load_uuids
+		- Local operations (GPU page allocation, KV release) are rank-specific but globally coordinated
+		- All decisions are based on gathered global state, not local state
+		
+		Returns:
+			(decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing)
+		"""
+		timing = FastBoundaryTimingStats()
+		boundary_start = time.perf_counter()
+		
+		# ========== PHASE 0: Wait for pending async operations (LOCAL) ==========
+		# CRITICAL: pending_load_uuids is GLOBALLY CONSISTENT from previous boundary
+		# All ranks enter this block together or not at all
+		self._wait_pending_kv_append_tasks()
+		
+		# Integrate previous async load if any
+		if pending_load_uuids:  # ALL ranks have identical pending_load_uuids
+			if pending_async_load_task is not None:
+				pending_async_load_task.wait()
+				torch.cuda.synchronize(self.torch_device)
+			
+			# CRITICAL: barrier ensures all ranks finish async load before continuing
+			dist.barrier()
+			
+			# Finalize integration
+			decode_uuids, batch = self._finalize_async_load_minimal(
+				pending_async_load_task,
+				pending_load_uuids,
+				pending_load_local_indices,
+				pending_load_global_ids,
+				decode_uuids,
+				batch,
+				gpu_manager
+			)
+		
+		if not decode_uuids:
+			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
+			return decode_uuids, batch, None, [], [], [], timing
+		
+		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
+		# Consolidate all per-rank info into one dict
+		t0 = time.perf_counter()
+		
+		local_free_pages = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
+		
+		# Build local state for sequences owned by this rank
+		local_seq_state = {}
+		for uuid in decode_uuids:
+			if uuid in self._uuid_to_local_map:
+				seq = self.global_batch.get_sequence(uuid)
+				local_seq_state[uuid] = {
+					'decoded_length': seq.decoded_length,
+					'current_context_length': seq.current_context_length,
+					'gpu_pages_allocated': seq.gpu_pages_allocated,
+					'eos_reached': seq.eos_reached,
+					'completed': self._is_sequence_completed(seq),
+					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
+					'assigned_rank': seq.assigned_rank,  # Include for consistency
+				}
+		
+		# Get candidates for loading (PREFILLED + ON_HOLD)
+		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+		onhold_seqs = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+		load_candidates = prefilled + onhold_seqs
+		
+		local_candidate_state = {}
+		for uuid in load_candidates:
+			if uuid in self._uuid_to_local_map:
+				seq = self.global_batch.get_sequence(uuid)
+				local_candidate_state[uuid] = {
+					'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
+					'assigned_rank': seq.assigned_rank,
+				}
+		
+		# Pack everything into one dict for single all_gather
+		local_payload = {
+			'free_pages': local_free_pages,
+			'seq_state': local_seq_state,
+			'candidate_state': local_candidate_state,
+		}
+		
+		all_payloads = [None] * self.world_size
+		dist.all_gather_object(all_payloads, local_payload)
+		
+		timing.gather_ms = (time.perf_counter() - t0) * 1000
+		
+		# ========== PHASE 2: PROCESS GATHERED DATA (LOCAL COMPUTATION) ==========
+		# CRITICAL: All computations below must be DETERMINISTIC across all ranks
+		t0 = time.perf_counter()
+		
+		# Extract per-rank free pages
+		per_rank_free = [p['free_pages'] for p in all_payloads]
+		
+		# Merge sequence state - each uuid appears exactly once (owned by one rank)
+		global_seq_state = {}
+		for rank_idx, payload in enumerate(all_payloads):
+			if payload and payload['seq_state']:
+				for uuid, state in payload['seq_state'].items():
+					global_seq_state[uuid] = state
+					global_seq_state[uuid]['owning_rank'] = rank_idx
+		
+		# Merge candidate state
+		global_candidate_info = {}
+		for payload in all_payloads:
+			if payload and payload['candidate_state']:
+				global_candidate_info.update(payload['candidate_state'])
+		
+		# VALIDATION: Check that all decode_uuids have state reported
+		missing_uuids = [u for u in decode_uuids if u not in global_seq_state]
+		if missing_uuids:
+			logging.error(
+				f"Rank {self.rank}: CRITICAL - {len(missing_uuids)} sequences missing from gathered state! "
+				f"This indicates a bug. Missing: {missing_uuids[:5]}"
+			)
+			# Safe fallback: remove missing sequences from decode_uuids
+			decode_uuids = [u for u in decode_uuids if u in global_seq_state]
+		
+		# Update local SequenceEntry with gathered info (for sequences on other ranks)
+		for uuid, state in global_seq_state.items():
+			if uuid not in self._uuid_to_local_map:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None:
+					seq.decoded_length = state['decoded_length']
+					seq.current_context_length = state['current_context_length']
+					seq.gpu_pages_allocated = state['gpu_pages_allocated']
+					seq.eos_reached = state['eos_reached']
+		
+		# ========== IDENTIFY COMPLETED SEQUENCES (DETERMINISTIC) ==========
+		completed_uuids = []
+		active_uuids = []
+		for uuid in decode_uuids:
+			state = global_seq_state.get(uuid)
+			# CRITICAL: Use gathered 'completed' flag, not local computation
+			if state and state['completed']:
+				completed_uuids.append(uuid)
+			else:
+				active_uuids.append(uuid)
+		
+		timing.num_completed = len(completed_uuids)
+		
+		# ========== RELEASE COMPLETED SEQUENCES ==========
+		if completed_uuids:
+			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+			if my_completed:
+				my_completed_local = self._get_local_indices_for_uuids(my_completed)
+				self._release_gpu_kv_pages(my_completed_local)
+				self._release_host_kv_pages_for_batch(my_completed)
+		
+		decode_uuids = active_uuids
+		batch = self._get_local_indices_for_uuids(decode_uuids)
+		
+		if not decode_uuids:
+			timing.process_ms = (time.perf_counter() - t0) * 1000
+			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
+			return decode_uuids, batch, None, [], [], [], timing
+		
+		# ========== CHECK/EXTEND PAGE BUFFERS (DETERMINISTIC) ==========
+		# CRITICAL: Use gathered 'assigned_rank' to ensure all ranks agree
+		seqs_needing_extension = []
+		total_additional_by_rank = [0] * self.world_size
+		
+		for uuid in decode_uuids:
+			state = global_seq_state.get(uuid)
+			if state and state['additional_pages_needed'] > 0:
+				# CRITICAL: Use assigned_rank from gathered state, not local
+				assigned_rank = state['assigned_rank']
+				total_additional_by_rank[assigned_rank] += state['additional_pages_needed']
+				if uuid in self._uuid_to_local_map:
+					seqs_needing_extension.append(uuid)
+		
+		# Check if all ranks can extend (DETERMINISTIC computation)
+		all_can_extend = all(
+			total_additional_by_rank[r] <= per_rank_free[r] 
+			for r in range(self.world_size)
+		)
+		
+		onhold_uuids = []
+		if all_can_extend and seqs_needing_extension:
+			# Simple extension - no eviction needed
+			self._extend_gpu_kv_allocation(seqs_needing_extension)
+		elif not all_can_extend:
+			# Need eviction - put longest-decoded sequences on hold
+			# CRITICAL: Sort DETERMINISTICALLY by (decoded_length DESC, global_idx ASC)
+			for r in range(self.world_size):
+				if total_additional_by_rank[r] > per_rank_free[r]:
+					# Use gathered state for filtering AND sorting
+					rank_seqs = [
+						(uuid, global_seq_state[uuid]) 
+						for uuid in decode_uuids 
+						if uuid in global_seq_state and global_seq_state[uuid]['assigned_rank'] == r
+					]
+					# CRITICAL: Stable sort with tie-breaker for determinism
+					rank_seqs.sort(
+						key=lambda x: (-x[1]['decoded_length'], 
+									self.global_batch.get_sequence(x[0]).global_idx)
+					)
+					
+					pages_to_free = total_additional_by_rank[r] - per_rank_free[r]
+					freed = 0
+					for uuid, state in rank_seqs:
+						if freed >= pages_to_free:
+							break
+						onhold_uuids.append(uuid)
+						freed += state['gpu_pages_allocated']
+			
+			# Evict locally owned sequences
+			my_onhold = [u for u in onhold_uuids if u in self._uuid_to_local_map]
+			if my_onhold:
+				local_indices = self._get_local_indices_for_uuids(my_onhold)
+				global_ids = self._local_indices_to_global_seq_ids(local_indices)
+				if global_ids and gpu_manager:
+					gpu_manager.free_pages_for_sequences(global_ids)
+				for uuid in my_onhold:
+					seq = self.global_batch.get_sequence(uuid)
+					seq.gpu_pages_allocated = 0
+					self._sequences_with_gpu_kv.discard(uuid)
+			
+			for uuid in onhold_uuids:
+				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+			
+			# Update active lists
+			onhold_set = set(onhold_uuids)
+			decode_uuids = [u for u in decode_uuids if u not in onhold_set]
+			batch = self._get_local_indices_for_uuids(decode_uuids)
+			
+			# Extend remaining sequences
+			remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
+			if remaining_needing_ext:
+				self._extend_gpu_kv_allocation(remaining_needing_ext)
+		
+		# ========== RECALCULATE FREE PAGES AFTER EXTENSION ==========
+		# CRITICAL: per_rank_free is now STALE - we need to account for changes
+		# Released pages from completed sequences: +freed
+		# Extended pages for remaining sequences: -extended
+		# For simplicity, recalculate from local manager for THIS rank only
+		# Other ranks' free pages don't matter for local allocation decisions
+		
+		timing.process_ms = (time.perf_counter() - t0) * 1000
+		
+		# ========== PHASE 3: SELECT AND LAUNCH ASYNC LOAD (DETERMINISTIC) ==========
+		new_async_task = None
+		new_load_uuids = []
+		new_load_local = []
+		new_load_global = []
+		
+		if load_candidates and decode_uuids:
+			# Sort candidates DETERMINISTICALLY by global_idx
+			load_candidates.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+			
+			# CRITICAL: Recalculate available pages per rank
+			# We need fresh counts after extension/eviction
+			# Use: original_free - pages_used_for_extension + pages_freed_from_eviction
+			# Simpler: just get fresh count from local manager
+			local_free_now = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
+			
+			# For other ranks, estimate: original - additional_used
+			adjusted_per_rank_free = list(per_rank_free)  # Copy
+			for r in range(self.world_size):
+				if r == self.rank:
+					adjusted_per_rank_free[r] = local_free_now
+				else:
+					# Estimate: freed from completed + freed from onhold - used for extension
+					freed_from_completed = sum(
+						global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
+						for u in completed_uuids
+						if global_seq_state.get(u, {}).get('assigned_rank') == r
+					)
+					freed_from_onhold = sum(
+						global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
+						for u in onhold_uuids
+						if global_seq_state.get(u, {}).get('assigned_rank') == r
+					)
+					used_for_extension = total_additional_by_rank[r] if all_can_extend else 0
+					adjusted_per_rank_free[r] = per_rank_free[r] + freed_from_completed + freed_from_onhold - used_for_extension
+			
+			# Select candidates that fit in ADJUSTED available GPU pages
+			rank_pages_used = [0] * self.world_size
+			for uuid in load_candidates:
+				info = global_candidate_info.get(uuid)
+				if info is None:
+					continue
+				
+				req_pages = info['pages_needed']
+				assigned_rank = info['assigned_rank']
+				
+				if req_pages == 0:
+					continue
+				
+				if rank_pages_used[assigned_rank] + req_pages <= adjusted_per_rank_free[assigned_rank]:
+					new_load_uuids.append(uuid)
+					rank_pages_used[assigned_rank] += req_pages
+			
+			if new_load_uuids:
+				# Get this rank's sequences to load
+				my_new_uuids = [u for u in new_load_uuids 
+							if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
+				new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
+				
+				if new_load_local:
+					new_load_global = self._local_indices_to_global_seq_ids(new_load_local)
+					tokens = self._compute_two_page_buffer_tokens(new_load_local)
+					
+					# Allocate pages
+					gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+					
+					# Get pointers and launch async load
+					worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+					if worker_view is not None:
+						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
+						gpu_manager.rebuild_page_table(new_load_global)
+						k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+						active_page_counts = gpu_manager.export_active_sequence_page_counts()
+						sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
+						
+						new_async_task = worker_view.async_load_layer_paged_kv_to_device(
+							sequence_ids=sequence_tensor,
+							active_page_counts=active_page_counts,
+							k_device_ptrs=k_ptrs,
+							v_device_ptrs=v_ptrs,
+						)
+						
+						# Restore page table to current batch
+						if existing_global_ids:
+							gpu_manager.rebuild_page_table(existing_global_ids)
+						
+						# Store tensor refs
+						self._async_load_tensors = {
+							'k_ptrs': k_ptrs, 'v_ptrs': v_ptrs,
+							'sequence_tensor': sequence_tensor,
+							'active_page_counts': active_page_counts,
+						}
+		
+		timing.num_loaded = len(new_load_uuids)
+		
+		# ========== FINAL PAGE TABLE REBUILD ==========
+		t0 = time.perf_counter()
+		self._rebuild_page_table_for_batch(batch, gpu_manager)
+		timing.rebuild_ms = (time.perf_counter() - t0) * 1000
+		
+		# ========== SINGLE FINAL BARRIER ==========
+		dist.barrier()
+		
+		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
+		
+		return decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing
+
+	def _finalize_async_load_minimal(
+		self,
+		async_task: object,
+		pending_uuids: List[str],
+		pending_local_indices: List[int],
+		pending_global_ids: List[int],
+		current_decode_uuids: List[str],
+		current_batch: List[int],
+		gpu_manager: GPUPagedKVCacheManager
+	) -> Tuple[List[str], List[int]]:
+		"""Minimal finalize without extra rebuilds - rebuild done once at end."""
+		Attn_Wrapper.async_kv_load_active = False
+		Attn_Wrapper.async_kv_load_task = None
+		
+		if hasattr(self, '_async_load_tensors'):
+			self._async_load_tensors = None
+		
+		self._update_batch_status(pending_uuids, SequenceStatus.IN_DECODE)
+		
+		for local_idx in pending_local_indices:
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+			self._sequences_with_gpu_kv.add(uuid)
+		
+		updated_uuids = current_decode_uuids + pending_uuids
+		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+		
+		uuid_to_local = {}
+		for idx in current_batch:
+			uuid = self._local_to_uuid_map.get(idx)
+			if uuid:
+				uuid_to_local[uuid] = idx
+		for idx in pending_local_indices:
+			uuid = self._local_to_uuid_map.get(idx)
+			if uuid:
+				uuid_to_local[uuid] = idx
+		
+		updated_batch = [uuid_to_local[u] for u in updated_uuids if u in uuid_to_local]
+		
+		return updated_uuids, updated_batch
+
+	def decoding_continuous_fast(
+		self, 
+		new_tokens: torch.Tensor, 
+		decode_uuids: List[str],
+		batch: List[int],
+		past_key_states: Optional[torch.Tensor] = None,
+		past_value_states: Optional[torch.Tensor] = None,
+		scale_dict: Optional[dict] = None,
+	) -> Tuple[List[str], List[int]]:
+		"""
+		OPTIMIZED continuous decoding with minimal collective overhead.
+		
+		Key optimizations:
+		1. Single batched all_gather per page boundary (vs 10+ in original)
+		2. Single page table rebuild per boundary (vs 4 in original)
+		3. Reduced logging overhead
+		4. No timing object allocation in hot path
+		"""
+		if "deepseek" in self.model_config.model_type:
+			self.model.model._use_flash_attention_2 = True
+		
+		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
+		if RUNTIME_ATTN_MODE != 3:
+			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
+			return decode_uuids, batch
+		
+		# Setup
+		gpu_manager = self.gpu_paged_kv_cache_manager
+		if gpu_manager is None:
+			gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+		
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		
+		Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
+		Attn_Wrapper.host_paged_kv_worker_view = worker_view
+		Attn_Wrapper.scale = scale_dict
+		Attn_Wrapper.past_key_states = past_key_states
+		Attn_Wrapper.past_value_states = past_value_states
+		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+		
+		# Async state
+		self._pending_kv_append_tasks = []
+		self._pending_kv_append_tensors = []
+		
+		pending_async_task = None
+		pending_load_uuids = []
+		pending_load_local = []
+		pending_load_global = []
+		
+		# Validation
+		for local_idx in batch:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			if uuid and uuid not in self._sequences_with_gpu_kv:
+				self._sequences_with_gpu_kv.add(uuid)
+		
+		iteration = 0
+		last_boundary = 0
+		total_boundary_ms = 0.0
+		total_forward_ms = 0.0
+		num_boundaries = 0
+		
+		# Main decode loop
+		while decode_uuids:
+			iteration += 1
+			
+			# Page boundary check
+			if iteration - last_boundary >= self.PAGE_SIZE:
+				last_boundary = iteration
+				
+				(decode_uuids, batch, 
+				 pending_async_task, pending_load_uuids, 
+				 pending_load_local, pending_load_global, 
+				 timing) = self._page_boundary_fast(
+					decode_uuids, batch, gpu_manager,
+					pending_async_task, pending_load_uuids,
+					pending_load_local, pending_load_global
+				)
+				
+				total_boundary_ms += timing.total_ms
+				num_boundaries += 1
+				
+				if self.rank == 0 and num_boundaries % 4 == 0:
+					logging.info(
+						f"Boundary {num_boundaries}: {timing.total_ms:.1f}ms "
+						f"(gather={timing.gather_ms:.1f}, proc={timing.process_ms:.1f}, "
+						f"rebuild={timing.rebuild_ms:.1f}), "
+						f"completed={timing.num_completed}, loaded={timing.num_loaded}"
+					)
+				
+				if not decode_uuids:
+					# Check for pending loads
+					if pending_load_uuids:
+						if pending_async_task is not None:
+							pending_async_task.wait()
+							torch.cuda.synchronize(self.torch_device)
+						dist.barrier()
+						
+						decode_uuids, batch = self._finalize_async_load_minimal(
+							pending_async_task, pending_load_uuids,
+							pending_load_local, pending_load_global,
+							decode_uuids, batch, gpu_manager
+						)
+						self._rebuild_page_table_for_batch(batch, gpu_manager)
+						
+						if batch:
+							new_tokens = self._rebuild_input_tokens(batch)
+						
+						pending_async_task = None
+						pending_load_uuids = []
+						pending_load_local = []
+						pending_load_global = []
+						
+						if decode_uuids:
+							continue
+					break
+				
+				new_tokens = self._rebuild_input_tokens(batch)
+			
+			# Forward pass
+			forward_start = time.perf_counter()
+			
+			with torch.inference_mode():
+				if batch:
+					# Build attention metadata
+					attention_masks = []
+					cache_seqlens = []
+					
+					for local_idx in batch:
+						uuid = self._local_to_uuid_map[local_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						ctx_len = seq.current_context_length
+						
+						mask = self.query_book[local_idx].encoded["attention_mask"][:, :ctx_len]
+						attention_masks.append(mask)
+						cache_seqlens.append(ctx_len)
+					
+					max_ctx = max(cache_seqlens)
+					padded_masks = []
+					for mask in attention_masks:
+						if mask.shape[1] < max_ctx:
+							pad = torch.zeros((1, max_ctx - mask.shape[1]), dtype=mask.dtype, device=mask.device)
+							mask = torch.cat([mask, pad], dim=1)
+						padded_masks.append(mask)
+					
+					attention_mask = torch.cat(padded_masks, dim=0).to(self.torch_device)
+					
+					Attn_Wrapper.attention_mask = attention_mask
+					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+					Attn_Wrapper.cache_seqlens = torch.tensor(cache_seqlens, dtype=torch.int32, device=self.torch_device)
+					Attn_Wrapper.max_seqlen = max_ctx
+					
+					if new_tokens.shape[0] != len(batch):
+						new_tokens = self._rebuild_input_tokens(batch)
+				else:
+					Attn_Wrapper.attention_mask = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+					Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+					Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
+					Attn_Wrapper.max_seqlen = 0
+					Attn_Wrapper.cur_batch = []
+					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+				
+				if batch:
+					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+				
+				# KV append callback
+				current_batch = list(batch)
+				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor):
+					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor)
+				Attn_Wrapper.kv_append_callback = kv_append_callback
+				
+				# Forward
+				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
+				new_tokens = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
+				
+				# Update sequences
+				for i, local_idx in enumerate(batch):
+					uuid = self._local_to_uuid_map[local_idx]
+					seq = self.global_batch.get_sequence(uuid)
+					
+					if self._is_sequence_completed(seq):
+						continue
+					
+					decode_pos = seq.decoded_length
+					self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
+					
+					attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
+					next_pos = seq.current_context_length
+					if next_pos < attn_mask.shape[0]:
+						attn_mask[next_pos] = 1
+					
+					seq.decoded_length += 1
+					seq.current_context_length += 1
+					
+					if self._should_stop_at_eos(new_tokens[i].item()):
+						seq.eos_reached = True
+					
+					if seq.decoded_length >= self.max_decoding_length:
+						seq.eos_reached = True
+			
+			total_forward_ms += (time.perf_counter() - forward_start) * 1000
+		
+		# Cleanup
+		self._wait_pending_kv_append_tasks()
+		if pending_async_task is not None:
+			pending_async_task.wait()
+			torch.cuda.synchronize(self.torch_device)
+		
+		Attn_Wrapper.kv_append_callback = None
+		Attn_Wrapper.scale = None
+		Attn_Wrapper.past_key_states = None
+		Attn_Wrapper.past_value_states = None
+		Attn_Wrapper.gpu_paged_kv_manager = None
+		Attn_Wrapper.host_paged_kv_worker_view = None
+		Attn_Wrapper.cur_batch = None
+		
+		# Summary
+		if self.rank == 0 and num_boundaries > 0:
+			avg_forward = total_forward_ms / iteration if iteration > 0 else 0
+			avg_boundary = total_boundary_ms / num_boundaries
+			logging.info(
+				f"\n{'='*50}\n"
+				f"FAST DECODE SUMMARY (Rank 0)\n"
+				f"{'='*50}\n"
+				f"Iterations: {iteration}, Boundaries: {num_boundaries}\n"
+				f"Avg forward: {avg_forward:.2f}ms\n"
+				f"Avg boundary: {avg_boundary:.2f}ms\n"
+				f"Boundary overhead/token: {avg_boundary / self.PAGE_SIZE:.3f}ms\n"
+				f"{'='*50}"
+			)
+		
+		return decode_uuids, batch
 
 	def decoding_continuous(
 		self, 
