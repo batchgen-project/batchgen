@@ -3122,6 +3122,12 @@ class BatchGenWorker:
 					break
 				
 				new_tokens = self._rebuild_input_tokens(batch)
+				# DEBUG: Log tokens rebuild after boundary
+				if new_tokens.shape[0] != len(batch):
+					logging.error(
+						f"Rank {self.rank}: POST-BOUNDARY new_tokens mismatch! "
+						f"batch_size={len(batch)}, new_tokens.shape={new_tokens.shape}"
+					)
 			
 			# Forward pass
 			forward_start = time.perf_counter()
@@ -3174,18 +3180,33 @@ class BatchGenWorker:
 					mgr = gpu_manager._gpu_page_table_manager
 					if mgr and mgr.gpu_table is not None:
 						page_table_size = mgr.gpu_table.shape[0]
-						if page_table_size != len(batch):
-							# CRITICAL: Force rebuild to fix the mismatch
+						batch_size = len(batch)
+						tokens_size = new_tokens.shape[0]
+						
+						# Check for ANY mismatch
+						if page_table_size != batch_size or page_table_size != tokens_size or batch_size != tokens_size:
 							logging.error(
 								f"Rank {self.rank}: PRE-FORWARD MISMATCH! "
-								f"page_table_size={page_table_size}, batch_size={len(batch)}, "
-								f"new_tokens.shape={new_tokens.shape}, iteration={iteration}. "
-								f"Forcing rebuild..."
+								f"page_table_size={page_table_size}, batch_size={batch_size}, "
+								f"new_tokens.shape[0]={tokens_size}, iteration={iteration}"
 							)
-							# Force rebuild with correct batch
-							global_ids = self._local_indices_to_global_seq_ids(batch)
-							gpu_manager.rebuild_page_table(global_ids)
-							logging.info(f"Rank {self.rank}: Forced rebuild complete, new shape={mgr.gpu_table.shape}")
+							
+							# Fix: rebuild new_tokens if it doesn't match batch
+							if tokens_size != batch_size:
+								logging.info(f"Rank {self.rank}: Rebuilding new_tokens to match batch...")
+								new_tokens = self._rebuild_input_tokens(batch)
+								tokens_size = new_tokens.shape[0]
+							
+							# Fix: rebuild page table if it doesn't match batch
+							if page_table_size != batch_size:
+								logging.info(f"Rank {self.rank}: Rebuilding page table to match batch...")
+								global_ids = self._local_indices_to_global_seq_ids(batch)
+								gpu_manager.rebuild_page_table(global_ids)
+							
+							logging.info(
+								f"Rank {self.rank}: After fix: page_table={mgr.gpu_table.shape[0]}, "
+								f"new_tokens={new_tokens.shape[0]}, batch={len(batch)}"
+							)
 				
 				# KV append callback
 				current_batch = list(batch)
@@ -4345,13 +4366,32 @@ class BatchGenWorker:
 		
 		tokens = []
 		for local_idx in batch:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._local_to_uuid_map.get(local_idx)
+			if uuid is None:
+				logging.error(f"Rank {self.rank}: _rebuild_input_tokens: local_idx {local_idx} not in _local_to_uuid_map!")
+				continue
 			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				logging.error(f"Rank {self.rank}: _rebuild_input_tokens: uuid {uuid} not in global_batch!")
+				continue
 			pos = max(0, seq.decoded_length - 1)
-			token = self.query_book[local_idx].decoded_tokens[:, pos:pos+1]
+			query_entry = self.query_book.get(local_idx)
+			if query_entry is None:
+				logging.error(f"Rank {self.rank}: _rebuild_input_tokens: local_idx {local_idx} not in query_book!")
+				continue
+			token = query_entry.decoded_tokens[:, pos:pos+1]
 			tokens.append(token)
 		
-		return torch.cat(tokens, dim=0).to(self.torch_device)
+		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
+		
+		if result.shape[0] != len(batch):
+			logging.error(
+				f"Rank {self.rank}: _rebuild_input_tokens MISMATCH: "
+				f"batch_size={len(batch)}, result_size={result.shape[0]}, "
+				f"tokens_collected={len(tokens)}"
+			)
+		
+		return result
 
 
 	def _sync_completion_status(
