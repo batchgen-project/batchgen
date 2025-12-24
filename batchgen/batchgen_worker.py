@@ -126,6 +126,8 @@ class FastBoundaryTimingStats:
 	num_kv_append_tasks: int = 0  # Track number of tasks waited
 	wait_async_load_ms: float = 0.0
 	finalize_load_ms: float = 0.0
+	# Phase 0.5: Sync decode_uuids
+	sync_decode_uuids_ms: float = 0.0
 	# Phase 1: Gather
 	gather_ms: float = 0.0
 	# Phase 2: Process
@@ -2567,10 +2569,45 @@ class BatchGenWorker:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing
 		
+		# ========== CRITICAL: SYNCHRONIZE decode_uuids ACROSS ALL RANKS ==========
+		# Each rank might have slightly different decode_uuids due to local operations.
+		# We need to ensure all ranks have the same view before state gathering.
+		# Use all_gather to collect decode_uuids from all ranks and compute the union.
+		t_sync = time.perf_counter()
+		local_decode_set = set(decode_uuids)
+		all_decode_sets = [None] * self.world_size
+		dist.all_gather_object(all_decode_sets, local_decode_set)
+		
+		# Compute union of all decode_uuids - any sequence that ANY rank thinks is active
+		# should be reported by its owning rank
+		global_decode_set = set()
+		for s in all_decode_sets:
+			if s:
+				global_decode_set.update(s)
+		
+		# Sort deterministically by global_idx for consistency
+		decode_uuids = sorted(
+			global_decode_set, 
+			key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+		)
+		
+		# Update local batch to match synchronized decode_uuids
+		batch = self._get_local_indices_for_uuids(decode_uuids)
+		
+		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
+		
 		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
 		t0 = time.perf_counter()
 		
 		local_free_pages = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
+		
+		# DEBUG: Log decode_uuids and which ones this rank owns
+		my_owned = [u for u in decode_uuids if u in self._uuid_to_local_map]
+		if self.rank == 0:
+			logging.debug(
+				f"Rank {self.rank}: State gathering - decode_uuids_len={len(decode_uuids)}, "
+				f"my_owned_count={len(my_owned)}"
+			)
 		
 		# Build local state for sequences owned by this rank
 		local_seq_state = {}
@@ -2637,9 +2674,23 @@ class BatchGenWorker:
 		# VALIDATION: Check that all decode_uuids have state reported
 		missing_uuids = [u for u in decode_uuids if u not in global_seq_state]
 		if missing_uuids:
+			# Enhanced diagnostics for debugging
+			for missing_uuid in missing_uuids[:10]:
+				seq = self.global_batch.get_sequence(missing_uuid)
+				expected_rank = seq.assigned_rank if seq else "N/A"
+				in_local_map = missing_uuid in self._uuid_to_local_map
+				seq_status = seq.status.name if seq else "NOT_FOUND"
+				# Check what state each rank reported for this uuid
+				rank_reported = [r for r, p in enumerate(all_payloads) 
+								if p and p.get('seq_state', {}).get(missing_uuid)]
+				logging.error(
+					f"Rank {self.rank}: Missing UUID={missing_uuid}, assigned_rank={expected_rank}, "
+					f"in_local_map={in_local_map}, status={seq_status}, reported_by_ranks={rank_reported}"
+				)
 			logging.error(
 				f"Rank {self.rank}: CRITICAL - {len(missing_uuids)} sequences missing from gathered state! "
-				f"This indicates a bug. Missing: {missing_uuids[:5]}"
+				f"decode_uuids_len={len(decode_uuids)}, global_seq_state_len={len(global_seq_state)}, "
+				f"Missing first 5: {missing_uuids[:5]}"
 			)
 			# Safe fallback: remove missing sequences from decode_uuids
 			decode_uuids = [u for u in decode_uuids if u in global_seq_state]
@@ -2958,7 +3009,25 @@ class BatchGenWorker:
 		if hasattr(self, '_async_load_tensors'):
 			self._async_load_tensors = None
 		
-		self._update_batch_status(pending_uuids, SequenceStatus.IN_DECODE)
+		# VALIDATION: Verify all pending_uuids exist and have assigned ranks
+		valid_pending_uuids = []
+		for uuid in pending_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				logging.error(f"Rank {self.rank}: pending_uuid {uuid} not found in global_batch!")
+				continue
+			if seq.assigned_rank is None:
+				logging.error(f"Rank {self.rank}: pending_uuid {uuid} has no assigned_rank!")
+				continue
+			valid_pending_uuids.append(uuid)
+		
+		if len(valid_pending_uuids) != len(pending_uuids):
+			logging.warning(
+				f"Rank {self.rank}: Filtered {len(pending_uuids) - len(valid_pending_uuids)} invalid "
+				f"pending_uuids out of {len(pending_uuids)}"
+			)
+		
+		self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
 		
 		for local_idx in pending_local_indices:
 			uuid = self._local_to_uuid_map[local_idx]
@@ -2966,7 +3035,7 @@ class BatchGenWorker:
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 			self._sequences_with_gpu_kv.add(uuid)
 		
-		updated_uuids = current_decode_uuids + pending_uuids
+		updated_uuids = current_decode_uuids + valid_pending_uuids
 		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 		
 		uuid_to_local = {}
@@ -3080,6 +3149,7 @@ class BatchGenWorker:
 						f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
 						f"wait_async={timing.wait_async_load_ms:.1f}, "
 						f"finalize={timing.finalize_load_ms:.1f}, "
+						f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
 						f"gather={timing.gather_ms:.1f}, "
 						f"proc={timing.process_ms:.1f}, "
 						f"ext={timing.extension_ms:.1f}, "
