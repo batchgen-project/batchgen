@@ -1,3 +1,4 @@
+import importlib
 import logging
 import os
 import sys
@@ -10,6 +11,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
+
+
+def _reload_worker_module():
+	"""
+	Hot-reload the batchgen_worker module to pick up code changes.
+	This reloads the module but doesn't affect already-instantiated objects.
+	For method-level changes, we can rebind methods to the existing worker.
+	"""
+	import batchgen.batchgen_worker as worker_module
+	importlib.reload(worker_module)
+	return worker_module
 
 
 def _setup_nccl_env():
@@ -159,6 +171,26 @@ def _server_worker_main_impl(
 		if task_data is None:
 			logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
 			break
+		
+		# --- STEP 3.5: Hot Reload Command ---
+		if isinstance(task_data, dict) and task_data.get("command") == "reload":
+			logging.info(f"Rank {global_rank}: Received reload command, hot-reloading worker module...")
+			try:
+				new_module = _reload_worker_module()
+				# Rebind key methods to the existing worker instance
+				# This allows code changes to take effect without recreating the worker
+				worker._page_boundary_fast = new_module.BatchGenWorker._page_boundary_fast.__get__(worker, type(worker))
+				worker.decoding_continuous_fast = new_module.BatchGenWorker.decoding_continuous_fast.__get__(worker, type(worker))
+				worker.generate = new_module.BatchGenWorker.generate.__get__(worker, type(worker))
+				worker._rebuild_input_tokens = new_module.BatchGenWorker._rebuild_input_tokens.__get__(worker, type(worker))
+				logging.info(f"Rank {global_rank}: Hot reload successful!")
+				if global_rank == 0:
+					response_queue.put({"status": "reload_success"})
+			except Exception as e:
+				logging.error(f"Rank {global_rank}: Hot reload failed: {e}", exc_info=True)
+				if global_rank == 0:
+					response_queue.put({"status": "reload_failed", "error": str(e)})
+			continue  # Skip to next iteration
 
 		# --- STEP 4: Inference with full global batch ---
 		local_results = []

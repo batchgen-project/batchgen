@@ -272,6 +272,14 @@ class BatchGenServer:
 		if command == 'ping':
 			return {'status': 'success', 'message': 'pong'}
 
+		elif command == 'reload':
+			# Hot-reload worker code without restarting the server
+			logging.info("Received reload command, sending to workers...")
+			with self.inference_lock:
+				self.request_queue.put({"command": "reload"})
+				result = self.response_queue.get()
+				return {'status': 'success', 'reload_result': result}
+
 		elif command == 'submit_inference':
 			if not queries:
 				return {'status': 'error', 'message': 'Empty queries list'}
