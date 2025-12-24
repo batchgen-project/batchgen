@@ -2627,7 +2627,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
 		# ---- 3.4) Extract results for local tokens and aggregate ------------
-		start_token_ids = self.rank * num_tokens
+		# CRITICAL: Use num_tokens_per_rank for stride since all_gather used padded size
+		start_token_ids = self.rank * self.num_tokens_per_rank
 		end_token_ids = start_token_ids + num_tokens
 
 		final_output = global_results[start_token_ids:end_token_ids]
@@ -2710,7 +2711,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
 		# ---- 3.4) Extract results for local tokens and aggregate ------------
-		start_token_ids = self.rank * num_tokens
+		# CRITICAL: Use num_tokens_per_rank for stride since all_gather used padded size
+		start_token_ids = self.rank * self.num_tokens_per_rank
 		end_token_ids = start_token_ids + num_tokens
 
 		final_output = global_results[start_token_ids:end_token_ids]
@@ -2796,7 +2798,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# 	self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
 		torch.distributed.all_reduce(global_results, op=dist.ReduceOp.SUM, async_op=False)
 		# ---- 3.4) Extract results for local tokens and aggregate ------------
-		start_token_ids = self.rank * num_tokens
+		# CRITICAL: Use num_tokens_per_rank for stride since all_gather used padded size
+		start_token_ids = self.rank * self.num_tokens_per_rank
 		end_token_ids = start_token_ids + num_tokens
 
 		final_output = global_results[start_token_ids:end_token_ids]
@@ -2865,7 +2868,8 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
 		# ---- 3.4) Extract results for local tokens and aggregate ------------
-		start_token_ids = self.rank * num_tokens
+		# CRITICAL: Use num_tokens_per_rank for stride since all_gather used padded size
+		start_token_ids = self.rank * self.num_tokens_per_rank
 		end_token_ids = start_token_ids + num_tokens
 
 		final_output = global_results[start_token_ids:end_token_ids]
