@@ -67,39 +67,15 @@ void RegisterPinnedRange(void* base, std::size_t bytes, int device_index,
     logger->info("Attempting cudaHostRegister (ptr={}, bytes={}, device={})", 
                  base, bytes, device_index);
     
-    // Check if memory is already registered in THIS process's CUDA context
-    // (each process has its own CUDA runtime state)
-    unsigned int existing_flags = 0;
-    cudaError_t check_result = cudaHostGetFlags(&existing_flags, base);
-    if (check_result == cudaSuccess) {
-        // Memory is already registered in this process - skip re-registration
-        logger->info("KV range already registered in this process (ptr={}, bytes={}, flags={})", 
-                     base, bytes, existing_flags);
-        return;
-    }
-    
     // Use cudaHostRegisterDefault to match Weights_Storage behavior
-    // cudaHostRegisterPortable|cudaHostRegisterMapped was causing error 1 (invalid argument)
-    // on some ranks, possibly due to memory alignment or size constraints
-    constexpr unsigned int kFlags = cudaHostRegisterDefault;
-    
-    cudaError_t register_result = cudaHostRegister(base, bytes, kFlags);
-    
-    if (register_result == cudaSuccess) {
-        logger->info("Successfully registered pinned KV range (ptr={}, bytes={}, device={})", 
-                     base, bytes, device_index);
-        return;
-    }
-    
-    // Log detailed error information for debugging
-    std::string err_msg = fmt::format(
-        "cudaHostRegister failed with error {} ({}) "
-        "(ptr={}, bytes={}, device={}, flags=cudaHostRegisterDefault)",
-        static_cast<int>(register_result),
-        cudaGetErrorString(register_result),
-        base, bytes, device_index);
-    logger->error(err_msg);
-    throw std::runtime_error(err_msg);
+    InvokeCudaChecked(
+        "cudaHostRegister", logger,
+        [&]() { return cudaHostRegister(base, bytes, cudaHostRegisterDefault); },
+        [&](const std::string& message) {
+            logger->error("{} (ptr={}, bytes={})", message, base, bytes);
+        });
+    logger->info("Successfully registered pinned KV range (ptr={}, bytes={}, device={})", 
+                 base, bytes, device_index);
 }
 
 void UnregisterPinnedRange(void* base, int device_index,
@@ -116,16 +92,6 @@ void UnregisterPinnedRange(void* base, int device_index,
         [&](const std::string& message) {
             logger->error("{} (device_index={})", message, device_index);
         });
-    
-    // Check if memory is registered in this process before unregistering
-    unsigned int flags = 0;
-    cudaError_t check_result = cudaHostGetFlags(&flags, base);
-    if (check_result != cudaSuccess) {
-        // Memory is not registered in this process - nothing to do
-        logger->info("KV range not registered in this process, skipping unregister (ptr={})", base);
-        return;
-    }
-    
     InvokeCudaChecked(
         "cudaHostUnregister", logger,
         [&]() { return cudaHostUnregister(base); },
