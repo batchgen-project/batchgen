@@ -695,6 +695,7 @@ class Attn_Wrapper(torch.nn.Module):
 							weight_scale=self.weight_dequant_scale,
 							gpu_paged_kv_manager=Attn_Wrapper.gpu_paged_kv_manager,
 							layer_idx=self.layer_idx,
+							batch_slice=(start_ids, end_ids),  # Pass batch slice for micro-batching
 						)
 						# logging.info(f"{self.layer_idx=}, {hidden_states.device}, {attn_result=}")
 						# scale = None

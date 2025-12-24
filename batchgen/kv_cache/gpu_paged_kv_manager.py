@@ -909,6 +909,7 @@ class GPUPagedKVCacheManager:
 		v_tensor: Optional[torch.Tensor],
 		sequence_lengths: torch.Tensor,
 		layer_idx: int,
+		batch_slice: Optional[tuple] = None,  # (start_idx, end_idx) for micro-batching
 	) -> None:
 		"""Writes single-position KV tokens for ``layer_idx`` using the cached
 		GPU page table order.
@@ -916,6 +917,11 @@ class GPUPagedKVCacheManager:
 		The provided ``k_tensor`` (and optional ``v_tensor``) must align with
 		the sequence ordering used when ``allocate_pages_for_sequences`` last
 		triggered a rebuild of the GPU page table.
+		
+		Args:
+			batch_slice: Optional tuple (start_idx, end_idx) indicating which slice 
+				of the full batch this call represents. When provided, the page table 
+				and slot_indices will be sliced accordingly.
 		"""
 		# op_name = "update_layer_decode_new_token"
 		# self._ensure_initialized()
@@ -940,7 +946,17 @@ class GPUPagedKVCacheManager:
 		slot_indices = self._gpu_page_table_manager._slot_index_tensor
 		token_indices = sequence_lengths
 
-		page_table_view = page_table
+		# Apply batch slice if provided (for micro-batching)
+		# NOTE: We keep the FULL page_table but slice slot_indices.
+		# slot_indices[i] tells the kernel which row of page_table to use for token i.
+		# For micro-batch [start_idx:end_idx], token i corresponds to global slot (start_idx + i),
+		# so slot_indices should be [start_idx, start_idx+1, ..., end_idx-1].
+		if batch_slice is not None:
+			start_idx, end_idx = batch_slice
+			# slot_indices[start_idx:end_idx] gives us [start_idx, start_idx+1, ..., end_idx-1]
+			# which correctly maps micro-batch tokens to full page table rows
+			slot_indices = slot_indices[start_idx:end_idx]
+		page_table_view = page_table  # Always use full page table
 		k_tokens = k_tensor.view(batch_size, -1)
 
 		if v_tensor is not None and self._v_cache is not None:

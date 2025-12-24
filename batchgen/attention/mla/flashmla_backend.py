@@ -1955,8 +1955,15 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	weight_scale: Optional[dict] = None,
 	gpu_paged_kv_manager: Optional[GPUPagedKVCacheManager] = None,
 	layer_idx: int = 0,
+	batch_slice: Optional[tuple] = None,  # (start_idx, end_idx) for micro-batching
 ) -> torch.Tensor:
-	"""Variant of the BF16 decoder that writes KV tokens via GPUPagedKVCacheManager."""
+	"""Variant of the BF16 decoder that writes KV tokens via GPUPagedKVCacheManager.
+	
+	Args:
+		batch_slice: Optional tuple (start_idx, end_idx) indicating which slice of the
+			full batch this call represents. When provided, the page table will be
+			sliced accordingly to match the input hidden_states batch dimension.
+	"""
 	if gpu_paged_kv_manager is None:
 		raise ValueError(
 			"gpu_paged_kv_manager must be provided for page-KV decoding backend",
@@ -2066,16 +2073,23 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		v_tensor=None,
 		sequence_lengths=sequence_lengths,
 		layer_idx=layer_idx,
+		batch_slice=batch_slice,  # Pass batch slice for micro-batching support
 	)
 
 	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
 		layer_idx=layer_idx
 	)
 
+	# Apply batch slice to block_table for micro-batching
+	if batch_slice is not None:
+		start_idx, end_idx = batch_slice
+		block_table = block_table[start_idx:end_idx]
+
 	# Validate block_table batch dimension matches input
 	assert block_table.shape[0] == bsz, (
 		f"[Layer {layer_idx}] block_table batch mismatch: "
 		f"block_table.shape[0]={block_table.shape[0]} != bsz={bsz}. "
+		f"batch_slice={batch_slice}. "
 		f"This indicates GPU page table is out of sync with the current batch."
 	)
 
