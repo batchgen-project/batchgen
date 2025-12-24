@@ -2556,6 +2556,12 @@ class BatchGenWorker:
 				gpu_manager
 			)
 			timing.finalize_load_ms = (time.perf_counter() - t0) * 1000
+			
+			# CRITICAL: Rebuild page table to include newly loaded sequences
+			# The GPU pages were allocated in the previous boundary, but the page table
+			# wasn't updated to include them in the active batch
+			if batch and gpu_manager is not None and gpu_manager.is_initialized:
+				self._rebuild_page_table_for_batch(batch, gpu_manager)
 		
 		if not decode_uuids:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
@@ -2895,7 +2901,10 @@ class BatchGenWorker:
 				f"Rank {self.rank}: BATCH MISMATCH after boundary! "
 				f"batch={sorted(batch)}, expected={sorted(expected_local)}"
 			)
-			batch = expected_local  # Fix it
+			batch = expected_local  # Fix the batch
+			# CRITICAL: Rebuild page table to match the corrected batch
+			self._rebuild_page_table_for_batch(batch, gpu_manager)
+			logging.info(f"Rank {self.rank}: Page table rebuilt after batch correction")
 		
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 		
