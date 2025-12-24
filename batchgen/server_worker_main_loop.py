@@ -133,6 +133,14 @@ def _server_worker_main_impl(
 
 	# 2. Instantiate the BatchGenWorker
 	worker = BatchGenWorker(args)
+	
+	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
+	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.
+	# Without this barrier, faster ranks will start the main loop and attempt collective
+	# operations while slower ranks are still initializing, causing NCCL errors.
+	logging.info(f"Rank {args.global_rank}: Worker initialized, waiting for all ranks at barrier...")
+	dist.barrier()
+	logging.info(f"Rank {args.global_rank}: All ranks ready, entering main loop.")
 
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
