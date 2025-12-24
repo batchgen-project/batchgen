@@ -2569,30 +2569,41 @@ class BatchGenWorker:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing
 		
-		# ========== CRITICAL: SYNCHRONIZE decode_uuids ACROSS ALL RANKS ==========
-		# Each rank might have slightly different decode_uuids due to local operations.
-		# We need to ensure all ranks have the same view before state gathering.
-		# Use all_gather to collect decode_uuids from all ranks and compute the union.
+		# ========== VALIDATE: decode_uuids SHOULD BE IDENTICAL ACROSS ALL RANKS ==========
+		# By design, global_batch status is synchronized at the end of each boundary.
+		# Therefore, decode_uuids (derived from global_batch) should be identical.
+		# If not, log an error to help diagnose the desync.
 		t_sync = time.perf_counter()
 		local_decode_set = set(decode_uuids)
 		all_decode_sets = [None] * self.world_size
 		dist.all_gather_object(all_decode_sets, local_decode_set)
 		
-		# Compute union of all decode_uuids - any sequence that ANY rank thinks is active
-		# should be reported by its owning rank
-		global_decode_set = set()
-		for s in all_decode_sets:
-			if s:
-				global_decode_set.update(s)
-		
-		# Sort deterministically by global_idx for consistency
-		decode_uuids = sorted(
-			global_decode_set, 
-			key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
-		)
-		
-		# Update local batch to match synchronized decode_uuids
-		batch = self._get_local_indices_for_uuids(decode_uuids)
+		# Check for desync
+		all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
+		if not all_sets_equal:
+			# Log detailed desync info
+			for r, s in enumerate(all_decode_sets):
+				if s != local_decode_set:
+					diff_in_r = s - local_decode_set if s else set()
+					diff_in_local = local_decode_set - s if s else local_decode_set
+					logging.error(
+						f"Rank {self.rank}: decode_uuids DESYNC detected! "
+						f"Rank {r} has {len(diff_in_r)} extra: {list(diff_in_r)[:5]}, "
+						f"Rank {self.rank} has {len(diff_in_local)} extra: {list(diff_in_local)[:5]}"
+					)
+			# Use UNION to ensure all sequences get their state gathered
+			# The owning rank will report the state for each sequence
+			# Completed sequences will be filtered out deterministically via gathered state
+			global_decode_set = set()
+			for s in all_decode_sets:
+				if s:
+					global_decode_set.update(s)
+			decode_uuids = sorted(
+				global_decode_set,
+				key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+			)
+			batch = self._get_local_indices_for_uuids(decode_uuids)
+			logging.warning(f"Rank {self.rank}: Using union to sync, decode_uuids now {len(decode_uuids)}")
 		
 		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
 		
@@ -2625,10 +2636,13 @@ class BatchGenWorker:
 				}
 		
 		# Get candidates for loading (PREFILLED + ON_HOLD)
+		# NOTE: By design, global_batch status should be synchronized, so all ranks
+		# should see the same PREFILLED/ON_HOLD sequences
 		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
 		onhold_seqs = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
 		load_candidates = prefilled + onhold_seqs
 		
+		# Each rank reports candidate state ONLY for sequences it owns
 		local_candidate_state = {}
 		for uuid in load_candidates:
 			if uuid in self._uuid_to_local_map:
@@ -2827,9 +2841,19 @@ class BatchGenWorker:
 		new_load_local = []
 		new_load_global = []
 		
-		if load_candidates and decode_uuids:
-			# Sort candidates DETERMINISTICALLY by global_idx
-			load_candidates.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+		# CRITICAL: Use global_candidate_info keys as the authoritative load_candidates list
+		# This ensures all ranks have the same view of candidates, since global_candidate_info
+		# is built from gathered state from all ranks.
+		# Local status queries (PREFILLED/ON_HOLD) can be desynchronized across ranks.
+		# ALSO: Filter out sequences that were marked COMPLETED in this boundary
+		# (their host KV pages have been released, so we can't load them)
+		completed_set = set(completed_uuids)
+		load_candidates_synced = sorted(
+			[u for u in global_candidate_info.keys() if u not in completed_set],
+			key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+		)
+		
+		if load_candidates_synced and decode_uuids:
 			
 			# CRITICAL: Recalculate available pages per rank
 			# We need fresh counts after extension/eviction
@@ -2861,7 +2885,7 @@ class BatchGenWorker:
 			
 			# Select candidates that fit in ADJUSTED available GPU pages
 			rank_pages_used = [0] * self.world_size
-			for uuid in load_candidates:
+			for uuid in load_candidates_synced:
 				info = global_candidate_info.get(uuid)
 				if info is None:
 					continue
