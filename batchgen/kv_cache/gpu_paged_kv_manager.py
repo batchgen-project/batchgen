@@ -389,11 +389,27 @@ class _GPUPageTableManager:
 
 		# Fast-path: if an existing GPU table already matches the exact
 		# shape we need and the order is identical, return a view into it.
+		old_shape = self.gpu_table.shape if self.gpu_table is not None else None
+		old_slot_count = len(self.slot_to_seq_id) if self.slot_to_seq_id else 0
+		
+		shape_match = self.gpu_table is not None and self.gpu_table.shape[0] == num_slots
+		cols_sufficient = self.gpu_table is not None and self.gpu_table.shape[1] >= new_max
+		order_match = self.slot_to_seq_id == wanted_order
+		
 		reuse_existing = (
 			self.gpu_table is not None
-			and self.gpu_table.shape[0] == num_slots
-			and self.gpu_table.shape[1] >= new_max
-			and self.slot_to_seq_id == wanted_order
+			and shape_match
+			and cols_sufficient
+			and order_match
+		)
+		
+		# DEBUG: Log detailed rebuild info
+		logging.info(
+			f"GPUPageTableManager.rebuild: "
+			f"num_slots={num_slots}, new_max={new_max}, "
+			f"old_shape={old_shape}, old_slot_count={old_slot_count}, "
+			f"shape_match={shape_match}, cols_sufficient={cols_sufficient}, order_match={order_match}, "
+			f"reuse_existing={reuse_existing}"
 		)
 
 		table = (
@@ -441,6 +457,16 @@ class _GPUPageTableManager:
 			self.slot_to_seq_id
 		)
 		self._active_page_indices_cpu = flat_pages_cpu
+		
+		# DEBUG: Log final state after rebuild
+		final_shape = self.gpu_table.shape if self.gpu_table is not None else None
+		return_shape = table[:num_slots, :].shape
+		logging.info(
+			f"GPUPageTableManager.rebuild DONE: "
+			f"self.gpu_table.shape={final_shape}, return_shape={return_shape}, "
+			f"slot_to_seq_id_len={len(self.slot_to_seq_id)}"
+		)
+		
 		# If table has more columns than needed, return a view with
 		# the requested number of rows and the existing columns.
 		return table[:num_slots, :]
@@ -767,6 +793,7 @@ class GPUPagedKVCacheManager:
 		Returns:
 			torch.Tensor: GPU-resident page table view aligned with ``sequence_ids``.
 		"""
+		import logging
 
 		self._ensure_initialized()
 		ordered_ids = list(sequence_ids)
@@ -784,9 +811,21 @@ class GPUPagedKVCacheManager:
 				+ ", ".join(str(seq_id) for seq_id in missing)
 			)
 
+		# DEBUG: Log before rebuild
+		old_shape = self._gpu_page_table_manager.gpu_table.shape if self._gpu_page_table_manager.gpu_table is not None else None
+		
 		table = self._gpu_page_table_manager.rebuild(
 			ordered_ids, self._sequences
 		)
+		
+		# DEBUG: Log after rebuild
+		new_shape = self._gpu_page_table_manager.gpu_table.shape if self._gpu_page_table_manager.gpu_table is not None else None
+		logging.debug(
+			f"rebuild_page_table: requested {len(ordered_ids)} seqs, "
+			f"old_shape={old_shape}, new_shape={new_shape}, "
+			f"returned_shape={table.shape}"
+		)
+		
 		self._update_active_page_pointer_tables()
 		return table
 

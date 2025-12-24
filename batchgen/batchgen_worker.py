@@ -2755,6 +2755,12 @@ class BatchGenWorker:
 			decode_uuids = [u for u in decode_uuids if u not in onhold_set]
 			batch = self._get_local_indices_for_uuids(decode_uuids)
 			
+			# DEBUG: Log batch size after on-hold
+			logging.info(
+				f"Rank {self.rank}: After on-hold: batch_size={len(batch)}, "
+				f"num_onhold={len(onhold_uuids)}, my_onhold={len(my_onhold)}"
+			)
+			
 			# Extend remaining sequences
 			remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
 			if remaining_needing_ext:
@@ -2867,7 +2873,22 @@ class BatchGenWorker:
 		
 		# ========== FINAL PAGE TABLE REBUILD ==========
 		t0 = time.perf_counter()
+		# DEBUG: Log batch size before final rebuild
+		global_ids_for_rebuild = self._local_indices_to_global_seq_ids(batch) if batch else []
+		logging.info(
+			f"Rank {self.rank}: FINAL REBUILD: batch_size={len(batch)}, "
+			f"global_ids_count={len(global_ids_for_rebuild)}"
+		)
 		self._rebuild_page_table_for_batch(batch, gpu_manager)
+		
+		# DEBUG: Verify page table size after rebuild
+		if gpu_manager and gpu_manager.is_initialized:
+			mgr = gpu_manager._gpu_page_table_manager
+			if mgr and mgr.gpu_table is not None:
+				logging.info(
+					f"Rank {self.rank}: After rebuild: gpu_table.shape={mgr.gpu_table.shape}, "
+					f"slot_to_seq_id_len={len(mgr.slot_to_seq_id)}"
+				)
 		timing.rebuild_ms = (time.perf_counter() - t0) * 1000
 		
 		# ========== UPDATE MOE BUFFER SIZE ==========
@@ -2905,6 +2926,16 @@ class BatchGenWorker:
 			# CRITICAL: Rebuild page table to match the corrected batch
 			self._rebuild_page_table_for_batch(batch, gpu_manager)
 			logging.info(f"Rank {self.rank}: Page table rebuilt after batch correction")
+		
+		# FINAL VERIFICATION: Ensure page table matches batch before returning
+		if batch and gpu_manager and gpu_manager.is_initialized:
+			mgr = gpu_manager._gpu_page_table_manager
+			if mgr and mgr.gpu_table is not None:
+				if mgr.gpu_table.shape[0] != len(batch):
+					logging.error(
+						f"Rank {self.rank}: CRITICAL - Page table STILL mismatched at function return! "
+						f"gpu_table.shape[0]={mgr.gpu_table.shape[0]}, batch_size={len(batch)}"
+					)
 		
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 		
@@ -3137,6 +3168,24 @@ class BatchGenWorker:
 				
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+				
+				# DEBUG: Verify page table matches batch before forward
+				if gpu_manager and gpu_manager.is_initialized:
+					mgr = gpu_manager._gpu_page_table_manager
+					if mgr and mgr.gpu_table is not None:
+						page_table_size = mgr.gpu_table.shape[0]
+						if page_table_size != len(batch):
+							# CRITICAL: Force rebuild to fix the mismatch
+							logging.error(
+								f"Rank {self.rank}: PRE-FORWARD MISMATCH! "
+								f"page_table_size={page_table_size}, batch_size={len(batch)}, "
+								f"new_tokens.shape={new_tokens.shape}, iteration={iteration}. "
+								f"Forcing rebuild..."
+							)
+							# Force rebuild with correct batch
+							global_ids = self._local_indices_to_global_seq_ids(batch)
+							gpu_manager.rebuild_page_table(global_ids)
+							logging.info(f"Rank {self.rank}: Forced rebuild complete, new shape={mgr.gpu_table.shape}")
 				
 				# KV append callback
 				current_batch = list(batch)
