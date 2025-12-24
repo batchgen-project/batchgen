@@ -1810,7 +1810,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 	def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
 		"""
 		Dynamically update num_tokens_per_rank for reduced communication.
-		Called at page boundaries when actual batch size is smaller than max buffer.
+		Called at page boundaries when actual batch size changes.
 		
 		This updates:
 		- self.num_tokens_per_rank: Used by moe_infer_allgather_allreduce_bf16_acc
@@ -1822,11 +1822,10 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		if num_tokens_per_rank == self.num_tokens_per_rank:
 			return  # No change needed
 		
-		# Safety check - don't exceed the pre-allocated max
+		# Allow growth beyond initial max - just update the max if needed
+		# The buffers (token_idx, topk_pos) will be reallocated below
 		if hasattr(self, 'max_num_tokens_per_rank') and num_tokens_per_rank > self.max_num_tokens_per_rank:
-			raise ValueError(
-				f"num_tokens_per_rank={num_tokens_per_rank} exceeds max_num_tokens_per_rank={self.max_num_tokens_per_rank}"
-			)
+			self.max_num_tokens_per_rank = num_tokens_per_rank
 		
 		self.num_tokens_per_rank = num_tokens_per_rank
 		global_num_tokens = self.num_tokens_per_rank * self.world_size

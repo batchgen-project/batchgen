@@ -26,10 +26,6 @@ def _setup_nccl_env():
 	if "NCCL_NET_RETRY_COUNT" not in os.environ:
 		os.environ["NCCL_NET_RETRY_COUNT"] = "100"  # More retries (default is ~10)
 	
-	# Enable async error handling for better error reporting
-	if "NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
-		os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
-
 
 def server_worker_main(
 	rank_idx: int,
