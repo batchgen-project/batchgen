@@ -784,6 +784,30 @@ class GPUPagedKVCacheManager:
 			self._clear_active_page_pointer_tables()
 		return allocations
 
+	def clear_page_table(self) -> None:
+		"""Clear the GPU page table to empty state (0 sequences).
+		
+		This should be called when all sequences have been freed and the batch is empty.
+		"""
+		self._ensure_initialized()
+		mgr = self._gpu_page_table_manager
+		
+		# Clear the GPU table to empty shape [0, max_pages]
+		max_pages = mgr.max_pages_per_sequence if mgr.max_pages_per_sequence > 0 else 1
+		mgr.gpu_table = torch.full(
+			(0, max_pages), -1, dtype=torch.int32, device=mgr.device
+		)
+		
+		# Clear the slot mappings
+		mgr.seq_id_to_slot = {}
+		mgr.slot_to_seq_id = []
+		mgr._slot_index_tensor = None
+		mgr._slot_to_seq_id_tensor = None
+		mgr._active_page_indices_cpu = None
+		
+		# Clear active page pointer tables
+		self._clear_active_page_pointer_tables()
+
 	def rebuild_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
 		"""Rebuilds the GPU page table following ``sequence_ids`` order.
 

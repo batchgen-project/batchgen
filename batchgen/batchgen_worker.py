@@ -3342,6 +3342,11 @@ class BatchGenWorker:
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
 				
+				# Skip forward pass entirely if batch is empty
+				if not batch:
+					logging.debug(f"Rank {self.rank}: Empty batch, skipping forward pass at iteration {iteration}")
+					continue
+				
 				# DEBUG: Verify page table matches batch before forward
 				if gpu_manager and gpu_manager.is_initialized:
 					mgr = gpu_manager._gpu_page_table_manager
@@ -3358,32 +3363,22 @@ class BatchGenWorker:
 								f"new_tokens.shape[0]={tokens_size}, iteration={iteration}"
 							)
 							
-							# Handle empty batch case - skip forward entirely
-							if batch_size == 0:
-								logging.info(f"Rank {self.rank}: Batch is empty, skipping page table rebuild")
-								# Don't try to rebuild - just continue with empty tensors
-							else:
-								# Fix: rebuild new_tokens if it doesn't match batch
-								if tokens_size != batch_size:
-									logging.info(f"Rank {self.rank}: Rebuilding new_tokens to match batch...")
-									new_tokens = self._rebuild_input_tokens(batch)
-									tokens_size = new_tokens.shape[0]
-								
-								# Fix: rebuild page table if it doesn't match batch
-								if page_table_size != batch_size:
-									logging.info(f"Rank {self.rank}: Rebuilding page table to match batch...")
-									global_ids = self._local_indices_to_global_seq_ids(batch)
-									gpu_manager.rebuild_page_table(global_ids)
-								
-								logging.info(
-									f"Rank {self.rank}: After fix: page_table={mgr.gpu_table.shape[0]}, "
-									f"new_tokens={new_tokens.shape[0]}, batch={len(batch)}"
-								)
-				
-				# Skip forward pass entirely if batch is empty
-				if not batch:
-					logging.debug(f"Rank {self.rank}: Empty batch, skipping forward pass at iteration {iteration}")
-					continue
+							# Fix: rebuild new_tokens if it doesn't match batch
+							if tokens_size != batch_size:
+								logging.info(f"Rank {self.rank}: Rebuilding new_tokens to match batch...")
+								new_tokens = self._rebuild_input_tokens(batch)
+								tokens_size = new_tokens.shape[0]
+							
+							# Fix: rebuild page table if it doesn't match batch
+							if page_table_size != batch_size:
+								logging.info(f"Rank {self.rank}: Rebuilding page table to match batch...")
+								global_ids = self._local_indices_to_global_seq_ids(batch)
+								gpu_manager.rebuild_page_table(global_ids)
+							
+							logging.info(
+								f"Rank {self.rank}: After fix: page_table={mgr.gpu_table.shape[0]}, "
+								f"new_tokens={new_tokens.shape[0]}, batch={len(batch)}"
+							)
 				
 				# KV append callback
 				current_batch = list(batch)
@@ -3989,7 +3984,9 @@ class BatchGenWorker:
 			return
 		
 		if not batch:
+			# Clear the page table to empty state when batch is empty
 			Attn_Wrapper.cur_batch = []
+			gpu_manager.clear_page_table()
 			return
 		
 		global_ids = self._local_indices_to_global_seq_ids(batch)
