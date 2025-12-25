@@ -2785,9 +2785,15 @@ class BatchGenWorker:
 		)
 		
 		onhold_uuids = []
+		onhold_set = set()  # Initialize early for later use
+		# Track actual pages used for extension (needed for load selection)
+		actual_extension_by_rank = [0] * self.world_size
+		
 		if all_can_extend and seqs_needing_extension:
 			# Simple extension - no eviction needed
 			self._extend_gpu_kv_allocation(seqs_needing_extension)
+			# All extension pages are used
+			actual_extension_by_rank = list(total_additional_by_rank)
 		elif not all_can_extend:
 			# Need eviction - put longest-decoded sequences on hold
 			# CRITICAL: Sort DETERMINISTICALLY by (decoded_length DESC, global_idx ASC)
@@ -2839,10 +2845,16 @@ class BatchGenWorker:
 				f"num_onhold={len(onhold_uuids)}, my_onhold={len(my_onhold)}"
 			)
 			
-			# Extend remaining sequences
+			# Extend remaining sequences and track actual extension pages used
 			remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
 			if remaining_needing_ext:
 				self._extend_gpu_kv_allocation(remaining_needing_ext)
+				# Calculate actual extension pages used per rank
+				for uuid in remaining_needing_ext:
+					state = global_seq_state.get(uuid, {})
+					r = state.get('assigned_rank')
+					if r is not None:
+						actual_extension_by_rank[r] += state.get('additional_pages_needed', 0)
 		
 		timing.num_onhold = len(onhold_uuids)
 		timing.extension_ms = (time.perf_counter() - t0) * 1000
@@ -2860,33 +2872,23 @@ class BatchGenWorker:
 		# Local status queries (PREFILLED/ON_HOLD) can be desynchronized across ranks.
 		# ALSO: Filter out sequences that were marked COMPLETED in this boundary
 		# (their host KV pages have been released, so we can't load them)
+		# ALSO: Filter out sequences put ON_HOLD in THIS boundary (to avoid loading just-evicted sequences)
 		completed_set = set(completed_uuids)
 		load_candidates_synced = sorted(
-			[u for u in global_candidate_info.keys() if u not in completed_set],
+			[u for u in global_candidate_info.keys() if u not in completed_set and u not in onhold_set],
 			key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
 		)
 		
 		if load_candidates_synced and decode_uuids:
 			
-			# CRITICAL: Calculate available pages per rank DETERMINISTICALLY
-			# All ranks MUST use the SAME values to ensure identical new_load_uuids selection.
-			# Using local_free_now for self would cause desync because other ranks use estimates.
-			# Instead, use the deterministic estimate for ALL ranks (including self).
-			adjusted_per_rank_free = list(per_rank_free)  # Copy
-			for r in range(self.world_size):
-				# Use deterministic estimate based on gathered state
-				freed_from_completed = sum(
-					global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
-					for u in completed_uuids
-					if global_seq_state.get(u, {}).get('assigned_rank') == r
-				)
-				freed_from_onhold = sum(
-					global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
-					for u in onhold_uuids
-					if global_seq_state.get(u, {}).get('assigned_rank') == r
-				)
-				used_for_extension = total_additional_by_rank[r] if all_can_extend else 0
-				adjusted_per_rank_free[r] = per_rank_free[r] + freed_from_completed + freed_from_onhold - used_for_extension
+			# CRITICAL: Gather ACTUAL free pages from all ranks AFTER extension/eviction
+			# This ensures accurate selection instead of relying on estimates
+			local_free_after = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
+			all_free_after = [0] * self.world_size
+			dist.all_gather_object(all_free_after, local_free_after)
+			
+			# Use gathered actual free pages for selection
+			adjusted_per_rank_free = all_free_after
 			
 			timing.load_select_ms = (time.perf_counter() - t0) * 1000
 			
@@ -2914,42 +2916,106 @@ class BatchGenWorker:
 							if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
 				new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
 				
+				# Track which UUIDs this rank actually loaded (for sync)
+				my_actually_loaded = set()
+				
 				if new_load_local:
-					new_load_global = self._local_indices_to_global_seq_ids(new_load_local)
-					tokens = self._compute_two_page_buffer_tokens(new_load_local)
+					# SAFETY CHECK: Verify actual pages needed doesn't exceed actual free pages
+					# The estimate may be off due to state drift, so we filter here
+					actual_free = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
 					
-					# Allocate pages
-					gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
-					timing.load_alloc_ms = (time.perf_counter() - t_alloc) * 1000
+					# Filter sequences that fit in actual free pages
+					filtered_local = []
+					filtered_global = []
+					filtered_tokens = []
+					pages_used = 0
 					
-					# Get pointers and launch async load
-					t_launch = time.perf_counter()
-					worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-					if worker_view is not None:
-						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
-						gpu_manager.rebuild_page_table(new_load_global)
-						k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
-						active_page_counts = gpu_manager.export_active_sequence_page_counts()
-						sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
+					for local_idx in new_load_local:
+						uuid = self._local_to_uuid_map[local_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						pages_needed = seq.get_gpu_pages_for_two_page_buffer()
 						
-						new_async_task = worker_view.async_load_layer_paged_kv_to_device(
-							sequence_ids=sequence_tensor,
-							active_page_counts=active_page_counts,
-							k_device_ptrs=k_ptrs,
-							v_device_ptrs=v_ptrs,
+						if pages_used + pages_needed <= actual_free:
+							filtered_local.append(local_idx)
+							filtered_global.append(seq.global_idx)
+							filtered_tokens.append(pages_needed * self.PAGE_SIZE)
+							pages_used += pages_needed
+							my_actually_loaded.add(uuid)
+						else:
+							# Log that we're dropping this sequence due to insufficient pages
+							gathered_pages = global_candidate_info.get(uuid, {}).get('pages_needed', 'N/A')
+							logging.warning(
+								f"Rank {self.rank}: Dropping {uuid} from load - "
+								f"need={pages_needed}, gathered={gathered_pages}, "
+								f"pages_used={pages_used}, actual_free={actual_free}"
+							)
+					
+					if filtered_local:
+						new_load_local = filtered_local
+						new_load_global = filtered_global
+						tokens = filtered_tokens
+						
+						# Allocate pages
+						gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+						timing.load_alloc_ms = (time.perf_counter() - t_alloc) * 1000
+						
+						# Get pointers and launch async load
+						t_launch = time.perf_counter()
+						worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+						if worker_view is not None:
+							existing_global_ids = self._local_indices_to_global_seq_ids(batch)
+							gpu_manager.rebuild_page_table(new_load_global)
+							k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+							active_page_counts = gpu_manager.export_active_sequence_page_counts()
+							sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
+							
+							new_async_task = worker_view.async_load_layer_paged_kv_to_device(
+								sequence_ids=sequence_tensor,
+								active_page_counts=active_page_counts,
+								k_device_ptrs=k_ptrs,
+								v_device_ptrs=v_ptrs,
+							)
+						
+							# Restore page table to current batch
+							if existing_global_ids:
+								gpu_manager.rebuild_page_table(existing_global_ids)
+							
+							# Store tensor refs
+							self._async_load_tensors = {
+								'k_ptrs': k_ptrs, 'v_ptrs': v_ptrs,
+								'sequence_tensor': sequence_tensor,
+								'active_page_counts': active_page_counts,
+							}
+						timing.load_launch_ms = (time.perf_counter() - t_launch) * 1000
+					else:
+						# All sequences were dropped due to insufficient pages
+						new_load_local = []
+						new_load_global = []
+						logging.warning(
+							f"Rank {self.rank}: All load candidates dropped due to insufficient pages, "
+							f"actual_free={actual_free}"
 						)
-						
-						# Restore page table to current batch
-						if existing_global_ids:
-							gpu_manager.rebuild_page_table(existing_global_ids)
-						
-						# Store tensor refs
-						self._async_load_tensors = {
-							'k_ptrs': k_ptrs, 'v_ptrs': v_ptrs,
-							'sequence_tensor': sequence_tensor,
-							'active_page_counts': active_page_counts,
-						}
-					timing.load_launch_ms = (time.perf_counter() - t_launch) * 1000
+				
+				# CRITICAL: Sync which sequences were actually loaded across ALL ranks
+				# This must be called by ALL ranks (even those with no sequences to load)
+				# If any rank dropped sequences, all ranks must update new_load_uuids
+				all_actually_loaded = [None] * self.world_size
+				dist.all_gather_object(all_actually_loaded, my_actually_loaded)
+				
+				# new_load_uuids should only include sequences that their owning rank actually loaded
+				actually_loaded_global = set()
+				for loaded_set in all_actually_loaded:
+					if loaded_set:
+						actually_loaded_global.update(loaded_set)
+				
+				# Update new_load_uuids to match what was actually loaded
+				original_count = len(new_load_uuids)
+				new_load_uuids = [u for u in new_load_uuids if u in actually_loaded_global]
+				if len(new_load_uuids) != original_count:
+					logging.warning(
+						f"Rank {self.rank}: new_load_uuids reduced from {original_count} to {len(new_load_uuids)} "
+						f"due to safety filter"
+					)
 		
 		timing.num_loaded = len(new_load_uuids)
 		
