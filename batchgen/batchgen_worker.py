@@ -2536,6 +2536,42 @@ class BatchGenWorker:
 		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks()
 		timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
 		
+		# ========== CRITICAL: SYNC decode_uuids BEFORE finalize_async_load ==========
+		# decode_uuids may have drifted between boundaries. We MUST sync BEFORE
+		# _finalize_async_load_minimal because it concatenates valid_pending_uuids 
+		# (synced) with current_decode_uuids (potentially desync'd).
+		# If we don't sync first, the output will be desync'd.
+		t_sync = time.perf_counter()
+		local_decode_set = set(decode_uuids)
+		all_decode_sets = [None] * self.world_size
+		dist.all_gather_object(all_decode_sets, local_decode_set)
+		
+		# Check for desync
+		all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
+		if not all_sets_equal:
+			# Log detailed desync info
+			for r, s in enumerate(all_decode_sets):
+				if s != local_decode_set:
+					diff_in_r = s - local_decode_set if s else set()
+					diff_in_local = local_decode_set - s if s else local_decode_set
+					logging.error(
+						f"Rank {self.rank}: decode_uuids DESYNC detected at boundary start! "
+						f"Rank {r} has {len(diff_in_r)} extra: {list(diff_in_r)[:5]}, "
+						f"Rank {self.rank} has {len(diff_in_local)} extra: {list(diff_in_local)[:5]}"
+					)
+			# Use UNION to ensure all sequences get their state gathered
+			global_decode_set = set()
+			for s in all_decode_sets:
+				if s:
+					global_decode_set.update(s)
+			decode_uuids = sorted(
+				global_decode_set,
+				key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+			)
+			batch = self._get_local_indices_for_uuids(decode_uuids)
+			logging.warning(f"Rank {self.rank}: Using union to sync at boundary start, decode_uuids now {len(decode_uuids)}")
+		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
+		
 		# Integrate previous async load if any
 		if pending_load_uuids:  # ALL ranks have identical pending_load_uuids
 			t0 = time.perf_counter()
@@ -2569,43 +2605,16 @@ class BatchGenWorker:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing
 		
-		# ========== VALIDATE: decode_uuids SHOULD BE IDENTICAL ACROSS ALL RANKS ==========
-		# By design, global_batch status is synchronized at the end of each boundary.
-		# Therefore, decode_uuids (derived from global_batch) should be identical.
-		# If not, log an error to help diagnose the desync.
-		t_sync = time.perf_counter()
-		local_decode_set = set(decode_uuids)
-		all_decode_sets = [None] * self.world_size
-		dist.all_gather_object(all_decode_sets, local_decode_set)
-		
-		# Check for desync
-		all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
-		if not all_sets_equal:
-			# Log detailed desync info
-			for r, s in enumerate(all_decode_sets):
-				if s != local_decode_set:
-					diff_in_r = s - local_decode_set if s else set()
-					diff_in_local = local_decode_set - s if s else local_decode_set
-					logging.error(
-						f"Rank {self.rank}: decode_uuids DESYNC detected! "
-						f"Rank {r} has {len(diff_in_r)} extra: {list(diff_in_r)[:5]}, "
-						f"Rank {self.rank} has {len(diff_in_local)} extra: {list(diff_in_local)[:5]}"
-					)
-			# Use UNION to ensure all sequences get their state gathered
-			# The owning rank will report the state for each sequence
-			# Completed sequences will be filtered out deterministically via gathered state
-			global_decode_set = set()
-			for s in all_decode_sets:
-				if s:
-					global_decode_set.update(s)
-			decode_uuids = sorted(
-				global_decode_set,
-				key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
-			)
-			batch = self._get_local_indices_for_uuids(decode_uuids)
-			logging.warning(f"Rank {self.rank}: Using union to sync, decode_uuids now {len(decode_uuids)}")
-		
-		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
+		# ========== POST-FINALIZE VALIDATION (debug only) ==========
+		# After sync+finalize, decode_uuids should be identical across all ranks.
+		# This is a sanity check - if we see desync here, there's a bug in our logic.
+		if logging.getLogger().isEnabledFor(logging.DEBUG):
+			local_decode_set = set(decode_uuids)
+			all_decode_sets = [None] * self.world_size
+			dist.all_gather_object(all_decode_sets, local_decode_set)
+			all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
+			if not all_sets_equal:
+				logging.error(f"Rank {self.rank}: BUG - decode_uuids still desync'd after sync+finalize!")
 		
 		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
 		t0 = time.perf_counter()
@@ -2859,31 +2868,25 @@ class BatchGenWorker:
 		
 		if load_candidates_synced and decode_uuids:
 			
-			# CRITICAL: Recalculate available pages per rank
-			# We need fresh counts after extension/eviction
-			# Use: original_free - pages_used_for_extension + pages_freed_from_eviction
-			# Simpler: just get fresh count from local manager
-			local_free_now = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
-			
-			# For other ranks, estimate: original - additional_used
+			# CRITICAL: Calculate available pages per rank DETERMINISTICALLY
+			# All ranks MUST use the SAME values to ensure identical new_load_uuids selection.
+			# Using local_free_now for self would cause desync because other ranks use estimates.
+			# Instead, use the deterministic estimate for ALL ranks (including self).
 			adjusted_per_rank_free = list(per_rank_free)  # Copy
 			for r in range(self.world_size):
-				if r == self.rank:
-					adjusted_per_rank_free[r] = local_free_now
-				else:
-					# Estimate: freed from completed + freed from onhold - used for extension
-					freed_from_completed = sum(
-						global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
-						for u in completed_uuids
-						if global_seq_state.get(u, {}).get('assigned_rank') == r
-					)
-					freed_from_onhold = sum(
-						global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
-						for u in onhold_uuids
-						if global_seq_state.get(u, {}).get('assigned_rank') == r
-					)
-					used_for_extension = total_additional_by_rank[r] if all_can_extend else 0
-					adjusted_per_rank_free[r] = per_rank_free[r] + freed_from_completed + freed_from_onhold - used_for_extension
+				# Use deterministic estimate based on gathered state
+				freed_from_completed = sum(
+					global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
+					for u in completed_uuids
+					if global_seq_state.get(u, {}).get('assigned_rank') == r
+				)
+				freed_from_onhold = sum(
+					global_seq_state.get(u, {}).get('gpu_pages_allocated', 0)
+					for u in onhold_uuids
+					if global_seq_state.get(u, {}).get('assigned_rank') == r
+				)
+				used_for_extension = total_additional_by_rank[r] if all_can_extend else 0
+				adjusted_per_rank_free[r] = per_rank_free[r] + freed_from_completed + freed_from_onhold - used_for_extension
 			
 			timing.load_select_ms = (time.perf_counter() - t0) * 1000
 			
