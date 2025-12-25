@@ -2635,22 +2635,26 @@ class BatchGenWorker:
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
 				}
 		
-		# Get candidates for loading (PREFILLED + ON_HOLD)
-		# NOTE: By design, global_batch status should be synchronized, so all ranks
-		# should see the same PREFILLED/ON_HOLD sequences
-		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		onhold_seqs = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
-		load_candidates = prefilled + onhold_seqs
-		
-		# Each rank reports candidate state ONLY for sequences it owns
+		# Get candidates for loading - report ALL owned sequences that could be loaded
+		# Instead of querying local PREFILLED/ON_HOLD status (which can be desync),
+		# report all owned sequences that are NOT currently in decode_uuids
+		# This ensures the gathered global_candidate_info is complete
+		decode_uuids_set = set(decode_uuids)
 		local_candidate_state = {}
-		for uuid in load_candidates:
-			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				local_candidate_state[uuid] = {
-					'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
-					'assigned_rank': seq.assigned_rank,
-				}
+		for uuid in self._uuid_to_local_map.keys():
+			if uuid in decode_uuids_set:
+				continue  # Already in decode batch
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			if seq.status == SequenceStatus.COMPLETED:
+				continue  # Don't load completed sequences
+			# Report this as a potential load candidate
+			local_candidate_state[uuid] = {
+				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
+				'assigned_rank': seq.assigned_rank,
+				'status': seq.status.name,  # Include status for debugging
+			}
 		
 		# Pack everything into one dict for single all_gather
 		local_payload = {
