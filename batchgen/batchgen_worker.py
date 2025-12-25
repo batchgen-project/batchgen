@@ -2402,8 +2402,9 @@ class BatchGenWorker:
 			# Do NOT call _release_gpu_kv_pages here to avoid double-free
 			
 			# Release host KV pages
+			# NOTE: release_sequence_pages already calls unregister_sequences internally,
+			# so we don't need to call unregister_sequences separately
 			worker_view.release_sequence_pages(global_sequence_ids)
-			worker_view.unregister_sequences(global_sequence_ids)
 			
 			# Rebuild GPU page table with remaining active sequences
 			manager = self.gpu_paged_kv_cache_manager
@@ -5031,21 +5032,39 @@ class BatchGenWorker:
 		# 2. TCPStore port binding issues
 		# The communicator is only destroyed when the worker is shut down.
 		
-		# 1. Release any remaining host KV pages
+		# 1. Release any remaining host KV pages for THIS RANK's sequences
+		# NOTE: Many sequences may already be released during normal decode completion.
+		# We only need to cleanup sequences that might still be registered.
 		if hasattr(self, 'global_batch') and self.global_batch is not None:
 			try:
 				worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-				if worker_view is not None and hasattr(self, '_uuid_to_local_map'):
+				if worker_view is not None and hasattr(self, '_uuid_to_local_map') and self._uuid_to_local_map:
+					# Collect all global_idx values for this rank's sequences
+					global_ids_to_release = []
 					for uuid in self._uuid_to_local_map.keys():
 						seq = self.global_batch.get_sequence(uuid)
 						if seq is not None:
+							global_ids_to_release.append(seq.global_idx)
+					
+					if global_ids_to_release:
+						logging.info(
+							f"Rank {self.rank}: Attempting to release host KV for {len(global_ids_to_release)} sequences"
+						)
+						# Try to release each sequence individually to handle already-released ones
+						released_count = 0
+						for seq_id in global_ids_to_release:
 							try:
-								worker_view.release_sequence_pages([seq.global_idx])
-								worker_view.unregister_sequences([seq.global_idx])
+								worker_view.release_sequence_pages([seq_id])
+								released_count += 1
 							except Exception:
-								pass  # Ignore errors for already-released pages
+								# Sequence was already released during decode - this is normal
+								pass
+						logging.info(f"Rank {self.rank}: Released {released_count}/{len(global_ids_to_release)} sequences (others already released)")
 			except Exception as e:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup host KV: {e}")
+		
+		# 2. Reset batch completion flag
+		self._batch_completed = False
 		
 		# 3. Destroy GPU KV cache (but keep the manager reference for reuse)
 		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
@@ -5063,7 +5082,10 @@ class BatchGenWorker:
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		
-		# 7. Clean up model weights (but NOT core_engine or parallel_manager)
+		# 7. Reset GPU KV tracking
+		self._sequences_with_gpu_kv = set()
+		
+		# 8. Clean up model weights (but NOT core_engine or parallel_manager)
 		if hasattr(self, 'model') and self.model is not None:
 			try:
 				self.deep_free_model_memory()
@@ -5071,11 +5093,11 @@ class BatchGenWorker:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup model: {e}")
 		self.model = None
 		
-		# 8. Clear CUDA cache
+		# 9. Clear CUDA cache
 		torch.cuda.empty_cache()
 		torch.cuda.synchronize()
 		
-		# 9. Force garbage collection
+		# 10. Force garbage collection
 		gc.collect()
 		
 		# Synchronize all ranks after cleanup

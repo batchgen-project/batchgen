@@ -306,6 +306,11 @@ class BatchGenServer:
 				dur = time.perf_counter() - start_t
 				logging.info(f"Batch finished in {dur:.2f}s")
 				
+				# Check if worker returned an error
+				if isinstance(result, dict) and 'error' in result:
+					logging.error(f"Worker inference failed: {result}")
+					return {'status': 'error', 'message': result.get('error', 'Unknown worker error')}
+				
 				return {'status': 'success', 'results': result}
 
 		return {'status': 'error', 'message': f'Unknown command: {command}'}

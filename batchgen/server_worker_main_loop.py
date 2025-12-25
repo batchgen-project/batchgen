@@ -194,6 +194,7 @@ def _server_worker_main_impl(
 
 		# --- STEP 4: Inference with full global batch ---
 		local_results = []
+		inference_error = None
 		try:
 			# Unpack payload - all ranks now have the full global batch
 			global_prompts = task_data.get("prompts", [])
@@ -219,20 +220,40 @@ def _server_worker_main_impl(
 
 		except Exception as e:
 			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
+			inference_error = str(e)
 			local_results = []
 
 		# --- STEP 5: Gather Results back to Rank 0 ---
 		gather_list = [None for _ in range(world_size)] if global_rank == 0 else None
 		dist.gather_object(local_results, gather_list, dst=0)
+		
+		# Also gather any errors from all ranks
+		error_list = [None for _ in range(world_size)] if global_rank == 0 else None
+		dist.gather_object(inference_error, error_list, dst=0)
 
 		# --- STEP 6: Response (Rank 0 Only) ---
 		if global_rank == 0:
+			# Check for errors first
+			errors = [e for e in error_list if e is not None] if error_list else []
+			if errors:
+				logging.error(f"Inference failed with errors from ranks: {errors}")
+				# Return error to client
+				response_queue.put({"error": errors[0], "all_errors": errors})
+				continue
+			
 			# Flatten results
 			final_results = []
 			if gather_list:
 				for batch_res in gather_list:
 					if batch_res:
 						final_results.extend(batch_res)
+			
+			# Safeguard: if results are empty but no errors, something went wrong
+			if not final_results and len(task_data.get("prompts", [])) > 0:
+				logging.error(f"Results are unexpectedly empty! gather_list={[type(x) for x in gather_list]}")
+				response_queue.put({"error": "Results unexpectedly empty after inference"})
+				continue
+				
 			response_queue.put(final_results)
 
 	# Cleanup
