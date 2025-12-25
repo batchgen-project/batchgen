@@ -3342,13 +3342,12 @@ class BatchGenWorker:
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
 				
-				# Skip forward pass entirely if batch is empty
-				if not batch:
-					logging.debug(f"Rank {self.rank}: Empty batch, skipping forward pass at iteration {iteration}")
-					continue
+				# NOTE: Do NOT skip forward pass even with empty batch!
+				# MoE models have all-to-all collective operations that ALL ranks must participate in.
+				# Skipping would cause deadlock as other ranks wait for this rank.
 				
-				# DEBUG: Verify page table matches batch before forward
-				if gpu_manager and gpu_manager.is_initialized:
+				# DEBUG: Verify page table matches batch before forward (only for non-empty batch)
+				if batch and gpu_manager and gpu_manager.is_initialized:
 					mgr = gpu_manager._gpu_page_table_manager
 					if mgr and mgr.gpu_table is not None:
 						page_table_size = mgr.gpu_table.shape[0]
