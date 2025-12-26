@@ -43,7 +43,7 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
 	build_host_kv_config,
 )
-from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
+from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
@@ -243,6 +243,15 @@ class BatchGenWorker:
 
 	def __init__(self, args: BatchGenWorkerArgs):
 		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
+		
+		# Log page buffer configuration (only on rank 0 to avoid spam)
+		if args.global_rank == 0:
+			logging.info(
+				f"GPU Page Buffer Configuration: "
+				f"INITIAL_GPU_PAGE_BUFFER={INITIAL_GPU_PAGE_BUFFER} pages ({INITIAL_GPU_PAGE_BUFFER * 64} tokens), "
+				f"EXTENSION_GPU_PAGE_BUFFER={EXTENSION_GPU_PAGE_BUFFER} pages ({EXTENSION_GPU_PAGE_BUFFER * 64} tokens). "
+				f"Control via env vars: BATCHGEN_INITIAL_GPU_PAGE_BUFFER, BATCHGEN_EXTENSION_GPU_PAGE_BUFFER"
+			)
 		
 		# 1. Store Arguments & Rank Information
 		self.args = args
@@ -517,6 +526,8 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			pages = seq.get_gpu_pages_for_two_page_buffer()
 			seq.gpu_pages_allocated = pages
+			# Mark that this sequence has received its initial GPU reservation
+			seq.mark_initial_gpu_reservation_done()
 		
 		manager.allocate_pages_for_sequences(global_ids, pages_per_seq)
 		manager.rebuild_page_table(global_ids)
@@ -541,7 +552,7 @@ class BatchGenWorker:
 			manager.rebuild_page_table(all_active_global_ids)
 		
 		logging.info(
-			f"Rank {self.rank}: Allocated two-page buffer GPU KV for {len(global_ids)} sequences"
+			f"Rank {self.rank}: Allocated GPU KV for {len(global_ids)} sequences"
 		)
 		return True
 
@@ -1903,6 +1914,8 @@ class BatchGenWorker:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+			# Mark that this sequence has received its initial GPU reservation
+			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
 
 	# ============ Main Generation Loop ============
@@ -2238,6 +2251,8 @@ class BatchGenWorker:
 					uuid = self._local_to_uuid_map[local_idx]
 					seq = self.global_batch.get_sequence(uuid)
 					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+					# Mark initial reservation done
+					seq.mark_initial_gpu_reservation_done()
 					self._sequences_with_gpu_kv.add(uuid)
 		else:
 			# Use two-page buffer allocation, NOT _prepare_gpu_paged_kv_cache
@@ -2248,6 +2263,8 @@ class BatchGenWorker:
 				uuid = self._local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+				# Mark initial reservation done
+				seq.mark_initial_gpu_reservation_done()
 				self._sequences_with_gpu_kv.add(uuid)
 			
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
@@ -3131,6 +3148,8 @@ class BatchGenWorker:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+			# Mark that this sequence has received its initial GPU reservation
+			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
 		
 		updated_uuids = current_decode_uuids + valid_pending_uuids
@@ -4361,6 +4380,8 @@ class BatchGenWorker:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+			# Mark that this sequence has received its initial GPU reservation
+			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
 		
 		# Merge into decode batch with deterministic ordering

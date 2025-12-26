@@ -1,16 +1,29 @@
 """
     Data structure for storing and updating query information.
     
-    Supports two-page buffer design for efficient GPU KV cache management:
-    - Instead of allocating full (prompt + max_decode) pages upfront,
-      we allocate current_context_length + 2*PAGE_SIZE tokens worth of pages.
+    Supports configurable page buffer design for efficient GPU KV cache management:
+    - Initial reservation: When first loaded to GPU, reserve INITIAL_GPU_PAGE_BUFFER pages
+      beyond current context to reduce load/on-hold churning.
+    - Extension reservation: At page boundaries, extend by EXTENSION_GPU_PAGE_BUFFER pages.
     - New KV tokens are streamed to host after each attention layer.
     - Sequences can be put ON_HOLD when GPU memory is insufficient.
+    
+    Environment Variables:
+    - BATCHGEN_INITIAL_GPU_PAGE_BUFFER: Pages to reserve on first GPU load (default: 64)
+    - BATCHGEN_EXTENSION_GPU_PAGE_BUFFER: Pages to add at boundaries (default: 2)
 """
 from enum import IntEnum
 from typing import Dict, List, Optional, Set
 import torch
 import math
+import os
+
+
+# Configurable page buffer sizes via environment variables
+# Initial reservation when sequence is first loaded to GPU (e.g., after prefill or from ON_HOLD)
+INITIAL_GPU_PAGE_BUFFER = int(os.environ.get("BATCHGEN_INITIAL_GPU_PAGE_BUFFER", "64"))
+# Extension buffer at page boundaries (for sequences already in decode)
+EXTENSION_GPU_PAGE_BUFFER = int(os.environ.get("BATCHGEN_EXTENSION_GPU_PAGE_BUFFER", "2"))
 
 
 class SequenceStatus(IntEnum):
@@ -30,6 +43,8 @@ class SequenceEntry:
         'kv_token_budget', 'assigned_rank', 'text', 'eos_reached',
         # Two-page buffer tracking
         'gpu_pages_allocated',
+        # Track whether this sequence has had its initial GPU reservation
+        'had_initial_gpu_reservation',
     )
 
     VALID_TRANSITIONS = {
@@ -70,6 +85,10 @@ class SequenceEntry:
         # Two-page buffer: tracks current GPU page allocation
         # This is separate from host pages (which always hold full kv_token_budget)
         self.gpu_pages_allocated: int = 0
+        
+        # Track whether this sequence has had its initial large GPU reservation
+        # Reset to False when sequence goes ON_HOLD (GPU pages released)
+        self.had_initial_gpu_reservation: bool = False
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:
@@ -93,35 +112,76 @@ class SequenceEntry:
         """Return number of pages currently used by this sequence's context."""
         return math.ceil(self.current_context_length / self.PAGE_SIZE)
 
-    # ============ Two-Page Buffer Methods (GPU KV) ============
+    # ============ Configurable Page Buffer Methods (GPU KV) ============
+
+    def get_gpu_pages_for_initial_load(self) -> int:
+        """
+        Get GPU pages needed for INITIAL load (first time loading to GPU).
+        
+        Uses INITIAL_GPU_PAGE_BUFFER (default 64 pages = 4096 tokens) to give
+        sequences a larger runway and reduce load/on-hold churning.
+        
+        This is used when:
+        - Sequence transitions from PREFILLED to IN_DECODE
+        - Sequence transitions from ON_HOLD back to IN_DECODE
+        
+        Returns:
+            Number of pages to allocate on GPU for initial load
+        """
+        buffer_tokens = self.current_context_length + INITIAL_GPU_PAGE_BUFFER * self.PAGE_SIZE
+        # Cap at full budget (don't over-allocate beyond what sequence needs)
+        buffer_tokens = min(buffer_tokens, self.kv_token_budget)
+        return math.ceil(buffer_tokens / self.PAGE_SIZE)
 
     def get_gpu_pages_for_two_page_buffer(self) -> int:
         """
-        Get GPU pages needed for two-page buffer design.
+        Get GPU pages needed for page buffer design.
         
-        Allocates enough pages for: current_context_length + 2*PAGE_SIZE tokens.
-        This ensures we have a 2-page (128 token) runway before needing to
-        either extend allocation or put the sequence ON_HOLD.
+        For INITIAL load (had_initial_gpu_reservation=False):
+            Allocates enough pages for: current_context_length + INITIAL_GPU_PAGE_BUFFER*PAGE_SIZE tokens.
+            This gives sequences a large runway to reduce load/on-hold traffic.
+        
+        For EXTENSION (had_initial_gpu_reservation=True):
+            Allocates enough pages for: current_context_length + EXTENSION_GPU_PAGE_BUFFER*PAGE_SIZE tokens.
+            This ensures we have a small buffer before needing extension.
         
         Returns:
             Number of pages to allocate on GPU
         """
-        buffer_tokens = self.current_context_length + 2 * self.PAGE_SIZE
+        if not self.had_initial_gpu_reservation:
+            # Initial load - use larger buffer
+            buffer_pages = INITIAL_GPU_PAGE_BUFFER
+        else:
+            # Extension - use smaller buffer
+            buffer_pages = EXTENSION_GPU_PAGE_BUFFER
+        
+        buffer_tokens = self.current_context_length + buffer_pages * self.PAGE_SIZE
         # Cap at full budget (don't over-allocate)
         buffer_tokens = min(buffer_tokens, self.kv_token_budget)
         return math.ceil(buffer_tokens / self.PAGE_SIZE)
 
     def get_additional_gpu_pages_needed(self) -> int:
         """
-        Get additional GPU pages needed to maintain two-page buffer.
+        Get additional GPU pages needed to maintain page buffer.
         
         Called at page boundaries to check if we need to extend GPU allocation.
+        Uses EXTENSION_GPU_PAGE_BUFFER for extension decisions.
         
         Returns:
             Number of additional pages needed (0 if current allocation is sufficient)
         """
-        required = self.get_gpu_pages_for_two_page_buffer()
+        # For extension, always use the extension buffer size
+        buffer_tokens = self.current_context_length + EXTENSION_GPU_PAGE_BUFFER * self.PAGE_SIZE
+        buffer_tokens = min(buffer_tokens, self.kv_token_budget)
+        required = math.ceil(buffer_tokens / self.PAGE_SIZE)
         return max(0, required - self.gpu_pages_allocated)
+
+    def mark_initial_gpu_reservation_done(self) -> None:
+        """
+        Mark that this sequence has received its initial GPU reservation.
+        Call this after the first GPU page allocation for this sequence.
+        """
+        self.had_initial_gpu_reservation = True
 
     def get_gpu_page_headroom(self) -> int:
         """
@@ -158,8 +218,10 @@ class SequenceEntry:
         """
         Reset GPU page allocation tracking.
         Called when sequence is put ON_HOLD (GPU pages released, host KV retained).
+        Also resets had_initial_gpu_reservation so next load gets the large initial buffer.
         """
         self.gpu_pages_allocated = 0
+        self.had_initial_gpu_reservation = False
 
     # ============ Completion and Status Methods ============
 
