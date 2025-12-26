@@ -311,6 +311,16 @@ class BatchGenWorker:
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
 		logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
 		# create_region=False because the main process created it; we just attach
+		# Use barrier + stagger to avoid race conditions when multiple processes
+		# call cudaHostRegister on the same shared memory pages concurrently.
+		# 1. Barrier: Sync all workers before registration
+		# 2. Stagger: Each local_rank waits (local_rank * 10s) before registering
+		dist.barrier()
+		stagger_delay = self.local_rank * 10.0  # 10 seconds between each local rank
+		if stagger_delay > 0:
+			logging.info(f"Rank {self.rank}: Waiting {stagger_delay:.1f}s before cudaHostRegister (local_rank={self.local_rank})")
+			time.sleep(stagger_delay)
+		logging.info(f"Rank {self.rank}: Starting cudaHostRegister (local_rank={self.local_rank})")
 		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
 
