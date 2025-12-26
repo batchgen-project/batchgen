@@ -1,5 +1,6 @@
 import concurrent.futures
 import copy
+import fcntl
 import functools
 import psutil
 import logging
@@ -311,17 +312,20 @@ class BatchGenWorker:
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
 		logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
 		# create_region=False because the main process created it; we just attach
-		# Use barrier + stagger to avoid race conditions when multiple processes
-		# call cudaHostRegister on the same shared memory pages concurrently.
-		# 1. Barrier: Sync all workers before registration
-		# 2. Stagger: Each local_rank waits (local_rank * 10s) before registering
-		dist.barrier()
-		stagger_delay = self.local_rank * 10.0  # 10 seconds between each local rank
-		if stagger_delay > 0:
-			logging.info(f"Rank {self.rank}: Waiting {stagger_delay:.1f}s before cudaHostRegister (local_rank={self.local_rank})")
-			time.sleep(stagger_delay)
-		logging.info(f"Rank {self.rank}: Starting cudaHostRegister (local_rank={self.local_rank})")
-		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+		# Serialize cudaHostRegister calls on each node using file lock.
+		# Multiple processes registering the same physical pages (via different virtual
+		# addresses from mmap) can cause race conditions in the CUDA driver.
+		# Registration takes ~180s, so staggering alone doesn't prevent overlap.
+		lock_file_path = f"/tmp/batchgen_cuda_host_register_node{args.nnode_rank}.lock"
+		logging.info(f"Rank {self.rank}: Waiting for cudaHostRegister lock (local_rank={self.local_rank})")
+		with open(lock_file_path, 'w') as lock_file:
+			fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+			try:
+				logging.info(f"Rank {self.rank}: Acquired lock, starting cudaHostRegister (local_rank={self.local_rank})")
+				self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+				logging.info(f"Rank {self.rank}: cudaHostRegister completed (local_rank={self.local_rank})")
+			finally:
+				fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
 
 		# 6. Initialize Placeholders for Core Components
