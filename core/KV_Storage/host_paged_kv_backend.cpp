@@ -208,7 +208,10 @@ void HostPagedKVBackend::SharedState::ComputeOffsets() {
     sequence_table_offset = offset;
     offset += sizeof(SequenceEntry) * sequence_capacity;
 
-    offset = AlignUp(offset, alignof(std::max_align_t));
+    // Align data_offset to system page size (typically 4096 bytes) because
+    // cudaHostRegister requires page-aligned pointers. Using std::max_align_t
+    // (16 bytes) is insufficient and causes "invalid argument" errors.
+    offset = AlignUp(offset, GetSystemPageSize());
     data_offset = offset;
     offset += data_bytes;
 
