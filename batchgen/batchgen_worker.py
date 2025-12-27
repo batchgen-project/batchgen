@@ -282,51 +282,61 @@ class BatchGenWorker:
 		self.weight_byte_size = args.weight_byte_size
 		self.enable_hugetlbfs = args.enable_hugetlbfs
 		
-		logging.info(f"Rank {self.rank}: Initializing shared memory segments.")
-		logging.info(
-			f"Rank {self.rank}: shm_name: {self.shm_name}, "
-			f"tensor_meta_shm_name: {self.tensor_meta_shm_name}, "
-			f"weight_byte_size: {self.weight_byte_size}, "
-			f"enable_hugetlbfs: {self.enable_hugetlbfs}"
-		)
-
-		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
-		self.weights_storage.Init(
-			self.shm_name, 
-			self.weight_byte_size, 
-			self.tensor_meta_shm_name,
-			self.enable_hugetlbfs
-		)
-		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
-
-		# 5. Initialize Host KV Cache Manager View
-		# This allows the worker to map to the host memory allocated by the main process
-		self.host_kv_cache_size = args.host_kv_cache_size
-		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
-		
-		worker_kv_config = build_host_kv_config(
-			model_name=args.model_name,
-			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
-		)
-		
-		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
-		logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
-		# create_region=False because the main process created it; we just attach
-		# Serialize cudaHostRegister calls on each node using file lock.
-		# Multiple processes registering the same physical pages (via different virtual
-		# addresses from mmap) can cause race conditions in the CUDA driver.
-		# Registration takes ~180s, so staggering alone doesn't prevent overlap.
+		# ============================================================
+		# CRITICAL: Serialize ALL cudaHostRegister calls on each node.
+		# ============================================================
+		# Both weights_storage.Init() and host_paged_kv.initialize() perform
+		# cudaHostRegister on shared memory. When multiple processes register
+		# the same physical pages (via different virtual addresses from mmap)
+		# concurrently, it can cause race conditions in the CUDA driver.
+		#
+		# The failure pattern: Process A starts registering weights (675GB, ~65s),
+		# Process B finishes weights and starts Host KV (1TB), but Process A is
+		# still registering - both are touching the same physical memory pages.
+		#
+		# Solution: Use a file lock to serialize ALL CUDA registrations per node.
 		lock_file_path = f"/tmp/batchgen_cuda_host_register_node{args.nnode_rank}.lock"
 		logging.info(f"Rank {self.rank}: Waiting for cudaHostRegister lock (local_rank={self.local_rank})")
-		with open(lock_file_path, 'w') as lock_file:
-			fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-			try:
-				logging.info(f"Rank {self.rank}: Acquired lock, starting cudaHostRegister (local_rank={self.local_rank})")
-				self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
-				logging.info(f"Rank {self.rank}: cudaHostRegister completed (local_rank={self.local_rank})")
-			finally:
-				fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-		logging.info(f"Rank {self.rank}: Host KV manager view initialized.")
+		lock_fd = os.open(lock_file_path, os.O_CREAT | os.O_RDWR, 0o666)
+		try:
+			fcntl.flock(lock_fd, fcntl.LOCK_EX)
+			logging.info(f"Rank {self.rank}: Acquired lock, starting CUDA registrations (local_rank={self.local_rank})")
+			
+			# 4a. Initialize Weights Storage (includes cudaHostRegister for ~675GB)
+			logging.info(f"Rank {self.rank}: Initializing shared memory segments.")
+			logging.info(
+				f"Rank {self.rank}: shm_name: {self.shm_name}, "
+				f"tensor_meta_shm_name: {self.tensor_meta_shm_name}, "
+				f"weight_byte_size: {self.weight_byte_size}, "
+				f"enable_hugetlbfs: {self.enable_hugetlbfs}"
+			)
+			self.weights_storage = core_engine.Weights_Storage(self.local_rank)
+			self.weights_storage.Init(
+				self.shm_name, 
+				self.weight_byte_size, 
+				self.tensor_meta_shm_name,
+				self.enable_hugetlbfs
+			)
+			logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
+
+			# 5. Initialize Host KV Cache Manager View (includes cudaHostRegister for ~1TB)
+			self.host_kv_cache_size = args.host_kv_cache_size
+			self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
+			
+			worker_kv_config = build_host_kv_config(
+				model_name=args.model_name,
+				host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
+			)
+			
+			self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+			logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
+			self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+			logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
+			
+		finally:
+			fcntl.flock(lock_fd, fcntl.LOCK_UN)
+			os.close(lock_fd)
+		logging.info(f"Rank {self.rank}: All CUDA registrations completed, lock released.")
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components

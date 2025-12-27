@@ -153,14 +153,42 @@ def _server_worker_main_impl(
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
 	world_size = args.world_size
+	
+	# NCCL timeout prevention strategy:
+	# The problem: NCCL watchdog times out if a collective operation doesn't complete within timeout.
+	# When Rank 0 is blocking on request_queue.get() while other ranks wait on broadcast, 
+	# NCCL will timeout if no work arrives.
+	#
+	# Solution: Rank 0 uses non-blocking queue.get with timeout, then all ranks periodically 
+	# perform a lightweight collective to keep NCCL alive (heartbeat pattern).
+	QUEUE_POLL_TIMEOUT = 30.0  # Rank 0 polls queue every 30 seconds
 
 	logging.info(f"Entering main server loop on rank {global_rank}.")
 	while True:
-		# --- STEP 1: Data Acquisition (Rank 0 only) ---
+		# --- STEP 1: Data Acquisition with heartbeat to prevent NCCL timeout ---
 		task_data = None
+		work_available = False
 
-		if global_rank == 0:
-			task_data = request_queue.get()
+		while not work_available:
+			if global_rank == 0:
+				# Rank 0: Non-blocking poll on queue with timeout
+				try:
+					task_data = request_queue.get(timeout=QUEUE_POLL_TIMEOUT)
+					work_available = True
+				except Exception:
+					# Queue.get timeout - no work yet, signal others
+					work_available = False
+			
+			# All ranks synchronize on work availability status
+			# This is a fast broadcast (single int) that keeps NCCL alive
+			status_tensor = torch.tensor([1 if work_available else 0], dtype=torch.int32, device='cuda')
+			dist.broadcast(status_tensor, src=0)
+			work_available = status_tensor.item() == 1
+			
+			if not work_available:
+				# No work yet - this broadcast acts as a heartbeat to prevent NCCL timeout
+				# Loop back and poll again
+				continue
 
 		# --- STEP 2: Broadcast full task to all ranks ---
 		task_container = [task_data]
