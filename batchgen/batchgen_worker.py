@@ -295,7 +295,10 @@ class BatchGenWorker:
 		# the same shared memory region concurrently, it can cause race
 		# conditions in the CUDA driver leading to "invalid argument" errors.
 		# Stagger initialization by local_rank to serialize the calls.
-		stagger_delay = self.local_rank * 3.0  # 3 seconds per rank
+		# NOTE: cudaHostRegister for 675GB weights takes ~13s, and Host KV
+		# cache (~1TB) also needs registration. Use 15s per rank to ensure
+		# each rank completes before the next one starts.
+		stagger_delay = self.local_rank * 15.0  # 15 seconds per rank
 		if stagger_delay > 0:
 			logging.info(f"Rank {self.rank}: Staggering cudaHostRegister by {stagger_delay:.1f}s (local_rank={self.local_rank})")
 			time.sleep(stagger_delay)
@@ -327,6 +330,18 @@ class BatchGenWorker:
 		)
 		
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		
+		# ===================================================================
+		# STAGGERED HOST KV INITIALIZATION: Avoid concurrent cudaHostRegister
+		# ===================================================================
+		# Same as weights_storage, stagger the Host KV cache registration
+		# to avoid concurrent cudaHostRegister calls on the same shared memory.
+		# Host KV cache (~1TB) registration can take ~12+ seconds.
+		stagger_delay_kv = self.local_rank * 15.0  # 15 seconds per rank
+		if stagger_delay_kv > 0:
+			logging.info(f"Rank {self.rank}: Staggering Host KV cudaHostRegister by {stagger_delay_kv:.1f}s (local_rank={self.local_rank})")
+			time.sleep(stagger_delay_kv)
+		
 		logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
 		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
 		logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
