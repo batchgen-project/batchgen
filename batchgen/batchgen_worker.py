@@ -332,19 +332,22 @@ class BatchGenWorker:
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
 		
 		# ===================================================================
-		# STAGGERED HOST KV INITIALIZATION: Avoid concurrent cudaHostRegister
+		# SEQUENTIAL HOST KV INITIALIZATION: Serialize cudaHostRegister calls
 		# ===================================================================
-		# Same as weights_storage, stagger the Host KV cache registration
-		# to avoid concurrent cudaHostRegister calls on the same shared memory.
-		# Host KV cache (~1TB) registration can take ~12+ seconds.
-		stagger_delay_kv = self.local_rank * 15.0  # 15 seconds per rank
-		if stagger_delay_kv > 0:
-			logging.info(f"Rank {self.rank}: Staggering Host KV cudaHostRegister by {stagger_delay_kv:.1f}s (local_rank={self.local_rank})")
-			time.sleep(stagger_delay_kv)
-		
-		logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
-		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
-		logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
+		# cudaHostRegister for Host KV cache (~1TB) can take varying times
+		# (12s to 170s+ depending on system load). Use a file lock to ensure
+		# only one process registers at a time on each node.
+		import fcntl
+		lock_file_path = f"/tmp/batchgen_host_kv_register_{os.environ.get('SLURM_NODEID', '0')}.lock"
+		logging.info(f"Rank {self.rank}: Waiting for Host KV cudaHostRegister lock (local_rank={self.local_rank})")
+		with open(lock_file_path, 'w') as lock_file:
+			fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+			try:
+				logging.info(f"Rank {self.rank}: Acquired Host KV lock, initializing core engine Host KV view.")
+				self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+				logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
+			finally:
+				fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
