@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -17,6 +18,9 @@ from batchgen.kv_cache.gpu_kv_kernels import (
 	run_paged_kv_token_update,
 	run_paged_kv_token_update_fused,
 )
+
+# Debug logging level for continuous batching page boundary
+BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
 # Default initial per-sequence token capacity used when first creating the
 # GPU-side page table. 16384 tokens -> with 64-token pages means 256 pages
@@ -404,13 +408,14 @@ class _GPUPageTableManager:
 		)
 		
 		# DEBUG: Log detailed rebuild info
-		logging.info(
-			f"GPUPageTableManager.rebuild: "
-			f"num_slots={num_slots}, new_max={new_max}, "
-			f"old_shape={old_shape}, old_slot_count={old_slot_count}, "
-			f"shape_match={shape_match}, cols_sufficient={cols_sufficient}, order_match={order_match}, "
-			f"reuse_existing={reuse_existing}"
-		)
+		if BATCHGEN_CB_DEBUG:
+			logging.info(
+				f"GPUPageTableManager.rebuild: "
+				f"num_slots={num_slots}, new_max={new_max}, "
+				f"old_shape={old_shape}, old_slot_count={old_slot_count}, "
+				f"shape_match={shape_match}, cols_sufficient={cols_sufficient}, order_match={order_match}, "
+				f"reuse_existing={reuse_existing}"
+			)
 
 		table = (
 			self.gpu_table
@@ -459,13 +464,14 @@ class _GPUPageTableManager:
 		self._active_page_indices_cpu = flat_pages_cpu
 		
 		# DEBUG: Log final state after rebuild
-		final_shape = self.gpu_table.shape if self.gpu_table is not None else None
-		return_shape = table[:num_slots, :].shape
-		logging.info(
-			f"GPUPageTableManager.rebuild DONE: "
-			f"self.gpu_table.shape={final_shape}, return_shape={return_shape}, "
-			f"slot_to_seq_id_len={len(self.slot_to_seq_id)}"
-		)
+		if BATCHGEN_CB_DEBUG:
+			final_shape = self.gpu_table.shape if self.gpu_table is not None else None
+			return_shape = table[:num_slots, :].shape
+			logging.info(
+				f"GPUPageTableManager.rebuild DONE: "
+				f"self.gpu_table.shape={final_shape}, return_shape={return_shape}, "
+				f"slot_to_seq_id_len={len(self.slot_to_seq_id)}"
+			)
 		
 		# If table has more columns than needed, return a view with
 		# the requested number of rows and the existing columns.

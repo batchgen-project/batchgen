@@ -11,6 +11,8 @@
     Environment Variables:
     - BATCHGEN_INITIAL_GPU_PAGE_BUFFER: Pages to reserve on first GPU load (default: 64)
     - BATCHGEN_EXTENSION_GPU_PAGE_BUFFER: Pages to add at boundaries (default: 2)
+    - BATCHGEN_DECISION_FREQUENCY_PAGES: How often to make scheduling decisions (default: 1 page = 64 tokens)
+      Must be <= EXTENSION_GPU_PAGE_BUFFER to ensure sequences don't overflow between decisions.
 """
 from enum import IntEnum
 from typing import Dict, List, Optional, Set
@@ -24,6 +26,20 @@ import os
 INITIAL_GPU_PAGE_BUFFER = int(os.environ.get("BATCHGEN_INITIAL_GPU_PAGE_BUFFER", "64"))
 # Extension buffer at page boundaries (for sequences already in decode)
 EXTENSION_GPU_PAGE_BUFFER = int(os.environ.get("BATCHGEN_EXTENSION_GPU_PAGE_BUFFER", "2"))
+# Decision frequency: how many pages (each 64 tokens) between boundary checks
+# Default: 1 page = check every 64 tokens. Set to 2 for every 128 tokens, etc.
+DECISION_FREQUENCY_PAGES = int(os.environ.get("BATCHGEN_DECISION_FREQUENCY_PAGES", "1"))
+
+# Enforce: EXTENSION_GPU_PAGE_BUFFER >= DECISION_FREQUENCY_PAGES
+# Otherwise sequences may overflow GPU pages between decision boundaries
+if EXTENSION_GPU_PAGE_BUFFER < DECISION_FREQUENCY_PAGES:
+    import logging
+    logging.warning(
+        f"BATCHGEN_EXTENSION_GPU_PAGE_BUFFER ({EXTENSION_GPU_PAGE_BUFFER}) < "
+        f"BATCHGEN_DECISION_FREQUENCY_PAGES ({DECISION_FREQUENCY_PAGES}). "
+        f"Auto-adjusting EXTENSION_GPU_PAGE_BUFFER to {DECISION_FREQUENCY_PAGES} to prevent overflow."
+    )
+    EXTENSION_GPU_PAGE_BUFFER = DECISION_FREQUENCY_PAGES
 
 
 class SequenceStatus(IntEnum):

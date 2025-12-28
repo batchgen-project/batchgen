@@ -44,7 +44,7 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
 	build_host_kv_config,
 )
-from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER
+from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
@@ -55,6 +55,9 @@ if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
 		nvshmem_init = None
 else:
 	nvshmem_init = None
+
+# Debug logging level for continuous batching page boundary
+BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
 
 from .scheduler.scheduler import Scheduler
@@ -237,7 +240,9 @@ class BatchGenWorker:
 	"""
 	Inference Runtime with Host-KV-First scheduling and Continuous Batching.
 	"""
-	PAGE_SIZE = 64  # Alignment for page boundary checks
+	PAGE_SIZE = 64  # Tokens per page (fixed)
+	# Decision frequency: check boundaries every N pages (configurable via DECISION_FREQUENCY_PAGES)
+	DECISION_INTERVAL = DECISION_FREQUENCY_PAGES * 64  # Tokens between boundary checks
 	# GPU_KV_CACHE_SIZE_GB = 20.0  # Default GPU KV cache size
 	GPU_KV_CACHE_SIZE_GB = float(os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB", "20.0"))
 
@@ -250,8 +255,9 @@ class BatchGenWorker:
 			logging.info(
 				f"GPU Page Buffer Configuration: "
 				f"INITIAL_GPU_PAGE_BUFFER={INITIAL_GPU_PAGE_BUFFER} pages ({INITIAL_GPU_PAGE_BUFFER * 64} tokens), "
-				f"EXTENSION_GPU_PAGE_BUFFER={EXTENSION_GPU_PAGE_BUFFER} pages ({EXTENSION_GPU_PAGE_BUFFER * 64} tokens). "
-				f"Control via env vars: BATCHGEN_INITIAL_GPU_PAGE_BUFFER, BATCHGEN_EXTENSION_GPU_PAGE_BUFFER"
+				f"EXTENSION_GPU_PAGE_BUFFER={EXTENSION_GPU_PAGE_BUFFER} pages ({EXTENSION_GPU_PAGE_BUFFER * 64} tokens), "
+				f"DECISION_FREQUENCY={DECISION_FREQUENCY_PAGES} pages ({DECISION_FREQUENCY_PAGES * 64} tokens). "
+				f"Control via env vars: BATCHGEN_INITIAL_GPU_PAGE_BUFFER, BATCHGEN_EXTENSION_GPU_PAGE_BUFFER, BATCHGEN_DECISION_FREQUENCY_PAGES"
 			)
 		
 		# 1. Store Arguments & Rank Information
@@ -282,61 +288,36 @@ class BatchGenWorker:
 		self.weight_byte_size = args.weight_byte_size
 		self.enable_hugetlbfs = args.enable_hugetlbfs
 		
-		# ============================================================
-		# CRITICAL: Serialize ALL cudaHostRegister calls on each node.
-		# ============================================================
-		# Both weights_storage.Init() and host_paged_kv.initialize() perform
-		# cudaHostRegister on shared memory. When multiple processes register
-		# the same physical pages (via different virtual addresses from mmap)
-		# concurrently, it can cause race conditions in the CUDA driver.
-		#
-		# The failure pattern: Process A starts registering weights (675GB, ~65s),
-		# Process B finishes weights and starts Host KV (1TB), but Process A is
-		# still registering - both are touching the same physical memory pages.
-		#
-		# Solution: Use a file lock to serialize ALL CUDA registrations per node.
-		lock_file_path = f"/tmp/batchgen_cuda_host_register_node{args.nnode_rank}.lock"
-		logging.info(f"Rank {self.rank}: Waiting for cudaHostRegister lock (local_rank={self.local_rank})")
-		lock_fd = os.open(lock_file_path, os.O_CREAT | os.O_RDWR, 0o666)
-		try:
-			fcntl.flock(lock_fd, fcntl.LOCK_EX)
-			logging.info(f"Rank {self.rank}: Acquired lock, starting CUDA registrations (local_rank={self.local_rank})")
-			
-			# 4a. Initialize Weights Storage (includes cudaHostRegister for ~675GB)
-			logging.info(f"Rank {self.rank}: Initializing shared memory segments.")
-			logging.info(
-				f"Rank {self.rank}: shm_name: {self.shm_name}, "
-				f"tensor_meta_shm_name: {self.tensor_meta_shm_name}, "
-				f"weight_byte_size: {self.weight_byte_size}, "
-				f"enable_hugetlbfs: {self.enable_hugetlbfs}"
-			)
-			self.weights_storage = core_engine.Weights_Storage(self.local_rank)
-			self.weights_storage.Init(
-				self.shm_name, 
-				self.weight_byte_size, 
-				self.tensor_meta_shm_name,
-				self.enable_hugetlbfs
-			)
-			logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
+		# 4. Initialize Weights Storage (cudaHostRegister for weights)
+		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
+		logging.info(
+			f"Rank {self.rank}: shm_name: {self.shm_name}, "
+			f"tensor_meta_shm_name: {self.tensor_meta_shm_name}, "
+			f"weight_byte_size: {self.weight_byte_size}, "
+			f"enable_hugetlbfs: {self.enable_hugetlbfs}"
+		)
+		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
+		self.weights_storage.Init(
+			self.shm_name, 
+			self.weight_byte_size, 
+			self.tensor_meta_shm_name,
+			self.enable_hugetlbfs
+		)
+		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
 
-			# 5. Initialize Host KV Cache Manager View (includes cudaHostRegister for ~1TB)
-			self.host_kv_cache_size = args.host_kv_cache_size
-			self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
-			
-			worker_kv_config = build_host_kv_config(
-				model_name=args.model_name,
-				host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
-			)
-			
-			self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
-			logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
-			self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
-			logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
-			
-		finally:
-			fcntl.flock(lock_fd, fcntl.LOCK_UN)
-			os.close(lock_fd)
-		logging.info(f"Rank {self.rank}: All CUDA registrations completed, lock released.")
+		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)
+		self.host_kv_cache_size = args.host_kv_cache_size
+		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
+		
+		worker_kv_config = build_host_kv_config(
+			model_name=args.model_name,
+			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
+		)
+		
+		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		logging.info(f"Rank {self.rank}: Initializing core engine Host KV view.")
+		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+		logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
@@ -2882,10 +2863,11 @@ class BatchGenWorker:
 			batch = self._get_local_indices_for_uuids(decode_uuids)
 			
 			# DEBUG: Log batch size after on-hold
-			logging.info(
-				f"Rank {self.rank}: After on-hold: batch_size={len(batch)}, "
-				f"num_onhold={len(onhold_uuids)}, my_onhold={len(my_onhold)}"
-			)
+			if BATCHGEN_CB_DEBUG:
+				logging.info(
+					f"Rank {self.rank}: After on-hold: batch_size={len(batch)}, "
+					f"num_onhold={len(onhold_uuids)}, my_onhold={len(my_onhold)}"
+				)
 			
 			# Extend remaining sequences and track actual extension pages used
 			remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
@@ -3064,15 +3046,16 @@ class BatchGenWorker:
 		# ========== FINAL PAGE TABLE REBUILD ==========
 		t0 = time.perf_counter()
 		# DEBUG: Log batch size before final rebuild
-		global_ids_for_rebuild = self._local_indices_to_global_seq_ids(batch) if batch else []
-		logging.info(
-			f"Rank {self.rank}: FINAL REBUILD: batch_size={len(batch)}, "
-			f"global_ids_count={len(global_ids_for_rebuild)}"
-		)
+		if BATCHGEN_CB_DEBUG:
+			global_ids_for_rebuild = self._local_indices_to_global_seq_ids(batch) if batch else []
+			logging.info(
+				f"Rank {self.rank}: FINAL REBUILD: batch_size={len(batch)}, "
+				f"global_ids_count={len(global_ids_for_rebuild)}"
+			)
 		self._rebuild_page_table_for_batch(batch, gpu_manager)
 		
 		# DEBUG: Verify page table size after rebuild
-		if gpu_manager and gpu_manager.is_initialized:
+		if BATCHGEN_CB_DEBUG and gpu_manager and gpu_manager.is_initialized:
 			mgr = gpu_manager._gpu_page_table_manager
 			if mgr and mgr.gpu_table is not None:
 				logging.info(
@@ -3259,8 +3242,8 @@ class BatchGenWorker:
 		while decode_uuids:
 			iteration += 1
 			
-			# Page boundary check
-			if iteration - last_boundary >= self.PAGE_SIZE:
+			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
+			if iteration - last_boundary >= self.DECISION_INTERVAL:
 				last_boundary = iteration
 				
 				(decode_uuids, batch, 
@@ -3283,27 +3266,37 @@ class BatchGenWorker:
 					num_completed_total = timing.total_completed_cumulative
 					num_in_decode = timing.total_active
 					
-					logging.info(
-						f"[Boundary {num_boundaries}] "
-						f"iter={iteration}, "
-						f"total={timing.total_ms:.1f}ms | "
-						f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
-						f"wait_async={timing.wait_async_load_ms:.1f}, "
-						f"finalize={timing.finalize_load_ms:.1f}, "
-						f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
-						f"gather={timing.gather_ms:.1f}, "
-						f"proc={timing.process_ms:.1f}, "
-						f"ext={timing.extension_ms:.1f}, "
-						f"load_sel={timing.load_select_ms:.1f}, "
-						f"load_alloc={timing.load_alloc_ms:.1f}, "
-						f"load_launch={timing.load_launch_ms:.1f}, "
-						f"rebuild={timing.rebuild_ms:.1f}, "
-						f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
-						f"barrier={timing.barrier_ms:.1f}ms | "
-						f"STATUS: active={num_in_decode}, completed={num_completed_total}/{initial_batch_size}, "
-						f"onhold={num_onhold}, prefilled={num_prefilled}, "
-						f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
-					)
+					if BATCHGEN_CB_DEBUG:
+						# Detailed timing log when debug is enabled
+						logging.info(
+							f"[Boundary {num_boundaries}] "
+							f"iter={iteration}, "
+							f"total={timing.total_ms:.1f}ms | "
+							f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
+							f"wait_async={timing.wait_async_load_ms:.1f}, "
+							f"finalize={timing.finalize_load_ms:.1f}, "
+							f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
+							f"gather={timing.gather_ms:.1f}, "
+							f"proc={timing.process_ms:.1f}, "
+							f"ext={timing.extension_ms:.1f}, "
+							f"load_sel={timing.load_select_ms:.1f}, "
+							f"load_alloc={timing.load_alloc_ms:.1f}, "
+							f"load_launch={timing.load_launch_ms:.1f}, "
+							f"rebuild={timing.rebuild_ms:.1f}, "
+							f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
+							f"barrier={timing.barrier_ms:.1f}ms | "
+							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{initial_batch_size}, "
+							f"onhold={num_onhold}, prefilled={num_prefilled}, "
+							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
+						)
+					else:
+						# Minimal log without timing details
+						logging.info(
+							f"[Boundary {num_boundaries}] iter={iteration} | "
+							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{initial_batch_size}, "
+							f"onhold={num_onhold}, prefilled={num_prefilled}, "
+							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
+						)
 				
 				if not decode_uuids:
 					# Check for pending loads
@@ -3485,7 +3478,7 @@ class BatchGenWorker:
 				f"Iterations: {iteration}, Boundaries: {num_boundaries}\n"
 				f"Avg forward: {avg_forward:.2f}ms\n"
 				f"Avg boundary: {avg_boundary:.2f}ms\n"
-				f"Boundary overhead/token: {avg_boundary / self.PAGE_SIZE:.3f}ms\n"
+				f"Boundary overhead/token: {avg_boundary / self.DECISION_INTERVAL:.3f}ms\n"
 				f"{'='*50}"
 			)
 		
@@ -3582,7 +3575,7 @@ class BatchGenWorker:
 			# =============================================================
 			# PAGE BOUNDARY LOGIC (with detailed timing)
 			# =============================================================
-			if iteration - last_page_boundary_check >= self.PAGE_SIZE:
+			if iteration - last_page_boundary_check >= self.DECISION_INTERVAL:
 				last_page_boundary_check = iteration
 				
 				timing = BoundaryTimingStats()
@@ -3986,7 +3979,7 @@ class BatchGenWorker:
 				f"  - allgather: {avg_allgather:.2f}ms\n"
 				f"  - barriers: {avg_barriers:.2f}ms\n"
 				f"  - page_table_rebuilds: {avg_rebuilds:.2f}ms\n"
-				f"Boundary overhead per token: {avg_boundary / self.PAGE_SIZE:.2f}ms\n"
+				f"Boundary overhead per token: {avg_boundary / self.DECISION_INTERVAL:.2f}ms\n"
 				f"{'='*60}"
 			)
 		
@@ -4663,8 +4656,8 @@ class BatchGenWorker:
 			if self.rank == 0:
 				logging.info(f"Decoding new token idx: {new_token_idx}")
 			
-			# Page boundary check
-			if new_token_idx > 0 and new_token_idx % self.PAGE_SIZE == 0:
+			# Page boundary check - use DECISION_INTERVAL
+			if new_token_idx > 0 and new_token_idx % self.DECISION_INTERVAL == 0:
 				dist.barrier()
 				
 				# FIXED: Use updated _check_and_handle_completions
