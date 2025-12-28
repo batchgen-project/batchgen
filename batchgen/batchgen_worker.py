@@ -288,6 +288,18 @@ class BatchGenWorker:
 		self.weight_byte_size = args.weight_byte_size
 		self.enable_hugetlbfs = args.enable_hugetlbfs
 		
+		# ===================================================================
+		# STAGGERED INITIALIZATION: Avoid concurrent cudaHostRegister calls
+		# ===================================================================
+		# When multiple processes on the same node call cudaHostRegister on
+		# the same shared memory region concurrently, it can cause race
+		# conditions in the CUDA driver leading to "invalid argument" errors.
+		# Stagger initialization by local_rank to serialize the calls.
+		stagger_delay = self.local_rank * 3.0  # 3 seconds per rank
+		if stagger_delay > 0:
+			logging.info(f"Rank {self.rank}: Staggering cudaHostRegister by {stagger_delay:.1f}s (local_rank={self.local_rank})")
+			time.sleep(stagger_delay)
+		
 		# 4. Initialize Weights Storage (cudaHostRegister for weights)
 		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
 		logging.info(
