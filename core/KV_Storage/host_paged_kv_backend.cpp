@@ -121,6 +121,41 @@ std::size_t SafeHardwareConcurrency() {
     return hint == 0 ? 1 : static_cast<std::size_t>(hint);
 }
 
+// Helper function to perform aligned mmap
+// This ensures the virtual address is aligned to the specified alignment (e.g., 2MB for huge pages)
+// which is often required for cudaHostRegister to work correctly with huge pages.
+void* mmap_aligned(size_t length, int prot, int flags, int fd, off_t offset, size_t alignment) {
+    // Allocate extra space to ensure we can find an aligned segment
+    size_t total_len = length + alignment;
+    
+    // Reserve address space using anonymous mapping
+    void* addr = mmap(nullptr, total_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+
+    uintptr_t raw_addr = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t aligned_addr = (raw_addr + alignment - 1) & ~(alignment - 1);
+    void* final_addr = reinterpret_cast<void*>(aligned_addr);
+
+    // Map the file into the aligned position using MAP_FIXED
+    // This replaces the anonymous mapping at that location
+    void* ret = mmap(final_addr, length, prot, flags | MAP_FIXED, fd, offset);
+    
+    // Unmap the unused parts of the reservation
+    size_t prefix_len = aligned_addr - raw_addr;
+    if (prefix_len > 0) {
+        munmap(addr, prefix_len);
+    }
+    
+    size_t suffix_len = total_len - length - prefix_len;
+    if (suffix_len > 0) {
+        munmap(reinterpret_cast<void*>(aligned_addr + length), suffix_len);
+    }
+
+    return ret;
+}
+
 }  // namespace
 
 struct HostPagedKVBackend::SharedState {
@@ -208,10 +243,13 @@ void HostPagedKVBackend::SharedState::ComputeOffsets() {
     sequence_table_offset = offset;
     offset += sizeof(SequenceEntry) * sequence_capacity;
 
-    // Align data_offset to system page size (typically 4096 bytes) because
-    // cudaHostRegister requires page-aligned pointers. Using std::max_align_t
-    // (16 bytes) is insufficient and causes "invalid argument" errors.
-    offset = AlignUp(offset, GetSystemPageSize());
+    // Align data_offset to 2MB (huge page size) because cudaHostRegister may require
+    // huge-page aligned pointers when the underlying memory is backed by huge pages
+    // (e.g., via Transparent Huge Pages or hugetlbfs).
+    // Using simple page alignment (4KB) can cause "invalid argument" errors with cudaHostRegister
+    // on some systems when THP is active.
+    constexpr std::size_t kHugePageAlignment = 2 * 1024 * 1024;
+    offset = AlignUp(offset, kHugePageAlignment);
     data_offset = offset;
     offset += data_bytes;
 
@@ -481,14 +519,25 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
         }
     }
 
-    void* mapped = mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, shm_fd, 0);
+    // Use mmap_aligned to ensure 2MB alignment for the shared memory mapping
+    // This is critical for cudaHostRegister to work reliably with huge pages (THP)
+    constexpr std::size_t kHugePageSize = 2 * 1024 * 1024;
+    // Ensure alignment is at least the system page size
+    const std::size_t alignment = std::max(kHugePageSize, page_size);
+    
+    void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, shm_fd, 0, alignment);
+
     if (mapped == MAP_FAILED) {
         const int err = errno;
         close(shm_fd);
         shm_fd = -1;
         throw std::system_error(err, std::generic_category(), "mmap failed");
     }
+
+    // Advise the kernel to use huge pages for this mapping if possible
+    // This complements the 2MB alignment we added to data_offset
+    madvise(mapped, total_bytes, MADV_HUGEPAGE);
 
     mapping = static_cast<std::byte*>(mapped);
     MapPointers();

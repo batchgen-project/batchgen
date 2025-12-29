@@ -216,258 +216,39 @@ int execute_command(const std::string& cmd) {
 //     return success;
 // }
 
-// void* allocate_shared_pinned_memory(const std::string& shm_name,
-//                                     int64_t size,
-//                                     bool create) {
-//     if (size <= 0) {
-//         throw std::runtime_error("Invalid size: " + std::to_string(size));
-//     }
+// Helper function to perform aligned mmap
+// This ensures the virtual address is aligned to the specified alignment (e.g., 2MB for huge pages)
+// which is often required for cudaHostRegister to work correctly with huge pages.
+void* mmap_aligned(size_t length, int prot, int flags, int fd, off_t offset, size_t alignment) {
+    // Allocate extra space to ensure we can find an aligned segment
+    size_t total_len = length + alignment;
     
-//     const size_t page_size = sysconf(_SC_PAGESIZE);
-//     const size_t huge_page_size = 2 * 1024 * 1024;  // 2MB
-    
-//     logger->info("Allocating shared memory: name={}, size={}MB, mode={}", 
-//                 shm_name, size / (1024*1024), 
-//                 create ? "server" : "worker");
-    
-//     void* ptr = nullptr;
-//     bool using_huge_pages = false;
-//     int64_t allocated_size = 0;
-//     std::string hugepage_path = "/dev/hugepages/" + shm_name;
-    
-//     // STAGE 1: Try hugetlbfs allocation (DEFAULT CHOICE)
-//     logger->info("Attempting hugepage allocation...");
-//     int flags = O_RDWR | (create ? O_CREAT : 0);
-//     int fd = open(hugepage_path.c_str(), flags, 0666);
-    
-//     if (fd >= 0) {
-//         // Align to huge page size
-//         int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
-        
-//         bool huge_alloc_success = false;
-//         if (create) {
-//             if (ftruncate64(fd, huge_aligned_size) == 0) {
-//                 huge_alloc_success = true;
-//             } else {
-//                 logger->warn("hugetlbfs ftruncate failed: {}", strerror(errno));
-//             }
-//         } else {
-//             huge_alloc_success = true;  // For workers, just try mmap
-//         }
-        
-//         if (huge_alloc_success) {
-//             ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-//             if (ptr != MAP_FAILED) {
-//                 allocated_size = huge_aligned_size;
-//                 logger->info("Successfully mapped {}GB using hugetlbfs", 
-//                            allocated_size / (1024.0*1024.0*1024.0));
-                
-//                 // For create mode, try page touching
-//                 if (create) {
-//                     // Try multi-threaded page touch first
-//                     if (touch_pages(ptr, size, huge_page_size, true)) {
-//                         using_huge_pages = true;
-//                         logger->info("Hugepage multi-threaded initialization succeeded");
-//                     } else {
-//                         // Fallback to single-threaded page touch
-//                         logger->warn("Multi-threaded hugepage touch failed, trying single-threaded...");
-//                         if (touch_pages(ptr, size, huge_page_size, false)) {
-//                             using_huge_pages = true;
-//                             logger->info("Hugepage single-threaded initialization succeeded");
-//                         } else {
-//                             // Both failed - give up hugepages
-//                             logger->error("Both multi and single threaded hugepage touch failed");
-//                             munmap(ptr, allocated_size);
-//                             ptr = nullptr;
-//                         }
-//                     }
-//                 } else {
-//                     // For workers, just accept the mapping
-//                     using_huge_pages = true;
-//                 }
-//             } else {
-//                 logger->warn("hugetlbfs mmap failed: {}", strerror(errno));
-//                 ptr = nullptr;
-//             }
-//         }
-        
-//         close(fd);
-        
-//         // If hugepage approach failed and we're in create mode, clean up
-//         if (!using_huge_pages && create) {
-//             logger->info("Cleaning up failed hugepage allocation...");
-//             unlink(hugepage_path.c_str());
-            
-//             // Reset hugepages to 0
-//             logger->info("Resetting hugepages to 0...");
-//             int ret = execute_command("sysctl -w vm.nr_hugepages=0");
-//             if (ret == 0) {
-//                 logger->info("Successfully reset hugepages");
-//             } else {
-//                 logger->warn("Failed to reset hugepages, user may need to manually clean up");
-//             }
-//         }
-//     } else {
-//         logger->debug("Could not open hugetlbfs: {}", strerror(errno));
-//     }
-    
-//     // STAGE 2: Fallback to regular shared memory with single-threaded touch
-//     if (!ptr) {
-//         logger->info("Falling back to regular shared memory...");
-        
-//         // Align to regular page size
-//         int64_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
-        
-//         int flags = O_RDWR | (create ? O_CREAT : 0);
-//         int fd = shm_open(shm_name.c_str(), flags, 0666);
-//         if (fd < 0) {
-//             throw std::runtime_error("shm_open failed: " + std::string(strerror(errno)));
-//         }
+    // Reserve address space using anonymous mapping
+    void* addr = mmap(nullptr, total_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) {
+        return MAP_FAILED;
+    }
 
-//         if (create && ftruncate64(fd, aligned_size) == -1) {
-//             close(fd);
-//             shm_unlink(shm_name.c_str());
-//             throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
-//         }
+    uintptr_t raw_addr = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t aligned_addr = (raw_addr + alignment - 1) & ~(alignment - 1);
+    void* final_addr = reinterpret_cast<void*>(aligned_addr);
 
-//         ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-//         close(fd);
-        
-//         if (ptr == MAP_FAILED) {
-//             if (create) shm_unlink(shm_name.c_str());
-//             throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
-//         }
-        
-//         allocated_size = aligned_size;
-//         logger->info("Allocated {}GB using regular pages", 
-//                    allocated_size / (1024.0*1024.0*1024.0));
-        
-//         // Try to enable transparent huge pages
-//         if (madvise(ptr, allocated_size, MADV_HUGEPAGE) == 0) {
-//             logger->debug("Enabled transparent huge pages hint");
-//         }
-        
-//         // For regular pages, only use single-threaded touch
-//         if (create) {
-//             if (!touch_pages(ptr, size, page_size, false)) {
-//                 logger->error("Regular page touch failed - memory may not be fully resident");
-//                 // Continue anyway - the allocation succeeded even if touch failed
-//             }
-//         }
-//     }
+    // Map the file into the aligned position using MAP_FIXED
+    // This replaces the anonymous mapping at that location
+    void* ret = mmap(final_addr, length, prot, flags | MAP_FIXED, fd, offset);
     
-//     // STAGE 3: Register with CUDA
-//     try {
-//         logger->info("Registering {}GB with CUDA...", size / (1024.0*1024.0*1024.0));
-//         auto cuda_start = std::chrono::high_resolution_clock::now();
-        
-//         cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
-        
-//         auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-//             std::chrono::high_resolution_clock::now() - cuda_start);
-        
-//         if (err != cudaSuccess) {
-//             throw std::runtime_error("cudaHostRegister failed: " + 
-//                                     std::string(cudaGetErrorString(err)));
-//         }
-        
-//         logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
-//     } catch (const std::exception& e) {
-//         // Clean up and rethrow
-//         munmap(ptr, allocated_size);
-//         if (create) {
-//             if (using_huge_pages) {
-//                 unlink(hugepage_path.c_str());
-//             } else {
-//                 shm_unlink(shm_name.c_str());
-//             }
-//         }
-//         throw;
-//     }
-    
-//     logger->info("Memory allocation completed successfully using {} pages",
-//                using_huge_pages ? "huge" : "regular");
-    
-//     return ptr;
-// }
-
-bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
-    // Set up signal handlers
-    struct sigaction sa;
-    sa.sa_sigaction = segv_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO;
-    struct sigaction old_sa_segv, old_sa_bus;
-    sigaction(SIGSEGV, &sa, &old_sa_segv);
-    sigaction(SIGBUS, &sa, &old_sa_bus);
-    
-    bool success = false;
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    if (multi_threaded) {
-        logger->info("Attempting multi-threaded memory initialization...");
-        const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
-        const int64_t chunk_size = size / num_threads;
-        
-        std::vector<std::thread> threads;
-        std::atomic<int> failed_threads(0);
-        
-        for (int i = 0; i < num_threads; i++) {
-            threads.emplace_back([=, &failed_threads]() {
-                int64_t start_offset = i * chunk_size;
-                int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
-                volatile char* p = reinterpret_cast<volatile char*>(ptr);
-                
-                g_in_page_touch = true;
-                if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-                    for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
-                        p[offset] = 0;
-                    }
-                } else {
-                    logger->warn("Thread {} caught signal during page touch", i);
-                    failed_threads++;
-                }
-                g_in_page_touch = false;
-            });
-        }
-        
-        for (auto& t : threads) {
-            t.join();
-        }
-        
-        success = (failed_threads == 0);
-        if (!success) {
-            logger->warn("{} threads failed during initialization", failed_threads.load());
-        }
-    } else {
-        logger->info("Attempting single-threaded memory initialization...");
-        volatile char* p = reinterpret_cast<volatile char*>(ptr);
-        
-        g_in_page_touch = true;
-        if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-            for (int64_t offset = 0; offset < size; offset += page_size) {
-                p[offset] = 0;
-            }
-            success = true;
-        } else {
-            logger->error("Single-threaded initialization failed with signal");
-        }
-        g_in_page_touch = false;
+    // Unmap the unused parts of the reservation
+    size_t prefix_len = aligned_addr - raw_addr;
+    if (prefix_len > 0) {
+        munmap(addr, prefix_len);
     }
     
-    // Restore original signal handlers
-    sigaction(SIGSEGV, &old_sa_segv, nullptr);
-    sigaction(SIGBUS, &old_sa_bus, nullptr);
-    
-    if (success) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::high_resolution_clock::now() - start_time);
-        logger->info("{} initialization completed in {:.2f}s", 
-                   multi_threaded ? "Multi-threaded" : "Single-threaded",
-                   duration.count() / 1000.0);
+    size_t suffix_len = total_len - length - prefix_len;
+    if (suffix_len > 0) {
+        munmap(reinterpret_cast<void*>(aligned_addr + length), suffix_len);
     }
-    
-    return success;
+
+    return ret;
 }
 
 // --- End of Mocked Dependencies ---
@@ -520,7 +301,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             if (create) {
                 int64_t huge_aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
                 if (ftruncate64(fd, huge_aligned_size) == 0) {
-                    ptr = mmap(nullptr, huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    // Use mmap_aligned to ensure 2MB alignment (or system page size if larger)
+                    size_t alignment = std::max(huge_page_size, page_size);
+                    ptr = mmap_aligned(huge_aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
                     if (ptr != MAP_FAILED) {
                         allocated_size = huge_aligned_size;
                         if (touch_pages(ptr, size, huge_page_size, true)) {
@@ -554,7 +337,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 }
 
                 if (file_size > 0) {
-                    ptr = mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    // Use mmap_aligned for workers too
+                    size_t alignment = std::max(huge_page_size, page_size);
+                    ptr = mmap_aligned(file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
                     if (ptr != MAP_FAILED) {
                         allocated_size = file_size;
                         using_huge_pages = true;
@@ -596,7 +381,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 shm_unlink(shm_name.c_str());
                 throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
             }
-            ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            // Use mmap_aligned with 2MB alignment (or system page size) even for regular shm
+            size_t alignment = std::max(huge_page_size, page_size);
+            ptr = mmap_aligned(aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
             allocated_size = aligned_size;
         } else { // Worker logic
             struct stat sb;
@@ -613,7 +400,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             if (file_size > 0) {
-                ptr = mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                // Use mmap_aligned for workers too
+                size_t alignment = std::max(huge_page_size, page_size);
+                ptr = mmap_aligned(file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0, alignment);
                 allocated_size = file_size;
             } else {
                  logger->error("Timed out waiting for server to create shm file.");
