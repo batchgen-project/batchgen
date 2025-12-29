@@ -1,6 +1,5 @@
 import concurrent.futures
 import copy
-import fcntl
 import functools
 import psutil
 import logging
@@ -287,22 +286,7 @@ class BatchGenWorker:
 		self.tensor_meta_shm_name = args.tensor_meta_shm_name
 		self.weight_byte_size = args.weight_byte_size
 		self.enable_hugetlbfs = args.enable_hugetlbfs
-		
-		# ===================================================================
-		# STAGGERED INITIALIZATION: Avoid concurrent cudaHostRegister calls
-		# ===================================================================
-		# When multiple processes on the same node call cudaHostRegister on
-		# the same shared memory region concurrently, it can cause race
-		# conditions in the CUDA driver leading to "invalid argument" errors.
-		# Stagger initialization by local_rank to serialize the calls.
-		# NOTE: cudaHostRegister for 675GB weights takes ~13s, and Host KV
-		# cache (~1TB) also needs registration. Use 15s per rank to ensure
-		# each rank completes before the next one starts.
-		stagger_delay = self.local_rank * 15.0  # 15 seconds per rank
-		if stagger_delay > 0:
-			logging.info(f"Rank {self.rank}: Staggering cudaHostRegister by {stagger_delay:.1f}s (local_rank={self.local_rank})")
-			time.sleep(stagger_delay)
-		
+
 		# 4. Initialize Weights Storage (cudaHostRegister for weights)
 		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
 		logging.info(
@@ -330,24 +314,11 @@ class BatchGenWorker:
 		)
 		
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
-		
-		# ===================================================================
-		# SEQUENTIAL HOST KV INITIALIZATION: Serialize cudaHostRegister calls
-		# ===================================================================
-		# cudaHostRegister for Host KV cache (~1TB) can take varying times
-		# (12s to 170s+ depending on system load). Use a file lock to ensure
-		# only one process registers at a time on each node.
-		import fcntl
-		lock_file_path = f"/tmp/batchgen_host_kv_register_{os.environ.get('SLURM_NODEID', '0')}.lock"
-		logging.info(f"Rank {self.rank}: Waiting for Host KV cudaHostRegister lock (local_rank={self.local_rank})")
-		with open(lock_file_path, 'w') as lock_file:
-			fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-			try:
-				logging.info(f"Rank {self.rank}: Acquired Host KV lock, initializing core engine Host KV view.")
-				self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
-				logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
-			finally:
-				fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+		# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
+		logging.info(f"Rank {self.rank}: Initializing Host KV view with parallel cudaHostRegister (local_rank={self.local_rank})")
+		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+		logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
@@ -768,14 +739,7 @@ class BatchGenWorker:
 		# Add to pending list - will be waited at page boundary
 		if task is not None:
 			self._pending_kv_append_tasks.append(task)
-		
-		# THROTTLING FIX: Prevent "Resource temporarily unavailable" (EAGAIN) error
-		# std::async creates a new thread for each task. With 61 layers and 64 tokens 
-		# per boundary, we can hit ~3900 concurrent threads per boundary interval.
-		# Wait and clear when threshold is reached to avoid exhausting system thread limits.
-		MAX_PENDING_KV_TASKS = 256
-		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
+		# NO wait here!
 
 	def _initialize_core_components(self, num_queries: int) -> None:
 		"""
@@ -4113,15 +4077,7 @@ class BatchGenWorker:
 		
 		# Add to pending list - will be waited at page boundary
 		self._pending_kv_append_tasks.append(task)
-		
-		# THROTTLING FIX: Prevent "Resource temporarily unavailable" (EAGAIN) error
-		# std::async creates a new thread for each task. With 61 layers and 64 tokens 
-		# per boundary, we can hit ~3900 concurrent threads per boundary interval.
-		# Wait and clear when threshold is reached to avoid exhausting system thread limits.
-		# Threshold: 256 tasks (conservative to leave room for other threads)
-		MAX_PENDING_KV_TASKS = 256
-		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
+		# NO return, NO wait
 
 	def _launch_async_load_new_sequences(
 		self,
