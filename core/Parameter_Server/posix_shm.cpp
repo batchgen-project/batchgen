@@ -137,84 +137,84 @@ int execute_command(const std::string& cmd) {
 }
 
 // Helper function for page touching with signal handling
-// bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
-//     // Set up signal handlers
-//     struct sigaction sa;
-//     sa.sa_sigaction = segv_handler;
-//     sigemptyset(&sa.sa_mask);
-//     sa.sa_flags = SA_SIGINFO;
-//     struct sigaction old_sa_segv, old_sa_bus;
-//     sigaction(SIGSEGV, &sa, &old_sa_segv);
-//     sigaction(SIGBUS, &sa, &old_sa_bus);
+bool touch_pages(void* ptr, int64_t size, long page_size, bool multi_threaded) {
+    // Set up signal handlers
+    struct sigaction sa;
+    sa.sa_sigaction = segv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    struct sigaction old_sa_segv, old_sa_bus;
+    sigaction(SIGSEGV, &sa, &old_sa_segv);
+    sigaction(SIGBUS, &sa, &old_sa_bus);
     
-//     bool success = false;
-//     auto start_time = std::chrono::high_resolution_clock::now();
+    bool success = false;
+    auto start_time = std::chrono::high_resolution_clock::now();
     
-//     if (multi_threaded) {
-//         logger->info("Attempting multi-threaded memory initialization...");
-//         const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
-//         const int64_t chunk_size = size / num_threads;
+    if (multi_threaded) {
+        logger->info("Attempting multi-threaded memory initialization...");
+        const int num_threads = std::min(16, (int)std::thread::hardware_concurrency());
+        const int64_t chunk_size = size / num_threads;
         
-//         std::vector<std::thread> threads;
-//         std::atomic<int> failed_threads(0);
+        std::vector<std::thread> threads;
+        std::atomic<int> failed_threads(0);
         
-//         for (int i = 0; i < num_threads; i++) {
-//             threads.emplace_back([=, &failed_threads]() {
-//                 int64_t start_offset = i * chunk_size;
-//                 int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
-//                 volatile char* p = reinterpret_cast<volatile char*>(ptr);
+        for (int i = 0; i < num_threads; i++) {
+            threads.emplace_back([=, &failed_threads]() {
+                int64_t start_offset = i * chunk_size;
+                int64_t end_offset = (i == num_threads - 1) ? size : start_offset + chunk_size;
+                volatile char* p = reinterpret_cast<volatile char*>(ptr);
                 
-//                 g_in_page_touch = true;
-//                 if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-//                     for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
-//                         p[offset] = 0;
-//                     }
-//                 } else {
-//                     logger->warn("Thread {} caught signal during page touch", i);
-//                     failed_threads++;
-//                 }
-//                 g_in_page_touch = false;
-//             });
-//         }
+                g_in_page_touch = true;
+                if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
+                    for (int64_t offset = start_offset; offset < end_offset; offset += page_size) {
+                        p[offset] = 0;
+                    }
+                } else {
+                    logger->warn("Thread {} caught signal during page touch", i);
+                    failed_threads++;
+                }
+                g_in_page_touch = false;
+            });
+        }
         
-//         for (auto& t : threads) {
-//             t.join();
-//         }
+        for (auto& t : threads) {
+            t.join();
+        }
         
-//         success = (failed_threads == 0);
-//         if (!success) {
-//             logger->warn("{} threads failed during initialization", failed_threads.load());
-//         }
-//     } else {
-//         logger->info("Attempting single-threaded memory initialization...");
-//         volatile char* p = reinterpret_cast<volatile char*>(ptr);
+        success = (failed_threads == 0);
+        if (!success) {
+            logger->warn("{} threads failed during initialization", failed_threads.load());
+        }
+    } else {
+        logger->info("Attempting single-threaded memory initialization...");
+        volatile char* p = reinterpret_cast<volatile char*>(ptr);
         
-//         g_in_page_touch = true;
-//         if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
-//             for (int64_t offset = 0; offset < size; offset += page_size) {
-//                 p[offset] = 0;
-//             }
-//             success = true;
-//         } else {
-//             logger->error("Single-threaded initialization failed with signal");
-//         }
-//         g_in_page_touch = false;
-//     }
+        g_in_page_touch = true;
+        if (sigsetjmp(g_page_touch_jmpbuf, 1) == 0) {
+            for (int64_t offset = 0; offset < size; offset += page_size) {
+                p[offset] = 0;
+            }
+            success = true;
+        } else {
+            logger->error("Single-threaded initialization failed with signal");
+        }
+        g_in_page_touch = false;
+    }
     
-//     // Restore original signal handlers
-//     sigaction(SIGSEGV, &old_sa_segv, nullptr);
-//     sigaction(SIGBUS, &old_sa_bus, nullptr);
+    // Restore original signal handlers
+    sigaction(SIGSEGV, &old_sa_segv, nullptr);
+    sigaction(SIGBUS, &old_sa_bus, nullptr);
     
-//     if (success) {
-//         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-//             std::chrono::high_resolution_clock::now() - start_time);
-//         logger->info("{} initialization completed in {:.2f}s", 
-//                    multi_threaded ? "Multi-threaded" : "Single-threaded",
-//                    duration.count() / 1000.0);
-//     }
+    if (success) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - start_time);
+        logger->info("{} initialization completed in {:.2f}s", 
+                   multi_threaded ? "Multi-threaded" : "Single-threaded",
+                   duration.count() / 1000.0);
+    }
     
-//     return success;
-// }
+    return success;
+}
 
 // Helper function to perform aligned mmap
 // This ensures the virtual address is aligned to the specified alignment (e.g., 2MB for huge pages)
