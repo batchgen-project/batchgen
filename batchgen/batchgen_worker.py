@@ -768,7 +768,14 @@ class BatchGenWorker:
 		# Add to pending list - will be waited at page boundary
 		if task is not None:
 			self._pending_kv_append_tasks.append(task)
-		# NO wait here!
+		
+		# THROTTLING FIX: Prevent "Resource temporarily unavailable" (EAGAIN) error
+		# std::async creates a new thread for each task. With 61 layers and 64 tokens 
+		# per boundary, we can hit ~3900 concurrent threads per boundary interval.
+		# Wait and clear when threshold is reached to avoid exhausting system thread limits.
+		MAX_PENDING_KV_TASKS = 256
+		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
+			self._wait_pending_kv_append_tasks()
 
 	def _initialize_core_components(self, num_queries: int) -> None:
 		"""
@@ -4106,7 +4113,15 @@ class BatchGenWorker:
 		
 		# Add to pending list - will be waited at page boundary
 		self._pending_kv_append_tasks.append(task)
-		# NO return, NO wait
+		
+		# THROTTLING FIX: Prevent "Resource temporarily unavailable" (EAGAIN) error
+		# std::async creates a new thread for each task. With 61 layers and 64 tokens 
+		# per boundary, we can hit ~3900 concurrent threads per boundary interval.
+		# Wait and clear when threshold is reached to avoid exhausting system thread limits.
+		# Threshold: 256 tasks (conservative to leave room for other threads)
+		MAX_PENDING_KV_TASKS = 256
+		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
+			self._wait_pending_kv_append_tasks()
 
 	def _launch_async_load_new_sequences(
 		self,
