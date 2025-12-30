@@ -2629,12 +2629,14 @@ class BatchGenWorker:
 				if prefill_uuids:
 					logging.info(f"Rank {self.rank}: Entering PREFILL for {len(prefill_uuids)} sequences")
 					self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL)
-					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
 
-					# A. Config Prefill
+					# A. Config Prefill (this adds new sequences to _uuid_to_local_map)
 					config_start = time.perf_counter()
 					self._config_prefill_for_batch(prefill_uuids)
 					config_prefill_time += time.perf_counter() - config_start
+
+					# Get local indices AFTER config (new sequences now in map)
+					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
 
 					# B. Execute Prefill
 					if local_prefill_indices:
@@ -2843,27 +2845,45 @@ class BatchGenWorker:
 		self._destroy_gpu_paged_kv_cache()
 
 		# STEP 3: Allocate host KV pages for new sequences (only THIS RANK's sequences)
-		# After rebalancing, assign new QUEUEING sequences to ranks
-		my_prefill_uuids = [uuid for uuid in prefill_uuids if uuid in self._uuid_to_local_map]
-		
+		# Check by assigned_rank, NOT by _uuid_to_local_map (which may not have new sequences yet)
+		my_prefill_uuids = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq.assigned_rank == self.rank:
+				my_prefill_uuids.append(uuid)
+				# Add to local maps if not already present (for new sequences)
+				if uuid not in self._uuid_to_local_map:
+					# O(1) allocation: prefer reusing freed indices, otherwise use next available
+					if self._free_local_indices:
+						new_local_idx = self._free_local_indices.pop()
+					else:
+						new_local_idx = self._next_local_idx
+						self._next_local_idx += 1
+					self._uuid_to_local_map[uuid] = new_local_idx
+					self._local_to_uuid_map[new_local_idx] = uuid
+					logging.debug(
+						f"Rank {self.rank}: Added new sequence {uuid[:8]}... to local maps "
+						f"(local_idx={new_local_idx})"
+					)
+
 		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
-			
+
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				global_sequence_ids.append(seq.global_idx)
 				sequence_tokens.append(seq.kv_token_budget)
-			
+
 			logging.info(
 				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV: {global_sequence_ids}"
 			)
-			
+
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
 			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
 				list(zip(global_sequence_ids, sequence_tokens))
 			)
-			
+
 			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
 			logging.info(f"Rank {self.rank}: Host KV Stats after allocation: {kv_stats}")
 		
