@@ -343,6 +343,8 @@ class BatchGenWorker:
 		self.model_batch_book: Dict = {}
 		self._local_to_uuid_map: Dict[int, str] = {}
 		self._uuid_to_local_map: Dict[str, int] = {}
+		self._free_local_indices: Set[int] = set()  # Track freed indices for O(1) allocation
+		self._next_local_idx: int = 0  # Next index if free list is empty
 		
 		# 8. Runtime State
 		self.eos_token_id: Optional[int] = None
@@ -1061,18 +1063,27 @@ class BatchGenWorker:
 		These are 'valid' sequences with KV in host memory.
 		Free pages = Total - used by valid sequences.
 
+		IMPORTANT: Host KV is shared per-node, so we count sequences from ALL ranks
+		on this node, not just this rank.
+
 		Returns:
 			Dict with: rank, node_id, num_free_pages, num_total_pages, num_used_pages, free_percent
 		"""
 		stats = self.host_paged_kv_worker_view.get_stats()
 
-		# Count pages used by PREFILLED + ON_HOLD sequences on this rank
+		# Count pages used by PREFILLED + ON_HOLD sequences on THIS NODE (all ranks on node)
+		# Host KV is shared across all GPUs on a node
+		node_id = self.rank // NUM_GPUS_PER_NODE
+		node_rank_start = node_id * NUM_GPUS_PER_NODE
+		node_rank_end = min(node_rank_start + NUM_GPUS_PER_NODE, self.world_size)
+
 		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD}
 		valid_sequences = []
-		for status in valid_statuses:
-			valid_sequences.extend(
-				self.global_batch.get_sequences_for_rank_with_status(self.rank, status)
-			)
+		for rank_on_node in range(node_rank_start, node_rank_end):
+			for status in valid_statuses:
+				valid_sequences.extend(
+					self.global_batch.get_sequences_for_rank_with_status(rank_on_node, status)
+				)
 
 		# Calculate pages used by valid sequences
 		used_pages = 0
@@ -1244,7 +1255,19 @@ class BatchGenWorker:
 
 				# Find dest node with most free space
 				dest_node_id = min(underutilized, key=lambda x: used_by_node[x[0]])[0]
-				dest_rank = dest_node_id * NUM_GPUS_PER_NODE  # Assign to rank 0 on dest node
+
+				# Distribute across ranks on dest node for load balancing
+				# Use round-robin based on migration count to this node
+				if not hasattr(self, '_dest_rank_counter'):
+					self._dest_rank_counter = {}
+				if dest_node_id not in self._dest_rank_counter:
+					self._dest_rank_counter[dest_node_id] = 0
+
+				dest_rank_offset = self._dest_rank_counter[dest_node_id] % NUM_GPUS_PER_NODE
+				dest_rank = dest_node_id * NUM_GPUS_PER_NODE + dest_rank_offset
+				if dest_rank >= self.world_size:
+					dest_rank = dest_node_id * NUM_GPUS_PER_NODE  # Fallback to rank 0
+				self._dest_rank_counter[dest_node_id] += 1
 
 				# Record migration
 				migrations.append({
@@ -1280,7 +1303,86 @@ class BatchGenWorker:
 
 		return migrations
 
-	def _execute_kv_migration(self, uuid: str, from_rank: int, to_rank: int) -> None:
+	def _execute_kv_migrations_parallel(self, migrations: List[Dict]) -> None:
+		"""Execute multiple KV migrations in parallel to utilize all network cards.
+
+		Groups migrations by independent rank pairs and executes them concurrently.
+		All ranks participate - those not involved in a particular migration round
+		call barrier to stay synchronized.
+
+		Args:
+			migrations: List of migration dicts with 'uuid', 'from_rank', 'to_rank', 'pages'
+		"""
+		if not migrations:
+			return
+
+		# Group migrations into parallel rounds
+		# Each round contains migrations that can execute concurrently (no shared ranks)
+		rounds = self._group_migrations_for_parallel_execution(migrations)
+
+		if self.rank == 0:
+			logging.info(f"[MIGRATION] Executing {len(migrations)} migrations in {len(rounds)} parallel rounds")
+
+		for round_idx, round_migrations in enumerate(rounds):
+			if self.rank == 0:
+				logging.info(f"[MIGRATION] Round {round_idx+1}/{len(rounds)}: {len(round_migrations)} parallel migrations")
+
+			# Find if this rank participates in this round
+			my_migration = None
+			for mig in round_migrations:
+				if self.rank == mig['from_rank'] or self.rank == mig['to_rank']:
+					my_migration = mig
+					break
+
+			# Execute migration if participating, otherwise just sync tensor shape info
+			if my_migration is not None:
+				self._execute_single_kv_migration(
+					uuid=my_migration['uuid'],
+					from_rank=my_migration['from_rank'],
+					to_rank=my_migration['to_rank']
+				)
+
+			# Barrier after each round to ensure all transfers in this round complete
+			dist.barrier()
+
+		if self.rank == 0:
+			logging.info(f"[MIGRATION] All {len(rounds)} parallel rounds completed")
+
+	def _group_migrations_for_parallel_execution(self, migrations: List[Dict]) -> List[List[Dict]]:
+		"""Group migrations into rounds that can execute in parallel.
+
+		Migrations in the same round must not share any source or destination ranks.
+		This ensures no rank is involved in multiple send/recv operations simultaneously.
+
+		Args:
+			migrations: List of migration dicts
+
+		Returns:
+			List of rounds, where each round is a list of migrations that can run in parallel
+		"""
+		rounds = []
+		remaining = list(migrations)
+
+		while remaining:
+			round_migrations = []
+			used_ranks = set()
+
+			for mig in remaining[:]:  # Iterate over copy
+				from_rank = mig['from_rank']
+				to_rank = mig['to_rank']
+
+				# Check if either rank is already used in this round
+				if from_rank not in used_ranks and to_rank not in used_ranks:
+					round_migrations.append(mig)
+					used_ranks.add(from_rank)
+					used_ranks.add(to_rank)
+					remaining.remove(mig)
+
+			rounds.append(round_migrations)
+
+		return rounds
+
+	def _execute_single_kv_migration(self, uuid: str, from_rank: int, to_rank: int) -> None:
 		"""Migrate KV cache for one sequence from source to dest rank.
 
 		Migration path: Direct host-to-host copy via network (no GPU staging)
@@ -1342,12 +1444,13 @@ class BatchGenWorker:
 			k_gpu = manager.copy_kv_to_tensor(global_idx)
 			t_extract = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
-			# Move to CPU (pinned memory for fast network transfer)
-			k_cpu = k_gpu.pin_memory().cpu() if not k_gpu.is_pinned() else k_gpu.cpu()
+			# Move to CPU - first copy GPU→CPU, then ensure contiguous
+			# Note: pin_memory() is only for CPU tensors and helps with fast DMA transfers
+			k_cpu = k_gpu.cpu().contiguous()
 			t_cpu = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→CPU copy: {(t_cpu-t_extract)*1000:.1f}ms")
 			# Send via PyTorch distributed (uses Gloo backend for CPU tensors, supports RDMA if available)
-			dist.send(tensor=k_cpu.contiguous(), dst=to_rank)
+			dist.send(tensor=k_cpu, dst=to_rank)
 			t_send = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: Network send: {(t_send-t_cpu)*1000:.1f}ms")
 			# Free GPU pages
@@ -1380,40 +1483,48 @@ class BatchGenWorker:
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 			t_alloc = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
-			# Allocate temporary GPU pages for staging
-			manager = self.gpu_paged_kv_cache_manager
-			if manager is None:
-				logging.error(f"Rank {self.rank}: GPU KV manager not initialized")
-				return
-			manager.allocate_pages_for_sequences([global_idx], [tokens_needed])
-			# Move CPU → GPU
+
+			# Move CPU → GPU for offload
+			# k_cpu shape: [num_layers, num_pages, page_size=64, num_heads, head_dim]
 			k_gpu = k_cpu.to(self.device, non_blocking=True)
 			torch.cuda.synchronize()  # Wait for transfer
 			t_gpu = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: CPU→GPU copy: {(t_gpu-t_alloc)*1000:.1f}ms")
-			# Insert into GPU page table
-			manager.copy_tensor_to_kv(global_idx, k_gpu)
-			t_insert = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor insertion: {(t_insert-t_gpu)*1000:.1f}ms")
-			# Store GPU → Host KV
-			sequence_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
-			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
-			active_page_counts = manager.export_active_sequence_page_counts()
-			store_task = worker_view.async_load_layer_paged_kv_to_device(
-				sequence_ids=sequence_tensor,
-				active_page_counts=active_page_counts,
-				k_device_ptrs=k_ptrs,
-				v_device_ptrs=v_ptrs,
-			)
-			store_task.wait()
+
+			# Offload layer-by-layer to host using async_offload_layer_kv_to_host
+			# API expects: k_tensor [batch=1, seq_len, num_heads, head_dim]
+			# Our k_gpu is [num_layers, num_pages, page_size, num_heads, head_dim]
+			# Reshape: num_pages * page_size = total tokens
+			seq_len = pages_needed * 64
+			sequence_ids_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
+			sequence_lengths = [seq_len]
+
+			for layer_idx in range(num_layers):
+				# Extract layer [num_pages, page_size, num_heads, head_dim]
+				layer_k = k_gpu[layer_idx]  # [num_pages, page_size, num_heads, head_dim]
+				# Reshape to [seq_len, num_heads, head_dim] then add batch dim
+				layer_k_flat = layer_k.reshape(seq_len, num_kv_heads, qk_rope_head_dim)
+				layer_k_batch = layer_k_flat.unsqueeze(0)  # [1, seq_len, num_heads, head_dim]
+
+				worker_view.async_offload_layer_kv_to_host(
+					layer_idx=layer_idx,
+					sequence_ids=sequence_ids_tensor,
+					k_tensor=layer_k_batch,
+					v_tensor=None,  # MLA has no V
+					sequence_lengths=sequence_lengths,
+				)
+				# Note: async_offload_layer_kv_to_host is fire-and-forget for each layer
+
+			# Sync to ensure all offloads complete
+			torch.cuda.synchronize()
 			t_store = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→Host store: {(t_store-t_insert)*1000:.1f}ms")
-			# Free GPU pages (keep only in host)
-			manager.free_pages_for_sequences([global_idx])
+			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→Host offload all layers: {(t_store-t_gpu)*1000:.1f}ms")
+			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
+			# It will be freed automatically when it goes out of scope
 			t_total = time.perf_counter()
 			logging.info(
 				f"[MIGRATION] Rank {self.rank}: Recv completed for {uuid[:8]}... "
-				f"in {(t_total-t0)*1000:.1f}ms (stored to host KV, freed GPU)"
+				f"in {(t_total-t0)*1000:.1f}ms (stored to host KV)"
 			)
 		# No barrier here - will be done in _rebalance_host_kv after all migrations
 
@@ -1451,23 +1562,11 @@ class BatchGenWorker:
 				f"({total_pages} total pages, ~{total_pages * 64} tokens)"
 			)
 
-		# STEP 1: Execute all migrations (NCCL transfers + host KV operations)
+		# STEP 1: Execute all migrations in parallel (host-to-host transfers)
+		# Parallel execution utilizes all network cards by having multiple rank pairs
+		# communicate simultaneously
 		migration_start = time.perf_counter()
-		for idx, mig in enumerate(migrations):
-			if self.rank == 0 and idx < 5:  # Log first 5
-				logging.info(
-					f"[REBALANCE]   Migration {idx+1}/{len(migrations)}: {mig['uuid'][:8]}... "
-					f"from rank {mig['from_rank']} → {mig['to_rank']} ({mig['pages']} pages)"
-				)
-
-			self._execute_kv_migration(
-				uuid=mig['uuid'],
-				from_rank=mig['from_rank'],
-				to_rank=mig['to_rank']
-			)
-
-		# BARRIER 1: Ensure all NCCL transfers and host KV alloc/dealloc complete
-		dist.barrier()
+		self._execute_kv_migrations_parallel(migrations)
 		migration_end = time.perf_counter()
 		if self.rank == 0:
 			logging.info(
@@ -1476,39 +1575,56 @@ class BatchGenWorker:
 			)
 
 		# STEP 2: Update sequence ownership metadata and local mappings
+		# CRITICAL: All ranks must update global_batch consistently
 		for mig in migrations:
 			seq = self.global_batch.get_sequence(mig['uuid'])
 			if seq is None:
 				logging.error(f"Rank {self.rank}: Cannot update ownership for {mig['uuid'][:8]}... - sequence not found")
 				continue
 
-			old_rank = seq.assigned_rank
+			# Use from_rank from migration plan, not seq.assigned_rank (could be stale)
 			new_rank = mig['to_rank']
 
 			# Update assigned_rank in sequence (all ranks do this for consistency)
 			seq.assigned_rank = new_rank
 
+			# IMPORTANT: Don't change sequence status - it remains PREFILLED or ON_HOLD
+			# The sequence is still valid, just owned by a different rank now
+
+		# Barrier to ensure all ranks have updated global_batch
+		dist.barrier()
+
+		# STEP 3: Update local mappings (rank-specific, after global metadata is consistent)
+		for mig in migrations:
+			old_rank = mig['from_rank']
+			new_rank = mig['to_rank']
+			uuid = mig['uuid']
+
 			# Update local mappings on source rank (remove)
 			if self.rank == old_rank:
-				local_idx = self._uuid_to_local_map.pop(mig['uuid'], None)
+				local_idx = self._uuid_to_local_map.pop(uuid, None)
 				if local_idx is not None:
 					self._local_to_uuid_map.pop(local_idx, None)
-					self._sequences_with_gpu_kv.discard(mig['uuid'])
-					logging.debug(f"Rank {self.rank}: Removed {mig['uuid'][:8]}... from local mappings (old local_idx={local_idx})")
+					self._sequences_with_gpu_kv.discard(uuid)
+					# Add freed index to free list for O(1) reuse
+					self._free_local_indices.add(local_idx)
+					logging.debug(f"Rank {self.rank}: Removed {uuid[:8]}... from local mappings (freed local_idx={local_idx})")
 
 			# Update local mappings on dest rank (add)
 			if self.rank == new_rank:
-				# Find next available local index (handle gaps from previous removals)
-				existing_indices = set(self._uuid_to_local_map.values())
-				new_local_idx = 0
-				while new_local_idx in existing_indices:
-					new_local_idx += 1
+				# O(1) allocation: prefer reusing freed indices, otherwise use next available
+				if self._free_local_indices:
+					new_local_idx = self._free_local_indices.pop()
+				else:
+					new_local_idx = self._next_local_idx
+					self._next_local_idx += 1
 
-				self._uuid_to_local_map[mig['uuid']] = new_local_idx
-				self._local_to_uuid_map[new_local_idx] = mig['uuid']
-				logging.debug(f"Rank {self.rank}: Added {mig['uuid'][:8]}... to local mappings (new local_idx={new_local_idx})")
+				self._uuid_to_local_map[uuid] = new_local_idx
+				self._local_to_uuid_map[new_local_idx] = uuid
+				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
+				logging.debug(f"Rank {self.rank}: Added {uuid[:8]}... to local mappings (new local_idx={new_local_idx})")
 
-		# BARRIER 2: Ensure all metadata updates are complete across all ranks
+		# BARRIER 2: Ensure all local mapping updates are complete across all ranks
 		dist.barrier()
 
 		rebalance_end = time.perf_counter()
@@ -1755,6 +1871,8 @@ class BatchGenWorker:
 		self.query_book = {}
 		self._local_to_uuid_map: Dict[int, str] = {}
 		self._uuid_to_local_map: Dict[str, int] = {}
+		self._free_local_indices: Set[int] = set()  # Reset free list
+		self._next_local_idx = len(my_uuids)  # Next available index after initial assignment
 
 		for local_idx, uuid in enumerate(my_uuids):
 			seq = self.global_batch.get_sequence(uuid)
