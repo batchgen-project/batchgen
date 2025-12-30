@@ -3339,12 +3339,14 @@ class BatchGenWorker:
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
 				}
 		
-		# Get candidates for loading - report ALL owned sequences that could be loaded
-		# Instead of querying local PREFILLED/ON_HOLD status (which can be desync),
-		# report all owned sequences that are NOT currently in decode_uuids
-		# This ensures the gathered global_candidate_info is complete
+		# Get candidates for loading - report PREFILLED/ON_HOLD sequences that could be loaded
+		# CRITICAL FIX: Only report PREFILLED or ON_HOLD sequences as load candidates.
+		# QUEUEING sequences have NOT been registered with host KV yet (registration
+		# happens during _config_prefill_for_batch), so trying to load them would fail
+		# with "Sequence X is not registered" error from the host KV backend.
 		decode_uuids_set = set(decode_uuids)
 		local_candidate_state = {}
+		valid_load_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD}
 		for uuid in self._uuid_to_local_map.keys():
 			if uuid in decode_uuids_set:
 				continue  # Already in decode batch
@@ -3353,6 +3355,8 @@ class BatchGenWorker:
 				continue
 			if seq.status == SequenceStatus.COMPLETED:
 				continue  # Don't load completed sequences
+			if seq.status not in valid_load_statuses:
+				continue  # Only load PREFILLED/ON_HOLD (not QUEUEING/IN_PREFILL)
 			# Report this as a potential load candidate
 			local_candidate_state[uuid] = {
 				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
