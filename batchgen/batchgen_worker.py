@@ -1058,9 +1058,13 @@ class BatchGenWorker:
 		return stats.num_free_pages
 
 	def _get_host_kv_utilization(self) -> Dict[str, int]:
-		"""Get host KV stats counting only PREFILLED and ON_HOLD sequences.
+		"""Get host KV stats counting sequences with KV in host memory.
 
-		These are 'valid' sequences with KV in host memory.
+		Valid sequences = PREFILLED, ON_HOLD, and IN_DECODE (all have KV in host).
+		- PREFILLED: KV stored in host after prefill
+		- ON_HOLD: KV retained in host when evicted from GPU
+		- IN_DECODE: KV streams to host after each attention layer
+
 		Free pages = Total - used by valid sequences.
 
 		IMPORTANT: Host KV is shared per-node, so we count sequences from ALL ranks
@@ -1071,13 +1075,14 @@ class BatchGenWorker:
 		"""
 		stats = self.host_paged_kv_worker_view.get_stats()
 
-		# Count pages used by PREFILLED + ON_HOLD sequences on THIS NODE (all ranks on node)
+		# Count pages used by sequences with KV in host on THIS NODE (all ranks on node)
 		# Host KV is shared across all GPUs on a node
 		node_id = self.rank // NUM_GPUS_PER_NODE
 		node_rank_start = node_id * NUM_GPUS_PER_NODE
 		node_rank_end = min(node_rank_start + NUM_GPUS_PER_NODE, self.world_size)
 
-		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD}
+		# CRITICAL FIX: IN_DECODE sequences also have KV in host (streams after each layer)
+		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
 		valid_sequences = []
 		for rank_on_node in range(node_rank_start, node_rank_end):
 			for status in valid_statuses:
@@ -1994,17 +1999,23 @@ class BatchGenWorker:
 		)
 
 		# Free GPU pages for these sequences
+		# CRITICAL FIX: GPU KV manager uses global_idx (not local_idx) as sequence ID
 		if hasattr(self, 'gpu_paged_kv_cache_manager') and self.gpu_paged_kv_cache_manager:
-			local_seq_ids = []
+			global_seq_ids = []
 			for uuid in uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq.assigned_rank == self.rank:
-					local_idx = self._uuid_to_local_map.get(uuid)
-					if local_idx is not None:
-						local_seq_ids.append(local_idx)
+					# Verify sequence is in local map (should be for IN_DECODE sequences)
+					if uuid in self._uuid_to_local_map:
+						global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
 
-			if local_seq_ids:
-				self.gpu_paged_kv_cache_manager.free_pages_for_sequences(local_seq_ids)
+			if global_seq_ids:
+				self.gpu_paged_kv_cache_manager.free_pages_for_sequences(global_seq_ids)
+				# Also remove from tracking set
+				for uuid in uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					if seq.assigned_rank == self.rank:
+						self._sequences_with_gpu_kv.discard(uuid)
 
 		# Update sequence status and reset GPU allocation
 		for uuid in uuids:
