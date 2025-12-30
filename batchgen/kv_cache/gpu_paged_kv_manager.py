@@ -1050,6 +1050,87 @@ class GPUPagedKVCacheManager:
 			num_total_pages_allocated=num_used,
 		)
 
+	def copy_kv_to_tensor(self, sequence_id: int) -> torch.Tensor:
+		"""Extract KV cache for a sequence from paged storage into a contiguous tensor.
+
+		Reconstructs the full KV tensor by gathering pages according to the page table.
+
+		Args:
+			sequence_id: Global sequence ID
+
+		Returns:
+			Contiguous K tensor of shape [num_layers, num_pages_used, page_size, num_heads, head_dim]
+			For MLA, V cache is not used (returns None implicitly)
+		"""
+		self._ensure_initialized()
+
+		# Get the sequence's slot in the page table
+		slot = self._gpu_page_table_manager.seq_id_to_slot.get(sequence_id)
+		if slot is None:
+			raise ValueError(f"copy_kv_to_tensor: sequence {sequence_id} not found in page table")
+
+		# Get the sequence state to know how many pages it uses
+		state = self._sequences.get(sequence_id)
+		if state is None:
+			raise ValueError(f"copy_kv_to_tensor: sequence {sequence_id} has no state")
+
+		num_pages_used = state.pages.numel()
+		page_indices = state.pages  # CPU tensor of page indices
+
+		# Reconstruct continuous tensor from paged storage
+		# Output shape: [num_layers, num_pages_used, page_size, num_heads, head_dim]
+		k_output = torch.empty(
+			(self.config.num_layers, num_pages_used, self.config.page_size_tokens,
+			 self.config.num_k_heads, self.config.k_head_dim),
+			dtype=self.config.kv_dtype,
+			device=self.device
+		)
+
+		# Copy each page from paged storage to contiguous tensor
+		for page_offset, page_idx in enumerate(page_indices):
+			page_idx_int = int(page_idx.item())
+			# Copy all layers for this page
+			# _k_cache shape: [num_layers, num_pages, page_size, num_heads, head_dim]
+			k_output[:, page_offset, :, :, :] = self._k_cache[:, page_idx_int, :, :, :]
+
+		return k_output
+
+	def copy_tensor_to_kv(self, sequence_id: int, k_tensor: torch.Tensor) -> None:
+		"""Insert received KV tensor into paged storage.
+
+		This is the inverse of copy_kv_to_tensor - scatters a contiguous tensor
+		into the paged KV cache according to the page table.
+
+		Args:
+			sequence_id: Global sequence ID
+			k_tensor: Contiguous K tensor [num_layers, num_pages_used, page_size, num_heads, head_dim]
+		"""
+		self._ensure_initialized()
+
+		# Get the sequence's page indices
+		state = self._sequences.get(sequence_id)
+		if state is None:
+			raise ValueError(f"copy_tensor_to_kv: sequence {sequence_id} has no state")
+
+		num_pages_used = state.pages.numel()
+		page_indices = state.pages  # CPU tensor of page indices
+
+		# Validate input shape
+		expected_shape = (self.config.num_layers, num_pages_used, self.config.page_size_tokens,
+						  self.config.num_k_heads, self.config.k_head_dim)
+		if k_tensor.shape != expected_shape:
+			raise ValueError(
+				f"copy_tensor_to_kv: k_tensor shape {k_tensor.shape} does not match "
+				f"expected {expected_shape} for sequence {sequence_id}"
+			)
+
+		# Scatter contiguous tensor into paged storage
+		for page_offset, page_idx in enumerate(page_indices):
+			page_idx_int = int(page_idx.item())
+			# Copy all layers for this page
+			# _k_cache shape: [num_layers, num_pages, page_size, num_heads, head_dim]
+			self._k_cache[:, page_idx_int, :, :, :] = k_tensor[:, page_offset, :, :, :]
+
 	# ------------------------------------------------------------------
 	# Internal helpers
 	# ------------------------------------------------------------------

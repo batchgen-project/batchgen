@@ -58,6 +58,11 @@ else:
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
+# Watermark-based prefill configuration
+HOST_KV_WATERMARK_PERCENT = int(os.environ.get('BATCHGEN_HOST_KV_WATERMARK', '70'))  # % FREE (70% = underutilized)
+ENABLE_WATERMARK_PREFILL = os.environ.get('BATCHGEN_ENABLE_WATERMARK_PREFILL', '0') == '1'  # Default OFF for safety
+NUM_GPUS_PER_NODE = int(os.environ.get('NUM_GPUS_PER_NODE', '8'))
+
 
 from .scheduler.scheduler import Scheduler
 
@@ -1050,6 +1055,478 @@ class BatchGenWorker:
 		stats = self.host_paged_kv_worker_view.get_stats()
 		return stats.num_free_pages
 
+	def _get_host_kv_utilization(self) -> Dict[str, int]:
+		"""Get host KV stats counting only PREFILLED and ON_HOLD sequences.
+
+		These are 'valid' sequences with KV in host memory.
+		Free pages = Total - used by valid sequences.
+
+		Returns:
+			Dict with: rank, node_id, num_free_pages, num_total_pages, num_used_pages, free_percent
+		"""
+		stats = self.host_paged_kv_worker_view.get_stats()
+
+		# Count pages used by PREFILLED + ON_HOLD sequences on this rank
+		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD}
+		valid_sequences = []
+		for status in valid_statuses:
+			valid_sequences.extend(
+				self.global_batch.get_sequences_for_rank_with_status(self.rank, status)
+			)
+
+		# Calculate pages used by valid sequences
+		used_pages = 0
+		for uuid in valid_sequences:
+			seq = self.global_batch.get_sequence(uuid)
+			pages_needed = math.ceil(seq.kv_token_budget / 64)
+			used_pages += pages_needed
+
+		# Free pages = total - used by valid sequences
+		free_pages = stats.num_total_pages - used_pages
+		free_percent = int((free_pages / stats.num_total_pages) * 100) if stats.num_total_pages > 0 else 100
+
+		# Log detailed stats for debugging (only on rank 0 of each node)
+		if self.local_rank == 0 and ENABLE_WATERMARK_PREFILL:
+			logging.info(
+				f"[WATERMARK] Rank {self.rank} (Node {self.rank // NUM_GPUS_PER_NODE}): "
+				f"Host KV utilization - {len(valid_sequences)} valid seqs "
+				f"({used_pages} pages used / {stats.num_total_pages} total = {100-free_percent}% utilized, {free_percent}% free)"
+			)
+
+		return {
+			'rank': self.rank,
+			'node_id': self.rank // NUM_GPUS_PER_NODE,
+			'num_free_pages': free_pages,
+			'num_total_pages': stats.num_total_pages,
+			'num_used_pages': used_pages,
+			'free_percent': free_percent
+		}
+
+	def _check_host_kv_watermark_trigger(self) -> bool:
+		"""Check if any node exceeds host KV free page watermark.
+
+		Watermark = 70% FREE (underutilized).
+		Only checks if this rank is local_rank 0 (one check per node).
+
+		Returns:
+			True if should interrupt decode and switch to prefill
+		"""
+		if not ENABLE_WATERMARK_PREFILL:
+			return False
+
+		# Only local_rank 0 reports (one per node)
+		if self.local_rank == 0:
+			local_stats = self._get_host_kv_utilization()
+		else:
+			local_stats = None
+
+		# Gather stats from all local_rank 0 representatives
+		all_stats = [None] * self.world_size
+		dist.all_gather_object(all_stats, local_stats)
+
+		# Filter to only node representatives
+		node_stats = [s for s in all_stats if s is not None]
+
+		if not node_stats:
+			return False
+
+		# Check if any node above watermark (too much free space)
+		max_free_percent = max(s['free_percent'] for s in node_stats)
+		above_watermark = max_free_percent > HOST_KV_WATERMARK_PERCENT
+
+		# Check if queued sequences available
+		has_queued = self.global_batch.has_queueing()
+
+		should_trigger = above_watermark and has_queued
+
+		# Log watermark check (throttled to reduce spam)
+		if self.rank == 0:
+			if should_trigger:
+				logging.info(
+					f"[WATERMARK] TRIGGER: max_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
+					f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
+				)
+				for s in node_stats:
+					logging.info(
+						f"[WATERMARK]   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
+						f"pages ({100-s['free_percent']}% utilized, {s['free_percent']}% free)"
+					)
+			else:
+				# Log summary even when not triggering (every 10th check to avoid spam)
+				if not hasattr(self, '_watermark_check_counter'):
+					self._watermark_check_counter = 0
+				self._watermark_check_counter += 1
+				if self._watermark_check_counter % 10 == 0:
+					logging.debug(
+						f"[WATERMARK] Check #{self._watermark_check_counter}: max_free={max_free_percent}%, "
+						f"threshold={HOST_KV_WATERMARK_PERCENT}%, has_queued={has_queued}, trigger={should_trigger}"
+					)
+
+		return should_trigger
+
+	def _plan_kv_migration(self) -> List[Dict]:
+		"""Plan sequence migrations to rebalance host KV across nodes.
+
+		Returns:
+			List of migration ops: [{'uuid': str, 'from_rank': int, 'to_rank': int, 'pages': int}, ...]
+		"""
+		# Gather host KV stats from all local_rank 0
+		if self.local_rank == 0:
+			local_stats = self._get_host_kv_utilization()
+		else:
+			local_stats = None
+
+		all_stats = [None] * self.world_size
+		dist.all_gather_object(all_stats, local_stats)
+		node_stats = {s['node_id']: s for s in all_stats if s is not None}
+
+		if len(node_stats) <= 1:
+			# Only one node, no migration needed
+			if self.rank == 0:
+				logging.info("[MIGRATION] Single node detected, skipping rebalancing")
+			return []
+
+		# Calculate target pages per node
+		total_used = sum(s['num_used_pages'] for s in node_stats.values())
+		num_nodes = len(node_stats)
+		target_per_node = total_used // num_nodes
+
+		if self.rank == 0:
+			logging.info(
+				f"[MIGRATION] Planning rebalance: {total_used} total pages across {num_nodes} nodes, "
+				f"target {target_per_node} pages/node"
+			)
+			for nid, s in sorted(node_stats.items()):
+				imbalance = s['num_used_pages'] - target_per_node
+				logging.info(
+					f"[MIGRATION]   Node {nid}: {s['num_used_pages']} pages "
+					f"({'+' if imbalance > 0 else ''}{imbalance} vs target)"
+				)
+
+		# Identify overloaded and underutilized nodes
+		overloaded = [(nid, s) for nid, s in node_stats.items() if s['num_used_pages'] > target_per_node]
+		underutilized = [(nid, s) for nid, s in node_stats.items() if s['num_used_pages'] < target_per_node]
+
+		if not overloaded or not underutilized:
+			# Already balanced
+			if self.rank == 0:
+				logging.info("[MIGRATION] Already balanced, no migrations needed")
+			return []
+
+		overloaded.sort(key=lambda x: x[1]['num_used_pages'], reverse=True)
+		underutilized.sort(key=lambda x: x[1]['num_used_pages'])
+
+		# Greedy migration planning
+		migrations = []
+		used_by_node = {nid: s['num_used_pages'] for nid, s in node_stats.items()}
+
+		for src_node_id, _ in overloaded:
+			while used_by_node[src_node_id] > target_per_node and underutilized:
+				# Find sequences to migrate from src_node
+				src_rank_base = src_node_id * NUM_GPUS_PER_NODE
+				candidate_sequences = []
+				for gpu_offset in range(NUM_GPUS_PER_NODE):
+					src_rank = src_rank_base + gpu_offset
+					if src_rank >= self.world_size:
+						break
+					for status in [SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD]:
+						candidate_sequences.extend(
+							self.global_batch.get_sequences_for_rank_with_status(src_rank, status)
+						)
+
+				if not candidate_sequences:
+					break
+
+				# Pick smallest sequence (better packing)
+				uuid = min(candidate_sequences, key=lambda u: self.global_batch.get_sequence(u).kv_token_budget)
+				seq = self.global_batch.get_sequence(uuid)
+				pages_needed = math.ceil(seq.kv_token_budget / 64)
+
+				# Find dest node with most free space
+				dest_node_id = min(underutilized, key=lambda x: used_by_node[x[0]])[0]
+				dest_rank = dest_node_id * NUM_GPUS_PER_NODE  # Assign to rank 0 on dest node
+
+				# Record migration
+				migrations.append({
+					'uuid': uuid,
+					'from_rank': seq.assigned_rank,
+					'to_rank': dest_rank,
+					'pages': pages_needed
+				})
+
+				# Update bookkeeping
+				used_by_node[src_node_id] -= pages_needed
+				used_by_node[dest_node_id] += pages_needed
+
+				# Remove from candidates
+				candidate_sequences.remove(uuid)
+
+				# Check if dest node is now balanced
+				if used_by_node[dest_node_id] >= target_per_node:
+					underutilized = [(nid, s) for nid, s in underutilized if nid != dest_node_id]
+
+		if self.rank == 0:
+			if migrations:
+				logging.info(f"[MIGRATION] Planned {len(migrations)} sequence migrations")
+				for i, mig in enumerate(migrations[:5]):  # Log first 5
+					logging.info(
+						f"[MIGRATION]   #{i+1}: seq {mig['uuid'][:8]}... "
+						f"rank {mig['from_rank']} → {mig['to_rank']} ({mig['pages']} pages)"
+					)
+				if len(migrations) > 5:
+					logging.info(f"[MIGRATION]   ... and {len(migrations)-5} more")
+			else:
+				logging.info("[MIGRATION] No migrations needed after planning")
+
+		return migrations
+
+	def _execute_kv_migration(self, uuid: str, from_rank: int, to_rank: int) -> None:
+		"""Migrate KV cache for one sequence from source to dest rank.
+
+		Migration path: Direct host-to-host copy via network (no GPU staging)
+		Uses PyTorch distributed send/recv on CPU tensors for efficient inter-node transfer.
+
+		Args:
+			uuid: Sequence UUID to migrate
+			from_rank: Source rank (current owner)
+			to_rank: Destination rank (new owner)
+		"""
+		seq = self.global_batch.get_sequence(uuid)
+		if seq is None:
+			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - sequence not found")
+			return
+
+		global_idx = seq.global_idx
+		pages_needed = math.ceil(seq.kv_token_budget / 64)
+		num_layers = self.model_config.num_hidden_layers
+		num_kv_heads = self.model_config.num_key_value_heads
+		qk_rope_head_dim = self.model_config.qk_rope_head_dim
+		kv_dtype = self.kv_dtype
+
+		# Tensor shape for MLA: [num_layers, pages, 64 tokens/page, num_heads, head_dim]
+		# MLA doesn't have separate V tensor
+		k_shape = (num_layers, pages_needed, 64, num_kv_heads, qk_rope_head_dim)
+		if self.rank == from_rank:
+			# ===== SOURCE RANK: Read from host KV, send directly over network =====
+			t0 = time.perf_counter()
+			logging.info(
+				f"[MIGRATION] Rank {self.rank}: Starting host→host migration of {uuid[:8]}... "
+				f"(global_idx={global_idx}) to rank {to_rank} ({pages_needed} pages, "
+				f"{pages_needed * 64} tokens)"
+			)
+			# Allocate CPU buffer for KV data
+			# We'll load host KV → GPU → CPU buffer, then send
+			# (Temporary workaround - ideally would read directly from host memory)
+			manager = self.gpu_paged_kv_cache_manager
+			worker_view = self.host_paged_kv_worker_view
+			if manager is None:
+				logging.error(f"Rank {self.rank}: GPU KV manager not initialized")
+				return
+			tokens_needed = pages_needed * 64
+			# Allocate temporary GPU pages
+			manager.allocate_pages_for_sequences([global_idx], [tokens_needed])
+			# Load host KV → GPU
+			sequence_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
+			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
+			active_page_counts = manager.export_active_sequence_page_counts()
+			load_task = worker_view.async_load_layer_paged_kv_to_device(
+				sequence_ids=sequence_tensor,
+				active_page_counts=active_page_counts,
+				k_device_ptrs=k_ptrs,
+				v_device_ptrs=v_ptrs,
+			)
+			load_task.wait()
+			t_load = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: Host→GPU load: {(t_load-t0)*1000:.1f}ms")
+			# Extract to contiguous tensor on GPU
+			k_gpu = manager.copy_kv_to_tensor(global_idx)
+			t_extract = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
+			# Move to CPU (pinned memory for fast network transfer)
+			k_cpu = k_gpu.pin_memory().cpu() if not k_gpu.is_pinned() else k_gpu.cpu()
+			t_cpu = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→CPU copy: {(t_cpu-t_extract)*1000:.1f}ms")
+			# Send via PyTorch distributed (uses Gloo backend for CPU tensors, supports RDMA if available)
+			dist.send(tensor=k_cpu.contiguous(), dst=to_rank)
+			t_send = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: Network send: {(t_send-t_cpu)*1000:.1f}ms")
+			# Free GPU pages
+			manager.free_pages_for_sequences([global_idx])
+			# Free host KV pages
+			worker_view.release_sequence_pages([global_idx])
+			t_total = time.perf_counter()
+			logging.info(
+				f"[MIGRATION] Rank {self.rank}: Send completed for {uuid[:8]}... "
+				f"in {(t_total-t0)*1000:.1f}ms (freed host + GPU KV)"
+			)
+		elif self.rank == to_rank:
+			# ===== DEST RANK: Receive over network, write to host KV =====
+			t0 = time.perf_counter()
+			logging.info(
+				f"[MIGRATION] Rank {self.rank}: Receiving host→host {uuid[:8]}... "
+				f"(global_idx={global_idx}) from rank {from_rank} ({pages_needed} pages, "
+				f"{pages_needed * 64} tokens)"
+			)
+			# Allocate CPU buffer for receiving
+			k_cpu = torch.empty(k_shape, dtype=kv_dtype, pin_memory=True)
+			# Receive via PyTorch distributed
+			dist.recv(tensor=k_cpu, src=from_rank)
+			t_recv = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: Network recv: {(t_recv-t0)*1000:.1f}ms")
+			# Register and allocate host KV pages
+			worker_view = self.host_paged_kv_worker_view
+			tokens_needed = pages_needed * 64
+			worker_view.register_sequences([global_idx])
+			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
+			t_alloc = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
+			# Allocate temporary GPU pages for staging
+			manager = self.gpu_paged_kv_cache_manager
+			if manager is None:
+				logging.error(f"Rank {self.rank}: GPU KV manager not initialized")
+				return
+			manager.allocate_pages_for_sequences([global_idx], [tokens_needed])
+			# Move CPU → GPU
+			k_gpu = k_cpu.to(self.device, non_blocking=True)
+			torch.cuda.synchronize()  # Wait for transfer
+			t_gpu = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: CPU→GPU copy: {(t_gpu-t_alloc)*1000:.1f}ms")
+			# Insert into GPU page table
+			manager.copy_tensor_to_kv(global_idx, k_gpu)
+			t_insert = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor insertion: {(t_insert-t_gpu)*1000:.1f}ms")
+			# Store GPU → Host KV
+			sequence_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
+			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
+			active_page_counts = manager.export_active_sequence_page_counts()
+			store_task = worker_view.async_load_layer_paged_kv_to_device(
+				sequence_ids=sequence_tensor,
+				active_page_counts=active_page_counts,
+				k_device_ptrs=k_ptrs,
+				v_device_ptrs=v_ptrs,
+			)
+			store_task.wait()
+			t_store = time.perf_counter()
+			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→Host store: {(t_store-t_insert)*1000:.1f}ms")
+			# Free GPU pages (keep only in host)
+			manager.free_pages_for_sequences([global_idx])
+			t_total = time.perf_counter()
+			logging.info(
+				f"[MIGRATION] Rank {self.rank}: Recv completed for {uuid[:8]}... "
+				f"in {(t_total-t0)*1000:.1f}ms (stored to host KV, freed GPU)"
+			)
+		# No barrier here - will be done in _rebalance_host_kv after all migrations
+
+	def _rebalance_host_kv(self) -> None:
+		"""Rebalance host KV cache by migrating sequences between nodes.
+
+		Called during _config_prefill_for_batch() before assigning new sequences.
+		This orchestrates the full rebalancing process:
+		1. Plan migrations (deterministic across all ranks)
+		2. Execute all migrations (NCCL transfers)
+		3. Barrier to ensure all transfers complete
+		4. Update sequence ownership metadata
+		5. Barrier to ensure metadata consistency
+		"""
+		if not ENABLE_WATERMARK_PREFILL:
+			return
+
+		rebalance_start = time.perf_counter()
+		if self.rank == 0:
+			logging.info("[REBALANCE] Starting host KV rebalancing")
+
+		# Plan migrations (all ranks compute same plan deterministically)
+		migrations = self._plan_kv_migration()
+
+		if not migrations:
+			if self.rank == 0:
+				logging.info("[REBALANCE] No migrations needed, host KV already balanced")
+			return
+
+		# Log migration summary
+		if self.rank == 0:
+			total_pages = sum(m['pages'] for m in migrations)
+			logging.info(
+				f"[REBALANCE] Executing {len(migrations)} migrations "
+				f"({total_pages} total pages, ~{total_pages * 64} tokens)"
+			)
+
+		# STEP 1: Execute all migrations (NCCL transfers + host KV operations)
+		migration_start = time.perf_counter()
+		for idx, mig in enumerate(migrations):
+			if self.rank == 0 and idx < 5:  # Log first 5
+				logging.info(
+					f"[REBALANCE]   Migration {idx+1}/{len(migrations)}: {mig['uuid'][:8]}... "
+					f"from rank {mig['from_rank']} → {mig['to_rank']} ({mig['pages']} pages)"
+				)
+
+			self._execute_kv_migration(
+				uuid=mig['uuid'],
+				from_rank=mig['from_rank'],
+				to_rank=mig['to_rank']
+			)
+
+		# BARRIER 1: Ensure all NCCL transfers and host KV alloc/dealloc complete
+		dist.barrier()
+		migration_end = time.perf_counter()
+		if self.rank == 0:
+			logging.info(
+				f"[REBALANCE] All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
+				f"({(migration_end-migration_start)*1000/len(migrations):.1f}ms per migration avg)"
+			)
+
+		# STEP 2: Update sequence ownership metadata and local mappings
+		for mig in migrations:
+			seq = self.global_batch.get_sequence(mig['uuid'])
+			if seq is None:
+				logging.error(f"Rank {self.rank}: Cannot update ownership for {mig['uuid'][:8]}... - sequence not found")
+				continue
+
+			old_rank = seq.assigned_rank
+			new_rank = mig['to_rank']
+
+			# Update assigned_rank in sequence (all ranks do this for consistency)
+			seq.assigned_rank = new_rank
+
+			# Update local mappings on source rank (remove)
+			if self.rank == old_rank:
+				local_idx = self._uuid_to_local_map.pop(mig['uuid'], None)
+				if local_idx is not None:
+					self._local_to_uuid_map.pop(local_idx, None)
+					self._sequences_with_gpu_kv.discard(mig['uuid'])
+					logging.debug(f"Rank {self.rank}: Removed {mig['uuid'][:8]}... from local mappings (old local_idx={local_idx})")
+
+			# Update local mappings on dest rank (add)
+			if self.rank == new_rank:
+				# Find next available local index (handle gaps from previous removals)
+				existing_indices = set(self._uuid_to_local_map.values())
+				new_local_idx = 0
+				while new_local_idx in existing_indices:
+					new_local_idx += 1
+
+				self._uuid_to_local_map[mig['uuid']] = new_local_idx
+				self._local_to_uuid_map[new_local_idx] = mig['uuid']
+				logging.debug(f"Rank {self.rank}: Added {mig['uuid'][:8]}... to local mappings (new local_idx={new_local_idx})")
+
+		# BARRIER 2: Ensure all metadata updates are complete across all ranks
+		dist.barrier()
+
+		rebalance_end = time.perf_counter()
+		if self.rank == 0:
+			logging.info(
+				f"[REBALANCE] Completed: {len(migrations)} sequences migrated "
+				f"in {(rebalance_end-rebalance_start)*1000:.1f}ms total"
+			)
+
+			# Log final distribution
+			if self.local_rank == 0:
+				final_stats = self._get_host_kv_utilization()
+				logging.info(
+					f"  Node {final_stats['node_id']} final state: "
+					f"{final_stats['num_used_pages']}/{final_stats['num_total_pages']} pages "
+					f"({100-final_stats['free_percent']}% utilized)"
+				)
+
 	def _get_gpu_kv_free_pages(self) -> int:
 		"""Get current free pages from GPU KV cache."""
 		manager = self.gpu_paged_kv_cache_manager
@@ -1385,9 +1862,40 @@ class BatchGenWorker:
 			f"Rank {self.rank}: Prefill batch: {len(prefill_batch)} sequences, "
 			f"per-node pages used: {node_pages_used}"
 		)
-		
+
 		return prefill_batch
 
+	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
+		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
+		if not uuids:
+			return
+
+		logging.info(
+			f"[WATERMARK] Rank {self.rank}: Putting {len(uuids)} sequences ON_HOLD "
+			f"(freeing GPU KV, keeping host KV)"
+		)
+
+		# Free GPU pages for these sequences
+		if hasattr(self, 'gpu_paged_kv_cache_manager') and self.gpu_paged_kv_cache_manager:
+			local_seq_ids = []
+			for uuid in uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq.assigned_rank == self.rank:
+					local_idx = self._uuid_to_local_map.get(uuid)
+					if local_idx is not None:
+						local_seq_ids.append(local_idx)
+
+			if local_seq_ids:
+				self.gpu_paged_kv_cache_manager.free_pages_for_sequences(local_seq_ids)
+
+		# Update sequence status and reset GPU allocation
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			seq.reset_gpu_allocation()  # Reset gpu_pages_allocated = 0
+			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+
+		# Synchronize state across all ranks
+		dist.barrier()
 
 	def _prepare_decode_batch(self) -> List[str]:
 		"""
@@ -2186,20 +2694,38 @@ class BatchGenWorker:
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
-		logging.info(f"Rank {self.rank}: Starting _config_prefill_for_batch")
-		
+		if self.rank == 0:
+			logging.info(
+				f"[PREFILL] Configuring prefill phase for {len(prefill_uuids)} sequences"
+			)
+
+		# STEP 1: Rebalance existing PREFILLED/ON_HOLD sequences across nodes
+		# This migrates sequences to balance host KV utilization before adding new sequences
+		if ENABLE_WATERMARK_PREFILL:
+			if self.rank == 0:
+				logging.info("[PREFILL] Running host KV rebalancing before prefill...")
+			rebalance_start = time.perf_counter()
+			self._rebalance_host_kv()
+			rebalance_time = time.perf_counter() - rebalance_start
+			if self.rank == 0:
+				logging.info(
+					f"[PREFILL] Rebalancing completed in {rebalance_time*1000:.1f}ms"
+				)
+
+		# STEP 2: Configure model for prefill
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
-		
+
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_weight_copy_queue()
 		self.core_engine.reset_prefill_buffer()
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 		self.core_engine.start_h2d_worker()
-		
+
 		self._destroy_gpu_paged_kv_cache()
-		
-		# Only allocate host KV pages for THIS RANK's sequences
+
+		# STEP 3: Allocate host KV pages for new sequences (only THIS RANK's sequences)
+		# After rebalancing, assign new QUEUEING sequences to ranks
 		my_prefill_uuids = [uuid for uuid in prefill_uuids if uuid in self._uuid_to_local_map]
 		
 		if my_prefill_uuids:
@@ -2543,21 +3069,21 @@ class BatchGenWorker:
 		pending_load_local_indices: List[int],
 		pending_load_global_ids: List[int],
 		cumulative_completed: int = 0,  # Track total completed so far
-	) -> Tuple[List[str], List[int], Optional[object], List[str], List[int], List[int], FastBoundaryTimingStats]:
+	) -> Tuple[List[str], List[int], Optional[object], List[str], List[int], List[int], FastBoundaryTimingStats, bool]:
 		"""
 		OPTIMIZED page boundary with consolidated collective operations.
-		
+
 		Reduces 10+ collectives to 2-3 by batching:
 		1. Single all_gather_object for: sequence metadata + completion status + extension info + free pages
 		2. One final barrier
-		
+
 		CRITICAL INVARIANTS FOR RANK ALIGNMENT:
 		- All ranks must compute IDENTICAL decode_uuids, completed_uuids, onhold_uuids, new_load_uuids
 		- Local operations (GPU page allocation, KV release) are rank-specific but globally coordinated
 		- All decisions are based on gathered global state, not local state
-		
+
 		Returns:
-			(decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing)
+			(decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered)
 		"""
 		timing = FastBoundaryTimingStats()
 		boundary_start = time.perf_counter()
@@ -3119,8 +3645,11 @@ class BatchGenWorker:
 					)
 		
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
-		
-		return decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing
+
+		# Check watermark trigger for dynamic prefill switching
+		watermark_triggered = self._check_host_kv_watermark_trigger()
+
+		return decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered
 
 	def _finalize_async_load_minimal(
 		self,
@@ -3253,18 +3782,29 @@ class BatchGenWorker:
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if iteration - last_boundary >= self.DECISION_INTERVAL:
 				last_boundary = iteration
-				
-				(decode_uuids, batch, 
-				 pending_async_task, pending_load_uuids, 
-				 pending_load_local, pending_load_global, 
-				 timing) = self._page_boundary_fast(
+
+				(decode_uuids, batch,
+				 pending_async_task, pending_load_uuids,
+				 pending_load_local, pending_load_global,
+				 timing, watermark_triggered) = self._page_boundary_fast(
 					decode_uuids, batch, gpu_manager,
 					pending_async_task, pending_load_uuids,
 					pending_load_local, pending_load_global
 				)
-				
+
 				total_boundary_ms += timing.total_ms
 				num_boundaries += 1
+
+				# Check if watermark triggered - interrupt decode for prefill
+				if watermark_triggered:
+					logging.info(
+						f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
+						f"sequences ON_HOLD, will trigger prefill"
+					)
+					# Put all remaining sequences ON_HOLD
+					self._put_sequences_on_hold(decode_uuids)
+					# Exit decode loop - will return to generate() which will trigger prefill
+					break
 				
 				# Detailed logging at every boundary (only rank 0)
 				if self.rank == 0:
