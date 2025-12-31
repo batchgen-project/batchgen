@@ -1347,6 +1347,12 @@ class BatchGenWorker:
 		if not migrations:
 			return
 
+		# CRITICAL: Create Gloo group BEFORE migrations start.
+		# dist.new_group() is a COLLECTIVE operation - ALL ranks must call it together.
+		# We create it here so all ranks participate, not just sender/receiver.
+		self._get_or_create_gloo_group()
+		dist.barrier()  # Ensure all ranks have created the group
+
 		# Group migrations into parallel rounds
 		# Each round contains migrations that can execute concurrently (no shared ranks)
 		rounds = self._group_migrations_for_parallel_execution(migrations)
