@@ -2780,6 +2780,17 @@ class BatchGenWorker:
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
 				dist.barrier()
+
+				# CRITICAL FIX: After decode returns (possibly due to watermark trigger),
+				# check if there are queued sequences waiting for prefill.
+				# If so, break out of inner decode loop to allow outer loop to enter prefill.
+				if self.global_batch.has_queueing():
+					logging.info(
+						f"Rank {self.rank}: Breaking decode loop - "
+						f"{len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))} "
+						f"sequences waiting for prefill"
+					)
+					break  # Exit inner decode while loop, outer loop will check has_queueing()
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
