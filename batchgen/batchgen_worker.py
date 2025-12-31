@@ -1436,9 +1436,16 @@ class BatchGenWorker:
 			if manager is None:
 				logging.error(f"Rank {self.rank}: GPU KV manager not initialized")
 				return
+			# Ensure GPU KV manager is initialized (may be destroyed between decode/prefill phases)
+			if not manager.is_initialized:
+				logging.debug(f"[MIGRATION] Rank {self.rank}: Re-initializing GPU KV manager for migration")
+				manager.initialize()
 			tokens_needed = pages_needed * page_size
 			# Allocate temporary GPU pages
 			manager.allocate_pages_for_sequences([global_idx], [tokens_needed])
+			# CRITICAL: Must rebuild page table after allocation before using get_padded_3d_page_pointers
+			# The GPU KV manager requires this to set up active slot mappings
+			manager.rebuild_page_table([global_idx])
 			# Load host KV → GPU
 			sequence_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
 			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
