@@ -1057,6 +1057,32 @@ class BatchGenWorker:
 		stats = self.host_paged_kv_worker_view.get_stats()
 		return stats.num_free_pages
 
+	def _get_or_create_gloo_group(self):
+		"""Get or create a Gloo process group for CPU tensor migrations.
+
+		Gloo backend supports CPU tensors and can use RDMA if available.
+		This is more memory efficient than NCCL (which requires GPU staging).
+
+		Returns:
+			The Gloo process group for CPU tensor operations.
+		"""
+		if not hasattr(self, '_gloo_migration_group') or self._gloo_migration_group is None:
+			logging.info(f"Rank {self.rank}: Creating Gloo process group for CPU migrations")
+			# Create a new group with Gloo backend including all ranks
+			self._gloo_migration_group = dist.new_group(
+				ranks=list(range(self.world_size)),
+				backend="gloo"
+			)
+			logging.info(f"Rank {self.rank}: Gloo process group created successfully")
+		return self._gloo_migration_group
+
+	def _destroy_gloo_group(self):
+		"""Destroy the Gloo process group after migrations are done."""
+		if hasattr(self, '_gloo_migration_group') and self._gloo_migration_group is not None:
+			logging.debug(f"Rank {self.rank}: Destroying Gloo process group")
+			dist.destroy_process_group(self._gloo_migration_group)
+			self._gloo_migration_group = None
+
 	def _get_host_kv_utilization(self) -> Dict[str, int]:
 		"""Get host KV stats counting sequences with KV in host memory.
 
@@ -1463,15 +1489,15 @@ class BatchGenWorker:
 			k_gpu = manager.copy_kv_to_tensor(global_idx)
 			t_extract = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
-			# Move to CPU - first copy GPU→CPU, then ensure contiguous
-			# Note: pin_memory() is only for CPU tensors and helps with fast DMA transfers
+			# Move GPU → CPU for Gloo transfer (Gloo supports CPU tensors, more memory efficient)
 			k_cpu = k_gpu.cpu().contiguous()
 			t_cpu = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→CPU copy: {(t_cpu-t_extract)*1000:.1f}ms")
-			# Send via PyTorch distributed (uses Gloo backend for CPU tensors, supports RDMA if available)
-			dist.send(tensor=k_cpu, dst=to_rank)
+			# Send via Gloo backend (supports CPU tensors and RDMA if available)
+			gloo_group = self._get_or_create_gloo_group()
+			dist.send(tensor=k_cpu, dst=to_rank, group=gloo_group)
 			t_send = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: Network send: {(t_send-t_cpu)*1000:.1f}ms")
+			logging.debug(f"[MIGRATION] Rank {self.rank}: Gloo send: {(t_send-t_cpu)*1000:.1f}ms")
 			# Free GPU pages
 			manager.free_pages_for_sequences([global_idx])
 			# Free host KV pages
@@ -1482,19 +1508,20 @@ class BatchGenWorker:
 				f"in {(t_total-t0)*1000:.1f}ms (freed host + GPU KV)"
 			)
 		elif self.rank == to_rank:
-			# ===== DEST RANK: Receive over network, write to host KV =====
+			# ===== DEST RANK: Receive over network via Gloo, write to host KV =====
 			t0 = time.perf_counter()
 			logging.info(
-				f"[MIGRATION] Rank {self.rank}: Receiving host→host {uuid[:8]}... "
+				f"[MIGRATION] Rank {self.rank}: Receiving {uuid[:8]}... "
 				f"(global_idx={global_idx}) from rank {from_rank} ({pages_needed} pages, "
 				f"{pages_needed * page_size} tokens)"
 			)
-			# Allocate CPU buffer for receiving
-			k_cpu = torch.empty(k_shape, dtype=kv_dtype, pin_memory=True)
-			# Receive via PyTorch distributed
-			dist.recv(tensor=k_cpu, src=from_rank)
+			# Allocate CPU buffer for receiving (Gloo supports CPU tensors)
+			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=True)
+			# Receive via Gloo backend
+			gloo_group = self._get_or_create_gloo_group()
+			dist.recv(tensor=k_cpu, src=from_rank, group=gloo_group)
 			t_recv = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: Network recv: {(t_recv-t0)*1000:.1f}ms")
+			logging.debug(f"[MIGRATION] Rank {self.rank}: Gloo recv: {(t_recv-t0)*1000:.1f}ms")
 			# Register and allocate host KV pages
 			worker_view = self.host_paged_kv_worker_view
 			tokens_needed = pages_needed * page_size
@@ -1502,11 +1529,9 @@ class BatchGenWorker:
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 			t_alloc = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
-
-			# Move CPU → GPU for offload
-			# k_cpu shape: [num_layers, num_pages, page_size=64, num_heads, head_dim]
+			# Move CPU → GPU for offload to host KV
 			k_gpu = k_cpu.to(self.device, non_blocking=True)
-			torch.cuda.synchronize()  # Wait for transfer
+			torch.cuda.synchronize()
 			t_gpu = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: CPU→GPU copy: {(t_gpu-t_alloc)*1000:.1f}ms")
 
