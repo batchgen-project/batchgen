@@ -1094,7 +1094,7 @@ class BatchGenWorker:
 		used_pages = 0
 		for uuid in valid_sequences:
 			seq = self.global_batch.get_sequence(uuid)
-			pages_needed = math.ceil(seq.kv_token_budget / 64)
+			pages_needed = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
 			used_pages += pages_needed
 
 		# Free pages = total - used by valid sequences
@@ -1256,7 +1256,7 @@ class BatchGenWorker:
 				# Pick smallest sequence (better packing)
 				uuid = min(candidate_sequences, key=lambda u: self.global_batch.get_sequence(u).kv_token_budget)
 				seq = self.global_batch.get_sequence(uuid)
-				pages_needed = math.ceil(seq.kv_token_budget / 64)
+				pages_needed = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
 
 				# Find dest node with most free space
 				dest_node_id = min(underutilized, key=lambda x: used_by_node[x[0]])[0]
@@ -1403,23 +1403,30 @@ class BatchGenWorker:
 			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - sequence not found")
 			return
 
-		global_idx = seq.global_idx
-		pages_needed = math.ceil(seq.kv_token_budget / 64)
+		# CRITICAL: Use GPU KV manager's config for tensor shape - this matches what
+		# copy_kv_to_tensor() returns and what copy_tensor_to_kv() expects.
+		# For MLA: num_k_heads=1 (latent attention), k_head_dim=576 (compressed KV)
+		# Do NOT use model_config.num_key_value_heads or hf_model_config.qk_rope_head_dim
+		# as those have different values!
+		gpu_kv_config = self.gpu_paged_kv_cache_manager.config
 		num_layers = self.model_config.num_hidden_layers
-		num_kv_heads = self.model_config.num_key_value_heads
-		qk_rope_head_dim = self.model_config.qk_rope_head_dim
-		kv_dtype = self.kv_dtype
+		num_k_heads = gpu_kv_config.num_k_heads  # For MLA: 1
+		k_head_dim = gpu_kv_config.k_head_dim    # For MLA: 576 (compressed KV)
+		kv_dtype = gpu_kv_config.kv_dtype
+		page_size = gpu_kv_config.page_size_tokens  # Should be 64
 
-		# Tensor shape for MLA: [num_layers, pages, 64 tokens/page, num_heads, head_dim]
-		# MLA doesn't have separate V tensor
-		k_shape = (num_layers, pages_needed, 64, num_kv_heads, qk_rope_head_dim)
+		global_idx = seq.global_idx
+		pages_needed = math.ceil(seq.kv_token_budget / page_size)
+
+		# Tensor shape matches GPU KV manager: [num_layers, pages, page_size, num_k_heads, k_head_dim]
+		k_shape = (num_layers, pages_needed, page_size, num_k_heads, k_head_dim)
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read from host KV, send directly over network =====
 			t0 = time.perf_counter()
 			logging.info(
 				f"[MIGRATION] Rank {self.rank}: Starting host→host migration of {uuid[:8]}... "
 				f"(global_idx={global_idx}) to rank {to_rank} ({pages_needed} pages, "
-				f"{pages_needed * 64} tokens)"
+				f"{pages_needed * page_size} tokens)"
 			)
 			# Allocate CPU buffer for KV data
 			# We'll load host KV → GPU → CPU buffer, then send
@@ -1429,7 +1436,7 @@ class BatchGenWorker:
 			if manager is None:
 				logging.error(f"Rank {self.rank}: GPU KV manager not initialized")
 				return
-			tokens_needed = pages_needed * 64
+			tokens_needed = pages_needed * page_size
 			# Allocate temporary GPU pages
 			manager.allocate_pages_for_sequences([global_idx], [tokens_needed])
 			# Load host KV → GPU
@@ -1473,7 +1480,7 @@ class BatchGenWorker:
 			logging.info(
 				f"[MIGRATION] Rank {self.rank}: Receiving host→host {uuid[:8]}... "
 				f"(global_idx={global_idx}) from rank {from_rank} ({pages_needed} pages, "
-				f"{pages_needed * 64} tokens)"
+				f"{pages_needed * page_size} tokens)"
 			)
 			# Allocate CPU buffer for receiving
 			k_cpu = torch.empty(k_shape, dtype=kv_dtype, pin_memory=True)
@@ -1483,7 +1490,7 @@ class BatchGenWorker:
 			logging.debug(f"[MIGRATION] Rank {self.rank}: Network recv: {(t_recv-t0)*1000:.1f}ms")
 			# Register and allocate host KV pages
 			worker_view = self.host_paged_kv_worker_view
-			tokens_needed = pages_needed * 64
+			tokens_needed = pages_needed * page_size
 			worker_view.register_sequences([global_idx])
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 			t_alloc = time.perf_counter()
@@ -1498,18 +1505,18 @@ class BatchGenWorker:
 
 			# Offload layer-by-layer to host using async_offload_layer_kv_to_host
 			# API expects: k_tensor [batch=1, seq_len, num_heads, head_dim]
-			# Our k_gpu is [num_layers, num_pages, page_size, num_heads, head_dim]
+			# Our k_gpu is [num_layers, num_pages, page_size, num_k_heads, k_head_dim]
 			# Reshape: num_pages * page_size = total tokens
-			seq_len = pages_needed * 64
+			seq_len = pages_needed * page_size
 			sequence_ids_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
 			sequence_lengths = [seq_len]
 
 			for layer_idx in range(num_layers):
-				# Extract layer [num_pages, page_size, num_heads, head_dim]
-				layer_k = k_gpu[layer_idx]  # [num_pages, page_size, num_heads, head_dim]
-				# Reshape to [seq_len, num_heads, head_dim] then add batch dim
-				layer_k_flat = layer_k.reshape(seq_len, num_kv_heads, qk_rope_head_dim)
-				layer_k_batch = layer_k_flat.unsqueeze(0)  # [1, seq_len, num_heads, head_dim]
+				# Extract layer [num_pages, page_size, num_k_heads, k_head_dim]
+				layer_k = k_gpu[layer_idx]  # [num_pages, page_size, num_k_heads, k_head_dim]
+				# Reshape to [seq_len, num_k_heads, k_head_dim] then add batch dim
+				layer_k_flat = layer_k.reshape(seq_len, num_k_heads, k_head_dim)
+				layer_k_batch = layer_k_flat.unsqueeze(0)  # [1, seq_len, num_k_heads, k_head_dim]
 
 				worker_view.async_offload_layer_kv_to_host(
 					layer_idx=layer_idx,
