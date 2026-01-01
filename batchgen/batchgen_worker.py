@@ -1261,10 +1261,12 @@ class BatchGenWorker:
 		# Greedy migration planning
 		migrations = []
 		used_by_node = {nid: s['num_used_pages'] for nid, s in node_stats.items()}
+		# Track sequences already selected for migration to avoid duplicates
+		migrated_uuids = set()
 
 		for src_node_id, _ in overloaded:
 			while used_by_node[src_node_id] > target_per_node and underutilized:
-				# Find sequences to migrate from src_node
+				# Find sequences to migrate from src_node (excluding already selected)
 				src_rank_base = src_node_id * NUM_GPUS_PER_NODE
 				candidate_sequences = []
 				for gpu_offset in range(NUM_GPUS_PER_NODE):
@@ -1272,17 +1274,25 @@ class BatchGenWorker:
 					if src_rank >= self.world_size:
 						break
 					for status in [SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD]:
-						candidate_sequences.extend(
-							self.global_batch.get_sequences_for_rank_with_status(src_rank, status)
-						)
+						for uuid in self.global_batch.get_sequences_for_rank_with_status(src_rank, status):
+							if uuid not in migrated_uuids:
+								candidate_sequences.append(uuid)
 
 				if not candidate_sequences:
+					if self.rank == 0:
+						logging.debug(f"[MIGRATION] No more candidates on node {src_node_id}, stopping")
 					break
 
 				# Pick smallest sequence (better packing)
 				uuid = min(candidate_sequences, key=lambda u: self.global_batch.get_sequence(u).kv_token_budget)
 				seq = self.global_batch.get_sequence(uuid)
 				pages_needed = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
+
+				if self.rank == 0:
+					logging.debug(
+						f"[MIGRATION] Selected seq {uuid[:8]}... from {len(candidate_sequences)} candidates "
+						f"(global_idx={seq.global_idx}, from_rank={seq.assigned_rank}, pages={pages_needed})"
+					)
 
 				# Find dest node with most free space
 				dest_node_id = min(underutilized, key=lambda x: used_by_node[x[0]])[0]
@@ -1308,16 +1318,34 @@ class BatchGenWorker:
 					'pages': pages_needed
 				})
 
+				# Mark as migrated to avoid selecting again
+				migrated_uuids.add(uuid)
+
 				# Update bookkeeping
 				used_by_node[src_node_id] -= pages_needed
 				used_by_node[dest_node_id] += pages_needed
 
-				# Remove from candidates
-				candidate_sequences.remove(uuid)
-
 				# Check if dest node is now balanced
 				if used_by_node[dest_node_id] >= target_per_node:
 					underutilized = [(nid, s) for nid, s in underutilized if nid != dest_node_id]
+
+		# Sanity check: ensure no duplicate UUIDs in migrations
+		migration_uuids = [m['uuid'] for m in migrations]
+		if len(migration_uuids) != len(set(migration_uuids)):
+			duplicate_uuids = [u for u in migration_uuids if migration_uuids.count(u) > 1]
+			logging.error(
+				f"[MIGRATION] BUG DETECTED: Duplicate sequences in migration plan! "
+				f"Duplicates: {[u[:8] for u in set(duplicate_uuids)]}"
+			)
+			# Remove duplicates, keep only first occurrence
+			seen = set()
+			unique_migrations = []
+			for mig in migrations:
+				if mig['uuid'] not in seen:
+					seen.add(mig['uuid'])
+					unique_migrations.append(mig)
+			migrations = unique_migrations
+			logging.warning(f"[MIGRATION] Removed duplicates, {len(migrations)} unique migrations remain")
 
 		if self.rank == 0:
 			if migrations:
@@ -1373,11 +1401,22 @@ class BatchGenWorker:
 
 			# Execute migration if participating, otherwise just sync tensor shape info
 			if my_migration is not None:
-				self._execute_single_kv_migration(
-					uuid=my_migration['uuid'],
-					from_rank=my_migration['from_rank'],
-					to_rank=my_migration['to_rank']
-				)
+				# Verify sequence exists and is in expected state before migration
+				seq = self.global_batch.get_sequence(my_migration['uuid'])
+				if seq is None:
+					logging.error(
+						f"[MIGRATION] Rank {self.rank}: SKIP migration - seq {my_migration['uuid'][:8]}... not found!"
+					)
+				else:
+					logging.debug(
+						f"[MIGRATION] Rank {self.rank}: Executing migration for {my_migration['uuid'][:8]}... "
+						f"(global_idx={seq.global_idx}, status={seq.status}, assigned_rank={seq.assigned_rank})"
+					)
+					self._execute_single_kv_migration(
+						uuid=my_migration['uuid'],
+						from_rank=my_migration['from_rank'],
+						to_rank=my_migration['to_rank']
+					)
 
 			# Barrier after each round to ensure all transfers in this round complete
 			dist.barrier()
