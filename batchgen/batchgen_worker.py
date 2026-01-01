@@ -2964,10 +2964,19 @@ class BatchGenWorker:
 		)
 		
 		# ============ Gather Results in Original Order ============
+		# NOTE: After migrations, sequences may have moved between ranks.
+		# Iterate over actual entries in _local_to_uuid_map (not sequential range)
+		# to handle cases where local indices were freed or added during migration.
 		res_with_idx = []
-		for local_idx in range(self.num_local_queries):
-			uuid = self._local_to_uuid_map[local_idx]
-			global_idx = self.global_batch.get_sequence(uuid).global_idx
+		for local_idx, uuid in self._local_to_uuid_map.items():
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch during result gathering")
+				continue
+			global_idx = seq.global_idx
+			if local_idx not in self.query_book:
+				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
+				continue
 			decoded_tokens = self.query_book[local_idx].decoded_tokens
 			res_with_idx.append((global_idx, decoded_tokens))
 		
