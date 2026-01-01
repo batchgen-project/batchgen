@@ -1546,6 +1546,18 @@ class BatchGenWorker:
 			manager.free_pages_for_sequences([global_idx])
 			# Free host KV pages
 			worker_view.release_sequence_pages([global_idx])
+			# Also send query_book data (input_ids, attention_mask, decoded_tokens)
+			local_idx = self._uuid_to_local_map.get(uuid)
+			if local_idx is not None and local_idx in self.query_book:
+				qb = self.query_book[local_idx]
+				# Send tensors via Gloo
+				dist.send(tensor=qb.encoded["input_ids"].cpu().contiguous(), dst=to_rank, group=gloo_group)
+				dist.send(tensor=qb.encoded["attention_mask"].cpu().contiguous(), dst=to_rank, group=gloo_group)
+				dist.send(tensor=qb.decoded_tokens.cpu().contiguous(), dst=to_rank, group=gloo_group)
+				logging.debug(f"[MIGRATION] Rank {self.rank}: Sent query_book for {uuid[:8]}...")
+			else:
+				logging.warning(f"[MIGRATION] Rank {self.rank}: No query_book entry for {uuid[:8]}... (local_idx={local_idx})")
+
 			t_total = time.perf_counter()
 			logging.debug(
 				f"[MIGRATION] Rank {self.rank}: Sent {uuid[:8]}... "
@@ -1609,6 +1621,33 @@ class BatchGenWorker:
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→Host offload all layers: {(t_store-t_gpu)*1000:.1f}ms")
 			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
 			# It will be freed automatically when it goes out of scope
+
+			# Receive query_book data (input_ids, attention_mask, decoded_tokens)
+			# Get tensor shapes from the Sequence object (all ranks have seq metadata)
+			input_ids_shape = seq.input_ids.shape
+			attention_mask_shape = seq.attention_mask.shape
+			decoded_tokens_shape = seq.decoded_tokens.shape
+
+			input_ids_recv = torch.empty(input_ids_shape, dtype=seq.input_ids.dtype, device="cpu")
+			attention_mask_recv = torch.empty(attention_mask_shape, dtype=seq.attention_mask.dtype, device="cpu")
+			decoded_tokens_recv = torch.empty(decoded_tokens_shape, dtype=seq.decoded_tokens.dtype, device="cpu")
+
+			dist.recv(tensor=input_ids_recv, src=from_rank, group=gloo_group)
+			dist.recv(tensor=attention_mask_recv, src=from_rank, group=gloo_group)
+			dist.recv(tensor=decoded_tokens_recv, src=from_rank, group=gloo_group)
+
+			# Store in pending dict for later query_book creation
+			if not hasattr(self, '_pending_migrated_query_book'):
+				self._pending_migrated_query_book = {}
+			self._pending_migrated_query_book[uuid] = {
+				'text': seq.text,
+				'input_ids': input_ids_recv,
+				'attention_mask': attention_mask_recv,
+				'decoded_tokens': decoded_tokens_recv,
+				'kv_token_budget': seq.kv_token_budget,
+			}
+			logging.debug(f"[MIGRATION] Rank {self.rank}: Recvd query_book for {uuid[:8]}...")
+
 			t_total = time.perf_counter()
 			logging.debug(
 				f"[MIGRATION] Rank {self.rank}: Recvd {uuid[:8]}... "
@@ -1694,6 +1733,8 @@ class BatchGenWorker:
 				if local_idx is not None:
 					self._local_to_uuid_map.pop(local_idx, None)
 					self._sequences_with_gpu_kv.discard(uuid)
+					# Remove query_book entry
+					self.query_book.pop(local_idx, None)
 					# Add freed index to free list for O(1) reuse
 					self._free_local_indices.add(local_idx)
 					logging.debug(f"Rank {self.rank}: Removed {uuid[:8]}... from local mappings (freed local_idx={local_idx})")
@@ -1710,6 +1751,23 @@ class BatchGenWorker:
 				self._uuid_to_local_map[uuid] = new_local_idx
 				self._local_to_uuid_map[new_local_idx] = uuid
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
+
+				# Create query_book entry from pending migrated data
+				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
+					pending = self._pending_migrated_query_book.pop(uuid)
+					self.query_book[new_local_idx] = query(
+						text=pending['text'],
+						encoded={
+							"input_ids": pending['input_ids'],
+							"attention_mask": pending['attention_mask'],
+						},
+						decoded_tokens=pending['decoded_tokens'],
+						kv_token_budget=pending['kv_token_budget'],
+					)
+					logging.debug(f"Rank {self.rank}: Created query_book[{new_local_idx}] for migrated {uuid[:8]}...")
+				else:
+					logging.error(f"Rank {self.rank}: No pending query_book data for migrated {uuid[:8]}...")
+
 				logging.debug(f"Rank {self.rank}: Added {uuid[:8]}... to local mappings (new local_idx={new_local_idx})")
 
 		# BARRIER 2: Ensure all local mapping updates are complete across all ranks
