@@ -3016,8 +3016,8 @@ class BatchGenWorker:
 		dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
 		max_num_seq = int(num_seq_per_rank.max().item())
 		
-		# Initialize GPU KV manager with fixed size if not already done
-		if self.gpu_paged_kv_cache_manager is None:
+		# Initialize GPU KV manager with fixed size if not already done or if destroyed
+		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
 			self._initialize_gpu_kv_manager_fixed_size()
 		
 		if self.world_size <= 8:
