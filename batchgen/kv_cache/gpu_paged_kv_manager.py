@@ -629,8 +629,8 @@ class GPUPagedKVCacheManager:
 			if self._v_cache is not None
 			else 0
 		)
-		logging.info(
-			"GPUPagedKVCacheManager ready (device=%s, layers=%d, pages=%d, v_cache=%s, total_bytes=%d (%fGB))",
+		logging.debug(
+			"GPUPagedKVCacheManager ready (device=%s, layers=%d, pages=%d, v_cache=%s, total_bytes=%d (%.2fGB))",
 			self.device,
 			self.config.num_layers,
 			self.config.num_pages,

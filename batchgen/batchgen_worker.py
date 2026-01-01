@@ -418,12 +418,12 @@ class BatchGenWorker:
 		)
 		manager.initialize()
 		self._bind_gpu_paged_kv_manager(manager)
-		
-		logging.info(
-			f"Rank {self.rank}: Initialized fixed-size GPU KV manager: "
-			f"{self.gpu_kv_cache_size_gb}GB, {config.num_pages} pages"
-		)
-		
+
+		if self.rank == 0:
+			logging.info(
+				f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb}GB, {config.num_pages} pages"
+			)
+
 		return manager
 		
 	def set_ignore_eos(self, ignore_eos: bool) -> None:
@@ -563,8 +563,8 @@ class BatchGenWorker:
 		
 		if all_active_global_ids:
 			manager.rebuild_page_table(all_active_global_ids)
-		
-		logging.info(
+
+		logging.debug(
 			f"Rank {self.rank}: Allocated GPU KV for {len(global_ids)} sequences"
 		)
 		return True
@@ -1264,6 +1264,10 @@ class BatchGenWorker:
 		# Track sequences already selected for migration to avoid duplicates
 		migrated_uuids = set()
 
+		# CRITICAL: Reset dest_rank_counter at start of each planning round
+		# to ensure deterministic behavior across all ranks
+		self._dest_rank_counter = {}
+
 		for src_node_id, _ in overloaded:
 			while used_by_node[src_node_id] > target_per_node and underutilized:
 				# Find sequences to migrate from src_node (excluding already selected)
@@ -1283,8 +1287,17 @@ class BatchGenWorker:
 						logging.debug(f"[MIGRATION] No more candidates on node {src_node_id}, stopping")
 					break
 
-				# Pick smallest sequence (better packing)
-				uuid = min(candidate_sequences, key=lambda u: self.global_batch.get_sequence(u).kv_token_budget)
+				# CRITICAL: Sort candidates deterministically before selection
+				# Set operations (get_sequences_for_rank_with_status) don't preserve order,
+				# so we must sort to ensure all ranks pick the same sequence
+				candidate_sequences.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
+
+				# Pick smallest sequence (better packing), with global_idx as tie-breaker
+				# This ensures deterministic selection across all ranks
+				uuid = min(candidate_sequences, key=lambda u: (
+					self.global_batch.get_sequence(u).kv_token_budget,
+					self.global_batch.get_sequence(u).global_idx  # Tie-breaker
+				))
 				seq = self.global_batch.get_sequence(uuid)
 				pages_needed = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
 
@@ -1294,13 +1307,13 @@ class BatchGenWorker:
 						f"(global_idx={seq.global_idx}, from_rank={seq.assigned_rank}, pages={pages_needed})"
 					)
 
-				# Find dest node with most free space
-				dest_node_id = min(underutilized, key=lambda x: used_by_node[x[0]])[0]
+				# Find dest node with most free space (lowest used pages)
+				# Use node_id as tie-breaker for determinism
+				dest_node_id = min(underutilized, key=lambda x: (used_by_node[x[0]], x[0]))[0]
 
 				# Distribute across ranks on dest node for load balancing
 				# Use round-robin based on migration count to this node
-				if not hasattr(self, '_dest_rank_counter'):
-					self._dest_rank_counter = {}
+				# (counter is reset at start of each planning round)
 				if dest_node_id not in self._dest_rank_counter:
 					self._dest_rank_counter[dest_node_id] = 0
 
@@ -2126,10 +2139,11 @@ class BatchGenWorker:
 				prefill_batch.append(uuid)
 				node_pages_used[seq_node] += req_pages
 		
-		logging.info(
-			f"Rank {self.rank}: Prefill batch: {len(prefill_batch)} sequences, "
-			f"per-node pages used: {node_pages_used}"
-		)
+		if self.rank == 0:
+			logging.info(
+				f"[PREFILL] Selected {len(prefill_batch)} sequences, "
+				f"per-node pages: {node_pages_used}"
+			)
 
 		return prefill_batch
 
@@ -2138,10 +2152,10 @@ class BatchGenWorker:
 		if not uuids:
 			return
 
-		logging.info(
-			f"[WATERMARK] Rank {self.rank}: Putting {len(uuids)} sequences ON_HOLD "
-			f"(freeing GPU KV, keeping host KV)"
-		)
+		if self.rank == 0:
+			logging.info(
+				f"[WATERMARK] Putting {len(uuids)} sequences ON_HOLD"
+			)
 
 		# Free GPU pages for these sequences
 		# CRITICAL FIX: GPU KV manager uses global_idx (not local_idx) as sequence ID
@@ -2214,12 +2228,12 @@ class BatchGenWorker:
 			if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
 				decode_batch.append(uuid)
 				rank_pages_used[assigned_rank] += req_pages
-		
-		logging.info(
-			f"Rank {self.rank}: Prepared decode batch: {len(decode_batch)} sequences, "
-			f"pages per rank: {rank_pages_used}"
-		)
-		
+
+		if self.rank == 0:
+			logging.info(
+				f"[DECODE] Prepared batch: {len(decode_batch)} sequences"
+			)
+
 		return decode_batch
 
 	def _check_and_extend_page_buffer(
@@ -2942,26 +2956,25 @@ class BatchGenWorker:
 				# check if there are queued sequences waiting for prefill.
 				# If so, break out of inner decode loop to allow outer loop to enter prefill.
 				if self.global_batch.has_queueing():
-					logging.info(
-						f"Rank {self.rank}: Breaking decode loop - "
-						f"{len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))} "
-						f"sequences waiting for prefill"
-					)
+					if self.rank == 0:
+						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
+						logging.info(f"[DECODE] Breaking for prefill - {num_queued} sequences queued")
 					break  # Exit inner decode while loop, outer loop will check has_queueing()
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
 		phase_switching_time = config_prefill_time + config_decode_time
-		
-		logging.info(
-			f"Rank {self.rank} Generation completed:\n"
-			f"  Prefill total time: {prefill_time:.1f}s\n"
-			f"  Decoding total time: {decoding_time:.1f}s\n"
-			f"  Generation total time: {generation_time:.1f}s\n"
-			f"  Phase switching time: {phase_switching_time:.1f}s\n"
-			f"  Config prefill time: {config_prefill_time:.1f}s\n"
-			f"  Config decoding time: {config_decode_time:.1f}s"
-		)
+
+		if self.rank == 0:
+			logging.info(
+				f"Generation completed:\n"
+				f"  Prefill total time: {prefill_time:.1f}s\n"
+				f"  Decoding total time: {decoding_time:.1f}s\n"
+				f"  Generation total time: {generation_time:.1f}s\n"
+				f"  Phase switching time: {phase_switching_time:.1f}s\n"
+				f"  Config prefill time: {config_prefill_time:.1f}s\n"
+				f"  Config decoding time: {config_decode_time:.1f}s"
+			)
 		
 		# ============ Gather Results in Original Order ============
 		# NOTE: After migrations, sequences may have moved between ranks.
@@ -3178,12 +3191,13 @@ class BatchGenWorker:
 			decode_batch.append(uuid)
 			rank_counts[assigned_rank] += 1
 			total_pages_needed += pages
-		
-		logging.info(
-			f"Rank {self.rank}: Prepared decode batch (two-page buffer): "
-			f"{len(decode_batch)} sequences, {total_pages_needed} pages"
-		)
-		
+
+		if self.rank == 0:
+			logging.info(
+				f"[DECODE] Prepared batch (two-page): {len(decode_batch)} sequences, "
+				f"{total_pages_needed} pages"
+			)
+
 		return decode_batch
 
 	def _try_load_new_sequences_at_boundary_v2(
@@ -3270,8 +3284,8 @@ class BatchGenWorker:
 				self.global_batch.get_sequence(uuid).global_idx
 				for uuid in my_uuids
 			]
-			
-			logging.info(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
+
+			logging.debug(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
 			
 			# NOTE: GPU KV pages should already be released by caller
 			# Do NOT call _release_gpu_kv_pages here to avoid double-free
@@ -3331,8 +3345,9 @@ class BatchGenWorker:
 			attention_masks,
 			self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size,
 		)
-		logging.info(f"Number of prefill micro batches: {num_prefill_micro_batches}")
-		
+		if self.rank == 0:
+			logging.info(f"Number of prefill micro batches: {num_prefill_micro_batches}")
+
 		cur_batch_start = 0
 		output_tokens = []
 		
@@ -5718,7 +5733,8 @@ class BatchGenWorker:
 	def init_nvshmem(self):
 		"""Initialize NVSHMEM only once per batch, not per decode iteration."""
 		if BATCHGEN_ENABLE_ALL_TO_ALL != "1" or nvshmem_init is None:
-			logging.info("Skipping NVSHMEM initialization; BATCHGEN_ENABLE_ALL_TO_ALL is disabled or nvshmem_init missing")
+			if self.rank == 0:
+				logging.debug("Skipping NVSHMEM initialization; BATCHGEN_ENABLE_ALL_TO_ALL is disabled")
 			return
 		
 		# Check if already initialized this run

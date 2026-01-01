@@ -89,7 +89,8 @@ class PrefillExecutor():
 			requests.position_ids, prefill_global_batch_size
 		)
 		uuid_batches = [requests.sequence_uuids[i * prefill_global_batch_size:(i + 1) * prefill_global_batch_size] for i in range(num_prefill_micro_batches)]
-		logging.info(f"Rank {self.rank}: Number of prefill micro batches: {num_prefill_micro_batches}")
+		if self.rank == 0:
+			logging.info(f"[PREFILL] Micro batches: {num_prefill_micro_batches}")
 		all_tokens = []
 		# all_logits = [] if self.engine_config.Prefill_Config.return_logits else None
 		with torch.inference_mode():

@@ -134,35 +134,30 @@ class DeepseekV3ParallelStrategyManager:
 
 	def configure_prefill(self):
 		"""
-			Configure a model skeletion for prefill pure dp 
+			Configure a model skeletion for prefill pure dp
 			and the corresponding weight copy task.
 		"""
 		import time
 		start_time = time.perf_counter()
-		logging.info("Starting configure_prefill")
-		
+		timings = {}
+
 		# Step 1: Set phase
-		step_start = time.perf_counter()
 		self.hf_model_config.phase = "prefill"
-		logging.info(f"Set phase to prefill took {time.perf_counter() - step_start:.4f}s")
-		
+
 		# Step 2: Initialize model
 		step_start = time.perf_counter()
 		self.model = DeepseekV3ForCausalLM(self.hf_model_config)
-		logging.info(f"DeepseekV3ForCausalLM initialization took {time.perf_counter() - step_start:.4f}s")
-		
+		timings['model_init'] = time.perf_counter() - step_start
+
 		# Step 3: Initialize data structures
-		step_start = time.perf_counter()
 		self.state_dict_name_map = {}
 		self.weight_copy_task = {}
 		self.weight_copy_task["attn"] = []
 		self.weight_copy_task["routed_expert"] = []
 		self.weight_copy_task["shared_expert"] = []
-		logging.info(f"Initialize data structures took {time.perf_counter() - step_start:.4f}s")
-		
+
 		# Step 4: Build weight copy task mappings
 		step_start = time.perf_counter()
-		loop_start = time.perf_counter()
 		for layer_idx in range(self.model_config.num_hidden_layers):
 			# Attention parameters
 			for name, _ in self.model.model.layers[
@@ -224,53 +219,56 @@ class DeepseekV3ParallelStrategyManager:
 						+ "_"
 						+ str(expert_idx)
 					)
-		
-		logging.info(f"Build weight copy task mappings (loop over {self.model_config.num_hidden_layers} layers) took {time.perf_counter() - loop_start:.4f}s")
-		
+		timings['weight_mappings'] = time.perf_counter() - step_start
+
 		# Step 5: Extract dequantize scale
 		step_start = time.perf_counter()
 		self._extract_dequantize_scale()
-		logging.info(f"_extract_dequantize_scale took {time.perf_counter() - step_start:.4f}s")
-		
+		timings['dequantize'] = time.perf_counter() - step_start
+
 		# Step 6: Load model skeleton
 		step_start = time.perf_counter()
 		self._load_model_skeleton()
-		logging.info(f"_load_model_skeleton took {time.perf_counter() - step_start:.4f}s")
-		
+		timings['skeleton'] = time.perf_counter() - step_start
+
 		# Step 7: Config attention module
 		step_start = time.perf_counter()
 		self._config_attn_module()
-		logging.info(f"_config_attn_module took {time.perf_counter() - step_start:.4f}s")
-		
+		timings['attn'] = time.perf_counter() - step_start
+
 		# Step 8: Config expert module
 		step_start = time.perf_counter()
 		self._config_expert_module()
-		logging.info(f"_config_expert_module took {time.perf_counter() - step_start:.4f}s")
-		
+		timings['expert'] = time.perf_counter() - step_start
+
 		# Step 9: Config lm_head hook
-		step_start = time.perf_counter()
 		self._config_lm_head_hook()
-		logging.info(f"_config_lm_head_hook took {time.perf_counter() - step_start:.4f}s")
-		
+
 		# Step 10: Set model to eval mode
-		step_start = time.perf_counter()
 		self.model.eval()
-		logging.info(f"model.eval() took {time.perf_counter() - step_start:.4f}s")
-		
+
 		# Step 11: Move model to device
 		step_start = time.perf_counter()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
-		logging.info(f"model.to(device) took {time.perf_counter() - step_start:.4f}s")
-		
+		timings['to_device'] = time.perf_counter() - step_start
+
 		total_time = time.perf_counter() - start_time
-		logging.info(f"configure_prefill completed in {total_time:.4f}s")
-		
+
+		# Log summary (rank 0 only)
+		if self.rank == 0:
+			logging.info(
+				f"[PREFILL] Model configured in {total_time:.2f}s "
+				f"(init={timings['model_init']:.1f}s, skeleton={timings['skeleton']:.1f}s, "
+				f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
+			)
+
 		return self.model, self.weight_copy_task
 	
 	def _warmup(self):
 		# Currently only need to warmup the MoEGate
 		torch._dynamo.config.inline_inbuilt_nn_modules = True
-		logging.info("Start torch compile warmup")
+		if self.rank == 0:
+			logging.info("Start torch compile warmup")
 		# from .modeling_deepseek_v3 import warmup_compiled_moe_gate
 		# device = self.engine_config.Basic_Config.device_torch
 		# with torch.inference_mode():
@@ -503,16 +501,12 @@ class DeepseekV3ParallelStrategyManager:
 		env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
 		if env_max_bsz is not None:
 			max_rank_bsz = int(env_max_bsz)
-			logging.info(
-				f"Rank {self.rank}: _init_decoding_padding_bsz - Using BATCHGEN_MAX_RANK_BSZ={max_rank_bsz} "
-				f"(padding_bsz was {padding_bsz})"
-			)
+			if self.rank == 0:
+				logging.info(f"[DECODE] Padding batch size: {max_rank_bsz} (from BATCHGEN_MAX_RANK_BSZ)")
 		else:
 			max_rank_bsz = padding_bsz
-			logging.info(
-				f"Rank {self.rank}: _init_decoding_padding_bsz - Using padding_bsz={padding_bsz} "
-				f"(BATCHGEN_MAX_RANK_BSZ not set)"
-			)
+			if self.rank == 0:
+				logging.info(f"[DECODE] Padding batch size: {padding_bsz}")
 		
 		for layer_idx in range(
 			self.hf_model_config.first_k_dense_replace,
