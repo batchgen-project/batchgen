@@ -1546,7 +1546,8 @@ class BatchGenWorker:
 			# Our k_gpu is [num_layers, num_pages, page_size, num_k_heads, k_head_dim]
 			# Reshape: num_pages * page_size = total tokens
 			seq_len = pages_needed * page_size
-			sequence_ids_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
+			# API expects sequence_ids as Python list, not tensor
+			sequence_ids_list = [global_idx]
 			sequence_lengths = [seq_len]
 
 			for layer_idx in range(num_layers):
@@ -1558,7 +1559,7 @@ class BatchGenWorker:
 
 				worker_view.async_offload_layer_kv_to_host(
 					layer_idx=layer_idx,
-					sequence_ids=sequence_ids_tensor,
+					sequence_ids=sequence_ids_list,
 					k_tensor=layer_k_batch,
 					v_tensor=None,  # MLA has no V
 					sequence_lengths=sequence_lengths,
