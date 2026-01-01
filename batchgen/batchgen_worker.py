@@ -3463,11 +3463,11 @@ class BatchGenWorker:
 			# wasn't updated to include them in the active batch
 			if batch and gpu_manager is not None and gpu_manager.is_initialized:
 				self._rebuild_page_table_for_batch(batch, gpu_manager)
-		
+
 		if not decode_uuids:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
-			return decode_uuids, batch, None, [], [], [], timing
-		
+			return decode_uuids, batch, None, [], [], [], timing, False
+
 		# ========== POST-FINALIZE VALIDATION (debug only) ==========
 		# After sync+finalize, decode_uuids should be identical across all ranks.
 		# This is a sanity check - if we see desync here, there's a bug in our logic.
@@ -3623,13 +3623,13 @@ class BatchGenWorker:
 		
 		decode_uuids = active_uuids
 		batch = self._get_local_indices_for_uuids(decode_uuids)
-		
+
 		timing.process_ms = (time.perf_counter() - t0) * 1000
-		
+
 		if not decode_uuids:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
-			return decode_uuids, batch, None, [], [], [], timing
-		
+			return decode_uuids, batch, None, [], [], [], timing, False
+
 		# ========== CHECK/EXTEND PAGE BUFFERS (DETERMINISTIC) ==========
 		t0 = time.perf_counter()
 		# CRITICAL: Use gathered 'assigned_rank' to ensure all ranks agree
@@ -4083,7 +4083,7 @@ class BatchGenWorker:
 		total_boundary_ms = 0.0
 		total_forward_ms = 0.0
 		num_boundaries = 0
-		initial_batch_size = len(decode_uuids)
+		global_batch_size = len(self.global_batch)
 		
 		# Main decode loop
 		while decode_uuids:
@@ -4143,7 +4143,7 @@ class BatchGenWorker:
 							f"rebuild={timing.rebuild_ms:.1f}, "
 							f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
 							f"barrier={timing.barrier_ms:.1f}ms | "
-							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{initial_batch_size}, "
+							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{global_batch_size}, "
 							f"onhold={num_onhold}, prefilled={num_prefilled}, "
 							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
 						)
@@ -4151,7 +4151,7 @@ class BatchGenWorker:
 						# Minimal log without timing details
 						logging.info(
 							f"[Boundary {num_boundaries}] iter={iteration} | "
-							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{initial_batch_size}, "
+							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{global_batch_size}, "
 							f"onhold={num_onhold}, prefilled={num_prefilled}, "
 							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
 						)
