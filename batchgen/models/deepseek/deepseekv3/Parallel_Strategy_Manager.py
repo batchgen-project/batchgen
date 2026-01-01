@@ -987,12 +987,10 @@ class DeepseekV3ParallelStrategyManager:
 			if key in self.skeleton_state_dict:
 				dequant_key = key + "_scale_inv"
 				if dequant_key in self.dequant_scale:
-					logging.info(f"Dequantizing and loading parameter: {key}")
 					param.data = deepseek_v3_dequantization(
 						self.skeleton_state_dict[key],
 						self.dequant_scale[dequant_key],
 					)
-					logging.info(f"Parameter {key} device: {param.data.device}, dtype: {param.data.dtype}")
 				else:
 					param.data = self.skeleton_state_dict[key]
 

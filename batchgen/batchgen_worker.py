@@ -1067,13 +1067,13 @@ class BatchGenWorker:
 			The Gloo process group for CPU tensor operations.
 		"""
 		if not hasattr(self, '_gloo_migration_group') or self._gloo_migration_group is None:
-			logging.info(f"Rank {self.rank}: Creating Gloo process group for CPU migrations")
+			logging.debug(f"Rank {self.rank}: Creating Gloo process group for CPU migrations")
 			# Create a new group with Gloo backend including all ranks
 			self._gloo_migration_group = dist.new_group(
 				ranks=list(range(self.world_size)),
 				backend="gloo"
 			)
-			logging.info(f"Rank {self.rank}: Gloo process group created successfully")
+			logging.debug(f"Rank {self.rank}: Gloo process group created")
 		return self._gloo_migration_group
 
 	def _destroy_gloo_group(self):
@@ -1494,10 +1494,9 @@ class BatchGenWorker:
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read from host KV, send directly over network =====
 			t0 = time.perf_counter()
-			logging.info(
-				f"[MIGRATION] Rank {self.rank}: Starting host→host migration of {uuid[:8]}... "
-				f"(global_idx={global_idx}) to rank {to_rank} ({pages_needed} pages, "
-				f"{pages_needed * page_size} tokens)"
+			logging.debug(
+				f"[MIGRATION] Rank {self.rank}: Send {uuid[:8]}... → rank {to_rank} "
+				f"({pages_needed} pages)"
 			)
 			# Allocate CPU buffer for KV data
 			# We'll load host KV → GPU → CPU buffer, then send
@@ -1548,17 +1547,16 @@ class BatchGenWorker:
 			# Free host KV pages
 			worker_view.release_sequence_pages([global_idx])
 			t_total = time.perf_counter()
-			logging.info(
-				f"[MIGRATION] Rank {self.rank}: Send completed for {uuid[:8]}... "
-				f"in {(t_total-t0)*1000:.1f}ms (freed host + GPU KV)"
+			logging.debug(
+				f"[MIGRATION] Rank {self.rank}: Sent {uuid[:8]}... "
+				f"in {(t_total-t0)*1000:.1f}ms"
 			)
 		elif self.rank == to_rank:
 			# ===== DEST RANK: Receive over network via Gloo, write to host KV =====
 			t0 = time.perf_counter()
-			logging.info(
-				f"[MIGRATION] Rank {self.rank}: Receiving {uuid[:8]}... "
-				f"(global_idx={global_idx}) from rank {from_rank} ({pages_needed} pages, "
-				f"{pages_needed * page_size} tokens)"
+			logging.debug(
+				f"[MIGRATION] Rank {self.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
+				f"({pages_needed} pages)"
 			)
 			# Allocate CPU buffer for receiving (Gloo supports CPU tensors)
 			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=True)
@@ -1612,9 +1610,9 @@ class BatchGenWorker:
 			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
 			# It will be freed automatically when it goes out of scope
 			t_total = time.perf_counter()
-			logging.info(
-				f"[MIGRATION] Rank {self.rank}: Recv completed for {uuid[:8]}... "
-				f"in {(t_total-t0)*1000:.1f}ms (stored to host KV)"
+			logging.debug(
+				f"[MIGRATION] Rank {self.rank}: Recvd {uuid[:8]}... "
+				f"in {(t_total-t0)*1000:.1f}ms"
 			)
 		# No barrier here - will be done in _rebalance_host_kv after all migrations
 
@@ -2708,22 +2706,34 @@ class BatchGenWorker:
 						raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 
 		iteration = 0
-		
+
 		# Continues until ALL sequences in the global batch are COMPLETED
 		while not self.global_batch.all_completed():
 			iteration += 1
-			logging.info(f"--- Iteration {iteration} ---")
+			if self.rank == 0:
+				logging.info(f"--- Iteration {iteration} ---")
 			
 			# =================================================================
 			# 1. PREFILL PHASE: Fill Host KV Cache
 			# =================================================================
 			if self.global_batch.has_queueing():
 				dist.barrier()
-				
+
+				# STEP 0: Rebalance host KV BEFORE batch selection
+				# This ensures batch selection uses accurate post-migration capacities
+				if ENABLE_WATERMARK_PREFILL:
+					rebalance_start = time.perf_counter()
+					self._rebalance_host_kv()
+					if self.rank == 0:
+						logging.info(
+							f"[PREFILL] Host KV rebalancing: {(time.perf_counter() - rebalance_start)*1000:.1f}ms"
+						)
+
 				prefill_uuids = self._prepare_prefill_batch()
 				
 				if prefill_uuids:
-					logging.info(f"Rank {self.rank}: Entering PREFILL for {len(prefill_uuids)} sequences")
+					if self.rank == 0:
+						logging.info(f"[PREFILL] Starting for {len(prefill_uuids)} sequences")
 					self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL)
 
 					# A. Config Prefill (this adds new sequences to _uuid_to_local_map)
@@ -2926,20 +2936,10 @@ class BatchGenWorker:
 				f"[PREFILL] Configuring prefill phase for {len(prefill_uuids)} sequences"
 			)
 
-		# STEP 1: Rebalance existing PREFILLED/ON_HOLD sequences across nodes
-		# This migrates sequences to balance host KV utilization before adding new sequences
-		if ENABLE_WATERMARK_PREFILL:
-			if self.rank == 0:
-				logging.info("[PREFILL] Running host KV rebalancing before prefill...")
-			rebalance_start = time.perf_counter()
-			self._rebalance_host_kv()
-			rebalance_time = time.perf_counter() - rebalance_start
-			if self.rank == 0:
-				logging.info(
-					f"[PREFILL] Rebalancing completed in {rebalance_time*1000:.1f}ms"
-				)
+		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
+		# to ensure batch selection uses accurate post-migration capacities.
 
-		# STEP 2: Configure model for prefill
+		# STEP 1: Configure model for prefill
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
 
@@ -2982,8 +2982,8 @@ class BatchGenWorker:
 				global_sequence_ids.append(seq.global_idx)
 				sequence_tokens.append(seq.kv_token_budget)
 
-			logging.info(
-				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV: {global_sequence_ids}"
+			logging.debug(
+				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV"
 			)
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
@@ -2992,18 +2992,20 @@ class BatchGenWorker:
 			)
 
 			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
-			logging.info(f"Rank {self.rank}: Host KV Stats after allocation: {kv_stats}")
-		
-		logging.info(f"Rank {self.rank}: _config_prefill_for_batch completed in {time.perf_counter() - start_time:.4f}s")
+			if self.rank == 0:
+				logging.info(f"[PREFILL] Host KV allocated: {kv_stats.num_used_pages}/{kv_stats.num_total_pages} pages")
+
+		if self.rank == 0:
+			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
 
 	def _config_decoding_for_batch(
-		self, 
-		decode_uuids: List[str], 
+		self,
+		decode_uuids: List[str],
 		local_decode_indices: List[int],
 		comm=None
 	) -> None:
 		"""Configure decoding phase with pre-sized GPU KV manager."""
-		logging.info(f"Rank {self.rank}: Starting _config_decoding_for_batch")
+		start_time = time.perf_counter()
 		
 		self.deep_free_model_memory()
 		self.init_nvshmem()
@@ -3059,7 +3061,8 @@ class BatchGenWorker:
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_decoding_buffer()
 		
-		logging.info(f"Rank {self.rank}: _config_decoding_for_batch completed")
+		if self.rank == 0:
+			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
 
 	def _prepare_decode_batch_two_page_buffer(self) -> List[str]:
 		"""
