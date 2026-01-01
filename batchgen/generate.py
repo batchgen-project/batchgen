@@ -129,16 +129,16 @@ class Generate():
 			# Todo: 
 			self._config_decoding(0)
 
-			# Log used memory before decoding
+			# Log used memory before decoding (debug level to reduce noise)
 			if self.rank == 0:
 				free_memory, total_memory = torch.cuda.mem_get_info()
 				free_memory = free_memory / 1024 / 1024 / 1024
 				total_memory = total_memory / 1024 / 1024 / 1024
-				logging.info(
-					f"Rank: {self.rank} Device torch memory usage before decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB / {total_memory} GB"
+				logging.debug(
+					f"Rank: {self.rank} Device torch memory usage before decoding: {torch.cuda.memory_allocated(self.torch_device) / (1024**3):.2f} GB / {total_memory:.2f} GB"
 				)
-				logging.info(
-					f"Rank: {self.rank} Device torch free memory before decoding: {free_memory} GB / {total_memory} GB"
+				logging.debug(
+					f"Rank: {self.rank} Device torch free memory before decoding: {free_memory:.2f} GB / {total_memory:.2f} GB"
 				)
 			dist.barrier()
 			torch.cuda.empty_cache()

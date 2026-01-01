@@ -1703,17 +1703,21 @@ class BatchGenWorker:
 
 		# STEP 2: Update sequence ownership metadata and local mappings
 		# CRITICAL: All ranks must update global_batch consistently
+		# MUST use assign_rank() to update both seq.assigned_rank AND _rank_index
 		for mig in migrations:
-			seq = self.global_batch.get_sequence(mig['uuid'])
-			if seq is None:
-				logging.error(f"Rank {self.rank}: Cannot update ownership for {mig['uuid'][:8]}... - sequence not found")
-				continue
-
-			# Use from_rank from migration plan, not seq.assigned_rank (could be stale)
+			uuid = mig['uuid']
 			new_rank = mig['to_rank']
 
-			# Update assigned_rank in sequence (all ranks do this for consistency)
-			seq.assigned_rank = new_rank
+			# CRITICAL FIX: Use assign_rank() instead of direct assignment!
+			# Direct assignment (seq.assigned_rank = x) only updates the attribute.
+			# assign_rank() also updates the _rank_index which is used by
+			# get_sequences_for_rank_with_status() - without this, the index
+			# becomes inconsistent and causes cross-rank state divergence.
+			try:
+				self.global_batch.assign_rank(uuid, new_rank)
+			except KeyError:
+				logging.error(f"Rank {self.rank}: Cannot update ownership for {uuid[:8]}... - sequence not found")
+				continue
 
 			# IMPORTANT: Don't change sequence status - it remains PREFILLED or ON_HOLD
 			# The sequence is still valid, just owned by a different rank now

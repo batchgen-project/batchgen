@@ -411,12 +411,12 @@ class DeepseekV3ParallelStrategyManager:
 		self._config_attn_module()
 		self._config_expert_module()
 		self._config_lm_head_hook()
-		# Log used GPU memory
-		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-		used_memory_gb = used_memory / (1024**3)
-		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
 		self.model.eval()
-		self.model.to(self.engine_config.Basic_Config.device_torch)			
+		self.model.to(self.engine_config.Basic_Config.device_torch)
+		# Log final GPU memory (rank 0 only)
+		if self.rank == 0:
+			used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
+			logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
 		return self.model, self.weight_copy_task
 
 
@@ -460,116 +460,32 @@ class DeepseekV3ParallelStrategyManager:
 					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 				)
 
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage before configure wrapper: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory before configure wrapper: {free_memory} GB / {total_memory} GB"
-		)
-
 		self._extract_dequantize_scale()
 		self._load_model_skeleton()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after load model skeleton {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after load model skeleton: {free_memory} GB / {total_memory} GB"
-		)
 		self._load_local_routed_experts()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after load local experts{torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after load local experts: {free_memory} GB / {total_memory} GB"
-		)
 		self._load_attn_module()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after load attn: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after load attn: {free_memory} GB / {total_memory} GB"
-		)
 		self._load_shared_expert_module()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after load shared experts{torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after load shared experts: {free_memory} GB / {total_memory} GB"
-		)
 		self._config_attn_module()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after config attn{torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after config attn: {free_memory} GB / {total_memory} GB"
-		)
 		self._config_expert_module()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after _config_expert_module: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after _config_expert_module: {free_memory} GB / {total_memory} GB"
-		)
 		self._config_lm_head_hook()
 		self._init_mode_decoding()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after _init_mode_decoding: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after _init_mode_decoding: {free_memory} GB / {total_memory} GB"
-		)		
 		self._init_decoding_padding_bsz(padding_bsz)
-		
+
 		enable_ata = os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0")
 		if enable_ata == "1":
 			self._init_ata_comms(padding_bsz)
-		used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-		used_memory_gb = used_memory / (1024**3)
-		logging.info(f"Used GPU memory: {used_memory_gb:.2f} GB")
+
 		self.model.eval()
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage before copy model instance to device: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory before copy model instance to device: {free_memory} GB / {total_memory} GB"
-		)
 		self.model.to(self.engine_config.Basic_Config.device_torch)
-		free_memory, total_memory = torch.cuda.mem_get_info()
-		free_memory = free_memory / 1024 / 1024 / 1024
-		total_memory = total_memory / 1024 / 1024 / 1024
-		logging.info(
-			f"Rank: {self.rank} Device torch memory usage after copy model instance to device: {torch.cuda.memory_allocated(self.local_rank) / (1024**3)} GB / {total_memory} GB"
-		)
-		logging.info(
-			f"Rank: {self.rank} Device torch free memory after copy model instance to device: {free_memory} GB / {total_memory} GB"
-		)
+
+		# Log final GPU memory usage (rank 0 only, single consolidated message)
+		if self.rank == 0:
+			used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
+			free_memory, total_memory = torch.cuda.mem_get_info()
+			logging.info(
+				f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used, "
+				f"{free_memory / (1024**3):.2f} GB free / {total_memory / (1024**3):.2f} GB total"
+			)
 		self._warmup()
 		return self.model, self.weight_copy_task
 

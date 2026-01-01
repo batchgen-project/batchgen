@@ -191,8 +191,6 @@ class Decode():
 		new_token_idx = 1
 
 		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
-		# Log device memory usage
-		logging.info(f"{self.rank} Device memory usage: {torch.cuda.memory_allocated(self.torch_device) / (1024**3)} GB")
 
 		if RUNTIME_ATTN_MODE == 3:
 			"""
