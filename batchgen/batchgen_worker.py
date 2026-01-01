@@ -361,7 +361,8 @@ class BatchGenWorker:
 		
 		# 10. Distributed Communication Info
 		self.dist_init_addr = args.dist_init_addr
-		self.comm = None # Initialized lazily or in Init()
+		self.comm = None  # Initialized lazily or in Init()
+		self._nccl_group = None  # StatelessProcessGroup for PyNccl (stores TCPStore)
 
 		COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
@@ -617,45 +618,47 @@ class BatchGenWorker:
 		return True
 
 	def _select_sequences_for_onhold(
-		self, 
+		self,
 		active_uuids: List[str],
 		required_free_pages: int
 	) -> List[str]:
 		"""
 		Select sequences to put ON_HOLD to free up GPU pages.
-		
-		Strategy: Select sequences with most progress (closest to completion)
-		as they have more KV in host already.
-		
+
+		Strategy: Evict SHORTEST decoded sequences first (least progress).
+		Rationale: Keep longer-decoded sequences in GPU because:
+		  1. They are closer to completion (may finish soon)
+		  2. We want to prioritize finishing sequences over starting new ones
+
 		Returns:
 			List of uuids to put ON_HOLD
 		"""
 		manager = self.gpu_paged_kv_cache_manager
 		current_free = manager.get_stats().num_free_pages if manager else 0
 		pages_to_free = required_free_pages - current_free
-		
+
 		if pages_to_free <= 0:
 			return []
-		
-		# Sort by decoded_length descending (most progress first)
+
+		# Sort by decoded_length ASCENDING (least progress first - evict these)
 		candidates = []
 		for uuid in active_uuids:
 			if uuid not in self._uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			candidates.append((uuid, seq.decoded_length, seq.gpu_pages_allocated))
-		
-		candidates.sort(key=lambda x: x[1], reverse=True)
-		
+
+		candidates.sort(key=lambda x: (x[1], x[0]))  # ascending by decoded_length, then uuid for determinism
+
 		onhold_uuids = []
 		freed = 0
-		
+
 		for uuid, _, pages in candidates:
 			if freed >= pages_to_free:
 				break
 			onhold_uuids.append(uuid)
 			freed += pages
-		
+
 		return onhold_uuids
 
 	def _put_sequences_onhold(self, uuids: List[str]) -> None:
@@ -2739,6 +2742,12 @@ class BatchGenWorker:
 		decoding_time = 0.0
 		config_prefill_time = 0.0
 		config_decode_time = 0.0
+
+		# Initialize cumulative decode counters (persist across prefill/decode switches)
+		self._cumulative_decode_iterations = 0
+		self._cumulative_decode_boundaries = 0
+		self._cumulative_boundary_ms = 0.0
+		self._cumulative_forward_ms = 0.0
 		
 		# Health check: ensure distributed connections are alive before starting
 		# This handles the case where server has been idle for a long time
@@ -2760,23 +2769,30 @@ class BatchGenWorker:
 			if self.comm is None:
 				device = torch.device("cuda", self.local_rank)
 				comm_master_addr = os.getenv("COMM_MASTER_ADDR")
-				
+
 				if comm_master_addr is None:
 					logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
 				elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
+					# Track port - incremented in _check_and_reinit_pynccl on failures
+					if not hasattr(self, '_nccl_port'):
+						self._nccl_port = 20003
+
 					try:
-						group = StatelessProcessGroup.create(
+						logging.info(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
+
+						# Store group separately so we can properly destroy it on reinit
+						self._nccl_group = StatelessProcessGroup.create(
 							host=comm_master_addr,
-							port=20003,
+							port=self._nccl_port,
 							rank=self.rank,
 							world_size=self.world_size,
-							data_expiration_seconds=36000,  # 10 hours - long enough for server idle time
+							data_expiration_seconds=36000,  # 10 hours
 						)
 						self.comm = PyNcclCommunicator(
-							group=group,
+							group=self._nccl_group,
 							device=device
 						)
-						logging.info(f"Rank {self.rank}: PyNccl communicator initialized successfully")
+						logging.info(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
 					except Exception as e:
 						logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 						raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
@@ -3558,6 +3574,7 @@ class BatchGenWorker:
 				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
 				'assigned_rank': seq.assigned_rank,
 				'status': seq.status.name,  # Include status for debugging
+				'decoded_length': seq.decoded_length,  # For prioritized loading
 			}
 		
 		# Pack everything into one dict for single all_gather
@@ -3690,19 +3707,23 @@ class BatchGenWorker:
 			# All extension pages are used
 			actual_extension_by_rank = list(total_additional_by_rank)
 		elif not all_can_extend:
-			# Need eviction - put longest-decoded sequences on hold
-			# CRITICAL: Sort DETERMINISTICALLY by (decoded_length DESC, global_idx ASC)
+			# Need eviction - put SHORTEST-decoded sequences on hold first
+			# Rationale: Keep longer-decoded sequences in GPU because:
+			#   1. They are closer to completion (may finish soon)
+			#   2. We want to prioritize finishing sequences over starting new ones
+			# CRITICAL: Sort DETERMINISTICALLY by (decoded_length ASC, global_idx ASC)
 			for r in range(self.world_size):
 				if total_additional_by_rank[r] > per_rank_free[r]:
 					# Use gathered state for filtering AND sorting
 					rank_seqs = [
-						(uuid, global_seq_state[uuid]) 
-						for uuid in decode_uuids 
+						(uuid, global_seq_state[uuid])
+						for uuid in decode_uuids
 						if uuid in global_seq_state and global_seq_state[uuid]['assigned_rank'] == r
 					]
 					# CRITICAL: Stable sort with tie-breaker for determinism
+					# Shortest decoded_length first (ascending), then by global_idx
 					rank_seqs.sort(
-						key=lambda x: (-x[1]['decoded_length'], 
+						key=lambda x: (x[1]['decoded_length'],
 									self.global_batch.get_sequence(x[0]).global_idx)
 					)
 					
@@ -3770,9 +3791,16 @@ class BatchGenWorker:
 		# (their host KV pages have been released, so we can't load them)
 		# ALSO: Filter out sequences put ON_HOLD in THIS boundary (to avoid loading just-evicted sequences)
 		completed_set = set(completed_uuids)
+		# LOADING STRATEGY: Prioritize LONGEST decoded sequences first
+		# Rationale: Longer-decoded sequences are closer to completion, so loading them
+		# helps finish sequences faster and reduces long-tail latency.
+		# Sort by decoded_length DESCENDING, global_idx as tie-breaker for determinism.
 		load_candidates_synced = sorted(
 			[u for u in global_candidate_info.keys() if u not in completed_set and u not in onhold_set],
-			key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+			key=lambda u: (
+				-global_candidate_info[u].get('decoded_length', 0),  # Descending (longest first)
+				self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+			)
 		)
 		
 		if load_candidates_synced and decode_uuids:
@@ -4106,20 +4134,30 @@ class BatchGenWorker:
 			if uuid and uuid not in self._sequences_with_gpu_kv:
 				self._sequences_with_gpu_kv.add(uuid)
 		
-		iteration = 0
+		# Use cumulative counters that persist across prefill/decode switches
+		# Initialize instance vars if not present (shouldn't happen, but safety)
+		if not hasattr(self, '_cumulative_decode_iterations'):
+			self._cumulative_decode_iterations = 0
+		if not hasattr(self, '_cumulative_decode_boundaries'):
+			self._cumulative_decode_boundaries = 0
+		if not hasattr(self, '_cumulative_boundary_ms'):
+			self._cumulative_boundary_ms = 0.0
+		if not hasattr(self, '_cumulative_forward_ms'):
+			self._cumulative_forward_ms = 0.0
+
+		# Local iteration counter (for boundary interval tracking within this decode round)
+		local_iteration = 0
 		last_boundary = 0
-		total_boundary_ms = 0.0
-		total_forward_ms = 0.0
-		num_boundaries = 0
 		global_batch_size = len(self.global_batch)
 		
 		# Main decode loop
 		while decode_uuids:
-			iteration += 1
-			
+			local_iteration += 1
+			self._cumulative_decode_iterations += 1
+
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
-			if iteration - last_boundary >= self.DECISION_INTERVAL:
-				last_boundary = iteration
+			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
+				last_boundary = local_iteration
 
 				(decode_uuids, batch,
 				 pending_async_task, pending_load_uuids,
@@ -4130,8 +4168,8 @@ class BatchGenWorker:
 					pending_load_local, pending_load_global
 				)
 
-				total_boundary_ms += timing.total_ms
-				num_boundaries += 1
+				self._cumulative_boundary_ms += timing.total_ms
+				self._cumulative_decode_boundaries += 1
 
 				# Check if watermark triggered - interrupt decode for prefill
 				if watermark_triggered:
@@ -4155,8 +4193,8 @@ class BatchGenWorker:
 					if BATCHGEN_CB_DEBUG:
 						# Detailed timing log when debug is enabled
 						logging.info(
-							f"[Boundary {num_boundaries}] "
-							f"iter={iteration}, "
+							f"[Boundary {self._cumulative_decode_boundaries}] "
+							f"iter={self._cumulative_decode_iterations}, "
 							f"total={timing.total_ms:.1f}ms | "
 							f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
 							f"wait_async={timing.wait_async_load_ms:.1f}, "
@@ -4178,7 +4216,7 @@ class BatchGenWorker:
 					else:
 						# Minimal log without timing details
 						logging.info(
-							f"[Boundary {num_boundaries}] iter={iteration} | "
+							f"[Boundary {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
 							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{global_batch_size}, "
 							f"onhold={num_onhold}, prefilled={num_prefilled}, "
 							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
@@ -4337,8 +4375,8 @@ class BatchGenWorker:
 					if seq.decoded_length >= self.max_decoding_length:
 						seq.eos_reached = True
 			
-			total_forward_ms += (time.perf_counter() - forward_start) * 1000
-		
+			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
+
 		# Cleanup
 		self._wait_pending_kv_append_tasks()
 		if pending_async_task is not None:
@@ -4353,15 +4391,15 @@ class BatchGenWorker:
 		Attn_Wrapper.host_paged_kv_worker_view = None
 		Attn_Wrapper.cur_batch = None
 		
-		# Summary
-		if self.rank == 0 and num_boundaries > 0:
-			avg_forward = total_forward_ms / iteration if iteration > 0 else 0
-			avg_boundary = total_boundary_ms / num_boundaries
+		# Summary (uses cumulative counters for accurate cross-round totals)
+		if self.rank == 0 and self._cumulative_decode_boundaries > 0:
+			avg_forward = self._cumulative_forward_ms / self._cumulative_decode_iterations if self._cumulative_decode_iterations > 0 else 0
+			avg_boundary = self._cumulative_boundary_ms / self._cumulative_decode_boundaries
 			logging.info(
 				f"\n{'='*50}\n"
 				f"FAST DECODE SUMMARY (Rank 0)\n"
 				f"{'='*50}\n"
-				f"Iterations: {iteration}, Boundaries: {num_boundaries}\n"
+				f"Total Iterations: {self._cumulative_decode_iterations}, Total Boundaries: {self._cumulative_decode_boundaries}\n"
 				f"Avg forward: {avg_forward:.2f}ms\n"
 				f"Avg boundary: {avg_boundary:.2f}ms\n"
 				f"Boundary overhead/token: {avg_boundary / self.DECISION_INTERVAL:.3f}ms\n"
@@ -4442,27 +4480,40 @@ class BatchGenWorker:
 		# Timing accumulator
 		boundary_timings: List[BoundaryTimingStats] = []
 		forward_times_ms: List[float] = []
-		
-		iteration = 0
+
+		# Use cumulative counters that persist across prefill/decode switches
+		if not hasattr(self, '_cumulative_decode_iterations'):
+			self._cumulative_decode_iterations = 0
+		if not hasattr(self, '_cumulative_decode_boundaries'):
+			self._cumulative_decode_boundaries = 0
+		if not hasattr(self, '_cumulative_boundary_ms'):
+			self._cumulative_boundary_ms = 0.0
+		if not hasattr(self, '_cumulative_forward_ms'):
+			self._cumulative_forward_ms = 0.0
+
+		# Local iteration counter (for boundary interval tracking within this decode round)
+		local_iteration = 0
 		last_page_boundary_check = 0
-		
+
 		# =========================================
 		# MAIN DECODE LOOP
 		# =========================================
 		while decode_uuids:
-			iteration += 1
-			
-			if self.rank == 0 and iteration % 100 == 0:
+			local_iteration += 1
+			self._cumulative_decode_iterations += 1
+
+			if self.rank == 0 and self._cumulative_decode_iterations % 100 == 0:
 				logging.info(
-					f"Decode iteration {iteration}, {len(decode_uuids)} active, "
+					f"Decode iteration {self._cumulative_decode_iterations}, {len(decode_uuids)} active, "
 					f"{len(batch)} local"
 				)
-			
+
 			# =============================================================
 			# PAGE BOUNDARY LOGIC (with detailed timing)
 			# =============================================================
-			if iteration - last_page_boundary_check >= self.DECISION_INTERVAL:
-				last_page_boundary_check = iteration
+			if local_iteration - last_page_boundary_check >= self.DECISION_INTERVAL:
+				last_page_boundary_check = local_iteration
+				self._cumulative_decode_boundaries += 1
 				
 				timing = BoundaryTimingStats()
 				boundary_start = time.perf_counter()
@@ -4612,10 +4663,11 @@ class BatchGenWorker:
 				
 				timing.total_boundary_ms = (time.perf_counter() - boundary_start) * 1000
 				boundary_timings.append(timing)
-				
-				# Log timing for this boundary
+				self._cumulative_boundary_ms += timing.total_boundary_ms
+
+				# Log timing for this boundary (uses cumulative counter)
 				if self.rank == 0:
-					logging.info(f"Page boundary {len(boundary_timings)}:\n{timing}")
+					logging.info(f"Page boundary {self._cumulative_decode_boundaries}:\n{timing}")
 								
 				if not decode_uuids:
 					if pending_load_uuids:  # Global check - all ranks enter
@@ -4813,8 +4865,10 @@ class BatchGenWorker:
 							f"Rank {self.rank}: Sequence {uuid} reached max_decoding_length"
 						)
 			
-			forward_times_ms.append((time.perf_counter() - forward_start) * 1000)
-		
+			forward_ms = (time.perf_counter() - forward_start) * 1000
+			forward_times_ms.append(forward_ms)
+			self._cumulative_forward_ms += forward_ms
+
 		# =========================================
 		# FINAL CLEANUP
 		# =========================================
@@ -4855,8 +4909,8 @@ class BatchGenWorker:
 				f"\n{'='*60}\n"
 				f"TIMING SUMMARY (Rank 0)\n"
 				f"{'='*60}\n"
-				f"Total iterations: {iteration}\n"
-				f"Total boundaries: {len(boundary_timings)}\n"
+				f"Total iterations: {self._cumulative_decode_iterations}\n"
+				f"Total boundaries: {self._cumulative_decode_boundaries}\n"
 				f"Avg forward pass: {avg_forward:.2f}ms\n"
 				f"Avg boundary total: {avg_boundary:.2f}ms\n"
 				f"  - wait_kv_append: {avg_wait_kv:.2f}ms\n"
@@ -4868,8 +4922,8 @@ class BatchGenWorker:
 				f"Boundary overhead per token: {avg_boundary / self.DECISION_INTERVAL:.2f}ms\n"
 				f"{'='*60}"
 			)
-		
-		logging.info(f"Rank {self.rank}: decoding_continuous completed after {iteration} iterations")
+
+		logging.info(f"Rank {self.rank}: decoding_continuous completed after {self._cumulative_decode_iterations} iterations")
 		
 		return decode_uuids, batch
 
@@ -5880,16 +5934,54 @@ class BatchGenWorker:
 		except Exception as e:
 			logging.warning(f"Rank {self.rank}: PyNccl health check failed: {e}")
 			logging.info(f"Rank {self.rank}: Attempting to reinitialize PyNccl communicator...")
-			
+
 			# Destroy old communicator
 			try:
 				if self.comm is not None:
 					self.comm.destroy()
 					self.comm = None
+					logging.info(f"Rank {self.rank}: NCCL communicator destroyed successfully")
 			except Exception as destroy_e:
 				logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {destroy_e}")
 				self.comm = None
-			
+
+			# Destroy old group (releases TCPStore and port)
+			try:
+				if self._nccl_group is not None:
+					# The group's store should be garbage collected when group is deleted
+					del self._nccl_group
+					self._nccl_group = None
+					# Force garbage collection to release TCPStore socket
+					gc.collect()
+					logging.info(f"Rank {self.rank}: NCCL group destroyed successfully")
+			except Exception as group_e:
+				logging.warning(f"Rank {self.rank}: Error destroying NCCL group: {group_e}")
+				self._nccl_group = None
+
+			# Synchronize all ranks before any tries to recreate (uses torch.distributed)
+			# This ensures all ranks have released their connections before rank 0
+			# tries to create a new TCPStore server
+			try:
+				if dist.is_initialized():
+					dist.barrier()
+					logging.debug(f"Rank {self.rank}: Barrier after NCCL cleanup passed")
+			except Exception as barrier_e:
+				logging.warning(f"Rank {self.rank}: Barrier after NCCL cleanup failed: {barrier_e}")
+
+			# Increment port number for next initialization to avoid port conflicts
+			# All ranks do this, so they'll all use the same new port
+			if not hasattr(self, '_nccl_port'):
+				self._nccl_port = 20003
+			self._nccl_port += 1
+			logging.info(f"Rank {self.rank}: Next PyNccl port will be {self._nccl_port}")
+
+			# Delay to allow OS to fully release resources
+			# Rank 0 needs extra time since it's the TCPStore server
+			if self.rank == 0:
+				time.sleep(1.0)
+			else:
+				time.sleep(0.5)
+
 			# Will be reinitialized lazily in generate()
 			return True
 
