@@ -565,6 +565,16 @@ class BatchGenWorker:
 		if all_active_global_ids:
 			manager.rebuild_page_table(all_active_global_ids)
 
+		# DIAGNOSTIC: Log page table order after allocation for debugging order mismatch
+		if manager and manager._gpu_page_table_manager:
+			final_slot_order = list(manager._gpu_page_table_manager.slot_to_seq_id) if manager._gpu_page_table_manager.slot_to_seq_id else []
+			logging.info(
+				f"Rank {self.rank}: [ALLOC DIAGNOSTIC] _allocate_gpu_kv_two_page_buffer finished. "
+				f"input_global_ids={global_ids[:5]}{'...' if len(global_ids) > 5 else ''} (len={len(global_ids)}), "
+				f"all_active_sorted={all_active_global_ids[:5]}{'...' if len(all_active_global_ids) > 5 else ''} (len={len(all_active_global_ids)}), "
+				f"final_slot_to_seq_id={final_slot_order[:5]}{'...' if len(final_slot_order) > 5 else ''} (len={len(final_slot_order)})"
+			)
+
 		logging.debug(
 			f"Rank {self.rank}: Allocated GPU KV for {len(global_ids)} sequences"
 		)
@@ -1880,11 +1890,23 @@ class BatchGenWorker:
 	def _local_indices_to_global_seq_ids(self, local_indices: List[int]) -> List[int]:
 		"""Convert local indices to global sequence IDs (global_idx from SequenceEntry)."""
 		global_seq_ids = []
+		missing_indices = []
 		for local_idx in local_indices:
 			uuid = self._local_to_uuid_map.get(local_idx)
 			if uuid:
 				seq = self.global_batch.get_sequence(uuid)
 				global_seq_ids.append(seq.global_idx)
+			else:
+				missing_indices.append(local_idx)
+
+		# CRITICAL: Log if any local indices are missing - this causes length mismatch
+		# which leads to KV corruption (wrong sequence KV read for wrong batch position)
+		if missing_indices:
+			logging.error(
+				f"Rank {self.rank}: MISSING LOCAL INDICES in _local_indices_to_global_seq_ids! "
+				f"input_len={len(local_indices)}, output_len={len(global_seq_ids)}, "
+				f"missing={missing_indices[:10]}..."
+			)
 		return global_seq_ids
 
 	def _get_my_sequences_by_status(self, status: SequenceStatus) -> List[str]:
@@ -4118,7 +4140,29 @@ class BatchGenWorker:
 		Attn_Wrapper.past_key_states = past_key_states
 		Attn_Wrapper.past_value_states = past_value_states
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
-		
+
+		# CRITICAL FIX: Ensure page table matches cur_batch at entry
+		# This fixes order mismatch that can occur during decode→prefill→decode transitions
+		if gpu_manager and gpu_manager._gpu_page_table_manager:
+			entry_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
+			if entry_slot_order != entry_cur_batch:
+				logging.error(
+					f"Rank {self.rank}: [ENTRY FIX] ORDER MISMATCH at decoding_continuous_fast entry! "
+					f"slot_to_seq_id={entry_slot_order[:5]}{'...' if len(entry_slot_order) > 5 else ''} (len={len(entry_slot_order)}), "
+					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). "
+					f"REBUILDING page table to match cur_batch..."
+				)
+				# FIX: Rebuild page table to match cur_batch order
+				if entry_cur_batch:
+					gpu_manager.rebuild_page_table(entry_cur_batch)
+					logging.info(f"Rank {self.rank}: [ENTRY FIX] Page table rebuilt to match cur_batch order")
+			else:
+				logging.info(
+					f"Rank {self.rank}: [ENTRY DIAGNOSTIC] decoding_continuous_fast entry OK. "
+					f"batch_size={len(batch)}, cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''}"
+				)
+
 		# Async state
 		self._pending_kv_append_tasks = []
 		self._pending_kv_append_tensors = []
@@ -4314,7 +4358,22 @@ class BatchGenWorker:
 						page_table_size = mgr.gpu_table.shape[0]
 						batch_size = len(batch)
 						tokens_size = new_tokens.shape[0]
-						
+
+						# CRITICAL: Verify page table ORDER matches cur_batch order
+						# If orders don't match, attention will read wrong KV data = corruption!
+						page_table_seq_order = list(mgr.slot_to_seq_id) if mgr.slot_to_seq_id else []
+						cur_batch_order = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
+						if page_table_seq_order != cur_batch_order:
+							logging.error(
+								f"Rank {self.rank}: KV CORRUPTION DETECTED - ORDER MISMATCH! "
+								f"page_table_order={page_table_seq_order[:5]}... "
+								f"cur_batch_order={cur_batch_order[:5]}... "
+								f"This WILL cause wrong KV reads!"
+							)
+							# Fix: Rebuild page table to match cur_batch order
+							gpu_manager.rebuild_page_table(cur_batch_order)
+							logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
+
 						# Check for ANY mismatch
 						if page_table_size != batch_size or page_table_size != tokens_size or batch_size != tokens_size:
 							logging.error(
@@ -4452,7 +4511,22 @@ class BatchGenWorker:
 		Attn_Wrapper.past_key_states = past_key_states
 		Attn_Wrapper.past_value_states = past_value_states
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
-		
+
+		# CRITICAL FIX: Ensure page table matches cur_batch at entry (same as decoding_continuous_fast)
+		if gpu_manager and gpu_manager._gpu_page_table_manager:
+			entry_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
+			if entry_slot_order != entry_cur_batch:
+				logging.error(
+					f"Rank {self.rank}: [ENTRY FIX] ORDER MISMATCH at decoding_continuous entry! "
+					f"slot_to_seq_id={entry_slot_order[:5]}{'...' if len(entry_slot_order) > 5 else ''} (len={len(entry_slot_order)}), "
+					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). "
+					f"REBUILDING page table to match cur_batch..."
+				)
+				if entry_cur_batch:
+					gpu_manager.rebuild_page_table(entry_cur_batch)
+					logging.info(f"Rank {self.rank}: [ENTRY FIX] Page table rebuilt to match cur_batch order")
+
 		# =========================================
 		# ASYNC STATE TRACKING
 		# =========================================
@@ -4766,7 +4840,25 @@ class BatchGenWorker:
 				# AFTER all batch validation is complete
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
-				
+
+					# CRITICAL: Verify page table ORDER matches cur_batch order
+					# If orders don't match, attention will read wrong KV data = corruption!
+					if gpu_manager and gpu_manager.is_initialized:
+						mgr = gpu_manager._gpu_page_table_manager
+						if mgr and mgr.slot_to_seq_id:
+							page_table_seq_order = list(mgr.slot_to_seq_id)
+							cur_batch_order = list(Attn_Wrapper.cur_batch)
+							if page_table_seq_order != cur_batch_order:
+								logging.error(
+									f"Rank {self.rank}: KV CORRUPTION DETECTED - ORDER MISMATCH! "
+									f"page_table_order={page_table_seq_order[:5]}... "
+									f"cur_batch_order={cur_batch_order[:5]}... "
+									f"This WILL cause wrong KV reads!"
+								)
+								# Fix: Rebuild page table to match cur_batch order
+								gpu_manager.rebuild_page_table(cur_batch_order)
+								logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
+
 				# KV append callback - FIRE AND FORGET
 				# Capture batch by value AFTER all modifications are done
 				current_batch = list(batch)
