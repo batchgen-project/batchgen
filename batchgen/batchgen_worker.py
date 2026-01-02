@@ -1559,6 +1559,29 @@ class BatchGenWorker:
 			k_gpu = manager.copy_kv_to_tensor(global_idx)
 			t_extract = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
+
+			# MIGRATION SEND VALIDATION: Verify KV data before sending
+			send_k_mean = k_gpu[0].float().mean().item()  # Sample layer 0
+			send_k_std = k_gpu[0].float().std().item()
+			send_has_nan = torch.isnan(k_gpu[0]).any().item()
+			send_is_zero = (k_gpu[0] == 0).all().item()
+			logging.info(
+				f"[MIGRATION SEND] Rank {self.rank}: Validating KV for {uuid[:8]}... (global_idx={global_idx}): "
+				f"k_gpu_shape={list(k_gpu.shape)}, "
+				f"layer0_mean={send_k_mean:.4f}, std={send_k_std:.4f}, "
+				f"has_nan={send_has_nan}, is_zero={send_is_zero}, "
+				f"first_values={k_gpu[0, 0, 0, 0, :4].tolist() if k_gpu.numel() > 0 else 'N/A'}"
+			)
+			if send_is_zero:
+				logging.error(
+					f"[MIGRATION SEND] Rank {self.rank}: CRITICAL - KV to send is ALL ZEROS for {uuid[:8]}! "
+					f"Host KV may be corrupted or load failed."
+				)
+			if send_has_nan:
+				logging.error(
+					f"[MIGRATION SEND] Rank {self.rank}: CRITICAL - KV to send has NaN for {uuid[:8]}!"
+				)
+
 			# Move GPU → CPU for Gloo transfer (Gloo supports CPU tensors, more memory efficient)
 			k_cpu = k_gpu.cpu().contiguous()
 			t_cpu = time.perf_counter()
@@ -1625,6 +1648,29 @@ class BatchGenWorker:
 			sequence_ids_list = [global_idx]
 			sequence_lengths = [seq_len]
 
+			# MIGRATION KV VALIDATION: Log first layer data before offload
+			first_layer_k = k_gpu[0]  # [num_pages, page_size, num_k_heads, k_head_dim]
+			migration_k_mean = first_layer_k.float().mean().item()
+			migration_k_std = first_layer_k.float().std().item()
+			migration_has_nan = torch.isnan(first_layer_k).any().item()
+			migration_is_zero = (first_layer_k == 0).all().item()
+			logging.info(
+				f"[MIGRATION RECV] Rank {self.rank}: Validating received KV for {uuid[:8]}... (global_idx={global_idx}): "
+				f"k_gpu_shape={list(k_gpu.shape)}, "
+				f"layer0_mean={migration_k_mean:.4f}, std={migration_k_std:.4f}, "
+				f"has_nan={migration_has_nan}, is_zero={migration_is_zero}, "
+				f"first_values={first_layer_k[0, 0, 0, :4].tolist() if first_layer_k.numel() > 0 else 'N/A'}"
+			)
+			if migration_is_zero:
+				logging.error(
+					f"[MIGRATION RECV] Rank {self.rank}: CRITICAL - Received KV is ALL ZEROS for {uuid[:8]}! "
+					f"This means network transfer failed or source had invalid data."
+				)
+			if migration_has_nan:
+				logging.error(
+					f"[MIGRATION RECV] Rank {self.rank}: CRITICAL - Received KV has NaN for {uuid[:8]}!"
+				)
+
 			for layer_idx in range(num_layers):
 				# Extract layer [num_pages, page_size, num_k_heads, k_head_dim]
 				layer_k = k_gpu[layer_idx]  # [num_pages, page_size, num_k_heads, k_head_dim]
@@ -1665,6 +1711,10 @@ class BatchGenWorker:
 			# Store in pending dict for later query_book creation
 			if not hasattr(self, '_pending_migrated_query_book'):
 				self._pending_migrated_query_book = {}
+			# Track migrated sequences for corruption correlation
+			if not hasattr(self, '_migrated_sequences'):
+				self._migrated_sequences = set()
+			self._migrated_sequences.add(uuid)
 			self._pending_migrated_query_book[uuid] = {
 				'text': seq.text,
 				'input_ids': input_ids_recv,
@@ -3517,6 +3567,48 @@ class BatchGenWorker:
 				pending_async_load_task.wait()
 				torch.cuda.synchronize(self.torch_device)
 				logging.info(f"Rank {self.rank}: [ASYNC LOAD FINALIZE] Task completed, CUDA synced")
+
+				# KV DATA VALIDATION: Sample loaded KV to verify correctness
+				# This helps detect "kv loaded from wrong place" bugs
+				if gpu_manager and gpu_manager.is_initialized and pending_load_global_ids:
+					try:
+						# Sample first sequence's KV data (layer 0, first page)
+						sample_global_id = pending_load_global_ids[0]
+						if sample_global_id in gpu_manager._sequences:
+							state = gpu_manager._sequences[sample_global_id]
+							if state.pages.numel() > 0:
+								first_page_idx = int(state.pages[0].item())
+								# Sample from layer 0
+								k_sample = gpu_manager._k_cache[0, first_page_idx, :4, :, :].clone().cpu()
+								# Check for anomalies
+								k_mean = k_sample.float().mean().item()
+								k_std = k_sample.float().std().item()
+								k_has_nan = torch.isnan(k_sample).any().item()
+								k_has_inf = torch.isinf(k_sample).any().item()
+								k_is_zero = (k_sample == 0).all().item()
+
+								logging.info(
+									f"Rank {self.rank}: [KV VALIDATION] Loaded seq {sample_global_id} layer 0: "
+									f"mean={k_mean:.4f}, std={k_std:.4f}, "
+									f"has_nan={k_has_nan}, has_inf={k_has_inf}, all_zero={k_is_zero}, "
+									f"first_values={k_sample[0, 0, :3].tolist()}"
+								)
+
+								# CRITICAL: If all zeros or has NaN/Inf, this indicates data wasn't loaded correctly
+								if k_is_zero:
+									logging.error(
+										f"Rank {self.rank}: [KV VALIDATION ERROR] Loaded KV is ALL ZEROS! "
+										f"global_id={sample_global_id}, page_idx={first_page_idx}. "
+										f"This likely means async load read from wrong location or didn't complete."
+									)
+								if k_has_nan or k_has_inf:
+									logging.error(
+										f"Rank {self.rank}: [KV VALIDATION ERROR] Loaded KV has NaN/Inf! "
+										f"global_id={sample_global_id}, page_idx={first_page_idx}."
+									)
+					except Exception as e:
+						logging.warning(f"Rank {self.rank}: [KV VALIDATION] Could not sample KV: {e}")
+
 			timing.wait_async_load_ms = (time.perf_counter() - t0) * 1000
 
 			# CRITICAL: barrier ensures all ranks finish async load before continuing
