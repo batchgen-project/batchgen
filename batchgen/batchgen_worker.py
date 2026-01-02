@@ -3504,11 +3504,21 @@ class BatchGenWorker:
 		# Integrate previous async load if any
 		if pending_load_uuids:  # ALL ranks have identical pending_load_uuids
 			t0 = time.perf_counter()
+
+			# ASYNC LOAD FINALIZE DIAGNOSTIC: Log what we're integrating
+			logging.info(
+				f"Rank {self.rank}: [ASYNC LOAD FINALIZE] Integrating {len(pending_load_uuids)} sequences: "
+				f"pending_global_ids={pending_load_global_ids[:5]}{'...' if len(pending_load_global_ids) > 5 else ''}, "
+				f"pending_local_indices={pending_load_local_indices[:5]}{'...' if len(pending_load_local_indices) > 5 else ''}, "
+				f"has_task={pending_async_load_task is not None}"
+			)
+
 			if pending_async_load_task is not None:
 				pending_async_load_task.wait()
 				torch.cuda.synchronize(self.torch_device)
+				logging.info(f"Rank {self.rank}: [ASYNC LOAD FINALIZE] Task completed, CUDA synced")
 			timing.wait_async_load_ms = (time.perf_counter() - t0) * 1000
-			
+
 			# CRITICAL: barrier ensures all ranks finish async load before continuing
 			dist.barrier()
 			
@@ -3529,6 +3539,22 @@ class BatchGenWorker:
 			# wasn't updated to include them in the active batch
 			if batch and gpu_manager is not None and gpu_manager.is_initialized:
 				self._rebuild_page_table_for_batch(batch, gpu_manager)
+
+				# POST-FINALIZE PAGE TABLE DIAGNOSTIC
+				if gpu_manager._gpu_page_table_manager:
+					post_finalize_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+					post_finalize_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+					if post_finalize_slot_order != post_finalize_batch_global_ids:
+						logging.error(
+							f"Rank {self.rank}: [POST-FINALIZE MISMATCH] Page table doesn't match batch after finalize! "
+							f"slot_to_seq_id={post_finalize_slot_order[:5]}{'...' if len(post_finalize_slot_order) > 5 else ''}, "
+							f"batch_global_ids={post_finalize_batch_global_ids[:5]}{'...' if len(post_finalize_batch_global_ids) > 5 else ''}"
+						)
+					else:
+						logging.info(
+							f"Rank {self.rank}: [POST-FINALIZE OK] Page table matches batch (len={len(batch)}), "
+							f"added {len(pending_load_uuids)} new sequences"
+						)
 
 		if not decode_uuids:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
@@ -3914,14 +3940,23 @@ class BatchGenWorker:
 							k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
 							active_page_counts = gpu_manager.export_active_sequence_page_counts()
 							sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
-							
+
+							# ASYNC LOAD DIAGNOSTIC: Log what we're loading
+							logging.info(
+								f"Rank {self.rank}: [ASYNC LOAD] Launching async load for {len(new_load_global)} sequences: "
+								f"global_ids={new_load_global[:5]}{'...' if len(new_load_global) > 5 else ''}, "
+								f"active_page_counts={active_page_counts.tolist()[:5] if hasattr(active_page_counts, 'tolist') else active_page_counts[:5]}..., "
+								f"k_ptrs_shape={k_ptrs.shape if hasattr(k_ptrs, 'shape') else 'N/A'}, "
+								f"existing_batch_global_ids={existing_global_ids[:5]}{'...' if len(existing_global_ids) > 5 else ''} (len={len(existing_global_ids)})"
+							)
+
 							new_async_task = worker_view.async_load_layer_paged_kv_to_device(
 								sequence_ids=sequence_tensor,
 								active_page_counts=active_page_counts,
 								k_device_ptrs=k_ptrs,
 								v_device_ptrs=v_ptrs,
 							)
-						
+
 							# Restore page table to current batch
 							if existing_global_ids:
 								gpu_manager.rebuild_page_table(existing_global_ids)
@@ -4214,6 +4249,28 @@ class BatchGenWorker:
 
 				self._cumulative_boundary_ms += timing.total_ms
 				self._cumulative_decode_boundaries += 1
+
+				# CRITICAL POST-BOUNDARY DIAGNOSTIC: Verify page table matches batch
+				# This catches KV cache corruption bugs that occur during page boundaries
+				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
+					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+
+					if post_boundary_slot_order != post_boundary_batch_global_ids:
+						logging.error(
+							f"Rank {self.rank}: [POST-BOUNDARY MISMATCH] Page table order mismatch after boundary! "
+							f"slot_to_seq_id={post_boundary_slot_order[:5]}{'...' if len(post_boundary_slot_order) > 5 else ''} (len={len(post_boundary_slot_order)}), "
+							f"batch_global_ids={post_boundary_batch_global_ids[:5]}{'...' if len(post_boundary_batch_global_ids) > 5 else ''} (len={len(post_boundary_batch_global_ids)}). "
+							f"Boundary #{self._cumulative_decode_boundaries}, iter={self._cumulative_decode_iterations}. REBUILDING page table..."
+						)
+						# CRITICAL FIX: Rebuild page table to match batch
+						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
+						logging.info(f"Rank {self.rank}: [POST-BOUNDARY FIX] Page table rebuilt to match batch")
+					else:
+						logging.debug(
+							f"Rank {self.rank}: [POST-BOUNDARY OK] Boundary #{self._cumulative_decode_boundaries} - "
+							f"page table matches batch (len={len(batch)})"
+						)
 
 				# Check if watermark triggered - interrupt decode for prefill
 				if watermark_triggered:
@@ -4734,10 +4791,32 @@ class BatchGenWorker:
 				t0 = time.perf_counter()
 				dist.barrier()
 				timing.barrier_final_ms = (time.perf_counter() - t0) * 1000
-				
+
 				timing.total_boundary_ms = (time.perf_counter() - boundary_start) * 1000
 				boundary_timings.append(timing)
 				self._cumulative_boundary_ms += timing.total_boundary_ms
+
+				# CRITICAL POST-BOUNDARY DIAGNOSTIC: Verify page table matches batch
+				# This catches KV cache corruption bugs that occur during page boundaries
+				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
+					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+
+					if post_boundary_slot_order != post_boundary_batch_global_ids:
+						logging.error(
+							f"Rank {self.rank}: [POST-BOUNDARY MISMATCH] Page table order mismatch after boundary! "
+							f"slot_to_seq_id={post_boundary_slot_order[:5]}{'...' if len(post_boundary_slot_order) > 5 else ''} (len={len(post_boundary_slot_order)}), "
+							f"batch_global_ids={post_boundary_batch_global_ids[:5]}{'...' if len(post_boundary_batch_global_ids) > 5 else ''} (len={len(post_boundary_batch_global_ids)}). "
+							f"Boundary #{self._cumulative_decode_boundaries}, iter={local_iteration}. REBUILDING page table..."
+						)
+						# CRITICAL FIX: Rebuild page table to match batch
+						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
+						logging.info(f"Rank {self.rank}: [POST-BOUNDARY FIX] Page table rebuilt to match batch")
+					else:
+						logging.debug(
+							f"Rank {self.rank}: [POST-BOUNDARY OK] Boundary #{self._cumulative_decode_boundaries} - "
+							f"page table matches batch (len={len(batch)})"
+						)
 
 				# Log timing for this boundary (uses cumulative counter)
 				if self.rank == 0:
