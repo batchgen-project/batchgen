@@ -1016,6 +1016,27 @@ class BatchGenWorker:
 		if worker_view is None:
 			raise RuntimeError("Host paged KV worker view is not bound to the core engine")
 		
+		# DIAGNOSTIC: Check if these are resuming sequences (have decoded tokens)
+		resuming_seq_info = []
+		for global_idx in global_sequence_ids:
+			# Find the sequence by global_idx
+			for uuid, local_idx in self._uuid_to_local_map.items():
+				seq = self.global_batch.get_sequence(uuid)
+				if seq and seq.global_idx == global_idx and seq.decoded_length > 0:
+					resuming_seq_info.append({
+						'global_idx': global_idx,
+						'decoded_length': seq.decoded_length,
+						'current_context_length': seq.current_context_length,
+					})
+					break
+		
+		if resuming_seq_info:
+			logging.warning(
+				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _load_host_kv_to_gpu loading KV for "
+				f"{len(resuming_seq_info)} RESUMING sequences (decoded_length > 0). "
+				f"First 5: {resuming_seq_info[:5]}"
+			)
+		
 		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
@@ -3069,13 +3090,38 @@ class BatchGenWorker:
 				# Re-sort for deterministic ordering
 				decode_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 				
-				# Verify all ranks have same decode_uuids count
+				# CRITICAL FIX: Verify all ranks have same decode_uuids AND force convergence
 				local_count = torch.tensor([len(decode_uuids)], dtype=torch.int64, device=self.torch_device)
 				all_counts = [torch.zeros_like(local_count) for _ in range(self.world_size)]
 				dist.all_gather(all_counts, local_count)
 				counts = [int(t.item()) for t in all_counts]
+				
 				if len(set(counts)) > 1:
-					logging.error(f"Rank {self.rank}: decode_uuids STILL divergent after sync! counts={counts}")
+					logging.error(
+						f"Rank {self.rank}: decode_uuids DIVERGENT! counts={counts}. "
+						f"Local decode_uuids: {[u for u in decode_uuids[:10]]}..."
+					)
+					# CRITICAL FIX: Force all ranks to use the INTERSECTION of sequences
+					# Gather all decode_uuids from all ranks and find common set
+					all_decode_uuids = [None] * self.world_size
+					dist.all_gather_object(all_decode_uuids, decode_uuids)
+					
+					# Find intersection - only sequences ALL ranks have
+					common_uuids = set(all_decode_uuids[0]) if all_decode_uuids[0] else set()
+					for rank_uuids in all_decode_uuids[1:]:
+						if rank_uuids:
+							common_uuids &= set(rank_uuids)
+					
+					# Rebuild decode_uuids from intersection, sorted by global_idx
+					decode_uuids = sorted(
+						[u for u in common_uuids if self.global_batch.get_sequence(u) is not None],
+						key=lambda u: self.global_batch.get_sequence(u).global_idx
+					)
+					
+					logging.warning(
+						f"Rank {self.rank}: [KV-CORRUPTION-FIX] Forced convergence to {len(decode_uuids)} common sequences. "
+						f"Dropped {counts[self.rank] - len(decode_uuids)} divergent sequences."
+					)
 				
 				if not decode_uuids:
 					break
@@ -3278,6 +3324,18 @@ class BatchGenWorker:
 	) -> None:
 		"""Configure decoding phase with pre-sized GPU KV manager."""
 		start_time = time.perf_counter()
+		
+		# VALIDATION: Verify decode_uuids consistency across all ranks
+		local_uuid_count = torch.tensor([len(decode_uuids)], dtype=torch.int64, device=self.torch_device)
+		all_uuid_counts = [torch.zeros_like(local_uuid_count) for _ in range(self.world_size)]
+		dist.all_gather(all_uuid_counts, local_uuid_count)
+		uuid_counts = [int(t.item()) for t in all_uuid_counts]
+		
+		if len(set(uuid_counts)) > 1:
+			logging.error(
+				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] CRITICAL - decode_uuids count mismatch at "
+				f"_config_decoding_for_batch entry! Counts: {uuid_counts}. This WILL cause KV corruption!"
+			)
 		
 		# DIAGNOSTIC: Log sequence states at decode config entry
 		# This helps identify KV corruption issues during prefill→decode transitions
