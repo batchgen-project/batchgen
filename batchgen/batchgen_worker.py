@@ -1905,6 +1905,21 @@ class BatchGenWorker:
 			dist.recv(tensor=input_ids_recv, src=from_rank, group=gloo_group)
 			dist.recv(tensor=attention_mask_recv, src=from_rank, group=gloo_group)
 			dist.recv(tensor=decoded_tokens_recv, src=from_rank, group=gloo_group)
+			
+			# DIAGNOSTIC: Verify received attention_mask has correct number of 1s
+			recv_attn_ones = attention_mask_recv.sum().item()
+			expected_ones = seq.current_context_length
+			if recv_attn_ones != expected_ones:
+				logging.error(
+					f"[MIGRATION RECV] Rank {self.rank}: ATTENTION MASK MISMATCH for {uuid[:8]}! "
+					f"received_ones={int(recv_attn_ones)}, expected={expected_ones} (ctx_len), "
+					f"prompt_len={seq.prompt_length}, decoded_len={seq.decoded_length}"
+				)
+			else:
+				logging.info(
+					f"[MIGRATION RECV] Rank {self.rank}: Attention mask OK for {uuid[:8]}: "
+					f"ones={int(recv_attn_ones)} == ctx_len={expected_ones}"
+				)
 
 			# Store in pending dict for later query_book creation
 			if not hasattr(self, '_pending_migrated_query_book'):
@@ -3004,6 +3019,27 @@ class BatchGenWorker:
 		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
 		tokens = self._compute_two_page_buffer_tokens(local_sequence_ids)
 		
+		# DIAGNOSTIC: Log details for resuming sequences (decoded_length > 0)
+		resuming_diag = []
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			if seq.decoded_length > 0:
+				qb = self.query_book.get(local_idx)
+				attn_mask_sum = qb.encoded["attention_mask"].sum().item() if qb else "N/A"
+				resuming_diag.append({
+					'uuid': uuid[:8],
+					'decoded_len': seq.decoded_length,
+					'ctx_len': seq.current_context_length,
+					'prompt_len': seq.prompt_length,
+					'attn_mask_sum': attn_mask_sum,
+				})
+		if resuming_diag:
+			logging.warning(
+				f"Rank {self.rank}: [RESUME-DIAG] Loading GPU KV for {len(resuming_diag)} RESUMING sequences. "
+				f"First 3: {resuming_diag[:3]}"
+			)
+		
 		# Guard before allocation
 		total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
 		free_pages = manager.get_stats().num_free_pages
@@ -3022,6 +3058,29 @@ class BatchGenWorker:
 
 		# 3. Load Host -> GPU (BLOCKING)
 		self._load_host_kv_to_gpu(manager, global_ids)
+		
+		# DIAGNOSTIC: After load, verify loaded data matches expected context length
+		post_load_diag = []
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			if seq.decoded_length > 0:  # Resuming sequence
+				allocated_pages = seq.get_gpu_pages_for_two_page_buffer()
+				allocated_tokens = allocated_pages * self.PAGE_SIZE
+				expected_kv_tokens = seq.current_context_length
+				post_load_diag.append({
+					'uuid': uuid[:8],
+					'decoded_len': seq.decoded_length,
+					'ctx_len': expected_kv_tokens,
+					'alloc_pages': allocated_pages,
+					'alloc_tokens': allocated_tokens,
+					'excess': allocated_tokens - expected_kv_tokens,
+				})
+		if post_load_diag:
+			logging.warning(
+				f"Rank {self.rank}: [POST-LOAD-DIAG] Loaded {len(post_load_diag)} RESUMING sequences. "
+				f"First 3: {post_load_diag[:3]}"
+			)
 		
 		# ← FIX: Update tracking state AFTER successful load
 		for local_idx in local_sequence_ids:
@@ -4815,14 +4874,62 @@ class BatchGenWorker:
 					attention_masks = []
 					cache_seqlens = []
 					
+					# DIAGNOSTIC: Check for attention mask inconsistency on first iteration
+					attn_mask_mismatch = []
+					resumed_mask_diag = []  # Diagnostic for resumed sequences
 					for local_idx in batch:
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						ctx_len = seq.current_context_length
 						
-						mask = self.query_book[local_idx].encoded["attention_mask"][:, :ctx_len]
+						full_mask = self.query_book[local_idx].encoded["attention_mask"]
+						mask = full_mask[:, :ctx_len]
+						actual_ones = mask.sum().item()
+						
+						# Check: attention mask should have exactly ctx_len ones
+						# (assuming all tokens in context should be attended to)
+						if actual_ones != ctx_len:
+							# Find first 0 position and last 1 position for diagnosis
+							mask_flat = mask.flatten()
+							zero_positions = (mask_flat == 0).nonzero(as_tuple=True)[0].tolist()[:5]
+							one_positions = (mask_flat == 1).nonzero(as_tuple=True)[0].tolist()[-5:]
+							
+							attn_mask_mismatch.append({
+								'uuid': uuid[:8],
+								'ctx_len': ctx_len,
+								'mask_ones': int(actual_ones),
+								'decoded_len': seq.decoded_length,
+								'prompt_len': seq.prompt_length,
+								'first_zeros': zero_positions,
+								'last_ones': one_positions,
+							})
+						
+						# Log mask details for resumed sequences (decoded_length > 1)
+						if seq.decoded_length > 1 and iteration <= 3:
+							mask_flat = mask.flatten()
+							last_10_values = mask_flat[-10:].tolist() if len(mask_flat) >= 10 else mask_flat.tolist()
+							resumed_mask_diag.append({
+								'uuid': uuid[:8],
+								'ctx_len': ctx_len,
+								'mask_ones': int(actual_ones),
+								'decoded_len': seq.decoded_length,
+								'last_10_mask': last_10_values,
+							})
+						
 						attention_masks.append(mask)
 						cache_seqlens.append(ctx_len)
+					
+					if resumed_mask_diag and self.rank == 0:
+						logging.warning(
+							f"[MASK-RESUME-DIAG] iter={iteration}: {len(resumed_mask_diag)} resumed seqs. "
+							f"First 3: {resumed_mask_diag[:3]}"
+						)
+					
+					if attn_mask_mismatch and iteration <= 5:
+						logging.error(
+							f"Rank {self.rank}: [ATTN-MASK-BUG] iter={iteration}: {len(attn_mask_mismatch)} "
+							f"sequences have attention_mask mismatch! First 5: {attn_mask_mismatch[:5]}"
+						)
 					
 					max_ctx = max(cache_seqlens)
 					padded_masks = []
@@ -4910,9 +5017,37 @@ class BatchGenWorker:
 					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor)
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				
+				# DIAGNOSTIC: Log input tokens for first few iterations with resumed sequences
+				resumed_in_batch = [
+					(i, local_idx, self._local_to_uuid_map.get(local_idx, '?')[:8], 
+					 self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx, '')).decoded_length 
+					 if self._local_to_uuid_map.get(local_idx) else 0)
+					for i, local_idx in enumerate(batch)
+					if self._local_to_uuid_map.get(local_idx) and 
+					   self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx)) and
+					   self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx)).decoded_length > 1
+				]
+				if resumed_in_batch and iteration <= 3 and self.rank == 0:
+					input_tokens_str = new_tokens[:5].flatten().tolist() if new_tokens.shape[0] <= 5 else new_tokens[:5].flatten().tolist()
+					logging.warning(
+						f"[FORWARD-DIAG] iter={iteration}, batch_size={len(batch)}, "
+						f"resumed_count={len(resumed_in_batch)}, "
+						f"input_tokens(first5)={input_tokens_str}, "
+						f"resumed_seqs(first3)={resumed_in_batch[:3]}"
+					)
+				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
-				new_tokens = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
+				new_tokens_out = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
+				
+				# DIAGNOSTIC: Log output tokens for first few iterations with resumed sequences
+				if resumed_in_batch and iteration <= 3 and self.rank == 0:
+					output_tokens_str = new_tokens_out[:5].flatten().tolist()
+					logging.warning(
+						f"[FORWARD-OUT-DIAG] iter={iteration}, output_tokens(first5)={output_tokens_str}"
+					)
+				
+				new_tokens = new_tokens_out
 				
 				# Update sequences
 				for i, local_idx in enumerate(batch):
@@ -6168,6 +6303,8 @@ class BatchGenWorker:
 			return torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		
 		tokens = []
+		suspicious_tokens = []  # Track potential issues
+		resumed_seq_diag = []  # Diagnostic for resumed sequences
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map.get(local_idx)
 			if uuid is None:
@@ -6184,6 +6321,48 @@ class BatchGenWorker:
 				continue
 			token = query_entry.decoded_tokens[:, pos:pos+1]
 			tokens.append(token)
+			
+			# COMPREHENSIVE DIAGNOSTIC: Log all resumed sequences (decoded_length > 1)
+			if seq.decoded_length > 1:  # Resuming sequence (not first decode step)
+				token_val = token.item()
+				# Also get a few surrounding tokens for context
+				dec_tokens = query_entry.decoded_tokens
+				max_dec_len = dec_tokens.shape[1] if dec_tokens is not None else 0
+				nearby_tokens = []
+				for i in range(max(0, pos-2), min(max_dec_len, pos+3)):
+					nearby_tokens.append(int(dec_tokens[0, i].item()))
+				
+				resumed_seq_diag.append({
+					'uuid': uuid[:8],
+					'decoded_len': seq.decoded_length,
+					'ctx_len': seq.current_context_length,
+					'prompt_len': seq.prompt_length,
+					'pos': pos,
+					'token_val': token_val,
+					'nearby': nearby_tokens,
+					'status': seq.status.name,
+				})
+				
+				if token_val == 0:
+					suspicious_tokens.append({
+						'uuid': uuid[:8],
+						'decoded_len': seq.decoded_length,
+						'pos': pos,
+						'token_val': token_val,
+					})
+		
+		# Log diagnostic for first few resumed sequences (helps debug gibberish after resume)
+		if resumed_seq_diag and self.rank == 0:
+			logging.warning(
+				f"[RESUME-INPUT-DIAG] {len(resumed_seq_diag)} resumed sequences in batch. "
+				f"First 3: {resumed_seq_diag[:3]}"
+			)
+		
+		if suspicious_tokens:
+			logging.error(
+				f"Rank {self.rank}: [INPUT-TOKEN-BUG] {len(suspicious_tokens)} resuming sequences have "
+				f"ZERO input token! First 5: {suspicious_tokens[:5]}"
+			)
 		
 		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		
