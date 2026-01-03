@@ -5084,7 +5084,7 @@ class BatchGenWorker:
 						logging.warning(f"[PAGE-TABLE-DIAG] iter={local_iteration}: first 5 slots: {page_diag}")
 						
 						# CRITICAL: Show batch-to-slot mapping
-						batch_global_ids = [self._local_to_global.get(local_idx, -1) for local_idx in batch[:5]]
+						batch_global_ids = self._local_indices_to_global_seq_ids(batch[:5])
 						batch_slot_lookup = []
 						for gid in batch_global_ids:
 							if gid in mgr.slot_to_seq_id:
