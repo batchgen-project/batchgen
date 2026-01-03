@@ -1229,12 +1229,17 @@ class BatchGenWorker:
 
 		# CRITICAL FIX: IN_DECODE sequences also have KV in host (streams after each layer)
 		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
-		valid_sequences = []
+		
+		# Count sequences per status for detailed logging
+		status_counts = {status: [] for status in valid_statuses}
 		for rank_on_node in range(node_rank_start, node_rank_end):
 			for status in valid_statuses:
-				valid_sequences.extend(
-					self.global_batch.get_sequences_for_rank_with_status(rank_on_node, status)
-				)
+				seqs = self.global_batch.get_sequences_for_rank_with_status(rank_on_node, status)
+				status_counts[status].extend(seqs)
+		
+		valid_sequences = []
+		for seqs in status_counts.values():
+			valid_sequences.extend(seqs)
 
 		# Calculate pages used by valid sequences
 		used_pages = 0
@@ -1249,10 +1254,14 @@ class BatchGenWorker:
 
 		# Log detailed stats for debugging (only on rank 0 of each node)
 		if self.local_rank == 0 and ENABLE_WATERMARK_PREFILL:
+			num_in_decode = len(status_counts[SequenceStatus.IN_DECODE])
+			num_onhold = len(status_counts[SequenceStatus.ON_HOLD])
+			num_prefilled = len(status_counts[SequenceStatus.PREFILLED])
 			logging.info(
 				f"[WATERMARK] Rank {self.rank} (Node {self.rank // NUM_GPUS_PER_NODE}): "
-				f"Host KV utilization - {len(valid_sequences)} valid seqs "
-				f"({used_pages} pages used / {stats.num_total_pages} total = {100-free_percent}% utilized, {free_percent}% free)"
+				f"Host KV: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
+				f"host_kv_total={len(valid_sequences)} "
+				f"({used_pages} pages / {stats.num_total_pages} = {100-free_percent}% used, {free_percent}% free)"
 			)
 
 		return {
@@ -4715,10 +4724,15 @@ class BatchGenWorker:
 				# Detailed logging at every boundary (only rank 0)
 				if self.rank == 0:
 					# Get status counts
+					# - in_decode: sequences currently in decode batch (IN_DECODE status)
+					# - onhold: sequences paused with host KV (ON_HOLD status)  
+					# - prefilled: sequences prefilled but not yet decoding (PREFILLED status)
+					# - host_kv_total: total sequences with host KV = prefilled + onhold + in_decode
+					num_in_decode = timing.total_active
 					num_onhold = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
 					num_prefilled = timing.total_prefilled
 					num_completed_total = timing.total_completed_cumulative
-					num_in_decode = timing.total_active
+					num_host_kv_total = num_prefilled + num_onhold + num_in_decode
 					
 					if BATCHGEN_CB_DEBUG:
 						# Detailed timing log when debug is enabled
@@ -4739,16 +4753,16 @@ class BatchGenWorker:
 							f"rebuild={timing.rebuild_ms:.1f}, "
 							f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
 							f"barrier={timing.barrier_ms:.1f}ms | "
-							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{global_batch_size}, "
-							f"onhold={num_onhold}, prefilled={num_prefilled}, "
+							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
+							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
 							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
 						)
 					else:
 						# Minimal log without timing details
 						logging.info(
 							f"[Boundary {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
-							f"STATUS: active={num_in_decode}, completed={num_completed_total}/{global_batch_size}, "
-							f"onhold={num_onhold}, prefilled={num_prefilled}, "
+							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
+							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
 							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
 						)
 				
