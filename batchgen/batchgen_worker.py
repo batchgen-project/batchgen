@@ -762,6 +762,30 @@ class BatchGenWorker:
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)  # [B, 1, D] -> [B, 1, 1, D]
 		
+		# NaN DETECTION: Check for NaN in KV tensor BEFORE appending to host
+		# This catches attention computation issues that would propagate to host KV
+		if layer_idx == 0 and torch.isnan(k_tensor).any():
+			nan_mask = torch.isnan(k_tensor).any(dim=-1).any(dim=-1).any(dim=-1)  # [batch]
+			nan_indices = torch.where(nan_mask)[0].tolist()
+			nan_seq_info = []
+			for idx in nan_indices:
+				if idx < len(batch):
+					local_idx = batch[idx]
+					uuid = self._local_to_uuid_map.get(local_idx, "unknown")
+					seq = self.global_batch.get_sequence(uuid) if uuid != "unknown" else None
+					nan_seq_info.append({
+						'batch_idx': idx,
+						'local_idx': local_idx,
+						'uuid': uuid[:8] if uuid != "unknown" else "unknown",
+						'global_idx': seq.global_idx if seq else -1,
+						'ctx_len': seq.current_context_length if seq else -1,
+					})
+			logging.error(
+				f"[KV-NaN-DETECT] Rank {self.rank}: NaN detected in k_tensor BEFORE host append! "
+				f"layer={layer_idx}, k_tensor_shape={list(k_tensor.shape)}, "
+				f"affected_seqs={nan_seq_info}"
+			)
+		
 		# Launch async append
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
@@ -1629,6 +1653,17 @@ class BatchGenWorker:
 			sequence_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
 			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 			active_page_counts = manager.export_active_sequence_page_counts()
+			
+			# PRE-LOAD DIAGNOSTIC: Log host KV state before loading
+			# This helps trace where NaN originates - in host storage or during load
+			host_stats = worker_view.get_stats()
+			logging.info(
+				f"[MIGRATION SEND PRE-LOAD] Rank {self.rank}: Loading host KV for {uuid[:8]}... "
+				f"global_idx={global_idx}, tokens_needed={tokens_needed}, "
+				f"active_page_counts={active_page_counts.tolist()}, "
+				f"host_stats=(used={host_stats.num_used_pages}, total={host_stats.num_total_pages})"
+			)
+			
 			load_task = worker_view.async_load_layer_paged_kv_to_device(
 				sequence_ids=sequence_tensor,
 				active_page_counts=active_page_counts,
@@ -1679,6 +1714,25 @@ class BatchGenWorker:
 			if send_has_nan:
 				logging.error(
 					f"[MIGRATION SEND] Rank {self.rank}: CRITICAL - KV to send has NaN for {uuid[:8]}!"
+				)
+				# DEEP LAYER-BY-LAYER NaN ANALYSIS: Find exactly which layers have NaN
+				nan_layers = []
+				for layer_idx in range(k_gpu.shape[0]):
+					layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
+					layer_valid_k = layer_k[:valid_tokens]
+					if torch.isnan(layer_valid_k).any():
+						# Find which tokens have NaN in this layer
+						nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
+						nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
+						nan_layers.append({
+							'layer': layer_idx,
+							'nan_token_count': nan_token_mask.sum().item(),
+							'first_nan_tokens': nan_token_indices,
+						})
+				logging.error(
+					f"[MIGRATION SEND] Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
+					f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
+					f"details={nan_layers[:5]}"  # First 5 layers with NaN
 				)
 
 			# Move GPU → CPU for Gloo transfer (Gloo supports CPU tensors, more memory efficient)
@@ -1785,6 +1839,25 @@ class BatchGenWorker:
 			if migration_has_nan:
 				logging.error(
 					f"[MIGRATION RECV] Rank {self.rank}: CRITICAL - Received KV has NaN for {uuid[:8]}!"
+				)
+				# DEEP LAYER-BY-LAYER NaN ANALYSIS: Find exactly which layers have NaN
+				nan_layers = []
+				for layer_idx in range(k_gpu.shape[0]):
+					layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
+					layer_valid_k = layer_k[:valid_tokens]
+					if torch.isnan(layer_valid_k).any():
+						# Find which tokens have NaN in this layer
+						nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
+						nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
+						nan_layers.append({
+							'layer': layer_idx,
+							'nan_token_count': nan_token_mask.sum().item(),
+							'first_nan_tokens': nan_token_indices,
+						})
+				logging.error(
+					f"[MIGRATION RECV] Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
+					f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
+					f"details={nan_layers[:5]}"  # First 5 layers with NaN
 				)
 
 			for layer_idx in range(num_layers):
@@ -5525,6 +5598,30 @@ class BatchGenWorker:
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
+		
+		# NaN DETECTION: Check for NaN in KV tensor BEFORE appending to host
+		# This catches attention computation issues that would propagate to host KV
+		if layer_idx == 0 and torch.isnan(k_tensor).any():
+			nan_mask = torch.isnan(k_tensor).any(dim=-1).any(dim=-1).any(dim=-1)  # [batch]
+			nan_indices = torch.where(nan_mask)[0].tolist()
+			nan_seq_info = []
+			for idx in nan_indices:
+				if idx < len(batch):
+					local_idx = batch[idx]
+					uuid = self._local_to_uuid_map.get(local_idx, "unknown")
+					seq = self.global_batch.get_sequence(uuid) if uuid != "unknown" else None
+					nan_seq_info.append({
+						'batch_idx': idx,
+						'local_idx': local_idx,
+						'uuid': uuid[:8] if uuid != "unknown" else "unknown",
+						'global_idx': seq.global_idx if seq else -1,
+						'ctx_len': seq.current_context_length if seq else -1,
+					})
+			logging.error(
+				f"[KV-NaN-DETECT] Rank {self.rank}: NaN detected in k_tensor BEFORE host append! "
+				f"layer={layer_idx}, k_tensor_shape={list(k_tensor.shape)}, "
+				f"affected_seqs={nan_seq_info}"
+			)
 		
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
