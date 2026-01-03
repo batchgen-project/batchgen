@@ -4921,13 +4921,13 @@ class BatchGenWorker:
 					
 					if resumed_mask_diag and self.rank == 0:
 						logging.warning(
-							f"[MASK-RESUME-DIAG] iter={iteration}: {len(resumed_mask_diag)} resumed seqs. "
+							f"[MASK-RESUME-DIAG] iter={local_iteration}: {len(resumed_mask_diag)} resumed seqs. "
 							f"First 3: {resumed_mask_diag[:3]}"
 						)
 					
 					if attn_mask_mismatch and local_iteration <= 5:
 						logging.error(
-							f"Rank {self.rank}: [ATTN-MASK-BUG] iter={iteration}: {len(attn_mask_mismatch)} "
+							f"Rank {self.rank}: [ATTN-MASK-BUG] iter={local_iteration}: {len(attn_mask_mismatch)} "
 							f"sequences have attention_mask mismatch! First 5: {attn_mask_mismatch[:5]}"
 						)
 					
@@ -4991,7 +4991,7 @@ class BatchGenWorker:
 							logging.error(
 								f"Rank {self.rank}: PRE-FORWARD MISMATCH! "
 								f"page_table_size={page_table_size}, batch_size={batch_size}, "
-								f"new_tokens.shape[0]={tokens_size}, iteration={iteration}"
+								f"new_tokens.shape[0]={tokens_size}, iteration={local_iteration}"
 							)
 							
 							# Fix: rebuild new_tokens if it doesn't match batch
