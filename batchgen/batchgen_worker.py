@@ -1969,6 +1969,21 @@ class BatchGenWorker:
 		# BARRIER 2: Ensure all local mapping updates are complete across all ranks
 		dist.barrier()
 
+		# CRITICAL FIX: Sync sequence metadata for ALL migrated sequences
+		# After migration, the receiver's local Sequence objects have stale metadata
+		# (current_context_length, decoded_length, etc.) from before they were updated
+		# by the source rank during decoding. We must sync this metadata so that:
+		# 1. KV validation uses correct current_context_length
+		# 2. Resume decoding starts at correct position
+		# 3. Page allocation uses correct values
+		migrated_uuids = [m['uuid'] for m in migrations]
+		if migrated_uuids:
+			self._sync_sequence_metadata(migrated_uuids)
+			logging.debug(f"Rank {self.rank}: Synced metadata for {len(migrated_uuids)} migrated sequences")
+
+		# BARRIER 3: Ensure metadata sync is complete before continuing
+		dist.barrier()
+
 		rebalance_end = time.perf_counter()
 		if self.rank == 0:
 			logging.info(
