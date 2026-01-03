@@ -518,12 +518,32 @@ class BatchGenWorker:
 		pages_per_seq = []
 		total_pages = 0
 		
+		# DIAGNOSTIC: Log allocation details for KV corruption investigation
+		alloc_details = []
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			pages = seq.get_gpu_pages_for_two_page_buffer()
 			pages_per_seq.append(pages * self.PAGE_SIZE)  # tokens for API
 			total_pages += pages
+			
+			# Track details for resuming sequences (decoded_length > 0)
+			if seq.decoded_length > 0:
+				alloc_details.append({
+					'uuid': uuid[:8],
+					'global_idx': seq.global_idx,
+					'decoded_length': seq.decoded_length,
+					'current_context_length': seq.current_context_length,
+					'pages_allocating': pages,
+					'had_initial_gpu_reservation': seq.had_initial_gpu_reservation,
+				})
+		
+		if alloc_details:
+			logging.info(
+				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _allocate_gpu_kv_two_page_buffer: "
+				f"Allocating GPU KV for {len(alloc_details)} RESUMING sequences. "
+				f"First 5: {alloc_details[:5]}"
+			)
 
 		free_pages = manager.get_stats().num_free_pages
 		if total_pages > free_pages:
@@ -1060,10 +1080,52 @@ class BatchGenWorker:
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
 			return
+		
+		# DIAGNOSTIC: Log state before destruction for KV corruption investigation
+		if self.global_batch is not None:
+			seqs_with_gpu_alloc = []
+			for seq in self.global_batch:
+				if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
+					seqs_with_gpu_alloc.append({
+						'uuid': seq.uuid[:8],
+						'global_idx': seq.global_idx,
+						'status': seq.status.name,
+						'gpu_pages_allocated': seq.gpu_pages_allocated,
+						'had_initial_gpu_reservation': seq.had_initial_gpu_reservation,
+						'current_context_length': seq.current_context_length,
+						'decoded_length': seq.decoded_length,
+					})
+			if seqs_with_gpu_alloc:
+				logging.warning(
+					f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _destroy_gpu_paged_kv_cache called with "
+					f"{len(seqs_with_gpu_alloc)} sequences having GPU allocation state. "
+					f"First 5: {seqs_with_gpu_alloc[:5]}"
+				)
+		
 		manager.destroy(empty_cuda_cache=empty_cuda_cache)
 		
 		# FIX Bug 2: Clear tracking set when GPU KV is destroyed
 		self._sequences_with_gpu_kv.clear()
+		
+		# CRITICAL FIX: Reset GPU allocation state for ALL non-completed sequences
+		# Without this, sequences retain stale had_initial_gpu_reservation=True,
+		# causing them to get insufficient GPU buffer on resume after prefill interruption
+		if self.global_batch is not None:
+			reset_count = 0
+			for seq in self.global_batch:
+				if seq.status != SequenceStatus.COMPLETED:
+					if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
+						logging.debug(
+							f"Rank {self.rank}: [KV-CORRUPTION-FIX] Resetting GPU state for {seq.uuid[:8]} "
+							f"(status={seq.status.name}, gpu_pages={seq.gpu_pages_allocated}, "
+							f"had_initial={seq.had_initial_gpu_reservation})"
+						)
+						seq.reset_gpu_allocation()
+						reset_count += 1
+			if reset_count > 0:
+				logging.info(
+					f"Rank {self.rank}: [KV-CORRUPTION-FIX] Reset GPU allocation state for {reset_count} sequences"
+				)
 
 	def _get_host_kv_free_pages(self) -> int:
 		"""Get current free pages from host KV cache."""
@@ -2526,8 +2588,15 @@ class BatchGenWorker:
 				
 				logging.info(f"Rank {self.rank}: Evicted {len(my_onhold)} local sequences")
 			
-			# Update status globally
+			# Update status globally AND reset GPU allocation state
+			# CRITICAL FIX: Must call reset_gpu_allocation() so sequences get proper initial buffer on resume
 			for uuid in global_onhold:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
+					logging.debug(
+						f"Rank {self.rank}: [KV-CORRUPTION-FIX] Resetting GPU state for ON_HOLD seq {uuid[:8]}"
+					)
+					seq.reset_gpu_allocation()
 				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 			
 			# ============ Step 8: Extend remaining sequences ============
@@ -3108,6 +3177,37 @@ class BatchGenWorker:
 				f"[PREFILL] Configuring prefill phase for {len(prefill_uuids)} sequences"
 			)
 
+		# DIAGNOSTIC: Log state of IN_DECODE/ON_HOLD sequences before prefill config
+		# This helps track KV corruption issues during decode→prefill→decode transitions
+		in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+		on_hold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+		if in_decode or on_hold:
+			logging.warning(
+				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _config_prefill_for_batch called while "
+				f"{len(in_decode)} IN_DECODE, {len(on_hold)} ON_HOLD, {len(prefilled)} PREFILLED sequences exist. "
+				f"This is a decode→prefill transition that may cause KV corruption if not handled properly."
+			)
+			# Log details of sequences that will be affected
+			for uuid in (in_decode + on_hold)[:5]:
+				seq = self.global_batch.get_sequence(uuid)
+				logging.warning(
+					f"Rank {self.rank}: [KV-CORRUPTION-DIAG] Affected seq {seq.uuid[:8]}: "
+					f"status={seq.status.name}, decoded_len={seq.decoded_length}, "
+					f"ctx_len={seq.current_context_length}, gpu_pages={seq.gpu_pages_allocated}, "
+					f"had_initial={seq.had_initial_gpu_reservation}"
+				)
+
+		# CRITICAL FIX: Flush pending KV append tasks before destroying GPU cache
+		# Without this, async KV writes may be in-flight when GPU cache is destroyed
+		if hasattr(self, '_pending_kv_append_tasks') and self._pending_kv_append_tasks:
+			logging.info(
+				f"Rank {self.rank}: [KV-CORRUPTION-FIX] Flushing {len(self._pending_kv_append_tasks)} "
+				f"pending KV append tasks before prefill config"
+			)
+			self._wait_pending_kv_append_tasks()
+			torch.cuda.synchronize(self.torch_device)
+
 		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
 		# to ensure batch selection uses accurate post-migration capacities.
 
@@ -3178,6 +3278,47 @@ class BatchGenWorker:
 	) -> None:
 		"""Configure decoding phase with pre-sized GPU KV manager."""
 		start_time = time.perf_counter()
+		
+		# DIAGNOSTIC: Log sequence states at decode config entry
+		# This helps identify KV corruption issues during prefill→decode transitions
+		resuming_seqs = []
+		fresh_seqs = []
+		for uuid in decode_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			seq_info = {
+				'uuid': seq.uuid[:8],
+				'global_idx': seq.global_idx,
+				'status': seq.status.name,
+				'decoded_length': seq.decoded_length,
+				'current_context_length': seq.current_context_length,
+				'gpu_pages_allocated': seq.gpu_pages_allocated,
+				'had_initial_gpu_reservation': seq.had_initial_gpu_reservation,
+			}
+			if seq.decoded_length > 0:
+				resuming_seqs.append(seq_info)
+			else:
+				fresh_seqs.append(seq_info)
+		
+		if resuming_seqs:
+			logging.warning(
+				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _config_decoding_for_batch: "
+				f"{len(resuming_seqs)} RESUMING sequences (decoded_length > 0). "
+				f"First 5: {resuming_seqs[:5]}"
+			)
+			# Check for potential issues: sequences with decoded tokens but no GPU reservation flag reset
+			problematic = [s for s in resuming_seqs 
+						   if s['gpu_pages_allocated'] == 0 and s['had_initial_gpu_reservation']]
+			if problematic:
+				logging.error(
+					f"Rank {self.rank}: [KV-CORRUPTION-DIAG] POTENTIAL BUG: {len(problematic)} sequences have "
+					f"decoded_length>0, gpu_pages_allocated=0, but had_initial_gpu_reservation=True! "
+					f"These won't get proper initial GPU buffer. First 5: {problematic[:5]}"
+				)
+		
+		if fresh_seqs and self.rank == 0:
+			logging.info(
+				f"[KV-CORRUPTION-DIAG] _config_decoding_for_batch: {len(fresh_seqs)} FRESH sequences (decoded_length=0)"
+			)
 		
 		self.deep_free_model_memory()
 		self.init_nvshmem()
