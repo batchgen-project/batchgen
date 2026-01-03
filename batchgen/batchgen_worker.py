@@ -4776,6 +4776,16 @@ class BatchGenWorker:
 
 				# Check if watermark triggered - interrupt decode for prefill
 				if watermark_triggered:
+					# CRITICAL FIX: Wait for pending KV append tasks BEFORE going ON_HOLD!
+					# Without this, KV data may not be fully written to host when sequences
+					# are later resumed, causing KV corruption and gibberish output.
+					num_waited = self._wait_pending_kv_append_tasks()
+					if num_waited > 0:
+						logging.info(
+							f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
+							f"before putting sequences ON_HOLD"
+						)
+					
 					logging.info(
 						f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
 						f"sequences ON_HOLD, will trigger prefill"
