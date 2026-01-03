@@ -2348,6 +2348,11 @@ class BatchGenWorker:
 				f"[WATERMARK] Putting {len(uuids)} sequences ON_HOLD"
 			)
 
+		# CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
+		# This ensures all ranks have consistent current_context_length values
+		# which is essential for correct KV migration validation later
+		self._sync_sequence_metadata(uuids)
+
 		# Free GPU pages for these sequences
 		# CRITICAL FIX: GPU KV manager uses global_idx (not local_idx) as sequence ID
 		if hasattr(self, 'gpu_paged_kv_cache_manager') and self.gpu_paged_kv_cache_manager:
@@ -3005,6 +3010,18 @@ class BatchGenWorker:
 			# =================================================================
 			if self.global_batch.has_queueing():
 				dist.barrier()
+
+				# CRITICAL FIX: Sync sequence metadata BEFORE rebalancing
+				# After decode interruption, each rank has divergent metadata for sequences
+				# it doesn't own locally. This sync ensures all ranks have consistent
+				# current_context_length values before migration, which is essential for
+				# correct KV validation on the receiver side.
+				on_hold_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.ON_HOLD]
+				in_decode_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.IN_DECODE]
+				all_active_uuids = on_hold_uuids + in_decode_uuids
+				if all_active_uuids:
+					self._sync_sequence_metadata(all_active_uuids)
+					logging.debug(f"Rank {self.rank}: Synced metadata for {len(all_active_uuids)} sequences before rebalance")
 
 				# STEP 0: Rebalance host KV BEFORE batch selection
 				# This ensures batch selection uses accurate post-migration capacities
