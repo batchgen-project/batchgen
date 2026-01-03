@@ -4905,7 +4905,7 @@ class BatchGenWorker:
 							})
 						
 						# Log mask details for resumed sequences (decoded_length > 1)
-						if seq.decoded_length > 1 and iteration <= 3:
+						if seq.decoded_length > 1 and local_iteration <= 3:
 							mask_flat = mask.flatten()
 							last_10_values = mask_flat[-10:].tolist() if len(mask_flat) >= 10 else mask_flat.tolist()
 							resumed_mask_diag.append({
@@ -4925,7 +4925,7 @@ class BatchGenWorker:
 							f"First 3: {resumed_mask_diag[:3]}"
 						)
 					
-					if attn_mask_mismatch and iteration <= 5:
+					if attn_mask_mismatch and local_iteration <= 5:
 						logging.error(
 							f"Rank {self.rank}: [ATTN-MASK-BUG] iter={iteration}: {len(attn_mask_mismatch)} "
 							f"sequences have attention_mask mismatch! First 5: {attn_mask_mismatch[:5]}"
@@ -5027,10 +5027,10 @@ class BatchGenWorker:
 					   self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx)) and
 					   self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx)).decoded_length > 1
 				]
-				if resumed_in_batch and iteration <= 3 and self.rank == 0:
+				if resumed_in_batch and local_iteration <= 3 and self.rank == 0:
 					input_tokens_str = new_tokens[:5].flatten().tolist() if new_tokens.shape[0] <= 5 else new_tokens[:5].flatten().tolist()
 					logging.warning(
-						f"[FORWARD-DIAG] iter={iteration}, batch_size={len(batch)}, "
+						f"[FORWARD-DIAG] iter={local_iteration}, batch_size={len(batch)}, "
 						f"resumed_count={len(resumed_in_batch)}, "
 						f"input_tokens(first5)={input_tokens_str}, "
 						f"resumed_seqs(first3)={resumed_in_batch[:3]}"
@@ -5041,10 +5041,10 @@ class BatchGenWorker:
 				new_tokens_out = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
 				
 				# DIAGNOSTIC: Log output tokens for first few iterations with resumed sequences
-				if resumed_in_batch and iteration <= 3 and self.rank == 0:
+				if resumed_in_batch and local_iteration <= 3 and self.rank == 0:
 					output_tokens_str = new_tokens_out[:5].flatten().tolist()
 					logging.warning(
-						f"[FORWARD-OUT-DIAG] iter={iteration}, output_tokens(first5)={output_tokens_str}"
+						f"[FORWARD-OUT-DIAG] iter={local_iteration}, output_tokens(first5)={output_tokens_str}"
 					)
 				
 				new_tokens = new_tokens_out
