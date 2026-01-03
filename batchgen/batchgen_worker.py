@@ -4958,6 +4958,24 @@ class BatchGenWorker:
 				
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+					
+					# CRITICAL FIX: Ensure page table order matches batch order BEFORE forward pass
+					# This is the root cause of KV corruption after resume - if they don't match,
+					# cache_seqlens[i] will correspond to wrong page_table[i], causing gibberish output
+					if gpu_manager and gpu_manager._gpu_page_table_manager:
+						slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+						batch_global_order = Attn_Wrapper.cur_batch
+						if slot_order != batch_global_order:
+							if local_iteration <= 3 and self.rank == 0:
+								logging.error(
+									f"[CRITICAL ORDER MISMATCH] iter={local_iteration}: cache_seqlens built from batch order, "
+									f"but page_table is in different order! "
+									f"batch_global_order={batch_global_order[:5]}... (len={len(batch_global_order)}), "
+									f"page_table_slot_order={slot_order[:5]}... (len={len(slot_order)}). "
+									f"Rebuilding page table to fix..."
+								)
+							# FIX: Rebuild page table to match batch order
+							gpu_manager.rebuild_page_table(batch_global_order)
 				
 				# NOTE: Do NOT skip forward pass even with empty batch!
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
@@ -5029,12 +5047,52 @@ class BatchGenWorker:
 				]
 				if resumed_in_batch and local_iteration <= 3 and self.rank == 0:
 					input_tokens_str = new_tokens[:5].flatten().tolist() if new_tokens.shape[0] <= 5 else new_tokens[:5].flatten().tolist()
+					
+					# CRITICAL: Also log cache_seqlens to verify they match the expected context lengths
+					cache_seqlens_list = Attn_Wrapper.cache_seqlens[:5].tolist() if Attn_Wrapper.cache_seqlens.shape[0] >= 5 else Attn_Wrapper.cache_seqlens.tolist()
+					
+					# Get expected context lengths from sequences
+					expected_ctx_lens = []
+					for i, local_idx in enumerate(batch[:5]):
+						uuid = self._local_to_uuid_map.get(local_idx)
+						if uuid:
+							seq = self.global_batch.get_sequence(uuid)
+							if seq:
+								expected_ctx_lens.append(seq.current_context_length)
+					
+					# Check if cache_seqlens match expected
+					seqlen_mismatch = cache_seqlens_list != expected_ctx_lens
+					
 					logging.warning(
 						f"[FORWARD-DIAG] iter={local_iteration}, batch_size={len(batch)}, "
 						f"resumed_count={len(resumed_in_batch)}, "
 						f"input_tokens(first5)={input_tokens_str}, "
+						f"cache_seqlens(first5)={cache_seqlens_list}, "
+						f"expected_ctx_lens(first5)={expected_ctx_lens}, "
+						f"SEQLEN_MISMATCH={seqlen_mismatch}, "
 						f"resumed_seqs(first3)={resumed_in_batch[:3]}"
 					)
+					
+					# NEW DIAGNOSTIC: Log page table content for first few sequences
+					if mgr and local_iteration <= 3:
+						page_diag = []
+						slot_seq_ids = list(mgr.slot_to_seq_id) if mgr.slot_to_seq_id else []
+						for i in range(min(5, len(slot_seq_ids))):
+							seq_id = slot_seq_ids[i]
+							first_page_idx = mgr.gpu_table[i, 0].item() if mgr.gpu_table is not None and i < mgr.gpu_table.shape[0] else -1
+							page_diag.append({'slot': i, 'seq_id': seq_id, 'first_page': first_page_idx})
+						logging.warning(f"[PAGE-TABLE-DIAG] iter={local_iteration}: first 5 slots: {page_diag}")
+						
+						# CRITICAL: Show batch-to-slot mapping
+						batch_global_ids = [self._local_to_global.get(local_idx, -1) for local_idx in batch[:5]]
+						batch_slot_lookup = []
+						for gid in batch_global_ids:
+							if gid in mgr.slot_to_seq_id:
+								slot = list(mgr.slot_to_seq_id).index(gid)
+								batch_slot_lookup.append({'gid': gid, 'slot': slot})
+							else:
+								batch_slot_lookup.append({'gid': gid, 'slot': 'NOT_FOUND'})
+						logging.warning(f"[BATCH-SLOT-MAP] iter={local_iteration}: batch_order(first5)={batch_global_ids}, slot_lookup={batch_slot_lookup}")
 				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
