@@ -1644,16 +1644,32 @@ class BatchGenWorker:
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
 
 			# MIGRATION SEND VALIDATION: Verify KV data before sending
-			send_k_mean = k_gpu[0].float().mean().item()  # Sample layer 0
-			send_k_std = k_gpu[0].float().std().item()
-			send_has_nan = torch.isnan(k_gpu[0]).any().item()
-			send_is_zero = (k_gpu[0] == 0).all().item()
+			# NOTE: Only validate the VALID portion of KV (up to current_context_length)
+			# The last page may have uninitialized slots beyond the actual token count
+			valid_tokens = seq.current_context_length
+			total_slots = pages_needed * page_size
+			
+			# Reshape layer 0 to [total_tokens, num_k_heads, k_head_dim] to slice valid portion
+			flat_k = k_gpu[0].reshape(total_slots, num_k_heads, k_head_dim)
+			valid_k = flat_k[:valid_tokens]
+			
+			send_k_mean = valid_k.float().mean().item()
+			send_k_std = valid_k.float().std().item()
+			send_has_nan = torch.isnan(valid_k).any().item()
+			send_is_zero = (valid_k == 0).all().item()
+			
+			# Check if NaN only in padding (this is OK)
+			full_has_nan = torch.isnan(k_gpu[0]).any().item()
+			padding_info = ""
+			if full_has_nan and not send_has_nan:
+				padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
+			
 			logging.info(
 				f"[MIGRATION SEND] Rank {self.rank}: Validating KV for {uuid[:8]}... (global_idx={global_idx}): "
-				f"k_gpu_shape={list(k_gpu.shape)}, "
+				f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
 				f"layer0_mean={send_k_mean:.4f}, std={send_k_std:.4f}, "
-				f"has_nan={send_has_nan}, is_zero={send_is_zero}, "
-				f"first_values={k_gpu[0, 0, 0, 0, :4].tolist() if k_gpu.numel() > 0 else 'N/A'}"
+				f"has_nan={send_has_nan}, is_zero={send_is_zero}{padding_info}, "
+				f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
 			)
 			if send_is_zero:
 				logging.error(
@@ -1732,17 +1748,34 @@ class BatchGenWorker:
 			sequence_lengths = [seq_len]
 
 			# MIGRATION KV VALIDATION: Log first layer data before offload
+			# NOTE: Only validate the VALID portion of KV (up to current_context_length)
+			# The last page may have uninitialized slots beyond the actual token count
 			first_layer_k = k_gpu[0]  # [num_pages, page_size, num_k_heads, k_head_dim]
-			migration_k_mean = first_layer_k.float().mean().item()
-			migration_k_std = first_layer_k.float().std().item()
-			migration_has_nan = torch.isnan(first_layer_k).any().item()
-			migration_is_zero = (first_layer_k == 0).all().item()
+			valid_tokens = seq.current_context_length
+			total_slots = pages_needed * page_size
+			
+			# Reshape to [total_tokens, num_k_heads, k_head_dim] to easily slice valid portion
+			flat_k = first_layer_k.reshape(total_slots, num_k_heads, k_head_dim)
+			valid_k = flat_k[:valid_tokens]  # Only validate actual tokens
+			
+			migration_k_mean = valid_k.float().mean().item()
+			migration_k_std = valid_k.float().std().item()
+			migration_has_nan = torch.isnan(valid_k).any().item()
+			migration_is_zero = (valid_k == 0).all().item()
+			
+			# Also check if the ENTIRE buffer has NaN (for debugging padding issues)
+			full_has_nan = torch.isnan(first_layer_k).any().item()
+			padding_info = ""
+			if full_has_nan and not migration_has_nan:
+				# NaN only in padding region - this is expected and OK
+				padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
+			
 			logging.info(
 				f"[MIGRATION RECV] Rank {self.rank}: Validating received KV for {uuid[:8]}... (global_idx={global_idx}): "
-				f"k_gpu_shape={list(k_gpu.shape)}, "
+				f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
 				f"layer0_mean={migration_k_mean:.4f}, std={migration_k_std:.4f}, "
-				f"has_nan={migration_has_nan}, is_zero={migration_is_zero}, "
-				f"first_values={first_layer_k[0, 0, 0, :4].tolist() if first_layer_k.numel() > 0 else 'N/A'}"
+				f"has_nan={migration_has_nan}, is_zero={migration_is_zero}{padding_info}, "
+				f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
 			)
 			if migration_is_zero:
 				logging.error(
