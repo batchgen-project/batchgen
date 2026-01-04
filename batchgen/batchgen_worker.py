@@ -1817,7 +1817,7 @@ class BatchGenWorker:
 			logging.debug(f"[MIGRATION] Rank {self.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
 			# Move CPU → GPU for offload to host KV
 			k_gpu = k_cpu.to(self.device, non_blocking=True)
-			torch.cuda.synchronize()
+			torch.cuda.synchronize(self.torch_device)
 			t_gpu = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: CPU→GPU copy: {(t_gpu-t_alloc)*1000:.1f}ms")
 
@@ -1906,7 +1906,7 @@ class BatchGenWorker:
 				# Note: async_offload_layer_kv_to_host is fire-and-forget for each layer
 
 			# Sync to ensure all offloads complete
-			torch.cuda.synchronize()
+			torch.cuda.synchronize(self.torch_device)
 			t_store = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→Host offload all layers: {(t_store-t_gpu)*1000:.1f}ms")
 			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
@@ -6113,6 +6113,10 @@ class BatchGenWorker:
 		"""
 		Wait for all pending KV append tasks at page boundary.
 		Returns the number of tasks that were waited for.
+		
+		CRITICAL: Also syncs CUDA to ensure all D2H DMA operations complete.
+		Without this, KV data may not be fully written to host memory when
+		sequences are later resumed, causing KV corruption.
 		"""
 		if not hasattr(self, '_pending_kv_append_tasks'):
 			return 0
@@ -6121,6 +6125,14 @@ class BatchGenWorker:
 		for task in self._pending_kv_append_tasks:
 			if task is not None:
 				task.wait()
+		
+		# CRITICAL FIX: Sync CUDA after waiting for tasks
+		# The async tasks use a separate CUDA stream for D2H copies.
+		# Even though each task internally syncs its stream via cudaEventSynchronize,
+		# we need a full device sync to ensure ALL pending operations complete
+		# before we allow GPU pages to be freed/reused.
+		if num_tasks > 0:
+			torch.cuda.synchronize(self.torch_device)
 		
 		self._pending_kv_append_tasks.clear()
 		
@@ -7172,7 +7184,7 @@ class BatchGenWorker:
 			# Quick health check using PyNccl all_reduce
 			health_tensor = torch.ones(1, device=self.torch_device, dtype=torch.float32)
 			self.comm.all_reduce(health_tensor, op=dist.ReduceOp.SUM, stream=torch.cuda.current_stream())
-			torch.cuda.synchronize()
+			torch.cuda.synchronize(self.torch_device)
 			
 			expected = float(self.world_size)
 			if abs(health_tensor.item() - expected) > 1e-6:
@@ -7282,7 +7294,7 @@ class BatchGenWorker:
 		
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
-			torch.cuda.synchronize()
+			torch.cuda.synchronize(self.torch_device)
 		
 		for _ in range(3):
 			gc.collect()
@@ -7370,7 +7382,7 @@ class BatchGenWorker:
 		
 		# 9. Clear CUDA cache
 		torch.cuda.empty_cache()
-		torch.cuda.synchronize()
+		torch.cuda.synchronize(self.torch_device)
 		
 		# 10. Force garbage collection
 		gc.collect()
