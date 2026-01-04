@@ -751,12 +751,32 @@ class BatchGenWorker:
 		sequence_ids = []
 		sequence_lengths = []
 		
+		# DIAGNOSTIC: Track host KV append positions for debugging
+		append_diag = []
+		
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			sequence_ids.append(seq.global_idx)
 			# Write position is current position (0-indexed)
-			sequence_lengths.append(seq.current_context_length - 1)
+			write_pos = seq.current_context_length - 1
+			sequence_lengths.append(write_pos)
+			
+			# Track for debugging (only first few sequences)
+			if len(append_diag) < 3 and seq.decoded_length > 1:
+				append_diag.append({
+					'gid': seq.global_idx,
+					'ctx_len': seq.current_context_length,
+					'decoded_len': seq.decoded_length,
+					'write_pos': write_pos,
+				})
+		
+		# Log append positions for resumed sequences (layer 0 only to reduce spam)
+		if layer_idx == 0 and append_diag:
+			logging.debug(
+				f"Rank {self.rank}: [HOST-KV-APPEND] layer=0, "
+				f"first_3_resumed_seqs={append_diag}"
+			)
 		
 		# Reshape for MLA if needed
 		if k_tensor.dim() == 3:
@@ -5104,6 +5124,92 @@ class BatchGenWorker:
 								batch_slot_lookup.append({'gid': gid, 'slot': 'NOT_FOUND'})
 						logging.warning(f"[BATCH-SLOT-MAP] iter={local_iteration}: batch_order(first5)={batch_global_ids}, slot_lookup={batch_slot_lookup}")
 				
+				# CRITICAL DIAGNOSTIC: Sample GPU KV content at resume iterations
+				# This helps identify if KV corruption is happening before/during attention
+				if resumed_in_batch and local_iteration <= 3 and gpu_manager and gpu_manager.is_initialized:
+					try:
+						# Sample KV from layer 0 for first sequence in batch
+						first_gid = self._local_indices_to_global_seq_ids(batch[:1])[0] if batch else None
+						if first_gid and first_gid in gpu_manager._sequences:
+							seq_state = gpu_manager._sequences[first_gid]
+							if seq_state.pages.numel() > 0:
+								# Get first page index
+								first_page = int(seq_state.pages[0].item())
+								# Get last page index
+								num_pages = seq_state.pages.numel()
+								last_page = int(seq_state.pages[num_pages-1].item())
+								
+								# Sample K values from first page (first 4 positions)
+								k_first_page = gpu_manager._k_cache[0, first_page, :4, :, :].clone().cpu()
+								k_first_mean = k_first_page.float().mean().item()
+								k_first_std = k_first_page.float().std().item()
+								
+								# CRITICAL: At iter 2+, check PREVIOUS position's KV (written at iter N-1)
+								# This detects if KV written at previous iteration got corrupted
+								first_local_idx_early = batch[0] if batch else None
+								first_uuid_early = self._local_to_uuid_map.get(first_local_idx_early) if first_local_idx_early else None
+								first_seq_early = self.global_batch.get_sequence(first_uuid_early) if first_uuid_early else None
+								ctx_len_early = first_seq_early.current_context_length if first_seq_early else 0
+								page_size_early = gpu_manager.config.page_size_tokens
+								
+								if local_iteration >= 2 and ctx_len_early >= 2:
+									# Check position ctx_len_early - 2 (KV written at previous iter)
+									prev_pos = ctx_len_early - 2  # Position written at iter N-1
+									prev_page = prev_pos // page_size_early
+									prev_offset = prev_pos % page_size_early
+									if prev_page < num_pages:
+										prev_page_idx = int(seq_state.pages[prev_page].item())
+										k_prev = gpu_manager._k_cache[0, prev_page_idx, prev_offset:prev_offset+1, :, :].clone().cpu()
+										k_prev_mean = k_prev.float().mean().item()
+										k_prev_std = k_prev.float().std().item()
+										k_prev_first5 = k_prev[0, 0, :5].tolist() if k_prev.numel() >= 5 else k_prev.flatten()[:5].tolist()
+										logging.warning(
+											f"[KV-PREV-POS-CHECK] iter={local_iteration}: gid={first_gid}, "
+											f"prev_pos={prev_pos}, prev_page_idx={prev_page_idx}, prev_offset={prev_offset}, "
+											f"k_prev(mean={k_prev_mean:.4f}, std={k_prev_std:.4f}), "
+											f"k_prev_first5={k_prev_first5}"
+										)
+								
+								# Sample K values from last page (position depends on ctx_len)
+								first_local_idx = batch[0] if batch else None
+								first_uuid = self._local_to_uuid_map.get(first_local_idx) if first_local_idx else None
+								first_seq = self.global_batch.get_sequence(first_uuid) if first_uuid else None
+								ctx_len = first_seq.current_context_length if first_seq else 0
+								
+								# Position in last page
+								page_size = gpu_manager.config.page_size_tokens
+								last_pos_in_seq = ctx_len - 1  # Last valid position
+								last_page_offset = last_pos_in_seq % page_size
+								
+								k_last_page = gpu_manager._k_cache[0, last_page, :4, :, :].clone().cpu()
+								k_last_mean = k_last_page.float().mean().item()
+								k_last_std = k_last_page.float().std().item()
+								
+								# Sample the specific position we're about to write (should be empty/old)
+								write_pos = ctx_len - 1  # Position where new KV will be written
+								write_page = write_pos // page_size
+								write_offset = write_pos % page_size
+								write_page_idx = int(seq_state.pages[write_page].item()) if write_page < num_pages else -1
+								
+								k_write_sample = None
+								if write_page_idx >= 0:
+									k_write_sample = gpu_manager._k_cache[0, write_page_idx, write_offset:write_offset+1, :, :].clone().cpu()
+									k_write_mean = k_write_sample.float().mean().item()
+									k_write_std = k_write_sample.float().std().item()
+								else:
+									k_write_mean = k_write_std = -999
+								
+								logging.warning(
+									f"[KV-CONTENT-DIAG] iter={local_iteration}: gid={first_gid}, ctx_len={ctx_len}, "
+									f"num_pages={num_pages}, first_page={first_page}, last_page={last_page}, "
+									f"k_first_page(mean={k_first_mean:.4f}, std={k_first_std:.4f}), "
+									f"k_last_page(mean={k_last_mean:.4f}, std={k_last_std:.4f}), "
+									f"write_pos={write_pos}, write_page_idx={write_page_idx}, "
+									f"k_write_pos(mean={k_write_mean:.4f}, std={k_write_std:.4f})"
+								)
+					except Exception as e:
+						logging.warning(f"[KV-CONTENT-DIAG] iter={local_iteration}: Error sampling KV: {e}")
+				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
 				new_tokens_out = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
@@ -5114,6 +5220,38 @@ class BatchGenWorker:
 					logging.warning(
 						f"[FORWARD-OUT-DIAG] iter={local_iteration}, output_tokens(first5)={output_tokens_str}"
 					)
+					
+					# CRITICAL: Verify KV was written correctly AFTER forward
+					if gpu_manager and gpu_manager.is_initialized and batch:
+						try:
+							first_gid = self._local_indices_to_global_seq_ids(batch[:1])[0]
+							if first_gid in gpu_manager._sequences:
+								seq_state = gpu_manager._sequences[first_gid]
+								first_local_idx = batch[0]
+								first_uuid = self._local_to_uuid_map.get(first_local_idx)
+								first_seq = self.global_batch.get_sequence(first_uuid)
+								ctx_len = first_seq.current_context_length if first_seq else 0
+								
+								page_size = gpu_manager.config.page_size_tokens
+								write_pos = ctx_len - 1  # Position where KV was just written
+								write_page = write_pos // page_size
+								write_offset = write_pos % page_size
+								num_pages = seq_state.pages.numel()
+								write_page_idx = int(seq_state.pages[write_page].item()) if write_page < num_pages else -1
+								
+								if write_page_idx >= 0:
+									k_after = gpu_manager._k_cache[0, write_page_idx, write_offset:write_offset+1, :, :].clone().cpu()
+									k_after_mean = k_after.float().mean().item()
+									k_after_std = k_after.float().std().item()
+									k_after_first5 = k_after[0, 0, :5].tolist() if k_after.numel() >= 5 else k_after.flatten()[:5].tolist()
+									logging.warning(
+										f"[KV-POST-FORWARD-DIAG] iter={local_iteration}: gid={first_gid}, "
+										f"write_pos={write_pos}, write_page_idx={write_page_idx}, write_offset={write_offset}, "
+										f"k_after(mean={k_after_mean:.4f}, std={k_after_std:.4f}), "
+										f"k_after_first5={k_after_first5}"
+									)
+						except Exception as e:
+							logging.warning(f"[KV-POST-FORWARD-DIAG] iter={local_iteration}: Error: {e}")
 				
 				new_tokens = new_tokens_out
 				
