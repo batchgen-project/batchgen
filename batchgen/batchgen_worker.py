@@ -806,6 +806,13 @@ class BatchGenWorker:
 				f"affected_seqs={nan_seq_info}"
 			)
 		
+		# CRITICAL: Sync default stream before launching async D2H copy.
+		# The k_tensor was computed on the default stream, but the async D2H copy
+		# uses a separate copy stream. Without this sync, the copy stream might
+		# start reading k_tensor before the default stream has finished writing it.
+		# This is the root cause of KV corruption after decode interruption/resume.
+		torch.cuda.current_stream(self.torch_device).synchronize()
+		
 		# Launch async append
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
@@ -1099,8 +1106,9 @@ class BatchGenWorker:
 		
 		# Wait for load to complete (this is synchronous load path used during prefill)
 		load_task.wait()
+		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
+		torch.cuda.synchronize(self.torch_device)
 		
-		# NOTE: No cuda sync needed - load_task.wait() ensures data is ready
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
@@ -1700,6 +1708,8 @@ class BatchGenWorker:
 				v_device_ptrs=v_ptrs,
 			)
 			load_task.wait()
+			# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
+			torch.cuda.synchronize(self.torch_device)
 			t_load = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: Host→GPU load: {(t_load-t0)*1000:.1f}ms")
 			# Extract to contiguous tensor on GPU
@@ -1896,6 +1906,15 @@ class BatchGenWorker:
 				layer_k_flat = layer_k.reshape(seq_len, num_k_heads, k_head_dim)
 				layer_k_batch = layer_k_flat.unsqueeze(0)  # [1, seq_len, num_k_heads, k_head_dim]
 
+				# CRITICAL: Keep a reference to the per-layer tensor until the
+				# async offload completes. The offload runs on a separate copy
+				# stream and uses the tensor's device memory; if Python GC
+				# frees/reuses that memory before the copy finishes we get
+				# corrupted data. We clear these refs after synchronizing below.
+				if not hasattr(self, '_pending_migration_offload_tensors'):
+					self._pending_migration_offload_tensors = []
+				self._pending_migration_offload_tensors.append(layer_k_batch)
+
 				worker_view.async_offload_layer_kv_to_host(
 					layer_idx=layer_idx,
 					sequence_ids=sequence_ids_list,
@@ -1907,6 +1926,10 @@ class BatchGenWorker:
 
 			# Sync to ensure all offloads complete
 			torch.cuda.synchronize(self.torch_device)
+			# Clear held references for migration offload tensors so memory
+			# can be reclaimed now that copies are guaranteed complete.
+			if hasattr(self, '_pending_migration_offload_tensors'):
+				self._pending_migration_offload_tensors.clear()
 			t_store = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→Host offload all layers: {(t_store-t_gpu)*1000:.1f}ms")
 			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
@@ -6216,6 +6239,13 @@ class BatchGenWorker:
 				f"layer={layer_idx}, k_tensor_shape={list(k_tensor.shape)}, "
 				f"affected_seqs={nan_seq_info}"
 			)
+		
+		# CRITICAL: Sync default stream before launching async D2H copy.
+		# The k_tensor was computed on the default stream, but the async D2H copy
+		# uses a separate copy stream. Without this sync, the copy stream might
+		# start reading k_tensor before the default stream has finished writing it.
+		# This is the root cause of KV corruption after decode interruption/resume.
+		torch.cuda.current_stream(self.torch_device).synchronize()
 		
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
