@@ -4510,15 +4510,6 @@ class BatchGenWorker:
 							active_page_counts = gpu_manager.export_active_sequence_page_counts()
 							sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
 
-							# ASYNC LOAD DIAGNOSTIC: Log what we're loading
-							logging.info(
-								f"Rank {self.rank}: [ASYNC LOAD] Launching async load for {len(new_load_global)} sequences: "
-								f"global_ids={new_load_global[:5]}{'...' if len(new_load_global) > 5 else ''}, "
-								f"active_page_counts={active_page_counts.tolist()[:5] if hasattr(active_page_counts, 'tolist') else active_page_counts[:5]}..., "
-								f"k_ptrs_shape={k_ptrs.shape if hasattr(k_ptrs, 'shape') else 'N/A'}, "
-								f"existing_batch_global_ids={existing_global_ids[:5]}{'...' if len(existing_global_ids) > 5 else ''} (len={len(existing_global_ids)})"
-							)
-
 							new_async_task = worker_view.async_load_layer_paged_kv_to_device(
 								sequence_ids=sequence_tensor,
 								active_page_counts=active_page_counts,
