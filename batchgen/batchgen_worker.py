@@ -5295,8 +5295,9 @@ class BatchGenWorker:
 								# CRITICAL: At iter 2+, check PREVIOUS position's KV (written at iter N-1)
 								# This detects if KV written at previous iteration got corrupted
 								first_local_idx_early = batch[0] if batch else None
-								first_uuid_early = self._local_to_uuid_map.get(first_local_idx_early) if first_local_idx_early else None
-								first_seq_early = self.global_batch.get_sequence(first_uuid_early) if first_uuid_early else None
+								# CRITICAL FIX: Use 'is not None' to handle local_idx=0 correctly (0 is falsy!)
+								first_uuid_early = self._local_to_uuid_map.get(first_local_idx_early) if first_local_idx_early is not None else None
+								first_seq_early = self.global_batch.get_sequence(first_uuid_early) if first_uuid_early is not None else None
 								ctx_len_early = first_seq_early.current_context_length if first_seq_early else 0
 								page_size_early = gpu_manager.config.page_size_tokens
 								
@@ -5320,8 +5321,9 @@ class BatchGenWorker:
 								
 								# Sample K values from last page (position depends on ctx_len)
 								first_local_idx = batch[0] if batch else None
-								first_uuid = self._local_to_uuid_map.get(first_local_idx) if first_local_idx else None
-								first_seq = self.global_batch.get_sequence(first_uuid) if first_uuid else None
+								# CRITICAL FIX: Use 'is not None' to handle local_idx=0 correctly (0 is falsy!)
+								first_uuid = self._local_to_uuid_map.get(first_local_idx) if first_local_idx is not None else None
+								first_seq = self.global_batch.get_sequence(first_uuid) if first_uuid is not None else None
 								ctx_len = first_seq.current_context_length if first_seq else 0
 								
 								# CRITICAL FIX: Repair ctx_len if it's inconsistent
@@ -5371,13 +5373,16 @@ class BatchGenWorker:
 								else:
 									k_write_mean = k_write_std = -999
 								
+								# DIAGNOSTIC: Log lookup chain details
 								logging.warning(
 									f"[KV-CONTENT-DIAG] iter={local_iteration}: gid={first_gid}, ctx_len={ctx_len}, "
 									f"num_pages={num_pages}, first_page={first_page}, last_page={last_page}, "
 									f"k_first_page(mean={k_first_mean:.4f}, std={k_first_std:.4f}), "
 									f"k_last_page(mean={k_last_mean:.4f}, std={k_last_std:.4f}), "
 									f"write_pos={write_pos}, write_page_idx={write_page_idx}, "
-									f"k_write_pos(mean={k_write_mean:.4f}, std={k_write_std:.4f})"
+									f"k_write_pos(mean={k_write_mean:.4f}, std={k_write_std:.4f}), "
+									f"first_local_idx={first_local_idx}, first_uuid={first_uuid is not None}, "
+									f"first_seq={first_seq is not None}"
 								)
 					except Exception as e:
 						logging.warning(f"[KV-CONTENT-DIAG] iter={local_iteration}: Error sampling KV: {e}")
