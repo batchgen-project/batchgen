@@ -2069,20 +2069,6 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
 	sequence_lengths = q_position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
 	
-	# DEBUG: Verify position_ids vs cache_seqlens relationship
-	# position_ids should be cache_seqlens - 1 (0-indexed position of current token)
-	if layer_idx == 0:
-		pos_sample = q_position_ids[:5].flatten().tolist() if bsz >= 5 else q_position_ids.flatten().tolist()
-		seqlen_sample = cache_seqlens[:5].tolist() if bsz >= 5 else cache_seqlens.tolist()
-		# Check if position_ids == cache_seqlens (bug) or position_ids == cache_seqlens - 1 (correct)
-		expected_pos = [s - 1 for s in seqlen_sample]
-		is_correct = pos_sample == expected_pos
-		logging.warning(
-			f"[KV-WRITE-POS-CHECK] layer=0: position_ids(first5)={pos_sample}, "
-			f"cache_seqlens(first5)={seqlen_sample}, expected_pos={expected_pos}, "
-			f"pos_ids_correct={is_correct}"
-		)
-	
 	gpu_paged_kv_manager.update_layer_decode_new_token(
 		k_tensor=k_tensor,
 		v_tensor=None,

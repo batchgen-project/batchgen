@@ -988,29 +988,6 @@ class GPUPagedKVCacheManager:
 			slot_indices = slot_indices[start_idx:end_idx]
 		page_table_view = page_table  # Always use full page table
 		k_tokens = k_tensor.view(batch_size, -1)
-		
-		# DEBUG: Log KV update details for layer 0 to track corruption
-		if layer_idx == 0:
-			import logging
-			_kv_debug_logger = logging.getLogger(__name__)
-			# Only log for first few iterations (controlled by external counter)
-			if hasattr(self, '_kv_update_log_count'):
-				self._kv_update_log_count += 1
-			else:
-				self._kv_update_log_count = 1
-			
-			if self._kv_update_log_count <= 10:  # Only first 10 calls per session
-				slot_ids_sample = slot_indices[:5].tolist() if slot_indices.numel() >= 5 else slot_indices.tolist()
-				token_ids_sample = token_indices[:5].tolist() if token_indices.numel() >= 5 else token_indices.tolist()
-				page_table_sample = page_table[:5, :2].tolist() if page_table.shape[0] >= 5 else page_table[:, :2].tolist()
-				k_mean = k_tokens.float().mean().item()
-				k_std = k_tokens.float().std().item()
-				_kv_debug_logger.warning(
-					f"[KV-UPDATE-L0] call #{self._kv_update_log_count}: batch_size={batch_size}, "
-					f"slot_indices(first5)={slot_ids_sample}, token_indices(first5)={token_ids_sample}, "
-					f"page_table_shape={list(page_table.shape)}, page_table(first5x2)={page_table_sample}, "
-					f"k_tokens(mean={k_mean:.4f}, std={k_std:.4f})"
-				)
 
 		if v_tensor is not None and self._v_cache is not None:
 			v_tokens: Optional[torch.Tensor] = v_tensor.view(batch_size, -1)
