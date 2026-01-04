@@ -58,6 +58,12 @@ else:
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
+# Optional runtime checks for NaN/Inf in KV tensors (disabled by default)
+BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == '1'
+
+# Optional gate for expensive/critical diagnostics (default off in production)
+BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
+
 # Watermark-based prefill configuration
 HOST_KV_WATERMARK_PERCENT = int(os.environ.get('BATCHGEN_HOST_KV_WATERMARK', '70'))  # % FREE (70% = underutilized)
 ENABLE_WATERMARK_PREFILL = os.environ.get('BATCHGEN_ENABLE_WATERMARK_PREFILL', '0') == '1'  # Default OFF for safety
@@ -518,7 +524,7 @@ class BatchGenWorker:
 		pages_per_seq = []
 		total_pages = 0
 		
-		# DIAGNOSTIC: Log allocation details for KV corruption investigation
+		# DIAGNOSTIC: Log allocation details for KV corruption investigation (debug-only / opt-in)
 		alloc_details = []
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
@@ -538,11 +544,9 @@ class BatchGenWorker:
 					'had_initial_gpu_reservation': seq.had_initial_gpu_reservation,
 				})
 		
-		if alloc_details:
-			logging.info(
-				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _allocate_gpu_kv_two_page_buffer: "
-				f"Allocating GPU KV for {len(alloc_details)} RESUMING sequences. "
-				f"First 5: {alloc_details[:5]}"
+		if alloc_details and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
+			logging.debug(
+				f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer: Allocating GPU KV for {len(alloc_details)} RESUMING sequences. First 5: {alloc_details[:5]}"
 			)
 
 		free_pages = manager.get_stats().num_free_pages
@@ -585,11 +589,11 @@ class BatchGenWorker:
 		if all_active_global_ids:
 			manager.rebuild_page_table(all_active_global_ids)
 
-		# DIAGNOSTIC: Log page table order after allocation for debugging order mismatch
-		if manager and manager._gpu_page_table_manager:
+		# DIAGNOSTIC: Log page table order after allocation for debugging order mismatch (debug-only / opt-in)
+		if manager and manager._gpu_page_table_manager and BATCHGEN_CB_DEBUG and BATCHGEN_ENABLE_CRITICAL_DIAGS:
 			final_slot_order = list(manager._gpu_page_table_manager.slot_to_seq_id) if manager._gpu_page_table_manager.slot_to_seq_id else []
-			logging.info(
-				f"Rank {self.rank}: [ALLOC DIAGNOSTIC] _allocate_gpu_kv_two_page_buffer finished. "
+			logging.debug(
+				f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer finished. "
 				f"input_global_ids={global_ids[:5]}{'...' if len(global_ids) > 5 else ''} (len={len(global_ids)}), "
 				f"all_active_sorted={all_active_global_ids[:5]}{'...' if len(all_active_global_ids) > 5 else ''} (len={len(all_active_global_ids)}), "
 				f"final_slot_to_seq_id={final_slot_order[:5]}{'...' if len(final_slot_order) > 5 else ''} (len={len(final_slot_order)})"
@@ -772,19 +776,17 @@ class BatchGenWorker:
 				})
 		
 		# Log append positions for resumed sequences (layer 0 only to reduce spam)
-		if layer_idx == 0 and append_diag:
+		if layer_idx == 0 and append_diag and BATCHGEN_CB_DEBUG:
 			logging.debug(
-				f"Rank {self.rank}: [HOST-KV-APPEND] layer=0, "
-				f"first_3_resumed_seqs={append_diag}"
+				f"Rank {self.rank}: layer=0 append positions: first_3_resumed_seqs={append_diag}"
 			)
 		
 		# Reshape for MLA if needed
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)  # [B, 1, D] -> [B, 1, 1, D]
 		
-		# NaN DETECTION: Check for NaN in KV tensor BEFORE appending to host
-		# This catches attention computation issues that would propagate to host KV
-		if layer_idx == 0 and torch.isnan(k_tensor).any():
+		# Optional NaN/Inf detection (disabled by default to avoid redundant checks/logs)
+		if BATCHGEN_ENABLE_NAN_CHECK and layer_idx == 0 and torch.isnan(k_tensor).any():
 			nan_mask = torch.isnan(k_tensor).any(dim=-1).any(dim=-1).any(dim=-1)  # [batch]
 			nan_indices = torch.where(nan_mask)[0].tolist()
 			nan_seq_info = []
@@ -801,9 +803,7 @@ class BatchGenWorker:
 						'ctx_len': seq.current_context_length if seq else -1,
 					})
 			logging.error(
-				f"[KV-NaN-DETECT] Rank {self.rank}: NaN detected in k_tensor BEFORE host append! "
-				f"layer={layer_idx}, k_tensor_shape={list(k_tensor.shape)}, "
-				f"affected_seqs={nan_seq_info}"
+				f"Rank {self.rank}: NaN detected in k_tensor BEFORE host append (layer={layer_idx}) - affected_seqs={nan_seq_info}"
 			)
 		
 		# CRITICAL: Sync default stream before launching async D2H copy.
@@ -868,12 +868,8 @@ class BatchGenWorker:
 		config_scheduler = Scheduler(self.max_input_length, self.max_decoding_length, self.args.world_size)
 		self.engine_config = config_scheduler.generate_config()
 		self.engine_config.Basic_Config.device = self.args.device
-		self.engine_config.Basic_Config.device_torch = torch.device(
-			f"cuda:{self.args.device}"
-		)
-		self.engine_config.Basic_Config.max_decoding_length = self.max_decoding_length
-		self.engine_config.Basic_Config.padding_length = self.max_input_length
-		self.engine_config.Basic_Config.rank = self.global_rank
+		# device_torch is the torch.device for CUDA ops
+		self.engine_config.Basic_Config.device_torch = torch.device(f"cuda:{self.args.device}")
 		self.engine_config.Basic_Config.world_size = self.world_size
 
 		if not self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens:
@@ -1081,11 +1077,9 @@ class BatchGenWorker:
 					})
 					break
 		
-		if resuming_seq_info:
-			logging.warning(
-				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _load_host_kv_to_gpu loading KV for "
-				f"{len(resuming_seq_info)} RESUMING sequences (decoded_length > 0). "
-				f"First 5: {resuming_seq_info[:5]}"
+		if resuming_seq_info and BATCHGEN_CB_DEBUG:
+			logging.debug(
+				f"Rank {self.rank}: _load_host_kv_to_gpu loading KV for {len(resuming_seq_info)} RESUMING sequences. First 5: {resuming_seq_info[:5]}"
 			)
 		
 		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
@@ -1154,8 +1148,8 @@ class BatchGenWorker:
 		if manager is None:
 			return
 		
-		# DIAGNOSTIC: Log state before destruction for KV corruption investigation
-		if self.global_batch is not None:
+	# DIAGNOSTIC: Log state before destruction for KV corruption investigation
+	if self.global_batch is not None:
 			seqs_with_gpu_alloc = []
 			for seq in self.global_batch:
 				if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
@@ -1168,9 +1162,9 @@ class BatchGenWorker:
 						'current_context_length': seq.current_context_length,
 						'decoded_length': seq.decoded_length,
 					})
-			if seqs_with_gpu_alloc:
-				logging.warning(
-					f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _destroy_gpu_paged_kv_cache called with "
+			if seqs_with_gpu_alloc and BATCHGEN_CB_DEBUG:
+				logging.debug(
+					f"Rank {self.rank}: _destroy_gpu_paged_kv_cache called with "
 					f"{len(seqs_with_gpu_alloc)} sequences having GPU allocation state. "
 					f"First 5: {seqs_with_gpu_alloc[:5]}"
 				)
@@ -1188,16 +1182,17 @@ class BatchGenWorker:
 			for seq in self.global_batch:
 				if seq.status != SequenceStatus.COMPLETED:
 					if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
-						logging.debug(
-							f"Rank {self.rank}: [KV-CORRUPTION-FIX] Resetting GPU state for {seq.uuid[:8]} "
-							f"(status={seq.status.name}, gpu_pages={seq.gpu_pages_allocated}, "
-							f"had_initial={seq.had_initial_gpu_reservation})"
-						)
+						if BATCHGEN_CB_DEBUG:
+							logging.debug(
+								f"Rank {self.rank}: Resetting GPU state for {seq.uuid[:8]} "
+								f"(status={seq.status.name}, gpu_pages={seq.gpu_pages_allocated}, "
+								f"had_initial={seq.had_initial_gpu_reservation})"
+							)
 						seq.reset_gpu_allocation()
 						reset_count += 1
 			if reset_count > 0:
 				logging.info(
-					f"Rank {self.rank}: [KV-CORRUPTION-FIX] Reset GPU allocation state for {reset_count} sequences"
+					f"Rank {self.rank}: Reset GPU allocation state for {reset_count} sequences"
 				)
 
 	def _get_host_kv_free_pages(self) -> int:
@@ -1286,7 +1281,7 @@ class BatchGenWorker:
 			num_onhold = len(status_counts[SequenceStatus.ON_HOLD])
 			num_prefilled = len(status_counts[SequenceStatus.PREFILLED])
 			logging.info(
-				f"[WATERMARK] Rank {self.rank} (Node {self.rank // NUM_GPUS_PER_NODE}): "
+				f"WATERMARK: Rank {self.rank} (Node {self.rank // NUM_GPUS_PER_NODE}): "
 				f"Host KV: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
 				f"host_kv_total={len(valid_sequences)} "
 				f"({used_pages} pages / {stats.num_total_pages} = {100-free_percent}% used, {free_percent}% free)"
@@ -1339,17 +1334,17 @@ class BatchGenWorker:
 		should_trigger = above_watermark and has_queued
 
 		# Log watermark check (throttled to reduce spam)
-		if self.rank == 0:
-			if should_trigger:
-				logging.info(
-					f"[WATERMARK] TRIGGER: max_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
-					f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
-				)
-				for s in node_stats:
+			if self.rank == 0:
+				if should_trigger:
 					logging.info(
-						f"[WATERMARK]   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
-						f"pages ({100-s['free_percent']}% utilized, {s['free_percent']}% free)"
+						f"WATERMARK TRIGGER: max_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
+						f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
 					)
+					for s in node_stats:
+						logging.info(
+							f"WATERMARK:   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
+							f"pages ({100-s['free_percent']}% utilized, {s['free_percent']}% free)"
+						)
 			else:
 				# Log summary even when not triggering (every 10th check to avoid spam)
 				if not hasattr(self, '_watermark_check_counter'):
@@ -1382,7 +1377,7 @@ class BatchGenWorker:
 		if len(node_stats) <= 1:
 			# Only one node, no migration needed
 			if self.rank == 0:
-				logging.info("[MIGRATION] Single node detected, skipping rebalancing")
+				logging.info("MIGRATION: Single node detected, skipping rebalancing")
 			return []
 
 		# Calculate target pages per node
@@ -1392,13 +1387,13 @@ class BatchGenWorker:
 
 		if self.rank == 0:
 			logging.info(
-				f"[MIGRATION] Planning rebalance: {total_used} total pages across {num_nodes} nodes, "
+				f"MIGRATION: Planning rebalance: {total_used} total pages across {num_nodes} nodes, "
 				f"target {target_per_node} pages/node"
 			)
 			for nid, s in sorted(node_stats.items()):
 				imbalance = s['num_used_pages'] - target_per_node
 				logging.info(
-					f"[MIGRATION]   Node {nid}: {s['num_used_pages']} pages "
+					f"MIGRATION:   Node {nid}: {s['num_used_pages']} pages "
 					f"({'+' if imbalance > 0 else ''}{imbalance} vs target)"
 				)
 
@@ -1409,7 +1404,7 @@ class BatchGenWorker:
 		if not overloaded or not underutilized:
 			# Already balanced
 			if self.rank == 0:
-				logging.info("[MIGRATION] Already balanced, no migrations needed")
+				logging.info("MIGRATION: Already balanced, no migrations needed")
 			return []
 
 		overloaded.sort(key=lambda x: x[1]['num_used_pages'], reverse=True)
@@ -1441,7 +1436,8 @@ class BatchGenWorker:
 
 				if not candidate_sequences:
 					if self.rank == 0:
-						logging.debug(f"[MIGRATION] No more candidates on node {src_node_id}, stopping")
+						if BATCHGEN_CB_DEBUG:
+							logging.debug(f"MIGRATION: No more candidates on node {src_node_id}, stopping")
 					break
 
 				# CRITICAL: Sort candidates deterministically before selection
@@ -1459,10 +1455,11 @@ class BatchGenWorker:
 				pages_needed = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
 
 				if self.rank == 0:
-					logging.debug(
-						f"[MIGRATION] Selected seq {uuid[:8]}... from {len(candidate_sequences)} candidates "
-						f"(global_idx={seq.global_idx}, from_rank={seq.assigned_rank}, pages={pages_needed})"
-					)
+					if BATCHGEN_CB_DEBUG:
+						logging.debug(
+							f"MIGRATION: Selected seq {uuid[:8]}... from {len(candidate_sequences)} candidates "
+							f"(global_idx={seq.global_idx}, from_rank={seq.assigned_rank}, pages={pages_needed})"
+						)
 
 				# Find dest node with most free space (lowest used pages)
 				# Use node_id as tie-breaker for determinism
@@ -1515,20 +1512,20 @@ class BatchGenWorker:
 					seen.add(mig['uuid'])
 					unique_migrations.append(mig)
 			migrations = unique_migrations
-			logging.warning(f"[MIGRATION] Removed duplicates, {len(migrations)} unique migrations remain")
+			logging.warning(f"MIGRATION: Removed duplicates, {len(migrations)} unique migrations remain")
 
 		if self.rank == 0:
 			if migrations:
-				logging.info(f"[MIGRATION] Planned {len(migrations)} sequence migrations")
+				logging.info(f"MIGRATION: Planned {len(migrations)} sequence migrations")
 				for i, mig in enumerate(migrations[:5]):  # Log first 5
 					logging.info(
-						f"[MIGRATION]   #{i+1}: seq {mig['uuid'][:8]}... "
-						f"rank {mig['from_rank']} → {mig['to_rank']} ({mig['pages']} pages)"
+						f"MIGRATION:   #{i+1}: seq {mig['uuid'][:8]}... "
+						f"rank {mig['from_rank']} -> {mig['to_rank']} ({mig['pages']} pages)"
 					)
 				if len(migrations) > 5:
-					logging.info(f"[MIGRATION]   ... and {len(migrations)-5} more")
+					logging.info(f"MIGRATION:   ... and {len(migrations)-5} more")
 			else:
-				logging.info("[MIGRATION] No migrations needed after planning")
+				logging.info("MIGRATION: No migrations needed after planning")
 
 		return migrations
 
@@ -1556,11 +1553,11 @@ class BatchGenWorker:
 		rounds = self._group_migrations_for_parallel_execution(migrations)
 
 		if self.rank == 0:
-			logging.info(f"[MIGRATION] Executing {len(migrations)} migrations in {len(rounds)} parallel rounds")
+			logging.info(f"MIGRATION: Executing {len(migrations)} migrations in {len(rounds)} parallel rounds")
 
 		for round_idx, round_migrations in enumerate(rounds):
 			if self.rank == 0:
-				logging.info(f"[MIGRATION] Round {round_idx+1}/{len(rounds)}: {len(round_migrations)} parallel migrations")
+				logging.info(f"MIGRATION: Round {round_idx+1}/{len(rounds)}: {len(round_migrations)} parallel migrations")
 
 			# Find if this rank participates in this round
 			my_migration = None
@@ -1574,14 +1571,13 @@ class BatchGenWorker:
 				# Verify sequence exists and is in expected state before migration
 				seq = self.global_batch.get_sequence(my_migration['uuid'])
 				if seq is None:
-					logging.error(
-						f"[MIGRATION] Rank {self.rank}: SKIP migration - seq {my_migration['uuid'][:8]}... not found!"
-					)
+					logging.error(f"MIGRATION: Rank {self.rank}: SKIP migration - seq {my_migration['uuid'][:8]}... not found!")
 				else:
-					logging.debug(
-						f"[MIGRATION] Rank {self.rank}: Executing migration for {my_migration['uuid'][:8]}... "
-						f"(global_idx={seq.global_idx}, status={seq.status}, assigned_rank={seq.assigned_rank})"
-					)
+					if BATCHGEN_CB_DEBUG:
+						logging.debug(
+							f"MIGRATION: Rank {self.rank}: Executing migration for {my_migration['uuid'][:8]}... "
+							f"(global_idx={seq.global_idx}, status={seq.status}, assigned_rank={seq.assigned_rank})"
+						)
 					self._execute_single_kv_migration(
 						uuid=my_migration['uuid'],
 						from_rank=my_migration['from_rank'],
@@ -1592,7 +1588,7 @@ class BatchGenWorker:
 			dist.barrier()
 
 		if self.rank == 0:
-			logging.info(f"[MIGRATION] All {len(rounds)} parallel rounds completed")
+			logging.info(f"MIGRATION: All {len(rounds)} parallel rounds completed")
 
 	def _group_migrations_for_parallel_execution(self, migrations: List[Dict]) -> List[List[Dict]]:
 		"""Group migrations into rounds that can execute in parallel.
@@ -1717,72 +1713,74 @@ class BatchGenWorker:
 			t_extract = time.perf_counter()
 			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
 
-			# MIGRATION SEND VALIDATION: Verify KV data before sending
-			# NOTE: Only validate the VALID portion of KV (up to current_context_length)
-			# The last page may have uninitialized slots beyond the actual token count
-			valid_tokens = seq.current_context_length
-			total_slots = pages_needed * page_size
+			# MIGRATION SEND VALIDATION: expensive validation only when explicitly enabled
+			if BATCHGEN_ENABLE_CRITICAL_DIAGS:
+				# NOTE: Only validate the VALID portion of KV (up to current_context_length)
+				# The last page may have uninitialized slots beyond the actual token count
+				valid_tokens = seq.current_context_length
+				total_slots = pages_needed * page_size
 			
-			# Reshape layer 0 to [total_tokens, num_k_heads, k_head_dim] to slice valid portion
-			flat_k = k_gpu[0].reshape(total_slots, num_k_heads, k_head_dim)
-			valid_k = flat_k[:valid_tokens]
+				# Reshape layer 0 to [total_tokens, num_k_heads, k_head_dim] to slice valid portion
+				flat_k = k_gpu[0].reshape(total_slots, num_k_heads, k_head_dim)
+				valid_k = flat_k[:valid_tokens]
 			
-			send_k_mean = valid_k.float().mean().item()
-			send_k_std = valid_k.float().std().item()
-			send_has_nan = torch.isnan(valid_k).any().item()
-			send_is_zero = (valid_k == 0).all().item()
+				send_k_mean = valid_k.float().mean().item()
+				send_k_std = valid_k.float().std().item()
+				send_has_nan = torch.isnan(valid_k).any().item()
+				send_is_zero = (valid_k == 0).all().item()
 			
-			# Check if NaN only in padding (this is OK)
-			full_has_nan = torch.isnan(k_gpu[0]).any().item()
-			padding_info = ""
-			if full_has_nan and not send_has_nan:
-				padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
+				# Check if NaN only in padding (this is OK)
+				full_has_nan = torch.isnan(k_gpu[0]).any().item()
+				padding_info = ""
+				if full_has_nan and not send_has_nan:
+					padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
 			
-			logging.info(
-				f"[MIGRATION SEND] Rank {self.rank}: Validating KV for {uuid[:8]}... (global_idx={global_idx}): "
-				f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
-				f"layer0_mean={send_k_mean:.4f}, std={send_k_std:.4f}, "
-				f"has_nan={send_has_nan}, is_zero={send_is_zero}{padding_info}, "
-				f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
-			)
-			if send_is_zero:
-				logging.error(
-					f"[MIGRATION SEND] Rank {self.rank}: CRITICAL - KV to send is ALL ZEROS for {uuid[:8]}! "
-					f"Host KV may be corrupted or load failed."
+				logging.info(
+					f"MIGRATION SEND: Rank {self.rank}: Validating KV for {uuid[:8]}... (global_idx={global_idx}): "
+					f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
+					f"layer0_mean={send_k_mean:.4f}, std={send_k_std:.4f}, "
+					f"has_nan={send_has_nan}, is_zero={send_is_zero}{padding_info}, "
+					f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
 				)
-			if send_has_nan:
-				logging.error(
-					f"[MIGRATION SEND] Rank {self.rank}: CRITICAL - KV to send has NaN for {uuid[:8]}!"
-				)
-				# DEEP LAYER-BY-LAYER NaN ANALYSIS: Find exactly which layers have NaN
-				nan_layers = []
-				for layer_idx in range(k_gpu.shape[0]):
-					layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
-					layer_valid_k = layer_k[:valid_tokens]
-					if torch.isnan(layer_valid_k).any():
-						# Find which tokens have NaN in this layer
-						nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
-						nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
-						nan_layers.append({
-							'layer': layer_idx,
-							'nan_token_count': nan_token_mask.sum().item(),
-							'first_nan_tokens': nan_token_indices,
-						})
-				logging.error(
-					f"[MIGRATION SEND] Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
-					f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
-					f"details={nan_layers[:5]}"  # First 5 layers with NaN
-				)
+				if send_is_zero:
+					logging.error(
+						f"MIGRATION SEND: Rank {self.rank}: CRITICAL - KV to send is ALL ZEROS for {uuid[:8]}! "
+						f"Host KV may be corrupted or load failed."
+					)
+				if send_has_nan:
+					logging.error(f"MIGRATION SEND: Rank {self.rank}: CRITICAL - KV to send has NaN for {uuid[:8]}!")
+					# DEEP LAYER-BY-LAYER NaN ANALYSIS (debug-only): Find exactly which layers have NaN
+					if BATCHGEN_CB_DEBUG:
+						nan_layers = []
+						for layer_idx in range(k_gpu.shape[0]):
+							layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
+							layer_valid_k = layer_k[:valid_tokens]
+							if torch.isnan(layer_valid_k).any():
+								# Find which tokens have NaN in this layer
+								nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
+								nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
+								nan_layers.append({
+									'layer': layer_idx,
+									'nan_token_count': nan_token_mask.sum().item(),
+									'first_nan_tokens': nan_token_indices,
+								})
+						logging.error(
+							f"MIGRATION SEND: Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
+							f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
+							f"details={nan_layers[:5]}"  # First 5 layers with NaN
+						)
 
 			# Move GPU → CPU for Gloo transfer (Gloo supports CPU tensors, more memory efficient)
 			k_cpu = k_gpu.cpu().contiguous()
 			t_cpu = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→CPU copy: {(t_cpu-t_extract)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: GPU→CPU copy: {(t_cpu-t_extract)*1000:.1f}ms")
 			# Send via Gloo backend (supports CPU tensors and RDMA if available)
 			gloo_group = self._get_or_create_gloo_group()
 			dist.send(tensor=k_cpu, dst=to_rank, group=gloo_group)
 			t_send = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: Gloo send: {(t_send-t_cpu)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo send: {(t_send-t_cpu)*1000:.1f}ms")
 			# Free GPU pages
 			manager.free_pages_for_sequences([global_idx])
 			# Free host KV pages
@@ -1795,41 +1793,47 @@ class BatchGenWorker:
 				dist.send(tensor=qb.encoded["input_ids"].cpu().contiguous(), dst=to_rank, group=gloo_group)
 				dist.send(tensor=qb.encoded["attention_mask"].cpu().contiguous(), dst=to_rank, group=gloo_group)
 				dist.send(tensor=qb.decoded_tokens.cpu().contiguous(), dst=to_rank, group=gloo_group)
-				logging.debug(f"[MIGRATION] Rank {self.rank}: Sent query_book for {uuid[:8]}...")
+				if BATCHGEN_CB_DEBUG:
+					logging.debug(f"MIGRATION: Rank {self.rank}: Sent query_book for {uuid[:8]}...")
 			else:
-				logging.warning(f"[MIGRATION] Rank {self.rank}: No query_book entry for {uuid[:8]}... (local_idx={local_idx})")
+				logging.warning(f"MIGRATION: Rank {self.rank}: No query_book entry for {uuid[:8]}... (local_idx={local_idx})")
 
 			t_total = time.perf_counter()
-			logging.debug(
-				f"[MIGRATION] Rank {self.rank}: Sent {uuid[:8]}... "
-				f"in {(t_total-t0)*1000:.1f}ms"
-			)
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(
+					f"MIGRATION: Rank {self.rank}: Sent {uuid[:8]}... "
+					f"in {(t_total-t0)*1000:.1f}ms"
+				)
 		elif self.rank == to_rank:
 			# ===== DEST RANK: Receive over network via Gloo, write to host KV =====
 			t0 = time.perf_counter()
-			logging.debug(
-				f"[MIGRATION] Rank {self.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
-				f"({pages_needed} pages)"
-			)
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(
+					f"MIGRATION: Rank {self.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
+					f"({pages_needed} pages)"
+				)
 			# Allocate CPU buffer for receiving (Gloo supports CPU tensors)
 			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=True)
 			# Receive via Gloo backend
 			gloo_group = self._get_or_create_gloo_group()
 			dist.recv(tensor=k_cpu, src=from_rank, group=gloo_group)
 			t_recv = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: Gloo recv: {(t_recv-t0)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo recv: {(t_recv-t0)*1000:.1f}ms")
 			# Register and allocate host KV pages
 			worker_view = self.host_paged_kv_worker_view
 			tokens_needed = pages_needed * page_size
 			worker_view.register_sequences([global_idx])
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 			t_alloc = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
 			# Move CPU → GPU for offload to host KV
 			k_gpu = k_cpu.to(self.device, non_blocking=True)
 			torch.cuda.synchronize(self.torch_device)
 			t_gpu = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: CPU→GPU copy: {(t_gpu-t_alloc)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: CPU→GPU copy: {(t_gpu-t_alloc)*1000:.1f}ms")
 
 			# Offload layer-by-layer to host using async_offload_layer_kv_to_host
 			# API expects: k_tensor [batch=1, seq_len, num_heads, head_dim]
@@ -1863,41 +1867,43 @@ class BatchGenWorker:
 				# NaN only in padding region - this is expected and OK
 				padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
 			
-			logging.info(
-				f"[MIGRATION RECV] Rank {self.rank}: Validating received KV for {uuid[:8]}... (global_idx={global_idx}): "
-				f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
-				f"layer0_mean={migration_k_mean:.4f}, std={migration_k_std:.4f}, "
-				f"has_nan={migration_has_nan}, is_zero={migration_is_zero}{padding_info}, "
-				f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
-			)
+			if BATCHGEN_CB_DEBUG:
+				logging.info(
+					f"MIGRATION: Rank {self.rank}: Validating received KV for {uuid[:8]}... (global_idx={global_idx}): "
+					f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
+					f"layer0_mean={migration_k_mean:.4f}, std={migration_k_std:.4f}, "
+					f"has_nan={migration_has_nan}, is_zero={migration_is_zero}{padding_info}, "
+					f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
+				)
 			if migration_is_zero:
 				logging.error(
-					f"[MIGRATION RECV] Rank {self.rank}: CRITICAL - Received KV is ALL ZEROS for {uuid[:8]}! "
+					f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV is ALL ZEROS for {uuid[:8]}! "
 					f"This means network transfer failed or source had invalid data."
 				)
 			if migration_has_nan:
 				logging.error(
-					f"[MIGRATION RECV] Rank {self.rank}: CRITICAL - Received KV has NaN for {uuid[:8]}!"
+					f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV has NaN for {uuid[:8]}!"
 				)
-				# DEEP LAYER-BY-LAYER NaN ANALYSIS: Find exactly which layers have NaN
-				nan_layers = []
-				for layer_idx in range(k_gpu.shape[0]):
-					layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
-					layer_valid_k = layer_k[:valid_tokens]
-					if torch.isnan(layer_valid_k).any():
-						# Find which tokens have NaN in this layer
-						nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
-						nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
-						nan_layers.append({
-							'layer': layer_idx,
-							'nan_token_count': nan_token_mask.sum().item(),
-							'first_nan_tokens': nan_token_indices,
-						})
-				logging.error(
-					f"[MIGRATION RECV] Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
-					f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
-					f"details={nan_layers[:5]}"  # First 5 layers with NaN
-				)
+				# DEEP LAYER-BY-LAYER NaN ANALYSIS (debug-only): Find exactly which layers have NaN
+				if BATCHGEN_CB_DEBUG:
+					nan_layers = []
+					for layer_idx in range(k_gpu.shape[0]):
+						layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
+						layer_valid_k = layer_k[:valid_tokens]
+						if torch.isnan(layer_valid_k).any():
+							# Find which tokens have NaN in this layer
+							nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
+							nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
+							nan_layers.append({
+								'layer': layer_idx,
+								'nan_token_count': nan_token_mask.sum().item(),
+								'first_nan_tokens': nan_token_indices,
+							})
+					logging.error(
+						f"MIGRATION RECV: Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
+						f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
+						f"details={nan_layers[:5]}"  # First 5 layers with NaN
+					)
 
 			for layer_idx in range(num_layers):
 				# Extract layer [num_pages, page_size, num_k_heads, k_head_dim]
@@ -1931,7 +1937,8 @@ class BatchGenWorker:
 			if hasattr(self, '_pending_migration_offload_tensors'):
 				self._pending_migration_offload_tensors.clear()
 			t_store = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU→Host offload all layers: {(t_store-t_gpu)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: GPU→Host offload all layers: {(t_store-t_gpu)*1000:.1f}ms")
 			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
 			# It will be freed automatically when it goes out of scope
 
@@ -1949,20 +1956,21 @@ class BatchGenWorker:
 			dist.recv(tensor=attention_mask_recv, src=from_rank, group=gloo_group)
 			dist.recv(tensor=decoded_tokens_recv, src=from_rank, group=gloo_group)
 			
-			# DIAGNOSTIC: Verify received attention_mask has correct number of 1s
+			# Verify received attention_mask has correct number of 1s
 			recv_attn_ones = attention_mask_recv.sum().item()
 			expected_ones = seq.current_context_length
 			if recv_attn_ones != expected_ones:
 				logging.error(
-					f"[MIGRATION RECV] Rank {self.rank}: ATTENTION MASK MISMATCH for {uuid[:8]}! "
+					f"MIGRATION RECV: Rank {self.rank}: ATTENTION MASK MISMATCH for {uuid[:8]}! "
 					f"received_ones={int(recv_attn_ones)}, expected={expected_ones} (ctx_len), "
 					f"prompt_len={seq.prompt_length}, decoded_len={seq.decoded_length}"
 				)
 			else:
-				logging.info(
-					f"[MIGRATION RECV] Rank {self.rank}: Attention mask OK for {uuid[:8]}: "
-					f"ones={int(recv_attn_ones)} == ctx_len={expected_ones}"
-				)
+				if BATCHGEN_CB_DEBUG:
+					logging.info(
+						f"MIGRATION: Rank {self.rank}: Attention mask OK for {uuid[:8]}: "
+						f"ones={int(recv_attn_ones)} == ctx_len={expected_ones}"
+					)
 
 			# Store in pending dict for later query_book creation
 			if not hasattr(self, '_pending_migrated_query_book'):
@@ -1978,13 +1986,15 @@ class BatchGenWorker:
 				'decoded_tokens': decoded_tokens_recv,
 				'kv_token_budget': seq.kv_token_budget,
 			}
-			logging.debug(f"[MIGRATION] Rank {self.rank}: Recvd query_book for {uuid[:8]}...")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: Recvd query_book for {uuid[:8]}...")
 
 			t_total = time.perf_counter()
-			logging.debug(
-				f"[MIGRATION] Rank {self.rank}: Recvd {uuid[:8]}... "
-				f"in {(t_total-t0)*1000:.1f}ms"
-			)
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(
+					f"MIGRATION: Rank {self.rank}: Recvd {uuid[:8]}... "
+					f"in {(t_total-t0)*1000:.1f}ms"
+				)
 		# No barrier here - will be done in _rebalance_host_kv after all migrations
 
 	def _rebalance_host_kv(self) -> None:
@@ -2003,21 +2013,21 @@ class BatchGenWorker:
 
 		rebalance_start = time.perf_counter()
 		if self.rank == 0:
-			logging.info("[REBALANCE] Starting host KV rebalancing")
+			logging.info("REBALANCE: Starting host KV rebalancing")
 
 		# Plan migrations (all ranks compute same plan deterministically)
 		migrations = self._plan_kv_migration()
 
 		if not migrations:
 			if self.rank == 0:
-				logging.info("[REBALANCE] No migrations needed, host KV already balanced")
+				logging.info("REBALANCE: No migrations needed, host KV already balanced")
 			return
 
 		# Log migration summary
 		if self.rank == 0:
 			total_pages = sum(m['pages'] for m in migrations)
 			logging.info(
-				f"[REBALANCE] Executing {len(migrations)} migrations "
+				f"REBALANCE: Executing {len(migrations)} migrations "
 				f"({total_pages} total pages, ~{total_pages * 64} tokens)"
 			)
 
@@ -2029,7 +2039,7 @@ class BatchGenWorker:
 		migration_end = time.perf_counter()
 		if self.rank == 0:
 			logging.info(
-				f"[REBALANCE] All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
+				f"REBALANCE: All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
 				f"({(migration_end-migration_start)*1000/len(migrations):.1f}ms per migration avg)"
 			)
 
@@ -2064,12 +2074,12 @@ class BatchGenWorker:
 		# If we sync AFTER updating local mappings, RECV side would skip updating because
 		# uuid would be in its _uuid_to_local_map, but its state is stale!
 		migrated_uuids = [m['uuid'] for m in migrations]
-		if migrated_uuids:
-			self._sync_sequence_metadata(migrated_uuids)
-			logging.info(
-				f"Rank {self.rank}: [MIGRATION] Synced metadata for {len(migrated_uuids)} sequences "
-				f"BEFORE local mapping update (SEND side still owns them)"
-			)
+			if migrated_uuids:
+				self._sync_sequence_metadata(migrated_uuids)
+				logging.info(
+					f"Rank {self.rank}: REBALANCE: Synced metadata for {len(migrated_uuids)} sequences "
+					f"BEFORE local mapping update (SEND side still owns them)"
+				)
 
 		# Barrier to ensure all ranks have synced metadata
 		dist.barrier()
@@ -2293,7 +2303,7 @@ class BatchGenWorker:
 				expected_ctx = seq.prompt_length + seq.decoded_length
 				if seq.current_context_length != expected_ctx:
 					logging.warning(
-						f"Rank {self.rank}: [SYNC-FIX] Correcting ctx_len for {uuid[:8]} before sync: "
+						f"Rank {self.rank}: Correcting ctx_len for {uuid[:8]} before sync: "
 						f"{seq.current_context_length} → {expected_ctx}"
 					)
 					seq.current_context_length = expected_ctx
@@ -2550,8 +2560,7 @@ class BatchGenWorker:
 					})
 		if onhold_mask_diag:
 			logging.error(
-				f"Rank {self.rank}: [ON_HOLD-MASK-BUG] {len(onhold_mask_diag)} sequences have "
-				f"attention_mask mismatch BEFORE going ON_HOLD! First 5: {onhold_mask_diag[:5]}"
+				f"Rank {self.rank}: {len(onhold_mask_diag)} sequences have attention_mask mismatch BEFORE going ON_HOLD. First 5: {onhold_mask_diag[:5]}"
 			)
 
 		# CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
@@ -2858,9 +2867,10 @@ class BatchGenWorker:
 			for uuid in global_onhold:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
-					logging.debug(
-						f"Rank {self.rank}: [KV-CORRUPTION-FIX] Resetting GPU state for ON_HOLD seq {uuid[:8]}"
-					)
+					if BATCHGEN_CB_DEBUG:
+						logging.debug(
+							f"Rank {self.rank}: Resetting GPU state for ON_HOLD seq {uuid[:8]}"
+						)
 					seq.reset_gpu_allocation()
 				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 			
@@ -3123,10 +3133,9 @@ class BatchGenWorker:
 					'prompt_len': seq.prompt_length,
 					'attn_mask_sum': attn_mask_sum,
 				})
-		if resuming_diag:
-			logging.warning(
-				f"Rank {self.rank}: [RESUME-DIAG] Loading GPU KV for {len(resuming_diag)} RESUMING sequences. "
-				f"First 3: {resuming_diag[:3]}"
+		if resuming_diag and BATCHGEN_CB_DEBUG:
+			logging.debug(
+				f"Rank {self.rank}: Loading GPU KV for {len(resuming_diag)} resuming sequences. First 3: {resuming_diag[:3]}"
 			)
 		
 		# Guard before allocation
@@ -3165,10 +3174,9 @@ class BatchGenWorker:
 					'alloc_tokens': allocated_tokens,
 					'excess': allocated_tokens - expected_kv_tokens,
 				})
-		if post_load_diag:
-			logging.warning(
-				f"Rank {self.rank}: [POST-LOAD-DIAG] Loaded {len(post_load_diag)} RESUMING sequences. "
-				f"First 3: {post_load_diag[:3]}"
+		if post_load_diag and BATCHGEN_CB_DEBUG:
+			logging.debug(
+				f"Rank {self.rank}: Loaded {len(post_load_diag)} resuming sequences. First 3: {post_load_diag[:3]}"
 			)
 		
 		# ← FIX: Update tracking state AFTER successful load
@@ -3419,7 +3427,7 @@ class BatchGenWorker:
 					)
 					
 					logging.warning(
-						f"Rank {self.rank}: [KV-CORRUPTION-FIX] Forced convergence to {len(decode_uuids)} common sequences. "
+						f"Rank {self.rank}: Forced convergence to {len(decode_uuids)} common sequences. "
 						f"Dropped {counts[self.rank] - len(decode_uuids)} divergent sequences."
 					)
 				
@@ -3527,18 +3535,18 @@ class BatchGenWorker:
 		# This helps track KV corruption issues during decode→prefill→decode transitions
 		in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
 		on_hold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
-		prefilled = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
-		if in_decode or on_hold:
-			logging.warning(
-				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _config_prefill_for_batch called while "
-				f"{len(in_decode)} IN_DECODE, {len(on_hold)} ON_HOLD, {len(prefilled)} PREFILLED sequences exist. "
-				f"This is a decode→prefill transition that may cause KV corruption if not handled properly."
+		prefilling = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+		if (in_decode or on_hold) and BATCHGEN_CB_DEBUG:
+			logging.debug(
+				f"Rank {self.rank}: _config_prefill_for_batch called while "
+				f"{len(in_decode)} IN_DECODE, {len(on_hold)} ON_HOLD, {len(prefilling)} PREFILLED sequences exist. "
+				f"This is a decode→prefill transition."
 			)
 			# Log details of sequences that will be affected
 			for uuid in (in_decode + on_hold)[:5]:
 				seq = self.global_batch.get_sequence(uuid)
-				logging.warning(
-					f"Rank {self.rank}: [KV-CORRUPTION-DIAG] Affected seq {seq.uuid[:8]}: "
+				logging.debug(
+					f"Rank {self.rank}: Affected seq {seq.uuid[:8]}: "
 					f"status={seq.status.name}, decoded_len={seq.decoded_length}, "
 					f"ctx_len={seq.current_context_length}, gpu_pages={seq.gpu_pages_allocated}, "
 					f"had_initial={seq.had_initial_gpu_reservation}"
@@ -3548,8 +3556,7 @@ class BatchGenWorker:
 		# Without this, async KV writes may be in-flight when GPU cache is destroyed
 		if hasattr(self, '_pending_kv_append_tasks') and self._pending_kv_append_tasks:
 			logging.info(
-				f"Rank {self.rank}: [KV-CORRUPTION-FIX] Flushing {len(self._pending_kv_append_tasks)} "
-				f"pending KV append tasks before prefill config"
+				f"Rank {self.rank}: Flushing {len(self._pending_kv_append_tasks)} pending KV append tasks before prefill config"
 			)
 			self._wait_pending_kv_append_tasks()
 			torch.cuda.synchronize(self.torch_device)
@@ -3650,14 +3657,13 @@ class BatchGenWorker:
 				if old_ctx == 0 or abs(old_ctx - expected_ctx) > 100:
 					# Only log significant mismatches to avoid log spam
 					logging.warning(
-						f"Rank {self.rank}: [CTX-LEN-REPAIR] Repaired {uuid[:8]} gid={seq.global_idx}: "
+						f"Rank {self.rank}: Repaired {uuid[:8]} gid={seq.global_idx}: "
 						f"ctx_len {old_ctx} → {expected_ctx} (prompt={seq.prompt_length}, decoded={seq.decoded_length})"
 					)
 		
 		if ctx_len_repaired_count > 0:
 			logging.info(
-				f"Rank {self.rank}: [CTX-LEN-REPAIR] Repaired current_context_length for "
-				f"{ctx_len_repaired_count}/{len(decode_uuids)} sequences"
+				f"Rank {self.rank}: Repaired current_context_length for {ctx_len_repaired_count}/{len(decode_uuids)} sequences"
 			)
 		
 		# ============ END CRITICAL FIX ============
@@ -3670,8 +3676,7 @@ class BatchGenWorker:
 		
 		if len(set(uuid_counts)) > 1:
 			logging.error(
-				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] CRITICAL - decode_uuids count mismatch at "
-				f"_config_decoding_for_batch entry! Counts: {uuid_counts}. This WILL cause KV corruption!"
+				f"Rank {self.rank}: CRITICAL - decode_uuids count mismatch at _config_decoding_for_batch entry! Counts: {uuid_counts}."
 			)
 		
 		# DIAGNOSTIC: Log sequence states at decode config entry
@@ -3695,9 +3700,9 @@ class BatchGenWorker:
 			else:
 				fresh_seqs.append(seq_info)
 		
-		if resuming_seqs:
-			logging.warning(
-				f"Rank {self.rank}: [KV-CORRUPTION-DIAG] _config_decoding_for_batch: "
+		if resuming_seqs and BATCHGEN_CB_DEBUG:
+			logging.debug(
+				f"Rank {self.rank}: _config_decoding_for_batch: "
 				f"{len(resuming_seqs)} RESUMING sequences (decoded_length > 0). "
 				f"First 5: {resuming_seqs[:5]}"
 			)
@@ -3706,14 +3711,14 @@ class BatchGenWorker:
 						   if s['gpu_pages_allocated'] == 0 and s['had_initial_gpu_reservation']]
 			if problematic:
 				logging.error(
-					f"Rank {self.rank}: [KV-CORRUPTION-DIAG] POTENTIAL BUG: {len(problematic)} sequences have "
+					f"Rank {self.rank}: POTENTIAL BUG: {len(problematic)} sequences have "
 					f"decoded_length>0, gpu_pages_allocated=0, but had_initial_gpu_reservation=True! "
-					f"These won't get proper initial GPU buffer. First 5: {problematic[:5]}"
+					f"First 5: {problematic[:5]}"
 				)
 		
-		if fresh_seqs and self.rank == 0:
-			logging.info(
-				f"[KV-CORRUPTION-DIAG] _config_decoding_for_batch: {len(fresh_seqs)} FRESH sequences (decoded_length=0)"
+		if fresh_seqs and self.rank == 0 and BATCHGEN_CB_DEBUG:
+			logging.debug(
+				f"_config_decoding_for_batch: {len(fresh_seqs)} FRESH sequences (decoded_length=0)"
 			)
 		
 		self.deep_free_model_memory()
@@ -4812,20 +4817,20 @@ class BatchGenWorker:
 			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
 			if entry_slot_order != entry_cur_batch:
 				logging.error(
-					f"Rank {self.rank}: [ENTRY FIX] ORDER MISMATCH at decoding_continuous_fast entry! "
+					f"Rank {self.rank}: ORDER MISMATCH at decoding_continuous_fast entry: "
 					f"slot_to_seq_id={entry_slot_order[:5]}{'...' if len(entry_slot_order) > 5 else ''} (len={len(entry_slot_order)}), "
-					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). "
-					f"REBUILDING page table to match cur_batch..."
+					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). Rebuilding page table..."
 				)
-				# FIX: Rebuild page table to match cur_batch order
+				# Rebuild page table to match cur_batch order
 				if entry_cur_batch:
 					gpu_manager.rebuild_page_table(entry_cur_batch)
-					logging.info(f"Rank {self.rank}: [ENTRY FIX] Page table rebuilt to match cur_batch order")
+					logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
 			else:
-				logging.info(
-					f"Rank {self.rank}: [ENTRY DIAGNOSTIC] decoding_continuous_fast entry OK. "
-					f"batch_size={len(batch)}, cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''}"
-				)
+				if BATCHGEN_CB_DEBUG:
+					logging.debug(
+						f"Rank {self.rank}: decoding_continuous_fast entry OK. "
+						f"batch_size={len(batch)}, cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''}"
+					)
 
 		# Async state
 		self._pending_kv_append_tasks = []
@@ -5076,18 +5081,20 @@ class BatchGenWorker:
 								repaired_mask = torch.zeros_like(full_mask)
 								repaired_mask[0, :ctx_len] = 1
 								full_mask.copy_(repaired_mask)
-								logging.warning(
-									f"Rank {self.rank}: [MASK-REPAIR] Repaired attention_mask for {uuid[:8]}: "
-									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-								)
+								if BATCHGEN_CB_DEBUG:
+									logging.debug(
+										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]}: "
+										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+									)
 								mask = full_mask[:, :ctx_len]
 							elif actual_ones < ctx_len:
 								# Too few ones - set all first ctx_len to 1
 								full_mask[0, :ctx_len] = 1
-								logging.warning(
-									f"Rank {self.rank}: [MASK-REPAIR] Repaired attention_mask for {uuid[:8]}: "
-									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-								)
+								if BATCHGEN_CB_DEBUG:
+									logging.debug(
+										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]}: "
+										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+									)
 								mask = full_mask[:, :ctx_len]
 						
 						# Log mask details for resumed sequences (decoded_length > 1)
@@ -5105,16 +5112,14 @@ class BatchGenWorker:
 						attention_masks.append(mask)
 						cache_seqlens.append(ctx_len)
 					
-					if resumed_mask_diag and self.rank == 0:
-						logging.warning(
-							f"[MASK-RESUME-DIAG] iter={local_iteration}: {len(resumed_mask_diag)} resumed seqs. "
-							f"First 3: {resumed_mask_diag[:3]}"
+					if resumed_mask_diag and self.rank == 0 and BATCHGEN_CB_DEBUG:
+						logging.debug(
+							f"iter={local_iteration}: {len(resumed_mask_diag)} resumed seqs. First 3: {resumed_mask_diag[:3]}"
 						)
 					
 					if attn_mask_mismatch and local_iteration <= 5:
 						logging.error(
-							f"Rank {self.rank}: [ATTN-MASK-BUG] iter={local_iteration}: {len(attn_mask_mismatch)} "
-							f"sequences have attention_mask mismatch! First 5: {attn_mask_mismatch[:5]}"
+							f"Rank {self.rank}: iter={local_iteration}: {len(attn_mask_mismatch)} sequences have attention_mask mismatch. First 5: {attn_mask_mismatch[:5]}"
 						)
 					
 					max_ctx = max(cache_seqlens)
@@ -5264,15 +5269,16 @@ class BatchGenWorker:
 					# Check if cache_seqlens match expected
 					seqlen_mismatch = cache_seqlens_list != expected_ctx_lens
 					
-					logging.warning(
-						f"[FORWARD-DIAG] iter={local_iteration}, batch_size={len(batch)}, "
-						f"resumed_count={len(resumed_in_batch)}, "
-						f"input_tokens(first5)={input_tokens_str}, "
-						f"cache_seqlens(first5)={cache_seqlens_list}, "
-						f"expected_ctx_lens(first5)={expected_ctx_lens}, "
-						f"SEQLEN_MISMATCH={seqlen_mismatch}, "
-						f"resumed_seqs(first3)={resumed_in_batch[:3]}"
-					)
+					if BATCHGEN_CB_DEBUG:
+						logging.debug(
+							f"iter={local_iteration}, batch_size={len(batch)}, "
+							f"resumed_count={len(resumed_in_batch)}, "
+							f"input_tokens(first5)={input_tokens_str}, "
+							f"cache_seqlens(first5)={cache_seqlens_list}, "
+							f"expected_ctx_lens(first5)={expected_ctx_lens}, "
+							f"SEQLEN_MISMATCH={seqlen_mismatch}, "
+							f"resumed_seqs(first3)={resumed_in_batch[:3]}"
+						)
 					
 					# NEW DIAGNOSTIC: Log page table content for first few sequences
 					if mgr and local_iteration <= 3:
@@ -5282,7 +5288,8 @@ class BatchGenWorker:
 							seq_id = slot_seq_ids[i]
 							first_page_idx = mgr.gpu_table[i, 0].item() if mgr.gpu_table is not None and i < mgr.gpu_table.shape[0] else -1
 							page_diag.append({'slot': i, 'seq_id': seq_id, 'first_page': first_page_idx})
-						logging.warning(f"[PAGE-TABLE-DIAG] iter={local_iteration}: first 5 slots: {page_diag}")
+						if BATCHGEN_CB_DEBUG:
+							logging.debug(f"iter={local_iteration}: page-table first 5 slots: {page_diag}")
 						
 						# CRITICAL: Show batch-to-slot mapping
 						batch_global_ids = self._local_indices_to_global_seq_ids(batch[:5])
@@ -5293,7 +5300,8 @@ class BatchGenWorker:
 								batch_slot_lookup.append({'gid': gid, 'slot': slot})
 							else:
 								batch_slot_lookup.append({'gid': gid, 'slot': 'NOT_FOUND'})
-						logging.warning(f"[BATCH-SLOT-MAP] iter={local_iteration}: batch_order(first5)={batch_global_ids}, slot_lookup={batch_slot_lookup}")
+						if BATCHGEN_CB_DEBUG:
+							logging.debug(f"iter={local_iteration}: batch_order(first5)={batch_global_ids}, slot_lookup={batch_slot_lookup}")
 				
 				# CRITICAL DIAGNOSTIC: Sample GPU KV content at resume iterations
 				# This helps identify if KV corruption is happening before/during attention
@@ -5335,12 +5343,13 @@ class BatchGenWorker:
 										k_prev_mean = k_prev.float().mean().item()
 										k_prev_std = k_prev.float().std().item()
 										k_prev_first5 = k_prev[0, 0, :5].tolist() if k_prev.numel() >= 5 else k_prev.flatten()[:5].tolist()
-										logging.warning(
-											f"[KV-PREV-POS-CHECK] iter={local_iteration}: gid={first_gid}, "
-											f"prev_pos={prev_pos}, prev_page_idx={prev_page_idx}, prev_offset={prev_offset}, "
-											f"k_prev(mean={k_prev_mean:.4f}, std={k_prev_std:.4f}), "
-											f"k_prev_first5={k_prev_first5}"
-										)
+										if BATCHGEN_CB_DEBUG:
+											logging.debug(
+												f"iter={local_iteration}: gid={first_gid}, "
+												f"prev_pos={prev_pos}, prev_page_idx={prev_page_idx}, prev_offset={prev_offset}, "
+												f"k_prev(mean={k_prev_mean:.4f}, std={k_prev_std:.4f}), "
+												f"k_prev_first5={k_prev_first5}"
+											)
 								
 								# Sample K values from last page (position depends on ctx_len)
 								first_local_idx = batch[0] if batch else None
@@ -5353,8 +5362,7 @@ class BatchGenWorker:
 								if first_seq and ctx_len != (first_seq.prompt_length + first_seq.decoded_length):
 									expected_ctx = first_seq.prompt_length + first_seq.decoded_length
 									logging.error(
-										f"Rank {self.rank}: [DIAG-CTX-REPAIR] In KV diag iter={local_iteration}: "
-										f"gid={first_gid}, ctx_len={ctx_len} → {expected_ctx}"
+										f"Rank {self.rank}: In KV diag iter={local_iteration}: gid={first_gid}, ctx_len={ctx_len} → {expected_ctx}"
 									)
 									first_seq.current_context_length = expected_ctx
 									ctx_len = expected_ctx
@@ -5362,14 +5370,13 @@ class BatchGenWorker:
 								# CRITICAL DIAGNOSTIC: Log sequence lookup details if ctx_len is suspiciously low
 								if first_seq and ctx_len < 100 and local_iteration == 1:
 									logging.error(
-										f"Rank {self.rank}: [CTX-LEN-BUG] first_local_idx={first_local_idx}, "
-										f"first_uuid={first_uuid}, first_seq.global_idx={first_seq.global_idx if first_seq else 'N/A'}, "
+										f"Rank {self.rank}: first_local_idx={first_local_idx}, first_uuid={first_uuid}, "
+										f"first_seq.global_idx={first_seq.global_idx if first_seq else 'N/A'}, "
 										f"first_seq.prompt_length={first_seq.prompt_length if first_seq else 'N/A'}, "
 										f"first_seq.decoded_length={first_seq.decoded_length if first_seq else 'N/A'}, "
 										f"first_seq.current_context_length={first_seq.current_context_length if first_seq else 'N/A'}, "
 										f"first_seq.status={first_seq.status.name if first_seq else 'N/A'}, "
-										f"first_gid_from_batch={first_gid}, "
-										f"batch_len={len(batch)}, "
+										f"first_gid_from_batch={first_gid}, batch_len={len(batch)}, "
 										f"gpu_manager_num_pages_for_gid={seq_state.pages.numel() if seq_state else 'N/A'}"
 									)
 								
@@ -5397,29 +5404,31 @@ class BatchGenWorker:
 									k_write_mean = k_write_std = -999
 								
 								# DIAGNOSTIC: Log lookup chain details
-								logging.warning(
-									f"[KV-CONTENT-DIAG] iter={local_iteration}: gid={first_gid}, ctx_len={ctx_len}, "
-									f"num_pages={num_pages}, first_page={first_page}, last_page={last_page}, "
-									f"k_first_page(mean={k_first_mean:.4f}, std={k_first_std:.4f}), "
-									f"k_last_page(mean={k_last_mean:.4f}, std={k_last_std:.4f}), "
-									f"write_pos={write_pos}, write_page_idx={write_page_idx}, "
-									f"k_write_pos(mean={k_write_mean:.4f}, std={k_write_std:.4f}), "
-									f"first_local_idx={first_local_idx}, first_uuid={first_uuid is not None}, "
-									f"first_seq={first_seq is not None}"
-								)
+								if BATCHGEN_CB_DEBUG:
+									logging.debug(
+										f"iter={local_iteration}: gid={first_gid}, ctx_len={ctx_len}, "
+										f"num_pages={num_pages}, first_page={first_page}, last_page={last_page}, "
+										f"k_first_page(mean={k_first_mean:.4f}, std={k_first_std:.4f}), "
+										f"k_last_page(mean={k_last_mean:.4f}, std={k_last_std:.4f}), "
+										f"write_pos={write_pos}, write_page_idx={write_page_idx}, "
+										f"k_write_pos(mean={k_write_mean:.4f}, std={k_write_std:.4f}), "
+										f"first_local_idx={first_local_idx}, first_uuid={first_uuid is not None}, "
+										f"first_seq={first_seq is not None}"
+									)
 					except Exception as e:
-						logging.warning(f"[KV-CONTENT-DIAG] iter={local_iteration}: Error sampling KV: {e}")
+						if BATCHGEN_CB_DEBUG:
+							logging.warning(f"iter={local_iteration}: Error sampling KV: {e}")
 				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
 				new_tokens_out = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
 				
 				# DIAGNOSTIC: Log output tokens for first few iterations with resumed sequences
-				if resumed_in_batch and local_iteration <= 3 and self.rank == 0:
-					output_tokens_str = new_tokens_out[:5].flatten().tolist()
-					logging.warning(
-						f"[FORWARD-OUT-DIAG] iter={local_iteration}, output_tokens(first5)={output_tokens_str}"
-					)
+					if resumed_in_batch and local_iteration <= 3 and self.rank == 0 and BATCHGEN_CB_DEBUG:
+						output_tokens_str = new_tokens_out[:5].flatten().tolist()
+						logging.debug(
+							f"iter={local_iteration}, output_tokens(first5)={output_tokens_str}"
+						)
 					
 					# CRITICAL: Verify KV was written correctly AFTER forward
 					if gpu_manager and gpu_manager.is_initialized and batch:
@@ -5444,14 +5453,16 @@ class BatchGenWorker:
 									k_after_mean = k_after.float().mean().item()
 									k_after_std = k_after.float().std().item()
 									k_after_first5 = k_after[0, 0, :5].tolist() if k_after.numel() >= 5 else k_after.flatten()[:5].tolist()
-									logging.warning(
-										f"[KV-POST-FORWARD-DIAG] iter={local_iteration}: gid={first_gid}, "
-										f"write_pos={write_pos}, write_page_idx={write_page_idx}, write_offset={write_offset}, "
-										f"k_after(mean={k_after_mean:.4f}, std={k_after_std:.4f}), "
-										f"k_after_first5={k_after_first5}"
-									)
+									if BATCHGEN_CB_DEBUG:
+										logging.debug(
+											f"iter={local_iteration}: gid={first_gid}, "
+											f"write_pos={write_pos}, write_page_idx={write_page_idx}, write_offset={write_offset}, "
+											f"k_after(mean={k_after_mean:.4f}, std={k_after_std:.4f}), "
+											f"k_after_first5={k_after_first5}"
+										)
 						except Exception as e:
-							logging.warning(f"[KV-POST-FORWARD-DIAG] iter={local_iteration}: Error: {e}")
+							if BATCHGEN_CB_DEBUG:
+								logging.warning(f"iter={local_iteration}: Error: {e}")
 				
 				new_tokens = new_tokens_out
 				
@@ -5564,14 +5575,13 @@ class BatchGenWorker:
 			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
 			if entry_slot_order != entry_cur_batch:
 				logging.error(
-					f"Rank {self.rank}: [ENTRY FIX] ORDER MISMATCH at decoding_continuous entry! "
+					f"Rank {self.rank}: ORDER MISMATCH at decoding_continuous entry: "
 					f"slot_to_seq_id={entry_slot_order[:5]}{'...' if len(entry_slot_order) > 5 else ''} (len={len(entry_slot_order)}), "
-					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). "
-					f"REBUILDING page table to match cur_batch..."
+					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). Rebuilding page table..."
 				)
 				if entry_cur_batch:
 					gpu_manager.rebuild_page_table(entry_cur_batch)
-					logging.info(f"Rank {self.rank}: [ENTRY FIX] Page table rebuilt to match cur_batch order")
+					logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
 
 		# =========================================
 		# ASYNC STATE TRACKING
@@ -5895,18 +5905,28 @@ class BatchGenWorker:
 								repaired_mask = torch.zeros_like(full_mask)
 								repaired_mask[0, :ctx_len] = 1
 								full_mask.copy_(repaired_mask)
-								logging.warning(
-									f"Rank {self.rank}: [MASK-REPAIR] (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
-									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-								)
+								if BATCHGEN_CB_DEBUG:
+									logging.debug(
+										f"Rank {self.rank}: (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
+										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+									)
+								else:
+									logging.info(
+										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]} (decoding_continuous); set first {ctx_len} positions to 1"
+									)
 								mask = full_mask[:, :ctx_len]
 							elif actual_ones < ctx_len:
 								# Too few ones - set all first ctx_len to 1
 								full_mask[0, :ctx_len] = 1
-								logging.warning(
-									f"Rank {self.rank}: [MASK-REPAIR] (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
-									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-								)
+								if BATCHGEN_CB_DEBUG:
+									logging.debug(
+										f"Rank {self.rank}: (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
+										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+									)
+								else:
+									logging.info(
+										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]} (decoding_continuous); set first {ctx_len} positions to 1"
+									)
 								mask = full_mask[:, :ctx_len]
 						
 						attention_masks.append(mask)
