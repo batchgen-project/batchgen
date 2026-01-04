@@ -356,6 +356,7 @@ class BatchGenWorker:
 		self.eos_token_id: Optional[int] = None
 		self.max_input_length = 0
 		self.max_decoding_length = 0
+		self.model_context_length = 131072  # Default 128K, updated from model config
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._ignore_eos: bool = False
@@ -386,13 +387,26 @@ class BatchGenWorker:
 		Initialize/reconfigure for a new batch.
 		- First call: performs full initialization of core_engine, parallel_manager, etc.
 		- Subsequent calls: only updates batch parameters and resets state.
+		
+		Args:
+			max_input_length: Maximum input length hint. If None, will be determined dynamically
+			                  during tokenization as the longest prompt in the batch.
+			                  For first initialization, a default of 8192 is used if None.
+			max_decoding_length: Maximum number of tokens to decode.
+			num_queries: Number of queries in the global batch.
 		"""
 		# Check if we need to reset state from previous batch
 		if self._core_initialized and self.global_batch is not None:
 			self._reset_for_new_batch()
 		
 		# Update batch-specific parameters
-		self.max_input_length = max_input_length
+		# max_input_length can be None - will be set during tokenization
+		# For first initialization, use a reasonable default if None (needed for scheduler)
+		if max_input_length is None or max_input_length <= 0:
+			# Default hint for scheduler; actual value determined during tokenization
+			self.max_input_length = 8192 if not self._core_initialized else 0
+		else:
+			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
 		
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
@@ -462,10 +476,15 @@ class BatchGenWorker:
 		
 		A sequence is completed if:
 		1. It reached max_decoding_length (always checked), OR
-		2. It hit EOS AND ignore_eos is False
+		2. It hit EOS AND ignore_eos is False, OR
+		3. current_context_length >= model_context_length (context limit reached)
 		"""
-		# Always complete at max length
+		# Always complete at max decoding length
 		if seq.decoded_length >= self.max_decoding_length:
+			return True
+		
+		# Complete if context length limit reached (prompt + decoded >= model max)
+		if seq.current_context_length >= self.model_context_length:
 			return True
 		
 		# Only complete at EOS if not ignoring EOS
@@ -853,6 +872,12 @@ class BatchGenWorker:
 			trust_remote_code=True,
 			local_files_only=True,
 		)
+		
+		# Extract model's maximum context length from config
+		# This is used for completion criteria: prompt_length + decoded_length < context_length
+		self.model_context_length = getattr(self.model_config, 'max_position_embeddings', 131072)  # Default 128K
+		logging.info(f"Rank {self.rank}: Model context length set to {self.model_context_length}")
+		
 		self.tokenizer = AutoTokenizer.from_pretrained(
 			self.cache_dir,
 			trust_remote_code=True,
@@ -957,6 +982,26 @@ class BatchGenWorker:
 		self.model_batch_book = {}
 		
 		logging.info(f"Rank {self.rank}: Batch config updated (max_input={self.max_input_length}, max_decode={self.max_decoding_length}, num_queries={num_queries})")
+
+	def _update_config_after_tokenization(self) -> None:
+		"""
+		Update engine config after tokenization determines the actual max_input_length.
+		This is called after _tokenize_global_batch() which sets self.max_input_length
+		to the longest prompt in the batch.
+		"""
+		if self.engine_config is None:
+			return
+			
+		old_padding_length = self.engine_config.Basic_Config.padding_length
+		if old_padding_length != self.max_input_length:
+			logging.info(
+				f"Rank {self.rank}: Updating padding_length from {old_padding_length} to {self.max_input_length} "
+				f"(based on actual longest prompt)"
+			)
+			self.engine_config.Basic_Config.padding_length = self.max_input_length
+			
+			if hasattr(self, 'input_arguments') and self.input_arguments is not None:
+				self.input_arguments.padding_length = self.max_input_length
 
 	# ============ KV Cache Helper Methods ============
 
@@ -2203,7 +2248,11 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: All ranks have {all_sizes_list[0]} sequences in global_batch")
 
 		# Step 2: Tokenize all sequences (all ranks do this identically)
+		# This determines the actual max_input_length dynamically
 		self._tokenize_global_batch()
+		
+		# Step 2.5: Update engine config with actual max_input_length after tokenization
+		self._update_config_after_tokenization()
 
 		# Step 3: Assign sequences to ranks (round-robin)
 		self._assign_sequences_to_ranks()
@@ -2350,22 +2399,54 @@ class BatchGenWorker:
 
 	def _tokenize_global_batch(self) -> None:
 		"""
-		Tokenize all sequences in the global batch.
+		Tokenize all sequences in the global batch without truncation.
+		The max_prompt_length is determined dynamically as the longest prompt.
 		All ranks execute this identically to maintain consistent state.
+		
+		After tokenization, completion criteria uses:
+		- EOS token reached, OR
+		- decoded_length >= max_decoding_length, OR  
+		- prompt_length + decoded_length >= model_context_length
 		"""
 		if self.global_batch is None:
 			raise RuntimeError("Global batch not initialized")
 
+		# Phase 1: Tokenize all sequences WITHOUT truncation to get actual lengths
+		tokenized_results = []
 		for seq in self.global_batch:
 			tokenized = self.tokenizer(
 				seq.text,
 				return_tensors="pt",
-				max_length=self.max_input_length,
-				truncation=True,
-				padding="max_length",
+				truncation=False,  # No truncation - keep full input
+				padding=False,     # No padding yet - we'll do it after finding max length
 			)
-
-			extended_size = self.max_input_length + self.max_decoding_length
+			tokenized_results.append(tokenized)
+		
+		# Phase 2: Find the longest prompt length to use as max_prompt_length
+		prompt_lengths = [t["input_ids"].size(1) for t in tokenized_results]
+		max_prompt_length = max(prompt_lengths)
+		
+		# Warn if any prompt exceeds model context length
+		if max_prompt_length >= self.model_context_length:
+			logging.warning(
+				f"Rank {self.rank}: Longest prompt ({max_prompt_length} tokens) exceeds or equals "
+				f"model context length ({self.model_context_length}). Some sequences may not decode."
+			)
+		
+		# Update self.max_input_length to the actual longest prompt
+		# This is used for attention mask shape: [bsz, max_prompt_length + max_decoding_length]
+		self.max_input_length = max_prompt_length
+		logging.info(
+			f"Rank {self.rank}: Dynamic max_prompt_length set to {max_prompt_length} "
+			f"(prompt lengths: min={min(prompt_lengths)}, max={max(prompt_lengths)})"
+		)
+		
+		# Phase 3: Create padded tensors with the determined max_prompt_length
+		extended_size = self.max_input_length + self.max_decoding_length
+		
+		for seq, tokenized in zip(self.global_batch, tokenized_results):
+			actual_prompt_len = tokenized["input_ids"].size(1)
+			
 			input_ids_extended = torch.zeros(
 				(1, extended_size), dtype=tokenized["input_ids"].dtype
 			)
@@ -2373,9 +2454,9 @@ class BatchGenWorker:
 				(1, extended_size), dtype=tokenized["attention_mask"].dtype
 			)
 
-			seq_len = tokenized["input_ids"].size(1)
-			input_ids_extended[0, :seq_len] = tokenized["input_ids"][0, :]
-			attention_mask_extended[0, :seq_len] = tokenized["attention_mask"][0, :]
+			# Copy the actual tokens (left-aligned, no truncation)
+			input_ids_extended[0, :actual_prompt_len] = tokenized["input_ids"][0, :]
+			attention_mask_extended[0, :actual_prompt_len] = tokenized["attention_mask"][0, :]
 
 			seq.input_ids = input_ids_extended
 			seq.attention_mask = attention_mask_extended
@@ -2383,12 +2464,13 @@ class BatchGenWorker:
 				1, self.max_decoding_length, dtype=torch.int64
 			)
 
-			actual_prompt_len = int(
-				tokenized["attention_mask"][0, :self.max_input_length].sum().item()
-			)
 			seq.prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
-			seq.kv_token_budget = actual_prompt_len + self.max_decoding_length
+			# kv_token_budget is capped by model context length
+			seq.kv_token_budget = min(
+				actual_prompt_len + self.max_decoding_length,
+				self.model_context_length
+			)
 
 		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
 

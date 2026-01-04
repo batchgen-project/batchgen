@@ -226,7 +226,9 @@ def _server_worker_main_impl(
 		try:
 			# Unpack payload - all ranks now have the full global batch
 			global_prompts = task_data.get("prompts", [])
-			current_max_input = task_data.get("max_input_len", 1024)
+			# max_input_len: If None or not provided, will be determined dynamically
+			# from the longest prompt in the batch during tokenization
+			current_max_input = task_data.get("max_input_len", None)
 			current_max_output = task_data.get("max_output_len", 128)
 			ignore_eos = task_data.get("ignore_eos", False)  # NEW: Extract ignore_eos
 
@@ -236,6 +238,7 @@ def _server_worker_main_impl(
 
 			if len(global_prompts) > 0:
 				# Initialize worker with global batch info
+				# max_input_length can be None - will be determined by longest prompt
 				worker.Init(current_max_input, current_max_output, len(global_prompts))
 				
 				# NEW: Set ignore_eos flag on worker
