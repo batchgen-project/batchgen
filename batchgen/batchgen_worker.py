@@ -1147,9 +1147,9 @@ class BatchGenWorker:
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
 			return
-		
-	# DIAGNOSTIC: Log state before destruction for KV corruption investigation
-	if self.global_batch is not None:
+
+		# DIAGNOSTIC: Log state before destruction for KV corruption investigation
+		if self.global_batch is not None:
 			seqs_with_gpu_alloc = []
 			for seq in self.global_batch:
 				if seq.gpu_pages_allocated > 0 or seq.had_initial_gpu_reservation:
@@ -1168,7 +1168,7 @@ class BatchGenWorker:
 					f"{len(seqs_with_gpu_alloc)} sequences having GPU allocation state. "
 					f"First 5: {seqs_with_gpu_alloc[:5]}"
 				)
-		
+
 		manager.destroy(empty_cuda_cache=empty_cuda_cache)
 		
 		# FIX Bug 2: Clear tracking set when GPU KV is destroyed
@@ -1334,27 +1334,27 @@ class BatchGenWorker:
 		should_trigger = above_watermark and has_queued
 
 		# Log watermark check (throttled to reduce spam)
-			if self.rank == 0:
-				if should_trigger:
+		if self.rank == 0:
+			if should_trigger:
+				logging.info(
+					f"WATERMARK TRIGGER: max_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
+					f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
+				)
+				for s in node_stats:
 					logging.info(
-						f"WATERMARK TRIGGER: max_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
-						f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
+						f"WATERMARK:   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
+						f"pages ({100-s['free_percent']}% utilized, {s['free_percent']}% free)"
 					)
-					for s in node_stats:
-						logging.info(
-							f"WATERMARK:   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
-							f"pages ({100-s['free_percent']}% utilized, {s['free_percent']}% free)"
-						)
-			else:
-				# Log summary even when not triggering (every 10th check to avoid spam)
-				if not hasattr(self, '_watermark_check_counter'):
-					self._watermark_check_counter = 0
-				self._watermark_check_counter += 1
-				if self._watermark_check_counter % 10 == 0:
-					logging.debug(
-						f"[WATERMARK] Check #{self._watermark_check_counter}: max_free={max_free_percent}%, "
-						f"threshold={HOST_KV_WATERMARK_PERCENT}%, has_queued={has_queued}, trigger={should_trigger}"
-					)
+		else:
+			# Log summary even when not triggering (every 10th check to avoid spam)
+			if not hasattr(self, '_watermark_check_counter'):
+				self._watermark_check_counter = 0
+			self._watermark_check_counter += 1
+			if self._watermark_check_counter % 10 == 0:
+				logging.debug(
+					f"[WATERMARK] Check #{self._watermark_check_counter}: max_free={max_free_percent}%, "
+					f"threshold={HOST_KV_WATERMARK_PERCENT}%, has_queued={has_queued}, trigger={should_trigger}"
+				)
 
 		return should_trigger
 
@@ -1688,14 +1688,14 @@ class BatchGenWorker:
 			active_page_counts = manager.export_active_sequence_page_counts()
 			
 			# PRE-LOAD DIAGNOSTIC: Log host KV state before loading
-			# This helps trace where NaN originates - in host storage or during load
-			host_stats = worker_view.get_stats()
-			logging.info(
-				f"[MIGRATION SEND PRE-LOAD] Rank {self.rank}: Loading host KV for {uuid[:8]}... "
-				f"global_idx={global_idx}, tokens_needed={tokens_needed}, "
-				f"active_page_counts={active_page_counts.tolist()}, "
-				f"host_stats=(used={host_stats.num_used_pages}, total={host_stats.num_total_pages})"
-			)
+			if BATCHGEN_CB_DEBUG:
+				host_stats = worker_view.get_stats()
+				logging.debug(
+					f"MIGRATION: Rank {self.rank}: Loading host KV for {uuid[:8]}... "
+					f"global_idx={global_idx}, tokens_needed={tokens_needed}, "
+					f"active_page_counts={active_page_counts.tolist()}, "
+					f"host_stats=(used={host_stats.num_used_pages}, total={host_stats.num_total_pages})"
+				)
 			
 			load_task = worker_view.async_load_layer_paged_kv_to_device(
 				sequence_ids=sequence_tensor,
@@ -1707,11 +1707,13 @@ class BatchGenWorker:
 			# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
 			torch.cuda.synchronize(self.torch_device)
 			t_load = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: Host→GPU load: {(t_load-t0)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: Host→GPU load: {(t_load-t0)*1000:.1f}ms")
 			# Extract to contiguous tensor on GPU
 			k_gpu = manager.copy_kv_to_tensor(global_idx)
 			t_extract = time.perf_counter()
-			logging.debug(f"[MIGRATION] Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(f"MIGRATION: Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
 
 			# MIGRATION SEND VALIDATION: expensive validation only when explicitly enabled
 			if BATCHGEN_ENABLE_CRITICAL_DIAGS:
@@ -1844,66 +1846,67 @@ class BatchGenWorker:
 			sequence_ids_list = [global_idx]
 			sequence_lengths = [seq_len]
 
-			# MIGRATION KV VALIDATION: Log first layer data before offload
-			# NOTE: Only validate the VALID portion of KV (up to current_context_length)
-			# The last page may have uninitialized slots beyond the actual token count
-			first_layer_k = k_gpu[0]  # [num_pages, page_size, num_k_heads, k_head_dim]
-			valid_tokens = seq.current_context_length
-			total_slots = pages_needed * page_size
-			
-			# Reshape to [total_tokens, num_k_heads, k_head_dim] to easily slice valid portion
-			flat_k = first_layer_k.reshape(total_slots, num_k_heads, k_head_dim)
-			valid_k = flat_k[:valid_tokens]  # Only validate actual tokens
-			
-			migration_k_mean = valid_k.float().mean().item()
-			migration_k_std = valid_k.float().std().item()
-			migration_has_nan = torch.isnan(valid_k).any().item()
-			migration_is_zero = (valid_k == 0).all().item()
-			
-			# Also check if the ENTIRE buffer has NaN (for debugging padding issues)
-			full_has_nan = torch.isnan(first_layer_k).any().item()
-			padding_info = ""
-			if full_has_nan and not migration_has_nan:
-				# NaN only in padding region - this is expected and OK
-				padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
-			
-			if BATCHGEN_CB_DEBUG:
-				logging.info(
-					f"MIGRATION: Rank {self.rank}: Validating received KV for {uuid[:8]}... (global_idx={global_idx}): "
-					f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
-					f"layer0_mean={migration_k_mean:.4f}, std={migration_k_std:.4f}, "
-					f"has_nan={migration_has_nan}, is_zero={migration_is_zero}{padding_info}, "
-					f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
-				)
-			if migration_is_zero:
-				logging.error(
-					f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV is ALL ZEROS for {uuid[:8]}! "
-					f"This means network transfer failed or source had invalid data."
-				)
-			if migration_has_nan:
-				logging.error(
-					f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV has NaN for {uuid[:8]}!"
-				)
-				# DEEP LAYER-BY-LAYER NaN ANALYSIS (debug-only): Find exactly which layers have NaN
+			# MIGRATION RECV VALIDATION: expensive validation only when explicitly enabled
+			if BATCHGEN_ENABLE_CRITICAL_DIAGS:
+				# NOTE: Only validate the VALID portion of KV (up to current_context_length)
+				# The last page may have uninitialized slots beyond the actual token count
+				first_layer_k = k_gpu[0]  # [num_pages, page_size, num_k_heads, k_head_dim]
+				valid_tokens = seq.current_context_length
+				total_slots = pages_needed * page_size
+				
+				# Reshape to [total_tokens, num_k_heads, k_head_dim] to easily slice valid portion
+				flat_k = first_layer_k.reshape(total_slots, num_k_heads, k_head_dim)
+				valid_k = flat_k[:valid_tokens]  # Only validate actual tokens
+				
+				migration_k_mean = valid_k.float().mean().item()
+				migration_k_std = valid_k.float().std().item()
+				migration_has_nan = torch.isnan(valid_k).any().item()
+				migration_is_zero = (valid_k == 0).all().item()
+				
+				# Also check if the ENTIRE buffer has NaN (for debugging padding issues)
+				full_has_nan = torch.isnan(first_layer_k).any().item()
+				padding_info = ""
+				if full_has_nan and not migration_has_nan:
+					# NaN only in padding region - this is expected and OK
+					padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
+				
 				if BATCHGEN_CB_DEBUG:
-					nan_layers = []
-					for layer_idx in range(k_gpu.shape[0]):
-						layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
-						layer_valid_k = layer_k[:valid_tokens]
-						if torch.isnan(layer_valid_k).any():
-							# Find which tokens have NaN in this layer
-							nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
-							nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
-							nan_layers.append({
-								'layer': layer_idx,
-								'nan_token_count': nan_token_mask.sum().item(),
-								'first_nan_tokens': nan_token_indices,
-							})
-					logging.error(
-						f"MIGRATION RECV: Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
-						f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
-						f"details={nan_layers[:5]}"  # First 5 layers with NaN
+					logging.info(
+						f"MIGRATION: Rank {self.rank}: Validating received KV for {uuid[:8]}... (global_idx={global_idx}): "
+						f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
+						f"layer0_mean={migration_k_mean:.4f}, std={migration_k_std:.4f}, "
+						f"has_nan={migration_has_nan}, is_zero={migration_is_zero}{padding_info}, "
+						f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
 					)
+				if migration_is_zero:
+					logging.error(
+						f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV is ALL ZEROS for {uuid[:8]}! "
+						f"This means network transfer failed or source had invalid data."
+					)
+				if migration_has_nan:
+					logging.error(
+						f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV has NaN for {uuid[:8]}!"
+					)
+					# DEEP LAYER-BY-LAYER NaN ANALYSIS (debug-only): Find exactly which layers have NaN
+					if BATCHGEN_CB_DEBUG:
+						nan_layers = []
+						for layer_idx in range(k_gpu.shape[0]):
+							layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
+							layer_valid_k = layer_k[:valid_tokens]
+							if torch.isnan(layer_valid_k).any():
+								# Find which tokens have NaN in this layer
+								nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
+								nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
+								nan_layers.append({
+									'layer': layer_idx,
+									'nan_token_count': nan_token_mask.sum().item(),
+									'first_nan_tokens': nan_token_indices,
+								})
+						logging.error(
+							f"MIGRATION RECV: Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
+							f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
+							f"details={nan_layers[:5]}"  # First 5 layers with NaN
+						)
 
 			for layer_idx in range(num_layers):
 				# Extract layer [num_pages, page_size, num_k_heads, k_head_dim]
@@ -2074,12 +2077,12 @@ class BatchGenWorker:
 		# If we sync AFTER updating local mappings, RECV side would skip updating because
 		# uuid would be in its _uuid_to_local_map, but its state is stale!
 		migrated_uuids = [m['uuid'] for m in migrations]
-			if migrated_uuids:
-				self._sync_sequence_metadata(migrated_uuids)
-				logging.info(
-					f"Rank {self.rank}: REBALANCE: Synced metadata for {len(migrated_uuids)} sequences "
-					f"BEFORE local mapping update (SEND side still owns them)"
-				)
+		if migrated_uuids:
+			self._sync_sequence_metadata(migrated_uuids)
+			logging.info(
+				f"Rank {self.rank}: REBALANCE: Synced metadata for {len(migrated_uuids)} sequences "
+				f"BEFORE local mapping update (SEND side still owns them)"
+			)
 
 		# Barrier to ensure all ranks have synced metadata
 		dist.barrier()
@@ -4097,63 +4100,18 @@ class BatchGenWorker:
 		if pending_load_uuids:  # ALL ranks have identical pending_load_uuids
 			t0 = time.perf_counter()
 
-			# ASYNC LOAD FINALIZE DIAGNOSTIC: Log what we're integrating
-			logging.info(
-				f"Rank {self.rank}: [ASYNC LOAD FINALIZE] Integrating {len(pending_load_uuids)} sequences: "
-				f"pending_global_ids={pending_load_global_ids[:5]}{'...' if len(pending_load_global_ids) > 5 else ''}, "
-				f"pending_local_indices={pending_load_local_indices[:5]}{'...' if len(pending_load_local_indices) > 5 else ''}, "
-				f"has_task={pending_async_load_task is not None}"
-			)
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(
+					f"Rank {self.rank}: Integrating {len(pending_load_uuids)} async-loaded sequences"
+				)
 
 			if pending_async_load_task is not None:
 				pending_async_load_task.wait()
 				torch.cuda.synchronize(self.torch_device)
-				logging.info(f"Rank {self.rank}: [ASYNC LOAD FINALIZE] Task completed, CUDA synced")
-
-				# KV DATA VALIDATION: Sample loaded KV to verify correctness
-				# This helps detect "kv loaded from wrong place" bugs
-				if gpu_manager and gpu_manager.is_initialized and pending_load_global_ids:
-					try:
-						# Sample first sequence's KV data (layer 0, first page)
-						sample_global_id = pending_load_global_ids[0]
-						if sample_global_id in gpu_manager._sequences:
-							state = gpu_manager._sequences[sample_global_id]
-							if state.pages.numel() > 0:
-								first_page_idx = int(state.pages[0].item())
-								# Sample from layer 0
-								k_sample = gpu_manager._k_cache[0, first_page_idx, :4, :, :].clone().cpu()
-								# Check for anomalies
-								k_mean = k_sample.float().mean().item()
-								k_std = k_sample.float().std().item()
-								k_has_nan = torch.isnan(k_sample).any().item()
-								k_has_inf = torch.isinf(k_sample).any().item()
-								k_is_zero = (k_sample == 0).all().item()
-
-								logging.info(
-									f"Rank {self.rank}: [KV VALIDATION] Loaded seq {sample_global_id} layer 0: "
-									f"mean={k_mean:.4f}, std={k_std:.4f}, "
-									f"has_nan={k_has_nan}, has_inf={k_has_inf}, all_zero={k_is_zero}, "
-									f"first_values={k_sample[0, 0, :3].tolist()}"
-								)
-
-								# CRITICAL: If all zeros or has NaN/Inf, this indicates data wasn't loaded correctly
-								if k_is_zero:
-									logging.error(
-										f"Rank {self.rank}: [KV VALIDATION ERROR] Loaded KV is ALL ZEROS! "
-										f"global_id={sample_global_id}, page_idx={first_page_idx}. "
-										f"This likely means async load read from wrong location or didn't complete."
-									)
-								if k_has_nan or k_has_inf:
-									logging.error(
-										f"Rank {self.rank}: [KV VALIDATION ERROR] Loaded KV has NaN/Inf! "
-										f"global_id={sample_global_id}, page_idx={first_page_idx}."
-									)
-					except Exception as e:
-						logging.warning(f"Rank {self.rank}: [KV VALIDATION] Could not sample KV: {e}")
 
 			timing.wait_async_load_ms = (time.perf_counter() - t0) * 1000
 
-			# CRITICAL: barrier ensures all ranks finish async load before continuing
+			# barrier ensures all ranks finish async load before continuing
 			dist.barrier()
 			
 			t0 = time.perf_counter()
@@ -4168,42 +4126,19 @@ class BatchGenWorker:
 			)
 			timing.finalize_load_ms = (time.perf_counter() - t0) * 1000
 			
-			# CRITICAL: Rebuild page table to include newly loaded sequences
-			# The GPU pages were allocated in the previous boundary, but the page table
-			# wasn't updated to include them in the active batch
+			# Rebuild page table to include newly loaded sequences
 			if batch and gpu_manager is not None and gpu_manager.is_initialized:
 				self._rebuild_page_table_for_batch(batch, gpu_manager)
-
-				# POST-FINALIZE PAGE TABLE DIAGNOSTIC
+				# Verify page table matches batch, fix if needed
 				if gpu_manager._gpu_page_table_manager:
 					post_finalize_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
 					post_finalize_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
 					if post_finalize_slot_order != post_finalize_batch_global_ids:
-						logging.error(
-							f"Rank {self.rank}: [POST-FINALIZE MISMATCH] Page table doesn't match batch after finalize! "
-							f"slot_to_seq_id={post_finalize_slot_order[:5]}{'...' if len(post_finalize_slot_order) > 5 else ''}, "
-							f"batch_global_ids={post_finalize_batch_global_ids[:5]}{'...' if len(post_finalize_batch_global_ids) > 5 else ''}"
-						)
-					else:
-						logging.info(
-							f"Rank {self.rank}: [POST-FINALIZE OK] Page table matches batch (len={len(batch)}), "
-							f"added {len(pending_load_uuids)} new sequences"
-						)
+						gpu_manager.rebuild_page_table(post_finalize_batch_global_ids)
 
 		if not decode_uuids:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing, False
-
-		# ========== POST-FINALIZE VALIDATION (debug only) ==========
-		# After sync+finalize, decode_uuids should be identical across all ranks.
-		# This is a sanity check - if we see desync here, there's a bug in our logic.
-		if logging.getLogger().isEnabledFor(logging.DEBUG):
-			local_decode_set = set(decode_uuids)
-			all_decode_sets = [None] * self.world_size
-			dist.all_gather_object(all_decode_sets, local_decode_set)
-			all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
-			if not all_sets_equal:
-				logging.error(f"Rank {self.rank}: BUG - decode_uuids still desync'd after sync+finalize!")
 		
 		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
 		t0 = time.perf_counter()
@@ -4884,27 +4819,14 @@ class BatchGenWorker:
 				self._cumulative_boundary_ms += timing.total_ms
 				self._cumulative_decode_boundaries += 1
 
-				# CRITICAL POST-BOUNDARY DIAGNOSTIC: Verify page table matches batch
-				# This catches KV cache corruption bugs that occur during page boundaries
+				# Post-boundary: verify page table matches batch and fix if needed
 				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
 					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
 					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
 
 					if post_boundary_slot_order != post_boundary_batch_global_ids:
-						logging.error(
-							f"Rank {self.rank}: [POST-BOUNDARY MISMATCH] Page table order mismatch after boundary! "
-							f"slot_to_seq_id={post_boundary_slot_order[:5]}{'...' if len(post_boundary_slot_order) > 5 else ''} (len={len(post_boundary_slot_order)}), "
-							f"batch_global_ids={post_boundary_batch_global_ids[:5]}{'...' if len(post_boundary_batch_global_ids) > 5 else ''} (len={len(post_boundary_batch_global_ids)}). "
-							f"Boundary #{self._cumulative_decode_boundaries}, iter={self._cumulative_decode_iterations}. REBUILDING page table..."
-						)
-						# CRITICAL FIX: Rebuild page table to match batch
+						# Fix: Rebuild page table to match batch
 						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
-						logging.info(f"Rank {self.rank}: [POST-BOUNDARY FIX] Page table rebuilt to match batch")
-					else:
-						logging.debug(
-							f"Rank {self.rank}: [POST-BOUNDARY OK] Boundary #{self._cumulative_decode_boundaries} - "
-							f"page table matches batch (len={len(batch)})"
-						)
 
 				# Check if watermark triggered - interrupt decode for prefill
 				if watermark_triggered:
@@ -5016,9 +4938,6 @@ class BatchGenWorker:
 					attention_masks = []
 					cache_seqlens = []
 					
-					# DIAGNOSTIC: Check for attention mask inconsistency on first iteration
-					attn_mask_mismatch = []
-					resumed_mask_diag = []  # Diagnostic for resumed sequences
 					for local_idx in batch:
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
@@ -5026,101 +4945,35 @@ class BatchGenWorker:
 						
 						full_mask = self.query_book[local_idx].encoded["attention_mask"]
 						
-						# CRITICAL FIX: If ctx_len is 0 but we have evidence the sequence was active,
+						# Fix: If ctx_len is 0 but we have evidence the sequence was active,
 						# this is a metadata sync bug. Recover ctx_len.
-						# Check multiple sources of truth:
-						# 1. decoded_length > 0 or prompt_length > 0 in SequenceEntry
-						# 2. attention_mask has ones (indicates context was built)
 						mask_ones_count = int(full_mask.sum().item())
 						expected_ctx_len = seq.prompt_length + seq.decoded_length
 						
 						if ctx_len == 0 and (seq.decoded_length > 0 or seq.prompt_length > 0 or mask_ones_count > 0):
-							
-							# Use the larger of mask_ones_count and expected_ctx_len
-							# (mask might have been updated but seq metadata lagged behind)
 							recovered_ctx_len = max(mask_ones_count, expected_ctx_len)
-							
 							if recovered_ctx_len > 0:
-								logging.error(
-									f"Rank {self.rank}: [CTX-LEN-RECOVERY] CRITICAL BUG DETECTED! "
-									f"uuid={uuid[:8]}, gid={seq.global_idx}, original_ctx_len=0, "
-									f"prompt_len={seq.prompt_length}, decoded_len={seq.decoded_length}, "
-									f"mask_ones={mask_ones_count}, recovered_ctx_len={recovered_ctx_len}. "
-									f"Fixing seq.current_context_length!"
-								)
 								ctx_len = recovered_ctx_len
 								seq.current_context_length = recovered_ctx_len
 						
 						mask = full_mask[:, :ctx_len]
 						actual_ones = mask.sum().item()
 						
-						# Check: attention mask should have exactly ctx_len ones
-						# (assuming all tokens in context should be attended to)
+						# Fix: Repair the attention_mask to match current_context_length
 						if actual_ones != ctx_len:
-							# Find first 0 position and last 1 position for diagnosis
-							mask_flat = mask.flatten()
-							zero_positions = (mask_flat == 0).nonzero(as_tuple=True)[0].tolist()[:5]
-							one_positions = (mask_flat == 1).nonzero(as_tuple=True)[0].tolist()[-5:]
-							
-							attn_mask_mismatch.append({
-								'uuid': uuid[:8],
-								'ctx_len': ctx_len,
-								'mask_ones': int(actual_ones),
-								'decoded_len': seq.decoded_length,
-								'prompt_len': seq.prompt_length,
-								'first_zeros': zero_positions,
-								'last_ones': one_positions,
-							})
-							
-							# CRITICAL FIX: Repair the attention_mask to match current_context_length
-							# This ensures position_ids = cache_seqlens - 1 relationship is maintained
-							# The mask should have exactly ctx_len ones in positions 0..(ctx_len-1)
 							if actual_ones > ctx_len:
 								# Too many ones - clear excess
-								# Find positions that have 1 beyond what we need
 								repaired_mask = torch.zeros_like(full_mask)
 								repaired_mask[0, :ctx_len] = 1
 								full_mask.copy_(repaired_mask)
-								if BATCHGEN_CB_DEBUG:
-									logging.debug(
-										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]}: "
-										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-									)
 								mask = full_mask[:, :ctx_len]
 							elif actual_ones < ctx_len:
 								# Too few ones - set all first ctx_len to 1
 								full_mask[0, :ctx_len] = 1
-								if BATCHGEN_CB_DEBUG:
-									logging.debug(
-										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]}: "
-										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-									)
 								mask = full_mask[:, :ctx_len]
-						
-						# Log mask details for resumed sequences (decoded_length > 1)
-						if seq.decoded_length > 1 and local_iteration <= 3:
-							mask_flat = mask.flatten()
-							last_10_values = mask_flat[-10:].tolist() if len(mask_flat) >= 10 else mask_flat.tolist()
-							resumed_mask_diag.append({
-								'uuid': uuid[:8],
-								'ctx_len': ctx_len,
-								'mask_ones': int(actual_ones),
-								'decoded_len': seq.decoded_length,
-								'last_10_mask': last_10_values,
-							})
 						
 						attention_masks.append(mask)
 						cache_seqlens.append(ctx_len)
-					
-					if resumed_mask_diag and self.rank == 0 and BATCHGEN_CB_DEBUG:
-						logging.debug(
-							f"iter={local_iteration}: {len(resumed_mask_diag)} resumed seqs. First 3: {resumed_mask_diag[:3]}"
-						)
-					
-					if attn_mask_mismatch and local_iteration <= 5:
-						logging.error(
-							f"Rank {self.rank}: iter={local_iteration}: {len(attn_mask_mismatch)} sequences have attention_mask mismatch. First 5: {attn_mask_mismatch[:5]}"
-						)
 					
 					max_ctx = max(cache_seqlens)
 					padded_masks = []
@@ -5136,21 +4989,6 @@ class BatchGenWorker:
 					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
 					Attn_Wrapper.cache_seqlens = torch.tensor(cache_seqlens, dtype=torch.int32, device=self.torch_device)
 					Attn_Wrapper.max_seqlen = max_ctx
-					
-					# DEBUG: Verify position_ids = cache_seqlens - 1 relationship
-					if local_iteration <= 3 and self.rank == 0:
-						pos_ids_sample = Attn_Wrapper.position_ids[:5].flatten().tolist() if len(batch) >= 5 else Attn_Wrapper.position_ids.flatten().tolist()
-						cache_seqlens_sample = Attn_Wrapper.cache_seqlens[:5].tolist() if len(batch) >= 5 else Attn_Wrapper.cache_seqlens.tolist()
-						mask_sums = attention_mask.sum(-1)[:5].tolist() if len(batch) >= 5 else attention_mask.sum(-1).tolist()
-						expected_pos = [s - 1 for s in cache_seqlens_sample]
-						logging.warning(
-							f"[POS-ID-VERIFY] iter={local_iteration}: "
-							f"position_ids(first5)={pos_ids_sample}, "
-							f"cache_seqlens(first5)={cache_seqlens_sample}, "
-							f"mask_sums(first5)={mask_sums}, "
-							f"expected_pos(seqlens-1)={expected_pos}, "
-							f"position_ids_match_expected={pos_ids_sample == expected_pos}"
-						)
 					
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
@@ -5172,68 +5010,12 @@ class BatchGenWorker:
 						slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
 						batch_global_order = Attn_Wrapper.cur_batch
 						if slot_order != batch_global_order:
-							if local_iteration <= 3 and self.rank == 0:
-								logging.error(
-									f"[CRITICAL ORDER MISMATCH] iter={local_iteration}: cache_seqlens built from batch order, "
-									f"but page_table is in different order! "
-									f"batch_global_order={batch_global_order[:5]}... (len={len(batch_global_order)}), "
-									f"page_table_slot_order={slot_order[:5]}... (len={len(slot_order)}). "
-									f"Rebuilding page table to fix..."
-								)
-							# FIX: Rebuild page table to match batch order
+							# Fix: Rebuild page table to match batch order
 							gpu_manager.rebuild_page_table(batch_global_order)
 				
 				# NOTE: Do NOT skip forward pass even with empty batch!
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
-				
-				# DEBUG: Verify page table matches batch before forward (only for non-empty batch)
-				if batch and gpu_manager and gpu_manager.is_initialized:
-					mgr = gpu_manager._gpu_page_table_manager
-					if mgr and mgr.gpu_table is not None:
-						page_table_size = mgr.gpu_table.shape[0]
-						batch_size = len(batch)
-						tokens_size = new_tokens.shape[0]
-
-						# CRITICAL: Verify page table ORDER matches cur_batch order
-						# If orders don't match, attention will read wrong KV data = corruption!
-						page_table_seq_order = list(mgr.slot_to_seq_id) if mgr.slot_to_seq_id else []
-						cur_batch_order = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
-						if page_table_seq_order != cur_batch_order:
-							logging.error(
-								f"Rank {self.rank}: KV CORRUPTION DETECTED - ORDER MISMATCH! "
-								f"page_table_order={page_table_seq_order[:5]}... "
-								f"cur_batch_order={cur_batch_order[:5]}... "
-								f"This WILL cause wrong KV reads!"
-							)
-							# Fix: Rebuild page table to match cur_batch order
-							gpu_manager.rebuild_page_table(cur_batch_order)
-							logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
-
-						# Check for ANY mismatch
-						if page_table_size != batch_size or page_table_size != tokens_size or batch_size != tokens_size:
-							logging.error(
-								f"Rank {self.rank}: PRE-FORWARD MISMATCH! "
-								f"page_table_size={page_table_size}, batch_size={batch_size}, "
-								f"new_tokens.shape[0]={tokens_size}, iteration={local_iteration}"
-							)
-							
-							# Fix: rebuild new_tokens if it doesn't match batch
-							if tokens_size != batch_size:
-								logging.info(f"Rank {self.rank}: Rebuilding new_tokens to match batch...")
-								new_tokens = self._rebuild_input_tokens(batch)
-								tokens_size = new_tokens.shape[0]
-							
-							# Fix: rebuild page table if it doesn't match batch
-							if page_table_size != batch_size:
-								logging.info(f"Rank {self.rank}: Rebuilding page table to match batch...")
-								global_ids = self._local_indices_to_global_seq_ids(batch)
-								gpu_manager.rebuild_page_table(global_ids)
-							
-							logging.info(
-								f"Rank {self.rank}: After fix: page_table={mgr.gpu_table.shape[0]}, "
-								f"new_tokens={new_tokens.shape[0]}, batch={len(batch)}"
-							)
 				
 				# KV append callback
 				current_batch = list(batch)
@@ -5241,255 +5023,36 @@ class BatchGenWorker:
 					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor)
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				
-				# DIAGNOSTIC: Log input tokens for first few iterations with resumed sequences
-				resumed_in_batch = [
-					(i, local_idx, self._local_to_uuid_map.get(local_idx, '?')[:8], 
-					 self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx, '')).decoded_length 
-					 if self._local_to_uuid_map.get(local_idx) else 0)
-					for i, local_idx in enumerate(batch)
-					if self._local_to_uuid_map.get(local_idx) and 
-					   self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx)) and
-					   self.global_batch.get_sequence(self._local_to_uuid_map.get(local_idx)).decoded_length > 1
-				]
-				if resumed_in_batch and local_iteration <= 3 and self.rank == 0:
-					input_tokens_str = new_tokens[:5].flatten().tolist() if new_tokens.shape[0] <= 5 else new_tokens[:5].flatten().tolist()
-					
-					# CRITICAL: Also log cache_seqlens to verify they match the expected context lengths
-					cache_seqlens_list = Attn_Wrapper.cache_seqlens[:5].tolist() if Attn_Wrapper.cache_seqlens.shape[0] >= 5 else Attn_Wrapper.cache_seqlens.tolist()
-					
-					# Get expected context lengths from sequences
-					expected_ctx_lens = []
-					for i, local_idx in enumerate(batch[:5]):
-						uuid = self._local_to_uuid_map.get(local_idx)
-						if uuid:
-							seq = self.global_batch.get_sequence(uuid)
-							if seq:
-								expected_ctx_lens.append(seq.current_context_length)
-					
-					# Check if cache_seqlens match expected
-					seqlen_mismatch = cache_seqlens_list != expected_ctx_lens
-					
-					if BATCHGEN_CB_DEBUG:
-						logging.debug(
-							f"iter={local_iteration}, batch_size={len(batch)}, "
-							f"resumed_count={len(resumed_in_batch)}, "
-							f"input_tokens(first5)={input_tokens_str}, "
-							f"cache_seqlens(first5)={cache_seqlens_list}, "
-							f"expected_ctx_lens(first5)={expected_ctx_lens}, "
-							f"SEQLEN_MISMATCH={seqlen_mismatch}, "
-							f"resumed_seqs(first3)={resumed_in_batch[:3]}"
-						)
-					
-					# NEW DIAGNOSTIC: Log page table content for first few sequences
-					if mgr and local_iteration <= 3:
-						page_diag = []
-						slot_seq_ids = list(mgr.slot_to_seq_id) if mgr.slot_to_seq_id else []
-						for i in range(min(5, len(slot_seq_ids))):
-							seq_id = slot_seq_ids[i]
-							first_page_idx = mgr.gpu_table[i, 0].item() if mgr.gpu_table is not None and i < mgr.gpu_table.shape[0] else -1
-							page_diag.append({'slot': i, 'seq_id': seq_id, 'first_page': first_page_idx})
-						if BATCHGEN_CB_DEBUG:
-							logging.debug(f"iter={local_iteration}: page-table first 5 slots: {page_diag}")
-						
-						# CRITICAL: Show batch-to-slot mapping
-						batch_global_ids = self._local_indices_to_global_seq_ids(batch[:5])
-						batch_slot_lookup = []
-						for gid in batch_global_ids:
-							if gid in mgr.slot_to_seq_id:
-								slot = list(mgr.slot_to_seq_id).index(gid)
-								batch_slot_lookup.append({'gid': gid, 'slot': slot})
-							else:
-								batch_slot_lookup.append({'gid': gid, 'slot': 'NOT_FOUND'})
-						if BATCHGEN_CB_DEBUG:
-							logging.debug(f"iter={local_iteration}: batch_order(first5)={batch_global_ids}, slot_lookup={batch_slot_lookup}")
-				
-				# CRITICAL DIAGNOSTIC: Sample GPU KV content at resume iterations
-				# This helps identify if KV corruption is happening before/during attention
-				if resumed_in_batch and local_iteration <= 3 and gpu_manager and gpu_manager.is_initialized:
-					try:
-						# Sample KV from layer 0 for first sequence in batch
-						first_gid = self._local_indices_to_global_seq_ids(batch[:1])[0] if batch else None
-						if first_gid and first_gid in gpu_manager._sequences:
-							seq_state = gpu_manager._sequences[first_gid]
-							if seq_state.pages.numel() > 0:
-								# Get first page index
-								first_page = int(seq_state.pages[0].item())
-								# Get last page index
-								num_pages = seq_state.pages.numel()
-								last_page = int(seq_state.pages[num_pages-1].item())
-								
-								# Sample K values from first page (first 4 positions)
-								k_first_page = gpu_manager._k_cache[0, first_page, :4, :, :].clone().cpu()
-								k_first_mean = k_first_page.float().mean().item()
-								k_first_std = k_first_page.float().std().item()
-								
-								# CRITICAL: At iter 2+, check PREVIOUS position's KV (written at iter N-1)
-								# This detects if KV written at previous iteration got corrupted
-								first_local_idx_early = batch[0] if batch else None
-								# CRITICAL FIX: Use 'is not None' to handle local_idx=0 correctly (0 is falsy!)
-								first_uuid_early = self._local_to_uuid_map.get(first_local_idx_early) if first_local_idx_early is not None else None
-								first_seq_early = self.global_batch.get_sequence(first_uuid_early) if first_uuid_early is not None else None
-								ctx_len_early = first_seq_early.current_context_length if first_seq_early else 0
-								page_size_early = gpu_manager.config.page_size_tokens
-								
-								if local_iteration >= 2 and ctx_len_early >= 2:
-									# Check position ctx_len_early - 2 (KV written at previous iter)
-									prev_pos = ctx_len_early - 2  # Position written at iter N-1
-									prev_page = prev_pos // page_size_early
-									prev_offset = prev_pos % page_size_early
-									if prev_page < num_pages:
-										prev_page_idx = int(seq_state.pages[prev_page].item())
-										k_prev = gpu_manager._k_cache[0, prev_page_idx, prev_offset:prev_offset+1, :, :].clone().cpu()
-										k_prev_mean = k_prev.float().mean().item()
-										k_prev_std = k_prev.float().std().item()
-										k_prev_first5 = k_prev[0, 0, :5].tolist() if k_prev.numel() >= 5 else k_prev.flatten()[:5].tolist()
-										if BATCHGEN_CB_DEBUG:
-											logging.debug(
-												f"iter={local_iteration}: gid={first_gid}, "
-												f"prev_pos={prev_pos}, prev_page_idx={prev_page_idx}, prev_offset={prev_offset}, "
-												f"k_prev(mean={k_prev_mean:.4f}, std={k_prev_std:.4f}), "
-												f"k_prev_first5={k_prev_first5}"
-											)
-								
-								# Sample K values from last page (position depends on ctx_len)
-								first_local_idx = batch[0] if batch else None
-								# CRITICAL FIX: Use 'is not None' to handle local_idx=0 correctly (0 is falsy!)
-								first_uuid = self._local_to_uuid_map.get(first_local_idx) if first_local_idx is not None else None
-								first_seq = self.global_batch.get_sequence(first_uuid) if first_uuid is not None else None
-								ctx_len = first_seq.current_context_length if first_seq else 0
-								
-								# CRITICAL FIX: Repair ctx_len if it's inconsistent
-								if first_seq and ctx_len != (first_seq.prompt_length + first_seq.decoded_length):
-									expected_ctx = first_seq.prompt_length + first_seq.decoded_length
-									logging.error(
-										f"Rank {self.rank}: In KV diag iter={local_iteration}: gid={first_gid}, ctx_len={ctx_len} → {expected_ctx}"
-									)
-									first_seq.current_context_length = expected_ctx
-									ctx_len = expected_ctx
-								
-								# CRITICAL DIAGNOSTIC: Log sequence lookup details if ctx_len is suspiciously low
-								if first_seq and ctx_len < 100 and local_iteration == 1:
-									logging.error(
-										f"Rank {self.rank}: first_local_idx={first_local_idx}, first_uuid={first_uuid}, "
-										f"first_seq.global_idx={first_seq.global_idx if first_seq else 'N/A'}, "
-										f"first_seq.prompt_length={first_seq.prompt_length if first_seq else 'N/A'}, "
-										f"first_seq.decoded_length={first_seq.decoded_length if first_seq else 'N/A'}, "
-										f"first_seq.current_context_length={first_seq.current_context_length if first_seq else 'N/A'}, "
-										f"first_seq.status={first_seq.status.name if first_seq else 'N/A'}, "
-										f"first_gid_from_batch={first_gid}, batch_len={len(batch)}, "
-										f"gpu_manager_num_pages_for_gid={seq_state.pages.numel() if seq_state else 'N/A'}"
-									)
-								
-								# Position in last page
-								page_size = gpu_manager.config.page_size_tokens
-								last_pos_in_seq = ctx_len - 1  # Last valid position
-								last_page_offset = last_pos_in_seq % page_size
-								
-								k_last_page = gpu_manager._k_cache[0, last_page, :4, :, :].clone().cpu()
-								k_last_mean = k_last_page.float().mean().item()
-								k_last_std = k_last_page.float().std().item()
-								
-								# Sample the specific position we're about to write (should be empty/old)
-								write_pos = ctx_len - 1  # Position where new KV will be written
-								write_page = write_pos // page_size
-								write_offset = write_pos % page_size
-								write_page_idx = int(seq_state.pages[write_page].item()) if write_page < num_pages else -1
-								
-								k_write_sample = None
-								if write_page_idx >= 0:
-									k_write_sample = gpu_manager._k_cache[0, write_page_idx, write_offset:write_offset+1, :, :].clone().cpu()
-									k_write_mean = k_write_sample.float().mean().item()
-									k_write_std = k_write_sample.float().std().item()
-								else:
-									k_write_mean = k_write_std = -999
-								
-								# DIAGNOSTIC: Log lookup chain details
-								if BATCHGEN_CB_DEBUG:
-									logging.debug(
-										f"iter={local_iteration}: gid={first_gid}, ctx_len={ctx_len}, "
-										f"num_pages={num_pages}, first_page={first_page}, last_page={last_page}, "
-										f"k_first_page(mean={k_first_mean:.4f}, std={k_first_std:.4f}), "
-										f"k_last_page(mean={k_last_mean:.4f}, std={k_last_std:.4f}), "
-										f"write_pos={write_pos}, write_page_idx={write_page_idx}, "
-										f"k_write_pos(mean={k_write_mean:.4f}, std={k_write_std:.4f}), "
-										f"first_local_idx={first_local_idx}, first_uuid={first_uuid is not None}, "
-										f"first_seq={first_seq is not None}"
-									)
-					except Exception as e:
-						if BATCHGEN_CB_DEBUG:
-							logging.warning(f"iter={local_iteration}: Error sampling KV: {e}")
-				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
 				new_tokens_out = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
+
+			new_tokens = new_tokens_out
+			
+			# Update sequences
+			for i, local_idx in enumerate(batch):
+				uuid = self._local_to_uuid_map[local_idx]
+				seq = self.global_batch.get_sequence(uuid)
 				
-				# DIAGNOSTIC: Log output tokens for first few iterations with resumed sequences
-					if resumed_in_batch and local_iteration <= 3 and self.rank == 0 and BATCHGEN_CB_DEBUG:
-						output_tokens_str = new_tokens_out[:5].flatten().tolist()
-						logging.debug(
-							f"iter={local_iteration}, output_tokens(first5)={output_tokens_str}"
-						)
-					
-					# CRITICAL: Verify KV was written correctly AFTER forward
-					if gpu_manager and gpu_manager.is_initialized and batch:
-						try:
-							first_gid = self._local_indices_to_global_seq_ids(batch[:1])[0]
-							if first_gid in gpu_manager._sequences:
-								seq_state = gpu_manager._sequences[first_gid]
-								first_local_idx = batch[0]
-								first_uuid = self._local_to_uuid_map.get(first_local_idx)
-								first_seq = self.global_batch.get_sequence(first_uuid)
-								ctx_len = first_seq.current_context_length if first_seq else 0
-								
-								page_size = gpu_manager.config.page_size_tokens
-								write_pos = ctx_len - 1  # Position where KV was just written
-								write_page = write_pos // page_size
-								write_offset = write_pos % page_size
-								num_pages = seq_state.pages.numel()
-								write_page_idx = int(seq_state.pages[write_page].item()) if write_page < num_pages else -1
-								
-								if write_page_idx >= 0:
-									k_after = gpu_manager._k_cache[0, write_page_idx, write_offset:write_offset+1, :, :].clone().cpu()
-									k_after_mean = k_after.float().mean().item()
-									k_after_std = k_after.float().std().item()
-									k_after_first5 = k_after[0, 0, :5].tolist() if k_after.numel() >= 5 else k_after.flatten()[:5].tolist()
-									if BATCHGEN_CB_DEBUG:
-										logging.debug(
-											f"iter={local_iteration}: gid={first_gid}, "
-											f"write_pos={write_pos}, write_page_idx={write_page_idx}, write_offset={write_offset}, "
-											f"k_after(mean={k_after_mean:.4f}, std={k_after_std:.4f}), "
-											f"k_after_first5={k_after_first5}"
-										)
-						except Exception as e:
-							if BATCHGEN_CB_DEBUG:
-								logging.warning(f"iter={local_iteration}: Error: {e}")
+				if self._is_sequence_completed(seq):
+					continue
 				
-				new_tokens = new_tokens_out
+				decode_pos = seq.decoded_length
+				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
 				
-				# Update sequences
-				for i, local_idx in enumerate(batch):
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					
-					if self._is_sequence_completed(seq):
-						continue
-					
-					decode_pos = seq.decoded_length
-					self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
-					
-					attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
-					next_pos = seq.current_context_length
-					if next_pos < attn_mask.shape[0]:
-						attn_mask[next_pos] = 1
-					
-					seq.decoded_length += 1
-					seq.current_context_length += 1
-					
-					if self._should_stop_at_eos(new_tokens[i].item()):
-						seq.eos_reached = True
-					
-					if seq.decoded_length >= self.max_decoding_length:
-						seq.eos_reached = True
+				attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
+				next_pos = seq.current_context_length
+				if next_pos < attn_mask.shape[0]:
+					attn_mask[next_pos] = 1
+				
+				seq.decoded_length += 1
+				seq.current_context_length += 1
+				
+				if self._should_stop_at_eos(new_tokens[i].item()):
+					seq.eos_reached = True
+				
+				if seq.decoded_length >= self.max_decoding_length:
+					seq.eos_reached = True
 			
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
@@ -5795,27 +5358,14 @@ class BatchGenWorker:
 				boundary_timings.append(timing)
 				self._cumulative_boundary_ms += timing.total_boundary_ms
 
-				# CRITICAL POST-BOUNDARY DIAGNOSTIC: Verify page table matches batch
-				# This catches KV cache corruption bugs that occur during page boundaries
+				# Post-boundary: verify page table matches batch and fix if needed
 				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
 					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
 					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
 
 					if post_boundary_slot_order != post_boundary_batch_global_ids:
-						logging.error(
-							f"Rank {self.rank}: [POST-BOUNDARY MISMATCH] Page table order mismatch after boundary! "
-							f"slot_to_seq_id={post_boundary_slot_order[:5]}{'...' if len(post_boundary_slot_order) > 5 else ''} (len={len(post_boundary_slot_order)}), "
-							f"batch_global_ids={post_boundary_batch_global_ids[:5]}{'...' if len(post_boundary_batch_global_ids) > 5 else ''} (len={len(post_boundary_batch_global_ids)}). "
-							f"Boundary #{self._cumulative_decode_boundaries}, iter={local_iteration}. REBUILDING page table..."
-						)
-						# CRITICAL FIX: Rebuild page table to match batch
+						# Fix: Rebuild page table to match batch
 						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
-						logging.info(f"Rank {self.rank}: [POST-BOUNDARY FIX] Page table rebuilt to match batch")
-					else:
-						logging.debug(
-							f"Rank {self.rank}: [POST-BOUNDARY OK] Boundary #{self._cumulative_decode_boundaries} - "
-							f"page table matches batch (len={len(batch)})"
-						)
 
 				# Log timing for this boundary (uses cumulative counter)
 				if self.rank == 0:
@@ -5875,58 +5425,31 @@ class BatchGenWorker:
 						
 						full_mask = self.query_book[local_idx].encoded["attention_mask"]
 						
-						# CRITICAL FIX: If ctx_len is 0 but we have evidence the sequence was active,
+						# Fix: If ctx_len is 0 but we have evidence the sequence was active,
 						# this is a metadata sync bug. Recover ctx_len.
 						mask_ones_count = int(full_mask.sum().item())
 						expected_ctx_len = seq.prompt_length + seq.decoded_length
 						
 						if ctx_len == 0 and (seq.decoded_length > 0 or seq.prompt_length > 0 or mask_ones_count > 0):
 							recovered_ctx_len = max(mask_ones_count, expected_ctx_len)
-							
 							if recovered_ctx_len > 0:
-								logging.error(
-									f"Rank {self.rank}: [CTX-LEN-RECOVERY] (decoding_continuous) CRITICAL BUG! "
-									f"uuid={uuid[:8]}, gid={seq.global_idx}, original_ctx_len=0, "
-									f"prompt_len={seq.prompt_length}, decoded_len={seq.decoded_length}, "
-									f"mask_ones={mask_ones_count}, recovered_ctx_len={recovered_ctx_len}. "
-									f"Fixing seq.current_context_length!"
-								)
 								ctx_len = recovered_ctx_len
 								seq.current_context_length = recovered_ctx_len
 						
 						mask = full_mask[:, :ctx_len]
 						actual_ones = mask.sum().item()
 						
-						# CRITICAL FIX: Repair attention_mask if mismatch with current_context_length
-						# This ensures position_ids = cache_seqlens - 1 relationship is maintained
+						# Fix: Repair attention_mask if mismatch with current_context_length
 						if actual_ones != ctx_len:
 							if actual_ones > ctx_len:
 								# Too many ones - clear excess
 								repaired_mask = torch.zeros_like(full_mask)
 								repaired_mask[0, :ctx_len] = 1
 								full_mask.copy_(repaired_mask)
-								if BATCHGEN_CB_DEBUG:
-									logging.debug(
-										f"Rank {self.rank}: (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
-										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-									)
-								else:
-									logging.info(
-										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]} (decoding_continuous); set first {ctx_len} positions to 1"
-									)
 								mask = full_mask[:, :ctx_len]
 							elif actual_ones < ctx_len:
 								# Too few ones - set all first ctx_len to 1
 								full_mask[0, :ctx_len] = 1
-								if BATCHGEN_CB_DEBUG:
-									logging.debug(
-										f"Rank {self.rank}: (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
-										f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
-									)
-								else:
-									logging.info(
-										f"Rank {self.rank}: Repaired attention_mask for {uuid[:8]} (decoding_continuous); set first {ctx_len} positions to 1"
-									)
 								mask = full_mask[:, :ctx_len]
 						
 						attention_masks.append(mask)
@@ -5974,23 +5497,15 @@ class BatchGenWorker:
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
 
-					# CRITICAL: Verify page table ORDER matches cur_batch order
-					# If orders don't match, attention will read wrong KV data = corruption!
+					# Verify page table order matches cur_batch order, fix if needed
 					if gpu_manager and gpu_manager.is_initialized:
 						mgr = gpu_manager._gpu_page_table_manager
 						if mgr and mgr.slot_to_seq_id:
 							page_table_seq_order = list(mgr.slot_to_seq_id)
 							cur_batch_order = list(Attn_Wrapper.cur_batch)
 							if page_table_seq_order != cur_batch_order:
-								logging.error(
-									f"Rank {self.rank}: KV CORRUPTION DETECTED - ORDER MISMATCH! "
-									f"page_table_order={page_table_seq_order[:5]}... "
-									f"cur_batch_order={cur_batch_order[:5]}... "
-									f"This WILL cause wrong KV reads!"
-								)
 								# Fix: Rebuild page table to match cur_batch order
 								gpu_manager.rebuild_page_table(cur_batch_order)
-								logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
 
 				# KV append callback - FIRE AND FORGET
 				# Capture batch by value AFTER all modifications are done
@@ -6000,46 +5515,6 @@ class BatchGenWorker:
 					# Returns None - NO BLOCKING WAIT
 				
 				Attn_Wrapper.kv_append_callback = kv_append_callback
-				
-				# ============ PRE-FORWARD VALIDATION ============
-				if len(batch) > 0:
-					# Validate tensor shapes match batch size
-					expected_bsz = len(batch)
-					actual_token_bsz = new_tokens.shape[0]
-					actual_mask_bsz = Attn_Wrapper.attention_mask.shape[0]
-					actual_pos_bsz = Attn_Wrapper.position_ids.shape[0]
-					actual_seqlen_bsz = Attn_Wrapper.cache_seqlens.shape[0]
-					
-					if actual_token_bsz != expected_bsz:
-						logging.error(
-							f"Rank {self.rank}: BATCH SIZE MISMATCH! "
-							f"expected={expected_bsz}, new_tokens.shape[0]={actual_token_bsz}"
-						)
-					if actual_mask_bsz != expected_bsz:
-						logging.error(
-							f"Rank {self.rank}: ATTENTION MASK MISMATCH! "
-							f"expected={expected_bsz}, attention_mask.shape[0]={actual_mask_bsz}"
-						)
-					if actual_pos_bsz != expected_bsz:
-						logging.error(
-							f"Rank {self.rank}: POSITION_IDS MISMATCH! "
-							f"expected={expected_bsz}, position_ids.shape[0]={actual_pos_bsz}"
-						)
-					if actual_seqlen_bsz != expected_bsz:
-						logging.error(
-							f"Rank {self.rank}: CACHE_SEQLENS MISMATCH! "
-							f"expected={expected_bsz}, cache_seqlens.shape[0]={actual_seqlen_bsz}"
-						)
-					
-					# Log summary for debugging
-					logging.debug(
-						f"Rank {self.rank}: Forward pass: batch={expected_bsz}, "
-						f"new_tokens={new_tokens.shape}, "
-						f"attention_mask={Attn_Wrapper.attention_mask.shape}, "
-						f"position_ids={Attn_Wrapper.position_ids.shape}, "
-						f"cache_seqlens={Attn_Wrapper.cache_seqlens.shape}, "
-						f"max_seqlen={Attn_Wrapper.max_seqlen}"
-					)
 				
 				# Forward pass
 				outputs = self.model(
@@ -6793,66 +6268,19 @@ class BatchGenWorker:
 			return torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		
 		tokens = []
-		suspicious_tokens = []  # Track potential issues
-		resumed_seq_diag = []  # Diagnostic for resumed sequences
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map.get(local_idx)
 			if uuid is None:
-				logging.error(f"Rank {self.rank}: _rebuild_input_tokens: local_idx {local_idx} not in _local_to_uuid_map!")
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
-				logging.error(f"Rank {self.rank}: _rebuild_input_tokens: uuid {uuid} not in global_batch!")
 				continue
 			pos = max(0, seq.decoded_length - 1)
 			query_entry = self.query_book.get(local_idx)
 			if query_entry is None:
-				logging.error(f"Rank {self.rank}: _rebuild_input_tokens: local_idx {local_idx} not in query_book!")
 				continue
 			token = query_entry.decoded_tokens[:, pos:pos+1]
 			tokens.append(token)
-			
-			# COMPREHENSIVE DIAGNOSTIC: Log all resumed sequences (decoded_length > 1)
-			if seq.decoded_length > 1:  # Resuming sequence (not first decode step)
-				token_val = token.item()
-				# Also get a few surrounding tokens for context
-				dec_tokens = query_entry.decoded_tokens
-				max_dec_len = dec_tokens.shape[1] if dec_tokens is not None else 0
-				nearby_tokens = []
-				for i in range(max(0, pos-2), min(max_dec_len, pos+3)):
-					nearby_tokens.append(int(dec_tokens[0, i].item()))
-				
-				resumed_seq_diag.append({
-					'uuid': uuid[:8],
-					'decoded_len': seq.decoded_length,
-					'ctx_len': seq.current_context_length,
-					'prompt_len': seq.prompt_length,
-					'pos': pos,
-					'token_val': token_val,
-					'nearby': nearby_tokens,
-					'status': seq.status.name,
-				})
-				
-				if token_val == 0:
-					suspicious_tokens.append({
-						'uuid': uuid[:8],
-						'decoded_len': seq.decoded_length,
-						'pos': pos,
-						'token_val': token_val,
-					})
-		
-		# Log diagnostic for first few resumed sequences (helps debug gibberish after resume)
-		if resumed_seq_diag and self.rank == 0:
-			logging.warning(
-				f"[RESUME-INPUT-DIAG] {len(resumed_seq_diag)} resumed sequences in batch. "
-				f"First 3: {resumed_seq_diag[:3]}"
-			)
-		
-		if suspicious_tokens:
-			logging.error(
-				f"Rank {self.rank}: [INPUT-TOKEN-BUG] {len(suspicious_tokens)} resuming sequences have "
-				f"ZERO input token! First 5: {suspicious_tokens[:5]}"
-			)
 		
 		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		
