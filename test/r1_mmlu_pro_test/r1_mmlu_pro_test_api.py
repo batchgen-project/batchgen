@@ -152,8 +152,8 @@ def run_inference_via_api(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--hugging_face_checkpoint", type=str)
-    parser.add_argument("--max_prompts", type=int, default=0)
-    parser.add_argument("--max_input_length", type=int)
+    parser.add_argument("--max_prompts", type=int, default=None, help="Max number of prompts to process. If not set, run the whole dataset.")
+    parser.add_argument("--max_input_length", type=int, default=None, help="Max input length hint. If not set, determined dynamically from longest prompt.")
     parser.add_argument("--max_decoding_length", type=int)
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
@@ -167,8 +167,10 @@ if __name__ == "__main__":
     dataset = pd.read_parquet(
         os.path.join(os.path.dirname(__file__), "mmlu_pro_test.parquet")
     )
-    if args.max_prompts != 0:
+    # Use top max_prompts sequences if specified, otherwise run whole dataset
+    if args.max_prompts is not None and args.max_prompts > 0:
         dataset = dataset.head(args.max_prompts)
+        logger.info(f"Using top {args.max_prompts} sequences from dataset")
 
     validation_set = pd.read_parquet(
         os.path.join(os.path.dirname(__file__), "mmlu_pro_validation.parquet")
@@ -241,11 +243,12 @@ if __name__ == "__main__":
         queries,
         add_special_tokens=True,
         padding=False,
-        truncation=False,
-        max_length=args.max_input_length,
+        truncation=False,  # No truncation - full prompts sent to server
     )
+    prompt_lengths = [len(t) for t in tokenized['input_ids']]
     logger.info(
-        f"Longest query length: {max([len(t) for t in tokenized['input_ids']])} tokens"
+        f"Prompt lengths: min={min(prompt_lengths)}, max={max(prompt_lengths)}, "
+        f"mean={sum(prompt_lengths)/len(prompt_lengths):.1f} tokens"
     )
 
     if torch.cuda.is_available():
