@@ -2260,15 +2260,27 @@ class BatchGenWorker:
 			return
 		
 		# Step 1: Each rank reports state for sequences it owns
+		# CRITICAL FIX: Also compute and send prompt_length so receivers can validate ctx_len
 		local_state = {}
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
+				# CRITICAL: Ensure current_context_length is consistent before sending
+				# The invariant is: current_context_length = prompt_length + decoded_length
+				expected_ctx = seq.prompt_length + seq.decoded_length
+				if seq.current_context_length != expected_ctx:
+					logging.warning(
+						f"Rank {self.rank}: [SYNC-FIX] Correcting ctx_len for {uuid[:8]} before sync: "
+						f"{seq.current_context_length} → {expected_ctx}"
+					)
+					seq.current_context_length = expected_ctx
+				
 				local_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
 					'gpu_pages_allocated': seq.gpu_pages_allocated,
 					'eos_reached': seq.eos_reached,
+					'prompt_length': seq.prompt_length,  # Include for validation
 				}
 		
 		# Step 2: All-gather state from all ranks
@@ -2287,6 +2299,16 @@ class BatchGenWorker:
 							seq.current_context_length = state['current_context_length']
 							seq.gpu_pages_allocated = state['gpu_pages_allocated']
 							seq.eos_reached = state['eos_reached']
+							
+							# VALIDATION: Ensure received ctx_len is consistent
+							expected_ctx = seq.prompt_length + seq.decoded_length
+							if seq.current_context_length != expected_ctx:
+								logging.error(
+									f"Rank {self.rank}: [SYNC-VALIDATE] Received inconsistent ctx_len for {uuid[:8]}: "
+									f"received={seq.current_context_length}, expected={expected_ctx} "
+									f"(prompt={seq.prompt_length}, decoded={seq.decoded_length})"
+								)
+								seq.current_context_length = expected_ctx
 
 	# ============ Tokenization and Assignment ============
 
@@ -2483,6 +2505,30 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(
 				f"[WATERMARK] Putting {len(uuids)} sequences ON_HOLD"
+			)
+
+		# DIAGNOSTIC: Verify attention_mask consistency BEFORE going ON_HOLD
+		# This helps identify if the mask-context mismatch is introduced before or after ON_HOLD
+		onhold_mask_diag = []
+		for uuid in uuids:
+			if uuid in self._uuid_to_local_map:
+				local_idx = self._uuid_to_local_map[uuid]
+				seq = self.global_batch.get_sequence(uuid)
+				ctx_len = seq.current_context_length
+				full_mask = self.query_book[local_idx].encoded["attention_mask"]
+				mask_ones = full_mask[:, :ctx_len].sum().item()
+				if mask_ones != ctx_len:
+					onhold_mask_diag.append({
+						'uuid': uuid[:8],
+						'ctx_len': ctx_len,
+						'mask_ones': int(mask_ones),
+						'decoded_len': seq.decoded_length,
+						'diff': int(mask_ones - ctx_len),
+					})
+		if onhold_mask_diag:
+			logging.error(
+				f"Rank {self.rank}: [ON_HOLD-MASK-BUG] {len(onhold_mask_diag)} sequences have "
+				f"attention_mask mismatch BEFORE going ON_HOLD! First 5: {onhold_mask_diag[:5]}"
 			)
 
 		# CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
@@ -3556,6 +3602,43 @@ class BatchGenWorker:
 		"""Configure decoding phase with pre-sized GPU KV manager."""
 		start_time = time.perf_counter()
 		
+		# ============ CRITICAL FIX: Repair current_context_length for ALL sequences FIRST ============
+		# This must happen BEFORE any validation or diagnostics that read current_context_length.
+		# The root cause of ctx_len=0 bug is that current_context_length can become stale during
+		# decode→prefill→decode transitions, especially after migrations.
+		# The fix: current_context_length = prompt_length + decoded_length is ALWAYS the correct value
+		# for sequences that have started decoding (decoded_length > 0 or have been prefilled).
+		ctx_len_repaired_count = 0
+		for uuid in decode_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			
+			# Compute the correct context length
+			# For sequences with decoded tokens: ctx_len = prompt_length + decoded_length
+			# For freshly prefilled sequences: ctx_len should equal prompt_length (decoded_length=0)
+			expected_ctx = seq.prompt_length + seq.decoded_length
+			
+			# Repair if mismatched
+			if seq.current_context_length != expected_ctx:
+				old_ctx = seq.current_context_length
+				seq.current_context_length = expected_ctx
+				ctx_len_repaired_count += 1
+				if old_ctx == 0 or abs(old_ctx - expected_ctx) > 100:
+					# Only log significant mismatches to avoid log spam
+					logging.warning(
+						f"Rank {self.rank}: [CTX-LEN-REPAIR] Repaired {uuid[:8]} gid={seq.global_idx}: "
+						f"ctx_len {old_ctx} → {expected_ctx} (prompt={seq.prompt_length}, decoded={seq.decoded_length})"
+					)
+		
+		if ctx_len_repaired_count > 0:
+			logging.info(
+				f"Rank {self.rank}: [CTX-LEN-REPAIR] Repaired current_context_length for "
+				f"{ctx_len_repaired_count}/{len(decode_uuids)} sequences"
+			)
+		
+		# ============ END CRITICAL FIX ============
+		
 		# VALIDATION: Verify decode_uuids consistency across all ranks
 		local_uuid_count = torch.tensor([len(decode_uuids)], dtype=torch.int64, device=self.torch_device)
 		all_uuid_counts = [torch.zeros_like(local_uuid_count) for _ in range(self.world_size)]
@@ -3574,6 +3657,7 @@ class BatchGenWorker:
 		fresh_seqs = []
 		for uuid in decode_uuids:
 			seq = self.global_batch.get_sequence(uuid)
+			
 			seq_info = {
 				'uuid': seq.uuid[:8],
 				'global_idx': seq.global_idx,
@@ -4913,6 +4997,32 @@ class BatchGenWorker:
 						ctx_len = seq.current_context_length
 						
 						full_mask = self.query_book[local_idx].encoded["attention_mask"]
+						
+						# CRITICAL FIX: If ctx_len is 0 but we have evidence the sequence was active,
+						# this is a metadata sync bug. Recover ctx_len.
+						# Check multiple sources of truth:
+						# 1. decoded_length > 0 or prompt_length > 0 in SequenceEntry
+						# 2. attention_mask has ones (indicates context was built)
+						mask_ones_count = int(full_mask.sum().item())
+						expected_ctx_len = seq.prompt_length + seq.decoded_length
+						
+						if ctx_len == 0 and (seq.decoded_length > 0 or seq.prompt_length > 0 or mask_ones_count > 0):
+							
+							# Use the larger of mask_ones_count and expected_ctx_len
+							# (mask might have been updated but seq metadata lagged behind)
+							recovered_ctx_len = max(mask_ones_count, expected_ctx_len)
+							
+							if recovered_ctx_len > 0:
+								logging.error(
+									f"Rank {self.rank}: [CTX-LEN-RECOVERY] CRITICAL BUG DETECTED! "
+									f"uuid={uuid[:8]}, gid={seq.global_idx}, original_ctx_len=0, "
+									f"prompt_len={seq.prompt_length}, decoded_len={seq.decoded_length}, "
+									f"mask_ones={mask_ones_count}, recovered_ctx_len={recovered_ctx_len}. "
+									f"Fixing seq.current_context_length!"
+								)
+								ctx_len = recovered_ctx_len
+								seq.current_context_length = recovered_ctx_len
+						
 						mask = full_mask[:, :ctx_len]
 						actual_ones = mask.sum().item()
 						
@@ -4933,6 +5043,29 @@ class BatchGenWorker:
 								'first_zeros': zero_positions,
 								'last_ones': one_positions,
 							})
+							
+							# CRITICAL FIX: Repair the attention_mask to match current_context_length
+							# This ensures position_ids = cache_seqlens - 1 relationship is maintained
+							# The mask should have exactly ctx_len ones in positions 0..(ctx_len-1)
+							if actual_ones > ctx_len:
+								# Too many ones - clear excess
+								# Find positions that have 1 beyond what we need
+								repaired_mask = torch.zeros_like(full_mask)
+								repaired_mask[0, :ctx_len] = 1
+								full_mask.copy_(repaired_mask)
+								logging.warning(
+									f"Rank {self.rank}: [MASK-REPAIR] Repaired attention_mask for {uuid[:8]}: "
+									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+								)
+								mask = full_mask[:, :ctx_len]
+							elif actual_ones < ctx_len:
+								# Too few ones - set all first ctx_len to 1
+								full_mask[0, :ctx_len] = 1
+								logging.warning(
+									f"Rank {self.rank}: [MASK-REPAIR] Repaired attention_mask for {uuid[:8]}: "
+									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+								)
+								mask = full_mask[:, :ctx_len]
 						
 						# Log mask details for resumed sequences (decoded_length > 1)
 						if seq.decoded_length > 1 and local_iteration <= 3:
@@ -4975,6 +5108,21 @@ class BatchGenWorker:
 					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
 					Attn_Wrapper.cache_seqlens = torch.tensor(cache_seqlens, dtype=torch.int32, device=self.torch_device)
 					Attn_Wrapper.max_seqlen = max_ctx
+					
+					# DEBUG: Verify position_ids = cache_seqlens - 1 relationship
+					if local_iteration <= 3 and self.rank == 0:
+						pos_ids_sample = Attn_Wrapper.position_ids[:5].flatten().tolist() if len(batch) >= 5 else Attn_Wrapper.position_ids.flatten().tolist()
+						cache_seqlens_sample = Attn_Wrapper.cache_seqlens[:5].tolist() if len(batch) >= 5 else Attn_Wrapper.cache_seqlens.tolist()
+						mask_sums = attention_mask.sum(-1)[:5].tolist() if len(batch) >= 5 else attention_mask.sum(-1).tolist()
+						expected_pos = [s - 1 for s in cache_seqlens_sample]
+						logging.warning(
+							f"[POS-ID-VERIFY] iter={local_iteration}: "
+							f"position_ids(first5)={pos_ids_sample}, "
+							f"cache_seqlens(first5)={cache_seqlens_sample}, "
+							f"mask_sums(first5)={mask_sums}, "
+							f"expected_pos(seqlens-1)={expected_pos}, "
+							f"position_ids_match_expected={pos_ids_sample == expected_pos}"
+						)
 					
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
@@ -5175,6 +5323,30 @@ class BatchGenWorker:
 								first_uuid = self._local_to_uuid_map.get(first_local_idx) if first_local_idx else None
 								first_seq = self.global_batch.get_sequence(first_uuid) if first_uuid else None
 								ctx_len = first_seq.current_context_length if first_seq else 0
+								
+								# CRITICAL FIX: Repair ctx_len if it's inconsistent
+								if first_seq and ctx_len != (first_seq.prompt_length + first_seq.decoded_length):
+									expected_ctx = first_seq.prompt_length + first_seq.decoded_length
+									logging.error(
+										f"Rank {self.rank}: [DIAG-CTX-REPAIR] In KV diag iter={local_iteration}: "
+										f"gid={first_gid}, ctx_len={ctx_len} → {expected_ctx}"
+									)
+									first_seq.current_context_length = expected_ctx
+									ctx_len = expected_ctx
+								
+								# CRITICAL DIAGNOSTIC: Log sequence lookup details if ctx_len is suspiciously low
+								if first_seq and ctx_len < 100 and local_iteration == 1:
+									logging.error(
+										f"Rank {self.rank}: [CTX-LEN-BUG] first_local_idx={first_local_idx}, "
+										f"first_uuid={first_uuid}, first_seq.global_idx={first_seq.global_idx if first_seq else 'N/A'}, "
+										f"first_seq.prompt_length={first_seq.prompt_length if first_seq else 'N/A'}, "
+										f"first_seq.decoded_length={first_seq.decoded_length if first_seq else 'N/A'}, "
+										f"first_seq.current_context_length={first_seq.current_context_length if first_seq else 'N/A'}, "
+										f"first_seq.status={first_seq.status.name if first_seq else 'N/A'}, "
+										f"first_gid_from_batch={first_gid}, "
+										f"batch_len={len(batch)}, "
+										f"gpu_manager_num_pages_for_gid={seq_state.pages.numel() if seq_state else 'N/A'}"
+									)
 								
 								# Position in last page
 								page_size = gpu_manager.config.page_size_tokens
@@ -5663,7 +5835,52 @@ class BatchGenWorker:
 						seq = self.global_batch.get_sequence(uuid)
 						ctx_len = seq.current_context_length
 						
-						mask = self.query_book[local_idx].encoded["attention_mask"][:, :ctx_len]
+						full_mask = self.query_book[local_idx].encoded["attention_mask"]
+						
+						# CRITICAL FIX: If ctx_len is 0 but we have evidence the sequence was active,
+						# this is a metadata sync bug. Recover ctx_len.
+						mask_ones_count = int(full_mask.sum().item())
+						expected_ctx_len = seq.prompt_length + seq.decoded_length
+						
+						if ctx_len == 0 and (seq.decoded_length > 0 or seq.prompt_length > 0 or mask_ones_count > 0):
+							recovered_ctx_len = max(mask_ones_count, expected_ctx_len)
+							
+							if recovered_ctx_len > 0:
+								logging.error(
+									f"Rank {self.rank}: [CTX-LEN-RECOVERY] (decoding_continuous) CRITICAL BUG! "
+									f"uuid={uuid[:8]}, gid={seq.global_idx}, original_ctx_len=0, "
+									f"prompt_len={seq.prompt_length}, decoded_len={seq.decoded_length}, "
+									f"mask_ones={mask_ones_count}, recovered_ctx_len={recovered_ctx_len}. "
+									f"Fixing seq.current_context_length!"
+								)
+								ctx_len = recovered_ctx_len
+								seq.current_context_length = recovered_ctx_len
+						
+						mask = full_mask[:, :ctx_len]
+						actual_ones = mask.sum().item()
+						
+						# CRITICAL FIX: Repair attention_mask if mismatch with current_context_length
+						# This ensures position_ids = cache_seqlens - 1 relationship is maintained
+						if actual_ones != ctx_len:
+							if actual_ones > ctx_len:
+								# Too many ones - clear excess
+								repaired_mask = torch.zeros_like(full_mask)
+								repaired_mask[0, :ctx_len] = 1
+								full_mask.copy_(repaired_mask)
+								logging.warning(
+									f"Rank {self.rank}: [MASK-REPAIR] (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
+									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+								)
+								mask = full_mask[:, :ctx_len]
+							elif actual_ones < ctx_len:
+								# Too few ones - set all first ctx_len to 1
+								full_mask[0, :ctx_len] = 1
+								logging.warning(
+									f"Rank {self.rank}: [MASK-REPAIR] (decoding_continuous) Repaired attention_mask for {uuid[:8]}: "
+									f"had {int(actual_ones)} ones, ctx_len={ctx_len}, set first {ctx_len} to 1"
+								)
+								mask = full_mask[:, :ctx_len]
+						
 						attention_masks.append(mask)
 						cache_seqlens.append(ctx_len)
 					

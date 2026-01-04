@@ -687,6 +687,18 @@ class Attn_Wrapper(torch.nn.Module):
 								f"slice=[{start_ids}:{end_ids}]"
 							)
 						
+						# DEBUG: Log position_ids vs cache_seqlens before calling attention (only layer 0, first micro-batch)
+						if self.layer_idx == 0 and i == 0:
+							pos_sample = micro_position_ids[:5].flatten().tolist() if micro_position_ids.shape[0] >= 5 else micro_position_ids.flatten().tolist()
+							seqlen_sample = micro_cache_seqlens[:5].tolist() if micro_cache_seqlens.shape[0] >= 5 else micro_cache_seqlens.tolist()
+							logging.warning(
+								f"[WRAPPER-CALL-DIAG] layer=0, micro_batch=0: "
+								f"position_ids(first5)={pos_sample}, "
+								f"cache_seqlens(first5)={seqlen_sample}, "
+								f"position_ids.dtype={micro_position_ids.dtype}, "
+								f"cache_seqlens.dtype={micro_cache_seqlens.dtype}"
+							)
+						
 						attn_result, k_tensor = self.module.decoding_attn_mode_3_bf16(
 							micro_hidden,
 							micro_position_ids,
