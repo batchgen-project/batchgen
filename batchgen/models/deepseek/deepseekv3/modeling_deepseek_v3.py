@@ -1190,19 +1190,27 @@ class DeepseekV3MoE_Prefill(nn.Module):
 			tokens_per_expert = tokens_per_expert_post_gather
 		tokens_per_expert = tokens_per_expert.cpu().numpy()
 
-		outputs = []
-		start_idx = 0
-		for i, num_tokens in enumerate(tokens_per_expert):
-			end_idx = start_idx + num_tokens
-			if num_tokens == 0:
-				continue
-			expert = self.experts[i + self.ep_rank * self.experts_per_rank]
-			tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-			expert_out = expert(tokens_for_this_expert)
-			outputs.append(expert_out)
-			start_idx = end_idx
+		# Pre-allocate output buffer to avoid torch.cat() memory overhead
+		total_tokens = int(tokens_per_expert.sum())
+		if total_tokens > 0:
+			# Get hidden_dim from sorted_tokens shape
+			hidden_dim = sorted_tokens.shape[-1]
+			outs = sorted_tokens.new_empty(total_tokens, hidden_dim)
 
-		outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+			read_idx = 0
+			write_idx = 0
+			for i, num_tokens in enumerate(tokens_per_expert):
+				if num_tokens == 0:
+					continue
+				expert = self.experts[i + self.ep_rank * self.experts_per_rank]
+				tokens_for_this_expert = sorted_tokens[read_idx:read_idx + num_tokens]
+				expert_out = expert(tokens_for_this_expert)
+				# Write directly to pre-allocated buffer
+				outs[write_idx:write_idx + num_tokens] = expert_out
+				read_idx += num_tokens
+				write_idx += num_tokens
+		else:
+			outs = sorted_tokens.new_empty(0)
 		if self.ep_size > 1:
 			new_x = torch.empty_like(outs)
 			new_x[gatherd_idxs] = outs

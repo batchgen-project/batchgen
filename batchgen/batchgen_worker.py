@@ -4198,74 +4198,101 @@ class BatchGenWorker:
 		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
 		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
 
-		# Create cu_seqlens for flash attention
-		cu_seqlens = torch.zeros(prepack_meta.num_original_sequences + 1, dtype=torch.int32, device=self.torch_device)
-		for i, seq_len in enumerate(prepack_meta.original_seq_lengths):
-			cu_seqlens[i + 1] = cu_seqlens[i] + seq_len
+		# Split sequences into micro-batches based on token count
+		# Use MoE_prefill_micro_batch_size as max sequences per micro-batch
+		max_seqs_per_batch = self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+		num_sequences = prepack_meta.num_original_sequences
+		seq_lengths_list = prepack_meta.original_seq_lengths
 
-		max_seqlen = max(prepack_meta.original_seq_lengths)
+		# Create micro-batches of sequences
+		micro_batches = []
+		current_batch_start = 0
 
-		# Set up Attn_Wrapper for prepacked mode
-		Attn_Wrapper.prepack_mode = True
-		Attn_Wrapper.prepack_cu_seqlens = cu_seqlens
-		Attn_Wrapper.prepack_max_seqlen = max_seqlen
-		Attn_Wrapper.prepack_num_sequences = prepack_meta.num_original_sequences
-		Attn_Wrapper.prepack_seq_lengths = prepack_meta.original_seq_lengths
-		Attn_Wrapper.position_ids = packed_position_ids_flat
-		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
-
-		# Run model forward
-		num_prefill_micro_batches = math.ceil(
-			len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
-		)
+		while current_batch_start < num_sequences:
+			current_batch_end = min(current_batch_start + max_seqs_per_batch, num_sequences)
+			micro_batches.append((current_batch_start, current_batch_end))
+			current_batch_start = current_batch_end
 
 		if self.rank == 0:
-			logging.info(f"Prepacked prefill: {num_prefill_micro_batches} micro batches")
+			logging.info(f"Prepacked prefill: {len(micro_batches)} micro batches")
 
 		output_tokens = []
 
-		# For prepacked mode, we process all sequences at once (single micro-batch for attention)
-		# but may split for MoE based on token count
 		with torch.inference_mode():
-			# Embed tokens
-			inputs_embeds = self.model.model.embed_tokens(packed_input_ids_flat.to(self.torch_device))
+			for batch_idx, (seq_start, seq_end) in enumerate(micro_batches):
+				# Get sequences for this micro-batch
+				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
+				batch_num_seqs = seq_end - seq_start
 
-			# Reshape to 3D: [1, total_tokens, hidden_dim]
-			# This is needed because MLP/MoE layers expect 3D input
-			# Using batch_size=1 with all tokens means no padding waste
-			hidden_states = inputs_embeds.unsqueeze(0)  # [1, total_tokens, hidden_dim]
+				# Extract tokens for this micro-batch
+				batch_input_ids = []
+				batch_position_ids = []
+				token_offset = sum(seq_lengths_list[:seq_start])  # Offset into flat tensors
 
-			# Forward through model layers
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				layer_outputs = decoder_layer(
-					hidden_states,
-					attention_mask=None,  # Not used in prepack mode
-					position_ids=None,  # Passed via Attn_Wrapper
-					past_key_value=None,
-					output_attentions=False,
-					use_cache=False,
+				for seq_idx in range(seq_start, seq_end):
+					seq_len = seq_lengths_list[seq_idx]
+					# Calculate where this sequence's tokens are in the flat tensor
+					seq_token_start = sum(seq_lengths_list[:seq_idx])
+					seq_token_end = seq_token_start + seq_len
+
+					batch_input_ids.append(packed_input_ids_flat[seq_token_start:seq_token_end])
+					batch_position_ids.append(packed_position_ids_flat[seq_token_start:seq_token_end])
+
+				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
+				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
+
+				# Create cu_seqlens for this micro-batch
+				batch_cu_seqlens = torch.zeros(batch_num_seqs + 1, dtype=torch.int32, device=self.torch_device)
+				for i, seq_len in enumerate(batch_seq_lengths):
+					batch_cu_seqlens[i + 1] = batch_cu_seqlens[i] + seq_len
+
+				batch_max_seqlen = max(batch_seq_lengths)
+
+				# Set up Attn_Wrapper for this micro-batch
+				Attn_Wrapper.prepack_mode = True
+				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
+				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
+				Attn_Wrapper.prepack_num_sequences = batch_num_seqs
+				Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
+				Attn_Wrapper.position_ids = batch_position_ids_flat
+				# Map local batch indices to global seq ids for this micro-batch
+				batch_local_indices = batch[seq_start:seq_end]
+				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch_local_indices)
+
+				# Embed tokens
+				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+
+				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
+				hidden_states = inputs_embeds.unsqueeze(0)
+
+				# Forward through model layers
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					layer_outputs = decoder_layer(
+						hidden_states,
+						attention_mask=None,
+						position_ids=None,
+						past_key_value=None,
+						output_attentions=False,
+						use_cache=False,
+					)
+					hidden_states = layer_outputs[0]
+
+				# Final norm
+				hidden_states = self.model.model.norm(hidden_states)
+
+				# Extract last token hidden states for each sequence
+				last_token_indices = batch_cu_seqlens[1:] - 1
+				last_token_hidden = hidden_states[0, last_token_indices, :]
+
+				# Call lm_head directly using F.linear to bypass the hook
+				logits = torch.nn.functional.linear(
+					last_token_hidden,
+					self.model.lm_head.weight,
+					self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 				)
-				hidden_states = layer_outputs[0]
 
-			# Final norm
-			hidden_states = self.model.model.norm(hidden_states)
-
-			# hidden_states is [1, total_tokens, hidden_dim]
-			# Extract last token hidden states for each sequence BEFORE lm_head
-			# This avoids the lm_head hook which expects standard 3D input
-			last_token_indices = cu_seqlens[1:] - 1  # Index of last token for each sequence
-			last_token_hidden = hidden_states[0, last_token_indices, :]  # [num_sequences, hidden_dim]
-
-			# Call lm_head directly using F.linear to bypass the hook
-			# lm_head is a Linear layer: output = input @ weight.T
-			logits = torch.nn.functional.linear(
-				last_token_hidden,
-				self.model.lm_head.weight,
-				self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-			)  # [num_sequences, vocab_size]
-
-			new_tokens = torch.argmax(logits, dim=-1).view(-1, 1)
-			output_tokens.append(new_tokens)
+				batch_new_tokens = torch.argmax(logits, dim=-1).view(-1, 1)
+				output_tokens.append(batch_new_tokens)
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
