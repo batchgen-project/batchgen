@@ -779,11 +779,23 @@ class Attn_Wrapper(torch.nn.Module):
 		"""
 		Forward pass for prepacked prefill mode.
 
-		In prepack mode, hidden_states is [total_tokens, hidden_dim] (flattened),
-		and we use cu_seqlens to track sequence boundaries.
+		In prepack mode, hidden_states is [1, total_tokens, hidden_dim] (3D with batch=1),
+		and we use cu_seqlens to track sequence boundaries for attention.
 		"""
 		hidden_states = kwargs["hidden_states"]
-		total_tokens = hidden_states.shape[0]
+
+		# Handle both 2D [total_tokens, hidden_dim] and 3D [1, total_tokens, hidden_dim] input
+		if hidden_states.dim() == 3:
+			# Input is [1, total_tokens, hidden_dim]
+			assert hidden_states.shape[0] == 1, "Prepack mode expects batch_size=1"
+			hidden_states_2d = hidden_states.squeeze(0)  # [total_tokens, hidden_dim]
+			input_was_3d = True
+		else:
+			# Input is already [total_tokens, hidden_dim]
+			hidden_states_2d = hidden_states
+			input_was_3d = False
+
+		total_tokens = hidden_states_2d.shape[0]
 
 		# Get prepack metadata from class variables
 		cu_seqlens = Attn_Wrapper.prepack_cu_seqlens
@@ -797,11 +809,11 @@ class Attn_Wrapper(torch.nn.Module):
 
 				logging.debug(f"Rank {dist.get_rank()} - Entering prepacked prefill attention")
 
-				# Call prepacked attention method
+				# Call prepacked attention method with 2D input
 				output = self.module.prefill_attn_w8a16_prepacked(
-					hidden_states,
-					position_ids.to(hidden_states.device),
-					cu_seqlens.to(hidden_states.device),
+					hidden_states_2d,
+					position_ids.to(hidden_states_2d.device),
+					cu_seqlens.to(hidden_states_2d.device),
 					max_seqlen,
 					num_sequences,
 					self.weight_dequant_scale
@@ -851,6 +863,10 @@ class Attn_Wrapper(torch.nn.Module):
 		logging.debug(
 			f"[Layer {self.layer_idx} - Attn_Wrapper] Finish prepacked forward pass."
 		)
+
+		# Reshape output back to 3D if input was 3D
+		if input_was_3d:
+			attn_output = attn_output.unsqueeze(0)  # [1, total_tokens, hidden_dim]
 
 		return attn_output, None, None
 

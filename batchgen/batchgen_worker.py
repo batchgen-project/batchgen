@@ -4230,9 +4230,12 @@ class BatchGenWorker:
 			# Embed tokens
 			inputs_embeds = self.model.model.embed_tokens(packed_input_ids_flat.to(self.torch_device))
 
-			# Forward through model layers
-			hidden_states = inputs_embeds
+			# Reshape to 3D: [1, total_tokens, hidden_dim]
+			# This is needed because MLP/MoE layers expect 3D input
+			# Using batch_size=1 with all tokens means no padding waste
+			hidden_states = inputs_embeds.unsqueeze(0)  # [1, total_tokens, hidden_dim]
 
+			# Forward through model layers
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				layer_outputs = decoder_layer(
 					hidden_states,
@@ -4246,6 +4249,9 @@ class BatchGenWorker:
 
 			# Final norm
 			hidden_states = self.model.model.norm(hidden_states)
+
+			# Flatten back to 2D for logits: [total_tokens, hidden_dim]
+			hidden_states = hidden_states.squeeze(0)
 
 			# Get logits
 			logits = self.model.lm_head(hidden_states)  # [total_tokens, vocab_size]
