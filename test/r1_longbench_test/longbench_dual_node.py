@@ -16,20 +16,21 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
+import argparse
 import logging
 import os
-from transformers import AutoTokenizer
-# from batchgen.engine import batchgen
-from batchgen.entrypoint import BatchGen
-import numpy as np
-import datasets
-import argparse
-import torch
-import pandas as pd
 from pathlib import Path
-from typing import List, Dict
-import glob
-import os
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoTokenizer
+
+from batchgen import BatchGenClient
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def load_longbench_datasets(base_dir: str = "longben") -> pd.DataFrame:
     """
@@ -114,23 +115,67 @@ def load_longbench_datasets(base_dir: str = "longben") -> pd.DataFrame:
     
     return final_df
 
+def _tensorize_sequence(token_ids: Any) -> torch.Tensor:
+    """Convert various token ID formats to a PyTorch tensor."""
+    if torch.is_tensor(token_ids):
+        return token_ids.detach().cpu()
+    if hasattr(token_ids, "tolist"):
+        return torch.tensor(token_ids.tolist(), dtype=torch.int64)
+    if isinstance(token_ids, np.ndarray):
+        return torch.tensor(token_ids.tolist(), dtype=torch.int64)
+    return torch.tensor(list(token_ids), dtype=torch.int64)
+
+
+def run_inference_via_api(
+    queries: List[str],
+    max_input_length: Optional[int],
+    max_decoding_length: int,
+    server_host: str,
+    server_port: int,
+) -> List[torch.Tensor]:
+    """Run inference via BatchGen API.
+    
+    Args:
+        queries: List of prompt strings
+        max_input_length: Max input length hint. None = auto-detect from longest prompt.
+        max_decoding_length: Max tokens to decode
+        server_host: Server hostname
+        server_port: Server port
+        
+    Returns:
+        List of output token tensors
+    """
+    client = BatchGenClient(server_host, server_port)
+    client.connect()
+    
+    start_time = pd.Timestamp.now()
+    response = client.submit_inference(
+        queries=queries,
+        max_input_len=max_input_length,
+        max_output_len=max_decoding_length,
+    )
+    latency = (pd.Timestamp.now() - start_time).total_seconds()
+    logger.info(f"Inference round-trip completed in {latency:.2f}s")
+    client.close()
+    
+    if not isinstance(response, dict) or "results" not in response:
+        raise RuntimeError(f"Invalid response from server: {response}")
+    sequences = response["results"]
+    if not sequences:
+        raise RuntimeError("Server returned empty results.")
+    return [_tensorize_sequence(tokens) for tokens in sequences[0]]
+
+
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--hugging_face_checkpoint", type=str)
-	parser.add_argument("--host_kv_cache_size", type=int)
 	parser.add_argument("--max_prompts", type=int, default=1024)
-	parser.add_argument("--ATTN_MODE", type=str)
-	parser.add_argument("--SPLIT_RATIO_W", type=str)
-	parser.add_argument("--max_input_length", type=int, default=1024)
+	parser.add_argument("--max_input_length", type=int, default=None, help="Max input length hint. If not set, determined dynamically from longest prompt.")
 	parser.add_argument("--max_decoding_length", type=int)
 	parser.add_argument("--dataset_cache_dir", type=str, default="~/.cache/huggingface/datasets/Xnhyacinth___long_bench")
 	parser.add_argument("--cache_dir", type=str, default=None)
 	parser.add_argument("--server_host", type=str, default="localhost")
 	parser.add_argument("--server_port", type=int, default=10900)
-	parser.add_argument("--dist_init_addr", type=str)
-	parser.add_argument("--nnodes", type=int, default=2)
-	parser.add_argument("--node_rank", type=int, default=0)
-	parser.add_argument("--kv_dtype", type=str, default="bfloat16", help="Key-Value cache data type, options are ['bf16','fp8']")
 	
 	args = parser.parse_args()
 
@@ -149,11 +194,11 @@ if __name__ == "__main__":
 	longbench_path = os.path.join(current_file_dir, "LongBench")
 	query_df = load_longbench_datasets(longbench_path)
 	queries = []
+	# Load all queries without length filtering
 	for q in query_df['context']:
-		if len(q.split(" ")) >= args.max_input_length:
-			queries.append(q)
-			if len(queries) == max_prompts:
-				break
+		queries.append(q)
+		if len(queries) == max_prompts:
+			break
 
 	# If number of queries is less than max_prompts, fill the rest by duplicating
 	if len(queries) < max_prompts:
@@ -173,37 +218,22 @@ if __name__ == "__main__":
 			messages, tokenize=False, add_generation_prompt=True
 		)
 		queries[prompt_idx] = text
-	logging.info(f"Number of prompts: {len(queries)}")
+	logger.info(f"Number of prompts: {len(queries)}")
 	if len(queries) != args.max_prompts:
-		logging.warning(f"Number of prompts {len(queries)} is not equal to max_prompts {args.max_prompts}.")
+		logger.warning(f"Number of prompts {len(queries)} is not equal to max_prompts {args.max_prompts}.")
 
 	"""
-		Step 3: Launch BatchGen using the standalone parameter server
+		Step 3: Run inference via BatchGen client API
 	"""
-	logging.info(f"Connecting to parameter server at {args.server_host}:{args.server_port}")
-	logging.info(f"Using model {hugging_face_checkpoint}")
+	logger.info(f"Connecting to server at {args.server_host}:{args.server_port}")
 	
-	# Log device 0 gpu memory usage
-	gpu0_memory = torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024
-	logging.info(f"GPU 0 memory usage before BatchGen init: {gpu0_memory} GB")
-	# Run inference with our standalone parameter server
-	answer_set = BatchGen(
-		huggingface_ckpt_name=hugging_face_checkpoint,
+	answer_set = run_inference_via_api(
 		queries=queries,
 		max_input_length=args.max_input_length,
 		max_decoding_length=args.max_decoding_length,
-		device=[0,1,2,3,4,5,6,7],		
-		host_kv_cache_size=args.host_kv_cache_size,
-		cache_dir=args.cache_dir,
-		# Connect to our standalone parameter server
-		parameter_server_host=args.server_host,
-		parameter_server_port=args.server_port,
-		dist_init_addr = args.dist_init_addr,
-		nnodes = args.nnodes,
-		node_rank = args.node_rank,
-		device_per_node= 8,
-		kv_dtype = args.kv_dtype,
-	).run()
+		server_host=args.server_host,
+		server_port=args.server_port,
+	)
 
 	"""
 		Step 4: Print responses to the prompts.
@@ -219,13 +249,11 @@ if __name__ == "__main__":
 		return tokenizer.decode(tokens[:end_pos], skip_special_tokens=False)
 
 	print_result = True
-	# print(answer_set[4].tolist())
 	if print_result:
 		for idx in range(len(answer_set)):
 			tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
-			# print(f"Prompt {idx}: {queries[idx][:args.max_input_length]}")
 			print("==================================================================")
-			print(f"Query {idx}: {queries[idx][:args.max_input_length]}")
+			print(f"Query {idx}: {queries[idx][:1000]}")  # Truncate long queries for display
 			print("\n\n")
 			print(f"Answer {idx}: {tmp_answer}")
 			print("\n\n")

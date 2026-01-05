@@ -308,6 +308,6 @@ if __name__ == "__main__":
     else:
         print("\n🎉 Perfect Score! No incorrect predictions.\n")
 
-    assert accuracy >= 0.80, (
-        f"Test Failed: Accuracy of {accuracy:.2%} is below the 80% threshold."
+    assert accuracy >= 0.835, (
+        f"Test Failed: Accuracy of {accuracy:.2%} is below the 83.5% threshold."
     )
