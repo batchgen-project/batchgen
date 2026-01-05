@@ -1320,25 +1320,18 @@ class BatchGenWorker:
 		free_pages = stats.num_total_pages - used_pages
 		free_percent = int((free_pages / stats.num_total_pages) * 100) if stats.num_total_pages > 0 else 100
 
-		# Log detailed stats for debugging (only on rank 0 of each node)
-		if self.local_rank == 0 and ENABLE_WATERMARK_PREFILL:
-			num_in_decode = len(status_counts[SequenceStatus.IN_DECODE])
-			num_onhold = len(status_counts[SequenceStatus.ON_HOLD])
-			num_prefilled = len(status_counts[SequenceStatus.PREFILLED])
-			logging.info(
-				f"WATERMARK: Rank {self.rank} (Node {self.rank // NUM_GPUS_PER_NODE}): "
-				f"Host KV: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
-				f"host_kv_total={len(valid_sequences)} "
-				f"({used_pages} pages / {stats.num_total_pages} = {100-free_percent}% used, {free_percent}% free)"
-			)
-
 		return {
 			'rank': self.rank,
 			'node_id': self.rank // NUM_GPUS_PER_NODE,
 			'num_free_pages': free_pages,
 			'num_total_pages': stats.num_total_pages,
 			'num_used_pages': used_pages,
-			'free_percent': free_percent
+			'free_percent': free_percent,
+			# Include sequence counts for global aggregation
+			'num_in_decode': len(status_counts[SequenceStatus.IN_DECODE]),
+			'num_onhold': len(status_counts[SequenceStatus.ON_HOLD]),
+			'num_prefilled': len(status_counts[SequenceStatus.PREFILLED]),
+			'num_valid_sequences': len(valid_sequences),
 		}
 
 	def _check_host_kv_watermark_trigger(self) -> bool:
@@ -1378,17 +1371,38 @@ class BatchGenWorker:
 
 		should_trigger = above_watermark and has_queued
 
-		# Log watermark check (throttled to reduce spam)
+		# Log global host KV cache stats (rank 0 only, aggregated across all nodes)
 		if self.rank == 0:
+			# Aggregate stats across all nodes
+			total_used_pages = sum(s['num_used_pages'] for s in node_stats)
+			total_pages = sum(s['num_total_pages'] for s in node_stats)
+			total_free_pages = sum(s['num_free_pages'] for s in node_stats)
+			global_used_percent = int((total_used_pages / total_pages) * 100) if total_pages > 0 else 0
+			global_free_percent = 100 - global_used_percent
+			
+			# Aggregate sequence counts (use first node's counts since global_batch is shared)
+			# Note: Each node sees the same global_batch, so counts are identical
+			total_in_decode = node_stats[0].get('num_in_decode', 0)
+			total_onhold = node_stats[0].get('num_onhold', 0)
+			total_prefilled = node_stats[0].get('num_prefilled', 0)
+			total_valid = node_stats[0].get('num_valid_sequences', 0)
+			
+			logging.info(
+				f"[Host KV Cache] Global: in_decode={total_in_decode}, onhold={total_onhold}, "
+				f"prefilled={total_prefilled}, total_seqs={total_valid} | "
+				f"Pages: {total_used_pages}/{total_pages} ({global_used_percent}% used, {global_free_percent}% free) "
+				f"across {len(node_stats)} node(s)"
+			)
+			
 			if should_trigger:
 				logging.info(
-					f"WATERMARK TRIGGER: max_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
+					f"[Host KV Cache] PREFILL TRIGGER: max_node_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
 					f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
 				)
 				for s in node_stats:
 					logging.info(
-						f"WATERMARK:   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
-						f"pages ({100-s['free_percent']}% utilized, {s['free_percent']}% free)"
+						f"[Host KV Cache]   Node {s['node_id']}: {s['num_used_pages']}/{s['num_total_pages']} "
+						f"pages ({100-s['free_percent']}% used, {s['free_percent']}% free)"
 					)
 		else:
 			# Log summary even when not triggering (every 10th check to avoid spam)
@@ -1397,7 +1411,7 @@ class BatchGenWorker:
 			self._watermark_check_counter += 1
 			if self._watermark_check_counter % 10 == 0:
 				logging.debug(
-					f"[WATERMARK] Check #{self._watermark_check_counter}: max_free={max_free_percent}%, "
+					f"[Host KV Cache] Check #{self._watermark_check_counter}: max_free={max_free_percent}%, "
 					f"threshold={HOST_KV_WATERMARK_PERCENT}%, has_queued={has_queued}, trigger={should_trigger}"
 				)
 
