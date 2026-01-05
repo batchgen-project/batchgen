@@ -15,3 +15,7 @@
 #  see the license for the specific language governing permissions and          #
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
+
+from batchgen.batchgen_client import BatchGenClient
+
+__all__ = ["BatchGenClient"]

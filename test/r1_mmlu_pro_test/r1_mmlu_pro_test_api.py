@@ -1,11 +1,7 @@
 import argparse
 import logging
 import os
-import pickle
-import random
 import re
-import socket
-import struct
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -13,64 +9,10 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer
 
+from batchgen.batchgen_client import BatchGenClient
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-class BatchGenClient:
-    """TCP client mirroring client_v2 behavior for inference API calls."""
-
-    def __init__(self, host: str, port: int) -> None:
-        self.host = host
-        self.port = port
-        self.sock: Optional[socket.socket] = None
-
-    def connect(self) -> None:
-        try:
-            logger.info(
-                f"Connecting to BatchGen Server at {self.host}:{self.port}..."
-            )
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            logger.info("Successfully connected.")
-        except Exception as exc:
-            logger.error(f"Connection failed: {exc}")
-            self.sock = None
-            raise
-
-    def send_request(self, data: Any) -> Any:
-        if not self.sock:
-            raise ConnectionError("Socket not connected.")
-
-        try:
-            payload = pickle.dumps(data)
-            self.sock.sendall(struct.pack("!I", len(payload)))
-            self.sock.sendall(payload)
-
-            size_bytes = self.sock.recv(4)
-            if not size_bytes:
-                raise ConnectionResetError(
-                    "Server closed connection before sending a response."
-                )
-            resp_size = struct.unpack("!I", size_bytes)[0]
-
-            resp_data = bytearray()
-            while len(resp_data) < resp_size:
-                chunk = self.sock.recv(min(4096, resp_size - len(resp_data)))
-                if not chunk:
-                    break
-                resp_data.extend(chunk)
-
-            return pickle.loads(resp_data)
-        except Exception as exc:
-            logger.error(f"Communication error: {exc}")
-            self.close()
-            return []
-
-    def close(self) -> None:
-        if self.sock:
-            self.sock.close()
-            self.sock = None
 
 
 def form_options(options: List[str]) -> str:
@@ -123,24 +65,36 @@ def _tensorize_sequence(token_ids: Any) -> torch.Tensor:
 
 def run_inference_via_api(
     queries: List[str],
-    max_input_length: int,
+    max_input_length: Optional[int],
     max_decoding_length: int,
     server_host: str,
     server_port: int,
 ) -> List[torch.Tensor]:
+    """Run inference via BatchGen API.
+    
+    Args:
+        queries: List of prompt strings
+        max_input_length: Max input length hint. None = auto-detect from longest prompt.
+        max_decoding_length: Max tokens to decode
+        server_host: Server hostname
+        server_port: Server port
+        
+    Returns:
+        List of output token tensors
+    """
     client = BatchGenClient(server_host, server_port)
     client.connect()
-    payload: Dict[str, Any] = {
-        "command": "submit_inference",
-        "queries": queries,
-        "max_input_len": max_input_length,
-        "max_output_len": max_decoding_length,
-    }
+    
     start_time = pd.Timestamp.now()
-    response = client.send_request(payload)
+    response = client.submit_inference(
+        queries=queries,
+        max_input_len=max_input_length,
+        max_output_len=max_decoding_length,
+    )
     latency = (pd.Timestamp.now() - start_time).total_seconds()
     logger.info(f"Inference round-trip completed in {latency:.2f}s")
     client.close()
+    
     if not isinstance(response, dict) or "results" not in response:
         raise RuntimeError(f"Invalid response from server: {response}")
     sequences = response["results"]

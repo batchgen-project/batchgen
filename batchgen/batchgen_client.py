@@ -2,72 +2,79 @@ import socket
 import struct
 import pickle
 import time
+import logging
 import argparse
 from typing import List, Optional, Dict, Any
 
+logger = logging.getLogger(__name__)
+
 
 class BatchGenClient:
+    """TCP client for BatchGen inference API calls."""
+
     def __init__(self, host: str = 'localhost', port: int = 10900):
         self.host = host
         self.port = port
-        self.sock = None
+        self.sock: Optional[socket.socket] = None
 
-    def connect(self):
+    def connect(self) -> None:
         """Establishes connection to the server."""
         try:
+            logger.info(f"Connecting to BatchGen Server at {self.host}:{self.port}...")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
-            print(f"Connected to {self.host}:{self.port}")
+            logger.info("Successfully connected.")
         except Exception as e:
-            print(f"Connection failed: {e}")
+            logger.error(f"Connection failed: {e}")
             self.sock = None
+            raise
 
-    def send_request(self, data: Dict[str, Any]) -> Optional[Dict]:
+    def send_request(self, data: Dict[str, Any]) -> Any:
         """
         Sends any Python object (List, Dict, etc.) to the server.
         Returns the response from the server.
         """
         if not self.sock:
-            print("Socket not connected.")
-            return None
+            raise ConnectionError("Socket not connected.")
 
         try:
             # 1. Serialize
-            serialized_data = pickle.dumps(data)
+            payload = pickle.dumps(data)
             
             # 2. Send Length (4 bytes, Big Endian)
-            length_prefix = struct.pack('!I', len(serialized_data))
-            self.sock.sendall(length_prefix)
+            self.sock.sendall(struct.pack('!I', len(payload)))
             
             # 3. Send Payload
-            self.sock.sendall(serialized_data)
+            self.sock.sendall(payload)
 
             # 4. Receive Response Length
-            size_data = self.sock.recv(4)
-            if not size_data:
-                return None
-            resp_size = struct.unpack('!I', size_data)[0]
+            size_bytes = self.sock.recv(4)
+            if not size_bytes:
+                raise ConnectionResetError(
+                    "Server closed connection before sending a response."
+                )
+            resp_size = struct.unpack('!I', size_bytes)[0]
 
-            # 5. Receive Response Payload
-            resp_data = b''
+            # 5. Receive Response Payload (using bytearray for efficiency)
+            resp_data = bytearray()
             while len(resp_data) < resp_size:
                 chunk = self.sock.recv(min(4096, resp_size - len(resp_data)))
                 if not chunk:
                     break
-                resp_data += chunk
+                resp_data.extend(chunk)
 
             # 6. Deserialize
             return pickle.loads(resp_data)
 
         except Exception as e:
-            print(f"Communication error: {e}")
+            logger.error(f"Communication error: {e}")
             self.close()
-            return None
+            return []
 
     def submit_inference(
         self,
         queries: List[str],
-        max_input_len: int = 1024,
+        max_input_len: Optional[int] = None,
         max_output_len: int = 128,
         ignore_eos: bool = False,
     ) -> Optional[Dict]:
@@ -76,7 +83,8 @@ class BatchGenClient:
         
         Args:
             queries: List of prompt strings
-            max_input_len: Maximum input sequence length
+            max_input_len: Maximum input sequence length. If None, determined
+                          dynamically from the longest prompt in the batch.
             max_output_len: Maximum output/decoding length
             ignore_eos: If True, ignore EOS tokens and decode to max_output_len
                        (useful for benchmarking)
@@ -84,10 +92,10 @@ class BatchGenClient:
         Returns:
             Server response dictionary
         """
-        payload = {
+        payload: Dict[str, Any] = {
             "command": "submit_inference",
             "queries": queries,
-            "max_input_len": max_input_len,
+            "max_input_len": max_input_len,  # Can be None for dynamic detection
             "max_output_len": max_output_len,
             "ignore_eos": ignore_eos,
         }
@@ -97,7 +105,8 @@ class BatchGenClient:
         """Send ping command to server."""
         return self.send_request({"command": "ping"})
 
-    def close(self):
+    def close(self) -> None:
+        """Close the connection."""
         if self.sock:
             self.sock.close()
             self.sock = None
