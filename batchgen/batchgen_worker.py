@@ -4250,17 +4250,21 @@ class BatchGenWorker:
 			# Final norm
 			hidden_states = self.model.model.norm(hidden_states)
 
-			# Flatten back to 2D for logits: [total_tokens, hidden_dim]
-			hidden_states = hidden_states.squeeze(0)
-
-			# Get logits
-			logits = self.model.lm_head(hidden_states)  # [total_tokens, vocab_size]
-
-			# Extract last token logits for each sequence
+			# hidden_states is [1, total_tokens, hidden_dim]
+			# Extract last token hidden states for each sequence BEFORE lm_head
+			# This avoids the lm_head hook which expects standard 3D input
 			last_token_indices = cu_seqlens[1:] - 1  # Index of last token for each sequence
-			last_token_logits = logits[last_token_indices]  # [num_sequences, vocab_size]
+			last_token_hidden = hidden_states[0, last_token_indices, :]  # [num_sequences, hidden_dim]
 
-			new_tokens = torch.argmax(last_token_logits, dim=-1).view(-1, 1)
+			# Call lm_head directly using F.linear to bypass the hook
+			# lm_head is a Linear layer: output = input @ weight.T
+			logits = torch.nn.functional.linear(
+				last_token_hidden,
+				self.model.lm_head.weight,
+				self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+			)  # [num_sequences, vocab_size]
+
+			new_tokens = torch.argmax(logits, dim=-1).view(-1, 1)
 			output_tokens.append(new_tokens)
 
 		# Reset prepack mode
