@@ -3306,14 +3306,16 @@ class BatchGenWorker:
 		self._cumulative_boundary_ms = 0.0
 		self._cumulative_forward_ms = 0.0
 		
-		# Health check: ensure distributed connections are alive before starting
-		# This handles the case where server has been idle for a long time
-		logging.info(f"Rank {self.rank}: Running distributed health checks before batch...")
-		if not self._check_and_reinit_distributed():
-			raise RuntimeError(f"Rank {self.rank}: Failed to ensure healthy torch.distributed connection")
+		# NOTE: torch.distributed is proactively reinitialized in _reset_for_new_batch()
+		# which is called before generate(). We still do a lightweight verification here.
+		# The proactive reinit ensures all ranks have fresh connections before any
+		# CPU-bound work (tokenization) that can cause timing divergence between ranks.
+		logging.info(f"Rank {self.rank}: Verifying distributed connections...")
+		if not dist.is_initialized():
+			raise RuntimeError(f"Rank {self.rank}: torch.distributed not initialized (should have been done in _reset_for_new_batch)")
 		if not self._check_and_reinit_pynccl():
 			raise RuntimeError(f"Rank {self.rank}: Failed to ensure healthy PyNccl communicator")
-		logging.info(f"Rank {self.rank}: Distributed health checks passed")
+		logging.info(f"Rank {self.rank}: Distributed connections verified")
 		
 		# Ensure communicator is ready
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
@@ -6735,6 +6737,70 @@ class BatchGenWorker:
 			except Exception as reinit_e:
 				logging.error(f"Rank {self.rank}: Failed to reinitialize torch.distributed: {reinit_e}")
 				return False
+
+	def _proactive_dist_reinit(self) -> None:
+		"""
+		Proactively destroy and reinitialize torch.distributed at the start of each batch.
+		
+		This is more aggressive than _check_and_reinit_distributed() - it always reinitializes
+		without checking if the connection is healthy first. This ensures all ranks start
+		fresh together when a new batch arrives, avoiding the sequential timeout cascade
+		that occurs when:
+		1. Server has been idle for a long time (NCCL connection may be stale)
+		2. Some ranks finish CPU-bound work faster and start collective ops
+		3. Those ranks timeout waiting for slower ranks
+		4. The timeout triggers more collective ops in error handling, worsening the cascade
+		
+		By reinitializing proactively BEFORE any collective operations, all ranks get a
+		fresh connection simultaneously.
+		"""
+		logging.info(f"Rank {self.rank}: Proactively reinitializing torch.distributed for new batch")
+		
+		# Step 1: Destroy existing PyNccl communicator
+		# This must be done BEFORE destroying torch.distributed, and will be recreated
+		# lazily in generate() after torch.distributed is reinitialized.
+		if hasattr(self, 'comm') and self.comm is not None:
+			try:
+				self.comm.destroy()
+				logging.debug(f"Rank {self.rank}: Destroyed PyNccl communicator")
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {e}")
+			self.comm = None
+		
+		if hasattr(self, '_nccl_group') and self._nccl_group is not None:
+			try:
+				del self._nccl_group
+				self._nccl_group = None
+				gc.collect()
+				logging.debug(f"Rank {self.rank}: Destroyed PyNccl group")
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Error destroying PyNccl group: {e}")
+			self._nccl_group = None
+		
+		# Increment port for PyNccl to avoid "Address already in use" on recreate
+		if hasattr(self, '_nccl_port'):
+			self._nccl_port += 1
+			logging.debug(f"Rank {self.rank}: Incremented PyNccl port to {self._nccl_port}")
+		
+		# Step 2: Destroy existing process group if it exists
+		if dist.is_initialized():
+			try:
+				dist.destroy_process_group()
+				logging.debug(f"Rank {self.rank}: Destroyed existing process group")
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Error destroying process group: {e}")
+		
+		# Step 3: Small sleep to allow socket cleanup
+		# This helps prevent "Address already in use" errors
+		time.sleep(0.5)
+		
+		# Step 4: Reinitialize torch.distributed
+		try:
+			self._init_torch_dist()
+			logging.info(f"Rank {self.rank}: torch.distributed reinitialized successfully")
+		except Exception as e:
+			logging.error(f"Rank {self.rank}: Failed to reinitialize torch.distributed: {e}")
+			raise RuntimeError(f"Rank {self.rank}: Failed to reinitialize torch.distributed: {e}")
 	
 	def _check_and_reinit_pynccl(self) -> bool:
 		"""
@@ -6874,7 +6940,14 @@ class BatchGenWorker:
 		"""
 		logging.info(f"Rank {self.rank}: Resetting state for new batch")
 		
-		# Synchronize all ranks before cleanup
+		# CRITICAL: Proactively reinitialize torch.distributed at the start of each batch.
+		# This prevents NCCL timeout issues when the server has been idle for a long time.
+		# By reinitializing BEFORE any barriers or collective operations, all ranks start
+		# fresh together, avoiding the sequential timeout cascade seen when some ranks
+		# finish CPU-bound work (like tokenization) faster than others.
+		self._proactive_dist_reinit()
+		
+		# Synchronize all ranks before cleanup (now safe since we just reinitialized)
 		dist.barrier()
 		self._ignore_eos = False
 
