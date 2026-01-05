@@ -44,6 +44,7 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 	build_host_kv_config,
 )
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES
+from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits, get_prepack_stats, PrepackMetadata
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
@@ -57,6 +58,10 @@ else:
 
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
+
+# Prepack mode for efficient prefill batching
+# Set BATCHGEN_ENABLE_PREPACK=1 to enable prepack optimization
+BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "0") == "1"
 
 # Optional runtime checks for NaN/Inf in KV tensors (disabled by default)
 BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == '1'
@@ -3411,7 +3416,10 @@ class BatchGenWorker:
 					if local_prefill_indices:
 						prefill_start = time.perf_counter()
 						with torch.inference_mode():
-							self.prefill(local_prefill_indices)
+							if BATCHGEN_ENABLE_PREPACK:
+								self.prefill_prepacked(local_prefill_indices)
+							else:
+								self.prefill(local_prefill_indices)
 						prefill_time += time.perf_counter() - prefill_start
 					
 					# Cleanup & Status Update
@@ -4120,6 +4128,156 @@ class BatchGenWorker:
 			if self._should_stop_at_eos(new_tokens[i].item()):
 				seq.eos_reached = True
 		
+		return new_tokens
+
+	def prefill_prepacked(self, batch: list[int]):
+		"""
+		Handle prefill for a batch using prepack optimization.
+
+		Prepack combines multiple shorter sequences into rows to minimize padding waste,
+		which is especially beneficial for MLP/MoE layers.
+
+		Args:
+			batch: list of local indices
+		"""
+		if "deepseek" in self.model_config.model_type:
+			self.model.model._use_flash_attention_2 = False
+
+		# Collect input_ids and attention_masks as lists for prepacking
+		input_ids_list = []
+		attention_mask_list = []
+		seq_lengths = []
+
+		for query_idx in batch:
+			input_ids = self.query_book[query_idx].encoded["input_ids"][:, :self.max_input_length]
+			attention_mask = self.query_book[query_idx].encoded["attention_mask"][:, :self.max_input_length]
+
+			# Get actual sequence length
+			actual_len = int(attention_mask.sum().item())
+			seq_lengths.append(actual_len)
+
+			input_ids_list.append(input_ids)
+			attention_mask_list.append(attention_mask)
+
+		# Prepack sequences
+		prepack_meta = prepack_sequences(
+			input_ids_list,
+			attention_mask_list,
+			row_capacity=None,  # Use max sequence length
+			device=self.torch_device,
+		)
+
+		# Log prepack statistics
+		if self.rank == 0:
+			stats = get_prepack_stats(prepack_meta)
+			logging.info(
+				f"Prepack stats: {stats['num_sequences']} seqs -> {stats['num_packed_rows']} rows, "
+				f"padding saved: {stats['padding_saved']} tokens, "
+				f"efficiency: {stats['packing_efficiency']:.2%}"
+			)
+
+		# Create flattened tensors for prepacked forward
+		# Flatten packed_input_ids to [total_tokens]
+		total_tokens = sum(prepack_meta.original_seq_lengths)
+
+		# Extract only valid tokens (non-padding) in order
+		packed_input_ids_flat = []
+		packed_position_ids_flat = []
+
+		for seq_idx in range(prepack_meta.num_original_sequences):
+			row_idx, start_pos = prepack_meta.pack_assignment[seq_idx]
+			seq_len = prepack_meta.original_seq_lengths[seq_idx]
+
+			# Extract tokens for this sequence
+			seq_input_ids = prepack_meta.packed_input_ids[row_idx, start_pos:start_pos + seq_len]
+			packed_input_ids_flat.append(seq_input_ids)
+
+			# Position IDs are 0, 1, 2, ... for each sequence
+			packed_position_ids_flat.append(torch.arange(seq_len, device=self.torch_device))
+
+		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
+		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
+
+		# Create cu_seqlens for flash attention
+		cu_seqlens = torch.zeros(prepack_meta.num_original_sequences + 1, dtype=torch.int32, device=self.torch_device)
+		for i, seq_len in enumerate(prepack_meta.original_seq_lengths):
+			cu_seqlens[i + 1] = cu_seqlens[i] + seq_len
+
+		max_seqlen = max(prepack_meta.original_seq_lengths)
+
+		# Set up Attn_Wrapper for prepacked mode
+		Attn_Wrapper.prepack_mode = True
+		Attn_Wrapper.prepack_cu_seqlens = cu_seqlens
+		Attn_Wrapper.prepack_max_seqlen = max_seqlen
+		Attn_Wrapper.prepack_num_sequences = prepack_meta.num_original_sequences
+		Attn_Wrapper.prepack_seq_lengths = prepack_meta.original_seq_lengths
+		Attn_Wrapper.position_ids = packed_position_ids_flat
+		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+
+		# Run model forward
+		num_prefill_micro_batches = math.ceil(
+			len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+		)
+
+		if self.rank == 0:
+			logging.info(f"Prepacked prefill: {num_prefill_micro_batches} micro batches")
+
+		output_tokens = []
+
+		# For prepacked mode, we process all sequences at once (single micro-batch for attention)
+		# but may split for MoE based on token count
+		with torch.inference_mode():
+			# Embed tokens
+			inputs_embeds = self.model.model.embed_tokens(packed_input_ids_flat.to(self.torch_device))
+
+			# Forward through model layers
+			hidden_states = inputs_embeds
+
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				layer_outputs = decoder_layer(
+					hidden_states,
+					attention_mask=None,  # Not used in prepack mode
+					position_ids=None,  # Passed via Attn_Wrapper
+					past_key_value=None,
+					output_attentions=False,
+					use_cache=False,
+				)
+				hidden_states = layer_outputs[0]
+
+			# Final norm
+			hidden_states = self.model.model.norm(hidden_states)
+
+			# Get logits
+			logits = self.model.lm_head(hidden_states)  # [total_tokens, vocab_size]
+
+			# Extract last token logits for each sequence
+			last_token_indices = cu_seqlens[1:] - 1  # Index of last token for each sequence
+			last_token_logits = logits[last_token_indices]  # [num_sequences, vocab_size]
+
+			new_tokens = torch.argmax(last_token_logits, dim=-1).view(-1, 1)
+			output_tokens.append(new_tokens)
+
+		# Reset prepack mode
+		Attn_Wrapper.prepack_mode = False
+		Attn_Wrapper.prepack_cu_seqlens = None
+		Attn_Wrapper.prepack_max_seqlen = None
+		Attn_Wrapper.prepack_num_sequences = None
+		Attn_Wrapper.prepack_seq_lengths = None
+
+		new_tokens = torch.cat(output_tokens, dim=0)
+		self.update_new_token(new_tokens, batch, 0)
+
+		# Update sequence state after prefill
+		for i, local_idx in enumerate(batch):
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			seq.decoded_length = 1
+			seq.current_context_length = seq.prompt_length + 1
+
+			# Check for EOS respecting ignore_eos flag
+			if self._should_stop_at_eos(new_tokens[i].item()):
+				seq.eos_reached = True
+
 		return new_tokens
 
 	# ============ OPTIMIZED PAGE BOUNDARY (Consolidated Collectives) ============

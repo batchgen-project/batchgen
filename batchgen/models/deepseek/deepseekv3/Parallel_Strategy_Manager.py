@@ -731,9 +731,11 @@ class DeepseekV3ParallelStrategyManager:
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			if self.engine_config.Basic_Config.gpu_arch == "hopper":
 				from ....attention.mla.fa3_backend import (
-					mla_prefill_flashattention3, 
+					mla_prefill_flashattention3,
 					mla_prefill_flashattention3_w8a16_deepgemm,
-					mla_prefill_flashattention3_fused_dequant
+					mla_prefill_flashattention3_fused_dequant,
+					mla_prefill_flashattention3_prepacked,
+					mla_prefill_flashattention3_w8a16_deepgemm_prepacked,
 				)
 				from ....attention.mla.flashmla_backend import (
 					mla_decoding_flashmla,
@@ -757,6 +759,22 @@ class DeepseekV3ParallelStrategyManager:
 					"prefill_attn_w8a16",
 					types.MethodType(
 						mla_prefill_flashattention3_w8a16_deepgemm, attn_module
+					),
+				)
+
+				# Prepacked prefill methods for efficient batching
+				setattr(
+					attn_module,
+					"prefill_attn_prepacked",
+					types.MethodType(
+						mla_prefill_flashattention3_prepacked, attn_module
+					),
+				)
+				setattr(
+					attn_module,
+					"prefill_attn_w8a16_prepacked",
+					types.MethodType(
+						mla_prefill_flashattention3_w8a16_deepgemm_prepacked, attn_module
 					),
 				)
 

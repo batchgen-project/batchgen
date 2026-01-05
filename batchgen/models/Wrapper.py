@@ -283,6 +283,13 @@ class Attn_Wrapper(torch.nn.Module):
 	# Store the async task object so we can wait for it
 	async_kv_load_task = None
 
+	# Prepack mode for efficient prefill batching
+	prepack_mode = False
+	prepack_cu_seqlens = None  # [num_sequences + 1] cumulative sequence lengths
+	prepack_max_seqlen = None  # Maximum sequence length
+	prepack_num_sequences = None  # Number of sequences
+	prepack_seq_lengths = None  # List of individual sequence lengths
+
 	def __init__(
 		self,
 		module,
@@ -345,6 +352,11 @@ class Attn_Wrapper(torch.nn.Module):
 				weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
 				for name, param in self.module.named_parameters():
 						param.data = weights_dict[name]
+
+			# Check if prepack mode is enabled
+			if Attn_Wrapper.prepack_mode:
+				return self._forward_prefill_prepacked(kwargs)
+
 			# Step 2: Prepare input
 			arg_dict = {
 				"hidden_states": kwargs["hidden_states"],
@@ -762,6 +774,85 @@ class Attn_Wrapper(torch.nn.Module):
 		self.module.q_a_layernorm.weight.data = torch.empty(0, device=self.module.q_a_layernorm.weight.data.device)
 		for key,value in self.weight_dequant_scale.items():
 			self.weight_dequant_scale[key] = None
+
+	def _forward_prefill_prepacked(self, kwargs):
+		"""
+		Forward pass for prepacked prefill mode.
+
+		In prepack mode, hidden_states is [total_tokens, hidden_dim] (flattened),
+		and we use cu_seqlens to track sequence boundaries.
+		"""
+		hidden_states = kwargs["hidden_states"]
+		total_tokens = hidden_states.shape[0]
+
+		# Get prepack metadata from class variables
+		cu_seqlens = Attn_Wrapper.prepack_cu_seqlens
+		max_seqlen = Attn_Wrapper.prepack_max_seqlen
+		num_sequences = Attn_Wrapper.prepack_num_sequences
+		seq_lengths = Attn_Wrapper.prepack_seq_lengths
+
+		with torch.inference_mode():
+			if "deepseek" in self.model_config.model_type:
+				position_ids = Attn_Wrapper.position_ids  # [total_tokens]
+
+				logging.debug(f"Rank {dist.get_rank()} - Entering prepacked prefill attention")
+
+				# Call prepacked attention method
+				output = self.module.prefill_attn_w8a16_prepacked(
+					hidden_states,
+					position_ids.to(hidden_states.device),
+					cu_seqlens.to(hidden_states.device),
+					max_seqlen,
+					num_sequences,
+					self.weight_dequant_scale
+				)
+
+				logging.debug(f"Rank {dist.get_rank()} - Exiting prepacked prefill attention")
+
+				attn_output = output[0]  # [total_tokens, hidden_dim]
+				key_cache = output[1]    # [total_tokens, kv_dim]
+			else:
+				raise NotImplementedError("Prepack mode only supports DeepSeek models currently")
+
+		# Offload KV cache per sequence
+		# key_cache is [total_tokens, kv_dim], need to split by sequence
+		global_sequence_ids = Attn_Wrapper.cur_batch
+
+		torch.cuda.current_stream().synchronize()  # Make sure KV is ready
+
+		# For prepacked mode, we need to offload KV for each sequence separately
+		# Split key_cache by cu_seqlens
+		for seq_idx in range(num_sequences):
+			start_idx = cu_seqlens[seq_idx].item()
+			end_idx = cu_seqlens[seq_idx + 1].item()
+			seq_len = end_idx - start_idx
+
+			seq_key_cache = key_cache[start_idx:end_idx]  # [seq_len, kv_dim]
+			seq_key_cache = seq_key_cache.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, kv_dim]
+
+			seq_global_id = [global_sequence_ids[seq_idx]]
+
+			self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+				layer_idx=self.layer_idx,
+				sequence_ids=seq_global_id,
+				k_tensor=seq_key_cache,
+				v_tensor=None,  # For DeepSeek-R1
+				sequence_lengths=[seq_len],
+			)
+
+		# Clean up
+		if self.get_weights:
+			self.core_engine.free_weights_buffer(self.attn_module_id)
+			for name, param in self.module.named_parameters():
+				param.data = torch.tensor(
+					0.0, dtype=param.data.dtype, device=param.data.device
+				)
+
+		logging.debug(
+			f"[Layer {self.layer_idx} - Attn_Wrapper] Finish prepacked forward pass."
+		)
+
+		return attn_output, None, None
 
 
 class Expert_Wrapper(torch.nn.Module):

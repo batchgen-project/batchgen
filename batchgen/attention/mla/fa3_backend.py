@@ -367,6 +367,9 @@ def act_quant_kernel_2d(
     scale_offset = pid_m * num_blocks_n + pid_n
     tl.store(scale_ptr + scale_offset, scale)
 
+# Maximum rows per kernel launch to avoid CUDA grid dimension limits
+# and memory access issues with very long sequences
+ACT_QUANT_MAX_ROWS = 32768  # 32K rows per chunk
 
 def act_quant(
     x: torch.Tensor, 
@@ -375,6 +378,7 @@ def act_quant(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies FP8 quantization. Handles arbitrary tensor shapes by flattening dims 0..-2.
+    For very long sequences, processes in chunks to avoid CUDA kernel limitations.
     """
     assert x.is_contiguous(), 'Input must be contiguous'
     
@@ -392,15 +396,36 @@ def act_quant(
     # Scale shape: (Rows, NumBlocks)
     scale = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
     
-    # 3. Launch Kernel
-    grid = (M, num_blocks)
-    act_quant_kernel_2d[grid](
-        x_flat, y, scale,
-        M, N,
-        eps=eps,
-        fp8_max=fp8_max,
-        BLOCK_SIZE=block_size
-    )
+    # 3. Launch Kernel - chunk if needed for long sequences
+    if M <= ACT_QUANT_MAX_ROWS:
+        # Single kernel launch for short sequences
+        grid = (M, num_blocks)
+        act_quant_kernel_2d[grid](
+            x_flat, y, scale,
+            M, N,
+            eps=eps,
+            fp8_max=fp8_max,
+            BLOCK_SIZE=block_size
+        )
+    else:
+        # Chunked processing for long sequences
+        for chunk_start in range(0, M, ACT_QUANT_MAX_ROWS):
+            chunk_end = min(chunk_start + ACT_QUANT_MAX_ROWS, M)
+            chunk_size = chunk_end - chunk_start
+            
+            # Get views into the chunk
+            x_chunk = x_flat[chunk_start:chunk_end]
+            y_chunk = y[chunk_start:chunk_end]
+            scale_chunk = scale[chunk_start:chunk_end]
+            
+            grid = (chunk_size, num_blocks)
+            act_quant_kernel_2d[grid](
+                x_chunk, y_chunk, scale_chunk,
+                chunk_size, N,
+                eps=eps,
+                fp8_max=fp8_max,
+                BLOCK_SIZE=block_size
+            )
     
     # 4. Restore Shapes
     # Reshape Y back to (E, T, H)
@@ -920,5 +945,218 @@ def mla_prefill_flashattention3_fused_dequant(
 	return attn_output, offload_kv
 
 
+# ============ Prepacked Prefill Functions ============
+
+@torch.inference_mode()
+def mla_prefill_flashattention3_prepacked(
+	self,
+	hidden_states: torch.Tensor,
+	position_ids: torch.Tensor,
+	cu_seqlens: torch.Tensor,
+	max_seqlen: int,
+	num_sequences: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""
+	MLA prefill on Hopper device for PREPACKED sequences.
+
+	This function handles prepacked input where multiple sequences are packed
+	together with proper cu_seqlens to separate them. No padding removal needed
+	since the input is already densely packed.
+
+	Args:
+		self: The attention module
+		hidden_states: [total_tokens, hidden_dim] - all tokens concatenated
+		position_ids: [total_tokens] - position within each sequence
+		cu_seqlens: [num_sequences + 1] - cumulative sequence lengths
+		max_seqlen: Maximum sequence length in the batch
+		num_sequences: Number of sequences
+
+	Returns:
+		attn_output: [total_tokens, hidden_dim]
+		offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim] for KV cache
+	"""
+	total_tokens = hidden_states.shape[0]
+
+	# Project Q
+	query_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
+	q_nope, q_pe = torch.split(
+		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)
+
+	# Project KV
+	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+	compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)
+	normed_kv = self.kv_a_layernorm(compressed_kv)
+	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+
+	# Apply rotary embeddings
+	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
+	# For prepacked, position_ids is 1D [total_tokens]
+	q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+
+	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
+	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
+
+	# Expand KV
+	kv = self.kv_b_proj(normed_kv)
+	kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+	k_nope, value_states = torch.split(
+		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+	)
+
+	# Assemble Q and K
+	query_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+	query_states[:, :, :self.qk_nope_head_dim] = q_nope
+	query_states[:, :, self.qk_nope_head_dim:] = q_pe
+
+	key_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+	key_states[:, :, :self.qk_nope_head_dim] = k_nope
+	key_states[:, :, self.qk_nope_head_dim:] = k_pe
+
+	query_states = query_states.contiguous()
+	key_states = key_states.contiguous()
+	value_states = value_states.contiguous()
+
+	# Flash attention with varlen - input is already packed, no unpadding needed
+	attn_output = flash_attn_varlen_func(
+		query_states,
+		key_states,
+		value_states,
+		cu_seqlens_q=cu_seqlens,
+		cu_seqlens_k=cu_seqlens,
+		max_seqlen_q=max_seqlen,
+		max_seqlen_k=max_seqlen,
+		softmax_scale=self.softmax_scale,
+		causal=True
+	)
+
+	# Handle tuple return from flash_attn
+	if isinstance(attn_output, tuple):
+		attn_output = attn_output[0]
+
+	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
+	attn_output = self.o_proj(attn_output)
+
+	return attn_output, offload_kv
 
 
+@torch.inference_mode()
+def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
+	self,
+	hidden_states: torch.Tensor,
+	position_ids: torch.Tensor,
+	cu_seqlens: torch.Tensor,
+	max_seqlen: int,
+	num_sequences: int,
+	weight_scale: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""
+	MLA prefill with W8A16 quantization for PREPACKED sequences.
+
+	Args:
+		self: The attention module
+		hidden_states: [total_tokens, hidden_dim] - all tokens concatenated
+		position_ids: [total_tokens] - position within each sequence
+		cu_seqlens: [num_sequences + 1] - cumulative sequence lengths
+		max_seqlen: Maximum sequence length in the batch
+		num_sequences: Number of sequences
+		weight_scale: Dictionary of weight scales for quantized weights
+
+	Returns:
+		attn_output: [total_tokens, hidden_dim]
+		offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
+	"""
+	total_tokens = hidden_states.shape[0]
+
+	# Project Q with W8A16
+	query_states = w8a16_gemm(
+		self.q_a_proj.weight.data,
+		weight_scale["q_a_proj.weight_scale_inv"],
+		hidden_states
+	)
+	query_states = self.q_a_layernorm(query_states)
+	query_states = w8a16_gemm(
+		self.q_b_proj.weight.data,
+		weight_scale["q_b_proj.weight_scale_inv"],
+		query_states
+	)
+
+	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
+	q_nope, q_pe = torch.split(
+		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)
+
+	# Project KV with W8A16
+	compressed_kv = w8a16_gemm(
+		self.kv_a_proj_with_mqa.weight.data,
+		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+		hidden_states
+	)
+	compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)
+	normed_kv = self.kv_a_layernorm(compressed_kv)
+	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+
+	# Apply rotary embeddings
+	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
+	q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+
+	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
+	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
+
+	# Expand KV with W8A16
+	kv = w8a16_gemm(
+		self.kv_b_proj.weight.data,
+		weight_scale["kv_b_proj.weight_scale_inv"],
+		normed_kv
+	)
+	kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+	k_nope, value_states = torch.split(
+		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+	)
+
+	# Assemble Q and K
+	query_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+	query_states[:, :, :self.qk_nope_head_dim] = q_nope
+	query_states[:, :, self.qk_nope_head_dim:] = q_pe
+
+	key_states = k_pe.new_empty(total_tokens, self.num_heads, self.q_head_dim)
+	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+	key_states[:, :, :self.qk_nope_head_dim] = k_nope
+	key_states[:, :, self.qk_nope_head_dim:] = k_pe
+
+	query_states = query_states.contiguous()
+	key_states = key_states.contiguous()
+	value_states = value_states.contiguous()
+
+	# Flash attention with varlen
+	attn_output = flash_attn_varlen_func(
+		query_states,
+		key_states,
+		value_states,
+		cu_seqlens_q=cu_seqlens,
+		cu_seqlens_k=cu_seqlens,
+		max_seqlen_q=max_seqlen,
+		max_seqlen_k=max_seqlen,
+		softmax_scale=self.softmax_scale,
+		causal=True
+	)
+
+	if isinstance(attn_output, tuple):
+		attn_output = attn_output[0]
+
+	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
+	attn_output = w8a16_gemm(
+		self.o_proj.weight.data,
+		weight_scale["o_proj.weight_scale_inv"],
+		attn_output
+	)
+
+	return attn_output, offload_kv
