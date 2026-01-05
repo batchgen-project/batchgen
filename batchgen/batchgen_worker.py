@@ -4048,10 +4048,7 @@ class BatchGenWorker:
 		batch: list of local indices
 		"""
 		if "deepseek" in self.model_config.model_type:
-			# Enable FlashAttention2 to avoid OOM from 4D attention mask allocation
-			# The Attn_Wrapper.prefill_attn_w8a16 uses flash_attn_varlen_func which
-			# handles variable-length sequences efficiently via cu_seqlens
-			self.model.model._use_flash_attention_2 = True
+			self.model.model._use_flash_attention_2 = False
 
 		input_ids = torch.cat(
 			[
