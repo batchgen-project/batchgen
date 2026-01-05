@@ -133,6 +133,10 @@ def _get_unpad_data(attention_mask):
 # from batchgen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
 from mgn_kernel import fused_rmsnorm
 
+# Threshold for fused_rmsnorm kernel - fall back to standard implementation for long sequences
+# The mgn_kernel fused_rmsnorm may have limitations on tensor dimensions
+FUSED_RMSNORM_MAX_TOKENS = 32768  # 32K tokens threshold
+
 class DeepseekV3RMSNorm(nn.Module):
 	def __init__(self, hidden_size, eps=1e-6):
 		"""==
@@ -143,10 +147,27 @@ class DeepseekV3RMSNorm(nn.Module):
 		self.variance_epsilon = eps
 		self.dim = hidden_size
 
+	def _standard_rmsnorm(self, hidden_states):
+		"""Standard RMSNorm implementation for long sequences."""
+		input_dtype = hidden_states.dtype
+		hidden_states = hidden_states.to(torch.float32)
+		variance = hidden_states.pow(2).mean(-1, keepdim=True)
+		hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+		return self.weight * hidden_states.to(input_dtype)
+
 	def forward(self, hidden_states):
 		# return fused_rmsnorm_func(hidden_states, self.weight, self.variance_epsilon)
 		if hidden_states.shape[0] == 0:
 			return hidden_states
+		
+		# Calculate total tokens: batch_size * seq_len
+		total_tokens = hidden_states.shape[0] * hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]
+		
+		# Fall back to standard implementation for long sequences
+		# The fused_rmsnorm kernel may have limitations on tensor dimensions
+		if total_tokens > FUSED_RMSNORM_MAX_TOKENS:
+			return self._standard_rmsnorm(hidden_states)
+		
 		return fused_rmsnorm(hidden_states, self.weight, self.variance_epsilon)
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
