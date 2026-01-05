@@ -4410,21 +4410,22 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 		if inputs_embeds is None:
 			inputs_embeds = self.embed_tokens(input_ids)
 
-		if self._use_flash_attention_2:
-			# 2d mask is passed through the layers
-			attention_mask = (
-				attention_mask
-				if (attention_mask is not None and 0 in attention_mask)
-				else None
-			)
-		else:
-			# 4d mask is passed through the layers
-			attention_mask = _prepare_4d_causal_attention_mask(
-				attention_mask,
-				(batch_size, seq_length),
-				inputs_embeds,
-				past_key_values_length,
-			)
+		# if self._use_flash_attention_2:
+		# 	# 2d mask is passed through the layers
+		# 	attention_mask = (
+		# 		attention_mask
+		# 		if (attention_mask is not None and 0 in attention_mask)
+		# 		else None
+		# 	)
+		# else:
+		# 	# 4d mask is passed through the layers
+		# 	attention_mask = _prepare_4d_causal_attention_mask(
+		# 		attention_mask,
+		# 		(batch_size, seq_length),
+		# 		inputs_embeds,
+		# 		past_key_values_length,
+		# 	)
+		
 
 		# embed positions
 		hidden_states = inputs_embeds
