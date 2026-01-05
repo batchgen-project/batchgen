@@ -172,8 +172,8 @@ if __name__ == "__main__":
 	parser.add_argument("--max_prompts", type=int, default=1024)
 	parser.add_argument("--max_input_length", type=int, default=None, help="Max input length hint. If not set, determined dynamically from longest prompt.")
 	parser.add_argument("--max_decoding_length", type=int)
-	parser.add_argument("--dataset_cache_dir", type=str, default="~/.cache/huggingface/datasets/Xnhyacinth___long_bench")
-	parser.add_argument("--cache_dir", type=str, default=None)
+	parser.add_argument("--dataset_dir", type=str, default=None, help="Path to LongBench dataset directory. If not set, uses ./LongBench relative to script.")
+	parser.add_argument("--cache_dir", type=str, default=None, help="Path to model cache directory.")
 	parser.add_argument("--server_host", type=str, default="localhost")
 	parser.add_argument("--server_port", type=int, default=10900)
 	
@@ -190,8 +190,13 @@ if __name__ == "__main__":
 	benchmark_name = "Xnhyacinth/LongBench"
 	max_prompts = args.max_prompts
 
-	current_file_dir = os.path.dirname(os.path.abspath(__file__))
-	longbench_path = os.path.join(current_file_dir, "LongBench")
+	# Use provided dataset_dir or default to ./LongBench relative to script
+	if args.dataset_dir:
+		longbench_path = args.dataset_dir
+	else:
+		current_file_dir = os.path.dirname(os.path.abspath(__file__))
+		longbench_path = os.path.join(current_file_dir, "LongBench")
+	
 	query_df = load_longbench_datasets(longbench_path)
 	queries = []
 	# Load all queries without length filtering
