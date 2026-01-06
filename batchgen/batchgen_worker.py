@@ -2480,17 +2480,25 @@ class BatchGenWorker:
 			f"(prompt lengths: min={min(prompt_lengths)}, max={max(prompt_lengths)})"
 		)
 		
-		# Phase 3: Create padded tensors with the determined max_prompt_length
-		extended_size = self.max_input_length + self.max_decoding_length
-		
+		# Phase 3: Create per-sequence tensors sized to their actual prompt length
+		# OPTIMIZATION: Don't pad all sequences to max_prompt_length - each sequence
+		# only needs space for its own prompt + decoding. This is critical for long-tailed
+		# distributions where a few sequences are very long but most are short.
 		for seq, tokenized in zip(self.global_batch, tokenized_results):
 			actual_prompt_len = tokenized["input_ids"].size(1)
-			
+
+			# Each sequence gets its own sized tensor: actual_prompt_len + max_decoding_length
+			# Capped by model context length to avoid wasting memory on impossible decoding
+			seq_extended_size = min(
+				actual_prompt_len + self.max_decoding_length,
+				self.model_context_length
+			)
+
 			input_ids_extended = torch.zeros(
-				(1, extended_size), dtype=tokenized["input_ids"].dtype
+				(1, seq_extended_size), dtype=tokenized["input_ids"].dtype
 			)
 			attention_mask_extended = torch.zeros(
-				(1, extended_size), dtype=tokenized["attention_mask"].dtype
+				(1, seq_extended_size), dtype=tokenized["attention_mask"].dtype
 			)
 
 			# Copy the actual tokens (left-aligned, no truncation)
@@ -2505,11 +2513,8 @@ class BatchGenWorker:
 
 			seq.prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
-			# kv_token_budget is capped by model context length
-			seq.kv_token_budget = min(
-				actual_prompt_len + self.max_decoding_length,
-				self.model_context_length
-			)
+			# kv_token_budget matches the tensor size
+			seq.kv_token_budget = seq_extended_size
 
 		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
 
@@ -4165,20 +4170,39 @@ class BatchGenWorker:
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
-		input_ids = torch.cat(
-			[
-				self.query_book[query_idx].encoded["input_ids"][:, : self.max_input_length]
-				for query_idx in batch
-			],
-			dim=0,
-		)
-		attention_masks = torch.cat(
-			[
-				self.query_book[query_idx].encoded["attention_mask"][:, : self.max_input_length]
-				for query_idx in batch
-			],
-			dim=0,
-		)
+		# Dynamic padding: find max length within THIS batch, not global max
+		# This is critical for long-tailed distributions
+		batch_seq_lengths = [
+			self.query_book[query_idx].encoded["input_ids"].shape[1]
+			for query_idx in batch
+		]
+		batch_max_len = max(batch_seq_lengths)
+
+		# Pad each sequence to batch_max_len
+		padded_input_ids = []
+		padded_attention_masks = []
+		for query_idx in batch:
+			seq_input_ids = self.query_book[query_idx].encoded["input_ids"]
+			seq_attention_mask = self.query_book[query_idx].encoded["attention_mask"]
+			seq_len = seq_input_ids.shape[1]
+
+			if seq_len < batch_max_len:
+				# Pad with zeros (left-aligned tokens, right-padded)
+				pad_len = batch_max_len - seq_len
+				seq_input_ids = torch.cat([
+					seq_input_ids,
+					torch.zeros((1, pad_len), dtype=seq_input_ids.dtype)
+				], dim=1)
+				seq_attention_mask = torch.cat([
+					seq_attention_mask,
+					torch.zeros((1, pad_len), dtype=seq_attention_mask.dtype)
+				], dim=1)
+
+			padded_input_ids.append(seq_input_ids)
+			padded_attention_masks.append(seq_attention_mask)
+
+		input_ids = torch.cat(padded_input_ids, dim=0)
+		attention_masks = torch.cat(padded_attention_masks, dim=0)
 
 		num_prefill_micro_batches = math.ceil(
 			len(batch) / self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
