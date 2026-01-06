@@ -162,7 +162,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--watchdog-timeout",
         type=float,
         default=180.0,
-        help="Worker watchdog timeout in seconds",
+        help="Worker watchdog timeout in seconds. Set to 0 to disable watchdog.",
+    )
+    parser.add_argument(
+        "--no-watchdog",
+        action="store_true",
+        help="Disable worker watchdog (equivalent to --watchdog-timeout 0)",
     )
     parser.add_argument(
         "--watchdog-test-stuck-time",
@@ -203,8 +208,8 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("max_input_len must be positive")
     if args.max_output_len <= 0:
         raise ValueError("max_output_len must be positive")
-    if args.watchdog_timeout is not None and args.watchdog_timeout <= 0:
-        raise ValueError("watchdog_timeout must be positive")
+    if args.watchdog_timeout is not None and args.watchdog_timeout < 0:
+        raise ValueError("watchdog_timeout must be non-negative (0 to disable)")
     if args.watchdog_heartbeat_interval is not None:
         if args.watchdog_timeout is None:
             raise ValueError(
@@ -223,6 +228,12 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
     """Parse CLI arguments and return a validated ServerArgs."""
     parser = _build_parser()
     parsed = parser.parse_args(argv)
+
+    # Handle watchdog disable options
+    watchdog_timeout = parsed.watchdog_timeout
+    if getattr(parsed, 'no_watchdog', False) or watchdog_timeout == 0:
+        watchdog_timeout = None
+
     server_args = ServerArgs(
         model=parsed.model,
         listen_ip=parsed.listen_ip,
@@ -241,7 +252,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         storage_path=parsed.storage_path,
         max_input_len=parsed.max_input_len,
         max_output_len=parsed.max_output_len,
-        watchdog_timeout=parsed.watchdog_timeout,
+        watchdog_timeout=watchdog_timeout,
         watchdog_test_stuck_time=parsed.watchdog_test_stuck_time,
         watchdog_heartbeat_interval=parsed.watchdog_heartbeat_interval,
     )

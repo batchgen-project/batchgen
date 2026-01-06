@@ -62,6 +62,20 @@ def server_worker_main(
 		os._exit(1)
 
 
+def _setup_worker_logging(rank_idx: int, global_rank: int = -1):
+	"""
+	Configure logging for worker processes.
+	Spawned processes don't inherit logging config from the parent process.
+	"""
+	# Use global_rank if available, otherwise fall back to rank_idx
+	rank_label = global_rank if global_rank >= 0 else rank_idx
+	logging.basicConfig(
+		level=logging.INFO,
+		format=f'%(asctime)s - [BatchGenWorker-{rank_label}] - %(levelname)s - %(message)s',
+		force=True,  # Override any existing configuration
+	)
+
+
 def _server_worker_main_impl(
 	rank_idx: int,
 	request_queue: mp.Queue,
@@ -74,7 +88,10 @@ def _server_worker_main_impl(
 	Rank 0 acts as the coordinator, reading from the master process queue.
 	All ranks receive the full global batch for coordinated scheduling.
 	"""
-	# Step 0: Set up NCCL environment for reliability
+	# Step 0: Configure logging for this worker process first
+	_setup_worker_logging(rank_idx)
+
+	# Step 0.5: Set up NCCL environment for reliability
 	_setup_nccl_env()
 	
 	# Step 1: Hydrate the rank of this process
@@ -82,6 +99,9 @@ def _server_worker_main_impl(
 	args.local_rank = rank_idx
 	args.global_rank = num_gpus_per_node * args.nnode_rank + rank_idx
 	args.device = args.local_rank
+
+	# Reconfigure logging with actual global rank for clearer log output
+	_setup_worker_logging(rank_idx, args.global_rank)
 
 	# 2. Initialize Process Group
 	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
@@ -156,6 +176,9 @@ def _server_worker_main_impl(
 	)
 	if watchdog_timeout:
 		logging.info(f"Rank {args.global_rank}: Watchdog initialized with timeout={watchdog_timeout}s")
+
+	# Pass watchdog to worker for fine-grained feeding during inference
+	worker.set_watchdog(watchdog)
 
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
 	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.

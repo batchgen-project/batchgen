@@ -19,7 +19,7 @@ from batchgen.server.server_args import prepare_server_args
 def main():
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - [BatchGenServer] - %(levelname)s - %(message)s",
     )
 
     try:

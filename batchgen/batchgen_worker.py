@@ -269,7 +269,10 @@ class BatchGenWorker:
 
 	def __init__(self, args: BatchGenWorkerArgs):
 		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
-		
+
+		# Watchdog for stuck detection (can be set via set_watchdog())
+		self._watchdog = None
+
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
 			logging.info(
@@ -460,15 +463,32 @@ class BatchGenWorker:
 	def set_ignore_eos(self, ignore_eos: bool) -> None:
 		"""
 		Set whether to ignore EOS tokens during decoding.
-		
+
 		When True, sequences will decode to max_decoding_length regardless of EOS.
 		Useful for benchmarking to ensure consistent workload across all sequences.
-		
+
 		Args:
 			ignore_eos: If True, ignore EOS tokens
 		"""
 		self._ignore_eos = ignore_eos
 		logging.info(f"Rank {self.rank}: ignore_eos set to {ignore_eos}")
+
+	def set_watchdog(self, watchdog) -> None:
+		"""
+		Set the watchdog for stuck detection during inference.
+
+		The watchdog will be fed periodically during generation to prevent
+		false timeout detection on long-running inference.
+
+		Args:
+			watchdog: Watchdog instance with a feed() method, or None to disable
+		"""
+		self._watchdog = watchdog
+
+	def feed_watchdog(self) -> None:
+		"""Feed the watchdog to prevent timeout during long operations."""
+		if self._watchdog is not None:
+			self._watchdog.feed()
 
 	def _should_stop_at_eos(self, token_id: int) -> bool:
 		"""
@@ -3373,7 +3393,10 @@ class BatchGenWorker:
 			iteration += 1
 			if self.rank == 0:
 				logging.info(f"--- Iteration {iteration} ---")
-			
+
+			# Feed watchdog to prevent timeout during long generation
+			self.feed_watchdog()
+
 			# =================================================================
 			# 1. PREFILL PHASE: Fill Host KV Cache
 			# =================================================================
@@ -4096,6 +4119,9 @@ class BatchGenWorker:
 		output_tokens = []
 		
 		for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
+			# Feed watchdog during long prefill operations
+			self.feed_watchdog()
+
 			with torch.inference_mode():
 				Attn_Wrapper.attention_mask = prefill_micro_batch_attention_masks[micro_batch_idx]
 				Attn_Wrapper.position_ids = create_position_ids_from_attention_mask(
@@ -4225,6 +4251,9 @@ class BatchGenWorker:
 
 		with torch.inference_mode():
 			for batch_idx, (seq_start, seq_end) in enumerate(micro_batches):
+				# Feed watchdog during long prefill operations
+				self.feed_watchdog()
+
 				# Get sequences for this micro-batch
 				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
 				batch_num_seqs = seq_end - seq_start
@@ -5091,6 +5120,9 @@ class BatchGenWorker:
 		while decode_uuids:
 			local_iteration += 1
 			self._cumulative_decode_iterations += 1
+
+			# Feed watchdog to prevent timeout during long decoding
+			self.feed_watchdog()
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
