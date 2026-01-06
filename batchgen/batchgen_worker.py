@@ -1411,18 +1411,13 @@ class BatchGenWorker:
 			global_used_percent = int((total_used_pages / total_pages) * 100) if total_pages > 0 else 0
 			global_free_percent = 100 - global_used_percent
 
-			# Aggregate sequence counts across ALL nodes (each node tracks its own sequences)
-			total_in_decode = sum(s.get('num_in_decode', 0) for s in node_stats)
-			total_onhold = sum(s.get('num_onhold', 0) for s in node_stats)
-			total_prefilled = sum(s.get('num_prefilled', 0) for s in node_stats)
-			total_valid = sum(s.get('num_valid_sequences', 0) for s in node_stats)
-
-			logging.info(
-				f"[Host KV Cache] Global: in_decode={total_in_decode}, onhold={total_onhold}, "
-				f"prefilled={total_prefilled}, total_seqs={total_valid} | "
-				f"Pages: {total_used_pages}/{total_pages} ({global_used_percent}% used, {global_free_percent}% free) "
-				f"across {len(node_stats)} node(s)"
-			)
+			# Store page stats for use in decode step logging
+			self._host_kv_page_stats = {
+				'used': total_used_pages,
+				'total': total_pages,
+				'free_percent': global_free_percent,
+				'num_nodes': len(node_stats),
+			}
 			
 			if should_trigger:
 				logging.info(
@@ -4288,23 +4283,38 @@ class BatchGenWorker:
 		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
 		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
 
-		# Split sequences into micro-batches based on token count
-		# Use MoE_prefill_micro_batch_size as max sequences per micro-batch
-		max_seqs_per_batch = self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size
+		# Split sequences into micro-batches based on TOKEN count (not sequence count)
+		# This prevents OOM when sequences have varying lengths
+		MAX_TOKENS_PER_MICRO_BATCH = 120_000  # 120K tokens max per micro-batch
 		num_sequences = prepack_meta.num_original_sequences
 		seq_lengths_list = prepack_meta.original_seq_lengths
 
-		# Create micro-batches of sequences
+		# Create micro-batches bounded by token count
 		micro_batches = []
 		current_batch_start = 0
+		current_batch_tokens = 0
 
-		while current_batch_start < num_sequences:
-			current_batch_end = min(current_batch_start + max_seqs_per_batch, num_sequences)
-			micro_batches.append((current_batch_start, current_batch_end))
-			current_batch_start = current_batch_end
+		for seq_idx in range(num_sequences):
+			seq_len = seq_lengths_list[seq_idx]
+
+			# If adding this sequence would exceed limit, finalize current batch
+			if current_batch_tokens + seq_len > MAX_TOKENS_PER_MICRO_BATCH and current_batch_tokens > 0:
+				micro_batches.append((current_batch_start, seq_idx))
+				current_batch_start = seq_idx
+				current_batch_tokens = 0
+
+			current_batch_tokens += seq_len
+
+		# Don't forget the last batch
+		if current_batch_start < num_sequences:
+			micro_batches.append((current_batch_start, num_sequences))
 
 		if self.rank == 0:
-			logging.info(f"Prepacked prefill: {len(micro_batches)} micro batches")
+			total_tokens = sum(seq_lengths_list)
+			logging.info(
+				f"Prepacked prefill: {len(micro_batches)} micro batches, "
+				f"{total_tokens:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
+			)
 
 		output_tokens = []
 
@@ -5242,10 +5252,16 @@ class BatchGenWorker:
 					num_completed_total = timing.total_completed_cumulative
 					num_host_kv_total = num_prefilled + num_onhold + num_in_decode
 					
+					# Get page stats if available
+					page_info = ""
+					if hasattr(self, '_host_kv_page_stats') and self._host_kv_page_stats:
+						ps = self._host_kv_page_stats
+						page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
+
 					if BATCHGEN_CB_DEBUG:
 						# Detailed timing log when debug is enabled
 						logging.info(
-							f"[Boundary {self._cumulative_decode_boundaries}] "
+							f"[Decode Interval {self._cumulative_decode_boundaries}] "
 							f"iter={self._cumulative_decode_iterations}, "
 							f"total={timing.total_ms:.1f}ms | "
 							f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
@@ -5263,15 +5279,17 @@ class BatchGenWorker:
 							f"barrier={timing.barrier_ms:.1f}ms | "
 							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
 							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
+							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
+							f"{page_info}"
 						)
 					else:
 						# Minimal log without timing details
 						logging.info(
-							f"[Boundary {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
+							f"[Decode {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
 							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
 							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"this_boundary: +completed={timing.num_completed}, +loaded={timing.num_loaded}, +onhold={timing.num_onhold}"
+							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
+							f"{page_info}"
 						)
 				
 				if not decode_uuids:
@@ -5454,15 +5472,15 @@ class BatchGenWorker:
 		# Only show when BATCHGEN_CB_LOG=DEBUG
 		if self.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
 			avg_forward = self._cumulative_forward_ms / self._cumulative_decode_iterations if self._cumulative_decode_iterations > 0 else 0
-			avg_boundary = self._cumulative_boundary_ms / self._cumulative_decode_boundaries
+			avg_round = self._cumulative_boundary_ms / self._cumulative_decode_boundaries
 			logging.debug(
 				f"\n{'='*50}\n"
 				f"DECODE SUMMARY (Rank 0)\n"
 				f"{'='*50}\n"
-				f"Total Iterations: {self._cumulative_decode_iterations}, Total Boundaries: {self._cumulative_decode_boundaries}\n"
+				f"Total Iterations: {self._cumulative_decode_iterations}, Total Rounds: {self._cumulative_decode_boundaries}\n"
 				f"Avg forward: {avg_forward:.2f}ms\n"
-				f"Avg boundary: {avg_boundary:.2f}ms\n"
-				f"Boundary overhead/token: {avg_boundary / self.DECISION_INTERVAL:.3f}ms\n"
+				f"Avg round overhead: {avg_round:.2f}ms\n"
+				f"Round overhead/token: {avg_round / self.DECISION_INTERVAL:.3f}ms\n"
 				f"{'='*50}"
 			)
 
