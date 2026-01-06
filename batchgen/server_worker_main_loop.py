@@ -253,7 +253,7 @@ def _server_worker_main_impl(
 				# Rebind key methods to the existing worker instance
 				# This allows code changes to take effect without recreating the worker
 				worker._page_boundary_fast = new_module.BatchGenWorker._page_boundary_fast.__get__(worker, type(worker))
-				worker.decoding_continuous_fast = new_module.BatchGenWorker.decoding_continuous_fast.__get__(worker, type(worker))
+				worker.decoding_continuous = new_module.BatchGenWorker.decoding_continuous.__get__(worker, type(worker))
 				worker.generate = new_module.BatchGenWorker.generate.__get__(worker, type(worker))
 				worker._rebuild_input_tokens = new_module.BatchGenWorker._rebuild_input_tokens.__get__(worker, type(worker))
 				logging.info(f"Rank {global_rank}: Hot reload successful!")

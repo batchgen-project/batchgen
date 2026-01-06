@@ -25,6 +25,7 @@ from batchgen.parameter_server_client import ParameterServerClient
 from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from tqdm import trange
 import gc
+import numpy as np
 from datetime import timedelta
 from dataclasses import dataclass
 import torch.distributed._symmetric_memory as symm_mem
@@ -1409,14 +1410,13 @@ class BatchGenWorker:
 			total_free_pages = sum(s['num_free_pages'] for s in node_stats)
 			global_used_percent = int((total_used_pages / total_pages) * 100) if total_pages > 0 else 0
 			global_free_percent = 100 - global_used_percent
-			
-			# Aggregate sequence counts (use first node's counts since global_batch is shared)
-			# Note: Each node sees the same global_batch, so counts are identical
-			total_in_decode = node_stats[0].get('num_in_decode', 0)
-			total_onhold = node_stats[0].get('num_onhold', 0)
-			total_prefilled = node_stats[0].get('num_prefilled', 0)
-			total_valid = node_stats[0].get('num_valid_sequences', 0)
-			
+
+			# Aggregate sequence counts across ALL nodes (each node tracks its own sequences)
+			total_in_decode = sum(s.get('num_in_decode', 0) for s in node_stats)
+			total_onhold = sum(s.get('num_onhold', 0) for s in node_stats)
+			total_prefilled = sum(s.get('num_prefilled', 0) for s in node_stats)
+			total_valid = sum(s.get('num_valid_sequences', 0) for s in node_stats)
+
 			logging.info(
 				f"[Host KV Cache] Global: in_decode={total_in_decode}, onhold={total_onhold}, "
 				f"prefilled={total_prefilled}, total_seqs={total_valid} | "
@@ -3317,6 +3317,69 @@ class BatchGenWorker:
 			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
 
+	# ============ Batch Statistics ============
+
+	def _log_batch_statistics(self) -> None:
+		"""
+		Log statistics about the completed batch including:
+		- Global batch size
+		- Prompt lengths: min, max, mean, median, P95, P99
+		- Decoded token lengths: min, max, mean, median, P95, P99
+
+		Only called from rank 0.
+		"""
+		if self.global_batch is None:
+			return
+
+		# Gather all sequences
+		prompt_lengths = []
+		decoded_lengths = []
+		for seq in self.global_batch:
+			prompt_lengths.append(seq.prompt_length)
+			decoded_lengths.append(seq.decoded_length)
+
+		if not prompt_lengths:
+			logging.info("[BATCH STATS] No sequences in batch.")
+			return
+
+		# Convert to numpy for statistics
+		prompt_arr = np.array(prompt_lengths)
+		decoded_arr = np.array(decoded_lengths)
+
+		# Compute statistics
+		def compute_stats(arr: np.ndarray) -> dict:
+			return {
+				'min': int(np.min(arr)),
+				'max': int(np.max(arr)),
+				'mean': float(np.mean(arr)),
+				'median': float(np.median(arr)),
+				'p95': float(np.percentile(arr, 95)),
+				'p99': float(np.percentile(arr, 99)),
+			}
+
+		prompt_stats = compute_stats(prompt_arr)
+		decoded_stats = compute_stats(decoded_arr)
+		batch_size = len(prompt_lengths)
+
+		# Log formatted output
+		logging.info(
+			f"\n{'='*60}\n"
+			f"BATCH STATISTICS\n"
+			f"{'='*60}\n"
+			f"  Global Batch Size: {batch_size}\n"
+			f"\n"
+			f"  Prompt Lengths:\n"
+			f"    Min: {prompt_stats['min']:,}  Max: {prompt_stats['max']:,}\n"
+			f"    Mean: {prompt_stats['mean']:,.1f}  Median: {prompt_stats['median']:,.1f}\n"
+			f"    P95: {prompt_stats['p95']:,.1f}  P99: {prompt_stats['p99']:,.1f}\n"
+			f"\n"
+			f"  Decoded Token Lengths:\n"
+			f"    Min: {decoded_stats['min']:,}  Max: {decoded_stats['max']:,}\n"
+			f"    Mean: {decoded_stats['mean']:,.1f}  Median: {decoded_stats['median']:,.1f}\n"
+			f"    P95: {decoded_stats['p95']:,.1f}  P99: {decoded_stats['p99']:,.1f}\n"
+			f"{'='*60}"
+		)
+
 	# ============ Main Generation Loop ============
 
 	def generate(self):
@@ -3336,13 +3399,11 @@ class BatchGenWorker:
 		self._cumulative_boundary_ms = 0.0
 		self._cumulative_forward_ms = 0.0
 		
-		# NOTE: torch.distributed is proactively reinitialized in _reset_for_new_batch()
-		# which is called before generate(). We still do a lightweight verification here.
-		# The proactive reinit ensures all ranks have fresh connections before any
-		# CPU-bound work (tokenization) that can cause timing divergence between ranks.
+		# NOTE: torch.distributed health was already verified in _reset_for_new_batch() via
+		# _ensure_dist_healthy(). This is just a sanity check - should never fail here.
 		logging.info(f"Rank {self.rank}: Verifying distributed connections...")
 		if not dist.is_initialized():
-			raise RuntimeError(f"Rank {self.rank}: torch.distributed not initialized (should have been done in _reset_for_new_batch)")
+			raise RuntimeError(f"Rank {self.rank}: torch.distributed not initialized (should have been verified in _reset_for_new_batch)")
 		if not self._check_and_reinit_pynccl():
 			raise RuntimeError(f"Rank {self.rank}: Failed to ensure healthy PyNccl communicator")
 		logging.info(f"Rank {self.rank}: Distributed connections verified")
@@ -3587,12 +3648,7 @@ class BatchGenWorker:
 					else:
 						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 
-					# Use optimized decoding by default, set BATCHGEN_LEGACY_DECODE=1 for old version
-					use_legacy = os.environ.get("BATCHGEN_LEGACY_DECODE", "0") == "1"
-					if use_legacy:
-						self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
-					else:
-						self.decoding_continuous_fast(new_tokens, decode_uuids, local_decode_indices)
+					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
 				decoding_time += time.perf_counter() - decode_start
 
 				# D. Cleanup
@@ -3623,7 +3679,10 @@ class BatchGenWorker:
 				f"  Config prefill time: {config_prefill_time:.1f}s\n"
 				f"  Config decoding time: {config_decode_time:.1f}s"
 			)
-		
+
+			# Compute and log batch statistics
+			self._log_batch_statistics()
+
 		# ============ Gather Results in Original Order ============
 		# NOTE: After migrations, sequences may have moved between ranks.
 		# Iterate over actual entries in _local_to_uuid_map (not sequential range)
@@ -5023,9 +5082,9 @@ class BatchGenWorker:
 		
 		return updated_uuids, updated_batch
 
-	def decoding_continuous_fast(
-		self, 
-		new_tokens: torch.Tensor, 
+	def decoding_continuous(
+		self,
+		new_tokens: torch.Tensor,
 		decode_uuids: List[str],
 		batch: List[int],
 		past_key_states: Optional[torch.Tensor] = None,
@@ -5033,8 +5092,8 @@ class BatchGenWorker:
 		scale_dict: Optional[dict] = None,
 	) -> Tuple[List[str], List[int]]:
 		"""
-		OPTIMIZED continuous decoding with minimal collective overhead.
-		
+		Continuous decoding with optimized collective operations.
+
 		Key optimizations:
 		1. Single batched all_gather per page boundary (vs 10+ in original)
 		2. Single page table rebuild per boundary (vs 4 in original)
@@ -5070,7 +5129,7 @@ class BatchGenWorker:
 			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
 			if entry_slot_order != entry_cur_batch:
 				logging.error(
-					f"Rank {self.rank}: ORDER MISMATCH at decoding_continuous_fast entry: "
+					f"Rank {self.rank}: ORDER MISMATCH at decoding_continuous entry: "
 					f"slot_to_seq_id={entry_slot_order[:5]}{'...' if len(entry_slot_order) > 5 else ''} (len={len(entry_slot_order)}), "
 					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). Rebuilding page table..."
 				)
@@ -5081,7 +5140,7 @@ class BatchGenWorker:
 			else:
 				if BATCHGEN_CB_DEBUG:
 					logging.debug(
-						f"Rank {self.rank}: decoding_continuous_fast entry OK. "
+						f"Rank {self.rank}: decoding_continuous entry OK. "
 						f"batch_size={len(batch)}, cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''}"
 					)
 
@@ -5392,12 +5451,13 @@ class BatchGenWorker:
 		Attn_Wrapper.cur_batch = None
 		
 		# Summary (uses cumulative counters for accurate cross-round totals)
-		if self.rank == 0 and self._cumulative_decode_boundaries > 0:
+		# Only show when BATCHGEN_CB_LOG=DEBUG
+		if self.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
 			avg_forward = self._cumulative_forward_ms / self._cumulative_decode_iterations if self._cumulative_decode_iterations > 0 else 0
 			avg_boundary = self._cumulative_boundary_ms / self._cumulative_decode_boundaries
-			logging.info(
+			logging.debug(
 				f"\n{'='*50}\n"
-				f"FAST DECODE SUMMARY (Rank 0)\n"
+				f"DECODE SUMMARY (Rank 0)\n"
 				f"{'='*50}\n"
 				f"Total Iterations: {self._cumulative_decode_iterations}, Total Boundaries: {self._cumulative_decode_boundaries}\n"
 				f"Avg forward: {avg_forward:.2f}ms\n"
@@ -5405,547 +5465,7 @@ class BatchGenWorker:
 				f"Boundary overhead/token: {avg_boundary / self.DECISION_INTERVAL:.3f}ms\n"
 				f"{'='*50}"
 			)
-		
-		return decode_uuids, batch
 
-	def decoding_continuous(
-		self, 
-		new_tokens: torch.Tensor, 
-		decode_uuids: List[str],
-		batch: List[int],
-		past_key_states: Optional[torch.Tensor] = None,
-		past_value_states: Optional[torch.Tensor] = None,
-		scale_dict: Optional[dict] = None,
-	) -> Tuple[List[str], List[int]]:
-		"""
-		Continuous decoding with async optimizations and detailed timing.
-		
-		Key Optimizations:
-		1. KV append: fire-and-forget, wait only at page boundaries
-		2. Load new sequences: async, overlap with next page's decoding
-		3. Consolidated page table rebuilds
-		4. Reduced barriers
-		
-		Timing instrumentation added for performance analysis.
-		"""
-		if "deepseek" in self.model_config.model_type:
-			self.model.model._use_flash_attention_2 = True
-		
-		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
-		
-		if RUNTIME_ATTN_MODE != 3:
-			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
-			return decode_uuids, batch
-		
-		# =========================================
-		# SETUP
-		# =========================================
-		gpu_manager = self.gpu_paged_kv_cache_manager
-		if gpu_manager is None:
-			gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
-		
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		
-		Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
-		Attn_Wrapper.host_paged_kv_worker_view = worker_view
-		Attn_Wrapper.scale = scale_dict
-		Attn_Wrapper.past_key_states = past_key_states
-		Attn_Wrapper.past_value_states = past_value_states
-		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
-
-		# CRITICAL FIX: Ensure page table matches cur_batch at entry (same as decoding_continuous_fast)
-		if gpu_manager and gpu_manager._gpu_page_table_manager:
-			entry_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
-			if entry_slot_order != entry_cur_batch:
-				logging.error(
-					f"Rank {self.rank}: ORDER MISMATCH at decoding_continuous entry: "
-					f"slot_to_seq_id={entry_slot_order[:5]}{'...' if len(entry_slot_order) > 5 else ''} (len={len(entry_slot_order)}), "
-					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). Rebuilding page table..."
-				)
-				if entry_cur_batch:
-					gpu_manager.rebuild_page_table(entry_cur_batch)
-					logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
-
-		# =========================================
-		# ASYNC STATE TRACKING
-		# =========================================
-		self._pending_kv_append_tasks: List = []
-		self._pending_kv_append_tensors: List = []  # Keep tensor refs alive during async ops
-		
-		pending_async_load_task = None
-		pending_load_uuids: List[str] = []
-		pending_load_local_indices: List[int] = []
-		pending_load_global_ids: List[int] = []
-		
-		# =========================================
-		# VALIDATION: Ensure tracking consistency
-		# =========================================
-		for local_idx in batch:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid and uuid not in self._sequences_with_gpu_kv:
-				# This can happen if config_decoding didn't properly track
-				logging.warning(
-					f"Rank {self.rank}: Sequence {uuid} in batch but not in "
-					f"_sequences_with_gpu_kv. Adding to tracking."
-				)
-				self._sequences_with_gpu_kv.add(uuid)
-		
-		# Timing accumulator
-		boundary_timings: List[BoundaryTimingStats] = []
-		forward_times_ms: List[float] = []
-
-		# Use cumulative counters that persist across prefill/decode switches
-		if not hasattr(self, '_cumulative_decode_iterations'):
-			self._cumulative_decode_iterations = 0
-		if not hasattr(self, '_cumulative_decode_boundaries'):
-			self._cumulative_decode_boundaries = 0
-		if not hasattr(self, '_cumulative_boundary_ms'):
-			self._cumulative_boundary_ms = 0.0
-		if not hasattr(self, '_cumulative_forward_ms'):
-			self._cumulative_forward_ms = 0.0
-
-		# Local iteration counter (for boundary interval tracking within this decode round)
-		local_iteration = 0
-		last_page_boundary_check = 0
-
-		# =========================================
-		# MAIN DECODE LOOP
-		# =========================================
-		while decode_uuids:
-			local_iteration += 1
-			self._cumulative_decode_iterations += 1
-
-			if self.rank == 0 and self._cumulative_decode_iterations % 100 == 0:
-				logging.info(
-					f"Decode iteration {self._cumulative_decode_iterations}, {len(decode_uuids)} active, "
-					f"{len(batch)} local"
-				)
-
-			# =============================================================
-			# PAGE BOUNDARY LOGIC (with detailed timing)
-			# =============================================================
-			if local_iteration - last_page_boundary_check >= self.DECISION_INTERVAL:
-				last_page_boundary_check = local_iteration
-				self._cumulative_decode_boundaries += 1
-				
-				timing = BoundaryTimingStats()
-				boundary_start = time.perf_counter()
-				
-				# --------------------------------------------------------
-				# PHASE 1: SYNC ALL PENDING OPERATIONS
-				# --------------------------------------------------------
-				
-				# 1a. Wait for KV append tasks (local operation)
-				t0 = time.perf_counter()
-				self._wait_pending_kv_append_tasks()
-				timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
-				
-				# 1a-bis. FIX Bug 5-6: Sync sequence metadata across all ranks
-				# This ensures all ranks have consistent view of decoded_length, 
-				# current_context_length, etc. before making any decisions
-				self._sync_sequence_metadata(decode_uuids)
-				
-				# 1b. Integrate PREVIOUS async load
-				# CRITICAL: Check pending_load_uuids (globally consistent) not pending_async_load_task
-				t0 = time.perf_counter()
-				if pending_load_uuids:  # ALL ranks have identical value
-					logging.debug(
-						f"Rank {self.rank}: Phase 1b - Integrating {len(pending_load_uuids)} pending sequences"
-					)
-					
-					# Wait for async task if THIS rank has one
-					if pending_async_load_task is not None:
-						pending_async_load_task.wait()
-						# Sync GPU to ensure async DMA completes before using the data
-						torch.cuda.synchronize(self.torch_device)
-					
-					# COLLECTIVE: All ranks synchronize here
-					dist.barrier()
-					
-					# Finalize integration (updates tracking, merges batches)
-					decode_uuids, batch = self._finalize_async_load(
-						pending_async_load_task,  # Can be None for ranks with no local sequences
-						pending_load_uuids,
-						pending_load_local_indices,
-						pending_load_global_ids,
-						decode_uuids,
-						batch,
-						gpu_manager
-					)
-					
-					# Clear pending state
-					pending_async_load_task = None
-					pending_load_uuids = []
-					pending_load_local_indices = []
-					pending_load_global_ids = []
-				
-				timing.finalize_async_load_ms = (time.perf_counter() - t0) * 1000
-				
-				# 1c. Rebuild page table ONCE after integration
-				t0 = time.perf_counter()
-				self._rebuild_page_table_for_batch(batch, gpu_manager)
-				timing.rebuild_after_integration_ms = (time.perf_counter() - t0) * 1000
-				
-				# 1d. COLLECTIVE: Ensure all ranks synchronized
-				t0 = time.perf_counter()
-				dist.barrier()
-				timing.barrier_after_sync_ms = (time.perf_counter() - t0) * 1000
-				
-				# --------------------------------------------------------
-				# PHASE 2: EVICTION (Completed Sequences)
-				# --------------------------------------------------------
-				
-				# 2a. Sync completion status
-				t0 = time.perf_counter()
-				decode_uuids, completed_uuids = self._sync_completion_status_at_boundary(decode_uuids)
-				timing.sync_completion_ms = (time.perf_counter() - t0) * 1000
-				timing.num_completed = len(completed_uuids)
-				
-				# 2b. Evict completed sequences
-				t0 = time.perf_counter()
-				need_rebuild_after_eviction = False
-				if completed_uuids:
-					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
-					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
-					if my_completed:
-						# FIX FLAW 2: Release BOTH GPU and Host KV pages for completed sequences
-						my_completed_local_indices = self._get_local_indices_for_uuids(my_completed)
-						self._release_gpu_kv_pages(my_completed_local_indices)
-						self._release_host_kv_pages_for_batch(my_completed)
-						need_rebuild_after_eviction = True
-					batch = self._get_local_indices_for_uuids(decode_uuids)
-				else:
-					batch = self._get_local_indices_for_uuids(decode_uuids)
-				timing.release_completed_ms = (time.perf_counter() - t0) * 1000
-				
-				# 2c. Rebuild only if we evicted
-				t0 = time.perf_counter()
-				if need_rebuild_after_eviction:
-					self._rebuild_page_table_for_batch(batch, gpu_manager)
-				timing.rebuild_after_eviction_ms = (time.perf_counter() - t0) * 1000
-				
-				# --------------------------------------------------------
-				# PHASE 3: EXTENSION (Grow Page Buffers)
-				# --------------------------------------------------------
-				t0 = time.perf_counter()
-				decode_uuids, batch, onhold_uuids = self._check_and_extend_page_buffer(
-					decode_uuids, batch
-				)
-				timing.extend_page_buffer_ms = (time.perf_counter() - t0) * 1000
-				timing.num_onhold = len(onhold_uuids)
-				
-				# Rebuild only if we put sequences ON_HOLD
-				t0 = time.perf_counter()
-				# if onhold_uuids:
-				# 	self._rebuild_page_table_for_batch(batch, gpu_manager)
-				self._rebuild_page_table_for_batch(batch, gpu_manager)
-				timing.rebuild_after_extension_ms = (time.perf_counter() - t0) * 1000
-				
-				# --------------------------------------------------------
-				# PHASE 4: LAUNCH ASYNC LOAD FOR NEW SEQUENCES
-				# --------------------------------------------------------
-				t0 = time.perf_counter()
-				(pending_async_load_task, 
-				pending_load_uuids, 
-				pending_load_local_indices,
-				pending_load_global_ids,
-				load_timing) = self._launch_async_load_new_sequences_timed(
-					decode_uuids, batch, gpu_manager
-				)
-				launch_total_ms = (time.perf_counter() - t0) * 1000
-				
-				# Unpack sub-timings
-				timing.allgather_free_pages_ms = load_timing.get('allgather_ms', 0)
-				timing.select_candidates_ms = load_timing.get('select_ms', 0)
-				timing.allocate_pages_ms = load_timing.get('allocate_ms', 0)
-				timing.launch_async_load_ms = load_timing.get('launch_ms', 0)
-				timing.restore_page_table_ms = load_timing.get('restore_ms', 0)
-				timing.num_loaded = len(pending_load_uuids)
-				
-				# --------------------------------------------------------
-				# PREPARE FOR NEXT PAGE
-				# --------------------------------------------------------
-				new_tokens = self._rebuild_input_tokens(batch)
-				
-				# NOTE: No cuda sync needed here - barrier provides synchronization
-				# and page table rebuilds are immediate GPU operations
-				
-				t0 = time.perf_counter()
-				dist.barrier()
-				timing.barrier_final_ms = (time.perf_counter() - t0) * 1000
-
-				timing.total_boundary_ms = (time.perf_counter() - boundary_start) * 1000
-				boundary_timings.append(timing)
-				self._cumulative_boundary_ms += timing.total_boundary_ms
-
-				# Post-boundary: verify page table matches batch and fix if needed
-				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
-					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
-
-					if post_boundary_slot_order != post_boundary_batch_global_ids:
-						# Fix: Rebuild page table to match batch
-						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
-
-				# Log timing for this boundary (uses cumulative counter)
-				if self.rank == 0:
-					logging.info(f"Page boundary {self._cumulative_decode_boundaries}:\n{timing}")
-								
-				if not decode_uuids:
-					if pending_load_uuids:  # Global check - all ranks enter
-						if pending_async_load_task is not None:
-							pending_async_load_task.wait()
-							# NOTE: Sync only when there was actual async work
-							torch.cuda.synchronize(self.torch_device)
-						dist.barrier()
-						
-						# MOVE OUTSIDE the task check:
-						decode_uuids, batch = self._finalize_async_load(
-							pending_async_load_task,  # Can be None - handled correctly inside
-							pending_load_uuids,
-							pending_load_local_indices,
-							pending_load_global_ids,
-							decode_uuids,
-							batch,
-							gpu_manager
-						)
-						
-						pending_async_load_task = None
-						pending_load_uuids = []
-						pending_load_local_indices = []
-						pending_load_global_ids = []
-						
-						self._rebuild_page_table_for_batch(batch, gpu_manager)
-						# NOTE: No sync needed - page table rebuild is immediate
-						
-						if batch:
-							new_tokens = self._rebuild_input_tokens(batch)
-						
-						if decode_uuids:
-							logging.debug(f"Rank {self.rank}: Resuming decode with {len(decode_uuids)} sequences")
-							continue
-					
-					break
-			
-			# =============================================================
-			# FORWARD PASS (with timing)
-			# =============================================================
-			forward_start = time.perf_counter()
-			
-			with torch.inference_mode():
-				if batch:
-					# Build attention metadata
-					attention_masks = []
-					cache_seqlens = []
-					
-					for local_idx in batch:
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
-						ctx_len = seq.current_context_length
-						
-						full_mask = self.query_book[local_idx].encoded["attention_mask"]
-						
-						# Fix: If ctx_len is 0 but we have evidence the sequence was active,
-						# this is a metadata sync bug. Recover ctx_len.
-						mask_ones_count = int(full_mask.sum().item())
-						expected_ctx_len = seq.prompt_length + seq.decoded_length
-						
-						if ctx_len == 0 and (seq.decoded_length > 0 or seq.prompt_length > 0 or mask_ones_count > 0):
-							recovered_ctx_len = max(mask_ones_count, expected_ctx_len)
-							if recovered_ctx_len > 0:
-								ctx_len = recovered_ctx_len
-								seq.current_context_length = recovered_ctx_len
-						
-						mask = full_mask[:, :ctx_len]
-						actual_ones = mask.sum().item()
-						
-						# Fix: Repair attention_mask if mismatch with current_context_length
-						if actual_ones != ctx_len:
-							if actual_ones > ctx_len:
-								# Too many ones - clear excess
-								repaired_mask = torch.zeros_like(full_mask)
-								repaired_mask[0, :ctx_len] = 1
-								full_mask.copy_(repaired_mask)
-								mask = full_mask[:, :ctx_len]
-							elif actual_ones < ctx_len:
-								# Too few ones - set all first ctx_len to 1
-								full_mask[0, :ctx_len] = 1
-								mask = full_mask[:, :ctx_len]
-						
-						attention_masks.append(mask)
-						cache_seqlens.append(ctx_len)
-					
-					max_ctx = max(cache_seqlens)
-					padded_masks = []
-					for mask in attention_masks:
-						if mask.shape[1] < max_ctx:
-							pad = torch.zeros(
-								(1, max_ctx - mask.shape[1]), 
-								dtype=mask.dtype, 
-								device=mask.device
-							)
-							mask = torch.cat([mask, pad], dim=1)
-						padded_masks.append(mask)
-					
-					attention_mask = torch.cat(padded_masks, dim=0).to(self.torch_device)
-					
-					Attn_Wrapper.attention_mask = attention_mask
-					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
-					Attn_Wrapper.cache_seqlens = torch.tensor(
-						cache_seqlens, dtype=torch.int32, device=self.torch_device
-					)
-					Attn_Wrapper.max_seqlen = max_ctx
-					
-					if new_tokens.shape[0] != len(batch):
-						new_tokens = self._rebuild_input_tokens(batch)
-				else:
-					Attn_Wrapper.attention_mask = torch.zeros(
-						(0, 1), dtype=torch.int64, device=self.torch_device
-					)
-					Attn_Wrapper.position_ids = torch.zeros(
-						(0, 1), dtype=torch.int64, device=self.torch_device
-					)
-					Attn_Wrapper.cache_seqlens = torch.zeros(
-						(0,), dtype=torch.int32, device=self.torch_device
-					)
-					Attn_Wrapper.max_seqlen = 0
-					Attn_Wrapper.cur_batch = []
-					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-				
-				# FIX Bug 3 & 4: Update Attn_Wrapper.cur_batch and capture batch for callback
-				# AFTER all batch validation is complete
-				if batch:
-					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
-
-					# Verify page table order matches cur_batch order, fix if needed
-					if gpu_manager and gpu_manager.is_initialized:
-						mgr = gpu_manager._gpu_page_table_manager
-						if mgr and mgr.slot_to_seq_id:
-							page_table_seq_order = list(mgr.slot_to_seq_id)
-							cur_batch_order = list(Attn_Wrapper.cur_batch)
-							if page_table_seq_order != cur_batch_order:
-								# Fix: Rebuild page table to match cur_batch order
-								gpu_manager.rebuild_page_table(cur_batch_order)
-
-				# KV append callback - FIRE AND FORGET
-				# Capture batch by value AFTER all modifications are done
-				current_batch = list(batch)
-				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor):
-					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor)
-					# Returns None - NO BLOCKING WAIT
-				
-				Attn_Wrapper.kv_append_callback = kv_append_callback
-				
-				# Forward pass
-				outputs = self.model(
-					new_tokens,
-					attention_mask=Attn_Wrapper.attention_mask,
-					use_cache=False,
-				)
-				
-				# Update sequences
-				new_tokens = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
-				
-				for i, local_idx in enumerate(batch):
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					
-					# FIXED: Check if sequence is already completed
-					# Use _is_sequence_completed to properly respect ignore_eos
-					if self._is_sequence_completed(seq):
-						continue
-					
-					decode_pos = seq.decoded_length
-					
-					# Store token
-					self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
-					
-					# Update attention mask
-					attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
-					next_pos = seq.current_context_length
-					if next_pos < attn_mask.shape[0]:
-						attn_mask[next_pos] = 1
-					
-					# Update sequence state
-					seq.decoded_length += 1
-					seq.current_context_length += 1
-					
-					# FIXED: Check EOS respecting ignore_eos flag
-					# Only set eos_reached if we should stop at this EOS
-					if self._should_stop_at_eos(new_tokens[i].item()):
-						seq.eos_reached = True
-						logging.debug(
-							f"Rank {self.rank}: Sequence {uuid} hit EOS at position {decode_pos}"
-						)
-					
-					# Check max length (always enforced)
-					if seq.decoded_length >= self.max_decoding_length:
-						seq.eos_reached = True  # Mark as done
-						logging.debug(
-							f"Rank {self.rank}: Sequence {uuid} reached max_decoding_length"
-						)
-			
-			forward_ms = (time.perf_counter() - forward_start) * 1000
-			forward_times_ms.append(forward_ms)
-			self._cumulative_forward_ms += forward_ms
-
-		# =========================================
-		# FINAL CLEANUP
-		# =========================================
-		self._wait_pending_kv_append_tasks()
-		
-		if pending_async_load_task is not None:
-			pending_async_load_task.wait()
-			torch.cuda.synchronize(self.torch_device)
-		
-		Attn_Wrapper.kv_append_callback = None
-		Attn_Wrapper.scale = None
-		Attn_Wrapper.past_key_states = None
-		Attn_Wrapper.past_value_states = None
-		Attn_Wrapper.gpu_paged_kv_manager = None
-		Attn_Wrapper.host_paged_kv_worker_view = None
-		Attn_Wrapper.cur_batch = None
-		
-		# =========================================
-		# TIMING SUMMARY
-		# =========================================
-		if self.rank == 0 and boundary_timings:
-			avg_forward = sum(forward_times_ms) / len(forward_times_ms) if forward_times_ms else 0
-			avg_boundary = sum(t.total_boundary_ms for t in boundary_timings) / len(boundary_timings)
-			
-			# Aggregate sub-timings
-			avg_wait_kv = sum(t.wait_kv_append_ms for t in boundary_timings) / len(boundary_timings)
-			avg_finalize = sum(t.finalize_async_load_ms for t in boundary_timings) / len(boundary_timings)
-			avg_sync_completion = sum(t.sync_completion_ms for t in boundary_timings) / len(boundary_timings)
-			avg_allgather = sum(t.allgather_free_pages_ms for t in boundary_timings) / len(boundary_timings)
-			avg_barriers = sum(t.barrier_after_sync_ms + t.barrier_final_ms for t in boundary_timings) / len(boundary_timings)
-			avg_rebuilds = sum(
-				t.rebuild_after_integration_ms + t.rebuild_after_eviction_ms + 
-				t.rebuild_after_extension_ms + t.restore_page_table_ms 
-				for t in boundary_timings
-			) / len(boundary_timings)
-			
-			logging.info(
-				f"\n{'='*60}\n"
-				f"TIMING SUMMARY (Rank 0)\n"
-				f"{'='*60}\n"
-				f"Total iterations: {self._cumulative_decode_iterations}\n"
-				f"Total boundaries: {self._cumulative_decode_boundaries}\n"
-				f"Avg forward pass: {avg_forward:.2f}ms\n"
-				f"Avg boundary total: {avg_boundary:.2f}ms\n"
-				f"  - wait_kv_append: {avg_wait_kv:.2f}ms\n"
-				f"  - finalize_load: {avg_finalize:.2f}ms\n"
-				f"  - sync_completion: {avg_sync_completion:.2f}ms\n"
-				f"  - allgather: {avg_allgather:.2f}ms\n"
-				f"  - barriers: {avg_barriers:.2f}ms\n"
-				f"  - page_table_rebuilds: {avg_rebuilds:.2f}ms\n"
-				f"Boundary overhead per token: {avg_boundary / self.DECISION_INTERVAL:.2f}ms\n"
-				f"{'='*60}"
-			)
-
-		logging.info(f"Rank {self.rank}: decoding_continuous completed after {self._cumulative_decode_iterations} iterations")
-		
 		return decode_uuids, batch
 
 	def _wait_pending_kv_append_tasks(self) -> int:
@@ -6913,7 +6433,103 @@ class BatchGenWorker:
 		except RuntimeError as e:
 			logging.error(f"Failed to initialize torch distributed: {e}")
 			raise
-	
+
+	def _ensure_dist_healthy(self) -> bool:
+		"""
+		Ensure torch.distributed is healthy before starting a new batch.
+
+		This performs a lightweight health check first. Only if the check fails
+		does it attempt to reinitialize with coordinated retries.
+
+		The key insight is: DON'T destroy a working connection. Only reinit if broken.
+
+		Returns True if healthy, False if reinit failed after all retries.
+		"""
+		MAX_REINIT_RETRIES = 5
+		INITIAL_RETRY_DELAY = 2.0  # seconds
+
+		# Step 1: Check if dist is even initialized
+		if not dist.is_initialized():
+			logging.warning(f"Rank {self.rank}: torch.distributed not initialized, attempting init...")
+			return self._coordinated_dist_reinit(MAX_REINIT_RETRIES, INITIAL_RETRY_DELAY)
+
+		# Step 2: Quick health check - use async op with short timeout
+		try:
+			health_tensor = torch.ones(1, device=self.torch_device)
+			work = dist.all_reduce(health_tensor, op=dist.ReduceOp.SUM, async_op=True)
+
+			# Wait with short timeout (10 seconds should be enough for healthy connection)
+			success = work.wait(timeout=timedelta(seconds=10))
+			if not success:
+				raise RuntimeError("Health check timed out")
+
+			expected = float(self.world_size)
+			if abs(health_tensor.item() - expected) > 1e-6:
+				raise RuntimeError(f"Health check mismatch: got {health_tensor.item()}, expected {expected}")
+
+			logging.debug(f"Rank {self.rank}: torch.distributed health check passed")
+			return True
+
+		except Exception as e:
+			logging.warning(f"Rank {self.rank}: torch.distributed health check failed: {e}")
+			logging.info(f"Rank {self.rank}: Attempting coordinated reinit...")
+			return self._coordinated_dist_reinit(MAX_REINIT_RETRIES, INITIAL_RETRY_DELAY)
+
+	def _coordinated_dist_reinit(self, max_retries: int, initial_delay: float) -> bool:
+		"""
+		Perform coordinated torch.distributed reinitialization with retries.
+
+		The challenge: when NCCL is broken, we can't use NCCL to coordinate.
+		Solution: Use exponential backoff retries. Rank 0 (which hosts TCPStore)
+		will eventually be ready when other ranks retry.
+
+		Args:
+			max_retries: Maximum number of reinit attempts
+			initial_delay: Initial delay between retries (doubles each attempt)
+
+		Returns:
+			True if reinit succeeded, False otherwise
+		"""
+		delay = initial_delay
+
+		for attempt in range(max_retries):
+			logging.info(f"Rank {self.rank}: Reinit attempt {attempt + 1}/{max_retries}")
+
+			# Step 1: Clean up existing process group
+			if dist.is_initialized():
+				try:
+					dist.destroy_process_group()
+					logging.debug(f"Rank {self.rank}: Destroyed existing process group")
+				except Exception as e:
+					logging.warning(f"Rank {self.rank}: Error destroying process group: {e}")
+
+			# Step 2: Clean up PyNccl communicator (must be done after destroying dist)
+			if hasattr(self, 'comm') and self.comm is not None:
+				try:
+					self.comm.destroy()
+					logging.debug(f"Rank {self.rank}: Destroyed PyNccl communicator")
+				except Exception as e:
+					logging.warning(f"Rank {self.rank}: Error destroying PyNccl communicator: {e}")
+				self.comm = None
+
+			# Step 3: Wait before retry (exponential backoff)
+			# Rank 0 waits less so it sets up TCPStore first
+			rank_delay = delay * (0.5 if self.rank == 0 else 1.0)
+			logging.debug(f"Rank {self.rank}: Waiting {rank_delay:.1f}s before reinit...")
+			time.sleep(rank_delay)
+
+			# Step 4: Try to reinitialize
+			try:
+				self._init_torch_dist()
+				logging.info(f"Rank {self.rank}: torch.distributed reinitialized successfully on attempt {attempt + 1}")
+				return True
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: Reinit attempt {attempt + 1} failed: {e}")
+				delay *= 2  # Exponential backoff
+
+		logging.error(f"Rank {self.rank}: Failed to reinitialize torch.distributed after {max_retries} attempts")
+		return False
+
 	def _check_and_reinit_distributed(self) -> bool:
 		"""
 		Check if torch.distributed is healthy. If not, attempt to reinitialize.
@@ -6972,19 +6588,19 @@ class BatchGenWorker:
 
 	def _proactive_dist_reinit(self) -> None:
 		"""
-		Proactively destroy and reinitialize torch.distributed at the start of each batch.
-		
-		This is more aggressive than _check_and_reinit_distributed() - it always reinitializes
-		without checking if the connection is healthy first. This ensures all ranks start
-		fresh together when a new batch arrives, avoiding the sequential timeout cascade
-		that occurs when:
-		1. Server has been idle for a long time (NCCL connection may be stale)
-		2. Some ranks finish CPU-bound work faster and start collective ops
-		3. Those ranks timeout waiting for slower ranks
-		4. The timeout triggers more collective ops in error handling, worsening the cascade
-		
-		By reinitializing proactively BEFORE any collective operations, all ranks get a
-		fresh connection simultaneously.
+		[DEPRECATED] Proactively destroy and reinitialize torch.distributed.
+
+		WARNING: This function is NO LONGER USED in production and should NOT be called
+		between batches. Destroying/reinitializing torch.distributed unconditionally in
+		multi-node setups causes NCCL connection failures because ranks destroy/reinit
+		at different times.
+
+		USE INSTEAD: _ensure_dist_healthy()
+		- Performs a lightweight health check first
+		- Only reinitializes if the connection is actually broken
+		- Uses coordinated retries with exponential backoff
+
+		This function is kept only for emergency debugging scenarios.
 		"""
 		logging.info(f"Rank {self.rank}: Proactively reinitializing torch.distributed for new batch")
 		
@@ -7169,17 +6785,17 @@ class BatchGenWorker:
 		Reset batch-specific state to prepare for a new batch.
 		Does NOT reinitialize core_engine, parallel_manager, or other heavy components.
 		NOTE: We keep self.comm (PyNcclCommunicator) alive across batches to avoid re-initialization overhead.
+		NOTE: torch.distributed is initialized at server startup. If NCCL connection is stale after
+		      long idle periods, we attempt coordinated reinit with retries.
 		"""
 		logging.info(f"Rank {self.rank}: Resetting state for new batch")
-		
-		# CRITICAL: Proactively reinitialize torch.distributed at the start of each batch.
-		# This prevents NCCL timeout issues when the server has been idle for a long time.
-		# By reinitializing BEFORE any barriers or collective operations, all ranks start
-		# fresh together, avoiding the sequential timeout cascade seen when some ranks
-		# finish CPU-bound work (like tokenization) faster than others.
-		self._proactive_dist_reinit()
-		
-		# Synchronize all ranks before cleanup (now safe since we just reinitialized)
+
+		# Check if torch.distributed needs reinitialization
+		# This only reinits if the connection is actually broken, not unconditionally
+		if not self._ensure_dist_healthy():
+			raise RuntimeError(f"Rank {self.rank}: Failed to ensure healthy torch.distributed connection")
+
+		# Synchronize all ranks before cleanup
 		dist.barrier()
 		self._ignore_eos = False
 
