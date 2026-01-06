@@ -3409,11 +3409,30 @@ class BatchGenWorker:
 			if dist.is_initialized():
 				assert self.rank == dist.get_rank(), \
 					f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
-			
-			# Only initialize communicator if not already initialized (reuse across batches)
-			if self.comm is None:
+
+			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+
+			# Coordinate PyNccl initialization across all ranks
+			# Use all_reduce to check if ANY rank needs to (re)init the communicator
+			need_init = 1 if self.comm is None else 0
+			need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
+			dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
+			any_rank_needs_init = need_init_tensor.item() > 0
+
+			if any_rank_needs_init:
+				# All ranks must participate in init - destroy any existing comm first
+				if self.comm is not None:
+					logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
+					try:
+						self.comm.destroy()
+					except Exception:
+						pass
+					self.comm = None
+					if hasattr(self, '_nccl_group') and self._nccl_group is not None:
+						del self._nccl_group
+						self._nccl_group = None
+
 				device = torch.device("cuda", self.local_rank)
-				comm_master_addr = os.getenv("COMM_MASTER_ADDR")
 
 				if comm_master_addr is None:
 					logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
@@ -3421,6 +3440,12 @@ class BatchGenWorker:
 					# Track port - incremented in _check_and_reinit_pynccl on failures
 					if not hasattr(self, '_nccl_port'):
 						self._nccl_port = 20003
+
+					# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
+					# is ready before other ranks try to connect. Different ranks may reach
+					# this point at very different times due to tokenization workload.
+					logging.info(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
+					dist.barrier()
 
 					try:
 						logging.info(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
@@ -6676,17 +6701,24 @@ class BatchGenWorker:
 		if self.comm is None:
 			# Will be lazily initialized in generate()
 			return True
-		
+
+		# Skip health check if communicator is not available (e.g., single GPU)
+		if not self.comm.available:
+			logging.debug(f"Rank {self.rank}: PyNccl communicator not available, skipping health check")
+			return True
+
 		try:
 			# Quick health check using PyNccl all_reduce
+			# CRITICAL: Must enable the communicator first - it's disabled by default after init
 			health_tensor = torch.ones(1, device=self.torch_device, dtype=torch.float32)
-			self.comm.all_reduce(health_tensor, op=dist.ReduceOp.SUM, stream=torch.cuda.current_stream())
+			with self.comm.change_state(enable=True):
+				self.comm.all_reduce(health_tensor, op=dist.ReduceOp.SUM, stream=torch.cuda.current_stream())
 			torch.cuda.synchronize(self.torch_device)
-			
+
 			expected = float(self.world_size)
 			if abs(health_tensor.item() - expected) > 1e-6:
 				raise RuntimeError(f"PyNccl health check mismatch: got {health_tensor.item()}, expected {expected}")
-			
+
 			logging.debug(f"Rank {self.rank}: PyNccl health check passed")
 			return True
 			
