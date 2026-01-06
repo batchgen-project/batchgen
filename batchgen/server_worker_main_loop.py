@@ -4,13 +4,14 @@ import os
 import sys
 import time
 import traceback
-from typing import Any, List
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
+from batchgen.server.watchdog import Watchdog
 
 
 def _reload_worker_module():
@@ -43,10 +44,11 @@ def server_worker_main(
 	rank_idx: int,
 	request_queue: mp.Queue,
 	response_queue: mp.Queue,
-	args: BatchGenWorkerArgs
+	args: BatchGenWorkerArgs,
+	ready_event: Optional[mp.Event] = None,
 ):
 	try:
-		_server_worker_main_impl(rank_idx, request_queue, response_queue, args)
+		_server_worker_main_impl(rank_idx, request_queue, response_queue, args, ready_event)
 	except Exception as e:
 		global_rank = getattr(args, "global_rank", None)
 		logging.error(f"[FATAL] Unhandled exception in worker "
@@ -64,7 +66,8 @@ def _server_worker_main_impl(
 	rank_idx: int,
 	request_queue: mp.Queue,
 	response_queue: mp.Queue,
-	args: BatchGenWorkerArgs
+	args: BatchGenWorkerArgs,
+	ready_event: Optional[mp.Event] = None,
 ):
 	"""
 	The main loop for the GPU workers.
@@ -141,7 +144,19 @@ def _server_worker_main_impl(
 
 	# 2. Instantiate the BatchGenWorker
 	worker = BatchGenWorker(args)
-	
+
+	# 2.5. Initialize watchdog for stuck process detection
+	watchdog_timeout = getattr(args, 'watchdog_timeout', None)
+	watchdog_test_stuck_time = getattr(args, 'watchdog_test_stuck_time', 0.0)
+	watchdog = Watchdog.create(
+		debug_name=f"worker-{args.global_rank}",
+		watchdog_timeout=watchdog_timeout,
+		soft=False,  # Hard mode: kill parent process on timeout
+		test_stuck_time=watchdog_test_stuck_time,
+	)
+	if watchdog_timeout:
+		logging.info(f"Rank {args.global_rank}: Watchdog initialized with timeout={watchdog_timeout}s")
+
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
 	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.
 	# Without this barrier, faster ranks will start the main loop and attempt collective
@@ -149,6 +164,11 @@ def _server_worker_main_impl(
 	logging.info(f"Rank {args.global_rank}: Worker initialized, waiting for all ranks at barrier...")
 	dist.barrier()
 	logging.info(f"Rank {args.global_rank}: All ranks ready, entering main loop.")
+
+	# Signal that workers are ready (only rank 0 sets the event to avoid race conditions)
+	if ready_event is not None and args.global_rank == 0:
+		ready_event.set()
+		logging.info(f"Rank {args.global_rank}: Signaled ready event to WorkerManager")
 
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
@@ -187,6 +207,8 @@ def _server_worker_main_impl(
 			
 			if not work_available:
 				# No work yet - this broadcast acts as a heartbeat to prevent NCCL timeout
+				# Also feed watchdog to prevent false stuck detection during idle periods
+				watchdog.feed()
 				# Loop back and poll again
 				continue
 
@@ -286,6 +308,9 @@ def _server_worker_main_impl(
 				continue
 				
 			response_queue.put(final_results)
+
+		# Feed watchdog after each successful iteration
+		watchdog.feed()
 
 	# Cleanup
 	dist.destroy_process_group()

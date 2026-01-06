@@ -9,10 +9,55 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer
 
-from batchgen.batchgen_client import BatchGenClient
+try:
+    import requests
+except ImportError as exc:
+    raise SystemExit(
+        "This script requires the 'requests' package. "
+        "Install it with: pip install requests"
+    ) from exc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class BatchGenHttpClient:
+    """HTTP client for the new OpenAI-compatible BatchGen API."""
+
+    def __init__(self, base_url: str, timeout_s: float = 6000.0) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+        self._session = requests.Session()
+
+    def post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self._base_url}{path}"
+        response = self._session.post(url, json=payload, timeout=self._timeout_s)
+        self._raise_for_status(response, "POST", url)
+        if not response.content:
+            return {}
+        return response.json()
+
+    def health_check(self) -> bool:
+        try:
+            url = f"{self._base_url}/health"
+            response = self._session.get(url, timeout=10.0)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def _raise_for_status(
+        self, response: requests.Response, method: str, url: str
+    ) -> None:
+        if response.status_code < 400:
+            return
+        detail = None
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(
+            f"{method} {url} failed ({response.status_code}): {detail}"
+        )
 
 
 def form_options(options: List[str]) -> str:
@@ -63,57 +108,117 @@ def _tensorize_sequence(token_ids: Any) -> torch.Tensor:
     return torch.tensor(list(token_ids), dtype=torch.int64)
 
 
-def run_inference_via_api(
+def normalize_token_sequences(results: Any) -> Optional[List[List[int]]]:
+    """Normalize various result formats to List[List[int]]."""
+    if torch.is_tensor(results):
+        results = results.detach().cpu().tolist()
+    elif isinstance(results, np.ndarray):
+        results = results.tolist()
+    elif isinstance(results, list) and results and torch.is_tensor(results[0]):
+        results = [item.detach().cpu().tolist() for item in results]
+
+    # Handle nested single-element lists
+    if isinstance(results, list) and len(results) == 1:
+        inner = results[0]
+        if torch.is_tensor(inner):
+            results = inner.detach().cpu().tolist()
+        elif isinstance(inner, np.ndarray):
+            results = inner.tolist()
+        else:
+            results = inner
+
+    if isinstance(results, list):
+        if results and all(isinstance(x, int) for x in results):
+            return [list(results)]
+        if results and all(isinstance(x, (list, tuple)) for x in results):
+            return [list(seq) for seq in results]
+    return None
+
+
+def run_inference_via_http_api(
     queries: List[str],
     max_input_length: Optional[int],
     max_decoding_length: int,
-    server_host: str,
-    server_port: int,
+    base_url: str,
+    ignore_eos: bool = False,
+    timeout_s: float = 6000.0,
 ) -> List[torch.Tensor]:
-    """Run inference via BatchGen API.
-    
+    """Run inference via BatchGen HTTP API.
+
     Args:
         queries: List of prompt strings
         max_input_length: Max input length hint. None = auto-detect from longest prompt.
         max_decoding_length: Max tokens to decode
-        server_host: Server hostname
-        server_port: Server port
-        
+        base_url: Server base URL (e.g., http://localhost:10900)
+        ignore_eos: Whether to ignore EOS tokens during generation
+        timeout_s: Request timeout in seconds
+
     Returns:
         List of output token tensors
     """
-    client = BatchGenClient(server_host, server_port)
-    client.connect()
-    
+    client = BatchGenHttpClient(base_url, timeout_s)
+
+    # Health check
+    if not client.health_check():
+        logger.warning("Server health check failed, proceeding anyway...")
+
+    payload = {
+        "prompts": queries,
+        "max_input_len": max_input_length,
+        "max_output_len": max_decoding_length,
+        "ignore_eos": ignore_eos,
+    }
+
     start_time = pd.Timestamp.now()
-    response = client.submit_inference(
-        queries=queries,
-        max_input_len=max_input_length,
-        max_output_len=max_decoding_length,
-    )
+    response = client.post_json("/v1/inference", payload)
     latency = (pd.Timestamp.now() - start_time).total_seconds()
-    logger.info(f"Inference round-trip completed in {latency:.2f}s")
-    client.close()
-    
-    if not isinstance(response, dict) or "results" not in response:
-        raise RuntimeError(f"Invalid response from server: {response}")
-    sequences = response["results"]
-    if not sequences:
+
+    server_latency_ms = response.get("latency_ms", "N/A")
+    logger.info(f"Inference completed in {latency:.2f}s (server latency: {server_latency_ms}ms)")
+
+    if response.get("status") != "success":
+        raise RuntimeError(f"Inference failed: {response}")
+
+    results = response.get("results")
+    if not results:
         raise RuntimeError("Server returned empty results.")
-    return [_tensorize_sequence(tokens) for tokens in sequences[0]]
+
+    # Normalize results to List[List[int]]
+    sequences = normalize_token_sequences(results)
+    if not sequences:
+        raise RuntimeError(f"Unexpected result format: {type(results)}")
+
+    return [_tensorize_sequence(tokens) for tokens in sequences]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hugging_face_checkpoint", type=str)
-    parser.add_argument("--max_prompts", type=int, default=None, help="Max number of prompts to process. If not set, run the whole dataset.")
-    parser.add_argument("--max_input_length", type=int, default=None, help="Max input length hint. If not set, determined dynamically from longest prompt.")
-    parser.add_argument("--max_decoding_length", type=int)
+    parser = argparse.ArgumentParser(description="MMLU Pro test client for BatchGen HTTP API")
+    parser.add_argument("--hugging_face_checkpoint", type=str, required=True)
+    parser.add_argument("--max_prompts", type=int, default=None,
+                        help="Max number of prompts to process. If not set, run the whole dataset.")
+    parser.add_argument("--max_input_length", type=int, default=None,
+                        help="Max input length hint. If not set, determined dynamically from longest prompt.")
+    parser.add_argument("--max_decoding_length", type=int, required=True)
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
-    parser.add_argument("--server_host", type=str, default="localhost")
-    parser.add_argument("--server_port", type=int, default=10900)
+    # New HTTP API arguments
+    parser.add_argument("--base_url", type=str, default=None,
+                        help="Server base URL (e.g., http://localhost:10900). Takes precedence over host/port.")
+    parser.add_argument("--server_host", type=str, default="localhost",
+                        help="Server hostname (legacy, use --base_url instead)")
+    parser.add_argument("--server_port", type=int, default=10900,
+                        help="Server port (legacy, use --base_url instead)")
+    parser.add_argument("--ignore_eos", action="store_true",
+                        help="Ignore EOS tokens and decode to max output length")
+    parser.add_argument("--timeout", type=float, default=6000.0,
+                        help="Request timeout in seconds")
     args = parser.parse_args()
+
+    # Construct base URL from host/port if not provided directly
+    if args.base_url:
+        base_url = args.base_url
+    else:
+        base_url = f"http://{args.server_host}:{args.server_port}"
 
     hugging_face_checkpoint = args.hugging_face_checkpoint
     benchmark_name = "TIGER-Lab/MMLU-Pro"
@@ -211,12 +316,15 @@ if __name__ == "__main__":
     else:
         logger.info("CUDA not available; skipping GPU memory log.")
 
-    answer_set = run_inference_via_api(
+    logger.info(f"Connecting to server at {base_url}")
+
+    answer_set = run_inference_via_http_api(
         queries=queries,
         max_input_length=args.max_input_length,
         max_decoding_length=args.max_decoding_length,
-        server_host=args.server_host,
-        server_port=args.server_port,
+        base_url=base_url,
+        ignore_eos=args.ignore_eos,
+        timeout_s=args.timeout,
     )
 
     print_result = True
@@ -271,24 +379,24 @@ if __name__ == "__main__":
             )
 
     accuracy = success / total_samples if total_samples > 0 else 0
-    print("\n--- ✅ Evaluation Summary ---")
+    print("\n--- Evaluation Summary ---")
     print(f"Total Samples: {total_samples}")
-    print(f"✅ Correct: {success}")
-    print(f"❌ Incorrect: {total_samples - success}")
+    print(f"Correct: {success}")
+    print(f"Incorrect: {total_samples - success}")
     print("-" * 30)
-    print(f"🎯 Accuracy: {accuracy:.2%}")
+    print(f"Accuracy: {accuracy:.2%}")
     print("-" * 30)
     print(
-        f"⚠️ Outputs missing '</think>' tag: {no_think_tag_count} ({no_think_tag_count / total_samples:.2%})"
+        f"Outputs missing '</think>' tag: {no_think_tag_count} ({no_think_tag_count / total_samples:.2%})"
     )
     print(
-        f"❓ Extraction Failures (random guess used): {extraction_failures} ({extraction_failures / total_samples:.2%})"
+        f"Extraction Failures (random guess used): {extraction_failures} ({extraction_failures / total_samples:.2%})"
     )
     print("---------------------------------\n")
 
     if incorrect_samples:
         print("\n" + "=" * 80)
-        print("🔍 DETAILED ERROR ANALYSIS - Incorrect Predictions")
+        print("DETAILED ERROR ANALYSIS - Incorrect Predictions")
         print("=" * 80)
         print(f"\nTotal Incorrect: {len(incorrect_samples)}\n")
         for idx, error in enumerate(incorrect_samples, 1):
@@ -298,15 +406,15 @@ if __name__ == "__main__":
             print(f"  Ground Truth: {error['ground_truth']}")
             flags = []
             if error["extraction_failed"]:
-                flags.append("⚠️ EXTRACTION FAILED")
+                flags.append("EXTRACTION FAILED")
             if error["no_think_tag"]:
-                flags.append("⚠️ NO </think> TAG")
+                flags.append("NO </think> TAG")
             if flags:
                 print(f"  Flags: {' | '.join(flags)}")
             print("-" * 40)
         print("=" * 80 + "\n")
     else:
-        print("\n🎉 Perfect Score! No incorrect predictions.\n")
+        print("\nPerfect Score! No incorrect predictions.\n")
 
     assert accuracy >= 0.835, (
         f"Test Failed: Accuracy of {accuracy:.2%} is below the 83.5% threshold."

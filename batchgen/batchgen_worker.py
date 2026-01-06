@@ -250,6 +250,11 @@ class BatchGenWorkerArgs:
 	kv_dtype: str
 	gpu_arch: str
 
+	# Watchdog configuration
+	watchdog_timeout: Optional[float] = 180.0  # Seconds before declaring process stuck
+	watchdog_test_stuck_time: float = 0.0  # Deliberate delay for testing
+	watchdog_heartbeat_interval: Optional[float] = None  # Heartbeat interval
+
 
 class BatchGenWorker:
 	"""

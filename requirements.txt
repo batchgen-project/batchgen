@@ -9,3 +9,5 @@ transformers==4.42.0
 fastapi
 einops
 uvicorn[standard]
+uvloop
+pydantic>=2.0.0

@@ -1,0 +1,250 @@
+"""Server argument parsing and validation utilities."""
+
+import argparse
+import socket
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+def is_port_available(port: int) -> bool:
+    """Return whether a port is available."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", port))
+            sock.listen(1)
+            return True
+        except (socket.error, OverflowError):
+            return False
+
+
+def parse_host_port(addr: str) -> tuple[str, int]:
+    """Parse a host:port string."""
+    if ":" not in addr:
+        raise ValueError(f"Address must be in host:port format, got '{addr}'")
+    host, port_str = addr.rsplit(":", 1)
+    host = host or "0.0.0.0"
+    try:
+        port = int(port_str)
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in address '{addr}'") from exc
+    return host, port
+
+
+def _validate_port_range(name: str, port: int) -> None:
+    if port <= 0 or port > 65535:
+        raise ValueError(f"Invalid {name}: {port}")
+
+
+def _ensure_local_port_free(port: int, label: str) -> None:
+    if not is_port_available(port):
+        raise ValueError(f"{label} port {port} is not available on this node")
+
+
+@dataclass
+class ServerArgs:
+    """Server configuration."""
+
+    model: str
+    listen_ip: str = "0.0.0.0"
+    listen_port: int = 10900
+    hf_cache_dir: Optional[Path] = None
+    cache_dir: Optional[Path] = None
+    pt_ckpt_dir: Optional[Path] = None
+    enable_hugetlbfs: bool = False
+    dist_init_addr: str = "localhost:12355"
+    kv_dtype: str = "bfloat16"
+    host_kv_cache_size: Optional[int] = None
+    gpu_arch: Optional[str] = None
+    nnodes: int = 1
+    node_rank: int = 0
+    world_size: int = 1
+    storage_path: Path = Path("tmp/server_storage")
+    max_input_len: int = 1024
+    max_output_len: int = 128
+    watchdog_timeout: Optional[float] = 180.0
+    watchdog_test_stuck_time: float = 0.0
+    watchdog_heartbeat_interval: Optional[float] = None
+
+    def resolve_paths(self) -> None:
+        """Normalize any path-like args."""
+        if isinstance(self.hf_cache_dir, str):
+            self.hf_cache_dir = Path(self.hf_cache_dir)
+        if isinstance(self.cache_dir, str):
+            self.cache_dir = Path(self.cache_dir)
+        if isinstance(self.pt_ckpt_dir, str):
+            self.pt_ckpt_dir = Path(self.pt_ckpt_dir)
+        if isinstance(self.storage_path, str):
+            self.storage_path = Path(self.storage_path)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="BatchGen FastAPI server")
+    parser.add_argument(
+        "--model", type=str, required=True, help="HuggingFace model name"
+    )
+    parser.add_argument(
+        "--listen-ip", type=str, default="0.0.0.0", help="Server listen IP"
+    )
+    parser.add_argument(
+        "--listen-port", type=int, default=10900, help="Server listen port"
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        type=Path,
+        default=None,
+        help="HuggingFace cache directory",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Cache directory for downloaded weights",
+    )
+    parser.add_argument(
+        "--pt-ckpt-dir",
+        type=Path,
+        default=None,
+        help="Path to PyTorch checkpoints",
+    )
+    parser.add_argument(
+        "--enable-hugetlbfs",
+        action="store_true",
+        help="Enable hugeTLBFS for shared memory (requires system support)",
+    )
+    parser.add_argument(
+        "--dist-init-addr",
+        type=str,
+        default="localhost:12355",
+        help="torch.distributed init addr",
+    )
+    parser.add_argument(
+        "--kv-dtype", type=str, default="bfloat16", help="KV cache dtype"
+    )
+    parser.add_argument(
+        "--host-kv-cache-size",
+        type=int,
+        default=None,
+        help="Host KV cache size (GB)",
+    )
+    parser.add_argument(
+        "--gpu-arch", type=str, default=None, help="GPU architecture hint"
+    )
+    parser.add_argument(
+        "--nnodes", type=int, default=1, help="Total nodes in the cluster"
+    )
+    parser.add_argument(
+        "--node-rank", type=int, default=0, help="Rank of this node"
+    )
+    parser.add_argument(
+        "--world-size", type=int, default=1, help="Total world size"
+    )
+    parser.add_argument(
+        "--storage-path",
+        type=Path,
+        default=Path("tmp/server_storage"),
+        help="Directory for uploaded files, batches, and outputs",
+    )
+    parser.add_argument(
+        "--max-input-len",
+        type=int,
+        default=1024,
+        help="Default max input length for inference",
+    )
+    parser.add_argument(
+        "--max-output-len",
+        type=int,
+        default=128,
+        help="Default max output length for inference",
+    )
+    parser.add_argument(
+        "--watchdog-timeout",
+        type=float,
+        default=180.0,
+        help="Worker watchdog timeout in seconds",
+    )
+    parser.add_argument(
+        "--watchdog-test-stuck-time",
+        type=float,
+        default=0.0,
+        help="Deliberately sleep during watchdog feed (testing only)",
+    )
+    parser.add_argument(
+        "--watchdog-heartbeat-interval",
+        type=float,
+        default=None,
+        help="Idle heartbeat interval in seconds when watchdog is enabled",
+    )
+    return parser
+
+
+def validate_server_args(args: ServerArgs) -> None:
+    """Validate parsed arguments."""
+    _validate_port_range("listen port", args.listen_port)
+    _ensure_local_port_free(args.listen_port, "Listen")
+
+    _, dist_port = parse_host_port(args.dist_init_addr)
+    _validate_port_range("dist_init_addr port", dist_port)
+
+    if args.nnodes > 1 and args.node_rank == 0:
+        _ensure_local_port_free(dist_port, "dist_init_addr")
+        communicator_port = 20003
+        _validate_port_range("communicator port", communicator_port)
+        _ensure_local_port_free(communicator_port, "COMM")
+
+    if args.nnodes <= 0:
+        raise ValueError("nnodes must be positive")
+    if args.world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if args.node_rank < 0 or args.node_rank >= args.nnodes:
+        raise ValueError("node_rank must be in [0, nnodes)")
+    if args.max_input_len <= 0:
+        raise ValueError("max_input_len must be positive")
+    if args.max_output_len <= 0:
+        raise ValueError("max_output_len must be positive")
+    if args.watchdog_timeout is not None and args.watchdog_timeout <= 0:
+        raise ValueError("watchdog_timeout must be positive")
+    if args.watchdog_heartbeat_interval is not None:
+        if args.watchdog_timeout is None:
+            raise ValueError(
+                "watchdog_heartbeat_interval requires watchdog_timeout"
+            )
+        if args.watchdog_heartbeat_interval <= 0:
+            raise ValueError("watchdog_heartbeat_interval must be positive")
+    if args.watchdog_test_stuck_time < 0:
+        raise ValueError("watchdog_test_stuck_time must be non-negative")
+    if args.watchdog_test_stuck_time > 0 and args.watchdog_timeout is None:
+        raise ValueError("watchdog_test_stuck_time requires watchdog_timeout")
+    args.storage_path.mkdir(parents=True, exist_ok=True)
+
+
+def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
+    """Parse CLI arguments and return a validated ServerArgs."""
+    parser = _build_parser()
+    parsed = parser.parse_args(argv)
+    server_args = ServerArgs(
+        model=parsed.model,
+        listen_ip=parsed.listen_ip,
+        listen_port=parsed.listen_port,
+        hf_cache_dir=parsed.hf_cache_dir,
+        cache_dir=parsed.cache_dir,
+        pt_ckpt_dir=parsed.pt_ckpt_dir,
+        enable_hugetlbfs=parsed.enable_hugetlbfs,
+        dist_init_addr=parsed.dist_init_addr,
+        kv_dtype=parsed.kv_dtype,
+        host_kv_cache_size=parsed.host_kv_cache_size,
+        gpu_arch=parsed.gpu_arch,
+        nnodes=parsed.nnodes,
+        node_rank=parsed.node_rank,
+        world_size=parsed.world_size,
+        storage_path=parsed.storage_path,
+        max_input_len=parsed.max_input_len,
+        max_output_len=parsed.max_output_len,
+        watchdog_timeout=parsed.watchdog_timeout,
+        watchdog_test_stuck_time=parsed.watchdog_test_stuck_time,
+        watchdog_heartbeat_interval=parsed.watchdog_heartbeat_interval,
+    )
+    server_args.resolve_paths()
+    validate_server_args(server_args)
+    return server_args
