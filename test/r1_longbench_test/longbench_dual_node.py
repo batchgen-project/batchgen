@@ -271,7 +271,8 @@ def decode_to_eos(tokenizer, tokens, min_tokens=5):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LongBench test client for BatchGen HTTP API")
     parser.add_argument("--hugging_face_checkpoint", type=str, required=True)
-    parser.add_argument("--max_prompts", type=int, default=1024)
+    parser.add_argument("--max_prompts", type=int, default=None,
+                        help="Max number of prompts to process. If not set, run the whole dataset.")
     parser.add_argument("--max_input_length", type=int, default=None,
                         help="Max input length hint. If not set, determined dynamically from longest prompt.")
     parser.add_argument("--max_decoding_length", type=int, required=True)
@@ -319,15 +320,16 @@ if __name__ == "__main__":
 
     query_df = load_longbench_datasets(longbench_path)
     queries = []
-    # Load all queries without length filtering
+    # Load queries - limit to max_prompts if specified, otherwise load all
     for q in query_df['context']:
         queries.append(q)
-        if len(queries) == max_prompts:
+        if max_prompts is not None and len(queries) >= max_prompts:
             break
 
-    # If number of queries is less than max_prompts, fill the rest by duplicating
-    if len(queries) < max_prompts:
-        queries = queries * (max_prompts // len(queries)) + queries[: max_prompts % len(queries)]
+    if max_prompts is not None:
+        logger.info(f"Using top {max_prompts} prompts from dataset")
+    else:
+        logger.info(f"Running whole dataset ({len(queries)} prompts)")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.cache_dir,
@@ -344,8 +346,6 @@ if __name__ == "__main__":
         )
         queries[prompt_idx] = text
     logger.info(f"Number of prompts: {len(queries)}")
-    if len(queries) != args.max_prompts:
-        logger.warning(f"Number of prompts {len(queries)} is not equal to max_prompts {args.max_prompts}.")
 
     """
         Step 3: Run inference via BatchGen HTTP API
