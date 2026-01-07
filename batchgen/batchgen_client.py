@@ -121,12 +121,12 @@ class BatchGenClient:
 class BatchGenHttpClient:
     """HTTP client for BatchGen OpenAI-compatible API."""
 
-    def __init__(self, base_url: str, timeout_s: float = 6000.0) -> None:
+    def __init__(self, base_url: str, timeout_s: Optional[float] = None) -> None:
         """Initialize the HTTP client.
 
         Args:
             base_url: Server base URL (e.g., http://localhost:10900)
-            timeout_s: Request timeout in seconds
+            timeout_s: Request timeout in seconds (None = wait forever)
         """
         if not _REQUESTS_AVAILABLE:
             raise ImportError(
@@ -209,6 +209,199 @@ class BatchGenHttpClient:
             raise RuntimeError(f"Unexpected result format: {type(results)}")
 
         return results
+
+    # ==================== Batch API Methods ====================
+
+    def upload_file(
+        self,
+        file_path: str,
+        purpose: str = "batch",
+    ) -> Dict[str, Any]:
+        """Upload a file to the server.
+
+        Args:
+            file_path: Path to the file to upload
+            purpose: File purpose ('batch' for input files)
+
+        Returns:
+            File object with id, filename, etc.
+        """
+        url = f"{self._base_url}/v1/files"
+        with open(file_path, "rb") as f:
+            files = {"file": (file_path.split("/")[-1], f)}
+            data = {"purpose": purpose}
+            response = self._session.post(
+                url, files=files, data=data, timeout=self._timeout_s
+            )
+        self._raise_for_status(response, "POST", url)
+        return response.json()
+
+    def create_batch(
+        self,
+        input_file_id: str,
+        endpoint: str = "/v1/chat/completions",
+        completion_window: str = "24h",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create a batch job.
+
+        Args:
+            input_file_id: ID of the uploaded input file
+            endpoint: Target endpoint ('/v1/chat/completions' or '/v1/completions')
+            completion_window: Time window for completion ('24h')
+            metadata: Optional metadata dictionary
+
+        Returns:
+            Batch object with id, status, etc.
+        """
+        payload = {
+            "input_file_id": input_file_id,
+            "endpoint": endpoint,
+            "completion_window": completion_window,
+        }
+        if metadata:
+            payload["metadata"] = metadata
+        return self.post_json("/v1/batches", payload)
+
+    def get_batch(self, batch_id: str) -> Dict[str, Any]:
+        """Get batch status.
+
+        Args:
+            batch_id: ID of the batch
+
+        Returns:
+            Batch object with current status
+        """
+        url = f"{self._base_url}/v1/batches/{batch_id}"
+        response = self._session.get(url, timeout=self._timeout_s)
+        self._raise_for_status(response, "GET", url)
+        return response.json()
+
+    def wait_for_batch(
+        self,
+        batch_id: str,
+        poll_interval: float = 5.0,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Wait for a batch to complete.
+
+        Args:
+            batch_id: ID of the batch
+            poll_interval: Seconds between status checks
+            timeout: Maximum seconds to wait (None = unlimited)
+
+        Returns:
+            Final batch object
+
+        Raises:
+            TimeoutError: If timeout exceeded
+            RuntimeError: If batch failed or was cancelled
+        """
+        start_time = time.time()
+        terminal_statuses = {"completed", "failed", "cancelled"}
+
+        while True:
+            batch = self.get_batch(batch_id)
+            status = batch.get("status")
+
+            if status in terminal_statuses:
+                if status == "failed":
+                    raise RuntimeError(f"Batch failed: {batch.get('error')}")
+                if status == "cancelled":
+                    raise RuntimeError("Batch was cancelled")
+                return batch
+
+            if timeout and (time.time() - start_time) > timeout:
+                raise TimeoutError(
+                    f"Batch {batch_id} did not complete within {timeout}s"
+                )
+
+            logger.info(f"Batch {batch_id} status: {status}, waiting...")
+            time.sleep(poll_interval)
+
+    def download_file_content(self, file_id: str) -> bytes:
+        """Download file content.
+
+        Args:
+            file_id: ID of the file to download
+
+        Returns:
+            File content as bytes
+        """
+        url = f"{self._base_url}/v1/files/{file_id}/content"
+        response = self._session.get(url, timeout=self._timeout_s)
+        self._raise_for_status(response, "GET", url)
+        return response.content
+
+    def get_file(self, file_id: str) -> Dict[str, Any]:
+        """Get file metadata.
+
+        Args:
+            file_id: ID of the file
+
+        Returns:
+            File object with metadata
+        """
+        url = f"{self._base_url}/v1/files/{file_id}"
+        response = self._session.get(url, timeout=self._timeout_s)
+        self._raise_for_status(response, "GET", url)
+        return response.json()
+
+    def submit_batch(
+        self,
+        input_file_path: str,
+        output_file_path: Optional[str] = None,
+        endpoint: str = "/v1/chat/completions",
+        poll_interval: float = 5.0,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Submit a batch job and wait for completion.
+
+        This is a convenience method that:
+        1. Uploads the input file
+        2. Creates the batch
+        3. Waits for completion
+        4. Downloads results to output file (if specified)
+
+        Args:
+            input_file_path: Path to input JSONL file
+            output_file_path: Path to save output JSONL (optional)
+            endpoint: Target endpoint
+            poll_interval: Seconds between status checks
+            timeout: Maximum seconds to wait
+
+        Returns:
+            Final batch object with output_file_id
+        """
+        # 1. Upload input file
+        logger.info(f"Uploading {input_file_path}...")
+        file_obj = self.upload_file(input_file_path, purpose="batch")
+        file_id = file_obj["id"]
+        logger.info(f"Uploaded file: {file_id}")
+
+        # 2. Create batch
+        logger.info("Creating batch...")
+        batch = self.create_batch(file_id, endpoint=endpoint)
+        batch_id = batch["id"]
+        logger.info(f"Created batch: {batch_id}")
+
+        # 3. Wait for completion
+        logger.info("Waiting for batch to complete...")
+        batch = self.wait_for_batch(batch_id, poll_interval, timeout)
+        logger.info(f"Batch completed: {batch['status']}")
+
+        # 4. Download results if output path specified
+        if output_file_path and batch.get("output_file_id"):
+            output_file_id = batch["output_file_id"]
+            logger.info(f"Downloading results from {output_file_id}...")
+            content = self.download_file_content(output_file_id)
+            with open(output_file_path, "wb") as f:
+                f.write(content)
+            logger.info(f"Saved results to {output_file_path}")
+
+        return batch
+
+    # ==================== Internal Methods ====================
 
     def _raise_for_status(
         self, response: "requests.Response", method: str, url: str

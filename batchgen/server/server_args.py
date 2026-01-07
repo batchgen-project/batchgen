@@ -42,6 +42,11 @@ def _ensure_local_port_free(port: int, label: str) -> None:
         raise ValueError(f"{label} port {port} is not available on this node")
 
 
+def _default_storage_path() -> Path:
+    """Return default storage path under batchgen directory."""
+    return Path(__file__).parent.parent / "storage"
+
+
 @dataclass
 class ServerArgs:
     """Server configuration."""
@@ -60,12 +65,17 @@ class ServerArgs:
     nnodes: int = 1
     node_rank: int = 0
     world_size: int = 1
-    storage_path: Path = Path("tmp/server_storage")
+    storage_path: Optional[Path] = None  # Default set in __post_init__
+    save_result: bool = False  # Save direct inference results to outputs/
     max_input_len: int = 1024
     max_output_len: int = 128
     watchdog_timeout: Optional[float] = 600.0  # 10 minutes for long inference tasks
     watchdog_test_stuck_time: float = 0.0
     watchdog_heartbeat_interval: Optional[float] = None
+
+    def __post_init__(self):
+        if self.storage_path is None:
+            self.storage_path = _default_storage_path()
 
     def resolve_paths(self) -> None:
         """Normalize any path-like args."""
@@ -143,8 +153,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--storage-path",
         type=Path,
-        default=Path("tmp/server_storage"),
-        help="Directory for uploaded files, batches, and outputs",
+        default=None,
+        help="Directory for uploaded files, batches, and outputs. Default: batchgen/storage/",
+    )
+    parser.add_argument(
+        "--save-result",
+        action="store_true",
+        help="Save direct inference results to {storage_path}/outputs/ as JSONL files",
     )
     parser.add_argument(
         "--max-input-len",
@@ -250,6 +265,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         node_rank=parsed.node_rank,
         world_size=parsed.world_size,
         storage_path=parsed.storage_path,
+        save_result=parsed.save_result,
         max_input_len=parsed.max_input_len,
         max_output_len=parsed.max_output_len,
         watchdog_timeout=watchdog_timeout,

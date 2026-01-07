@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 import uuid
@@ -300,6 +301,7 @@ def create_app(
     async def run_inference(request: Request, body: RawInferenceRequest):
         worker: WorkerManager = request.app.state.worker
         server_args: ServerArgs = request.app.state.server_args
+        storage: StorageManager = request.app.state.storage
 
         max_input_len = body.max_input_len or server_args.max_input_len
         max_output_len = body.max_output_len or server_args.max_output_len
@@ -318,11 +320,50 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc))
 
         latency_ms = int((time.perf_counter() - start) * 1000)
-        return {
+        normalized_results = normalize_inference_results(results)
+
+        response_data = {
             "status": "success",
-            "results": normalize_inference_results(results),
+            "results": normalized_results,
             "latency_ms": latency_ms,
         }
+
+        # Save results to file if save_result is enabled
+        if server_args.save_result:
+            output_file_id = f"file-{uuid.uuid4().hex}"
+            output_path = storage.output_dir / f"{output_file_id}.jsonl"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with output_path.open("w", encoding="utf-8") as f:
+                for idx, result in enumerate(normalized_results):
+                    record = {
+                        "custom_id": f"inference-{idx}",
+                        "prompt": body.prompts[idx] if idx < len(body.prompts) else "",
+                        "response": result,
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            # Save file metadata
+            file_meta = FileObject(
+                id=output_file_id,
+                bytes=output_path.stat().st_size,
+                created_at=int(time.time()),
+                filename=f"{output_file_id}.jsonl",
+                purpose=FilePurpose.BATCH_OUTPUT.value,
+                status=FileStatus.PROCESSED.value,
+                status_details=None,
+                checksum=None,
+            )
+            storage.save_metadata(output_file_id, file_meta.dict())
+
+            # Also copy to files_dir for download via /v1/files/{id}/content
+            import shutil
+            shutil.copy(output_path, storage.files_dir / output_file_id)
+
+            response_data["output_file_id"] = output_file_id
+            logger.info(f"Saved inference results to {output_path}")
+
+        return response_data
 
     @app.get("/health")
     async def health_check():
