@@ -45,6 +45,8 @@ def run_inference_via_http_api(
     base_url: str,
     ignore_eos: bool = False,
     timeout_s: float = 6000.0,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
 ) -> List[str]:
     """Run inference via BatchGen HTTP API.
 
@@ -55,6 +57,8 @@ def run_inference_via_http_api(
         base_url: Server base URL (e.g., http://localhost:10900)
         ignore_eos: Whether to ignore EOS tokens during generation
         timeout_s: Request timeout in seconds
+        temperature: Sampling temperature (None = greedy decoding)
+        top_p: Nucleus sampling threshold (None = disabled)
 
     Returns:
         List of decoded output strings
@@ -65,12 +69,17 @@ def run_inference_via_http_api(
     if not client.health_check():
         logger.warning("Server health check failed, proceeding anyway...")
 
+    if temperature is not None or top_p is not None:
+        logger.info(f"Sampling params: temperature={temperature}, top_p={top_p}")
+
     start_time = pd.Timestamp.now()
     results = client.submit_inference(
         prompts=queries,
         max_input_len=max_input_length,
         max_output_len=max_decoding_length,
         ignore_eos=ignore_eos,
+        temperature=temperature,
+        top_p=top_p,
     )
     latency = (pd.Timestamp.now() - start_time).total_seconds()
     logger.info(f"Inference completed in {latency:.2f}s")
@@ -99,6 +108,10 @@ if __name__ == "__main__":
                         help="Ignore EOS tokens and decode to max output length")
     parser.add_argument("--timeout", type=float, default=6000.0,
                         help="Request timeout in seconds")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="Sampling temperature (default: None = greedy decoding)")
+    parser.add_argument("--top_p", type=float, default=None,
+                        help="Nucleus sampling threshold (default: None = disabled)")
     args = parser.parse_args()
 
     # Construct base URL from host/port if not provided directly
@@ -212,6 +225,8 @@ if __name__ == "__main__":
         base_url=base_url,
         ignore_eos=args.ignore_eos,
         timeout_s=args.timeout,
+        temperature=args.temperature,
+        top_p=args.top_p,
     )
 
     print_result = True
