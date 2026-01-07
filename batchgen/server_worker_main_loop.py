@@ -147,9 +147,7 @@ def _server_worker_main_impl(
 		rank=args.global_rank,
 		world_size=args.world_size,
 		local_rank=args.local_rank,
-		heartbeat_interval=10.0,  # Check every 10 seconds
 	)
-	logging.info(f"Rank {args.global_rank}: Distributed kill switch initialized")
 
 	# CRITICAL: Warmup NCCL connections before entering server loop
 	# This ensures all inter-node NCCL connections are fully established
@@ -272,6 +270,13 @@ def _server_worker_main_impl(
 				# No work yet - this broadcast acts as a heartbeat to prevent NCCL timeout
 				# Also feed watchdog to prevent false stuck detection during idle periods
 				watchdog.feed()
+				# Check and propagate kill signals across all workers
+				# This is a safe point to do NCCL operations since we're idle
+				if not kill_switch.check_and_propagate():
+					logging.warning(f"Rank {global_rank}: Kill signal propagated, exiting.")
+					task_data = None
+					work_available = True
+					break
 				# Loop back and poll again
 				continue
 
