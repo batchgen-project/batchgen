@@ -143,33 +143,33 @@ def _server_worker_main_impl(
 	# Without this, the first collective may fail with "Connection refused"
 	# if remote ranks haven't fully initialized their NCCL listeners.
 	try:
-		logging.info(f"Rank {args.global_rank}: Starting NCCL connection warmup...")
-		
+		logging.debug(f"Rank {args.global_rank}: Starting NCCL connection warmup...")
+
 		# Step 1: Simple barrier to ensure all ranks have reached this point
 		dist.barrier()
-		logging.info(f"Rank {args.global_rank}: Barrier 1 passed")
-		
+		logging.debug(f"Rank {args.global_rank}: Barrier 1 passed")
+
 		# Step 2: Small all_reduce to establish actual NCCL connections
 		# NCCL lazily establishes connections, so we force it here
 		warmup_tensor = torch.ones(1, device=f"cuda:{args.local_rank}")
 		dist.all_reduce(warmup_tensor, op=dist.ReduceOp.SUM)
 		torch.cuda.synchronize()
-		
+
 		expected = float(args.world_size)
 		if abs(warmup_tensor.item() - expected) > 1e-6:
 			raise RuntimeError(f"NCCL warmup failed: expected {expected}, got {warmup_tensor.item()}")
-		logging.info(f"Rank {args.global_rank}: all_reduce warmup passed")
-		
+		logging.debug(f"Rank {args.global_rank}: all_reduce warmup passed")
+
 		# Step 3: Test broadcast_object_list specifically since that's what fails
 		test_obj = [args.global_rank] if args.global_rank == 0 else [None]
 		dist.broadcast_object_list(test_obj, src=0)
 		if test_obj[0] != 0:
 			raise RuntimeError(f"broadcast_object_list warmup failed: got {test_obj[0]}")
-		logging.info(f"Rank {args.global_rank}: broadcast_object_list warmup passed")
-		
+		logging.debug(f"Rank {args.global_rank}: broadcast_object_list warmup passed")
+
 		# Final barrier to ensure all warmup is complete
 		dist.barrier()
-		logging.info(f"Rank {args.global_rank}: NCCL warmup complete, all connections established")
+		logging.info(f"Rank {args.global_rank}: NCCL warmup complete")
 		
 	except Exception as e:
 		logging.error(f"Rank {args.global_rank}: NCCL warmup failed: {e}")

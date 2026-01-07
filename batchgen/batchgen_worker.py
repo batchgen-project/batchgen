@@ -5,6 +5,7 @@ import psutil
 import logging
 import math
 import os
+import socket
 import sys
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
@@ -224,6 +225,38 @@ class InputArguments:
 				setattr(self, key, value)
 			else:
 				raise AttributeError(f"InputArguments has no attribute '{key}'")
+
+
+def _is_port_available(host: str, port: int) -> bool:
+	"""Check if a port is available for binding on the given host."""
+	try:
+		with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+			s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+			s.bind((host, port))
+			return True
+	except (OSError, socket.error):
+		return False
+
+
+def _find_available_port(host: str, start_port: int, max_attempts: int = 100) -> int:
+	"""Find an available port starting from start_port.
+
+	Args:
+		host: Host address to bind to
+		start_port: Starting port number to check
+		max_attempts: Maximum number of ports to try
+
+	Returns:
+		An available port number
+
+	Raises:
+		RuntimeError: If no available port is found within max_attempts
+	"""
+	for offset in range(max_attempts):
+		port = start_port + offset
+		if _is_port_available(host, port):
+			return port
+	raise RuntimeError(f"No available port found in range [{start_port}, {start_port + max_attempts})")
 
 
 @dataclass
@@ -3487,14 +3520,28 @@ class BatchGenWorker:
 					if not hasattr(self, '_nccl_port'):
 						self._nccl_port = 20003
 
+					# Rank 0 finds an available port, then broadcasts to all ranks
+					if self.rank == 0:
+						try:
+							self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
+							logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
+						except RuntimeError as e:
+							logging.error(f"Rank 0: Failed to find available port: {e}")
+							raise
+
+					# Broadcast the chosen port from rank 0 to all ranks
+					port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+					dist.broadcast(port_tensor, src=0)
+					self._nccl_port = port_tensor.item()
+
 					# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
 					# is ready before other ranks try to connect. Different ranks may reach
 					# this point at very different times due to tokenization workload.
-					logging.info(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
+					logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
 					dist.barrier()
 
 					try:
-						logging.info(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
+						logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
 
 						# Store group separately so we can properly destroy it on reinit
 						self._nccl_group = StatelessProcessGroup.create(
@@ -3508,7 +3555,11 @@ class BatchGenWorker:
 							group=self._nccl_group,
 							device=device
 						)
-						logging.info(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
+						# Only rank 0 logs at INFO level to reduce verbosity
+						if self.rank == 0:
+							logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
+						else:
+							logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
 					except Exception as e:
 						logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 						raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
@@ -6866,12 +6917,23 @@ class BatchGenWorker:
 			except Exception as barrier_e:
 				logging.warning(f"Rank {self.rank}: Barrier after NCCL cleanup failed: {barrier_e}")
 
-			# Increment port number for next initialization to avoid port conflicts
-			# All ranks do this, so they'll all use the same new port
+			# Find next available port for reinitialization
+			# Rank 0 finds the port, then broadcasts to all ranks
 			if not hasattr(self, '_nccl_port'):
 				self._nccl_port = 20003
-			self._nccl_port += 1
-			logging.info(f"Rank {self.rank}: Next PyNccl port will be {self._nccl_port}")
+			comm_master_addr = os.getenv("COMM_MASTER_ADDR", "127.0.0.1")
+			if self.rank == 0:
+				try:
+					self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port + 1)
+					logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl reinit")
+				except RuntimeError as e:
+					logging.error(f"Rank 0: Failed to find available port: {e}")
+					return False
+			# Broadcast port to all ranks
+			port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+			dist.broadcast(port_tensor, src=0)
+			self._nccl_port = port_tensor.item()
+			logging.debug(f"Rank {self.rank}: Next PyNccl port will be {self._nccl_port}")
 
 			# Delay to allow OS to fully release resources
 			# Rank 0 needs extra time since it's the TCPStore server
