@@ -2467,17 +2467,38 @@ class BatchGenWorker:
 		if self.global_batch is None:
 			raise RuntimeError("Global batch not initialized")
 
-		# Phase 1: Tokenize all sequences WITHOUT truncation to get actual lengths
+		# Phase 1: Batch tokenize all sequences at once (much faster than sequential)
+		# HuggingFace tokenizers use Rust with multi-threading for batch tokenization
+		all_texts = [seq.text for seq in self.global_batch]
+
+		if self.rank == 0:
+			logging.info(f"Batch tokenizing {len(all_texts)} sequences...")
+
+		tokenize_start = time.perf_counter()
+		batch_tokenized = self.tokenizer(
+			all_texts,
+			return_tensors="pt",
+			truncation=False,  # No truncation - keep full input
+			padding=True,      # Pad to longest in batch for uniform tensor shape
+			return_attention_mask=True,
+		)
+		tokenize_time = time.perf_counter() - tokenize_start
+
+		if self.rank == 0:
+			logging.info(f"Batch tokenization complete in {tokenize_time:.2f}s")
+
+		# Extract individual sequences from the batch result
+		# batch_tokenized["input_ids"] has shape [batch_size, max_seq_len]
+		# BatchGen uses right-padding: valid tokens at [0:actual_len], padding at [actual_len:]
 		tokenized_results = []
-		for seq in self.global_batch:
-			tokenized = self.tokenizer(
-				seq.text,
-				return_tensors="pt",
-				truncation=False,  # No truncation - keep full input
-				padding=False,     # No padding yet - we'll do it after finding max length
-			)
-			tokenized_results.append(tokenized)
-		
+		for i in range(len(all_texts)):
+			# Count non-pad tokens (attention_mask == 1)
+			actual_len = int(batch_tokenized["attention_mask"][i].sum().item())
+			tokenized_results.append({
+				"input_ids": batch_tokenized["input_ids"][i:i+1, :actual_len],
+				"attention_mask": batch_tokenized["attention_mask"][i:i+1, :actual_len],
+			})
+
 		# Phase 2: Find the longest prompt length to use as max_prompt_length
 		prompt_lengths = [t["input_ids"].size(1) for t in tokenized_results]
 		max_prompt_length = max(prompt_lengths)
@@ -2515,12 +2536,15 @@ class BatchGenWorker:
 				(1, seq_extended_size), dtype=tokenized["input_ids"].dtype
 			)
 			attention_mask_extended = torch.zeros(
-				(1, seq_extended_size), dtype=tokenized["attention_mask"].dtype
+				(1, seq_extended_size), dtype=torch.int64
 			)
 
 			# Copy the actual tokens (left-aligned, no truncation)
 			input_ids_extended[0, :actual_prompt_len] = tokenized["input_ids"][0, :]
-			attention_mask_extended[0, :actual_prompt_len] = tokenized["attention_mask"][0, :]
+			# CRITICAL: Set attention mask to exactly match input_ids length
+			# Don't copy from tokenizer's attention_mask - just set 1s for valid tokens
+			# This ensures attention_mask.sum() == prompt_length == current_context_length
+			attention_mask_extended[0, :actual_prompt_len] = 1
 
 			seq.input_ids = input_ids_extended
 			seq.attention_mask = attention_mask_extended
@@ -3741,23 +3765,60 @@ class BatchGenWorker:
 				continue
 			decoded_tokens = self.query_book[local_idx].decoded_tokens
 			res_with_idx.append((global_idx, decoded_tokens))
-		
+
 		all_results = [None] * self.world_size
 		dist.all_gather_object(all_results, res_with_idx)
-		
+
 		all_results = [item for sublist in all_results for item in sublist]
 		all_results.sort(key=lambda x: x[0])
-		
-		sorted_tokens = [item[1] for item in all_results]
-		res_tensor = torch.cat(sorted_tokens, dim=0).cpu()
-		
+
+		# Decode tokens to strings (only on rank 0 since only rank 0 returns results)
+		decoded_strings = []
+		if self.rank == 0:
+			decode_start = time.perf_counter()
+			for global_idx, tokens in all_results:
+				decoded_str = self._decode_tokens_to_string(tokens)
+				decoded_strings.append(decoded_str)
+			decode_time = time.perf_counter() - decode_start
+			logging.info(f"Detokenization complete: {len(decoded_strings)} sequences in {decode_time:.2f}s")
+
 		dist.barrier()
 		self._batch_completed = True
-		
+
 		if self.rank == 0:
-			return [res_tensor]
+			return decoded_strings
 		else:
 			return []
+
+	def _decode_tokens_to_string(self, tokens: torch.Tensor, min_tokens: int = 1) -> str:
+		"""Decode token IDs to string, stopping at first EOS token.
+
+		Args:
+			tokens: Tensor of token IDs, shape [1, seq_len] or [seq_len]
+			min_tokens: Minimum tokens before considering EOS (to avoid empty outputs)
+
+		Returns:
+			Decoded string, truncated at first valid EOS position
+		"""
+		# Flatten to 1D if needed
+		if tokens.dim() > 1:
+			tokens = tokens.squeeze(0)
+
+		tokens_list = tokens.tolist()
+
+		# Find first EOS token position (after min_tokens)
+		eos_positions = [i for i, t in enumerate(tokens_list) if t == self.eos_token_id and i >= min_tokens]
+
+		if eos_positions:
+			end_pos = eos_positions[0]
+		else:
+			# No EOS found, use all non-zero tokens
+			# Find last non-zero token
+			non_zero = [i for i, t in enumerate(tokens_list) if t != 0]
+			end_pos = non_zero[-1] + 1 if non_zero else len(tokens_list)
+
+		# Decode tokens up to end position
+		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
 
 	# ============ Phase Configuration ============
 

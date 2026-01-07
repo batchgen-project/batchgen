@@ -6,6 +6,12 @@ import logging
 import argparse
 from typing import List, Optional, Dict, Any
 
+try:
+    import requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -110,6 +116,118 @@ class BatchGenClient:
         if self.sock:
             self.sock.close()
             self.sock = None
+
+
+class BatchGenHttpClient:
+    """HTTP client for BatchGen OpenAI-compatible API."""
+
+    def __init__(self, base_url: str, timeout_s: float = 6000.0) -> None:
+        """Initialize the HTTP client.
+
+        Args:
+            base_url: Server base URL (e.g., http://localhost:10900)
+            timeout_s: Request timeout in seconds
+        """
+        if not _REQUESTS_AVAILABLE:
+            raise ImportError(
+                "BatchGenHttpClient requires the 'requests' package. "
+                "Install it with: pip install requests"
+            )
+        self._base_url = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+        self._session = requests.Session()
+
+    def post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a POST request with JSON payload.
+
+        Args:
+            path: API endpoint path (e.g., /v1/inference)
+            payload: JSON payload dictionary
+
+        Returns:
+            Response JSON as dictionary
+        """
+        url = f"{self._base_url}{path}"
+        response = self._session.post(url, json=payload, timeout=self._timeout_s)
+        self._raise_for_status(response, "POST", url)
+        if not response.content:
+            return {}
+        return response.json()
+
+    def health_check(self) -> bool:
+        """Check if the server is healthy.
+
+        Returns:
+            True if server responds with 200, False otherwise
+        """
+        try:
+            url = f"{self._base_url}/health"
+            response = self._session.get(url, timeout=10.0)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def submit_inference(
+        self,
+        prompts: List[str],
+        max_input_len: Optional[int] = None,
+        max_output_len: int = 128,
+        ignore_eos: bool = False,
+    ) -> List[str]:
+        """Submit inference request and get decoded string results.
+
+        Args:
+            prompts: List of prompt strings
+            max_input_len: Maximum input sequence length. If None, determined
+                          dynamically from the longest prompt in the batch.
+            max_output_len: Maximum output/decoding length
+            ignore_eos: If True, ignore EOS tokens and decode to max_output_len
+
+        Returns:
+            List of decoded output strings
+
+        Raises:
+            RuntimeError: If inference fails or returns unexpected format
+        """
+        payload = {
+            "prompts": prompts,
+            "max_input_len": max_input_len,
+            "max_output_len": max_output_len,
+            "ignore_eos": ignore_eos,
+        }
+
+        response = self.post_json("/v1/inference", payload)
+
+        if response.get("status") != "success":
+            raise RuntimeError(f"Inference failed: {response}")
+
+        results = response.get("results")
+        if not results:
+            raise RuntimeError("Server returned empty results.")
+
+        if not isinstance(results, list):
+            raise RuntimeError(f"Unexpected result format: {type(results)}")
+
+        return results
+
+    def _raise_for_status(
+        self, response: "requests.Response", method: str, url: str
+    ) -> None:
+        """Raise an exception if the response status indicates an error."""
+        if response.status_code < 400:
+            return
+        detail = None
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(
+            f"{method} {url} failed ({response.status_code}): {detail}"
+        )
+
+    def close(self) -> None:
+        """Close the HTTP session."""
+        self._session.close()
 
 
 def main():

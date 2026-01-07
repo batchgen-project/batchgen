@@ -4,60 +4,14 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoTokenizer
 
-try:
-    import requests
-except ImportError as exc:
-    raise SystemExit(
-        "This script requires the 'requests' package. "
-        "Install it with: pip install requests"
-    ) from exc
+from batchgen.batchgen_client import BatchGenHttpClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-class BatchGenHttpClient:
-    """HTTP client for the new OpenAI-compatible BatchGen API."""
-
-    def __init__(self, base_url: str, timeout_s: float = 6000.0) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._timeout_s = timeout_s
-        self._session = requests.Session()
-
-    def post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self._base_url}{path}"
-        response = self._session.post(url, json=payload, timeout=self._timeout_s)
-        self._raise_for_status(response, "POST", url)
-        if not response.content:
-            return {}
-        return response.json()
-
-    def health_check(self) -> bool:
-        try:
-            url = f"{self._base_url}/health"
-            response = self._session.get(url, timeout=10.0)
-            return response.status_code == 200
-        except Exception:
-            return False
-
-    def _raise_for_status(
-        self, response: requests.Response, method: str, url: str
-    ) -> None:
-        if response.status_code < 400:
-            return
-        detail = None
-        try:
-            detail = response.json()
-        except ValueError:
-            detail = response.text
-        raise RuntimeError(
-            f"{method} {url} failed ({response.status_code}): {detail}"
-        )
 
 
 def form_options(options: List[str]) -> str:
@@ -66,20 +20,6 @@ def form_options(options: List[str]) -> str:
     for opt, letter in zip(options, opts):
         option_str += f"({letter}): {opt}\n"
     return option_str
-
-
-def decode_to_eos(
-    tokenizer: AutoTokenizer, tokens: List[int], min_tokens: int = 5
-) -> str:
-    tokens_array = np.array(tokens)
-    eos_positions = np.where(tokens_array == tokenizer.eos_token_id)[0]
-    valid_eos_positions = eos_positions[eos_positions >= min_tokens]
-    end_pos = (
-        valid_eos_positions[0]
-        if len(valid_eos_positions) > 0
-        else len(tokens_array)
-    )
-    return tokenizer.decode(tokens[:end_pos], skip_special_tokens=True)
 
 
 def extract_prediction(model_output: str) -> Tuple[Optional[str], bool]:
@@ -98,43 +38,6 @@ def extract_prediction(model_output: str) -> Tuple[Optional[str], bool]:
     return None, think_tag_found
 
 
-def _tensorize_sequence(token_ids: Any) -> torch.Tensor:
-    if torch.is_tensor(token_ids):
-        return token_ids.detach().cpu()
-    if hasattr(token_ids, "tolist"):
-        return torch.tensor(token_ids.tolist(), dtype=torch.int64)
-    if isinstance(token_ids, np.ndarray):
-        return torch.tensor(token_ids.tolist(), dtype=torch.int64)
-    return torch.tensor(list(token_ids), dtype=torch.int64)
-
-
-def normalize_token_sequences(results: Any) -> Optional[List[List[int]]]:
-    """Normalize various result formats to List[List[int]]."""
-    if torch.is_tensor(results):
-        results = results.detach().cpu().tolist()
-    elif isinstance(results, np.ndarray):
-        results = results.tolist()
-    elif isinstance(results, list) and results and torch.is_tensor(results[0]):
-        results = [item.detach().cpu().tolist() for item in results]
-
-    # Handle nested single-element lists
-    if isinstance(results, list) and len(results) == 1:
-        inner = results[0]
-        if torch.is_tensor(inner):
-            results = inner.detach().cpu().tolist()
-        elif isinstance(inner, np.ndarray):
-            results = inner.tolist()
-        else:
-            results = inner
-
-    if isinstance(results, list):
-        if results and all(isinstance(x, int) for x in results):
-            return [list(results)]
-        if results and all(isinstance(x, (list, tuple)) for x in results):
-            return [list(seq) for seq in results]
-    return None
-
-
 def run_inference_via_http_api(
     queries: List[str],
     max_input_length: Optional[int],
@@ -142,7 +45,7 @@ def run_inference_via_http_api(
     base_url: str,
     ignore_eos: bool = False,
     timeout_s: float = 6000.0,
-) -> List[torch.Tensor]:
+) -> List[str]:
     """Run inference via BatchGen HTTP API.
 
     Args:
@@ -154,7 +57,7 @@ def run_inference_via_http_api(
         timeout_s: Request timeout in seconds
 
     Returns:
-        List of output token tensors
+        List of decoded output strings
     """
     client = BatchGenHttpClient(base_url, timeout_s)
 
@@ -162,33 +65,17 @@ def run_inference_via_http_api(
     if not client.health_check():
         logger.warning("Server health check failed, proceeding anyway...")
 
-    payload = {
-        "prompts": queries,
-        "max_input_len": max_input_length,
-        "max_output_len": max_decoding_length,
-        "ignore_eos": ignore_eos,
-    }
-
     start_time = pd.Timestamp.now()
-    response = client.post_json("/v1/inference", payload)
+    results = client.submit_inference(
+        prompts=queries,
+        max_input_len=max_input_length,
+        max_output_len=max_decoding_length,
+        ignore_eos=ignore_eos,
+    )
     latency = (pd.Timestamp.now() - start_time).total_seconds()
+    logger.info(f"Inference completed in {latency:.2f}s")
 
-    server_latency_ms = response.get("latency_ms", "N/A")
-    logger.info(f"Inference completed in {latency:.2f}s (server latency: {server_latency_ms}ms)")
-
-    if response.get("status") != "success":
-        raise RuntimeError(f"Inference failed: {response}")
-
-    results = response.get("results")
-    if not results:
-        raise RuntimeError("Server returned empty results.")
-
-    # Normalize results to List[List[int]]
-    sequences = normalize_token_sequences(results)
-    if not sequences:
-        raise RuntimeError(f"Unexpected result format: {type(results)}")
-
-    return [_tensorize_sequence(tokens) for tokens in sequences]
+    return results
 
 
 if __name__ == "__main__":
@@ -330,13 +217,13 @@ if __name__ == "__main__":
     print_result = True
     if print_result:
         for idx in range(len(answer_set)):
-            tmp_answer = decode_to_eos(tokenizer, answer_set[idx].tolist())
+            # Results are now decoded strings directly from the server
             print(
                 "=================================================================="
             )
             print(f"Query {idx}: {queries[idx]}")
             print("\n\n")
-            print(f"Answer {idx}: {tmp_answer}")
+            print(f"Answer {idx}: {answer_set[idx]}")
             print(
                 "=================================================================="
             )
@@ -351,7 +238,8 @@ if __name__ == "__main__":
     incorrect_samples: List[Dict[str, Any]] = []
 
     for i in range(total_samples):
-        model_output = decode_to_eos(tokenizer, answer_set[i].tolist())
+        # Results are now decoded strings directly from the server
+        model_output = answer_set[i]
         extracted_answer, think_tag_found = extract_prediction(model_output)
         if not think_tag_found:
             no_think_tag_count += 1
