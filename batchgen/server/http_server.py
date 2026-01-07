@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from batchgen.server.batch_scheduler import BatchScheduler, parse_batch_file
 from batchgen.server.io_struct import (
@@ -37,6 +39,42 @@ from batchgen.server.storage import StorageManager
 from batchgen.server.worker_manager import WorkerExitState, WorkerManager
 
 logger = logging.getLogger(__name__)
+
+# Pattern for endpoints that should have quiet logging (only log errors)
+# GET requests to batch status endpoints are very frequent during polling
+QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /health$")
+
+
+class QuietAccessLogMiddleware(BaseHTTPMiddleware):
+    """Middleware to reduce verbose access logging for polling endpoints.
+
+    Only logs requests that:
+    - Return non-2xx status codes (errors)
+    - Are POST/PUT/DELETE requests (state changes)
+    - Are not in the QUIET_ENDPOINTS pattern
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.perf_counter()
+        response = await call_next(request)
+
+        # Build request signature
+        request_line = f"{request.method} {request.url.path}"
+
+        # Decide whether to log
+        should_log = True
+        if QUIET_ENDPOINTS.match(request_line):
+            # Only log if error status
+            should_log = response.status_code >= 400
+
+        if should_log:
+            process_time = (time.perf_counter() - start_time) * 1000
+            logger.info(
+                f"{request.client.host}:{request.client.port} - "
+                f"\"{request_line}\" {response.status_code} ({process_time:.0f}ms)"
+            )
+
+        return response
 
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -70,6 +108,9 @@ def create_app(
 
     app = FastAPI(title="BatchGen OpenAI-Compatible API", lifespan=lifespan)
     app.state.worker_exit_state = worker_exit_state
+
+    # Add custom access logging middleware (replaces uvicorn's default)
+    app.add_middleware(QuietAccessLogMiddleware)
 
     @app.post("/v1/files", response_model=FileObject)
     async def upload_file(
@@ -406,6 +447,7 @@ def launch_server(server_args: ServerArgs) -> None:
             host=server_args.listen_ip,
             port=server_args.listen_port,
             log_level="info",
+            access_log=False,  # Use custom QuietAccessLogMiddleware instead
             timeout_keep_alive=1000,
             loop="uvloop",
         )
