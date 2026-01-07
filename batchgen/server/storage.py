@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Optional
@@ -115,12 +116,19 @@ class StorageManager:
     def write_output_file(
         self, file_id: str, items: List[BatchResultItem]
     ) -> Path:
-        output_path = self.files_dir / file_id
-        with output_path.open("w", encoding="utf-8") as handle:
+        # Write to files_dir for API access via /v1/files/{id}/content
+        api_path = self.files_dir / file_id
+        with api_path.open("w", encoding="utf-8") as handle:
             for item in items:
                 handle.write(json.dumps(item.dict(), default=str))
                 handle.write("\n")
-        return output_path
+
+        # Also write to output_dir with .jsonl extension for direct access
+        output_path = self.output_dir / f"{file_id}.jsonl"
+        shutil.copy(api_path, output_path)
+        logger.info(f"Batch results saved to {output_path}")
+
+        return api_path
 
     # ---------------------- Helpers ----------------------
     def _write_json(self, path: Path, data: Dict) -> None:

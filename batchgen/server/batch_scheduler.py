@@ -297,20 +297,29 @@ class BatchScheduler:
                     message="No result returned for this request.",
                 )
             else:
-                token_ids = self._coerce_token_ids(result)
-                if token_ids is None:
-                    error = BatchError(
-                        code="invalid_result",
-                        message=(
-                            "Unsupported result payload: " f"{type(result)}"
-                        ),
-                    )
-                else:
-                    prompt_text = prompts[idx] if idx < len(prompts) else ""
-                    body = self._build_response_body(
-                        request, token_ids, prompt_text
+                prompt_text = prompts[idx] if idx < len(prompts) else ""
+                # Handle both decoded strings and token IDs
+                if isinstance(result, str):
+                    # Worker returned decoded string (server-side detokenization)
+                    body = self._build_response_body_from_text(
+                        request, result, prompt_text
                     )
                     response = self._wrap_response(body)
+                else:
+                    # Worker returned token IDs (legacy behavior)
+                    token_ids = self._coerce_token_ids(result)
+                    if token_ids is None:
+                        error = BatchError(
+                            code="invalid_result",
+                            message=(
+                                "Unsupported result payload: " f"{type(result)}"
+                            ),
+                        )
+                    else:
+                        body = self._build_response_body(
+                            request, token_ids, prompt_text
+                        )
+                        response = self._wrap_response(body)
 
             output.append(
                 BatchResultItem(
@@ -380,6 +389,66 @@ class BatchScheduler:
                 usage=usage,
             )
         return body
+
+    def _build_response_body_from_text(
+        self,
+        request: BatchRequestItem,
+        decoded_text: str,
+        prompt_text: str,
+    ) -> BatchResponseBody:
+        """Build response body from decoded text (server-side detokenization)."""
+        model = request.body.model
+        created_at = int(time.time())
+        usage = self._build_usage_from_text(model, prompt_text, decoded_text)
+
+        if request.url == BatchEndpoint.CHAT_COMPLETIONS:
+            body: BatchResponseBody = ChatCompletionResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex}",
+                created=created_at,
+                model=model,
+                choices=[
+                    ChatCompletionChoice(
+                        index=0,
+                        message=ChatCompletionChoiceMessage(
+                            content=decoded_text
+                        ),
+                        logprobs=None,
+                        finish_reason=None,
+                    )
+                ],
+                usage=usage,
+            )
+        else:
+            body = CompletionResponse(
+                id=f"cmpl-{uuid.uuid4().hex}",
+                created=created_at,
+                model=model,
+                choices=[
+                    CompletionChoice(
+                        index=0,
+                        text=decoded_text,
+                        logprobs=None,
+                        finish_reason=None,
+                    )
+                ],
+                usage=usage,
+            )
+        return body
+
+    def _build_usage_from_text(
+        self, model: str, prompt_text: str, completion_text: str
+    ) -> Optional[Usage]:
+        """Build usage stats from text (for server-side detokenization)."""
+        tokenizer = self._get_tokenizer(model)
+        if tokenizer is None:
+            return None
+        prompt_tokens = self._count_tokens(tokenizer, prompt_text)
+        completion_tokens = self._count_tokens(tokenizer, completion_text)
+        return Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
 
     def _build_usage(
         self, model: str, prompt_text: str, token_ids: List[int]
