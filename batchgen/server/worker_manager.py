@@ -10,6 +10,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import psutil
+
 import torch
 import torch.multiprocessing as mp
 
@@ -17,6 +19,7 @@ from batchgen.batchgen_worker import BatchGenWorkerArgs
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
+from batchgen.server.process_utils import cleanup_resources
 from batchgen.server.server_args import ServerArgs
 from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
@@ -89,6 +92,7 @@ class WorkerManager:
         self._stopping = False
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
+        self._hugepages_enabled = False  # Track if hugepages were configured
 
     # ---------------------- Public API ----------------------
     def start(self) -> None:
@@ -100,6 +104,7 @@ class WorkerManager:
         self._ready_event.clear()
         if self.args.enable_hugetlbfs:
             self._config_hugepages()
+            self._hugepages_enabled = True
 
         config_torch_module_initializer()
         if self.args.host_kv_cache_size:
@@ -123,19 +128,70 @@ class WorkerManager:
             return
         self._stopping = True
         self._monitor_stop_event.set()
+        logger.info("Stopping WorkerManager...")
+
+        # Stop the monitor thread
         if self._monitor_thread is not None:
             self._monitor_thread.join(timeout=5)
+
+        # Collect worker PIDs before sending shutdown signal
+        worker_pids = self._get_worker_pids()
+
+        # Send poison pill to signal graceful shutdown
         try:
             self.request_queue.put(None)
         except Exception:
             logger.warning("Failed to signal worker shutdown", exc_info=True)
+
+        # Wait for workers to exit gracefully
+        workers_joined = False
         if self.worker_process is not None:
             try:
                 with self._join_lock:
                     self.worker_process.join(timeout=30)
+                workers_joined = True
             except Exception:
                 logger.warning("Failed to join worker process", exc_info=True)
+
+        # Force-kill workers that didn't exit gracefully
+        if not workers_joined and worker_pids:
+            logger.warning(
+                "Workers did not exit gracefully, force-killing..."
+            )
+            for pid in worker_pids:
+                try:
+                    proc = psutil.Process(pid)
+                    proc.kill()
+                    logger.info(f"Force-killed worker process {pid}")
+                except Exception:
+                    pass
+
+        # Get shm_name for cleanup if available
+        shm_name = self.model_info.get("shm_name")
+        shm_prefix = shm_name if shm_name else "batchgen"
+
+        # Cleanup resources (shared memory, hugepages, etc.)
+        cleanup_resources(
+            shm_prefix=shm_prefix,
+            clean_hugepages=self._hugepages_enabled,
+            kill_workers=False,  # Already handled above
+        )
+
         self.started = False
+        logger.info("WorkerManager stopped")
+
+    def _get_worker_pids(self) -> List[int]:
+        """Get PIDs of all worker processes."""
+        pids = []
+        if self.worker_process is None:
+            return pids
+        processes = getattr(self.worker_process, "processes", None)
+        if not processes:
+            return pids
+        for proc in processes:
+            if proc.pid is not None:
+                pids.append(proc.pid)
+        return pids
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state

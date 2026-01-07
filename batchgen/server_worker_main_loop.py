@@ -1,6 +1,7 @@
 import importlib
 import logging
 import os
+import signal
 import sys
 import time
 import traceback
@@ -11,6 +12,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
+from batchgen.server.process_utils import install_worker_signal_handlers
 from batchgen.server.watchdog import Watchdog
 
 
@@ -90,6 +92,19 @@ def _server_worker_main_impl(
 	"""
 	# Step 0: Configure logging for this worker process first
 	_setup_worker_logging(rank_idx)
+
+	# Step 0.1: Install signal handlers so workers respond to Ctrl+C
+	# This is critical for multi-node setups where node 1 workers might be
+	# blocked in NCCL operations when node 0 is killed.
+	def _worker_shutdown_callback():
+		"""Cleanup callback when worker receives termination signal."""
+		try:
+			if dist.is_available() and dist.is_initialized():
+				dist.destroy_process_group()
+		except Exception:
+			pass
+
+	install_worker_signal_handlers(_worker_shutdown_callback)
 
 	# Step 0.5: Set up NCCL environment for reliability
 	_setup_nccl_env()

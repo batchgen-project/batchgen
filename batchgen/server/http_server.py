@@ -374,8 +374,25 @@ def create_app(
 
 def launch_server(server_args: ServerArgs) -> None:
     """Launch the HTTP server."""
+    import signal
+    from batchgen.server.process_utils import cleanup_resources
+
     worker_exit_state = WorkerExitState()
     app = create_app(server_args, worker_exit_state)
+    shutdown_requested = False
+
+    def shutdown_handler(signum, frame):
+        nonlocal shutdown_requested
+        sig_name = signal.Signals(signum).name
+        logger.info(f"Received {sig_name}, initiating graceful shutdown...")
+        shutdown_requested = True
+        # Re-raise to let uvicorn handle shutdown
+        raise KeyboardInterrupt()
+
+    # Install signal handlers for graceful shutdown
+    original_sigint = signal.signal(signal.SIGINT, shutdown_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, shutdown_handler)
+
     try:
         logger.info("Starting BatchGen HTTP server.")
         uvicorn.run(
@@ -386,8 +403,24 @@ def launch_server(server_args: ServerArgs) -> None:
             timeout_keep_alive=1000,
             loop="uvloop",
         )
+    except KeyboardInterrupt:
+        if shutdown_requested:
+            logger.info("Graceful shutdown initiated by signal.")
     finally:
+        # Restore original signal handlers
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+
         logger.info("HTTP server stopped.")
+
+        # Final cleanup in case lifespan cleanup was incomplete
+        # (e.g., if server was killed before lifespan could run)
+        cleanup_resources(
+            shm_prefix=None,  # Clean all shared memory files
+            clean_hugepages=server_args.enable_hugetlbfs,
+            kill_workers=True,  # Force kill any remaining workers
+        )
+
         if worker_exit_state.is_failed():
             reason = worker_exit_state.reason or "Worker process exited."
             raise RuntimeError(reason)
