@@ -12,6 +12,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
+from batchgen.server.distributed_kill import (
+	DistributedKillSwitch,
+	create_kill_switch,
+)
 from batchgen.server.process_utils import install_worker_signal_handlers
 from batchgen.server.watchdog import Watchdog
 
@@ -137,6 +141,16 @@ def _server_worker_main_impl(
 	torch.cuda.set_device(args.local_rank)
 	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
 
+	# Initialize distributed kill switch for coordinated shutdown across all nodes
+	# This must happen after process group init but before any worker operations
+	kill_switch = create_kill_switch(
+		rank=args.global_rank,
+		world_size=args.world_size,
+		local_rank=args.local_rank,
+		heartbeat_interval=10.0,  # Check every 10 seconds
+	)
+	logging.info(f"Rank {args.global_rank}: Distributed kill switch initialized")
+
 	# CRITICAL: Warmup NCCL connections before entering server loop
 	# This ensures all inter-node NCCL connections are fully established
 	# before any application-level communication happens.
@@ -223,11 +237,22 @@ def _server_worker_main_impl(
 
 	logging.info(f"Entering main server loop on rank {global_rank}.")
 	while True:
+		# --- STEP 0: Check kill switch before each iteration ---
+		if kill_switch.should_exit():
+			logging.warning(f"Rank {global_rank}: Kill switch triggered, exiting main loop. Reason: {kill_switch.kill_reason}")
+			break
+
 		# --- STEP 1: Data Acquisition with heartbeat to prevent NCCL timeout ---
 		task_data = None
 		work_available = False
 
 		while not work_available:
+			# Check kill switch during idle polling
+			if kill_switch.should_exit():
+				logging.warning(f"Rank {global_rank}: Kill switch triggered during idle, exiting.")
+				task_data = None  # Signal shutdown
+				work_available = True
+				break
 			if global_rank == 0:
 				# Rank 0: Non-blocking poll on queue with timeout
 				try:
@@ -321,6 +346,8 @@ def _server_worker_main_impl(
 			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
 			inference_error = str(e)
 			local_results = []
+			# Trigger distributed kill so all workers exit
+			kill_switch.trigger_kill(f"Inference error on rank {global_rank}: {e}")
 
 		# --- STEP 5: Gather Results back to Rank 0 ---
 		gather_list = [None for _ in range(world_size)] if global_rank == 0 else None
@@ -359,4 +386,6 @@ def _server_worker_main_impl(
 		# not here. This ensures we only monitor actual inference operations.
 
 	# Cleanup
+	kill_switch.stop()
 	dist.destroy_process_group()
+	logging.info(f"Rank {global_rank}: Worker shutdown complete")
