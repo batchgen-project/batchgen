@@ -83,10 +83,12 @@ class BatchGenClient:
         max_input_len: Optional[int] = None,
         max_output_len: int = 128,
         ignore_eos: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Optional[Dict]:
         """
         Submit inference request with generation parameters.
-        
+
         Args:
             queries: List of prompt strings
             max_input_len: Maximum input sequence length. If None, determined
@@ -94,7 +96,9 @@ class BatchGenClient:
             max_output_len: Maximum output/decoding length
             ignore_eos: If True, ignore EOS tokens and decode to max_output_len
                        (useful for benchmarking)
-        
+            temperature: Sampling temperature (None = greedy decoding)
+            top_p: Nucleus sampling threshold (None = disabled)
+
         Returns:
             Server response dictionary
         """
@@ -105,6 +109,10 @@ class BatchGenClient:
             "max_output_len": max_output_len,
             "ignore_eos": ignore_eos,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
         return self.send_request(payload)
 
     def ping(self) -> Optional[Dict]:
@@ -173,6 +181,8 @@ class BatchGenHttpClient:
         max_input_len: Optional[int] = None,
         max_output_len: int = 128,
         ignore_eos: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> List[str]:
         """Submit inference request and get decoded string results.
 
@@ -182,6 +192,8 @@ class BatchGenHttpClient:
                           dynamically from the longest prompt in the batch.
             max_output_len: Maximum output/decoding length
             ignore_eos: If True, ignore EOS tokens and decode to max_output_len
+            temperature: Sampling temperature (None = greedy decoding)
+            top_p: Nucleus sampling threshold (None = disabled)
 
         Returns:
             List of decoded output strings
@@ -189,12 +201,16 @@ class BatchGenHttpClient:
         Raises:
             RuntimeError: If inference fails or returns unexpected format
         """
-        payload = {
+        payload: Dict[str, Any] = {
             "prompts": prompts,
             "max_input_len": max_input_len,
             "max_output_len": max_output_len,
             "ignore_eos": ignore_eos,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
 
         response = self.post_json("/v1/inference", payload)
 
@@ -242,6 +258,9 @@ class BatchGenHttpClient:
         endpoint: str = "/v1/chat/completions",
         completion_window: str = "24h",
         metadata: Optional[Dict[str, Any]] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Create a batch job.
 
@@ -250,17 +269,26 @@ class BatchGenHttpClient:
             endpoint: Target endpoint ('/v1/chat/completions' or '/v1/completions')
             completion_window: Time window for completion ('24h')
             metadata: Optional metadata dictionary
+            max_tokens: Override max tokens for all requests (None = use per-request)
+            temperature: Sampling temperature (None = greedy decoding)
+            top_p: Nucleus sampling threshold (None = disabled)
 
         Returns:
             Batch object with id, status, etc.
         """
-        payload = {
+        payload: Dict[str, Any] = {
             "input_file_id": input_file_id,
             "endpoint": endpoint,
             "completion_window": completion_window,
         }
         if metadata:
             payload["metadata"] = metadata
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
         return self.post_json("/v1/batches", payload)
 
     def get_batch(self, batch_id: str) -> Dict[str, Any]:
@@ -354,6 +382,9 @@ class BatchGenHttpClient:
         endpoint: str = "/v1/chat/completions",
         poll_interval: float = 5.0,
         timeout: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Submit a batch job and wait for completion.
 
@@ -369,6 +400,9 @@ class BatchGenHttpClient:
             endpoint: Target endpoint
             poll_interval: Seconds between status checks
             timeout: Maximum seconds to wait
+            max_tokens: Override max tokens for all requests (None = use per-request)
+            temperature: Sampling temperature (None = greedy decoding)
+            top_p: Nucleus sampling threshold (None = disabled)
 
         Returns:
             Final batch object with output_file_id
@@ -381,7 +415,13 @@ class BatchGenHttpClient:
 
         # 2. Create batch
         logger.info("Creating batch...")
-        batch = self.create_batch(file_id, endpoint=endpoint)
+        batch = self.create_batch(
+            file_id,
+            endpoint=endpoint,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
         batch_id = batch["id"]
         logger.info(f"Created batch: {batch_id}")
 

@@ -165,6 +165,8 @@ def run_batch_workflow(
     base_url: str,
     poll_interval: float = 5.0,
     timeout: Optional[float] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Run the full OpenAI Batch API workflow.
 
@@ -174,6 +176,8 @@ def run_batch_workflow(
         base_url: Server base URL
         poll_interval: Seconds between status checks
         timeout: Maximum seconds to wait
+        temperature: Sampling temperature (None = greedy decoding)
+        top_p: Nucleus sampling threshold (None = disabled)
 
     Returns:
         List of result dictionaries
@@ -192,6 +196,8 @@ def run_batch_workflow(
         endpoint="/v1/chat/completions",
         poll_interval=poll_interval,
         timeout=timeout,
+        temperature=temperature,
+        top_p=top_p,
     )
 
     # Download and parse results
@@ -246,6 +252,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--timeout", type=float, default=None, help="Maximum seconds to wait for batch"
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (default: None = greedy decoding)",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling threshold (default: None = disabled)",
+    )
     args = parser.parse_args()
 
     # Construct base URL
@@ -292,12 +310,16 @@ if __name__ == "__main__":
 
     # Run batch workflow
     logger.info(f"Connecting to server at {base_url}")
+    if args.temperature is not None or args.top_p is not None:
+        logger.info(f"Sampling params: temperature={args.temperature}, top_p={args.top_p}")
     results = run_batch_workflow(
         input_file_path=str(input_file),
         output_file_path=None,  # Results downloaded from server
         base_url=base_url,
         poll_interval=args.poll_interval,
         timeout=args.timeout,
+        temperature=args.temperature,
+        top_p=args.top_p,
     )
 
     # Sort results by custom_id to match original order
