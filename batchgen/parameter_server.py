@@ -4,8 +4,10 @@ Standalone Parameter Server for BatchGen
 This script starts a long-running parameter server that hosts model weights in shared memory.
 It uses socket communication to handle requests from client processes.
 """
+import atexit
 import os
 import sys
+import tempfile
 import time
 import logging
 import argparse
@@ -68,24 +70,42 @@ class ParameterServer:
 		
 		# Shared memory for skeleton state dict
 		self.skeleton_state_dict_shm_name = None
-		
+		self.skeleton_state_dict_file = None
+
+		# Register atexit cleanup for temp files (handles normal exits, exceptions, etc.)
+		atexit.register(self._cleanup_temp_files)
+
 		# Setup signal handlers for graceful shutdown
 		signal.signal(signal.SIGINT, self.handle_shutdown)
 		signal.signal(signal.SIGTERM, self.handle_shutdown)
 
+	def _cleanup_temp_files(self):
+		"""Clean up temporary skeleton state dict file. Called by atexit and signal handlers."""
+		if self.skeleton_state_dict_file and os.path.exists(self.skeleton_state_dict_file):
+			try:
+				logging.info(f"Cleaning up skeleton state dict temp file: {self.skeleton_state_dict_file}")
+				os.remove(self.skeleton_state_dict_file)
+				self.skeleton_state_dict_file = None
+			except Exception as e:
+				logging.warning(f"Failed to cleanup temp file {self.skeleton_state_dict_file}: {e}")
+
 	def create_skeleton_state_dict_shared_memory(self, skeleton_state_dict):
 		"""
-		Create file-based storage for large skeleton state dict with PyTorch compatibility
-		
+		Create file-based storage for large skeleton state dict with PyTorch compatibility.
+
+		Uses Python's tempfile module for automatic cleanup on process exit.
+		The temp file is created in the system temp directory and registered
+		for cleanup via atexit.
+
 		Args:
 			skeleton_state_dict: The skeleton state dict to put in shared memory
-			
+
 		Returns:
 			Name of the file identifier
 		"""
 		try:
 			logging.info("Starting serialization of skeleton state dict...")
-			
+
 			# Use torch.save instead of pickle for PyTorch tensors
 			import io
 			buffer = io.BytesIO()
@@ -93,36 +113,36 @@ class ParameterServer:
 			serialized_dict = buffer.getvalue()
 			serialized_size = len(serialized_dict)
 			logging.info(f"Serialized skeleton state dict size: {serialized_size} bytes")
-			
-			# Create a backup directory
-			backup_dir = os.path.join(os.getcwd(), "shared_memory_backup")
-			os.makedirs(backup_dir, exist_ok=True)
-			
-			# Create a unique filename
-			import random
-			import string
-			timestamp = int(time.time()) % 10000
-			random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
-			file_name = f"skel_{timestamp}_{random_suffix}.pt"  # Use .pt extension for PyTorch files
-			file_path = os.path.join(backup_dir, file_name)
-			
+
+			# Clean up previous temp file if exists
+			self._cleanup_temp_files()
+
+			# Use tempfile.mkstemp for a secure temp file in system temp directory
+			# The file persists until explicitly deleted (not auto-deleted on close)
+			# This allows worker processes to read it
+			fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
+
+			# Close the file descriptor - we'll use torch.save which opens its own handle
+			os.close(fd)
+
 			# Write the file directly with torch.save
-			logging.info(f"Writing large state dict to file: {file_path}")
+			logging.info(f"Writing skeleton state dict to temp file: {file_path}")
 			torch.save(skeleton_state_dict, file_path)
-			
+
 			# Verify the file was written correctly
 			actual_size = os.path.getsize(file_path)
-			logging.info(f"Successfully wrote state dict to file, size: {actual_size} bytes")
-			
-			# Store the file path for cleanup later
+			logging.info(f"Successfully wrote state dict to temp file, size: {actual_size} bytes")
+
+			# Store the file path for cleanup later (via atexit or signal handlers)
 			self.skeleton_state_dict_file = file_path
-			
-			# No need for shared memory name anymore, just use the file name as identifier
+
+			# Use the full path as the identifier (clients need to know where to find it)
+			file_name = os.path.basename(file_path)
 			self.skeleton_state_dict_shm_name = file_name
-			
+
 			return file_name
 		except Exception as e:
-			logging.error(f"Error creating shared memory: {e}")
+			logging.error(f"Error creating skeleton state dict temp file: {e}")
 			return None
 	
 	def create_skeleton_state_dict_shared_memory_dep(self, skeleton_state_dict):
@@ -476,15 +496,8 @@ class ParameterServer:
 			except Exception as e:
 				logging.warning(f"Shared memory cleanup not properly, you may need to manually clear by `rm -f /dev/hugepages/{shm_path}`: {e}")
 
-		# rm -rf Writing large state dict to file:
-		if hasattr(self, 'skeleton_state_dict_file') and self.skeleton_state_dict_file:
-			try:
-				if os.path.exists(self.skeleton_state_dict_file):
-					logging.info(f"Removing skeleton state dict temporary file: {self.skeleton_state_dict_file}")
-					os.remove(self.skeleton_state_dict_file)
-					self.skeleton_state_dict_file = None
-			except Exception as e:
-				logging.warning(f"Deleting emoving skeleton state dict temporary file not properly, please manually clean ./shared_memory_backup/: {e}")
+		# Clean up skeleton state dict temp file
+		self._cleanup_temp_files()
 
 
 		self.running = False

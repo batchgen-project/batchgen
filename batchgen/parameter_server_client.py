@@ -8,6 +8,7 @@ import json
 import pickle
 import struct
 import logging
+import tempfile
 import time
 from typing import Dict, Any, Optional, List, Union
 from multiprocessing import shared_memory
@@ -220,38 +221,52 @@ class ParameterServerClient:
                 raise RuntimeError(f"Failed to load skeleton state dict: {e}")
         
         else:
-            # Fall back to shared memory method if file not found (backwards compatibility)
+            # Fall back: search for file by name in multiple locations
             skeleton_state_dict_shm_name = response.get('skeleton_state_dict_shm_name')
-            if skeleton_state_dict_shm_name and skeleton_state_dict_shm_name.endswith('.bin'):
-                # This is actually a file name, not shared memory
-                # Try looking in the backup directory
-                backup_dir = os.path.join(os.getcwd(), "shared_memory_backup")
-                file_path = os.path.join(backup_dir, skeleton_state_dict_shm_name)
-                
-                if os.path.exists(file_path):
-                    try:
-                        logging.info(f"Loading skeleton state dict from backup file: {file_path}")
-                        
-                        # Similar code as above to read the file
-                        with open(file_path, 'rb') as f:
-                            size_bytes = f.read(8)
-                            serialized_size = struct.unpack('!Q', size_bytes)[0]
-                            
-                            data = bytearray(serialized_size)
-                            chunk_size = 100 * 1024 * 1024
-                            for i in range(0, serialized_size, chunk_size):
-                                end = min(i + chunk_size, serialized_size)
-                                chunk = f.read(end - i)
-                                data[i:i+len(chunk)] = chunk
-                        
-                        skeleton_state_dict = pickle.loads(bytes(data))
-                        response['skeleton_state_dict'] = skeleton_state_dict
-                        
-                    except Exception as e:
-                        logging.error(f"Error loading from backup file: {e}")
-                        raise RuntimeError(f"Failed to load skeleton state dict: {e}")
-                else:
-                    raise RuntimeError(f"Skeleton state dict file not found: {file_path}")
+            if skeleton_state_dict_shm_name:
+                # Search locations in order of preference
+                search_paths = [
+                    # 1. System temp directory (new location)
+                    os.path.join(tempfile.gettempdir(), skeleton_state_dict_shm_name),
+                    # 2. Legacy backup directory
+                    os.path.join(os.getcwd(), "shared_memory_backup", skeleton_state_dict_shm_name),
+                ]
+
+                file_found = False
+                for file_path in search_paths:
+                    if os.path.exists(file_path):
+                        try:
+                            logging.info(f"Loading skeleton state dict from: {file_path}")
+
+                            if file_path.endswith('.pt'):
+                                # PyTorch format (new)
+                                skeleton_state_dict = torch.load(file_path)
+                            else:
+                                # Legacy pickle format (.bin)
+                                with open(file_path, 'rb') as f:
+                                    size_bytes = f.read(8)
+                                    serialized_size = struct.unpack('!Q', size_bytes)[0]
+
+                                    data = bytearray(serialized_size)
+                                    chunk_size = 100 * 1024 * 1024
+                                    for i in range(0, serialized_size, chunk_size):
+                                        end = min(i + chunk_size, serialized_size)
+                                        chunk = f.read(end - i)
+                                        data[i:i+len(chunk)] = chunk
+
+                                skeleton_state_dict = pickle.loads(bytes(data))
+
+                            logging.info(f"Successfully loaded skeleton state dict with {len(skeleton_state_dict)} keys")
+                            response['skeleton_state_dict'] = skeleton_state_dict
+                            file_found = True
+                            break
+
+                        except Exception as e:
+                            logging.warning(f"Error loading from {file_path}: {e}, trying next location...")
+                            continue
+
+                if not file_found:
+                    raise RuntimeError(f"Skeleton state dict file not found in any location: {search_paths}")
         
         return response
 
