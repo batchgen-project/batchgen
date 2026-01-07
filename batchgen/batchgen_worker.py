@@ -54,6 +54,8 @@ from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits
 from batchgen.continuous_batching import FastBoundaryTimingStats
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
+# Migration data structures for KV cache migration between nodes
+from batchgen.migration import MigrationOp, HostKVStats
 
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
@@ -1452,11 +1454,11 @@ class BatchGenWorker:
 
 		return should_trigger
 
-	def _plan_kv_migration(self) -> List[Dict]:
+	def _plan_kv_migration(self) -> List[MigrationOp]:
 		"""Plan sequence migrations to rebalance host KV across nodes.
 
 		Returns:
-			List of migration ops: [{'uuid': str, 'from_rank': int, 'to_rank': int, 'pages': int}, ...]
+			List of MigrationOp objects describing planned migrations.
 		"""
 		# Gather host KV stats from all local_rank 0
 		if self.local_rank == 0:
@@ -1571,13 +1573,13 @@ class BatchGenWorker:
 					dest_rank = dest_node_id * NUM_GPUS_PER_NODE  # Fallback to rank 0
 				self._dest_rank_counter[dest_node_id] += 1
 
-				# Record migration
-				migrations.append({
-					'uuid': uuid,
-					'from_rank': seq.assigned_rank,
-					'to_rank': dest_rank,
-					'pages': pages_needed
-				})
+				# Record migration using MigrationOp dataclass
+				migrations.append(MigrationOp(
+					uuid=uuid,
+					from_rank=seq.assigned_rank,
+					to_rank=dest_rank,
+					pages=pages_needed
+				))
 
 				# Mark as migrated to avoid selecting again
 				migrated_uuids.add(uuid)
@@ -1591,7 +1593,7 @@ class BatchGenWorker:
 					underutilized = [(nid, s) for nid, s in underutilized if nid != dest_node_id]
 
 		# Sanity check: ensure no duplicate UUIDs in migrations
-		migration_uuids = [m['uuid'] for m in migrations]
+		migration_uuids = [m.uuid for m in migrations]
 		if len(migration_uuids) != len(set(migration_uuids)):
 			duplicate_uuids = [u for u in migration_uuids if migration_uuids.count(u) > 1]
 			logging.error(
@@ -1602,8 +1604,8 @@ class BatchGenWorker:
 			seen = set()
 			unique_migrations = []
 			for mig in migrations:
-				if mig['uuid'] not in seen:
-					seen.add(mig['uuid'])
+				if mig.uuid not in seen:
+					seen.add(mig.uuid)
 					unique_migrations.append(mig)
 			migrations = unique_migrations
 			logging.warning(f"MIGRATION: Removed duplicates, {len(migrations)} unique migrations remain")
@@ -1613,8 +1615,8 @@ class BatchGenWorker:
 				logging.info(f"MIGRATION: Planned {len(migrations)} sequence migrations")
 				for i, mig in enumerate(migrations[:5]):  # Log first 5
 					logging.info(
-						f"MIGRATION:   #{i+1}: seq {mig['uuid'][:8]}... "
-						f"rank {mig['from_rank']} -> {mig['to_rank']} ({mig['pages']} pages)"
+						f"MIGRATION:   #{i+1}: seq {mig.uuid[:8]}... "
+						f"rank {mig.from_rank} -> {mig.to_rank} ({mig.pages} pages)"
 					)
 				if len(migrations) > 5:
 					logging.info(f"MIGRATION:   ... and {len(migrations)-5} more")
@@ -1623,7 +1625,7 @@ class BatchGenWorker:
 
 		return migrations
 
-	def _execute_kv_migrations_parallel(self, migrations: List[Dict]) -> None:
+	def _execute_kv_migrations_parallel(self, migrations: List[MigrationOp]) -> None:
 		"""Execute multiple KV migrations in parallel to utilize all network cards.
 
 		Groups migrations by independent rank pairs and executes them concurrently.
@@ -1631,7 +1633,7 @@ class BatchGenWorker:
 		call barrier to stay synchronized.
 
 		Args:
-			migrations: List of migration dicts with 'uuid', 'from_rank', 'to_rank', 'pages'
+			migrations: List of MigrationOp objects describing migrations to execute.
 		"""
 		if not migrations:
 			return
@@ -1656,26 +1658,26 @@ class BatchGenWorker:
 			# Find if this rank participates in this round
 			my_migration = None
 			for mig in round_migrations:
-				if self.rank == mig['from_rank'] or self.rank == mig['to_rank']:
+				if self.rank == mig.from_rank or self.rank == mig.to_rank:
 					my_migration = mig
 					break
 
 			# Execute migration if participating, otherwise just sync tensor shape info
 			if my_migration is not None:
 				# Verify sequence exists and is in expected state before migration
-				seq = self.global_batch.get_sequence(my_migration['uuid'])
+				seq = self.global_batch.get_sequence(my_migration.uuid)
 				if seq is None:
-					logging.error(f"MIGRATION: Rank {self.rank}: SKIP migration - seq {my_migration['uuid'][:8]}... not found!")
+					logging.error(f"MIGRATION: Rank {self.rank}: SKIP migration - seq {my_migration.uuid[:8]}... not found!")
 				else:
 					if BATCHGEN_CB_DEBUG:
 						logging.debug(
-							f"MIGRATION: Rank {self.rank}: Executing migration for {my_migration['uuid'][:8]}... "
+							f"MIGRATION: Rank {self.rank}: Executing migration for {my_migration.uuid[:8]}... "
 							f"(global_idx={seq.global_idx}, status={seq.status}, assigned_rank={seq.assigned_rank})"
 						)
 					self._execute_single_kv_migration(
-						uuid=my_migration['uuid'],
-						from_rank=my_migration['from_rank'],
-						to_rank=my_migration['to_rank']
+						uuid=my_migration.uuid,
+						from_rank=my_migration.from_rank,
+						to_rank=my_migration.to_rank
 					)
 
 			# Barrier after each round to ensure all transfers in this round complete
@@ -1684,14 +1686,14 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(f"MIGRATION: All {len(rounds)} parallel rounds completed")
 
-	def _group_migrations_for_parallel_execution(self, migrations: List[Dict]) -> List[List[Dict]]:
+	def _group_migrations_for_parallel_execution(self, migrations: List[MigrationOp]) -> List[List[MigrationOp]]:
 		"""Group migrations into rounds that can execute in parallel.
 
 		Migrations in the same round must not share any source or destination ranks.
 		This ensures no rank is involved in multiple send/recv operations simultaneously.
 
 		Args:
-			migrations: List of migration dicts
+			migrations: List of MigrationOp objects
 
 		Returns:
 			List of rounds, where each round is a list of migrations that can run in parallel
@@ -1704,8 +1706,8 @@ class BatchGenWorker:
 			used_ranks = set()
 
 			for mig in remaining[:]:  # Iterate over copy
-				from_rank = mig['from_rank']
-				to_rank = mig['to_rank']
+				from_rank = mig.from_rank
+				to_rank = mig.to_rank
 
 				# Check if either rank is already used in this round
 				if from_rank not in used_ranks and to_rank not in used_ranks:
@@ -2122,7 +2124,7 @@ class BatchGenWorker:
 
 		# Log migration summary
 		if self.rank == 0:
-			total_pages = sum(m['pages'] for m in migrations)
+			total_pages = sum(m.pages for m in migrations)
 			logging.info(
 				f"REBALANCE: Executing {len(migrations)} migrations "
 				f"({total_pages} total pages, ~{total_pages * 64} tokens)"
@@ -2144,8 +2146,8 @@ class BatchGenWorker:
 		# CRITICAL: All ranks must update global_batch consistently
 		# MUST use assign_rank() to update both seq.assigned_rank AND _rank_index
 		for mig in migrations:
-			uuid = mig['uuid']
-			new_rank = mig['to_rank']
+			uuid = mig.uuid
+			new_rank = mig.to_rank
 
 			# CRITICAL FIX: Use assign_rank() instead of direct assignment!
 			# Direct assignment (seq.assigned_rank = x) only updates the attribute.
@@ -2170,7 +2172,7 @@ class BatchGenWorker:
 		# - RECV side does NOT have them in _uuid_to_local_map yet (will receive and update)
 		# If we sync AFTER updating local mappings, RECV side would skip updating because
 		# uuid would be in its _uuid_to_local_map, but its state is stale!
-		migrated_uuids = [m['uuid'] for m in migrations]
+		migrated_uuids = [m.uuid for m in migrations]
 		if migrated_uuids:
 			self._sync_sequence_metadata(migrated_uuids)
 			logging.info(
@@ -2183,9 +2185,9 @@ class BatchGenWorker:
 
 		# STEP 3: Update local mappings (rank-specific, after global metadata is consistent)
 		for mig in migrations:
-			old_rank = mig['from_rank']
-			new_rank = mig['to_rank']
-			uuid = mig['uuid']
+			old_rank = mig.from_rank
+			new_rank = mig.to_rank
+			uuid = mig.uuid
 
 			# Update local mappings on source rank (remove)
 			if self.rank == old_rank:
