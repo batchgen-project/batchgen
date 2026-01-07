@@ -294,6 +294,8 @@ def _server_worker_main_impl(
 			# Sampling parameters (None = greedy decoding)
 			temperature = task_data.get("temperature", None)
 			top_p = task_data.get("top_p", None)
+			if global_rank == 0:
+				logging.info(f"[PAYLOAD] Extracted from task_data: temperature={temperature}, top_p={top_p}")
 
 			# Clear previous state if supported
 			if hasattr(worker, 'reset_runtime_state'):

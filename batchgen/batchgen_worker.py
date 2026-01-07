@@ -408,7 +408,11 @@ class BatchGenWorker:
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._ignore_eos: bool = False
-		
+		self._temperature: Optional[float] = None  # Sampling temperature (None = greedy)
+		self._top_p: Optional[float] = None  # Nucleus sampling threshold (None = disabled)
+		self._logged_greedy: bool = False  # Track if we've logged greedy mode this batch
+		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
+
 		# 9. Initialization Flags
 		self._core_initialized = False
 		self._batch_completed = False
@@ -520,8 +524,12 @@ class BatchGenWorker:
 		"""
 		self._temperature = temperature
 		self._top_p = top_p
+		# Always log on rank 0 - use WARNING to ensure visibility
 		if self.rank == 0:
-			logging.info(f"Rank {self.rank}: sampling params set - temperature={temperature}, top_p={top_p}")
+			if temperature is not None or top_p is not None:
+				logging.warning(f"[SAMPLING] temperature={temperature}, top_p={top_p} - will use sampling")
+			else:
+				logging.info(f"[SAMPLING] temperature=None, top_p=None - will use greedy decoding")
 
 	def _select_tokens(self, logits: torch.Tensor) -> torch.Tensor:
 		"""
@@ -535,9 +543,17 @@ class BatchGenWorker:
 		"""
 		# Fast path: greedy decoding (default)
 		if self._temperature is None or self._temperature <= 0:
+			# Log once per batch (only rank 0, first decode step)
+			if not getattr(self, '_logged_greedy', False) and self.rank == 0:
+				logging.debug(f"Using GREEDY decoding (temperature={self._temperature})")
+				self._logged_greedy = True
 			return torch.argmax(logits, dim=-1, keepdim=True)
 
 		# Sampling with temperature/top_p
+		# Log once per batch (only rank 0, first decode step)
+		if not getattr(self, '_logged_sampling', False) and self.rank == 0:
+			logging.info(f"Using SAMPLING: temperature={self._temperature}, top_p={self._top_p}")
+			self._logged_sampling = True
 		from batchgen.sampling import sample_tokens
 		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
 
@@ -7050,6 +7066,9 @@ class BatchGenWorker:
 		# Synchronize all ranks before cleanup
 		dist.barrier()
 		self._ignore_eos = False
+		# Reset logging flags for new batch (to log sampling mode once per batch)
+		self._logged_greedy = False
+		self._logged_sampling = False
 
 		# NOTE: We intentionally do NOT destroy self.comm here.
 		# PyNccl communicator is reused across batches to avoid:
