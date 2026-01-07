@@ -63,7 +63,7 @@ class ServerArgs:
     storage_path: Path = Path("tmp/server_storage")
     max_input_len: int = 1024
     max_output_len: int = 128
-    watchdog_timeout: Optional[float] = 180.0
+    watchdog_timeout: Optional[float] = 600.0  # 10 minutes for long inference tasks
     watchdog_test_stuck_time: float = 0.0
     watchdog_heartbeat_interval: Optional[float] = None
 

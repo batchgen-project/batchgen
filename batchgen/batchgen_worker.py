@@ -27,6 +27,7 @@ from tqdm import trange
 import gc
 import numpy as np
 from datetime import timedelta
+from contextlib import contextmanager
 from dataclasses import dataclass
 import torch.distributed._symmetric_memory as symm_mem
 from batchgen.distributed.utils import StatelessProcessGroup
@@ -252,7 +253,7 @@ class BatchGenWorkerArgs:
 	gpu_arch: str
 
 	# Watchdog configuration
-	watchdog_timeout: Optional[float] = 180.0  # Seconds before declaring process stuck
+	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
 	watchdog_test_stuck_time: float = 0.0  # Deliberate delay for testing
 	watchdog_heartbeat_interval: Optional[float] = None  # Heartbeat interval
 
@@ -490,6 +491,19 @@ class BatchGenWorker:
 		"""Feed the watchdog to prevent timeout during long operations."""
 		if self._watchdog is not None:
 			self._watchdog.feed()
+
+	@contextmanager
+	def disable_watchdog(self):
+		"""Context manager to temporarily disable watchdog during non-critical phases.
+
+		Use this during tokenization, setup, and other phases where we don't want
+		the watchdog to trigger. The watchdog should only monitor prefill and decode.
+		"""
+		if self._watchdog is not None:
+			with self._watchdog.disable():
+				yield
+		else:
+			yield
 
 	def _should_stop_at_eos(self, token_id: int) -> bool:
 		"""
@@ -2286,24 +2300,27 @@ class BatchGenWorker:
 		
 		logging.info(f"Rank {self.rank}: All ranks have {all_sizes_list[0]} sequences in global_batch")
 
-		# Step 2: Tokenize all sequences (all ranks do this identically)
-		# This determines the actual max_input_length dynamically
-		self._tokenize_global_batch()
-		
-		# Step 2.5: Update engine config with actual max_input_length after tokenization
-		self._update_config_after_tokenization()
+		# Disable watchdog during setup phase - only monitor prefill/decode
+		with self.disable_watchdog():
+			# Step 2: Tokenize all sequences (all ranks do this identically)
+			# This determines the actual max_input_length dynamically
+			self._tokenize_global_batch()
 
-		# Step 3: Assign sequences to ranks (round-robin)
-		self._assign_sequences_to_ranks()
+			# Step 2.5: Update engine config with actual max_input_length after tokenization
+			self._update_config_after_tokenization()
 
-		# Step 4: Build query_book for backward compatibility
-		self._build_local_query_book()
+			# Step 3: Assign sequences to ranks (round-robin)
+			self._assign_sequences_to_ranks()
 
-		# Step 5: Set counts for compatibility
-		self.num_global_queries = len(global_prompts)
-		self.num_local_queries = len(self.global_batch.get_sequences_for_rank(self.rank))
+			# Step 4: Build query_book for backward compatibility
+			self._build_local_query_book()
+
+			# Step 5: Set counts for compatibility
+			self.num_global_queries = len(global_prompts)
+			self.num_local_queries = len(self.global_batch.get_sequences_for_rank(self.rank))
 
 		# Step 6: Run generation with KV-driven scheduling
+		# Watchdog is now active - monitors prefill and decode phases
 		return self.generate()
 
 	# ============ UUID/Index Conversion Helpers ============
@@ -3480,8 +3497,8 @@ class BatchGenWorker:
 			if self.rank == 0:
 				logging.info(f"--- Iteration {iteration} ---")
 
-			# Feed watchdog to prevent timeout during long generation
-			self.feed_watchdog()
+			# NOTE: Watchdog is fed within prefill and decode loops, not here.
+			# This ensures we only monitor the actual inference phases.
 
 			# =================================================================
 			# 1. PREFILL PHASE: Fill Host KV Cache
@@ -4368,7 +4385,12 @@ class BatchGenWorker:
 		output_tokens = []
 
 		with torch.inference_mode():
-			for batch_idx, (seq_start, seq_end) in enumerate(micro_batches):
+			for batch_idx, (seq_start, seq_end) in tqdm(
+				enumerate(micro_batches),
+				total=len(micro_batches),
+				desc="Prepacked Prefill",
+				disable=(self.rank != 0)  # Only show progress on rank 0
+			):
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()
 

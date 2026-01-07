@@ -332,8 +332,8 @@ def _server_worker_main_impl(
 				
 			response_queue.put(final_results)
 
-		# Feed watchdog after each successful iteration
-		watchdog.feed()
+		# NOTE: Watchdog is fed within prefill/decode phases in the worker,
+		# not here. This ensures we only monitor actual inference operations.
 
 	# Cleanup
 	dist.destroy_process_group()
