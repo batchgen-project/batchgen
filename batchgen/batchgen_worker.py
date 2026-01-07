@@ -5639,7 +5639,7 @@ class BatchGenWorker:
 				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
-				new_tokens_out = self._select_tokens(outputs.logits)
+				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
 			
@@ -6474,16 +6474,16 @@ class BatchGenWorker:
 						attention_mask=attention_mask.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = self._select_tokens(new_tokens.logits)
+					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
 					self.update_new_token(new_tokens, batch, new_token_idx)
-					
+
 					# Update sequence state
 					for i, local_idx in enumerate(batch):
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						seq.decoded_length = new_token_idx + 1
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
-						
+
 						# Only mark eos_reached if we should stop at EOS
 						if self._should_stop_at_eos(new_tokens[i].item()):
 							seq.eos_reached = True
@@ -6550,16 +6550,16 @@ class BatchGenWorker:
 						attention_mask=attention_mask.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = self._select_tokens(new_tokens.logits)
+					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
 					self.update_new_token(new_tokens, batch, new_token_idx)
-					
+
 					# Update sequence state
 					for i, local_idx in enumerate(batch):
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						seq.decoded_length = new_token_idx + 1
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
-						
+
 						# Only mark eos_reached if we should stop at EOS
 						if self._should_stop_at_eos(new_tokens[i].item()):
 							seq.eos_reached = True
