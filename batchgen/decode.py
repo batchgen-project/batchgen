@@ -1,21 +1,38 @@
-import torch
-import math
+"""Decode phase management for batch inference.
+
+This module defines the decode phase execution, including token-by-token
+generation with continuous batching support. The scheduler calls decode
+after prefill to generate output tokens.
+
+Classes:
+    DecodeInput: Input data for decode model forward pass
+    DecodeOutput: Output from a single decode step
+    DecodeConfig: Configuration parameters for decode phase
+    DecodeTimingStats: Timing statistics for decode operations
+    DecodeExecutor: Manages single decode steps
+    Decode: Legacy decode implementation (to be deprecated)
+"""
+
 import logging
-import tqdm
-from typing import Optional, List, Dict
+import math
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import torch
 import torch.distributed as dist
-from dataclasses import dataclass
+import tqdm
 
-from batchgen.models.Wrapper import Attn_Wrapper
-from batchgen.utils import create_position_ids_from_attention_mask
-from batchgen.sampling import sample_with_temperature_top_p, greedy_decode
-from batchgen.sequence import SequenceBatch
-from batchgen.models.engine_loader import core_engine as bg
 from batchgen.config.config import EngineConfig, ModelConfig
+from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
+from batchgen.models.engine_loader import core_engine as bg
+from batchgen.models.Wrapper import Attn_Wrapper
+from batchgen.sampling import greedy_decode, sample_with_temperature_top_p
+from batchgen.sequence import SequenceBatch
+from batchgen.utils import create_position_ids_from_attention_mask
 
-from batchgen.kv_cache.gpu_paged_kv_manager import (
-    GPUPagedKVCacheManager,
-)
+logger = logging.getLogger(__name__)
 
 @dataclass
 class DecodeInput:
@@ -578,3 +595,218 @@ class Decode():
 						self.update_new_token(new_tokens, batch, new_token_idx)
 						print(f"New tokens: {new_tokens}")
 					new_token_idx += 1
+
+
+# ============ Additional Decode Utilities ============
+
+
+@dataclass
+class DecodeConfig:
+    """Configuration parameters for decode phase.
+
+    This dataclass holds all configuration needed to set up and execute
+    a decode phase with continuous batching support.
+    """
+
+    # Batch configuration
+    max_batch_size: int = 256  # Maximum sequences per decode batch
+    page_size: int = 64  # Tokens per page for KV cache
+
+    # Generation configuration
+    max_new_tokens: int = 128  # Maximum tokens to generate
+    ignore_eos: bool = False  # Whether to ignore EOS tokens
+
+    # Sampling configuration
+    temperature: Optional[float] = None  # None = greedy
+    top_p: Optional[float] = None  # None = disabled
+    top_k: int = 0  # 0 = disabled
+
+    # Continuous batching configuration
+    use_continuous_batching: bool = True
+    two_page_buffer: bool = True  # Allocate 2 pages initially
+
+    # Performance configuration
+    boundary_check_interval: int = 64  # Check page boundary every N tokens
+
+
+@dataclass
+class DecodeTimingStats:
+    """Timing statistics for decode phase."""
+
+    total_ms: float = 0.0
+    config_ms: float = 0.0
+    forward_ms: float = 0.0
+    sampling_ms: float = 0.0
+    kv_operations_ms: float = 0.0
+    page_boundary_ms: float = 0.0
+
+    # Counts
+    num_steps: int = 0
+    num_tokens_generated: int = 0
+    num_sequences_completed: int = 0
+    num_page_boundaries: int = 0
+
+    def summary(self) -> str:
+        """Return a one-line summary of timing."""
+        tokens_per_sec = (
+            self.num_tokens_generated / (self.total_ms / 1000)
+            if self.total_ms > 0
+            else 0
+        )
+        return (
+            f"total={self.total_ms:.1f}ms, forward={self.forward_ms:.1f}ms, "
+            f"tokens={self.num_tokens_generated}, tps={tokens_per_sec:.1f}"
+        )
+
+
+@dataclass
+class DecodeBatchState:
+    """State tracking for a decode batch during continuous batching.
+
+    This class tracks the state of all sequences in a decode batch,
+    enabling efficient updates and status queries.
+    """
+
+    # Sequence tracking
+    active_uuids: List[str] = field(default_factory=list)
+    completed_uuids: List[str] = field(default_factory=list)
+    on_hold_uuids: List[str] = field(default_factory=list)
+
+    # Token tracking
+    current_step: int = 0
+    tokens_in_page: int = 0  # Tokens generated since last page boundary
+
+    # GPU state
+    gpu_batch_indices: List[int] = field(default_factory=list)
+
+    @property
+    def num_active(self) -> int:
+        """Number of actively decoding sequences."""
+        return len(self.active_uuids)
+
+    @property
+    def num_completed(self) -> int:
+        """Number of completed sequences."""
+        return len(self.completed_uuids)
+
+    def is_at_page_boundary(self, page_size: int = 64) -> bool:
+        """Check if we're at a page boundary."""
+        return self.tokens_in_page >= page_size
+
+    def advance_step(self) -> None:
+        """Advance to next decode step."""
+        self.current_step += 1
+        self.tokens_in_page += 1
+
+
+def check_eos_batch(
+    new_tokens: torch.Tensor,
+    eos_token_id: int,
+    sequence_uuids: List[str],
+) -> Tuple[List[str], List[str]]:
+    """Check for EOS tokens in a batch of new tokens.
+
+    Args:
+        new_tokens: [batch_size, 1] tensor of new token IDs
+        eos_token_id: The EOS token ID to check for
+        sequence_uuids: List of sequence UUIDs corresponding to tokens
+
+    Returns:
+        (continuing_uuids, completed_uuids)
+    """
+    # Flatten tokens for comparison
+    tokens_flat = new_tokens.view(-1).cpu().tolist()
+
+    continuing = []
+    completed = []
+
+    for uuid, token in zip(sequence_uuids, tokens_flat):
+        if token == eos_token_id:
+            completed.append(uuid)
+        else:
+            continuing.append(uuid)
+
+    return continuing, completed
+
+
+def check_max_length_batch(
+    sequence_lengths: Dict[str, int],
+    max_length: int,
+    sequence_uuids: List[str],
+) -> Tuple[List[str], List[str]]:
+    """Check for sequences that have reached max length.
+
+    Args:
+        sequence_lengths: Dict mapping uuid -> current decoded length
+        max_length: Maximum allowed length
+        sequence_uuids: List of sequence UUIDs to check
+
+    Returns:
+        (continuing_uuids, completed_uuids)
+    """
+    continuing = []
+    completed = []
+
+    for uuid in sequence_uuids:
+        length = sequence_lengths.get(uuid, 0)
+        if length >= max_length:
+            completed.append(uuid)
+        else:
+            continuing.append(uuid)
+
+    return continuing, completed
+
+
+def select_tokens_with_config(
+    logits: torch.Tensor,
+    config: DecodeConfig,
+) -> torch.Tensor:
+    """Select tokens using configuration.
+
+    Args:
+        logits: [batch_size, vocab_size] logits from model
+        config: Decode configuration with sampling parameters
+
+    Returns:
+        [batch_size, 1] selected token indices
+    """
+    # Fast path: greedy decoding
+    if config.temperature is None or config.temperature <= 0:
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    # Import here to avoid circular import
+    from batchgen.sampling import sample_tokens
+
+    return sample_tokens(
+        logits,
+        temperature=config.temperature,
+        top_p=config.top_p,
+        top_k=config.top_k,
+    )
+
+
+def create_decode_attention_mask(
+    prompt_lengths: List[int],
+    decoded_lengths: List[int],
+    max_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create attention mask for decode step.
+
+    Args:
+        prompt_lengths: List of prompt lengths per sequence
+        decoded_lengths: List of decoded token counts per sequence
+        max_length: Maximum sequence length for mask
+        device: Device to create mask on
+
+    Returns:
+        [batch_size, max_length] attention mask
+    """
+    batch_size = len(prompt_lengths)
+    mask = torch.zeros(batch_size, max_length, dtype=torch.int64, device=device)
+
+    for i, (prompt_len, decoded_len) in enumerate(zip(prompt_lengths, decoded_lengths)):
+        total_len = prompt_len + decoded_len
+        mask[i, :total_len] = 1
+
+    return mask

@@ -1,20 +1,31 @@
-"""
-	We modularize prefill and decoding.
-	This module defines prefill. 
-	The scheduler would call prefill and decoding.
+"""Prefill phase management for batch inference.
+
+This module defines the prefill phase execution, including configuration,
+execution, and cleanup. The scheduler calls prefill before decoding.
+
+Classes:
+    PrefillRequest: Input data for prefill model forward pass
+    PrefillResult: Output from the prefill stage
+    PrefillConfig: Configuration parameters for prefill phase
+    PrefillExecutor: Manages the prefill process lifecycle
+    Prefill: Legacy prefill implementation (to be deprecated)
 """
 
-import torch
-import math
 import logging
-import tqdm
-from dataclasses import dataclass
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
 import torch.distributed as dist
-from typing import Optional
+import tqdm
+
 from batchgen.models.Wrapper import Attn_Wrapper
-from batchgen.utils import create_position_ids_from_attention_mask
 from batchgen.sequence import SequenceBatch, SequenceStatus
-from batchgen.utils import deep_free_model_memory
+from batchgen.utils import create_position_ids_from_attention_mask, deep_free_model_memory
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class PrefillRequest:
@@ -68,7 +79,7 @@ class PrefillExecutor():
 		self.core_engine.start_h2d_worker()
 
 		# Model-specific adjustments
-		self._configure_model_specifics(self)
+		self._configure_model_specifics()
 
 	def _configure_model_specifics(self):
 		# TODO: will be removed after fully refactoring of model forward pass
@@ -331,4 +342,175 @@ class Prefill():
 		return new_tokens
 
 
+# ============ Additional Prefill Utilities ============
 
+
+@dataclass
+class PrefillConfig:
+    """Configuration parameters for prefill phase.
+
+    This dataclass holds all configuration needed to set up and execute
+    a prefill phase, enabling cleaner interfaces between components.
+    """
+
+    # Batch configuration
+    micro_batch_size: int = 1  # Sequences per micro-batch
+    max_input_length: int = 2048  # Maximum input sequence length
+
+    # Model configuration
+    use_flash_attention: bool = True
+    use_cache: bool = True  # Whether to cache KV for decode phase
+
+    # Host KV configuration
+    allocate_host_kv: bool = True  # Whether to allocate host KV pages
+
+    # Prepack configuration (for efficient batching)
+    use_prepack: bool = True  # Whether to use prepacked prefill
+    prepack_max_tokens: int = 8192  # Max tokens per prepacked batch
+
+    # Sampling configuration
+    sample_first_token: bool = True  # Whether to sample first decode token
+    temperature: Optional[float] = None  # None = greedy
+    top_p: Optional[float] = None  # None = disabled
+
+
+@dataclass
+class PrefillTimingStats:
+    """Timing statistics for prefill phase."""
+
+    total_ms: float = 0.0
+    config_ms: float = 0.0
+    tokenization_ms: float = 0.0
+    forward_ms: float = 0.0
+    kv_allocation_ms: float = 0.0
+    cleanup_ms: float = 0.0
+
+    # Counts
+    num_sequences: int = 0
+    num_micro_batches: int = 0
+    total_tokens: int = 0
+
+    def summary(self) -> str:
+        """Return a one-line summary of timing."""
+        return (
+            f"total={self.total_ms:.1f}ms, config={self.config_ms:.1f}ms, "
+            f"forward={self.forward_ms:.1f}ms, seqs={self.num_sequences}, "
+            f"tokens={self.total_tokens}"
+        )
+
+
+@dataclass
+class PrepackBatch:
+    """A prepacked batch for efficient prefill.
+
+    Prepack combines multiple variable-length sequences into a single
+    tensor with minimal padding, improving GPU utilization.
+    """
+
+    # Sequence identifiers
+    sequence_uuids: List[str] = field(default_factory=list)
+    global_indices: List[int] = field(default_factory=list)
+
+    # Packed tensors
+    input_ids: Optional[torch.Tensor] = None  # [total_tokens]
+    position_ids: Optional[torch.Tensor] = None  # [total_tokens]
+
+    # Sequence boundaries for unpacking
+    sequence_lengths: List[int] = field(default_factory=list)
+    cumulative_lengths: List[int] = field(default_factory=list)  # For indexing
+
+    @property
+    def total_tokens(self) -> int:
+        """Total number of tokens in the prepacked batch."""
+        return sum(self.sequence_lengths)
+
+    @property
+    def num_sequences(self) -> int:
+        """Number of sequences in the batch."""
+        return len(self.sequence_uuids)
+
+
+def create_prepack_batches(
+    sequences: List[Tuple[str, torch.Tensor, int]],
+    max_tokens_per_batch: int = 8192,
+) -> List[PrepackBatch]:
+    """Create prepacked batches from sequences for efficient prefill.
+
+    This function groups sequences into batches that fit within the token
+    budget, minimizing padding waste.
+
+    Args:
+        sequences: List of (uuid, input_ids, global_idx) tuples
+        max_tokens_per_batch: Maximum tokens per prepacked batch
+
+    Returns:
+        List of PrepackBatch objects
+    """
+    if not sequences:
+        return []
+
+    # Sort by length for better packing (longest first for greedy bin packing)
+    sorted_seqs = sorted(
+        sequences, key=lambda x: x[1].numel(), reverse=True
+    )
+
+    batches = []
+    current_batch = PrepackBatch()
+    current_tokens = 0
+
+    for uuid, input_ids, global_idx in sorted_seqs:
+        seq_len = input_ids.numel()
+
+        # Start new batch if this sequence doesn't fit
+        if current_tokens + seq_len > max_tokens_per_batch and current_batch.num_sequences > 0:
+            # Finalize current batch
+            _finalize_prepack_batch(current_batch)
+            batches.append(current_batch)
+            current_batch = PrepackBatch()
+            current_tokens = 0
+
+        # Add sequence to current batch
+        current_batch.sequence_uuids.append(uuid)
+        current_batch.global_indices.append(global_idx)
+        current_batch.sequence_lengths.append(seq_len)
+        current_tokens += seq_len
+
+    # Finalize last batch
+    if current_batch.num_sequences > 0:
+        _finalize_prepack_batch(current_batch)
+        batches.append(current_batch)
+
+    return batches
+
+
+def _finalize_prepack_batch(batch: PrepackBatch) -> None:
+    """Finalize a prepack batch by computing cumulative lengths."""
+    cumsum = 0
+    batch.cumulative_lengths = []
+    for length in batch.sequence_lengths:
+        batch.cumulative_lengths.append(cumsum)
+        cumsum += length
+
+
+def unpack_prefill_outputs(
+    packed_logits: torch.Tensor,
+    batch: PrepackBatch,
+) -> List[torch.Tensor]:
+    """Unpack prefill outputs to get per-sequence last token logits.
+
+    Args:
+        packed_logits: [total_tokens, vocab_size] logits from packed forward
+        batch: PrepackBatch with sequence boundaries
+
+    Returns:
+        List of [1, vocab_size] tensors, one per sequence
+    """
+    outputs = []
+    for i, (start, length) in enumerate(
+        zip(batch.cumulative_lengths, batch.sequence_lengths)
+    ):
+        # Get logits for last token of this sequence
+        last_token_idx = start + length - 1
+        seq_logits = packed_logits[last_token_idx : last_token_idx + 1, :]
+        outputs.append(seq_logits)
+    return outputs

@@ -49,6 +49,12 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES
 from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits, get_prepack_stats, PrepackMetadata
 
+# Import modularized components
+# FastBoundaryTimingStats: Timing dataclass for page boundary operations
+from batchgen.continuous_batching import FastBoundaryTimingStats
+# sample_tokens: Token sampling with temperature/top_p support
+from batchgen.sampling import sample_tokens
+
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
 	try:
@@ -79,98 +85,6 @@ NUM_GPUS_PER_NODE = int(os.environ.get('NUM_GPUS_PER_NODE', '8'))
 
 
 from .scheduler.scheduler import Scheduler
-
-@dataclass
-class BoundaryTimingStats:
-	"""Timing statistics for page boundary operations."""
-	# Phase 1: Sync
-	wait_kv_append_ms: float = 0.0
-	finalize_async_load_ms: float = 0.0
-	rebuild_after_integration_ms: float = 0.0
-	barrier_after_sync_ms: float = 0.0
-	
-	# Phase 2: Eviction
-	sync_completion_ms: float = 0.0
-	release_completed_ms: float = 0.0
-	rebuild_after_eviction_ms: float = 0.0
-	
-	# Phase 3: Extension
-	extend_page_buffer_ms: float = 0.0
-	rebuild_after_extension_ms: float = 0.0
-	
-	# Phase 4: Async Load Launch
-	allgather_free_pages_ms: float = 0.0
-	select_candidates_ms: float = 0.0
-	allocate_pages_ms: float = 0.0
-	launch_async_load_ms: float = 0.0
-	restore_page_table_ms: float = 0.0
-	
-	# Overall
-	total_boundary_ms: float = 0.0
-	barrier_final_ms: float = 0.0
-	
-	# Counts
-	num_completed: int = 0
-	num_onhold: int = 0
-	num_loaded: int = 0
-	
-	def __str__(self) -> str:
-		return (
-			f"Boundary Timing (total={self.total_boundary_ms:.2f}ms):\n"
-			f"  Phase 1 SYNC:\n"
-			f"    wait_kv_append={self.wait_kv_append_ms:.2f}ms\n"
-			f"    finalize_load={self.finalize_async_load_ms:.2f}ms\n"
-			f"    rebuild_integration={self.rebuild_after_integration_ms:.2f}ms\n"
-			f"    barrier={self.barrier_after_sync_ms:.2f}ms\n"
-			f"  Phase 2 EVICTION ({self.num_completed} completed):\n"
-			f"    sync_completion={self.sync_completion_ms:.2f}ms\n"
-			f"    release={self.release_completed_ms:.2f}ms\n"
-			f"    rebuild={self.rebuild_after_eviction_ms:.2f}ms\n"
-			f"  Phase 3 EXTENSION ({self.num_onhold} on_hold):\n"
-			f"    extend={self.extend_page_buffer_ms:.2f}ms\n"
-			f"    rebuild={self.rebuild_after_extension_ms:.2f}ms\n"
-			f"  Phase 4 ASYNC LOAD ({self.num_loaded} new):\n"
-			f"    allgather={self.allgather_free_pages_ms:.2f}ms\n"
-			f"    select={self.select_candidates_ms:.2f}ms\n"
-			f"    allocate={self.allocate_pages_ms:.2f}ms\n"
-			f"    launch={self.launch_async_load_ms:.2f}ms\n"
-			f"    restore_pt={self.restore_page_table_ms:.2f}ms\n"
-			f"  Final barrier={self.barrier_final_ms:.2f}ms"
-		)
-
-
-@dataclass
-class FastBoundaryTimingStats:
-	"""Detailed timing for optimized page boundary."""
-	total_ms: float = 0.0
-	# Phase 0: Async wait
-	wait_kv_append_ms: float = 0.0
-	num_kv_append_tasks: int = 0  # Track number of tasks waited
-	wait_async_load_ms: float = 0.0
-	finalize_load_ms: float = 0.0
-	# Phase 0.5: Sync decode_uuids
-	sync_decode_uuids_ms: float = 0.0
-	# Phase 1: Gather
-	gather_ms: float = 0.0
-	# Phase 2: Process
-	process_ms: float = 0.0
-	extension_ms: float = 0.0
-	# Phase 3: Async load launch
-	load_select_ms: float = 0.0
-	load_alloc_ms: float = 0.0
-	load_launch_ms: float = 0.0
-	# Phase 4: Rebuild + MoE buffer + barrier
-	rebuild_ms: float = 0.0
-	moe_buffer_update_ms: float = 0.0  # Time to sync and update MoE buffer size
-	barrier_ms: float = 0.0
-	# Counts
-	num_completed: int = 0
-	num_onhold: int = 0
-	num_loaded: int = 0
-	# Status counts
-	total_active: int = 0
-	total_prefilled: int = 0
-	total_completed_cumulative: int = 0
 
 
 class query:
