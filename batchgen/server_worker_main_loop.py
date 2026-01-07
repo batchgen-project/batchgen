@@ -290,7 +290,10 @@ def _server_worker_main_impl(
 			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
 			current_max_output = task_data.get("max_output_len", 128)
-			ignore_eos = task_data.get("ignore_eos", False)  # NEW: Extract ignore_eos
+			ignore_eos = task_data.get("ignore_eos", False)
+			# Sampling parameters (None = greedy decoding)
+			temperature = task_data.get("temperature", None)
+			top_p = task_data.get("top_p", None)
 
 			# Clear previous state if supported
 			if hasattr(worker, 'reset_runtime_state'):
@@ -300,9 +303,12 @@ def _server_worker_main_impl(
 				# Initialize worker with global batch info
 				# max_input_length can be None - will be determined by longest prompt
 				worker.Init(current_max_input, current_max_output, len(global_prompts))
-				
-				# NEW: Set ignore_eos flag on worker
+
+				# Set ignore_eos flag on worker
 				worker.set_ignore_eos(ignore_eos)
+
+				# Set sampling parameters (None = greedy decoding)
+				worker.set_sampling_params(temperature=temperature, top_p=top_p)
 
 				# Process the global batch - worker internally handles distribution
 				local_results = worker.process_new_batch(global_prompts)

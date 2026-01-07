@@ -134,6 +134,10 @@ class CreateBatchRequest(BaseModel):
     endpoint: BatchEndpoint = BatchEndpoint.CHAT_COMPLETIONS
     completion_window: CompletionWindow = CompletionWindow.ONE_DAY
     metadata: Optional[Dict[str, Any]] = None
+    # Inference parameters (override per-request values)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
+    top_p: Optional[float] = Field(default=None, ge=0, le=1)
 
 
 class BatchObject(BaseModel):
@@ -152,6 +156,10 @@ class BatchObject(BaseModel):
     cancelling_at: Optional[int] = None
     error: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    # Inference parameters (set at batch creation, None = use defaults)
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
 
     @root_validator(pre=True)
     def default_timestamps(cls, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -270,6 +278,9 @@ class RawInferenceRequest(BaseModel):
     max_input_len: Optional[int] = Field(default=None, ge=1)
     max_output_len: Optional[int] = Field(default=None, ge=1)
     ignore_eos: bool = False
+    # Sampling parameters (None = greedy decoding)
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
+    top_p: Optional[float] = Field(default=None, ge=0, le=1)
 
     @validator("prompts")
     def validate_prompts(cls, value: List[str]) -> List[str]:

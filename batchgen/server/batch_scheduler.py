@@ -190,14 +190,18 @@ class BatchScheduler:
             )
             return
 
-        prompts, max_tokens = self._convert_requests_to_worker_inputs(requests)
+        prompts, per_request_max_tokens = self._convert_requests_to_worker_inputs(requests)
+        # Use batch-level max_tokens if specified, otherwise use per-request value
+        max_tokens = batch.max_tokens or per_request_max_tokens
         try:
             results = await asyncio.to_thread(
                 self.worker.infer,
                 prompts,
                 self.server_args.max_input_len,
                 max_tokens,
-                False,
+                False,  # ignore_eos
+                batch.temperature,  # None = greedy decoding
+                batch.top_p,  # None = disabled
             )
         except Exception as exc:
             self.storage.update_batch_status(

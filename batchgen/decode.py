@@ -127,8 +127,34 @@ class Decode():
 		self.world_size = self.engine_config.Basic_Config.world_size
 		self.torch_device = self.engine_config.Basic_Config.device_torch
 
+		# Sampling parameters (None = greedy decoding)
+		self._temperature: Optional[float] = None
+		self._top_p: Optional[float] = None
+
 		# self.gpu_paged_kv_manager = GPUPagedKVCacheManager(self.engine_config)
 
+	def set_sampling_params(self, temperature: Optional[float] = None, top_p: Optional[float] = None) -> None:
+		"""Set sampling parameters for token generation."""
+		self._temperature = temperature
+		self._top_p = top_p
+
+	def _select_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+		"""
+		Select next tokens from logits using greedy or sampling strategy.
+
+		Args:
+			logits: [batch_size, vocab_size] logits from model
+
+		Returns:
+			[batch_size, 1] selected token indices
+		"""
+		# Fast path: greedy decoding (default)
+		if self._temperature is None or self._temperature <= 0:
+			return torch.argmax(logits, dim=-1, keepdim=True)
+
+		# Sampling with temperature/top_p
+		from batchgen.sampling import sample_tokens
+		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
 
 	def config_decode(self, num_seq, comm=None):
 		logging.info(f"Start Config Decoding")
@@ -224,9 +250,7 @@ class Decode():
 						# position_ids=position_ids.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-						-1, 1
-					)
+					new_tokens = self._select_tokens(new_tokens.logits)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 				new_token_idx += 1
 			Attn_Wrapper.scale = None
@@ -295,9 +319,7 @@ class Decode():
 							# position_ids=position_ids.to(self.torch_device),
 							use_cache=False,
 						)
-						new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-							-1, 1
-						)
+						new_tokens = self._select_tokens(new_tokens.logits)
 						# logging.info(f"New tokens: {new_tokens}")
 						# start = time.perf_counter()
 						self.update_new_token(new_tokens, batch, new_token_idx)
@@ -425,9 +447,7 @@ class Decode():
 						)
 						# torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
 						# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
-						new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-							-1, 1
-						)
+						new_tokens = self._select_tokens(new_tokens.logits)
 						self.update_new_token(new_tokens, batch, new_token_idx)
 						# torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
 						# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
@@ -554,9 +574,7 @@ class Decode():
 							# position_ids=position_ids,
 							use_cache=False,
 						)
-						new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(
-							-1, 1
-						)
+						new_tokens = self._select_tokens(new_tokens.logits)
 						self.update_new_token(new_tokens, batch, new_token_idx)
 						print(f"New tokens: {new_tokens}")
 					new_token_idx += 1

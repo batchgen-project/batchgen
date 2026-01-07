@@ -202,6 +202,8 @@ class WorkerManager:
         max_input_len: Optional[int],
         max_output_len: int,
         ignore_eos: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -210,6 +212,8 @@ class WorkerManager:
             "max_input_len": max_input_len or self.args.max_input_len,
             "max_output_len": max_output_len,
             "ignore_eos": ignore_eos,
+            "temperature": temperature,
+            "top_p": top_p,
         }
         with self._lock:
             self.request_queue.put(payload)

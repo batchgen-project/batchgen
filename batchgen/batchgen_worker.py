@@ -508,6 +508,39 @@ class BatchGenWorker:
 		self._ignore_eos = ignore_eos
 		logging.info(f"Rank {self.rank}: ignore_eos set to {ignore_eos}")
 
+	def set_sampling_params(self, temperature: Optional[float] = None, top_p: Optional[float] = None) -> None:
+		"""
+		Set sampling parameters for token generation.
+
+		Args:
+			temperature: Sampling temperature. None or 0 = greedy decoding (deterministic).
+			            Higher values (e.g., 0.7-1.0) increase randomness.
+			top_p: Nucleus sampling threshold. None or 1.0 = disabled.
+			       Lower values (e.g., 0.9) restrict sampling to top tokens.
+		"""
+		self._temperature = temperature
+		self._top_p = top_p
+		if self.rank == 0:
+			logging.info(f"Rank {self.rank}: sampling params set - temperature={temperature}, top_p={top_p}")
+
+	def _select_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+		"""
+		Select next tokens from logits using greedy or sampling strategy.
+
+		Args:
+			logits: [batch_size, vocab_size] logits from model
+
+		Returns:
+			[batch_size, 1] selected token indices
+		"""
+		# Fast path: greedy decoding (default)
+		if self._temperature is None or self._temperature <= 0:
+			return torch.argmax(logits, dim=-1, keepdim=True)
+
+		# Sampling with temperature/top_p
+		from batchgen.sampling import sample_tokens
+		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
+
 	def set_watchdog(self, watchdog) -> None:
 		"""
 		Set the watchdog for stuck detection during inference.
@@ -4374,7 +4407,7 @@ class BatchGenWorker:
 					attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
 					use_cache=False,
 				)
-				new_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1).view(-1, 1)
+				new_tokens = self._select_tokens(outputs.logits[:, -1, :])
 				output_tokens.append(new_tokens)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
@@ -4577,7 +4610,7 @@ class BatchGenWorker:
 					self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 				)
 
-				batch_new_tokens = torch.argmax(logits, dim=-1).view(-1, 1)
+				batch_new_tokens = self._select_tokens(logits)
 				output_tokens.append(batch_new_tokens)
 
 		# Reset prepack mode
@@ -5606,7 +5639,7 @@ class BatchGenWorker:
 				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
-				new_tokens_out = torch.argmax(outputs.logits, dim=-1).view(-1, 1)
+				new_tokens_out = self._select_tokens(outputs.logits)
 
 			new_tokens = new_tokens_out
 			
@@ -6441,7 +6474,7 @@ class BatchGenWorker:
 						attention_mask=attention_mask.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(-1, 1)
+					new_tokens = self._select_tokens(new_tokens.logits)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 					
 					# Update sequence state
@@ -6517,7 +6550,7 @@ class BatchGenWorker:
 						attention_mask=attention_mask.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = torch.argmax(new_tokens.logits, dim=-1).view(-1, 1)
+					new_tokens = self._select_tokens(new_tokens.logits)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 					
 					# Update sequence state

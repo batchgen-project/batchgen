@@ -233,6 +233,10 @@ def create_app(
             created_at=now,
             expires_at=expires_at,
             metadata=body.metadata,
+            # Inference parameters (override per-request values)
+            max_tokens=body.max_tokens,
+            temperature=body.temperature,
+            top_p=body.top_p,
         )
         storage.save_batch(batch)
         await scheduler.enqueue(batch_id)
@@ -314,6 +318,8 @@ def create_app(
                 max_input_len,
                 max_output_len,
                 body.ignore_eos,
+                body.temperature,  # None = greedy decoding
+                body.top_p,  # None = disabled
             )
         except Exception as exc:
             logger.exception("Inference failed")
