@@ -36,10 +36,21 @@ def _setup_nccl_env():
 	# NCCL_SOCKET_TIMEOUT: timeout in milliseconds for socket operations (default: varies)
 	if "NCCL_SOCKET_TIMEOUT" not in os.environ:
 		os.environ["NCCL_SOCKET_TIMEOUT"] = "300000"  # 5 minutes in ms
-	
+
 	# NCCL_NET_RETRY_COUNT: number of retries for network operations
 	if "NCCL_NET_RETRY_COUNT" not in os.environ:
 		os.environ["NCCL_NET_RETRY_COUNT"] = "100"  # More retries (default is ~10)
+
+	# TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: PyTorch NCCL HeartbeatMonitor timeout
+	# Default is 60s which can cause false timeouts during long CPU-bound operations
+	# (e.g., tokenizing large batches). Options:
+	#   - Set to 0 to DISABLE heartbeat monitoring entirely
+	#   - Set to 300+ for large batch processing
+	heartbeat_timeout = os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC")
+	if heartbeat_timeout is None:
+		# Disable heartbeat by default - parallel tokenization keeps NCCL alive anyway
+		os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "0"
+		logging.info("Disabled NCCL HeartbeatMonitor (TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=0)")
 	
 
 def server_worker_main(

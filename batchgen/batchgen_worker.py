@@ -2455,59 +2455,98 @@ class BatchGenWorker:
 		"""
 		Tokenize all sequences in the global batch without truncation.
 		The max_prompt_length is determined dynamically as the longest prompt.
-		All ranks execute this identically to maintain consistent state.
-		
+
+		PARALLEL TOKENIZATION: Each rank tokenizes a subset of sequences, then
+		results are gathered across all ranks. This reduces tokenization time
+		by ~world_size and keeps NCCL alive during the process (prevents
+		NCCL HeartbeatMonitor timeout for large batches).
+
 		After tokenization, completion criteria uses:
 		- EOS token reached, OR
-		- decoded_length >= max_decoding_length, OR  
+		- decoded_length >= max_decoding_length, OR
 		- prompt_length + decoded_length >= model_context_length
 		"""
 		if self.global_batch is None:
 			raise RuntimeError("Global batch not initialized")
 
-		# Phase 1: Batch tokenize all sequences at once (much faster than sequential)
-		# HuggingFace tokenizers use Rust with multi-threading for batch tokenization
+		# Phase 1: PARALLEL batch tokenization across ranks
+		# Each rank tokenizes sequences[rank::world_size] to divide the work
 		all_texts = [seq.text for seq in self.global_batch]
+		num_sequences = len(all_texts)
+
+		# Determine this rank's subset of sequences to tokenize
+		my_indices = list(range(self.rank, num_sequences, self.world_size))
+		my_texts = [all_texts[i] for i in my_indices]
 
 		if self.rank == 0:
-			logging.info(f"Batch tokenizing {len(all_texts)} sequences...")
+			logging.info(
+				f"Parallel tokenizing {num_sequences} sequences across {self.world_size} ranks "
+				f"(~{len(my_indices)} per rank)..."
+			)
 
 		tokenize_start = time.perf_counter()
-		batch_tokenized = self.tokenizer(
-			all_texts,
-			return_tensors="pt",
-			truncation=False,  # No truncation - keep full input
-			padding=True,      # Pad to longest in batch for uniform tensor shape
-			return_attention_mask=True,
-		)
-		tokenize_time = time.perf_counter() - tokenize_start
 
+		# Each rank tokenizes its subset
+		if my_texts:
+			my_batch_tokenized = self.tokenizer(
+				my_texts,
+				return_tensors="pt",
+				truncation=False,  # No truncation - keep full input
+				padding=True,      # Pad to longest in this subset
+				return_attention_mask=True,
+			)
+			# Extract individual sequences from the batch result
+			my_tokenized = []
+			for i in range(len(my_texts)):
+				actual_len = int(my_batch_tokenized["attention_mask"][i].sum().item())
+				my_tokenized.append({
+					"global_idx": my_indices[i],
+					"input_ids": my_batch_tokenized["input_ids"][i, :actual_len].tolist(),
+					"length": actual_len,
+				})
+		else:
+			my_tokenized = []
+
+		local_tokenize_time = time.perf_counter() - tokenize_start
+		logging.debug(f"Rank {self.rank}: Local tokenization of {len(my_texts)} sequences in {local_tokenize_time:.2f}s")
+
+		# Phase 1.5: Gather all tokenized results to all ranks
+		# This keeps NCCL alive and shares results efficiently
+		gather_start = time.perf_counter()
+		all_tokenized_lists = [None] * self.world_size
+		dist.all_gather_object(all_tokenized_lists, my_tokenized)
+		gather_time = time.perf_counter() - gather_start
+
+		# Merge results from all ranks, indexed by global_idx
+		# Store only lightweight data (lists), not tensors, to minimize memory
+		tokenized_by_idx = {}
+		for rank_results in all_tokenized_lists:
+			if rank_results:
+				for item in rank_results:
+					tokenized_by_idx[item["global_idx"]] = item
+
+		# Free the gathered lists immediately
+		del all_tokenized_lists
+
+		total_tokenize_time = time.perf_counter() - tokenize_start
 		if self.rank == 0:
-			logging.info(f"Batch tokenization complete in {tokenize_time:.2f}s")
-
-		# Extract individual sequences from the batch result
-		# batch_tokenized["input_ids"] has shape [batch_size, max_seq_len]
-		# BatchGen uses right-padding: valid tokens at [0:actual_len], padding at [actual_len:]
-		tokenized_results = []
-		for i in range(len(all_texts)):
-			# Count non-pad tokens (attention_mask == 1)
-			actual_len = int(batch_tokenized["attention_mask"][i].sum().item())
-			tokenized_results.append({
-				"input_ids": batch_tokenized["input_ids"][i:i+1, :actual_len],
-				"attention_mask": batch_tokenized["attention_mask"][i:i+1, :actual_len],
-			})
+			logging.info(
+				f"Parallel tokenization complete in {total_tokenize_time:.2f}s "
+				f"(local: {local_tokenize_time:.2f}s, gather: {gather_time:.2f}s)"
+			)
 
 		# Phase 2: Find the longest prompt length to use as max_prompt_length
-		prompt_lengths = [t["input_ids"].size(1) for t in tokenized_results]
+		# Use lightweight length field instead of creating tensors
+		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
 		max_prompt_length = max(prompt_lengths)
-		
+
 		# Warn if any prompt exceeds model context length
 		if max_prompt_length >= self.model_context_length:
 			logging.warning(
 				f"Rank {self.rank}: Longest prompt ({max_prompt_length} tokens) exceeds or equals "
 				f"model context length ({self.model_context_length}). Some sequences may not decode."
 			)
-		
+
 		# Update self.max_input_length to the actual longest prompt
 		# This is used for attention mask shape: [bsz, max_prompt_length + max_decoding_length]
 		self.max_input_length = max_prompt_length
@@ -2515,13 +2554,15 @@ class BatchGenWorker:
 			f"Rank {self.rank}: Dynamic max_prompt_length set to {max_prompt_length} "
 			f"(prompt lengths: min={min(prompt_lengths)}, max={max(prompt_lengths)})"
 		)
-		
+
 		# Phase 3: Create per-sequence tensors sized to their actual prompt length
-		# OPTIMIZATION: Don't pad all sequences to max_prompt_length - each sequence
-		# only needs space for its own prompt + decoding. This is critical for long-tailed
-		# distributions where a few sequences are very long but most are short.
-		for seq, tokenized in zip(self.global_batch, tokenized_results):
-			actual_prompt_len = tokenized["input_ids"].size(1)
+		# MEMORY OPTIMIZATION: Create tensors one at a time directly from gathered lists,
+		# avoiding intermediate tensor storage. Each sequence only needs space for its
+		# own prompt + decoding, critical for long-tailed distributions.
+		for i, seq in enumerate(self.global_batch):
+			item = tokenized_by_idx[i]
+			input_ids_list = item["input_ids"]
+			actual_prompt_len = item["length"]
 
 			# Each sequence gets its own sized tensor: actual_prompt_len + max_decoding_length
 			# Capped by model context length to avoid wasting memory on impossible decoding
@@ -2530,25 +2571,21 @@ class BatchGenWorker:
 				self.model_context_length
 			)
 
-			input_ids_extended = torch.zeros(
-				(1, seq_extended_size), dtype=tokenized["input_ids"].dtype
-			)
-			attention_mask_extended = torch.zeros(
-				(1, seq_extended_size), dtype=torch.int64
-			)
+			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
+			attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
 
-			# Copy the actual tokens (left-aligned, no truncation)
-			input_ids_extended[0, :actual_prompt_len] = tokenized["input_ids"][0, :]
+			# Copy the actual tokens directly from list (left-aligned, no truncation)
+			input_ids_extended[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
 			# CRITICAL: Set attention mask to exactly match input_ids length
-			# Don't copy from tokenizer's attention_mask - just set 1s for valid tokens
 			# This ensures attention_mask.sum() == prompt_length == current_context_length
 			attention_mask_extended[0, :actual_prompt_len] = 1
 
 			seq.input_ids = input_ids_extended
 			seq.attention_mask = attention_mask_extended
-			seq.decoded_tokens = torch.zeros(
-				1, self.max_decoding_length, dtype=torch.int64
-			)
+			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
+
+			# Free the tokenized data for this sequence immediately
+			del tokenized_by_idx[i]
 
 			seq.prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
