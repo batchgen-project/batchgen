@@ -2559,10 +2559,20 @@ class BatchGenWorker:
 		# MEMORY OPTIMIZATION: Create tensors one at a time directly from gathered lists,
 		# avoiding intermediate tensor storage. Each sequence only needs space for its
 		# own prompt + decoding, critical for long-tailed distributions.
-		for i, seq in enumerate(self.global_batch):
-			item = tokenized_by_idx[i]
+		for seq in self.global_batch:
+			# CRITICAL: Use seq.global_idx to lookup, NOT enumeration index
+			# tokenized_by_idx is keyed by global_idx from parallel tokenization
+			item = tokenized_by_idx[seq.global_idx]
 			input_ids_list = item["input_ids"]
 			actual_prompt_len = item["length"]
+
+			# Validation: ensure token list length matches stored length
+			if len(input_ids_list) != actual_prompt_len:
+				logging.error(
+					f"Rank {self.rank}: Token length mismatch for seq {seq.global_idx}: "
+					f"list_len={len(input_ids_list)}, stored_len={actual_prompt_len}"
+				)
+				actual_prompt_len = len(input_ids_list)  # Use actual list length
 
 			# Each sequence gets its own sized tensor: actual_prompt_len + max_decoding_length
 			# Capped by model context length to avoid wasting memory on impossible decoding
@@ -2585,7 +2595,7 @@ class BatchGenWorker:
 			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
 
 			# Free the tokenized data for this sequence immediately
-			del tokenized_by_idx[i]
+			del tokenized_by_idx[seq.global_idx]
 
 			seq.prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
