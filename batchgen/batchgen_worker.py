@@ -2559,18 +2559,50 @@ class BatchGenWorker:
 
 	def _assign_sequences_to_ranks(self) -> None:
 		"""
-		Assign sequences to ranks using round-robin distribution.
+		Assign sequences to ranks balancing predicted attention tile workload.
 		All ranks execute this identically to maintain consistent assignment.
+
+		Uses greedy bin-packing: sort sequences by predicted tiles (descending),
+		then assign each to the rank with fewest total tiles. This balances
+		attention compute across ranks, reducing synchronization wait time.
 		"""
 		if self.global_batch is None:
 			raise RuntimeError("Global batch not initialized")
 
-		for seq in self.global_batch:
-			assigned_rank = seq.global_idx % self.world_size
-			self.global_batch.assign_rank(seq.uuid, assigned_rank)
+		# Sort sequences by predicted total context (descending) for better bin-packing
+		# Larger sequences first ensures better balance
+		sequences = list(self.global_batch)
+		sequences.sort(
+			key=lambda s: s.prompt_length + s.max_decode_length,
+			reverse=True
+		)
 
+		# Track total tiles per rank (attention tile = 128 tokens)
+		TILE_SIZE = 128
+		rank_tiles = [0] * self.world_size
+
+		for seq in sequences:
+			# Predict total context length at decode completion
+			predicted_context = seq.prompt_length + seq.max_decode_length
+			predicted_tiles = (predicted_context + TILE_SIZE - 1) // TILE_SIZE  # ceil_div
+
+			# Assign to rank with fewest tiles (greedy)
+			target_rank = rank_tiles.index(min(rank_tiles))
+			self.global_batch.assign_rank(seq.uuid, target_rank)
+			rank_tiles[target_rank] += predicted_tiles
+
+		# Log balance quality
 		my_seqs = self.global_batch.get_sequences_for_rank(self.rank)
-		logging.info(f"Rank {self.rank}: Assigned {len(my_seqs)} sequences: {my_seqs}")
+		if self.rank == 0:
+			imbalance = (max(rank_tiles) - min(rank_tiles)) / max(rank_tiles) * 100 if max(rank_tiles) > 0 else 0
+			logging.info(
+				f"Workload distribution (tiles per rank): {rank_tiles}, "
+				f"imbalance: {imbalance:.1f}%"
+			)
+		logging.info(
+			f"Rank {self.rank}: Assigned {len(my_seqs)} sequences, "
+			f"tiles={rank_tiles[self.rank]}"
+		)
 
 	def _build_local_query_book(self) -> None:
 		"""
@@ -2605,20 +2637,19 @@ class BatchGenWorker:
 			self._uuid_to_local_map[uuid] = local_idx
 		
 		# Validation: Check that we have all sequences assigned to this rank
-		expected_count = 0
-		for seq in self.global_batch:
-			if seq.global_idx % self.world_size == self.rank:
-				expected_count += 1
-		
+		expected_count = sum(
+			1 for seq in self.global_batch if seq.assigned_rank == self.rank
+		)
+
 		if len(my_uuids) != expected_count:
 			logging.error(
 				f"Rank {self.rank}: CRITICAL MISMATCH - expected {expected_count} sequences "
 				f"but got {len(my_uuids)} from get_sequences_for_rank!"
 			)
-		
+
 		logging.info(
 			f"Rank {self.rank}: Built local query_book with {len(self.query_book)} entries "
-			f"(expected {expected_count}, global_batch has {len(self.global_batch)} sequences)"
+			f"(global_batch has {len(self.global_batch)} sequences)"
 		)
 
 	# ============ KV-Driven Batch Preparation ============
