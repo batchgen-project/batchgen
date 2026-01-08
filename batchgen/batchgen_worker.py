@@ -5581,60 +5581,36 @@ class BatchGenWorker:
 			
 			with torch.inference_mode():
 				if batch:
-					# Build attention metadata
-					attention_masks = []
+					# Build attention metadata - collect only cache_seqlens
 					cache_seqlens = []
-					
+
 					for local_idx in batch:
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						ctx_len = seq.current_context_length
-						
-						full_mask = self.query_book[local_idx].encoded["attention_mask"]
-						
-						# Fix: If ctx_len is 0 but we have evidence the sequence was active,
-						# this is a metadata sync bug. Recover ctx_len.
-						mask_ones_count = int(full_mask.sum().item())
-						expected_ctx_len = seq.prompt_length + seq.decoded_length
-						
-						if ctx_len == 0 and (seq.decoded_length > 0 or seq.prompt_length > 0 or mask_ones_count > 0):
-							recovered_ctx_len = max(mask_ones_count, expected_ctx_len)
-							if recovered_ctx_len > 0:
-								ctx_len = recovered_ctx_len
-								seq.current_context_length = recovered_ctx_len
-						
-						mask = full_mask[:, :ctx_len]
-						actual_ones = mask.sum().item()
-						
-						# Fix: Repair the attention_mask to match current_context_length
-						if actual_ones != ctx_len:
-							if actual_ones > ctx_len:
-								# Too many ones - clear excess
-								repaired_mask = torch.zeros_like(full_mask)
-								repaired_mask[0, :ctx_len] = 1
-								full_mask.copy_(repaired_mask)
-								mask = full_mask[:, :ctx_len]
-							elif actual_ones < ctx_len:
-								# Too few ones - set all first ctx_len to 1
-								full_mask[0, :ctx_len] = 1
-								mask = full_mask[:, :ctx_len]
-						
-						attention_masks.append(mask)
+
+						# Fast path: trust metadata. ctx_len is maintained correctly.
+						# Recovery logic only runs if ctx_len is suspiciously 0 (rare edge case)
+						if ctx_len == 0:
+							expected_ctx_len = seq.prompt_length + seq.decoded_length
+							if expected_ctx_len > 0:
+								ctx_len = expected_ctx_len
+								seq.current_context_length = expected_ctx_len
+
 						cache_seqlens.append(ctx_len)
-					
+
 					max_ctx = max(cache_seqlens)
-					padded_masks = []
-					for mask in attention_masks:
-						if mask.shape[1] < max_ctx:
-							pad = torch.zeros((1, max_ctx - mask.shape[1]), dtype=mask.dtype, device=mask.device)
-							mask = torch.cat([mask, pad], dim=1)
-						padded_masks.append(mask)
-					
-					attention_mask = torch.cat(padded_masks, dim=0).to(self.torch_device)
-					
+					# Optimization: Build attention mask vectorized (single CUDA op)
+					# Creates mask where mask[i,j] = 1 if j < cache_seqlens[i]
+					positions = torch.arange(max_ctx, device=self.torch_device)
+					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
+					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)
+
 					Attn_Wrapper.attention_mask = attention_mask
-					Attn_Wrapper.position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
-					Attn_Wrapper.cache_seqlens = torch.tensor(cache_seqlens, dtype=torch.int32, device=self.torch_device)
+					# Optimization: Compute position_ids from cache_seqlens directly (O(batch))
+					# instead of attention_mask.sum(-1) which is O(batch × max_ctx)
+					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
+					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
 					Attn_Wrapper.max_seqlen = max_ctx
 					
 					if new_tokens.shape[0] != len(batch):
@@ -5675,29 +5651,34 @@ class BatchGenWorker:
 				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
-			
+
+			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
+			# This avoids N GPU synchronizations which cause heavy CPU overhead
+			new_tokens_cpu = new_tokens.cpu()
+
 			# Update sequences
 			for i, local_idx in enumerate(batch):
 				uuid = self._local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
-				
+
 				if self._is_sequence_completed(seq):
 					continue
-				
+
 				decode_pos = seq.decoded_length
-				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens[i].cpu()
-				
+				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
+
 				attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
 				next_pos = seq.current_context_length
 				if next_pos < attn_mask.shape[0]:
 					attn_mask[next_pos] = 1
-				
+
 				seq.decoded_length += 1
 				seq.current_context_length += 1
-				
-				if self._should_stop_at_eos(new_tokens[i].item()):
+
+				# Use CPU tensor to avoid GPU sync
+				if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 					seq.eos_reached = True
-				
+
 				if seq.decoded_length >= self.max_decoding_length:
 					seq.eos_reached = True
 			
