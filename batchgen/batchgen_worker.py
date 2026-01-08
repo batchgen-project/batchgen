@@ -3751,6 +3751,22 @@ class BatchGenWorker:
 		generation_time = time.perf_counter() - generation_start_time
 		phase_switching_time = config_prefill_time + config_decode_time
 
+		# Compute throughput metrics from all sequences
+		total_prompt_tokens = 0
+		total_decoded_tokens = 0
+		num_sequences = 0
+		if self.global_batch is not None:
+			for seq in self.global_batch:
+				total_prompt_tokens += seq.prompt_length
+				total_decoded_tokens += seq.decoded_length
+				num_sequences += 1
+
+		# Calculate throughput (tokens/second)
+		prefill_throughput = total_prompt_tokens / prefill_time if prefill_time > 0 else 0
+		decode_throughput = total_decoded_tokens / decoding_time if decoding_time > 0 else 0
+		total_tokens = total_prompt_tokens + total_decoded_tokens
+		overall_throughput = total_tokens / generation_time if generation_time > 0 else 0
+
 		if self.rank == 0:
 			logging.info(
 				f"Generation completed:\n"
@@ -3759,7 +3775,14 @@ class BatchGenWorker:
 				f"  Generation total time: {generation_time:.1f}s\n"
 				f"  Phase switching time: {phase_switching_time:.1f}s\n"
 				f"  Config prefill time: {config_prefill_time:.1f}s\n"
-				f"  Config decoding time: {config_decode_time:.1f}s"
+				f"  Config decoding time: {config_decode_time:.1f}s\n"
+				f"  ---\n"
+				f"  Total sequences: {num_sequences}\n"
+				f"  Total prompt tokens: {total_prompt_tokens:,}\n"
+				f"  Total decoded tokens: {total_decoded_tokens:,}\n"
+				f"  Prefill throughput: {prefill_throughput:,.1f} tokens/s\n"
+				f"  Decode throughput: {decode_throughput:,.1f} tokens/s\n"
+				f"  Overall throughput: {overall_throughput:,.1f} tokens/s"
 			)
 
 			# Compute and log batch statistics
