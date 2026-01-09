@@ -182,9 +182,14 @@ def unmount_hugetlbfs() -> bool:
 def reset_hugepages_allocation() -> bool:
     """Reset huge pages allocation to 0.
 
+    Runs both sysctl and direct /proc write for robustness.
+
     Returns:
-        True if successful, False otherwise.
+        True if at least one method succeeded, False otherwise.
     """
+    success = False
+
+    # Method 1: sysctl -w vm.nr_hugepages=0
     try:
         result = subprocess.run(
             ["sysctl", "-w", "vm.nr_hugepages=0"],
@@ -193,17 +198,27 @@ def reset_hugepages_allocation() -> bool:
             timeout=10,
         )
         if result.returncode == 0:
-            logger.info("Reset vm.nr_hugepages to 0")
-            return True
+            logger.info("Reset vm.nr_hugepages to 0 via sysctl")
+            success = True
         else:
-            logger.warning(f"Failed to reset hugepages: {result.stderr}")
-            return False
+            logger.warning(f"sysctl failed: {result.stderr}")
     except subprocess.TimeoutExpired:
-        logger.warning("Timeout while resetting hugepages")
-        return False
+        logger.warning("Timeout with sysctl")
     except Exception as e:
-        logger.warning(f"Error resetting hugepages: {e}")
-        return False
+        logger.warning(f"sysctl error: {e}")
+
+    # Method 2: echo 0 > /proc/sys/vm/nr_hugepages
+    try:
+        with open("/proc/sys/vm/nr_hugepages", "w") as f:
+            f.write("0\n")
+        logger.info("Reset vm.nr_hugepages to 0 via /proc")
+        success = True
+    except PermissionError:
+        logger.warning("Permission denied writing to /proc/sys/vm/nr_hugepages (need root)")
+    except Exception as e:
+        logger.warning(f"Failed to reset hugepages via /proc: {e}")
+
+    return success
 
 
 def cleanup_resources(
