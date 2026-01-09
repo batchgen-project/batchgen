@@ -1085,12 +1085,9 @@ class BatchGenWorker:
 			self.world_size
 		)
 
-		# Calculate GPU KV cache size NOW, right after model is loaded
-		# This must happen BEFORE any inference (prefill/decode) to measure
-		# only model weights, not activation memory
-		torch.cuda.synchronize(self.torch_device)
-		self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
-		logging.info(f"Rank {self.rank}: GPU KV cache size calculated: {self.gpu_kv_cache_size_gb:.2f} GB")
+		# NOTE: GPU KV cache size is calculated LATER in _config_decoding_for_batch()
+		# after configure_decoding() loads model weights to GPU. At this point,
+		# only the model skeleton exists and weights haven't been loaded yet.
 
 		logging.info(f"Rank {self.rank}: One-time core initialization completed")
 
@@ -3064,10 +3061,27 @@ class BatchGenWorker:
 		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
 			total_pages = self.gpu_paged_kv_cache_manager.get_stats().num_total_pages
 		else:
-			# Initial batch: estimate from config
-			# Ensure GPU KV cache size is calculated
+			# Initial batch: use THEORETICAL estimate for batch selection
+			# This is called BEFORE configure_decoding(), so model weights are not yet on GPU.
+			# Use conservative estimate: total_gpu * frac - estimated_model_size
+			# The actual GPU KV size will be recalculated in _config_decoding_for_batch()
+			# after model weights are loaded.
 			if self.gpu_kv_cache_size_gb is None:
-				self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
+				_, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+				total_mem_gb = total_mem_bytes / (1024 ** 3)
+				# Conservative model size estimate (DeepSeek-R1 uses ~60GB per GPU)
+				# This is just for batch selection; actual value computed later
+				estimated_model_size_gb = 65.0
+				self.gpu_kv_cache_size_gb = max(
+					1.0,
+					total_mem_gb * self.gpu_memory_frac - estimated_model_size_gb
+				)
+				if self.rank == 0:
+					logging.info(
+						f"[GPU-KV] Theoretical estimate for batch selection: {self.gpu_kv_cache_size_gb:.2f} GB "
+						f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - model: {estimated_model_size_gb:.0f} GB). "
+						f"Will recalculate after model loading."
+					)
 			from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config_fixed_size
 			config = build_gpu_kv_config_fixed_size(
 				model_name=self.huggingface_ckpt_name,
@@ -4302,6 +4316,39 @@ class BatchGenWorker:
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_weight_copy_queue()
 			self.core_engine.reset_decoding_buffer()
+
+		# STEP 1.5: Recalculate GPU KV cache size NOW after model weights are loaded
+		# This uses actual GPU memory measurement via torch.cuda.mem_get_info() (NVIDIA API)
+		# Overrides any theoretical estimate from _prepare_decode_batch()
+		torch.cuda.synchronize(self.torch_device)
+		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+		free_mem_gb = free_mem_bytes / (1024 ** 3)
+		total_mem_gb = total_mem_bytes / (1024 ** 3)
+		used_mem_gb = total_mem_gb - free_mem_gb
+
+		# Formula: gpu_kv_cache = total * frac - used
+		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
+		if new_gpu_kv_cache_size > 0:
+			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
+			if self.rank == 0:
+				logging.info(
+					f"[GPU-KV] Calculated after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
+					f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
+				)
+		else:
+			# Fallback to minimum if calculation yields non-positive
+			self.gpu_kv_cache_size_gb = 1.0
+			if self.rank == 0:
+				logging.warning(
+					f"[GPU-KV] Calculated size non-positive ({new_gpu_kv_cache_size:.2f} GB). "
+					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
+					f"Using minimum 1 GB."
+				)
+
+		# Broadcast GPU KV cache size from rank 0 to ensure all ranks use the same value
+		size_tensor = torch.tensor([self.gpu_kv_cache_size_gb], dtype=torch.float32, device=self.torch_device)
+		dist.broadcast(size_tensor, src=0)
+		self.gpu_kv_cache_size_gb = float(size_tensor.item())
 
 		# STEP 2: Initialize GPU KV manager with fixed size (now model is loaded, can compute accurate size)
 		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
