@@ -72,6 +72,14 @@ class ServerArgs:
     watchdog_timeout: Optional[float] = 600.0  # 10 minutes for long inference tasks
     watchdog_test_stuck_time: float = 0.0
     watchdog_heartbeat_interval: Optional[float] = None
+    # Prepack optimization (default: enabled, recommended always on)
+    enable_prepack: bool = True
+    # Host KV watermark percentage (default: 70% free = underutilized threshold)
+    host_kv_watermark: int = 70
+    # Decode preemption: interrupt decode for prefill when host KV is underutilized (default: enabled)
+    enable_decode_preemption: bool = True
+    # GPU memory fraction for KV cache: gpu_kv_size = GPU_mem * frac - model_size (default: 0.9)
+    gpu_memory_frac: float = 0.9
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -196,6 +204,40 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Idle heartbeat interval in seconds when watchdog is enabled",
     )
+    parser.add_argument(
+        "--enable-prepack",
+        action="store_true",
+        default=True,
+        help="Enable prepack optimization for efficient prefill batching (default: enabled, recommended always on)",
+    )
+    parser.add_argument(
+        "--no-prepack",
+        action="store_true",
+        help="Disable prepack optimization",
+    )
+    parser.add_argument(
+        "--host-kv-watermark",
+        type=int,
+        default=70,
+        help="Host KV cache watermark percentage. When free slots exceed this threshold, prefill is prioritized (default: 70)",
+    )
+    parser.add_argument(
+        "--enable-decode-preemption",
+        action="store_true",
+        default=True,
+        help="Enable decode preemption. Interrupts decode to prefill new sequences when host KV is underutilized (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-decode-preemption",
+        action="store_true",
+        help="Disable decode preemption",
+    )
+    parser.add_argument(
+        "--gpu-memory-frac",
+        type=float,
+        default=0.9,
+        help="Fraction of GPU memory to use for KV cache. GPU KV cache size = GPU_mem * frac - model_size (default: 0.9)",
+    )
     return parser
 
 
@@ -236,6 +278,10 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("watchdog_test_stuck_time must be non-negative")
     if args.watchdog_test_stuck_time > 0 and args.watchdog_timeout is None:
         raise ValueError("watchdog_test_stuck_time requires watchdog_timeout")
+    if args.host_kv_watermark < 0 or args.host_kv_watermark > 100:
+        raise ValueError("host_kv_watermark must be between 0 and 100")
+    if args.gpu_memory_frac <= 0 or args.gpu_memory_frac > 1.0:
+        raise ValueError("gpu_memory_frac must be between 0 and 1.0")
     args.storage_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -271,6 +317,10 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         watchdog_timeout=watchdog_timeout,
         watchdog_test_stuck_time=parsed.watchdog_test_stuck_time,
         watchdog_heartbeat_interval=parsed.watchdog_heartbeat_interval,
+        enable_prepack=not getattr(parsed, 'no_prepack', False),
+        host_kv_watermark=parsed.host_kv_watermark,
+        enable_decode_preemption=not getattr(parsed, 'no_decode_preemption', False),
+        gpu_memory_frac=parsed.gpu_memory_frac,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

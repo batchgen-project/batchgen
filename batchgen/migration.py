@@ -68,18 +68,18 @@ class KVMigrationHelper:
     def __init__(
         self,
         worker: Any,  # BatchGenWorker instance
-        enable_watermark_prefill: bool = True,
+        enable_decode_preemption: bool = True,
         debug: bool = False,
     ):
         """Initialize the migration helper.
 
         Args:
             worker: BatchGenWorker instance
-            enable_watermark_prefill: Whether to enable watermark-based prefill triggering
+            enable_decode_preemption: Whether to enable decode preemption (interrupt decode for prefill)
             debug: Enable verbose debug logging
         """
         self.worker = worker
-        self.enable_watermark_prefill = enable_watermark_prefill
+        self.enable_decode_preemption = enable_decode_preemption
         self.debug = debug
 
         # Gloo process group for CPU tensor migrations
@@ -194,7 +194,7 @@ class KVMigrationHelper:
         Returns:
             True if should interrupt decode and switch to prefill
         """
-        if not self.enable_watermark_prefill:
+        if not self.enable_decode_preemption:
             return False
 
         # Only local_rank 0 reports (one per node)

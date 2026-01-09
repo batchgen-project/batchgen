@@ -440,56 +440,21 @@ for batch in batches:
 
 ## Troubleshooting
 
-### Common Issues
-
-#### NCCL Connection Timeout
-
-```
-RuntimeError: NCCL connection timeout
-```
-
-**Solution**: Ensure all nodes can reach each other on ports 12355 and 20003. Check firewall rules.
-
-```bash
-# Test connectivity
-nc -zv node0-ip 12355
-nc -zv node0-ip 20003
-```
-
-#### Shared Memory Error
+### Shared Memory Error
 
 ```
 ValueError: Shared memory size is not enough
 ```
 
-**Solution**: Increase shared memory size:
+**Solution**: Mount shared memory with full host memory size:
 
 ```bash
-# Temporary
-sudo mount -o remount,size=512G /dev/shm
+# Temporary (replace 1500G with your host memory size)
+sudo mount -o remount,size=1500G /dev/shm
 
 # Permanent (add to /etc/fstab)
-tmpfs /dev/shm tmpfs defaults,size=512G 0 0
+tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
 ```
-
-#### Model Files Not Found
-
-```
-FileNotFoundError: No checkpoint files found
-```
-
-**Solution**: Ensure `--cache-dir` points to the directory containing `.safetensors` files, not the parent directory.
-
-#### Out of Memory
-
-```
-CUDA out of memory
-```
-
-**Solution**:
-- Increase `--host-kv-cache-size` to offload KV cache to host memory
-- Reduce `--max-input-len` and `--max-output-len`
-- Add more nodes to distribute the model
 
 ---
 
@@ -497,13 +462,15 @@ CUDA out of memory
 
 1. **Pre-convert checkpoints**: Always convert checkpoints before deployment to eliminate cold-start time.
 
-2. **Use hugeTLBFS**: Enable `--enable-hugetlbfs` for better memory performance (requires system configuration).
+2. **Host KV cache size**: The `--host-kv-cache-size` parameter is essential for performance. Set it to the maximum available:
+   ```
+   host_kv_cache_size = 0.9 × host_memory - model_size
+   ```
+   For example, with 1.5TB host memory and DeepSeek-R1 (~700GB model), use `--host-kv-cache-size 650`.
 
-3. **Batch requests**: Group requests into larger batches for better throughput.
+3. **Use hugeTLBFS**: Enable `--enable-hugetlbfs` for better memory performance (requires system configuration).
 
-4. **Host KV cache**: For long sequences, use `--host-kv-cache-size` to enable KV cache offloading.
-
-5. **Monitor with watchdog**: Keep `--watchdog-timeout` enabled to detect stuck workers.
+4. **Batch requests**: Group requests into larger batches for better throughput.
 
 ---
 

@@ -37,7 +37,6 @@ class Scheduler:
 		num_k_buffer = 6
 		k_buffer_size = num_k_buffer * attn_decoding_micro_batch_size * self.Max_Context_Length * 576 / (1024 ** 3) * kv_element_size # in GB
 		self.config.GPU_Buffer_Config.kv_buffer_num_tokens = attn_decoding_micro_batch_size * self.Max_Context_Length
-		logging.info(f"kv buffer num tokens: {self.config.GPU_Buffer_Config.kv_buffer_num_tokens}")
 
 
 		available_gpu_mem = 96 * DEFAULT_MEM_FRAC  # Assuming 96GB GPU memory
@@ -53,12 +52,11 @@ class Scheduler:
 		if self.config.Basic_Config.attn_mode == 3:
 			num_local_expert_per_layer = EXPERT_PER_RANK
 			expert_size = num_local_expert_per_layer * 2.4
-			# Fix 
+			# Fix
 			self.per_seq_size = self.Max_Context_Length * 61 * 576 / (1024 ** 3) * kv_element_size # in GB
 			self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = (
 				int((available_gpu_mem - model_skeleton_size - cuda_page_table_default_size - expert_size - NCCL_default_buffer_usage) / self.per_seq_size)
 			)
-			logging.info(f"Max Available MoE decoding micro batch size: {self.config.Module_Batching_Config.MoE_decoding_micro_batch_size}")
 		if num_local_expert_per_layer == EXPERT_PER_RANK:
 			num_decoding_module_buffer_routed_expert = 0
 

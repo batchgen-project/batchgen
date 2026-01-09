@@ -70,9 +70,9 @@ else:
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
-# Prepack mode for efficient prefill batching
-# Set BATCHGEN_ENABLE_PREPACK=1 to enable prepack optimization
-BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "0") == "1"
+# Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
+# Default: enabled (recommended always on). Use --no-prepack to disable.
+BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "1") == "1"
 
 # Optional runtime checks for NaN/Inf in KV tensors (disabled by default)
 BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == '1'
@@ -80,9 +80,16 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
-# Watermark-based prefill configuration
-HOST_KV_WATERMARK_PERCENT = int(os.environ.get('BATCHGEN_HOST_KV_WATERMARK', '70'))  # % FREE (70% = underutilized)
-ENABLE_WATERMARK_PREFILL = os.environ.get('BATCHGEN_ENABLE_WATERMARK_PREFILL', '0') == '1'  # Default OFF for safety
+# Decode preemption configuration (DEPRECATED: use CLI args instead)
+# --host-kv-watermark: Default 70% (when free slots exceed this threshold, prefill is prioritized)
+# --enable-decode-preemption / --no-decode-preemption: Default enabled
+HOST_KV_WATERMARK_PERCENT = int(os.environ.get('BATCHGEN_HOST_KV_WATERMARK', '70'))
+ENABLE_DECODE_PREEMPTION = os.environ.get('BATCHGEN_ENABLE_DECODE_PREEMPTION', '1') == '1'  # Default ON
+
+# GPU KV cache size override (DEPRECATED: use --gpu-memory-frac CLI arg instead)
+# If set, overrides the automatic calculation. Otherwise, size is computed as:
+# gpu_kv_cache = GPU_mem * gpu_memory_frac - model_instance_size
+_GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 NUM_GPUS_PER_NODE = int(os.environ.get('NUM_GPUS_PER_NODE', '8'))
 
 
@@ -206,6 +213,15 @@ class BatchGenWorkerArgs:
 	watchdog_test_stuck_time: float = 0.0  # Deliberate delay for testing
 	watchdog_heartbeat_interval: Optional[float] = None  # Heartbeat interval
 
+	# Prepack optimization (default: enabled, recommended always on)
+	enable_prepack: bool = True
+	# Host KV watermark percentage (default: 70% free = underutilized threshold)
+	host_kv_watermark: int = 70
+	# Decode preemption: interrupt decode for prefill when host KV is underutilized (default: enabled)
+	enable_decode_preemption: bool = True
+	# GPU KV cache size in GB (calculated: GPU_mem * gpu_memory_frac - model_size)
+	gpu_kv_cache_size_gb: Optional[float] = None
+
 
 class BatchGenWorker:
 	"""
@@ -214,8 +230,6 @@ class BatchGenWorker:
 	PAGE_SIZE = 64  # Tokens per page (fixed)
 	# Decision frequency: check boundaries every N pages (configurable via DECISION_FREQUENCY_PAGES)
 	DECISION_INTERVAL = DECISION_FREQUENCY_PAGES * 64  # Tokens between boundary checks
-	# GPU_KV_CACHE_SIZE_GB = 20.0  # Default GPU KV cache size
-	GPU_KV_CACHE_SIZE_GB = float(os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB", "20.0"))
 
 
 	def __init__(self, args: BatchGenWorkerArgs):
@@ -261,6 +275,11 @@ class BatchGenWorker:
 		self.tensor_meta_shm_name = args.tensor_meta_shm_name
 		self.weight_byte_size = args.weight_byte_size
 		self.enable_hugetlbfs = args.enable_hugetlbfs
+
+		# Prepack and decode preemption configuration from args
+		self.enable_prepack = args.enable_prepack
+		self.host_kv_watermark = args.host_kv_watermark
+		self.enable_decode_preemption = args.enable_decode_preemption
 
 		# 4. Initialize Weights Storage (cudaHostRegister for weights)
 		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
@@ -342,8 +361,21 @@ class BatchGenWorker:
 		COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
 
-		# Add GPU KV cache size configuration
-		self.gpu_kv_cache_size_gb = getattr(args, 'gpu_kv_cache_size_gb', self.GPU_KV_CACHE_SIZE_GB)
+		# GPU KV cache size configuration
+		# Priority: 1) env var override, 2) calculated value from args, 3) error
+		if _GPU_KV_CACHE_SIZE_OVERRIDE is not None:
+			self.gpu_kv_cache_size_gb = float(_GPU_KV_CACHE_SIZE_OVERRIDE)
+			if self.rank == 0:
+				logging.info(f"GPU KV cache size: {self.gpu_kv_cache_size_gb} GB (from BATCHGEN_GPU_KV_CACHE_SIZE_GB env var)")
+		elif args.gpu_kv_cache_size_gb is not None:
+			self.gpu_kv_cache_size_gb = args.gpu_kv_cache_size_gb
+			if self.rank == 0:
+				logging.info(f"GPU KV cache size: {self.gpu_kv_cache_size_gb:.2f} GB (calculated)")
+		else:
+			raise ValueError(
+				"GPU KV cache size not configured. Either set BATCHGEN_GPU_KV_CACHE_SIZE_GB "
+				"environment variable or ensure --gpu-memory-frac is set for automatic calculation."
+			)
 		
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
@@ -1386,7 +1418,7 @@ class BatchGenWorker:
 		Returns:
 			True if should interrupt decode and switch to prefill
 		"""
-		if not ENABLE_WATERMARK_PREFILL:
+		if not self.enable_decode_preemption:
 			return False
 
 		# Only local_rank 0 reports (one per node)
@@ -1407,7 +1439,7 @@ class BatchGenWorker:
 
 		# Check if any node above watermark (too much free space)
 		max_free_percent = max(s['free_percent'] for s in node_stats)
-		above_watermark = max_free_percent > HOST_KV_WATERMARK_PERCENT
+		above_watermark = max_free_percent > self.host_kv_watermark
 
 		# Check if queued sequences available
 		has_queued = self.global_batch.has_queueing()
@@ -1433,7 +1465,7 @@ class BatchGenWorker:
 			
 			if should_trigger:
 				logging.info(
-					f"[Host KV Cache] PREFILL TRIGGER: max_node_free={max_free_percent}% > {HOST_KV_WATERMARK_PERCENT}%, "
+					f"[Host KV Cache] PREFILL TRIGGER: max_node_free={max_free_percent}% > {self.host_kv_watermark}%, "
 					f"queued_sequences={len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))}"
 				)
 				for s in node_stats:
@@ -1449,7 +1481,7 @@ class BatchGenWorker:
 			if self._watermark_check_counter % 10 == 0:
 				logging.debug(
 					f"[Host KV Cache] Check #{self._watermark_check_counter}: max_free={max_free_percent}%, "
-					f"threshold={HOST_KV_WATERMARK_PERCENT}%, has_queued={has_queued}, trigger={should_trigger}"
+					f"threshold={self.host_kv_watermark}%, has_queued={has_queued}, trigger={should_trigger}"
 				)
 
 		return should_trigger
@@ -2107,7 +2139,7 @@ class BatchGenWorker:
 		4. Update sequence ownership metadata
 		5. Barrier to ensure metadata consistency
 		"""
-		if not ENABLE_WATERMARK_PREFILL:
+		if not self.enable_decode_preemption:
 			return
 
 		rebalance_start = time.perf_counter()
@@ -3748,7 +3780,7 @@ class BatchGenWorker:
 
 				# STEP 0: Rebalance host KV BEFORE batch selection
 				# This ensures batch selection uses accurate post-migration capacities
-				if ENABLE_WATERMARK_PREFILL:
+				if self.enable_decode_preemption:
 					rebalance_start = time.perf_counter()
 					self._rebalance_host_kv()
 					if self.rank == 0:
@@ -3775,7 +3807,7 @@ class BatchGenWorker:
 					if local_prefill_indices:
 						prefill_start = time.perf_counter()
 						with torch.inference_mode():
-							if BATCHGEN_ENABLE_PREPACK:
+							if self.enable_prepack:
 								self.prefill_prepacked(local_prefill_indices)
 							else:
 								self.prefill(local_prefill_indices)

@@ -300,6 +300,10 @@ class WorkerManager:
             watchdog_timeout=self.args.watchdog_timeout,
             watchdog_test_stuck_time=self.args.watchdog_test_stuck_time,
             watchdog_heartbeat_interval=self.args.watchdog_heartbeat_interval,
+            enable_prepack=self.args.enable_prepack,
+            host_kv_watermark=self.args.host_kv_watermark,
+            enable_decode_preemption=self.args.enable_decode_preemption,
+            gpu_kv_cache_size_gb=self._calculate_gpu_kv_cache_size(),
         )
         self.worker_process = mp.spawn(
             server_worker_main,
@@ -512,6 +516,60 @@ class WorkerManager:
             )
         else:
             self.args_dict["host_kv_cache_size_per_rank"] = available_mem
+
+    def _calculate_gpu_kv_cache_size(self) -> float:
+        """Calculate GPU KV cache size based on available GPU memory.
+
+        Formula: gpu_kv_cache = GPU_total_memory * gpu_memory_frac - model_instance_size
+
+        For MoE models, the model weights are in host memory (shared memory),
+        so model_instance_size is estimated as parameter_server_size / world_size.
+        """
+        num_devices = torch.cuda.device_count()
+        if num_devices == 0:
+            raise RuntimeError("No CUDA devices found for GPU KV cache calculation")
+
+        # Get GPU memory (use device 0 as reference, assume homogeneous)
+        gpu_total_mem_bytes = torch.cuda.get_device_properties(0).total_memory
+        gpu_total_mem_gb = gpu_total_mem_bytes / (1024 ** 3)
+
+        # Calculate model instance size per GPU
+        # For MoE with expert streaming, this is an approximation
+        world_size = self.args.world_size or (num_devices * self.args.nnodes)
+        if world_size == 1 and num_devices > 1:
+            world_size = num_devices * self.args.nnodes
+
+        model_size_bytes = self.model_info.get("parameter_server_size", 0)
+        model_instance_per_gpu_gb = (model_size_bytes / world_size) / (1024 ** 3)
+
+        # Calculate GPU KV cache size
+        gpu_kv_cache_gb = (
+            gpu_total_mem_gb * self.args.gpu_memory_frac - model_instance_per_gpu_gb
+        )
+
+        # Ensure we have a positive value
+        if gpu_kv_cache_gb <= 0:
+            logger.warning(
+                "Calculated GPU KV cache size is non-positive (%.2f GB). "
+                "GPU memory: %.2f GB, frac: %.2f, model per GPU: %.2f GB. "
+                "Using minimum of 1 GB.",
+                gpu_kv_cache_gb,
+                gpu_total_mem_gb,
+                self.args.gpu_memory_frac,
+                model_instance_per_gpu_gb,
+            )
+            gpu_kv_cache_gb = 1.0
+
+        logger.info(
+            "GPU KV cache size calculated: %.2f GB "
+            "(GPU mem: %.2f GB × frac: %.2f - model/GPU: %.2f GB)",
+            gpu_kv_cache_gb,
+            gpu_total_mem_gb,
+            self.args.gpu_memory_frac,
+            model_instance_per_gpu_gb,
+        )
+
+        return gpu_kv_cache_gb
 
     @staticmethod
     def allocate_host_kv_cache(
