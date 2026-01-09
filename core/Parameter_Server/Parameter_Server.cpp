@@ -418,9 +418,10 @@ void Parameter_Server::Init(
                        (total_memory - free_memory) / (1024 * 1024 * 1024),
                        total_memory / (1024 * 1024 * 1024));
     
-    // Allocate shared pinned memory for weights
+    // Allocate shared memory for weights (server does NOT register with CUDA - no GPU access needed)
+    // Only worker processes will call cudaHostRegister for DMA
     void* weight_ptr = nullptr;
-    weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true, this->enable_hugetlbfs);
+    weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true, this->enable_hugetlbfs, false);
     this->byte_size_ = byte_size;
     this->weight_ptr_ = weight_ptr;
 

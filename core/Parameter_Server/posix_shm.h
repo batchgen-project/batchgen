@@ -23,7 +23,8 @@
 #include <string>
 #include <unordered_map>
 void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
-                                    bool create, bool enable_hugetlbfs);
+                                    bool create, bool enable_hugetlbfs,
+                                    bool pin_for_cuda = true);
 void free_shared_pinned_memory(std::string& shm_name, void* ptr, int64_t size,
                                bool create);
 void serialize_to_shared_memory(

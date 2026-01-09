@@ -255,24 +255,27 @@ void* mmap_aligned(size_t length, int prot, int flags, int fd, off_t offset, siz
 
 
 /**
- * @brief Allocates shared memory that is pinned for CUDA operations.
+ * @brief Allocates shared memory optionally pinned for CUDA operations.
  * * This function supports two allocation strategies:
  * 1.  Hugetlbfs: Uses large 2MB pages for potentially better performance, but requires
  * root privileges and proper system configuration. Controlled by enable_hugetlbfs.
  * 2.  Regular Shared Memory: A fallback using standard 4KB pages via shm_open.
- * * In both cases, the allocated memory is "touched" to ensure it is resident in RAM
- * and then pinned using cudaHostRegister for efficient GPU access.
+ * * In both cases, the allocated memory is "touched" to ensure it is resident in RAM.
+ * If pin_for_cuda is true, memory is also registered with cudaHostRegister for DMA.
  * * @param shm_name The name for the shared memory segment.
  * @param size The desired size of the allocation in bytes.
  * @param create True if the caller is the server (creates the segment), false for workers.
  * @param enable_hugetlbfs If true, attempts to use hugetlbfs for allocation.
- * @return A void pointer to the allocated and pinned shared memory.
+ * @param pin_for_cuda If true, register memory with cudaHostRegister for GPU DMA access.
+ *                     Server should pass false (no GPU access needed), workers pass true.
+ * @return A void pointer to the allocated shared memory.
  * @throws std::runtime_error on failure.
  */
 void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int64_t size,
                                     bool create,
-                                    bool enable_hugetlbfs) {
+                                    bool enable_hugetlbfs,
+                                    bool pin_for_cuda) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
@@ -429,32 +432,37 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
         }
     }
 
-    // STAGE 3: Register the successfully allocated memory with CUDA
-    try {
-        logger->info("Registering {:.3f}GB with CUDA...", size / (1024.0 * 1024.0 * 1024.0));
-        auto cuda_start = std::chrono::high_resolution_clock::now();
+    // STAGE 3: Register the successfully allocated memory with CUDA (only if pin_for_cuda is true)
+    // Server process skips this to avoid GPU memory usage from page tables
+    if (pin_for_cuda) {
+        try {
+            logger->info("Registering {:.3f}GB with CUDA...", size / (1024.0 * 1024.0 * 1024.0));
+            auto cuda_start = std::chrono::high_resolution_clock::now();
 
-        cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+            cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
 
-        auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::high_resolution_clock::now() - cuda_start);
+            auto cuda_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - cuda_start);
 
-        if (err != cudaSuccess) {
-            throw std::runtime_error("cudaHostRegister failed: " + std::string(cudaGetErrorString(err)));
-        }
-
-        logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
-    } catch (const std::exception& e) {
-        // Clean up memory and rethrow if CUDA registration fails
-        munmap(ptr, allocated_size);
-        if (create) {
-            if (using_huge_pages) {
-                unlink(hugepage_path.c_str());
-            } else {
-                shm_unlink(shm_name.c_str());
+            if (err != cudaSuccess) {
+                throw std::runtime_error("cudaHostRegister failed: " + std::string(cudaGetErrorString(err)));
             }
+
+            logger->info("CUDA registration completed in {:.2f}s", cuda_duration.count() / 1000.0);
+        } catch (const std::exception& e) {
+            // Clean up memory and rethrow if CUDA registration fails
+            munmap(ptr, allocated_size);
+            if (create) {
+                if (using_huge_pages) {
+                    unlink(hugepage_path.c_str());
+                } else {
+                    shm_unlink(shm_name.c_str());
+                }
+            }
+            throw;
         }
-        throw;
+    } else {
+        logger->info("Skipping CUDA registration (server mode, no GPU access needed)");
     }
 
     logger->info("Memory allocation completed successfully using {} pages.",

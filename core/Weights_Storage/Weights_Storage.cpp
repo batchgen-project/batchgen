@@ -81,9 +81,10 @@ void Weights_Storage::Init(
     this->logger->info(
         "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
         shm_name, byte_size);
-        
+
+    // Worker process: register with CUDA for DMA access (pin_for_cuda=true)
     void* weight_ptr =
-        allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs);
+        allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs, true);
         
     // Check if weight_ptr is null
     if (weight_ptr == nullptr) {
