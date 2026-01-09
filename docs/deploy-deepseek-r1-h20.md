@@ -134,9 +134,12 @@ Run on each node with the appropriate `--node-rank`:
 
 ```bash
 # Node 0 (Master)
-docker run --gpus all \
-    --network host \
-    --shm-size=512g \
+docker run \
+    --cap-add=SYS_NICE \
+    --cap-add=SYS_ADMIN \
+    --runtime=nvidia \
+    --gpus all \
+    --network=host \
     -v /shared/models:/models:ro \
     -v /shared/storage:/storage \
     batchgen:latest \
@@ -150,9 +153,12 @@ docker run --gpus all \
     --dist-init-addr node0-ip:12355
 
 # Node 1
-docker run --gpus all \
-    --network host \
-    --shm-size=512g \
+docker run \
+    --cap-add=SYS_NICE \
+    --cap-add=SYS_ADMIN \
+    --runtime=nvidia \
+    --gpus all \
+    --network=host \
     -v /shared/models:/models:ro \
     -v /shared/storage:/storage \
     batchgen:latest \
@@ -165,6 +171,10 @@ docker run --gpus all \
     --node-rank 1 \
     --dist-init-addr node0-ip:12355
 ```
+
+**Optional flags** (add if needed):
+- `--privileged`: Full host access (use with caution)
+- `--ipc=host`: Share host IPC namespace
 
 ---
 
