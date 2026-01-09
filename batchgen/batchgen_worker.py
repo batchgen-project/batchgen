@@ -432,27 +432,28 @@ class BatchGenWorker:
 
 		# Rank 0 calculates, then broadcasts to all ranks
 		if self.rank == 0:
-			# Get actual free GPU memory (after model is loaded)
+			# Get actual GPU memory usage (after model is loaded)
 			free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
 			free_mem_gb = free_mem_bytes / (1024 ** 3)
 			total_mem_gb = total_mem_bytes / (1024 ** 3)
 			used_mem_gb = total_mem_gb - free_mem_gb
 
-			# Use fraction of free memory for KV cache
-			gpu_kv_cache_gb = free_mem_gb * self.gpu_memory_frac
+			# Formula: gpu_kv_cache = total * frac - used
+			# This reserves (1-frac) of GPU memory for activations and overhead
+			gpu_kv_cache_gb = total_mem_gb * self.gpu_memory_frac - used_mem_gb
 
 			# Ensure positive value
 			if gpu_kv_cache_gb <= 0:
 				logging.warning(
 					f"[GPU-KV] Calculated size is non-positive ({gpu_kv_cache_gb:.2f} GB). "
-					f"Free: {free_mem_gb:.2f} GB, frac: {self.gpu_memory_frac}. Using minimum 1 GB."
+					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
+					f"Using minimum 1 GB."
 				)
 				gpu_kv_cache_gb = 1.0
 
 			logging.info(
 				f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
-				f"(free: {free_mem_gb:.2f} GB × frac: {self.gpu_memory_frac}, "
-				f"used: {used_mem_gb:.2f} GB / total: {total_mem_gb:.2f} GB)"
+				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
 			)
 		else:
 			gpu_kv_cache_gb = 0.0
