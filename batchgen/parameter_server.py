@@ -700,6 +700,18 @@ class ParameterServer:
 		
 		# Handle cache_dir - exactly as in original implementation
 		if cache_dir is None:
+			# Check if model download is allowed (disabled by default for production safety)
+			allow_model_download = request.get('allow_model_download', False)
+			if not allow_model_download:
+				error_msg = (
+					"Error: Model download is disabled by default for production safety.\n"
+					"Please either:\n"
+					"  1. Provide cache_dir pointing to pre-downloaded model files, OR\n"
+					"  2. Set allow_model_download=True in the request to enable downloading from HuggingFace Hub"
+				)
+				logging.error(error_msg)
+				return {'status': 'error', 'message': error_msg}
+
 			try:
 				logging.info("Downloading model from Hugging Face")
 				from huggingface_hub import snapshot_download

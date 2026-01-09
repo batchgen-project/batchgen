@@ -494,6 +494,7 @@ class DeepSeek_Initializer:
             huggingface_ckpt_name,
             cache_dir=hf_cache_dir,
             trust_remote_code=True,
+            local_files_only=True,
         )
         # TODO:
         self.model_config = self._parse_model_config()

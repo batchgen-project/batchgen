@@ -55,7 +55,9 @@ class DeepSeek_Parameter_Server:
             else DeepseekV3Config
         )
         self.hf_model_config = config_cls.from_pretrained(
-            huggingface_ckpt_name, trust_remote_code=True
+            huggingface_ckpt_name,
+            trust_remote_code=True,
+            local_files_only=True,
         )
         self.hf_model_config._name_or_path = huggingface_ckpt_name
         self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
@@ -116,55 +118,10 @@ class DeepSeek_Parameter_Server:
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free memory before cpp pm Init: {gpu0_memory} GB / {total_memory} GB")
-        # Todo: Fix this
-        self.pt_ckpt_dir = os.path.join(self.cache_dir, "converted_ckpt")
-        file_list = []
-        for file_name in os.listdir(self.cache_dir):
-            if file_name.endswith(".safetensors") or file_name.endswith(".pt"):
-                file_list.append(os.path.join(self.cache_dir, file_name))
-        if not os.path.exists(self.pt_ckpt_dir):
-            os.makedirs(self.pt_ckpt_dir, exist_ok=True)
-            logging.info(f"First time run this model, converting the checkpoint files to BatchGen compatible format.")
-            converter = ckpt_converter()
-            for file_path in tqdm(file_list, desc="Converting checkpoint files", smoothing=0):
-                logging.debug(f"Converting {file_path} to {self.pt_ckpt_dir}")
-                converter.convert(file_path, self.pt_ckpt_dir)
-        else:
-            # Check if files are corrupted
-            # Num of metadata(.json) and bin(.bin) files should be the same as file_list
-            # Also they should be in the same name exclusing the extension
-            metadata_files = []
-            bin_files = []
-            for file_name in os.listdir(self.pt_ckpt_dir):
-                if file_name.endswith(".json"):
-                    metadata_files.append(os.path.join(self.pt_ckpt_dir, file_name))
-                elif file_name.endswith(".bin"):
-                    bin_files.append(os.path.join(self.pt_ckpt_dir, file_name))
-            if len(metadata_files) != len(bin_files):
-                raise ValueError(
-                    f"Metadata files {len(metadata_files)} and bin files {len(bin_files)} do not match. \
-                    Please clean the converted_ckpt dir in {self.cache_dir} and run again."
-                )
-            if len(metadata_files) != len(file_list):
-                raise ValueError(
-                    f"Metadata files {len(metadata_files)} and original checkpoint files {len(file_list)} do not match. \
-                    Please clean the converted_ckpt dir in {self.cache_dir} and run again."
-                )
-            for files in file_list:
-                file_name = os.path.basename(files)
-                metadata_file = os.path.join(
-                    self.pt_ckpt_dir, file_name.replace(".safetensors", ".json").replace(".pt", ".json")
-                )
-                bin_file = os.path.join(
-                    self.pt_ckpt_dir, file_name.replace(".safetensors", ".bin").replace(".pt", ".bin")
-                )
-                if not os.path.exists(metadata_file):
-                    raise FileNotFoundError(f"Metadata file {metadata_file} does not exist. \
-                    Please clean the converted_ckpt dir in {self.cache_dir} and run again.")    
-                if not os.path.exists(bin_file):
-                    raise FileNotFoundError(f"Bin file {bin_file} does not exist. \
-                    Please clean the converted_ckpt dir in {self.cache_dir} and run again.")
-         
+
+        # Convert checkpoint files to BatchGen format (or validate existing conversion)
+        converter = ckpt_converter()
+        self.pt_ckpt_dir = converter.convert_model_directory(self.cache_dir)
 
         self.parameter_server.Init(
             self.shm_name,

@@ -87,6 +87,14 @@ class BatchGenServer:
 		self.args.pt_ckpt_dir = pt_ckpt_dir
 
 		if not endpoint and self.args.cache_dir is None:
+			# Check if model download is allowed (disabled by default for production safety)
+			if not getattr(self.args, 'allow_model_download', False):
+				raise RuntimeError(
+					"Error: Model download is disabled by default for production safety.\n"
+					"Please either:\n"
+					"  1. Provide --cache-dir pointing to pre-downloaded model files, OR\n"
+					"  2. Add --allow-model-download flag to enable downloading from HuggingFace Hub"
+				)
 			self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
 
 		if endpoint:
@@ -499,7 +507,13 @@ def parse_args():
 	parser.add_argument("--nnodes", type=int, default=1)
 	parser.add_argument("--node-rank", type=int, default=0)
 	parser.add_argument("--world-size", type=int, default=1)
-	
+	parser.add_argument(
+		"--allow-model-download",
+		action="store_true",
+		default=False,
+		help="Allow downloading model from HuggingFace Hub. Disabled by default for production safety."
+	)
+
 	return parser.parse_args()
 
 if __name__ == "__main__":

@@ -46,14 +46,14 @@ class Mixtral_Parameter_Server:
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         # config_cls = DeepseekV2Config if "V2" in huggingface_ckpt_name else DeepseekV3Config
-        # Get hf_token from env
+        # Get hf_token from env (optional for offline mode)
         hf_token = os.getenv("HF_TOKEN")
-        if hf_token is None:
-            raise ValueError(
-                "Please set HF_TOKEN in environment variable to use Mixtral models"
-            )
+        # Note: HF_TOKEN is only needed if downloading from HuggingFace Hub
+        # For offline/air-gapped deployments with local files, it's not required
         self.hf_model_config = AutoConfig.from_pretrained(
-            huggingface_ckpt_name, token=hf_token
+            huggingface_ckpt_name,
+            token=hf_token,
+            local_files_only=True,
         )
 
         # self.hf_model_config = AutoConfig.from_pretrained(huggingface_ckpt_name, cache_dir=cache_dir, trust_remote_code=True)

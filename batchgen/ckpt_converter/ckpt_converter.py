@@ -110,6 +110,157 @@ class ckpt_converter:
 		with open(out_metadata_name, "w") as metadata_file:
 			json.dump(metadata, metadata_file, indent=4)
 
+	def _get_checkpoint_files(self, input_dir):
+		"""
+		Get list of checkpoint files (.safetensors or .pt) in a directory.
+
+		Args:
+			input_dir: Directory to scan for checkpoint files
+
+		Returns:
+			List of full paths to checkpoint files
+		"""
+		file_list = []
+		for file_name in os.listdir(input_dir):
+			if file_name.endswith(".safetensors") or file_name.endswith(".pt"):
+				file_list.append(os.path.join(input_dir, file_name))
+		return sorted(file_list)
+
+	def validate_converted_directory(self, input_dir, output_dir):
+		"""
+		Validate that converted checkpoint files are consistent with source files.
+
+		Args:
+			input_dir: Directory containing source .safetensors or .pt files
+			output_dir: Directory containing converted .bin and .json files
+
+		Returns:
+			Tuple of (is_valid: bool, error_message: str or None)
+		"""
+		file_list = self._get_checkpoint_files(input_dir)
+
+		if not file_list:
+			return False, f"No checkpoint files (.safetensors or .pt) found in {input_dir}"
+
+		# Count metadata and bin files
+		metadata_files = []
+		bin_files = []
+		for file_name in os.listdir(output_dir):
+			if file_name.endswith(".json"):
+				metadata_files.append(os.path.join(output_dir, file_name))
+			elif file_name.endswith(".bin"):
+				bin_files.append(os.path.join(output_dir, file_name))
+
+		# Check counts match
+		if len(metadata_files) != len(bin_files):
+			return False, (
+				f"Metadata files ({len(metadata_files)}) and bin files ({len(bin_files)}) count mismatch. "
+				f"Please clean {output_dir} and reconvert."
+			)
+
+		if len(metadata_files) != len(file_list):
+			return False, (
+				f"Converted files ({len(metadata_files)}) and source checkpoint files ({len(file_list)}) count mismatch. "
+				f"Please clean {output_dir} and reconvert."
+			)
+
+		# Check each source file has corresponding converted files
+		for src_file in file_list:
+			file_name = os.path.basename(src_file)
+			metadata_file = os.path.join(
+				output_dir,
+				file_name.replace(".safetensors", ".json").replace(".pt", ".json")
+			)
+			bin_file = os.path.join(
+				output_dir,
+				file_name.replace(".safetensors", ".bin").replace(".pt", ".bin")
+			)
+
+			if not os.path.exists(metadata_file):
+				return False, (
+					f"Metadata file {metadata_file} does not exist. "
+					f"Please clean {output_dir} and reconvert."
+				)
+			if not os.path.exists(bin_file):
+				return False, (
+					f"Bin file {bin_file} does not exist. "
+					f"Please clean {output_dir} and reconvert."
+				)
+
+		return True, None
+
+	def convert_model_directory(self, input_dir, output_dir=None, force=False):
+		"""
+		Convert all checkpoint files in a directory to BatchGen format.
+
+		This method converts all .safetensors and .pt files in the input directory
+		to the BatchGen format (.bin + .json metadata files) for peak SSD read performance.
+
+		Args:
+			input_dir: Directory containing .safetensors or .pt checkpoint files
+			output_dir: Output directory for converted files.
+			           If None, defaults to <input_dir>/converted_ckpt
+			force: If True, reconvert even if output directory already exists
+			       and contains valid converted files
+
+		Returns:
+			Path to the directory containing converted checkpoint files
+
+		Raises:
+			FileNotFoundError: If input_dir does not exist
+			ValueError: If no checkpoint files found in input_dir
+			RuntimeError: If validation fails and force=False
+		"""
+		# Validate input directory
+		if not os.path.exists(input_dir):
+			raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
+
+		if not os.path.isdir(input_dir):
+			raise ValueError(f"{input_dir} is not a directory.")
+
+		# Set default output directory
+		if output_dir is None:
+			output_dir = os.path.join(input_dir, "converted_ckpt")
+
+		# Get list of checkpoint files
+		file_list = self._get_checkpoint_files(input_dir)
+
+		if not file_list:
+			raise ValueError(f"No checkpoint files (.safetensors or .pt) found in {input_dir}")
+
+		logging.info(f"Found {len(file_list)} checkpoint files to convert")
+
+		# Check if already converted
+		if os.path.exists(output_dir) and not force:
+			is_valid, error_msg = self.validate_converted_directory(input_dir, output_dir)
+			if is_valid:
+				logging.info(f"Converted checkpoint files already exist and are valid in {output_dir}")
+				return output_dir
+			else:
+				raise RuntimeError(
+					f"Converted directory exists but validation failed: {error_msg}\n"
+					f"Use force=True to reconvert, or manually clean {output_dir}"
+				)
+
+		# Create output directory
+		os.makedirs(output_dir, exist_ok=True)
+		logging.info(f"Converting {len(file_list)} checkpoint files to BatchGen format...")
+
+		# Convert each file with progress
+		try:
+			from tqdm import tqdm
+			file_iterator = tqdm(file_list, desc="Converting checkpoint files", smoothing=0)
+		except ImportError:
+			file_iterator = file_list
+			logging.info("Install tqdm for progress bar: pip install tqdm")
+
+		for file_path in file_iterator:
+			logging.debug(f"Converting {file_path} to {output_dir}")
+			self.convert(file_path, output_dir)
+
+		logging.info(f"Conversion complete. Output directory: {output_dir}")
+		return output_dir
+
 	
 
 		

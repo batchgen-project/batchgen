@@ -17,5 +17,6 @@
 # ---------------------------------------------------------------------------- #
 
 from batchgen.batchgen_client import BatchGenClient
+from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
-__all__ = ["BatchGenClient"]
+__all__ = ["BatchGenClient", "ckpt_converter"]
