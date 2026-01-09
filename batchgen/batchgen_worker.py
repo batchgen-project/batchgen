@@ -410,6 +410,37 @@ class BatchGenWorker:
 		
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
+	def _get_model_instance_size_bytes(self) -> int:
+		"""
+		Calculate the actual model instance size on this GPU.
+
+		Sums up all parameters and buffers in self.model.
+		This accounts for duplicated weights across ranks.
+
+		Falls back to weight_byte_size / world_size if model not yet instantiated.
+
+		Returns:
+			Total bytes of model parameters and buffers on this GPU.
+		"""
+		if self.model is None:
+			# Fallback: estimate from total weight size / world_size
+			# This is less accurate but works before model is configured
+			fallback_size = self.weight_byte_size // self.world_size
+			logging.info(f"[GPU-KV] Model not yet instantiated, using fallback size: {fallback_size / (1024**3):.2f} GB")
+			return fallback_size
+
+		total_bytes = 0
+
+		# Sum all parameters
+		for param in self.model.parameters():
+			total_bytes += param.numel() * param.element_size()
+
+		# Sum all buffers
+		for buffer in self.model.buffers():
+			total_bytes += buffer.numel() * buffer.element_size()
+
+		return total_bytes
+
 	def _calculate_gpu_kv_cache_size(self) -> float:
 		"""
 		Calculate GPU KV cache size based on available GPU memory.
@@ -417,7 +448,7 @@ class BatchGenWorker:
 		Formula: gpu_kv_cache = GPU_total_memory * gpu_memory_frac - model_instance_size
 
 		Rank 0 calculates and broadcasts to all ranks to ensure consistency.
-		Called right before GPU KV manager initialization when model is fully loaded.
+		Called right before GPU KV manager initialization after model is configured.
 		"""
 		# Check for environment variable override first
 		if _GPU_KV_CACHE_SIZE_OVERRIDE is not None:
@@ -435,8 +466,9 @@ class BatchGenWorker:
 			gpu_total_mem_bytes = torch.cuda.get_device_properties(self.local_rank).total_memory
 			gpu_total_mem_gb = gpu_total_mem_bytes / (1024 ** 3)
 
-			# Model instance size per GPU = total_weight_size / world_size
-			model_instance_per_gpu_gb = (self.weight_byte_size / self.world_size) / (1024 ** 3)
+			# Get actual model instance size on this GPU (includes duplicated weights)
+			model_instance_bytes = self._get_model_instance_size_bytes()
+			model_instance_per_gpu_gb = model_instance_bytes / (1024 ** 3)
 
 			# Calculate GPU KV cache size
 			gpu_kv_cache_gb = gpu_total_mem_gb * self.gpu_memory_frac - model_instance_per_gpu_gb
@@ -4272,11 +4304,8 @@ class BatchGenWorker:
 		num_seq_per_rank[self.rank] = num_local_seq
 		dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
 		max_num_seq = int(num_seq_per_rank.max().item())
-		
-		# Initialize GPU KV manager with fixed size if not already done or if destroyed
-		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
-			self._initialize_gpu_kv_manager_fixed_size()
-		
+
+		# STEP 1: Configure model for decoding first (needed for accurate GPU KV size calculation)
 		if self.world_size <= 8:
 			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
 			self.set_phase("decode")
@@ -4286,22 +4315,21 @@ class BatchGenWorker:
 			self.core_engine.reset_decoding_buffer()
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
-			
-			# FIX Bug 2: Track GPU KV allocation for world_size <= 8 path as well
-			if local_decode_indices:
-				self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
-				for local_idx in local_decode_indices:
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-					# Mark initial reservation done
-					seq.mark_initial_gpu_reservation_done()
-					self._sequences_with_gpu_kv.add(uuid)
 		else:
-			# Use two-page buffer allocation, NOT _prepare_gpu_paged_kv_cache
+			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
+			self.set_phase("decode")
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_kv_copy_queue()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+
+		# STEP 2: Initialize GPU KV manager with fixed size (now model is loaded, can compute accurate size)
+		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
+			self._initialize_gpu_kv_manager_fixed_size()
+
+		# STEP 3: Allocate GPU KV for sequences
+		if local_decode_indices:
 			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
-			
-			# Track correctly
 			for local_idx in local_decode_indices:
 				uuid = self._local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
@@ -4309,14 +4337,6 @@ class BatchGenWorker:
 				# Mark initial reservation done
 				seq.mark_initial_gpu_reservation_done()
 				self._sequences_with_gpu_kv.add(uuid)
-			
-			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
-			
-			self.set_phase("decode")
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
