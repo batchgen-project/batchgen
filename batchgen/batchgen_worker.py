@@ -3053,6 +3053,9 @@ class BatchGenWorker:
 			total_pages = self.gpu_paged_kv_cache_manager.get_stats().num_total_pages
 		else:
 			# Initial batch: estimate from config
+			# Ensure GPU KV cache size is calculated
+			if self.gpu_kv_cache_size_gb is None:
+				self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
 			from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config_fixed_size
 			config = build_gpu_kv_config_fixed_size(
 				model_name=self.huggingface_ckpt_name,
