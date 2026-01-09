@@ -412,13 +412,18 @@ class BatchGenWorker:
 
 	def _calculate_gpu_kv_cache_size(self) -> float:
 		"""
-		Calculate GPU KV cache size based on actual free GPU memory.
+		Calculate GPU KV cache size based on actual GPU memory usage.
 
-		Uses torch.cuda.mem_get_info() to get real free memory after model is loaded.
-		Formula: gpu_kv_cache = free_memory * gpu_memory_frac
+		Uses torch.cuda.mem_get_info() to get real memory usage after model is loaded.
+		Formula: gpu_kv_cache = total_gpu_mem * gpu_memory_frac - used_mem
+
+		This reserves (1-gpu_memory_frac) of total GPU memory for activations and overhead.
+
+		IMPORTANT: Must be called in _initialize_core_components() right after model loading,
+		BEFORE any inference (prefill/decode). If called during/after prefill, activation
+		memory will be included in 'used_mem', resulting in incorrect (possibly negative) size.
 
 		Rank 0 calculates and broadcasts to all ranks to ensure consistency.
-		Called right before GPU KV manager initialization after model is configured.
 		"""
 		# Check for environment variable override first
 		if _GPU_KV_CACHE_SIZE_OVERRIDE is not None:
@@ -1079,7 +1084,14 @@ class BatchGenWorker:
 			self.global_rank,
 			self.world_size
 		)
-		
+
+		# Calculate GPU KV cache size NOW, right after model is loaded
+		# This must happen BEFORE any inference (prefill/decode) to measure
+		# only model weights, not activation memory
+		torch.cuda.synchronize(self.torch_device)
+		self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
+		logging.info(f"Rank {self.rank}: GPU KV cache size calculated: {self.gpu_kv_cache_size_gb:.2f} GB")
+
 		logging.info(f"Rank {self.rank}: One-time core initialization completed")
 
 	def _update_batch_config(self, num_queries: int) -> None:
