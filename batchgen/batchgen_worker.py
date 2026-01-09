@@ -410,42 +410,12 @@ class BatchGenWorker:
 		
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
-	def _get_model_instance_size_bytes(self) -> int:
-		"""
-		Calculate the actual model instance size on this GPU.
-
-		Sums up all parameters and buffers in self.model.
-		This accounts for duplicated weights across ranks.
-
-		Falls back to weight_byte_size / world_size if model not yet instantiated.
-
-		Returns:
-			Total bytes of model parameters and buffers on this GPU.
-		"""
-		if self.model is None:
-			# Fallback: estimate from total weight size / world_size
-			# This is less accurate but works before model is configured
-			fallback_size = self.weight_byte_size // self.world_size
-			logging.info(f"[GPU-KV] Model not yet instantiated, using fallback size: {fallback_size / (1024**3):.2f} GB")
-			return fallback_size
-
-		total_bytes = 0
-
-		# Sum all parameters
-		for param in self.model.parameters():
-			total_bytes += param.numel() * param.element_size()
-
-		# Sum all buffers
-		for buffer in self.model.buffers():
-			total_bytes += buffer.numel() * buffer.element_size()
-
-		return total_bytes
-
 	def _calculate_gpu_kv_cache_size(self) -> float:
 		"""
-		Calculate GPU KV cache size based on available GPU memory.
+		Calculate GPU KV cache size based on actual free GPU memory.
 
-		Formula: gpu_kv_cache = GPU_total_memory * gpu_memory_frac - model_instance_size
+		Uses torch.cuda.mem_get_info() to get real free memory after model is loaded.
+		Formula: gpu_kv_cache = free_memory * gpu_memory_frac
 
 		Rank 0 calculates and broadcasts to all ranks to ensure consistency.
 		Called right before GPU KV manager initialization after model is configured.
@@ -462,30 +432,27 @@ class BatchGenWorker:
 
 		# Rank 0 calculates, then broadcasts to all ranks
 		if self.rank == 0:
-			# Get GPU memory
-			gpu_total_mem_bytes = torch.cuda.get_device_properties(self.local_rank).total_memory
-			gpu_total_mem_gb = gpu_total_mem_bytes / (1024 ** 3)
+			# Get actual free GPU memory (after model is loaded)
+			free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+			free_mem_gb = free_mem_bytes / (1024 ** 3)
+			total_mem_gb = total_mem_bytes / (1024 ** 3)
+			used_mem_gb = total_mem_gb - free_mem_gb
 
-			# Get actual model instance size on this GPU (includes duplicated weights)
-			model_instance_bytes = self._get_model_instance_size_bytes()
-			model_instance_per_gpu_gb = model_instance_bytes / (1024 ** 3)
-
-			# Calculate GPU KV cache size
-			gpu_kv_cache_gb = gpu_total_mem_gb * self.gpu_memory_frac - model_instance_per_gpu_gb
+			# Use fraction of free memory for KV cache
+			gpu_kv_cache_gb = free_mem_gb * self.gpu_memory_frac
 
 			# Ensure positive value
 			if gpu_kv_cache_gb <= 0:
 				logging.warning(
 					f"[GPU-KV] Calculated size is non-positive ({gpu_kv_cache_gb:.2f} GB). "
-					f"GPU mem: {gpu_total_mem_gb:.2f} GB, frac: {self.gpu_memory_frac}, "
-					f"model/GPU: {model_instance_per_gpu_gb:.2f} GB. Using minimum 1 GB."
+					f"Free: {free_mem_gb:.2f} GB, frac: {self.gpu_memory_frac}. Using minimum 1 GB."
 				)
 				gpu_kv_cache_gb = 1.0
 
 			logging.info(
 				f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
-				f"(GPU mem: {gpu_total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} "
-				f"- model/GPU: {model_instance_per_gpu_gb:.2f} GB)"
+				f"(free: {free_mem_gb:.2f} GB × frac: {self.gpu_memory_frac}, "
+				f"used: {used_mem_gb:.2f} GB / total: {total_mem_gb:.2f} GB)"
 			)
 		else:
 			gpu_kv_cache_gb = 0.0
