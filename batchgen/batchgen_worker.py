@@ -219,8 +219,8 @@ class BatchGenWorkerArgs:
 	host_kv_watermark: int = 70
 	# Decode preemption: interrupt decode for prefill when host KV is underutilized (default: enabled)
 	enable_decode_preemption: bool = True
-	# GPU KV cache size in GB (calculated: GPU_mem * gpu_memory_frac - model_size)
-	gpu_kv_cache_size_gb: Optional[float] = None
+	# GPU memory fraction for KV cache calculation (default: 0.9)
+	gpu_memory_frac: float = 0.9
 
 
 class BatchGenWorker:
@@ -361,21 +361,10 @@ class BatchGenWorker:
 		COMM_MASTER_ADDR = self.dist_init_addr.split(':')[0]
 		os.environ['COMM_MASTER_ADDR'] = COMM_MASTER_ADDR
 
-		# GPU KV cache size configuration
-		# Priority: 1) env var override, 2) calculated value from args, 3) error
-		if _GPU_KV_CACHE_SIZE_OVERRIDE is not None:
-			self.gpu_kv_cache_size_gb = float(_GPU_KV_CACHE_SIZE_OVERRIDE)
-			if self.rank == 0:
-				logging.info(f"GPU KV cache size: {self.gpu_kv_cache_size_gb} GB (from BATCHGEN_GPU_KV_CACHE_SIZE_GB env var)")
-		elif args.gpu_kv_cache_size_gb is not None:
-			self.gpu_kv_cache_size_gb = args.gpu_kv_cache_size_gb
-			if self.rank == 0:
-				logging.info(f"GPU KV cache size: {self.gpu_kv_cache_size_gb:.2f} GB (calculated)")
-		else:
-			raise ValueError(
-				"GPU KV cache size not configured. Either set BATCHGEN_GPU_KV_CACHE_SIZE_GB "
-				"environment variable or ensure --gpu-memory-frac is set for automatic calculation."
-			)
+		# GPU KV cache configuration
+		# Store gpu_memory_frac, actual size calculated later right before GPU KV manager init
+		self.gpu_memory_frac = args.gpu_memory_frac
+		self.gpu_kv_cache_size_gb: Optional[float] = None  # Calculated in _calculate_gpu_kv_cache_size()
 		
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
@@ -421,18 +410,77 @@ class BatchGenWorker:
 		
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
+	def _calculate_gpu_kv_cache_size(self) -> float:
+		"""
+		Calculate GPU KV cache size based on available GPU memory.
+
+		Formula: gpu_kv_cache = GPU_total_memory * gpu_memory_frac - model_instance_size
+
+		Rank 0 calculates and broadcasts to all ranks to ensure consistency.
+		Called right before GPU KV manager initialization when model is fully loaded.
+		"""
+		# Check for environment variable override first
+		if _GPU_KV_CACHE_SIZE_OVERRIDE is not None:
+			gpu_kv_cache_gb = float(_GPU_KV_CACHE_SIZE_OVERRIDE)
+			if self.rank == 0:
+				logging.info(
+					f"[GPU-KV] Size from env override: {gpu_kv_cache_gb:.2f} GB "
+					f"(BATCHGEN_GPU_KV_CACHE_SIZE_GB)"
+				)
+			return gpu_kv_cache_gb
+
+		# Rank 0 calculates, then broadcasts to all ranks
+		if self.rank == 0:
+			# Get GPU memory
+			gpu_total_mem_bytes = torch.cuda.get_device_properties(self.local_rank).total_memory
+			gpu_total_mem_gb = gpu_total_mem_bytes / (1024 ** 3)
+
+			# Model instance size per GPU = total_weight_size / world_size
+			model_instance_per_gpu_gb = (self.weight_byte_size / self.world_size) / (1024 ** 3)
+
+			# Calculate GPU KV cache size
+			gpu_kv_cache_gb = gpu_total_mem_gb * self.gpu_memory_frac - model_instance_per_gpu_gb
+
+			# Ensure positive value
+			if gpu_kv_cache_gb <= 0:
+				logging.warning(
+					f"[GPU-KV] Calculated size is non-positive ({gpu_kv_cache_gb:.2f} GB). "
+					f"GPU mem: {gpu_total_mem_gb:.2f} GB, frac: {self.gpu_memory_frac}, "
+					f"model/GPU: {model_instance_per_gpu_gb:.2f} GB. Using minimum 1 GB."
+				)
+				gpu_kv_cache_gb = 1.0
+
+			logging.info(
+				f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
+				f"(GPU mem: {gpu_total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} "
+				f"- model/GPU: {model_instance_per_gpu_gb:.2f} GB)"
+			)
+		else:
+			gpu_kv_cache_gb = 0.0
+
+		# Broadcast from rank 0 to all ranks
+		size_tensor = torch.tensor([gpu_kv_cache_gb], dtype=torch.float32, device=self.torch_device)
+		dist.broadcast(size_tensor, src=0)
+		gpu_kv_cache_gb = float(size_tensor.item())
+
+		return gpu_kv_cache_gb
+
 	def _initialize_gpu_kv_manager_fixed_size(self) -> GPUPagedKVCacheManager:
 		"""
 		Initialize GPU KV manager with pre-determined fixed size.
 		Called once at the start of decoding.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config_fixed_size
-		
+
+		# Calculate GPU KV cache size if not already done
+		if self.gpu_kv_cache_size_gb is None:
+			self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
+
 		config = build_gpu_kv_config_fixed_size(
 			model_name=self.huggingface_ckpt_name,
 			gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
 		)
-		
+
 		manager = GPUPagedKVCacheManager(
 			config=config,
 			device=self.local_rank,
@@ -442,7 +490,7 @@ class BatchGenWorker:
 
 		if self.rank == 0:
 			logging.info(
-				f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb}GB, {config.num_pages} pages"
+				f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {config.num_pages} pages"
 			)
 
 		return manager
