@@ -43,21 +43,6 @@ BatchGen is an efficient serving engine optimized specifically for **Mixture-of-
 - Latency-insensitive bulk inference tasks (e.g., large batch inference during off-peak hours)
 - Deep-research applications that deliver high-quality results overnight
 
-### Supported Models
-
-| Model | Precision | Status |
-|-------|-----------|--------|
-| DeepSeek-R1-671B | Full (BF16/FP8) | Supported |
-| DeepSeek-V3-671B | Full (BF16/FP8) | Supported |
-
-### Supported Hardware
-
-- **Hopper Architecture**: H100, H20
-- **Ampere Architecture**: A100, A5000, RTX 4090
-
-Recommended configurations for 8xH20, 8xA100, and 8xA5000 nodes are included in `./batchgen/configurations/`.
-
----
 
 ## Getting Started
 
@@ -134,21 +119,5 @@ We learned from the following projects when building BatchGen:
 
 - [SGLang](https://github.com/sgl-project/sglang) - High-performance serving framework for LLMs
 - [vLLM](https://github.com/vllm-project/vllm) - High-throughput and memory-efficient inference engine
-- [FlashMLA](https://github.com/deepseek-ai/FlashMLA) - Optimized Multi-head Latent Attention for DeepSeek models
-- [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) - FP8 GEMM kernels for Hopper GPUs
 
 ---
-
-## Citation
-
-```bibtex
-@misc{xu2025moegenhighthroughputmoeinference,
-      title={BatchGen: High-Throughput MoE Inference on a Single GPU with Module-Based Batching},
-      author={Tairan Xu and Leyang Xue and Zhan Lu and Adrian Jackson and Luo Mai},
-      year={2025},
-      eprint={2503.09716},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2503.09716},
-}
-```
