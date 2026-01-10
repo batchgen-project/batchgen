@@ -179,11 +179,11 @@ storage/
 
 ## Watchdog Configuration
 
-The watchdog monitors worker processes and restarts them if they become unresponsive.
+The watchdog monitors worker processes and restarts them if they become unresponsive. It is fed after each prefill micro-batch and each decode step.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--watchdog-timeout` | `180` | Seconds before declaring a worker stuck. Set to 0 to disable. |
+| `--watchdog-timeout` | `300` | Timeout in seconds per micro-batch/decode step. Set to 0 to disable. |
 | `--no-watchdog` | - | Disable watchdog (equivalent to `--watchdog-timeout 0`) |
 
 **When to adjust watchdog timeout:**
