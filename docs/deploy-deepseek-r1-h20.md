@@ -130,11 +130,11 @@ For more details, see [`docker/README.md`](../docker/README.md).
 
 ### Run Container
 
-Run on each node with the appropriate `--node-rank`:
+Run on each node with the appropriate `--node-rank`. The container provides an interactive shell where you can start the server.
 
 ```bash
 # Node 0 (Master)
-docker run \
+docker run -it \
     --cap-add=SYS_NICE \
     --cap-add=SYS_ADMIN \
     --runtime=nvidia \
@@ -142,18 +142,10 @@ docker run \
     --network=host \
     -v /shared/models:/models:ro \
     -v /shared/storage:/storage \
-    batchgen:latest \
-    python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --cache-dir /models/DeepSeek-R1 \
-    --storage-path /storage \
-    --world-size 16 \
-    --nnodes 2 \
-    --node-rank 0 \
-    --dist-init-addr node0-ip:12355
+    batchgen:latest
 
 # Node 1
-docker run \
+docker run -it \
     --cap-add=SYS_NICE \
     --cap-add=SYS_ADMIN \
     --runtime=nvidia \
@@ -161,20 +153,14 @@ docker run \
     --network=host \
     -v /shared/models:/models:ro \
     -v /shared/storage:/storage \
-    batchgen:latest \
-    python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --cache-dir /models/DeepSeek-R1 \
-    --storage-path /storage \
-    --world-size 16 \
-    --nnodes 2 \
-    --node-rank 1 \
-    --dist-init-addr node0-ip:12355
+    batchgen:latest
 ```
 
 **Optional flags** (add if needed):
 - `--privileged`: Full host access (use with caution)
 - `--ipc=host`: Share host IPC namespace
+
+Once inside the container, start the server using the commands in [Section 5](#5-start-batchgen-server).
 
 ---
 
@@ -311,8 +297,6 @@ result = client.submit_batch(
     input_file_path="requests.jsonl",
     output_file_path="results.jsonl",
     endpoint="/v1/chat/completions",
-    poll_interval=10.0,  # Check status every 10 seconds
-    timeout=3600,        # Max 1 hour
     max_tokens=1024,     # Override per-request max_tokens
     temperature=0.7,     # Sampling temperature
 )
@@ -343,12 +327,8 @@ batch = client.create_batch(
 )
 print(f"Created batch: {batch['id']}")
 
-# Step 3: Wait for completion
-batch = client.wait_for_batch(
-    batch_id=batch["id"],
-    poll_interval=5.0,
-    timeout=7200,  # 2 hours
-)
+# Step 3: Wait for completion (no timeout by default)
+batch = client.wait_for_batch(batch_id=batch["id"])
 print(f"Batch status: {batch['status']}")
 
 # Step 4: Download results
