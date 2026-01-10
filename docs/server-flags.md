@@ -121,7 +121,7 @@ sudo mount -t hugetlbfs none /mnt/hugepages
 
 ## Inference Configuration
 
-### Continuous Batching
+### Dynamic Sequence Management
 
 Controls how BatchGen schedules sequences on GPU.
 
