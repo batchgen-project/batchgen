@@ -506,9 +506,42 @@ class WorkerManager:
             available_mem = self.args.host_kv_cache_size
         else:
             import psutil
+            import shutil
 
+            # Calculate host memory based budget: host_mem * 0.9 - model_size
             mem = psutil.virtual_memory()
-            available_mem = (mem.total - (20 * 1024**3)) // (1024**3)
+            model_size_gb = self.model_info.get("parameter_server_size", 0) / (1024**3)
+            host_mem_budget = int(mem.total * 0.9 / (1024**3) - model_size_gb)
+
+            # Check /dev/shm free space
+            try:
+                shm_stat = shutil.disk_usage("/dev/shm")
+                shm_free_gb = shm_stat.free // (1024**3)
+            except (OSError, FileNotFoundError):
+                shm_free_gb = host_mem_budget  # Fallback if /dev/shm not available
+
+            # Use minimum of host memory budget and /dev/shm free space
+            available_mem = min(host_mem_budget, shm_free_gb)
+
+            # Warn if /dev/shm is limiting
+            if shm_free_gb < host_mem_budget:
+                logger.warning(
+                    "Host KV cache size limited by /dev/shm free space (%d GB). "
+                    "For full utilization, mount /dev/shm with host memory size: "
+                    "sudo mount -o remount,size=%dG /dev/shm",
+                    shm_free_gb,
+                    int(mem.total / (1024**3)),
+                )
+
+            logger.info(
+                "Auto-detected host KV cache size: %d GB "
+                "(host_mem=%.1f GB, model_size=%.1f GB, /dev/shm_free=%d GB)",
+                available_mem,
+                mem.total / (1024**3),
+                model_size_gb,
+                shm_free_gb,
+            )
+
         if available_mem <= 0:
             raise RuntimeError("Unable to determine host KV cache budget")
         num_devices = torch.cuda.device_count()

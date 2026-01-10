@@ -79,14 +79,31 @@ python -m batchgen.launch_http_server \
 | `--host-kv-cache-size` | Auto | Host KV cache size in GB. Critical for throughput. |
 | `--kv-dtype` | `bfloat16` | Data type for KV cache (`bfloat16`, `float16`, `float8_e4m3fn`) |
 
-**Recommended `--host-kv-cache-size` calculation:**
+**Auto-detection formula** (when `--host-kv-cache-size` is not specified):
 ```
-host_kv_cache_size = 0.9 × available_host_memory - model_size
+host_kv_cache_size = min(host_mem × 0.9 - model_size, /dev/shm_free_space)
 ```
+
+If `/dev/shm` free space is smaller than the calculated budget, a warning will be logged recommending to increase `/dev/shm` size.
 
 For DeepSeek-R1 (~700GB model) on a 1.5TB memory node:
 ```bash
 --host-kv-cache-size 650  # (1500 * 0.9) - 700 ≈ 650 GB
+```
+
+**Important: /dev/shm size requirement**
+
+Host KV cache uses shared memory (`/dev/shm`). If the cache size exceeds available `/dev/shm` space, you must increase it first:
+
+```bash
+# Check current size
+df -h /dev/shm
+
+# Increase temporarily (replace 1500G with your host memory size)
+sudo mount -o remount,size=1500G /dev/shm
+
+# Or make permanent by adding to /etc/fstab:
+# tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
 ```
 
 ### GPU Memory
