@@ -170,23 +170,34 @@ class WorkerManager:
         # Collect worker PIDs before sending shutdown signal
         worker_pids = self._get_worker_pids()
 
-        # Send poison pill to signal graceful shutdown
+        # Send SIGTERM to workers immediately for faster shutdown
+        # This is critical for Node 1 workers that may be blocked in NCCL
+        # waiting for Node 0 (which may already be shutting down)
+        if worker_pids:
+            logger.info("Sending SIGTERM to %d worker processes...", len(worker_pids))
+            for pid in worker_pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass  # Process already exited
+
+        # Also send poison pill in case workers are not blocked in NCCL
         try:
             self.request_queue.put(None)
         except Exception:
             logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-        # Wait for workers to exit gracefully
+        # Wait for workers to exit (reduced timeout for interactive use)
         workers_joined = False
         if self.worker_process is not None:
             try:
                 with self._join_lock:
-                    self.worker_process.join(timeout=30)
+                    self.worker_process.join(timeout=5)  # Reduced from 30s
                 workers_joined = True
             except Exception:
                 logger.warning("Failed to join worker process", exc_info=True)
 
-        # Force-kill workers that didn't exit gracefully
+        # Force-kill workers that didn't exit after SIGTERM
         if not workers_joined and worker_pids:
             logger.warning(
                 "Workers did not exit gracefully, force-killing..."
