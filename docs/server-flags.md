@@ -185,8 +185,6 @@ The watchdog monitors worker processes and restarts them if they become unrespon
 |------|---------|-------------|
 | `--watchdog-timeout` | `180` | Seconds before declaring a worker stuck. Set to 0 to disable. |
 | `--no-watchdog` | - | Disable watchdog (equivalent to `--watchdog-timeout 0`) |
-| `--watchdog-heartbeat-interval` | None | Heartbeat interval when workers are idle (seconds) |
-| `--watchdog-test-stuck-time` | `0` | Deliberately sleep during watchdog feed (testing only) |
 
 **When to adjust watchdog timeout:**
 - Increase for very long sequences or slow hardware
@@ -194,18 +192,7 @@ The watchdog monitors worker processes and restarts them if they become unrespon
 
 ---
 
-## Complete Examples
-
-### Single Node (8 GPUs)
-
-```bash
-python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --cache-dir /models/DeepSeek-R1 \
-    --host-kv-cache-size 400
-```
-
-### Two Nodes (16 GPUs)
+## Example: Two Nodes (16 GPUs)
 
 ```bash
 # Node 0 (Master)
@@ -226,42 +213,6 @@ python -m batchgen.launch_http_server \
     --host-kv-cache-size 650 \
     --storage-path /shared/storage
 ```
-
-### Development Mode
-
-```bash
-python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --cache-dir /models/DeepSeek-R1 \
-    --no-watchdog \
-    --save-result
-```
-
-### Maximum Performance
-
-```bash
-python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --cache-dir /models/DeepSeek-R1 \
-    --host-kv-cache-size 650 \
-    --gpu-memory-frac 0.95 \
-    --enable-hugetlbfs \
-    --initial-gpu-page-buffer 64 \
-    --extension-gpu-page-buffer 8
-```
-
----
-
-## Environment Variables
-
-Some settings can also be configured via environment variables (deprecated, prefer CLI flags):
-
-| Environment Variable | CLI Flag |
-|---------------------|----------|
-| `BATCHGEN_ENABLE_PREPACK` | `--enable-prepack` |
-| `BATCHGEN_HOST_KV_WATERMARK` | `--host-kv-watermark` |
-| `BATCHGEN_ENABLE_DECODE_PREEMPTION` | `--enable-decode-preemption` |
-| `BATCHGEN_GPU_KV_CACHE_SIZE_GB` | `--gpu-memory-frac` |
 
 ---
 
