@@ -203,11 +203,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable prepack optimization for efficient prefill batching (default: enabled, recommended always on)",
     )
     parser.add_argument(
-        "--no-prepack",
-        action="store_true",
-        help="Disable prepack optimization",
-    )
-    parser.add_argument(
         "--host-kv-watermark",
         type=int,
         default=70,
@@ -336,7 +331,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         watchdog_timeout=watchdog_timeout,
         watchdog_test_stuck_time=parsed.watchdog_test_stuck_time,
         watchdog_heartbeat_interval=parsed.watchdog_heartbeat_interval,
-        enable_prepack=not getattr(parsed, 'no_prepack', False),
+        enable_prepack=True,  # Always enabled, recommended for all use cases
         host_kv_watermark=parsed.host_kv_watermark,
         enable_decode_preemption=not getattr(parsed, 'no_decode_preemption', False),
         gpu_memory_frac=parsed.gpu_memory_frac,

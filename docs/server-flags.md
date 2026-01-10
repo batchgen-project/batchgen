@@ -155,10 +155,9 @@ At page boundaries during decode, `extension_gpu_page_buffer` pages are added. T
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable-prepack` | `true` | Enable prepack optimization for efficient prefill batching |
-| `--no-prepack` | - | Disable prepack optimization (not recommended) |
+| `--enable-prepack` | `true` | Enable prepack optimization for efficient prefill batching (always on) |
 
-Prepack optimization packs multiple sequences into a single batch for efficient prefill. It's recommended to always keep this enabled.
+Prepack optimization packs multiple sequences into a single batch for efficient prefill. This is always enabled.
 
 ---
 
@@ -270,7 +269,7 @@ Some settings can also be configured via environment variables (deprecated, pref
 
 | Environment Variable | CLI Flag |
 |---------------------|----------|
-| `BATCHGEN_ENABLE_PREPACK` | `--enable-prepack` / `--no-prepack` |
+| `BATCHGEN_ENABLE_PREPACK` | `--enable-prepack` |
 | `BATCHGEN_HOST_KV_WATERMARK` | `--host-kv-watermark` |
 | `BATCHGEN_ENABLE_DECODE_PREEMPTION` | `--enable-decode-preemption` |
 | `BATCHGEN_GPU_KV_CACHE_SIZE_GB` | `--gpu-memory-frac` |
