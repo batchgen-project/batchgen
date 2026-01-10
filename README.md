@@ -8,7 +8,7 @@
 
 <div align="center">
  <h3> High-throughput Offline Inference for MoE Models with Limited GPU Memory</h3>
-  <strong><a href="#Performance">Performance</a> | <a href="#Installation"> Installation</a> | <a href="#Quick-Start">Quick Start </a> </strong>
+  <strong><a href="#Installation"> Installation</a> | <a href="#Documentation">Documentation</a> | <a href="#Quick-Start">Quick Start </a> </strong>
 </div>
 
 
@@ -122,10 +122,14 @@ cd BatchGen
 pip install -e .
 ```
 
-## Quick Start
-For 2-8*H20 Serving, please refer to ```./docs/Serving_with_two_nodes.```
+## Documentation
 
-Following is an example for one node or within one node.
+- **[Deployment Guide](docs/deploy-deepseek-r1-h20.md)** - Step-by-step guide for multi-node deployment
+- **[Server Flags Reference](docs/server-flags.md)** - Complete list of all server configuration flags
+
+## Quick Start
+
+Following is an example for single-node deployment. For multi-node (2-8 H20 GPUs), see the [Deployment Guide](docs/deploy-deepseek-r1-h20.md).
 BatchGen seamlessly integrates with Huggingface environment. Start inference with Huggingface checkpoint name.
 ### Example usage of serving DeepSeek-R1 on 8*H20 node
 #### Start Server

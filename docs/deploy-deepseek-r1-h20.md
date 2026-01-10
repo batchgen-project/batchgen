@@ -276,22 +276,20 @@ python -m batchgen.launch_http_server \
 
 ### Server Arguments Reference
 
+Key arguments for multi-node deployment:
+
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--model` | required | HuggingFace model name |
 | `--cache-dir` | None | Path to pre-downloaded model files |
-| `--listen-ip` | 0.0.0.0 | Server listen IP |
-| `--listen-port` | 10900 | Server listen port |
 | `--world-size` | 1 | Total number of GPUs across all nodes |
-| `--nnodes` | 1 | Number of nodes |
-| `--node-rank` | 0 | Rank of this node (0-indexed) |
-| `--dist-init-addr` | localhost:12355 | NCCL distributed init address |
+| `--nnodes` | 1 | Number of nodes in the cluster |
+| `--node-rank` | 0 | Rank of this node (0 = master) |
+| `--dist-init-addr` | localhost:12355 | Address for distributed init (`master-ip:port`) |
+| `--host-kv-cache-size` | None | Host KV cache size in GB (critical for throughput) |
 | `--storage-path` | batchgen/storage/ | Directory for files and batches |
-| `--host-kv-cache-size` | None | Host KV cache size in GB |
-| `--max-input-len` | 1024 | Default max input sequence length |
-| `--max-output-len` | 128 | Default max output length |
-| `--watchdog-timeout` | 180 | Worker watchdog timeout (0 to disable) |
-| `--enable-hugetlbfs` | False | Enable hugeTLBFS for shared memory |
+
+For the complete list of all server flags, see **[Server Flags Reference](server-flags.md)**.
 
 ---
 
@@ -474,8 +472,12 @@ tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
 
 ---
 
+## See Also
+
+- [Server Flags Reference](server-flags.md) - Complete list of all server flags
+- [README](../README.md) - Installation and quick start
+
 ## Support
 
 For issues and questions:
-- GitHub Issues: https://github.com/your-org/BatchGen/issues
-- Documentation: https://github.com/your-org/BatchGen/docs
+- GitHub Issues: https://github.com/EfficientMoE/BatchGen/issues
