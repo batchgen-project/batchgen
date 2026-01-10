@@ -228,6 +228,21 @@ with open("requests.jsonl", "w") as f:
 
 ## 5. Start BatchGen Server
 
+### Prerequisites: Mount Shared Memory
+
+BatchGen uses `/dev/shm` for host KV cache. Before starting the server, ensure `/dev/shm` is mounted with sufficient size (should match your host memory):
+
+```bash
+# Check current size
+df -h /dev/shm
+
+# Mount with full host memory size (replace 1500G with your host memory)
+sudo mount -o remount,size=1500G /dev/shm
+
+# To make permanent, add to /etc/fstab:
+# tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
+```
+
 ### 2 Nodes × 8 GPUs = 16 GPUs
 
 #### Node 0 (Master)
@@ -413,26 +428,6 @@ batches = response.json()["data"]
 
 for batch in batches:
     print(f"Batch: {batch['id']}, Status: {batch['status']}")
-```
-
----
-
-## Troubleshooting
-
-### Shared Memory Error
-
-```
-ValueError: Shared memory size is not enough
-```
-
-**Solution**: Mount shared memory with full host memory size:
-
-```bash
-# Temporary (replace 1500G with your host memory size)
-sudo mount -o remount,size=1500G /dev/shm
-
-# Permanent (add to /etc/fstab)
-tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
 ```
 
 ---
