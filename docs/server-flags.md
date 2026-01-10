@@ -140,8 +140,7 @@ Controls how BatchGen schedules sequences on GPU.
 | `--extension-gpu-page-buffer` | `4` | Pages to add at page boundaries during decode |
 | `--decision-frequency-pages` | `2` | How often to make scheduling decisions (in pages) |
 | `--host-kv-watermark` | `70` | Percentage threshold for prioritizing prefill over decode |
-| `--enable-decode-preemption` | `true` | Allow interrupting decode to prefill new sequences |
-| `--no-decode-preemption` | - | Disable decode preemption |
+| `--enable-decode-preemption` | `true` | Allow interrupting decode to prefill new sequences (always on) |
 
 **GPU Page Buffer Design:**
 

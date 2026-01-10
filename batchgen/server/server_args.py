@@ -212,12 +212,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--enable-decode-preemption",
         action="store_true",
         default=True,
-        help="Enable decode preemption. Interrupts decode to prefill new sequences when host KV is underutilized (default: enabled)",
-    )
-    parser.add_argument(
-        "--no-decode-preemption",
-        action="store_true",
-        help="Disable decode preemption",
+        help="Enable decode preemption. Interrupts decode to prefill new sequences when host KV is underutilized (default: enabled, recommended always on)",
     )
     parser.add_argument(
         "--gpu-memory-frac",
@@ -333,7 +328,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         watchdog_heartbeat_interval=parsed.watchdog_heartbeat_interval,
         enable_prepack=True,  # Always enabled, recommended for all use cases
         host_kv_watermark=parsed.host_kv_watermark,
-        enable_decode_preemption=not getattr(parsed, 'no_decode_preemption', False),
+        enable_decode_preemption=True,  # Always enabled, recommended for all use cases
         gpu_memory_frac=parsed.gpu_memory_frac,
         initial_gpu_page_buffer=parsed.initial_gpu_page_buffer,
         extension_gpu_page_buffer=parsed.extension_gpu_page_buffer,
