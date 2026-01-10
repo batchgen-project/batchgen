@@ -5,52 +5,72 @@
   </picture>
 </p>
 
-
 <div align="center">
- <h3> High-throughput Offline Inference for MoE Models with Limited GPU Memory</h3>
-  <strong><a href="#Installation"> Installation</a> | <a href="#Documentation">Documentation</a></strong>
+
+[![GitHub Stars](https://img.shields.io/github/stars/EfficientMoE/BatchGen?style=social)](https://github.com/EfficientMoE/BatchGen/stargazers)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+**High-throughput Offline Inference for MoE Models with Limited GPU Memory**
+
+[Documentation](docs/) | [Deployment Guide](docs/deploy-deepseek-r1-h20.md) | [Server Flags](docs/server-flags.md)
+
 </div>
 
+---
 
-# About
-BatchGen is an efficient serving engine optimized specifically for **Mixture-of-Expert(MoE)** based large language models. It is tailored for bulk **offline inference** tasks and **limited GPU resources**. It enables low cost serving for latency-insensitive applications.
+## News
 
-**Core Features**
+- [2025/01] BatchGen v1.0 released with support for DeepSeek-R1/V3-671B full precision inference.
+
+---
+
+## About
+
+BatchGen is an efficient serving engine optimized specifically for **Mixture-of-Expert (MoE)** based large language models. It is designed for bulk **offline inference** tasks on **limited GPU resources**, enabling low-cost serving for latency-insensitive applications.
+
+### Core Features
 
 - **Module-Based Batching**: A fine-grained batching strategy ensures consistently high GPU utilization throughout every forward pass.
+
 - **Efficient Data Swapping Engine**: Supports inference of large-scale models (e.g., DeepSeek-R1) on constrained hardware setups such as single NVIDIA A5000 or RTX 4090 GPUs, aggressively maximizing overlap between computation and memory transfers to achieve optimal efficiency.
-- **Tailored Offloading and Parallel Strategy**: Different parallel strategies, model weights offloaidng and KV-Cache offloading are applied to different models and hardware settings.
 
+- **Tailored Offloading and Parallel Strategy**: Different parallel strategies, model weights offloading and KV-Cache offloading are applied to different models and hardware settings.
 
-# Application Scenarios
-- MoE model evaluation.
-- Company deployed LLM workflow for raw data formation.
-- Latency-insensitive bulk inference tasks. Such as large batch inference launched in valley period.
-- Deep-research applications. Deliver high-quality results overnight.
+### Application Scenarios
 
+- MoE model evaluation
+- Company deployed LLM workflow for raw data formation
+- Latency-insensitive bulk inference tasks (e.g., large batch inference during off-peak hours)
+- Deep-research applications that deliver high-quality results overnight
 
+### Supported Models
 
-# Supported Models
-- **DeepSeek-R1/V3-671B. FULL Precision.**
+| Model | Precision | Status |
+|-------|-----------|--------|
+| DeepSeek-R1-671B | Full (BF16/FP8) | Supported |
+| DeepSeek-V3-671B | Full (BF16/FP8) | Supported |
 
-# Supported Hardware
-Hopper and Ampere archtecture are supported.
+### Supported Hardware
 
-Recommended configurations for 8xH20, 8xA100 and 8xA5000 node are included in ./batchgen/configurations/
+- **Hopper Architecture**: H100, H20
+- **Ampere Architecture**: A100, A5000, RTX 4090
 
+Recommended configurations for 8xH20, 8xA100, and 8xA5000 nodes are included in `./batchgen/configurations/`.
 
-## Installation
+---
+
+## Getting Started
 
 ### Hardware Requirements
 
-**Host Memory**: Must be larger than the model size. Additional memory is used for the host KV cache, which stores KV states for sequences waiting to be processed. Larger host KV cache sizes generally result in better throughput as more sequences can be batched together.
+**Host Memory**: Must be larger than the model size. Additional memory is used for the host KV cache, which stores KV states for sequences waiting to be processed. Larger host KV cache sizes generally result in better throughput.
 
-For example, to serve DeepSeek-R1-671B (~700GB model weights), we recommend at least 1TB host memory: ~700GB for model weights + 300GB for host KV cache.
+For DeepSeek-R1-671B (~700GB model weights), we recommend at least 1TB host memory: ~700GB for model weights + 300GB for host KV cache.
 
-### Quick Install (Recommended)
+### Installation
 
 ```bash
-git clone git@github.com:EfficientMoE/BatchGen.git
+git clone https://github.com/EfficientMoE/BatchGen.git
 cd BatchGen
 ./scripts/install_deps.sh
 ```
@@ -62,12 +82,43 @@ This script automatically installs:
 - DeepGEMM
 - BatchGen
 
-Alternatively, use make:
+For manual installation, see the [Manual Installation Guide](docs/manual-installation.md).
+
+### Quick Start
+
+**1. Download Model Checkpoints**
+
 ```bash
-make install-all
+huggingface-cli download deepseek-ai/DeepSeek-R1 \
+    --local-dir /shared/models/DeepSeek-R1
 ```
 
-For manual installation or more control, see the [Manual Installation Guide](docs/manual-installation.md).
+**2. Start the Server**
+
+```bash
+python -m batchgen.launch_http_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --cache-dir /shared/models/DeepSeek-R1 \
+    --host-kv-cache-size 256
+```
+
+**3. Submit Batch Jobs**
+
+```python
+from batchgen.batchgen_client import BatchGenHttpClient
+
+client = BatchGenHttpClient(host="localhost", port=10900)
+
+result = client.submit_batch(
+    input_file_path="requests.jsonl",
+    output_file_path="results.jsonl",
+    endpoint="/v1/chat/completions",
+)
+```
+
+For multi-node deployment, see the [Deployment Guide](docs/deploy-deepseek-r1-h20.md).
+
+---
 
 ## Documentation
 
@@ -75,9 +126,22 @@ For manual installation or more control, see the [Manual Installation Guide](doc
 - **[Server Flags Reference](docs/server-flags.md)** - Complete list of all server configuration flags
 - **[Manual Installation](docs/manual-installation.md)** - Step-by-step manual installation instructions
 
+---
+
+## Acknowledgements
+
+We learned from the following projects when building BatchGen:
+
+- [SGLang](https://github.com/sgl-project/sglang) - High-performance serving framework for LLMs
+- [vLLM](https://github.com/vllm-project/vllm) - High-throughput and memory-efficient inference engine
+- [FlashMLA](https://github.com/deepseek-ai/FlashMLA) - Optimized Multi-head Latent Attention for DeepSeek models
+- [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) - FP8 GEMM kernels for Hopper GPUs
+
+---
 
 ## Citation
-```
+
+```bibtex
 @misc{xu2025moegenhighthroughputmoeinference,
       title={BatchGen: High-Throughput MoE Inference on a Single GPU with Module-Based Batching},
       author={Tairan Xu and Leyang Xue and Zhan Lu and Adrian Jackson and Luo Mai},
