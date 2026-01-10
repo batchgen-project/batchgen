@@ -4320,7 +4320,10 @@ class BatchGenWorker:
 		# STEP 1.5: Recalculate GPU KV cache size NOW after model weights are loaded
 		# This uses actual GPU memory measurement via torch.cuda.mem_get_info() (NVIDIA API)
 		# Overrides any theoretical estimate from _prepare_decode_batch()
+		# Clear PyTorch cache first to get accurate measurement of model weights only
+		# (warmup may have allocated temporary buffers that inflate memory usage)
 		torch.cuda.synchronize(self.torch_device)
+		torch.cuda.empty_cache()
 		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
 		free_mem_gb = free_mem_bytes / (1024 ** 3)
 		total_mem_gb = total_mem_bytes / (1024 ** 3)
