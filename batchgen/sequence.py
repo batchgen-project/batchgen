@@ -1,45 +1,56 @@
 """
     Data structure for storing and updating query information.
-    
+
     Supports configurable page buffer design for efficient GPU KV cache management:
     - Initial reservation: When first loaded to GPU, reserve INITIAL_GPU_PAGE_BUFFER pages
       beyond current context to reduce load/on-hold churning.
     - Extension reservation: At page boundaries, extend by EXTENSION_GPU_PAGE_BUFFER pages.
     - New KV tokens are streamed to host after each attention layer.
     - Sequences can be put ON_HOLD when GPU memory is insufficient.
-    
-    Environment Variables:
-    - BATCHGEN_INITIAL_GPU_PAGE_BUFFER: Pages to reserve on first GPU load (default: 64)
-    - BATCHGEN_EXTENSION_GPU_PAGE_BUFFER: Pages to add at boundaries (default: 2)
-    - BATCHGEN_DECISION_FREQUENCY_PAGES: How often to make scheduling decisions (default: 1 page = 64 tokens)
-      Must be <= EXTENSION_GPU_PAGE_BUFFER to ensure sequences don't overflow between decisions.
+
+    Configuration:
+    Call configure_page_buffers() at startup to set page buffer values.
+    Server flags:
+    - --initial-gpu-page-buffer: Pages to reserve on first GPU load (default: 32)
+    - --extension-gpu-page-buffer: Pages to add at boundaries (default: 4)
+    - --decision-frequency-pages: How often to make scheduling decisions (default: 2)
+      Must be <= extension_gpu_page_buffer to ensure sequences don't overflow between decisions.
 """
 from enum import IntEnum
 from typing import Dict, List, Optional, Set
 import torch
 import math
-import os
 
 
-# Configurable page buffer sizes via environment variables
+# Default page buffer sizes (can be overridden via configure_page_buffers())
 # Initial reservation when sequence is first loaded to GPU (e.g., after prefill or from ON_HOLD)
-INITIAL_GPU_PAGE_BUFFER = int(os.environ.get("BATCHGEN_INITIAL_GPU_PAGE_BUFFER", "64"))
+INITIAL_GPU_PAGE_BUFFER = 32  # Pages to reserve on first GPU load
 # Extension buffer at page boundaries (for sequences already in decode)
-EXTENSION_GPU_PAGE_BUFFER = int(os.environ.get("BATCHGEN_EXTENSION_GPU_PAGE_BUFFER", "2"))
+EXTENSION_GPU_PAGE_BUFFER = 4  # Pages to add at boundaries
 # Decision frequency: how many pages (each 64 tokens) between boundary checks
-# Default: 1 page = check every 64 tokens. Set to 2 for every 128 tokens, etc.
-DECISION_FREQUENCY_PAGES = int(os.environ.get("BATCHGEN_DECISION_FREQUENCY_PAGES", "1"))
+DECISION_FREQUENCY_PAGES = 2  # How often to make scheduling decisions (in pages)
 
-# Enforce: EXTENSION_GPU_PAGE_BUFFER >= DECISION_FREQUENCY_PAGES
-# Otherwise sequences may overflow GPU pages between decision boundaries
-if EXTENSION_GPU_PAGE_BUFFER < DECISION_FREQUENCY_PAGES:
-    import logging
-    logging.warning(
-        f"BATCHGEN_EXTENSION_GPU_PAGE_BUFFER ({EXTENSION_GPU_PAGE_BUFFER}) < "
-        f"BATCHGEN_DECISION_FREQUENCY_PAGES ({DECISION_FREQUENCY_PAGES}). "
-        f"Auto-adjusting EXTENSION_GPU_PAGE_BUFFER to {DECISION_FREQUENCY_PAGES} to prevent overflow."
-    )
-    EXTENSION_GPU_PAGE_BUFFER = DECISION_FREQUENCY_PAGES
+
+def configure_page_buffers(
+    initial_gpu_page_buffer: int = 32,
+    extension_gpu_page_buffer: int = 4,
+    decision_frequency_pages: int = 2
+) -> None:
+    """Configure page buffer settings at runtime.
+
+    This should be called during server/worker initialization with values
+    from server args.
+
+    Args:
+        initial_gpu_page_buffer: Pages to reserve on first GPU load (default: 32)
+        extension_gpu_page_buffer: Pages to add at page boundaries (default: 4)
+        decision_frequency_pages: How often to make scheduling decisions in pages (default: 2)
+    """
+    global INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES
+
+    INITIAL_GPU_PAGE_BUFFER = initial_gpu_page_buffer
+    EXTENSION_GPU_PAGE_BUFFER = extension_gpu_page_buffer
+    DECISION_FREQUENCY_PAGES = decision_frequency_pages
 
 
 class SequenceStatus(IntEnum):

@@ -80,6 +80,10 @@ class ServerArgs:
     enable_decode_preemption: bool = True
     # GPU memory fraction for KV cache: gpu_kv_size = GPU_mem * frac - model_size (default: 0.9)
     gpu_memory_frac: float = 0.9
+    # GPU page buffer settings for decode scheduling
+    initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
+    extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
+    decision_frequency_pages: int = 2  # How often to make scheduling decisions (in pages)
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -238,6 +242,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.9,
         help="Fraction of GPU memory to use for KV cache. GPU KV cache size = GPU_mem * frac - model_size (default: 0.9)",
     )
+    parser.add_argument(
+        "--initial-gpu-page-buffer",
+        type=int,
+        default=32,
+        help="Pages to reserve on first GPU load (default: 32, each page = 64 tokens)",
+    )
+    parser.add_argument(
+        "--extension-gpu-page-buffer",
+        type=int,
+        default=4,
+        help="Pages to add at page boundaries during decode (default: 4)",
+    )
+    parser.add_argument(
+        "--decision-frequency-pages",
+        type=int,
+        default=2,
+        help="How often to make scheduling decisions in pages (default: 2, each page = 64 tokens)",
+    )
     return parser
 
 
@@ -282,6 +304,17 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("host_kv_watermark must be between 0 and 100")
     if args.gpu_memory_frac <= 0 or args.gpu_memory_frac > 1.0:
         raise ValueError("gpu_memory_frac must be between 0 and 1.0")
+    if args.initial_gpu_page_buffer <= 0:
+        raise ValueError("initial_gpu_page_buffer must be positive")
+    if args.extension_gpu_page_buffer <= 0:
+        raise ValueError("extension_gpu_page_buffer must be positive")
+    if args.decision_frequency_pages <= 0:
+        raise ValueError("decision_frequency_pages must be positive")
+    if args.extension_gpu_page_buffer < args.decision_frequency_pages:
+        raise ValueError(
+            f"extension_gpu_page_buffer ({args.extension_gpu_page_buffer}) must be >= "
+            f"decision_frequency_pages ({args.decision_frequency_pages}) to prevent overflow"
+        )
     args.storage_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -321,6 +354,9 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         host_kv_watermark=parsed.host_kv_watermark,
         enable_decode_preemption=not getattr(parsed, 'no_decode_preemption', False),
         gpu_memory_frac=parsed.gpu_memory_frac,
+        initial_gpu_page_buffer=parsed.initial_gpu_page_buffer,
+        extension_gpu_page_buffer=parsed.extension_gpu_page_buffer,
+        decision_frequency_pages=parsed.decision_frequency_pages,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

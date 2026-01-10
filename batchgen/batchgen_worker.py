@@ -46,7 +46,7 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
 	build_host_kv_config,
 )
-from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES
+from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
 from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits, get_prepack_stats, PrepackMetadata
 
 # Import modularized components
@@ -221,6 +221,10 @@ class BatchGenWorkerArgs:
 	enable_decode_preemption: bool = True
 	# GPU memory fraction for KV cache calculation (default: 0.9)
 	gpu_memory_frac: float = 0.9
+	# GPU page buffer settings for decode scheduling
+	initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
+	extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
+	decision_frequency_pages: int = 2  # How often to make scheduling decisions (in pages)
 
 
 class BatchGenWorker:
@@ -235,6 +239,15 @@ class BatchGenWorker:
 	def __init__(self, args: BatchGenWorkerArgs):
 		logging.info(f"Rank {args.global_rank}: Initializing BatchGenWorker.")
 
+		# Configure page buffer settings from args (must be done before using the globals)
+		configure_page_buffers(
+			initial_gpu_page_buffer=args.initial_gpu_page_buffer,
+			extension_gpu_page_buffer=args.extension_gpu_page_buffer,
+			decision_frequency_pages=args.decision_frequency_pages,
+		)
+		# Update class attribute after configuration
+		BatchGenWorker.DECISION_INTERVAL = args.decision_frequency_pages * 64
+
 		# Watchdog for stuck detection (can be set via set_watchdog())
 		self._watchdog = None
 
@@ -242,10 +255,9 @@ class BatchGenWorker:
 		if args.global_rank == 0:
 			logging.info(
 				f"GPU Page Buffer Configuration: "
-				f"INITIAL_GPU_PAGE_BUFFER={INITIAL_GPU_PAGE_BUFFER} pages ({INITIAL_GPU_PAGE_BUFFER * 64} tokens), "
-				f"EXTENSION_GPU_PAGE_BUFFER={EXTENSION_GPU_PAGE_BUFFER} pages ({EXTENSION_GPU_PAGE_BUFFER * 64} tokens), "
-				f"DECISION_FREQUENCY={DECISION_FREQUENCY_PAGES} pages ({DECISION_FREQUENCY_PAGES * 64} tokens). "
-				f"Control via env vars: BATCHGEN_INITIAL_GPU_PAGE_BUFFER, BATCHGEN_EXTENSION_GPU_PAGE_BUFFER, BATCHGEN_DECISION_FREQUENCY_PAGES"
+				f"initial_gpu_page_buffer={args.initial_gpu_page_buffer} pages ({args.initial_gpu_page_buffer * 64} tokens), "
+				f"extension_gpu_page_buffer={args.extension_gpu_page_buffer} pages ({args.extension_gpu_page_buffer * 64} tokens), "
+				f"decision_frequency_pages={args.decision_frequency_pages} pages ({args.decision_frequency_pages * 64} tokens)"
 			)
 		
 		# 1. Store Arguments & Rank Information

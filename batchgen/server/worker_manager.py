@@ -304,6 +304,9 @@ class WorkerManager:
             host_kv_watermark=self.args.host_kv_watermark,
             enable_decode_preemption=self.args.enable_decode_preemption,
             gpu_memory_frac=self.args.gpu_memory_frac,
+            initial_gpu_page_buffer=self.args.initial_gpu_page_buffer,
+            extension_gpu_page_buffer=self.args.extension_gpu_page_buffer,
+            decision_frequency_pages=self.args.decision_frequency_pages,
         )
         self.worker_process = mp.spawn(
             server_worker_main,
