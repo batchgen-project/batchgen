@@ -242,7 +242,7 @@ class WorkerManager:
             raise RuntimeError("WorkerManager has not been started")
         payload = {
             "prompts": prompts,
-            "max_input_len": max_input_len or self.args.max_input_len,
+            "max_input_len": max_input_len,  # None = dynamically determined
             "max_output_len": max_output_len,
             "ignore_eos": ignore_eos,
             "temperature": temperature,

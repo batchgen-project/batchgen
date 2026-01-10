@@ -348,8 +348,8 @@ def create_app(
         server_args: ServerArgs = request.app.state.server_args
         storage: StorageManager = request.app.state.storage
 
-        max_input_len = body.max_input_len or server_args.max_input_len
-        max_output_len = body.max_output_len or server_args.max_output_len
+        max_input_len = body.max_input_len  # None = dynamically determined
+        max_output_len = body.max_output_len or 128  # Default max output tokens
 
         start = time.perf_counter()
         try:

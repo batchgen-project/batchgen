@@ -197,7 +197,7 @@ class BatchScheduler:
             results = await asyncio.to_thread(
                 self.worker.infer,
                 prompts,
-                self.server_args.max_input_len,
+                None,  # max_input_len: dynamically determined from prompts
                 max_tokens,
                 False,  # ignore_eos
                 batch.temperature,  # None = greedy decoding
@@ -248,14 +248,10 @@ class BatchScheduler:
                 prompt = self._format_chat_messages(
                     [m.dict() for m in body.messages], body.model
                 )
-                current_max_tokens = (
-                    body.max_tokens or self.server_args.max_output_len
-                )
+                current_max_tokens = body.max_tokens or 128
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
-                current_max_tokens = (
-                    body.max_tokens or self.server_args.max_output_len
-                )
+                current_max_tokens = body.max_tokens or 128
             else:
                 raise ValueError("Unsupported request body type")
 
@@ -264,7 +260,7 @@ class BatchScheduler:
                 max_tokens = current_max_tokens
 
         if max_tokens is None:
-            max_tokens = self.server_args.max_output_len
+            max_tokens = 128  # Default max output tokens
         return prompts, max_tokens
 
     def _format_chat_messages(self, messages: List[dict], model: str) -> str:
@@ -508,7 +504,7 @@ class BatchScheduler:
                 "Install transformers or configure it in the environment."
             )
 
-        cache_dir = self.server_args.cache_dir or self.server_args.hf_cache_dir
+        cache_dir = self.server_args.cache_dir
         cache_dir_value = str(cache_dir) if cache_dir else None
         try:
             tokenizer = AutoTokenizer.from_pretrained(
