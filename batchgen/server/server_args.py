@@ -113,22 +113,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--listen-port", type=int, default=10900, help="Server listen port"
     )
     parser.add_argument(
-        "--hf-cache-dir",
-        type=Path,
-        default=None,
-        help="HuggingFace cache directory",
-    )
-    parser.add_argument(
         "--cache-dir",
         type=Path,
         default=None,
-        help="Cache directory for downloaded weights",
-    )
-    parser.add_argument(
-        "--pt-ckpt-dir",
-        type=Path,
-        default=None,
-        help="Path to PyTorch checkpoints",
+        help="Path to pre-downloaded model weights",
     )
     parser.add_argument(
         "--enable-hugetlbfs",
@@ -332,9 +320,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         model=parsed.model,
         listen_ip=parsed.listen_ip,
         listen_port=parsed.listen_port,
-        hf_cache_dir=parsed.hf_cache_dir,
         cache_dir=parsed.cache_dir,
-        pt_ckpt_dir=parsed.pt_ckpt_dir,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         dist_init_addr=parsed.dist_init_addr,
         kv_dtype=parsed.kv_dtype,

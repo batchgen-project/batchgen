@@ -35,13 +35,9 @@ python -m batchgen.launch_http_server \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--cache-dir` | None | Path to downloaded model weights. Use this for pre-downloaded checkpoints. |
-| `--hf-cache-dir` | None | HuggingFace cache directory (where `transformers` stores downloaded models) |
-| `--pt-ckpt-dir` | None | Path to PyTorch checkpoint files (`.pt` format) |
 
 **Usage Notes:**
 - Use `--cache-dir` when you've downloaded the model to a specific location
-- Use `--hf-cache-dir` to point to your HuggingFace cache (typically `~/.cache/huggingface`)
-- Use `--pt-ckpt-dir` for custom PyTorch checkpoint directories
 
 ---
 
