@@ -58,39 +58,64 @@ conda create --name batchgen python=3.11
 conda activate batchgen
 ```
 
-### Dependencies installation
-Currently, BatchGen depends on torch==2.7.0+cu128
+### Quick Install (Recommended for Hopper GPUs)
+
+Clone the repository and run the install script:
+```bash
+git clone git@github.com:EfficientMoE/BatchGen.git
+cd BatchGen
+./scripts/install_deps.sh
+```
+
+This script automatically installs:
+- PyTorch with CUDA 12.8 support
+- flash-attention 3 (Hopper optimized)
+- FlashMLA
+- DeepGEMM
+- BatchGen
+
+Alternatively, use make:
+```bash
+make install-all
+```
+
+### Manual Installation
+
+If you prefer manual installation or need more control:
+
+#### 1. Install PyTorch with CUDA support
 ```bash
 pip install torch==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 ```
 
+#### 2. Install flash-attention (for Ampere GPUs)
 ```bash
 pip install flash-attn --no-build-isolation
 ```
-For Hopper user, please install flash-attention 3 beta release refer to https://github.com/Dao-AILab/flash-attention
+
+#### 3. Install Hopper-specific dependencies
+
+For Hopper GPUs (H100, H20, etc.), install these optimized kernels:
+
+**flash-attention 3** (see https://github.com/Dao-AILab/flash-attention):
 ```bash
 git clone git@github.com:Dao-AILab/flash-attention.git
-cd ./flash-attention/hopper/
-python setup.py install
-```
-For Hopper user, please install FlashMLA refer to https://github.com/deepseek-ai/FlashMLA/tree/main
-```bash
-git clone git@github.com:deepseek-ai/FlashMLA.git
-cd FlashMLA
-python setup.py install
+cd flash-attention && git checkout v2.8.2
+cd hopper && pip install . --no-build-isolation
 ```
 
-For Hopper user, please install DeepGEMM refer to https://github.com/deepseek-ai/DeepGEMM
+**FlashMLA** (see https://github.com/deepseek-ai/FlashMLA):
+```bash
+pip install git+https://github.com/deepseek-ai/FlashMLA.git --no-build-isolation
+```
+
+**DeepGEMM** (see https://github.com/deepseek-ai/DeepGEMM):
 ```bash
 git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
-cd DeepGEMM
-cat develop.sh
-./develop.sh
-cat install.sh
-./install.sh
+cd DeepGEMM && pip install . --no-build-isolation
 ```
 
-### Install BatchGen from codebase
+#### 4. Install BatchGen
 ```bash
 git clone git@github.com:EfficientMoE/BatchGen.git
 cd BatchGen
