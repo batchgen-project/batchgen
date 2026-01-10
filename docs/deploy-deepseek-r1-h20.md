@@ -288,6 +288,7 @@ Key arguments for multi-node deployment:
 | `--dist-init-addr` | localhost:12355 | Address for distributed init (`master-ip:port`) |
 | `--host-kv-cache-size` | None | Host KV cache size in GB (critical for throughput) |
 | `--storage-path` | batchgen/storage/ | Directory for files and batches |
+| `--save-result` | false | Save inference results to `{storage_path}/outputs/` |
 
 For the complete list of all server flags, see **[Server Flags Reference](server-flags.md)**.
 
