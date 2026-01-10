@@ -1,5 +1,28 @@
+"""
+DEPRECATED: This generic scheduler is no longer used.
+
+Use model-specific planners instead:
+    from batchgen.planner import get_planner
+    PlannerClass = get_planner(model_name)
+    planner = PlannerClass()
+    config = planner.generate_config(engine_config)
+
+The EngineConfig is now created by model-specific initializers which
+use model-specific planners to compute all config values.
+"""
+
+import warnings
+
+warnings.warn(
+    "Generic scheduler is deprecated. Use model-specific planners from batchgen.planner instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 from ..config.config import EngineConfig
 import logging
+
+
 class Scheduler:
 	def __version__(self):
 		""" 

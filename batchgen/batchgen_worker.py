@@ -93,7 +93,7 @@ _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 NUM_GPUS_PER_NODE = int(os.environ.get('NUM_GPUS_PER_NODE', '8'))
 
 
-from .scheduler.scheduler import Scheduler
+# Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
 
 
 class query:
@@ -1018,15 +1018,9 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}")
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
-		config_scheduler = Scheduler(self.max_input_length, self.max_decoding_length, self.args.world_size)
-		self.engine_config = config_scheduler.generate_config()
-		self.engine_config.Basic_Config.device = self.args.device
-		# device_torch is the torch.device for CUDA ops
-		self.engine_config.Basic_Config.device_torch = torch.device(f"cuda:{self.args.device}")
-		self.engine_config.Basic_Config.world_size = self.world_size
-
-		if not self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens:
-			logging.warning(f"kv_buffer_num_tokens is set to {self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens}")
+		# Note: EngineConfig is created by the model-specific initializer which uses a Planner
+		# to compute all config values. The initializer is the single source of truth.
+		# No need to create a separate scheduler here - it would be thrown away anyway.
 
 		self.device = self.args.device
 		self.torch_device = torch.device(f"cuda:{self.args.device}")
@@ -4666,10 +4660,12 @@ class BatchGenWorker:
 			attention_mask_list.append(attention_mask)
 
 		# Prepack sequences
+		# Row capacity is set by planner in config (None = no limit, use max sequence length)
+		row_capacity = self.engine_config.Module_Batching_Config.prepack_row_capacity
 		prepack_meta = prepack_sequences(
 			input_ids_list,
 			attention_mask_list,
-			row_capacity=None,  # Use max sequence length
+			row_capacity=row_capacity,
 			device=self.torch_device,
 		)
 
@@ -4706,7 +4702,8 @@ class BatchGenWorker:
 
 		# Split sequences into micro-batches based on TOKEN count (not sequence count)
 		# This prevents OOM when sequences have varying lengths
-		MAX_TOKENS_PER_MICRO_BATCH = 120_000  # 120K tokens max per micro-batch
+		# Token cap is set by planner in config, worker reads from config (no hardcoded values)
+		MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
 		num_sequences = prepack_meta.num_original_sequences
 		seq_lengths_list = prepack_meta.original_seq_lengths
 

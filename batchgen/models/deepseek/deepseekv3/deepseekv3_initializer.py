@@ -43,7 +43,7 @@ except ImportError:
 from typing import Tuple
 from ....config.engine_config_parser import parse_config_from_json
 from .set_basic_config import set_basic_config
-from .scheduler import Scheduler
+from .planner import DeepSeekV3Planner
 
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 
@@ -160,10 +160,10 @@ class DeepseekV3Initializer:
         logging.info(f"device: {input_arguments.device}")
         self.engine_config = set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
-        self.scheduler = Scheduler()
-        self.engine_config = self.scheduler.generate_config(self.engine_config)
+        self.planner = DeepSeekV3Planner()
+        self.engine_config = self.planner.generate_config(self.engine_config)
         if self.global_rank == 0:
-            logging.info(f"Engine config after scheduling: {self.engine_config}")
+            logging.info(f"Engine config after planning: {self.engine_config}")
 
 
         self.shm_name = input_arguments.shm_name

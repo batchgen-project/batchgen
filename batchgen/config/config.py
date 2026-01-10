@@ -82,17 +82,23 @@ class BasicConfig:
 @dataclass
 class ModuleBatchingConfig:
     global_batch_size: Optional[int] = 0
+    # Token-based prefill config (for prepack mode, always recommended)
+    prefill_micro_batch_token_cap: int = 120_000  # Max tokens per prefill micro-batch
+    prepack_row_capacity: Optional[int] = None  # Token budget per packed row (None = no limit)
+    # Sequence-count based prefill config (for non-prepack mode)
     attn_prefill_micro_batch_size: Optional[int] = 0
     MoE_prefill_micro_batch_size: Optional[int] = 0
     expert_prefill_batch_size_upper_bound: Optional[int] = 0
     attn_decoding_micro_batch_size: Optional[int] = 0
     MoE_decoding_micro_batch_size: Optional[int] = 0
     expert_decoding_batch_size_upper_bound: Optional[int] = 0
-    
+
     def __str__(self):
         return (
             f"ModuleBatchingConfig:\n"
             f"  global_batch_size: {self.global_batch_size}\n"
+            f"  prefill_micro_batch_token_cap: {self.prefill_micro_batch_token_cap}\n"
+            f"  prepack_row_capacity: {self.prepack_row_capacity}\n"
             f"  attn_prefill_micro_batch_size: {self.attn_prefill_micro_batch_size}\n"
             f"  MoE_prefill_micro_batch_size: {self.MoE_prefill_micro_batch_size}\n"
             f"  expert_prefill_batch_size_upper_bound: {self.expert_prefill_batch_size_upper_bound}\n"
