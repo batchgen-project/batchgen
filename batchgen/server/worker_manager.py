@@ -29,6 +29,39 @@ logger = logging.getLogger(__name__)
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 
 
+def detect_gpu_arch() -> str:
+    """Auto-detect GPU architecture based on CUDA compute capability.
+
+    Returns:
+        'hopper' for compute capability >= 9.0 (H100, H20, etc.)
+        'ampere' for compute capability 8.x (A100, A5000, RTX 4090, etc.)
+
+    Raises:
+        RuntimeError: If no CUDA devices found or unsupported architecture
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA devices available for GPU architecture detection")
+
+    major, minor = torch.cuda.get_device_capability(0)
+    device_name = torch.cuda.get_device_name(0)
+
+    if major >= 9:
+        arch = "hopper"
+    elif major == 8:
+        arch = "ampere"
+    else:
+        raise RuntimeError(
+            f"Unsupported GPU architecture: compute capability {major}.{minor} "
+            f"({device_name}). BatchGen requires Hopper (sm_90+) or Ampere (sm_80+)."
+        )
+
+    logger.info(
+        "Auto-detected GPU architecture: %s (compute capability %d.%d, %s)",
+        arch, major, minor, device_name,
+    )
+    return arch
+
+
 class WorkerExitState:
     """Tracks worker failures that require the main process to exit."""
 
@@ -273,6 +306,9 @@ class WorkerManager:
         if world_size == 1 and local_device_count > 1:
             world_size = local_device_count * self.args.nnodes
 
+        # Auto-detect GPU architecture if not specified
+        gpu_arch = self.args.gpu_arch or detect_gpu_arch()
+
         args = BatchGenWorkerArgs(
             model_name=self.args.model,
             hf_cache_dir=self.args.hf_cache_dir,
@@ -283,7 +319,7 @@ class WorkerManager:
             world_size=world_size,
             nnode_rank=self.args.node_rank,
             nnodes=self.args.nnodes,
-            gpu_arch=self.args.gpu_arch,
+            gpu_arch=gpu_arch,
             shm_name=self.model_info["shm_name"],
             tensor_meta_shm_name=self.model_info["tensor_meta_shm_name"],
             enable_hugetlbfs=self.args.enable_hugetlbfs,

@@ -122,17 +122,9 @@ gpu_kv_cache = GPU_memory × gpu_memory_frac - model_instance_size
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable-hugetlbfs` | `false` | Enable hugeTLBFS for shared memory. Requires system configuration. |
+| `--enable-hugetlbfs` | `false` | Enable hugeTLBFS for shared memory. Requires root privileges (sudo). |
 
-**To enable hugeTLBFS:**
-```bash
-# Allocate huge pages (requires root)
-echo 10000 | sudo tee /proc/sys/vm/nr_hugepages
-
-# Mount hugetlbfs
-sudo mkdir -p /mnt/hugepages
-sudo mount -t hugetlbfs none /mnt/hugepages
-```
+**Note:** When `--enable-hugetlbfs` is enabled, BatchGen will automatically configure huge pages. This requires running the server with root privileges (sudo).
 
 ---
 
