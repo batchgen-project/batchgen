@@ -121,15 +121,6 @@ sudo mount -t hugetlbfs none /mnt/hugepages
 
 ## Inference Configuration
 
-### Sequence Length Limits
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--max-input-len` | `1024` | Default maximum input sequence length (tokens) |
-| `--max-output-len` | `128` | Default maximum output/generation length (tokens) |
-
-These are defaults that can be overridden per-request via the API.
-
 ### Continuous Batching
 
 Controls how BatchGen schedules sequences on GPU.
@@ -202,9 +193,7 @@ The watchdog monitors worker processes and restarts them if they become unrespon
 python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --cache-dir /models/DeepSeek-R1 \
-    --host-kv-cache-size 400 \
-    --max-input-len 8192 \
-    --max-output-len 4096
+    --host-kv-cache-size 400
 ```
 
 ### Two Nodes (16 GPUs)
@@ -217,9 +206,7 @@ python -m batchgen.launch_http_server \
     --world-size 16 --nnodes 2 --node-rank 0 \
     --dist-init-addr 192.168.1.100:12355 \
     --host-kv-cache-size 650 \
-    --storage-path /shared/storage \
-    --max-input-len 16000 \
-    --max-output-len 8000
+    --storage-path /shared/storage
 
 # Node 1
 python -m batchgen.launch_http_server \
@@ -228,9 +215,7 @@ python -m batchgen.launch_http_server \
     --world-size 16 --nnodes 2 --node-rank 1 \
     --dist-init-addr 192.168.1.100:12355 \
     --host-kv-cache-size 650 \
-    --storage-path /shared/storage \
-    --max-input-len 16000 \
-    --max-output-len 8000
+    --storage-path /shared/storage
 ```
 
 ### Development Mode
@@ -240,9 +225,7 @@ python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --cache-dir /models/DeepSeek-R1 \
     --no-watchdog \
-    --save-result \
-    --max-input-len 512 \
-    --max-output-len 128
+    --save-result
 ```
 
 ### Maximum Performance
@@ -255,9 +238,7 @@ python -m batchgen.launch_http_server \
     --gpu-memory-frac 0.95 \
     --enable-hugetlbfs \
     --initial-gpu-page-buffer 64 \
-    --extension-gpu-page-buffer 8 \
-    --max-input-len 16000 \
-    --max-output-len 8000
+    --extension-gpu-page-buffer 8
 ```
 
 ---

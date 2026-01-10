@@ -67,8 +67,6 @@ class ServerArgs:
     world_size: int = 1
     storage_path: Optional[Path] = None  # Default set in __post_init__
     save_result: bool = False  # Save direct inference results to outputs/
-    max_input_len: int = 1024
-    max_output_len: int = 128
     watchdog_timeout: Optional[float] = 600.0  # 10 minutes for long inference tasks
     watchdog_test_stuck_time: float = 0.0
     watchdog_heartbeat_interval: Optional[float] = None
@@ -162,18 +160,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Save direct inference results to {storage_path}/outputs/ as JSONL files",
     )
     parser.add_argument(
-        "--max-input-len",
-        type=int,
-        default=1024,
-        help="Default max input length for inference",
-    )
-    parser.add_argument(
-        "--max-output-len",
-        type=int,
-        default=128,
-        help="Default max output length for inference",
-    )
-    parser.add_argument(
         "--watchdog-timeout",
         type=float,
         default=180.0,
@@ -261,10 +247,6 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("world_size must be positive")
     if args.node_rank < 0 or args.node_rank >= args.nnodes:
         raise ValueError("node_rank must be in [0, nnodes)")
-    if args.max_input_len <= 0:
-        raise ValueError("max_input_len must be positive")
-    if args.max_output_len <= 0:
-        raise ValueError("max_output_len must be positive")
     if args.watchdog_timeout is not None and args.watchdog_timeout < 0:
         raise ValueError("watchdog_timeout must be non-negative (0 to disable)")
     if args.watchdog_heartbeat_interval is not None:
@@ -321,8 +303,6 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         world_size=parsed.world_size,
         storage_path=parsed.storage_path,
         save_result=parsed.save_result,
-        max_input_len=parsed.max_input_len,
-        max_output_len=parsed.max_output_len,
         watchdog_timeout=watchdog_timeout,
         watchdog_test_stuck_time=parsed.watchdog_test_stuck_time,
         watchdog_heartbeat_interval=parsed.watchdog_heartbeat_interval,
