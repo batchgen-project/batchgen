@@ -361,11 +361,13 @@ std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
     // Set the log level
     logger->set_level(spdlog::level::from_str(log_level));
 
-    // Set the pattern based on the log level
+    // Set the pattern to match Python logging format:
+    // 2026-01-10 10:51:29,379 - [LoggerName] - INFO - message
+    // Note: spdlog %l gives lowercase level (info), %^%l%$ adds color
     if (logger->level() <= spdlog::level::debug) {
-        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] %v");
+        logger->set_pattern("%Y-%m-%d %H:%M:%S,%e - [%n] - %^%l%$ - %v");
     } else {
-        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
+        logger->set_pattern("%Y-%m-%d %H:%M:%S,%e - [%n] - %^%l%$ - %v");
     }
 
     // Make this logger the default logger
