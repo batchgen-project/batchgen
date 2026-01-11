@@ -63,20 +63,46 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
 
     Args:
         shm_prefix: Prefix to match shared memory files. If None, clean all
-                   files. Default is 'batchgen'.
+                   files using rm -rf for aggressive cleanup. Default is 'batchgen'.
 
     Returns:
-        Number of files removed.
+        Number of files removed (approximate for rm -rf).
     """
     shm_dir = Path("/dev/shm")
     if not shm_dir.exists():
         return 0
 
+    # If no prefix specified, use aggressive rm -rf cleanup
+    if shm_prefix is None:
+        try:
+            result = subprocess.run(
+                ["rm", "-rf", "/dev/shm/*"],
+                shell=False,
+                capture_output=True,
+                timeout=30,
+            )
+            # rm with glob doesn't work directly, use shell
+            result = subprocess.run(
+                "rm -rf /dev/shm/*",
+                shell=True,
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                logger.info("Cleaned up all shared memory files from /dev/shm")
+                return 1  # Approximate
+            else:
+                logger.warning(f"rm -rf /dev/shm/* failed: {result.stderr}")
+        except Exception as e:
+            logger.warning(f"Error cleaning /dev/shm with rm -rf: {e}")
+        return 0
+
+    # Prefix-based cleanup
     removed = 0
     try:
         for shm_file in shm_dir.iterdir():
             if shm_file.is_file():
-                if shm_prefix is None or shm_file.name.startswith(shm_prefix):
+                if shm_file.name.startswith(shm_prefix):
                     try:
                         shm_file.unlink()
                         logger.debug(f"Removed /dev/shm/{shm_file.name}")
@@ -92,31 +118,31 @@ def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
 
 
 def cleanup_hugepages_files() -> int:
-    """Clean up files in /dev/hugepages.
+    """Clean up files in /dev/hugepages using rm -rf for aggressive cleanup.
 
     Returns:
-        Number of files removed.
+        Number of files removed (approximate).
     """
     hugepages_dir = Path("/dev/hugepages")
     if not hugepages_dir.exists():
         return 0
 
-    removed = 0
     try:
-        for hp_file in hugepages_dir.iterdir():
-            if hp_file.is_file():
-                try:
-                    hp_file.unlink()
-                    logger.debug(f"Removed /dev/hugepages/{hp_file.name}")
-                    removed += 1
-                except (PermissionError, OSError) as e:
-                    logger.warning(f"Failed to remove {hp_file}: {e}")
+        result = subprocess.run(
+            "rm -rf /dev/hugepages/*",
+            shell=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            logger.info("Cleaned up all files from /dev/hugepages")
+            return 1  # Approximate
+        else:
+            logger.warning(f"rm -rf /dev/hugepages/* failed: {result.stderr}")
     except Exception as e:
         logger.warning(f"Error cleaning /dev/hugepages: {e}")
 
-    if removed > 0:
-        logger.info(f"Cleaned up {removed} files from /dev/hugepages")
-    return removed
+    return 0
 
 
 def unmount_hugetlbfs() -> bool:

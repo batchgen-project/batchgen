@@ -437,8 +437,10 @@ def launch_server(server_args: ServerArgs) -> None:
         raise KeyboardInterrupt()
 
     # Install signal handlers for graceful shutdown
+    # SIGQUIT is sent by watchdog when worker timeout occurs
     original_sigint = signal.signal(signal.SIGINT, shutdown_handler)
     original_sigterm = signal.signal(signal.SIGTERM, shutdown_handler)
+    original_sigquit = signal.signal(signal.SIGQUIT, shutdown_handler)
 
     try:
         logger.info("Starting BatchGen HTTP server.")
@@ -458,14 +460,16 @@ def launch_server(server_args: ServerArgs) -> None:
         # Restore original signal handlers
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
+        signal.signal(signal.SIGQUIT, original_sigquit)
 
         logger.info("HTTP server stopped.")
 
         # Final cleanup in case lifespan cleanup was incomplete
-        # (e.g., if server was killed before lifespan could run)
+        # (e.g., if server was killed before lifespan could run, or watchdog triggered)
+        # Always clean hugepages on shutdown for complete resource release
         cleanup_resources(
             shm_prefix=None,  # Clean all shared memory files
-            clean_hugepages=server_args.enable_hugetlbfs,
+            clean_hugepages=True,  # Always clean hugepages on shutdown
             kill_workers=True,  # Force kill any remaining workers
         )
 
