@@ -3850,13 +3850,15 @@ class BatchGenWorker:
 				dist.barrier()
 
 				# CRITICAL FIX: Sync sequence metadata BEFORE rebalancing
-				# After decode interruption, each rank has divergent metadata for sequences
-				# it doesn't own locally. This sync ensures all ranks have consistent
-				# current_context_length values before migration, which is essential for
-				# correct KV validation on the receiver side.
+				# After decode interruption or prefill completion, each rank has divergent
+				# metadata for sequences it doesn't own locally. This sync ensures all ranks
+				# have consistent current_context_length values before migration. PREFILLED
+				# sequences must be synced because their attention mask has been updated
+				# (prompt_len + 1) after prefill, and migration includes PREFILLED status.
+				prefilled_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.PREFILLED]
 				on_hold_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.ON_HOLD]
 				in_decode_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.IN_DECODE]
-				all_active_uuids = on_hold_uuids + in_decode_uuids
+				all_active_uuids = prefilled_uuids + on_hold_uuids + in_decode_uuids
 				if all_active_uuids:
 					self._sync_sequence_metadata(all_active_uuids)
 					logging.debug(f"Rank {self.rank}: Synced metadata for {len(all_active_uuids)} sequences before rebalance")
