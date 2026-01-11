@@ -21,46 +21,43 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/l
 
     
 WORKDIR /root/moegen
-RUN uv venv --python ${PYTHON_VERSION}
+RUN uv venv --python ${PYTHON_VERSION} --seed
 
 ENV PATH="/root/moegen/.venv/bin:$PATH"
 
 # Make sure to install ninja to enable fast builds
-RUN uv pip install torch==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128 wheel packaging ninja \
+RUN uv pip install torch==2.9.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128 \
+    setuptools wheel packaging ninja \
     && uv cache clean
     
-# Install Flash Attention, DeepGEMM and FlashMLA
+# Install Flash Attention
 RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && cd flash-attention \
-    && git checkout v2.8.2 \
+    && git checkout v2.8.3 \
     && cd hopper \
-    && uv pip install . --no-build-isolation \
-    && uv pip install git+https://github.com/deepseek-ai/FlashMLA.git@9edee0c022cd0938148a18e334203b0aab43aa19 --no-build-isolation \
-    && git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git \
-    && cd DeepGEMM \
-    && git checkout d374456 \
-    && git submodule update --init --recursive \
     && uv pip install . --no-build-isolation \
     && uv cache clean
 
-# Download LongBench dataset to /root/.cache
-RUN uv pip install datasets==2.16.1 && uv pip install test-kernel-0ab602a9 && uv cache clean && python -c "\
-from datasets import load_dataset; \
-task_names = [ \
-    '2wikimqa', '2wikimqa_e', 'dureader', 'gov_report', 'gov_report_e', 'hotpotqa', \
-    'hotpotqa_e', 'lcc', 'lcc_e', 'lsht', 'multi_news', 'multi_news_e', 'multifieldqa_en', \
-    'multifieldqa_en_e', 'multifieldqa_zh', 'musique', 'narrativeqa', 'passage_count', \
-    'passage_count_e', 'passage_retrieval_en', 'passage_retrieval_en_e', 'passage_retrieval_zh', \
-    'qasper', 'qasper_e', 'qmsum', 'repobench-p', 'repobench-p_e', 'samsum', 'samsum_e', \
-    'trec', 'trec_e', 'triviaqa', 'triviaqa_e', 'vcsum' \
-]; \
-[load_dataset('Xnhyacinth/LongBench', name, split='test') for name in task_names] \
-"
+# Install FlashMLA
+RUN git clone --recursive https://github.com/deepseek-ai/FlashMLA.git \
+    && cd FlashMLA \
+    && git checkout 1408756a88e52a25196b759eaf8db89d2b51b5a1 \
+    && git submodule update --init --recursive \
+    && FLASH_MLA_DISABLE_SM100=1 uv pip install -v . --no-build-isolation \
+    && uv cache clean
+
+# Install DeepGEMM
+RUN git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git \
+    && cd DeepGEMM \
+    && git checkout v2.1.1.post3 \
+    && git submodule update --init --recursive \
+    && bash ./install.sh \
+    && uv cache clean
 
 # Install from moe gen source
 COPY . /root/moegen
 
-RUN uv pip install -e . -v \
+RUN uv pip install -r requirements.txt && uv pip install -e . -v \
     && uv cache clean
 
 ENV NCCL_BUFFSIZE=16777216
