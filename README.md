@@ -10,7 +10,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/EfficientMoE/BatchGen?style=social)](https://github.com/EfficientMoE/BatchGen/stargazers)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-**High-throughput Offline Inference for MoE Models with Limited GPU Memory**
+**High-Throughput Batch Inference**
 
 [Documentation](docs/) | [Deployment Guide](docs/deploy-deepseek-r1-h20.md) | [Server Flags](docs/server-flags.md)
 
@@ -20,28 +20,25 @@
 
 ## News
 
-- [2025/01] BatchGen v1.0 released with support for DeepSeek-R1/V3-671B full precision inference.
+- [2026/01] BatchGen v1.0 released with support for DeepSeek-R1/V3-671B.
 
 ---
 
 ## About
 
-BatchGen is an efficient serving engine optimized specifically for **Mixture-of-Expert (MoE)** based large language models. It is designed for bulk **offline inference** tasks on **limited GPU resources**, enabling low-cost serving for latency-insensitive applications.
+BatchGen is a high-throughput batch inference engine designed to minimize batch completion time (BCT) for large-scale batch workloads and MoE-based LLMs.
 
-### Core Features
+### Key Innovations
 
-- **Module-Based Batching**: A fine-grained batching strategy ensures consistently high GPU utilization throughout every forward pass.
-
-- **Efficient Data Swapping Engine**: Supports inference of large-scale models (e.g., DeepSeek-R1) on constrained hardware setups such as single NVIDIA A5000 or RTX 4090 GPUs, aggressively maximizing overlap between computation and memory transfers to achieve optimal efficiency.
-
-- **Tailored Offloading and Parallel Strategy**: Different parallel strategies, model weights offloading and KV-Cache offloading are applied to different models and hardware settings.
+BatchGen introduces the sequence coroutine compute model, which treats each sequence's computation as an event-driven coroutine that can be paused, resumed, and reorganized. A static planner optimizes batch configurations through lightweight profiling, while a dynamic sequence scheduler yields, combines, and migrates sequence coroutines at runtime—enabling larger expert-level batches for sparse MoE models, mitigating long-tail stragglers, and maintaining high device utilization across GPU clusters.
 
 ### Application Scenarios
 
-- MoE model evaluation
-- Company deployed LLM workflow for raw data formation
-- Latency-insensitive bulk inference tasks (e.g., large batch inference during off-peak hours)
-- Deep-research applications that deliver high-quality results overnight
+- Large-scale offline inference and data processing pipelines
+- Synthetic data generation
+- Model evaluation and benchmarking
+- Test-time scaling (e.g., chain-of-thought, self-consistency)
+- RL rollouts and post-training workflows
 
 
 ## Getting Started
