@@ -67,7 +67,7 @@ class ServerArgs:
     world_size: int = 1
     storage_path: Optional[Path] = None  # Default set in __post_init__
     save_result: bool = False  # Save direct inference results to outputs/
-    watchdog_timeout: Optional[float] = 300.0  # 5 minutes per micro-batch/decode step
+    watchdog_timeout: Optional[float] = None  # Disabled by default
     watchdog_test_stuck_time: float = 0.0
     watchdog_heartbeat_interval: Optional[float] = None
     # Prepack optimization (default: enabled, recommended always on)
@@ -162,13 +162,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--watchdog-timeout",
         type=float,
-        default=300.0,
-        help="Watchdog timeout in seconds per micro-batch/decode step. Set to 0 to disable.",
+        default=None,
+        help="Watchdog timeout in seconds per micro-batch/decode step. Default: disabled. Recommended: 300 for production.",
     )
     parser.add_argument(
         "--no-watchdog",
         action="store_true",
-        help="Disable worker watchdog (equivalent to --watchdog-timeout 0)",
+        help="Disable worker watchdog (default behavior, kept for compatibility)",
     )
     parser.add_argument(
         "--watchdog-test-stuck-time",

@@ -183,12 +183,12 @@ The watchdog monitors worker processes and restarts them if they become unrespon
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--watchdog-timeout` | `300` | Timeout in seconds per micro-batch/decode step. Set to 0 to disable. |
-| `--no-watchdog` | - | Disable watchdog (equivalent to `--watchdog-timeout 0`) |
+| `--watchdog-timeout` | Disabled | Timeout in seconds per micro-batch/decode step. Recommended: 300 for production. |
+| `--no-watchdog` | - | Disable watchdog (default behavior, kept for compatibility) |
 
-**When to adjust watchdog timeout:**
-- Increase for very long sequences or slow hardware
-- Disable (`--no-watchdog`) during development/debugging
+**When to enable watchdog:**
+- For production deployments: use `--watchdog-timeout 300` (5 minutes)
+- Increase timeout for very long sequences or slow hardware
 
 ---
 
