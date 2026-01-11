@@ -219,4 +219,5 @@ python -m batchgen.launch_http_server \
 ## See Also
 
 - [Deployment Guide](deploy-deepseek-r1-h20.md) - Step-by-step multi-node deployment
+- [Client API Reference](client-api.md) - Python client usage and parameters
 - [README](../README.md) - Installation and quick start

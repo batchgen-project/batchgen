@@ -135,7 +135,7 @@ class CreateBatchRequest(BaseModel):
     completion_window: CompletionWindow = CompletionWindow.ONE_DAY
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (override per-request values)
-    max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_decoding_length: Optional[int] = Field(default=None, ge=1)
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
 
@@ -157,7 +157,7 @@ class BatchObject(BaseModel):
     error: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (set at batch creation, None = use defaults)
-    max_tokens: Optional[int] = None
+    max_decoding_length: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
 

@@ -305,15 +305,15 @@ The Batch API is best for processing large numbers of requests asynchronously.
 from batchgen.batchgen_client import BatchGenHttpClient
 
 # Connect to server
-client = BatchGenHttpClient(host="node0-ip", port=10900)
+client = BatchGenHttpClient(base_url="http://node0-ip:10900")
 
 # Submit batch job (upload, create, wait, download in one call)
 result = client.submit_batch(
     input_file_path="requests.jsonl",
     output_file_path="results.jsonl",
     endpoint="/v1/chat/completions",
-    max_tokens=1024,     # Override per-request max_tokens
-    temperature=0.7,     # Sampling temperature
+    max_decoding_length=1024,  # Override per-request max_tokens
+    temperature=0.7,           # Sampling temperature
 )
 
 print(f"Batch completed: {result['id']}")
@@ -328,7 +328,7 @@ For more control over the batch lifecycle:
 from batchgen.batchgen_client import BatchGenHttpClient
 import time
 
-client = BatchGenHttpClient(host="node0-ip", port=10900)
+client = BatchGenHttpClient(base_url="http://node0-ip:10900")
 
 # Step 1: Upload input file
 file_obj = client.upload_file("requests.jsonl", purpose="batch")
@@ -338,7 +338,7 @@ print(f"Uploaded file: {file_obj['id']}")
 batch = client.create_batch(
     input_file_id=file_obj["id"],
     endpoint="/v1/chat/completions",
-    max_tokens=512,
+    max_decoding_length=512,
 )
 print(f"Created batch: {batch['id']}")
 
@@ -394,7 +394,7 @@ for r in results:
 ```python
 from batchgen.batchgen_client import BatchGenHttpClient
 
-client = BatchGenHttpClient(host="node0-ip", port=10900)
+client = BatchGenHttpClient(base_url="http://node0-ip:10900")
 
 # Get batch info
 batch = client.get_batch("batch_abc123")
@@ -420,7 +420,7 @@ if batch["output_file_id"]:
 from batchgen.batchgen_client import BatchGenHttpClient
 import requests
 
-client = BatchGenHttpClient(host="node0-ip", port=10900)
+client = BatchGenHttpClient(base_url="http://node0-ip:10900")
 
 # List batches via HTTP
 response = requests.get(f"http://node0-ip:10900/v1/batches")
@@ -451,6 +451,7 @@ for batch in batches:
 ## See Also
 
 - [Server Flags Reference](server-flags.md) - Complete list of all server flags
+- [Client API Reference](client-api.md) - Python client usage and parameters
 - [README](../README.md) - Installation and quick start
 
 ## Support

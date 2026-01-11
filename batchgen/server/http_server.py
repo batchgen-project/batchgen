@@ -275,7 +275,7 @@ def create_app(
             expires_at=expires_at,
             metadata=body.metadata,
             # Inference parameters (override per-request values)
-            max_tokens=body.max_tokens,
+            max_decoding_length=body.max_decoding_length,
             temperature=body.temperature,
             top_p=body.top_p,
         )

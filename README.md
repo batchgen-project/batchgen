@@ -63,39 +63,9 @@ This script automatically installs:
 
 For manual installation, see the [Manual Installation Guide](docs/manual-installation.md).
 
-### Quick Start
+### Deployment
 
-**1. Download Model Checkpoints**
-
-```bash
-huggingface-cli download deepseek-ai/DeepSeek-R1 \
-    --local-dir /shared/models/DeepSeek-R1
-```
-
-**2. Start the Server**
-
-```bash
-python -m batchgen.launch_http_server \
-    --model deepseek-ai/DeepSeek-R1 \
-    --cache-dir /shared/models/DeepSeek-R1 \
-    --host-kv-cache-size 256
-```
-
-**3. Submit Batch Jobs**
-
-```python
-from batchgen.batchgen_client import BatchGenHttpClient
-
-client = BatchGenHttpClient(host="localhost", port=10900)
-
-result = client.submit_batch(
-    input_file_path="requests.jsonl",
-    output_file_path="results.jsonl",
-    endpoint="/v1/chat/completions",
-)
-```
-
-For multi-node deployment, see the [Deployment Guide](docs/deploy-deepseek-r1-h20.md).
+For complete deployment instructions including model download, checkpoint conversion, server setup, and submitting jobs, see the **[Deployment Guide](docs/deploy-deepseek-r1-h20.md)**.
 
 ---
 
@@ -103,6 +73,7 @@ For multi-node deployment, see the [Deployment Guide](docs/deploy-deepseek-r1-h2
 
 - **[Deployment Guide](docs/deploy-deepseek-r1-h20.md)** - Step-by-step guide for multi-node deployment
 - **[Server Flags Reference](docs/server-flags.md)** - Complete list of all server configuration flags
+- **[Client API Reference](docs/client-api.md)** - Python client usage and parameters
 - **[Manual Installation](docs/manual-installation.md)** - Step-by-step manual installation instructions
 
 ---

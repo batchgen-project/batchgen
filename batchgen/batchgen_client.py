@@ -258,7 +258,7 @@ class BatchGenHttpClient:
         endpoint: str = "/v1/chat/completions",
         completion_window: str = "24h",
         metadata: Optional[Dict[str, Any]] = None,
-        max_tokens: Optional[int] = None,
+        max_decoding_length: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -269,7 +269,7 @@ class BatchGenHttpClient:
             endpoint: Target endpoint ('/v1/chat/completions' or '/v1/completions')
             completion_window: Time window for completion ('24h')
             metadata: Optional metadata dictionary
-            max_tokens: Override max tokens for all requests (None = use per-request)
+            max_decoding_length: Override max decoding length for all requests (None = use per-request)
             temperature: Sampling temperature (None = greedy decoding)
             top_p: Nucleus sampling threshold (None = disabled)
 
@@ -283,8 +283,8 @@ class BatchGenHttpClient:
         }
         if metadata:
             payload["metadata"] = metadata
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+        if max_decoding_length is not None:
+            payload["max_decoding_length"] = max_decoding_length
         if temperature is not None:
             payload["temperature"] = temperature
         if top_p is not None:
@@ -382,7 +382,7 @@ class BatchGenHttpClient:
         endpoint: str = "/v1/chat/completions",
         poll_interval: float = 5.0,
         timeout: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        max_decoding_length: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -400,7 +400,7 @@ class BatchGenHttpClient:
             endpoint: Target endpoint
             poll_interval: Seconds between status checks
             timeout: Maximum seconds to wait
-            max_tokens: Override max tokens for all requests (None = use per-request)
+            max_decoding_length: Override max decoding length for all requests (None = use per-request)
             temperature: Sampling temperature (None = greedy decoding)
             top_p: Nucleus sampling threshold (None = disabled)
 
@@ -418,7 +418,7 @@ class BatchGenHttpClient:
         batch = self.create_batch(
             file_id,
             endpoint=endpoint,
-            max_tokens=max_tokens,
+            max_decoding_length=max_decoding_length,
             temperature=temperature,
             top_p=top_p,
         )
