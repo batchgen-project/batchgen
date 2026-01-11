@@ -49,6 +49,11 @@ def _setup_nccl_env():
 	if os.environ.get("TORCH_NCCL_ENABLE_MONITORING") is None:
 		os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
 		logging.info("Disabled NCCL HeartbeatMonitor (TORCH_NCCL_ENABLE_MONITORING=0)")
+
+	# NCCL_BUFFSIZE: buffer size for NCCL operations (default: 4MB)
+	# Larger buffer improves throughput for multi-node communication
+	if "NCCL_BUFFSIZE" not in os.environ:
+		os.environ["NCCL_BUFFSIZE"] = "16777216"  # 16MB buffer size
 	
 
 def server_worker_main(

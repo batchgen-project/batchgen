@@ -243,6 +243,14 @@ sudo mount -o remount,size=1500G /dev/shm
 # tmpfs /dev/shm tmpfs defaults,size=1500G 0 0
 ```
 
+### Set NCCL Environment Variables
+
+For optimal multi-node communication performance:
+
+```bash
+export NCCL_BUFFSIZE=16777216  # 16MB buffer size
+```
+
 ### 2 Nodes × 8 GPUs = 16 GPUs
 
 #### Node 0 (Master)
