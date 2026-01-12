@@ -1,10 +1,8 @@
 from .modeling_deepseek_v3 import (
 	DeepseekV3ForCausalLM
 )
-from ...wrappers import (
-	DeepSeekAttnWrapper,
-	DeepSeekExpertWrapper
-)
+from ...wrappers import DeepSeekExpertWrapper
+from ...Wrapper import Attn_Wrapper
 import logging
 from ....quantization.fp8e4m3 import (
 	deepseek_v3_dequantization
@@ -857,7 +855,7 @@ class DeepseekV3ParallelStrategyManager:
 					weight_dequant_scales[key] = param.to(
 						self.engine_config.Basic_Config.device_torch
 					)
-			attn_wrapper_instance = DeepSeekAttnWrapper(
+			attn_wrapper_instance = Attn_Wrapper(
 				attn_module,
 				layer_idx,
 				self.core_engine,
