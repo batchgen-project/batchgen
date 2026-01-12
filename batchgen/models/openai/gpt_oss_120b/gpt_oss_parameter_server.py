@@ -39,7 +39,7 @@ from tqdm import tqdm, trange
 
 from .configuration_gpt_oss import GptOssConfig
 from .modeling_gpt_oss import GptOssForCausalLM
-from ...ckpt_converter.ckpt_converter import ckpt_converter
+from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
 # Path to local GPT-OSS config directory (same as this file's directory)
 _GPT_OSS_CONFIG_DIR = Path(__file__).parent
