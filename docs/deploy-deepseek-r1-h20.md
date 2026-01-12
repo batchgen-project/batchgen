@@ -135,8 +135,6 @@ Run on each node with the appropriate `--node-rank`. The container provides an i
 ```bash
 # Node 0 (Master)
 docker run -it \
-    --cap-add=SYS_NICE \
-    --cap-add=SYS_ADMIN \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -146,8 +144,6 @@ docker run -it \
 
 # Node 1
 docker run -it \
-    --cap-add=SYS_NICE \
-    --cap-add=SYS_ADMIN \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -157,6 +153,7 @@ docker run -it \
 ```
 
 **Optional flags** (add if needed):
+- `--cap-add=SYS_ADMIN`: Required only when using `--enable-hugetlbfs` (for sysctl and mount commands)
 - `--privileged`: Full host access (use with caution)
 - `--ipc=host`: Share host IPC namespace
 
