@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 
 from .modeling_gpt_oss import GptOssForCausalLM
-from ..wrappers import GptOssExpertWrapper, GptOssAttnWrapper
+from batchgen.models.wrappers import GptOssExpertWrapper, GptOssAttnWrapper
 
 
 class GptOssParallelStrategyManager:
