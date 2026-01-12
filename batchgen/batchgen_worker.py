@@ -3050,7 +3050,9 @@ class BatchGenWorker:
 	def _get_num_nodes(self) -> int:
 		"""Get total number of nodes."""
 		gpus_per_node = torch.cuda.device_count()
-		return self.world_size // gpus_per_node
+		# For world_size=1 or when world_size < gpus_per_node, we have 1 node
+		num_nodes = max(1, self.world_size // gpus_per_node)
+		return num_nodes
 
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
