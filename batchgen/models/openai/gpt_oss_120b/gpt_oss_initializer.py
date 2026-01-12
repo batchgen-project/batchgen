@@ -100,17 +100,50 @@ class GptOssInitializer:
 
     def _set_basic_config(self, engine_config: EngineConfig, args) -> EngineConfig:
         """Set basic engine configuration from arguments."""
+        # Device
         engine_config.Basic_Config.device = args.device
-        engine_config.Basic_Config.device_torch = torch.device(args.device)
+        engine_config.Basic_Config.device_torch = torch.device(f"cuda:{args.device}")
+
+        # Distributed
+        engine_config.Basic_Config.world_size = args.world_size
+        engine_config.Basic_Config.rank = args.rank
+
+        # GPU architecture
+        if args.gpu_arch:
+            engine_config.Basic_Config.gpu_arch = args.gpu_arch.lower()
+        else:
+            # Auto-detect GPU architecture
+            props = torch.cuda.get_device_properties(args.device)
+            if props.major >= 9:
+                engine_config.Basic_Config.gpu_arch = "hopper"
+            else:
+                engine_config.Basic_Config.gpu_arch = "ampere"
+
+        # Lengths
         engine_config.Basic_Config.padding_length = args.padding_length
         engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
-        engine_config.Basic_Config.world_size = args.world_size
-        engine_config.Basic_Config.local_rank = args.local_rank
-        engine_config.Basic_Config.global_rank = args.global_rank
 
-        # GPT-OSS uses BF16 for attention (not quantized)
+        # Weight dtype: GPT-OSS uses MXFP4 but we represent as bfloat16 after dequant
+        engine_config.Basic_Config.weight_dtype = "bfloat16"
+        engine_config.Basic_Config.weight_dtype_torch = torch.bfloat16
+
+        # KV dtype: GPT-OSS uses BF16 for attention (not quantized)
         engine_config.Basic_Config.kv_dtype = "bfloat16"
         engine_config.Basic_Config.kv_dtype_torch = torch.bfloat16
+
+        # Attention dtype
+        engine_config.Basic_Config.attention_dtype = "bfloat16"
+
+        # Activation dtype
+        engine_config.Basic_Config.activation_dtype = "bfloat16"
+        engine_config.Basic_Config.activation_dtype_torch = torch.bfloat16
+
+        # Module types
+        engine_config.Basic_Config.module_types = ["attn", "routed_expert"]
+
+        # Misc
+        engine_config.Basic_Config.num_threads = 0
+        engine_config.Basic_Config.log_level = "info"
 
         return engine_config
 
