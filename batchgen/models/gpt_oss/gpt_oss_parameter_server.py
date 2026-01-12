@@ -25,20 +25,24 @@ Model specs:
 """
 
 import gc
+import json
 import logging
 import os
 import shutil
 import uuid
 from multiprocessing import Process
+from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
-from transformers import AutoConfig
 
 from .configuration_gpt_oss import GptOssConfig
 from .modeling_gpt_oss import GptOssForCausalLM
 from ...ckpt_converter.ckpt_converter import ckpt_converter
+
+# Path to local GPT-OSS config directory (relative to this file)
+_GPT_OSS_CONFIG_DIR = Path(__file__).parent.parent / "openai" / " gpt-oss-120b "
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -74,12 +78,19 @@ class GptOss_Parameter_Server:
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
 
-        # Load model configuration
-        self.hf_model_config = GptOssConfig.from_pretrained(
-            huggingface_ckpt_name,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
+        # Load model configuration from local config directory
+        config_path = _GPT_OSS_CONFIG_DIR / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"GPT-OSS config not found at {config_path}. "
+                f"Expected config directory: {_GPT_OSS_CONFIG_DIR}"
+            )
+
+        logging.info(f"Loading GPT-OSS config from: {config_path}")
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+
+        self.hf_model_config = GptOssConfig(**config_dict)
         self.hf_model_config._name_or_path = huggingface_ckpt_name
         self.hf_model_config.architectures = ["GptOssForCausalLM"]
 
