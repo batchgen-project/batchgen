@@ -104,6 +104,9 @@ class GptOssInitializer:
         engine_config.Basic_Config.device_torch = torch.device(args.device)
         engine_config.Basic_Config.padding_length = args.padding_length
         engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
+        engine_config.Basic_Config.world_size = args.world_size
+        engine_config.Basic_Config.local_rank = args.local_rank
+        engine_config.Basic_Config.global_rank = args.global_rank
 
         # GPT-OSS uses BF16 for attention (not quantized)
         engine_config.Basic_Config.kv_dtype = "bfloat16"
