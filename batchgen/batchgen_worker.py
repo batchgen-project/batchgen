@@ -1061,6 +1061,55 @@ class BatchGenWorker:
 							return self._enc.decode(token_ids)
 						return self._enc.decode([token_ids])
 
+					def __call__(self, texts, return_tensors=None, truncation=False,
+								 padding=False, return_attention_mask=True, **kwargs):
+						"""HuggingFace-compatible __call__ method for batch tokenization."""
+						import torch
+
+						# Handle single string input
+						if isinstance(texts, str):
+							texts = [texts]
+
+						# Encode all texts
+						all_ids = [self._enc.encode(t) for t in texts]
+
+						# Find max length for padding
+						if padding:
+							max_len = max(len(ids) for ids in all_ids)
+						else:
+							max_len = None
+
+						# Build output
+						input_ids = []
+						attention_mask = []
+
+						for ids in all_ids:
+							if padding and len(ids) < max_len:
+								# Pad to max_len
+								pad_len = max_len - len(ids)
+								if self.padding_side == "right":
+									padded_ids = ids + [self.pad_token_id] * pad_len
+									mask = [1] * len(ids) + [0] * pad_len
+								else:
+									padded_ids = [self.pad_token_id] * pad_len + ids
+									mask = [0] * pad_len + [1] * len(ids)
+								input_ids.append(padded_ids)
+								attention_mask.append(mask)
+							else:
+								input_ids.append(ids)
+								attention_mask.append([1] * len(ids))
+
+						# Convert to tensors if requested
+						if return_tensors == "pt":
+							input_ids = torch.tensor(input_ids, dtype=torch.long)
+							attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+
+						result = {"input_ids": input_ids}
+						if return_attention_mask:
+							result["attention_mask"] = attention_mask
+
+						return result
+
 					def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
 						# Simple chat template for GPT-OSS
 						text_parts = []
