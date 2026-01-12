@@ -310,12 +310,23 @@ class WorkerManager:
         if local_device_count == 0:
             raise RuntimeError("No CUDA devices found.")
 
-        logger.info("Spawning %s DDP workers", local_device_count)
-        world_size = self.args.world_size or (
-            local_device_count * self.args.nnodes
-        )
-        if world_size == 1 and local_device_count > 1:
+        # Determine world_size and number of local workers
+        if self.args.world_size is not None and self.args.world_size > 0:
+            # Explicit world_size specified - respect it
+            world_size = self.args.world_size
+            # Calculate local workers: world_size / nnodes (for this node)
+            local_workers = max(1, world_size // self.args.nnodes)
+            # Cap at available GPUs
+            local_workers = min(local_workers, local_device_count)
+        else:
+            # Auto-detect: use all available GPUs
             world_size = local_device_count * self.args.nnodes
+            local_workers = local_device_count
+
+        logger.info(
+            "Spawning %d DDP workers (world_size=%d, nnodes=%d, local_gpus=%d)",
+            local_workers, world_size, self.args.nnodes, local_device_count
+        )
 
         # Auto-detect GPU architecture if not specified
         gpu_arch = self.args.gpu_arch or detect_gpu_arch()
@@ -363,7 +374,7 @@ class WorkerManager:
                 args,
                 self._ready_event,
             ),
-            nprocs=local_device_count,
+            nprocs=local_workers,
             join=False,
             daemon=True,
         )
