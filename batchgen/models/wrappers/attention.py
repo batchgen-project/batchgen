@@ -205,10 +205,12 @@ class AttnWrapperBase(BaseModuleWrapper):
             self.apply_weights(dequant_weights)
 
         # Route to appropriate phase handler
+        # Extract hidden_states to avoid passing it twice (positionally and in kwargs)
+        hidden_states = kwargs.pop("hidden_states", None)
         if self.phase == "prefill":
-            result = self._forward_prefill(kwargs.get("hidden_states"), **kwargs)
+            result = self._forward_prefill(hidden_states, **kwargs)
         else:
-            result = self._forward_decode(kwargs.get("hidden_states"), **kwargs)
+            result = self._forward_decode(hidden_states, **kwargs)
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx}] "

@@ -283,7 +283,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
             self.apply_weights(weights)
 
         # Route to phase handler
-        hidden_states = kwargs.get("hidden_states")
+        # Extract hidden_states to avoid passing it twice (positionally and in kwargs)
+        hidden_states = kwargs.pop("hidden_states", None)
         if self.phase == "prefill":
             result = self._forward_prefill(hidden_states, **kwargs)
         else:
