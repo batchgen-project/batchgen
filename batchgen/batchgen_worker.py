@@ -1007,12 +1007,27 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: Performing one-time core initialization")
 		
 		config_torch_module_initializer()
-		
-		self.model_config = AutoConfig.from_pretrained(
-			self.cache_dir,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
+
+		# GPT-OSS: use custom config class (not registered in AutoConfig)
+		if "gpt-oss" in self.model_name.lower() or "gpt_oss" in self.model_name.lower():
+			from batchgen.models.openai.gpt_oss_120b.configuration_gpt_oss import GptOssConfig
+			from pathlib import Path
+			import json
+
+			# Load config from local gpt_oss_120b directory
+			config_dir = Path(__file__).parent / "models" / "openai" / "gpt_oss_120b"
+			config_path = config_dir / "config.json"
+			logging.info(f"Rank {self.rank}: Loading GPT-OSS config from: {config_path}")
+
+			with open(config_path, "r") as f:
+				config_dict = json.load(f)
+			self.model_config = GptOssConfig(**config_dict)
+		else:
+			self.model_config = AutoConfig.from_pretrained(
+				self.cache_dir,
+				trust_remote_code=True,
+				local_files_only=True,
+			)
 		
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
