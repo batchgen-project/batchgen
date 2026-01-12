@@ -1,10 +1,8 @@
 from .modeling_deepseek_v3 import (
 	DeepseekV3ForCausalLM
 )
-from ...Wrapper import (
-	Attn_Wrapper,
-	Expert_Wrapper
-)
+from ...wrappers import DeepSeekExpertWrapper
+from ...Wrapper import Attn_Wrapper
 import logging
 from ....quantization.fp8e4m3 import (
 	deepseek_v3_dequantization
@@ -926,7 +924,7 @@ class DeepseekV3ParallelStrategyManager:
 			sum(p.numel() * p.element_size() for p in self.model.parameters())
 			/ (1024**3)
 		)
-		if dist.get_rank() == 0:
+		if self.rank == 0:
 			logging.info(f"Model skeleton size: {model_skeletion_byte_size:.2f} GB")
 		# Rank 0 print out all the tensors in the model with tensor size in MB
 		# if dist.get_rank() == 0:
@@ -975,7 +973,7 @@ class DeepseekV3ParallelStrategyManager:
 						self.engine_config.Basic_Config.device_torch
 					)
 
-			layer.mlp.shared_experts = Expert_Wrapper(
+			layer.mlp.shared_experts = DeepSeekExpertWrapper(
 				layer.mlp.shared_experts,
 				layer_idx,
 				-1,
@@ -1009,7 +1007,7 @@ class DeepseekV3ParallelStrategyManager:
 						weight_dequant_scales[key] = param.to(
 							self.engine_config.Basic_Config.device_torch
 						)
-				layer.mlp.experts[expert_idx] = Expert_Wrapper(
+				layer.mlp.experts[expert_idx] = DeepSeekExpertWrapper(
 					layer.mlp.experts[expert_idx],
 					layer_idx,
 					expert_idx,
@@ -1063,7 +1061,7 @@ class DeepseekV3ParallelStrategyManager:
 				
 
 
-			layer.mlp.shared_experts = Expert_Wrapper(
+			layer.mlp.shared_experts = DeepSeekExpertWrapper(
 				layer.mlp.shared_experts,
 				layer_idx,
 				-1,
@@ -1110,7 +1108,7 @@ class DeepseekV3ParallelStrategyManager:
 						weight_dequant_scales[name + postfix] = self.skeleton_state_dict[key].to(
 							self.engine_config.Basic_Config.device_torch
 						)
-				layer.mlp.experts[expert_idx] = Expert_Wrapper(
+				layer.mlp.experts[expert_idx] = DeepSeekExpertWrapper(
 					layer.mlp.experts[expert_idx],
 					layer_idx,
 					expert_idx,

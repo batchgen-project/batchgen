@@ -17,6 +17,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+from batchgen.models.wrappers import BaseModuleWrapper
 
 from .config.config import EngineConfig
 from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
@@ -6790,6 +6791,7 @@ class BatchGenWorker:
 		self.core_engine.set_phase(phase)
 		Attn_Wrapper.phase = phase
 		Expert_Wrapper.phase = phase
+		BaseModuleWrapper.phase = phase
 
 	def update_new_token(
 		self, new_tokens: torch.Tensor, query_idx: List[int], new_token_idx: int
