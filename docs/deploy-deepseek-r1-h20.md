@@ -157,8 +157,10 @@ docker run -it \
 ```
 
 **Optional flags** (add if needed):
+- `--shm-size <SIZE>`: Increase `/dev/shm` inside the container (use this OR `--ipc=host`, e.g. `--shm-size 256g`)
+- `--ipc=host`: Share host IPC namespace (use this OR `--shm-size`, recommended if you want to fully reuse host `/dev/shm`)
+- `--ulimit memlock=-1`: Set unlimited memlock
 - `--privileged`: Full host access (use with caution)
-- `--ipc=host`: Share host IPC namespace
 
 Once inside the container, start the server using the commands in [Section 5](#5-start-batchgen-server).
 
