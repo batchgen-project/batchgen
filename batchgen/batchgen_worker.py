@@ -1141,6 +1141,9 @@ class BatchGenWorker:
 		else:
 			self._load_hf_tokenizer()
 
+		# Initialize engine and model (runs for all tokenizer paths)
+		self._initialize_engine_and_model(num_queries)
+
 	def _load_hf_tokenizer(self):
 		"""Load tokenizer using HuggingFace AutoTokenizer."""
 		tokenizer_path = self.cache_dir
@@ -1165,6 +1168,8 @@ class BatchGenWorker:
 		self.eos_token_id = self.tokenizer.eos_token_id
 		logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}")
 
+	def _initialize_engine_and_model(self, num_queries: int):
+		"""Initialize engine config, model initializer, and parallel strategy manager."""
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
 		# Note: EngineConfig is created by the model-specific initializer which uses a Planner
 		# to compute all config values. The initializer is the single source of truth.
@@ -1204,7 +1209,7 @@ class BatchGenWorker:
 			"gpu_arch": self.gpu_arch
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
-			
+
 		self.input_arguments = InputArguments(**input_arguments)
 		self.initializer = get_initializer(self.huggingface_ckpt_name)
 		self.initializer = self.initializer(self.input_arguments)
@@ -1214,7 +1219,7 @@ class BatchGenWorker:
 
 		self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		self.engine_config.Basic_Config.num_queries = num_queries
-		
+
 		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
 		self.parallel_manager = self.parallel_manager(
 			self.hf_model_config,
