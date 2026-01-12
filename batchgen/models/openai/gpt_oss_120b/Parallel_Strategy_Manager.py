@@ -150,17 +150,36 @@ class GptOssParallelStrategyManager:
         """Load non-expert weights (embeddings, attention, norms, lm_head)."""
         logging.info("Loading model skeleton...")
 
+        # Debug: Log available keys in skeleton_state_dict
+        skeleton_keys = list(self.skeleton_state_dict.keys())
+        logging.info(f"Skeleton state dict has {len(skeleton_keys)} keys")
+        if skeleton_keys:
+            logging.info(f"First 10 skeleton keys: {skeleton_keys[:10]}")
+            # Find any keys containing common substrings
+            for substr in ["embed", "norm", "attn", "layer", "lm_head"]:
+                matching = [k for k in skeleton_keys if substr in k.lower()][:3]
+                if matching:
+                    logging.info(f"Keys containing '{substr}': {matching}")
+
         # Filter skeleton state dict for non-expert weights
+        loaded_count = 0
+        missing_count = 0
         for name, param in self.model.named_parameters():
             if "experts" in name:
                 continue  # Skip expert weights (loaded separately with MXFP4)
 
             if name in self.skeleton_state_dict:
                 param.data.copy_(self.skeleton_state_dict[name])
+                loaded_count += 1
             else:
-                logging.warning(f"Missing skeleton weight: {name}")
+                missing_count += 1
+                if missing_count <= 5:  # Only log first 5 missing
+                    logging.warning(f"Missing skeleton weight: {name}")
 
-        logging.info("Model skeleton loaded")
+        if missing_count > 5:
+            logging.warning(f"... and {missing_count - 5} more missing weights")
+
+        logging.info(f"Model skeleton loaded: {loaded_count} loaded, {missing_count} missing")
 
     def _config_attn_module(self):
         """Configure attention modules with BatchGen wrappers."""
