@@ -153,9 +153,10 @@ docker run -it \
 ```
 
 **Optional flags** (add if needed):
-- `--cap-add=SYS_ADMIN`: Required only when using `--enable-hugetlbfs` (for sysctl and mount commands)
+- `--shm-size <SIZE>`: Increase `/dev/shm` inside the container (use this OR `--ipc=host`, e.g. `--shm-size 256g`)
+- `--ipc=host`: Share host IPC namespace (use this OR `--shm-size`, recommended if you want to fully reuse host `/dev/shm`)
+- `--ulimit memlock=-1`: Set unlimited memlock
 - `--privileged`: Full host access (use with caution)
-- `--ipc=host`: Share host IPC namespace
 
 Once inside the container, start the server using the commands in [Section 5](#5-start-batchgen-server).
 

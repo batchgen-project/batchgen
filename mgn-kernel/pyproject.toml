@@ -9,7 +9,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "test-kernel-0ab602a9"
-version = "0.1.2"
+version = "0.1.5"
 description = "Custom CUDA Kernels for BatchGen Project"
 readme = "README.md"
 requires-python = ">=3.9"
