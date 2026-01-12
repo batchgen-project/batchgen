@@ -507,21 +507,69 @@ class BatchScheduler:
         cache_dir = self.server_args.cache_dir
         cache_dir_value = str(cache_dir) if cache_dir else None
 
-        # GPT-OSS: load tokenizer from local config directory
+        # GPT-OSS: use tiktoken directly (HuggingFace tokenizer.json is incompatible)
         if "gpt-oss" in model.lower() or "gpt_oss" in model.lower():
+            try:
+                import tiktoken
+                from tiktoken import Encoding
+
+                # GPT-OSS uses o200k_base encoding (same as GPT-4o)
+                logger.info("Loading GPT-OSS tokenizer via tiktoken (o200k_base)")
+                enc = tiktoken.get_encoding("o200k_base")
+
+                # Create a minimal tokenizer wrapper compatible with HuggingFace interface
+                class TiktokenWrapper:
+                    def __init__(self, encoding: Encoding):
+                        self._enc = encoding
+                        self.eos_token_id = 200002  # <|return|>
+                        self.pad_token_id = 199999  # <|endoftext|>
+                        self.bos_token_id = 199998  # <|startoftext|>
+
+                    def encode(self, text, add_special_tokens=True):
+                        return self._enc.encode(text)
+
+                    def decode(self, token_ids, skip_special_tokens=True):
+                        if isinstance(token_ids, list):
+                            return self._enc.decode(token_ids)
+                        return self._enc.decode([token_ids])
+
+                    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                        # Simple chat template for GPT-OSS
+                        text_parts = []
+                        for msg in messages:
+                            role = msg.get("role", "user")
+                            content = msg.get("content", "")
+                            if role == "system":
+                                text_parts.append(f"System: {content}\n")
+                            elif role == "user":
+                                text_parts.append(f"User: {content}\n")
+                            elif role == "assistant":
+                                text_parts.append(f"Assistant: {content}\n")
+                        if add_generation_prompt:
+                            text_parts.append("Assistant:")
+                        result = "".join(text_parts)
+                        if tokenize:
+                            return self.encode(result)
+                        return result
+
+                tokenizer = TiktokenWrapper(enc)
+                self._tokenizer = tokenizer
+                self._tokenizer_model = model
+                return tokenizer
+            except ImportError:
+                logger.warning("tiktoken not available, trying HuggingFace tokenizer")
+            except Exception as e:
+                logger.warning(f"tiktoken failed: {e}, trying HuggingFace tokenizer")
+
+            # Fallback to HuggingFace
             from pathlib import Path
             gpt_oss_config_dir = (
                 Path(__file__).parent.parent / "models" / "openai" / "gpt_oss_120b"
             )
             if gpt_oss_config_dir.exists():
                 tokenizer_path = str(gpt_oss_config_dir)
-                logger.info(f"Loading GPT-OSS tokenizer from: {tokenizer_path}")
             else:
                 tokenizer_path = model
-                logger.warning(
-                    f"GPT-OSS config dir not found at {gpt_oss_config_dir}, "
-                    f"falling back to model name: {model}"
-                )
         else:
             tokenizer_path = model
 

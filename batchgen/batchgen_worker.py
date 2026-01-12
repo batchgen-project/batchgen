@@ -1019,24 +1019,67 @@ class BatchGenWorker:
 		self.model_context_length = getattr(self.model_config, 'max_position_embeddings', 131072)  # Default 128K
 		logging.info(f"Rank {self.rank}: Model context length set to {self.model_context_length}")
 		
-		# Determine tokenizer path - GPT-OSS uses local config directory
+		# GPT-OSS: use tiktoken directly (HuggingFace tokenizer.json is incompatible)
 		if "gpt-oss" in self.model_name.lower() or "gpt_oss" in self.model_name.lower():
-			from pathlib import Path
-			gpt_oss_config_dir = (
-				Path(__file__).parent / "models" / "openai" / "gpt_oss_120b"
-			)
-			if gpt_oss_config_dir.exists():
-				tokenizer_path = str(gpt_oss_config_dir)
-				logging.info(f"Rank {self.rank}: Loading GPT-OSS tokenizer from: {tokenizer_path}")
-			else:
-				tokenizer_path = self.cache_dir
-				logging.warning(
-					f"Rank {self.rank}: GPT-OSS config dir not found at {gpt_oss_config_dir}, "
-					f"falling back to cache_dir: {self.cache_dir}"
-				)
-		else:
-			tokenizer_path = self.cache_dir
+			try:
+				import tiktoken
+				from tiktoken import Encoding
 
+				# GPT-OSS uses o200k_base encoding (same as GPT-4o)
+				logging.info(f"Rank {self.rank}: Loading GPT-OSS tokenizer via tiktoken (o200k_base)")
+				enc = tiktoken.get_encoding("o200k_base")
+
+				# Create a minimal tokenizer wrapper compatible with HuggingFace interface
+				class TiktokenWrapper:
+					def __init__(self, encoding: Encoding):
+						self._enc = encoding
+						self.eos_token_id = 200002  # <|return|>
+						self.pad_token_id = 199999  # <|endoftext|>
+						self.bos_token_id = 199998  # <|startoftext|>
+						self.padding_side = "right"
+
+					def encode(self, text, add_special_tokens=True):
+						return self._enc.encode(text)
+
+					def decode(self, token_ids, skip_special_tokens=True):
+						if isinstance(token_ids, list):
+							return self._enc.decode(token_ids)
+						return self._enc.decode([token_ids])
+
+					def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+						# Simple chat template for GPT-OSS
+						text_parts = []
+						for msg in messages:
+							role = msg.get("role", "user")
+							content = msg.get("content", "")
+							if role == "system":
+								text_parts.append(f"System: {content}\n")
+							elif role == "user":
+								text_parts.append(f"User: {content}\n")
+							elif role == "assistant":
+								text_parts.append(f"Assistant: {content}\n")
+						if add_generation_prompt:
+							text_parts.append("Assistant:")
+						result = "".join(text_parts)
+						if tokenize:
+							return self.encode(result)
+						return result
+
+				self.tokenizer = TiktokenWrapper(enc)
+				self.eos_token_id = self.tokenizer.eos_token_id
+				logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}")
+			except ImportError:
+				logging.warning(f"Rank {self.rank}: tiktoken not available, trying HuggingFace tokenizer")
+				self._load_hf_tokenizer()
+			except Exception as e:
+				logging.warning(f"Rank {self.rank}: tiktoken failed: {e}, trying HuggingFace tokenizer")
+				self._load_hf_tokenizer()
+		else:
+			self._load_hf_tokenizer()
+
+	def _load_hf_tokenizer(self):
+		"""Load tokenizer using HuggingFace AutoTokenizer."""
+		tokenizer_path = self.cache_dir
 		try:
 			self.tokenizer = AutoTokenizer.from_pretrained(
 				tokenizer_path,
@@ -1053,7 +1096,7 @@ class BatchGenWorker:
 				use_fast=False,
 			)
 		self.tokenizer.padding_side = "right"
-		
+
 		# Set EOS token ID from tokenizer
 		self.eos_token_id = self.tokenizer.eos_token_id
 		logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}")
