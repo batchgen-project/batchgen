@@ -1,7 +1,12 @@
 from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import DeepseekV3Initializer
+from batchgen.models.openai.gpt_oss_120b.gpt_oss_initializer import GptOssInitializer
+
 
 def get_initializer(model_name:str):
-	if model_name.lower() in ["deepseek-ai/deepseek-r1", "deepseek-ai/deepseek-v3"]:
+	model_lower = model_name.lower()
+	if model_lower in ["deepseek-ai/deepseek-r1", "deepseek-ai/deepseek-v3"]:
 		return DeepseekV3Initializer
+	elif "gpt-oss" in model_lower or "gpt_oss" in model_lower:
+		return GptOssInitializer
 	else:
 		raise ValueError(f"Unsupported model name: {model_name}")
