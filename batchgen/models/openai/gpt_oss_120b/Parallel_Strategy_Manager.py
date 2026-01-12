@@ -34,6 +34,51 @@ from .modeling_gpt_oss import GptOssForCausalLM
 from batchgen.models.wrappers import GptOssExpertWrapper, GptOssAttnWrapper
 
 
+def _build_gpt_oss_name_mapping() -> Dict[str, str]:
+    """Build mapping from original GPT-OSS checkpoint names to HuggingFace names.
+
+    Original GPT-OSS naming (0-indexed):
+    - embedding.weight → model.embed_tokens.weight
+    - unembedding.weight → lm_head.weight
+    - block.{N}.attn.norm.scale → model.layers.{N}.input_layernorm.weight
+    - block.{N}.mlp.norm.scale → model.layers.{N}.post_attention_layernorm.weight
+    - block.{N}.attn.out.weight/bias → model.layers.{N}.self_attn.o_proj.weight/bias
+    - block.{N}.mlp.gate.weight/bias → model.layers.{N}.mlp.router.weight/bias
+    - final_norm.scale → model.norm.weight
+
+    Note: QKV weights (block.{N}.attn.qkv.*) need special handling - see _load_model_skeleton()
+
+    Returns:
+        Dict mapping original checkpoint names to HuggingFace names
+    """
+    mapping = {
+        "embedding.weight": "model.embed_tokens.weight",
+        "unembedding.weight": "lm_head.weight",
+        "final_norm.scale": "model.norm.weight",
+    }
+
+    # Build per-layer mappings (36 layers, 0-indexed in both)
+    for layer_idx in range(36):
+        # Layer norms
+        mapping[f"block.{layer_idx}.attn.norm.scale"] = f"model.layers.{layer_idx}.input_layernorm.weight"
+        mapping[f"block.{layer_idx}.mlp.norm.scale"] = f"model.layers.{layer_idx}.post_attention_layernorm.weight"
+
+        # Attention output projection
+        mapping[f"block.{layer_idx}.attn.out.weight"] = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
+        mapping[f"block.{layer_idx}.attn.out.bias"] = f"model.layers.{layer_idx}.self_attn.o_proj.bias"
+
+        # Router (gate)
+        mapping[f"block.{layer_idx}.mlp.gate.weight"] = f"model.layers.{layer_idx}.mlp.router.weight"
+        mapping[f"block.{layer_idx}.mlp.gate.bias"] = f"model.layers.{layer_idx}.mlp.router.bias"
+
+    return mapping
+
+
+def _build_reverse_mapping(mapping: Dict[str, str]) -> Dict[str, str]:
+    """Build reverse mapping from HuggingFace names to original names."""
+    return {v: k for k, v in mapping.items()}
+
+
 class GptOssParallelStrategyManager:
     """Manage parallel execution strategy for GPT-OSS-120B.
 
@@ -43,6 +88,16 @@ class GptOssParallelStrategyManager:
     - MXFP4 dequantization for expert weights
     - BF16 attention weights (not quantized)
     """
+
+    # Class-level name mapping (built once)
+    _name_mapping = None
+
+    @classmethod
+    def get_name_mapping(cls) -> Dict[str, str]:
+        """Get the original→HuggingFace name mapping (cached)."""
+        if cls._name_mapping is None:
+            cls._name_mapping = _build_gpt_oss_name_mapping()
+        return cls._name_mapping
 
     def __init__(
         self,
@@ -147,7 +202,11 @@ class GptOssParallelStrategyManager:
         return self.model, self.weight_copy_task
 
     def _load_model_skeleton(self):
-        """Load non-expert weights (embeddings, attention, norms, lm_head)."""
+        """Load non-expert weights (embeddings, attention, norms, lm_head).
+
+        Handles name mapping from original GPT-OSS checkpoint format to HuggingFace format.
+        Also handles QKV weight splitting since original uses combined qkv weights.
+        """
         logging.info("Loading model skeleton...")
 
         # Debug: Log available keys in skeleton_state_dict
@@ -155,29 +214,73 @@ class GptOssParallelStrategyManager:
         logging.info(f"Skeleton state dict has {len(skeleton_keys)} keys")
         if skeleton_keys:
             logging.info(f"First 10 skeleton keys: {skeleton_keys[:10]}")
-            # Find any keys containing common substrings
-            for substr in ["embed", "norm", "attn", "layer", "lm_head"]:
-                matching = [k for k in skeleton_keys if substr in k.lower()][:3]
-                if matching:
-                    logging.info(f"Keys containing '{substr}': {matching}")
 
-        # Filter skeleton state dict for non-expert weights
+        # Build reverse mapping: HuggingFace name → original checkpoint name
+        fwd_mapping = self.get_name_mapping()
+        rev_mapping = _build_reverse_mapping(fwd_mapping)
+
+        # Model config for QKV splitting
+        num_q_heads = self.hf_model_config.num_attention_heads  # 64
+        num_kv_heads = self.hf_model_config.num_key_value_heads  # 8
+        head_dim = self.hf_model_config.head_dim  # 64
+
         loaded_count = 0
         missing_count = 0
+        missing_keys = []
+
         for name, param in self.model.named_parameters():
             if "experts" in name:
                 continue  # Skip expert weights (loaded separately with MXFP4)
 
+            # Try direct match first
             if name in self.skeleton_state_dict:
                 param.data.copy_(self.skeleton_state_dict[name])
                 loaded_count += 1
-            else:
-                missing_count += 1
-                if missing_count <= 5:  # Only log first 5 missing
-                    logging.warning(f"Missing skeleton weight: {name}")
+                continue
 
-        if missing_count > 5:
-            logging.warning(f"... and {missing_count - 5} more missing weights")
+            # Try reverse mapping (HuggingFace → original)
+            original_name = rev_mapping.get(name)
+            if original_name and original_name in self.skeleton_state_dict:
+                param.data.copy_(self.skeleton_state_dict[original_name])
+                loaded_count += 1
+                continue
+
+            # Handle QKV weight splitting
+            # Original: block.{N}.attn.qkv.weight → q_proj, k_proj, v_proj
+            if "self_attn.q_proj" in name or "self_attn.k_proj" in name or "self_attn.v_proj" in name:
+                # Extract layer index
+                parts = name.split(".")
+                layer_idx = int(parts[2])
+                suffix = "weight" if "weight" in name else "bias"
+                qkv_key = f"block.{layer_idx}.attn.qkv.{suffix}"
+
+                if qkv_key in self.skeleton_state_dict:
+                    qkv_tensor = self.skeleton_state_dict[qkv_key]
+
+                    # QKV layout: [q_heads * head_dim + 2 * kv_heads * head_dim, hidden]
+                    # Split into Q, K, V
+                    q_size = num_q_heads * head_dim
+                    kv_size = num_kv_heads * head_dim
+
+                    if "q_proj" in name:
+                        param.data.copy_(qkv_tensor[:q_size])
+                    elif "k_proj" in name:
+                        param.data.copy_(qkv_tensor[q_size:q_size + kv_size])
+                    elif "v_proj" in name:
+                        param.data.copy_(qkv_tensor[q_size + kv_size:q_size + 2 * kv_size])
+
+                    loaded_count += 1
+                    continue
+
+            # Not found
+            missing_count += 1
+            if missing_count <= 10:
+                missing_keys.append(name)
+
+        if missing_keys:
+            logging.warning(f"Missing skeleton weights (first 10): {missing_keys}")
+        if missing_count > 10:
+            logging.warning(f"... and {missing_count - 10} more missing weights")
 
         logging.info(f"Model skeleton loaded: {loaded_count} loaded, {missing_count} missing")
 

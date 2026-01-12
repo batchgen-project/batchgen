@@ -163,91 +163,112 @@ class GptOss_Parameter_Server:
         return self.shm_name, self.tensor_meta_shm_name
 
     def _parse_state_dict(self):
-        """Parse model state dict to build weight copy tasks and name mapping."""
-        self.hf_model_config._attn_implementation = "eager"
+        """Parse model state dict to build weight copy tasks and name mapping.
 
-        model = GptOssForCausalLM._from_config(self.hf_model_config).to("cpu")
-        model.eval()
+        Uses ORIGINAL GPT-OSS checkpoint names (not HuggingFace names) since
+        the checkpoint converter preserves original tensor names.
 
+        Original GPT-OSS naming convention:
+        - embedding.weight, unembedding.weight
+        - block.{N}.attn.qkv.weight/bias (combined QKV)
+        - block.{N}.attn.out.weight/bias
+        - block.{N}.attn.norm.scale
+        - block.{N}.mlp.gate.weight/bias (router)
+        - block.{N}.mlp.mlp1_weight.blocks (expert gate_proj, packed MXFP4)
+        - block.{N}.mlp.mlp1_weight.scales
+        - block.{N}.mlp.mlp2_weight.blocks (expert up_proj + down_proj, packed MXFP4)
+        - block.{N}.mlp.mlp2_weight.scales
+        - block.{N}.mlp.norm.scale
+        - final_norm.scale
+        """
         self.weight_copy_task["attn"] = []
         self.weight_copy_task["routed_expert"] = []
 
         num_layers = self.hf_model_config.num_hidden_layers
-        num_experts = self.hf_model_config.num_local_experts
 
         for layer_idx in trange(num_layers, desc="Parsing GPT-OSS state_dict"):
-            # Attention weights
-            for name, _ in model.model.layers[layer_idx].self_attn.named_parameters():
-                tensor_full_name = f"model.layers.{layer_idx}.self_attn.{name}"
-                self.state_dict_name_map[tensor_full_name] = {
-                    "module_key": f"attn_{layer_idx}",
-                    "tensor_key": name,
-                }
+            # Attention weights (using original GPT-OSS names)
+            # Combined QKV weight/bias
+            self.state_dict_name_map[f"block.{layer_idx}.attn.qkv.weight"] = {
+                "module_key": f"attn_{layer_idx}",
+                "tensor_key": "qkv.weight",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.attn.qkv.bias"] = {
+                "module_key": f"attn_{layer_idx}",
+                "tensor_key": "qkv.bias",
+            }
+            # Output projection
+            self.state_dict_name_map[f"block.{layer_idx}.attn.out.weight"] = {
+                "module_key": f"attn_{layer_idx}",
+                "tensor_key": "o_proj.weight",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.attn.out.bias"] = {
+                "module_key": f"attn_{layer_idx}",
+                "tensor_key": "o_proj.bias",
+            }
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
 
-            # Expert weights (MoE)
-            for expert_idx in range(num_experts):
-                for name, _ in (
-                    model.model.layers[layer_idx].mlp.experts[expert_idx].named_parameters()
-                ):
-                    tensor_full_name = (
-                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
-                    )
-                    self.state_dict_name_map[tensor_full_name] = {
-                        "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
-                        "tensor_key": name,
-                    }
-                self.weight_copy_task["routed_expert"].append(
-                    f"routed_expert_{layer_idx}_{expert_idx}"
-                )
+            # Expert weights (MXFP4 packed format)
+            # GPT-OSS uses shared mlp1_weight and mlp2_weight for all experts in a layer
+            # mlp1_weight = gate_proj for all experts
+            # mlp2_weight = up_proj + down_proj for all experts
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp1_weight.blocks"] = {
+                "module_key": f"routed_expert_{layer_idx}",
+                "tensor_key": "mlp1_weight.blocks",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp1_weight.scales"] = {
+                "module_key": f"routed_expert_{layer_idx}",
+                "tensor_key": "mlp1_weight.scales",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp2_weight.blocks"] = {
+                "module_key": f"routed_expert_{layer_idx}",
+                "tensor_key": "mlp2_weight.blocks",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp2_weight.scales"] = {
+                "module_key": f"routed_expert_{layer_idx}",
+                "tensor_key": "mlp2_weight.scales",
+            }
+            # Add one routed_expert task per layer (weights are shared across experts)
+            self.weight_copy_task["routed_expert"].append(f"routed_expert_{layer_idx}")
 
             # Router weights (gate)
-            for name, _ in model.model.layers[layer_idx].mlp.router.named_parameters():
-                tensor_full_name = f"model.layers.{layer_idx}.mlp.router.{name}"
-                self.state_dict_name_map[tensor_full_name] = {
-                    "module_key": f"router_{layer_idx}",
-                    "tensor_key": name,
-                }
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.gate.weight"] = {
+                "module_key": f"router_{layer_idx}",
+                "tensor_key": "weight",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.gate.bias"] = {
+                "module_key": f"router_{layer_idx}",
+                "tensor_key": "bias",
+            }
 
             # Layer norms
-            for name, _ in model.model.layers[layer_idx].input_layernorm.named_parameters():
-                tensor_full_name = f"model.layers.{layer_idx}.input_layernorm.{name}"
-                self.state_dict_name_map[tensor_full_name] = {
-                    "module_key": f"input_layernorm_{layer_idx}",
-                    "tensor_key": name,
-                }
-
-            for name, _ in model.model.layers[layer_idx].post_attention_layernorm.named_parameters():
-                tensor_full_name = f"model.layers.{layer_idx}.post_attention_layernorm.{name}"
-                self.state_dict_name_map[tensor_full_name] = {
-                    "module_key": f"post_attention_layernorm_{layer_idx}",
-                    "tensor_key": name,
-                }
-
-        # Embedding and final norm
-        for name, _ in model.model.embed_tokens.named_parameters():
-            tensor_full_name = f"model.embed_tokens.{name}"
-            self.state_dict_name_map[tensor_full_name] = {
-                "module_key": "embed_tokens",
-                "tensor_key": name,
+            self.state_dict_name_map[f"block.{layer_idx}.attn.norm.scale"] = {
+                "module_key": f"input_layernorm_{layer_idx}",
+                "tensor_key": "weight",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.norm.scale"] = {
+                "module_key": f"post_attention_layernorm_{layer_idx}",
+                "tensor_key": "weight",
             }
 
-        for name, _ in model.model.norm.named_parameters():
-            tensor_full_name = f"model.norm.{name}"
-            self.state_dict_name_map[tensor_full_name] = {
-                "module_key": "final_norm",
-                "tensor_key": name,
-            }
+        # Embedding
+        self.state_dict_name_map["embedding.weight"] = {
+            "module_key": "embed_tokens",
+            "tensor_key": "weight",
+        }
 
-        # LM head
-        for name, _ in model.lm_head.named_parameters():
-            tensor_full_name = f"lm_head.{name}"
-            self.state_dict_name_map[tensor_full_name] = {
-                "module_key": "lm_head",
-                "tensor_key": name,
-            }
+        # Final norm
+        self.state_dict_name_map["final_norm.scale"] = {
+            "module_key": "final_norm",
+            "tensor_key": "weight",
+        }
 
-        del model
+        # LM head (unembedding)
+        self.state_dict_name_map["unembedding.weight"] = {
+            "module_key": "lm_head",
+            "tensor_key": "weight",
+        }
+
         gc.collect()
         torch.cuda.empty_cache()
 
