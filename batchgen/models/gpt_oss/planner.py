@@ -50,15 +50,24 @@ class GptOssPlanner(BasePlanner):
     def _adjust_config_for_model(self):
         """GPT-OSS-specific config adjustments.
 
-        For single H20 GPU:
-        - All 128 experts local (no EP)
-        - No tensor parallelism
-        - Maximize host KV cache usage for long context
+        For single H20 GPU (world_size == 1):
+        - All 128 experts local (no expert parallelism needed)
+        - Expert indices computed dynamically in model based on rank/world_size
+        - MXFP4 experts are smaller than FP8 (~0.4GB vs 2.4GB each)
+
+        For world_size == 1:
+        - experts_per_rank = NUM_EXPERTS // 1 = 128
+        - routed_expert_start_idx = 0 * 128 = 0
+        - routed_expert_end_idx = 1 * 128 = 128
         """
-        # Single GPU: all experts local
-        self.engine_config.EP_Config.num_local_expert_per_layer = self.NUM_EXPERTS
-        self.engine_config.EP_Config.expert_start_idx = 0
-        self.engine_config.EP_Config.expert_end_idx = self.NUM_EXPERTS
+        # Override base planner's num_local_expert calculation
+        # Base planner assumes 2.4GB per expert (FP8), but MXFP4 experts are ~0.4GB
+        # For world_size == 1, all experts should be local
+        if self.world_size == 1:
+            # All 128 experts fit on single H20 with MXFP4 (~55GB total)
+            self.config.EP_Config.num_local_expert_per_layer = self.NUM_EXPERTS
+            # No module buffer swapping needed - all experts resident
+            self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
 
     def get_module_shapes(self) -> dict:
         """Return GPT-OSS-120B specific tensor shapes."""

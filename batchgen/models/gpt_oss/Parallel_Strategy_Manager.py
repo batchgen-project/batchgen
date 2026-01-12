@@ -31,8 +31,7 @@ import torch
 import torch.distributed as dist
 
 from .modeling_gpt_oss import GptOssForCausalLM
-from ...Wrapper import Attn_Wrapper, Expert_Wrapper
-from ....quantization.mxfp4 import mxfp4_dequantize
+from ..wrappers import GptOssExpertWrapper, GptOssAttnWrapper
 
 
 class GptOssParallelStrategyManager:
@@ -169,14 +168,15 @@ class GptOssParallelStrategyManager:
 
         for layer_idx in range(self.model_config.num_hidden_layers):
             attn = self.model.model.layers[layer_idx].self_attn
-            module_key = f"attn_{layer_idx}"
 
             # Wrap attention for BatchGen execution
-            wrapped_attn = Attn_Wrapper(
-                attn,
-                self.core_engine,
-                self.engine_config,
-                module_key,
+            # GptOssAttnWrapper handles GQA and alternating sliding/full attention
+            wrapped_attn = GptOssAttnWrapper(
+                module=attn,
+                layer_idx=layer_idx,
+                core_engine=self.core_engine,
+                engine_config=self.engine_config,
+                model_config=self.model_config,
             )
             self.model.model.layers[layer_idx].self_attn = wrapped_attn
 
@@ -189,15 +189,16 @@ class GptOssParallelStrategyManager:
         for layer_idx in range(self.model_config.num_hidden_layers):
             for expert_idx in range(self.model_config.num_local_experts):
                 expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
-                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
 
                 # Wrap expert for BatchGen execution with MXFP4 support
-                wrapped_expert = Expert_Wrapper(
-                    expert,
-                    self.core_engine,
-                    self.engine_config,
-                    module_key,
-                    dequant_fn=self._mxfp4_dequant,
+                # GptOssExpertWrapper handles MXFP4 dequantization internally
+                wrapped_expert = GptOssExpertWrapper(
+                    module=expert,
+                    layer_idx=layer_idx,
+                    expert_idx=expert_idx,
+                    core_engine=self.core_engine,
+                    engine_config=self.engine_config,
+                    model_config=self.model_config,
                 )
                 self.model.model.layers[layer_idx].mlp.experts[expert_idx] = wrapped_expert
 
@@ -208,24 +209,6 @@ class GptOssParallelStrategyManager:
         """Configure LM head for output processing."""
         logging.info("Configuring LM head...")
         # LM head is in BF16, no special handling needed for MXFP4
-
-    def _mxfp4_dequant(
-        self,
-        packed: torch.Tensor,
-        scales: torch.Tensor,
-        dtype: torch.dtype = torch.bfloat16,
-    ) -> torch.Tensor:
-        """Dequantize MXFP4 weights for expert computation.
-
-        Args:
-            packed: Packed FP4 values [out_features, in_features//2]
-            scales: Scale factors [out_features, in_features//32]
-            dtype: Output dtype (default: bfloat16)
-
-        Returns:
-            Dequantized weight tensor [out_features, in_features]
-        """
-        return mxfp4_dequantize(packed, scales, dtype)
 
     def configure_decoding(self) -> Tuple:
         """Configure model for decoding phase.
