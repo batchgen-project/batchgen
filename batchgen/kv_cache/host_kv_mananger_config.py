@@ -76,8 +76,19 @@ _DEEPSEEK_MLA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# GPT-OSS-120B: GQA with 8 KV heads, 36 layers
+_GPT_OSS_GQA_PROFILE = _HostKVModelProfile(
+	num_layers=36,
+	num_k_heads=8,
+	k_head_dim=64,
+	num_v_heads=8,
+	v_head_dim=64,
+	kv_dtype="bfloat16",
+)
+
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
+	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -89,6 +100,12 @@ for canonical, aliases in {
 		"deepseek/deepseek-v3",
 		"deepseek-r1",
 		"deepseek-v3",
+	),
+	"gpt_oss_gqa": (
+		"openai/gpt-oss-120b",
+		"openai/gpt-oss",
+		"gpt-oss-120b",
+		"gpt-oss",
 	),
 }.items():
 	for alias in aliases:
@@ -230,6 +247,11 @@ def build_gpu_kv_config_fixed_size(
 		# DeepSeek MLA: compressed KV
 		kv_dim = 512  # compressed_kv_dim
 		num_layers = 61
+		dtype_bytes = 2  # bfloat16
+	elif "gpt-oss" in model_name.lower() or "gpt_oss" in model_name.lower():
+		# GPT-OSS GQA: 8 KV heads, head_dim=64
+		kv_dim = 8 * 64 * 2  # K + V heads
+		num_layers = 36
 		dtype_bytes = 2  # bfloat16
 	else:
 		raise NotImplementedError(f"Model {model_name} not supported")

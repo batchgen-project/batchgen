@@ -475,6 +475,17 @@ class WorkerManager:
                 pt_ckpt_dir,
                 self.args.enable_hugetlbfs,
             )
+        elif "gpt-oss" in self.args.model.lower() or "gpt_oss" in self.args.model.lower():
+            from batchgen.models.gpt_oss.gpt_oss_parameter_server import (
+                GptOss_Parameter_Server,
+            )
+
+            parameter_server = GptOss_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                pt_ckpt_dir,
+                self.args.enable_hugetlbfs,
+            )
         elif "mixtral" in self.args.model.lower():
             from batchgen.models.mixtral.mixtral_parameter_server import (
                 Mixtral_Parameter_Server,
