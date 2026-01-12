@@ -487,7 +487,7 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
             )
         elif "gpt-oss" in self.args.model.lower() or "gpt_oss" in self.args.model.lower():
-            from batchgen.models.gpt_oss.gpt_oss_parameter_server import (
+            from batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server import (
                 GptOss_Parameter_Server,
             )
 

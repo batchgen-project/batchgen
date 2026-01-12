@@ -41,8 +41,8 @@ from .configuration_gpt_oss import GptOssConfig
 from .modeling_gpt_oss import GptOssForCausalLM
 from ...ckpt_converter.ckpt_converter import ckpt_converter
 
-# Path to local GPT-OSS config directory (relative to this file)
-_GPT_OSS_CONFIG_DIR = Path(__file__).parent.parent / "openai" / " gpt-oss-120b "
+# Path to local GPT-OSS config directory (same as this file's directory)
+_GPT_OSS_CONFIG_DIR = Path(__file__).parent
 
 try:
     from batchgen.core_engine import Parameter_Server

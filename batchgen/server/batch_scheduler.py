@@ -506,9 +506,28 @@ class BatchScheduler:
 
         cache_dir = self.server_args.cache_dir
         cache_dir_value = str(cache_dir) if cache_dir else None
+
+        # GPT-OSS: load tokenizer from local config directory
+        if "gpt-oss" in model.lower() or "gpt_oss" in model.lower():
+            from pathlib import Path
+            gpt_oss_config_dir = (
+                Path(__file__).parent.parent / "models" / "openai" / "gpt_oss_120b"
+            )
+            if gpt_oss_config_dir.exists():
+                tokenizer_path = str(gpt_oss_config_dir)
+                logger.info(f"Loading GPT-OSS tokenizer from: {tokenizer_path}")
+            else:
+                tokenizer_path = model
+                logger.warning(
+                    f"GPT-OSS config dir not found at {gpt_oss_config_dir}, "
+                    f"falling back to model name: {model}"
+                )
+        else:
+            tokenizer_path = model
+
         try:
             tokenizer = AutoTokenizer.from_pretrained(
-                model,
+                tokenizer_path,
                 cache_dir=cache_dir_value,
                 trust_remote_code=True,
                 local_files_only=True,

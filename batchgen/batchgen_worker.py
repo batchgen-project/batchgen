@@ -1019,8 +1019,26 @@ class BatchGenWorker:
 		self.model_context_length = getattr(self.model_config, 'max_position_embeddings', 131072)  # Default 128K
 		logging.info(f"Rank {self.rank}: Model context length set to {self.model_context_length}")
 		
+		# Determine tokenizer path - GPT-OSS uses local config directory
+		if "gpt-oss" in self.model_name.lower() or "gpt_oss" in self.model_name.lower():
+			from pathlib import Path
+			gpt_oss_config_dir = (
+				Path(__file__).parent / "models" / "openai" / "gpt_oss_120b"
+			)
+			if gpt_oss_config_dir.exists():
+				tokenizer_path = str(gpt_oss_config_dir)
+				logging.info(f"Rank {self.rank}: Loading GPT-OSS tokenizer from: {tokenizer_path}")
+			else:
+				tokenizer_path = self.cache_dir
+				logging.warning(
+					f"Rank {self.rank}: GPT-OSS config dir not found at {gpt_oss_config_dir}, "
+					f"falling back to cache_dir: {self.cache_dir}"
+				)
+		else:
+			tokenizer_path = self.cache_dir
+
 		self.tokenizer = AutoTokenizer.from_pretrained(
-			self.cache_dir,
+			tokenizer_path,
 			trust_remote_code=True,
 			local_files_only=True,
 		)
