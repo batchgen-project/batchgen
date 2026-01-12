@@ -533,9 +533,20 @@ class BatchScheduler:
                 local_files_only=True,
             )
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to load tokenizer for {model}: {exc}"
-            ) from exc
+            # Fall back to slow tokenizer if fast tokenizer fails
+            logger.warning(f"Fast tokenizer failed, trying slow tokenizer: {exc}")
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_path,
+                    cache_dir=cache_dir_value,
+                    trust_remote_code=True,
+                    local_files_only=True,
+                    use_fast=False,
+                )
+            except Exception as exc2:
+                raise RuntimeError(
+                    f"Failed to load tokenizer for {model}: {exc2}"
+                ) from exc2
         self._tokenizer = tokenizer
         self._tokenizer_model = model
         return tokenizer

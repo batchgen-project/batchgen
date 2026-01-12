@@ -1037,11 +1037,21 @@ class BatchGenWorker:
 		else:
 			tokenizer_path = self.cache_dir
 
-		self.tokenizer = AutoTokenizer.from_pretrained(
-			tokenizer_path,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
+		try:
+			self.tokenizer = AutoTokenizer.from_pretrained(
+				tokenizer_path,
+				trust_remote_code=True,
+				local_files_only=True,
+			)
+		except Exception as exc:
+			# Fall back to slow tokenizer if fast tokenizer fails
+			logging.warning(f"Rank {self.rank}: Fast tokenizer failed, trying slow tokenizer: {exc}")
+			self.tokenizer = AutoTokenizer.from_pretrained(
+				tokenizer_path,
+				trust_remote_code=True,
+				local_files_only=True,
+				use_fast=False,
+			)
 		self.tokenizer.padding_side = "right"
 		
 		# Set EOS token ID from tokenizer
