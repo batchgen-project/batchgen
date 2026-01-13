@@ -307,10 +307,15 @@ class GptOssParallelStrategyManager:
         return self.model, self.weight_copy_task
 
     def _build_weight_mappings(self):
-        """Build state_dict_name_map and weight_copy_task."""
+        """Build state_dict_name_map and weight_copy_task.
+
+        NOTE: For GPT-OSS, attention weights are SKELETON (loaded once at init
+        via _load_model_skeleton), NOT dynamically loaded. Only expert weights
+        are in state_dict_name_map for dynamic loading via core_engine.get_weights().
+        """
         self.state_dict_name_map = {}
         self.weight_copy_task = {
-            "attn": [],
+            "attn": [],  # Empty - attention is skeleton, not dynamically loaded
             "routed_expert": [],
         }
 
@@ -318,17 +323,10 @@ class GptOssParallelStrategyManager:
         num_experts = self.model_config.num_local_experts
 
         for layer_idx in range(num_layers):
-            # Attention weights (BF16)
-            attn_tensors = ["qkv.weight", "qkv.bias", "out.weight", "out.bias"]
-            for tensor_name in attn_tensors:
-                ckpt_name = f"block.{layer_idx}.attn.{tensor_name}"
-                self.state_dict_name_map[ckpt_name] = {
-                    "module_key": f"attn_{layer_idx}",
-                    "tensor_key": tensor_name,
-                }
-            self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
+            # NOTE: Attention weights are NOT added here - they are skeleton weights
+            # loaded via _load_model_skeleton() from skeleton_state_dict
 
-            # Expert weights (MXFP4) - sliced format
+            # Expert weights (MXFP4) - sliced format, dynamically loaded
             for expert_idx in range(num_experts):
                 module_key = f"routed_expert_{layer_idx}_{expert_idx}"
 
@@ -343,8 +341,8 @@ class GptOssParallelStrategyManager:
                 self.weight_copy_task["routed_expert"].append(module_key)
 
         logging.info(
-            f"Weight mappings: {len(self.weight_copy_task['attn'])} attn, "
-            f"{len(self.weight_copy_task['routed_expert'])} experts"
+            f"Weight mappings: {len(self.weight_copy_task['attn'])} attn (skeleton), "
+            f"{len(self.weight_copy_task['routed_expert'])} experts (dynamic)"
         )
 
     def _load_model_skeleton(self):
