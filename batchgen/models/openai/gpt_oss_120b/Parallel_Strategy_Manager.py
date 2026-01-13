@@ -54,6 +54,7 @@ class GptOssModelShim(nn.Module):
     - model.embed_tokens → transformer.embedding
     - model.layers → transformer.block
     - model.norm → transformer.norm
+    - model._use_flash_attention_2 (flag)
 
     This shim provides these mappings.
     """
@@ -61,6 +62,8 @@ class GptOssModelShim(nn.Module):
     def __init__(self, transformer: Transformer):
         super().__init__()
         self._transformer = transformer
+        # BatchGenWorker sets this flag
+        self._use_flash_attention_2 = False
 
     @property
     def embed_tokens(self):
