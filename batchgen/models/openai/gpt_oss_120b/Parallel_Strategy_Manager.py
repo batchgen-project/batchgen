@@ -305,6 +305,24 @@ class GptOssParallelStrategyManager:
         start_time = time.perf_counter()
         timings = {}
 
+        # Early validation of skeleton_state_dict
+        if self.skeleton_state_dict is None:
+            raise RuntimeError(
+                "skeleton_state_dict is None! This means the parameter server didn't return "
+                "skeleton weights. Check that ps.parameter_server.get_skeleton_state_dict() "
+                "is returning the expected tensors."
+            )
+        if len(self.skeleton_state_dict) == 0:
+            raise RuntimeError(
+                "skeleton_state_dict is empty! This means no tensors were loaded as skeleton weights. "
+                "All tensors may have been added to state_dict_name_map instead. "
+                "Check the _parse_state_dict() logic in gpt_oss_parameter_server.py."
+            )
+        logging.info(f"skeleton_state_dict received with {len(self.skeleton_state_dict)} tensors")
+        # Log first few tensor names as early indicator of naming convention
+        sample_keys = list(self.skeleton_state_dict.keys())[:5]
+        logging.info(f"Sample skeleton tensor names: {sample_keys}")
+
         # Step 1: Create OpenAI-style model config
         step_start = time.perf_counter()
         gpt_oss_config = GptOssModelConfig(
@@ -593,6 +611,53 @@ class GptOssParallelStrategyManager:
                 if var in self.skeleton_state_dict:
                     return var, self.skeleton_state_dict[var]
 
+            # Fallback: fuzzy match by layer index and tensor type
+            # This handles cases where checkpoint naming is completely different
+            if layer_idx is not None:
+                layer_str = str(layer_idx)
+                # Determine what type of tensor we're looking for
+                tensor_type = None
+                if ".qkv." in target_name and ".weight" in target_name:
+                    tensor_type = "qkv_weight"
+                    keywords = ["qkv", "c_attn", "q_proj", "wqkv", "in_proj"]
+                elif ".qkv." in target_name and ".bias" in target_name:
+                    tensor_type = "qkv_bias"
+                    keywords = ["qkv", "c_attn", "q_proj", "wqkv", "in_proj"]
+                elif ".out." in target_name and ".weight" in target_name:
+                    tensor_type = "out_weight"
+                    keywords = ["out", "c_proj", "o_proj", "out_proj", "dense"]
+                elif ".out." in target_name and ".bias" in target_name:
+                    tensor_type = "out_bias"
+                    keywords = ["out", "c_proj", "o_proj", "out_proj", "dense"]
+                elif ".norm." in target_name:
+                    tensor_type = "norm"
+                    keywords = ["norm", "ln", "layernorm"]
+                elif ".gate." in target_name:
+                    tensor_type = "gate"
+                    keywords = ["gate", "router"]
+
+                if tensor_type and keywords:
+                    is_weight = "weight" in target_name
+                    is_bias = "bias" in target_name
+                    is_scale = "scale" in target_name
+
+                    for ckpt_name, ckpt_tensor in self.skeleton_state_dict.items():
+                        ckpt_lower = ckpt_name.lower()
+                        # Must contain layer index
+                        if layer_str not in ckpt_name:
+                            continue
+                        # Must match weight/bias/scale type
+                        if is_weight and "weight" not in ckpt_lower:
+                            continue
+                        if is_bias and "bias" not in ckpt_lower:
+                            continue
+                        if is_scale and "scale" not in ckpt_lower and "weight" not in ckpt_lower:
+                            continue
+                        # Check if any keyword matches
+                        if any(kw in ckpt_lower for kw in keywords):
+                            logging.info(f"Fuzzy matched: {target_name} -> {ckpt_name}")
+                            return ckpt_name, ckpt_tensor
+
             return None, None
 
         # Build the expected mappings (model parameter names)
@@ -753,6 +818,17 @@ class GptOssParallelStrategyManager:
             logging.error(f"Found {len(issues)} Linear layer weight issues! ({valid_count} layers OK)")
             for issue in issues:
                 logging.error(f"  {issue}")
+
+            # Check if any attention weights are still placeholders - this is fatal
+            attn_issues = [i for i in issues if 'attn' in i and 'placeholder' in i]
+            if attn_issues:
+                raise RuntimeError(
+                    f"FATAL: {len(attn_issues)} attention layer weights are still placeholders!\n"
+                    f"This means skeleton loading failed to find/load attention weights.\n"
+                    f"Issues:\n" + "\n".join(f"  - {i}" for i in attn_issues[:10]) + "\n"
+                    f"Check the skeleton_state_dict logs above to see what tensors are available.\n"
+                    f"The checkpoint may use different naming conventions than expected."
+                )
         else:
             logging.info(f"All {valid_count} Linear layer weights validated OK (all proper 2D shapes)")
         logging.info("=== END VALIDATION ===")
