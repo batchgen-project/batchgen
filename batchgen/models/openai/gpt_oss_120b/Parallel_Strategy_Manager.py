@@ -348,7 +348,11 @@ class GptOssParallelStrategyManager:
         )
 
     def _load_model_skeleton(self):
-        """Load skeleton weights (embeddings, norms, router, attention sinks)."""
+        """Load skeleton weights (embeddings, norms, router, attention sinks).
+
+        Handles potential naming differences between OpenAI checkpoint format
+        and our model.py parameter names through a flexible mapping system.
+        """
         if self.skeleton_state_dict is None:
             logging.warning("No skeleton_state_dict provided")
             return
@@ -356,49 +360,121 @@ class GptOssParallelStrategyManager:
         device = self.engine_config.Basic_Config.device_torch
         loaded = 0
         skipped = 0
-
-        # Direct mapping from checkpoint names to model parameter names
-        # Note: Model uses 'block' (singular), RMSNorm uses 'scale' (not 'weight')
-        # unembedding has bias=False in model.py, so no unembedding.bias
-        mappings = {
-            "embedding.weight": "embedding.weight",
-            "unembedding.weight": "unembedding.weight",
-            "norm.scale": "norm.scale",  # RMSNorm uses .scale
-        }
-
-        # Add per-layer mappings
-        # Model uses self.block (singular ModuleList), RMSNorm uses .scale
-        for layer_idx in range(self.model_config.num_hidden_layers):
-            mappings.update({
-                # Attention norm and sinks
-                f"block.{layer_idx}.attn.norm.scale": f"block.{layer_idx}.attn.norm.scale",
-                f"block.{layer_idx}.attn.sinks": f"block.{layer_idx}.attn.sinks",
-                # Attention QKV and output projections (BF16, not quantized)
-                f"block.{layer_idx}.attn.qkv.weight": f"block.{layer_idx}.attn.qkv.weight",
-                f"block.{layer_idx}.attn.qkv.bias": f"block.{layer_idx}.attn.qkv.bias",
-                f"block.{layer_idx}.attn.out.weight": f"block.{layer_idx}.attn.out.weight",
-                f"block.{layer_idx}.attn.out.bias": f"block.{layer_idx}.attn.out.bias",
-                # MLP norm and gate (router)
-                f"block.{layer_idx}.mlp.norm.scale": f"block.{layer_idx}.mlp.norm.scale",
-                f"block.{layer_idx}.mlp.gate.weight": f"block.{layer_idx}.mlp.gate.weight",
-                f"block.{layer_idx}.mlp.gate.bias": f"block.{layer_idx}.mlp.gate.bias",
-            })
+        missing = []
 
         # Access transformer through wrapper
         transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
         model_state = dict(transformer.named_parameters())
 
-        for ckpt_name, model_name in mappings.items():
-            if ckpt_name in self.skeleton_state_dict:
-                if model_name in model_state:
-                    tensor = self.skeleton_state_dict[ckpt_name]
-                    model_state[model_name].data.copy_(tensor.to(device))
-                    loaded += 1
-                else:
-                    skipped += 1
-                    logging.debug(f"Model param not found: {model_name}")
+        # Debug: Log ALL skeleton tensor names to understand checkpoint format
+        if self.skeleton_state_dict:
+            logging.info(f"=== SKELETON STATE DICT DEBUG ===")
+            logging.info(f"Total tensors in skeleton_state_dict: {len(self.skeleton_state_dict)}")
+            logging.info(f"All tensor names:")
+            for k, v in sorted(self.skeleton_state_dict.items()):
+                logging.info(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
+            logging.info(f"=== END SKELETON DEBUG ===")
+        else:
+            logging.error("skeleton_state_dict is empty or None!")
+            return
 
-        logging.info(f"Skeleton loaded: {loaded} weights, {skipped} skipped")
+        # Debug: Log model parameters
+        logging.info(f"=== MODEL PARAMETERS DEBUG ===")
+        logging.info(f"Total model parameters: {len(model_state)}")
+        for k, v in sorted(model_state.items()):
+            if not any(x in k for x in ['experts', 'mlp1', 'mlp2']):  # Skip expert params
+                logging.info(f"  {k}: shape={list(v.shape)}")
+        logging.info(f"=== END MODEL DEBUG ===")
+
+        # Build flexible name mapping: try multiple checkpoint naming conventions
+        # OpenAI checkpoint might use different prefixes
+        def find_skeleton_tensor(target_name: str) -> tuple:
+            """Find a tensor in skeleton_state_dict with flexible naming."""
+            # Direct match first
+            if target_name in self.skeleton_state_dict:
+                return target_name, self.skeleton_state_dict[target_name]
+
+            # Try common variations
+            variations = [
+                target_name,                                    # exact match
+                f"transformer.{target_name}",                   # transformer. prefix
+                f"model.{target_name}",                         # model. prefix
+                target_name.replace("embedding.", "tok_embeddings."),  # tok_embeddings
+                target_name.replace("unembedding.", "output."),        # output for LM head
+                target_name.replace("unembedding.", "lm_head."),       # lm_head for LM head
+                target_name.replace(".scale", ".weight"),              # .weight instead of .scale
+                target_name.replace("norm.scale", "ln.weight"),        # ln instead of norm
+                target_name.replace("block.", "layers."),              # layers instead of block
+                target_name.replace("block.", "h."),                   # h instead of block (GPT-2 style)
+            ]
+
+            for var in variations:
+                if var in self.skeleton_state_dict:
+                    return var, self.skeleton_state_dict[var]
+
+            return None, None
+
+        # Build the expected mappings (model parameter names)
+        expected_params = {
+            "embedding.weight": "embedding.weight",
+            "unembedding.weight": "unembedding.weight",
+            "norm.scale": "norm.scale",
+        }
+
+        # Add per-layer mappings
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            expected_params.update({
+                f"block.{layer_idx}.attn.norm.scale": f"block.{layer_idx}.attn.norm.scale",
+                f"block.{layer_idx}.attn.sinks": f"block.{layer_idx}.attn.sinks",
+                f"block.{layer_idx}.attn.qkv.weight": f"block.{layer_idx}.attn.qkv.weight",
+                f"block.{layer_idx}.attn.qkv.bias": f"block.{layer_idx}.attn.qkv.bias",
+                f"block.{layer_idx}.attn.out.weight": f"block.{layer_idx}.attn.out.weight",
+                f"block.{layer_idx}.attn.out.bias": f"block.{layer_idx}.attn.out.bias",
+                f"block.{layer_idx}.mlp.norm.scale": f"block.{layer_idx}.mlp.norm.scale",
+                f"block.{layer_idx}.mlp.gate.weight": f"block.{layer_idx}.mlp.gate.weight",
+                f"block.{layer_idx}.mlp.gate.bias": f"block.{layer_idx}.mlp.gate.bias",
+            })
+
+        # Load each expected parameter
+        for target_name, model_name in expected_params.items():
+            ckpt_name, tensor = find_skeleton_tensor(target_name)
+
+            if tensor is None:
+                missing.append(target_name)
+                continue
+
+            if model_name not in model_state:
+                logging.debug(f"Model param not found: {model_name}")
+                skipped += 1
+                continue
+
+            model_param = model_state[model_name]
+
+            # Shape validation
+            if tensor.shape != model_param.shape:
+                logging.error(
+                    f"Shape mismatch for {target_name}:\n"
+                    f"  Checkpoint ({ckpt_name}): {list(tensor.shape)}\n"
+                    f"  Model ({model_name}): {list(model_param.shape)}"
+                )
+                continue
+
+            # Copy tensor to model
+            try:
+                model_param.data.copy_(tensor.to(device))
+                loaded += 1
+                if ckpt_name != target_name:
+                    logging.info(f"Loaded {ckpt_name} -> {model_name} (name variation)")
+            except Exception as e:
+                logging.error(f"Failed to copy {ckpt_name} -> {model_name}: {e}")
+
+        # Summary
+        logging.info(f"Skeleton loading complete:")
+        logging.info(f"  Loaded: {loaded}")
+        logging.info(f"  Skipped: {skipped}")
+        logging.info(f"  Missing: {len(missing)}")
+        if missing and len(missing) <= 20:
+            logging.warning(f"  Missing tensors: {missing}")
 
     def _config_attn_module(self):
         """Configure attention modules.
