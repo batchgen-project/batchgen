@@ -220,6 +220,7 @@ class GptOss_Parameter_Server:
         num_experts = self.model_config.num_experts
 
         # Process each checkpoint file
+        dtype_logged = set()  # Track which dtypes we've logged
         for ckpt_file in tqdm(ckpt_files, desc="Processing checkpoint files"):
             ckpt_path = os.path.join(self.cache_dir, ckpt_file)
             tensors = load_file(ckpt_path)
@@ -227,6 +228,25 @@ class GptOss_Parameter_Server:
             sliced_tensors = {}
 
             for name, tensor in tensors.items():
+                # Log dtype info once per tensor type
+                tensor_type = None
+                if "mlp1_weight.blocks" in name:
+                    tensor_type = "mlp1_weight.blocks"
+                elif "mlp1_weight.scales" in name:
+                    tensor_type = "mlp1_weight.scales"
+                elif "mlp1_bias" in name:
+                    tensor_type = "mlp1_bias"
+                elif "mlp2_weight.blocks" in name:
+                    tensor_type = "mlp2_weight.blocks"
+                elif "mlp2_weight.scales" in name:
+                    tensor_type = "mlp2_weight.scales"
+                elif "mlp2_bias" in name:
+                    tensor_type = "mlp2_bias"
+
+                if tensor_type and tensor_type not in dtype_logged:
+                    logging.info(f"Original checkpoint tensor dtype: {tensor_type} -> {tensor.dtype}, shape={list(tensor.shape)}")
+                    dtype_logged.add(tensor_type)
+
                 # Check if this is a stacked expert tensor
                 if self._is_stacked_expert_tensor(name):
                     # Slice and rename
@@ -278,20 +298,32 @@ class GptOss_Parameter_Server:
     ) -> Dict[str, torch.Tensor]:
         """Slice a stacked expert tensor into individual expert tensors.
 
-        Input: block.{L}.mlp.mlp1_weight.blocks [128, out_dim, in_dim//2]
-        Output: block.{L}.mlp.experts.{E}.mlp1.packed [out_dim, in_dim//2] for E in 0..127
+        GPT-OSS MXFP4 checkpoint format (actual shapes):
+        - mlp1_weight.blocks: [128, 5760, 90, 16] - 4D tensor, need to reshape to 2D
+        - mlp1_weight.scales: [128, 5760, 90] - 3D tensor, already 2D after slicing
+        - mlp1_bias: [128, 5760] - BF16, already 1D after slicing
+        - mlp2_weight.blocks: [128, 2880, 90, 16]
+        - mlp2_weight.scales: [128, 2880, 90]
+        - mlp2_bias: [128, 2880]
+
+        The packed format uses groups of 32 values:
+        - blocks shape: [num_experts, out_dim, K//32, 16] where 16 bytes = 32 FP4 values
+        - We reshape [out_dim, K//32, 16] -> [out_dim, K//2] for 2D packed tensor
         """
         sliced = {}
 
-        # Determine tensor type from name
+        # Determine tensor type and whether to reshape
+        reshape_packed = False
         if "mlp1_weight.blocks" in name:
             tensor_suffix = "mlp1.packed"
+            reshape_packed = True
         elif "mlp1_weight.scales" in name:
             tensor_suffix = "mlp1.scales"
         elif "mlp1_bias" in name:
             tensor_suffix = "mlp1.bias"
         elif "mlp2_weight.blocks" in name:
             tensor_suffix = "mlp2.packed"
+            reshape_packed = True
         elif "mlp2_weight.scales" in name:
             tensor_suffix = "mlp2.scales"
         elif "mlp2_bias" in name:
@@ -304,8 +336,16 @@ class GptOss_Parameter_Server:
             f"Expected {num_experts} experts, got {tensor.shape[0]} in {name}"
 
         for expert_idx in range(num_experts):
+            expert_tensor = tensor[expert_idx]
+
+            # Reshape 3D packed tensor to 2D: [out_dim, K//32, 16] -> [out_dim, K//2]
+            if reshape_packed and expert_tensor.dim() == 3:
+                out_dim = expert_tensor.shape[0]
+                # Flatten last two dimensions: [K//32, 16] -> [K//2]
+                expert_tensor = expert_tensor.reshape(out_dim, -1)
+
             new_name = f"block.{layer_idx}.mlp.experts.{expert_idx}.{tensor_suffix}"
-            sliced[new_name] = tensor[expert_idx].contiguous()
+            sliced[new_name] = expert_tensor.contiguous()
 
         return sliced
 
