@@ -502,23 +502,33 @@ class GptOssParallelStrategyManager:
 
             model_param = model_state[model_name]
 
-            # Shape validation
-            if tensor.shape != model_param.shape:
-                logging.error(
-                    f"Shape mismatch for {target_name}:\n"
-                    f"  Checkpoint ({ckpt_name}): {list(tensor.shape)}\n"
-                    f"  Model ({model_name}): {list(model_param.shape)}"
-                )
-                continue
-
-            # Copy tensor to model
+            # Handle placeholder parameters (shape [1] from config_torch_module_initializer)
+            # When using memory-efficient init, all params start as [1] placeholders
+            # We need to replace the data entirely, not copy (which requires same shape)
             try:
-                model_param.data.copy_(tensor.to(device))
+                is_placeholder = (model_param.numel() == 1 and tensor.numel() > 1)
+
+                if is_placeholder:
+                    # Replace placeholder with actual tensor data
+                    model_param.data = tensor.to(device)
+                    logging.debug(f"Replaced placeholder {model_name} with shape {list(tensor.shape)}")
+                elif tensor.shape == model_param.shape:
+                    # Normal copy for matching shapes
+                    model_param.data.copy_(tensor.to(device))
+                else:
+                    # Shape mismatch (not a placeholder case)
+                    logging.error(
+                        f"Shape mismatch for {target_name}:\n"
+                        f"  Checkpoint ({ckpt_name}): {list(tensor.shape)}\n"
+                        f"  Model ({model_name}): {list(model_param.shape)}"
+                    )
+                    continue
+
                 loaded += 1
                 if ckpt_name != target_name:
                     logging.info(f"Loaded {ckpt_name} -> {model_name} (name variation)")
             except Exception as e:
-                logging.error(f"Failed to copy {ckpt_name} -> {model_name}: {e}")
+                logging.error(f"Failed to load {ckpt_name} -> {model_name}: {e}")
 
         # Summary
         logging.info(f"Skeleton loading complete:")
@@ -536,30 +546,43 @@ class GptOssParallelStrategyManager:
 
         This helps debug 'weight must be 2-D' errors by identifying
         which layers have malformed weights after skeleton loading.
+
+        Note: If using config_torch_module_initializer(), parameters start
+        as [1] placeholders and are replaced during skeleton loading.
         """
-        logging.info("=== VALIDATING LINEAR LAYER WEIGHTS ===")
+        logging.info("=== VALIDATING LINEAR LAYER WEIGHTS (POST-SKELETON LOADING) ===")
         issues = []
+        valid_count = 0
 
         for name, module in transformer.named_modules():
             if isinstance(module, nn.Linear):
                 weight = module.weight
-                if weight.dim() != 2:
+
+                # Check for placeholder that wasn't replaced
+                if weight.numel() == 1:
+                    issues.append(f"{name}.weight: still placeholder shape={list(weight.shape)}")
+                    logging.error(f"PLACEHOLDER NOT REPLACED: {name}.weight is still shape={list(weight.shape)}")
+                elif weight.dim() != 2:
                     issues.append(f"{name}.weight: expected 2D, got {weight.dim()}D shape={list(weight.shape)}")
                     logging.error(f"INVALID: {name}.weight has {weight.dim()}D shape={list(weight.shape)}")
                 else:
+                    valid_count += 1
                     logging.debug(f"OK: {name}.weight shape={list(weight.shape)}")
 
                 if module.bias is not None:
-                    if module.bias.dim() != 1:
+                    if module.bias.numel() == 1 and name not in ['embedding']:
+                        # Bias placeholder (but some biases legitimately have 1 element)
+                        pass  # Skip bias placeholder check for now
+                    elif module.bias.dim() != 1:
                         issues.append(f"{name}.bias: expected 1D, got {module.bias.dim()}D")
                         logging.error(f"INVALID: {name}.bias has {module.bias.dim()}D shape")
 
         if issues:
-            logging.error(f"Found {len(issues)} Linear layer weight issues!")
+            logging.error(f"Found {len(issues)} Linear layer weight issues! ({valid_count} layers OK)")
             for issue in issues:
                 logging.error(f"  {issue}")
         else:
-            logging.info("All Linear layer weights validated OK (all 2D)")
+            logging.info(f"All {valid_count} Linear layer weights validated OK (all proper 2D shapes)")
         logging.info("=== END VALIDATION ===")
 
     def _config_attn_module(self):
