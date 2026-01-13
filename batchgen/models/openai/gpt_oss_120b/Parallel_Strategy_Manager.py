@@ -213,7 +213,14 @@ class GptOssParallelStrategyManager:
         skeleton_keys = list(self.skeleton_state_dict.keys())
         logging.info(f"Skeleton state dict has {len(skeleton_keys)} keys")
         if skeleton_keys:
-            logging.info(f"First 10 skeleton keys: {skeleton_keys[:10]}")
+            logging.info(f"First 20 skeleton keys: {skeleton_keys[:20]}")
+            # Check for specific keys we expect
+            for check_key in ["embedding.weight", "unembedding.weight", "final_norm.scale",
+                              "block.0.attn.qkv.weight", "block.0.attn.norm.scale"]:
+                if check_key in self.skeleton_state_dict:
+                    logging.info(f"Found key: {check_key}")
+                else:
+                    logging.warning(f"Missing expected key: {check_key}")
 
         # Build reverse mapping: HuggingFace name → original checkpoint name
         fwd_mapping = self.get_name_mapping()
