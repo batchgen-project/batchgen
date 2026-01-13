@@ -200,17 +200,25 @@ class GptOssParallelStrategyManager:
         logging.info("Loading model skeleton...")
 
         # Debug: Log available keys in skeleton_state_dict
-        skeleton_keys = list(self.skeleton_state_dict.keys())
+        skeleton_keys = sorted(self.skeleton_state_dict.keys())
         logging.info(f"Skeleton state dict has {len(skeleton_keys)} keys")
-        if skeleton_keys:
-            logging.info(f"First 20 skeleton keys: {skeleton_keys[:20]}")
-            # Check for specific keys we expect
-            for check_key in ["embedding.weight", "unembedding.weight", "final_norm.scale",
-                              "block.0.attn.qkv.weight", "block.0.attn.norm.scale"]:
-                if check_key in self.skeleton_state_dict:
-                    logging.info(f"Found key: {check_key}")
-                else:
-                    logging.warning(f"Missing expected key: {check_key}")
+
+        # Group and summarize keys
+        embedding_keys = [k for k in skeleton_keys if 'embedding' in k or 'embed' in k]
+        norm_keys = [k for k in skeleton_keys if 'norm' in k or 'final' in k]
+        logging.info(f"Embedding-related keys: {embedding_keys}")
+        logging.info(f"Norm-related keys (first 10): {norm_keys[:10]}")
+
+        # Check for specific keys we expect
+        expected_keys = ["embedding.weight", "unembedding.weight", "final_norm.scale",
+                         "block.0.attn.norm.scale", "block.0.mlp.norm.scale",
+                         "block.0.mlp.gate.weight"]
+        for check_key in expected_keys:
+            if check_key in self.skeleton_state_dict:
+                tensor = self.skeleton_state_dict[check_key]
+                logging.info(f"Found key: {check_key}, shape: {tensor.shape}, dtype: {tensor.dtype}")
+            else:
+                logging.warning(f"Missing expected key: {check_key}")
 
         # Build reverse mapping: HuggingFace name → original checkpoint name
         fwd_mapping = self.get_name_mapping()
@@ -280,6 +288,16 @@ class GptOssParallelStrategyManager:
             logging.warning(f"... and {missing_count - 10} more missing weights")
 
         logging.info(f"Model skeleton loaded: {loaded_count} loaded, {missing_count} missing")
+
+        # Debug: Check for parameters with unexpected shapes (e.g., [1])
+        small_params = []
+        for name, param in self.model.named_parameters():
+            if "experts" in name:
+                continue
+            if param.numel() <= 10:  # Very small parameters
+                small_params.append((name, list(param.shape)))
+        if small_params:
+            logging.warning(f"Parameters with very small shapes: {small_params}")
 
     def _config_attn_module(self):
         """Configure attention modules with BatchGen wrappers."""
