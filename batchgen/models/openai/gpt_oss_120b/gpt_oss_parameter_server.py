@@ -168,18 +168,23 @@ class GptOss_Parameter_Server:
         Uses ORIGINAL GPT-OSS checkpoint names (not HuggingFace names) since
         the checkpoint converter preserves original tensor names.
 
+        IMPORTANT: Only attention and expert weights go in state_dict_name_map
+        for dynamic loading. Skeleton weights (embeddings, norms, lm_head, router)
+        are NOT added to state_dict_name_map - they go directly to skeleton_state_dict
+        with their original checkpoint names.
+
         Original GPT-OSS naming convention:
+        Skeleton weights (loaded once, kept in model):
         - embedding.weight, unembedding.weight
+        - block.{N}.attn.norm.scale, block.{N}.mlp.norm.scale
+        - block.{N}.mlp.gate.weight/bias (router)
+        - final_norm.scale
+
+        Dynamic weights (loaded on-demand):
         - block.{N}.attn.qkv.weight/bias (combined QKV)
         - block.{N}.attn.out.weight/bias
-        - block.{N}.attn.norm.scale
-        - block.{N}.mlp.gate.weight/bias (router)
-        - block.{N}.mlp.mlp1_weight.blocks (expert gate_proj, packed MXFP4)
-        - block.{N}.mlp.mlp1_weight.scales
-        - block.{N}.mlp.mlp2_weight.blocks (expert up_proj + down_proj, packed MXFP4)
-        - block.{N}.mlp.mlp2_weight.scales
-        - block.{N}.mlp.norm.scale
-        - final_norm.scale
+        - block.{N}.mlp.mlp1_weight.blocks/scales (expert gate_proj, packed MXFP4)
+        - block.{N}.mlp.mlp2_weight.blocks/scales (expert up_proj + down_proj, packed MXFP4)
         """
         self.weight_copy_task["attn"] = []
         self.weight_copy_task["routed_expert"] = []
@@ -187,7 +192,7 @@ class GptOss_Parameter_Server:
         num_layers = self.hf_model_config.num_hidden_layers
 
         for layer_idx in trange(num_layers, desc="Parsing GPT-OSS state_dict"):
-            # Attention weights (using original GPT-OSS names)
+            # Attention weights (using original GPT-OSS names) - DYNAMIC LOADING
             # Combined QKV weight/bias
             self.state_dict_name_map[f"block.{layer_idx}.attn.qkv.weight"] = {
                 "module_key": f"attn_{layer_idx}",
@@ -208,7 +213,7 @@ class GptOss_Parameter_Server:
             }
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
 
-            # Expert weights (MXFP4 packed format)
+            # Expert weights (MXFP4 packed format) - DYNAMIC LOADING
             # GPT-OSS uses shared mlp1_weight and mlp2_weight for all experts in a layer
             # mlp1_weight = gate_proj for all experts
             # mlp2_weight = up_proj + down_proj for all experts
@@ -228,46 +233,20 @@ class GptOss_Parameter_Server:
                 "module_key": f"routed_expert_{layer_idx}",
                 "tensor_key": "mlp2_weight.scales",
             }
+            # Also include MLP biases in expert module
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp1_bias"] = {
+                "module_key": f"routed_expert_{layer_idx}",
+                "tensor_key": "mlp1_bias",
+            }
+            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp2_bias"] = {
+                "module_key": f"routed_expert_{layer_idx}",
+                "tensor_key": "mlp2_bias",
+            }
             # Add one routed_expert task per layer (weights are shared across experts)
             self.weight_copy_task["routed_expert"].append(f"routed_expert_{layer_idx}")
 
-            # Router weights (gate)
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.gate.weight"] = {
-                "module_key": f"router_{layer_idx}",
-                "tensor_key": "weight",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.gate.bias"] = {
-                "module_key": f"router_{layer_idx}",
-                "tensor_key": "bias",
-            }
-
-            # Layer norms
-            self.state_dict_name_map[f"block.{layer_idx}.attn.norm.scale"] = {
-                "module_key": f"input_layernorm_{layer_idx}",
-                "tensor_key": "weight",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.norm.scale"] = {
-                "module_key": f"post_attention_layernorm_{layer_idx}",
-                "tensor_key": "weight",
-            }
-
-        # Embedding
-        self.state_dict_name_map["embedding.weight"] = {
-            "module_key": "embed_tokens",
-            "tensor_key": "weight",
-        }
-
-        # Final norm
-        self.state_dict_name_map["final_norm.scale"] = {
-            "module_key": "final_norm",
-            "tensor_key": "weight",
-        }
-
-        # LM head (unembedding)
-        self.state_dict_name_map["unembedding.weight"] = {
-            "module_key": "lm_head",
-            "tensor_key": "weight",
-        }
+            # NOTE: Router, layer norms, embeddings, final_norm, lm_head are NOT added
+            # to state_dict_name_map - they will go to skeleton_state_dict automatically
 
         gc.collect()
         torch.cuda.empty_cache()
