@@ -190,55 +190,63 @@ Weights_Storage::get_module_weights_storage(std::string module_key) {
 
 py::dict Weights_Storage::get_tensor(std::string module_key) {
     /* Get the tensor from the weights storage and return as Python dict. */
-    
+
     // Check if module key exists
     if (this->module_weights_storage_.find(module_key) ==
         this->module_weights_storage_.end()) {
         this->logger->error("Module key not found in storage: {}", module_key);
         throw std::runtime_error("Module key not found in storage.");
     }
-    
+
     // Get module weights
     auto module_weights = this->module_weights_storage_[module_key];
-    
+
     // Define tensor options
+    // BF16 for norm and bias tensors
     auto bf16_option = torch::TensorOptions()
         .dtype(torch::kBFloat16)
         .device(torch::kCPU)
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
-        
-    auto fp8_option = torch::TensorOptions()
-        .dtype(torch::kFloat8_e4m3fn)
+
+    // Use configured weight_dtype_torch for packed weights
+    // (fp8 for DeepSeek, uint8 for GPT-OSS MXFP4)
+    auto weight_option = torch::TensorOptions()
+        .dtype(this->engine_config_.basic_config.weight_dtype_torch)
         .device(torch::kCPU)
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
-    
+
     // Create Python dict to store tensors
     py::dict tensors;
-    
+
     // Iterate through module weights and create tensors
     for (auto& [tensor_key, tensor_buffer] : module_weights) {
         torch::Tensor tensor;
-        
-        // If "norm" in tensor_key, use bf16 dtype
-        if (tensor_key.find("norm") != std::string::npos) {
+
+        // Determine dtype based on tensor name:
+        // - "norm" and "bias" tensors use BF16
+        // - Everything else (packed, scales, etc.) uses weight_dtype_torch
+        bool use_bf16 = (tensor_key.find("norm") != std::string::npos ||
+                         tensor_key.find("bias") != std::string::npos);
+
+        if (use_bf16) {
             tensor = torch::from_blob(
-                tensor_buffer.data_ptr, 
+                tensor_buffer.data_ptr,
                 tensor_buffer.tensor_shape,
                 bf16_option
             );
         } else {
             tensor = torch::from_blob(
-                tensor_buffer.data_ptr, 
+                tensor_buffer.data_ptr,
                 tensor_buffer.tensor_shape,
-                fp8_option
+                weight_option
             );
         }
-        
+
         // Add tensor to Python dict
         tensors[tensor_key.c_str()] = tensor;
     }
-    
+
     return tensors;
 }
