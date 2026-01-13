@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from gpt_oss.torch.weights import Checkpoint
+from .weights import Checkpoint
 
 
 @dataclass
