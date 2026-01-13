@@ -300,7 +300,7 @@ void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_id
     // Log the keys of the module_in_buffers_ in the same log msg
     std::ostringstream oss;
     oss << "Map keys: ";
-    
+
     size_t count = 0;
     for (const auto& [key, value] : this->module_in_buffers_) {
         oss << key;
@@ -319,38 +319,38 @@ void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_id
     } else {
         throw std::runtime_error("Invalid phase: " + std::string(phase));
     }
-    
+
     // Create the current expert name once
     std::string current_expert_name = "routed_expert_" + std::to_string(layer_idx) + "_" + std::to_string(expert_idx);
-    
+
     // Find index of current expert in weight_copy_tasks_ in one pass
     const auto& expert_tasks = this->weight_copy_tasks_["routed_expert"];
     auto task_it = std::find(expert_tasks.begin(), expert_tasks.end(), current_expert_name);
     if (task_it == expert_tasks.end()) {
         return; // Expert name not found, nothing to clear
     }
-    
+
     // Build the set of allowed expert names efficiently
     std::unordered_set<std::string> allowed_expert_names;
     allowed_expert_names.reserve(num_expert_buffer); // Preallocate for performance
     allowed_expert_names.insert(current_expert_name);
-    
+
     size_t task_size = expert_tasks.size();
     size_t idx = std::distance(expert_tasks.begin(), task_it);
-    
+
     // Add the next (num_expert_buffer - 1) expert names
     for (int64_t i = 1; i < num_expert_buffer; i++) {
         idx = (idx + 1) % task_size; // Wrap around more efficiently
         allowed_expert_names.insert(expert_tasks[idx]);
     }
-    
+
     // Remove buffers in one pass, avoiding temporary storage vector
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
         for (auto it = this->module_in_buffers_.begin(); it != this->module_in_buffers_.end();) {
             const auto& key = it->first;
             // Check if this is a routed expert buffer not in our allowed list
-            if (key.compare(0, 13, "routed_expert") == 0 && 
+            if (key.compare(0, 13, "routed_expert") == 0 &&
                 allowed_expert_names.find(key) == allowed_expert_names.end()) {
                 this->logger_->debug(
                     "Clearing expert buffer: layer_idx: {}, expert_idx: {}, {} cleared",

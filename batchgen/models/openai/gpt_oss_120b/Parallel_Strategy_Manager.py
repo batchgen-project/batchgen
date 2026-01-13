@@ -125,9 +125,11 @@ class GptOssCausalLMWrapper(nn.Module):
 class GptOssExpertWrapper(nn.Module):
     """Expert wrapper for GPT-OSS W4A16 MXFP4 inference.
 
-    Wraps ExpertMLP modules and handles dynamic MXFP4 weight loading
-    from BatchGen's core_engine. When called, loads weights from shared
-    memory and passes them to the wrapped module's deepgemm_forward().
+    Supports two modes:
+    1. get_weights=True (dynamic): Load weights from core_engine per forward,
+       then free buffer after use. Used for remote experts in multi-GPU.
+    2. get_weights=False (pre-loaded): Use pre-loaded weights stored at init.
+       Used for local experts in single-GPU where all 128 experts fit.
 
     This is the GPT-OSS equivalent of BatchGen's Expert_Wrapper, but
     adapted for MXFP4 (uint8 weights) instead of BF16 weights.
@@ -140,6 +142,8 @@ class GptOssExpertWrapper(nn.Module):
         expert_idx: int,
         core_engine,
         swiglu_limit: float = 7.0,
+        get_weights: bool = True,
+        preloaded_weights: Optional[Dict[str, torch.Tensor]] = None,
     ):
         super().__init__()
         self.module = expert_module
@@ -147,6 +151,7 @@ class GptOssExpertWrapper(nn.Module):
         self.expert_idx = expert_idx
         self.core_engine = core_engine
         self.swiglu_limit = swiglu_limit
+        self.get_weights = get_weights
 
         # Module key for core_engine weight lookup
         self.expert_weights_idx = f"routed_expert_{layer_idx}_{expert_idx}"
@@ -155,8 +160,14 @@ class GptOssExpertWrapper(nn.Module):
         # core_engine.get_weights() expects (str, str)
         self.phase = "prefill"
 
+        # Pre-loaded weights (for local experts with get_weights=False)
+        self.preloaded_weights = preloaded_weights
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with dynamic MXFP4 weight loading.
+        """Forward pass with MXFP4 weights.
+
+        If get_weights=True: Load from core_engine, forward, free buffer.
+        If get_weights=False: Use pre-loaded weights directly.
 
         Args:
             hidden_states: [batch, hidden_size] BF16
@@ -164,14 +175,18 @@ class GptOssExpertWrapper(nn.Module):
         Returns:
             output: [batch, hidden_size] BF16
         """
-        # Load MXFP4 weights from core_engine
-        weights_dict = self.core_engine.get_weights(self.expert_weights_idx, self.phase)
-
-        # Call the expert's deepgemm_forward with loaded weights
-        output = self.module.deepgemm_forward(hidden_states, weights_dict)
-
-        # Free weights buffer after use
-        self.core_engine.free_weights_buffer(self.expert_weights_idx)
+        if self.get_weights:
+            # Dynamic loading mode: load -> forward -> free
+            weights_dict = self.core_engine.get_weights(self.expert_weights_idx, self.phase)
+            output = self.module.deepgemm_forward(hidden_states, weights_dict)
+            self.core_engine.free_weights_buffer(self.expert_weights_idx)
+        else:
+            # Pre-loaded mode: use cached weights directly
+            if self.preloaded_weights is None:
+                raise RuntimeError(
+                    f"Expert {self.expert_weights_idx} has get_weights=False but no preloaded_weights"
+                )
+            output = self.module.deepgemm_forward(hidden_states, self.preloaded_weights)
 
         return output
 
@@ -344,12 +359,17 @@ class GptOssParallelStrategyManager:
         self._config_attn_module()
         timings['attn'] = time.perf_counter() - step_start
 
-        # Step 6: Configure expert modules with W4A16 MXFP4
+        # Step 6: Pre-load local expert weights (for world_size==1)
+        step_start = time.perf_counter()
+        self._load_local_routed_experts()
+        timings['expert_preload'] = time.perf_counter() - step_start
+
+        # Step 7: Configure expert modules with W4A16 MXFP4
         step_start = time.perf_counter()
         self._config_expert_module()
         timings['expert'] = time.perf_counter() - step_start
 
-        # Step 7: Finalize
+        # Step 8: Finalize
         self.model.eval()
 
         total_time = time.perf_counter() - start_time
@@ -365,8 +385,16 @@ class GptOssParallelStrategyManager:
         """Build state_dict_name_map and weight_copy_task.
 
         NOTE: For GPT-OSS, attention weights are SKELETON (loaded once at init
-        via _load_model_skeleton), NOT dynamically loaded. Only expert weights
-        are in state_dict_name_map for dynamic loading via core_engine.get_weights().
+        via _load_model_skeleton), NOT dynamically loaded.
+
+        For world_size==1 (single GPU), ALL expert weights are also loaded as
+        skeleton (pre-loaded at init) to avoid HtoD buffer contention issues.
+        The original circular queue eviction logic works well when
+        buffer_slots >= local_experts, but GPT-OSS has 128 experts with only
+        8 buffer slots.
+
+        For world_size>1, expert weights are loaded dynamically via HtoD
+        (fewer local experts per GPU makes circular queue viable).
         """
         self.state_dict_name_map = {}
         self.weight_copy_task = {
@@ -377,11 +405,18 @@ class GptOssParallelStrategyManager:
         num_layers = self.model_config.num_hidden_layers
         num_experts = self.model_config.num_local_experts
 
+        # For world_size==1, all experts are local and pre-loaded (skeleton mode)
+        # For world_size>1, experts are loaded dynamically via HtoD
+        all_experts_local = (self.world_size == 1)
+
+        # Build local_routed_experts list for pre-loading
+        self.local_routed_experts = []
+
         for layer_idx in range(num_layers):
             # NOTE: Attention weights are NOT added here - they are skeleton weights
             # loaded via _load_model_skeleton() from skeleton_state_dict
 
-            # Expert weights (MXFP4) - sliced format, dynamically loaded
+            # Expert weights (MXFP4) - state_dict_name_map is always needed for loading
             for expert_idx in range(num_experts):
                 module_key = f"routed_expert_{layer_idx}_{expert_idx}"
 
@@ -393,12 +428,23 @@ class GptOssParallelStrategyManager:
                             "tensor_key": f"{mlp_name}.{tensor_type}",
                         }
 
-                self.weight_copy_task["routed_expert"].append(module_key)
+                if all_experts_local:
+                    # Pre-load at init (skeleton mode) - don't add to weight_copy_task
+                    self.local_routed_experts.append(module_key)
+                else:
+                    # Dynamic loading via HtoD
+                    self.weight_copy_task["routed_expert"].append(module_key)
 
-        logging.info(
-            f"Weight mappings: {len(self.weight_copy_task['attn'])} attn (skeleton), "
-            f"{len(self.weight_copy_task['routed_expert'])} experts (dynamic)"
-        )
+        if all_experts_local:
+            logging.info(
+                f"Weight mappings (world_size=1): {len(self.local_routed_experts)} experts (pre-loaded), "
+                f"0 experts (dynamic)"
+            )
+        else:
+            logging.info(
+                f"Weight mappings: {len(self.weight_copy_task['attn'])} attn (skeleton), "
+                f"{len(self.weight_copy_task['routed_expert'])} experts (dynamic)"
+            )
 
     def _load_model_skeleton(self):
         """Load skeleton weights (embeddings, norms, router, attention sinks).
@@ -586,6 +632,59 @@ class GptOssParallelStrategyManager:
             logging.info(f"All {valid_count} Linear layer weights validated OK (all proper 2D shapes)")
         logging.info("=== END VALIDATION ===")
 
+    def _load_local_routed_experts(self):
+        """Pre-load local routed expert weights to GPU.
+
+        For world_size==1, all 128 experts per layer are local and need to be
+        pre-loaded at init. This avoids HtoD buffer contention issues where
+        the circular queue eviction logic doesn't work well with
+        128 experts and only 8 buffer slots.
+
+        Uses core_engine.get_tensor() to load weights directly from storage,
+        bypassing the GPU buffer system.
+        """
+        if not hasattr(self, 'local_routed_experts') or not self.local_routed_experts:
+            logging.info("No local routed experts to pre-load (using dynamic HtoD loading)")
+            return
+
+        device = self.engine_config.Basic_Config.device_torch
+        transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
+
+        logging.info(f"Pre-loading {len(self.local_routed_experts)} local routed expert weights to GPU...")
+
+        # Store pre-loaded weights in a dict for wrapper access
+        self.preloaded_expert_weights = {}
+
+        for module_key in self.local_routed_experts:
+            # Parse layer_idx and expert_idx from module_key
+            # Format: "routed_expert_{layer_idx}_{expert_idx}"
+            parts = module_key.split("_")
+            layer_idx = int(parts[2])
+            expert_idx = int(parts[3])
+
+            # Get weights from storage using get_tensor()
+            # This returns a dict with keys like 'mlp1.packed', 'mlp1.scales', etc.
+            try:
+                tensors = self.core_engine.get_tensor(module_key)
+
+                # Move weights to GPU
+                weights_gpu = {}
+                for key, tensor in tensors.items():
+                    weights_gpu[key] = tensor.to(device)
+
+                # Store for wrapper access
+                self.preloaded_expert_weights[module_key] = weights_gpu
+
+            except Exception as e:
+                logging.error(f"Failed to pre-load expert {module_key}: {e}")
+                raise
+
+        logging.info(f"Pre-loaded {len(self.preloaded_expert_weights)} expert weight sets to GPU")
+
+        # Log memory usage
+        used_memory = torch.cuda.memory_allocated(device)
+        logging.info(f"GPU memory after expert pre-load: {used_memory / (1024**3):.2f} GB")
+
     def _config_attn_module(self):
         """Configure attention modules.
 
@@ -613,15 +712,22 @@ class GptOssParallelStrategyManager:
     def _config_expert_module(self):
         """Configure expert modules with W4A16 MXFP4 forward pass.
 
-        Wraps each ExpertMLP module with GptOssExpertWrapper, which handles
-        dynamic MXFP4 weight loading from core_engine during forward pass.
+        For local experts (pre-loaded at init), wraps with get_weights=False
+        and passes pre-loaded weights. For remote experts, wraps with
+        get_weights=True for dynamic loading via HtoD.
         """
         num_layers = self.model_config.num_hidden_layers
         num_experts = self.model_config.num_local_experts
         swiglu_limit = getattr(self.model_config, 'swiglu_limit', 7.0)
 
+        # Check if we have pre-loaded experts
+        has_preloaded = hasattr(self, 'preloaded_expert_weights') and self.preloaded_expert_weights
+
         # Access transformer through wrapper
         transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
+
+        local_count = 0
+        dynamic_count = 0
 
         # Wrap each expert module with GptOssExpertWrapper
         for layer_idx in range(num_layers):
@@ -630,14 +736,35 @@ class GptOssParallelStrategyManager:
             # Create new ModuleList with wrapped experts
             wrapped_experts = nn.ModuleList()
             for expert_idx in range(num_experts):
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
                 original_expert = mlp_block.experts[expert_idx]
-                wrapped = GptOssExpertWrapper(
-                    expert_module=original_expert,
-                    layer_idx=layer_idx,
-                    expert_idx=expert_idx,
-                    core_engine=self.core_engine,
-                    swiglu_limit=swiglu_limit,
-                )
+
+                # Check if this expert is pre-loaded (local)
+                if has_preloaded and module_key in self.preloaded_expert_weights:
+                    # Local expert: use pre-loaded weights, no dynamic loading
+                    wrapped = GptOssExpertWrapper(
+                        expert_module=original_expert,
+                        layer_idx=layer_idx,
+                        expert_idx=expert_idx,
+                        core_engine=self.core_engine,
+                        swiglu_limit=swiglu_limit,
+                        get_weights=False,
+                        preloaded_weights=self.preloaded_expert_weights[module_key],
+                    )
+                    local_count += 1
+                else:
+                    # Remote expert: load dynamically via HtoD
+                    wrapped = GptOssExpertWrapper(
+                        expert_module=original_expert,
+                        layer_idx=layer_idx,
+                        expert_idx=expert_idx,
+                        core_engine=self.core_engine,
+                        swiglu_limit=swiglu_limit,
+                        get_weights=True,
+                        preloaded_weights=None,
+                    )
+                    dynamic_count += 1
+
                 wrapped_experts.append(wrapped)
 
             # Replace original experts with wrapped versions
@@ -646,8 +773,10 @@ class GptOssParallelStrategyManager:
             # Store reference to core_engine on MLPBlock for potential direct use
             mlp_block.core_engine = self.core_engine
 
-        total_experts = num_layers * num_experts
-        logging.info(f"Wrapped {total_experts} expert modules with GptOssExpertWrapper (W4A16 MXFP4)")
+        logging.info(
+            f"Wrapped {local_count + dynamic_count} expert modules: "
+            f"{local_count} local (pre-loaded), {dynamic_count} dynamic (HtoD)"
+        )
 
     def configure_decoding(self) -> Tuple:
         """Configure model for decoding phase.

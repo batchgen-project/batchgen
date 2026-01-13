@@ -70,11 +70,14 @@ class GptOssPlanner(BasePlanner):
         # GPT-OSS: Attention weights are SKELETON (loaded once), not dynamically loaded.
         # Only routed_expert needs GPU buffer allocation for dynamic H2D copy.
         # Remove "attn" and "shared_expert" from buffer configs.
+        #
+        # For world_size==1: ALL experts are pre-loaded at init (no HtoD needed)
+        # For world_size>1: Experts loaded dynamically via HtoD with circular queue eviction
         self.config.GPU_Buffer_Config.num_prefill_module_buffer = {
             "routed_expert": 8,  # 8 concurrent expert buffers for prefill
         }
         self.config.GPU_Buffer_Config.num_decoding_module_buffer = {
-            "routed_expert": 4 if self.world_size > 1 else 0,  # 0 if all experts resident
+            "routed_expert": 4 if self.world_size > 1 else 0,  # 0 if all experts pre-loaded
         }
 
     def get_module_shapes(self) -> dict:
