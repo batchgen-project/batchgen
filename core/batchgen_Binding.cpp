@@ -301,15 +301,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     
     py::class_<Weights_Storage>(m, "Weights_Storage")
         // Updated Constructor Binding
-        .def(py::init<int>(), py::arg("device_id")) 
-        
+        .def(py::init<int>(), py::arg("device_id"))
+
         .def("Init", &Weights_Storage::Init,
             py::arg("shm_name"),
             py::arg("byte_size"),
             py::arg("module_weights_shm"),
             py::arg("enable_hugetlbfs") = false)
         .def("get_tensor", &Weights_Storage::get_tensor,
-            py::arg("module_key"));
+            py::arg("module_key"))
+        .def("set_weight_dtype", &Weights_Storage::set_weight_dtype,
+            py::arg("dtype"),
+            "Set weight dtype for get_tensor (fp8 for DeepSeek, uint8 for GPT-OSS)");
     
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
         .def(py::init<>())

@@ -69,6 +69,10 @@ class Weights_Storage {
     // Returns Python Dictionary for Pybind11
     py::dict get_tensor(std::string module_key);
 
+    // Set weight dtype for get_tensor (fp8 for DeepSeek, uint8 for GPT-OSS MXFP4)
+    // Takes int8_t enum value: torch.uint8 = 0, torch.float8_e4m3fn = 25
+    void set_weight_dtype(int8_t dtype) { weight_dtype_ = static_cast<c10::ScalarType>(dtype); }
+
    private:
     int device_id_; // Stored device ID
     std::shared_ptr<spdlog::logger> logger;
@@ -76,7 +80,10 @@ class Weights_Storage {
     std::string shm_name;
     void* weight_ptr_;
     int64_t byte_size_;
-    
+
+    // Weight dtype for packed weights (default: fp8 for DeepSeek)
+    c10::ScalarType weight_dtype_ = c10::kFloat8_e4m3fn;
+
     /* "attn_0" -> "o_proj" -> ptr */
     std::unordered_map<std::string,
                        std::unordered_map<std::string, tensor_buffer>>

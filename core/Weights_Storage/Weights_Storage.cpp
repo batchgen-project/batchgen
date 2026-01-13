@@ -209,10 +209,10 @@ py::dict Weights_Storage::get_tensor(std::string module_key) {
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
 
-    // Use configured weight_dtype_torch for packed weights
+    // Use configured weight_dtype for packed weights
     // (fp8 for DeepSeek, uint8 for GPT-OSS MXFP4)
     auto weight_option = torch::TensorOptions()
-        .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+        .dtype(this->weight_dtype_)
         .device(torch::kCPU)
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);

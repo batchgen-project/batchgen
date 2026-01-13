@@ -250,6 +250,12 @@ class GptOssInitializer:
         """
         try:
             torch.cuda.set_device(self.local_rank)
+
+            # Set weight dtype for MXFP4 (uint8 packed weights)
+            # This affects how Weights_Storage.get_tensor() creates tensors
+            # In PyTorch: torch.uint8 -> c10::ScalarType::Byte = 0
+            weights_storage.set_weight_dtype(0)  # 0 = torch.uint8
+            logging.info("Set Weights_Storage weight dtype to uint8 for MXFP4")
             if self.global_rank == 0:
                 logging.info(f"Engine config: {self.engine_config}")
 
