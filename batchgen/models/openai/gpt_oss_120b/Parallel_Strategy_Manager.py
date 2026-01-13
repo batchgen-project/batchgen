@@ -488,25 +488,107 @@ class GptOssParallelStrategyManager:
         # Build flexible name mapping: try multiple checkpoint naming conventions
         # OpenAI checkpoint might use different prefixes
         def find_skeleton_tensor(target_name: str) -> tuple:
-            """Find a tensor in skeleton_state_dict with flexible naming."""
+            """Find a tensor in skeleton_state_dict with flexible naming.
+
+            GPT-OSS checkpoint may use various naming conventions:
+            - block.{N}.attn.qkv.weight (our model.py style)
+            - block.{N}.attn_qkv.weight (underscore variant)
+            - block.{N}.self_attn.qkv_proj.weight
+            - block.{N}.attn.c_attn.weight (GPT-2 style)
+            - h.{N}.attn.c_attn.weight (GPT-2 with 'h' prefix)
+            """
             # Direct match first
             if target_name in self.skeleton_state_dict:
                 return target_name, self.skeleton_state_dict[target_name]
 
-            # Try common variations
-            variations = [
-                target_name,                                    # exact match
-                f"transformer.{target_name}",                   # transformer. prefix
-                f"model.{target_name}",                         # model. prefix
-                target_name.replace("embedding.", "tok_embeddings."),  # tok_embeddings
-                target_name.replace("unembedding.", "output."),        # output for LM head
-                target_name.replace("unembedding.", "lm_head."),       # lm_head for LM head
-                target_name.replace(".scale", ".weight"),              # .weight instead of .scale
-                target_name.replace("norm.scale", "ln.weight"),        # ln instead of norm
-                target_name.replace("block.", "layers."),              # layers instead of block
-                target_name.replace("block.", "h."),                   # h instead of block (GPT-2 style)
-            ]
+            # Build comprehensive variations
+            variations = [target_name]  # exact match first
 
+            # Extract layer index if present (e.g., "block.5.attn.qkv.weight" -> layer=5)
+            import re
+            layer_match = re.search(r'block\.(\d+)\.', target_name)
+            layer_idx = int(layer_match.group(1)) if layer_match else None
+
+            # Common prefix variations
+            for prefix in ["", "transformer.", "model.", "transformer.model."]:
+                variations.append(f"{prefix}{target_name}")
+
+            # GPT-2 style: block -> h
+            variations.append(target_name.replace("block.", "h."))
+            variations.append(f"transformer.{target_name.replace('block.', 'h.')}")
+
+            # Attention naming variations
+            if ".attn." in target_name:
+                # attn -> self_attn
+                variations.append(target_name.replace(".attn.", ".self_attn."))
+                # attn -> attention
+                variations.append(target_name.replace(".attn.", ".attention."))
+
+                # QKV variations
+                if ".qkv." in target_name:
+                    # qkv -> c_attn (GPT-2)
+                    variations.append(target_name.replace(".qkv.", ".c_attn."))
+                    # qkv -> qkv_proj
+                    variations.append(target_name.replace(".qkv.", ".qkv_proj."))
+                    # attn.qkv -> attn_qkv (underscore)
+                    variations.append(target_name.replace(".attn.qkv.", ".attn_qkv."))
+                    # attn.qkv -> Wqkv
+                    variations.append(target_name.replace(".attn.qkv.", ".attn.Wqkv."))
+
+                # Output projection variations
+                if ".out." in target_name:
+                    # out -> c_proj (GPT-2)
+                    variations.append(target_name.replace(".out.", ".c_proj."))
+                    # out -> o_proj
+                    variations.append(target_name.replace(".out.", ".o_proj."))
+                    # out -> out_proj
+                    variations.append(target_name.replace(".out.", ".out_proj."))
+                    # attn.out -> attn_out (underscore)
+                    variations.append(target_name.replace(".attn.out.", ".attn_out."))
+
+                # Norm variations
+                if ".norm." in target_name:
+                    # norm -> ln (layer norm)
+                    variations.append(target_name.replace(".norm.", ".ln."))
+                    # norm -> input_layernorm
+                    variations.append(target_name.replace(".attn.norm.", ".input_layernorm."))
+                    # attn.norm -> attn_norm
+                    variations.append(target_name.replace(".attn.norm.", ".attn_norm."))
+
+            # MLP/FFN variations
+            if ".mlp." in target_name:
+                if ".mlp.norm." in target_name:
+                    # mlp.norm -> post_attention_layernorm
+                    variations.append(target_name.replace(".mlp.norm.", ".post_attention_layernorm."))
+                    # mlp.norm -> mlp_norm
+                    variations.append(target_name.replace(".mlp.norm.", ".mlp_norm."))
+                if ".mlp.gate." in target_name:
+                    # gate -> router
+                    variations.append(target_name.replace(".mlp.gate.", ".mlp.router."))
+                    # mlp.gate -> moe_gate
+                    variations.append(target_name.replace(".mlp.gate.", ".moe_gate."))
+
+            # Embedding variations
+            if "embedding." in target_name:
+                variations.append(target_name.replace("embedding.", "tok_embeddings."))
+                variations.append(target_name.replace("embedding.", "embed_tokens."))
+                variations.append(target_name.replace("embedding.", "wte."))
+
+            # Unembedding/LM head variations
+            if "unembedding." in target_name:
+                variations.append(target_name.replace("unembedding.", "output."))
+                variations.append(target_name.replace("unembedding.", "lm_head."))
+
+            # Scale -> weight variations
+            if ".scale" in target_name:
+                variations.append(target_name.replace(".scale", ".weight"))
+
+            # Add transformer prefix to all variations
+            for var in list(variations):
+                if not var.startswith("transformer."):
+                    variations.append(f"transformer.{var}")
+
+            # Try all variations
             for var in variations:
                 if var in self.skeleton_state_dict:
                     return var, self.skeleton_state_dict[var]
@@ -534,12 +616,38 @@ class GptOssParallelStrategyManager:
                 f"block.{layer_idx}.mlp.gate.bias": f"block.{layer_idx}.mlp.gate.bias",
             })
 
+        # Helper to find similar tensor names for debugging
+        def find_similar_names(target_name: str, skeleton_keys: list, max_results: int = 3) -> list:
+            """Find skeleton keys that might match the target name."""
+            import re
+            # Extract key parts from target name
+            parts = target_name.lower().split('.')
+            similar = []
+            for key in skeleton_keys:
+                key_lower = key.lower()
+                # Check how many parts match
+                matches = sum(1 for p in parts if p in key_lower)
+                if matches >= 2:  # At least 2 parts match
+                    similar.append((key, matches))
+            # Sort by number of matches (descending)
+            similar.sort(key=lambda x: x[1], reverse=True)
+            return [s[0] for s in similar[:max_results]]
+
         # Load each expected parameter
+        skeleton_keys = list(self.skeleton_state_dict.keys()) if self.skeleton_state_dict else []
+
         for target_name, model_name in expected_params.items():
             ckpt_name, tensor = find_skeleton_tensor(target_name)
 
             if tensor is None:
                 missing.append(target_name)
+                # For critical attention weights, log potential matches
+                if "qkv" in target_name or "out" in target_name:
+                    similar = find_similar_names(target_name, skeleton_keys)
+                    if similar:
+                        logging.warning(
+                            f"Missing {target_name}, possible matches in skeleton: {similar}"
+                        )
                 continue
 
             if model_name not in model_state:
@@ -584,6 +692,23 @@ class GptOssParallelStrategyManager:
         logging.info(f"  Missing: {len(missing)}")
         if missing and len(missing) <= 20:
             logging.warning(f"  Missing tensors: {missing}")
+
+        # Check if critical attention weights are missing
+        critical_missing = [m for m in missing if "qkv" in m or "out" in m]
+        if critical_missing:
+            logging.error(
+                f"CRITICAL: {len(critical_missing)} attention weights missing from skeleton!\n"
+                f"  Missing: {critical_missing[:5]}{'...' if len(critical_missing) > 5 else ''}\n"
+                f"  skeleton_state_dict has {len(skeleton_keys)} tensors\n"
+                f"  This usually means the checkpoint uses different naming.\n"
+                f"  Check the skeleton tensor names logged above and update find_skeleton_tensor()."
+            )
+            # Log all skeleton keys containing 'attn' or 'qkv' for debugging
+            attn_keys = [k for k in skeleton_keys if 'attn' in k.lower() or 'qkv' in k.lower()]
+            if attn_keys:
+                logging.error(f"  Skeleton tensors with 'attn' or 'qkv': {attn_keys[:10]}")
+            else:
+                logging.error(f"  No skeleton tensors with 'attn' or 'qkv' found - checkpoint may not contain attention weights!")
 
         # Validate all Linear layers have proper 2D weights
         self._validate_linear_weights(transformer)
