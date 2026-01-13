@@ -151,8 +151,9 @@ class GptOssExpertWrapper(nn.Module):
         # Module key for core_engine weight lookup
         self.expert_weights_idx = f"routed_expert_{layer_idx}_{expert_idx}"
 
-        # Phase for prefetching (0 = prefill, 1 = decode)
-        self.phase = 0
+        # Phase for prefetching: "prefill" or "decode"
+        # core_engine.get_weights() expects (str, str)
+        self.phase = "prefill"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with dynamic MXFP4 weight loading.
@@ -174,8 +175,8 @@ class GptOssExpertWrapper(nn.Module):
 
         return output
 
-    def set_phase(self, phase: int):
-        """Set the execution phase (0=prefill, 1=decode)."""
+    def set_phase(self, phase: str):
+        """Set the execution phase ("prefill" or "decode")."""
         self.phase = phase
 
 
