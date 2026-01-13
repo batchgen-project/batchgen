@@ -21,7 +21,23 @@
 Handles model weight loading and shared memory allocation for GPT-OSS.
 Model specs:
 - 36 layers, 128 experts, 117B total params (5.1B active)
-- MXFP4 quantized weights (~55 GB for MoE, ~3 GB for attention)
+- MXFP4 quantized expert weights stored as uint8 packed + uint8 scales
+
+Key difference from DeepSeek:
+- GPT-OSS stores all experts in ONE stacked tensor per layer: [num_experts, ...]
+- We slice these into individual expert tensors during checkpoint conversion
+- This allows reusing DeepSeek-style expert handling
+
+OpenAI checkpoint tensor naming:
+- block.{N}.mlp.mlp1_weight.blocks: [128, intermediate*2, hidden//2] - MXFP4 packed
+- block.{N}.mlp.mlp1_weight.scales: [128, intermediate*2, hidden//32] - scales
+- block.{N}.mlp.mlp2_weight.blocks: [128, hidden, intermediate//2] - MXFP4 packed
+- block.{N}.mlp.mlp2_weight.scales: [128, hidden, intermediate//32] - scales
+
+After slicing:
+- block.{N}.mlp.experts.{E}.mlp1.packed: [intermediate*2, hidden//2]
+- block.{N}.mlp.experts.{E}.mlp1.scales: [intermediate*2, hidden//32]
+- etc.
 """
 
 import gc
@@ -30,15 +46,15 @@ import logging
 import os
 import shutil
 import uuid
+from dataclasses import dataclass
 from multiprocessing import Process
 from pathlib import Path
+from typing import Dict, Any
 
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from tqdm import tqdm, trange
 
-from .configuration_gpt_oss import GptOssConfig
-from .modeling_gpt_oss import GptOssForCausalLM
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
 # Path to local GPT-OSS config directory (same as this file's directory)
@@ -51,17 +67,37 @@ except ImportError:
     Parameter_Server = core_engine.Parameter_Server
 
 
+@dataclass
+class ModelConfig:
+    """GPT-OSS model configuration (OpenAI style)."""
+    num_hidden_layers: int = 36
+    num_experts: int = 128
+    experts_per_token: int = 4
+    vocab_size: int = 201088
+    hidden_size: int = 2880
+    intermediate_size: int = 2880
+    swiglu_limit: float = 7.0
+    head_dim: int = 64
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 8
+    sliding_window: int = 128
+    initial_context_length: int = 4096
+    rope_theta: float = 150000.0
+    rope_scaling_factor: float = 32.0
+    rope_ntk_alpha: float = 1.0
+    rope_ntk_beta: float = 32.0
+
+
 class GptOss_Parameter_Server:
     """Parameter server for GPT-OSS-120B model weights.
 
-    Manages shared memory allocation for model parameters, enabling
-    efficient weight loading across multiple GPU workers.
+    This class handles:
+    1. Loading GPT-OSS checkpoint (stacked expert format)
+    2. Slicing stacked experts into individual expert tensors
+    3. Converting to BatchGen format with proper state_dict_name_map
+    4. Allocating shared memory for efficient multi-GPU inference
 
-    Args:
-        huggingface_ckpt_name: HuggingFace model identifier (e.g., "openai/gpt-oss-120b")
-        cache_dir: Directory containing model checkpoint files
-        pt_ckpt_dir: Directory for converted PyTorch checkpoint files
-        enable_hugetlbfs: Whether to use hugepages for shared memory
+    MXFP4 weights are stored as-is (blocks + scales) for W4A16 GEMM.
     """
 
     def __init__(
@@ -78,7 +114,7 @@ class GptOss_Parameter_Server:
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
 
-        # Load model configuration from local config directory
+        # Load model configuration from local config directory (OpenAI style)
         config_path = _GPT_OSS_CONFIG_DIR / "config.json"
         if not config_path.exists():
             raise FileNotFoundError(
@@ -90,15 +126,13 @@ class GptOss_Parameter_Server:
         with open(config_path, "r") as f:
             config_dict = json.load(f)
 
-        self.hf_model_config = GptOssConfig(**config_dict)
-        self.hf_model_config._name_or_path = huggingface_ckpt_name
-        self.hf_model_config.architectures = ["GptOssForCausalLM"]
+        self.model_config = ModelConfig(**config_dict)
 
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(
-            f"GPT-OSS Parameter Server instantiation: GPU 0 free memory: {gpu0_memory:.2f} GB / {total_memory:.2f} GB"
+            f"GPT-OSS Parameter Server: GPU 0 free memory: {gpu0_memory:.2f} GB / {total_memory:.2f} GB"
         )
 
     def Init(self):
@@ -106,193 +140,250 @@ class GptOss_Parameter_Server:
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(
-            f"GPU 0 free mem at Init start: {gpu0_memory:.2f} GB / {total_memory:.2f} GB"
-        )
+        logging.info(f"GPU 0 free mem at Init start: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
 
+        # Step 1: Convert and slice checkpoint if needed
+        self.converted_ckpt_dir = self._convert_and_slice_checkpoint()
+
+        # Step 2: Build state_dict_name_map for sliced tensors
         self._parse_state_dict()
 
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
-        total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(
-            f"GPU 0 free mem before cpp PM instantiate: {gpu0_memory:.2f} GB / {total_memory:.2f} GB"
-        )
+        logging.info(f"GPU 0 free mem before C++ PM init: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
 
+        # Step 3: Initialize C++ parameter server
         self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
 
-        # Calculate required shared memory size for GPT-OSS-120B
-        # MXFP4 quantized: ~55 GB for experts + ~3 GB for attention + ~2 GB for embeddings
-        # Total estimated: ~60 GB
+        # GPT-OSS-120B memory estimate:
+        # - MXFP4 experts: ~55 GB (128 experts × 36 layers × ~12MB each)
+        # - BF16 attention: ~3 GB
+        # - Embeddings: ~1 GB
+        # Total: ~60 GB
         byte_size = 65 * 1024 * 1024 * 1024  # 65 GB with buffer
 
         total, used, free = shutil.disk_usage("/dev/shm")
         logging.info(f"Freespace in /dev/shm: {free / 1024 / 1024 / 1024:.2f} GB")
         if free < byte_size:
             raise ValueError(
-                f"Shared memory size is not enough. Required: {byte_size / 1024 / 1024 / 1024:.2f} GB, "
-                f"Available: {free / 1024 / 1024 / 1024:.2f} GB. "
-                f"Please clear /dev/shm or increase the size by running "
-                f"'sudo mount -o remount,size=<size>G /dev/shm'"
+                f"Shared memory insufficient. Required: {byte_size / 1024**3:.2f} GB, "
+                f"Available: {free / 1024**3:.2f} GB. "
+                f"Run: sudo mount -o remount,size=<size>G /dev/shm"
             )
 
         self.shm_name = "/shm_" + str(uuid.uuid4())
         self.tensor_meta_shm_name = "/shm_" + str(uuid.uuid4())
-        logging.info(f"Model parameters shared memory name: {self.shm_name}")
-        logging.info(f"Tensor meta shared memory name: {self.tensor_meta_shm_name}")
-        logging.info(f"Byte size: {byte_size / 1024 / 1024 / 1024:.2f} GB")
+        logging.info(f"Model parameters SHM: {self.shm_name}")
+        logging.info(f"Tensor meta SHM: {self.tensor_meta_shm_name}")
+        logging.info(f"Byte size: {byte_size / 1024**3:.2f} GB")
 
-        free_memory, total_memory = torch.cuda.mem_get_info()
-        gpu0_memory = free_memory / 1024 / 1024 / 1024
-        total_memory = total_memory / 1024 / 1024 / 1024
-        logging.info(
-            f"GPU 0 free memory before cpp PM Init: {gpu0_memory:.2f} GB / {total_memory:.2f} GB"
-        )
-
-        # Convert checkpoint files to BatchGen format (or validate existing conversion)
-        converter = ckpt_converter()
-        self.pt_ckpt_dir = converter.convert_model_directory(self.cache_dir)
-
+        # Step 4: Initialize parameter server with sliced checkpoint
         self.parameter_server.Init(
             self.shm_name,
             self.tensor_meta_shm_name,
             byte_size,
-            self.pt_ckpt_dir,
+            self.converted_ckpt_dir,
             self.state_dict_name_map,
         )
         return self.shm_name, self.tensor_meta_shm_name
 
+    def _convert_and_slice_checkpoint(self) -> str:
+        """Convert GPT-OSS checkpoint: slice stacked experts into individual tensors.
+
+        GPT-OSS stores all 128 experts in one tensor per layer.
+        We slice them into individual expert tensors for BatchGen compatibility.
+
+        Returns:
+            Path to converted checkpoint directory
+        """
+        output_dir = os.path.join(self.cache_dir, "batchgen_converted")
+        marker_file = os.path.join(output_dir, ".conversion_complete")
+
+        # Check if already converted
+        if os.path.exists(marker_file):
+            logging.info(f"Using existing converted checkpoint at {output_dir}")
+            return output_dir
+
+        logging.info(f"Converting GPT-OSS checkpoint with expert slicing...")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Find all checkpoint files
+        ckpt_files = [
+            f for f in os.listdir(self.cache_dir)
+            if f.endswith(".safetensors")
+        ]
+
+        if not ckpt_files:
+            raise FileNotFoundError(f"No .safetensors files in {self.cache_dir}")
+
+        num_layers = self.model_config.num_hidden_layers
+        num_experts = self.model_config.num_experts
+
+        # Process each checkpoint file
+        for ckpt_file in tqdm(ckpt_files, desc="Processing checkpoint files"):
+            ckpt_path = os.path.join(self.cache_dir, ckpt_file)
+            tensors = load_file(ckpt_path)
+
+            sliced_tensors = {}
+
+            for name, tensor in tensors.items():
+                # Check if this is a stacked expert tensor
+                if self._is_stacked_expert_tensor(name):
+                    # Slice and rename
+                    layer_idx = self._extract_layer_idx(name)
+                    sliced = self._slice_expert_tensor(name, tensor, layer_idx, num_experts)
+                    sliced_tensors.update(sliced)
+                else:
+                    # Keep as-is (attention, embeddings, norms, router)
+                    sliced_tensors[name] = tensor
+
+            # Save sliced checkpoint
+            output_path = os.path.join(output_dir, ckpt_file)
+            save_file(sliced_tensors, output_path)
+            logging.info(f"Saved sliced checkpoint: {output_path} ({len(sliced_tensors)} tensors)")
+
+        # Run standard BatchGen conversion on sliced checkpoint
+        converter = ckpt_converter()
+        final_dir = converter.convert_model_directory(output_dir)
+
+        # Mark conversion complete
+        with open(marker_file, "w") as f:
+            f.write("complete")
+
+        logging.info(f"Checkpoint conversion complete: {final_dir}")
+        return final_dir
+
+    def _is_stacked_expert_tensor(self, name: str) -> bool:
+        """Check if tensor is a stacked expert tensor (mlp1/mlp2 weights)."""
+        stacked_patterns = [
+            ".mlp.mlp1_weight.blocks",
+            ".mlp.mlp1_weight.scales",
+            ".mlp.mlp1_bias",
+            ".mlp.mlp2_weight.blocks",
+            ".mlp.mlp2_weight.scales",
+            ".mlp.mlp2_bias",
+        ]
+        return any(p in name for p in stacked_patterns)
+
+    def _extract_layer_idx(self, name: str) -> int:
+        """Extract layer index from tensor name like 'block.5.mlp...'"""
+        parts = name.split(".")
+        for i, part in enumerate(parts):
+            if part == "block" and i + 1 < len(parts):
+                return int(parts[i + 1])
+        raise ValueError(f"Cannot extract layer index from {name}")
+
+    def _slice_expert_tensor(
+        self, name: str, tensor: torch.Tensor, layer_idx: int, num_experts: int
+    ) -> Dict[str, torch.Tensor]:
+        """Slice a stacked expert tensor into individual expert tensors.
+
+        Input: block.{L}.mlp.mlp1_weight.blocks [128, out_dim, in_dim//2]
+        Output: block.{L}.mlp.experts.{E}.mlp1.packed [out_dim, in_dim//2] for E in 0..127
+        """
+        sliced = {}
+
+        # Determine tensor type from name
+        if "mlp1_weight.blocks" in name:
+            tensor_suffix = "mlp1.packed"
+        elif "mlp1_weight.scales" in name:
+            tensor_suffix = "mlp1.scales"
+        elif "mlp1_bias" in name:
+            tensor_suffix = "mlp1.bias"
+        elif "mlp2_weight.blocks" in name:
+            tensor_suffix = "mlp2.packed"
+        elif "mlp2_weight.scales" in name:
+            tensor_suffix = "mlp2.scales"
+        elif "mlp2_bias" in name:
+            tensor_suffix = "mlp2.bias"
+        else:
+            raise ValueError(f"Unknown stacked tensor type: {name}")
+
+        # Slice along first dimension (num_experts)
+        assert tensor.shape[0] == num_experts, \
+            f"Expected {num_experts} experts, got {tensor.shape[0]} in {name}"
+
+        for expert_idx in range(num_experts):
+            new_name = f"block.{layer_idx}.mlp.experts.{expert_idx}.{tensor_suffix}"
+            sliced[new_name] = tensor[expert_idx].contiguous()
+
+        return sliced
+
     def _parse_state_dict(self):
-        """Parse model state dict to build weight copy tasks and name mapping.
+        """Build state_dict_name_map for sliced expert tensors.
 
-        Uses ORIGINAL GPT-OSS checkpoint names (not HuggingFace names) since
-        the checkpoint converter preserves original tensor names.
+        Maps checkpoint tensor names to (module_key, tensor_key) pairs.
+        Uses DeepSeek-style naming: routed_expert_{layer}_{expert}
 
-        IMPORTANT: Only attention and expert weights go in state_dict_name_map
-        for dynamic loading. Skeleton weights (embeddings, norms, lm_head, router)
-        are NOT added to state_dict_name_map - they go directly to skeleton_state_dict
-        with their original checkpoint names.
+        NOTE: GPT-OSS attention weights are NOT in state_dict_name_map.
+        They are loaded as skeleton weights (once at init) because:
+        1. BF16 attention weights are not quantized (no special handling needed)
+        2. They don't change between requests
+        3. No custom attention wrapper exists for GPT-OSS (uses vanilla model.py attention)
 
-        Original GPT-OSS naming convention:
-        Skeleton weights (loaded once, kept in model):
-        - embedding.weight, unembedding.weight
-        - block.{N}.attn.norm.scale, block.{N}.mlp.norm.scale
-        - block.{N}.mlp.gate.weight/bias (router)
-        - final_norm.scale
-
-        Dynamic weights (loaded on-demand):
-        - block.{N}.attn.qkv.weight/bias (combined QKV)
-        - block.{N}.attn.out.weight/bias
-        - block.{N}.mlp.mlp1_weight.blocks/scales (expert gate_proj, packed MXFP4)
-        - block.{N}.mlp.mlp2_weight.blocks/scales (expert up_proj + down_proj, packed MXFP4)
+        Only expert MLP weights (MXFP4) are dynamically loaded via Expert_Wrapper.
         """
         self.weight_copy_task["attn"] = []
         self.weight_copy_task["routed_expert"] = []
 
-        num_layers = self.hf_model_config.num_hidden_layers
+        num_layers = self.model_config.num_hidden_layers
+        num_experts = self.model_config.num_experts
 
-        for layer_idx in trange(num_layers, desc="Parsing GPT-OSS state_dict"):
-            # Attention weights (using original GPT-OSS names) - DYNAMIC LOADING
-            # Combined QKV weight/bias
-            self.state_dict_name_map[f"block.{layer_idx}.attn.qkv.weight"] = {
-                "module_key": f"attn_{layer_idx}",
-                "tensor_key": "qkv.weight",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.attn.qkv.bias"] = {
-                "module_key": f"attn_{layer_idx}",
-                "tensor_key": "qkv.bias",
-            }
-            # Output projection
-            self.state_dict_name_map[f"block.{layer_idx}.attn.out.weight"] = {
-                "module_key": f"attn_{layer_idx}",
-                "tensor_key": "o_proj.weight",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.attn.out.bias"] = {
-                "module_key": f"attn_{layer_idx}",
-                "tensor_key": "o_proj.bias",
-            }
-            self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
+        for layer_idx in trange(num_layers, desc="Building state_dict_name_map"):
+            # =================================================================
+            # Attention weights (BF16) - SKELETON LOADING
+            # =================================================================
+            # NOTE: Attention weights are NOT added to state_dict_name_map.
+            # They will be loaded as skeleton weights via get_skeleton_state_dict()
+            # and then loaded into the model by Parallel_Strategy_Manager._load_model_skeleton()
+            #
+            # Weights loaded as skeleton:
+            # - block.{N}.attn.qkv.weight, block.{N}.attn.qkv.bias
+            # - block.{N}.attn.out.weight, block.{N}.attn.out.bias
+            # - block.{N}.attn.norm.scale, block.{N}.attn.sinks
 
-            # Expert weights (MXFP4 packed format) - DYNAMIC LOADING
-            # GPT-OSS uses shared mlp1_weight and mlp2_weight for all experts in a layer
-            # mlp1_weight = gate_proj for all experts
-            # mlp2_weight = up_proj + down_proj for all experts
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp1_weight.blocks"] = {
-                "module_key": f"routed_expert_{layer_idx}",
-                "tensor_key": "mlp1_weight.blocks",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp1_weight.scales"] = {
-                "module_key": f"routed_expert_{layer_idx}",
-                "tensor_key": "mlp1_weight.scales",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp2_weight.blocks"] = {
-                "module_key": f"routed_expert_{layer_idx}",
-                "tensor_key": "mlp2_weight.blocks",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp2_weight.scales"] = {
-                "module_key": f"routed_expert_{layer_idx}",
-                "tensor_key": "mlp2_weight.scales",
-            }
-            # Also include MLP biases in expert module
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp1_bias"] = {
-                "module_key": f"routed_expert_{layer_idx}",
-                "tensor_key": "mlp1_bias",
-            }
-            self.state_dict_name_map[f"block.{layer_idx}.mlp.mlp2_bias"] = {
-                "module_key": f"routed_expert_{layer_idx}",
-                "tensor_key": "mlp2_bias",
-            }
-            # Add one routed_expert task per layer (weights are shared across experts)
-            self.weight_copy_task["routed_expert"].append(f"routed_expert_{layer_idx}")
+            # =================================================================
+            # Expert MLP weights (MXFP4) - DYNAMIC LOADING
+            # Each expert is now a separate module (after slicing)
+            # =================================================================
+            for expert_idx in range(num_experts):
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
 
-            # NOTE: Router, layer norms, embeddings, final_norm, lm_head are NOT added
-            # to state_dict_name_map - they will go to skeleton_state_dict automatically
+                # mlp1 (gate+up projection) - MXFP4
+                self.state_dict_name_map[f"block.{layer_idx}.mlp.experts.{expert_idx}.mlp1.packed"] = {
+                    "module_key": module_key,
+                    "tensor_key": "mlp1.packed",
+                }
+                self.state_dict_name_map[f"block.{layer_idx}.mlp.experts.{expert_idx}.mlp1.scales"] = {
+                    "module_key": module_key,
+                    "tensor_key": "mlp1.scales",
+                }
+                self.state_dict_name_map[f"block.{layer_idx}.mlp.experts.{expert_idx}.mlp1.bias"] = {
+                    "module_key": module_key,
+                    "tensor_key": "mlp1.bias",
+                }
+
+                # mlp2 (down projection) - MXFP4
+                self.state_dict_name_map[f"block.{layer_idx}.mlp.experts.{expert_idx}.mlp2.packed"] = {
+                    "module_key": module_key,
+                    "tensor_key": "mlp2.packed",
+                }
+                self.state_dict_name_map[f"block.{layer_idx}.mlp.experts.{expert_idx}.mlp2.scales"] = {
+                    "module_key": module_key,
+                    "tensor_key": "mlp2.scales",
+                }
+                self.state_dict_name_map[f"block.{layer_idx}.mlp.experts.{expert_idx}.mlp2.bias"] = {
+                    "module_key": module_key,
+                    "tensor_key": "mlp2.bias",
+                }
+
+                self.weight_copy_task["routed_expert"].append(module_key)
+
+        # Log summary
+        num_attn = len(self.weight_copy_task["attn"])
+        num_expert = len(self.weight_copy_task["routed_expert"])
+        num_tensors = len(self.state_dict_name_map)
+        logging.info(f"State dict map: {num_attn} attn modules, {num_expert} expert modules, {num_tensors} tensors")
 
         gc.collect()
         torch.cuda.empty_cache()
-
-    def save_and_load(self, file_path, save_dir):
-        """Convert safetensors file to PyTorch format."""
-        tensor_dict = load_file(file_path)
-        torch.save(tensor_dict, save_dir)
-        return tensor_dict
-
-    def _save_safetensors_to_pt(self):
-        """Convert safetensors checkpoint files to PyTorch format."""
-        logging.info(f"cache_dir: {self.cache_dir}")
-        ckpt_files = os.listdir(self.cache_dir)
-        ckpt_files = [
-            os.path.join(self.cache_dir, ckpt)
-            for ckpt in ckpt_files
-            if ckpt.endswith(".safetensors")
-        ]
-        processes = []
-        for ckpt in tqdm(ckpt_files, desc="Loading checkpoint files", smoothing=0):
-            dst_dir = os.path.join(
-                self.pt_ckpt_dir,
-                ckpt.split("/")[-1].replace(".safetensors", ".pt"),
-            )
-            if os.path.exists(dst_dir):
-                continue
-
-            logging.info(
-                f"Checkpoint file: {ckpt} not found in {self.pt_ckpt_dir}. "
-                f"Converting now. Will skip this step next time."
-            )
-            p = Process(target=self.save_and_load, args=(ckpt, dst_dir))
-            p.start()
-            processes.append(p)
-
-        try:
-            for p in processes:
-                p.join()
-                if p.exitcode != 0:
-                    logging.error(f"Process terminated with exit code {p.exitcode}")
-                    import sys
-                    sys.exit(1)
-                p.close()
-        except Exception as e:
-            logging.error(f"Error occurred: {e}")
-            import sys
-            sys.exit(1)
-        logging.info("All safetensor loader processes joined")

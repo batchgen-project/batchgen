@@ -282,6 +282,10 @@ class GptOssAttention(nn.Module):
             beta_slow=config.rope_scaling.get("beta_slow", 1.0),
         )
 
+        # Attention sinks - learnable KV pairs for attention optimization
+        # Shape: [num_kv_heads, 2, head_dim] for K and V sinks
+        self.sinks = nn.Parameter(torch.zeros(self.num_kv_heads, 2, self.head_dim))
+
     def forward(
         self,
         hidden_states: torch.Tensor,

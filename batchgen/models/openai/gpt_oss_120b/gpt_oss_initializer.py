@@ -18,7 +18,12 @@
 
 """GPT-OSS-120B initializer for BatchGen.
 
-Handles model initialization, weight loading, and MXFP4 dequantization.
+Handles model initialization and weight loading using W4A16 fused GEMM.
+
+GPT-OSS uses MXFP4 quantization (4-bit weights) with W4A16 inference:
+- Weights: MXFP4 (uint8 packed + uint8 scales) - stay in 4-bit
+- Activations: BF16
+- GEMM: Fused dequant-GEMM (dequantize on-the-fly during matrix multiply)
 """
 
 import logging
@@ -39,34 +44,21 @@ except ImportError:
     core_engine = loader_module.batchgen
 
 
-def mxfp4_dequantize_weight(
-    packed: torch.Tensor,
-    scales: torch.Tensor,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Dequantize MXFP4 packed weights.
-
-    Args:
-        packed: Packed FP4 values as uint8 [out_features, in_features//2]
-        scales: Scale factors as uint8 [out_features, in_features//32]
-        dtype: Output dtype (default: bfloat16)
-
-    Returns:
-        Dequantized weight tensor [out_features, in_features]
-    """
-    # Import the MXFP4 dequantization function
-    from batchgen.quantization.mxfp4 import mxfp4_dequantize
-    return mxfp4_dequantize(packed, scales, dtype)
-
-
 class GptOssInitializer:
     """Initialize GPT-OSS-120B model for BatchGen inference.
 
     Handles:
-    - Model configuration parsing
-    - Engine configuration
-    - Weight loading with MXFP4 dequantization
+    - Model configuration parsing (OpenAI-style config)
+    - Engine configuration for W4A16 MXFP4 inference
+    - Weight loading (MXFP4 packed + scales, no pre-dequantization)
     - KV cache configuration for single H20 GPU
+
+    GPT-OSS-120B architecture:
+    - 36 layers, 128 experts (Top-4 routing)
+    - GQA: 64 attention heads, 8 KV heads
+    - Combined QKV projection (not separate Q/K/V)
+    - MXFP4 quantized expert weights (~55GB total)
+    - BF16 attention weights (~3GB)
     """
 
     def __init__(self, input_arguments):
@@ -123,9 +115,11 @@ class GptOssInitializer:
         engine_config.Basic_Config.padding_length = args.padding_length
         engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
 
-        # Weight dtype: GPT-OSS uses MXFP4 but we represent as bfloat16 after dequant
-        engine_config.Basic_Config.weight_dtype = "bfloat16"
-        engine_config.Basic_Config.weight_dtype_torch = torch.bfloat16
+        # Weight dtype: GPT-OSS uses MXFP4 (W4A16 - keep weights as 4-bit uint8)
+        # Expert weights stored as packed uint8 + scales uint8
+        # Dequantization happens on-the-fly during fused GEMM
+        engine_config.Basic_Config.weight_dtype = "uint8"
+        engine_config.Basic_Config.weight_dtype_torch = torch.uint8
 
         # KV dtype: GPT-OSS uses BF16 for attention (not quantized)
         engine_config.Basic_Config.kv_dtype = "bfloat16"
@@ -190,24 +184,42 @@ class GptOssInitializer:
         )
 
         # Module shapes for GPT-OSS (attention in BF16, experts in MXFP4)
+        # GPT-OSS uses combined QKV projection (OpenAI style), not separate Q/K/V
+        hidden_size = 2880
+        num_q_heads = 64
+        num_kv_heads = 8
+        head_dim = 64
+        intermediate_size = 2880
+
+        # Combined QKV dim: Q (64*64) + K (8*64) + V (8*64) = 4096 + 512 + 512 = 5120
+        qkv_dim = (num_q_heads + 2 * num_kv_heads) * head_dim  # 5120
+        out_dim = num_q_heads * head_dim  # 4096
+
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             "attn": {
-                # GQA: 64 query heads, 8 KV heads, head_dim=64
-                "q_proj.weight": [4096, 2880],  # [64*64, hidden]
-                "k_proj.weight": [512, 2880],   # [8*64, hidden]
-                "v_proj.weight": [512, 2880],   # [8*64, hidden]
-                "o_proj.weight": [2880, 4096],  # [hidden, 64*64]
+                # Combined QKV projection (BF16)
+                "qkv.weight": [qkv_dim, hidden_size],  # [5120, 2880]
+                "qkv.bias": [qkv_dim],  # [5120]
+                # Output projection (BF16)
+                "out.weight": [hidden_size, out_dim],  # [2880, 4096]
+                "out.bias": [hidden_size],  # [2880]
             },
             "routed_expert": {
-                # MXFP4 quantized: store as packed + scales
-                "gate_proj.weight": [2880, 2880],  # Will be MXFP4
-                "up_proj.weight": [2880, 2880],
-                "down_proj.weight": [2880, 2880],
+                # MXFP4 quantized expert weights
+                # mlp1 = gate_proj || up_proj (concatenated)
+                # mlp2 = down_proj
+                # Stored as packed uint8 + scales uint8 + bias BF16
+                "mlp1.packed": [intermediate_size * 2, hidden_size // 2],  # [5760, 1440]
+                "mlp1.scales": [intermediate_size * 2, hidden_size // 32],  # [5760, 90]
+                "mlp1.bias": [intermediate_size * 2],  # [5760]
+                "mlp2.packed": [hidden_size, intermediate_size // 2],  # [2880, 1440]
+                "mlp2.scales": [hidden_size, intermediate_size // 32],  # [2880, 90]
+                "mlp2.bias": [hidden_size],  # [2880]
             },
         }
 
     def _parse_model_config(self) -> ModelConfig:
-        """Parse GPT-OSS model configuration."""
+        """Parse GPT-OSS model configuration (OpenAI style)."""
         model_config = ModelConfig()
 
         model_config.model_type = "gpt_oss"
@@ -220,11 +232,18 @@ class GptOssInitializer:
         model_config.intermediate_size = 2880
         model_config.num_experts_per_tok = 4
         model_config.sliding_window = 128
+        model_config.swiglu_limit = 7.0
+        model_config.vocab_size = 201088
+        model_config.rope_theta = 150000.0
 
         return model_config
 
     def Init(self, weights_storage) -> Tuple:
         """Initialize the core engine and load weights.
+
+        GPT-OSS uses W4A16 inference (MXFP4 weights, BF16 activations).
+        Weights are loaded as packed uint8 + scales uint8, no pre-dequantization.
+        Dequantization happens on-the-fly in fused MXFP4 GEMM kernels.
 
         Args:
             weights_storage: Storage for model weights
@@ -244,14 +263,19 @@ class GptOssInitializer:
             logging.info("Core engine created")
             logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
 
-            # GPT-OSS-120B: ~55GB MXFP4 weights
-            if "gpt-oss" in self.hf_model_config._name_or_path.lower():
-                param_byte_size = 55 * 1024 * 1024 * 1024  # ~55GB for MXFP4
+            # GPT-OSS-120B memory estimate (W4A16):
+            # - MXFP4 expert weights: ~55GB (128 experts × 36 layers, packed + scales)
+            # - BF16 attention weights: ~3GB (not quantized)
+            # - Embeddings + LM head: ~2GB
+            # Total: ~60GB (fits on single H20 96GB GPU)
+            if "gpt-oss" in self.hf_model_config._name_or_path.lower() or \
+               "gpt_oss" in self.hf_model_config._name_or_path.lower():
+                param_byte_size = 60 * 1024 * 1024 * 1024  # ~60GB for MXFP4 + BF16
             else:
-                raise ValueError("Unknown huggingface model card for GPT-OSS")
+                raise ValueError("Unknown model card for GPT-OSS")
 
             self.core_engine.Init()
-            logging.info("Core engine initialized")
+            logging.info("Core engine initialized (W4A16 MXFP4 mode)")
 
         except Exception as e:
             logging.error(f"Error during initialization: {e}")

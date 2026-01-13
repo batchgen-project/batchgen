@@ -382,7 +382,7 @@ class BatchGenServer:
 			raise RuntimeError(f"Failed to download model: {exc}") from exc
 
 	def _load_model_locally(self, _hf_cache_dir: str, pt_ckpt_dir: str) -> None:
-		
+
 		if "deepseek" in self.args.model.lower():
 			from batchgen.models.deepseek.deepseek_parameter_server import (
 				DeepSeek_Parameter_Server,
@@ -396,6 +396,13 @@ class BatchGenServer:
 			)
 			ps = Mixtral_Parameter_Server(
 				self.args.model, self.args.cache_dir, pt_ckpt_dir
+			)
+		elif "gpt-oss" in self.args.model.lower() or "gpt_oss" in self.args.model.lower():
+			from batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server import (
+				GptOss_Parameter_Server,
+			)
+			ps = GptOss_Parameter_Server(
+				self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs
 			)
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")

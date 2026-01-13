@@ -4690,6 +4690,7 @@ class BatchGenWorker:
 		Handle the prefill for a batch.
 		batch: list of local indices
 		"""
+		# DeepSeek uses _use_flash_attention_2 flag; GPT-OSS doesn't have this
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
@@ -4797,6 +4798,7 @@ class BatchGenWorker:
 		Args:
 			batch: list of local indices
 		"""
+		# DeepSeek uses _use_flash_attention_2 flag; GPT-OSS doesn't have this
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
@@ -5690,6 +5692,7 @@ class BatchGenWorker:
 		3. Reduced logging overhead
 		4. No timing object allocation in hot path
 		"""
+		# DeepSeek uses _use_flash_attention_2 flag; GPT-OSS doesn't have this
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
@@ -6867,6 +6870,15 @@ class BatchGenWorker:
 								* self.model_config.num_key_value_heads
 								* self.model_config.head_dim
 								* 2
+							)
+						elif "gpt_oss" in self.model_config.model_type:
+							# GPT-OSS uses GQA with 8 KV heads, head_dim=64
+							# KV dim per layer = 2 * num_kv_heads * head_dim = 1024
+							past_kv_byte_size = (
+								(self.max_input_length + idx)
+								* self.model_config.num_key_value_heads
+								* self.model_config.head_dim
+								* 2  # K and V
 							)
 						else:
 							raise ValueError(f"Model architecture {self.model_config.model_type} not supported yet.")
