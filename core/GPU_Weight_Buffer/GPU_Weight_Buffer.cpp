@@ -73,6 +73,12 @@ void GPU_Weight_Buffer::Init() {
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);
+    auto bf16_options =
+        torch::TensorOptions()
+            .dtype(torch::kBFloat16)
+            .device(torch::kCUDA, this->engine_config_.basic_config.device)
+            .requires_grad(false)
+            .memory_format(torch::MemoryFormat::Contiguous);
     for (auto& [module_type, num_buffer] : num_buffers) {
         this->buffers_[module_type].clear();
         this->buffers_[module_type].resize(num_buffer);
@@ -81,19 +87,17 @@ void GPU_Weight_Buffer::Init() {
         for (auto& [buffer_name, buffer_shape] : buffer_shapes[module_type]) {
             for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
                  buffer_idx++) {
-                if (buffer_name.find("norm") == std::string::npos) {
+                // Determine dtype based on tensor name:
+                // - "norm" and "bias" tensors use BF16
+                // - Everything else uses weight_dtype_torch (e.g., uint8 for MXFP4)
+                bool use_bf16 = (buffer_name.find("norm") != std::string::npos ||
+                                 buffer_name.find("bias") != std::string::npos);
+                if (use_bf16) {
+                    this->buffers_[module_type][buffer_idx][buffer_name] =
+                        torch::zeros(buffer_shape, bf16_options);
+                } else {
                     this->buffers_[module_type][buffer_idx][buffer_name] =
                         torch::zeros(buffer_shape, options);
-                } else {
-                    auto bf16_options =
-                        torch::TensorOptions()
-                            .dtype(torch::kBFloat16)
-                            .device(torch::kCUDA,
-                                    this->engine_config_.basic_config.device)
-                            .requires_grad(false)
-                            .memory_format(torch::MemoryFormat::Contiguous);
-                    this->buffers_[module_type][buffer_idx][buffer_name] =
-                        torch::ones(buffer_shape, bf16_options);
                 }
             }
         }
@@ -112,6 +116,12 @@ void GPU_Weight_Buffer::resize_buffer() {
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);
+    auto bf16_options =
+        torch::TensorOptions()
+            .dtype(torch::kBFloat16)
+            .device(torch::kCUDA, this->engine_config_.basic_config.device)
+            .requires_grad(false)
+            .memory_format(torch::MemoryFormat::Contiguous);
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
         int64_t to_add_buffer = num_buffers["routed_expert"] -
@@ -120,19 +130,17 @@ void GPU_Weight_Buffer::resize_buffer() {
             module_weight_tensor_map new_buffer;
             for (auto& [buffer_name, buffer_shape] :
                  buffer_shapes["routed_expert"]) {
-                if (buffer_name.find("norm") == std::string::npos) {
+                // Determine dtype based on tensor name:
+                // - "norm" and "bias" tensors use BF16
+                // - Everything else uses weight_dtype_torch (e.g., uint8 for MXFP4)
+                bool use_bf16 = (buffer_name.find("norm") != std::string::npos ||
+                                 buffer_name.find("bias") != std::string::npos);
+                if (use_bf16) {
+                    new_buffer[buffer_name] =
+                        torch::zeros(buffer_shape, bf16_options);
+                } else {
                     new_buffer[buffer_name] =
                         torch::zeros(buffer_shape, options);
-                } else {
-                    auto bf16_options =
-                        torch::TensorOptions()
-                            .dtype(torch::kBFloat16)
-                            .device(torch::kCUDA,
-                                    this->engine_config_.basic_config.device)
-                            .requires_grad(false)
-                            .memory_format(torch::MemoryFormat::Contiguous);
-                    new_buffer[buffer_name] =
-                        torch::ones(buffer_shape, bf16_options);
                 }
             }
             this->buffers_["routed_expert"].push_back(new_buffer);

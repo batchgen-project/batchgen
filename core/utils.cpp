@@ -53,14 +53,18 @@ torch::ScalarType str_to_torch_dtype(const std::string& dtype_str) {
         {"float32", torch::kFloat32},
         {"bfloat16", torch::kBFloat16},
         {"float8_e4m3fn", torch::kFloat8_e4m3fn},
-        {"float8_e5m2", torch::kFloat8_e5m2}
+        {"float8_e5m2", torch::kFloat8_e5m2},
+        {"uint8", torch::kUInt8},    // For MXFP4 packed weights
+        {"int8", torch::kInt8},
+        {"int32", torch::kInt32},
+        {"int64", torch::kInt64},
     };
 
     auto it = dtype_map.find(dtype_str);
     if (it != dtype_map.end()) {
         return it->second;
     }
-    
+
     // Default to float32 if not found
     return torch::kFloat32;
 }
