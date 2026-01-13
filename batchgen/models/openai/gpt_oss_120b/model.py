@@ -225,34 +225,49 @@ class AttentionBlock(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass supporting both 2D [seq, hidden] and 3D [batch, seq, hidden] input.
+
+        BatchGenWorker passes 3D tensors, but internal attention computation expects 2D.
+        We flatten batch*seq at start and restore at end.
+        """
+        # Handle 3D input from BatchGenWorker: [batch, seq, hidden] -> [batch*seq, hidden]
+        input_shape = x.shape
+        if x.dim() == 3:
+            batch_size, seq_len, hidden_size = x.shape
+            x = x.view(batch_size * seq_len, hidden_size)
+        else:
+            batch_size = None
+
         t = self.norm(x)
         qkv = self.qkv(t)
-        q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
-        k = qkv[
-            :,
-            self.num_attention_heads
-            * self.head_dim : (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
-        v = qkv[
-            :,
-            (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
 
+        # Split QKV using last dimension (works for both 2D and 3D after flatten)
+        q_dim = self.num_attention_heads * self.head_dim
+        k_dim = self.num_key_value_heads * self.head_dim
+        v_dim = self.num_key_value_heads * self.head_dim
+
+        q = qkv[..., :q_dim].contiguous()
+        k = qkv[..., q_dim:q_dim + k_dim].contiguous()
+        v = qkv[..., q_dim + k_dim:q_dim + k_dim + v_dim].contiguous()
+
+        num_tokens = q.shape[0]
         q = q.view(
-            -1,
+            num_tokens,
             self.num_key_value_heads,
             self.num_attention_heads // self.num_key_value_heads,
             self.head_dim,
         )
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
+        k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
+        v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
         q, k = self.rope(q, k)
         t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
         t = self.out(t)
         t = x + t
+
+        # Restore 3D shape if input was 3D: [batch*seq, hidden] -> [batch, seq, hidden]
+        if batch_size is not None:
+            t = t.view(batch_size, seq_len, -1)
+
         return t
 
 
@@ -401,15 +416,25 @@ class MLPBlock(torch.nn.Module):
 
         When wrapped by BatchGen, self.experts[i] is a GPT-OSS_Expert_Wrapper
         that handles MXFP4 weight loading and calls deepgemm_forward.
+
+        Supports both 2D [num_tokens, hidden] and 3D [batch, seq, hidden] input.
         """
-        batch_size = x.shape[0]
+        # Handle 3D input from BatchGenWorker: [batch, seq, hidden] -> [num_tokens, hidden]
+        input_shape = x.shape
+        if x.dim() == 3:
+            batch_dim, seq_len, hidden_size = x.shape
+            x = x.view(batch_dim * seq_len, hidden_size)
+        else:
+            batch_dim = None
+
+        num_tokens = x.shape[0]
 
         # Compute routing
         t = self.norm(x)
         g = self.gate(t)
-        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-        expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
-        expert_indices = experts.indices  # [batch, experts_per_token]
+        experts_result = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
+        expert_weights = torch.nn.functional.softmax(experts_result.values, dim=-1)
+        expert_indices = experts_result.indices  # [num_tokens, experts_per_token]
 
         # Initialize output accumulator
         output = torch.zeros_like(x)
@@ -420,20 +445,20 @@ class MLPBlock(torch.nn.Module):
         for expert_idx in unique_experts:
             expert_idx_item = expert_idx.item()
 
-            # Find which (batch, slot) pairs use this expert
-            mask = (expert_indices == expert_idx)  # [batch, experts_per_token]
+            # Find which (token, slot) pairs use this expert
+            mask = (expert_indices == expert_idx)  # [num_tokens, experts_per_token]
 
             # Get the tokens and weights for this expert
-            batch_indices, slot_indices = torch.where(mask)
+            token_indices, slot_indices = torch.where(mask)
 
-            if len(batch_indices) == 0:
+            if len(token_indices) == 0:
                 continue
 
             # Gather input tokens for this expert
-            expert_input = t[batch_indices]  # [num_tokens, hidden]
+            expert_input = t[token_indices]  # [num_selected, hidden]
 
             # Get the weights for these tokens
-            token_weights = expert_weights[batch_indices, slot_indices]  # [num_tokens]
+            token_weights = expert_weights[token_indices, slot_indices]  # [num_selected]
 
             # Forward through expert wrapper (handles MXFP4 weight loading)
             # The wrapper's __call__ loads weights and calls deepgemm_forward
@@ -443,9 +468,15 @@ class MLPBlock(torch.nn.Module):
             weighted_output = expert_output * token_weights.unsqueeze(-1)
 
             # Scatter-add to output
-            output.index_add_(0, batch_indices, weighted_output)
+            output.index_add_(0, token_indices, weighted_output)
 
-        return x + output
+        result = x + output
+
+        # Restore 3D shape if input was 3D: [num_tokens, hidden] -> [batch, seq, hidden]
+        if batch_dim is not None:
+            result = result.view(batch_dim, seq_len, -1)
+
+        return result
 
 
 class TransformerBlock(torch.nn.Module):
