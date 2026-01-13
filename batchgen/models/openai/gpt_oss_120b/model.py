@@ -449,6 +449,13 @@ class MLPBlock(torch.nn.Module):
 
 
 class TransformerBlock(torch.nn.Module):
+    """Transformer block with attention and MLP.
+
+    Supports both OpenAI-style (simple x input) and HuggingFace-style
+    (hidden_states with attention_mask, position_ids, etc.) calling conventions
+    for compatibility with BatchGenWorker.
+    """
+
     def __init__(
         self,
         config: ModelConfig,
@@ -460,9 +467,40 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, layer_idx, device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: tuple | None = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor | tuple:
+        """Forward pass with HuggingFace-compatible signature.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_size] or [seq_len, hidden_size]
+            attention_mask: Attention mask (currently handled internally, ignored here)
+            position_ids: Position IDs (RoPE computed internally, ignored here)
+            past_key_value: KV cache (not yet supported)
+            output_attentions: Whether to output attention weights (not supported)
+            use_cache: Whether to use KV cache (not yet supported)
+            cache_position: Cache position indices (not yet supported)
+
+        Returns:
+            hidden_states tensor, or tuple of (hidden_states, ...) if use_cache
+        """
+        # OpenAI model.py uses simple forward(x) internally
+        x = hidden_states
         x = self.attn(x)
         x = self.mlp(x)
+
+        # Return format compatible with HuggingFace expectations
+        if use_cache:
+            # Return (hidden_states, present_key_value) - KV cache not implemented yet
+            return (x, None)
         return x
 
 
