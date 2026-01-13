@@ -77,7 +77,25 @@ void Weights_Storage::Init(
     auto start_time = std::chrono::high_resolution_clock::now();
     this->byte_size_ = byte_size;
     auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
-    
+
+    // Debug: Log how many modules were deserialized
+    size_t total_tensors = 0;
+    for (const auto& [module_key, tensor_map] : weights_map) {
+        total_tensors += tensor_map.size();
+    }
+    this->logger->info(
+        "Deserialized weights_map from shm '{}': {} modules, {} total tensors",
+        tensor_meta_shm_name, weights_map.size(), total_tensors);
+
+    // Log first few module keys for debugging
+    size_t logged = 0;
+    for (const auto& [module_key, tensor_map] : weights_map) {
+        if (logged < 5) {
+            this->logger->info("  Module: {} with {} tensors", module_key, tensor_map.size());
+            logged++;
+        }
+    }
+
     this->logger->info(
         "Initializing Weights_Storage with shared memory name: {} and byte size: {}",
         shm_name, byte_size);

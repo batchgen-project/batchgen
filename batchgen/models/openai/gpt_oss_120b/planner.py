@@ -66,8 +66,16 @@ class GptOssPlanner(BasePlanner):
         if self.world_size == 1:
             # All 128 experts fit on single H20 with MXFP4 (~55GB total)
             self.config.EP_Config.num_local_expert_per_layer = self.NUM_EXPERTS
-            # No module buffer swapping needed - all experts resident
-            self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
+
+        # GPT-OSS: Attention weights are SKELETON (loaded once), not dynamically loaded.
+        # Only routed_expert needs GPU buffer allocation for dynamic H2D copy.
+        # Remove "attn" and "shared_expert" from buffer configs.
+        self.config.GPU_Buffer_Config.num_prefill_module_buffer = {
+            "routed_expert": 8,  # 8 concurrent expert buffers for prefill
+        }
+        self.config.GPU_Buffer_Config.num_decoding_module_buffer = {
+            "routed_expert": 4 if self.world_size > 1 else 0,  # 0 if all experts resident
+        }
 
     def get_module_shapes(self) -> dict:
         """Return GPT-OSS-120B specific tensor shapes."""

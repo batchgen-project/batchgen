@@ -412,51 +412,57 @@ void HtoD_Engine::HtoD_Worker() {
 
         for (auto& module_type :
              this->engine_config_.basic_config.module_types) {
-            auto optional_buffer =
-                this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
-            if (optional_buffer.has_value()) {
-                this->logger_->debug("Acquired buffer for module type: {}",
-                                     module_type);
-                CUDA_CHECK(
-                    cudaSetDevice(this->engine_config_.basic_config.device));
-                auto [buffer, buffer_idx] = optional_buffer.value();
-                std::string module_name;
-                while (this->weights_copy_task_queue_[module_type].try_pop(
-                           module_name) == false) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-                auto dst = buffer.get();
-                auto src = this->weights_storage_.get_module_weights_storage(
-                    module_name);
-                torch::Tensor tmp_src;
-                void* src_ptr;
-                int64_t src_byte_size;
-                for (auto& [tensor_name, host_tensor_storage] : src) {
-                    src_ptr = host_tensor_storage.data_ptr;
-                    src_byte_size = host_tensor_storage.byte_size;
-                    if (dst[tensor_name].defined() &&
-                        dst[tensor_name].has_storage()) {
-                        this->blocking_copy_(dst[tensor_name].data_ptr(),
-                                            src_ptr, src_byte_size);
-                    } else {
-                        this->logger_->error(
-                            "Tensor {} doesn't have valid storage",
-                            tensor_name);
-                        std::runtime_error("Tensor doesn't have valid storage");
+            try {
+                auto optional_buffer =
+                    this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
+                if (optional_buffer.has_value()) {
+                    this->logger_->debug("Acquired buffer for module type: {}",
+                                         module_type);
+                    CUDA_CHECK(
+                        cudaSetDevice(this->engine_config_.basic_config.device));
+                    auto [buffer, buffer_idx] = optional_buffer.value();
+                    std::string module_name;
+                    while (this->weights_copy_task_queue_[module_type].try_pop(
+                               module_name) == false) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                    this->logger_->debug("Copying module: {} (type: {})", module_name, module_type);
+                    auto dst = buffer.get();
+                    auto src = this->weights_storage_.get_module_weights_storage(
+                        module_name);
+                    torch::Tensor tmp_src;
+                    void* src_ptr;
+                    int64_t src_byte_size;
+                    for (auto& [tensor_name, host_tensor_storage] : src) {
+                        src_ptr = host_tensor_storage.data_ptr;
+                        src_byte_size = host_tensor_storage.byte_size;
+                        if (dst[tensor_name].defined() &&
+                            dst[tensor_name].has_storage()) {
+                            this->blocking_copy_(dst[tensor_name].data_ptr(),
+                                                src_ptr, src_byte_size);
+                        } else {
+                            this->logger_->error(
+                                "Tensor {} doesn't have valid storage",
+                                tensor_name);
+                            std::runtime_error("Tensor doesn't have valid storage");
+                        }
+                    }
+                    this->logger_->debug("Copied module: {} to buffer: {}",
+                                        module_name, buffer_idx);
+                    // CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
+                    // CUDA_CHECK(cudaStreamSynchronize(0));
+                    this->gpu_weight_buffer_.weights_copy_complete(
+                        module_type, module_name, buffer_idx);
+                    /* PUSH THE TASK BACK */
+                    {
+                        std::lock_guard<std::mutex> lock(this->mutex_);
+                        this->weights_copy_task_queue_[module_type].push(
+                            module_name);
                     }
                 }
-                this->logger_->debug("Copied module: {} to buffer: {}",
-                                    module_name, buffer_idx);
-                // CUDA_CHECK(cudaStreamSynchronize(this->HtoD_stream));
-                // CUDA_CHECK(cudaStreamSynchronize(0));
-                this->gpu_weight_buffer_.weights_copy_complete(
-                    module_type, module_name, buffer_idx);
-                /* PUSH THE TASK BACK */
-                {
-                    std::lock_guard<std::mutex> lock(this->mutex_);
-                    this->weights_copy_task_queue_[module_type].push(
-                        module_name);
-                }
+            } catch (const std::exception& e) {
+                this->logger_->error("HtoD weight copy error for module_type '{}': {}",
+                                    module_type, e.what());
             }
         }
     }

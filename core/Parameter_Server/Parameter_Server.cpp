@@ -430,9 +430,30 @@ void Parameter_Server::Init(
     // Load weights from the model_weights_path
     _load_cus_format_file_to_host_mem(model_weights_path, weight_ptr, state_dict_name_map);
 
+    // Debug: Log how many modules are being serialized
+    size_t total_tensors = 0;
+    for (const auto& [module_key, tensor_map] : this->module_weights_storage_) {
+        total_tensors += tensor_map.size();
+    }
+    this->logger->info(
+        "Serializing module_weights_storage_: {} modules, {} total tensors to shm '{}'",
+        this->module_weights_storage_.size(), total_tensors, tensor_meta_shm_name);
+
+    // Log first few module keys for debugging
+    size_t logged = 0;
+    for (const auto& [module_key, tensor_map] : this->module_weights_storage_) {
+        if (logged < 5) {
+            this->logger->info("  Module: {} with {} tensors", module_key, tensor_map.size());
+            logged++;
+        }
+    }
+
+    // Also log skeleton_state_dict_ size
+    this->logger->info("skeleton_state_dict_ has {} tensors", this->skeleton_state_dict_.size());
+
     // Serialize the module weights storage to shared memory
     serialize_to_shared_memory(this->module_weights_storage_, tensor_meta_shm_name);
-    
+
     std::cout << std::endl;
     this->logger->info("Parameter Server Initialized.");
 };
