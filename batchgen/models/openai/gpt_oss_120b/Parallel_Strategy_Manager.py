@@ -305,10 +305,26 @@ class GptOssParallelStrategyManager:
         )
         timings['config'] = time.perf_counter() - step_start
 
+        # Debug: Log config values
+        logging.info(f"=== GPT-OSS CONFIG DEBUG ===")
+        logging.info(f"  hidden_size={gpt_oss_config.hidden_size}")
+        logging.info(f"  head_dim={gpt_oss_config.head_dim}")
+        logging.info(f"  num_attention_heads={gpt_oss_config.num_attention_heads}")
+        logging.info(f"  num_key_value_heads={gpt_oss_config.num_key_value_heads}")
+        qkv_dim = gpt_oss_config.head_dim * (gpt_oss_config.num_attention_heads + 2 * gpt_oss_config.num_key_value_heads)
+        logging.info(f"  Expected qkv_dim={qkv_dim}")
+        logging.info(f"  Expected qkv.weight shape=[{qkv_dim}, {gpt_oss_config.hidden_size}]")
+        logging.info(f"=== END CONFIG DEBUG ===")
+
         # Step 2: Initialize model skeleton (OpenAI Transformer wrapped for BatchGen)
         step_start = time.perf_counter()
         device = self.engine_config.Basic_Config.device_torch
+        logging.info(f"Creating Transformer on device={device}")
         transformer = Transformer(gpt_oss_config, device=device)
+
+        # Debug: Check first layer's qkv weight immediately after creation
+        first_qkv = transformer.block[0].attn.qkv
+        logging.info(f"After Transformer creation: block.0.attn.qkv.weight.shape={list(first_qkv.weight.shape)}")
         self.model = GptOssCausalLMWrapper(transformer)
         timings['model_init'] = time.perf_counter() - step_start
 
@@ -511,6 +527,40 @@ class GptOssParallelStrategyManager:
         logging.info(f"  Missing: {len(missing)}")
         if missing and len(missing) <= 20:
             logging.warning(f"  Missing tensors: {missing}")
+
+        # Validate all Linear layers have proper 2D weights
+        self._validate_linear_weights(transformer)
+
+    def _validate_linear_weights(self, transformer):
+        """Validate all Linear layers have proper 2D weights.
+
+        This helps debug 'weight must be 2-D' errors by identifying
+        which layers have malformed weights after skeleton loading.
+        """
+        logging.info("=== VALIDATING LINEAR LAYER WEIGHTS ===")
+        issues = []
+
+        for name, module in transformer.named_modules():
+            if isinstance(module, nn.Linear):
+                weight = module.weight
+                if weight.dim() != 2:
+                    issues.append(f"{name}.weight: expected 2D, got {weight.dim()}D shape={list(weight.shape)}")
+                    logging.error(f"INVALID: {name}.weight has {weight.dim()}D shape={list(weight.shape)}")
+                else:
+                    logging.debug(f"OK: {name}.weight shape={list(weight.shape)}")
+
+                if module.bias is not None:
+                    if module.bias.dim() != 1:
+                        issues.append(f"{name}.bias: expected 1D, got {module.bias.dim()}D")
+                        logging.error(f"INVALID: {name}.bias has {module.bias.dim()}D shape")
+
+        if issues:
+            logging.error(f"Found {len(issues)} Linear layer weight issues!")
+            for issue in issues:
+                logging.error(f"  {issue}")
+        else:
+            logging.info("All Linear layer weights validated OK (all 2D)")
+        logging.info("=== END VALIDATION ===")
 
     def _config_attn_module(self):
         """Configure attention modules.

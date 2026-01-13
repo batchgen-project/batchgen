@@ -193,9 +193,19 @@ class AttentionBlock(torch.nn.Module):
         qkv_dim = config.head_dim * (
             config.num_attention_heads + 2 * config.num_key_value_heads
         )
+
+        # Debug: Log dimensions for layer 0
+        if layer_idx == 0:
+            print(f"[AttentionBlock {layer_idx}] Creating qkv Linear: in={config.hidden_size}, out={qkv_dim}, device={device}")
+
         self.qkv = torch.nn.Linear(
             config.hidden_size, qkv_dim, device=device, dtype=torch.bfloat16
         )
+
+        # Debug: Check weight shape immediately after creation
+        if layer_idx == 0:
+            print(f"[AttentionBlock {layer_idx}] qkv.weight.shape={list(self.qkv.weight.shape)}")
+
         self.out = torch.nn.Linear(
             config.head_dim * config.num_attention_heads,
             config.hidden_size,
@@ -324,6 +334,14 @@ class ExpertMLP(torch.nn.Module):
         mlp2_packed = weights_dict['mlp2.packed']
         mlp2_scales = weights_dict['mlp2.scales']
         mlp2_bias = weights_dict['mlp2.bias']
+
+        # Validate weight shapes (debug)
+        assert mlp1_packed.dim() == 2, f"mlp1.packed must be 2D, got {mlp1_packed.dim()}D: {mlp1_packed.shape}"
+        assert mlp1_scales.dim() == 2, f"mlp1.scales must be 2D, got {mlp1_scales.dim()}D: {mlp1_scales.shape}"
+        assert mlp1_bias.dim() == 1, f"mlp1.bias must be 1D, got {mlp1_bias.dim()}D: {mlp1_bias.shape}"
+        assert mlp2_packed.dim() == 2, f"mlp2.packed must be 2D, got {mlp2_packed.dim()}D: {mlp2_packed.shape}"
+        assert mlp2_scales.dim() == 2, f"mlp2.scales must be 2D, got {mlp2_scales.dim()}D: {mlp2_scales.shape}"
+        assert mlp2_bias.dim() == 1, f"mlp2.bias must be 1D, got {mlp2_bias.dim()}D: {mlp2_bias.shape}"
 
         # MLP1: [batch, hidden] -> [batch, intermediate*2]
         t = fused_mxfp4_gemm(x, mlp1_packed, mlp1_scales)
