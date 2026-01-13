@@ -724,14 +724,32 @@ class GptOssParallelStrategyManager:
 
             # Handle placeholder parameters (shape [1] from config_torch_module_initializer)
             # When using memory-efficient init, all params start as [1] placeholders
-            # We need to replace the data entirely, not copy (which requires same shape)
+            # We need to replace the parameter entirely using setattr on the parent module
             try:
                 is_placeholder = (model_param.numel() == 1 and tensor.numel() > 1)
 
                 if is_placeholder:
-                    # Replace placeholder with actual tensor data
-                    model_param.data = tensor.to(device)
-                    logging.debug(f"Replaced placeholder {model_name} with shape {list(tensor.shape)}")
+                    # For placeholder replacement, we need to find the parent module
+                    # and replace the parameter attribute directly
+                    # model_name is like "block.0.attn.qkv.weight"
+                    parts = model_name.rsplit('.', 1)
+                    if len(parts) == 2:
+                        module_path, param_name = parts
+                        # Navigate to the parent module
+                        parent_module = transformer
+                        for attr in module_path.split('.'):
+                            if attr.isdigit():
+                                parent_module = parent_module[int(attr)]
+                            else:
+                                parent_module = getattr(parent_module, attr)
+                        # Replace the parameter with a new nn.Parameter
+                        new_param = nn.Parameter(tensor.to(device), requires_grad=False)
+                        setattr(parent_module, param_name, new_param)
+                        logging.debug(f"Replaced placeholder {model_name} with shape {list(tensor.shape)}")
+                    else:
+                        # Top-level parameter (rare case)
+                        model_param.data = tensor.to(device)
+                        logging.debug(f"Replaced top-level placeholder {model_name}")
                 elif tensor.shape == model_param.shape:
                     # Normal copy for matching shapes
                     model_param.data.copy_(tensor.to(device))
@@ -749,6 +767,8 @@ class GptOssParallelStrategyManager:
                     logging.info(f"Loaded {ckpt_name} -> {model_name} (name variation)")
             except Exception as e:
                 logging.error(f"Failed to load {ckpt_name} -> {model_name}: {e}")
+                import traceback
+                logging.error(traceback.format_exc())
 
         # Summary
         logging.info(f"Skeleton loading complete:")
