@@ -158,20 +158,10 @@ class GptOssParallelStrategyManager:
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
 
             # Routed experts (MXFP4 quantized)
-            for expert_idx in range(self.model_config.num_local_experts):
-                for name, _ in (
-                    self.model.model.layers[layer_idx].mlp.experts[expert_idx].named_parameters()
-                ):
-                    tensor_full_name = (
-                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
-                    )
-                    self.state_dict_name_map[tensor_full_name] = {
-                        "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
-                        "tensor_key": name,
-                    }
-                self.weight_copy_task["routed_expert"].append(
-                    f"routed_expert_{layer_idx}_{expert_idx}"
-                )
+            # GPT-OSS uses SHARED weights per layer - all 128 experts share the same
+            # mlp1_weight and mlp2_weight tensors. Each expert wrapper slices its portion.
+            # Weight copy task uses per-layer key (not per-expert)
+            self.weight_copy_task["routed_expert"].append(f"routed_expert_{layer_idx}")
 
         timings["mapping_build"] = time.perf_counter() - step_start
 

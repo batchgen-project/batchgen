@@ -48,8 +48,16 @@ class GptOssExpertWrapper(ExpertWrapperBase):
     - Packed as 2 values per uint8 byte
     - Scale stored as uint8, exponent = scale - 127
 
+    Weight Layout:
+    - GPT-OSS uses SHARED weights per layer, not per expert
+    - mlp1_weight: [128 * intermediate_size, hidden_size] - all experts' gate_proj
+    - mlp2_weight: [128 * intermediate_size * 2, hidden_size] - all experts' up_proj + down_proj
+    - Each expert slices its portion using expert_idx
+
     Attributes:
         dequant_fn: MXFP4 dequantization function
+        intermediate_size: Size of intermediate layer per expert
+        num_experts: Total number of experts (128)
     """
 
     def __init__(
@@ -77,6 +85,11 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             get_weights=True
         )
 
+        # Store dimensions for weight slicing
+        self.intermediate_size = model_config.intermediate_size
+        self.hidden_size = model_config.hidden_size
+        self.num_experts = model_config.num_local_experts
+
         # Import MXFP4 dequantization
         try:
             from batchgen.quantization.mxfp4 import mxfp4_dequantize
@@ -85,42 +98,87 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             logging.warning("MXFP4 dequantization not available, using identity")
             self.dequant_fn = lambda packed, scales, dtype=torch.bfloat16: packed
 
+    def _build_module_key(self) -> str:
+        """Build module key for weight loading.
+
+        GPT-OSS uses SHARED weights per layer, so all experts in a layer
+        share the same module_key. Weight slicing is done in dequantize_weights().
+
+        Returns:
+            Per-layer module key: 'routed_expert_{layer_idx}'
+        """
+        return f"routed_expert_{self.layer_idx}"
+
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Dequantize MXFP4 packed weights to BF16.
+        """Dequantize MXFP4 packed weights and slice for this expert.
 
-        Expected weight format in weights_dict:
-        - "gate_proj.weight": packed uint8 tensor
-        - "gate_proj.weight_scales": scale uint8 tensor
-        - "up_proj.weight": packed uint8 tensor
-        - "up_proj.weight_scales": scale uint8 tensor
-        - "down_proj.weight": packed uint8 tensor
-        - "down_proj.weight_scales": scale uint8 tensor
+        GPT-OSS checkpoint format uses SHARED weights per layer:
+        - "mlp1_weight.blocks": packed gate_proj for all 128 experts
+        - "mlp1_weight.scales": scales for mlp1_weight
+        - "mlp2_weight.blocks": packed up_proj + down_proj for all experts
+        - "mlp2_weight.scales": scales for mlp2_weight
+        - "mlp1_bias": bias for gate_proj (all experts)
+        - "mlp2_bias": bias for up/down_proj (all experts)
+
+        This method:
+        1. Dequantizes the full MXFP4 tensors
+        2. Slices the portion for this expert based on expert_idx
 
         Args:
-            weights_dict: Dict with packed weights and scales
+            weights_dict: Dict with packed weights and scales (shared per layer)
 
         Returns:
-            Dict with dequantized BF16 weights
+            Dict with dequantized BF16 weights for this expert only
         """
         result = {}
 
-        for name, tensor in weights_dict.items():
-            # Skip scale tensors - they're used with their corresponding weights
-            if name.endswith("_scales"):
-                continue
+        # Calculate slice indices for this expert
+        start_idx = self.expert_idx * self.intermediate_size
+        end_idx = (self.expert_idx + 1) * self.intermediate_size
 
-            # Check if this weight has a scale tensor
-            scale_key = f"{name}_scales"
-            if scale_key in weights_dict:
-                # MXFP4 quantized weight - dequantize
-                packed = tensor
-                scales = weights_dict[scale_key]
-                result[name] = self.dequant_fn(packed, scales, torch.bfloat16)
-            else:
-                # Not quantized - use as-is
-                result[name] = tensor
+        # Handle mlp1_weight (gate_proj)
+        if "mlp1_weight.blocks" in weights_dict and "mlp1_weight.scales" in weights_dict:
+            packed = weights_dict["mlp1_weight.blocks"]
+            scales = weights_dict["mlp1_weight.scales"]
+            full_weight = self.dequant_fn(packed, scales, torch.bfloat16)
+            # Slice gate_proj for this expert
+            result["gate_proj.weight"] = full_weight[start_idx:end_idx, :]
+
+        # Handle mlp2_weight (up_proj + down_proj combined)
+        # Layout: first half is up_proj, second half is down_proj
+        if "mlp2_weight.blocks" in weights_dict and "mlp2_weight.scales" in weights_dict:
+            packed = weights_dict["mlp2_weight.blocks"]
+            scales = weights_dict["mlp2_weight.scales"]
+            full_weight = self.dequant_fn(packed, scales, torch.bfloat16)
+
+            # mlp2_weight layout: [128 * intermediate_size * 2, hidden_size]
+            # First 128 * intermediate_size rows = up_proj for all experts
+            # Next 128 * intermediate_size rows = down_proj for all experts
+            total_up_size = self.num_experts * self.intermediate_size
+
+            # Slice up_proj for this expert
+            up_start = start_idx
+            up_end = end_idx
+            result["up_proj.weight"] = full_weight[up_start:up_end, :]
+
+            # Slice down_proj for this expert (offset by total up_proj size)
+            down_start = total_up_size + start_idx
+            down_end = total_up_size + end_idx
+            result["down_proj.weight"] = full_weight[down_start:down_end, :]
+
+        # Handle biases (if present)
+        if "mlp1_bias" in weights_dict:
+            full_bias = weights_dict["mlp1_bias"]
+            result["gate_proj.bias"] = full_bias[start_idx:end_idx]
+
+        if "mlp2_bias" in weights_dict:
+            full_bias = weights_dict["mlp2_bias"]
+            # Same layout as weights
+            total_up_size = self.num_experts * self.intermediate_size
+            result["up_proj.bias"] = full_bias[start_idx:end_idx]
+            result["down_proj.bias"] = full_bias[total_up_size + start_idx:total_up_size + end_idx]
 
         return result
 
