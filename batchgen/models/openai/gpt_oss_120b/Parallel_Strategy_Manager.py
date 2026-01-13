@@ -47,17 +47,52 @@ class CausalLMOutputWithPast:
     past_key_values: Optional[Tuple] = None
 
 
+class GptOssModelShim(nn.Module):
+    """Shim to provide HuggingFace-style attribute access for GPT-OSS Transformer.
+
+    BatchGenWorker expects:
+    - model.embed_tokens → transformer.embedding
+    - model.layers → transformer.block
+    - model.norm → transformer.norm
+
+    This shim provides these mappings.
+    """
+
+    def __init__(self, transformer: Transformer):
+        super().__init__()
+        self._transformer = transformer
+
+    @property
+    def embed_tokens(self):
+        """Map HuggingFace embed_tokens to OpenAI embedding."""
+        return self._transformer.embedding
+
+    @property
+    def layers(self):
+        """Map HuggingFace layers to OpenAI block."""
+        return self._transformer.block
+
+    @property
+    def norm(self):
+        """Map HuggingFace norm to OpenAI norm."""
+        return self._transformer.norm
+
+
 class GptOssCausalLMWrapper(nn.Module):
     """Wrapper for GPT-OSS Transformer to match BatchGenWorker interface.
 
     The OpenAI model.py Transformer has a simple forward(x) signature,
     but BatchGenWorker expects forward(input_ids, attention_mask, use_cache)
     and returns an object with .logits attribute.
+
+    Also provides HuggingFace-compatible attribute access via .model shim.
     """
 
     def __init__(self, transformer: Transformer):
         super().__init__()
         self.transformer = transformer
+        # Provide HuggingFace-style model.model.* access
+        self.model = GptOssModelShim(transformer)
 
     def forward(
         self,

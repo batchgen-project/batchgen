@@ -200,9 +200,11 @@ class GptOss_Parameter_Server:
         marker_file = os.path.join(output_dir, ".conversion_complete")
 
         # Check if already converted
+        # Note: ckpt_converter creates a 'converted_ckpt' subdirectory
+        converted_ckpt_dir = os.path.join(output_dir, "converted_ckpt")
         if os.path.exists(marker_file):
-            logging.info(f"Using existing converted checkpoint at {output_dir}")
-            return output_dir
+            logging.info(f"Using existing converted checkpoint at {converted_ckpt_dir}")
+            return converted_ckpt_dir
 
         logging.info(f"Converting GPT-OSS checkpoint with expert slicing...")
         os.makedirs(output_dir, exist_ok=True)
