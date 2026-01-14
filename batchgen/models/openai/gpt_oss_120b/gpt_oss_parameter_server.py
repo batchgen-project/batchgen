@@ -352,17 +352,17 @@ class GptOss_Parameter_Server:
         return sliced
 
     def _parse_state_dict(self):
-        """Build state_dict_name_map for attention and expert tensors.
+        """Build state_dict_name_map for expert tensors.
 
         Maps checkpoint tensor names to (module_key, tensor_key) pairs.
         Uses BatchGen naming conventions:
-        - attn_{layer} for attention modules
         - routed_expert_{layer}_{expert} for MoE expert modules
 
-        Both attention and expert weights are added to state_dict_name_map
-        for HtoD (host-to-device) loading via wrappers.
+        NOTE: Attention weights are NOT added to state_dict_name_map.
+        They stay in skeleton_state_dict and are loaded once at init.
+        Only expert weights (~55GB) need HtoD for memory efficiency.
+        Attention weights (~3GB) fit in GPU memory as skeleton.
         """
-        self.weight_copy_task["attn"] = []
         self.weight_copy_task["routed_expert"] = []
 
         num_layers = self.model_config.num_hidden_layers
@@ -370,28 +370,10 @@ class GptOss_Parameter_Server:
 
         for layer_idx in trange(num_layers, desc="Building state_dict_name_map"):
             # =================================================================
-            # Attention weights (BF16) - HtoD via GptOssAttnWrapper
+            # Attention weights (BF16) - SKELETON (not in state_dict_name_map)
+            # Stays in skeleton_state_dict, loaded once at init by PSM
             # =================================================================
-            attn_module_key = f"attn_{layer_idx}"
-
-            # Add attention tensors to state_dict_name_map
-            attn_tensors = [
-                ("qkv.weight", "qkv.weight"),
-                ("qkv.bias", "qkv.bias"),
-                ("out.weight", "out.weight"),
-                ("out.bias", "out.bias"),
-                ("norm.scale", "norm.scale"),
-                ("sinks", "sinks"),
-            ]
-            for ckpt_suffix, tensor_key in attn_tensors:
-                ckpt_name = f"block.{layer_idx}.attn.{ckpt_suffix}"
-                self.state_dict_name_map[ckpt_name] = {
-                    "module_key": attn_module_key,
-                    "tensor_key": tensor_key,
-                }
-
-            # Add to weight_copy_task for HtoD loading
-            self.weight_copy_task["attn"].append(attn_module_key)
+            # (no state_dict_name_map entries for attention)
 
             # =================================================================
             # Expert MLP weights (MXFP4) - HtoD via GptOssExpertWrapper
@@ -431,10 +413,10 @@ class GptOss_Parameter_Server:
                 self.weight_copy_task["routed_expert"].append(module_key)
 
         # Log summary
-        num_attn = len(self.weight_copy_task["attn"])
         num_expert = len(self.weight_copy_task["routed_expert"])
         num_tensors = len(self.state_dict_name_map)
-        logging.info(f"State dict map: {num_attn} attn modules, {num_expert} expert modules, {num_tensors} tensors")
+        logging.info(f"State dict map: {num_expert} expert modules (HtoD), {num_tensors} tensors")
+        logging.info(f"Attention weights will be in skeleton_state_dict (loaded once at init)")
 
         gc.collect()
         torch.cuda.empty_cache()

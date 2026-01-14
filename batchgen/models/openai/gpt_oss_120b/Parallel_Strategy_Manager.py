@@ -488,7 +488,8 @@ class GptOssParallelStrategyManager:
     def _build_weight_mappings(self):
         """Build state_dict_name_map and weight_copy_task.
 
-        Both attention and expert weights support HtoD loading via wrappers.
+        Attention weights are SKELETON (loaded once at init, ~3GB).
+        Expert weights use HtoD (dynamic loading, ~55GB).
 
         For world_size==1 (single GPU), ALL expert weights are also loaded as
         skeleton (pre-loaded at init) to avoid HtoD buffer contention issues.
@@ -501,7 +502,6 @@ class GptOssParallelStrategyManager:
         """
         self.state_dict_name_map = {}
         self.weight_copy_task = {
-            "attn": [],
             "routed_expert": [],
         }
 
@@ -517,28 +517,10 @@ class GptOssParallelStrategyManager:
 
         for layer_idx in range(num_layers):
             # =================================================================
-            # Attention weights (BF16) - HtoD via GptOssAttnWrapper
+            # Attention weights (BF16) - SKELETON (loaded from skeleton_state_dict)
+            # NOT in state_dict_name_map, loaded by _load_model_skeleton()
             # =================================================================
-            attn_module_key = f"attn_{layer_idx}"
-
-            # Add attention tensors to state_dict_name_map
-            attn_tensors = [
-                ("qkv.weight", "qkv.weight"),
-                ("qkv.bias", "qkv.bias"),
-                ("out.weight", "out.weight"),
-                ("out.bias", "out.bias"),
-                ("norm.scale", "norm.scale"),
-                ("sinks", "sinks"),
-            ]
-            for ckpt_suffix, tensor_key in attn_tensors:
-                ckpt_name = f"block.{layer_idx}.attn.{ckpt_suffix}"
-                self.state_dict_name_map[ckpt_name] = {
-                    "module_key": attn_module_key,
-                    "tensor_key": tensor_key,
-                }
-
-            # Add to weight_copy_task for HtoD loading
-            self.weight_copy_task["attn"].append(attn_module_key)
+            # (no state_dict_name_map entries for attention)
 
             # =================================================================
             # Expert weights (MXFP4) - HtoD via GptOssExpertWrapper
@@ -564,15 +546,14 @@ class GptOssParallelStrategyManager:
         if all_experts_local:
             logging.info(
                 f"Weight mappings (world_size=1): "
-                f"{len(self.weight_copy_task['attn'])} attn (HtoD), "
-                f"{len(self.local_routed_experts)} experts (pre-loaded), "
-                f"0 experts (dynamic)"
+                f"attention (skeleton), "
+                f"{len(self.local_routed_experts)} experts (pre-loaded)"
             )
         else:
             logging.info(
                 f"Weight mappings: "
-                f"{len(self.weight_copy_task['attn'])} attn (HtoD), "
-                f"{len(self.weight_copy_task['routed_expert'])} experts (dynamic)"
+                f"attention (skeleton), "
+                f"{len(self.weight_copy_task['routed_expert'])} experts (HtoD)"
             )
 
     def _load_model_skeleton(self):
@@ -772,23 +753,28 @@ class GptOssParallelStrategyManager:
             return None, None
 
         # Build the expected mappings (model parameter names)
-        # NOTE: Attention weights (qkv, out, norm, sinks) are loaded via HtoD,
-        # NOT skeleton. They're in state_dict_name_map, not skeleton_state_dict.
+        # Attention weights are SKELETON (loaded once at init, ~3GB total)
+        # Expert weights use HtoD (dynamic loading, ~55GB total)
         expected_params = {
             "embedding.weight": "embedding.weight",
             "unembedding.weight": "unembedding.weight",
             "norm.scale": "norm.scale",
         }
 
-        # Add per-layer mappings (only MLP skeleton, not attention)
+        # Add per-layer mappings (attention and MLP skeleton)
         for layer_idx in range(self.model_config.num_hidden_layers):
             expected_params.update({
-                # MLP gate and norm are skeleton (loaded once at init)
+                # Attention weights - skeleton (loaded once at init)
+                f"block.{layer_idx}.attn.norm.scale": f"block.{layer_idx}.attn.norm.scale",
+                f"block.{layer_idx}.attn.sinks": f"block.{layer_idx}.attn.sinks",
+                f"block.{layer_idx}.attn.qkv.weight": f"block.{layer_idx}.attn.qkv.weight",
+                f"block.{layer_idx}.attn.qkv.bias": f"block.{layer_idx}.attn.qkv.bias",
+                f"block.{layer_idx}.attn.out.weight": f"block.{layer_idx}.attn.out.weight",
+                f"block.{layer_idx}.attn.out.bias": f"block.{layer_idx}.attn.out.bias",
+                # MLP gate and norm - skeleton (loaded once at init)
                 f"block.{layer_idx}.mlp.norm.scale": f"block.{layer_idx}.mlp.norm.scale",
                 f"block.{layer_idx}.mlp.gate.weight": f"block.{layer_idx}.mlp.gate.weight",
                 f"block.{layer_idx}.mlp.gate.bias": f"block.{layer_idx}.mlp.gate.bias",
-                # Attention weights are loaded via HtoD, not skeleton
-                # See GptOssAttnWrapper.forward() for HtoD loading
             })
 
         # Helper to find similar tensor names for debugging
@@ -897,28 +883,16 @@ class GptOssParallelStrategyManager:
         This helps debug 'weight must be 2-D' errors by identifying
         which layers have malformed weights after skeleton loading.
 
-        Note: Attention weights (qkv, out) are loaded via HtoD, NOT skeleton.
-        They're expected to have proper shapes but uninitialized values.
+        All attention and MLP gate/norm weights are skeleton (loaded at init).
+        Expert MLP weights are either skeleton (world_size=1) or HtoD.
         """
         logging.info("=== VALIDATING LINEAR LAYER WEIGHTS (POST-SKELETON LOADING) ===")
         issues = []
         valid_count = 0
-        htod_count = 0
 
         for name, module in transformer.named_modules():
             if isinstance(module, nn.Linear):
                 weight = module.weight
-
-                # Skip attention weights - they're loaded via HtoD, not skeleton
-                # They should have proper shapes but may have random values
-                is_attention = '.attn.' in name and any(x in name for x in ['qkv', 'out'])
-                if is_attention:
-                    if weight.dim() == 2:
-                        htod_count += 1
-                        logging.debug(f"HTOD: {name}.weight shape={list(weight.shape)} (loaded via HtoD)")
-                    else:
-                        issues.append(f"{name}.weight: expected 2D, got {weight.dim()}D shape={list(weight.shape)}")
-                    continue
 
                 # Check for placeholder that wasn't replaced
                 if weight.numel() == 1:
@@ -940,11 +914,22 @@ class GptOssParallelStrategyManager:
                         logging.error(f"INVALID: {name}.bias has {module.bias.dim()}D shape")
 
         if issues:
-            logging.error(f"Found {len(issues)} Linear layer weight issues! ({valid_count} skeleton OK, {htod_count} HtoD)")
+            logging.error(f"Found {len(issues)} Linear layer weight issues! ({valid_count} OK)")
             for issue in issues:
                 logging.error(f"  {issue}")
+
+            # Check if attention weights are still placeholders - this is fatal
+            attn_issues = [i for i in issues if 'attn' in i and 'placeholder' in i]
+            if attn_issues:
+                raise RuntimeError(
+                    f"FATAL: {len(attn_issues)} attention weights are still placeholders!\n"
+                    f"Skeleton loading failed to load attention weights from checkpoint.\n"
+                    f"Issues:\n" + "\n".join(f"  - {i}" for i in attn_issues[:10]) + "\n"
+                    f"Check the skeleton_state_dict logs above to see what tensors are available.\n"
+                    f"The checkpoint may use different naming conventions than expected."
+                )
         else:
-            logging.info(f"All Linear layer weights validated OK: {valid_count} skeleton, {htod_count} HtoD")
+            logging.info(f"All {valid_count} Linear layer weights validated OK")
         logging.info("=== END VALIDATION ===")
 
     def _load_local_routed_experts(self):

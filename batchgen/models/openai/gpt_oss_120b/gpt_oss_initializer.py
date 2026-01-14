@@ -132,9 +132,10 @@ class GptOssInitializer:
         engine_config.Basic_Config.activation_dtype = "bfloat16"
         engine_config.Basic_Config.activation_dtype_torch = torch.bfloat16
 
-        # Module types - both attn and routed_expert for GPT-OSS
-        # Both are loaded via HtoD (host-to-device) during prefill
-        engine_config.Basic_Config.module_types = ["attn", "routed_expert"]
+        # Module types - only routed_expert for GPT-OSS
+        # Attention weights are skeleton (loaded once at init, ~3GB)
+        # Expert weights use HtoD (dynamic loading, ~55GB total)
+        engine_config.Basic_Config.module_types = ["routed_expert"]
 
         # Misc
         engine_config.Basic_Config.num_threads = 0
@@ -196,21 +197,9 @@ class GptOssInitializer:
         qkv_dim = (num_q_heads + 2 * num_kv_heads) * head_dim  # 5120
         out_dim = num_q_heads * head_dim  # 4096
 
-        # Both attn and routed_expert need GPU buffer allocation for HtoD
+        # Only routed_expert needs GPU buffer allocation for HtoD
+        # Attention weights are skeleton (loaded once at init)
         self.engine_config.GPU_Buffer_Config.module_shapes = {
-            "attn": {
-                # BF16 attention weights
-                # qkv: combined Q/K/V projection [qkv_dim, hidden] = [5120, 2880]
-                # out: output projection [hidden, q_heads*head_dim] = [2880, 4096]
-                # norm: RMSNorm scale [hidden] = [2880]
-                # sinks: attention sinks [num_q_heads] = [64]
-                "qkv.weight": [qkv_dim, hidden_size],  # [5120, 2880]
-                "qkv.bias": [qkv_dim],  # [5120]
-                "out.weight": [hidden_size, out_dim],  # [2880, 4096]
-                "out.bias": [hidden_size],  # [2880]
-                "norm.scale": [hidden_size],  # [2880]
-                "sinks": [num_q_heads],  # [64]
-            },
             "routed_expert": {
                 # MXFP4 quantized expert weights
                 # mlp1 = gate_proj || up_proj (concatenated)
