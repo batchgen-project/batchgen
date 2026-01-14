@@ -132,9 +132,14 @@ For more details, see [`docker/README.md`](../docker/README.md).
 
 Run on each node with the appropriate `--node-rank`. The container provides an interactive shell where you can start the server.
 
+#### Option A: With `--cap-add=SYS_ADMIN` (Recommended)
+
+This option allows you to remount `/dev/shm` inside the container for maximum flexibility:
+
 ```bash
 # Node 0 (Master)
 docker run -it \
+    --cap-add=SYS_ADMIN \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -144,6 +149,7 @@ docker run -it \
 
 # Node 1
 docker run -it \
+    --cap-add=SYS_ADMIN \
     --runtime=nvidia \
     --gpus all \
     --network=host \
@@ -152,11 +158,54 @@ docker run -it \
     batchgen:latest
 ```
 
-**Optional flags** (add if needed):
-- `--shm-size <SIZE>`: Increase `/dev/shm` inside the container (use this OR `--ipc=host`, e.g. `--shm-size 256g`)
-- `--ipc=host`: Share host IPC namespace (use this OR `--shm-size`, recommended if you want to fully reuse host `/dev/shm`)
-- `--ulimit memlock=-1`: Set unlimited memlock
-- `--privileged`: Full host access (use with caution)
+Once inside the container, remount `/dev/shm` with sufficient size before starting the server:
+
+```bash
+# Inside container: remount /dev/shm with host memory size (e.g., 2048G)
+mount -o remount,size=2048G /dev/shm
+```
+
+#### Option B: With `--shm-size` (No SYS_ADMIN)
+
+If you cannot use `--cap-add=SYS_ADMIN`, pre-configure `/dev/shm` size at container start. Set `--shm-size` to your total host memory size:
+
+```bash
+# Node 0 (Master) - Example with 2TB host memory
+docker run -it \
+    --shm-size=2048g \
+    --runtime=nvidia \
+    --gpus all \
+    --network=host \
+    -v /shared/models:/models:ro \
+    -v /shared/storage:/storage \
+    batchgen:latest
+
+# Node 1
+docker run -it \
+    --shm-size=2048g \
+    --runtime=nvidia \
+    --gpus all \
+    --network=host \
+    -v /shared/models:/models:ro \
+    -v /shared/storage:/storage \
+    batchgen:latest
+```
+
+### Docker Flags Explained
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--cap-add=SYS_ADMIN` | Conditional | **Required for `--enable-hugetlbfs`**. Also allows remounting `/dev/shm` inside container |
+| `--shm-size=<size>` | Conditional | Pre-set `/dev/shm` size. **Required if not using `--cap-add=SYS_ADMIN`**. Recommend setting to total host memory (e.g., `2048g`) |
+| `--runtime=nvidia` | Yes | Enable NVIDIA GPU access |
+| `--gpus all` | Yes | Expose all GPUs to container |
+| `--network=host` | Yes | Required for multi-node distributed communication |
+| `-v /shared/models:/models:ro` | Yes | Mount model checkpoint directory |
+| `-v /shared/storage:/storage` | Yes | Mount storage for batch files and results |
+
+**Optional flags:**
+- `--privileged`: Full host access. Alternative to `--cap-add=SYS_ADMIN` but grants more permissions (use with caution)
+- `--ipc=host`: Share host IPC namespace. Required by some communication libraries
 
 Once inside the container, start the server using the commands in [Section 5](#5-start-batchgen-server).
 
