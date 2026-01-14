@@ -636,6 +636,9 @@ class Transformer(torch.nn.Module):
         x = self.embedding(x)
         for block in self.block:
             x = block(x)
+            # Handle HuggingFace-style tuple return (hidden_states, past_key_value)
+            if isinstance(x, tuple):
+                x = x[0]
         x = self.norm(x)
         x = self.unembedding(x)
         return x
