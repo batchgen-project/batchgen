@@ -575,13 +575,24 @@ class GptOssParallelStrategyManager:
         transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
         model_state = dict(transformer.named_parameters())
 
-        # Debug: Log ALL skeleton tensor names to understand checkpoint format
+        # Debug: Log skeleton tensor names, especially attention
         if self.skeleton_state_dict:
             logging.info(f"=== SKELETON STATE DICT DEBUG ===")
             logging.info(f"Total tensors in skeleton_state_dict: {len(self.skeleton_state_dict)}")
-            logging.info(f"All tensor names:")
-            for k, v in sorted(self.skeleton_state_dict.items()):
-                logging.info(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
+            # Count attention tensors
+            attn_tensors = [k for k in self.skeleton_state_dict.keys() if 'attn' in k.lower()]
+            logging.info(f"Attention tensors found: {len(attn_tensors)}")
+            if attn_tensors:
+                for k in sorted(attn_tensors)[:10]:  # Show first 10
+                    v = self.skeleton_state_dict[k]
+                    logging.info(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
+                if len(attn_tensors) > 10:
+                    logging.info(f"  ... and {len(attn_tensors) - 10} more attention tensors")
+            else:
+                logging.error("NO attention tensors in skeleton_state_dict!")
+                logging.info("Sample skeleton tensor names:")
+                for k in list(self.skeleton_state_dict.keys())[:20]:
+                    logging.info(f"  {k}")
             logging.info(f"=== END SKELETON DEBUG ===")
         else:
             logging.error("skeleton_state_dict is empty or None!")
@@ -841,7 +852,11 @@ class GptOssParallelStrategyManager:
                         # Replace the parameter with a new nn.Parameter
                         new_param = nn.Parameter(tensor.to(device), requires_grad=False)
                         setattr(parent_module, param_name, new_param)
-                        logging.debug(f"Replaced placeholder {model_name} with shape {list(tensor.shape)}")
+                        # Log attention weights explicitly at INFO level
+                        if 'attn' in model_name:
+                            logging.info(f"Loaded attention: {model_name} shape={list(tensor.shape)}")
+                        else:
+                            logging.debug(f"Replaced placeholder {model_name} with shape {list(tensor.shape)}")
                     else:
                         # Top-level parameter (rare case)
                         model_param.data = tensor.to(device)
@@ -873,6 +888,15 @@ class GptOssParallelStrategyManager:
         logging.info(f"  Missing: {len(missing)}")
         if missing and len(missing) <= 20:
             logging.warning(f"  Missing tensors: {missing}")
+
+        # Verify first attention layer weights were loaded
+        first_attn = transformer.block[0].attn
+        logging.info(f"=== POST-SKELETON VERIFICATION ===")
+        logging.info(f"  block.0.attn.qkv.weight.shape = {list(first_attn.qkv.weight.shape)}")
+        logging.info(f"  block.0.attn.out.weight.shape = {list(first_attn.out.weight.shape)}")
+        if first_attn.qkv.weight.numel() == 1:
+            logging.error("CRITICAL: block.0.attn.qkv.weight is still placeholder!")
+        logging.info(f"=== END VERIFICATION ===")
 
         # Validate all Linear layers have proper 2D weights
         self._validate_linear_weights(transformer)
