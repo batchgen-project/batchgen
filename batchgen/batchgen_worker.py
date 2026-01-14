@@ -319,7 +319,7 @@ class BatchGenWorker:
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
 		)
-		
+
 		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
 
 		# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
@@ -1379,9 +1379,30 @@ class BatchGenWorker:
 		manager: GPUPagedKVCacheManager,
 		global_sequence_ids: List[int],
 	) -> None:
-		"""Copy prefetched host KV pages into the GPU cache."""
+		"""Copy prefetched host KV pages into the GPU cache.
+
+		NOTE: For GQA models (GPT-OSS), the MLAHostPagedKVWorkerView doesn't support
+		V cache operations. Skip host-to-GPU KV loading for GQA models.
+		This means KV cache must be computed on-the-fly during decode.
+		"""
 		if not global_sequence_ids:
 			return
+
+		# Check if this is a GQA model (GPT-OSS) that needs V cache
+		# MLAHostPagedKVWorkerView only supports MLA (no V cache), not GQA
+		is_gqa_model = (
+			"gpt-oss" in self.model_name.lower() or
+			"gpt_oss" in self.model_name.lower()
+		)
+
+		if is_gqa_model and manager.config.has_v_cache:
+			logging.warning(
+				f"Rank {self.rank}: Skipping host-to-GPU KV loading for GQA model "
+				f"(MLAHostPagedKVWorkerView doesn't support V cache). "
+				f"KV cache will be recomputed during decode."
+			)
+			return
+
 		copy_start = time.perf_counter()
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
@@ -1409,12 +1430,12 @@ class BatchGenWorker:
 		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
-		
+
 		logging.debug(
 			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
 			f"{len(global_sequence_ids)} sequences..."
 		)
-		
+
 		load_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_sequence_page_counts,
