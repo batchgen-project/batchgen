@@ -195,7 +195,6 @@ docker run -it \
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--cap-add=SYS_NICE` | Yes | Required for process scheduling priority |
 | `--cap-add=SYS_ADMIN` | Conditional | **Required for `--enable-hugetlbfs`**. Also allows remounting `/dev/shm` inside container |
 | `--shm-size=<size>` | Conditional | Pre-set `/dev/shm` size. **Required if not using `--cap-add=SYS_ADMIN`**. Recommend setting to total host memory (e.g., `2048g`) |
 | `--runtime=nvidia` | Yes | Enable NVIDIA GPU access |
