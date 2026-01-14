@@ -59,7 +59,16 @@ class GptOssPlanner(BasePlanner):
         - experts_per_rank = NUM_EXPERTS // 1 = 128
         - routed_expert_start_idx = 0 * 128 = 0
         - routed_expert_end_idx = 1 * 128 = 128
+
+        GPT-OSS uses GQA (not MLA), so MLAHostPagedKVWorkerView doesn't work
+        (it doesn't support V cache). We MUST use attn_mode=3 (full GPU KV)
+        to keep KV cache on GPU throughout prefill and decode.
         """
+        # CRITICAL: Use attn_mode=3 for GPT-OSS regardless of world_size
+        # GPT-OSS uses GQA which needs V cache, but MLAHostPagedKVWorkerView
+        # only supports MLA (no V cache). Using attn_mode=3 keeps KV on GPU.
+        self.config.Basic_Config.attn_mode = 3
+
         # Override base planner's num_local_expert calculation
         # Base planner assumes 2.4GB per expert (FP8), but MXFP4 experts are ~0.4GB
         # For world_size == 1, all experts should be local

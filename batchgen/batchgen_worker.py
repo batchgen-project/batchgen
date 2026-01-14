@@ -6914,12 +6914,50 @@ class BatchGenWorker:
 
 					Attn_Wrapper.attention_mask = attention_mask
 					Attn_Wrapper.position_ids = position_ids
-					new_tokens = self.model(
-						new_tokens.to(self.torch_device),
-						attention_mask=attention_mask.to(self.torch_device),
-						use_cache=False,
-					)
-					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
+
+					# GPT-OSS: Full-sequence decode (no KV caching in attention module)
+					if "gpt_oss" in self.model_config.model_type:
+						# Build full sequences for each batch item
+						full_sequences = []
+						for query_idx in batch:
+							input_ids = self.query_book[query_idx].encoded["input_ids"]
+							if new_token_idx > 0:
+								decoded = self.query_book[query_idx].decoded_tokens[:, :new_token_idx]
+								full_seq = torch.cat([input_ids, decoded], dim=1)
+							else:
+								full_seq = input_ids
+							full_sequences.append(full_seq)
+
+						# Pad sequences to same length
+						max_seq_len = max(seq.shape[1] for seq in full_sequences)
+						padded_seqs = []
+						for seq in full_sequences:
+							if seq.shape[1] < max_seq_len:
+								padding = torch.zeros(
+									seq.shape[0], max_seq_len - seq.shape[1],
+									dtype=seq.dtype, device=seq.device
+								)
+								seq = torch.cat([seq, padding], dim=1)
+							padded_seqs.append(seq)
+						full_input = torch.cat(padded_seqs, dim=0).to(self.torch_device)
+
+						# Update position_ids for full sequence
+						position_ids = create_position_ids_from_attention_mask(attention_mask)
+						Attn_Wrapper.position_ids = position_ids
+
+						outputs = self.model(
+							full_input,
+							attention_mask=attention_mask.to(self.torch_device),
+							use_cache=False,
+						)
+						new_tokens = self._select_tokens(outputs.logits[:, -1, :])
+					else:
+						new_tokens = self.model(
+							new_tokens.to(self.torch_device),
+							attention_mask=attention_mask.to(self.torch_device),
+							use_cache=False,
+						)
+						new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
 					self.update_new_token(new_tokens, batch, new_token_idx)
 
 					# Update sequence state
@@ -6932,7 +6970,7 @@ class BatchGenWorker:
 						# Only mark eos_reached if we should stop at EOS
 						if self._should_stop_at_eos(new_tokens[i].item()):
 							seq.eos_reached = True
-						
+
 						# Always check max length
 						if seq.decoded_length >= self.max_decoding_length:
 							seq.eos_reached = True
@@ -7006,12 +7044,56 @@ class BatchGenWorker:
 
 					Attn_Wrapper.attention_mask = attention_mask
 					Attn_Wrapper.position_ids = position_ids
-					new_tokens = self.model(
-						new_tokens.to(self.torch_device),
-						attention_mask=attention_mask.to(self.torch_device),
-						use_cache=False,
-					)
-					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
+
+					# GPT-OSS: Full-sequence decode (no KV caching in attention module)
+					# Must pass full sequence each time for model to have context
+					if "gpt_oss" in self.model_config.model_type:
+						# Build full sequences for each batch item
+						full_sequences = []
+						for query_idx in batch:
+							# Get original input_ids (prompt)
+							input_ids = self.query_book[query_idx].encoded["input_ids"]
+							# Get decoded tokens so far (up to but not including new_token_idx)
+							if new_token_idx > 0:
+								decoded = self.query_book[query_idx].decoded_tokens[:, :new_token_idx]
+								full_seq = torch.cat([input_ids, decoded], dim=1)
+							else:
+								full_seq = input_ids
+							full_sequences.append(full_seq)
+
+						# Pad sequences to same length
+						max_seq_len = max(seq.shape[1] for seq in full_sequences)
+						padded_seqs = []
+						for seq in full_sequences:
+							if seq.shape[1] < max_seq_len:
+								# Pad with 0 (padding token)
+								padding = torch.zeros(
+									seq.shape[0], max_seq_len - seq.shape[1],
+									dtype=seq.dtype, device=seq.device
+								)
+								seq = torch.cat([seq, padding], dim=1)
+							padded_seqs.append(seq)
+						full_input = torch.cat(padded_seqs, dim=0).to(self.torch_device)
+
+						# Update position_ids for full sequence
+						position_ids = create_position_ids_from_attention_mask(attention_mask)
+						Attn_Wrapper.position_ids = position_ids
+
+						outputs = self.model(
+							full_input,
+							attention_mask=attention_mask.to(self.torch_device),
+							use_cache=False,
+						)
+						# Get logits from last position of each sequence
+						new_tokens = self._select_tokens(outputs.logits[:, -1, :])
+					else:
+						# Standard single-token decode for models with KV caching
+						new_tokens = self.model(
+							new_tokens.to(self.torch_device),
+							attention_mask=attention_mask.to(self.torch_device),
+							use_cache=False,
+						)
+						new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
 					self.update_new_token(new_tokens, batch, new_token_idx)
 
 					# Update sequence state
@@ -7034,6 +7116,86 @@ class BatchGenWorker:
 			elif RUNTIME_ATTN_MODE == 2:
 				"""CPU-GPU Parallel ATTN - Deprecated"""
 				logging.warning("RUNTIME_ATTN_MODE 2 is deprecated")
+				new_token_idx += 1
+
+			elif RUNTIME_ATTN_MODE == 3:
+				"""FULL GPU DECODING MODE - KV cache stays on GPU"""
+				# GPT-OSS: Full-sequence decode (no KV caching in attention module)
+				# For models without KV caching, must pass full sequence each time
+				if "gpt_oss" in self.model_config.model_type:
+					with torch.inference_mode():
+						Attn_Wrapper.cur_batch = [batch]
+
+						# Collect and pad attention masks to same length
+						target_len = self.max_input_length + new_token_idx
+						masks = []
+						for query_idx in batch:
+							mask = self.query_book[query_idx].encoded["attention_mask"]
+							if mask.shape[1] < target_len:
+								padding = torch.zeros(
+									mask.shape[0], target_len - mask.shape[1],
+									dtype=mask.dtype, device=mask.device
+								)
+								mask = torch.cat([mask, padding], dim=1)
+							else:
+								mask = mask[:, :target_len]
+							masks.append(mask)
+						attention_mask = torch.cat(masks, dim=0).to(self.torch_device)
+
+						# Build full sequences for each batch item
+						full_sequences = []
+						for query_idx in batch:
+							input_ids = self.query_book[query_idx].encoded["input_ids"]
+							if new_token_idx > 0:
+								decoded = self.query_book[query_idx].decoded_tokens[:, :new_token_idx]
+								full_seq = torch.cat([input_ids, decoded], dim=1)
+							else:
+								full_seq = input_ids
+							full_sequences.append(full_seq)
+
+						# Pad sequences to same length
+						max_seq_len = max(seq.shape[1] for seq in full_sequences)
+						padded_seqs = []
+						for seq in full_sequences:
+							if seq.shape[1] < max_seq_len:
+								padding = torch.zeros(
+									seq.shape[0], max_seq_len - seq.shape[1],
+									dtype=seq.dtype, device=seq.device
+								)
+								seq = torch.cat([seq, padding], dim=1)
+							padded_seqs.append(seq)
+						full_input = torch.cat(padded_seqs, dim=0).to(self.torch_device)
+
+						# Set position_ids for full sequence
+						position_ids = create_position_ids_from_attention_mask(attention_mask)
+						Attn_Wrapper.attention_mask = attention_mask
+						Attn_Wrapper.position_ids = position_ids
+
+						outputs = self.model(
+							full_input,
+							attention_mask=attention_mask,
+							use_cache=False,
+						)
+						new_tokens = self._select_tokens(outputs.logits[:, -1, :])
+						self.update_new_token(new_tokens, batch, new_token_idx)
+
+						# Update sequence state
+						for i, local_idx in enumerate(batch):
+							uuid = self._local_to_uuid_map[local_idx]
+							seq = self.global_batch.get_sequence(uuid)
+							seq.decoded_length = new_token_idx + 1
+							seq.current_context_length = seq.prompt_length + new_token_idx + 1
+
+							if self._should_stop_at_eos(new_tokens[i].item()):
+								seq.eos_reached = True
+
+							if seq.decoded_length >= self.max_decoding_length:
+								seq.eos_reached = True
+
+				else:
+					# Other models with proper KV caching - not yet implemented for mode 3
+					logging.warning(f"RUNTIME_ATTN_MODE 3 not fully implemented for {self.model_config.model_type}")
+
 				new_token_idx += 1
 
 	# ============ Utility Methods ============
