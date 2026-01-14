@@ -6889,15 +6889,22 @@ class BatchGenWorker:
 				"""CPU ATTN MODE - NO ATTN MICRO BATCH"""
 				with torch.inference_mode():
 					Attn_Wrapper.cur_batch = [batch]
-					attention_mask = torch.cat(
-						[
-							self.query_book[query_idx].encoded["attention_mask"][
-								:, : self.max_input_length + new_token_idx
-							]
-							for query_idx in batch
-						],
-						dim=0,
-					)
+					# Collect and pad attention masks to same length before concatenation
+					target_len = self.max_input_length + new_token_idx
+					masks = []
+					for query_idx in batch:
+						mask = self.query_book[query_idx].encoded["attention_mask"]
+						if mask.shape[1] < target_len:
+							# Pad with zeros if mask is shorter than target
+							padding = torch.zeros(
+								mask.shape[0], target_len - mask.shape[1],
+								dtype=mask.dtype, device=mask.device
+							)
+							mask = torch.cat([mask, padding], dim=1)
+						else:
+							mask = mask[:, :target_len]
+						masks.append(mask)
+					attention_mask = torch.cat(masks, dim=0)
 					if "deepseek" not in self.model_config.model_type:
 						position_ids = create_position_ids_from_attention_mask(
 							attention_mask
@@ -6976,15 +6983,22 @@ class BatchGenWorker:
 								)
 
 				with torch.inference_mode():
-					attention_mask = torch.cat(
-						[
-							self.query_book[query_idx].encoded["attention_mask"][
-								:, : self.max_input_length + new_token_idx
-							]
-							for query_idx in batch
-						],
-						dim=0,
-					).to(self.torch_device)
+					# Collect and pad attention masks to same length before concatenation
+					target_len = self.max_input_length + new_token_idx
+					masks = []
+					for query_idx in batch:
+						mask = self.query_book[query_idx].encoded["attention_mask"]
+						if mask.shape[1] < target_len:
+							# Pad with zeros if mask is shorter than target
+							padding = torch.zeros(
+								mask.shape[0], target_len - mask.shape[1],
+								dtype=mask.dtype, device=mask.device
+							)
+							mask = torch.cat([mask, padding], dim=1)
+						else:
+							mask = mask[:, :target_len]
+						masks.append(mask)
+					attention_mask = torch.cat(masks, dim=0).to(self.torch_device)
 					if "deepseek" in self.model_config.model_type:
 						position_ids = create_position_ids_from_attention_mask(attention_mask)
 					else:
