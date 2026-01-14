@@ -30,6 +30,25 @@ from ..quantization.fp8e4m3 import (
 	compressed_kv_fp8_to_bf16_per_token
 )
 
+
+# Module-level helper for safe rank access (handles world_size == 1)
+_cached_global_rank = None
+
+def _get_safe_rank() -> int:
+	"""Get rank with proper guard for world_size == 1.
+
+	Returns 0 if distributed is not initialized, otherwise returns
+	the actual rank. Caches the result for performance.
+	"""
+	global _cached_global_rank
+	if _cached_global_rank is None:
+		if not dist.is_initialized():
+			_cached_global_rank = 0
+		else:
+			_cached_global_rank = int(dist.get_rank())
+	return _cached_global_rank
+
+
 # @triton.jit
 # def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
 # 	"""
@@ -313,7 +332,11 @@ class Attn_Wrapper(torch.nn.Module):
 	@classmethod
 	def _get_global_rank(cls) -> int:
 		if cls._global_rank is None:
-			cls._global_rank = int(dist.get_rank())
+			# Guard for world_size == 1 (no distributed init)
+			if not dist.is_initialized():
+				cls._global_rank = 0
+			else:
+				cls._global_rank = int(dist.get_rank())
 		return cls._global_rank
 
 	@classmethod
@@ -424,7 +447,7 @@ class Attn_Wrapper(torch.nn.Module):
 						# logging.debug(f"Cur attention mask shape {cur_attention_mask.shape}")
 						# logging.debug(f"Cur attention mask{cur_attention_mask[0].tolist()}")
 						# exit()
-						logging.debug(f"Rank {dist.get_rank()} - Entering prefill attention")
+						logging.debug(f"Rank {self._get_global_rank()} - Entering prefill attention")
 						# logging.info(f"{self.layer_idx=}, {cur_hidden_states.shape=}, {cur_hidden_states=} {cur_attention_mask=}, {position_ids=}")
 						output = self.module.prefill_attn_w8a16(
 							cur_hidden_states,
@@ -432,7 +455,7 @@ class Attn_Wrapper(torch.nn.Module):
 							position_ids.to(cur_hidden_states.device),
 							self.weight_dequant_scale
 						)
-						logging.debug(f"Rank {dist.get_rank()} - Quiting prefill attention")
+						logging.debug(f"Rank {self._get_global_rank()} - Quiting prefill attention")
 						key_cache = output[1]
 						value_cache = torch.ones(
 							1,
@@ -516,8 +539,8 @@ class Attn_Wrapper(torch.nn.Module):
 
 		elif Attn_Wrapper.phase == "decode":
 			# TODO: FIX
-			rank = dist.get_rank() 
-			world_size = dist.get_world_size()
+			rank = self._get_global_rank()
+			world_size = dist.get_world_size() if dist.is_initialized() else 1
 			EXPERT_PER_RANK = self.model_config.num_local_experts // world_size
 			current_rank_offloaded_expert_idx = (
 				rank * EXPERT_PER_RANK + self.engine_config.EP_Config.num_local_expert_per_layer
@@ -577,19 +600,19 @@ class Attn_Wrapper(torch.nn.Module):
 			if Attn_Wrapper.async_kv_load_active and self.layer_idx == 0:
 				# Wait for the C++ async task to complete (this waits for its internal CUDA stream)
 				if Attn_Wrapper.async_kv_load_task is not None:
-					logging.info(f"[Rank {dist.get_rank()}] Layer 0: Waiting for async KV load task...")
+					logging.info(f"[Rank {self._get_global_rank()}] Layer 0: Waiting for async KV load task...")
 					Attn_Wrapper.async_kv_load_task.wait()
-					logging.info(f"[Rank {dist.get_rank()}] Layer 0: Async KV load task completed, syncing CUDA...")
+					logging.info(f"[Rank {self._get_global_rank()}] Layer 0: Async KV load task completed, syncing CUDA...")
 					Attn_Wrapper.async_kv_load_task = None  # Clear after waiting
 					Attn_Wrapper.async_kv_load_active = False  # Clear flag too
 				# FULL device sync to ensure ALL async operations complete
 				torch.cuda.synchronize()
-				logging.info(f"[Rank {dist.get_rank()}] Layer 0: CUDA sync complete")
-				
+				logging.info(f"[Rank {self._get_global_rank()}] Layer 0: CUDA sync complete")
+
 			hidden_states = kwargs["hidden_states"]
 			if hidden_states.shape[0] == 0:
 				logging.debug(
-					f"[Rank: {dist.get_rank()} Layer {self.layer_idx} - Attn_Wrapper] Empty hidden states, skip."
+					f"[Rank: {self._get_global_rank()} Layer {self.layer_idx} - Attn_Wrapper] Empty hidden states, skip."
 				)
 				return hidden_states, None, None
 			attention_mask = Attn_Wrapper.attention_mask
@@ -674,22 +697,22 @@ class Attn_Wrapper(torch.nn.Module):
 						if self.layer_idx == 0:
 							# Only log on layer 0 to avoid spam
 							logging.debug(
-								f"[Rank {dist.get_rank()} Layer {self.layer_idx}] "
+								f"[Rank {self._get_global_rank()} Layer {self.layer_idx}] "
 								f"micro_batch {i}: hidden.shape={micro_hidden.shape}, "
 								f"position_ids.shape={micro_position_ids.shape}, "
 								f"cache_seqlens.shape={micro_cache_seqlens.shape}"
 							)
-						
+
 						if micro_hidden.shape[0] == 0:
 							logging.warning(
-								f"[Rank {dist.get_rank()} Layer {self.layer_idx}] "
+								f"[Rank {self._get_global_rank()} Layer {self.layer_idx}] "
 								f"SKIPPING empty micro_batch {i}: start={start_ids}, end={end_ids}"
 							)
 							continue
-						
+
 						if micro_position_ids.numel() == 0:
 							logging.error(
-								f"[Rank {dist.get_rank()} Layer {self.layer_idx}] "
+								f"[Rank {self._get_global_rank()} Layer {self.layer_idx}] "
 								f"EMPTY position_ids for micro_batch {i}! "
 								f"position_ids.shape={position_ids.shape}, "
 								f"start={start_ids}, end={end_ids}"
@@ -745,7 +768,7 @@ class Attn_Wrapper(torch.nn.Module):
 				# self.module.o_proj.weight.data = self.fp8_o_proj
 				pass
 			logging.debug(
-				f"[Rank: {dist.get_rank()} Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
+				f"[Rank: {self._get_global_rank()} Layer {self.layer_idx} - Attn_Wrapper] Finish forward pass. Phase: {Attn_Wrapper.phase}"
 			)
 			return final_attn_result, None, None
 	
@@ -807,7 +830,7 @@ class Attn_Wrapper(torch.nn.Module):
 			if "deepseek" in self.model_config.model_type:
 				position_ids = Attn_Wrapper.position_ids  # [total_tokens]
 
-				logging.debug(f"Rank {dist.get_rank()} - Entering prepacked prefill attention")
+				logging.debug(f"Rank {self._get_global_rank()} - Entering prepacked prefill attention")
 
 				# Call prepacked attention method with 2D input
 				output = self.module.prefill_attn_w8a16_prepacked(
@@ -819,7 +842,7 @@ class Attn_Wrapper(torch.nn.Module):
 					self.weight_dequant_scale
 				)
 
-				logging.debug(f"Rank {dist.get_rank()} - Exiting prepacked prefill attention")
+				logging.debug(f"Rank {self._get_global_rank()} - Exiting prepacked prefill attention")
 
 				attn_output = output[0]  # [total_tokens, hidden_dim]
 				key_cache = output[1]    # [total_tokens, kv_dim]
@@ -1003,7 +1026,7 @@ class Expert_Wrapper(torch.nn.Module):
 			pass
 
 		logging.debug(
-			f"[Rank {dist.get_rank()} Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"
+			f"[Rank {_get_safe_rank()} Layer {self.layer_idx} - Expert {self.expert_idx}] Finish forward pass. Phase: {Expert_Wrapper.phase}"
 		)
 		if self.expert_idx != -1:
 			# self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)

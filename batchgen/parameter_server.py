@@ -485,9 +485,9 @@ class ParameterServer:
 				# Remove leading slash if present to avoid double slash in path
 				clean_name = shm_name.lstrip('/')
 				shm_path = os.path.join("/dev/hugepages", clean_name)
-				
+
 				logging.info(f"Removing shared memory file {shm_path}")
-				
+
 				if os.path.exists(shm_path):
 					os.remove(shm_path)
 					logging.info(f"Successfully removed {shm_path}")
@@ -499,6 +499,32 @@ class ParameterServer:
 		# Clean up skeleton state dict temp file
 		self._cleanup_temp_files()
 
+		# Clean up hugepages allocation - critical for releasing system memory
+		# Use both methods for robustness
+		if self.enable_hugetlbfs:
+			# Method 1: sysctl
+			try:
+				command = ['sysctl', '-w', 'vm.nr_hugepages=0']
+				logging.info(f"Running command to clean up hugepages: {' '.join(command)}")
+				result = subprocess.run(command, check=True, capture_output=True, text=True)
+				if result.stdout:
+					logging.info(f"Command output: {result.stdout.strip()}")
+				if result.stderr:
+					logging.warning(f"Command error: {result.stderr.strip()}")
+			except subprocess.CalledProcessError as e:
+				logging.warning(f"Error cleaning up hugepages via sysctl: {e}")
+			except Exception as e:
+				logging.warning(f"Unexpected error cleaning up hugepages via sysctl: {e}")
+
+			# Method 2: Direct /proc write (fallback)
+			try:
+				with open("/proc/sys/vm/nr_hugepages", "w") as f:
+					f.write("0\n")
+				logging.info("Reset vm.nr_hugepages to 0 via /proc")
+			except PermissionError:
+				logging.warning("Permission denied writing to /proc/sys/vm/nr_hugepages (need root)")
+			except Exception as e:
+				logging.warning(f"Failed to reset hugepages via /proc: {e}")
 
 		self.running = False
 	

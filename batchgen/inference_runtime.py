@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from batchgen.get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+from batchgen.models.wrappers import BaseModuleWrapper
 from batchgen.model_instance import ModelForwardInput, ModelForwardOutput
 from batchgen.utils import deep_free_model_memory
 
@@ -58,6 +59,7 @@ class InferenceRuntime:
 		self.core_engine.set_phase(phase)
 		Attn_Wrapper.phase = phase
 		Expert_Wrapper.phase = phase
+		BaseModuleWrapper.phase = phase
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_weight_copy_queue()
 		self.core_engine.reset_prefill_buffer()
@@ -102,6 +104,7 @@ class InferenceRuntime:
 			self.core_engine.set_phase(phase)
 			Attn_Wrapper.phase = phase
 			Expert_Wrapper.phase = phase
+			BaseModuleWrapper.phase = phase
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()
@@ -114,6 +117,7 @@ class InferenceRuntime:
 			self.core_engine.set_phase(phase)
 			Attn_Wrapper.phase = phase
 			Expert_Wrapper.phase = phase
+			BaseModuleWrapper.phase = phase
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
 			self.core_engine.clear_kv_buffer()

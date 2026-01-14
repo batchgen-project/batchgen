@@ -327,10 +327,37 @@ class BatchGenServer:
 		logging.info("Shutdown signal received...")
 		self.running = False
 
+		# Clean up hugepages allocation - critical for releasing system memory on node 0
+		# Use both methods for robustness
+		if getattr(self.args, 'enable_hugetlbfs', False):
+			# Method 1: sysctl
+			try:
+				command = ['sysctl', '-w', 'vm.nr_hugepages=0']
+				logging.info(f"Running command to clean up hugepages: {' '.join(command)}")
+				result = subprocess.run(command, check=True, capture_output=True, text=True)
+				if result.stdout:
+					logging.info(f"Command output: {result.stdout.strip()}")
+				if result.stderr:
+					logging.warning(f"Command error: {result.stderr.strip()}")
+			except subprocess.CalledProcessError as e:
+				logging.warning(f"Error cleaning up hugepages via sysctl: {e}")
+			except Exception as e:
+				logging.warning(f"Unexpected error cleaning up hugepages via sysctl: {e}")
+
+			# Method 2: Direct /proc write (fallback)
+			try:
+				with open("/proc/sys/vm/nr_hugepages", "w") as f:
+					f.write("0\n")
+				logging.info("Reset vm.nr_hugepages to 0 via /proc")
+			except PermissionError:
+				logging.warning("Permission denied writing to /proc/sys/vm/nr_hugepages (need root)")
+			except Exception as e:
+				logging.warning(f"Failed to reset hugepages via /proc: {e}")
+
 	def cleanup(self):
 		logging.info("Cleaning up...")
 		self.running = False
-		
+
 		# Poison Pill for workers
 		try:
 			if self.request_queue:
