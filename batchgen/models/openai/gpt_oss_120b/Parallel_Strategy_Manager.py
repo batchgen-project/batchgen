@@ -266,6 +266,19 @@ class GptOssAttnWrapper(nn.Module):
                         weights_dict[tensor_key], requires_grad=False
                     ))
 
+        # Debug: Log weight shapes at inference time (layer 0 only)
+        if self.layer_idx == 0:
+            import logging
+            logging.warning(f"[GptOssAttnWrapper L{self.layer_idx}] forward() called")
+            logging.warning(f"  hidden_states.shape = {list(hidden_states.shape)}")
+            logging.warning(f"  get_weights = {self.get_weights}")
+            # Check the module's qkv weight
+            qkv_weight = self.module.qkv.weight
+            logging.warning(f"  self.module.qkv.weight.shape = {list(qkv_weight.shape)}")
+            logging.warning(f"  self.module.qkv.weight.numel() = {qkv_weight.numel()}")
+            if qkv_weight.numel() == 1:
+                logging.error(f"CRITICAL: qkv.weight is still a placeholder at inference time!")
+
         # Execute attention forward
         output = self.module(hidden_states, **kwargs)
 
@@ -689,16 +702,24 @@ class GptOssParallelStrategyManager:
                     # mlp.gate -> moe_gate
                     variations.append(target_name.replace(".mlp.gate.", ".moe_gate."))
 
-            # Embedding variations
+            # Embedding variations (GPT-OSS checkpoint may use different names)
             if "embedding." in target_name:
                 variations.append(target_name.replace("embedding.", "tok_embeddings."))
                 variations.append(target_name.replace("embedding.", "embed_tokens."))
                 variations.append(target_name.replace("embedding.", "wte."))
+                # Model-prefixed variations
+                variations.append(f"model.{target_name}")
+                variations.append(target_name.replace("embedding.", "model.embed_tokens."))
+                variations.append(target_name.replace("embedding.", "transformer.wte."))
 
             # Unembedding/LM head variations
             if "unembedding." in target_name:
                 variations.append(target_name.replace("unembedding.", "output."))
                 variations.append(target_name.replace("unembedding.", "lm_head."))
+                # Model-prefixed variations
+                variations.append(f"model.{target_name}")
+                variations.append(target_name.replace("unembedding.", "model.lm_head."))
+                variations.append(target_name.replace("unembedding.", "transformer.wte."))
 
             # Scale -> weight variations
             if ".scale" in target_name:
@@ -852,9 +873,11 @@ class GptOssParallelStrategyManager:
                         # Replace the parameter with a new nn.Parameter
                         new_param = nn.Parameter(tensor.to(device), requires_grad=False)
                         setattr(parent_module, param_name, new_param)
-                        # Log attention weights explicitly at INFO level
+                        # Log critical weights explicitly at INFO level
                         if 'attn' in model_name:
                             logging.info(f"Loaded attention: {model_name} shape={list(tensor.shape)}")
+                        elif 'embedding' in model_name or 'unembedding' in model_name:
+                            logging.info(f"Loaded embedding: {model_name} shape={list(tensor.shape)}")
                         else:
                             logging.debug(f"Replaced placeholder {model_name} with shape {list(tensor.shape)}")
                     else:
@@ -902,15 +925,37 @@ class GptOssParallelStrategyManager:
         self._validate_linear_weights(transformer)
 
     def _validate_linear_weights(self, transformer):
-        """Validate Linear layers have proper 2D weights.
+        """Validate Linear and Embedding layers have proper weights.
 
         This helps debug 'weight must be 2-D' errors by identifying
         which layers have malformed weights after skeleton loading.
 
         All attention and MLP gate/norm weights are skeleton (loaded at init).
         Expert MLP weights are either skeleton (world_size=1) or HtoD.
+
+        NOTE: config_torch_module_initializer() patches ALL nn.Module subclasses
+        including nn.Embedding, so embedding weights can also be [1] placeholders.
         """
-        logging.info("=== VALIDATING LINEAR LAYER WEIGHTS (POST-SKELETON LOADING) ===")
+        logging.info("=== VALIDATING WEIGHTS (POST-SKELETON LOADING) ===")
+
+        # First, validate embedding layers (critical for inference)
+        logging.info("Checking Embedding layers...")
+        for name, module in transformer.named_modules():
+            if isinstance(module, nn.Embedding):
+                weight = module.weight
+                logging.info(f"  {name}.weight: shape={list(weight.shape)}, numel={weight.numel()}")
+                if weight.numel() == 1:
+                    logging.error(f"CRITICAL: {name}.weight is still a [1] placeholder!")
+                    logging.error(f"  Expected shape: [{module.num_embeddings}, {module.embedding_dim}]")
+                    raise RuntimeError(
+                        f"FATAL: Embedding '{name}' weight is still a placeholder!\n"
+                        f"Expected shape: [{module.num_embeddings}, {module.embedding_dim}]\n"
+                        f"Actual shape: {list(weight.shape)}\n"
+                        f"The checkpoint may use different tensor names for embedding.\n"
+                        f"Check the skeleton_state_dict logs to see available tensor names."
+                    )
+
+        logging.info("Checking Linear layers...")
         issues = []
         valid_count = 0
 
@@ -1049,10 +1094,26 @@ class GptOssParallelStrategyManager:
             # Replace attention module with wrapped version
             transformer.block[layer_idx].attn = wrapped
 
+            # Debug: Verify weights are still correct after wrapping (layer 0 only)
+            if layer_idx == 0:
+                qkv_weight_shape = list(wrapped.module.qkv.weight.shape)
+                logging.info(f"[After wrapping L0] wrapped.module.qkv.weight.shape = {qkv_weight_shape}")
+                if wrapped.module.qkv.weight.numel() == 1:
+                    logging.error("CRITICAL: qkv.weight is placeholder after wrapping!")
+
             if get_weights:
                 htod_count += 1
             else:
                 skeleton_count += 1
+
+        # Final verification: Check layer 0 through the transformer hierarchy
+        wrapped_attn = transformer.block[0].attn
+        logging.info(f"=== FINAL WRAPPING VERIFICATION ===")
+        logging.info(f"  transformer.block[0].attn type = {type(wrapped_attn).__name__}")
+        if hasattr(wrapped_attn, 'module'):
+            logging.info(f"  wrapped_attn.module type = {type(wrapped_attn.module).__name__}")
+            logging.info(f"  wrapped_attn.module.qkv.weight.shape = {list(wrapped_attn.module.qkv.weight.shape)}")
+        logging.info(f"=== END FINAL VERIFICATION ===")
 
         logging.info(
             f"Configured {num_layers} attention modules: "
