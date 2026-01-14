@@ -1100,15 +1100,40 @@ class GptOssParallelStrategyManager:
         Returns:
             Tuple of (model, weight_copy_task)
         """
+        # Debug: Check self.model state
+        logging.info(
+            f"[DECODE DEBUG] configure_decoding called. "
+            f"hasattr(self, 'model')={hasattr(self, 'model')}, "
+            f"self.model is None={getattr(self, 'model', 'NOT_SET') is None}, "
+            f"type(self.model)={type(getattr(self, 'model', None))}"
+        )
+
         # If model doesn't exist yet (shouldn't happen, but handle it)
         if not hasattr(self, 'model') or self.model is None:
             logging.warning("configure_decoding called before configure_prefill, initializing...")
             return self.configure_prefill()
 
+        # Debug: Check model structure
+        logging.info(
+            f"[DECODE DEBUG] self.model id={id(self.model)}, "
+            f"type={type(self.model).__name__}"
+        )
+
         # Debug: Check embedding weight shape before decode
         transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
+        logging.info(
+            f"[DECODE DEBUG] transformer id={id(transformer)}, "
+            f"type={type(transformer).__name__}, "
+            f"hasattr(embedding)={hasattr(transformer, 'embedding')}"
+        )
+
         if hasattr(transformer, 'embedding'):
-            emb_weight = transformer.embedding.weight
+            emb_module = transformer.embedding
+            logging.info(
+                f"[DECODE DEBUG] embedding module: type={type(emb_module).__name__}, "
+                f"id={id(emb_module)}"
+            )
+            emb_weight = emb_module.weight
             logging.info(
                 f"[DECODE DEBUG] Embedding weight: shape={emb_weight.shape}, "
                 f"dim={emb_weight.dim()}, dtype={emb_weight.dtype}, "

@@ -4061,9 +4061,14 @@ class BatchGenWorker:
 							else:
 								self.prefill(local_prefill_indices)
 						prefill_time += time.perf_counter() - prefill_start
-					
+
 					# Cleanup & Status Update
-					self._unregister_fp8_weights()
+					# GPT-OSS: Skip FP8 cleanup - uses different model structure (MXFP4)
+					if not (
+						"gpt-oss" in self.model_name.lower() or
+						"gpt_oss" in self.model_name.lower()
+					):
+						self._unregister_fp8_weights()
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
 					dist.barrier()
 
@@ -4137,8 +4142,15 @@ class BatchGenWorker:
 				decoding_time += time.perf_counter() - decode_start
 
 				# D. Cleanup
-				self._unregister_fp8_weights()
-				self.deep_free_model_memory()
+				# GPT-OSS: Skip FP8/cleanup operations - uses different model structure
+				is_gpt_oss = (
+					"gpt-oss" in self.model_name.lower() or
+					"gpt_oss" in self.model_name.lower()
+				)
+				if not is_gpt_oss:
+					self._unregister_fp8_weights()
+					# Skip deep_free_model_memory() for GPT-OSS - skeleton weights can't be reloaded
+					self.deep_free_model_memory()
 				dist.barrier()
 
 				# CRITICAL FIX: After decode returns (possibly due to watermark trigger),
@@ -4473,8 +4485,22 @@ class BatchGenWorker:
 			logging.debug(
 				f"_config_decoding_for_batch: {len(fresh_seqs)} FRESH sequences (decoded_length=0)"
 			)
-		
-		self.deep_free_model_memory()
+
+		# GPT-OSS: Skip deep_free_model_memory() because skeleton weights are pre-loaded
+		# and cannot be reloaded (no HtoD for skeleton weights like embedding, attention).
+		# For DeepSeek-style models, all weights are loaded via HtoD each forward,
+		# so deep_free_model_memory() is safe to call.
+		is_gpt_oss = (
+			"gpt-oss" in self.model_name.lower() or
+			"gpt_oss" in self.model_name.lower()
+		)
+		if is_gpt_oss:
+			logging.info(
+				f"Rank {self.rank}: Skipping deep_free_model_memory() for GPT-OSS "
+				f"(skeleton weights are pre-loaded)"
+			)
+		else:
+			self.deep_free_model_memory()
 		self.init_nvshmem()
 		
 		num_local_seq = len(local_decode_indices)
