@@ -639,11 +639,10 @@ class TransformerBlock(torch.nn.Module):
         x = self.attn(x, attention_mask=attention_mask)
         x = self.mlp(x)
 
-        # Return format compatible with HuggingFace expectations
-        if use_cache:
-            # Return (hidden_states, present_key_value) - KV cache not implemented yet
-            return (x, None)
-        return x
+        # ALWAYS return tuple (hidden_states, past_key_value) to match HuggingFace format
+        # BatchGenWorker expects tuple output and does `hidden_states = layer_output[0]`
+        # If we return tensor directly, layer_output[0] indexes into tensor's first dim!
+        return (x, None)
 
 
 class Transformer(torch.nn.Module):
