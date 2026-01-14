@@ -1,5 +1,4 @@
 from batchgen.models.deepseek.deepseekv3.Parallel_Strategy_Manager import DeepseekV3ParallelStrategyManager
-from batchgen.models.gpt_oss.Parallel_Strategy_Manager import GptOssParallelStrategyManager
 from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import GptOssParallelStrategyManager
 
 

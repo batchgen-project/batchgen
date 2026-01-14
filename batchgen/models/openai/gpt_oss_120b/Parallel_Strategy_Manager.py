@@ -195,6 +195,92 @@ class GptOssExpertWrapper(nn.Module):
         self.phase = phase
 
 
+class GptOssAttnWrapper(nn.Module):
+    """Attention wrapper for GPT-OSS with HtoD weight fetching.
+
+    Supports two modes:
+    1. get_weights=True (HtoD): Load weights from core_engine per forward,
+       then free buffer after use.
+    2. get_weights=False (skeleton): Weights already loaded in module parameters.
+
+    Following BatchGen's Attn_Wrapper pattern from DeepSeek implementation.
+    """
+    phase = "prefill"  # Class variable for phase tracking
+
+    def __init__(
+        self,
+        module: nn.Module,
+        layer_idx: int,
+        core_engine,
+        engine_config,
+        model_config,
+        get_weights: bool = True,
+    ):
+        super().__init__()
+        self.module = module
+        self.layer_idx = layer_idx
+        self.core_engine = core_engine
+        self.engine_config = engine_config
+        self.model_config = model_config
+        self.get_weights = get_weights
+        self.attn_module_id = f"attn_{layer_idx}"
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Forward pass with HtoD weight fetching.
+
+        If get_weights=True: Load weights from core_engine, forward, free buffer.
+        If get_weights=False: Use existing weights in module parameters.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_size] or [batch*seq_len, hidden_size]
+            **kwargs: Additional arguments passed to attention module
+
+        Returns:
+            output: Attention output tensor
+        """
+        if self.get_weights:
+            # HtoD: Load attention weights from host
+            weights_dict = self.core_engine.get_weights(
+                self.attn_module_id, GptOssAttnWrapper.phase
+            )
+
+            # Apply weights to module parameters
+            # Map tensor_key to module parameter names
+            param_mapping = {
+                "qkv.weight": "qkv.weight",
+                "qkv.bias": "qkv.bias",
+                "out.weight": "out.weight",
+                "out.bias": "out.bias",
+                "norm.scale": "norm.scale",
+                "sinks": "sinks",
+            }
+
+            for tensor_key, param_name in param_mapping.items():
+                if tensor_key in weights_dict:
+                    # Navigate to the parameter
+                    parts = param_name.split('.')
+                    target = self.module
+                    for part in parts[:-1]:
+                        target = getattr(target, part)
+                    setattr(target, parts[-1], nn.Parameter(
+                        weights_dict[tensor_key], requires_grad=False
+                    ))
+
+        # Execute attention forward
+        output = self.module(hidden_states, **kwargs)
+
+        if self.get_weights:
+            # Free GPU buffer
+            self.core_engine.free_weights_buffer(self.attn_module_id)
+
+        return output
+
+    @classmethod
+    def set_phase(cls, phase: str):
+        """Set the execution phase for all instances."""
+        cls.phase = phase
+
+
 class GptOssMXFP4ExpertForward:
     """Standalone MXFP4 expert forward pass (for use without wrapper).
 
@@ -402,8 +488,7 @@ class GptOssParallelStrategyManager:
     def _build_weight_mappings(self):
         """Build state_dict_name_map and weight_copy_task.
 
-        NOTE: For GPT-OSS, attention weights are SKELETON (loaded once at init
-        via _load_model_skeleton), NOT dynamically loaded.
+        Both attention and expert weights support HtoD loading via wrappers.
 
         For world_size==1 (single GPU), ALL expert weights are also loaded as
         skeleton (pre-loaded at init) to avoid HtoD buffer contention issues.
@@ -416,7 +501,7 @@ class GptOssParallelStrategyManager:
         """
         self.state_dict_name_map = {}
         self.weight_copy_task = {
-            "attn": [],  # Empty - attention is skeleton, not dynamically loaded
+            "attn": [],
             "routed_expert": [],
         }
 
@@ -431,10 +516,33 @@ class GptOssParallelStrategyManager:
         self.local_routed_experts = []
 
         for layer_idx in range(num_layers):
-            # NOTE: Attention weights are NOT added here - they are skeleton weights
-            # loaded via _load_model_skeleton() from skeleton_state_dict
+            # =================================================================
+            # Attention weights (BF16) - HtoD via GptOssAttnWrapper
+            # =================================================================
+            attn_module_key = f"attn_{layer_idx}"
 
-            # Expert weights (MXFP4) - state_dict_name_map is always needed for loading
+            # Add attention tensors to state_dict_name_map
+            attn_tensors = [
+                ("qkv.weight", "qkv.weight"),
+                ("qkv.bias", "qkv.bias"),
+                ("out.weight", "out.weight"),
+                ("out.bias", "out.bias"),
+                ("norm.scale", "norm.scale"),
+                ("sinks", "sinks"),
+            ]
+            for ckpt_suffix, tensor_key in attn_tensors:
+                ckpt_name = f"block.{layer_idx}.attn.{ckpt_suffix}"
+                self.state_dict_name_map[ckpt_name] = {
+                    "module_key": attn_module_key,
+                    "tensor_key": tensor_key,
+                }
+
+            # Add to weight_copy_task for HtoD loading
+            self.weight_copy_task["attn"].append(attn_module_key)
+
+            # =================================================================
+            # Expert weights (MXFP4) - HtoD via GptOssExpertWrapper
+            # =================================================================
             for expert_idx in range(num_experts):
                 module_key = f"routed_expert_{layer_idx}_{expert_idx}"
 
@@ -455,12 +563,15 @@ class GptOssParallelStrategyManager:
 
         if all_experts_local:
             logging.info(
-                f"Weight mappings (world_size=1): {len(self.local_routed_experts)} experts (pre-loaded), "
+                f"Weight mappings (world_size=1): "
+                f"{len(self.weight_copy_task['attn'])} attn (HtoD), "
+                f"{len(self.local_routed_experts)} experts (pre-loaded), "
                 f"0 experts (dynamic)"
             )
         else:
             logging.info(
-                f"Weight mappings: {len(self.weight_copy_task['attn'])} attn (skeleton), "
+                f"Weight mappings: "
+                f"{len(self.weight_copy_task['attn'])} attn (HtoD), "
                 f"{len(self.weight_copy_task['routed_expert'])} experts (dynamic)"
             )
 
@@ -907,13 +1018,15 @@ class GptOssParallelStrategyManager:
         logging.info(f"GPU memory after expert pre-load: {used_memory / (1024**3):.2f} GB")
 
     def _config_attn_module(self):
-        """Configure attention modules.
+        """Configure attention modules with GptOssAttnWrapper.
 
         GPT-OSS attention uses:
         - Combined QKV projection (block.{N}.attn.qkv)
         - GQA (64 Q heads, 8 KV heads)
         - Alternating sliding (128) / full attention
         - Attention sinks
+
+        Wraps each attention module with GptOssAttnWrapper for HtoD weight fetching.
         """
         num_layers = self.model_config.num_hidden_layers
         device = self.engine_config.Basic_Config.device_torch
@@ -921,14 +1034,38 @@ class GptOssParallelStrategyManager:
         # Access transformer through wrapper
         transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
 
+        htod_count = 0
+        skeleton_count = 0
+
         for layer_idx in range(num_layers):
-            attn_block = transformer.block[layer_idx].attn
+            attn_module = transformer.block[layer_idx].attn
 
-            # Attention weights will be loaded dynamically via core_engine
-            # Configure any special attention handling here
-            attn_block.layer_idx = layer_idx
+            # Check if attention needs HtoD loading (in weight_copy_task)
+            attn_module_key = f"attn_{layer_idx}"
+            get_weights = attn_module_key in self.weight_copy_task.get("attn", [])
 
-        logging.info(f"Configured {num_layers} attention modules")
+            # Wrap with GptOssAttnWrapper
+            wrapped = GptOssAttnWrapper(
+                module=attn_module,
+                layer_idx=layer_idx,
+                core_engine=self.core_engine,
+                engine_config=self.engine_config,
+                model_config=self.model_config,
+                get_weights=get_weights,
+            )
+
+            # Replace attention module with wrapped version
+            transformer.block[layer_idx].attn = wrapped
+
+            if get_weights:
+                htod_count += 1
+            else:
+                skeleton_count += 1
+
+        logging.info(
+            f"Configured {num_layers} attention modules: "
+            f"{htod_count} HtoD, {skeleton_count} skeleton"
+        )
 
     def _config_expert_module(self):
         """Configure expert modules with W4A16 MXFP4 forward pass.

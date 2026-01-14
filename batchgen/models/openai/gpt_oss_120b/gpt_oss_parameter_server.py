@@ -352,18 +352,15 @@ class GptOss_Parameter_Server:
         return sliced
 
     def _parse_state_dict(self):
-        """Build state_dict_name_map for sliced expert tensors.
+        """Build state_dict_name_map for attention and expert tensors.
 
         Maps checkpoint tensor names to (module_key, tensor_key) pairs.
-        Uses DeepSeek-style naming: routed_expert_{layer}_{expert}
+        Uses BatchGen naming conventions:
+        - attn_{layer} for attention modules
+        - routed_expert_{layer}_{expert} for MoE expert modules
 
-        NOTE: GPT-OSS attention weights are NOT in state_dict_name_map.
-        They are loaded as skeleton weights (once at init) because:
-        1. BF16 attention weights are not quantized (no special handling needed)
-        2. They don't change between requests
-        3. No custom attention wrapper exists for GPT-OSS (uses vanilla model.py attention)
-
-        Only expert MLP weights (MXFP4) are dynamically loaded via Expert_Wrapper.
+        Both attention and expert weights are added to state_dict_name_map
+        for HtoD (host-to-device) loading via wrappers.
         """
         self.weight_copy_task["attn"] = []
         self.weight_copy_task["routed_expert"] = []
@@ -373,19 +370,31 @@ class GptOss_Parameter_Server:
 
         for layer_idx in trange(num_layers, desc="Building state_dict_name_map"):
             # =================================================================
-            # Attention weights (BF16) - SKELETON LOADING
+            # Attention weights (BF16) - HtoD via GptOssAttnWrapper
             # =================================================================
-            # NOTE: Attention weights are NOT added to state_dict_name_map.
-            # They will be loaded as skeleton weights via get_skeleton_state_dict()
-            # and then loaded into the model by Parallel_Strategy_Manager._load_model_skeleton()
-            #
-            # Weights loaded as skeleton:
-            # - block.{N}.attn.qkv.weight, block.{N}.attn.qkv.bias
-            # - block.{N}.attn.out.weight, block.{N}.attn.out.bias
-            # - block.{N}.attn.norm.scale, block.{N}.attn.sinks
+            attn_module_key = f"attn_{layer_idx}"
+
+            # Add attention tensors to state_dict_name_map
+            attn_tensors = [
+                ("qkv.weight", "qkv.weight"),
+                ("qkv.bias", "qkv.bias"),
+                ("out.weight", "out.weight"),
+                ("out.bias", "out.bias"),
+                ("norm.scale", "norm.scale"),
+                ("sinks", "sinks"),
+            ]
+            for ckpt_suffix, tensor_key in attn_tensors:
+                ckpt_name = f"block.{layer_idx}.attn.{ckpt_suffix}"
+                self.state_dict_name_map[ckpt_name] = {
+                    "module_key": attn_module_key,
+                    "tensor_key": tensor_key,
+                }
+
+            # Add to weight_copy_task for HtoD loading
+            self.weight_copy_task["attn"].append(attn_module_key)
 
             # =================================================================
-            # Expert MLP weights (MXFP4) - DYNAMIC LOADING
+            # Expert MLP weights (MXFP4) - HtoD via GptOssExpertWrapper
             # Each expert is now a separate module (after slicing)
             # =================================================================
             for expert_idx in range(num_experts):
