@@ -302,6 +302,14 @@ class GptOssAttnWrapper(nn.Module):
 
         return output
 
+    def _unregister_fp8_weights(self):
+        """No-op for FP8 weight unregistration.
+
+        GPT-OSS uses MXFP4 (not FP8), so this is a no-op.
+        BatchGenWorker calls this after prefill cleanup.
+        """
+        pass
+
     @classmethod
     def set_phase(cls, phase: str):
         """Set the execution phase for all instances."""
