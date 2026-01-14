@@ -772,24 +772,23 @@ class GptOssParallelStrategyManager:
             return None, None
 
         # Build the expected mappings (model parameter names)
+        # NOTE: Attention weights (qkv, out, norm, sinks) are loaded via HtoD,
+        # NOT skeleton. They're in state_dict_name_map, not skeleton_state_dict.
         expected_params = {
             "embedding.weight": "embedding.weight",
             "unembedding.weight": "unembedding.weight",
             "norm.scale": "norm.scale",
         }
 
-        # Add per-layer mappings
+        # Add per-layer mappings (only MLP skeleton, not attention)
         for layer_idx in range(self.model_config.num_hidden_layers):
             expected_params.update({
-                f"block.{layer_idx}.attn.norm.scale": f"block.{layer_idx}.attn.norm.scale",
-                f"block.{layer_idx}.attn.sinks": f"block.{layer_idx}.attn.sinks",
-                f"block.{layer_idx}.attn.qkv.weight": f"block.{layer_idx}.attn.qkv.weight",
-                f"block.{layer_idx}.attn.qkv.bias": f"block.{layer_idx}.attn.qkv.bias",
-                f"block.{layer_idx}.attn.out.weight": f"block.{layer_idx}.attn.out.weight",
-                f"block.{layer_idx}.attn.out.bias": f"block.{layer_idx}.attn.out.bias",
+                # MLP gate and norm are skeleton (loaded once at init)
                 f"block.{layer_idx}.mlp.norm.scale": f"block.{layer_idx}.mlp.norm.scale",
                 f"block.{layer_idx}.mlp.gate.weight": f"block.{layer_idx}.mlp.gate.weight",
                 f"block.{layer_idx}.mlp.gate.bias": f"block.{layer_idx}.mlp.gate.bias",
+                # Attention weights are loaded via HtoD, not skeleton
+                # See GptOssAttnWrapper.forward() for HtoD loading
             })
 
         # Helper to find similar tensor names for debugging
@@ -889,42 +888,37 @@ class GptOssParallelStrategyManager:
         if missing and len(missing) <= 20:
             logging.warning(f"  Missing tensors: {missing}")
 
-        # Check if critical attention weights are missing
-        critical_missing = [m for m in missing if "qkv" in m or "out" in m]
-        if critical_missing:
-            logging.error(
-                f"CRITICAL: {len(critical_missing)} attention weights missing from skeleton!\n"
-                f"  Missing: {critical_missing[:5]}{'...' if len(critical_missing) > 5 else ''}\n"
-                f"  skeleton_state_dict has {len(skeleton_keys)} tensors\n"
-                f"  This usually means the checkpoint uses different naming.\n"
-                f"  Check the skeleton tensor names logged above and update find_skeleton_tensor()."
-            )
-            # Log all skeleton keys containing 'attn' or 'qkv' for debugging
-            attn_keys = [k for k in skeleton_keys if 'attn' in k.lower() or 'qkv' in k.lower()]
-            if attn_keys:
-                logging.error(f"  Skeleton tensors with 'attn' or 'qkv': {attn_keys[:10]}")
-            else:
-                logging.error(f"  No skeleton tensors with 'attn' or 'qkv' found - checkpoint may not contain attention weights!")
-
         # Validate all Linear layers have proper 2D weights
         self._validate_linear_weights(transformer)
 
     def _validate_linear_weights(self, transformer):
-        """Validate all Linear layers have proper 2D weights.
+        """Validate Linear layers have proper 2D weights.
 
         This helps debug 'weight must be 2-D' errors by identifying
         which layers have malformed weights after skeleton loading.
 
-        Note: If using config_torch_module_initializer(), parameters start
-        as [1] placeholders and are replaced during skeleton loading.
+        Note: Attention weights (qkv, out) are loaded via HtoD, NOT skeleton.
+        They're expected to have proper shapes but uninitialized values.
         """
         logging.info("=== VALIDATING LINEAR LAYER WEIGHTS (POST-SKELETON LOADING) ===")
         issues = []
         valid_count = 0
+        htod_count = 0
 
         for name, module in transformer.named_modules():
             if isinstance(module, nn.Linear):
                 weight = module.weight
+
+                # Skip attention weights - they're loaded via HtoD, not skeleton
+                # They should have proper shapes but may have random values
+                is_attention = '.attn.' in name and any(x in name for x in ['qkv', 'out'])
+                if is_attention:
+                    if weight.dim() == 2:
+                        htod_count += 1
+                        logging.debug(f"HTOD: {name}.weight shape={list(weight.shape)} (loaded via HtoD)")
+                    else:
+                        issues.append(f"{name}.weight: expected 2D, got {weight.dim()}D shape={list(weight.shape)}")
+                    continue
 
                 # Check for placeholder that wasn't replaced
                 if weight.numel() == 1:
@@ -946,22 +940,11 @@ class GptOssParallelStrategyManager:
                         logging.error(f"INVALID: {name}.bias has {module.bias.dim()}D shape")
 
         if issues:
-            logging.error(f"Found {len(issues)} Linear layer weight issues! ({valid_count} layers OK)")
+            logging.error(f"Found {len(issues)} Linear layer weight issues! ({valid_count} skeleton OK, {htod_count} HtoD)")
             for issue in issues:
                 logging.error(f"  {issue}")
-
-            # Check if any attention weights are still placeholders - this is fatal
-            attn_issues = [i for i in issues if 'attn' in i and 'placeholder' in i]
-            if attn_issues:
-                raise RuntimeError(
-                    f"FATAL: {len(attn_issues)} attention layer weights are still placeholders!\n"
-                    f"This means skeleton loading failed to find/load attention weights.\n"
-                    f"Issues:\n" + "\n".join(f"  - {i}" for i in attn_issues[:10]) + "\n"
-                    f"Check the skeleton_state_dict logs above to see what tensors are available.\n"
-                    f"The checkpoint may use different naming conventions than expected."
-                )
         else:
-            logging.info(f"All {valid_count} Linear layer weights validated OK (all proper 2D shapes)")
+            logging.info(f"All Linear layer weights validated OK: {valid_count} skeleton, {htod_count} HtoD")
         logging.info("=== END VALIDATION ===")
 
     def _load_local_routed_experts(self):

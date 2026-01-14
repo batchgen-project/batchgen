@@ -132,11 +132,9 @@ class GptOssInitializer:
         engine_config.Basic_Config.activation_dtype = "bfloat16"
         engine_config.Basic_Config.activation_dtype_torch = torch.bfloat16
 
-        # Module types - only routed_expert for GPT-OSS
-        # NOTE: Attention weights are SKELETON (loaded once via _load_model_skeleton),
-        # not dynamically loaded via HtoD. Including "attn" here would cause the
-        # HtoD worker to block forever waiting on an empty queue.
-        engine_config.Basic_Config.module_types = ["routed_expert"]
+        # Module types - both attn and routed_expert for GPT-OSS
+        # Both are loaded via HtoD (host-to-device) during prefill
+        engine_config.Basic_Config.module_types = ["attn", "routed_expert"]
 
         # Misc
         engine_config.Basic_Config.num_threads = 0
@@ -198,9 +196,21 @@ class GptOssInitializer:
         qkv_dim = (num_q_heads + 2 * num_kv_heads) * head_dim  # 5120
         out_dim = num_q_heads * head_dim  # 4096
 
-        # NOTE: Only routed_expert needs GPU buffer allocation.
-        # Attention weights are SKELETON (loaded once into model parameters).
+        # Both attn and routed_expert need GPU buffer allocation for HtoD
         self.engine_config.GPU_Buffer_Config.module_shapes = {
+            "attn": {
+                # BF16 attention weights
+                # qkv: combined Q/K/V projection [qkv_dim, hidden] = [5120, 2880]
+                # out: output projection [hidden, q_heads*head_dim] = [2880, 4096]
+                # norm: RMSNorm scale [hidden] = [2880]
+                # sinks: attention sinks [num_q_heads] = [64]
+                "qkv.weight": [qkv_dim, hidden_size],  # [5120, 2880]
+                "qkv.bias": [qkv_dim],  # [5120]
+                "out.weight": [hidden_size, out_dim],  # [2880, 4096]
+                "out.bias": [hidden_size],  # [2880]
+                "norm.scale": [hidden_size],  # [2880]
+                "sinks": [num_q_heads],  # [64]
+            },
             "routed_expert": {
                 # MXFP4 quantized expert weights
                 # mlp1 = gate_proj || up_proj (concatenated)
