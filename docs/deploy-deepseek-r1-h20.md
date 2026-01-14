@@ -139,7 +139,6 @@ This option allows you to remount `/dev/shm` inside the container for maximum fl
 ```bash
 # Node 0 (Master)
 docker run -it \
-    --cap-add=SYS_NICE \
     --cap-add=SYS_ADMIN \
     --runtime=nvidia \
     --gpus all \
@@ -150,7 +149,6 @@ docker run -it \
 
 # Node 1
 docker run -it \
-    --cap-add=SYS_NICE \
     --cap-add=SYS_ADMIN \
     --runtime=nvidia \
     --gpus all \
@@ -163,8 +161,8 @@ docker run -it \
 Once inside the container, remount `/dev/shm` with sufficient size before starting the server:
 
 ```bash
-# Inside container: remount /dev/shm with host memory size (e.g., 1500G)
-mount -o remount,size=1500G /dev/shm
+# Inside container: remount /dev/shm with host memory size (e.g., 2048G)
+mount -o remount,size=2048G /dev/shm
 ```
 
 #### Option B: With `--shm-size` (No SYS_ADMIN)
@@ -174,7 +172,6 @@ If you cannot use `--cap-add=SYS_ADMIN`, pre-configure `/dev/shm` size at contai
 ```bash
 # Node 0 (Master) - Example with 2TB host memory
 docker run -it \
-    --cap-add=SYS_NICE \
     --shm-size=2048g \
     --runtime=nvidia \
     --gpus all \
@@ -185,7 +182,6 @@ docker run -it \
 
 # Node 1
 docker run -it \
-    --cap-add=SYS_NICE \
     --shm-size=2048g \
     --runtime=nvidia \
     --gpus all \
@@ -210,7 +206,7 @@ docker run -it \
 
 **Optional flags:**
 - `--privileged`: Full host access. Alternative to `--cap-add=SYS_ADMIN` but grants more permissions (use with caution)
-- `--ipc=host`: Share host IPC namespace. Required by some communication libraries (e.g., certain NCCL configurations)
+- `--ipc=host`: Share host IPC namespace. Required by some communication libraries
 
 Once inside the container, start the server using the commands in [Section 5](#5-start-batchgen-server).
 
