@@ -48,16 +48,8 @@ class GptOssExpertWrapper(ExpertWrapperBase):
     - Packed as 2 values per uint8 byte
     - Scale stored as uint8, exponent = scale - 127
 
-    Weight Layout:
-    - GPT-OSS uses SHARED weights per layer, not per expert
-    - mlp1_weight: [128 * intermediate_size, hidden_size] - all experts' gate_proj
-    - mlp2_weight: [128 * intermediate_size * 2, hidden_size] - all experts' up_proj + down_proj
-    - Each expert slices its portion using expert_idx
-
     Attributes:
         dequant_fn: MXFP4 dequantization function
-        intermediate_size: Size of intermediate layer per expert
-        num_experts: Total number of experts (128)
     """
 
     def __init__(
@@ -179,6 +171,42 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             total_up_size = self.num_experts * self.intermediate_size
             result["up_proj.bias"] = full_bias[start_idx:end_idx]
             result["down_proj.bias"] = full_bias[total_up_size + start_idx:total_up_size + end_idx]
+    def dequantize_weights(
+        self, weights_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Dequantize MXFP4 packed weights to BF16.
+
+        Expected weight format in weights_dict:
+        - "gate_proj.weight": packed uint8 tensor
+        - "gate_proj.weight_scales": scale uint8 tensor
+        - "up_proj.weight": packed uint8 tensor
+        - "up_proj.weight_scales": scale uint8 tensor
+        - "down_proj.weight": packed uint8 tensor
+        - "down_proj.weight_scales": scale uint8 tensor
+
+        Args:
+            weights_dict: Dict with packed weights and scales
+
+        Returns:
+            Dict with dequantized BF16 weights
+        """
+        result = {}
+
+        for name, tensor in weights_dict.items():
+            # Skip scale tensors - they're used with their corresponding weights
+            if name.endswith("_scales"):
+                continue
+
+            # Check if this weight has a scale tensor
+            scale_key = f"{name}_scales"
+            if scale_key in weights_dict:
+                # MXFP4 quantized weight - dequantize
+                packed = tensor
+                scales = weights_dict[scale_key]
+                result[name] = self.dequant_fn(packed, scales, torch.bfloat16)
+            else:
+                # Not quantized - use as-is
+                result[name] = tensor
 
         return result
 
