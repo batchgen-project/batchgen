@@ -868,11 +868,22 @@ class GptOssParallelStrategyManager:
         # Validate embedding layers (critical for inference)
         for name, module in transformer.named_modules():
             if isinstance(module, nn.Embedding):
-                if module.weight.numel() == 1:
+                weight = module.weight
+                logging.info(
+                    f"[SKELETON] Embedding '{name}': shape={weight.shape}, "
+                    f"dim={weight.dim()}, numel={weight.numel()}"
+                )
+                if weight.numel() == 1:
                     raise RuntimeError(
                         f"FATAL: Embedding '{name}' weight is still a placeholder!\n"
                         f"Expected shape: [{module.num_embeddings}, {module.embedding_dim}]\n"
                         f"The checkpoint may use different tensor names for embedding."
+                    )
+                if weight.dim() != 2:
+                    raise RuntimeError(
+                        f"FATAL: Embedding '{name}' weight has {weight.dim()}D shape, expected 2D!\n"
+                        f"Shape: {weight.shape}\n"
+                        f"Expected: [{module.num_embeddings}, {module.embedding_dim}]"
                     )
 
         # Validate Linear layers
@@ -1093,6 +1104,21 @@ class GptOssParallelStrategyManager:
         if not hasattr(self, 'model') or self.model is None:
             logging.warning("configure_decoding called before configure_prefill, initializing...")
             return self.configure_prefill()
+
+        # Debug: Check embedding weight shape before decode
+        transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
+        if hasattr(transformer, 'embedding'):
+            emb_weight = transformer.embedding.weight
+            logging.info(
+                f"[DECODE DEBUG] Embedding weight: shape={emb_weight.shape}, "
+                f"dim={emb_weight.dim()}, dtype={emb_weight.dtype}, "
+                f"device={emb_weight.device}"
+            )
+            if emb_weight.dim() != 2:
+                logging.error(
+                    f"[DECODE DEBUG] CRITICAL: Embedding weight is {emb_weight.dim()}D, expected 2D! "
+                    f"This will cause decode to fail."
+                )
 
         # Update phase for all wrappers
         self._set_decode_phase()
