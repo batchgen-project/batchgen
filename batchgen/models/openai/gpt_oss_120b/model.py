@@ -252,9 +252,13 @@ class AttentionBlock(torch.nn.Module):
         # Debug: Log dimensions for layer 0 with stack trace
         if layer_idx == 0:
             import traceback
-            print(f"[AttentionBlock {layer_idx}] Creating qkv Linear: in={config.hidden_size}, out={qkv_dim}, device={device}")
-            print("Stack trace:")
-            traceback.print_stack()
+            import logging
+            import sys
+            stack_str = ''.join(traceback.format_stack())
+            logging.warning(f"[AttentionBlock {layer_idx}] Creating qkv Linear: in={config.hidden_size}, out={qkv_dim}, device={device}")
+            logging.warning(f"Stack trace:\n{stack_str}")
+            sys.stdout.flush()
+            sys.stderr.flush()
 
         self.qkv = torch.nn.Linear(
             config.hidden_size, qkv_dim, device=device, dtype=torch.bfloat16
@@ -262,7 +266,8 @@ class AttentionBlock(torch.nn.Module):
 
         # Debug: Check weight shape immediately after creation
         if layer_idx == 0:
-            print(f"[AttentionBlock {layer_idx}] qkv.weight.shape={list(self.qkv.weight.shape)}")
+            import logging
+            logging.warning(f"[AttentionBlock {layer_idx}] qkv.weight.shape={list(self.qkv.weight.shape)}")
 
         self.out = torch.nn.Linear(
             config.head_dim * config.num_attention_heads,
