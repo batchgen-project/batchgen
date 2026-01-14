@@ -642,11 +642,12 @@ class Transformer(torch.nn.Module):
         logging.warning(f"[Transformer.forward] input_ids.shape = {list(x.shape)}")
         x = self.embedding(x)
         logging.warning(f"[Transformer.forward] after embedding: x.shape = {list(x.shape)}")
-        # Debug: Check first block's attn type and weight shape
+        # Debug: Check first block's attn type and weight shape with object IDs
         first_attn = self.block[0].attn
         logging.warning(f"[Transformer.forward] block[0].attn type = {type(first_attn).__name__}")
         if hasattr(first_attn, 'module'):
             inner_qkv = first_attn.module.qkv
+            logging.warning(f"[Transformer.forward] wrapper id={id(first_attn)}, module id={id(first_attn.module)}, qkv id={id(inner_qkv)}, weight id={id(inner_qkv.weight)}")
             logging.warning(f"[Transformer.forward] block[0].attn.module.qkv.weight.shape = {list(inner_qkv.weight.shape)}")
         elif hasattr(first_attn, 'qkv'):
             logging.warning(f"[Transformer.forward] block[0].attn.qkv.weight.shape = {list(first_attn.qkv.weight.shape)}")

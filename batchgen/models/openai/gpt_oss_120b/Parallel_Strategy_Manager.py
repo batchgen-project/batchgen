@@ -272,12 +272,18 @@ class GptOssAttnWrapper(nn.Module):
             logging.warning(f"[GptOssAttnWrapper L{self.layer_idx}] forward() called")
             logging.warning(f"  hidden_states.shape = {list(hidden_states.shape)}")
             logging.warning(f"  get_weights = {self.get_weights}")
+            # Log object IDs to compare with wrapping logs
+            logging.warning(f"  wrapper id={id(self)}, module id={id(self.module)}, qkv id={id(self.module.qkv)}, weight id={id(self.module.qkv.weight)}")
             # Check the module's qkv weight
             qkv_weight = self.module.qkv.weight
             logging.warning(f"  self.module.qkv.weight.shape = {list(qkv_weight.shape)}")
             logging.warning(f"  self.module.qkv.weight.numel() = {qkv_weight.numel()}")
             if qkv_weight.numel() == 1:
                 logging.error(f"CRITICAL: qkv.weight is still a placeholder at inference time!")
+                # Additional debug: check if weight is a Parameter or Tensor
+                logging.error(f"  weight type = {type(qkv_weight)}")
+                logging.error(f"  weight.data type = {type(qkv_weight.data)}")
+                logging.error(f"  weight.requires_grad = {qkv_weight.requires_grad}")
 
         # Execute attention forward
         output = self.module(hidden_states, **kwargs)
@@ -1098,6 +1104,7 @@ class GptOssParallelStrategyManager:
             if layer_idx == 0:
                 qkv_weight_shape = list(wrapped.module.qkv.weight.shape)
                 logging.info(f"[After wrapping L0] wrapped.module.qkv.weight.shape = {qkv_weight_shape}")
+                logging.info(f"[After wrapping L0] wrapper id={id(wrapped)}, module id={id(wrapped.module)}, qkv id={id(wrapped.module.qkv)}, weight id={id(wrapped.module.qkv.weight)}")
                 if wrapped.module.qkv.weight.numel() == 1:
                     logging.error("CRITICAL: qkv.weight is placeholder after wrapping!")
 
