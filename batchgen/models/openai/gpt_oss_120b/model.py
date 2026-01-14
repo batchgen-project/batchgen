@@ -249,9 +249,12 @@ class AttentionBlock(torch.nn.Module):
             config.num_attention_heads + 2 * config.num_key_value_heads
         )
 
-        # Debug: Log dimensions for layer 0
+        # Debug: Log dimensions for layer 0 with stack trace
         if layer_idx == 0:
+            import traceback
             print(f"[AttentionBlock {layer_idx}] Creating qkv Linear: in={config.hidden_size}, out={qkv_dim}, device={device}")
+            print("Stack trace:")
+            traceback.print_stack()
 
         self.qkv = torch.nn.Linear(
             config.hidden_size, qkv_dim, device=device, dtype=torch.bfloat16
