@@ -878,7 +878,26 @@ class GptOssParallelStrategyManager:
                                 parent_module = getattr(parent_module, attr)
                         # Replace the parameter with a new nn.Parameter
                         new_param = nn.Parameter(tensor.to(device), requires_grad=False)
+
+                        # Debug: Log before setattr (layer 0 attention only)
+                        if 'block.0.attn' in model_name:
+                            old_param = getattr(parent_module, param_name, None)
+                            logging.info(f"[SETATTR DEBUG] {model_name}:")
+                            logging.info(f"  parent_module type = {type(parent_module).__name__}")
+                            logging.info(f"  param_name = {param_name}")
+                            logging.info(f"  old_param.shape = {list(old_param.shape) if old_param is not None else 'None'}")
+                            logging.info(f"  new_param.shape = {list(new_param.shape)}")
+
                         setattr(parent_module, param_name, new_param)
+
+                        # Debug: Verify immediately after setattr (layer 0 attention only)
+                        if 'block.0.attn' in model_name:
+                            verify_param = getattr(parent_module, param_name, None)
+                            logging.info(f"  after setattr: verify_param.shape = {list(verify_param.shape) if verify_param is not None else 'None'}")
+                            logging.info(f"  after setattr: id(new_param)={id(new_param)}, id(verify_param)={id(verify_param)}")
+                            if verify_param is None or verify_param.numel() == 1:
+                                logging.error(f"  CRITICAL: setattr FAILED to replace parameter!")
+
                         # Log critical weights explicitly at INFO level
                         if 'attn' in model_name:
                             logging.info(f"Loaded attention: {model_name} shape={list(tensor.shape)}")
