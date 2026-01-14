@@ -122,9 +122,10 @@ class RotaryEmbedding(torch.nn.Module):
 
         return concentration, inv_freq
 
-    def _compute_cos_sin(self, num_tokens: int):
+    def _compute_cos_sin(self, num_tokens: int, position_offset: int = 0):
         concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
+        # Add position_offset to support KV caching during decode
+        t = torch.arange(position_offset, position_offset + num_tokens, dtype=torch.float32, device=self.device)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
@@ -134,9 +135,17 @@ class RotaryEmbedding(torch.nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        position_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embeddings to query and key.
+
+        Args:
+            query: Query tensor
+            key: Key tensor
+            position_offset: Position offset for decode mode (cached sequence length)
+        """
         num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        cos, sin = self._compute_cos_sin(num_tokens, position_offset)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_dim)
@@ -276,7 +285,10 @@ class AttentionBlock(torch.nn.Module):
         self,
         x: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        past_key_value: tuple | None = None,
+        position_offset: int = 0,
+        return_kv: bool = False,
+    ) -> tuple:
         """Forward pass supporting both 2D [seq, hidden] and 3D [batch, seq, hidden] input.
 
         BatchGenWorker passes 3D tensors, but internal attention computation expects 2D.
@@ -285,6 +297,13 @@ class AttentionBlock(torch.nn.Module):
         Args:
             x: Input tensor [batch, seq, hidden] or [seq, hidden]
             attention_mask: Optional attention mask from BatchGenWorker
+            past_key_value: Optional (past_k, past_v) tuple for cached KV
+            position_offset: Position offset for RoPE when using cached KV
+            return_kv: Whether to return (output, (k, v)) or just output
+
+        Returns:
+            If return_kv=True: (output, (key_cache, value_cache))
+            If return_kv=False: output
         """
         # Handle 3D input from BatchGenWorker: [batch, seq, hidden] -> [batch*seq, hidden]
         if x.dim() == 3:
@@ -292,6 +311,7 @@ class AttentionBlock(torch.nn.Module):
             x = x.view(batch_size * seq_len, hidden_size)
         else:
             batch_size = None
+            seq_len = x.shape[0] if x.dim() == 2 else 1
 
         t = self.norm(x)
         qkv = self.qkv(t)
@@ -314,7 +334,17 @@ class AttentionBlock(torch.nn.Module):
         )
         k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
+
+        # Apply RoPE with position offset for decode
+        q, k = self.rope(q, k, position_offset=position_offset)
+
+        # Concatenate with cached KV if available
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=0)
+            v = torch.cat([past_v, v], dim=0)
+
+        # Compute attention
         t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window, attention_mask)
         t = self.out(t)
         t = x + t
@@ -323,6 +353,9 @@ class AttentionBlock(torch.nn.Module):
         if batch_size is not None:
             t = t.view(batch_size, seq_len, -1)
 
+        if return_kv:
+            # Return K, V for caching (after concatenation with past)
+            return t, (k, v)
         return t
 
 

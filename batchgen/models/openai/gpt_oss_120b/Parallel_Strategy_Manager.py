@@ -204,16 +204,26 @@ class GptOssExpertWrapper(nn.Module):
 
 
 class GptOssAttnWrapper(nn.Module):
-    """Attention wrapper for GPT-OSS with HtoD weight fetching.
+    """Attention wrapper for GPT-OSS with HtoD weight fetching and KV caching.
 
     Supports two modes:
     1. get_weights=True (HtoD): Load weights from core_engine per forward,
        then free buffer after use.
     2. get_weights=False (skeleton): Weights already loaded in module parameters.
 
+    KV Caching:
+    - During prefill: Stores K, V tensors in class-level cache per sequence
+    - During decode: Retrieves cached K, V and concatenates with new K, V
+
     Following BatchGen's Attn_Wrapper pattern from DeepSeek implementation.
     """
-    phase = "prefill"  # Class variable for phase tracking
+    # Class-level state (set by BatchGenWorker before forward)
+    phase: str = "prefill"
+    kv_cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = {}
+    cur_batch: List[int] = []
+    attention_mask: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+    sequence_lengths: Dict[int, int] = {}  # seq_id -> current length
 
     def __init__(
         self,
@@ -233,14 +243,44 @@ class GptOssAttnWrapper(nn.Module):
         self.get_weights = get_weights
         self.attn_module_id = f"attn_{layer_idx}"
 
+    @classmethod
+    def clear_kv_cache(cls):
+        """Clear all KV cache."""
+        cls.kv_cache = {}
+        cls.sequence_lengths = {}
+
+    @classmethod
+    def clear_sequence_kv(cls, seq_id: int):
+        """Clear KV cache for a specific sequence."""
+        for layer_cache in cls.kv_cache.values():
+            if seq_id in layer_cache:
+                del layer_cache[seq_id]
+        if seq_id in cls.sequence_lengths:
+            del cls.sequence_lengths[seq_id]
+
+    def _get_cached_kv(self, seq_id: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Get cached K, V for a sequence at this layer."""
+        if self.layer_idx not in GptOssAttnWrapper.kv_cache:
+            return None
+        return GptOssAttnWrapper.kv_cache[self.layer_idx].get(seq_id)
+
+    def _store_kv(self, seq_id: int, k: torch.Tensor, v: torch.Tensor):
+        """Store K, V in cache for a sequence at this layer."""
+        if self.layer_idx not in GptOssAttnWrapper.kv_cache:
+            GptOssAttnWrapper.kv_cache[self.layer_idx] = {}
+        GptOssAttnWrapper.kv_cache[self.layer_idx][seq_id] = (k, v)
+
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Forward pass with HtoD weight fetching.
+        """Forward pass with HtoD weight fetching and KV caching.
 
         If get_weights=True: Load weights from core_engine, forward, free buffer.
         If get_weights=False: Use existing weights in module parameters.
 
+        During prefill: Stores K, V in cache
+        During decode: Uses cached K, V for context
+
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size] or [batch*seq_len, hidden_size]
+            hidden_states: Input tensor [batch, seq_len, hidden_size]
             **kwargs: Additional arguments passed to attention module
 
         Returns:
@@ -253,7 +293,6 @@ class GptOssAttnWrapper(nn.Module):
             )
 
             # Apply weights to module parameters
-            # Map tensor_key to module parameter names
             param_mapping = {
                 "qkv.weight": "qkv.weight",
                 "qkv.bias": "qkv.bias",
@@ -265,7 +304,6 @@ class GptOssAttnWrapper(nn.Module):
 
             for tensor_key, param_name in param_mapping.items():
                 if tensor_key in weights_dict:
-                    # Navigate to the parameter
                     parts = param_name.split('.')
                     target = self.module
                     for part in parts[:-1]:
@@ -274,8 +312,62 @@ class GptOssAttnWrapper(nn.Module):
                         weights_dict[tensor_key], requires_grad=False
                     ))
 
-        # Execute attention forward
-        output = self.module(hidden_states, **kwargs)
+        # Handle batch processing with KV caching
+        batch_size = hidden_states.shape[0] if hidden_states.dim() == 3 else 1
+        seq_len = hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]
+
+        if GptOssAttnWrapper.phase == "prefill":
+            # Prefill: compute K, V and cache them
+            output, (k, v) = self.module(
+                hidden_states,
+                attention_mask=None,
+                past_key_value=None,
+                position_offset=0,
+                return_kv=True,
+            )
+
+            # Store K, V for each sequence in batch
+            for batch_idx in range(batch_size):
+                seq_id = GptOssAttnWrapper.cur_batch[batch_idx] if batch_idx < len(GptOssAttnWrapper.cur_batch) else batch_idx
+                # For batched case, K/V are [batch*seq, heads, head_dim] - need to slice per sequence
+                if batch_size > 1:
+                    start_idx = batch_idx * seq_len
+                    end_idx = (batch_idx + 1) * seq_len
+                    seq_k = k[start_idx:end_idx]
+                    seq_v = v[start_idx:end_idx]
+                else:
+                    seq_k = k
+                    seq_v = v
+                self._store_kv(seq_id, seq_k, seq_v)
+                GptOssAttnWrapper.sequence_lengths[seq_id] = seq_len
+
+        else:
+            # Decode: use cached K, V
+            outputs = []
+            for batch_idx in range(batch_size):
+                if hidden_states.dim() == 3:
+                    seq_hidden = hidden_states[batch_idx:batch_idx+1]
+                else:
+                    seq_hidden = hidden_states
+
+                seq_id = GptOssAttnWrapper.cur_batch[batch_idx] if batch_idx < len(GptOssAttnWrapper.cur_batch) else batch_idx
+                cached_kv = self._get_cached_kv(seq_id)
+                position_offset = GptOssAttnWrapper.sequence_lengths.get(seq_id, 0)
+
+                out, (k, v) = self.module(
+                    seq_hidden,
+                    attention_mask=None,
+                    past_key_value=cached_kv,
+                    position_offset=position_offset,
+                    return_kv=True,
+                )
+                outputs.append(out)
+
+                # Update cache with concatenated K, V
+                self._store_kv(seq_id, k, v)
+                GptOssAttnWrapper.sequence_lengths[seq_id] = position_offset + (seq_hidden.shape[1] if seq_hidden.dim() == 3 else 1)
+
+            output = torch.cat(outputs, dim=0)
 
         if self.get_weights:
             # Free GPU buffer
