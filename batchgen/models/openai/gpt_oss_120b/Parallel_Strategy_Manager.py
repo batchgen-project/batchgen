@@ -97,6 +97,14 @@ class GptOssCausalLMWrapper(nn.Module):
         # Provide HuggingFace-style model.model.* access
         self.model = GptOssModelShim(transformer)
 
+    @property
+    def lm_head(self):
+        """Map HuggingFace lm_head to OpenAI unembedding.
+
+        BatchGenWorker accesses model.lm_head.weight for the output projection.
+        """
+        return self.transformer.unembedding
+
     def forward(
         self,
         input_ids: torch.Tensor,
