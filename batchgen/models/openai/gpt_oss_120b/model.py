@@ -609,6 +609,14 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, layer_idx, device)
 
+    @property
+    def self_attn(self):
+        """Map HuggingFace self_attn to OpenAI attn.
+
+        BatchGenWorker accesses layer.self_attn for attention module.
+        """
+        return self.attn
+
     def forward(
         self,
         hidden_states: torch.Tensor,
