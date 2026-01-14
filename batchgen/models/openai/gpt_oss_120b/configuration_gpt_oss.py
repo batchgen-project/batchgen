@@ -117,6 +117,10 @@ class GptOssConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
 
+        # BatchGen compatibility: GPT-OSS has all MoE layers (no dense-only layers)
+        # first_k_dense_replace = 1 means layer 0+ are MoE (no dense prefix)
+        self.first_k_dense_replace = 1
+
         # Layer types: alternating sliding/full attention
         if layer_types is None:
             self.layer_types = ["sliding_attention", "full_attention"] * (num_hidden_layers // 2)
