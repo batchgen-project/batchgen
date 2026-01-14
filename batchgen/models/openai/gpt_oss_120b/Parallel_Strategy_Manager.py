@@ -274,25 +274,6 @@ class GptOssAttnWrapper(nn.Module):
                         weights_dict[tensor_key], requires_grad=False
                     ))
 
-        # Debug: Log weight shapes at inference time (layer 0 only)
-        if self.layer_idx == 0:
-            import logging
-            logging.warning(f"[GptOssAttnWrapper L{self.layer_idx}] forward() called")
-            logging.warning(f"  hidden_states.shape = {list(hidden_states.shape)}")
-            logging.warning(f"  get_weights = {self.get_weights}")
-            # Log object IDs to compare with wrapping logs
-            logging.warning(f"  wrapper id={id(self)}, module id={id(self.module)}, qkv id={id(self.module.qkv)}, weight id={id(self.module.qkv.weight)}")
-            # Check the module's qkv weight
-            qkv_weight = self.module.qkv.weight
-            logging.warning(f"  self.module.qkv.weight.shape = {list(qkv_weight.shape)}")
-            logging.warning(f"  self.module.qkv.weight.numel() = {qkv_weight.numel()}")
-            if qkv_weight.numel() == 1:
-                logging.error(f"CRITICAL: qkv.weight is still a placeholder at inference time!")
-                # Additional debug: check if weight is a Parameter or Tensor
-                logging.error(f"  weight type = {type(qkv_weight)}")
-                logging.error(f"  weight.data type = {type(qkv_weight.data)}")
-                logging.error(f"  weight.requires_grad = {qkv_weight.requires_grad}")
-
         # Execute attention forward
         output = self.module(hidden_states, **kwargs)
 
@@ -460,26 +441,10 @@ class GptOssParallelStrategyManager:
         )
         timings['config'] = time.perf_counter() - step_start
 
-        # Debug: Log config values
-        logging.info(f"=== GPT-OSS CONFIG DEBUG ===")
-        logging.info(f"  hidden_size={gpt_oss_config.hidden_size}")
-        logging.info(f"  head_dim={gpt_oss_config.head_dim}")
-        logging.info(f"  num_attention_heads={gpt_oss_config.num_attention_heads}")
-        logging.info(f"  num_key_value_heads={gpt_oss_config.num_key_value_heads}")
-        qkv_dim = gpt_oss_config.head_dim * (gpt_oss_config.num_attention_heads + 2 * gpt_oss_config.num_key_value_heads)
-        logging.info(f"  Expected qkv_dim={qkv_dim}")
-        logging.info(f"  Expected qkv.weight shape=[{qkv_dim}, {gpt_oss_config.hidden_size}]")
-        logging.info(f"=== END CONFIG DEBUG ===")
-
         # Step 2: Initialize model skeleton (OpenAI Transformer wrapped for BatchGen)
         step_start = time.perf_counter()
         device = self.engine_config.Basic_Config.device_torch
-        logging.info(f"Creating Transformer on device={device}")
         transformer = Transformer(gpt_oss_config, device=device)
-
-        # Debug: Check first layer's qkv weight immediately after creation
-        first_qkv = transformer.block[0].attn.qkv
-        logging.info(f"After Transformer creation: block.0.attn.qkv.weight.shape={list(first_qkv.weight.shape)}")
         self.model = GptOssCausalLMWrapper(transformer)
         timings['model_init'] = time.perf_counter() - step_start
 
@@ -609,37 +574,6 @@ class GptOssParallelStrategyManager:
         # Access transformer through wrapper
         transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
         model_state = dict(transformer.named_parameters())
-
-        # Debug: Log skeleton tensor names, especially attention
-        if self.skeleton_state_dict:
-            logging.info(f"=== SKELETON STATE DICT DEBUG ===")
-            logging.info(f"Total tensors in skeleton_state_dict: {len(self.skeleton_state_dict)}")
-            # Count attention tensors
-            attn_tensors = [k for k in self.skeleton_state_dict.keys() if 'attn' in k.lower()]
-            logging.info(f"Attention tensors found: {len(attn_tensors)}")
-            if attn_tensors:
-                for k in sorted(attn_tensors)[:10]:  # Show first 10
-                    v = self.skeleton_state_dict[k]
-                    logging.info(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
-                if len(attn_tensors) > 10:
-                    logging.info(f"  ... and {len(attn_tensors) - 10} more attention tensors")
-            else:
-                logging.error("NO attention tensors in skeleton_state_dict!")
-                logging.info("Sample skeleton tensor names:")
-                for k in list(self.skeleton_state_dict.keys())[:20]:
-                    logging.info(f"  {k}")
-            logging.info(f"=== END SKELETON DEBUG ===")
-        else:
-            logging.error("skeleton_state_dict is empty or None!")
-            return
-
-        # Debug: Log model parameters
-        logging.info(f"=== MODEL PARAMETERS DEBUG ===")
-        logging.info(f"Total model parameters: {len(model_state)}")
-        for k, v in sorted(model_state.items()):
-            if not any(x in k for x in ['experts', 'mlp1', 'mlp2']):  # Skip expert params
-                logging.info(f"  {k}: shape={list(v.shape)}")
-        logging.info(f"=== END MODEL DEBUG ===")
 
         # Build flexible name mapping: try multiple checkpoint naming conventions
         # OpenAI checkpoint might use different prefixes
@@ -894,33 +828,7 @@ class GptOssParallelStrategyManager:
                                 parent_module = getattr(parent_module, attr)
                         # Replace the parameter with a new nn.Parameter
                         new_param = nn.Parameter(tensor.to(device), requires_grad=False)
-
-                        # Debug: Log before setattr (layer 0 attention only)
-                        if 'block.0.attn' in model_name:
-                            old_param = getattr(parent_module, param_name, None)
-                            logging.info(f"[SETATTR DEBUG] {model_name}:")
-                            logging.info(f"  parent_module type = {type(parent_module).__name__}")
-                            logging.info(f"  param_name = {param_name}")
-                            logging.info(f"  old_param.shape = {list(old_param.shape) if old_param is not None else 'None'}")
-                            logging.info(f"  new_param.shape = {list(new_param.shape)}")
-
                         setattr(parent_module, param_name, new_param)
-
-                        # Debug: Verify immediately after setattr (layer 0 attention only)
-                        if 'block.0.attn' in model_name:
-                            verify_param = getattr(parent_module, param_name, None)
-                            logging.info(f"  after setattr: verify_param.shape = {list(verify_param.shape) if verify_param is not None else 'None'}")
-                            logging.info(f"  after setattr: id(new_param)={id(new_param)}, id(verify_param)={id(verify_param)}")
-                            if verify_param is None or verify_param.numel() == 1:
-                                logging.error(f"  CRITICAL: setattr FAILED to replace parameter!")
-
-                        # Log critical weights explicitly at INFO level
-                        if 'attn' in model_name:
-                            logging.info(f"Loaded attention: {model_name} shape={list(tensor.shape)}")
-                        elif 'embedding' in model_name or 'unembedding' in model_name:
-                            logging.info(f"Loaded embedding: {model_name} shape={list(tensor.shape)}")
-                        else:
-                            logging.debug(f"Replaced placeholder {model_name} with shape {list(tensor.shape)}")
                     else:
                         # Top-level parameter (rare case)
                         model_param.data = tensor.to(device)
@@ -946,21 +854,7 @@ class GptOssParallelStrategyManager:
                 logging.error(traceback.format_exc())
 
         # Summary
-        logging.info(f"Skeleton loading complete:")
-        logging.info(f"  Loaded: {loaded}")
-        logging.info(f"  Skipped: {skipped}")
-        logging.info(f"  Missing: {len(missing)}")
-        if missing and len(missing) <= 20:
-            logging.warning(f"  Missing tensors: {missing}")
-
-        # Verify first attention layer weights were loaded
-        first_attn = transformer.block[0].attn
-        logging.info(f"=== POST-SKELETON VERIFICATION ===")
-        logging.info(f"  block.0.attn.qkv.weight.shape = {list(first_attn.qkv.weight.shape)}")
-        logging.info(f"  block.0.attn.out.weight.shape = {list(first_attn.out.weight.shape)}")
-        if first_attn.qkv.weight.numel() == 1:
-            logging.error("CRITICAL: block.0.attn.qkv.weight is still placeholder!")
-        logging.info(f"=== END VERIFICATION ===")
+        logging.info(f"Skeleton loading: {loaded} loaded, {skipped} skipped, {len(missing)} missing")
 
         # Validate all Linear layers have proper 2D weights
         self._validate_linear_weights(transformer)
@@ -968,79 +862,45 @@ class GptOssParallelStrategyManager:
     def _validate_linear_weights(self, transformer):
         """Validate Linear and Embedding layers have proper weights.
 
-        This helps debug 'weight must be 2-D' errors by identifying
-        which layers have malformed weights after skeleton loading.
-
-        All attention and MLP gate/norm weights are skeleton (loaded at init).
-        Expert MLP weights are either skeleton (world_size=1) or HtoD.
-
-        NOTE: config_torch_module_initializer() patches ALL nn.Module subclasses
-        including nn.Embedding, so embedding weights can also be [1] placeholders.
+        Checks that skeleton loading successfully replaced all placeholder weights.
+        Raises RuntimeError if critical weights (attention, embedding) are invalid.
         """
-        logging.info("=== VALIDATING WEIGHTS (POST-SKELETON LOADING) ===")
-
-        # First, validate embedding layers (critical for inference)
-        logging.info("Checking Embedding layers...")
+        # Validate embedding layers (critical for inference)
         for name, module in transformer.named_modules():
             if isinstance(module, nn.Embedding):
-                weight = module.weight
-                logging.info(f"  {name}.weight: shape={list(weight.shape)}, numel={weight.numel()}")
-                if weight.numel() == 1:
-                    logging.error(f"CRITICAL: {name}.weight is still a [1] placeholder!")
-                    logging.error(f"  Expected shape: [{module.num_embeddings}, {module.embedding_dim}]")
+                if module.weight.numel() == 1:
                     raise RuntimeError(
                         f"FATAL: Embedding '{name}' weight is still a placeholder!\n"
                         f"Expected shape: [{module.num_embeddings}, {module.embedding_dim}]\n"
-                        f"Actual shape: {list(weight.shape)}\n"
-                        f"The checkpoint may use different tensor names for embedding.\n"
-                        f"Check the skeleton_state_dict logs to see available tensor names."
+                        f"The checkpoint may use different tensor names for embedding."
                     )
 
-        logging.info("Checking Linear layers...")
+        # Validate Linear layers
         issues = []
         valid_count = 0
 
         for name, module in transformer.named_modules():
             if isinstance(module, nn.Linear):
                 weight = module.weight
-
-                # Check for placeholder that wasn't replaced
                 if weight.numel() == 1:
-                    issues.append(f"{name}.weight: still placeholder shape={list(weight.shape)}")
-                    logging.error(f"PLACEHOLDER NOT REPLACED: {name}.weight is still shape={list(weight.shape)}")
+                    issues.append(f"{name}.weight: placeholder")
                 elif weight.dim() != 2:
-                    issues.append(f"{name}.weight: expected 2D, got {weight.dim()}D shape={list(weight.shape)}")
-                    logging.error(f"INVALID: {name}.weight has {weight.dim()}D shape={list(weight.shape)}")
+                    issues.append(f"{name}.weight: {weight.dim()}D (expected 2D)")
                 else:
                     valid_count += 1
-                    logging.debug(f"OK: {name}.weight shape={list(weight.shape)}")
-
-                if module.bias is not None:
-                    if module.bias.numel() == 1 and name not in ['embedding']:
-                        # Bias placeholder (but some biases legitimately have 1 element)
-                        pass  # Skip bias placeholder check for now
-                    elif module.bias.dim() != 1:
-                        issues.append(f"{name}.bias: expected 1D, got {module.bias.dim()}D")
-                        logging.error(f"INVALID: {name}.bias has {module.bias.dim()}D shape")
 
         if issues:
-            logging.error(f"Found {len(issues)} Linear layer weight issues! ({valid_count} OK)")
-            for issue in issues:
-                logging.error(f"  {issue}")
-
             # Check if attention weights are still placeholders - this is fatal
-            attn_issues = [i for i in issues if 'attn' in i and 'placeholder' in i]
+            attn_issues = [i for i in issues if 'attn' in i]
             if attn_issues:
                 raise RuntimeError(
-                    f"FATAL: {len(attn_issues)} attention weights are still placeholders!\n"
-                    f"Skeleton loading failed to load attention weights from checkpoint.\n"
-                    f"Issues:\n" + "\n".join(f"  - {i}" for i in attn_issues[:10]) + "\n"
-                    f"Check the skeleton_state_dict logs above to see what tensors are available.\n"
-                    f"The checkpoint may use different naming conventions than expected."
+                    f"FATAL: {len(attn_issues)} attention weights invalid!\n"
+                    f"Issues: {attn_issues[:5]}\n"
+                    f"Skeleton loading failed. Check checkpoint tensor names."
                 )
+            logging.warning(f"Weight validation: {len(issues)} issues ({valid_count} OK)")
         else:
-            logging.info(f"All {valid_count} Linear layer weights validated OK")
-        logging.info("=== END VALIDATION ===")
+            logging.info(f"Weight validation: {valid_count} Linear layers OK")
 
     def _load_local_routed_experts(self):
         """Pre-load local routed expert weights to GPU.
@@ -1135,27 +995,10 @@ class GptOssParallelStrategyManager:
             # Replace attention module with wrapped version
             transformer.block[layer_idx].attn = wrapped
 
-            # Debug: Verify weights are still correct after wrapping (layer 0 only)
-            if layer_idx == 0:
-                qkv_weight_shape = list(wrapped.module.qkv.weight.shape)
-                logging.info(f"[After wrapping L0] wrapped.module.qkv.weight.shape = {qkv_weight_shape}")
-                logging.info(f"[After wrapping L0] wrapper id={id(wrapped)}, module id={id(wrapped.module)}, qkv id={id(wrapped.module.qkv)}, weight id={id(wrapped.module.qkv.weight)}")
-                if wrapped.module.qkv.weight.numel() == 1:
-                    logging.error("CRITICAL: qkv.weight is placeholder after wrapping!")
-
             if get_weights:
                 htod_count += 1
             else:
                 skeleton_count += 1
-
-        # Final verification: Check layer 0 through the transformer hierarchy
-        wrapped_attn = transformer.block[0].attn
-        logging.info(f"=== FINAL WRAPPING VERIFICATION ===")
-        logging.info(f"  transformer.block[0].attn type = {type(wrapped_attn).__name__}")
-        if hasattr(wrapped_attn, 'module'):
-            logging.info(f"  wrapped_attn.module type = {type(wrapped_attn.module).__name__}")
-            logging.info(f"  wrapped_attn.module.qkv.weight.shape = {list(wrapped_attn.module.qkv.weight.shape)}")
-        logging.info(f"=== END FINAL VERIFICATION ===")
 
         logging.info(
             f"Configured {num_layers} attention modules: "
@@ -1234,9 +1077,70 @@ class GptOssParallelStrategyManager:
     def configure_decoding(self) -> Tuple:
         """Configure model for decoding phase.
 
-        Same as prefill for single-GPU deployment.
+        For GPT-OSS with single-GPU deployment:
+        - Model is already initialized from prefill
+        - Just update the phase to "decode" for all wrappers
+        - Return the same model and weight_copy_task
+
+        For multi-GPU deployment:
+        - Similar to prefill but with phase="decode"
+        - Expert routing may differ (more experts in host memory for decode)
+
+        Returns:
+            Tuple of (model, weight_copy_task)
         """
-        return self.configure_prefill()
+        # If model doesn't exist yet (shouldn't happen, but handle it)
+        if not hasattr(self, 'model') or self.model is None:
+            logging.warning("configure_decoding called before configure_prefill, initializing...")
+            return self.configure_prefill()
+
+        # Update phase for all wrappers
+        self._set_decode_phase()
+
+        logging.info("Configured for decoding phase")
+        return self.model, self.weight_copy_task
+
+    def _set_decode_phase(self):
+        """Set phase to 'decode' for all attention and expert wrappers.
+
+        This affects:
+        - GptOssAttnWrapper.phase (class variable) - for weight prefetching
+        - GptOssExpertWrapper.phase (instance variable) - for expert weight loading
+        """
+        # Set attention wrapper phase (class variable)
+        GptOssAttnWrapper.set_phase("decode")
+
+        # Set expert wrapper phase (instance variables)
+        transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
+        num_layers = self.model_config.num_hidden_layers
+        num_experts = self.model_config.num_local_experts
+
+        for layer_idx in range(num_layers):
+            mlp_block = transformer.block[layer_idx].mlp
+            for expert_idx in range(num_experts):
+                expert_wrapper = mlp_block.experts[expert_idx]
+                if hasattr(expert_wrapper, 'set_phase'):
+                    expert_wrapper.set_phase("decode")
+
+    def set_prefill_phase(self):
+        """Reset phase to 'prefill' for all wrappers.
+
+        Called when switching back from decode to prefill mode.
+        """
+        # Set attention wrapper phase (class variable)
+        GptOssAttnWrapper.set_phase("prefill")
+
+        # Set expert wrapper phase (instance variables)
+        transformer = self.model.transformer if hasattr(self.model, 'transformer') else self.model
+        num_layers = self.model_config.num_hidden_layers
+        num_experts = self.model_config.num_local_experts
+
+        for layer_idx in range(num_layers):
+            mlp_block = transformer.block[layer_idx].mlp
+            for expert_idx in range(num_experts):
+                expert_wrapper = mlp_block.experts[expert_idx]
+                if hasattr(expert_wrapper, 'set_phase'):
+                    expert_wrapper.set_phase("prefill")
 
     def get_weight_copy_task(self) -> Dict[str, List[str]]:
         """Return the weight copy task mapping."""

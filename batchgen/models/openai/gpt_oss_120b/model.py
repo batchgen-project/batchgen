@@ -236,7 +236,7 @@ class AttentionBlock(torch.nn.Module):
         device: torch.device | None = None,
     ):
         super().__init__()
-        self.layer_idx = layer_idx  # Store for debug logging
+        self.layer_idx = layer_idx
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -250,25 +250,9 @@ class AttentionBlock(torch.nn.Module):
             config.num_attention_heads + 2 * config.num_key_value_heads
         )
 
-        # Debug: Log dimensions for layer 0 with stack trace
-        if layer_idx == 0:
-            import traceback
-            import logging
-            import sys
-            stack_str = ''.join(traceback.format_stack())
-            logging.warning(f"[AttentionBlock {layer_idx}] Creating qkv Linear: in={config.hidden_size}, out={qkv_dim}, device={device}")
-            logging.warning(f"Stack trace:\n{stack_str}")
-            sys.stdout.flush()
-            sys.stderr.flush()
-
         self.qkv = torch.nn.Linear(
             config.hidden_size, qkv_dim, device=device, dtype=torch.bfloat16
         )
-
-        # Debug: Check weight shape immediately after creation
-        if layer_idx == 0:
-            import logging
-            logging.warning(f"[AttentionBlock {layer_idx}] qkv.weight.shape={list(self.qkv.weight.shape)}")
 
         self.out = torch.nn.Linear(
             config.head_dim * config.num_attention_heads,
@@ -302,35 +286,15 @@ class AttentionBlock(torch.nn.Module):
             x: Input tensor [batch, seq, hidden] or [seq, hidden]
             attention_mask: Optional attention mask from BatchGenWorker
         """
-        # Debug: Log input shape for all layers to find where it goes wrong
-        import logging
-        if not hasattr(self, '_forward_count'):
-            self._forward_count = 0
-        self._forward_count += 1
-        # Log first few forwards to avoid log spam
-        if self._forward_count <= 5:
-            logging.warning(f"[AttentionBlock.forward #{self._forward_count}] input x.shape={list(x.shape)}, x.dim()={x.dim()}")
-
         # Handle 3D input from BatchGenWorker: [batch, seq, hidden] -> [batch*seq, hidden]
-        input_shape = x.shape
         if x.dim() == 3:
             batch_size, seq_len, hidden_size = x.shape
             x = x.view(batch_size * seq_len, hidden_size)
         else:
             batch_size = None
-            if self._forward_count <= 5:
-                logging.warning(f"  Input is NOT 3D! x.shape={list(x.shape)}")
-
-        if self._forward_count <= 5:
-            logging.warning(f"  After flatten: x.shape={list(x.shape)}")
 
         t = self.norm(x)
-        if self._forward_count <= 5:
-            logging.warning(f"  After norm: t.shape={list(t.shape)}")
-
         qkv = self.qkv(t)
-        if self._forward_count <= 5:
-            logging.warning(f"  After qkv: qkv.shape={list(qkv.shape)}, qkv.numel()={qkv.numel()}")
 
         # Split QKV using last dimension (works for both 2D and 3D after flatten)
         q_dim = self.num_attention_heads * self.head_dim
@@ -342,26 +306,12 @@ class AttentionBlock(torch.nn.Module):
         v = qkv[..., q_dim + k_dim:q_dim + k_dim + v_dim].contiguous()
 
         num_tokens = q.shape[0]
-        # Debug: Catch reshape failure with full state dump
-        try:
-            q = q.view(
-                num_tokens,
-                self.num_key_value_heads,
-                self.num_attention_heads // self.num_key_value_heads,
-                self.head_dim,
-            )
-        except RuntimeError as e:
-            import logging
-            logging.error(f"[AttentionBlock q.view() FAILED] layer_idx={self.layer_idx}")
-            logging.error(f"  forward_count={self._forward_count}")
-            logging.error(f"  input_shape={list(input_shape)}")
-            logging.error(f"  qkv.shape={list(qkv.shape)}, qkv.numel()={qkv.numel()}")
-            logging.error(f"  q.shape={list(q.shape)}, q.numel()={q.numel()}")
-            logging.error(f"  num_tokens={num_tokens}")
-            logging.error(f"  target_shape=[{num_tokens}, {self.num_key_value_heads}, {self.num_attention_heads // self.num_key_value_heads}, {self.head_dim}]")
-            logging.error(f"  target_numel={num_tokens * self.num_key_value_heads * (self.num_attention_heads // self.num_key_value_heads) * self.head_dim}")
-            logging.error(f"  self.qkv.weight.shape={list(self.qkv.weight.shape)}")
-            raise
+        q = q.view(
+            num_tokens,
+            self.num_key_value_heads,
+            self.num_attention_heads // self.num_key_value_heads,
+            self.head_dim,
+        )
         k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
         q, k = self.rope(q, k)
@@ -683,20 +633,7 @@ class Transformer(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        import logging
-        logging.warning(f"[Transformer.forward] input_ids.shape = {list(x.shape)}")
         x = self.embedding(x)
-        logging.warning(f"[Transformer.forward] after embedding: x.shape = {list(x.shape)}")
-        # Debug: Check first block's attn type and weight shape with object IDs
-        first_attn = self.block[0].attn
-        logging.warning(f"[Transformer.forward] block[0].attn type = {type(first_attn).__name__}")
-        if hasattr(first_attn, 'module'):
-            inner_qkv = first_attn.module.qkv
-            logging.warning(f"[Transformer.forward] wrapper id={id(first_attn)}, module id={id(first_attn.module)}, qkv id={id(inner_qkv)}, weight id={id(inner_qkv.weight)}")
-            logging.warning(f"[Transformer.forward] block[0].attn.module.qkv.weight.shape = {list(inner_qkv.weight.shape)}")
-        elif hasattr(first_attn, 'qkv'):
-            logging.warning(f"[Transformer.forward] block[0].attn.qkv.weight.shape = {list(first_attn.qkv.weight.shape)}")
-
         for block in self.block:
             x = block(x)
         x = self.norm(x)
