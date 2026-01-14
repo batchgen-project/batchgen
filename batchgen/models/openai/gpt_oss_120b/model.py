@@ -519,6 +519,10 @@ class MLPBlock(torch.nn.Module):
         # Reference to BatchGen core_engine (set during initialization)
         self.core_engine = None
 
+        # BatchGen compatibility: GPT-OSS has no shared experts (all are routed)
+        # Setting to None makes hasattr checks pass safely
+        self.shared_experts = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with top-k expert routing.
 
