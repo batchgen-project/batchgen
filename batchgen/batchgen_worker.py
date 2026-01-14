@@ -4288,11 +4288,23 @@ class BatchGenWorker:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
 
-		self.core_engine.stop_h2d_worker()
-		self.core_engine.clear_weight_copy_queue()
-		self.core_engine.reset_prefill_buffer()
-		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-		self.core_engine.start_h2d_worker()
+		# Check if there's any HtoD work to do
+		# For models with all weights pre-loaded (e.g., GPT-OSS single GPU), skip H2D operations
+		has_htod_work = any(
+			len(self.weight_copy_task.get(key, [])) > 0
+			for key in self.weight_copy_task
+		)
+
+		if has_htod_work:
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_prefill_buffer()
+			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+			self.core_engine.start_h2d_worker()
+		else:
+			# Skip H2D worker for pre-loaded models (all weights on GPU)
+			logging.info("[PREFILL] Skipping H2D worker (all weights pre-loaded)")
+			self.core_engine.reset_prefill_buffer()
 
 		self._destroy_gpu_paged_kv_cache()
 
@@ -4456,18 +4468,33 @@ class BatchGenWorker:
 			logging.info("[DECODE DEBUG] After configure_decoding()")
 			self.set_phase("decode")
 			logging.info("[DECODE DEBUG] After set_phase('decode')")
-			self.core_engine.stop_h2d_worker()
-			logging.info("[DECODE DEBUG] After stop_h2d_worker()")
-			self.core_engine.clear_kv_copy_queue()
-			logging.info("[DECODE DEBUG] After clear_kv_copy_queue()")
-			self.core_engine.clear_weight_copy_queue()
-			logging.info("[DECODE DEBUG] After clear_weight_copy_queue()")
-			self.core_engine.reset_decoding_buffer()
-			logging.info("[DECODE DEBUG] After reset_decoding_buffer()")
-			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-			logging.info(f"[DECODE DEBUG] After set_weight_copy_queue(), weight_copy_task keys={list(self.weight_copy_task.keys())}")
-			self.core_engine.start_h2d_worker()
-			logging.info("[DECODE DEBUG] After start_h2d_worker()")
+
+			# Check if there's any HtoD work to do
+			# For models with all weights pre-loaded (e.g., GPT-OSS single GPU), skip H2D operations
+			has_htod_work = any(
+				len(self.weight_copy_task.get(key, [])) > 0
+				for key in self.weight_copy_task
+			)
+			logging.info(f"[DECODE DEBUG] has_htod_work={has_htod_work}, weight_copy_task={self.weight_copy_task}")
+
+			if has_htod_work:
+				self.core_engine.stop_h2d_worker()
+				logging.info("[DECODE DEBUG] After stop_h2d_worker()")
+				self.core_engine.clear_kv_copy_queue()
+				logging.info("[DECODE DEBUG] After clear_kv_copy_queue()")
+				self.core_engine.clear_weight_copy_queue()
+				logging.info("[DECODE DEBUG] After clear_weight_copy_queue()")
+				self.core_engine.reset_decoding_buffer()
+				logging.info("[DECODE DEBUG] After reset_decoding_buffer()")
+				self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+				logging.info(f"[DECODE DEBUG] After set_weight_copy_queue()")
+				self.core_engine.start_h2d_worker()
+				logging.info("[DECODE DEBUG] After start_h2d_worker()")
+			else:
+				# Skip H2D worker for pre-loaded models (all weights on GPU)
+				logging.info("[DECODE DEBUG] Skipping H2D worker (all weights pre-loaded)")
+				self.core_engine.clear_kv_copy_queue()
+				self.core_engine.reset_decoding_buffer()
 		else:
 			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
 			self.set_phase("decode")
