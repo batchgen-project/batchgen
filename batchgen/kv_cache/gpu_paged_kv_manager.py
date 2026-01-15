@@ -999,6 +999,22 @@ class GPUPagedKVCacheManager:
 		if self._v_cache is not None:
 			v_cache_layer = self._v_cache[layer_idx]
 
+		# DEBUG: Log parameters before kernel call (only for layer 0)
+		if layer_idx == 0:
+			import logging
+			page_size = self.config.page_size_tokens
+			max_token_idx = token_indices.max().item() if token_indices.numel() > 0 else 0
+			max_page_slot = max_token_idx // page_size
+			logging.info(
+				f"[KV-UPDATE DEBUG] layer=0, batch_size={batch_size}, "
+				f"page_table_shape={page_table_view.shape}, "
+				f"slot_indices_shape={slot_indices.shape}, "
+				f"token_indices: min={token_indices.min().item()}, max={max_token_idx}, "
+				f"max_page_slot_needed={max_page_slot}, "
+				f"page_size={page_size}, "
+				f"k_cache_shape={k_cache_layer.shape}"
+			)
+
 		run_paged_kv_token_update_fused(
 			k_cache=k_cache_layer,
 			k_tokens=k_tokens,

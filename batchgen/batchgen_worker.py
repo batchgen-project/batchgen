@@ -5820,12 +5820,12 @@ class BatchGenWorker:
 			if wrapper:
 				wrapper.gpu_paged_kv_manager = gpu_manager
 				wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
-			# Enable timing for GPT-OSS decode
-			try:
-				from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
-				DECODE_TIMING.enable()
-			except ImportError:
-				pass
+			# Timing disabled for debugging - enable later
+			# try:
+			# 	from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
+			# 	DECODE_TIMING.enable()
+			# except ImportError:
+			# 	pass
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
