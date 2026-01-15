@@ -6070,6 +6070,19 @@ class BatchGenWorker:
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
 
+					# GPT-OSS: Set up GptOssAttnWrapper for Mode 3 decode
+					if "gpt_oss" in self.model_config.model_type:
+						wrapper = _get_gpt_oss_attn_wrapper()
+						if wrapper:
+							wrapper.cur_batch = Attn_Wrapper.cur_batch
+							wrapper.position_ids = Attn_Wrapper.position_ids
+							# Build sequence_lengths dict from cache_seqlens
+							seq_lengths_dict = {}
+							for i, seq_id in enumerate(wrapper.cur_batch):
+								if i < len(cache_seqlens):
+									seq_lengths_dict[seq_id] = cache_seqlens[i]
+							wrapper.sequence_lengths = seq_lengths_dict
+
 					# OPTIMIZATION: Only check page table if not already verified this batch
 					# Between boundaries, batch doesn't change so page table stays valid
 					if not _page_table_verified_this_batch:
@@ -6149,6 +6162,8 @@ class BatchGenWorker:
 			if wrapper:
 				wrapper.gpu_paged_kv_manager = None
 				wrapper.cur_batch = None
+				wrapper.position_ids = None
+				wrapper.sequence_lengths = {}
 
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
