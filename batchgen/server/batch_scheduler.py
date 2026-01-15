@@ -513,9 +513,36 @@ class BatchScheduler:
                 import tiktoken
                 from tiktoken import Encoding
 
-                # GPT-OSS uses o200k_base encoding (same as GPT-4o)
-                logger.info("Loading GPT-OSS tokenizer via tiktoken (o200k_base)")
-                enc = tiktoken.get_encoding("o200k_base")
+                # GPT-OSS uses o200k_base encoding with custom special tokens
+                logger.info("Loading GPT-OSS tokenizer via tiktoken (o200k_harmony)")
+                o200k_base = tiktoken.get_encoding("o200k_base")
+
+                # Create custom encoding with GPT-OSS special tokens (from gpt_oss/tokenizer.py)
+                enc = tiktoken.Encoding(
+                    name="o200k_harmony",
+                    pat_str=o200k_base._pat_str,
+                    mergeable_ranks=o200k_base._mergeable_ranks,
+                    special_tokens={
+                        **o200k_base._special_tokens,
+                        "<|startoftext|>": 199998,
+                        "<|endoftext|>": 199999,
+                        "<|reserved_200000|>": 200000,
+                        "<|reserved_200001|>": 200001,
+                        "<|return|>": 200002,
+                        "<|constrain|>": 200003,
+                        "<|reserved_200004|>": 200004,
+                        "<|channel|>": 200005,
+                        "<|start|>": 200006,
+                        "<|end|>": 200007,
+                        "<|message|>": 200008,
+                        "<|reserved_200009|>": 200009,
+                        "<|reserved_200010|>": 200010,
+                        "<|reserved_200011|>": 200011,
+                        "<|call|>": 200012,
+                    } | {
+                        f"<|reserved_{i}|>": i for i in range(200013, 201088)
+                    },
+                )
 
                 # Create a minimal tokenizer wrapper compatible with HuggingFace interface
                 class TiktokenWrapper:
@@ -527,7 +554,8 @@ class BatchScheduler:
                         self.padding_side = "right"
 
                     def encode(self, text, add_special_tokens=True):
-                        return self._enc.encode(text)
+                        # Use allowed_special="all" to handle special tokens in text
+                        return self._enc.encode(text, allowed_special="all")
 
                     def decode(self, token_ids, skip_special_tokens=True):
                         if isinstance(token_ids, list):
@@ -543,8 +571,8 @@ class BatchScheduler:
                         if isinstance(texts, str):
                             texts = [texts]
 
-                        # Encode all texts
-                        all_ids = [self._enc.encode(t) for t in texts]
+                        # Encode all texts with special tokens allowed
+                        all_ids = [self._enc.encode(t, allowed_special="all") for t in texts]
 
                         # Find max length for padding
                         if padding:
