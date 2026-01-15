@@ -228,6 +228,71 @@ class TestPrefill:
             except ImportError:
                 pytest.skip("flash-attention not available")
 
+    def test_prefill_debug(self):
+        """Debug test to understand numerical mismatch."""
+        from .fa_prefill import gqa_prefill_fa
+
+        # Simple case: batch=1, small sequences, no sliding window
+        batch_size, num_queries, num_keys = 1, 16, 16
+        nheads, nheads_kv, headdim = 8, 2, 64
+        num_groups = nheads // nheads_kv
+
+        # Create test data
+        torch.manual_seed(42)
+        q = torch.randn(batch_size, num_queries, nheads_kv, num_groups, headdim,
+                        device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(batch_size, num_keys, nheads_kv, headdim,
+                        device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(batch_size, num_keys, nheads_kv, headdim,
+                        device="cuda", dtype=torch.bfloat16)
+        # Use zero sinks first to isolate the attention computation
+        sinks_zero = torch.zeros(nheads, device="cuda", dtype=torch.bfloat16)
+        sm_scale = headdim ** -0.5
+
+        # Get reference output (no sinks)
+        output_ref = attention_ref(q, k, v, sinks_zero, sm_scale, None)
+        print(f"\nReference output shape: {output_ref.shape}")
+
+        # Convert to flash format
+        q_varlen, k_varlen, v_varlen, cu_q, cu_k, max_q, max_k = reshape_for_flash_varlen(q, k, v)
+        print(f"Q varlen shape: {q_varlen.shape}")
+        print(f"K varlen shape: {k_varlen.shape}")
+        print(f"cu_seqlens_q: {cu_q}")
+        print(f"cu_seqlens_k: {cu_k}")
+
+        # Run FA prefill (no sinks)
+        output_fa, lse = gqa_prefill_fa(
+            q_varlen, k_varlen, v_varlen, cu_q, cu_k, max_q, max_k,
+            sinks=None, softmax_scale=sm_scale, sliding_window=None
+        )
+        print(f"FA output shape: {output_fa.shape}")
+        print(f"LSE shape: {lse.shape if lse is not None else None}")
+
+        # Reshape FA output
+        output_fa_reshaped = output_fa.reshape(batch_size, num_queries, nheads * headdim)
+        print(f"FA output reshaped: {output_fa_reshaped.shape}")
+
+        # Compare without sinks first
+        diff = (output_fa_reshaped - output_ref).abs()
+        print(f"Max diff (no sinks): {diff.max().item():.6f}")
+        print(f"Mean diff (no sinks): {diff.mean().item():.6f}")
+
+        # Now test with sinks
+        sinks = torch.randn(nheads, device="cuda", dtype=torch.bfloat16)
+        output_ref_sinks = attention_ref(q, k, v, sinks, sm_scale, None)
+        output_fa_sinks, lse_sinks = gqa_prefill_fa(
+            q_varlen, k_varlen, v_varlen, cu_q, cu_k, max_q, max_k,
+            sinks=sinks, softmax_scale=sm_scale, sliding_window=None
+        )
+        output_fa_sinks_reshaped = output_fa_sinks.reshape(batch_size, num_queries, nheads * headdim)
+
+        diff_sinks = (output_fa_sinks_reshaped - output_ref_sinks).abs()
+        print(f"Max diff (with sinks): {diff_sinks.max().item():.6f}")
+        print(f"Mean diff (with sinks): {diff_sinks.mean().item():.6f}")
+
+        # This test is for debugging - don't fail
+        torch.testing.assert_close(output_fa_reshaped, output_ref, rtol=1e-2, atol=1e-2)
+
     @pytest.mark.parametrize("batch_size", [1, 2])
     @pytest.mark.parametrize("num_queries", [64, 128])
     @pytest.mark.parametrize("num_keys", [64, 128])
