@@ -9,16 +9,21 @@ from typing import Optional, Tuple
 
 # Detect which flash attention version is available
 _USE_FA3 = False
+_flash_with_kvcache = None
+
 try:
     from flash_attn_interface import flash_attn_with_kvcache as _fa3_with_kvcache
     _USE_FA3 = True
+    _flash_with_kvcache = _fa3_with_kvcache
 except ImportError:
-    _fa3_with_kvcache = None
+    pass
 
-try:
-    from flash_attn import flash_attn_with_kvcache as _fa2_with_kvcache
-except ImportError:
-    _fa2_with_kvcache = None
+if _flash_with_kvcache is None:
+    try:
+        from flash_attn import flash_attn_with_kvcache as _fa2_with_kvcache
+        _flash_with_kvcache = _fa2_with_kvcache
+    except ImportError:
+        pass
 
 
 def gqa_decode_fa(
@@ -47,8 +52,11 @@ def gqa_decode_fa(
     Returns:
         Tuple of:
             - output: Attention output (batch, seqlen_q, nheads, headdim)
-            - lse: Log-sum-exp values (batch, nheads, seqlen_q) or None if sinks not provided
+            - lse: Log-sum-exp values or None if sinks not provided
     """
+    if _flash_with_kvcache is None:
+        raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
+
     # Set up window_size parameter
     if sliding_window is not None and sliding_window > 0:
         window_size = (sliding_window - 1, 0)
@@ -61,62 +69,39 @@ def gqa_decode_fa(
 
     lse = None
 
-    if _USE_FA3 and _fa3_with_kvcache is not None:
-        # FA3 (Hopper) - uses return_softmax_lse for kvcache function
-        if sinks is not None:
-            output, lse = _fa3_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                page_table=block_table,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                return_softmax_lse=True,
-            )
+    # FA3 uses page_table, FA2 uses block_table
+    page_table_kwarg = "page_table" if _USE_FA3 else "block_table"
+
+    if sinks is not None:
+        # Need LSE for sink correction
+        result = _flash_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+            return_softmax_lse=True,
+            **{page_table_kwarg: block_table},
+        )
+        # Handle return value - could be (output, lse) or (output, lse, ...)
+        if isinstance(result, tuple):
+            output = result[0]
+            lse = result[1]
         else:
-            output = _fa3_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                page_table=block_table,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-            )
-    elif _fa2_with_kvcache is not None:
-        # FA2 (Ampere) - uses return_softmax_lse
-        if sinks is not None:
-            result = _fa2_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                return_softmax_lse=True,
-            )
-            if isinstance(result, tuple):
-                output, lse = result[0], result[1]
-            else:
-                output = result
-        else:
-            output = _fa2_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-            )
+            output = result
     else:
-        raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
+        output = _flash_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+            **{page_table_kwarg: block_table},
+        )
 
     # Apply sink correction if sinks provided
     if sinks is not None and lse is not None:
@@ -151,8 +136,11 @@ def gqa_decode_fa_contiguous(
     Returns:
         Tuple of:
             - output: Attention output (batch, seqlen_q, nheads, headdim)
-            - lse: Log-sum-exp values (batch, nheads, seqlen_q) or None if sinks not provided
+            - lse: Log-sum-exp values or None if sinks not provided
     """
+    if _flash_with_kvcache is None:
+        raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
+
     if sliding_window is not None and sliding_window > 0:
         window_size = (sliding_window - 1, 0)
     else:
@@ -163,14 +151,8 @@ def gqa_decode_fa_contiguous(
 
     lse = None
 
-    # Both FA2 and FA3 use return_softmax_lse for flash_attn_with_kvcache
-    flash_fn = _fa3_with_kvcache if (_USE_FA3 and _fa3_with_kvcache is not None) else _fa2_with_kvcache
-
-    if flash_fn is None:
-        raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
-
     if sinks is not None:
-        output, lse = flash_fn(
+        result = _flash_with_kvcache(
             q,
             k_cache,
             v_cache,
@@ -180,8 +162,13 @@ def gqa_decode_fa_contiguous(
             window_size=window_size,
             return_softmax_lse=True,
         )
+        if isinstance(result, tuple):
+            output = result[0]
+            lse = result[1]
+        else:
+            output = result
     else:
-        output = flash_fn(
+        output = _flash_with_kvcache(
             q,
             k_cache,
             v_cache,

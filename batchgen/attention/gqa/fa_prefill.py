@@ -9,16 +9,21 @@ from typing import Optional, Tuple
 
 # Detect which flash attention version is available
 _USE_FA3 = False
+_flash_varlen_func = None
+
 try:
     from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen_func
     _USE_FA3 = True
+    _flash_varlen_func = _fa3_varlen_func
 except ImportError:
-    _fa3_varlen_func = None
+    pass
 
-try:
-    from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
-except ImportError:
-    _fa2_varlen_func = None
+if _flash_varlen_func is None:
+    try:
+        from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
+        _flash_varlen_func = _fa2_varlen_func
+    except ImportError:
+        pass
 
 
 def gqa_prefill_fa(
@@ -50,8 +55,11 @@ def gqa_prefill_fa(
     Returns:
         Tuple of:
             - output: Attention output (total_q, nheads, headdim)
-            - lse: Log-sum-exp values (nheads, total_q) or None if sinks not provided
+            - lse: Log-sum-exp values or None if sinks not provided
     """
+    if _flash_varlen_func is None:
+        raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
+
     # Set up window_size parameter
     # Flash attention uses (window_size_left, window_size_right)
     # For causal with sliding window: (sliding_window - 1, 0)
@@ -66,60 +74,37 @@ def gqa_prefill_fa(
 
     lse = None
 
-    if _USE_FA3 and _fa3_varlen_func is not None:
-        # FA3 (Hopper) - uses return_attn_probs to return (output, softmax_lse)
-        if sinks is not None:
-            # Need LSE for sink correction
-            output, lse = _fa3_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                return_attn_probs=True,
-            )
+    if sinks is not None:
+        # Need LSE for sink correction - both FA2 and FA3 use return_softmax_lse
+        result = _flash_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+            return_softmax_lse=True,
+        )
+        # Handle return value - could be (output, lse) or (output, lse, ...)
+        if isinstance(result, tuple):
+            output = result[0]
+            lse = result[1]
         else:
-            # No sinks, don't need LSE
-            output = _fa3_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-            )
-    elif _fa2_varlen_func is not None:
-        # FA2 (Ampere) - uses return_softmax_lse
-        if sinks is not None:
-            output, lse, *_ = _fa2_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                return_softmax_lse=True,
-            )
-        else:
-            output = _fa2_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-            )
+            output = result
     else:
-        raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
+        # No sinks, don't need LSE
+        output = _flash_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+        )
 
     # Apply sink correction if sinks provided
     if sinks is not None and lse is not None:
