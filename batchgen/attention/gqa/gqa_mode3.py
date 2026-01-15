@@ -124,9 +124,10 @@ def gqa_decoding_mode_3_bf16(
     v_new = v.squeeze(1)
 
     # 4. Offload: Store new K, V to GPU paged cache
+    # Manager expects [batch, seq_len=1, num_kv_heads, head_dim]
     gpu_paged_kv_manager.update_layer_decode_new_token(
-        k_tensor=k.squeeze(1),  # [batch, num_kv_heads, head_dim]
-        v_tensor=v.squeeze(1),
+        k_tensor=k,  # [batch, 1, num_kv_heads, head_dim]
+        v_tensor=v,
         sequence_lengths=cache_seqlens,
         layer_idx=layer_idx,
         batch_slice=batch_slice,
