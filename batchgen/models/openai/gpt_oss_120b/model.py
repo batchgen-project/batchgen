@@ -166,28 +166,38 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0, attention_mask=None):
     Falls back to naive implementation only for small sequences.
 
     Args:
-        Q: Query tensor [n_tokens, n_kv_heads, q_mult, head_dim]
-        K: Key tensor [n_tokens, n_kv_heads, head_dim]
-        V: Value tensor [n_tokens, n_kv_heads, head_dim]
+        Q: Query tensor [q_len, n_kv_heads, q_mult, head_dim]
+        K: Key tensor [kv_len, n_kv_heads, head_dim]
+        V: Value tensor [kv_len, n_kv_heads, head_dim]
         S: Attention sinks [num_attention_heads] (currently ignored for efficiency)
         sm_scale: Softmax scale factor
         sliding_window: Sliding window size (0 = no window, full attention)
         attention_mask: Optional attention mask from BatchGenWorker
     """
-    n_tokens, n_kv_heads, q_mult, d_head = Q.shape
+    q_len, n_kv_heads, q_mult, d_head = Q.shape
+    kv_len = K.shape[0]
     n_q_heads = n_kv_heads * q_mult
 
     # Reshape for PyTorch SDPA: [batch, heads, seq, head_dim]
-    # Q: [n_tokens, n_kv_heads, q_mult, d_head] -> [1, n_q_heads, n_tokens, d_head]
-    Q = Q.permute(1, 2, 0, 3).reshape(1, n_q_heads, n_tokens, d_head)
+    # Q: [q_len, n_kv_heads, q_mult, d_head] -> [1, n_q_heads, q_len, d_head]
+    Q = Q.permute(1, 2, 0, 3).reshape(1, n_q_heads, q_len, d_head)
 
-    # K, V: [n_tokens, n_kv_heads, d_head] -> [1, n_kv_heads, n_tokens, d_head]
+    # K, V: [kv_len, n_kv_heads, d_head] -> [1, n_kv_heads, kv_len, d_head]
     K = K.permute(1, 0, 2).unsqueeze(0)
     V = V.permute(1, 0, 2).unsqueeze(0)
 
     # Expand K, V for GQA: replicate each KV head q_mult times
-    K = K.repeat_interleave(q_mult, dim=1)  # [1, n_q_heads, n_tokens, d_head]
-    V = V.repeat_interleave(q_mult, dim=1)  # [1, n_q_heads, n_tokens, d_head]
+    K = K.repeat_interleave(q_mult, dim=1)  # [1, n_q_heads, kv_len, d_head]
+    V = V.repeat_interleave(q_mult, dim=1)  # [1, n_q_heads, kv_len, d_head]
+
+    # Determine if this is decode mode (Q has fewer tokens than K/V)
+    # In decode mode, the new query token(s) can attend to all cached K/V
+    # so we don't need causal masking (the new token is at the end)
+    is_decode = (q_len < kv_len)
+
+    # Use causal masking only for prefill (q_len == kv_len) when no explicit mask
+    # For decode, new tokens can attend to all context without masking
+    use_causal = (attention_mask is None) and not is_decode
 
     # Use PyTorch's memory-efficient SDPA
     # Note: attention sinks (S) are skipped for memory efficiency
@@ -201,12 +211,12 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0, attention_mask=None):
             Q, K, V,
             attn_mask=attention_mask,
             dropout_p=0.0,
-            is_causal=(attention_mask is None),  # Use causal if no mask provided
+            is_causal=use_causal,
             scale=sm_scale,
         )
 
-    # Reshape output: [1, n_q_heads, n_tokens, d_head] -> [n_tokens, n_q_heads * d_head]
-    attn_output = attn_output.squeeze(0).permute(1, 0, 2).reshape(n_tokens, -1)
+    # Reshape output: [1, n_q_heads, q_len, d_head] -> [q_len, n_q_heads * d_head]
+    attn_output = attn_output.squeeze(0).permute(1, 0, 2).reshape(q_len, -1)
 
     return attn_output
 

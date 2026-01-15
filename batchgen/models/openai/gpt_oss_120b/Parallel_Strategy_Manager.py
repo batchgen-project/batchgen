@@ -342,7 +342,8 @@ class GptOssAttnWrapper(nn.Module):
                 GptOssAttnWrapper.sequence_lengths[seq_id] = seq_len
 
         else:
-            # Decode: use cached K, V
+            # Decode: use cached K, V (sequential per-sequence processing)
+            # NOTE: Batched decode requires refactoring AttentionBlock to support 4D KV cache
             outputs = []
             for batch_idx in range(batch_size):
                 if hidden_states.dim() == 3:
