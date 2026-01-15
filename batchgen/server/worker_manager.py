@@ -630,7 +630,16 @@ class WorkerManager:
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
         )
-        host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+        # Choose manager based on model attention type:
+        # - GQA models (GPT-OSS): use MHAHostPagedKVManager (supports V cache)
+        # - MLA models (DeepSeek): use MLAHostPagedKVManager (no V cache)
+        model_name_lower = model_name.lower()
+        is_gqa_model = "gpt-oss" in model_name_lower or "gpt_oss" in model_name_lower
+        if is_gqa_model:
+            logging.info("Using MHAHostPagedKVManager for GQA model (has V cache)")
+            host_paged_kv_manager = bg_lib.MHAHostPagedKVManager(config)
+        else:
+            host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
         host_paged_kv_manager.initialize(True)
         return host_paged_kv_manager
 

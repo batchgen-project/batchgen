@@ -103,7 +103,14 @@ class BatchGenServer:
 			host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
 			model_name=self.args.model
 		)
-		host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+		# Choose manager based on model attention type
+		model_name_lower = self.args.model.lower()
+		is_gqa_model = "gpt-oss" in model_name_lower or "gpt_oss" in model_name_lower
+		if is_gqa_model:
+			logging.info("Using MHAHostPagedKVManager for GQA model (has V cache)")
+			host_paged_kv_manager = bg_lib.MHAHostPagedKVManager(config)
+		else:
+			host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
 		host_paged_kv_manager.initialize(True)
 		return host_paged_kv_manager
 
