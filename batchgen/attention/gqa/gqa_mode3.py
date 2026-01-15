@@ -188,17 +188,20 @@ def _apply_rope(
     Args:
         q: Query tensor [batch, seq_len, num_heads, head_dim]
         k: Key tensor [batch, seq_len, num_kv_heads, head_dim]
-        cos: Cosine values [max_pos, head_dim//2]
-        sin: Sine values [max_pos, head_dim//2]
+        cos: Cosine values [max_pos, head_dim//2] or [batch, head_dim//2] if pre-indexed
+        sin: Sine values [max_pos, head_dim//2] or [batch, head_dim//2] if pre-indexed
         position_ids: Position IDs [batch]
 
     Returns:
         Tuple of (q_rotated, k_rotated)
     """
     # Get cos/sin for current positions
-    # position_ids: [batch], cos: [max_pos, head_dim//2]
-    cos = cos[position_ids]  # [batch, head_dim//2]
-    sin = sin[position_ids]  # [batch, head_dim//2]
+    # If cos/sin are already position-indexed (shape [batch, head_dim//2]), skip indexing
+    batch_size = position_ids.shape[0]
+    if cos.shape[0] != batch_size:
+        # cos: [max_pos, head_dim//2] -> index to [batch, head_dim//2]
+        cos = cos[position_ids]
+        sin = sin[position_ids]
 
     # Expand for broadcast: [batch, 1, 1, head_dim//2]
     cos = cos.unsqueeze(1).unsqueeze(2)
