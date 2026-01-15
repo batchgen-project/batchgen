@@ -631,6 +631,9 @@ class ExpertMLP(torch.nn.Module):
         # Weights are passed to forward(), not stored as buffers/parameters
         # This allows efficient handling of MXFP4 uint8 tensors
 
+    # Debug counter for logging (class variable)
+    _debug_call_count = 0
+
     def forward(self, x: torch.Tensor, weights_dict: dict) -> torch.Tensor:
         """Forward pass with W4A16 MXFP4 GEMM.
 
@@ -650,6 +653,7 @@ class ExpertMLP(torch.nn.Module):
             Output tensor [batch, hidden_size] in BF16
         """
         from batchgen.moe.fused_mxfp4_gemm import fused_mxfp4_gemm
+        import logging
 
         # Extract weights from dict
         mlp1_packed = weights_dict['mlp1.packed']
@@ -658,6 +662,26 @@ class ExpertMLP(torch.nn.Module):
         mlp2_packed = weights_dict['mlp2.packed']
         mlp2_scales = weights_dict['mlp2.scales']
         mlp2_bias = weights_dict['mlp2.bias']
+
+        # Debug logging (only first few calls)
+        ExpertMLP._debug_call_count += 1
+        if ExpertMLP._debug_call_count <= 3:
+            logging.info(
+                f"[ExpertMLP DEBUG] L{self.layer_idx} E{self.expert_idx} call #{ExpertMLP._debug_call_count}: "
+                f"x={x.shape} {x.dtype}, "
+                f"mlp1.packed={mlp1_packed.shape} {mlp1_packed.dtype}, "
+                f"mlp1.scales={mlp1_scales.shape} {mlp1_scales.dtype}, "
+                f"mlp1.bias={mlp1_bias.shape} {mlp1_bias.dtype}, "
+                f"mlp2.packed={mlp2_packed.shape} {mlp2_packed.dtype}, "
+                f"mlp2.scales={mlp2_scales.shape} {mlp2_scales.dtype}, "
+                f"mlp2.bias={mlp2_bias.shape} {mlp2_bias.dtype}"
+            )
+            # Check weight content (first few values)
+            logging.info(
+                f"  mlp1_packed[:3,:3]={mlp1_packed[:3,:3].tolist()}, "
+                f"mlp1_scales[:3,:3]={mlp1_scales[:3,:3].tolist()}, "
+                f"mlp1_bias[:5]={mlp1_bias[:5].tolist()}"
+            )
 
         # Validate weight shapes (debug)
         assert mlp1_packed.dim() == 2, f"mlp1.packed must be 2D, got {mlp1_packed.dim()}D: {mlp1_packed.shape}"

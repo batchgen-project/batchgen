@@ -5937,8 +5937,9 @@ class BatchGenWorker:
 			try:
 				from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
 				DECODE_TIMING.enable()
-			except ImportError:
-				pass
+				logging.info(f"Rank {self.rank}: DECODE_TIMING enabled={DECODE_TIMING.enabled}")
+			except ImportError as e:
+				logging.warning(f"Rank {self.rank}: Failed to import DECODE_TIMING: {e}")
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
@@ -6299,10 +6300,11 @@ class BatchGenWorker:
 			if self.rank == 0:
 				try:
 					from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
+					logging.info(f"Printing timing stats (enabled={DECODE_TIMING.enabled}, num_keys={len(DECODE_TIMING.total_times)})")
 					DECODE_TIMING.print_stats()
 					DECODE_TIMING.disable()
-				except ImportError:
-					pass
+				except ImportError as e:
+					logging.warning(f"Failed to print DECODE_TIMING: {e}")
 
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
