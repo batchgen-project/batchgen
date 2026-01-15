@@ -90,6 +90,10 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             logging.warning("MXFP4 dequantization not available, using identity")
             self.dequant_fn = lambda packed, scales, dtype=torch.bfloat16: packed
 
+        # Store weights for passing to ExpertMLP.forward()
+        # ExpertMLP expects weights_dict as argument, not as module parameters
+        self._current_weights = None
+
     def _build_module_key(self) -> str:
         """Build module key for weight loading.
 
@@ -104,116 +108,53 @@ class GptOssExpertWrapper(ExpertWrapperBase):
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Dequantize MXFP4 packed weights and slice for this expert.
+        """Convert loaded weights to format expected by ExpertMLP.forward().
 
-        GPT-OSS checkpoint format uses SHARED weights per layer:
-        - "mlp1_weight.blocks": packed gate_proj for all 128 experts
-        - "mlp1_weight.scales": scales for mlp1_weight
-        - "mlp2_weight.blocks": packed up_proj + down_proj for all experts
-        - "mlp2_weight.scales": scales for mlp2_weight
-        - "mlp1_bias": bias for gate_proj (all experts)
-        - "mlp2_bias": bias for up/down_proj (all experts)
+        ExpertMLP expects weights_dict with these keys:
+        - 'mlp1.packed': [intermediate*2, hidden//2] uint8
+        - 'mlp1.scales': [intermediate*2, hidden//32] uint8
+        - 'mlp1.bias': [intermediate*2] BF16
+        - 'mlp2.packed': [hidden, intermediate//2] uint8
+        - 'mlp2.scales': [hidden, intermediate//32] uint8
+        - 'mlp2.bias': [hidden] BF16
 
-        This method:
-        1. Dequantizes the full MXFP4 tensors
-        2. Slices the portion for this expert based on expert_idx
+        The weights are kept in MXFP4 format - ExpertMLP handles dequantization
+        internally via fused_mxfp4_gemm.
 
         Args:
-            weights_dict: Dict with packed weights and scales (shared per layer)
+            weights_dict: Dict with weights from core_engine
 
         Returns:
-            Dict with dequantized BF16 weights for this expert only
+            Dict formatted for ExpertMLP.forward()
         """
         result = {}
 
-        # Calculate slice indices for this expert
-        start_idx = self.expert_idx * self.intermediate_size
-        end_idx = (self.expert_idx + 1) * self.intermediate_size
+        # Map weight names to ExpertMLP expected format
+        # Core engine may provide weights with different naming conventions
+        key_mapping = {
+            'mlp1.packed': ['mlp1.packed', 'mlp1_weight.blocks', 'gate_up.packed'],
+            'mlp1.scales': ['mlp1.scales', 'mlp1_weight.scales', 'gate_up.scales'],
+            'mlp1.bias': ['mlp1.bias', 'mlp1_bias', 'gate_up.bias'],
+            'mlp2.packed': ['mlp2.packed', 'mlp2_weight.blocks', 'down.packed'],
+            'mlp2.scales': ['mlp2.scales', 'mlp2_weight.scales', 'down.scales'],
+            'mlp2.bias': ['mlp2.bias', 'mlp2_bias', 'down.bias'],
+        }
 
-        # Handle mlp1_weight (gate_proj)
-        if "mlp1_weight.blocks" in weights_dict and "mlp1_weight.scales" in weights_dict:
-            packed = weights_dict["mlp1_weight.blocks"]
-            scales = weights_dict["mlp1_weight.scales"]
-            full_weight = self.dequant_fn(packed, scales, torch.bfloat16)
-            # Slice gate_proj for this expert
-            result["gate_proj.weight"] = full_weight[start_idx:end_idx, :]
+        for target_key, source_keys in key_mapping.items():
+            for src_key in source_keys:
+                if src_key in weights_dict:
+                    result[target_key] = weights_dict[src_key]
+                    break
 
-        # Handle mlp2_weight (up_proj + down_proj combined)
-        # Layout: first half is up_proj, second half is down_proj
-        if "mlp2_weight.blocks" in weights_dict and "mlp2_weight.scales" in weights_dict:
-            packed = weights_dict["mlp2_weight.blocks"]
-            scales = weights_dict["mlp2_weight.scales"]
-            full_weight = self.dequant_fn(packed, scales, torch.bfloat16)
-
-            # mlp2_weight layout: [128 * intermediate_size * 2, hidden_size]
-            # First 128 * intermediate_size rows = up_proj for all experts
-            # Next 128 * intermediate_size rows = down_proj for all experts
-            total_up_size = self.num_experts * self.intermediate_size
-
-            # Slice up_proj for this expert
-            up_start = start_idx
-            up_end = end_idx
-            result["up_proj.weight"] = full_weight[up_start:up_end, :]
-
-            # Slice down_proj for this expert (offset by total up_proj size)
-            down_start = total_up_size + start_idx
-            down_end = total_up_size + end_idx
-            result["down_proj.weight"] = full_weight[down_start:down_end, :]
-
-        # Handle biases (if present)
-        if "mlp1_bias" in weights_dict:
-            full_bias = weights_dict["mlp1_bias"]
-            result["gate_proj.bias"] = full_bias[start_idx:end_idx]
-
-        if "mlp2_bias" in weights_dict:
-            full_bias = weights_dict["mlp2_bias"]
-            # Same layout as weights
-            total_up_size = self.num_experts * self.intermediate_size
-            result["up_proj.bias"] = full_bias[start_idx:end_idx]
-            result["down_proj.bias"] = full_bias[total_up_size + start_idx:total_up_size + end_idx]
-    def dequantize_weights(
-        self, weights_dict: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Dequantize MXFP4 packed weights to BF16.
-
-        Expected weight format in weights_dict:
-        - "gate_proj.weight": packed uint8 tensor
-        - "gate_proj.weight_scales": scale uint8 tensor
-        - "up_proj.weight": packed uint8 tensor
-        - "up_proj.weight_scales": scale uint8 tensor
-        - "down_proj.weight": packed uint8 tensor
-        - "down_proj.weight_scales": scale uint8 tensor
-
-        Args:
-            weights_dict: Dict with packed weights and scales
-
-        Returns:
-            Dict with dequantized BF16 weights
-        """
-        result = {}
-
-        for name, tensor in weights_dict.items():
-            # Skip scale tensors - they're used with their corresponding weights
-            if name.endswith("_scales"):
-                continue
-
-            # Check if this weight has a scale tensor
-            scale_key = f"{name}_scales"
-            if scale_key in weights_dict:
-                # MXFP4 quantized weight - dequantize
-                packed = tensor
-                scales = weights_dict[scale_key]
-                result[name] = self.dequant_fn(packed, scales, torch.bfloat16)
-            else:
-                # Not quantized - use as-is
-                result[name] = tensor
-
+        # Store for use in _forward_impl
+        self._current_weights = result
         return result
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """SwiGLU forward with clamping.
+        """Forward through ExpertMLP with MXFP4 weights.
 
-        GPT-OSS uses clamped SwiGLU: clamp(silu(gate) * up, -7, 7)
+        ExpertMLP.forward() expects (x, weights_dict) where weights_dict
+        contains MXFP4 packed weights and scales.
 
         Args:
             hidden_states: Input tensor [num_tokens, hidden_size]
@@ -221,17 +162,21 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         Returns:
             Output tensor [num_tokens, hidden_size]
         """
-        return self.module(hidden_states)
+        if self._current_weights is None:
+            raise RuntimeError(
+                f"Expert {self.expert_idx} layer {self.layer_idx}: "
+                "weights not loaded before forward"
+            )
+        return self.module(hidden_states, self._current_weights)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with MXFP4 dequantization.
+        """Forward pass with MXFP4 weights.
 
         Flow:
         1. Load MXFP4 packed weights from core engine
-        2. Dequantize to BF16
-        3. Apply to module
-        4. Micro-batch forward through SwiGLU
-        5. Cleanup
+        2. Format weights for ExpertMLP (stores in self._current_weights)
+        3. Micro-batch forward through ExpertMLP
+        4. Cleanup
 
         Args:
             hidden_states: Input tensor [num_tokens, hidden_size]
@@ -248,13 +193,10 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         # Load MXFP4 weights from core engine
         weights = self.load_weights(self.module_key)
 
-        # Dequantize MXFP4 to BF16
-        dequant_weights = self.dequantize_weights(weights)
+        # Format weights for ExpertMLP (stores in self._current_weights)
+        self.dequantize_weights(weights)
 
-        # Apply to module
-        self.apply_weights(dequant_weights)
-
-        # Micro-batch forward
+        # Micro-batch forward (uses self._current_weights)
         result = self.micro_batch_forward(hidden_states, "expert")
 
         # Cleanup
@@ -262,7 +204,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             self.engine_config.Basic_Config.device_torch
         ).synchronize()
         self.free_weights(self.module_key)
-        self.clear_weights()
+        self._current_weights = None  # Clear weights reference
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
