@@ -340,8 +340,8 @@ class TestPrefill:
         # Reshape FA output to match reference
         output_fa = output_fa.reshape(batch_size, num_queries, nheads * headdim)
 
-        # Compare - use slightly higher tolerance for bfloat16 + sink correction
-        torch.testing.assert_close(output_fa, output_ref, rtol=2e-2, atol=2e-2)
+        # Compare
+        torch.testing.assert_close(output_fa, output_ref, rtol=1e-2, atol=1e-2)
 
 
 # =============================================================================
