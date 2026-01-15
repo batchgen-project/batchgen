@@ -62,18 +62,18 @@ def gqa_decode_fa(
     lse = None
 
     if _USE_FA3 and _fa3_with_kvcache is not None:
-        # FA3 (Hopper) - uses return_attn_probs to return (output, softmax_lse)
+        # FA3 (Hopper) - uses return_softmax_lse for kvcache function
         if sinks is not None:
             output, lse = _fa3_with_kvcache(
                 q,
                 k_cache,
                 v_cache,
                 cache_seqlens=cache_seqlens,
-                block_table=block_table,
+                page_table=block_table,
                 softmax_scale=softmax_scale,
                 causal=True,
                 window_size=window_size,
-                return_attn_probs=True,
+                return_softmax_lse=True,
             )
         else:
             output = _fa3_with_kvcache(
@@ -81,7 +81,7 @@ def gqa_decode_fa(
                 k_cache,
                 v_cache,
                 cache_seqlens=cache_seqlens,
-                block_table=block_table,
+                page_table=block_table,
                 softmax_scale=softmax_scale,
                 causal=True,
                 window_size=window_size,
@@ -163,56 +163,33 @@ def gqa_decode_fa_contiguous(
 
     lse = None
 
-    if _USE_FA3 and _fa3_with_kvcache is not None:
-        if sinks is not None:
-            output, lse = _fa3_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                return_attn_probs=True,
-            )
-        else:
-            output = _fa3_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-            )
-    elif _fa2_with_kvcache is not None:
-        if sinks is not None:
-            result = _fa2_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                return_softmax_lse=True,
-            )
-            if isinstance(result, tuple):
-                output, lse = result[0], result[1]
-            else:
-                output = result
-        else:
-            output = _fa2_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                cache_seqlens=cache_seqlens,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-            )
-    else:
+    # Both FA2 and FA3 use return_softmax_lse for flash_attn_with_kvcache
+    flash_fn = _fa3_with_kvcache if (_USE_FA3 and _fa3_with_kvcache is not None) else _fa2_with_kvcache
+
+    if flash_fn is None:
         raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
+
+    if sinks is not None:
+        output, lse = flash_fn(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+            return_softmax_lse=True,
+        )
+    else:
+        output = flash_fn(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+        )
 
     if sinks is not None and lse is not None:
         from .sink_correction import apply_sink_correction
