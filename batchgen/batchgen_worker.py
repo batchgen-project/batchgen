@@ -5814,6 +5814,13 @@ class BatchGenWorker:
 		Attn_Wrapper.past_value_states = past_value_states
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 
+		# GPT-OSS: Also set GptOssAttnWrapper for Mode 3 decoding
+		if "gpt_oss" in self.model_config.model_type:
+			wrapper = _get_gpt_oss_attn_wrapper()
+			if wrapper:
+				wrapper.gpu_paged_kv_manager = gpu_manager
+				wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
 		if gpu_manager and gpu_manager._gpu_page_table_manager:
@@ -6135,7 +6142,14 @@ class BatchGenWorker:
 		Attn_Wrapper.gpu_paged_kv_manager = None
 		Attn_Wrapper.host_paged_kv_worker_view = None
 		Attn_Wrapper.cur_batch = None
-		
+
+		# GPT-OSS: Clean up GptOssAttnWrapper
+		if "gpt_oss" in self.model_config.model_type:
+			wrapper = _get_gpt_oss_attn_wrapper()
+			if wrapper:
+				wrapper.gpu_paged_kv_manager = None
+				wrapper.cur_batch = None
+
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
 		if self.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
