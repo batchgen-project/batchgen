@@ -260,6 +260,25 @@ class TestPrefill:
         print(f"Reference (no sinks) output shape: {output_ref_no_sinks.shape}")
         print(f"Reference LSE shape: {lse_ref.shape}")
 
+        # Debug: Check what FA3 actually returns
+        from flash_attn_interface import flash_attn_varlen_func as fa3_func
+        raw_result = fa3_func(
+            q_varlen, k_varlen, v_varlen,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q, max_seqlen_k=max_k,
+            softmax_scale=sm_scale, causal=True,
+        )
+        print(f"FA3 raw result type: {type(raw_result)}")
+        if isinstance(raw_result, tuple):
+            print(f"FA3 tuple length: {len(raw_result)}")
+            for i, r in enumerate(raw_result):
+                if r is not None:
+                    print(f"  result[{i}] shape: {r.shape}, dtype: {r.dtype}")
+                else:
+                    print(f"  result[{i}]: None")
+        else:
+            print(f"FA3 single tensor shape: {raw_result.shape}")
+
         output_fa, lse_fa = gqa_prefill_fa(
             q_varlen, k_varlen, v_varlen, cu_q, cu_k, max_q, max_k,
             sinks=None, softmax_scale=sm_scale, sliding_window=None

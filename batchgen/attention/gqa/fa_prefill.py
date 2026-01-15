@@ -75,7 +75,7 @@ def gqa_prefill_fa(
     lse = None
 
     if _USE_FA3:
-        # FA3 returns (output, lse) by default - no special parameter needed
+        # FA3 interface - check what it actually returns
         result = _flash_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens_q,
@@ -86,12 +86,16 @@ def gqa_prefill_fa(
             causal=True,
             window_size=window_size,
         )
-        # FA3 always returns (output, lse)
+        # FA3 returns (output, lse) tuple
         if isinstance(result, tuple):
             output = result[0]
-            lse = result[1]
+            lse = result[1] if len(result) > 1 else None
+            # Debug: print what we got
+            # print(f"FA3 returned tuple of length {len(result)}, lse shape: {lse.shape if lse is not None else None}")
         else:
             output = result
+            # Debug: print result type
+            # print(f"FA3 returned non-tuple: {type(result)}")
     else:
         # FA2 needs return_softmax_lse=True to get LSE
         if sinks is not None:
