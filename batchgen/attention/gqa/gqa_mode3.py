@@ -41,12 +41,13 @@ def gqa_decoding_mode_3_bf16(
     # KV cache manager
     gpu_paged_kv_manager,
     layer_idx: int,
-    batch_slice: Optional[Tuple[int, int]] = None,
     # Config
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
     sm_scale: float,
+    # Optional
+    batch_slice: Optional[Tuple[int, int]] = None,
     sliding_window: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """GQA Mode 3 decode: GPU paged KV cache.
