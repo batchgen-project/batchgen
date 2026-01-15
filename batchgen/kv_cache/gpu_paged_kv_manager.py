@@ -999,12 +999,50 @@ class GPUPagedKVCacheManager:
 		if self._v_cache is not None:
 			v_cache_layer = self._v_cache[layer_idx]
 
-		# DEBUG: Log parameters before kernel call (only for layer 0)
+		# DEBUG: Log parameters and validate before kernel call (only for layer 0)
 		if layer_idx == 0:
 			import logging
 			page_size = self.config.page_size_tokens
 			max_token_idx = token_indices.max().item() if token_indices.numel() > 0 else 0
 			max_page_slot = max_token_idx // page_size
+
+			# Check if page_slot would exceed page_table columns
+			num_page_table_cols = page_table_view.shape[1]
+			if max_page_slot >= num_page_table_cols:
+				logging.error(
+					f"[KV-UPDATE ERROR] max_page_slot ({max_page_slot}) >= page_table_cols ({num_page_table_cols})! "
+					f"token_indices max={max_token_idx}, page_size={page_size}. "
+					f"This will cause illegal memory access!"
+				)
+
+			# Check if any target page is -1 (unallocated)
+			# For each token, compute page_slot and check page_table[slot, page_slot]
+			invalid_pages = []
+			for i in range(batch_size):
+				slot = slot_indices[i].item()
+				tok_idx = token_indices[i].item()
+				ps = tok_idx // page_size
+				if ps < num_page_table_cols:
+					page_val = page_table_view[slot, ps].item()
+					if page_val < 0:
+						invalid_pages.append((i, slot, tok_idx, ps, page_val))
+
+			if invalid_pages:
+				logging.error(
+					f"[KV-UPDATE ERROR] Found {len(invalid_pages)} tokens targeting unallocated pages! "
+					f"First 3: {invalid_pages[:3]}. This will cause illegal memory access!"
+				)
+				# Log sequence info for debugging
+				slot_to_seq = self._gpu_page_table_manager.slot_to_seq_id
+				for i, slot, tok_idx, ps, page_val in invalid_pages[:3]:
+					seq_id = slot_to_seq[slot] if slot < len(slot_to_seq) else "unknown"
+					seq_state = self._sequences.get(seq_id)
+					num_pages = seq_state.pages.numel() if seq_state else 0
+					logging.error(
+						f"  Token {i}: seq_id={seq_id}, slot={slot}, tok_idx={tok_idx}, "
+						f"page_slot={ps}, page_val={page_val}, seq_num_pages={num_pages}"
+					)
+
 			logging.info(
 				f"[KV-UPDATE DEBUG] layer=0, batch_size={batch_size}, "
 				f"page_table_shape={page_table_view.shape}, "

@@ -5814,12 +5814,12 @@ class BatchGenWorker:
 		Attn_Wrapper.past_value_states = past_value_states
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 
-		# GPT-OSS: Also set GptOssAttnWrapper for Mode 3 decoding
+		# GPT-OSS: Also set GptOssAttnWrapper class-level attrs for Mode 3 decoding
 		if "gpt_oss" in self.model_config.model_type:
-			wrapper = _get_gpt_oss_attn_wrapper()
-			if wrapper:
-				wrapper.gpu_paged_kv_manager = gpu_manager
-				wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+			wrapper_class = _get_gpt_oss_attn_wrapper()
+			if wrapper_class:
+				wrapper_class.gpu_paged_kv_manager = gpu_manager
+				wrapper_class.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 			# Timing disabled for debugging - enable later
 			# try:
 			# 	from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
@@ -6078,17 +6078,19 @@ class BatchGenWorker:
 
 					# GPT-OSS: Set up GptOssAttnWrapper for Mode 3 decode
 					if "gpt_oss" in self.model_config.model_type:
-						wrapper = _get_gpt_oss_attn_wrapper()
-						if wrapper:
-							wrapper.cur_batch = Attn_Wrapper.cur_batch
+						wrapper_class = _get_gpt_oss_attn_wrapper()
+						if wrapper_class:
+							# Update CLASS-level attributes (not instance attributes)
+							# _forward_mode_3 reads from class attributes, not instance
+							wrapper_class.cur_batch = Attn_Wrapper.cur_batch
 							# Squeeze position_ids: GPT-OSS expects [batch], not [batch, 1]
-							wrapper.position_ids = Attn_Wrapper.position_ids.squeeze(-1)
+							wrapper_class.position_ids = Attn_Wrapper.position_ids.squeeze(-1)
 							# Build sequence_lengths dict from cache_seqlens
 							seq_lengths_dict = {}
-							for i, seq_id in enumerate(wrapper.cur_batch):
+							for i, seq_id in enumerate(wrapper_class.cur_batch):
 								if i < len(cache_seqlens):
 									seq_lengths_dict[seq_id] = cache_seqlens[i]
-							wrapper.sequence_lengths = seq_lengths_dict
+							wrapper_class.sequence_lengths = seq_lengths_dict
 
 					# OPTIMIZATION: Only check page table if not already verified this batch
 					# Between boundaries, batch doesn't change so page table stays valid
@@ -6168,14 +6170,14 @@ class BatchGenWorker:
 		Attn_Wrapper.host_paged_kv_worker_view = None
 		Attn_Wrapper.cur_batch = None
 
-		# GPT-OSS: Clean up GptOssAttnWrapper
+		# GPT-OSS: Clean up GptOssAttnWrapper class-level attrs
 		if "gpt_oss" in self.model_config.model_type:
-			wrapper = _get_gpt_oss_attn_wrapper()
-			if wrapper:
-				wrapper.gpu_paged_kv_manager = None
-				wrapper.cur_batch = None
-				wrapper.position_ids = None
-				wrapper.sequence_lengths = {}
+			wrapper_class = _get_gpt_oss_attn_wrapper()
+			if wrapper_class:
+				wrapper_class.gpu_paged_kv_manager = None
+				wrapper_class.cur_batch = None
+				wrapper_class.position_ids = None
+				wrapper_class.sequence_lengths = {}
 			# Print timing stats and disable
 			if self.rank == 0:
 				try:
