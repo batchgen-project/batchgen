@@ -6075,7 +6075,8 @@ class BatchGenWorker:
 						wrapper = _get_gpt_oss_attn_wrapper()
 						if wrapper:
 							wrapper.cur_batch = Attn_Wrapper.cur_batch
-							wrapper.position_ids = Attn_Wrapper.position_ids
+							# Squeeze position_ids: GPT-OSS expects [batch], not [batch, 1]
+							wrapper.position_ids = Attn_Wrapper.position_ids.squeeze(-1)
 							# Build sequence_lengths dict from cache_seqlens
 							seq_lengths_dict = {}
 							for i, seq_id in enumerate(wrapper.cur_batch):
