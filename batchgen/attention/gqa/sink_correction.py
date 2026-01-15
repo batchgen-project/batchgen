@@ -39,6 +39,8 @@ def apply_sink_correction(
     nheads = sinks.shape[0]
     sinks = sinks.float()  # Ensure float32 for numerical stability
 
+    output_dtype = output.dtype
+
     if lse.dim() == 2:
         # Varlen prefill: lse is (nheads, total_tokens)
         # output is (total_tokens, nheads, headdim)
@@ -46,7 +48,8 @@ def apply_sink_correction(
         lse_transposed = lse.T.float()  # (total_tokens, nheads)
         sinks_broadcast = sinks.view(1, nheads)  # (1, nheads)
         factor = torch.sigmoid(lse_transposed - sinks_broadcast)  # (total_tokens, nheads)
-        return output * factor.unsqueeze(-1)  # (total_tokens, nheads, 1)
+        result = output.float() * factor.unsqueeze(-1)  # (total_tokens, nheads, 1)
+        return result.to(output_dtype)
 
     elif lse.dim() == 3:
         # Padded prefill or decode: lse is (batch, nheads, seqlen)
@@ -57,7 +60,8 @@ def apply_sink_correction(
         factor = torch.sigmoid(lse_float - sinks_broadcast)  # (batch, nheads, seqlen)
         # Transpose factor to match output: (batch, seqlen, nheads)
         factor = factor.transpose(1, 2)  # (batch, seqlen, nheads)
-        return output * factor.unsqueeze(-1)  # (batch, seqlen, nheads, 1)
+        result = output.float() * factor.unsqueeze(-1)  # (batch, seqlen, nheads, 1)
+        return result.to(output_dtype)
 
     else:
         raise ValueError(f"Unexpected LSE shape: {lse.shape}, expected 2D or 3D")
