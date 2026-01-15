@@ -264,7 +264,6 @@ def fused_mxfp4_grouped_gemm_kernel(
             tile_id += num_programs
 
 
-@torch.inference_mode()
 # Debug counter for GEMM logging (only first few calls per phase)
 _gemm_debug_count = 0
 _gemm_debug_phase = "prefill"
@@ -275,6 +274,7 @@ def reset_gemm_debug_for_decode():
     _gemm_debug_count = 0
     _gemm_debug_phase = "decode"
 
+@torch.inference_mode()
 def fused_mxfp4_gemm(
     lhs: torch.Tensor,           # [M, K] BF16
     rhs_packed: torch.Tensor,    # [N, K//2] uint8 (MXFP4 packed)
