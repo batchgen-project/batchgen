@@ -5820,6 +5820,12 @@ class BatchGenWorker:
 			if wrapper:
 				wrapper.gpu_paged_kv_manager = gpu_manager
 				wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+			# Enable timing for GPT-OSS decode
+			try:
+				from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
+				DECODE_TIMING.enable()
+			except ImportError:
+				pass
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
@@ -6170,6 +6176,14 @@ class BatchGenWorker:
 				wrapper.cur_batch = None
 				wrapper.position_ids = None
 				wrapper.sequence_lengths = {}
+			# Print timing stats and disable
+			if self.rank == 0:
+				try:
+					from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
+					DECODE_TIMING.print_stats()
+					DECODE_TIMING.disable()
+				except ImportError:
+					pass
 
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG

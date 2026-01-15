@@ -1,12 +1,94 @@
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
 
 from .weights import Checkpoint
+
+
+# =============================================================================
+# Timing infrastructure for performance profiling
+# =============================================================================
+class DecodeTimingStats:
+    """Accumulates timing statistics for decode operations."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.enabled = False
+        self.call_counts = {}
+        self.total_times = {}
+        self._start_times = {}
+
+    def enable(self):
+        self.enabled = True
+        self.reset()
+        self.enabled = True
+
+    def disable(self):
+        self.enabled = False
+
+    def start(self, name: str):
+        if not self.enabled:
+            return
+        torch.cuda.synchronize()
+        self._start_times[name] = time.perf_counter()
+
+    def stop(self, name: str):
+        if not self.enabled or name not in self._start_times:
+            return
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - self._start_times[name]
+        if name not in self.total_times:
+            self.total_times[name] = 0.0
+            self.call_counts[name] = 0
+        self.total_times[name] += elapsed
+        self.call_counts[name] += 1
+        del self._start_times[name]
+
+    @contextmanager
+    def time(self, name: str):
+        self.start(name)
+        try:
+            yield
+        finally:
+            self.stop(name)
+
+    def print_stats(self):
+        if not self.total_times:
+            print("[TIMING] No timing data collected")
+            return
+
+        print("\n" + "=" * 70)
+        print("DECODE TIMING STATISTICS")
+        print("=" * 70)
+
+        # Sort by total time descending
+        sorted_items = sorted(self.total_times.items(), key=lambda x: -x[1])
+        total_measured = sum(self.total_times.values())
+
+        print(f"{'Operation':<40} {'Total(ms)':>10} {'Calls':>8} {'Avg(ms)':>10} {'%':>6}")
+        print("-" * 70)
+
+        for name, total_time in sorted_items:
+            calls = self.call_counts[name]
+            avg_time = total_time / calls if calls > 0 else 0
+            pct = (total_time / total_measured * 100) if total_measured > 0 else 0
+            print(f"{name:<40} {total_time*1000:>10.2f} {calls:>8} {avg_time*1000:>10.3f} {pct:>5.1f}%")
+
+        print("-" * 70)
+        print(f"{'TOTAL MEASURED':<40} {total_measured*1000:>10.2f}")
+        print("=" * 70 + "\n")
+
+
+# Global timing stats instance
+DECODE_TIMING = DecodeTimingStats()
 
 
 @dataclass
@@ -869,11 +951,12 @@ class MLPBlock(torch.nn.Module):
         num_tokens = x.shape[0]
 
         # Compute routing
-        t = self.norm(x)
-        g = self.gate(t)
-        experts_result = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-        expert_weights = torch.nn.functional.softmax(experts_result.values, dim=-1)
-        expert_indices = experts_result.indices  # [num_tokens, experts_per_token]
+        with DECODE_TIMING.time("mlp.routing"):
+            t = self.norm(x)
+            g = self.gate(t)
+            experts_result = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
+            expert_weights = torch.nn.functional.softmax(experts_result.values, dim=-1)
+            expert_indices = experts_result.indices  # [num_tokens, experts_per_token]
 
         # Initialize output accumulator
         output = torch.zeros_like(x)
@@ -881,33 +964,34 @@ class MLPBlock(torch.nn.Module):
         # Get unique experts and their token assignments
         unique_experts = torch.unique(expert_indices)
 
-        for expert_idx in unique_experts:
-            expert_idx_item = expert_idx.item()
+        with DECODE_TIMING.time("mlp.expert_loop"):
+            for expert_idx in unique_experts:
+                expert_idx_item = expert_idx.item()
 
-            # Find which (token, slot) pairs use this expert
-            mask = (expert_indices == expert_idx)  # [num_tokens, experts_per_token]
+                # Find which (token, slot) pairs use this expert
+                mask = (expert_indices == expert_idx)  # [num_tokens, experts_per_token]
 
-            # Get the tokens and weights for this expert
-            token_indices, slot_indices = torch.where(mask)
+                # Get the tokens and weights for this expert
+                token_indices, slot_indices = torch.where(mask)
 
-            if len(token_indices) == 0:
-                continue
+                if len(token_indices) == 0:
+                    continue
 
-            # Gather input tokens for this expert
-            expert_input = t[token_indices]  # [num_selected, hidden]
+                # Gather input tokens for this expert
+                expert_input = t[token_indices]  # [num_selected, hidden]
 
-            # Get the weights for these tokens
-            token_weights = expert_weights[token_indices, slot_indices]  # [num_selected]
+                # Get the weights for these tokens
+                token_weights = expert_weights[token_indices, slot_indices]  # [num_selected]
 
-            # Forward through expert wrapper (handles MXFP4 weight loading)
-            # The wrapper's __call__ loads weights and calls deepgemm_forward
-            expert_output = self.experts[expert_idx_item](expert_input)
+                # Forward through expert wrapper (handles MXFP4 weight loading)
+                # The wrapper's __call__ loads weights and calls deepgemm_forward
+                expert_output = self.experts[expert_idx_item](expert_input)
 
-            # Weighted output
-            weighted_output = expert_output * token_weights.unsqueeze(-1)
+                # Weighted output
+                weighted_output = expert_output * token_weights.unsqueeze(-1)
 
-            # Scatter-add to output
-            output.index_add_(0, token_indices, weighted_output)
+                # Scatter-add to output
+                output.index_add_(0, token_indices, weighted_output)
 
         result = x + output
 
@@ -972,8 +1056,12 @@ class TransformerBlock(torch.nn.Module):
         """
         # Pass attention_mask to attention for proper sequence boundary handling
         x = hidden_states
-        x = self.attn(x, attention_mask=attention_mask)
-        x = self.mlp(x)
+
+        with DECODE_TIMING.time(f"attn"):
+            x = self.attn(x, attention_mask=attention_mask)
+
+        with DECODE_TIMING.time(f"mlp"):
+            x = self.mlp(x)
 
         # ALWAYS return tuple (hidden_states, past_key_value) to match HuggingFace format
         # BatchGenWorker expects tuple output and does `hidden_states = layer_output[0]`
@@ -1007,14 +1095,21 @@ class Transformer(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
+        with DECODE_TIMING.time("embedding"):
+            x = self.embedding(x)
+
         for block in self.block:
             x = block(x)
             # Handle HuggingFace-style tuple return (hidden_states, past_key_value)
             if isinstance(x, tuple):
                 x = x[0]
-        x = self.norm(x)
-        x = self.unembedding(x)
+
+        with DECODE_TIMING.time("final_norm"):
+            x = self.norm(x)
+
+        with DECODE_TIMING.time("unembedding"):
+            x = self.unembedding(x)
+
         return x
 
     @staticmethod

@@ -21,6 +21,14 @@ from typing import Optional, Tuple
 from .fa_decode import gqa_decode_fa
 from .sink_correction import apply_sink_correction
 
+# Import timing from model module (lazy to avoid circular import)
+def _get_timing():
+    try:
+        from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
+        return DECODE_TIMING
+    except ImportError:
+        return None
+
 
 def gqa_decoding_mode_3_bf16(
     hidden_states: torch.Tensor,
@@ -93,14 +101,23 @@ def gqa_decoding_mode_3_bf16(
         - k_new: New key tensor for this decode step
         - v_new: New value tensor for this decode step
     """
+    timing = _get_timing()
     batch_size = hidden_states.shape[0]
     hidden_size = hidden_states.shape[-1]
 
     # 1. RMSNorm
-    t = _rms_norm(hidden_states, norm_weight, norm_eps)
+    if timing and timing.enabled:
+        with timing.time("attn.rms_norm"):
+            t = _rms_norm(hidden_states, norm_weight, norm_eps)
+    else:
+        t = _rms_norm(hidden_states, norm_weight, norm_eps)
 
     # 2. QKV projection
-    qkv = F.linear(t, qkv_weight, qkv_bias)
+    if timing and timing.enabled:
+        with timing.time("attn.qkv_proj"):
+            qkv = F.linear(t, qkv_weight, qkv_bias)
+    else:
+        qkv = F.linear(t, qkv_weight, qkv_bias)
 
     # Split into Q, K, V
     q_dim = num_q_heads * head_dim
@@ -117,7 +134,11 @@ def gqa_decoding_mode_3_bf16(
     v = v.view(batch_size, 1, num_kv_heads, head_dim)
 
     # 3. Apply RoPE
-    q, k = _apply_rope(q, k, rope_cos, rope_sin, position_ids)
+    if timing and timing.enabled:
+        with timing.time("attn.rope"):
+            q, k = _apply_rope(q, k, rope_cos, rope_sin, position_ids)
+    else:
+        q, k = _apply_rope(q, k, rope_cos, rope_sin, position_ids)
 
     # Keep original k, v for return
     k_new = k.squeeze(1)  # [batch, num_kv_heads, head_dim]
@@ -125,18 +146,34 @@ def gqa_decoding_mode_3_bf16(
 
     # 4. Offload: Store new K, V to GPU paged cache
     # Manager expects [batch, seq_len=1, num_kv_heads, head_dim]
-    gpu_paged_kv_manager.update_layer_decode_new_token(
-        k_tensor=k,  # [batch, 1, num_kv_heads, head_dim]
-        v_tensor=v,
-        sequence_lengths=cache_seqlens,
-        layer_idx=layer_idx,
-        batch_slice=batch_slice,
-    )
+    if timing and timing.enabled:
+        with timing.time("attn.kv_update"):
+            gpu_paged_kv_manager.update_layer_decode_new_token(
+                k_tensor=k,  # [batch, 1, num_kv_heads, head_dim]
+                v_tensor=v,
+                sequence_lengths=cache_seqlens,
+                layer_idx=layer_idx,
+                batch_slice=batch_slice,
+            )
+    else:
+        gpu_paged_kv_manager.update_layer_decode_new_token(
+            k_tensor=k,
+            v_tensor=v,
+            sequence_lengths=cache_seqlens,
+            layer_idx=layer_idx,
+            batch_slice=batch_slice,
+        )
 
     # 5. Get blocked historical KV and page table
-    blocked_k, blocked_v, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
-        layer_idx=layer_idx
-    )
+    if timing and timing.enabled:
+        with timing.time("attn.kv_fetch"):
+            blocked_k, blocked_v, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
+                layer_idx=layer_idx
+            )
+    else:
+        blocked_k, blocked_v, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
+            layer_idx=layer_idx
+        )
 
     # Apply batch slice to block_table for micro-batching (like DeepSeek)
     if batch_slice is not None:
@@ -147,23 +184,40 @@ def gqa_decoding_mode_3_bf16(
         cache_seqlens_slice = cache_seqlens
 
     # 6. Flash attention with paged KV
-    attn_output, lse = gqa_decode_fa(
-        q,  # [batch, 1, num_q_heads, head_dim]
-        blocked_k,  # [num_blocks, page_size, num_kv_heads, head_dim]
-        blocked_v,
-        cache_seqlens=cache_seqlens_slice,
-        block_table=block_table,
-        sinks=sinks,
-        softmax_scale=sm_scale,
-        sliding_window=sliding_window if sliding_window > 0 else None,
-    )
+    if timing and timing.enabled:
+        with timing.time("attn.flash_attn"):
+            attn_output, lse = gqa_decode_fa(
+                q,  # [batch, 1, num_q_heads, head_dim]
+                blocked_k,  # [num_blocks, page_size, num_kv_heads, head_dim]
+                blocked_v,
+                cache_seqlens=cache_seqlens_slice,
+                block_table=block_table,
+                sinks=sinks,
+                softmax_scale=sm_scale,
+                sliding_window=sliding_window if sliding_window > 0 else None,
+            )
+    else:
+        attn_output, lse = gqa_decode_fa(
+            q,
+            blocked_k,
+            blocked_v,
+            cache_seqlens=cache_seqlens_slice,
+            block_table=block_table,
+            sinks=sinks,
+            softmax_scale=sm_scale,
+            sliding_window=sliding_window if sliding_window > 0 else None,
+        )
 
     # 7. Reshape and output projection
     # attn_output: [batch, 1, num_q_heads, head_dim] -> [batch, q_dim]
     attn_output = attn_output.view(batch_size, -1)
 
     # 8. Output projection
-    attn_output = F.linear(attn_output, out_weight, out_bias)
+    if timing and timing.enabled:
+        with timing.time("attn.out_proj"):
+            attn_output = F.linear(attn_output, out_weight, out_bias)
+    else:
+        attn_output = F.linear(attn_output, out_weight, out_bias)
 
     return attn_output, k_new, v_new
 
