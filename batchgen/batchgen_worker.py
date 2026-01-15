@@ -790,19 +790,19 @@ class BatchGenWorker:
 	def _extend_gpu_kv_allocation(self, uuids: List[str]) -> bool:
 		"""
 		Extend GPU KV allocation for sequences that need more pages.
-		
+
 		Returns:
 			True if all extensions succeeded, False if insufficient pages
 		"""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
 			return False
-		
+
 		free_pages = manager.get_stats().num_free_pages
-		
+
 		extensions_needed = []
 		total_additional = 0
-		
+
 		for uuid in uuids:
 			if uuid not in self._uuid_to_local_map:
 				continue
@@ -811,27 +811,112 @@ class BatchGenWorker:
 			if additional > 0:
 				extensions_needed.append((uuid, additional))
 				total_additional += additional
-		
+
 		if total_additional > free_pages:
 			logging.warning(
 				f"Rank {self.rank}: Insufficient GPU pages for extension: "
 				f"need {total_additional}, have {free_pages}"
 			)
 			return False
-		
+
 		# Perform extensions
 		for uuid, additional in extensions_needed:
 			seq = self.global_batch.get_sequence(uuid)
 			local_idx = self._uuid_to_local_map[uuid]
 			global_id = seq.global_idx
-			
+
 			# Extend allocation
 			new_total_pages = seq.gpu_pages_allocated + additional
 			new_total_tokens = new_total_pages * self.PAGE_SIZE
-			
+
 			manager.extend_pages_for_sequence(global_id, new_total_tokens)
 			seq.gpu_pages_allocated = new_total_pages
-		
+
+		return True
+
+	def _ensure_pages_for_write_positions(
+		self,
+		batch: List[int],
+		cache_seqlens: List[int],
+		gpu_manager,
+	) -> bool:
+		"""
+		Ensure GPU pages are allocated for the write positions in cache_seqlens.
+
+		This is a safety check before decode forward pass to prevent writing
+		to unallocated pages. Each cache_seqlens[i] represents the position
+		where the new token will be written for sequence batch[i].
+
+		Args:
+			batch: List of local sequence indices
+			cache_seqlens: List of write positions (current context lengths)
+			gpu_manager: GPU paged KV cache manager
+
+		Returns:
+			True if all sequences have sufficient pages, False otherwise
+		"""
+		if gpu_manager is None or not batch:
+			return True
+
+		PAGE_SIZE = self.PAGE_SIZE
+		extensions_needed = []
+		total_additional = 0
+
+		for i, local_idx in enumerate(batch):
+			if i >= len(cache_seqlens):
+				continue
+
+			write_pos = cache_seqlens[i]
+			# Page needed for write_pos (0-indexed position)
+			page_needed = write_pos // PAGE_SIZE + 1  # +1 because we need pages 0..page_needed-1
+
+			uuid = self._local_to_uuid_map.get(local_idx)
+			if not uuid:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if not seq:
+				continue
+
+			current_pages = seq.gpu_pages_allocated
+			if page_needed > current_pages:
+				additional = page_needed - current_pages
+				extensions_needed.append((uuid, seq, additional))
+				total_additional += additional
+
+		if not extensions_needed:
+			return True
+
+		# Check if we have enough free pages
+		free_pages = gpu_manager.get_stats().num_free_pages
+		if total_additional > free_pages:
+			logging.error(
+				f"Rank {self.rank}: Insufficient GPU pages for write positions: "
+				f"need {total_additional} additional, have {free_pages} free"
+			)
+			return False
+
+		# Extend pages for sequences that need it
+		rebuild_needed = False
+		for uuid, seq, additional in extensions_needed:
+			global_id = seq.global_idx
+			new_total_pages = seq.gpu_pages_allocated + additional
+			new_total_tokens = new_total_pages * PAGE_SIZE
+
+			gpu_manager.extend_pages_for_sequence(global_id, new_total_tokens)
+			seq.gpu_pages_allocated = new_total_pages
+			rebuild_needed = True
+
+			if BATCHGEN_CB_DEBUG:
+				logging.debug(
+					f"Rank {self.rank}: Extended pages for seq {uuid[:8]}: "
+					f"+{additional} pages -> {new_total_pages} total"
+				)
+
+		# Rebuild page table if pages were extended
+		if rebuild_needed:
+			global_ids = self._local_indices_to_global_seq_ids(batch)
+			gpu_manager.rebuild_page_table(global_ids)
+
 		return True
 
 	def _select_sequences_for_onhold(
@@ -6091,6 +6176,10 @@ class BatchGenWorker:
 								if i < len(cache_seqlens):
 									seq_lengths_dict[seq_id] = cache_seqlens[i]
 							wrapper_class.sequence_lengths = seq_lengths_dict
+
+					# CRITICAL: Ensure pages are allocated for the write positions BEFORE forward pass
+					# This prevents illegal memory access when writing to page boundaries
+					self._ensure_pages_for_write_positions(batch, cache_seqlens, gpu_manager)
 
 					# OPTIMIZATION: Only check page table if not already verified this batch
 					# Between boundaries, batch doesn't change so page table stays valid
