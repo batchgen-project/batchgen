@@ -7,6 +7,19 @@ Supports both FA2 (Ampere) and FA3 (Hopper).
 import torch
 from typing import Optional, Tuple
 
+# Detect which flash attention version is available
+_USE_FA3 = False
+try:
+    from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen_func
+    _USE_FA3 = True
+except ImportError:
+    _fa3_varlen_func = None
+
+try:
+    from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
+except ImportError:
+    _fa2_varlen_func = None
+
 
 def gqa_prefill_fa(
     q: torch.Tensor,
@@ -37,14 +50,8 @@ def gqa_prefill_fa(
     Returns:
         Tuple of:
             - output: Attention output (total_q, nheads, headdim)
-            - lse: Log-sum-exp values (nheads, total_q)
+            - lse: Log-sum-exp values (nheads, total_q) or None if sinks not provided
     """
-    # Try FA3 first (Hopper), fall back to FA2
-    try:
-        from flash_attn_interface import flash_attn_varlen_func
-    except ImportError:
-        from flash_attn import flash_attn_varlen_func
-
     # Set up window_size parameter
     # Flash attention uses (window_size_left, window_size_right)
     # For causal with sliding window: (sliding_window - 1, 0)
@@ -57,29 +64,65 @@ def gqa_prefill_fa(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
-    # Call flash attention
-    result = flash_attn_varlen_func(
-        q, k, v,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size=window_size,
-        return_softmax_lse=True,
-    )
+    lse = None
 
-    # Unpack result - FA returns (output, lse, ...) when return_softmax_lse=True
-    if isinstance(result, tuple):
-        output = result[0]
-        lse = result[1]
+    if _USE_FA3 and _fa3_varlen_func is not None:
+        # FA3 (Hopper) - uses return_attn_probs to return (output, softmax_lse)
+        if sinks is not None:
+            # Need LSE for sink correction
+            output, lse = _fa3_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+                return_attn_probs=True,
+            )
+        else:
+            # No sinks, don't need LSE
+            output = _fa3_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+            )
+    elif _fa2_varlen_func is not None:
+        # FA2 (Ampere) - uses return_softmax_lse
+        if sinks is not None:
+            output, lse, *_ = _fa2_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+                return_softmax_lse=True,
+            )
+        else:
+            output = _fa2_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+            )
     else:
-        raise RuntimeError("flash_attn_varlen_func did not return LSE. "
-                          "Make sure return_softmax_lse=True is supported.")
+        raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
 
     # Apply sink correction if sinks provided
-    if sinks is not None:
+    if sinks is not None and lse is not None:
         from .sink_correction import apply_sink_correction
         output = apply_sink_correction(output, lse, sinks)
 
