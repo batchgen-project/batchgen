@@ -10,11 +10,14 @@ from typing import Optional, Tuple
 # Detect which flash attention version is available
 _USE_FA3 = False
 _flash_varlen_func = None
+_flash_attn_forward = None  # FA3 low-level API that returns LSE
 
 try:
     from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen_func
+    from flash_attn_interface import _flash_attn_forward as _fa3_forward
     _USE_FA3 = True
     _flash_varlen_func = _fa3_varlen_func
+    _flash_attn_forward = _fa3_forward
 except ImportError:
     pass
 
