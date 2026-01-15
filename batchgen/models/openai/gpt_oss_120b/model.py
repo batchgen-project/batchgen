@@ -221,6 +221,79 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0, attention_mask=None):
     return attn_output
 
 
+def sdpa_flash(Q, K, V, S, sm_scale, sliding_window=0):
+    """Flash Attention SDPA with attention sinks support.
+
+    Uses flash_attn for efficient attention computation with proper sink correction.
+    Supports both prefill (q_len == kv_len) and decode (q_len < kv_len) modes.
+
+    Args:
+        Q: Query tensor [q_len, n_kv_heads, q_mult, head_dim]
+        K: Key tensor [kv_len, n_kv_heads, head_dim]
+        V: Value tensor [kv_len, n_kv_heads, head_dim]
+        S: Attention sinks [num_attention_heads]
+        sm_scale: Softmax scale factor
+        sliding_window: Sliding window size (0 = no window, full attention)
+    """
+    from batchgen.attention.gqa import gqa_prefill_fa, gqa_decode_fa_contiguous
+
+    q_len, n_kv_heads, q_mult, d_head = Q.shape
+    kv_len = K.shape[0]
+    n_q_heads = n_kv_heads * q_mult
+
+    # Convert sliding_window: 0 means no window (None for flash attn)
+    window = sliding_window if sliding_window > 0 else None
+
+    # Reshape Q: [q_len, n_kv_heads, q_mult, head_dim] -> [q_len, n_q_heads, head_dim]
+    Q_flash = Q.view(q_len, n_q_heads, d_head).contiguous()
+
+    # K, V are already in correct shape: [kv_len, n_kv_heads, head_dim]
+    K_flash = K.contiguous()
+    V_flash = V.contiguous()
+
+    # Determine if this is prefill or decode
+    is_decode = (q_len == 1 and kv_len > 1)
+
+    if is_decode:
+        # Decode mode: use flash_attn_with_kvcache (contiguous)
+        # Reshape to batch format: [1, seq, heads, dim]
+        Q_batch = Q_flash.unsqueeze(0)  # [1, 1, n_q_heads, d_head]
+        K_batch = K_flash.unsqueeze(0)  # [1, kv_len, n_kv_heads, d_head]
+        V_batch = V_flash.unsqueeze(0)  # [1, kv_len, n_kv_heads, d_head]
+
+        cache_seqlens = torch.tensor([kv_len], dtype=torch.int32, device=Q.device)
+
+        attn_output, _ = gqa_decode_fa_contiguous(
+            Q_batch, K_batch, V_batch,
+            cache_seqlens=cache_seqlens,
+            sinks=S,
+            softmax_scale=sm_scale,
+            sliding_window=window,
+        )
+        # Output: [1, 1, n_q_heads, d_head] -> [1, n_q_heads * d_head]
+        attn_output = attn_output.view(q_len, n_q_heads * d_head)
+    else:
+        # Prefill mode: use flash_attn_varlen_func
+        # Already in varlen format: [total_tokens, heads, dim]
+        cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=Q.device)
+        cu_seqlens_k = torch.tensor([0, kv_len], dtype=torch.int32, device=Q.device)
+
+        attn_output, _ = gqa_prefill_fa(
+            Q_flash, K_flash, V_flash,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_len,
+            sinks=S,
+            softmax_scale=sm_scale,
+            sliding_window=window,
+        )
+        # Output: [q_len, n_q_heads, d_head] -> [q_len, n_q_heads * d_head]
+        attn_output = attn_output.view(q_len, n_q_heads * d_head)
+
+    return attn_output
+
+
 def sdpa_naive(Q, K, V, S, sm_scale, sliding_window=0):
     """Original naive SDPA implementation for small sequences or debugging.
 
@@ -354,8 +427,8 @@ class AttentionBlock(torch.nn.Module):
             k = torch.cat([past_k, k], dim=0)
             v = torch.cat([past_v, v], dim=0)
 
-        # Compute attention
-        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window, attention_mask)
+        # Compute attention using flash attention with sink correction
+        t = sdpa_flash(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
         t = self.out(t)
         t = x + t
 
