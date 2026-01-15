@@ -6110,7 +6110,12 @@ class BatchGenWorker:
 				
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
-				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
+				# Handle both 3D logits [batch, seq_len, vocab] and 2D logits [batch, vocab]
+				# GPT-OSS Mode 3 returns 2D logits for decode
+				logits = outputs.logits
+				if logits.dim() == 3:
+					logits = logits[:, -1, :]
+				new_tokens_out = self._select_tokens(logits)
 
 			new_tokens = new_tokens_out
 
