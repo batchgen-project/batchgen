@@ -135,10 +135,10 @@ def gqa_decoding_mode_3_bf16(
 
     # 5. Get blocked historical KV and page table
     blocked_k, blocked_v, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
-        layer_idx, batch_slice=batch_slice
+        layer_idx=layer_idx
     )
 
-    # Handle batch slicing for block_table
+    # Apply batch slice to block_table for micro-batching (like DeepSeek)
     if batch_slice is not None:
         start_idx, end_idx = batch_slice
         block_table = block_table[start_idx:end_idx]
