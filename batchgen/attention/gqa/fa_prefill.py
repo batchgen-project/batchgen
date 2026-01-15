@@ -74,8 +74,8 @@ def gqa_prefill_fa(
 
     lse = None
 
-    if sinks is not None:
-        # Need LSE for sink correction - both FA2 and FA3 use return_softmax_lse
+    if _USE_FA3:
+        # FA3 returns (output, lse) by default - no special parameter needed
         result = _flash_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens_q,
@@ -85,26 +85,43 @@ def gqa_prefill_fa(
             softmax_scale=softmax_scale,
             causal=True,
             window_size=window_size,
-            return_softmax_lse=True,
         )
-        # Handle return value - could be (output, lse) or (output, lse, ...)
+        # FA3 always returns (output, lse)
         if isinstance(result, tuple):
             output = result[0]
             lse = result[1]
         else:
             output = result
     else:
-        # No sinks, don't need LSE
-        output = _flash_varlen_func(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=True,
-            window_size=window_size,
-        )
+        # FA2 needs return_softmax_lse=True to get LSE
+        if sinks is not None:
+            result = _flash_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+                return_softmax_lse=True,
+            )
+            if isinstance(result, tuple):
+                output = result[0]
+                lse = result[1]
+            else:
+                output = result
+        else:
+            output = _flash_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+            )
 
     # Apply sink correction if sinks provided
     if sinks is not None and lse is not None:
