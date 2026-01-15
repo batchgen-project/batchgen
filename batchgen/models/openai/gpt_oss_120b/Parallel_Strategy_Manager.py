@@ -186,7 +186,7 @@ class GptOssExpertWrapper(nn.Module):
         if self.get_weights:
             # Dynamic loading mode: load -> forward -> free
             weights_dict = self.core_engine.get_weights(self.expert_weights_idx, self.phase)
-            output = self.module.deepgemm_forward(hidden_states, weights_dict)
+            output = self.module.forward(hidden_states, weights_dict)
             self.core_engine.free_weights_buffer(self.expert_weights_idx)
         else:
             # Pre-loaded mode: use cached weights directly
@@ -194,7 +194,7 @@ class GptOssExpertWrapper(nn.Module):
                 raise RuntimeError(
                     f"Expert {self.expert_weights_idx} has get_weights=False but no preloaded_weights"
                 )
-            output = self.module.deepgemm_forward(hidden_states, self.preloaded_weights)
+            output = self.module.forward(hidden_states, self.preloaded_weights)
 
         return output
 
@@ -206,14 +206,19 @@ class GptOssExpertWrapper(nn.Module):
 class GptOssAttnWrapper(nn.Module):
     """Attention wrapper for GPT-OSS with HtoD weight fetching and KV caching.
 
-    Supports two modes:
+    Supports three modes:
     1. get_weights=True (HtoD): Load weights from core_engine per forward,
        then free buffer after use.
     2. get_weights=False (skeleton): Weights already loaded in module parameters.
+    3. Mode 3 (GPU paged KV): Use GPU paged KV cache for decode (pure GPU decode).
 
-    KV Caching:
+    KV Caching (Mode 1/2):
     - During prefill: Stores K, V tensors in class-level cache per sequence
     - During decode: Retrieves cached K, V and concatenates with new K, V
+
+    KV Caching (Mode 3):
+    - During prefill: Offload K, V to GPU paged cache
+    - During decode: Read from GPU paged cache (no HtoD transfer)
 
     Following BatchGen's Attn_Wrapper pattern from DeepSeek implementation.
     """
@@ -224,6 +229,8 @@ class GptOssAttnWrapper(nn.Module):
     attention_mask: Optional[torch.Tensor] = None
     position_ids: Optional[torch.Tensor] = None
     sequence_lengths: Dict[int, int] = {}  # seq_id -> current length
+    # Mode 3: GPU paged KV manager (set by ParallelStrategyManager)
+    gpu_paged_kv_manager = None
 
     def __init__(
         self,
@@ -276,6 +283,8 @@ class GptOssAttnWrapper(nn.Module):
         If get_weights=True: Load weights from core_engine, forward, free buffer.
         If get_weights=False: Use existing weights in module parameters.
 
+        Mode 3: Use GPU paged KV cache for decode (pure GPU decode).
+
         During prefill: Stores K, V in cache
         During decode: Uses cached K, V for context
 
@@ -286,6 +295,11 @@ class GptOssAttnWrapper(nn.Module):
         Returns:
             output: Attention output tensor
         """
+        # Check if mode 3 (GPU paged KV) is enabled
+        attn_mode = getattr(self.engine_config.Basic_Config, 'attn_mode', 1)
+        if attn_mode == 3 and GptOssAttnWrapper.phase == "decode":
+            return self._forward_mode_3(hidden_states, **kwargs)
+
         if self.get_weights:
             # HtoD: Load attention weights from host
             weights_dict = self.core_engine.get_weights(
@@ -375,6 +389,55 @@ class GptOssAttnWrapper(nn.Module):
             self.core_engine.free_weights_buffer(self.attn_module_id)
 
         return output
+
+    def _forward_mode_3(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Mode 3 forward: GPU paged KV cache decode.
+
+        Uses GPU paged KV cache for decode - no HtoD transfer for KV.
+        KV cache was populated during prefill.
+
+        Args:
+            hidden_states: Input tensor [batch, hidden_size]
+            **kwargs: Additional arguments (position_ids, cache_seqlens, etc.)
+
+        Returns:
+            output: Attention output tensor
+        """
+        gpu_paged_kv_manager = GptOssAttnWrapper.gpu_paged_kv_manager
+        if gpu_paged_kv_manager is None:
+            raise RuntimeError("Mode 3 requires gpu_paged_kv_manager to be set")
+
+        # Get parameters from kwargs or class-level state
+        position_ids = kwargs.get('position_ids', GptOssAttnWrapper.position_ids)
+        batch_slice = kwargs.get('batch_slice')
+
+        # Compute cache_seqlens from sequence_lengths
+        batch_size = hidden_states.shape[0]
+        cache_seqlens = torch.tensor(
+            [GptOssAttnWrapper.sequence_lengths.get(
+                GptOssAttnWrapper.cur_batch[i] if i < len(GptOssAttnWrapper.cur_batch) else i, 0
+            ) for i in range(batch_size)],
+            dtype=torch.int32,
+            device=hidden_states.device
+        )
+        max_seqlen = cache_seqlens.max().item()
+
+        # Call mode 3 attention
+        attn_output, k_new, v_new = self.module.decoding_attn_mode_3_bf16(
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager=gpu_paged_kv_manager,
+            batch_slice=batch_slice,
+        )
+
+        # Update sequence lengths
+        for i in range(batch_size):
+            seq_id = GptOssAttnWrapper.cur_batch[i] if i < len(GptOssAttnWrapper.cur_batch) else i
+            GptOssAttnWrapper.sequence_lengths[seq_id] = cache_seqlens[i].item() + 1
+
+        return attn_output
 
     def _unregister_fp8_weights(self):
         """No-op for FP8 weight unregistration.

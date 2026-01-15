@@ -4998,7 +4998,8 @@ class BatchGenWorker:
 				enumerate(micro_batches),
 				total=len(micro_batches),
 				desc="Prepacked Prefill",
-				disable=(self.rank != 0)  # Only show progress on rank 0
+				disable=(self.rank != 0),  # Only show progress on rank 0
+				leave=False,  # Prevent duplicate final output
 			):
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()

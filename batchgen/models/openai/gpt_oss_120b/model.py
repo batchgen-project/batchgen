@@ -441,6 +441,62 @@ class AttentionBlock(torch.nn.Module):
             return t, (k, v)
         return t
 
+    def decoding_attn_mode_3_bf16(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        batch_slice: tuple | None = None,
+    ) -> tuple:
+        """Mode 3 decode using GPU paged KV cache.
+
+        Args:
+            hidden_states: Input tensor [batch, hidden_size]
+            position_ids: Position IDs for RoPE [batch]
+            cache_seqlens: Current sequence lengths [batch]
+            max_seqlen: Maximum sequence length in batch
+            gpu_paged_kv_manager: GPU paged KV cache manager
+            batch_slice: Optional (start, end) for micro-batching
+
+        Returns:
+            Tuple of (attn_output, k_new, v_new)
+        """
+        from batchgen.attention.gqa import gqa_decoding_mode_3_bf16
+
+        # Compute RoPE cos/sin for current positions
+        # position_ids: [batch]
+        concentration, inv_freq = self.rope._compute_concentration_and_inv_freq()
+        t = position_ids.float()
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        rope_cos = freqs.cos() * concentration
+        rope_sin = freqs.sin() * concentration
+
+        return gqa_decoding_mode_3_bf16(
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            qkv_weight=self.qkv.weight,
+            qkv_bias=self.qkv.bias,
+            out_weight=self.out.weight,
+            out_bias=self.out.bias,
+            norm_weight=self.norm.scale,
+            norm_eps=self.norm.eps,
+            sinks=self.sinks,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            gpu_paged_kv_manager=gpu_paged_kv_manager,
+            layer_idx=self.layer_idx,
+            batch_slice=batch_slice,
+            num_q_heads=self.num_attention_heads,
+            num_kv_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            sm_scale=self.sm_scale,
+            sliding_window=self.sliding_window,
+        )
+
 
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     """SwiGLU activation with clamping.
@@ -490,19 +546,13 @@ class ExpertMLP(torch.nn.Module):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.device = device
 
-        # Weights are passed to deepgemm_forward, not stored as buffers/parameters
+        # Weights are passed to forward(), not stored as buffers/parameters
         # This allows efficient handling of MXFP4 uint8 tensors
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Standard forward - raises error, use deepgemm_forward for W4A16."""
-        raise NotImplementedError(
-            "ExpertMLP.forward() is not supported. Use deepgemm_forward() for W4A16 inference."
-        )
-
-    def deepgemm_forward(self, x: torch.Tensor, weights_dict: dict) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weights_dict: dict) -> torch.Tensor:
         """Forward pass with W4A16 MXFP4 GEMM.
 
-        Called by GPT-OSS_Expert_Wrapper with dynamically loaded weights.
+        Called by GptOssExpertWrapper with dynamically loaded weights.
 
         Args:
             x: Input tensor [batch, hidden_size] in BF16
@@ -554,6 +604,13 @@ class MLPBlock(torch.nn.Module):
 
     This block uses the BatchGen pattern where each expert is a separate module
     that can be wrapped by Expert_Wrapper for dynamic weight loading.
+
+    Supports two execution modes:
+    1. Per-expert (default): Each expert is called individually via Expert_Wrapper.
+       Weights are loaded dynamically by BatchGen's parameter server.
+    2. Fused grouped GEMM: All experts are stored as 3D tensors and processed
+       together using fused MXFP4 grouped GEMM. Use set_grouped_weights() to
+       enable this mode.
     """
 
     def __init__(
@@ -568,6 +625,7 @@ class MLPBlock(torch.nn.Module):
         self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
         self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # Skeleton weights (always loaded, not per-expert)
@@ -589,6 +647,199 @@ class MLPBlock(torch.nn.Module):
         # Setting to None makes hasattr checks pass safely
         self.shared_experts = None
 
+        # Grouped weights mode (disabled by default)
+        # When enabled, uses fused grouped GEMM instead of per-expert calls
+        self._use_grouped_gemm = False
+        self._grouped_weights = None
+        self._token_dispatcher = None
+
+    def set_grouped_weights(
+        self,
+        w1_packed: torch.Tensor,
+        w1_scales: torch.Tensor,
+        w1_bias: torch.Tensor | None,
+        w2_packed: torch.Tensor,
+        w2_scales: torch.Tensor,
+        w2_bias: torch.Tensor | None,
+    ):
+        """Enable fused grouped GEMM mode with pre-loaded 3D weight tensors.
+
+        When set, forward() uses fused MXFP4 grouped GEMM instead of
+        per-expert calls. This is more efficient when all expert weights
+        are available in memory.
+
+        Args:
+            w1_packed: MXFP4 packed W1 [num_experts, intermediate*2, hidden//2]
+            w1_scales: W1 scales [num_experts, intermediate*2, hidden//32]
+            w1_bias: W1 bias [num_experts, intermediate*2] or None
+            w2_packed: MXFP4 packed W2 [num_experts, hidden, intermediate//2]
+            w2_scales: W2 scales [num_experts, hidden, intermediate//32]
+            w2_bias: W2 bias [hidden] or None (shared across experts)
+        """
+        from batchgen.moe.token_dispatch import LocalTokenDispatcher
+
+        self._grouped_weights = {
+            'w1_packed': w1_packed,
+            'w1_scales': w1_scales,
+            'w1_bias': w1_bias,
+            'w2_packed': w2_packed,
+            'w2_scales': w2_scales,
+            'w2_bias': w2_bias,
+        }
+        self._use_grouped_gemm = True
+        self._token_dispatcher = LocalTokenDispatcher()
+
+    def clear_grouped_weights(self):
+        """Disable grouped GEMM mode and revert to per-expert calls."""
+        self._grouped_weights = None
+        self._use_grouped_gemm = False
+        self._token_dispatcher = None
+
+    def _forward_grouped_gemm(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using fused grouped GEMM (when grouped weights are set)."""
+        from batchgen.moe.moe_mxfp4 import moe_mxfp4_forward
+
+        # Handle 3D input
+        input_shape = x.shape
+        if x.dim() == 3:
+            batch_dim, seq_len, hidden_size = x.shape
+            x = x.view(batch_dim * seq_len, hidden_size)
+        else:
+            batch_dim = None
+
+        # Normalize input
+        t = self.norm(x)
+
+        # Use fused MoE forward with grouped GEMM
+        output = moe_mxfp4_forward(
+            t,
+            self.gate.weight.T,  # [hidden, num_experts]
+            self.gate.bias,
+            self._grouped_weights['w1_packed'],
+            self._grouped_weights['w1_scales'],
+            self._grouped_weights['w1_bias'],
+            self._grouped_weights['w2_packed'],
+            self._grouped_weights['w2_scales'],
+            self._grouped_weights['w2_bias'],
+            experts_per_token=self.experts_per_token,
+            swiglu_limit=self.swiglu_limit,
+            dispatcher=self._token_dispatcher,
+        )
+
+        result = x + output
+
+        # Restore 3D shape if needed
+        if batch_dim is not None:
+            result = result.view(batch_dim, seq_len, -1)
+
+        return result
+
+    def _forward_grouped_from_loaded(self, x: torch.Tensor) -> torch.Tensor:
+        """Grouped GEMM using dynamically loaded per-expert weights.
+
+        This mode loads weights for routed experts, collects them into lists,
+        and calls the grouped GEMM kernel. More efficient than per-expert
+        sequential forward when multiple experts are needed.
+
+        Requires core_engine to be set for weight loading.
+        """
+        from batchgen.moe.routing import moe_routing
+        from batchgen.moe.token_dispatch import LocalTokenDispatcher
+        from batchgen.moe.fused_mxfp4_gemm import fused_mxfp4_moe_gemm_from_list
+
+        # Handle 3D input
+        input_shape = x.shape
+        if x.dim() == 3:
+            batch_dim, seq_len, hidden_size = x.shape
+            x = x.view(batch_dim * seq_len, hidden_size)
+        else:
+            batch_dim = None
+
+        num_tokens = x.shape[0]
+
+        # 1. Normalize and compute routing
+        t = self.norm(x)
+        topk_indices, topk_weights = moe_routing(
+            t, self.gate.weight.T, self.gate.bias, self.experts_per_token
+        )
+
+        # 2. Find unique routed experts
+        routed_expert_ids = topk_indices.unique().tolist()
+
+        # 3. Load weights for routed experts
+        w1_packed_list, w1_scales_list, w1_bias_list = [], [], []
+        w2_packed_list, w2_scales_list = [], []
+
+        for expert_id in routed_expert_ids:
+            weights = self.core_engine.get_weights(
+                f"routed_expert_{self.layer_idx}_{expert_id}", self._phase
+            )
+            w1_packed_list.append(weights['mlp1.packed'])
+            w1_scales_list.append(weights['mlp1.scales'])
+            w1_bias_list.append(weights['mlp1.bias'])
+            w2_packed_list.append(weights['mlp2.packed'])
+            w2_scales_list.append(weights['mlp2.scales'])
+
+        # 4. Dispatch tokens
+        dispatcher = LocalTokenDispatcher()
+        dispatch_result = dispatcher.dispatch(t, topk_indices, topk_weights)
+
+        # Build expert counts/offsets for loaded experts only
+        # Map from routed_expert_ids indices to dispatch_result counts
+        num_loaded = len(routed_expert_ids)
+        expert_counts = torch.zeros(num_loaded, dtype=torch.int32, device=x.device)
+        expert_offsets = torch.zeros(num_loaded, dtype=torch.int32, device=x.device)
+
+        # Create mapping from original expert ID to loaded index
+        expert_id_to_idx = {eid: idx for idx, eid in enumerate(routed_expert_ids)}
+
+        # Recompute counts for loaded experts
+        for i, eid in enumerate(routed_expert_ids):
+            if eid < len(dispatch_result.expert_counts):
+                expert_counts[i] = dispatch_result.expert_counts[eid]
+                expert_offsets[i] = dispatch_result.expert_offsets[eid]
+
+        # 5. W1 GEMM
+        h = fused_mxfp4_moe_gemm_from_list(
+            dispatch_result.dispatched_x,
+            w1_packed_list, w1_scales_list,
+            expert_counts, expert_offsets,
+        )
+
+        # Add W1 bias
+        for i, bias in enumerate(w1_bias_list):
+            start = expert_offsets[i].item()
+            count = expert_counts[i].item()
+            if count > 0:
+                h[start:start + count] = h[start:start + count] + bias
+
+        # SwiGLU activation
+        h = swiglu(h, limit=self.swiglu_limit)
+
+        # 6. W2 GEMM
+        out = fused_mxfp4_moe_gemm_from_list(
+            h,
+            w2_packed_list, w2_scales_list,
+            expert_counts, expert_offsets,
+        )
+
+        # 7. Combine: scatter back with weighted sum
+        output = dispatcher.combine(out, dispatch_result, num_tokens)
+
+        # 8. Free weights
+        for expert_id in routed_expert_ids:
+            self.core_engine.free_weights_buffer(
+                f"routed_expert_{self.layer_idx}_{expert_id}"
+            )
+
+        result = x + output
+
+        # Restore 3D shape if needed
+        if batch_dim is not None:
+            result = result.view(batch_dim, seq_len, -1)
+
+        return result
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with top-k expert routing.
 
@@ -599,7 +850,14 @@ class MLPBlock(torch.nn.Module):
         that handles MXFP4 weight loading and calls deepgemm_forward.
 
         Supports both 2D [num_tokens, hidden] and 3D [batch, seq, hidden] input.
+
+        If grouped weights are set via set_grouped_weights(), uses fused
+        grouped GEMM instead of per-expert calls for better efficiency.
         """
+        # Use fused grouped GEMM if weights are pre-loaded
+        if self._use_grouped_gemm:
+            return self._forward_grouped_gemm(x)
+
         # Handle 3D input from BatchGenWorker: [batch, seq, hidden] -> [num_tokens, hidden]
         input_shape = x.shape
         if x.dim() == 3:
