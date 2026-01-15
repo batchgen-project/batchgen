@@ -265,6 +265,16 @@ def fused_mxfp4_grouped_gemm_kernel(
 
 
 @torch.inference_mode()
+# Debug counter for GEMM logging (only first few calls per phase)
+_gemm_debug_count = 0
+_gemm_debug_phase = "prefill"
+
+def reset_gemm_debug_for_decode():
+    """Reset GEMM debug counter for decode phase."""
+    global _gemm_debug_count, _gemm_debug_phase
+    _gemm_debug_count = 0
+    _gemm_debug_phase = "decode"
+
 def fused_mxfp4_gemm(
     lhs: torch.Tensor,           # [M, K] BF16
     rhs_packed: torch.Tensor,    # [N, K//2] uint8 (MXFP4 packed)
@@ -280,6 +290,8 @@ def fused_mxfp4_gemm(
     Returns:
         Output [M, N] in BF16
     """
+    global _gemm_debug_count
+
     assert lhs.dtype == torch.bfloat16, f"LHS must be BF16, got {lhs.dtype}"
     assert rhs_packed.dtype == torch.uint8, f"RHS packed must be uint8, got {rhs_packed.dtype}"
     assert rhs_scales.dtype == torch.uint8, f"RHS scales must be uint8, got {rhs_scales.dtype}"
@@ -313,6 +325,21 @@ def fused_mxfp4_gemm(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
     )
+
+    # Debug logging (first few calls per phase)
+    _gemm_debug_count += 1
+    if _gemm_debug_count <= 3:
+        # Check output values for sanity
+        out_abs_max = output.abs().max().item()
+        out_mean = output.float().mean().item()
+        out_std = output.float().std().item()
+        lhs_abs_max = lhs.abs().max().item()
+        logging.info(
+            f"[GEMM DEBUG] phase={_gemm_debug_phase} call #{_gemm_debug_count}: "
+            f"lhs={lhs.shape} (max={lhs_abs_max:.3f}), "
+            f"rhs={rhs_packed.shape}, scales={rhs_scales.shape}, "
+            f"output={output.shape} (max={out_abs_max:.3f}, mean={out_mean:.3f}, std={out_std:.3f})"
+        )
 
     return output
 

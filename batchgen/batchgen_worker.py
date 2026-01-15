@@ -5933,13 +5933,18 @@ class BatchGenWorker:
 			if wrapper_class:
 				wrapper_class.gpu_paged_kv_manager = gpu_manager
 				wrapper_class.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
-			# Enable timing stats
+			# Enable timing stats and reset debug counters for decode phase
 			try:
-				from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING
+				from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING, ExpertMLP
+				from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import GptOssExpertWrapper
+				from batchgen.moe.fused_mxfp4_gemm import reset_gemm_debug_for_decode
 				DECODE_TIMING.enable()
-				logging.info(f"Rank {self.rank}: DECODE_TIMING enabled={DECODE_TIMING.enabled}")
+				ExpertMLP.reset_debug_for_decode()
+				GptOssExpertWrapper._wrapper_debug_count = 0  # Reset wrapper debug counter
+				reset_gemm_debug_for_decode()  # Reset GEMM debug counter
+				logging.info(f"Rank {self.rank}: DECODE_TIMING enabled={DECODE_TIMING.enabled}, all debug counters reset for decode")
 			except ImportError as e:
-				logging.warning(f"Rank {self.rank}: Failed to import DECODE_TIMING: {e}")
+				logging.warning(f"Rank {self.rank}: Failed to import decode debug modules: {e}")
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions

@@ -61,30 +61,36 @@ class DecodeTimingStats:
             self.stop(name)
 
     def print_stats(self):
+        import logging
         if not self.total_times:
-            print("[TIMING] No timing data collected")
+            logging.info("[TIMING] No timing data collected")
             return
 
-        print("\n" + "=" * 70)
-        print("DECODE TIMING STATISTICS")
-        print("=" * 70)
+        lines = []
+        lines.append("\n" + "=" * 70)
+        lines.append("DECODE TIMING STATISTICS")
+        lines.append("=" * 70)
 
         # Sort by total time descending
         sorted_items = sorted(self.total_times.items(), key=lambda x: -x[1])
         total_measured = sum(self.total_times.values())
 
-        print(f"{'Operation':<40} {'Total(ms)':>10} {'Calls':>8} {'Avg(ms)':>10} {'%':>6}")
-        print("-" * 70)
+        lines.append(f"{'Operation':<40} {'Total(ms)':>10} {'Calls':>8} {'Avg(ms)':>10} {'%':>6}")
+        lines.append("-" * 70)
 
         for name, total_time in sorted_items:
             calls = self.call_counts[name]
             avg_time = total_time / calls if calls > 0 else 0
             pct = (total_time / total_measured * 100) if total_measured > 0 else 0
-            print(f"{name:<40} {total_time*1000:>10.2f} {calls:>8} {avg_time*1000:>10.3f} {pct:>5.1f}%")
+            lines.append(f"{name:<40} {total_time*1000:>10.2f} {calls:>8} {avg_time*1000:>10.3f} {pct:>5.1f}%")
 
-        print("-" * 70)
-        print(f"{'TOTAL MEASURED':<40} {total_measured*1000:>10.2f}")
-        print("=" * 70 + "\n")
+        lines.append("-" * 70)
+        lines.append(f"{'TOTAL MEASURED':<40} {total_measured*1000:>10.2f}")
+        lines.append("=" * 70)
+
+        # Log all lines
+        for line in lines:
+            logging.info(line)
 
 
 # Global timing stats instance
@@ -633,6 +639,13 @@ class ExpertMLP(torch.nn.Module):
 
     # Debug counter for logging (class variable)
     _debug_call_count = 0
+    _current_phase = "prefill"
+
+    @classmethod
+    def reset_debug_for_decode(cls):
+        """Reset debug counter at start of decode phase to enable decode logging."""
+        cls._debug_call_count = 0
+        cls._current_phase = "decode"
 
     def forward(self, x: torch.Tensor, weights_dict: dict) -> torch.Tensor:
         """Forward pass with W4A16 MXFP4 GEMM.
@@ -663,11 +676,11 @@ class ExpertMLP(torch.nn.Module):
         mlp2_scales = weights_dict['mlp2.scales']
         mlp2_bias = weights_dict['mlp2.bias']
 
-        # Debug logging (only first few calls)
+        # Debug logging (only first few calls per phase)
         ExpertMLP._debug_call_count += 1
         if ExpertMLP._debug_call_count <= 3:
             logging.info(
-                f"[ExpertMLP DEBUG] L{self.layer_idx} E{self.expert_idx} call #{ExpertMLP._debug_call_count}: "
+                f"[ExpertMLP DEBUG] PHASE={ExpertMLP._current_phase} L{self.layer_idx} E{self.expert_idx} call #{ExpertMLP._debug_call_count}: "
                 f"x={x.shape} {x.dtype}, "
                 f"mlp1.packed={mlp1_packed.shape} {mlp1_packed.dtype}, "
                 f"mlp1.scales={mlp1_scales.shape} {mlp1_scales.dtype}, "

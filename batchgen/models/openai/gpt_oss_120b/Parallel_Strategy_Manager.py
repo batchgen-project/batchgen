@@ -171,6 +171,9 @@ class GptOssExpertWrapper(nn.Module):
         # Pre-loaded weights (for local experts with get_weights=False)
         self.preloaded_weights = preloaded_weights
 
+    # Class-level debug counter for decode phase (separate from ExpertMLP counter)
+    _wrapper_debug_count = 0
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with MXFP4 weights.
 
@@ -183,6 +186,15 @@ class GptOssExpertWrapper(nn.Module):
         Returns:
             output: [batch, hidden_size] BF16
         """
+        # Debug logging for decode path (first few calls per phase)
+        GptOssExpertWrapper._wrapper_debug_count += 1
+        if GptOssExpertWrapper._wrapper_debug_count <= 5:
+            logging.info(
+                f"[GptOssExpertWrapper DEBUG] phase={self.phase} expert={self.expert_weights_idx} "
+                f"get_weights={self.get_weights} input={hidden_states.shape} {hidden_states.dtype} "
+                f"call #{GptOssExpertWrapper._wrapper_debug_count}"
+            )
+
         if self.get_weights:
             # Dynamic loading mode: load -> forward -> free
             weights_dict = self.core_engine.get_weights(self.expert_weights_idx, self.phase)
