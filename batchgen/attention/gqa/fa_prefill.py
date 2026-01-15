@@ -78,27 +78,29 @@ def gqa_prefill_fa(
     lse = None
 
     if _USE_FA3:
-        # FA3 interface - check what it actually returns
-        result = _flash_varlen_func(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
+        # Use _flash_attn_forward to get LSE (flash_attn_varlen_func doesn't return it)
+        # Call pattern matches FlashAttnVarlenFunc.forward
+        output, lse, *rest = _flash_attn_forward(
+            q,
+            k,
+            v,
+            None, None,  # k_new, v_new
+            None,  # qv
+            None,  # out (let it allocate)
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,  # cu_seqlens_k_new
+            None,  # seqused_q
+            None,  # seqused_k
+            max_seqlen_q,
+            max_seqlen_k,
+            None, None, None,  # page_table, kv_batch_idx, leftpad_k
+            None, None, None,  # rotary_cos, rotary_sin, seqlens_rotary
+            None, None, None,  # q_descale, k_descale, v_descale
+            softmax_scale,
             causal=True,
             window_size=window_size,
         )
-        # FA3 returns (output, lse) tuple
-        if isinstance(result, tuple):
-            output = result[0]
-            lse = result[1] if len(result) > 1 else None
-            # Debug: print what we got
-            # print(f"FA3 returned tuple of length {len(result)}, lse shape: {lse.shape if lse is not None else None}")
-        else:
-            output = result
-            # Debug: print result type
-            # print(f"FA3 returned non-tuple: {type(result)}")
     else:
         # FA2 needs return_softmax_lse=True to get LSE
         if sinks is not None:
