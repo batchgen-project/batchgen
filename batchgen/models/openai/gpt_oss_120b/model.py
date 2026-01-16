@@ -586,19 +586,42 @@ class AttentionBlock(torch.nn.Module):
         )
 
 
-def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
-    """SwiGLU activation with clamping.
+def swiglu(x, alpha: float = 1.702, limit: float = 7.0, interleaved: bool = False):
+    """GPT-OSS specific SwiGLU activation with clamping.
 
-    Uses contiguous chunk splitting (not interleaved) to match
-    GptOssMXFP4ExpertForward pattern.
+    This is NOT standard SwiGLU! GPT-OSS uses a custom variant:
+    - alpha=1.702 scaling on sigmoid (not standard silu which has alpha=1.0)
+    - (x_linear + 1) adds bias of 1 to the linear branch
+    - Clamping on INPUTS, not output
+
+    From OpenAI's gpt_oss/triton/moe.py:
+        out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+        return out_glu * (x_linear + 1)
+
+    Args:
+        x: Input tensor [..., intermediate*2] - gate and up projections concatenated
+        alpha: Scaling factor for sigmoid (GPT-OSS uses 1.702)
+        limit: Clamp limit for input values
+        interleaved: If True, use interleaved layout; False uses contiguous chunks
+
+    Returns:
+        Output tensor [..., intermediate]
     """
-    # Use chunk for contiguous splitting (matches GptOssMXFP4ExpertForward)
-    x_glu, x_linear = x.chunk(2, dim=-1)
-    # Clamp the input values
+    if interleaved:
+        # Interleaved: gate at even indices, up at odd indices
+        x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    else:
+        # Contiguous: first half is gate, second half is up
+        x_glu, x_linear = x.chunk(2, dim=-1)
+
+    # Clamp INPUTS (not output) - this is GPT-OSS specific
     x_glu = x_glu.clamp(max=limit)
     x_linear = x_linear.clamp(min=-limit, max=limit)
+
+    # GPT-OSS activation: x * sigmoid(alpha * x), NOT standard silu!
     out_glu = x_glu * torch.sigmoid(alpha * x_glu)
-    # Note we add an extra bias of 1 to the linear layer
+
+    # Add +1 bias to linear branch (GPT-OSS specific)
     return out_glu * (x_linear + 1)
 
 
