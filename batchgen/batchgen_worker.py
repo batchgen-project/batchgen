@@ -1109,8 +1109,8 @@ class BatchGenWorker:
 			self.world_size
 		)
 
-		# NOTE: GPU KV cache size is calculated LATER in _config_decoding_for_batch()
-		# after configure_decoding() loads model weights to GPU. At this point,
+		# NOTE: GPU KV cache size is calculated in generate() via _init_gpu_kv_with_actual_size()
+		# after _load_decode_model() loads model weights to GPU. At this point (init),
 		# only the model skeleton exists and weights haven't been loaded yet.
 
 		logging.info(f"Rank {self.rank}: One-time core initialization completed")
@@ -3081,37 +3081,14 @@ class BatchGenWorker:
 		if not all_candidates:
 			return []
 		
-		# Get GPU page capacity
-		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
-			total_pages = self.gpu_paged_kv_cache_manager.get_stats().num_total_pages
-		else:
-			# Initial batch: use THEORETICAL estimate for batch selection
-			# This is called BEFORE configure_decoding(), so model weights are not yet on GPU.
-			# Use conservative estimate: total_gpu * frac - estimated_model_size
-			# The actual GPU KV size will be recalculated in _config_decoding_for_batch()
-			# after model weights are loaded.
-			if self.gpu_kv_cache_size_gb is None:
-				_, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
-				total_mem_gb = total_mem_bytes / (1024 ** 3)
-				# Conservative model size estimate (DeepSeek-R1 uses ~60GB per GPU)
-				# This is just for batch selection; actual value computed later
-				estimated_model_size_gb = 65.0
-				self.gpu_kv_cache_size_gb = max(
-					1.0,
-					total_mem_gb * self.gpu_memory_frac - estimated_model_size_gb
-				)
-				if self.rank == 0:
-					logging.info(
-						f"[GPU-KV] Theoretical estimate for batch selection: {self.gpu_kv_cache_size_gb:.2f} GB "
-						f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - model: {estimated_model_size_gb:.0f} GB). "
-						f"Will recalculate after model loading."
-					)
-			from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config_fixed_size
-			config = build_gpu_kv_config_fixed_size(
-				model_name=self.huggingface_ckpt_name,
-				gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
+		# Get GPU page capacity - GPU KV manager must be initialized before batch selection
+		# (model loading and GPU KV init happen in generate() BEFORE this call)
+		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
+			raise RuntimeError(
+				"GPU KV manager must be initialized before _prepare_decode_batch(). "
+				"Ensure _load_decode_model() and _init_gpu_kv_with_actual_size() are called first."
 			)
-			total_pages = config.num_pages
+		total_pages = self.gpu_paged_kv_cache_manager.get_stats().num_total_pages
 		
 		# 90% watermark
 		capacity_per_rank = int(total_pages * 0.9)
@@ -3929,7 +3906,25 @@ class BatchGenWorker:
 			   self.global_batch.has_on_hold()):
 				# NOTE: Barrier removed - tensor sync operations below provide synchronization
 
-				# A. Prepare Initial Decode Batch (from PREFILLED)
+				# ============ STEP A: Load model FIRST (needed for accurate GPU KV size) ============
+				# Estimate max sequences per rank for buffer allocation
+				# Use PREFILLED + ON_HOLD + IN_DECODE as upper bound
+				prefilled_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED))
+				onhold_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
+				in_decode_count = len(self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE))
+				total_candidates = prefilled_count + onhold_count + in_decode_count
+				# Estimate max per rank (ceiling division)
+				max_num_seq_estimate = (total_candidates + self.world_size - 1) // self.world_size
+				# Ensure at least some minimum
+				max_num_seq_estimate = max(max_num_seq_estimate, 16)
+
+				self._load_decode_model(max_num_seq_estimate, self.comm)
+
+				# ============ STEP B: Init GPU KV with ACTUAL size ============
+				# Only initializes if not already done; subsequent iterations skip
+				self._init_gpu_kv_with_actual_size()
+
+				# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
 				decode_uuids = self._prepare_decode_batch()
 				
 				# Include currently running sequences - PRESERVE ORDER
@@ -3976,7 +3971,7 @@ class BatchGenWorker:
 
 				# B. Config Decode
 				config_start = time.perf_counter()
-				self._config_decoding_for_batch(decode_uuids, local_decode_indices, self.comm)
+				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
 				config_decode_time += time.perf_counter() - config_start
 
 				# C. Execute Continuous Decode
@@ -4218,13 +4213,112 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
 
+	def _load_decode_model(self, max_num_seq: int, comm=None) -> None:
+		"""
+		Load model for decoding phase. Must be called ONCE at the start of decode phase,
+		BEFORE batch selection, so we know actual GPU KV capacity.
+
+		Args:
+			max_num_seq: Maximum number of sequences per rank for buffer allocation.
+			comm: NCCL communicator for EP offloading mode.
+		"""
+		self.deep_free_model_memory()
+		self.init_nvshmem()
+
+		use_pure_gpu_decoding = (self.world_size > 8)
+		enable_ep_offloading = getattr(self.engine_config.EP_Config, 'enable_offloading', False)
+
+		if not use_pure_gpu_decoding:
+			# Single-node: use configure_decoding with optional comm for EP offloading
+			decoding_comm = comm if enable_ep_offloading else None
+			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
+				padding_bsz=max_num_seq, comm=decoding_comm
+			)
+			self.set_phase("decode")
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_kv_copy_queue()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+			self.core_engine.start_h2d_worker()
+		else:
+			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
+			self.set_phase("decode")
+			self.core_engine.stop_h2d_worker()
+			self.core_engine.clear_kv_copy_queue()
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
+
+		if self.rank == 0:
+			logging.info(f"[DECODE] Model loaded for decoding phase")
+
+	def _init_gpu_kv_with_actual_size(self) -> None:
+		"""
+		Calculate actual GPU KV size AFTER model loading and initialize the manager.
+		This replaces the theoretical estimation - must be called after _load_decode_model().
+
+		Only runs the full calculation and initialization on the first call;
+		subsequent calls skip if the manager is already initialized.
+		"""
+		# Skip if GPU KV manager is already initialized (subsequent decode iterations)
+		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
+			return
+
+		# First time: Calculate actual GPU KV size
+		torch.cuda.synchronize(self.torch_device)
+		torch.cuda.empty_cache()
+
+		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
+		free_mem_gb = free_mem_bytes / (1024 ** 3)
+		total_mem_gb = total_mem_bytes / (1024 ** 3)
+		used_mem_gb = total_mem_gb - free_mem_gb
+
+		# Formula: gpu_kv_cache = total * frac - used
+		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
+		if new_gpu_kv_cache_size > 0:
+			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
+		else:
+			# Fallback to minimum
+			self.gpu_kv_cache_size_gb = 1.0
+			if self.rank == 0:
+				logging.warning(
+					f"[GPU-KV] Calculated size non-positive ({new_gpu_kv_cache_size:.2f} GB). "
+					f"Using minimum 1 GB."
+				)
+
+		if self.rank == 0:
+			logging.info(
+				f"[GPU-KV] Actual size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
+				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
+			)
+
+		# Broadcast to ensure all ranks use same value
+		size_tensor = torch.tensor([self.gpu_kv_cache_size_gb], dtype=torch.float32, device=self.torch_device)
+		dist.broadcast(size_tensor, src=0)
+		self.gpu_kv_cache_size_gb = float(size_tensor.item())
+
+		# Initialize GPU KV manager with actual size
+		self._initialize_gpu_kv_manager_fixed_size()
+
+		if self.rank == 0:
+			stats = self.gpu_paged_kv_cache_manager.get_stats()
+			logging.info(f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {stats.num_total_pages} pages")
+
 	def _config_decoding_for_batch(
 		self,
 		decode_uuids: List[str],
-		local_decode_indices: List[int],
-		comm=None
+		local_decode_indices: List[int]
 	) -> None:
-		"""Configure decoding phase with pre-sized GPU KV manager."""
+		"""
+		Configure decoding for a specific batch - allocates GPU KV pages.
+
+		NOTE: This method is SIMPLIFIED - model loading and GPU KV manager init
+		now happen earlier in generate() via _load_decode_model() and
+		_init_gpu_kv_with_actual_size(). This method only handles:
+		1. Context length repair
+		2. Validation/diagnostics
+		3. GPU KV page allocation
+		"""
 		start_time = time.perf_counter()
 		
 		# ============ CRITICAL FIX: Repair current_context_length for ALL sequences FIRST ============
@@ -4315,88 +4409,20 @@ class BatchGenWorker:
 			logging.debug(
 				f"_config_decoding_for_batch: {len(fresh_seqs)} FRESH sequences (decoded_length=0)"
 			)
-		
-		self.deep_free_model_memory()
-		self.init_nvshmem()
-		
-		num_local_seq = len(local_decode_indices)
-		num_seq_per_rank = torch.zeros(self.world_size, dtype=torch.int32, device=self.torch_device)
-		num_seq_per_rank[self.rank] = num_local_seq
-		dist.all_reduce(num_seq_per_rank, op=dist.ReduceOp.SUM)
-		max_num_seq = int(num_seq_per_rank.max().item())
 
-		# STEP 1: Configure model for decoding first (needed for accurate GPU KV size calculation)
-		# Use pure_gpu_decoding() for:
-		#   - Multi-node (world_size > 8): all experts on GPU, no offloading needed
-		# Use configure_decoding() for:
-		#   - Single-node without EP offloading: legacy mode, no NCCL comm needed
-		#   - Single-node with EP offloading: partial experts persistent, needs NCCL comm
-		use_pure_gpu_decoding = (self.world_size > 8)
-		enable_ep_offloading = getattr(self.engine_config.EP_Config, 'enable_offloading', False)
+		# ============ SIMPLIFIED: Model and GPU KV manager already initialized ============
+		# Model loading and GPU KV manager init now happen in generate() BEFORE batch selection
+		# via _load_decode_model() and _init_gpu_kv_with_actual_size()
+		assert self.model is not None, (
+			"Model must be loaded before _config_decoding_for_batch(). "
+			"Ensure _load_decode_model() was called first."
+		)
+		assert self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized, (
+			"GPU KV manager must be initialized before _config_decoding_for_batch(). "
+			"Ensure _init_gpu_kv_with_actual_size() was called first."
+		)
 
-		if not use_pure_gpu_decoding:
-			# Single-node: use configure_decoding with optional comm for EP offloading
-			# EP offloading needs comm for all-gather/all-reduce in MoE forward
-			decoding_comm = comm if enable_ep_offloading else None
-			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
-				padding_bsz=max_num_seq, comm=decoding_comm
-			)
-			self.set_phase("decode")
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
-			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
-			self.core_engine.start_h2d_worker()
-		else:
-			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
-			self.set_phase("decode")
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
-
-		# STEP 1.5: Recalculate GPU KV cache size NOW after model weights are loaded
-		# This uses actual GPU memory measurement via torch.cuda.mem_get_info() (NVIDIA API)
-		# Overrides any theoretical estimate from _prepare_decode_batch()
-		# Clear PyTorch cache first to get accurate measurement of model weights only
-		# (warmup may have allocated temporary buffers that inflate memory usage)
-		torch.cuda.synchronize(self.torch_device)
-		torch.cuda.empty_cache()
-		free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(self.local_rank)
-		free_mem_gb = free_mem_bytes / (1024 ** 3)
-		total_mem_gb = total_mem_bytes / (1024 ** 3)
-		used_mem_gb = total_mem_gb - free_mem_gb
-
-		# Formula: gpu_kv_cache = total * frac - used
-		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
-		if new_gpu_kv_cache_size > 0:
-			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
-			if self.rank == 0:
-				logging.info(
-					f"[GPU-KV] Calculated after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
-					f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
-				)
-		else:
-			# Fallback to minimum if calculation yields non-positive
-			self.gpu_kv_cache_size_gb = 1.0
-			if self.rank == 0:
-				logging.warning(
-					f"[GPU-KV] Calculated size non-positive ({new_gpu_kv_cache_size:.2f} GB). "
-					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
-					f"Using minimum 1 GB."
-				)
-
-		# Broadcast GPU KV cache size from rank 0 to ensure all ranks use the same value
-		size_tensor = torch.tensor([self.gpu_kv_cache_size_gb], dtype=torch.float32, device=self.torch_device)
-		dist.broadcast(size_tensor, src=0)
-		self.gpu_kv_cache_size_gb = float(size_tensor.item())
-
-		# STEP 2: Initialize GPU KV manager with fixed size (now model is loaded, can compute accurate size)
-		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
-			self._initialize_gpu_kv_manager_fixed_size()
-
-		# STEP 3: Allocate GPU KV for sequences
+		# Allocate GPU KV for sequences
 		if local_decode_indices:
 			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
 			for local_idx in local_decode_indices:
