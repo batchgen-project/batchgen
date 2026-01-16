@@ -449,7 +449,8 @@ class GptOssAttnWrapper(nn.Module):
             seq_id = GptOssAttnWrapper.cur_batch[i] if i < len(GptOssAttnWrapper.cur_batch) else i
             GptOssAttnWrapper.sequence_lengths[seq_id] = cache_seqlens[i].item() + 1
 
-        return attn_output
+        # Add residual connection (critical for transformer to work!)
+        return hidden_states + attn_output
 
     def _unregister_fp8_weights(self):
         """No-op for FP8 weight unregistration.
