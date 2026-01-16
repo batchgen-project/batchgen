@@ -723,6 +723,13 @@ class DeepseekV3ParallelStrategyManager:
 
 
 	def _init_mode_decoding(self):
+		# Skip grouped GEMM initialization for EP offloading mode
+		# In EP offloading, non-persistent experts don't have fp8_gate/fp8_up/fp8_down registered
+		# and moe_infer_loop_with_offloading() doesn't use these pointer lists anyway
+		if self.enable_ep_offloading:
+			logging.info("EP offloading mode: skipping grouped GEMM init (using loop-based execution)")
+			return
+
 		for layer_idx in range(
 			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
