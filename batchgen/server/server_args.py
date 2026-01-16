@@ -82,6 +82,9 @@ class ServerArgs:
     initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
     extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
     decision_frequency_pages: int = 2  # How often to make scheduling decisions (in pages)
+    # EP with offloading settings
+    enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
+    ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -224,6 +227,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
         help="How often to make scheduling decisions in pages (default: 2, each page = 64 tokens)",
     )
+    parser.add_argument(
+        "--enable-ep-with-offloading",
+        action="store_true",
+        default=False,
+        help="Enable Expert Parallelism with offloading mode (partial experts persistent on GPU)",
+    )
+    parser.add_argument(
+        "--ep-offloading-ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of experts per layer to offload (0.0-1.0). E.g., 0.2 means 20%% of experts loaded/freed at runtime",
+    )
     return parser
 
 
@@ -275,6 +290,12 @@ def validate_server_args(args: ServerArgs) -> None:
             f"extension_gpu_page_buffer ({args.extension_gpu_page_buffer}) must be >= "
             f"decision_frequency_pages ({args.decision_frequency_pages}) to prevent overflow"
         )
+    if args.ep_offloading_ratio < 0.0 or args.ep_offloading_ratio > 1.0:
+        raise ValueError("ep_offloading_ratio must be between 0.0 and 1.0")
+    if args.ep_offloading_ratio > 0.0 and not args.enable_ep_with_offloading:
+        raise ValueError(
+            "ep_offloading_ratio > 0 requires --enable-ep-with-offloading"
+        )
     args.storage_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -313,6 +334,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         initial_gpu_page_buffer=parsed.initial_gpu_page_buffer,
         extension_gpu_page_buffer=parsed.extension_gpu_page_buffer,
         decision_frequency_pages=parsed.decision_frequency_pages,
+        enable_ep_with_offloading=parsed.enable_ep_with_offloading,
+        ep_offloading_ratio=parsed.ep_offloading_ratio,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)
