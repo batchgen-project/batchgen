@@ -114,6 +114,15 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 			raise ValueError("Currently gpu_arch must be 'hopper', or 'ampere'")
 		engine_config.Basic_Config.gpu_arch = input_arguments.gpu_arch.lower()
 
+	""" EP Offloading Config """
+	# Set EP offloading settings from input arguments so planner can use them
+	if input_arguments.get('enable_ep_with_offloading', False):
+		engine_config.EP_Config.enable_offloading = True
+		engine_config.EP_Config.offloading_ratio = input_arguments.get('ep_offloading_ratio', 0.0)
+		logging.info(
+			f"EP offloading config set: enable_offloading=True, "
+			f"offloading_ratio={engine_config.EP_Config.offloading_ratio}"
+		)
 
 	return engine_config
 

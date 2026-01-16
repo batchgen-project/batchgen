@@ -139,11 +139,25 @@ class BasePlanner(ABC):
 
         non_static_memory_usage = k_buffer_size + model_skeleton_size + cuda_page_table_default_size
         available_memory_for_expert_cache = available_gpu_mem - non_static_memory_usage
-        num_local_expert_per_layer = min(
-            expert_per_rank,
-            int(available_memory_for_expert_cache // 2.4)
-        )
-        num_decoding_module_buffer_routed_expert = expert_per_rank - num_local_expert_per_layer + 2
+
+        # Check if EP offloading is enabled - if so, use offloading_ratio instead of memory-based calculation
+        if self.config.EP_Config.enable_offloading and self.config.EP_Config.offloading_ratio > 0:
+            # EP offloading: use offloading_ratio to determine persistent vs offloaded experts
+            num_local_expert_per_layer = int(expert_per_rank * (1 - self.config.EP_Config.offloading_ratio))
+            # Buffer count = number of offloaded experts + overhead
+            num_offloaded = expert_per_rank - num_local_expert_per_layer
+            num_decoding_module_buffer_routed_expert = num_offloaded + 2
+            logging.info(
+                f"EP offloading enabled: {num_local_expert_per_layer} persistent, "
+                f"{num_offloaded} offloaded, {num_decoding_module_buffer_routed_expert} buffers"
+            )
+        else:
+            # Default: calculate based on available GPU memory
+            num_local_expert_per_layer = min(
+                expert_per_rank,
+                int(available_memory_for_expert_cache // 2.4)
+            )
+            num_decoding_module_buffer_routed_expert = expert_per_rank - num_local_expert_per_layer + 2
 
         if self.config.Basic_Config.attn_mode == 3:
             num_local_expert_per_layer = expert_per_rank
