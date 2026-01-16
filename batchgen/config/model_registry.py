@@ -138,6 +138,9 @@ def load_config(model_identifier: str) -> "BaseModelConfig":
     """
     from .model_config import BaseModelConfig
 
+    # Convert Path objects to string for pattern matching
+    model_identifier = str(model_identifier)
+
     config = None
 
     # Step 1: Try to detect model type from identifier patterns
