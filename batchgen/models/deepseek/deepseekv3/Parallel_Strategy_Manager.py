@@ -368,9 +368,12 @@ class DeepseekV3ParallelStrategyManager:
 				)
 
 		self.weight_copy_task["routed_expert"] = self.host_routed_experts
-		# assert len(self.weight_copy_task["routed_expert"]) == 0
+		# NOTE: For decoding mode, attention and shared experts are persistent (loaded via _load_model_skeleton).
+		# Only offloaded routed experts need weight copying. DO NOT add attention/shared_expert to weight_copy_task.
+		# weight_copy_task["attn"] and weight_copy_task["shared_expert"] stay EMPTY.
 
-
+		# Build state_dict_name_map for all modules (needed for weight loading lookups)
+		# but do NOT add to weight_copy_task (attention and shared experts are persistent)
 		for layer_idx in range(self.model_config.num_hidden_layers):
 			for name, _ in self.model.model.layers[
 				layer_idx
@@ -382,7 +385,7 @@ class DeepseekV3ParallelStrategyManager:
 					"module_key": "attn_" + str(layer_idx),
 					"tensor_key": name,
 				}
-			self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
+			# DO NOT add attention to weight_copy_task - it's persistent for decoding
 
 			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 				for name, _ in self.model.model.layers[
@@ -398,9 +401,7 @@ class DeepseekV3ParallelStrategyManager:
 						"module_key": "shared_expert_" + str(layer_idx),
 						"tensor_key": name,
 					}
-				self.weight_copy_task["shared_expert"].append(
-					"shared_expert_" + str(layer_idx)
-				)
+				# DO NOT add shared_expert to weight_copy_task - it's persistent for decoding
 
 				for expert_idx in range(self.model_config.num_local_experts):
 					for name, _ in (
@@ -453,6 +454,20 @@ class DeepseekV3ParallelStrategyManager:
 		if self.rank == 0:
 			used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
 			logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
+
+		# Log weight_copy_task summary for debugging
+		logging.info(
+			f"Rank {self.rank}: weight_copy_task summary - "
+			f"attn: {len(self.weight_copy_task['attn'])}, "
+			f"shared_expert: {len(self.weight_copy_task['shared_expert'])}, "
+			f"routed_expert: {len(self.weight_copy_task['routed_expert'])}"
+		)
+		if len(self.weight_copy_task['routed_expert']) > 0:
+			logging.info(
+				f"Rank {self.rank}: First few offloaded experts: "
+				f"{self.weight_copy_task['routed_expert'][:5]}"
+			)
+
 		return self.model, self.weight_copy_task
 
 
