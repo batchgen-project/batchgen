@@ -32,6 +32,7 @@ import torch.distributed as dist
 # from batchgen.config import EngineConfig, ModelConfig
 from ....config.config import EngineConfig, ModelConfig
 from .configuration_deepseek_v3 import DeepseekV3Config
+from batchgen.config.model_registry import load_config
 try:
     from batchgen.core_engine import batchgen as core_engine
 except ImportError:
@@ -140,9 +141,9 @@ def deepseek_v3_dequantization(
 
 class DeepseekV3Initializer:
     def __init__(self, input_arguments):
-        self.hf_model_config = DeepseekV3Config()
-        self.hf_model_config._name_or_path = input_arguments.huggingface_ckpt_name
-        self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
+        self.loaded_model_config = DeepseekV3Config()
+        self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
+        self.loaded_model_config.architectures = ["DeepseekV3ForCausalLM"]
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
@@ -250,11 +251,11 @@ class DeepseekV3Initializer:
             )
 
             logging.info("Core engine created")
-            logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
+            logging.info(f"_name_or_path: {self.loaded_model_config._name_or_path}")
             if (
-                "deepseek-ai/DeepSeek-V3" in self.hf_model_config._name_or_path
+                "deepseek-ai/DeepSeek-V3" in self.loaded_model_config._name_or_path
                 or "deepseek-ai/DeepSeek-R1"
-                in self.hf_model_config._name_or_path
+                in self.loaded_model_config._name_or_path
             ):
                 param_byte_size = 675 * 1024 * 1024 * 1024
             else:
@@ -274,7 +275,7 @@ class DeepseekV3Initializer:
             self.core_engine,
             self.engine_config,
             self.model_config,
-            self.hf_model_config
+            self.loaded_model_config
         )
 
 

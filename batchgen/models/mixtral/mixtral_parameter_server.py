@@ -27,7 +27,9 @@ from tqdm import tqdm, trange
 
 # from .deepseekv2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
 # from .deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-from transformers import AutoConfig, MixtralForCausalLM
+from transformers import MixtralForCausalLM, MixtralConfig as HFMixtralConfig
+
+from batchgen.config.model_registry import load_config
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -45,18 +47,12 @@ class Mixtral_Parameter_Server:
         self.pt_ckpt_dir = pt_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
-        # config_cls = DeepseekV2Config if "V2" in huggingface_ckpt_name else DeepseekV3Config
-        # Get hf_token from env (optional for offline mode)
-        hf_token = os.getenv("HF_TOKEN")
-        # Note: HF_TOKEN is only needed if downloading from HuggingFace Hub
-        # For offline/air-gapped deployments with local files, it's not required
-        self.hf_model_config = AutoConfig.from_pretrained(
-            huggingface_ckpt_name,
-            token=hf_token,
-            local_files_only=True,
-        )
+        # Use BatchGen's unified config system instead of HuggingFace AutoConfig
+        self.model_config = load_config(huggingface_ckpt_name)
 
-        # self.hf_model_config = AutoConfig.from_pretrained(huggingface_ckpt_name, cache_dir=cache_dir, trust_remote_code=True)
+        # Create HuggingFace config for model instantiation (local config class, NOT AutoConfig)
+        self.hf_config = HFMixtralConfig()
+        self.hf_config._name_or_path = huggingface_ckpt_name
 
     def Init(self):
         self._save_safetensors_to_pt()
@@ -96,8 +92,9 @@ class Mixtral_Parameter_Server:
         return self.shm_name, self.tensor_meta_shm_name
 
     def _parse_state_dict(self):
-        self.hf_model_config._attn_implementation = "eager"
-        model = MixtralForCausalLM._from_config(self.hf_model_config)
+        # Use HuggingFace config for model instantiation (PretrainedConfig required)
+        self.hf_config._attn_implementation = "eager"
+        model = MixtralForCausalLM._from_config(self.hf_config)
         model.eval()
 
         self.weight_copy_task["attn"] = []

@@ -28,9 +28,8 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
-from transformers import AutoConfig
-
 from batchgen.config import EngineConfig, ModelConfig
+from batchgen.config.model_registry import load_config
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -46,6 +45,7 @@ from .modeling_deepseek_v2 import (
     apply_rotary_pos_emb,
     rotate_half,
 )
+from .configuration_deepseek_v2 import DeepseekV2Config as HFDeepseekV2Config
 
 
 def rotary_pos_emb(t, cos, sin, position_ids, unsqueeze_dim=1):
@@ -490,12 +490,13 @@ class DeepSeek_Initializer:
         self.host_kv_cache_byte_size = host_kv_cache_size * 1024 * 1024 * 1024
 
         self.model = None
-        self.hf_model_config = AutoConfig.from_pretrained(
-            huggingface_ckpt_name,
-            cache_dir=hf_cache_dir,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
+        # Use BatchGen's unified config system instead of HuggingFace AutoConfig
+        self.loaded_model_config = load_config(huggingface_ckpt_name)
+
+        # Create HuggingFace config for model instantiation (local config class, NOT AutoConfig)
+        self.hf_config = HFDeepseekV2Config()
+        self.hf_config._name_or_path = huggingface_ckpt_name
+
         # TODO:
         self.model_config = self._parse_model_config()
         self._default_engine_config()
@@ -512,9 +513,9 @@ class DeepSeek_Initializer:
         total_memory = props.total_memory / (1024**3)
         logging.info(f"Current device total memory: {total_memory} GB")
         if (
-            self.hf_model_config._name_or_path
+            self.loaded_model_config._name_or_path
             == "deepseek-ai/DeepSeek-V2-Lite-Chat" or
-            self.hf_model_config._name_or_path
+            self.loaded_model_config._name_or_path
             == "deepseek-ai/DeepSeek-V2-Lite"
         ):
             self.engine_config.Basic_Config.log_level = "info"
@@ -762,11 +763,11 @@ class DeepSeek_Initializer:
     def _parse_model_config(self):
         model_config = ModelConfig()
         # V2/V2.5
-        if "DeepSeek-V2" in self.hf_model_config._name_or_path:
+        if "DeepSeek-V2" in self.loaded_model_config._name_or_path:
             if (
-                self.hf_model_config._name_or_path
+                self.loaded_model_config._name_or_path
                 == "deepseek-ai/DeepSeek-V2-Lite-Chat" or 
-                self.hf_model_config._name_or_path
+                self.loaded_model_config._name_or_path
                 == "deepseek-ai/DeepSeek-V2-Lite"
             ):
                 model_config.model_type = "deepseek_v2"
@@ -787,8 +788,8 @@ class DeepSeek_Initializer:
                 model_config.compressed_kv_dim = 576
 
         elif (
-            "DeepSeek-V3" in self.hf_model_config._name_or_path
-            or "DeepSeek-R1" in self.hf_model_config._name_or_path
+            "DeepSeek-V3" in self.loaded_model_config._name_or_path
+            or "DeepSeek-R1" in self.loaded_model_config._name_or_path
         ):
             model_config.model_type = "deepseek_v3"
             model_config.num_hidden_layers = 61
@@ -870,9 +871,9 @@ class DeepSeek_Initializer:
             )
             logging.info("Core engine created")
             if (
-                self.hf_model_config._name_or_path
+                self.loaded_model_config._name_or_path
                 == "deepseek-ai/DeepSeek-V2-Lite-Chat" or 
-                self.hf_model_config._name_or_path
+                self.loaded_model_config._name_or_path
                 == "deepseek-ai/DeepSeek-V2-Lite"
             ):
                 param_byte_size = 32 * 1024 * 1024 * 1024
@@ -916,10 +917,11 @@ class DeepSeek_Initializer:
 
     def _parse_state_dict(self):
         model_init_start_time = time.perf_counter()
-        self.hf_model_config._attn_implementation = "eager"
+        # Use HuggingFace config for model instantiation (PretrainedConfig required)
+        self.hf_config._attn_implementation = "eager"
         if self.model_config.model_type == "deepseek_v2":
             self.model = DeepseekV2ForCausalLM._from_config(
-                self.hf_model_config
+                self.hf_config
             ).to(self.engine_config.Basic_Config.device_torch)
         else:
             raise ValueError("Model not supported")
@@ -945,7 +947,7 @@ class DeepSeek_Initializer:
                 }
             self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
 
-            if layer_idx >= self.hf_model_config.first_k_dense_replace:
+            if layer_idx >= self.loaded_model_config.first_k_dense_replace:
                 for name, _ in self.model.model.layers[
                     layer_idx
                 ].mlp.shared_experts.named_parameters():
@@ -1055,7 +1057,7 @@ class DeepSeek_Initializer:
         Replace expert module with the wrapper.
         """
         for layer_idx in range(
-            self.hf_model_config.first_k_dense_replace,
+            self.loaded_model_config.first_k_dense_replace,
             len(self.model.model.layers),
         ):
             layer = self.model.model.layers[layer_idx]

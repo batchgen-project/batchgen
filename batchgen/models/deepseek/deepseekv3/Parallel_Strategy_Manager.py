@@ -22,7 +22,7 @@ else:
 class DeepseekV3ParallelStrategyManager:
 	def __init__(
 		self, 
-		hf_model_config, 
+		loaded_model_config, 
 		engine_config, 
 		model_config,
 		core_engine,
@@ -31,7 +31,7 @@ class DeepseekV3ParallelStrategyManager:
 		global_rank,
 		world_size
 	):
-		self.hf_model_config = hf_model_config
+		self.loaded_model_config = loaded_model_config
 		self.engine_config = engine_config
 		self.model_config = model_config
 		self.core_engine = core_engine
@@ -48,12 +48,12 @@ class DeepseekV3ParallelStrategyManager:
 	# 		Configure a model skeletion for prefill pure dp 
 	# 		and the corresponding weight copy task.
 	# 	"""
-	# 	self.hf_model_config.phase = "prefill"
+	# 	self.loaded_model_config.phase = "prefill"
 	# 	# self.model = DeepseekV3ForCausalLM._from_config(
-	# 	# 	self.hf_model_config
+	# 	# 	self.loaded_model_config
 	# 	# )
-	# 	# logging.info(f"hf_model_config: {self.hf_model_config}")
-	# 	self.model = DeepseekV3ForCausalLM(self.hf_model_config)
+	# 	# logging.info(f"loaded_model_config: {self.loaded_model_config}")
+	# 	self.model = DeepseekV3ForCausalLM(self.loaded_model_config)
 	# 	self.state_dict_name_map = {}
 	# 	self.weight_copy_task = {}
 	# 	self.weight_copy_task["attn"] = []
@@ -73,7 +73,7 @@ class DeepseekV3ParallelStrategyManager:
 	# 			}
 	# 		self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
 
-	# 		if layer_idx >= self.hf_model_config.first_k_dense_replace:
+	# 		if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 	# 			for name, _ in self.model.model.layers[
 	# 				layer_idx
 	# 			].mlp.shared_experts.named_parameters():
@@ -140,11 +140,11 @@ class DeepseekV3ParallelStrategyManager:
 		timings = {}
 
 		# Step 1: Set phase
-		self.hf_model_config.phase = "prefill"
+		self.loaded_model_config.phase = "prefill"
 
 		# Step 2: Initialize model
 		step_start = time.perf_counter()
-		self.model = DeepseekV3ForCausalLM(self.hf_model_config)
+		self.model = DeepseekV3ForCausalLM(self.loaded_model_config)
 		timings['model_init'] = time.perf_counter() - step_start
 
 		# Step 3: Initialize data structures
@@ -170,7 +170,7 @@ class DeepseekV3ParallelStrategyManager:
 				}
 			self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
 
-			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 				# Shared experts
 				for name, _ in self.model.model.layers[
 					layer_idx
@@ -271,7 +271,7 @@ class DeepseekV3ParallelStrategyManager:
 		# device = self.engine_config.Basic_Config.device_torch
 		# with torch.inference_mode():
 		# 	warmup_compiled_moe_gate(device)
-		for layer_idx in range(self.hf_model_config.first_k_dense_replace, self.model_config.num_hidden_layers):
+		for layer_idx in range(self.loaded_model_config.first_k_dense_replace, self.model_config.num_hidden_layers):
 			layer = self.model.model.layers[layer_idx].mlp.gate
 			if hasattr(layer, "warmup"):
 				if self.global_rank == 0:
@@ -286,7 +286,7 @@ class DeepseekV3ParallelStrategyManager:
 			# 		_ = layer.decoding_forward(dummy_hidden_states)
 
 		
-		# for layer_idx in range(self.hf_model_config.first_k_dense_replace, self.hf_model_config.first_k_dense_replace + 1):
+		# for layer_idx in range(self.loaded_model_config.first_k_dense_replace, self.loaded_model_config.first_k_dense_replace + 1):
 		# 	layer = self.model.model.layers[layer_idx].mlp.gate
 		# 	if hasattr(layer, "warmup"):
 		# 		layer.warmup()
@@ -297,12 +297,12 @@ class DeepseekV3ParallelStrategyManager:
 			Configure a model skeletion for decoding, 
 			DP + EP 
 		"""
-		self.hf_model_config.phase = "decode"
-		self.hf_model_config._attn_implementation = "eager"
+		self.loaded_model_config.phase = "decode"
+		self.loaded_model_config._attn_implementation = "eager"
 		self.model = None
 		torch.cuda.empty_cache()
 		self.model = DeepseekV3ForCausalLM._from_config(
-			self.hf_model_config
+			self.loaded_model_config
 		)
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
@@ -328,7 +328,7 @@ class DeepseekV3ParallelStrategyManager:
 		routed_expert_host_start_idx = routed_expert_gpu_end_idx
 		routed_expert_host_end_idx = (self.global_rank + 1) * NUM_EXPERT_PER_RANK
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
 			# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
@@ -359,7 +359,7 @@ class DeepseekV3ParallelStrategyManager:
 				}
 			self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
 
-			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 				for name, _ in self.model.model.layers[
 					layer_idx
 				].mlp.shared_experts.named_parameters():
@@ -422,15 +422,15 @@ class DeepseekV3ParallelStrategyManager:
 			Duplicate attention modules and shared experts in each dp worker.
 			Split routed experts.
 		"""
-		self.hf_model_config.phase = "decode"
-		self.hf_model_config._attn_implementation = "eager"
+		self.loaded_model_config.phase = "decode"
+		self.loaded_model_config._attn_implementation = "eager"
 
 		self.model = None
 		torch.cuda.empty_cache()
 		# self.model = DeepseekV3ForCausalLM._from_config(
-		# 	self.hf_model_config, comm
+		# 	self.loaded_model_config, comm
 		# )
-		self.model = DeepseekV3ForCausalLM(self.hf_model_config, comm)
+		self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
 		""" In this case, empty copy task. """
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
@@ -446,7 +446,7 @@ class DeepseekV3ParallelStrategyManager:
 
 		self.local_routed_experts = []
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
 			# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
@@ -507,7 +507,7 @@ class DeepseekV3ParallelStrategyManager:
 				logging.info(f"[DECODE] Padding batch size: {padding_bsz}")
 		
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
 			layer = self.model.model.layers[layer_idx].mlp
@@ -523,7 +523,7 @@ class DeepseekV3ParallelStrategyManager:
 			num_tokens_per_rank: The max batch size across all ranks for this page
 		"""
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
 			layer = self.model.model.layers[layer_idx].mlp
@@ -627,7 +627,7 @@ class DeepseekV3ParallelStrategyManager:
 			)
 		
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
 			layer = self.model.model.layers[layer_idx].mlp
@@ -652,7 +652,7 @@ class DeepseekV3ParallelStrategyManager:
 
 	def _init_mode_decoding(self):
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,
 		):
 			layer = self.model.model.layers[layer_idx].mlp
@@ -694,7 +694,7 @@ class DeepseekV3ParallelStrategyManager:
 
 	def _load_shared_expert_module(self):
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			len(self.model.model.layers),
 		):
 			layer = self.model.model.layers[layer_idx]
@@ -883,7 +883,7 @@ class DeepseekV3ParallelStrategyManager:
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			attn_module._unregister_fp8_weights()
-			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 				for routed_expert_idx in self.local_routed_experts:
 					self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
 
@@ -951,7 +951,7 @@ class DeepseekV3ParallelStrategyManager:
 		"""
 		start_time = time.perf_counter()
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			len(self.model.model.layers),
 		):
 			layer = self.model.model.layers[layer_idx]
@@ -1037,7 +1037,7 @@ class DeepseekV3ParallelStrategyManager:
 		start_time = time.perf_counter()
 		mlp_names = ["gate_proj", "up_proj", "down_proj"]
 		for layer_idx in range(
-			self.hf_model_config.first_k_dense_replace,
+			self.loaded_model_config.first_k_dense_replace,
 			len(self.model.model.layers),
 		):
 			layer = self.model.model.layers[layer_idx]

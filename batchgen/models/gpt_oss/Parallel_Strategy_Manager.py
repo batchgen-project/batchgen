@@ -46,7 +46,7 @@ class GptOssParallelStrategyManager:
 
     def __init__(
         self,
-        hf_model_config,
+        loaded_model_config,
         engine_config,
         model_config,
         core_engine,
@@ -55,7 +55,7 @@ class GptOssParallelStrategyManager:
         global_rank: int,
         world_size: int,
     ):
-        self.hf_model_config = hf_model_config
+        self.loaded_model_config = loaded_model_config
         self.engine_config = engine_config
         self.model_config = model_config
         self.core_engine = core_engine
@@ -77,11 +77,11 @@ class GptOssParallelStrategyManager:
         timings = {}
 
         # Step 1: Set phase
-        self.hf_model_config.phase = "prefill"
+        self.loaded_model_config.phase = "prefill"
 
         # Step 2: Initialize model
         step_start = time.perf_counter()
-        self.model = GptOssForCausalLM(self.hf_model_config)
+        self.model = GptOssForCausalLM(self.loaded_model_config)
         timings["model_init"] = time.perf_counter() - step_start
 
         # Step 3: Initialize data structures

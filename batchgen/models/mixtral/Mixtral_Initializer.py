@@ -27,12 +27,14 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import AutoConfig
 from transformers.models.mixtral.modeling_mixtral import (
     MixtralForCausalLM,
     apply_rotary_pos_emb,
     repeat_kv,
 )
+from transformers import MixtralConfig as HFMixtralConfig
+
+from batchgen.config.model_registry import load_config
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -255,12 +257,12 @@ class Mixtral_Initializer:
         self.host_kv_cache_byte_size = host_kv_cache_size * 1024 * 1024 * 1024
 
         self.model = None
-        self.hf_model_config = AutoConfig.from_pretrained(
-            huggingface_ckpt_name,
-            cache_dir=hf_cache_dir,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
+        # Use BatchGen's unified config system instead of HuggingFace AutoConfig
+        self.loaded_model_config = load_config(huggingface_ckpt_name)
+
+        # Create HuggingFace config for model instantiation (local config class, NOT AutoConfig)
+        self.hf_config = HFMixtralConfig()
+        self.hf_config._name_or_path = huggingface_ckpt_name
 
         self.model_config = self._parse_model_config()
         self._default_engine_config()
@@ -286,7 +288,7 @@ class Mixtral_Initializer:
         total_memory = props.total_memory / (1024**3)
         logging.info(f"Current device total memory: {total_memory} GB")
 
-        if "8x7B" in self.hf_model_config._name_or_path:
+        if "8x7B" in self.loaded_model_config._name_or_path:
             self.engine_config.Basic_Config.log_level = "info"
             self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
             self.engine_config.Basic_Config.dtype_str = "bfloat16"
@@ -403,7 +405,7 @@ class Mixtral_Initializer:
                 },
             }
 
-        elif "8x22B" in self.hf_model_config._name_or_path:
+        elif "8x22B" in self.loaded_model_config._name_or_path:
             self.engine_config.Basic_Config.log_level = "info"
             self.engine_config.Basic_Config.torch_dtype = torch.bfloat16
             self.engine_config.Basic_Config.dtype_str = "bfloat16"
@@ -521,12 +523,12 @@ class Mixtral_Initializer:
 
         else:
             raise ValueError(
-                f"Model {self.hf_model_config._name_or_path} not supported yet"
+                f"Model {self.loaded_model_config._name_or_path} not supported yet"
             )
 
     def _parse_model_config(self):
         model_config = ModelConfig()
-        if "8x7B" in self.hf_model_config._name_or_path:
+        if "8x7B" in self.loaded_model_config._name_or_path:
             model_config.model_type = "mixtral"
             model_config.num_hidden_layers = 32
             model_config.num_local_experts = 8
@@ -536,7 +538,7 @@ class Mixtral_Initializer:
             model_config.intermediate_size = 14336
             model_config.head_dim = 128
 
-        elif "8x22B" in self.hf_model_config._name_or_path:
+        elif "8x22B" in self.loaded_model_config._name_or_path:
             model_config.model_type = "mixtral"
             model_config.num_hidden_layers = 56
             model_config.num_local_experts = 8
@@ -661,8 +663,9 @@ class Mixtral_Initializer:
 
     def _parse_state_dict(self):
         model_init_start_time = time.perf_counter()
-        self.hf_model_config._attn_implementation = "flash_attention_2"
-        self.model = MixtralForCausalLM._from_config(self.hf_model_config).to(
+        # Use HuggingFace config for model instantiation (PretrainedConfig required)
+        self.hf_config._attn_implementation = "flash_attention_2"
+        self.model = MixtralForCausalLM._from_config(self.hf_config).to(
             self.engine_config.Basic_Config.device_torch
         )
         self.model.eval()
