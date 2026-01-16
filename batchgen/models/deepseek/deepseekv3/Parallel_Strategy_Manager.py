@@ -294,8 +294,13 @@ class DeepseekV3ParallelStrategyManager:
 
 	def configure_decoding(self):
 		"""
-			Configure a model skeletion for decoding, 
-			DP + EP 
+			Configure a model skeleton for decoding,
+			DP + EP with optional offloading.
+
+			When enable_offloading is True:
+			- Uses offloading_ratio to determine which experts are persistent (GPU-resident)
+			- persistent=True: weights pre-loaded on GPU
+			- persistent=False: weights loaded from buffer each forward
 		"""
 		self.loaded_model_config.phase = "decode"
 		self.loaded_model_config._attn_implementation = "eager"
@@ -318,9 +323,29 @@ class DeepseekV3ParallelStrategyManager:
 		self.host_routed_experts = []
 		# self.expert_location_map = {}
 
-		NUM_LOCAL_EXPERT_PER_LAYER = self.engine_config.EP_Config.num_local_expert_per_layer  
 		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
 		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
+
+		# Calculate NUM_LOCAL_EXPERT_PER_LAYER based on offloading settings
+		if self.engine_config.EP_Config.enable_offloading:
+			# Use offloading_ratio: (1 - ratio) are persistent, ratio are offloaded
+			offload_ratio = self.engine_config.EP_Config.offloading_ratio
+			NUM_LOCAL_EXPERT_PER_LAYER = int(NUM_EXPERT_PER_RANK * (1 - offload_ratio))
+			logging.info(
+				f"Rank {self.rank}: EP with offloading enabled. "
+				f"Experts per rank: {NUM_EXPERT_PER_RANK}, "
+				f"Persistent (GPU): {NUM_LOCAL_EXPERT_PER_LAYER}, "
+				f"Offloaded (host): {NUM_EXPERT_PER_RANK - NUM_LOCAL_EXPERT_PER_LAYER}"
+			)
+		else:
+			# Use configured value or default to all experts persistent
+			NUM_LOCAL_EXPERT_PER_LAYER = self.engine_config.EP_Config.num_local_expert_per_layer
+			if NUM_LOCAL_EXPERT_PER_LAYER is None or NUM_LOCAL_EXPERT_PER_LAYER == 0:
+				NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
+
+		# Store for later use in _config_expert_module
+		self.num_local_expert_per_layer = NUM_LOCAL_EXPERT_PER_LAYER
+		self.enable_ep_offloading = self.engine_config.EP_Config.enable_offloading
 
 
 		routed_expert_gpu_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
@@ -407,6 +432,21 @@ class DeepseekV3ParallelStrategyManager:
 		self._config_attn_module()
 		self._config_expert_module()
 		self._config_lm_head_hook()
+
+		# Set enable_ep_offloading flag on MoE layers for loop-based execution
+		if self.enable_ep_offloading:
+			for layer_idx in range(
+				self.loaded_model_config.first_k_dense_replace,
+				self.model_config.num_hidden_layers,
+			):
+				layer = self.model.model.layers[layer_idx]
+				# layer.mlp is DeepseekV3MoE_Decoding_FP8
+				layer.mlp.enable_ep_offloading = True
+			logging.info(
+				f"Rank {self.rank}: Set enable_ep_offloading=True on MoE layers "
+				f"(layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1})"
+			)
+
 		self.model.eval()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
 		# Log final GPU memory (rank 0 only)
@@ -841,10 +881,11 @@ class DeepseekV3ParallelStrategyManager:
 				)
 
 
+			# Attention: persistent if NOT in weight_copy_task
 			if "attn_" + str(layer_idx) in self.weight_copy_task["attn"]:
-				get_weights = True
+				persistent = False  # In offload list, needs loading
 			else:
-				get_weights = False
+				persistent = True  # Not in offload list, pre-loaded on GPU
 			weight_dequant_scales = {}
 			prefix = "model.layers." + str(layer_idx) + ".self_attn."
 			postfix = ".weight_scale_inv"
@@ -861,11 +902,12 @@ class DeepseekV3ParallelStrategyManager:
 				self.core_engine,
 				self.engine_config,
 				self.model_config,
-				get_weights,
+				persistent,
 				weight_dequant_scales,
 			)
 			self.model.model.layers[layer_idx].self_attn = attn_wrapper_instance
-			if get_weights == False:
+			if persistent:
+				# Persistent attention: register FP8 weights for direct GPU access
 				attn_wrapper_instance._register_fp8_weights()
 				for key, value in attn_wrapper_instance.weight_dequant_scale.items():
 					value = value.to(
@@ -948,6 +990,10 @@ class DeepseekV3ParallelStrategyManager:
 	def _config_expert_module_(self):
 		"""
 		Replace expert module with the wrapper.
+
+		persistent flag semantics:
+		- True: weights are pre-loaded on GPU, no buffer fetch needed
+		- False: weights need to be loaded from buffer each forward
 		"""
 		start_time = time.perf_counter()
 		for layer_idx in range(
@@ -955,13 +1001,14 @@ class DeepseekV3ParallelStrategyManager:
 			len(self.model.model.layers),
 		):
 			layer = self.model.model.layers[layer_idx]
+			# Shared expert: persistent if NOT in weight_copy_task
 			if (
 				"shared_expert_" + str(layer_idx)
 				in self.weight_copy_task["shared_expert"]
 			):
-				get_weights = True
+				persistent = False  # In offload list, needs loading
 			else:
-				get_weights = False
+				persistent = True  # Not in offload list, pre-loaded on GPU
 
 			prefix = "model.layers." + str(layer_idx) + ".mlp.shared_experts."
 			postfix = ".weight_scale_inv"
@@ -980,17 +1027,18 @@ class DeepseekV3ParallelStrategyManager:
 				self.core_engine,
 				self.engine_config,
 				self.model_config,
-				get_weights,
+				persistent,
 				weight_dequant_scales,
 			)
 			for expert_idx in range(len(layer.mlp.experts)):
+				# Routed expert: persistent if NOT in weight_copy_task
 				if (
 					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 					in self.weight_copy_task["routed_expert"]
 				):
-					get_weights = True
+					persistent = False  # In offload list, needs loading
 				else:
-					get_weights = False
+					persistent = True  # Not in offload list, pre-loaded on GPU
 
 				prefix = (
 					"model.layers."
@@ -1014,10 +1062,11 @@ class DeepseekV3ParallelStrategyManager:
 					self.core_engine,
 					self.engine_config,
 					self.model_config,
-					get_weights,
+					persistent,
 					weight_dequant_scales,
 				)
-				if get_weights == False:
+				if persistent:
+					# Persistent expert: register FP8 weights for direct GPU access
 					layer.mlp.experts[expert_idx]._register_fp8_weights()
 					for key, value in layer.mlp.experts[expert_idx].weight_dequant_scale.items():
 						value = value.to(
@@ -1033,6 +1082,13 @@ class DeepseekV3ParallelStrategyManager:
 	def _config_expert_module(self):
 		"""
 		Replace expert module with the wrapper.
+
+		persistent flag semantics:
+		- True: weights are pre-loaded on GPU, no buffer fetch needed
+		- False: weights need to be loaded from buffer each forward
+
+		An expert is persistent if it is NOT in weight_copy_task (i.e., already on GPU).
+		An expert is non-persistent if it IS in weight_copy_task (needs dynamic loading).
 		"""
 		start_time = time.perf_counter()
 		mlp_names = ["gate_proj", "up_proj", "down_proj"]
@@ -1041,13 +1097,14 @@ class DeepseekV3ParallelStrategyManager:
 			len(self.model.model.layers),
 		):
 			layer = self.model.model.layers[layer_idx]
+			# Shared expert: persistent if NOT in weight_copy_task
 			if (
 				"shared_expert_" + str(layer_idx)
 				in self.weight_copy_task["shared_expert"]
 			):
-				get_weights = True
+				persistent = False  # In offload list, needs loading
 			else:
-				get_weights = False
+				persistent = True  # Not in offload list, pre-loaded on GPU
 
 			prefix = "model.layers." + str(layer_idx) + ".mlp.shared_experts."
 			postfix = ".weight_scale_inv"
@@ -1058,7 +1115,7 @@ class DeepseekV3ParallelStrategyManager:
 					weight_dequant_scales[name + postfix] = self.skeleton_state_dict[key].to(
 						self.engine_config.Basic_Config.device_torch
 					)
-				
+
 
 
 			layer.mlp.shared_experts = DeepSeekExpertWrapper(
@@ -1068,24 +1125,26 @@ class DeepseekV3ParallelStrategyManager:
 				self.core_engine,
 				self.engine_config,
 				self.model_config,
-				get_weights,
+				persistent,
 				weight_dequant_scales,
 			)
-			if get_weights == False:
+			if persistent:
+					# Persistent expert: register FP8 weights for direct GPU access
 					layer.mlp.shared_experts._register_fp8_weights()
 					for key, value in layer.mlp.shared_experts.weight_dequant_scale.items():
 						value = value.to(
 							self.engine_config.Basic_Config.device_torch
 						)
-			
+
 			for expert_idx in range(len(layer.mlp.experts)):
+				# Routed expert: persistent if NOT in weight_copy_task
 				if (
 					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
 					in self.weight_copy_task["routed_expert"]
 				):
-					get_weights = True
+					persistent = False  # In offload list, needs loading
 				else:
-					get_weights = False
+					persistent = True  # Not in offload list, pre-loaded on GPU
 
 				prefix = (
 					"model.layers."
@@ -1115,10 +1174,11 @@ class DeepseekV3ParallelStrategyManager:
 					self.core_engine,
 					self.engine_config,
 					self.model_config,
-					get_weights,
+					persistent,
 					weight_dequant_scales,
 				)
-				if get_weights == False:
+				if persistent:
+					# Persistent expert: register FP8 weights for direct GPU access
 					layer.mlp.experts[expert_idx]._register_fp8_weights()
 					for key, value in layer.mlp.experts[expert_idx].weight_dequant_scale.items():
 						value = value.to(

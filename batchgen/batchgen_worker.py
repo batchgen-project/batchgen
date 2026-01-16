@@ -138,6 +138,9 @@ class InputArguments:
 	global_rank: int = 0
 	world_size: int = 1
 	gpu_arch: str = "hopper"
+	# EP with offloading settings
+	enable_ep_with_offloading: bool = False
+	ep_offloading_ratio: float = 0.0
 
 	def get(self, key, default=None):
 		return getattr(self, key, default)
@@ -228,6 +231,10 @@ class BatchGenWorkerArgs:
 	initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
 	extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
 	decision_frequency_pages: int = 2  # How often to make scheduling decisions (in pages)
+
+	# EP with offloading settings
+	enable_ep_with_offloading: bool = False  # Enable Expert Parallelism with offloading
+	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 
 
 class BatchGenWorker:
@@ -1064,7 +1071,10 @@ class BatchGenWorker:
 			"rank": self.global_rank,
 			"global_rank": self.global_rank,
 			"world_size": self.world_size,
-			"gpu_arch": self.gpu_arch
+			"gpu_arch": self.gpu_arch,
+			# EP with offloading settings
+			"enable_ep_with_offloading": self.args.enable_ep_with_offloading,
+			"ep_offloading_ratio": self.args.ep_offloading_ratio,
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 			
@@ -1077,7 +1087,16 @@ class BatchGenWorker:
 
 		self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		self.engine_config.Basic_Config.num_queries = num_queries
-		
+
+		# Set EP offloading config from command-line args
+		self.engine_config.EP_Config.enable_offloading = self.args.enable_ep_with_offloading
+		self.engine_config.EP_Config.offloading_ratio = self.args.ep_offloading_ratio
+		if self.engine_config.EP_Config.enable_offloading:
+			logging.info(
+				f"Rank {self.rank}: EP with offloading enabled, "
+				f"offloading_ratio={self.engine_config.EP_Config.offloading_ratio}"
+			)
+
 		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
 		self.parallel_manager = self.parallel_manager(
 			self.loaded_model_config,

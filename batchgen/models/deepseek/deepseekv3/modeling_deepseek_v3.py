@@ -1917,14 +1917,146 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		orig_shape = hidden_states.shape
 		hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 		identity = hidden_states
-		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL","0") == "1":
-			moe_infer_fn = self.moe_infer_pplx_a2a_fp8_dispatch
+
+		# Select execution path based on config
+		if getattr(self, 'enable_ep_offloading', False):
+			# Use loop-based execution for EP with offloading (dynamic weight loading)
+			out = self.moe_infer_loop_with_offloading(hidden_states)
+		elif os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL","0") == "1":
+			out = self.moe_infer_pplx_a2a_fp8_dispatch(hidden_states)
 		else:
-			moe_infer_fn = self.moe_infer_allgather_allreduce_bf16_acc
-		out = moe_infer_fn(hidden_states)
+			out = self.moe_infer_allgather_allreduce_bf16_acc(hidden_states)
+
 		out = out + self.shared_experts(identity)
 		return out.view(*orig_shape)
-	
+
+	@torch.inference_mode()
+	def moe_infer_loop_with_offloading(self, x):
+		"""
+		Loop-based expert execution for EP with offloading.
+
+		This method is used when some experts are not persistent (not pre-loaded on GPU)
+		and need to be dynamically loaded from host memory. Each expert is called
+		individually via Expert_Wrapper, which handles weight loading internally
+		based on the 'persistent' flag.
+
+		Args:
+			x: Input tensor [num_tokens, hidden_size]
+
+		Returns:
+			Output tensor [num_tokens, hidden_size]
+		"""
+		num_tokens, hidden_size = x.shape
+		device = x.device
+
+		# Handle zero-token case
+		if num_tokens == 0:
+			return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
+
+		# ---- 1) AllGather: Collect tokens from all ranks ----
+		all_tokens = torch.zeros(
+			(self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
+			device=self.device,
+			dtype=torch.bfloat16
+		)
+
+		if x.shape[0] < self.num_tokens_per_rank:
+			padded_hidden_states = torch.zeros(
+				(self.num_tokens_per_rank, hidden_size),
+				device=self.device,
+				dtype=x.dtype
+			)
+			padded_hidden_states[:x.shape[0]] = x
+		else:
+			padded_hidden_states = x
+
+		with self.comm.change_state(enable=True):
+			self.comm.all_gather(
+				all_tokens,
+				padded_hidden_states,
+				stream=torch.cuda.default_stream(self.device)
+			)
+
+		# ---- 2) Gate computation on global tokens ----
+		global_x = all_tokens
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])
+		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
+		global_x = global_x.squeeze(1)
+
+		# ---- 3) Count tokens per expert and sort ----
+		# topk_idx: [num_global_tokens, num_experts_per_tok]
+		num_global_tokens = global_x.shape[0]
+		K = self.num_experts_per_tok
+
+		# Create a flat view of expert assignments
+		flat_expert_idx = topk_idx.view(-1)  # [num_global_tokens * K]
+
+		# Count tokens for each expert in local range
+		expert_token_counts = torch.zeros(
+			self.experts_per_rank, dtype=torch.int64, device=device
+		)
+		for local_e in range(self.experts_per_rank):
+			global_e = self.routed_expert_start_idx + local_e
+			expert_token_counts[local_e] = (flat_expert_idx == global_e).sum()
+
+		# Sort tokens by expert assignment for efficient batching
+		# For each (token, topk_position), map to expert
+		token_indices = torch.arange(num_global_tokens, device=device).repeat_interleave(K)
+		topk_positions = torch.arange(K, device=device).repeat(num_global_tokens)
+
+		# ---- 4) Loop-based expert execution ----
+		# Initialize output buffer
+		global_results = torch.zeros(
+			(num_global_tokens, hidden_size),
+			device=device,
+			dtype=torch.float32
+		)
+
+		# Process each local expert
+		for local_e in range(self.experts_per_rank):
+			global_e = self.routed_expert_start_idx + local_e
+
+			# Find tokens routed to this expert
+			mask = flat_expert_idx == global_e
+			if not mask.any():
+				continue
+
+			# Get token indices and topk positions for this expert
+			expert_token_idx = token_indices[mask]
+			expert_topk_pos = topk_positions[mask]
+
+			# Gather tokens for this expert
+			tokens_for_expert = global_x[expert_token_idx]
+
+			# Call expert forward (Expert_Wrapper handles weight loading)
+			# For non-persistent experts, this will load weights from buffer
+			expert = self.experts[global_e]
+			expert_output = expert(tokens_for_expert)
+
+			# Get weights for these tokens at these topk positions
+			expert_weights = topk_weight[expert_token_idx, expert_topk_pos]
+
+			# Weighted accumulation into results
+			weighted_output = expert_output * expert_weights.unsqueeze(-1)
+			global_results.index_add_(0, expert_token_idx, weighted_output)
+
+		global_results = global_results.to(torch.bfloat16)
+
+		# ---- 5) AllReduce: Combine results from all ranks ----
+		with self.comm.change_state(enable=True):
+			self.comm.all_reduce(
+				global_results,
+				op=dist.ReduceOp.SUM,
+				stream=torch.cuda.default_stream(self.device)
+			)
+
+		# ---- 6) Extract results for local tokens ----
+		start_token_ids = self.rank * self.num_tokens_per_rank
+		end_token_ids = start_token_ids + num_tokens
+
+		final_output = global_results[start_token_ids:end_token_ids]
+		return final_output.to(x.dtype)
+
 	@torch.inference_mode()
 	def moe_infer_pplx_a2a_bf16_dispatch(self,x):
 		num_tokens, hidden_size = x.shape

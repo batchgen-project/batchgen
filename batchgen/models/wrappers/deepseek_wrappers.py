@@ -78,7 +78,7 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
         core_engine,
         engine_config,
         model_config,
-        get_weights: bool = True,
+        persistent: bool = False,
         weight_dequant_scale: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Initialize DeepSeek expert wrapper.
@@ -90,12 +90,14 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
             core_engine: BatchGen core engine
             engine_config: Engine configuration
             model_config: Model configuration
-            get_weights: Whether to load weights from core engine
+            persistent: Whether weights are pre-loaded on GPU.
+                        True = pre-loaded, no buffer fetch needed.
+                        False = load from buffer each forward.
             weight_dequant_scale: Dict of FP8 scale factors
         """
         super().__init__(
             module, layer_idx, expert_idx, core_engine, engine_config, model_config,
-            get_weights
+            persistent
         )
         self.weight_dequant_scale = weight_dequant_scale or {}
 
@@ -129,7 +131,7 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
     def _register_fp8_weights(self):
         """Cache FP8 weights for local experts.
 
-        Called when get_weights=False - weights stay in GPU memory.
+        Called when persistent=True - weights stay in GPU memory.
         """
         self.fp8_gate = self.module.gate_proj.weight.data
         self.fp8_up = self.module.up_proj.weight.data
@@ -160,8 +162,8 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with FP8 handling.
 
-        If get_weights=True: Load from core engine, dequantize, forward, cleanup
-        If get_weights=False: Use cached FP8 weights directly
+        If persistent=True: Use cached FP8 weights directly (pre-loaded on GPU)
+        If persistent=False: Load from core engine, dequantize, forward, cleanup
 
         Args:
             hidden_states: Input tensor [num_tokens, hidden_size]
@@ -175,8 +177,8 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
             f"Forward pass. Phase: {self.phase}"
         )
 
-        if self.get_weights:
-            # Load weights from core engine
+        if not self.persistent:
+            # Load weights from core engine (non-persistent experts)
             weights = self.load_weights(self.module_key)
 
             # Apply weights to module (dequantization happens in deepgemm_forward)
@@ -184,7 +186,7 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
                 param.data = weights[name]
 
         else:
-            # Use cached FP8 weights
+            # Use cached FP8 weights (persistent experts)
             self.module.gate_proj.weight.data = self.fp8_gate
             self.module.up_proj.weight.data = self.fp8_up
             self.module.down_proj.weight.data = self.fp8_down
@@ -192,8 +194,8 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
         # Micro-batch forward
         result = self.micro_batch_forward(hidden_states, "expert")
 
-        # Cleanup
-        if self.get_weights:
+        # Cleanup for non-persistent experts
+        if not self.persistent:
             torch.cuda.current_stream(
                 self.engine_config.Basic_Config.device_torch
             ).synchronize()
@@ -223,13 +225,13 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
         core_engine,
         engine_config,
         model_config,
-        get_weights: bool = True,
+        persistent: bool = True,
         weight_dequant_scale: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Initialize DeepSeek attention wrapper."""
         super().__init__(
             module, layer_idx, core_engine, engine_config, model_config,
-            get_weights, weight_dequant_scale
+            persistent, weight_dequant_scale
         )
 
         # FP8 weight caching

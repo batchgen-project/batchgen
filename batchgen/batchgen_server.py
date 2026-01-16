@@ -145,6 +145,10 @@ class BatchGenServer:
 			global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
 			skeleton_state_dict=self.skeleton_state_dict,
 
+			# EP with offloading settings
+			enable_ep_with_offloading=getattr(self.args, 'enable_ep_with_offloading', False),
+			ep_offloading_ratio=getattr(self.args, 'ep_offloading_ratio', 0.0),
+
 			# Place holder
 			local_rank=-1,
 			global_rank=-1,
@@ -539,6 +543,18 @@ def parse_args():
 		action="store_true",
 		default=False,
 		help="Allow downloading model from HuggingFace Hub. Disabled by default for production safety."
+	)
+	parser.add_argument(
+		"--enable-ep-with-offloading",
+		action="store_true",
+		default=False,
+		help="Enable Expert Parallelism with offloading mode (partial experts persistent on GPU)"
+	)
+	parser.add_argument(
+		"--ep-offloading-ratio",
+		type=float,
+		default=0.0,
+		help="Ratio of experts per layer to offload (0.0-1.0). E.g., 0.2 means 20%% of experts loaded/freed at runtime"
 	)
 
 	return parser.parse_args()

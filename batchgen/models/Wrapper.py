@@ -316,16 +316,29 @@ class Attn_Wrapper(torch.nn.Module):
 		core_engine,
 		engine_config,
 		model_config,
-		get_weights,
+		persistent,
 		weight_dequant_scale=None,
 	):
+		"""Initialize attention wrapper.
+
+		Args:
+			module: Attention module to wrap
+			layer_idx: Layer index in the model
+			core_engine: BatchGen core engine
+			engine_config: Engine configuration
+			model_config: Model configuration
+			persistent: Whether weights are pre-loaded on GPU.
+				True = pre-loaded, no buffer fetch needed (default for attention).
+				False = load from buffer each forward.
+			weight_dequant_scale: Dict of weight dequantization scales
+		"""
 		super().__init__()
 		self.module = module
 		self.layer_idx = layer_idx
 		self.core_engine = core_engine
 		self.engine_config = engine_config
 		self.model_config = model_config
-		self.get_weights = get_weights
+		self.persistent = persistent
 		self.attn_module_id = "attn" + "_" + str(self.layer_idx)
 		self.weight_dequant_scale = weight_dequant_scale
 
@@ -371,7 +384,8 @@ class Attn_Wrapper(torch.nn.Module):
 			"""
 				All attn Mode has the same prefill logic.
 			"""
-			if self.get_weights:
+			if not self.persistent:
+				# Load weights from core engine (non-persistent attention)
 				weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
 				for name, param in self.module.named_parameters():
 						param.data = weights_dict[name]
@@ -522,8 +536,8 @@ class Attn_Wrapper(torch.nn.Module):
 				# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 				# torch.cuda.synchronize(self.engine_config.Basic_Config.device_torch)
 			
-			# Step 4: Clean up
-			if self.get_weights:
+			# Step 4: Clean up for non-persistent attention
+			if not self.persistent:
 				self.core_engine.free_weights_buffer(self.attn_module_id)
 				for name, param in self.module.named_parameters():
 					param.data = torch.tensor(
@@ -577,11 +591,13 @@ class Attn_Wrapper(torch.nn.Module):
 			# 			)
 
 
-			if self.get_weights:
+			if not self.persistent:
+				# Load weights from core engine (non-persistent attention)
 				weights_dict = self.core_engine.get_weights(self.attn_module_id, Attn_Wrapper.phase)
 				for name, param in self.module.named_parameters():
 					param.data = weights_dict[name]
 			else:
+				# Persistent attention - weights already on GPU
 				# for name, param in self.module.named_parameters():
 				# 	if (
 				# 		self.weight_dequant_scale is not None
@@ -751,8 +767,8 @@ class Attn_Wrapper(torch.nn.Module):
 
 					
 
-			# Step 4: Clean up
-			if self.get_weights:
+			# Step 4: Clean up for non-persistent attention
+			if not self.persistent:
 				torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 				self.core_engine.free_weights_buffer(self.attn_module_id)
 				for name, param in self.module.named_parameters():
@@ -760,6 +776,7 @@ class Attn_Wrapper(torch.nn.Module):
 						0.0, dtype=param.data.dtype, device=param.data.device
 					)
 			else:
+				# Persistent attention - weights remain on GPU
 				# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 				# self.module.q_a_proj.weight.data = self.fp8_q_a_proj
 				# self.module.q_b_proj.weight.data = self.fp8_q_b_proj
@@ -875,8 +892,8 @@ class Attn_Wrapper(torch.nn.Module):
 				sequence_lengths=[seq_len],
 			)
 
-		# Clean up
-		if self.get_weights:
+		# Clean up for non-persistent attention
+		if not self.persistent:
 			self.core_engine.free_weights_buffer(self.attn_module_id)
 			for name, param in self.module.named_parameters():
 				param.data = torch.tensor(
@@ -909,9 +926,23 @@ class Expert_Wrapper(torch.nn.Module):
 		core_engine,
 		engine_config,
 		model_config,
-		get_weights,
+		persistent,
 		weight_dequant_scale=None,
 	):
+		"""Initialize expert wrapper.
+
+		Args:
+			expert_module: Expert FFN module to wrap
+			layer_idx: Layer index in the model
+			expert_idx: Expert index within the layer (-1 for shared expert)
+			core_engine: BatchGen core engine for weight management
+			engine_config: Engine configuration
+			model_config: Model configuration
+			persistent: Whether weights are pre-loaded on GPU.
+				True = pre-loaded, no buffer fetch needed.
+				False = load from buffer each forward.
+			weight_dequant_scale: Dict of FP8 scale factors
+		"""
 		super().__init__()
 		self.module = expert_module
 		self.layer_idx = layer_idx
@@ -919,7 +950,7 @@ class Expert_Wrapper(torch.nn.Module):
 		self.engine_config = engine_config
 		self.model_config = model_config
 		self.core_engine = core_engine
-		self.get_weights = get_weights
+		self.persistent = persistent
 		self.weight_dequant_scale = weight_dequant_scale
 		if self.expert_idx >= 0:
 			self.expert_weights_idx = (
@@ -942,7 +973,8 @@ class Expert_Wrapper(torch.nn.Module):
 		if self.expert_idx != -1:
 			# self.core_engine.clear_expert_buffer(self.layer_idx, 0, Attn_Wrapper.phase)
 			pass
-		if self.get_weights:
+		if not self.persistent:
+			# Load weights from core engine (non-persistent experts)
 			weights_dict = self.core_engine.get_weights(self.expert_weights_idx, Attn_Wrapper.phase)
 			# torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 			# for name, param in self.module.named_parameters():
@@ -950,7 +982,7 @@ class Expert_Wrapper(torch.nn.Module):
 			#         self.weight_dequant_scale is not None
 			#         and name + "_scale_inv" in self.weight_dequant_scale
 			#     ):
-					
+
 			#         param.data = deepseek_v3_dequantization(
 			#             weights_dict[name],
 			#             self.weight_dequant_scale[name + "_scale_inv"]
@@ -1007,9 +1039,9 @@ class Expert_Wrapper(torch.nn.Module):
 				"""deepgemm kernel"""
 				result[start:end] = self.module.deepgemm_forward(micro_batch, self.weight_dequant_scale)
 
-		# Step 3: Clean up
-		if self.get_weights:
-			torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize() 
+		# Step 3: Clean up for non-persistent experts
+		if not self.persistent:
+			torch.cuda.current_stream(self.engine_config.Basic_Config.device_torch).synchronize()
 			self.core_engine.free_weights_buffer(self.expert_weights_idx)
 			# with torch.inference_mode():
 			for name, param in self.module.named_parameters():
