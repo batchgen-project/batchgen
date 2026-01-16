@@ -45,6 +45,7 @@ from .modeling_deepseek_v2 import (
     apply_rotary_pos_emb,
     rotate_half,
 )
+from .configuration_deepseek_v2 import DeepseekV2Config as HFDeepseekV2Config
 
 
 def rotary_pos_emb(t, cos, sin, position_ids, unsqueeze_dim=1):
@@ -491,6 +492,11 @@ class DeepSeek_Initializer:
         self.model = None
         # Use BatchGen's unified config system instead of HuggingFace AutoConfig
         self.loaded_model_config = load_config(huggingface_ckpt_name)
+
+        # Create HuggingFace config for model instantiation (local config class, NOT AutoConfig)
+        self.hf_config = HFDeepseekV2Config()
+        self.hf_config._name_or_path = huggingface_ckpt_name
+
         # TODO:
         self.model_config = self._parse_model_config()
         self._default_engine_config()
@@ -911,10 +917,11 @@ class DeepSeek_Initializer:
 
     def _parse_state_dict(self):
         model_init_start_time = time.perf_counter()
-        self.loaded_model_config._attn_implementation = "eager"
+        # Use HuggingFace config for model instantiation (PretrainedConfig required)
+        self.hf_config._attn_implementation = "eager"
         if self.model_config.model_type == "deepseek_v2":
             self.model = DeepseekV2ForCausalLM._from_config(
-                self.loaded_model_config
+                self.hf_config
             ).to(self.engine_config.Basic_Config.device_torch)
         else:
             raise ValueError("Model not supported")

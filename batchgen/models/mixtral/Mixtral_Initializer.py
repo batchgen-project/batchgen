@@ -32,6 +32,7 @@ from transformers.models.mixtral.modeling_mixtral import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
+from transformers import MixtralConfig as HFMixtralConfig
 
 from batchgen.config.model_registry import load_config
 
@@ -258,6 +259,10 @@ class Mixtral_Initializer:
         self.model = None
         # Use BatchGen's unified config system instead of HuggingFace AutoConfig
         self.loaded_model_config = load_config(huggingface_ckpt_name)
+
+        # Create HuggingFace config for model instantiation (local config class, NOT AutoConfig)
+        self.hf_config = HFMixtralConfig()
+        self.hf_config._name_or_path = huggingface_ckpt_name
 
         self.model_config = self._parse_model_config()
         self._default_engine_config()
@@ -658,8 +663,9 @@ class Mixtral_Initializer:
 
     def _parse_state_dict(self):
         model_init_start_time = time.perf_counter()
-        self.loaded_model_config._attn_implementation = "flash_attention_2"
-        self.model = MixtralForCausalLM._from_config(self.loaded_model_config).to(
+        # Use HuggingFace config for model instantiation (PretrainedConfig required)
+        self.hf_config._attn_implementation = "flash_attention_2"
+        self.model = MixtralForCausalLM._from_config(self.hf_config).to(
             self.engine_config.Basic_Config.device_torch
         )
         self.model.eval()

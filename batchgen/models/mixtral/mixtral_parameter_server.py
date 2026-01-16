@@ -27,7 +27,7 @@ from tqdm import tqdm, trange
 
 # from .deepseekv2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
 # from .deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-from transformers import MixtralForCausalLM
+from transformers import MixtralForCausalLM, MixtralConfig as HFMixtralConfig
 
 from batchgen.config.model_registry import load_config
 
@@ -49,6 +49,10 @@ class Mixtral_Parameter_Server:
         self.state_dict_name_map = {}
         # Use BatchGen's unified config system instead of HuggingFace AutoConfig
         self.model_config = load_config(huggingface_ckpt_name)
+
+        # Create HuggingFace config for model instantiation (local config class, NOT AutoConfig)
+        self.hf_config = HFMixtralConfig()
+        self.hf_config._name_or_path = huggingface_ckpt_name
 
     def Init(self):
         self._save_safetensors_to_pt()
@@ -88,8 +92,9 @@ class Mixtral_Parameter_Server:
         return self.shm_name, self.tensor_meta_shm_name
 
     def _parse_state_dict(self):
-        self.model_config._attn_implementation = "eager"
-        model = MixtralForCausalLM._from_config(self.model_config)
+        # Use HuggingFace config for model instantiation (PretrainedConfig required)
+        self.hf_config._attn_implementation = "eager"
+        model = MixtralForCausalLM._from_config(self.hf_config)
         model.eval()
 
         self.weight_copy_task["attn"] = []

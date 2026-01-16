@@ -28,6 +28,8 @@ import gc
 
 from .deepseekv2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
 from .deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+from .deepseekv2.configuration_deepseek_v2 import DeepseekV2Config as HFDeepseekV2Config
+from .deepseekv3.configuration_deepseek_v3 import DeepseekV3Config as HFDeepseekV3Config
 from ...ckpt_converter.ckpt_converter import ckpt_converter
 from batchgen.config.model_registry import load_config
 
@@ -49,6 +51,16 @@ class DeepSeek_Parameter_Server:
         self.enable_hugetlbfs = enable_hugetlbfs
         # Use BatchGen's unified config system instead of HuggingFace config classes
         self.model_config = load_config(huggingface_ckpt_name)
+
+        # Create HuggingFace config for model instantiation (local config classes, NOT AutoConfig)
+        if self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
+            self.hf_config = HFDeepseekV3Config()
+        elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
+            self.hf_config = HFDeepseekV2Config()
+        else:
+            raise ValueError(f"Unknown architecture: {self.model_config.architectures[0]}")
+        self.hf_config._name_or_path = huggingface_ckpt_name
+
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
@@ -121,11 +133,12 @@ class DeepSeek_Parameter_Server:
         return self.shm_name, self.tensor_meta_shm_name
 
     def _parse_state_dict(self):
-        self.model_config._attn_implementation = "eager"
+        # Use HuggingFace config for model instantiation (PretrainedConfig required)
+        self.hf_config._attn_implementation = "eager"
         if self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
-            model = DeepseekV2ForCausalLM._from_config(self.model_config).to('cpu')
+            model = DeepseekV2ForCausalLM._from_config(self.hf_config).to('cpu')
         elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
-            model = DeepseekV3ForCausalLM._from_config(self.model_config).to('cpu')
+            model = DeepseekV3ForCausalLM._from_config(self.hf_config).to('cpu')
         else:
             raise ValueError("Unknown model architecture")
         model.eval()
