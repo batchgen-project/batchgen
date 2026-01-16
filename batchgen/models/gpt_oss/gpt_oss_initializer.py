@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from ....config.config import EngineConfig, ModelConfig
 from .configuration_gpt_oss import GptOssConfig
+from batchgen.config.model_registry import load_config
 from .planner import GptOssPlanner
 
 try:
@@ -70,9 +71,9 @@ class GptOssInitializer:
     """
 
     def __init__(self, input_arguments):
-        self.hf_model_config = GptOssConfig()
-        self.hf_model_config._name_or_path = input_arguments.huggingface_ckpt_name
-        self.hf_model_config.architectures = ["GptOssForCausalLM"]
+        self.loaded_model_config = GptOssConfig()
+        self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
+        self.loaded_model_config.architectures = ["GptOssForCausalLM"]
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
@@ -194,7 +195,7 @@ class GptOssInitializer:
             weights_storage: Storage for model weights
 
         Returns:
-            Tuple of (core_engine, engine_config, model_config, hf_model_config)
+            Tuple of (core_engine, engine_config, model_config, loaded_model_config)
         """
         try:
             torch.cuda.set_device(self.local_rank)
@@ -206,10 +207,10 @@ class GptOssInitializer:
             )
 
             logging.info("Core engine created")
-            logging.info(f"_name_or_path: {self.hf_model_config._name_or_path}")
+            logging.info(f"_name_or_path: {self.loaded_model_config._name_or_path}")
 
             # GPT-OSS-120B: ~55GB MXFP4 weights
-            if "gpt-oss" in self.hf_model_config._name_or_path.lower():
+            if "gpt-oss" in self.loaded_model_config._name_or_path.lower():
                 param_byte_size = 55 * 1024 * 1024 * 1024  # ~55GB for MXFP4
             else:
                 raise ValueError("Unknown huggingface model card for GPT-OSS")
@@ -225,5 +226,5 @@ class GptOssInitializer:
             self.core_engine,
             self.engine_config,
             self.model_config,
-            self.hf_model_config,
+            self.loaded_model_config,
         )

@@ -24,14 +24,12 @@ from multiprocessing import Process
 import torch
 from safetensors.torch import load_file
 from tqdm import tqdm, trange
-from transformers import AutoConfig
 import gc
 
-from .deepseekv2.configuration_deepseek_v2 import DeepseekV2Config
 from .deepseekv2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
-from .deepseekv3.configuration_deepseek_v3 import DeepseekV3Config
 from .deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from ...ckpt_converter.ckpt_converter import ckpt_converter
+from batchgen.config.model_registry import load_config
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -49,18 +47,8 @@ class DeepSeek_Parameter_Server:
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
-        config_cls = (
-            DeepseekV2Config
-            if "V2" in huggingface_ckpt_name
-            else DeepseekV3Config
-        )
-        self.hf_model_config = config_cls.from_pretrained(
-            huggingface_ckpt_name,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-        self.hf_model_config._name_or_path = huggingface_ckpt_name
-        self.hf_model_config.architectures = ["DeepseekV3ForCausalLM"]
+        # Use BatchGen's unified config system instead of HuggingFace config classes
+        self.model_config = load_config(huggingface_ckpt_name)
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
         total_memory = total_memory / 1024 / 1024 / 1024
@@ -69,7 +57,7 @@ class DeepSeek_Parameter_Server:
 
 
 
-        # self.hf_model_config = AutoConfig.from_pretrained(huggingface_ckpt_name, cache_dir=cache_dir, trust_remote_code=True)
+        # self.model_config = AutoConfig.from_pretrained(huggingface_ckpt_name, cache_dir=cache_dir, trust_remote_code=True)
 
     def Init(self):
         # log gpu 0 memory usage before init
@@ -85,13 +73,13 @@ class DeepSeek_Parameter_Server:
         logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory} GB / {total_memory} GB")
 
         self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
-        logging.info(f"architectures: {self.hf_model_config.architectures[0]}")
-        if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
+        logging.info(f"architectures: {self.model_config.architectures[0]}")
+        if self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
             if "DeepSeek-V2-Lite" in self.huggingface_ckpt_name:
                 byte_size = 32 * 1024 * 1024 * 1024
             else:
                 byte_size = 236 * 1024 * 1024 * 1024 * 2
-        elif self.hf_model_config.architectures[0] == "DeepseekV3ForCausalLM":
+        elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
             byte_size = 675 * 1024 * 1024 * 1024
         else:
             raise ValueError("Unknown huggingface model card")
@@ -133,11 +121,11 @@ class DeepSeek_Parameter_Server:
         return self.shm_name, self.tensor_meta_shm_name
 
     def _parse_state_dict(self):
-        self.hf_model_config._attn_implementation = "eager"
-        if self.hf_model_config.architectures[0] == "DeepseekV2ForCausalLM":
-            model = DeepseekV2ForCausalLM._from_config(self.hf_model_config).to('cpu')
-        elif self.hf_model_config.architectures[0] == "DeepseekV3ForCausalLM":
-            model = DeepseekV3ForCausalLM._from_config(self.hf_model_config).to('cpu')
+        self.model_config._attn_implementation = "eager"
+        if self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
+            model = DeepseekV2ForCausalLM._from_config(self.model_config).to('cpu')
+        elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
+            model = DeepseekV3ForCausalLM._from_config(self.model_config).to('cpu')
         else:
             raise ValueError("Unknown model architecture")
         model.eval()
@@ -161,7 +149,7 @@ class DeepSeek_Parameter_Server:
                 }
             self.weight_copy_task["attn"].append("attn_" + str(layer_idx))
 
-            if layer_idx >= self.hf_model_config.first_k_dense_replace:
+            if layer_idx >= self.model_config.first_k_dense_replace:
                 for name, _ in model.model.layers[
                     layer_idx
                 ].mlp.shared_experts.named_parameters():

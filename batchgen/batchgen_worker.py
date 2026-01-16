@@ -14,7 +14,9 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
+
+from batchgen.config.model_registry import load_config
 
 from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
 from batchgen.models.wrappers import BaseModuleWrapper
@@ -332,7 +334,7 @@ class BatchGenWorker:
 		self.gpu_paged_kv_cache_manager = None
 		self.model = None
 		self.model_config = None
-		self.hf_model_config = None
+		self.loaded_model_config = None
 		self.engine_config = None
 		self.core_engine = None
 		self.tokenizer = None
@@ -1008,11 +1010,7 @@ class BatchGenWorker:
 		
 		config_torch_module_initializer()
 		
-		self.model_config = AutoConfig.from_pretrained(
-			self.cache_dir,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
+		self.model_config = load_config(self.cache_dir)
 		
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
@@ -1073,7 +1071,7 @@ class BatchGenWorker:
 		self.input_arguments = InputArguments(**input_arguments)
 		self.initializer = get_initializer(self.huggingface_ckpt_name)
 		self.initializer = self.initializer(self.input_arguments)
-		self.core_engine, self.engine_config, self.model_config, self.hf_model_config = (
+		self.core_engine, self.engine_config, self.model_config, self.loaded_model_config = (
 			self.initializer.Init(self.weights_storage)
 		)
 
@@ -1082,7 +1080,7 @@ class BatchGenWorker:
 		
 		self.parallel_manager = get_parallel_strategy_manager(self.huggingface_ckpt_name)
 		self.parallel_manager = self.parallel_manager(
-			self.hf_model_config,
+			self.loaded_model_config,
 			self.engine_config,
 			self.model_config,
 			self.core_engine,
@@ -1835,7 +1833,7 @@ class BatchGenWorker:
 		# CRITICAL: Use GPU KV manager's config for tensor shape - this matches what
 		# copy_kv_to_tensor() returns and what copy_tensor_to_kv() expects.
 		# For MLA: num_k_heads=1 (latent attention), k_head_dim=576 (compressed KV)
-		# Do NOT use model_config.num_key_value_heads or hf_model_config.qk_rope_head_dim
+		# Do NOT use model_config.num_key_value_heads or loaded_model_config.qk_rope_head_dim
 		# as those have different values!
 		gpu_kv_config = self.gpu_paged_kv_cache_manager.config
 		num_layers = self.model_config.num_hidden_layers
@@ -7191,7 +7189,7 @@ class BatchGenWorker:
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
 			attn_module._unregister_fp8_weights()
-			if layer_idx >= self.hf_model_config.first_k_dense_replace:
+			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 				if hasattr(self.model.model.layers[layer_idx].mlp.shared_experts, '_unregister_fp8_weights'):
 					self.model.model.layers[layer_idx].mlp.shared_experts._unregister_fp8_weights()
 				for routed_expert_idx in range(self.model_config.num_local_experts):

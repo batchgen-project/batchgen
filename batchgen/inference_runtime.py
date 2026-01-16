@@ -21,12 +21,12 @@ from batchgen.utils import deep_free_model_memory
 	- get_current_phase: get the current phase, prefill or decode
 """
 class InferenceRuntime:
-	def __init__(self, model_name: str, engine_config, model_config, hf_model_config, core_engine, skeleton_state_dict, local_rank:int, global_rank:int, world_size:int):
+	def __init__(self, model_name: str, engine_config, model_config, loaded_model_config, core_engine, skeleton_state_dict, local_rank:int, global_rank:int, world_size:int):
 		""" Init variables """
 		self.model_name = model_name
 		self.engine_config = engine_config
 		self.model_config = model_config
-		self.hf_model_config = hf_model_config
+		self.loaded_model_config = loaded_model_config
 		self.core_engine = core_engine
 		self.skeleton_state_dict = skeleton_state_dict
 		self.local_rank = local_rank
@@ -36,7 +36,7 @@ class InferenceRuntime:
 		""" Init model initializer, currently named parallel manager """
 		self.parallel_manager = get_parallel_strategy_manager(self.model_name)
 		self.parallel_manager = self.parallel_manager(
-			self.hf_model_config,
+			self.loaded_model_config,
 			self.engine_config,
 			self.model_config,
 			self.core_engine,
