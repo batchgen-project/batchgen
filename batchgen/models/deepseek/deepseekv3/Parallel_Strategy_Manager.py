@@ -292,7 +292,7 @@ class DeepseekV3ParallelStrategyManager:
 		# 		layer.warmup()
 
 
-	def configure_decoding(self, padding_bsz=None):
+	def configure_decoding(self, padding_bsz=None, comm=None):
 		"""
 			Configure a model skeleton for decoding,
 			DP + EP with optional offloading.
@@ -301,6 +301,8 @@ class DeepseekV3ParallelStrategyManager:
 				padding_bsz: Maximum batch size per rank for token buffer allocation.
 					Required for EP offloading mode (moe_infer_loop_with_offloading).
 					If None, uses BATCHGEN_MAX_RANK_BSZ env var or defaults to 128.
+				comm: NCCL communicator for all-gather/all-reduce operations.
+					Required for EP offloading mode to enable distributed MoE forward.
 
 			When enable_offloading is True:
 			- Uses offloading_ratio to determine which experts are persistent (GPU-resident)
@@ -311,9 +313,13 @@ class DeepseekV3ParallelStrategyManager:
 		self.loaded_model_config._attn_implementation = "eager"
 		self.model = None
 		torch.cuda.empty_cache()
-		self.model = DeepseekV3ForCausalLM._from_config(
-			self.loaded_model_config
-		)
+		# Use comm if provided (EP offloading mode), otherwise use _from_config (legacy mode)
+		if comm is not None:
+			self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
+		else:
+			self.model = DeepseekV3ForCausalLM._from_config(
+				self.loaded_model_config
+			)
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
 		self.weight_copy_task["attn"] = []

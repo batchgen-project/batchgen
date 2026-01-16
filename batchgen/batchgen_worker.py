@@ -4327,14 +4327,20 @@ class BatchGenWorker:
 
 		# STEP 1: Configure model for decoding first (needed for accurate GPU KV size calculation)
 		# Use pure_gpu_decoding() for:
-		#   - Multi-node (world_size > 8): needs NCCL comm for all-gather/all-reduce
-		#   - EP with offloading: needs same NCCL comm setup as multi-node
+		#   - Multi-node (world_size > 8): all experts on GPU, no offloading needed
 		# Use configure_decoding() for:
 		#   - Single-node without EP offloading: legacy mode, no NCCL comm needed
-		use_pure_gpu_decoding = (self.world_size > 8) or getattr(self.engine_config.EP_Config, 'enable_offloading', False)
+		#   - Single-node with EP offloading: partial experts persistent, needs NCCL comm
+		use_pure_gpu_decoding = (self.world_size > 8)
+		enable_ep_offloading = getattr(self.engine_config.EP_Config, 'enable_offloading', False)
 
 		if not use_pure_gpu_decoding:
-			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(padding_bsz=max_num_seq)
+			# Single-node: use configure_decoding with optional comm for EP offloading
+			# EP offloading needs comm for all-gather/all-reduce in MoE forward
+			decoding_comm = comm if enable_ep_offloading else None
+			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
+				padding_bsz=max_num_seq, comm=decoding_comm
+			)
 			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
