@@ -1,6 +1,5 @@
 import torch
 import deep_gemm
-import logging
 
 def w8a8_deepgemm(
     a: torch.Tensor,
@@ -17,14 +16,6 @@ def w8a8_deepgemm(
     """
     M, K = a.shape
     N = w.shape[0]
-
-    # DEBUG: Log tensor dimensions to diagnose deep_gemm assertion errors
-    logging.info(
-        f"[w8a8_deepgemm] a.shape={a.shape}, a.dim={a.dim()}, a.dtype={a.dtype}, "
-        f"a_scale.shape={a_scale.shape}, a_scale.dim={a_scale.dim()}, "
-        f"w.shape={w.shape}, w.dim={w.dim()}, w.dtype={w.dtype}, "
-        f"w_scale.shape={w_scale.shape}, w_scale.dim={w_scale.dim()}"
-    )
 
     # Ensure contiguity
     a = a.contiguous()

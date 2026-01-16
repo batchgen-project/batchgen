@@ -430,6 +430,10 @@ class DeepseekV3ParallelStrategyManager:
 		self._extract_dequantize_scale()
 		self._load_model_skeleton()
 		self._load_local_routed_experts()
+		# Load attention and shared expert FP8 weights (required for attn_mode=3 / EP offloading)
+		# These are persistent on GPU, but need explicit loading like pure_gpu_decoding does
+		self._load_attn_module()
+		self._load_shared_expert_module()
 		self._config_attn_module()
 		self._config_expert_module()
 		self._config_lm_head_hook()

@@ -2004,17 +2004,6 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 
 	hidden_states, hidden_states_scale = act_quant(hidden_states)
 
-	# DEBUG: Log tensor shapes before w8a8_deepgemm
-	if layer_idx == 0:
-		logging.info(
-			f"[DEBUG w8a8_deepgemm] layer={layer_idx}, bsz={bsz}, "
-			f"hidden_states.shape={hidden_states.shape}, hidden_states.dtype={hidden_states.dtype}, "
-			f"hidden_states_scale.shape={hidden_states_scale.shape}, hidden_states_scale.dtype={hidden_states_scale.dtype}, "
-			f"q_a_proj.weight.shape={self.q_a_proj.weight.shape}, q_a_proj.weight.dtype={self.q_a_proj.weight.dtype}, "
-			f"q_a_proj_scale.shape={weight_scale['q_a_proj.weight_scale_inv'].shape}, "
-			f"q_a_proj_scale.dtype={weight_scale['q_a_proj.weight_scale_inv'].dtype}"
-		)
-
 	q = w8a8_deepgemm(
 		hidden_states,
 		hidden_states_scale,
