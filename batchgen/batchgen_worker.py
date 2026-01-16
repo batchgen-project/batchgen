@@ -1010,7 +1010,7 @@ class BatchGenWorker:
 		
 		config_torch_module_initializer()
 		
-		self.model_config = load_config(self.cache_dir)
+		self.model_config = load_config(self.huggingface_ckpt_name)
 		
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
