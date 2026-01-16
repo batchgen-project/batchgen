@@ -4326,7 +4326,14 @@ class BatchGenWorker:
 		max_num_seq = int(num_seq_per_rank.max().item())
 
 		# STEP 1: Configure model for decoding first (needed for accurate GPU KV size calculation)
-		if self.world_size <= 8:
+		# Use pure_gpu_decoding() for:
+		#   - Multi-node (world_size > 8): needs NCCL comm for all-gather/all-reduce
+		#   - EP with offloading: needs same NCCL comm setup as multi-node
+		# Use configure_decoding() for:
+		#   - Single-node without EP offloading: legacy mode, no NCCL comm needed
+		use_pure_gpu_decoding = (self.world_size > 8) or getattr(self.engine_config.EP_Config, 'enable_offloading', False)
+
+		if not use_pure_gpu_decoding:
 			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(padding_bsz=max_num_seq)
 			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()

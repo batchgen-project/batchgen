@@ -493,9 +493,15 @@ class DeepseekV3ParallelStrategyManager:
 			Beta 1: Load full mode into GPU.
 			Duplicate attention modules and shared experts in each dp worker.
 			Split routed experts.
+
+			Also used for EP with offloading on single-node (8 GPUs) since it requires
+			the same NCCL comm setup for all-gather/all-reduce operations.
 		"""
 		self.loaded_model_config.phase = "decode"
 		self.loaded_model_config._attn_implementation = "eager"
+
+		# Store EP offloading flag for use in _init_mode_decoding() and _config_expert_module()
+		self.enable_ep_offloading = self.engine_config.EP_Config.enable_offloading
 
 		self.model = None
 		torch.cuda.empty_cache()
@@ -536,6 +542,20 @@ class DeepseekV3ParallelStrategyManager:
 		self._config_attn_module()
 		self._config_expert_module()
 		self._config_lm_head_hook()
+
+		# Set enable_ep_offloading flag on MoE layers for loop-based execution
+		if self.enable_ep_offloading:
+			for layer_idx in range(
+				self.loaded_model_config.first_k_dense_replace,
+				self.model_config.num_hidden_layers,
+			):
+				layer = self.model.model.layers[layer_idx]
+				layer.mlp.enable_ep_offloading = True
+			logging.info(
+				f"Rank {self.rank}: Set enable_ep_offloading=True on MoE layers "
+				f"(layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1})"
+			)
+
 		self._init_mode_decoding()
 		self._init_decoding_padding_bsz(padding_bsz)
 
