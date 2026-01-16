@@ -1095,10 +1095,30 @@ class TransformerBlock(torch.nn.Module):
         x = hidden_states
 
         with DECODE_TIMING.time(f"attn"):
-            x = self.attn(x, attention_mask=attention_mask)
+            attn_out = self.attn(x, attention_mask=attention_mask)
 
         with DECODE_TIMING.time(f"mlp"):
-            x = self.mlp(x)
+            mlp_out = self.mlp(attn_out)
+
+        # Debug: Log hidden state values at layer 0 and 35 (first few decode calls)
+        if self.layer_idx in (0, 35) and DECODE_TIMING.enabled:
+            call_count = DECODE_TIMING.call_counts.get("attn", 0)
+            if call_count <= 3:
+                import logging
+                in_max = hidden_states.abs().max().item()
+                attn_max = attn_out.abs().max().item()
+                mlp_max = mlp_out.abs().max().item()
+                in_mean = hidden_states.float().mean().item()
+                attn_mean = attn_out.float().mean().item()
+                mlp_mean = mlp_out.float().mean().item()
+                logging.info(
+                    f"[LAYER {self.layer_idx} DEBUG] call #{call_count}: "
+                    f"input (max={in_max:.2f}, mean={in_mean:.4f}) -> "
+                    f"attn (max={attn_max:.2f}, mean={attn_mean:.4f}) -> "
+                    f"mlp (max={mlp_max:.2f}, mean={mlp_mean:.4f})"
+                )
+
+        x = mlp_out
 
         # ALWAYS return tuple (hidden_states, past_key_value) to match HuggingFace format
         # BatchGenWorker expects tuple output and does `hidden_states = layer_output[0]`
@@ -1131,9 +1151,21 @@ class Transformer(torch.nn.Module):
             dtype=torch.bfloat16,
         )
 
+    # Debug counter for forward pass logging
+    _forward_debug_count = 0
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import logging
+
         with DECODE_TIMING.time("embedding"):
             x = self.embedding(x)
+
+        # Debug: Log embedding output (first few calls)
+        Transformer._forward_debug_count += 1
+        if Transformer._forward_debug_count <= 3:
+            emb_max = x.abs().max().item()
+            emb_mean = x.float().mean().item()
+            logging.info(f"[TRANSFORMER DEBUG] call #{Transformer._forward_debug_count}: embedding out (max={emb_max:.2f}, mean={emb_mean:.4f})")
 
         for block in self.block:
             x = block(x)
@@ -1141,13 +1173,36 @@ class Transformer(torch.nn.Module):
             if isinstance(x, tuple):
                 x = x[0]
 
+        # Debug: Log final hidden states before norm
+        if Transformer._forward_debug_count <= 3:
+            pre_norm_max = x.abs().max().item()
+            pre_norm_mean = x.float().mean().item()
+
         with DECODE_TIMING.time("final_norm"):
             x = self.norm(x)
 
-        with DECODE_TIMING.time("unembedding"):
-            x = self.unembedding(x)
+        # Debug: Log after norm
+        if Transformer._forward_debug_count <= 3:
+            post_norm_max = x.abs().max().item()
+            post_norm_mean = x.float().mean().item()
 
-        return x
+        with DECODE_TIMING.time("unembedding"):
+            logits = self.unembedding(x)
+
+        # Debug: Log logits
+        if Transformer._forward_debug_count <= 3:
+            logits_max = logits.abs().max().item()
+            logits_mean = logits.float().mean().item()
+            # Also check top prediction
+            top_token = logits[:, -1, :].argmax(dim=-1)[0].item() if logits.dim() == 3 else logits[-1, :].argmax().item()
+            logging.info(
+                f"[TRANSFORMER DEBUG] call #{Transformer._forward_debug_count}: "
+                f"pre_norm (max={pre_norm_max:.2f}, mean={pre_norm_mean:.4f}) -> "
+                f"post_norm (max={post_norm_max:.2f}, mean={post_norm_mean:.4f}) -> "
+                f"logits (max={logits_max:.2f}, mean={logits_mean:.4f}), top_token={top_token}"
+            )
+
+        return logits
 
     @staticmethod
     def from_checkpoint(

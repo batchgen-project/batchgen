@@ -5935,12 +5935,13 @@ class BatchGenWorker:
 				wrapper_class.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 			# Enable timing stats and reset debug counters for decode phase
 			try:
-				from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING, ExpertMLP
+				from batchgen.models.openai.gpt_oss_120b.model import DECODE_TIMING, ExpertMLP, Transformer
 				from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import GptOssExpertWrapper
 				from batchgen.moe.fused_mxfp4_gemm import reset_gemm_debug_for_decode
 				DECODE_TIMING.enable()
 				ExpertMLP.reset_debug_for_decode()
 				GptOssExpertWrapper._wrapper_debug_count = 0  # Reset wrapper debug counter
+				Transformer._forward_debug_count = 0  # Reset transformer debug counter
 				reset_gemm_debug_for_decode()  # Reset GEMM debug counter
 				logging.info(f"Rank {self.rank}: DECODE_TIMING enabled={DECODE_TIMING.enabled}, all debug counters reset for decode")
 			except ImportError as e:
