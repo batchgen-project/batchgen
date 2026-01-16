@@ -292,10 +292,15 @@ class DeepseekV3ParallelStrategyManager:
 		# 		layer.warmup()
 
 
-	def configure_decoding(self):
+	def configure_decoding(self, padding_bsz=None):
 		"""
 			Configure a model skeleton for decoding,
 			DP + EP with optional offloading.
+
+			Args:
+				padding_bsz: Maximum batch size per rank for token buffer allocation.
+					Required for EP offloading mode (moe_infer_loop_with_offloading).
+					If None, uses BATCHGEN_MAX_RANK_BSZ env var or defaults to 128.
 
 			When enable_offloading is True:
 			- Uses offloading_ratio to determine which experts are persistent (GPU-resident)
@@ -458,6 +463,14 @@ class DeepseekV3ParallelStrategyManager:
 		if self.rank == 0:
 			used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
 			logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
+
+		# Initialize MoE layers for decoding (required for EP offloading mode)
+		# This sets up num_tokens_per_rank and other buffers needed for all-gather/all-reduce
+		self._init_mode_decoding()
+		# Use provided padding_bsz, or default to 128 if not provided
+		# _init_decoding_padding_bsz will also check BATCHGEN_MAX_RANK_BSZ env var
+		effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
+		self._init_decoding_padding_bsz(effective_padding_bsz)
 
 		# Log weight_copy_task summary for debugging
 		logging.info(

@@ -4327,7 +4327,7 @@ class BatchGenWorker:
 
 		# STEP 1: Configure model for decoding first (needed for accurate GPU KV size calculation)
 		if self.world_size <= 8:
-			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
+			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(padding_bsz=max_num_seq)
 			self.set_phase("decode")
 			self.core_engine.stop_h2d_worker()
 			self.core_engine.clear_kv_copy_queue()
