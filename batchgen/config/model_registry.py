@@ -29,16 +29,20 @@ Usage:
     # Load config from local model directory
     config = load_config("/path/to/model")
 
+    # Load config from HuggingFace model identifier
+    config = load_config("deepseek-ai/DeepSeek-R1", cache_dir="/path/to/cache")
+
     # Access config attributes
     print(config.model_type)
     print(config.num_hidden_layers)
     print(config.is_moe())
 """
 
-from typing import Dict, Type, TYPE_CHECKING
+from typing import Dict, Type, Optional, TYPE_CHECKING
 from pathlib import Path
 import json
 import logging
+import os
 
 if TYPE_CHECKING:
     from .model_config import BaseModelConfig
@@ -56,6 +60,18 @@ ARCH_PATTERNS: Dict[str, str] = {
     "Mixtral": "mixtral",
     "GptOss": "gpt_oss",
     "Qwen2Moe": "qwen2_moe",
+}
+
+# Model name/identifier patterns for detection from HuggingFace model IDs
+# Maps patterns found in model names to model_type
+MODEL_NAME_PATTERNS: Dict[str, str] = {
+    "DeepSeek-R1": "deepseek_v3",
+    "DeepSeek-V3": "deepseek_v3",
+    "DeepSeek-V2-Lite": "deepseek_v2",
+    "DeepSeek-V2": "deepseek_v2",
+    "Mixtral-8x22B": "mixtral",
+    "Mixtral-8x7B": "mixtral",
+    "gpt-oss": "gpt_oss",
 }
 
 
@@ -81,69 +97,100 @@ def register_config(model_type: str):
     return decorator
 
 
-def load_config(model_dir: str) -> "BaseModelConfig":
-    """Auto-detect model type and load config from local directory.
+def _detect_model_type_from_identifier(model_identifier: str) -> Optional[str]:
+    """Detect model type from HuggingFace model identifier.
+
+    Args:
+        model_identifier: HuggingFace model ID (e.g., "deepseek-ai/DeepSeek-R1")
+
+    Returns:
+        model_type string if detected, None otherwise
+    """
+    # Check each pattern - order matters (more specific patterns first)
+    # MODEL_NAME_PATTERNS is ordered with more specific patterns first
+    for pattern, model_type in MODEL_NAME_PATTERNS.items():
+        if pattern in model_identifier:
+            logger.debug(f"Detected model_type={model_type} from identifier={model_identifier}")
+            return model_type
+    return None
+
+
+def load_config(model_identifier: str) -> "BaseModelConfig":
+    """Auto-detect model type and load appropriate BatchGen config.
 
     This function replaces HuggingFace's AutoConfig.from_pretrained().
 
     Detection order:
-    1. Try model_type field in config.json
-    2. Fallback: detect from architectures field
-    3. Ultimate fallback: use BaseModelConfig
+    1. Try to detect model type from HuggingFace model identifier patterns
+    2. If local directory, try model_type field in config.json
+    3. Fallback: detect from architectures field in config.json
+    4. Ultimate fallback: use BaseModelConfig
 
     Args:
-        model_dir: Path to model directory containing config.json
+        model_identifier: Either a HuggingFace model ID (e.g., "deepseek-ai/DeepSeek-R1")
+                         or a local path to model directory containing config.json
 
     Returns:
-        Appropriate config class instance
+        Appropriate config class instance with pre-defined BatchGen defaults
 
     Raises:
-        FileNotFoundError: If config.json doesn't exist
-        json.JSONDecodeError: If config.json is invalid
+        ValueError: If model type cannot be detected and no local config.json exists
     """
     from .model_config import BaseModelConfig
 
-    config_path = Path(model_dir) / "config.json"
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    with open(config_path, 'r') as f:
-        data = json.load(f)
-
     config = None
 
-    # Try model_type first
-    model_type = data.get("model_type", "")
-    if model_type in CONFIG_REGISTRY:
-        logger.debug(f"Loading config for model_type={model_type}")
-        config = CONFIG_REGISTRY[model_type].from_dir(model_dir)
-    else:
-        # Fallback: detect from architectures
-        archs = data.get("architectures", [])
-        for arch in archs:
-            for pattern, config_type in ARCH_PATTERNS.items():
-                if pattern in arch and config_type in CONFIG_REGISTRY:
-                    logger.debug(
-                        f"Detected model_type={config_type} from architecture={arch}"
-                    )
-                    config = CONFIG_REGISTRY[config_type].from_dir(model_dir)
+    # Step 1: Try to detect model type from identifier patterns
+    detected_type = _detect_model_type_from_identifier(model_identifier)
+    if detected_type and detected_type in CONFIG_REGISTRY:
+        logger.info(f"Using built-in config for model_type={detected_type}")
+        config = CONFIG_REGISTRY[detected_type]()
+        config._name_or_path = model_identifier
+        return config
+
+    # Step 2: Check if it's a local directory with config.json
+    config_path = Path(model_identifier) / "config.json"
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            data = json.load(f)
+
+        # Try model_type first
+        model_type = data.get("model_type", "")
+        if model_type in CONFIG_REGISTRY:
+            logger.debug(f"Loading config for model_type={model_type}")
+            config = CONFIG_REGISTRY[model_type].from_dir(model_identifier)
+        else:
+            # Fallback: detect from architectures
+            archs = data.get("architectures", [])
+            for arch in archs:
+                for pattern, config_type in ARCH_PATTERNS.items():
+                    if pattern in arch and config_type in CONFIG_REGISTRY:
+                        logger.debug(
+                            f"Detected model_type={config_type} from architecture={arch}"
+                        )
+                        config = CONFIG_REGISTRY[config_type].from_dir(model_identifier)
+                        break
+                if config is not None:
                     break
-            if config is not None:
-                break
 
-    if config is None:
-        # Ultimate fallback: use base config
-        logger.warning(
-            f"Unknown model type '{model_type}' with architectures {archs}. "
-            f"Using BaseModelConfig. Registered types: {list(CONFIG_REGISTRY.keys())}"
-        )
-        config = BaseModelConfig.from_dir(model_dir)
+        if config is None:
+            # Ultimate fallback: use base config from local file
+            logger.warning(
+                f"Unknown model type '{model_type}' with architectures {archs}. "
+                f"Using BaseModelConfig. Registered types: {list(CONFIG_REGISTRY.keys())}"
+            )
+            config = BaseModelConfig.from_dir(model_identifier)
 
-    # Set _name_or_path to the model directory for compatibility
-    config._name_or_path = model_dir
+        config._name_or_path = model_identifier
+        return config
 
-    return config
+    # Step 3: No local config.json and pattern not recognized
+    raise ValueError(
+        f"Cannot detect model type for '{model_identifier}'. "
+        f"Not a recognized HuggingFace model ID and no local config.json found. "
+        f"Known patterns: {list(MODEL_NAME_PATTERNS.keys())}. "
+        f"Registered model types: {list(CONFIG_REGISTRY.keys())}"
+    )
 
 
 def get_registered_models() -> Dict[str, Type["BaseModelConfig"]]:
