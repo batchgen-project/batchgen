@@ -409,34 +409,46 @@ class GptOssAttnWrapper(nn.Module):
         KV cache was populated during prefill.
 
         Args:
-            hidden_states: Input tensor [batch, hidden_size]
+            hidden_states: Input tensor [batch, hidden_size] or [batch, seq, hidden_size]
             **kwargs: Additional arguments (position_ids, cache_seqlens, etc.)
 
         Returns:
-            output: Attention output tensor
+            output: Attention output tensor (same shape as input)
         """
         gpu_paged_kv_manager = GptOssAttnWrapper.gpu_paged_kv_manager
         if gpu_paged_kv_manager is None:
             raise RuntimeError("Mode 3 requires gpu_paged_kv_manager to be set")
+
+        # Handle 3D input: [batch, seq, hidden] -> [batch*seq, hidden]
+        # For decode, seq should be 1, so this mainly ensures consistent 2D format
+        original_shape = hidden_states.shape
+        if hidden_states.dim() == 3:
+            orig_batch_dim, orig_seq_len, hidden_size = hidden_states.shape
+            hidden_states_2d = hidden_states.view(orig_batch_dim * orig_seq_len, hidden_size)
+        else:
+            orig_batch_dim = None
+            orig_seq_len = None
+            hidden_states_2d = hidden_states
 
         # Get parameters from kwargs or class-level state
         position_ids = kwargs.get('position_ids', GptOssAttnWrapper.position_ids)
         batch_slice = kwargs.get('batch_slice')
 
         # Compute cache_seqlens from sequence_lengths
-        batch_size = hidden_states.shape[0]
+        # Use the actual decode batch size (number of sequences)
+        batch_size = hidden_states_2d.shape[0]
         cache_seqlens = torch.tensor(
             [GptOssAttnWrapper.sequence_lengths.get(
                 GptOssAttnWrapper.cur_batch[i] if i < len(GptOssAttnWrapper.cur_batch) else i, 0
             ) for i in range(batch_size)],
             dtype=torch.int32,
-            device=hidden_states.device
+            device=hidden_states_2d.device
         )
         max_seqlen = cache_seqlens.max().item()
 
-        # Call mode 3 attention
+        # Call mode 3 attention with 2D input
         attn_output, k_new, v_new = self.module.decoding_attn_mode_3_bf16(
-            hidden_states,
+            hidden_states_2d,
             position_ids,
             cache_seqlens,
             max_seqlen,
@@ -450,7 +462,13 @@ class GptOssAttnWrapper(nn.Module):
             GptOssAttnWrapper.sequence_lengths[seq_id] = cache_seqlens[i].item() + 1
 
         # Add residual connection (critical for transformer to work!)
-        return hidden_states + attn_output
+        result = hidden_states_2d + attn_output
+
+        # Restore 3D shape if input was 3D
+        if orig_batch_dim is not None:
+            result = result.view(orig_batch_dim, orig_seq_len, -1)
+
+        return result
 
     def _unregister_fp8_weights(self):
         """No-op for FP8 weight unregistration.
