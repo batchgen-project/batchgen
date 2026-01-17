@@ -5174,6 +5174,9 @@ class BatchGenWorker:
 
 		timing.process_ms = (time.perf_counter() - t0) * 1000
 
+		# Calculate completed count BEFORE early return to ensure final iteration reports correctly
+		timing.total_completed_cumulative = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
+
 		if not decode_uuids:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing, False

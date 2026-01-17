@@ -493,19 +493,6 @@ class DeepseekV3ParallelStrategyManager:
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
 			self._init_ata_comms(effective_padding_bsz)
 
-		# Log weight_copy_task summary for debugging
-		logging.info(
-			f"Rank {self.rank}: weight_copy_task summary - "
-			f"attn: {len(self.weight_copy_task['attn'])}, "
-			f"shared_expert: {len(self.weight_copy_task['shared_expert'])}, "
-			f"routed_expert: {len(self.weight_copy_task['routed_expert'])}"
-		)
-		if len(self.weight_copy_task['routed_expert']) > 0:
-			logging.info(
-				f"Rank {self.rank}: First few offloaded experts: "
-				f"{self.weight_copy_task['routed_expert'][:5]}"
-			)
-
 		# Warmup compiled kernels
 		self._warmup()
 
@@ -679,7 +666,8 @@ class DeepseekV3ParallelStrategyManager:
 		# In EP offloading, non-persistent experts don't have fp8_gate/fp8_up/fp8_down registered
 		# and moe_infer_loop_with_offloading() doesn't use these pointer lists anyway
 		if self.enable_ep_offloading:
-			logging.info("EP offloading mode: skipping grouped GEMM init (using loop-based execution)")
+			if self.rank == 0:
+				logging.info("EP offloading mode: skipping grouped GEMM init (using loop-based execution)")
 			return
 
 		for layer_idx in range(
