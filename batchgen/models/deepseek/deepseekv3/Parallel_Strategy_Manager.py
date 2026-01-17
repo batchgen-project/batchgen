@@ -294,53 +294,59 @@ class DeepseekV3ParallelStrategyManager:
 
 	def configure_decoding(self, padding_bsz=None, comm=None):
 		"""
-			Configure a model skeleton for decoding,
-			DP + EP with optional offloading.
+		Configure model for decoding: DP + EP with optional offloading.
 
-			Args:
-				padding_bsz: Maximum batch size per rank for token buffer allocation.
-					Required for EP offloading mode (moe_infer_loop_with_offloading).
-					If None, uses BATCHGEN_MAX_RANK_BSZ env var or defaults to 128.
-				comm: NCCL communicator for all-gather/all-reduce operations.
-					Required for EP offloading mode to enable distributed MoE forward.
+		Handles all deployment scenarios:
+		- Multi-node (world_size > 8): all experts persistent (no offloading)
+		- Single-node with EP offloading: partial persistence based on offloading_ratio
+		- Single-node without offloading: all experts persistent
 
-			When enable_offloading is True:
-			- Uses offloading_ratio to determine which experts are persistent (GPU-resident)
-			- persistent=True: weights pre-loaded on GPU
-			- persistent=False: weights loaded from buffer each forward
+		Args:
+			padding_bsz: Maximum batch size per rank for token buffer allocation.
+				Required for EP offloading mode (moe_infer_loop_with_offloading).
+				If None, uses BATCHGEN_MAX_RANK_BSZ env var or defaults to 128.
+			comm: NCCL communicator for all-gather/all-reduce operations.
+				Required for distributed MoE forward.
+
+		When enable_offloading is True:
+		- Uses offloading_ratio to determine which experts are persistent (GPU-resident)
+		- persistent=True: weights pre-loaded on GPU
+		- persistent=False: weights loaded from buffer each forward
 		"""
 		self.loaded_model_config.phase = "decode"
 		self.loaded_model_config._attn_implementation = "eager"
 		self.model = None
 		torch.cuda.empty_cache()
-		# Use comm if provided (EP offloading mode), otherwise use _from_config (legacy mode)
-		if comm is not None:
-			self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
-		else:
-			self.model = DeepseekV3ForCausalLM._from_config(
-				self.loaded_model_config
-			)
+
+		# Always use comm for NCCL collectives
+		self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
+
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
 		self.weight_copy_task["attn"] = []
 		self.weight_copy_task["routed_expert"] = []
 		self.weight_copy_task["shared_expert"] = []
 
-		# We have 8 devices and 256 experts per layer.
-		# In this case, we hold NUM_LOCAL_EXPERT_PER_LAYER in the GPU and the 32 - NUM_LOCAL_EXPERT_PER_LAYER in the host memory.
-		# So the self.local_routed_experts in just the names of experts in each rank's GPU.
-
 		self.local_routed_experts = []
 		self.host_routed_experts = []
-		# self.expert_location_map = {}
 
 		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
 		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
 
-		# Calculate NUM_LOCAL_EXPERT_PER_LAYER based on offloading settings
-		if self.engine_config.EP_Config.enable_offloading:
-			# Use offloading_ratio: (1 - ratio) are persistent, ratio are offloaded
+		# Determine offloading behavior based on deployment scenario
+		if self.world_size > 8:
+			# Multi-node: all experts persistent (no offloading across nodes)
+			offload_ratio = 0.0
+			self.enable_ep_offloading = False
+			NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
+			logging.info(
+				f"Rank {self.rank}: Multi-node mode (world_size={self.world_size}). "
+				f"All {NUM_EXPERT_PER_RANK} experts per rank are persistent."
+			)
+		elif self.engine_config.EP_Config.enable_offloading:
+			# Single-node with EP offloading
 			offload_ratio = self.engine_config.EP_Config.offloading_ratio
+			self.enable_ep_offloading = True
 			NUM_LOCAL_EXPERT_PER_LAYER = int(NUM_EXPERT_PER_RANK * (1 - offload_ratio))
 			logging.info(
 				f"Rank {self.rank}: EP with offloading enabled. "
@@ -349,14 +355,19 @@ class DeepseekV3ParallelStrategyManager:
 				f"Offloaded (host): {NUM_EXPERT_PER_RANK - NUM_LOCAL_EXPERT_PER_LAYER}"
 			)
 		else:
-			# Use configured value or default to all experts persistent
+			# Single-node without offloading: all experts persistent
+			offload_ratio = 0.0
+			self.enable_ep_offloading = False
 			NUM_LOCAL_EXPERT_PER_LAYER = self.engine_config.EP_Config.num_local_expert_per_layer
 			if NUM_LOCAL_EXPERT_PER_LAYER is None or NUM_LOCAL_EXPERT_PER_LAYER == 0:
 				NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
+			logging.info(
+				f"Rank {self.rank}: Single-node mode without offloading. "
+				f"{NUM_LOCAL_EXPERT_PER_LAYER} experts persistent per rank."
+			)
 
 		# Store for later use in _config_expert_module
 		self.num_local_expert_per_layer = NUM_LOCAL_EXPERT_PER_LAYER
-		self.enable_ep_offloading = self.engine_config.EP_Config.enable_offloading
 
 
 		routed_expert_gpu_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
@@ -442,7 +453,7 @@ class DeepseekV3ParallelStrategyManager:
 		self._load_model_skeleton()
 		self._load_local_routed_experts()
 		# Load attention and shared expert FP8 weights (required for attn_mode=3 / EP offloading)
-		# These are persistent on GPU, but need explicit loading like pure_gpu_decoding does
+		# These are persistent on GPU, but need explicit loading
 		self._load_attn_module()
 		self._load_shared_expert_module()
 		self._config_attn_module()
@@ -478,6 +489,10 @@ class DeepseekV3ParallelStrategyManager:
 		effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
 		self._init_decoding_padding_bsz(effective_padding_bsz)
 
+		# Initialize All-to-All comms if enabled (used for multi-node or benchmark scenarios)
+		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
+			self._init_ata_comms(effective_padding_bsz)
+
 		# Log weight_copy_task summary for debugging
 		logging.info(
 			f"Rank {self.rank}: weight_copy_task summary - "
@@ -491,99 +506,10 @@ class DeepseekV3ParallelStrategyManager:
 				f"{self.weight_copy_task['routed_expert'][:5]}"
 			)
 
-		return self.model, self.weight_copy_task
-
-
-	def pure_gpu_decoding(self, padding_bsz, comm=None):
-		"""
-			Beta 1: Load full mode into GPU.
-			Duplicate attention modules and shared experts in each dp worker.
-			Split routed experts.
-
-			Also used for EP with offloading on single-node (8 GPUs) since it requires
-			the same NCCL comm setup for all-gather/all-reduce operations.
-		"""
-		self.loaded_model_config.phase = "decode"
-		self.loaded_model_config._attn_implementation = "eager"
-
-		# Store EP offloading flag for use in _init_mode_decoding() and _config_expert_module()
-		self.enable_ep_offloading = self.engine_config.EP_Config.enable_offloading
-
-		self.model = None
-		torch.cuda.empty_cache()
-		# self.model = DeepseekV3ForCausalLM._from_config(
-		# 	self.loaded_model_config, comm
-		# )
-		self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
-		""" In this case, empty copy task. """
-		self.weight_copy_task = {}
-		self.state_dict_name_map = {}
-		self.weight_copy_task["attn"] = []
-		self.weight_copy_task["routed_expert"] = []
-		self.weight_copy_task["shared_expert"] = []
-
-		NUM_TOTAL_EXPERTS = 256          # Total experts per layer
-		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
-
-		routed_expert_gpu_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
-		routed_expert_gpu_end_idx = routed_expert_gpu_start_idx + NUM_EXPERT_PER_RANK
-
-		self.local_routed_experts = []
-		for layer_idx in range(
-			self.loaded_model_config.first_k_dense_replace,
-			self.model_config.num_hidden_layers,
-		):
-			# The first NUM_LOCAL_EXPERT_PER_LAYER in each part associated with the corresponding rank.
-			# The rest of the experts in the part are stored in the host memory.
-			for expert_idx in range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx):
-				self.local_routed_experts.append(
-					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
-				)
-
-		self._extract_dequantize_scale()
-		self._load_model_skeleton()
-		self._load_local_routed_experts()
-		self._load_attn_module()
-		self._load_shared_expert_module()
-		self._config_attn_module()
-		self._config_expert_module()
-		self._config_lm_head_hook()
-
-		# Set enable_ep_offloading flag on MoE layers for loop-based execution
-		if self.enable_ep_offloading:
-			for layer_idx in range(
-				self.loaded_model_config.first_k_dense_replace,
-				self.model_config.num_hidden_layers,
-			):
-				layer = self.model.model.layers[layer_idx]
-				layer.mlp.enable_ep_offloading = True
-			logging.info(
-				f"Rank {self.rank}: Set enable_ep_offloading=True on MoE layers "
-				f"(layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1})"
-			)
-
-		self._init_mode_decoding()
-		self._init_decoding_padding_bsz(padding_bsz)
-
-		enable_ata = os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0")
-		if enable_ata == "1":
-			self._init_ata_comms(padding_bsz)
-
-		self.model.eval()
-		self.model.to(self.engine_config.Basic_Config.device_torch)
-
-		# Log final GPU memory usage (rank 0 only, single consolidated message)
-		if self.rank == 0:
-			used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-			free_memory, total_memory = torch.cuda.mem_get_info()
-			logging.info(
-				f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used, "
-				f"{free_memory / (1024**3):.2f} GB free / {total_memory / (1024**3):.2f} GB total"
-			)
+		# Warmup compiled kernels
 		self._warmup()
-		return self.model, self.weight_copy_task
 
-	
+		return self.model, self.weight_copy_task
 
 	def _init_decoding_padding_bsz(self, padding_bsz):
 		"""

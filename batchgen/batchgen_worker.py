@@ -4218,36 +4218,32 @@ class BatchGenWorker:
 		Load model for decoding phase. Must be called ONCE at the start of decode phase,
 		BEFORE batch selection, so we know actual GPU KV capacity.
 
+		Uses unified configure_decoding() which handles all scenarios:
+		- Multi-node (world_size > 8): all experts persistent
+		- Single-node with EP offloading: partial persistence based on offloading_ratio
+		- Single-node without offloading: all experts persistent
+
 		Args:
 			max_num_seq: Maximum number of sequences per rank for buffer allocation.
-			comm: NCCL communicator for EP offloading mode.
+			comm: NCCL communicator for distributed MoE forward.
 		"""
 		self.deep_free_model_memory()
 		self.init_nvshmem()
 
-		use_pure_gpu_decoding = (self.world_size > 8)
-		enable_ep_offloading = getattr(self.engine_config.EP_Config, 'enable_offloading', False)
+		# Unified method handles all deployment scenarios
+		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
+			padding_bsz=max_num_seq, comm=comm
+		)
+		self.set_phase("decode")
+		self.core_engine.stop_h2d_worker()
+		self.core_engine.clear_kv_copy_queue()
+		self.core_engine.clear_weight_copy_queue()
+		self.core_engine.reset_decoding_buffer()
 
-		if not use_pure_gpu_decoding:
-			# Single-node: use configure_decoding with optional comm for EP offloading
-			decoding_comm = comm if enable_ep_offloading else None
-			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
-				padding_bsz=max_num_seq, comm=decoding_comm
-			)
-			self.set_phase("decode")
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
+		# Only start H2D worker if there are experts to offload
+		if self.weight_copy_task.get("routed_expert"):
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
-		else:
-			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
-			self.set_phase("decode")
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
 
 		if self.rank == 0:
 			logging.info(f"[DECODE] Model loaded for decoding phase")
