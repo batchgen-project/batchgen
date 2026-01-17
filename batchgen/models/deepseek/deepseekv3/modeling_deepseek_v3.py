@@ -1949,26 +1949,34 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		num_tokens, hidden_size = x.shape
 		device = x.device
 
-		# Handle zero-token case
-		if num_tokens == 0:
-			return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
+		# BOUNDS CHECK: Ensure num_tokens doesn't exceed buffer size
+		if num_tokens > self.num_tokens_per_rank:
+			import logging
+			logging.error(
+				f"[MoE Loop BUFFER OVERFLOW] num_tokens={num_tokens} exceeds "
+				f"num_tokens_per_rank={self.num_tokens_per_rank}. This will cause issues!"
+			)
+			raise RuntimeError(
+				f"MoE buffer overflow: num_tokens={num_tokens} > num_tokens_per_rank={self.num_tokens_per_rank}"
+			)
 
 		# ---- 1) AllGather: Collect tokens from all ranks ----
+		# CRITICAL: Even with zero local tokens, we must participate in collectives
+		# to avoid NCCL deadlock when other ranks have tokens
 		all_tokens = torch.zeros(
 			(self.world_size * self.num_tokens_per_rank, self.config.hidden_size),
 			device=self.device,
 			dtype=torch.bfloat16
 		)
 
-		if x.shape[0] < self.num_tokens_per_rank:
-			padded_hidden_states = torch.zeros(
-				(self.num_tokens_per_rank, hidden_size),
-				device=self.device,
-				dtype=x.dtype
-			)
-			padded_hidden_states[:x.shape[0]] = x
-		else:
-			padded_hidden_states = x
+		# Pad local tokens to num_tokens_per_rank (handles zero-token case too)
+		padded_hidden_states = torch.zeros(
+			(self.num_tokens_per_rank, hidden_size),
+			device=self.device,
+			dtype=x.dtype
+		)
+		if num_tokens > 0:
+			padded_hidden_states[:num_tokens] = x
 
 		with self.comm.change_state(enable=True):
 			self.comm.all_gather(
