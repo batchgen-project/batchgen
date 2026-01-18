@@ -102,16 +102,37 @@ class FastTokenizer(BaseTokenizer):
                 return json.load(f)
         return {}
 
+    def _extract_token_string(self, token) -> Optional[str]:
+        """Extract token string from config value.
+
+        Handles both plain string tokens and HuggingFace AddedToken dicts:
+        - String: "token" -> "token"
+        - Dict: {"__type": "AddedToken", "content": "token", ...} -> "token"
+
+        Args:
+            token: Token value from config (str, dict, or None)
+
+        Returns:
+            Token string or None
+        """
+        if token is None:
+            return None
+        if isinstance(token, str):
+            return token
+        if isinstance(token, dict) and "content" in token:
+            return token["content"]
+        return None
+
     def _setup_special_tokens(self, config: Dict) -> None:
         """Set up special token IDs from config.
 
         Args:
             config: Tokenizer config dict
         """
-        # Get special tokens from config
-        bos_token = config.get("bos_token")
-        eos_token = config.get("eos_token")
-        pad_token = config.get("pad_token")
+        # Get special tokens from config (handles AddedToken dicts)
+        bos_token = self._extract_token_string(config.get("bos_token"))
+        eos_token = self._extract_token_string(config.get("eos_token"))
+        pad_token = self._extract_token_string(config.get("pad_token"))
 
         # Try to get token IDs from the tokenizer vocabulary
         vocab = self.tokenizer.get_vocab()
