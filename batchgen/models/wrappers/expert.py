@@ -49,7 +49,7 @@ class ExpertWrapperBase(BaseModuleWrapper):
     Attributes:
         expert_idx: Expert index within the layer (-1 for shared expert)
         module_key: Key for weight loading from core engine
-        get_weights: Whether to load weights from core engine (vs cached)
+        persistent: Whether weights are pre-loaded on GPU (no buffer fetch needed)
     """
 
     def __init__(
@@ -60,7 +60,7 @@ class ExpertWrapperBase(BaseModuleWrapper):
         core_engine,
         engine_config,
         model_config,
-        get_weights: bool = True,
+        persistent: bool = False,
     ):
         """Initialize expert wrapper.
 
@@ -71,11 +71,13 @@ class ExpertWrapperBase(BaseModuleWrapper):
             core_engine: BatchGen core engine for weight management
             engine_config: Engine configuration
             model_config: Model configuration
-            get_weights: Whether to load weights from core engine each forward
+            persistent: Whether weights are pre-loaded on GPU.
+                        True = pre-loaded, no buffer fetch needed.
+                        False = load from buffer each forward.
         """
         super().__init__(module, layer_idx, core_engine, engine_config, model_config)
         self.expert_idx = expert_idx
-        self.get_weights = get_weights
+        self.persistent = persistent
         self.module_key = self._build_module_key()
 
     def _build_module_key(self) -> str:
@@ -140,8 +142,8 @@ class ExpertWrapperBase(BaseModuleWrapper):
             f"Forward pass. Phase: {self.phase}"
         )
 
-        if self.get_weights:
-            # Load weights from core engine
+        if not self.persistent:
+            # Load weights from core engine (non-persistent experts)
             weights = self.load_weights(self.module_key)
 
             # Dequantize (subclass may override)
@@ -153,8 +155,8 @@ class ExpertWrapperBase(BaseModuleWrapper):
         # Micro-batch forward
         result = self.micro_batch_forward(hidden_states, "expert")
 
-        if self.get_weights:
-            # Sync and cleanup
+        if not self.persistent:
+            # Sync and cleanup (non-persistent experts)
             torch.cuda.current_stream(
                 self.engine_config.Basic_Config.device_torch
             ).synchronize()

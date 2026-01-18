@@ -111,11 +111,17 @@ class BasePlanner(ABC):
         expert_per_rank = self.NUM_EXPERTS // self.world_size
         assert expert_per_rank > 0, "EXPERT_PER_RANK must be greater than 0"
 
-        # Set attention mode based on world size
+        # Set attention mode based on world size and EP offloading
+        # attn_mode = 3 uses decoding_continuous() which properly handles dynamic weight loading
+        # attn_mode = 1 uses legacy modes that don't support EP with offloading
         if self.world_size > 8:
             self.config.Basic_Config.attn_mode = 3  # DUAL-NODE
+        elif self.config.EP_Config.enable_offloading:
+            # EP with offloading on single-node requires attn_mode = 3 for decoding_continuous()
+            self.config.Basic_Config.attn_mode = 3
+            logging.info("EP offloading enabled on single-node: setting attn_mode=3 for decoding_continuous()")
         else:
-            self.config.Basic_Config.attn_mode = 1  # SINGLE-NODE
+            self.config.Basic_Config.attn_mode = 1  # SINGLE-NODE (legacy)
 
         # Compute decoding micro batch size using model-specific MAGIC_NUM
         attn_decoding_micro_batch_size = self.MAGIC_NUM // self.max_prompt_length
@@ -139,14 +145,33 @@ class BasePlanner(ABC):
 
         non_static_memory_usage = k_buffer_size + model_skeleton_size + cuda_page_table_default_size
         available_memory_for_expert_cache = available_gpu_mem - non_static_memory_usage
-        num_local_expert_per_layer = min(
-            expert_per_rank,
-            int(available_memory_for_expert_cache // 2.4)
-        )
-        num_decoding_module_buffer_routed_expert = expert_per_rank - num_local_expert_per_layer + 2
+
+        # Check if EP offloading is enabled - if so, use offloading_ratio instead of memory-based calculation
+        if self.config.EP_Config.enable_offloading and self.config.EP_Config.offloading_ratio > 0:
+            # EP offloading: use offloading_ratio to determine persistent vs offloaded experts
+            num_local_expert_per_layer = int(expert_per_rank * (1 - self.config.EP_Config.offloading_ratio))
+            # Buffer count = number of offloaded experts + overhead
+            num_offloaded = expert_per_rank - num_local_expert_per_layer
+            num_decoding_module_buffer_routed_expert = num_offloaded + 2
+            logging.info(
+                f"EP offloading enabled: {num_local_expert_per_layer} persistent, "
+                f"{num_offloaded} offloaded, {num_decoding_module_buffer_routed_expert} buffers"
+            )
+        else:
+            # Default: calculate based on available GPU memory
+            num_local_expert_per_layer = min(
+                expert_per_rank,
+                int(available_memory_for_expert_cache // 2.4)
+            )
+            num_decoding_module_buffer_routed_expert = expert_per_rank - num_local_expert_per_layer + 2
 
         if self.config.Basic_Config.attn_mode == 3:
-            num_local_expert_per_layer = expert_per_rank
+            # For attn_mode=3 (dual-node or EP offloading), calculate MoE decoding batch size
+            if not self.config.EP_Config.enable_offloading:
+                # Dual-node mode: all experts persistent on GPU
+                num_local_expert_per_layer = expert_per_rank
+            # EP offloading mode: keep num_local_expert_per_layer from offloading calculation above
+
             expert_size = num_local_expert_per_layer * 2.4
             per_seq_size = self.max_context_length * 61 * 576 / (1024 ** 3) * kv_element_size
             self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = int(
@@ -158,7 +183,8 @@ class BasePlanner(ABC):
                 f"{self.config.Module_Batching_Config.MoE_decoding_micro_batch_size}"
             )
 
-        if num_local_expert_per_layer == expert_per_rank:
+        # Only zero out buffers if ALL experts are persistent (no offloading)
+        if num_local_expert_per_layer == expert_per_rank and not self.config.EP_Config.enable_offloading:
             num_decoding_module_buffer_routed_expert = 0
 
         # Update config
@@ -167,13 +193,23 @@ class BasePlanner(ABC):
         self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = num_decoding_module_buffer_routed_expert
         self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
 
-        if self.config.Basic_Config.attn_mode == 3:
-            # Decoding module buffers are zero for dual-node mode
+        if self.config.Basic_Config.attn_mode == 3 and not self.config.EP_Config.enable_offloading:
+            # Decoding module buffers are zero for dual-node mode (all experts persistent)
+            # Note: For EP with offloading on single-node, we need to keep expert buffers
             self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
             self.config.GPU_Buffer_Config.num_decoding_module_buffer["attn"] = 0
             self.config.GPU_Buffer_Config.num_decoding_module_buffer["shared_expert"] = 0
             self.config.GPU_Buffer_Config.num_k_buffer = 0
             self.config.GPU_Buffer_Config.kv_buffer_num_tokens = 0
+        elif self.config.EP_Config.enable_offloading:
+            # EP with offloading: keep expert buffers, but zero out attn/shared_expert
+            # (attention and shared experts are persistent in this mode)
+            self.config.GPU_Buffer_Config.num_decoding_module_buffer["attn"] = 0
+            self.config.GPU_Buffer_Config.num_decoding_module_buffer["shared_expert"] = 0
+            logging.info(
+                f"EP offloading mode: keeping {num_decoding_module_buffer_routed_expert} expert buffers, "
+                f"attn and shared_expert buffers set to 0 (persistent)"
+            )
 
         # Adjust prefill batch sizes based on prompt length
         if self.max_prompt_length > 14000:

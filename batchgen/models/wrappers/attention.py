@@ -91,7 +91,7 @@ class AttnWrapperBase(BaseModuleWrapper):
         core_engine,
         engine_config,
         model_config,
-        get_weights: bool = True,
+        persistent: bool = True,
         weight_dequant_scale: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Initialize attention wrapper.
@@ -102,11 +102,13 @@ class AttnWrapperBase(BaseModuleWrapper):
             core_engine: BatchGen core engine
             engine_config: Engine configuration
             model_config: Model configuration
-            get_weights: Whether to load weights from core engine
+            persistent: Whether weights are pre-loaded on GPU.
+                        True = pre-loaded, no buffer fetch needed (default for attention).
+                        False = load from buffer each forward.
             weight_dequant_scale: Dict of weight dequantization scales
         """
         super().__init__(module, layer_idx, core_engine, engine_config, model_config)
-        self.get_weights = get_weights
+        self.persistent = persistent
         self.weight_dequant_scale = weight_dequant_scale or {}
         self.module_key = f"attn_{layer_idx}"
 
@@ -198,8 +200,8 @@ class AttnWrapperBase(BaseModuleWrapper):
             f"Attn forward. Phase: {self.phase}"
         )
 
-        # Load weights if needed
-        if self.get_weights:
+        # Load weights if not persistent (non-persistent attention modules)
+        if not self.persistent:
             weights = self.load_weights(self.module_key)
             dequant_weights = self.dequantize_weights(weights)
             self.apply_weights(dequant_weights)

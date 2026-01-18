@@ -144,12 +144,16 @@ class KVStorageConfig:
 class EPConfig:
     enable: bool = False
     num_local_expert_per_layer: int = 0
+    enable_offloading: bool = False  # Enable EP with offloading mode
+    offloading_ratio: float = 0.0    # Ratio of experts per layer to offload (0.0-1.0)
 
     def __str__(self):
         return (
             f"EPConfig:\n"
             f"  enable: {self.enable}\n"
-            f"  num_local_expert_per_layer: {self.num_local_expert_per_layer}"
+            f"  num_local_expert_per_layer: {self.num_local_expert_per_layer}\n"
+            f"  enable_offloading: {self.enable_offloading}\n"
+            f"  offloading_ratio: {self.offloading_ratio}"
         )
 
 @dataclass

@@ -1,5 +1,6 @@
 import torch
 import deep_gemm
+
 def w8a8_deepgemm(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -15,29 +16,29 @@ def w8a8_deepgemm(
     """
     M, K = a.shape
     N = w.shape[0]
-    
+
     # Ensure contiguity
     a = a.contiguous()
     w = w.contiguous()
     a_scale = a_scale.contiguous()
     w_scale = w_scale.contiguous()
-    
+
     lhs = (a, a_scale)
     rhs = (w, w_scale)
-    
+
     # Allocate output
     if out is None:
         output = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     else:
         output = out
-    
+
     # Call with optional parameters
     deep_gemm.fp8_gemm_nt(
-        lhs, 
-        rhs, 
+        lhs,
+        rhs,
         output,
         disable_ue8m0_cast=disable_ue8m0_cast,
         recipe=recipe
     )
-    
+
     return output if out is None else None

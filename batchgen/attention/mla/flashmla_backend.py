@@ -2001,9 +2001,9 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		)
 
 	hidden_states = hidden_states.squeeze(1)
-	
+
 	hidden_states, hidden_states_scale = act_quant(hidden_states)
-	
+
 	q = w8a8_deepgemm(
 		hidden_states,
 		hidden_states_scale,

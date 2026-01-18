@@ -330,6 +330,35 @@ python -m batchgen.launch_http_server \
     --host-kv-cache-size 256
 ```
 
+### Single Node × 8 GPUs (EP with Offloading)
+
+For single-node deployment with 8 H20 GPUs, enable Expert Parallelism with partial offloading. This allows running DeepSeek-R1 on a single node by keeping frequently-used experts on GPU and dynamically loading others from host memory.
+
+```bash
+python -m batchgen.launch_http_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --cache-dir /shared/models/DeepSeek-R1 \
+    --dist-init-addr "your-ip:33001" \
+    --nnodes 1 \
+    --node-rank 0 \
+    --kv-dtype "bf16" \
+    --world-size 8 \
+    --host-kv-cache-size 128 \
+    --enable-hugetlbfs \
+    --storage-path /shared/storage \
+    --save-result \
+    --gpu-memory-frac 0.96 \
+    --enable-ep-with-offloading \
+    --ep-offloading-ratio 0.3
+```
+
+**EP Offloading Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--enable-ep-with-offloading` | Enable Expert Parallelism with partial expert offloading mode |
+| `--ep-offloading-ratio` | Ratio of experts to offload (0.0-1.0). 0.3 means 30% of experts are loaded dynamically |
+
 ### Server Arguments Reference
 
 Key arguments for multi-node deployment:

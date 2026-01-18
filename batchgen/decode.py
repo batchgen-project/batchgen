@@ -187,26 +187,20 @@ class Decode():
 		max_num_seq = int(num_seq_per_rank.max().item())
 
 
-		# TODO:
-		if self.world_size <= 8:
-			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-			self.set_phase("decode")
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_kv_buffer()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
+		# Unified method handles all deployment scenarios (multi-node, single-node with/without offloading)
+		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
+			padding_bsz=max_num_seq, comm=comm
+		)
+		self.set_phase("decode")
+		self.core_engine.stop_h2d_worker()
+		self.core_engine.clear_kv_copy_queue()
+		self.core_engine.clear_kv_buffer()
+		self.core_engine.clear_weight_copy_queue()
+		self.core_engine.reset_decoding_buffer()
+		# Only start H2D worker if there are experts to offload
+		if self.weight_copy_task.get("routed_expert"):
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
-		else:
-			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
-
-			self.set_phase("decode")
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_kv_buffer()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
 
 		logging.info(f"{self.rank} End Config Decoding")
 

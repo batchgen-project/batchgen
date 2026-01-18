@@ -97,32 +97,24 @@ class InferenceRuntime:
 		# Get the maximum number of sequences across all ranks
 		max_num_seq = int(num_seq_per_rank.max().item())
 
-		# TODO:
+		# Unified method handles all deployment scenarios (multi-node, single-node with/without offloading)
 		phase = "decode"
-		if self.world_size <= 8:
-			self.model, self.weight_copy_task = self.parallel_manager.configure_decoding()
-			self.core_engine.set_phase(phase)
-			Attn_Wrapper.phase = phase
-			Expert_Wrapper.phase = phase
-			BaseModuleWrapper.phase = phase
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_kv_buffer()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
+		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
+			padding_bsz=max_num_seq, comm=comm
+		)
+		self.core_engine.set_phase(phase)
+		Attn_Wrapper.phase = phase
+		Expert_Wrapper.phase = phase
+		BaseModuleWrapper.phase = phase
+		self.core_engine.stop_h2d_worker()
+		self.core_engine.clear_kv_copy_queue()
+		self.core_engine.clear_kv_buffer()
+		self.core_engine.clear_weight_copy_queue()
+		self.core_engine.reset_decoding_buffer()
+		# Only start H2D worker if there are experts to offload
+		if self.weight_copy_task.get("routed_expert"):
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
-		else:
-			self.model, self.weight_copy_task = self.parallel_manager.pure_gpu_decoding(max_num_seq, comm)
-			self.core_engine.set_phase(phase)
-			Attn_Wrapper.phase = phase
-			Expert_Wrapper.phase = phase
-			BaseModuleWrapper.phase = phase
-			self.core_engine.stop_h2d_worker()
-			self.core_engine.clear_kv_copy_queue()
-			self.core_engine.clear_kv_buffer()
-			self.core_engine.clear_weight_copy_queue()
-			self.core_engine.reset_decoding_buffer()
 
 		self.current_phase = phase
 		logging.info(f"{self.rank} End Config Decoding")

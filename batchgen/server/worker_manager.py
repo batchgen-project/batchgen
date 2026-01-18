@@ -354,6 +354,8 @@ class WorkerManager:
             initial_gpu_page_buffer=self.args.initial_gpu_page_buffer,
             extension_gpu_page_buffer=self.args.extension_gpu_page_buffer,
             decision_frequency_pages=self.args.decision_frequency_pages,
+            enable_ep_with_offloading=self.args.enable_ep_with_offloading,
+            ep_offloading_ratio=self.args.ep_offloading_ratio,
         )
         self.worker_process = mp.spawn(
             server_worker_main,
