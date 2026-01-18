@@ -5678,6 +5678,20 @@ class BatchGenWorker:
 		last_boundary = 0
 		global_batch_size = len(self.global_batch)
 
+		# ========== INITIAL MOE BUFFER SYNC ==========
+		# Sync buffer size BEFORE first forward pass to prevent overflow.
+		# The boundary sync (in _page_boundary_fast) only happens after DECISION_INTERVAL
+		# iterations, but the first forward pass runs immediately. Without this sync,
+		# if one rank has more tokens than the initial estimate (ceil(total/world_size)),
+		# we get buffer overflow.
+		local_batch_size = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
+		dist.all_reduce(local_batch_size, op=dist.ReduceOp.MAX)
+		max_batch_size = local_batch_size.item()
+
+		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
+				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
+
 		# OPTIMIZATION: Track if page table was verified since last batch change
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
