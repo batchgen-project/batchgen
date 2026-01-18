@@ -1,0 +1,105 @@
+# ---------------------------------------------------------------------------- #
+#  BatchGen                                                                      #
+#  copyright (c) EfficientMoE team 2025                                             #
+#                                                                               #
+#  licensed under the apache license, version 2.0 (the "license");              #
+#  you may not use this file except in compliance with the license.             #
+#                                                                               #
+#  you may obtain a copy of the license at                                      #
+#                                                                               #
+#                  http://www.apache.org/licenses/license-2.0                   #
+#                                                                               #
+#  unless required by applicable law or agreed to in writing, software          #
+#  distributed under the license is distributed on an "as is" basis,            #
+#  without warranties or conditions of any kind, either express or implied.     #
+#  see the license for the specific language governing permissions and          #
+#  limitations under the license.                                               #
+# ---------------------------------------------------------------------------- #
+
+"""DeepSeek-V3/R1 tokenizer for BatchGen.
+
+This module provides the tokenizer implementation for DeepSeek-V3 and DeepSeek-R1
+models, which use the same tokenizer architecture.
+
+DeepSeek tokenizer specifications:
+- Vocabulary size: 129,280 tokens
+- BOS token: <|begin▁of▁sentence|> (ID: 100000)
+- EOS token: <|end▁of▁sentence|> (ID: 100001)
+- Uses HuggingFace tokenizer.json format
+
+The tokenizer.json file is bundled with BatchGen in this directory.
+It is NOT loaded from user's cache directory.
+"""
+
+import logging
+from pathlib import Path
+
+from batchgen.config.fast_tokenizer import FastTokenizer
+from batchgen.config.tokenizer_registry import register_tokenizer
+
+logger = logging.getLogger(__name__)
+
+# Tokenizer files are in the same directory as this module
+TOKENIZER_DIR = Path(__file__).parent
+
+
+# DeepSeek-V3/R1 special token IDs
+DEEPSEEK_V3_BOS_TOKEN_ID = 100000  # <|begin▁of▁sentence|>
+DEEPSEEK_V3_EOS_TOKEN_ID = 100001  # <|end▁of▁sentence|>
+DEEPSEEK_V3_VOCAB_SIZE = 129280
+
+
+@register_tokenizer("deepseek_v3")
+class DeepSeekV3Tokenizer(FastTokenizer):
+    """DeepSeek-V3/R1 tokenizer.
+
+    Loads tokenizer.json from package directory (not user cache).
+
+    Attributes:
+        bos_token_id: 100000 (<|begin▁of▁sentence|>)
+        eos_token_id: 100001 (<|end▁of▁sentence|>)
+        pad_token_id: 100001 (uses EOS as pad token)
+        vocab_size: 129,280
+    """
+
+    def __init__(self):
+        """Initialize the DeepSeek-V3 tokenizer.
+
+        Loads tokenizer.json from the package directory (TOKENIZER_DIR).
+        """
+        # Load from package directory, not user path
+        super().__init__(str(TOKENIZER_DIR))
+
+        # Override with DeepSeek-specific special token IDs
+        # These are the correct values for DeepSeek-V3/R1 models
+        self.bos_token_id = DEEPSEEK_V3_BOS_TOKEN_ID
+        self.eos_token_id = DEEPSEEK_V3_EOS_TOKEN_ID
+        self.pad_token_id = DEEPSEEK_V3_EOS_TOKEN_ID  # Use EOS as pad token
+        self.vocab_size = DEEPSEEK_V3_VOCAB_SIZE
+
+        # Get the actual token strings from vocabulary for padding setup
+        vocab = self.tokenizer.get_vocab()
+        self.bos_token = None
+        self.eos_token = None
+        self.pad_token = None
+
+        # Find tokens by ID
+        id_to_token = {v: k for k, v in vocab.items()}
+        if self.bos_token_id in id_to_token:
+            self.bos_token = id_to_token[self.bos_token_id]
+        if self.eos_token_id in id_to_token:
+            self.eos_token = id_to_token[self.eos_token_id]
+            self.pad_token = self.eos_token  # Use EOS as pad
+
+        # Re-enable padding with correct pad token
+        if self.pad_token is not None:
+            self.tokenizer.enable_padding(
+                direction="right",
+                pad_id=self.pad_token_id,
+                pad_token=self.pad_token,
+            )
+
+        logger.info(
+            f"DeepSeek-V3 tokenizer initialized: vocab_size={self.vocab_size}, "
+            f"bos={self.bos_token_id}, eos={self.eos_token_id}"
+        )

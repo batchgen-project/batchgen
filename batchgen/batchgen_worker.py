@@ -14,9 +14,8 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
-from transformers import AutoTokenizer
-
 from batchgen.config.model_registry import load_config
+from batchgen.config.tokenizer_registry import load_tokenizer
 
 from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
 from batchgen.models.wrappers import BaseModuleWrapper
@@ -1024,13 +1023,11 @@ class BatchGenWorker:
 		self.model_context_length = getattr(self.model_config, 'max_position_embeddings', 131072)  # Default 128K
 		logging.info(f"Rank {self.rank}: Model context length set to {self.model_context_length}")
 		
-		self.tokenizer = AutoTokenizer.from_pretrained(
-			self.cache_dir,
-			trust_remote_code=True,
-			local_files_only=True,
-		)
-		self.tokenizer.padding_side = "right"
-		
+		# Load tokenizer using BatchGen's tokenizer abstraction
+		# This removes the dependency on transformers.AutoTokenizer
+		# Pass model identifier for pattern matching; tokenizer loads from package dir
+		self.tokenizer = load_tokenizer(self.huggingface_ckpt_name)
+
 		# Set EOS token ID from tokenizer
 		self.eos_token_id = self.tokenizer.eos_token_id
 		logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}")
