@@ -158,6 +158,41 @@ At page boundaries during decode, `extension_gpu_page_buffer` pages are added. T
 
 Prepack optimization packs multiple sequences into a single batch for efficient prefill. This is always enabled.
 
+### Expert Parallelism with Offloading
+
+For single-node deployments where GPU memory is limited, enable partial expert offloading to run large MoE models with high throughput.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable-ep-with-offloading` | `false` | Enable Expert Parallelism with partial expert offloading mode |
+| `--ep-offloading-ratio` | `0.0` | Ratio of experts to offload (0.0-1.0). Higher values save GPU memory but reduce throughput |
+
+**Example: Single Node with 8 H20 GPUs**
+
+```bash
+python -m batchgen.launch_http_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --cache-dir /shared/models/DeepSeek-R1 \
+    --kv-dtype "bf16" \
+    --world-size 8 \
+    --host-kv-cache-size 128 \
+    --enable-hugetlbfs \
+    --gpu-memory-frac 0.96 \
+    --enable-ep-with-offloading \
+    --ep-offloading-ratio 0.3
+```
+
+**How offloading works:**
+- DeepSeek-R1 has 256 experts per MoE layer
+- With 8 GPUs, each GPU handles 32 experts (256 / 8)
+- `--ep-offloading-ratio 0.3` keeps 70% of experts persistent on GPU (22 experts per GPU)
+- The remaining 30% (10 experts) are loaded synchronously from host memory, overlapped with computation as much as possible
+
+**Constraints:**
+- Requires `--enable-ep-with-offloading` to use `--ep-offloading-ratio > 0`
+- Offloading ratio must be between 0.0 and 1.0
+- Not needed if GPU memory is sufficient (e.g., two-node H20 deployment)
+
 ---
 
 ## Storage Configuration
