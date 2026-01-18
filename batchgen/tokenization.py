@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from transformers import PreTrainedTokenizer
+
+from batchgen.config.base_tokenizer import BaseTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +30,13 @@ class SequenceTokens:
 class BatchTokenizer:
     """Handles batch tokenization and detokenization for inference.
 
-    This class wraps a HuggingFace tokenizer and provides optimized batch
+    This class wraps a BatchGen tokenizer and provides optimized batch
     tokenization with proper handling of variable-length sequences.
     """
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: BaseTokenizer,
         eos_token_id: int,
         model_context_length: int,
         rank: int = 0,
@@ -43,7 +44,7 @@ class BatchTokenizer:
         """Initialize the batch tokenizer.
 
         Args:
-            tokenizer: HuggingFace tokenizer instance
+            tokenizer: BatchGen tokenizer instance (BaseTokenizer or subclass)
             eos_token_id: Token ID for end-of-sequence
             model_context_length: Maximum context length the model supports
             rank: Process rank for logging (default: 0)

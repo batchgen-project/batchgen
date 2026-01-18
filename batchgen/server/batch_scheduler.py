@@ -494,29 +494,27 @@ class BatchScheduler:
         return trimmed
 
     def _get_tokenizer(self, model: str) -> Optional[Any]:
+        """Load tokenizer for the given model.
+
+        Uses BatchGen's tokenizer abstraction which removes the dependency
+        on transformers.AutoTokenizer for supported models.
+
+        The model name is used for pattern matching to select the appropriate
+        tokenizer. Tokenizer files are loaded from the BatchGen package directory.
+        """
         if self._tokenizer_model == model and self._tokenizer is not None:
             return self._tokenizer
-        try:
-            from transformers import AutoTokenizer
-        except ImportError:
-            raise RuntimeError(
-                "Transformers is required for batch decoding. "
-                "Install transformers or configure it in the environment."
-            )
 
-        cache_dir = self.server_args.cache_dir
-        cache_dir_value = str(cache_dir) if cache_dir else None
+        from batchgen.config.tokenizer_registry import load_tokenizer
+
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model,
-                cache_dir=cache_dir_value,
-                trust_remote_code=True,
-                local_files_only=True,
-            )
+            # Model name used for pattern matching; tokenizer loads from package dir
+            tokenizer = load_tokenizer(model)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load tokenizer for {model}: {exc}"
             ) from exc
+
         self._tokenizer = tokenizer
         self._tokenizer_model = model
         return tokenizer
