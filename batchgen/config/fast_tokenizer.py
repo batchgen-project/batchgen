@@ -80,9 +80,12 @@ class FastTokenizer(BaseTokenizer):
         self.tokenizer = Tokenizer.from_file(str(tokenizer_file))
         logger.info(f"Loaded tokenizer from {tokenizer_file}")
 
-        # Load config for special tokens
-        config = tokenizer_config or self._load_config()
-        self._setup_special_tokens(config)
+        # Load config for special tokens and chat template
+        self._config = tokenizer_config or self._load_config()
+        self._setup_special_tokens(self._config)
+
+        # Store chat template if available
+        self.chat_template = self._config.get("chat_template")
 
         # Get vocab size from tokenizer
         self.vocab_size = self.tokenizer.get_vocab_size()
@@ -276,3 +279,57 @@ class FastTokenizer(BaseTokenizer):
                 result["attention_mask"] = attention_masks
 
         return result
+
+    def apply_chat_template(
+        self,
+        messages: List[Dict[str, str]],
+        tokenize: bool = True,
+        add_generation_prompt: bool = False,
+        **kwargs,
+    ) -> Union[str, List[int]]:
+        """Apply chat template to format messages.
+
+        Uses the Jinja2 chat_template from tokenizer_config.json to format
+        a list of chat messages into a prompt string.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys
+            tokenize: If True, return token IDs; if False, return string
+            add_generation_prompt: Whether to add generation prompt at the end
+            **kwargs: Additional arguments passed to template
+
+        Returns:
+            Formatted prompt string (if tokenize=False) or token IDs (if tokenize=True)
+
+        Raises:
+            ValueError: If no chat template is available
+        """
+        if not self.chat_template:
+            raise ValueError(
+                "This tokenizer does not have a chat_template. "
+                "Cannot apply chat template formatting."
+            )
+
+        try:
+            from jinja2 import Template, StrictUndefined
+        except ImportError:
+            raise ImportError(
+                "jinja2 is required for apply_chat_template. "
+                "Install it with: pip install jinja2"
+            )
+
+        # Create Jinja2 template
+        template = Template(self.chat_template, undefined=StrictUndefined)
+
+        # Render the template with messages and special tokens
+        rendered = template.render(
+            messages=messages,
+            bos_token=self.bos_token or "",
+            eos_token=self.eos_token or "",
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+        if tokenize:
+            return self.encode(rendered, add_special_tokens=False)
+        return rendered
