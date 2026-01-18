@@ -7256,45 +7256,31 @@ class BatchGenWorker:
 					self.model.model.layers[layer_idx].mlp.cleanup()
 
 	def deep_free_model_memory(self):
-		"""Deep cleanup of model and all its submodules"""
+		"""Release model memory without CPU transfer overhead.
+
+		Previous implementation moved model to CPU before deletion, causing
+		unnecessary PCIe traffic for large models. This minimal approach:
+		1. Synchronizes CUDA to ensure pending ops complete
+		2. Deletes model reference directly
+		3. Releases memory back to CUDA allocator
+		"""
 		if not hasattr(self, 'model') or self.model is None:
 			return
-		
-		self.model.eval()
-		self.model.to('cpu')
-		with torch.no_grad():
-			def clear_module(module):
-				for param in module.parameters():
-					param.data = torch.empty(0)
-					if param.grad is not None:
-						param.grad.data = torch.empty(0)
-						param.grad = None
-				for buffer in module.buffers():
-					buffer.data = torch.empty(0)
-				module._forward_hooks.clear()
-				module._forward_pre_hooks.clear()
-				module._backward_hooks.clear()
-				for submodule in module.children():
-					clear_module(submodule)
-			
-			clear_module(self.model)
-		
-		self.model.to('cpu')
+
+		# Ensure all GPU operations complete before deletion
+		if torch.cuda.is_available():
+			torch.cuda.synchronize(self.torch_device)
+
+		# Delete model directly without CPU transfer
 		del self.model
 		self.model = None
-		
-		if hasattr(self, 'optimizer'):
-			self.optimizer.zero_grad(set_to_none=True)
-			del self.optimizer
-		
+
+		# Release memory
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
-			torch.cuda.synchronize(self.torch_device)
-		
-		for _ in range(3):
-			gc.collect()
-			if torch.cuda.is_available():
-				torch.cuda.empty_cache()
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
 
 	def _reset_for_new_batch(self) -> None:
 		"""

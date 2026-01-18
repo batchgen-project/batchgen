@@ -1,3 +1,4 @@
+import gc
 import torch
 # import pynvml
 import logging
@@ -121,36 +122,37 @@ def create_position_ids_from_attention_mask(
 	return position_ids
 
 
-def deep_free_model_memory(model):
-	"""Deep cleanup of model and all its submodules"""	
-	# Step 1: Set model to eval and disable gradients
-	model.eval()
-	with torch.no_grad():
-		# Step 2: Recursively clear all module parameters and buffers
-		def clear_module(module):
-			# Clear parameters
-			for param in module.parameters():
-				param.data = torch.empty(0)
-				if param.grad is not None:
-					param.grad.data = torch.empty(0)
-					param.grad = None
-			
-			# Clear buffers
-			for buffer in module.buffers():
-				buffer.data = torch.empty(0)
-			
-			# Clear module hooks
-			module._forward_hooks.clear()
-			module._forward_pre_hooks.clear()
-			module._backward_hooks.clear()
-			
-			# Recursively clear submodules
-			for submodule in module.children():
-				clear_module(submodule)
-		
-		clear_module(model)
-	
-	# Step 3: Move to CPU and delete
-	model.to('cpu')
+def deep_free_model_memory(model, device=None):
+	"""Release model memory without CPU transfer overhead.
+
+	Previous implementation moved model to CPU before deletion, causing
+	unnecessary PCIe traffic for large models. This minimal approach:
+	1. Synchronizes CUDA to ensure pending ops complete
+	2. Deletes model reference directly
+	3. Releases memory back to CUDA allocator
+
+	Args:
+		model: PyTorch model to free
+		device: Optional CUDA device for synchronization
+	"""
+	if model is None:
+		return None
+
+	# Ensure all GPU operations complete before deletion
+	if torch.cuda.is_available():
+		if device is not None:
+			torch.cuda.synchronize(device)
+		else:
+			torch.cuda.synchronize()
+
+	# Delete model directly without CPU transfer
 	del model
+
+	# Release memory
+	if torch.cuda.is_available():
+		torch.cuda.empty_cache()
+	gc.collect()
+	if torch.cuda.is_available():
+		torch.cuda.empty_cache()
+
 	return None
