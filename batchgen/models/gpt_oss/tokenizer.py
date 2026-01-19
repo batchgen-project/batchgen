@@ -39,8 +39,8 @@ from batchgen.config.tokenizer_registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
 
-# Tokenizer files are in the same directory as this module
-TOKENIZER_DIR = Path(__file__).parent
+# Tokenizer files are in the openai/gpt-oss-120b directory
+TOKENIZER_DIR = Path(__file__).parent.parent / "openai" / "gpt-oss-120b"
 
 
 # GPT-OSS-120B special token IDs
