@@ -467,12 +467,9 @@ class BatchGenServer:
 			available_mem = (mem.total - (20 * 1024**3)) // (1024**3)
 		if available_mem <= 0:
 			raise RuntimeError("Unable to determine host KV cache budget")
-		num_devices = torch.cuda.device_count()
+		# Host KV cache is per-node shared - no division needed
 		self.args_dict = vars(self.args)
-		if num_devices > 0:
-			self.args_dict["host_kv_cache_size_per_rank"] = available_mem // num_devices
-		else:
-			self.args_dict["host_kv_cache_size_per_rank"] = available_mem
+		self.args_dict["host_kv_cache_size_per_rank"] = available_mem
 
 	@staticmethod
 	def _parse_parameter_server_endpoint(endpoint: str) -> tuple[str, int]:

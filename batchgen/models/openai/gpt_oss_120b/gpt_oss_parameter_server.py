@@ -113,8 +113,8 @@ class GptOss_Parameter_Server:
 
         self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
 
-        # GPT-OSS-120B: ~55GB MXFP4 weights
-        byte_size = 60 * 1024 * 1024 * 1024  # 60GB with some buffer
+        # GPT-OSS-120B: ~65GB total (61GB MXFP4 experts + 4GB BF16 attn/embed)
+        byte_size = 70 * 1024 * 1024 * 1024  # 70GB with buffer
 
         total, used, free = shutil.disk_usage("/dev/shm")
         logging.info(f"Freespace in /dev/shm: {free/1024/1024/1024:.2f} GB")

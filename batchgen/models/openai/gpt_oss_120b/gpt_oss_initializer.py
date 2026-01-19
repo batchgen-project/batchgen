@@ -118,6 +118,14 @@ class GptOssInitializer:
         engine_config.Basic_Config.kv_dtype = "bfloat16"
         engine_config.Basic_Config.kv_dtype_torch = torch.bfloat16
 
+        # CRITICAL: Required for planner to calculate expert distribution
+        engine_config.Basic_Config.world_size = args.world_size
+        engine_config.Basic_Config.rank = args.rank
+        engine_config.Basic_Config.num_queries = getattr(args, 'num_queries', 1)
+        engine_config.Basic_Config.module_types = ["attn", "routed_expert"]
+        engine_config.Basic_Config.num_threads = 0
+        engine_config.Basic_Config.gpu_arch = getattr(args, 'gpu_arch', 'hopper')
+
         return engine_config
 
     def _default_engine_config(self):
