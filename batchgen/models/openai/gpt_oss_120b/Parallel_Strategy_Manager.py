@@ -150,6 +150,17 @@ class GptOssParallelStrategyManager:
         """Load non-expert weights (embeddings, attention, norms, lm_head)."""
         logging.info("Loading model skeleton...")
 
+        # Debug: Print skeleton_state_dict keys for verification
+        skeleton_keys = list(self.skeleton_state_dict.keys()) if self.skeleton_state_dict else []
+        logging.info(f"Skeleton state_dict has {len(skeleton_keys)} keys")
+        if skeleton_keys:
+            logging.debug(f"Sample skeleton keys: {skeleton_keys[:15]}")
+
+        # Debug: Print expected model parameter names (non-expert)
+        expected_params = [n for n, _ in self.model.named_parameters() if "experts" not in n]
+        logging.info(f"Model expects {len(expected_params)} non-expert parameters")
+        logging.debug(f"Sample expected params: {expected_params[:15]}")
+
         # Filter skeleton state dict for non-expert weights
         for name, param in self.model.named_parameters():
             if "experts" in name:

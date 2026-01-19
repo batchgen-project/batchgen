@@ -197,7 +197,7 @@ class GptOss_Parameter_Server:
             }
 
             # Router/gate weights
-            self.state_dict_name_map[f"model.layers.{layer_idx}.moe.router.weight"] = {
+            self.state_dict_name_map[f"model.layers.{layer_idx}.mlp.router.weight"] = {
                 "module_key": f"moe_router_{layer_idx}",
                 "tensor_key": "weight",
             }
@@ -282,6 +282,14 @@ class GptOss_Parameter_Server:
 
         logging.info(f"Found {len(tensor_to_file)} tensors in checkpoint")
 
+        # Debug: Print first few tensor names from each category to verify naming convention
+        sample_tensors = list(tensor_to_file.keys())[:20]
+        logging.debug(f"Sample checkpoint tensor names: {sample_tensors}")
+
+        # Print layer 0 tensor names for verification
+        layer0_tensors = [k for k in tensor_to_file.keys() if "block.0." in k or "0." in k][:15]
+        logging.info(f"Layer 0 checkpoint tensors (for verification): {layer0_tensors}")
+
         # Process each layer
         for layer_idx in trange(self.num_layers, desc="Converting layers"):
             self._convert_layer(layer_idx, tensor_to_file)
@@ -344,7 +352,7 @@ class GptOss_Parameter_Server:
         # Router/gate weights
         gate_name = f"block.{layer_idx}.mlp.gate.weight"
         if gate_name in tensor_to_file:
-            layer_tensors[f"model.layers.{layer_idx}.moe.router.weight"] = self._load_tensor(gate_name, tensor_to_file)
+            layer_tensors[f"model.layers.{layer_idx}.mlp.router.weight"] = self._load_tensor(gate_name, tensor_to_file)
 
         # MLP weights - MXFP4 packed
         # mlp1 contains gate_proj + up_proj combined
