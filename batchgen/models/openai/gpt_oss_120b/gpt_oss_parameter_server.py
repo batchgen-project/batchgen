@@ -148,6 +148,24 @@ class GptOss_Parameter_Server:
             self.state_dict_name_map,
         )
 
+        # Debug: Log what skeleton_state_dict the C++ parameter server returns
+        try:
+            skeleton_dict = self.parameter_server.get_skeleton_state_dict()
+            logging.info(f"C++ Parameter_Server.get_skeleton_state_dict() returned {len(skeleton_dict)} keys")
+            if skeleton_dict:
+                sample_keys = list(skeleton_dict.keys())[:20]
+                logging.info(f"  Sample skeleton keys: {sample_keys}")
+            else:
+                logging.warning("  WARNING: skeleton_state_dict is EMPTY!")
+                # Check if the converted_ckpt_dir is correct
+                logging.info(f"  converted_ckpt_dir: {self.converted_ckpt_dir}")
+                logging.info(f"  converted_ckpt_dir exists: {os.path.exists(self.converted_ckpt_dir)}")
+                if os.path.exists(self.converted_ckpt_dir):
+                    files = os.listdir(self.converted_ckpt_dir)
+                    logging.info(f"  Files in converted_ckpt_dir: {files}")
+        except Exception as e:
+            logging.error(f"Failed to get skeleton_state_dict: {e}")
+
         # Expose weights_storage for core engine
         self._weights_storage = self.parameter_server
 
@@ -176,7 +194,8 @@ class GptOss_Parameter_Server:
         self.weight_copy_task["routed_expert"] = []
 
         for layer_idx in trange(self.num_layers, desc="Parsing state_dict"):
-            # Attention weights - explicit list including sinks and biases
+            # Attention weights - these go to module_weights_storage_ for dynamic loading
+            # Note: We add explicit list to match the converted checkpoint tensor names
             attn_tensor_names = [
                 "q_proj.weight",
                 "q_proj.bias",
@@ -196,27 +215,11 @@ class GptOss_Parameter_Server:
                 }
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
 
-            # Layer norms
-            self.state_dict_name_map[f"model.layers.{layer_idx}.input_layernorm.weight"] = {
-                "module_key": f"layer_{layer_idx}",
-                "tensor_key": "input_layernorm.weight",
-            }
-            self.state_dict_name_map[f"model.layers.{layer_idx}.post_attention_layernorm.weight"] = {
-                "module_key": f"layer_{layer_idx}",
-                "tensor_key": "post_attention_layernorm.weight",
-            }
+            # NOTE: Layer norms, router weights, embeddings, final norm, and lm_head
+            # are NOT added to state_dict_name_map - they will go to skeleton_state_dict_
+            # and be loaded directly into the model by Parallel_Strategy_Manager
 
-            # Router/gate weights (including bias)
-            self.state_dict_name_map[f"model.layers.{layer_idx}.mlp.router.weight"] = {
-                "module_key": f"moe_router_{layer_idx}",
-                "tensor_key": "weight",
-            }
-            self.state_dict_name_map[f"model.layers.{layer_idx}.mlp.router.bias"] = {
-                "module_key": f"moe_router_{layer_idx}",
-                "tensor_key": "bias",
-            }
-
-            # Expert weights - register per-expert
+            # Expert weights - register per-expert for dynamic loading
             # Include MXFP4 scale tensors which aren't in named_parameters()
             expert_tensor_names = [
                 "gate_proj.weight",
@@ -240,19 +243,10 @@ class GptOss_Parameter_Server:
                     f"routed_expert_{layer_idx}_{expert_idx}"
                 )
 
-        # Non-layer tensors (embeddings, final norm, lm_head)
-        self.state_dict_name_map["model.embed_tokens.weight"] = {
-            "module_key": "embed",
-            "tensor_key": "weight",
-        }
-        self.state_dict_name_map["model.norm.weight"] = {
-            "module_key": "final_norm",
-            "tensor_key": "weight",
-        }
-        self.state_dict_name_map["lm_head.weight"] = {
-            "module_key": "lm_head",
-            "tensor_key": "weight",
-        }
+        # NOTE: Non-layer tensors (embeddings, final norm, lm_head) are NOT added to
+        # state_dict_name_map - they will go to skeleton_state_dict_ automatically
+        # because the C++ Parameter_Server puts any tensor not in state_dict_name_map
+        # into skeleton_state_dict_
 
         del model
         gc.collect()
@@ -273,6 +267,37 @@ class GptOss_Parameter_Server:
         converted_marker = os.path.join(self.converted_ckpt_dir, ".gpt_oss_converted")
         if os.path.exists(converted_marker):
             logging.info(f"Checkpoint already converted at {self.converted_ckpt_dir}")
+            # Log what converted files exist
+            converted_files = [f for f in os.listdir(self.converted_ckpt_dir) if f.endswith(('.bin', '.json'))]
+            logging.info(f"Converted files: {sorted(converted_files)}")
+
+            # Log tensor names from JSON metadata files - helps debug skeleton loading
+            import json
+            skeleton_candidates = []  # Tensors that should go to skeleton (not in state_dict_name_map)
+            for json_file in sorted([f for f in converted_files if f.endswith('.json')]):
+                json_path = os.path.join(self.converted_ckpt_dir, json_file)
+                try:
+                    with open(json_path, 'r') as f:
+                        meta = json.load(f)
+                        tensor_names = list(meta.get('state_dict', {}).keys())
+                        logging.info(f"  {json_file}: {len(tensor_names)} tensors")
+                        if tensor_names:
+                            logging.info(f"    Sample tensors: {tensor_names[:5]}")
+                        # Check which tensors are NOT in state_dict_name_map (these go to skeleton)
+                        for tname in tensor_names:
+                            if tname not in self.state_dict_name_map:
+                                skeleton_candidates.append(tname)
+                except Exception as e:
+                    logging.warning(f"  {json_file}: Failed to read - {e}")
+
+            # Log expected skeleton tensors
+            if skeleton_candidates:
+                logging.info(f"Tensors NOT in state_dict_name_map (should go to skeleton): {len(skeleton_candidates)}")
+                logging.info(f"  Sample skeleton candidates: {skeleton_candidates[:10]}")
+            else:
+                logging.warning("WARNING: No skeleton candidates found! This may cause 'Missing skeleton weight' errors.")
+                logging.warning("  Try deleting the converted checkpoint directory to force re-conversion:")
+                logging.warning(f"    rm -rf {self.converted_ckpt_dir}")
             return
 
         logging.info(f"Converting checkpoint from {self.cache_dir} to {self.converted_ckpt_dir}")
@@ -528,6 +553,11 @@ class GptOss_Parameter_Server:
         """
         import json
 
+        logging.info(f"Saving {len(tensors)} tensors to {output_file}")
+        if tensors:
+            sample_keys = list(tensors.keys())[:10]
+            logging.debug(f"  Sample tensor names: {sample_keys}")
+
         metadata = {
             "file_name": os.path.basename(output_file),
             "state_dict": {},
@@ -580,3 +610,5 @@ class GptOss_Parameter_Server:
 
         with open(json_file, "w") as f:
             json.dump(metadata, f, indent=2)
+
+        logging.info(f"  Saved {len(metadata['state_dict'])} tensors, total {metadata['total_byte_size']/1024/1024:.2f} MB")
