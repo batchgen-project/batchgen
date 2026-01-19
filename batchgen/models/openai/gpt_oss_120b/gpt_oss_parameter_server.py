@@ -170,12 +170,16 @@ class GptOss_Parameter_Server:
         self.weight_copy_task["routed_expert"] = []
 
         for layer_idx in trange(self.num_layers, desc="Parsing state_dict"):
-            # Attention weights - explicit list including sinks
+            # Attention weights - explicit list including sinks and biases
             attn_tensor_names = [
                 "q_proj.weight",
+                "q_proj.bias",
                 "k_proj.weight",
+                "k_proj.bias",
                 "v_proj.weight",
+                "v_proj.bias",
                 "o_proj.weight",
+                "o_proj.bias",
                 "sinks",  # Attention sinks for GPT-OSS
             ]
             for name in attn_tensor_names:
@@ -324,12 +328,16 @@ class GptOss_Parameter_Server:
 
         layer_tensors = {}
 
-        # Attention weights - copy directly
+        # Attention weights - copy directly (including biases for attention_bias=True)
         attn_tensor_names = [
             f"block.{layer_idx}.attn.q_proj.weight",
+            f"block.{layer_idx}.attn.q_proj.bias",
             f"block.{layer_idx}.attn.k_proj.weight",
+            f"block.{layer_idx}.attn.k_proj.bias",
             f"block.{layer_idx}.attn.v_proj.weight",
+            f"block.{layer_idx}.attn.v_proj.bias",
             f"block.{layer_idx}.attn.o_proj.weight",
+            f"block.{layer_idx}.attn.o_proj.bias",
             f"block.{layer_idx}.attn.sinks",  # Attention sinks
         ]
 
