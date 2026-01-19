@@ -147,7 +147,10 @@ class GptOssParallelStrategyManager:
         return self.model, self.weight_copy_task
 
     def _load_model_skeleton(self):
-        """Load non-expert weights (embeddings, attention, norms, lm_head).
+        """Load skeleton weights (embeddings, layer norms, router, lm_head).
+
+        Skeleton weights are parameters NOT in state_dict_name_map. Parameters in
+        state_dict_name_map (attention, experts) are loaded dynamically via wrappers.
 
         Note: Due to config_torch_module_initializer() in BatchGen, model parameters
         are created with placeholder shape [1] to save memory. We use direct assignment
@@ -169,18 +172,20 @@ class GptOssParallelStrategyManager:
             logging.info(f"Final norm-related keys: {norm_keys}")
             logging.info(f"LM head-related keys: {lm_head_keys}")
 
-        # Debug: Print expected model parameter names (non-expert)
-        expected_params = [n for n, _ in self.model.named_parameters() if "experts" not in n]
-        logging.info(f"Model expects {len(expected_params)} non-expert parameters")
-        logging.debug(f"Sample expected params: {expected_params[:15]}")
-
         loaded_count = 0
         missing_count = 0
+        skipped_module_weights = 0
 
-        # Filter skeleton state dict for non-expert weights
+        # Load only skeleton weights (NOT in state_dict_name_map)
+        # Weights in state_dict_name_map are loaded dynamically via wrappers
         for name, param in self.model.named_parameters():
             if "experts" in name:
                 continue  # Skip expert weights (loaded separately with MXFP4)
+
+            # Skip weights that will be loaded via module_weights (in state_dict_name_map)
+            if name in self.state_dict_name_map:
+                skipped_module_weights += 1
+                continue
 
             if name in self.skeleton_state_dict:
                 skeleton_tensor = self.skeleton_state_dict[name]
@@ -194,7 +199,7 @@ class GptOssParallelStrategyManager:
                 logging.warning(f"Missing skeleton weight: {name}")
                 missing_count += 1
 
-        logging.info(f"Model skeleton loaded: {loaded_count} weights loaded, {missing_count} missing")
+        logging.info(f"Model skeleton loaded: {loaded_count} weights loaded, {missing_count} missing, {skipped_module_weights} skipped (will load via wrappers)")
 
     def _config_attn_module(self):
         """Configure attention modules with BatchGen wrappers."""
