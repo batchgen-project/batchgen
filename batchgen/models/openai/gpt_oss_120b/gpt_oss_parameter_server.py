@@ -441,8 +441,8 @@ class GptOss_Parameter_Server:
         - block.{n}.attn.qkv.weight/bias - FUSED Q/K/V, need to split
         - block.{n}.attn.out.weight/bias - Output projection
         - block.{n}.attn.sinks - Attention sinks
-        - block.{n}.attn.norm.weight - Pre-attention layer norm (input_layernorm)
-        - block.{n}.mlp.norm.weight - Post-attention layer norm (post_attention_layernorm)
+        - block.{n}.attn.norm.scale - Pre-attention layer norm (input_layernorm) NOTE: .scale not .weight
+        - block.{n}.mlp.norm.scale - Post-attention layer norm (post_attention_layernorm) NOTE: .scale not .weight
         - block.{n}.mlp.gate.weight/bias - Router
         """
         output_file = os.path.join(self.converted_ckpt_dir, f"layer_{layer_idx}.bin")
@@ -508,11 +508,11 @@ class GptOss_Parameter_Server:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.sinks"] = self._load_tensor(sinks_name, tensor_to_file)
             module_tensors.append(f"model.layers.{layer_idx}.self_attn.sinks")
 
-        # Layer norms - OpenAI uses different naming
-        # block.{n}.attn.norm.weight -> input_layernorm (pre-attention)
-        # block.{n}.mlp.norm.weight -> post_attention_layernorm
-        attn_norm_name = f"block.{layer_idx}.attn.norm.weight"
-        mlp_norm_name = f"block.{layer_idx}.mlp.norm.weight"
+        # Layer norms - OpenAI uses .scale instead of .weight
+        # block.{n}.attn.norm.scale -> input_layernorm (pre-attention)
+        # block.{n}.mlp.norm.scale -> post_attention_layernorm
+        attn_norm_name = f"block.{layer_idx}.attn.norm.scale"
+        mlp_norm_name = f"block.{layer_idx}.mlp.norm.scale"
 
         if attn_norm_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.input_layernorm.weight"] = self._load_tensor(attn_norm_name, tensor_to_file)
@@ -626,7 +626,7 @@ class GptOss_Parameter_Server:
 
         OpenAI checkpoint format:
         - embedding.weight -> model.embed_tokens.weight
-        - norm.weight -> model.norm.weight (final layer norm)
+        - norm.scale -> model.norm.weight (final layer norm, note: .scale not .weight)
         - unembedding.weight -> lm_head.weight
         """
         output_file = os.path.join(self.converted_ckpt_dir, "non_layer.bin")
@@ -641,8 +641,8 @@ class GptOss_Parameter_Server:
             tensors["model.embed_tokens.weight"] = self._load_tensor(embed_name, tensor_to_file)
             logging.info(f"Loaded embedding: {tensors['model.embed_tokens.weight'].shape}")
 
-        # Final layer norm - OpenAI uses "norm.weight"
-        final_norm_name = "norm.weight"
+        # Final layer norm - OpenAI uses "norm.scale" (not .weight)
+        final_norm_name = "norm.scale"
         if final_norm_name in tensor_to_file:
             tensors["model.norm.weight"] = self._load_tensor(final_norm_name, tensor_to_file)
             logging.info(f"Loaded final norm: {tensors['model.norm.weight'].shape}")
