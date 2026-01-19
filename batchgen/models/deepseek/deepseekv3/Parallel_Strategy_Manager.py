@@ -1,12 +1,10 @@
 from .modeling_deepseek_v3 import (
 	DeepseekV3ForCausalLM
 )
-from ...wrappers import DeepSeekExpertWrapper
+from .wrappers import DeepSeekExpertWrapper
 from ...Wrapper import Attn_Wrapper
 import logging
-from ....quantization.fp8e4m3 import (
-	deepseek_v3_dequantization
-)
+from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 import types
 import torch.distributed as dist	
 import time

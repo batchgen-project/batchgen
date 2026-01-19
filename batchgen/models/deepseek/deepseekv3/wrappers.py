@@ -29,30 +29,8 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from .expert import ExpertWrapperBase
-from .attention import AttnWrapperBase
-
-
-def deepseek_v3_dequantization(
-    x: torch.Tensor, scale_inv: torch.Tensor, block_size: int = 128
-) -> torch.Tensor:
-    """Dequantize FP8 weights using block-wise scaling.
-
-    Args:
-        x: FP8 quantized weights
-        scale_inv: Inverse scale factors
-        block_size: Block size for dequantization
-
-    Returns:
-        Dequantized BF16 weights
-    """
-    # Import the actual dequantization function
-    try:
-        from batchgen.models.Wrapper import deepseek_v3_dequantization as _dequant
-        return _dequant(x, scale_inv, block_size)
-    except ImportError:
-        # Fallback: simple multiplication
-        return x.to(torch.bfloat16) * scale_inv
+from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
+from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 
 
 class DeepSeekExpertWrapper(ExpertWrapperBase):

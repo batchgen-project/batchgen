@@ -31,8 +31,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from .expert import ExpertWrapperBase
-from .attention import AttnWrapperBase
+from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 
 
 class GptOssExpertWrapper(ExpertWrapperBase):
