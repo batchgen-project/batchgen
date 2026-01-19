@@ -376,6 +376,8 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                     dtype = torch::kBFloat16;
                 } else if (tensor_info.dtype == "float8_e4m3fn") {
                     dtype = torch::kFloat8_e4m3fn;
+                } else if (tensor_info.dtype == "uint8") {
+                    dtype = torch::kUInt8;
                 } else {
                     throw std::runtime_error("Unsupported dtype: " + tensor_info.dtype);
                 }
