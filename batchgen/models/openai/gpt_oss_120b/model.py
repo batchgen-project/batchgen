@@ -560,7 +560,15 @@ class GptOssModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        # Debug: Log config values before creating embedding
+        import logging
+        logging.info(f"GptOssModel.__init__: Creating embedding with vocab_size={config.vocab_size}, hidden_size={config.hidden_size}, padding_idx={self.padding_idx}")
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+
+        # Debug: Log actual embedding shape
+        logging.info(f"GptOssModel.__init__: embed_tokens.weight.shape={self.embed_tokens.weight.shape}")
+
         self.layers = nn.ModuleList(
             [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -647,9 +655,18 @@ class GptOss(nn.Module):
     def __init__(self, config: GptOssConfig):
         super().__init__()
         self.config = config
+
+        # Debug: Log config values
+        import logging
+        logging.info(f"GptOss.__init__: vocab_size={config.vocab_size}, hidden_size={config.hidden_size}")
+
         self.model = GptOssModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Debug: Log actual parameter shapes
+        logging.info(f"GptOss.__init__: embed_tokens.weight.shape={self.model.embed_tokens.weight.shape}")
+        logging.info(f"GptOss.__init__: lm_head.weight.shape={self.lm_head.weight.shape}")
 
     def forward(
         self,
