@@ -30,7 +30,7 @@ from typing import Dict, List, Tuple
 import torch
 import torch.distributed as dist
 
-from .model import GptOssForCausalLM
+from .model import GptOss
 from .wrappers import GptOssExpertWrapper, GptOssAttnWrapper
 
 
@@ -81,7 +81,7 @@ class GptOssParallelStrategyManager:
 
         # Step 2: Initialize model
         step_start = time.perf_counter()
-        self.model = GptOssForCausalLM(self.loaded_model_config)
+        self.model = GptOss(self.loaded_model_config)
         timings["model_init"] = time.perf_counter() - step_start
 
         # Step 3: Initialize data structures

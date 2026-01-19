@@ -53,7 +53,7 @@ class GptOss120BConfig(BaseModelConfig):
 
     # ==================== Identity ====================
     model_type: str = "gpt_oss"
-    architectures: List[str] = field(default_factory=lambda: ["GptOssForCausalLM"])
+    architectures: List[str] = field(default_factory=lambda: ["GptOss"])
 
     # ==================== Core Architecture ====================
     vocab_size: int = 201088

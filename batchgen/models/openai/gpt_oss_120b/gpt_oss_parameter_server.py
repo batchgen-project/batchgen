@@ -50,7 +50,7 @@ import torch
 from safetensors import safe_open
 from tqdm import tqdm, trange
 
-from .model import GptOssForCausalLM
+from .model import GptOss
 from .configuration_gpt_oss import GptOssConfig
 from batchgen.config.model_registry import load_config
 
@@ -163,7 +163,7 @@ class GptOss_Parameter_Server:
         """
         # Create model to parse weight names
         self.hf_config._attn_implementation = "eager"
-        model = GptOssForCausalLM._from_config(self.hf_config).to('cpu')
+        model = GptOss(self.hf_config).to('cpu')
         model.eval()
 
         self.weight_copy_task["attn"] = []

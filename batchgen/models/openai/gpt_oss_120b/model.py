@@ -637,8 +637,12 @@ class GptOssModel(nn.Module):
         return (hidden_states, next_cache, all_hidden_states, all_self_attns)
 
 
-class GptOssForCausalLM(nn.Module):
-    """GPT-OSS-120B model with language modeling head."""
+class GptOss(nn.Module):
+    """GPT-OSS-120B model with language modeling head.
+
+    Instantiate with BatchGen config:
+        model = GptOss(config)
+    """
 
     def __init__(self, config: GptOssConfig):
         super().__init__()

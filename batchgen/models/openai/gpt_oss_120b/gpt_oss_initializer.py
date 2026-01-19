@@ -74,7 +74,7 @@ class GptOssInitializer:
     def __init__(self, input_arguments):
         self.loaded_model_config = GptOssConfig()
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
-        self.loaded_model_config.architectures = ["GptOssForCausalLM"]
+        self.loaded_model_config.architectures = ["GptOss"]
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
