@@ -175,7 +175,16 @@ class GptOssParallelStrategyManager:
                 continue  # Skip expert weights (loaded separately with MXFP4)
 
             if name in self.skeleton_state_dict:
-                param.data.copy_(self.skeleton_state_dict[name])
+                skeleton_tensor = self.skeleton_state_dict[name]
+                # Debug: Log shape comparison for first few params and any mismatches
+                if param.shape != skeleton_tensor.shape:
+                    logging.error(f"SHAPE MISMATCH: {name}")
+                    logging.error(f"  Model param shape: {param.shape}")
+                    logging.error(f"  Skeleton tensor shape: {skeleton_tensor.shape}")
+                    logging.error(f"  Skeleton tensor dtype: {skeleton_tensor.dtype}")
+                    logging.error(f"  Skeleton tensor values (first 10): {skeleton_tensor.flatten()[:10]}")
+                    raise RuntimeError(f"Shape mismatch for {name}: model={param.shape}, skeleton={skeleton_tensor.shape}")
+                param.data.copy_(skeleton_tensor)
             else:
                 logging.warning(f"Missing skeleton weight: {name}")
 
