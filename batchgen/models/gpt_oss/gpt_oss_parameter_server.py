@@ -484,7 +484,14 @@ class GptOss_Parameter_Server:
                 metadata["total_byte_size"] += byte_size
 
                 # Write tensor bytes
-                f.write(tensor.numpy().tobytes())
+                # Note: bfloat16 is not supported by numpy, view as uint16 instead
+                tensor = tensor.contiguous()
+                if tensor.dtype == torch.bfloat16:
+                    # View bf16 as uint16 for numpy compatibility (same byte layout)
+                    tensor_bytes = tensor.view(torch.uint16).numpy().tobytes()
+                else:
+                    tensor_bytes = tensor.numpy().tobytes()
+                f.write(tensor_bytes)
 
         with open(json_file, "w") as f:
             json.dump(metadata, f, indent=2)
