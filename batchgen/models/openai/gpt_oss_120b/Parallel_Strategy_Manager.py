@@ -147,7 +147,12 @@ class GptOssParallelStrategyManager:
         return self.model, self.weight_copy_task
 
     def _load_model_skeleton(self):
-        """Load non-expert weights (embeddings, attention, norms, lm_head)."""
+        """Load non-expert weights (embeddings, attention, norms, lm_head).
+
+        Note: Due to config_torch_module_initializer() in BatchGen, model parameters
+        are created with placeholder shape [1] to save memory. We use direct assignment
+        (param.data = tensor) instead of copy_() to load the actual weights.
+        """
         logging.info("Loading model skeleton...")
 
         # Debug: Print skeleton_state_dict keys for verification
@@ -169,6 +174,9 @@ class GptOssParallelStrategyManager:
         logging.info(f"Model expects {len(expected_params)} non-expert parameters")
         logging.debug(f"Sample expected params: {expected_params[:15]}")
 
+        loaded_count = 0
+        missing_count = 0
+
         # Filter skeleton state dict for non-expert weights
         for name, param in self.model.named_parameters():
             if "experts" in name:
@@ -176,19 +184,17 @@ class GptOssParallelStrategyManager:
 
             if name in self.skeleton_state_dict:
                 skeleton_tensor = self.skeleton_state_dict[name]
-                # Debug: Log shape comparison for first few params and any mismatches
-                if param.shape != skeleton_tensor.shape:
-                    logging.error(f"SHAPE MISMATCH: {name}")
-                    logging.error(f"  Model param shape: {param.shape}")
-                    logging.error(f"  Skeleton tensor shape: {skeleton_tensor.shape}")
-                    logging.error(f"  Skeleton tensor dtype: {skeleton_tensor.dtype}")
-                    logging.error(f"  Skeleton tensor values (first 10): {skeleton_tensor.flatten()[:10]}")
-                    raise RuntimeError(f"Shape mismatch for {name}: model={param.shape}, skeleton={skeleton_tensor.shape}")
-                param.data.copy_(skeleton_tensor)
+                # Use direct assignment instead of copy_() because model params
+                # are created with placeholder shape [1] due to memory optimization
+                # in config_torch_module_initializer()
+                param.data = skeleton_tensor.to(param.device)
+                loaded_count += 1
+                logging.debug(f"Loaded skeleton weight: {name} shape={skeleton_tensor.shape}")
             else:
                 logging.warning(f"Missing skeleton weight: {name}")
+                missing_count += 1
 
-        logging.info("Model skeleton loaded")
+        logging.info(f"Model skeleton loaded: {loaded_count} weights loaded, {missing_count} missing")
 
     def _config_attn_module(self):
         """Configure attention modules with BatchGen wrappers."""
