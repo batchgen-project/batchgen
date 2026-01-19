@@ -118,6 +118,13 @@ class GptOssInitializer:
         engine_config.Basic_Config.kv_dtype = "bfloat16"
         engine_config.Basic_Config.kv_dtype_torch = torch.bfloat16
 
+        # Fallback weight_dtype for modules not in weight_dtypes map
+        # GPT-OSS attention uses BF16, experts use uint8 (set in _default_engine_config)
+        engine_config.Basic_Config.weight_dtype = "bfloat16"
+        engine_config.Basic_Config.weight_dtype_torch = torch.bfloat16
+        engine_config.Basic_Config.activation_dtype = "bfloat16"
+        engine_config.Basic_Config.activation_dtype_torch = torch.bfloat16
+
         # CRITICAL: Required for planner to calculate expert distribution
         engine_config.Basic_Config.world_size = args.world_size
         engine_config.Basic_Config.rank = args.rank
@@ -204,6 +211,14 @@ class GptOssInitializer:
                 "down_proj.weight_scales": [hidden_size, scales_intermediate],
                 "down_proj.bias": [hidden_size],
             },
+        }
+
+        # Per-module weight dtypes for mixed-dtype model
+        # Attention: BF16 (not quantized)
+        # MoE experts: uint8 (MXFP4 packed)
+        self.engine_config.GPU_Buffer_Config.weight_dtypes = {
+            "attn": torch.bfloat16,
+            "routed_expert": torch.uint8,
         }
 
     def _parse_model_config(self) -> ModelConfig:

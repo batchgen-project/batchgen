@@ -208,6 +208,18 @@ GPU_Buffer_Config parse_gpu_buffer_config(const py::object& engine_config) {
         }
         gpu_buffer_config.module_shapes[module_type] = module_shape;
     }
+
+    // Parse per-module weight dtypes (optional, for mixed-dtype models like GPT-OSS)
+    if (py::hasattr(gpu_buffer_config_obj, "weight_dtypes")) {
+        py::dict weight_dtypes_py = gpu_buffer_config_obj.attr("weight_dtypes").cast<py::dict>();
+        for (auto item : weight_dtypes_py) {
+            std::string module_type = item.first.cast<std::string>();
+            // PyTorch dtype is passed as torch.dtype object, cast to ScalarType
+            torch::Dtype dtype = item.second.cast<torch::Dtype>();
+            gpu_buffer_config.weight_dtypes[module_type] = dtype;
+        }
+    }
+
     return gpu_buffer_config;
 };
 

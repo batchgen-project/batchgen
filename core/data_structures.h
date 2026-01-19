@@ -106,6 +106,7 @@ struct GPU_Buffer_Config {
     int64_t num_v_buffer;
     int64_t num_kv_buffer;
     int64_t kv_buffer_num_tokens;  // Size of the buffer in tokens.
+    std::unordered_map<std::string, torch::Dtype> weight_dtypes;  // Per-module dtype
 };
 
 struct HostPagedKVConfig {

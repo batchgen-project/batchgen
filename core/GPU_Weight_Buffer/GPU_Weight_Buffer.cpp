@@ -67,13 +67,21 @@ void GPU_Weight_Buffer::Init() {
         this->engine_config_.gpu_buffer_config
             .num_prefill_module_buffer;  // TODO: {"attn": 1, "routed_expert":
                                          // 160, "shared_expert": 1}
-    auto options =
-        torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
-            .device(torch::kCUDA, this->engine_config_.basic_config.device)
-            .requires_grad(false)
-            .memory_format(torch::MemoryFormat::Contiguous);
     for (auto& [module_type, num_buffer] : num_buffers) {
+        // Per-module dtype lookup with fallback to global weight_dtype
+        torch::Dtype module_dtype;
+        auto dtype_it = this->engine_config_.gpu_buffer_config.weight_dtypes.find(module_type);
+        if (dtype_it != this->engine_config_.gpu_buffer_config.weight_dtypes.end()) {
+            module_dtype = dtype_it->second;
+        } else {
+            module_dtype = this->engine_config_.basic_config.weight_dtype_torch;
+        }
+        auto options =
+            torch::TensorOptions()
+                .dtype(module_dtype)
+                .device(torch::kCUDA, this->engine_config_.basic_config.device)
+                .requires_grad(false)
+                .memory_format(torch::MemoryFormat::Contiguous);
         this->buffers_[module_type].clear();
         this->buffers_[module_type].resize(num_buffer);
         this->buffer_status_[module_type].clear();
@@ -106,9 +114,17 @@ void GPU_Weight_Buffer::resize_buffer() {
         this->engine_config_.gpu_buffer_config
             .num_decoding_module_buffer;  // {"attn": 1, "routed_expert": 160,
                                           // "shared_expert": 1}
+    // Per-module dtype lookup for routed_expert
+    torch::Dtype module_dtype;
+    auto dtype_it = this->engine_config_.gpu_buffer_config.weight_dtypes.find("routed_expert");
+    if (dtype_it != this->engine_config_.gpu_buffer_config.weight_dtypes.end()) {
+        module_dtype = dtype_it->second;
+    } else {
+        module_dtype = this->engine_config_.basic_config.weight_dtype_torch;
+    }
     auto options =
         torch::TensorOptions()
-            .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+            .dtype(module_dtype)
             .device(torch::kCUDA, this->engine_config_.basic_config.device)
             .requires_grad(false)
             .memory_format(torch::MemoryFormat::Contiguous);
@@ -531,13 +547,21 @@ void GPU_Weight_Buffer::clear_expert_buffer(int64_t layer_idx, int64_t expert_id
 void GPU_Weight_Buffer::reset_prefill_buffer() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_prefill_module_buffer;
-    
+
+    // Per-module dtype lookup for routed_expert
+    torch::Dtype module_dtype;
+    auto dtype_it = this->engine_config_.gpu_buffer_config.weight_dtypes.find("routed_expert");
+    if (dtype_it != this->engine_config_.gpu_buffer_config.weight_dtypes.end()) {
+        module_dtype = dtype_it->second;
+    } else {
+        module_dtype = this->engine_config_.basic_config.weight_dtype_torch;
+    }
     auto options = torch::TensorOptions()
-        .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+        .dtype(module_dtype)
         .device(torch::kCUDA, this->engine_config_.basic_config.device)
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
-    
+
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
         
@@ -790,13 +814,21 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
 void GPU_Weight_Buffer::reset_decoding_buffer() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers = this->engine_config_.gpu_buffer_config.num_decoding_module_buffer;
-    
+
+    // Per-module dtype lookup for routed_expert
+    torch::Dtype module_dtype;
+    auto dtype_it = this->engine_config_.gpu_buffer_config.weight_dtypes.find("routed_expert");
+    if (dtype_it != this->engine_config_.gpu_buffer_config.weight_dtypes.end()) {
+        module_dtype = dtype_it->second;
+    } else {
+        module_dtype = this->engine_config_.basic_config.weight_dtype_torch;
+    }
     auto options = torch::TensorOptions()
-        .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+        .dtype(module_dtype)
         .device(torch::kCUDA, this->engine_config_.basic_config.device)
         .requires_grad(false)
         .memory_format(torch::MemoryFormat::Contiguous);
-    
+
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
         
@@ -828,15 +860,14 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
                         torch::zeros(buffer_shape, options);
                 } else {
-                    // Note: Original decoding uses same options for norm (not bf16)
-                    // Recreating options inline as in original
-                    auto options = torch::TensorOptions()
-                        .dtype(this->engine_config_.basic_config.weight_dtype_torch)
+                    // Norm buffers use per-module dtype (same as main options)
+                    auto norm_options = torch::TensorOptions()
+                        .dtype(module_dtype)
                         .device(torch::kCUDA, this->engine_config_.basic_config.device)
                         .requires_grad(false)
                         .memory_format(torch::MemoryFormat::Contiguous);
                     this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                        torch::ones(buffer_shape, options);
+                        torch::ones(buffer_shape, norm_options);
                 }
             }
         }
