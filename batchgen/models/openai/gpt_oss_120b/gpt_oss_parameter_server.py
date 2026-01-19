@@ -248,6 +248,51 @@ class GptOss_Parameter_Server:
         # because the C++ Parameter_Server puts any tensor not in state_dict_name_map
         # into skeleton_state_dict_
 
+        # Log comprehensive summary of state_dict_name_map
+        logging.info("=" * 60)
+        logging.info("STATE_DICT_NAME_MAP SUMMARY")
+        logging.info("=" * 60)
+        logging.info(f"Total entries in state_dict_name_map: {len(self.state_dict_name_map)}")
+
+        # Count by module type
+        attn_count = sum(1 for k in self.state_dict_name_map if "self_attn" in k)
+        expert_count = sum(1 for k in self.state_dict_name_map if "mlp.experts" in k)
+        logging.info(f"  Attention tensors: {attn_count}")
+        logging.info(f"  Expert tensors: {expert_count}")
+
+        # Sample entries
+        sample_entries = list(self.state_dict_name_map.items())[:5]
+        logging.info(f"Sample state_dict_name_map entries:")
+        for tensor_name, mapping in sample_entries:
+            logging.info(f"  '{tensor_name}' -> module_key='{mapping['module_key']}', tensor_key='{mapping['tensor_key']}'")
+
+        # Log what model parameters should go to skeleton (NOT in state_dict_name_map)
+        skeleton_params = []
+        for name, _ in model.named_parameters():
+            if name not in self.state_dict_name_map:
+                skeleton_params.append(name)
+
+        logging.info(f"\nModel parameters NOT in state_dict_name_map (should go to skeleton): {len(skeleton_params)}")
+        for param_name in skeleton_params[:20]:  # First 20
+            logging.info(f"  SKELETON: {param_name}")
+        if len(skeleton_params) > 20:
+            logging.info(f"  ... and {len(skeleton_params) - 20} more")
+
+        # Categorize skeleton params
+        embed_params = [p for p in skeleton_params if "embed" in p]
+        norm_params = [p for p in skeleton_params if "norm" in p and "layernorm" not in p.lower()]
+        layernorm_params = [p for p in skeleton_params if "layernorm" in p.lower()]
+        router_params = [p for p in skeleton_params if "router" in p]
+        lm_head_params = [p for p in skeleton_params if "lm_head" in p]
+
+        logging.info(f"\nSkeleton param categories:")
+        logging.info(f"  Embedding: {len(embed_params)} - {embed_params}")
+        logging.info(f"  Final norm: {len(norm_params)} - {norm_params}")
+        logging.info(f"  Layer norms: {len(layernorm_params)}")
+        logging.info(f"  Routers: {len(router_params)}")
+        logging.info(f"  LM head: {len(lm_head_params)} - {lm_head_params}")
+        logging.info("=" * 60)
+
         del model
         gc.collect()
         torch.cuda.empty_cache()
@@ -301,6 +346,37 @@ class GptOss_Parameter_Server:
             return
 
         logging.info(f"Converting checkpoint from {self.cache_dir} to {self.converted_ckpt_dir}")
+
+        # Log the name mapping convention
+        logging.info(f"\n{'='*60}")
+        logging.info("CHECKPOINT -> BATCHGEN NAME MAPPING CONVENTION")
+        logging.info(f"{'='*60}")
+        logging.info("Attention (per layer):")
+        logging.info("  block.{L}.attn.qkv.weight -> model.layers.{L}.self_attn.{q,k,v}_proj.weight (SPLIT)")
+        logging.info("  block.{L}.attn.qkv.bias   -> model.layers.{L}.self_attn.{q,k,v}_proj.bias (SPLIT)")
+        logging.info("  block.{L}.attn.out.weight -> model.layers.{L}.self_attn.o_proj.weight")
+        logging.info("  block.{L}.attn.out.bias   -> model.layers.{L}.self_attn.o_proj.bias")
+        logging.info("  block.{L}.attn.sinks      -> model.layers.{L}.self_attn.sinks")
+        logging.info("")
+        logging.info("Layer norms (SKELETON - NOT in state_dict_name_map):")
+        logging.info("  block.{L}.attn.norm.weight -> model.layers.{L}.input_layernorm.weight")
+        logging.info("  block.{L}.mlp.norm.weight  -> model.layers.{L}.post_attention_layernorm.weight")
+        logging.info("")
+        logging.info("Router (SKELETON - NOT in state_dict_name_map):")
+        logging.info("  block.{L}.mlp.gate.weight -> model.layers.{L}.mlp.router.weight")
+        logging.info("  block.{L}.mlp.gate.bias   -> model.layers.{L}.mlp.router.bias")
+        logging.info("")
+        logging.info("Expert MLP (MXFP4, per expert E=0..127):")
+        logging.info("  block.{L}.mlp.mlp1_weight.blocks[E,:2880,:] -> model.layers.{L}.mlp.experts.{E}.gate_proj.weight")
+        logging.info("  block.{L}.mlp.mlp1_weight.blocks[E,2880:,:] -> model.layers.{L}.mlp.experts.{E}.up_proj.weight")
+        logging.info("  block.{L}.mlp.mlp2_weight.blocks[E]         -> model.layers.{L}.mlp.experts.{E}.down_proj.weight")
+        logging.info("  (same pattern for scales and biases)")
+        logging.info("")
+        logging.info("Non-layer tensors (SKELETON - NOT in state_dict_name_map):")
+        logging.info("  embedding.weight   -> model.embed_tokens.weight")
+        logging.info("  norm.weight        -> model.norm.weight")
+        logging.info("  unembedding.weight -> lm_head.weight")
+        logging.info(f"{'='*60}\n")
 
         # Find all safetensor files
         safetensor_files = [
@@ -371,9 +447,12 @@ class GptOss_Parameter_Server:
         """
         output_file = os.path.join(self.converted_ckpt_dir, f"layer_{layer_idx}.bin")
         if os.path.exists(output_file):
+            logging.debug(f"Layer {layer_idx} already converted, skipping")
             return
 
         layer_tensors = {}
+        skeleton_tensors = []  # Track which tensors should go to skeleton
+        module_tensors = []    # Track which tensors should go to module_weights
 
         # Handle FUSED QKV - split into separate Q, K, V projections
         # QKV shape: [q_dim + 2*kv_dim, hidden_size] = [5120, 2880]
@@ -390,6 +469,11 @@ class GptOss_Parameter_Server:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = q_weight
             layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = k_weight
             layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = v_weight
+            module_tensors.extend([
+                f"model.layers.{layer_idx}.self_attn.q_proj.weight",
+                f"model.layers.{layer_idx}.self_attn.k_proj.weight",
+                f"model.layers.{layer_idx}.self_attn.v_proj.weight",
+            ])
             logging.debug(f"Layer {layer_idx} QKV weight split: Q={q_weight.shape}, K={k_weight.shape}, V={v_weight.shape}")
 
         if qkv_bias_name in tensor_to_file:
@@ -401,6 +485,11 @@ class GptOss_Parameter_Server:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.bias"] = q_bias
             layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.bias"] = k_bias
             layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.bias"] = v_bias
+            module_tensors.extend([
+                f"model.layers.{layer_idx}.self_attn.q_proj.bias",
+                f"model.layers.{layer_idx}.self_attn.k_proj.bias",
+                f"model.layers.{layer_idx}.self_attn.v_proj.bias",
+            ])
 
         # Output projection
         out_weight_name = f"block.{layer_idx}.attn.out.weight"
@@ -408,13 +497,16 @@ class GptOss_Parameter_Server:
 
         if out_weight_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.o_proj.weight"] = self._load_tensor(out_weight_name, tensor_to_file)
+            module_tensors.append(f"model.layers.{layer_idx}.self_attn.o_proj.weight")
         if out_bias_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.o_proj.bias"] = self._load_tensor(out_bias_name, tensor_to_file)
+            module_tensors.append(f"model.layers.{layer_idx}.self_attn.o_proj.bias")
 
         # Attention sinks
         sinks_name = f"block.{layer_idx}.attn.sinks"
         if sinks_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.sinks"] = self._load_tensor(sinks_name, tensor_to_file)
+            module_tensors.append(f"model.layers.{layer_idx}.self_attn.sinks")
 
         # Layer norms - OpenAI uses different naming
         # block.{n}.attn.norm.weight -> input_layernorm (pre-attention)
@@ -424,8 +516,10 @@ class GptOss_Parameter_Server:
 
         if attn_norm_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.input_layernorm.weight"] = self._load_tensor(attn_norm_name, tensor_to_file)
+            skeleton_tensors.append(f"model.layers.{layer_idx}.input_layernorm.weight")
         if mlp_norm_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.post_attention_layernorm.weight"] = self._load_tensor(mlp_norm_name, tensor_to_file)
+            skeleton_tensors.append(f"model.layers.{layer_idx}.post_attention_layernorm.weight")
 
         # Router/gate weights (including bias)
         gate_weight_name = f"block.{layer_idx}.mlp.gate.weight"
@@ -438,8 +532,10 @@ class GptOss_Parameter_Server:
             if gate_weight.shape[0] == self.hidden_size and gate_weight.shape[1] == self.num_experts:
                 gate_weight = gate_weight.T.contiguous()
             layer_tensors[f"model.layers.{layer_idx}.mlp.router.weight"] = gate_weight
+            skeleton_tensors.append(f"model.layers.{layer_idx}.mlp.router.weight")
         if gate_bias_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.mlp.router.bias"] = self._load_tensor(gate_bias_name, tensor_to_file)
+            skeleton_tensors.append(f"model.layers.{layer_idx}.mlp.router.bias")
 
         # MLP weights - MXFP4 packed
         # mlp1 contains gate_proj + up_proj combined
@@ -499,6 +595,25 @@ class GptOss_Parameter_Server:
                 layer_tensors[f"{prefix}.down_proj.weight_scales"] = down_scales
                 layer_tensors[f"{prefix}.down_proj.bias"] = down_bias
 
+        # Log layer conversion summary
+        if layer_idx == 0:  # Only log details for first layer to avoid spam
+            logging.info(f"\n{'='*60}")
+            logging.info(f"LAYER {layer_idx} CONVERSION SUMMARY (detailed for layer 0 only)")
+            logging.info(f"{'='*60}")
+            logging.info(f"Total tensors in layer: {len(layer_tensors)}")
+            logging.info(f"\nSkeleton tensors (NOT in state_dict_name_map, will go to skeleton_state_dict_):")
+            for t in skeleton_tensors:
+                in_map = t in self.state_dict_name_map
+                logging.info(f"  {t} -> in_state_dict_name_map={in_map}")
+            logging.info(f"\nModule tensors (IN state_dict_name_map, will go to module_weights_storage_):")
+            for t in module_tensors[:10]:  # First 10 only
+                if t in self.state_dict_name_map:
+                    mapping = self.state_dict_name_map[t]
+                    logging.info(f"  {t} -> module_key='{mapping['module_key']}', tensor_key='{mapping['tensor_key']}'")
+            if len(module_tensors) > 10:
+                logging.info(f"  ... and {len(module_tensors) - 10} more module tensors")
+            logging.info(f"{'='*60}\n")
+
         # Save layer tensors
         self._save_tensors(layer_tensors, output_file)
 
@@ -543,6 +658,17 @@ class GptOss_Parameter_Server:
             # Debug: print available tensor names
             non_block_tensors = [k for k in tensor_to_file.keys() if not k.startswith("block.")]
             logging.warning(f"Available non-block tensors: {non_block_tensors}")
+        else:
+            # Log non-layer tensor mapping
+            logging.info(f"\n{'='*60}")
+            logging.info("NON-LAYER TENSORS CONVERSION")
+            logging.info(f"{'='*60}")
+            for batchgen_name in tensors.keys():
+                in_map = batchgen_name in self.state_dict_name_map
+                logging.info(f"  {batchgen_name}")
+                logging.info(f"    -> in_state_dict_name_map: {in_map}")
+                logging.info(f"    -> Will go to: {'module_weights_storage_' if in_map else 'skeleton_state_dict_'}")
+            logging.info(f"{'='*60}\n")
 
         self._save_tensors(tensors, output_file)
 
