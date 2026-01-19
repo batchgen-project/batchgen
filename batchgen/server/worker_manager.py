@@ -486,7 +486,7 @@ class WorkerManager:
                 self.args.model, self.args.cache_dir, converted_ckpt_dir
             )
         elif "gpt-oss-120b" in self.args.model.lower():
-            from batchgen.models.gpt_oss.gpt_oss_parameter_server import (
+            from batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server import (
                 GptOss_Parameter_Server,
             )
 

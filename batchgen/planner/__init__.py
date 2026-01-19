@@ -44,7 +44,7 @@ def get_planner(model_name: str) -> Type[BasePlanner]:
         return DeepSeekV3Planner
 
     if "gpt-oss-120b" in model_lower:
-        from batchgen.models.gpt_oss.planner import GptOssPlanner
+        from batchgen.models.openai.gpt_oss_120b.planner import GptOssPlanner
         return GptOssPlanner
 
     raise ValueError(f"No planner available for model: {model_name}")

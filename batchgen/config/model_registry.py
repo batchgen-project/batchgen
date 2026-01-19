@@ -207,7 +207,7 @@ def get_registered_models() -> Dict[str, Type["BaseModelConfig"]]:
 def _import_model_configs():
     """Import all model-specific config modules to register them."""
     try:
-        from batchgen.models.gpt_oss import config as _  # noqa: F401
+        from batchgen.models.openai.gpt_oss_120b import config as _  # noqa: F401
     except ImportError:
         pass
 

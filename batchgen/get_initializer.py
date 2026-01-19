@@ -1,5 +1,5 @@
 from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import DeepseekV3Initializer
-from batchgen.models.gpt_oss.gpt_oss_initializer import GptOssInitializer
+from batchgen.models.openai.gpt_oss_120b.gpt_oss_initializer import GptOssInitializer
 
 def get_initializer(model_name:str):
 	model_lower = model_name.lower()
