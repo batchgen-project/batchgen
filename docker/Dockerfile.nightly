@@ -1,0 +1,11 @@
+# Nightly test image - builds BatchGen from source on top of deps base image
+FROM batchgen-deps:latest
+
+WORKDIR /root/moegen
+
+# Copy BatchGen source and install
+COPY . /root/moegen
+RUN uv pip install -r requirements.txt && uv pip install -e . -v \
+    && uv cache clean
+
+CMD ["sleep", "infinity"]

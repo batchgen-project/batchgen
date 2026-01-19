@@ -1,0 +1,105 @@
+name: Nightly Cluster Regression Tests
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 3 AM UTC daily
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Test level to run'
+        type: choice
+        options:
+          - 'test-0-server-only'
+          - 'test-1-single-node-mmlu'
+          - 'test-2-two-node'
+        default: 'test-0-server-only'
+
+env:
+  DIST_INIT_ADDR: "29.194.13.138:33001"
+  MODEL_PATH_NODE0: "/data2/tairan/modelscope/hub/models/deepseek-ai/DeepSeek-R1"
+  STORAGE_PATH: "/data2/tairan/workspace/H20_bench"
+
+jobs:
+  # ==================================================
+  # Job 1: Build Docker image from source
+  # ==================================================
+  build:
+    runs-on: [self-hosted, gpu, node0]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build nightly test image
+        run: |
+          echo "Building Docker image from source..."
+          docker buildx build \
+            --progress=plain \
+            -f docker/Dockerfile.nightly \
+            -t batchgen-test:nightly \
+            .
+
+      - name: Verify image build
+        run: |
+          echo "Verifying BatchGen can be imported..."
+          docker run --rm batchgen-test:nightly \
+            python -c "import batchgen; print('BatchGen version:', batchgen.__version__ if hasattr(batchgen, '__version__') else 'OK')"
+
+  # ==================================================
+  # Job 2: test-0 - Server startup test
+  # ==================================================
+  test-0-server-startup:
+    needs: build
+    runs-on: [self-hosted, gpu, node0]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run server startup test
+        run: |
+          docker run --rm --gpus all \
+            --cap-add=SYS_ADMIN \
+            -e GLOO_SOCKET_IFNAME=bond0 \
+            -e NCCL_SOCKET_IFNAME=bond0 \
+            -e NCCL_IB_DISABLE='0' \
+            -e NCCL_NET="ib" \
+            -e NCCL_OOB_NET_IFNAME="mlx5_" \
+            -e NCCL_OOB_NET_ENABLE=1 \
+            -e NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7 \
+            -v ${{ env.MODEL_PATH_NODE0 }}:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/:ro \
+            -v ${{ env.STORAGE_PATH }}:${{ env.STORAGE_PATH }} \
+            -v $(pwd)/.github/workflows/scripts:/scripts:ro \
+            --network host \
+            --privileged \
+            --shm-size 512g \
+            --ipc=host \
+            batchgen-test:nightly \
+            bash /scripts/test-server-startup.sh \
+              --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
+              --storage-path "${{ env.STORAGE_PATH }}" \
+              --dist-init-addr "${{ env.DIST_INIT_ADDR }}" \
+              --timeout 600
+
+  # ==================================================
+  # Notification on failure
+  # ==================================================
+  notify-failure:
+    needs: [build, test-0-server-startup]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Nightly test failed - ${new Date().toISOString().split('T')[0]}`,
+              body: `## Test Failed\n\n` +
+                    `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n` +
+                    `**Commit:** ${context.sha}\n\n` +
+                    `Please investigate.`,
+              labels: ['ci-failure']
+            });
