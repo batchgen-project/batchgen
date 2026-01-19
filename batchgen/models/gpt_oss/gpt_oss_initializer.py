@@ -28,9 +28,9 @@ from typing import Tuple, Optional
 import torch
 import torch.nn as nn
 
-from ....config.config import EngineConfig, ModelConfig
-from .configuration_gpt_oss import GptOssConfig
+from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
+from .configuration_gpt_oss import GptOssConfig
 from .planner import GptOssPlanner
 from .gpt_oss_parameter_server import GptOss_Parameter_Server
 
