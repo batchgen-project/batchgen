@@ -23,7 +23,7 @@ Handles model initialization, weight loading, and MXFP4 dequantization.
 
 import logging
 import os
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,7 @@ from ....config.config import EngineConfig, ModelConfig
 from .configuration_gpt_oss import GptOssConfig
 from batchgen.config.model_registry import load_config
 from .planner import GptOssPlanner
+from .gpt_oss_parameter_server import GptOss_Parameter_Server
 
 try:
     from batchgen.core_engine import batchgen as core_engine
@@ -85,6 +86,10 @@ class GptOssInitializer:
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
+        # Cache directory for checkpoint conversion
+        self.cache_dir = getattr(input_arguments, 'cache_dir', None)
+        self.pt_ckpt_dir = getattr(input_arguments, 'pt_ckpt_dir', None)
+
         self.model_config = self._parse_model_config()
 
         self.engine_config = EngineConfig()
@@ -98,6 +103,9 @@ class GptOssInitializer:
 
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name
+
+        # Initialize parameter server for weight loading
+        self.parameter_server: Optional[GptOss_Parameter_Server] = None
 
     def _set_basic_config(self, engine_config: EngineConfig, args) -> EngineConfig:
         """Set basic engine configuration from arguments."""
@@ -155,19 +163,38 @@ class GptOssInitializer:
         )
 
         # Module shapes for GPT-OSS (attention in BF16, experts in MXFP4)
+        # MXFP4 packing: 2 FP4 values per uint8 byte
+        # Scales: 1 scale per 32 FP4 elements
+        hidden_size = self.model_config.hidden_size  # 2880
+        intermediate_size = self.model_config.intermediate_size  # 2880
+        packed_hidden = hidden_size // 2  # 1440 (packed dimension)
+        scales_hidden = hidden_size // 32  # 90 (scales dimension)
+        packed_intermediate = intermediate_size // 2  # 1440
+        scales_intermediate = intermediate_size // 32  # 90
+
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             "attn": {
                 # GQA: 64 query heads, 8 KV heads, head_dim=64
+                # Attention weights are in BF16, not MXFP4
                 "q_proj.weight": [4096, 2880],  # [64*64, hidden]
                 "k_proj.weight": [512, 2880],   # [8*64, hidden]
                 "v_proj.weight": [512, 2880],   # [8*64, hidden]
                 "o_proj.weight": [2880, 4096],  # [hidden, 64*64]
             },
             "routed_expert": {
-                # MXFP4 quantized: store as packed + scales
-                "gate_proj.weight": [2880, 2880],  # Will be MXFP4
-                "up_proj.weight": [2880, 2880],
-                "down_proj.weight": [2880, 2880],
+                # MXFP4 quantized: packed weights (uint8) + scales (uint8)
+                # gate_proj: [intermediate_size, hidden_size] -> packed [intermediate, hidden//2]
+                "gate_proj.weight": [intermediate_size, packed_hidden],
+                "gate_proj.weight_scales": [intermediate_size, scales_hidden],
+                "gate_proj.bias": [intermediate_size],
+                # up_proj: [intermediate_size, hidden_size] -> packed
+                "up_proj.weight": [intermediate_size, packed_hidden],
+                "up_proj.weight_scales": [intermediate_size, scales_hidden],
+                "up_proj.bias": [intermediate_size],
+                # down_proj: [hidden_size, intermediate_size] -> packed [hidden, intermediate//2]
+                "down_proj.weight": [hidden_size, packed_intermediate],
+                "down_proj.weight_scales": [hidden_size, scales_intermediate],
+                "down_proj.bias": [hidden_size],
             },
         }
 
@@ -188,11 +215,31 @@ class GptOssInitializer:
 
         return model_config
 
-    def Init(self, weights_storage) -> Tuple:
+    def _create_parameter_server(self) -> GptOss_Parameter_Server:
+        """Create and initialize the parameter server for MXFP4 weight loading.
+
+        Returns:
+            Initialized parameter server with weights loaded
+        """
+        logging.info("Creating GPT-OSS parameter server for MXFP4 weight loading")
+
+        parameter_server = GptOss_Parameter_Server(
+            huggingface_ckpt_name=self.loaded_model_config._name_or_path,
+            cache_dir=self.cache_dir,
+            pt_ckpt_dir=self.pt_ckpt_dir,
+            enable_hugetlbfs=self.enable_hugetlbfs,
+        )
+        parameter_server.Init()
+
+        logging.info("Parameter server initialized")
+        return parameter_server
+
+    def Init(self, weights_storage=None) -> Tuple:
         """Initialize the core engine and load weights.
 
         Args:
-            weights_storage: Storage for model weights
+            weights_storage: Storage for model weights. If None, creates parameter
+                           server internally to provide weights.
 
         Returns:
             Tuple of (core_engine, engine_config, model_config, loaded_model_config)
@@ -201,6 +248,11 @@ class GptOssInitializer:
             torch.cuda.set_device(self.local_rank)
             if self.global_rank == 0:
                 logging.info(f"Engine config: {self.engine_config}")
+
+            # Create parameter server if weights_storage not provided
+            if weights_storage is None:
+                self.parameter_server = self._create_parameter_server()
+                weights_storage = self.parameter_server.weights_storage
 
             self.core_engine = core_engine(
                 self.engine_config, self.model_config, weights_storage
