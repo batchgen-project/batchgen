@@ -91,6 +91,12 @@ class GptOss_Parameter_Server:
         self.num_experts = 128
         self.intermediate_size = 2880
         self.hidden_size = 2880
+        self.num_attention_heads = 64
+        self.num_key_value_heads = 8
+        self.head_dim = 64
+        # QKV split dimensions: Q=64*64=4096, K=8*64=512, V=8*64=512
+        self.q_dim = self.num_attention_heads * self.head_dim  # 4096
+        self.kv_dim = self.num_key_value_heads * self.head_dim  # 512
 
         free_memory, total_memory = torch.cuda.mem_get_info()
         gpu0_memory = free_memory / 1024 / 1024 / 1024
@@ -200,10 +206,14 @@ class GptOss_Parameter_Server:
                 "tensor_key": "post_attention_layernorm.weight",
             }
 
-            # Router/gate weights
+            # Router/gate weights (including bias)
             self.state_dict_name_map[f"model.layers.{layer_idx}.mlp.router.weight"] = {
                 "module_key": f"moe_router_{layer_idx}",
                 "tensor_key": "weight",
+            }
+            self.state_dict_name_map[f"model.layers.{layer_idx}.mlp.router.bias"] = {
+                "module_key": f"moe_router_{layer_idx}",
+                "tensor_key": "bias",
             }
 
             # Expert weights - register per-expert
@@ -287,12 +297,16 @@ class GptOss_Parameter_Server:
         logging.info(f"Found {len(tensor_to_file)} tensors in checkpoint")
 
         # Debug: Print first few tensor names from each category to verify naming convention
-        sample_tensors = list(tensor_to_file.keys())[:20]
-        logging.debug(f"Sample checkpoint tensor names: {sample_tensors}")
+        sample_tensors = list(tensor_to_file.keys())[:30]
+        logging.info(f"Sample checkpoint tensor names (first 30): {sample_tensors}")
 
         # Print layer 0 tensor names for verification
-        layer0_tensors = [k for k in tensor_to_file.keys() if "block.0." in k or "0." in k][:15]
+        layer0_tensors = [k for k in tensor_to_file.keys() if "block.0." in k][:20]
         logging.info(f"Layer 0 checkpoint tensors (for verification): {layer0_tensors}")
+
+        # Print non-block tensors (embedding, norm, unembedding)
+        non_block_tensors = [k for k in tensor_to_file.keys() if not k.startswith("block.")]
+        logging.info(f"Non-block checkpoint tensors: {non_block_tensors}")
 
         # Process each layer
         for layer_idx in trange(self.num_layers, desc="Converting layers"):
@@ -319,8 +333,16 @@ class GptOss_Parameter_Server:
         """Convert a single layer's weights.
 
         Handles:
-        - Attention weights (copy as-is)
+        - Attention weights (split fused QKV)
         - MLP expert weights (slice + split + rename)
+
+        OpenAI checkpoint format:
+        - block.{n}.attn.qkv.weight/bias - FUSED Q/K/V, need to split
+        - block.{n}.attn.out.weight/bias - Output projection
+        - block.{n}.attn.sinks - Attention sinks
+        - block.{n}.attn.norm.weight - Pre-attention layer norm (input_layernorm)
+        - block.{n}.mlp.norm.weight - Post-attention layer norm (post_attention_layernorm)
+        - block.{n}.mlp.gate.weight/bias - Router
         """
         output_file = os.path.join(self.converted_ckpt_dir, f"layer_{layer_idx}.bin")
         if os.path.exists(output_file):
@@ -328,39 +350,71 @@ class GptOss_Parameter_Server:
 
         layer_tensors = {}
 
-        # Attention weights - copy directly (including biases for attention_bias=True)
-        attn_tensor_names = [
-            f"block.{layer_idx}.attn.q_proj.weight",
-            f"block.{layer_idx}.attn.q_proj.bias",
-            f"block.{layer_idx}.attn.k_proj.weight",
-            f"block.{layer_idx}.attn.k_proj.bias",
-            f"block.{layer_idx}.attn.v_proj.weight",
-            f"block.{layer_idx}.attn.v_proj.bias",
-            f"block.{layer_idx}.attn.o_proj.weight",
-            f"block.{layer_idx}.attn.o_proj.bias",
-            f"block.{layer_idx}.attn.sinks",  # Attention sinks
-        ]
+        # Handle FUSED QKV - split into separate Q, K, V projections
+        # QKV shape: [q_dim + 2*kv_dim, hidden_size] = [5120, 2880]
+        qkv_weight_name = f"block.{layer_idx}.attn.qkv.weight"
+        qkv_bias_name = f"block.{layer_idx}.attn.qkv.bias"
 
-        for name in attn_tensor_names:
-            if name in tensor_to_file:
-                tensor = self._load_tensor(name, tensor_to_file)
-                # Map to BatchGen naming
-                batchgen_name = name.replace(f"block.{layer_idx}.attn.", f"model.layers.{layer_idx}.self_attn.")
-                layer_tensors[batchgen_name] = tensor
+        if qkv_weight_name in tensor_to_file:
+            qkv_weight = self._load_tensor(qkv_weight_name, tensor_to_file)  # [5120, 2880]
+            # Split: Q=[4096, 2880], K=[512, 2880], V=[512, 2880]
+            q_weight = qkv_weight[:self.q_dim]  # [4096, 2880]
+            k_weight = qkv_weight[self.q_dim:self.q_dim + self.kv_dim]  # [512, 2880]
+            v_weight = qkv_weight[self.q_dim + self.kv_dim:]  # [512, 2880]
 
-        # Layer norms
-        norm_names = [
-            (f"block.{layer_idx}.input_layernorm.weight", f"model.layers.{layer_idx}.input_layernorm.weight"),
-            (f"block.{layer_idx}.post_attention_layernorm.weight", f"model.layers.{layer_idx}.post_attention_layernorm.weight"),
-        ]
-        for ckpt_name, bg_name in norm_names:
-            if ckpt_name in tensor_to_file:
-                layer_tensors[bg_name] = self._load_tensor(ckpt_name, tensor_to_file)
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = q_weight
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = k_weight
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = v_weight
+            logging.debug(f"Layer {layer_idx} QKV weight split: Q={q_weight.shape}, K={k_weight.shape}, V={v_weight.shape}")
 
-        # Router/gate weights
-        gate_name = f"block.{layer_idx}.mlp.gate.weight"
-        if gate_name in tensor_to_file:
-            layer_tensors[f"model.layers.{layer_idx}.mlp.router.weight"] = self._load_tensor(gate_name, tensor_to_file)
+        if qkv_bias_name in tensor_to_file:
+            qkv_bias = self._load_tensor(qkv_bias_name, tensor_to_file)  # [5120]
+            q_bias = qkv_bias[:self.q_dim]
+            k_bias = qkv_bias[self.q_dim:self.q_dim + self.kv_dim]
+            v_bias = qkv_bias[self.q_dim + self.kv_dim:]
+
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.bias"] = q_bias
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.bias"] = k_bias
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.bias"] = v_bias
+
+        # Output projection
+        out_weight_name = f"block.{layer_idx}.attn.out.weight"
+        out_bias_name = f"block.{layer_idx}.attn.out.bias"
+
+        if out_weight_name in tensor_to_file:
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.o_proj.weight"] = self._load_tensor(out_weight_name, tensor_to_file)
+        if out_bias_name in tensor_to_file:
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.o_proj.bias"] = self._load_tensor(out_bias_name, tensor_to_file)
+
+        # Attention sinks
+        sinks_name = f"block.{layer_idx}.attn.sinks"
+        if sinks_name in tensor_to_file:
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.sinks"] = self._load_tensor(sinks_name, tensor_to_file)
+
+        # Layer norms - OpenAI uses different naming
+        # block.{n}.attn.norm.weight -> input_layernorm (pre-attention)
+        # block.{n}.mlp.norm.weight -> post_attention_layernorm
+        attn_norm_name = f"block.{layer_idx}.attn.norm.weight"
+        mlp_norm_name = f"block.{layer_idx}.mlp.norm.weight"
+
+        if attn_norm_name in tensor_to_file:
+            layer_tensors[f"model.layers.{layer_idx}.input_layernorm.weight"] = self._load_tensor(attn_norm_name, tensor_to_file)
+        if mlp_norm_name in tensor_to_file:
+            layer_tensors[f"model.layers.{layer_idx}.post_attention_layernorm.weight"] = self._load_tensor(mlp_norm_name, tensor_to_file)
+
+        # Router/gate weights (including bias)
+        gate_weight_name = f"block.{layer_idx}.mlp.gate.weight"
+        gate_bias_name = f"block.{layer_idx}.mlp.gate.bias"
+
+        if gate_weight_name in tensor_to_file:
+            # Note: OpenAI gate weight is [hidden_size, num_experts], may need transpose
+            gate_weight = self._load_tensor(gate_weight_name, tensor_to_file)
+            # Check if transpose needed (BatchGen expects [num_experts, hidden_size])
+            if gate_weight.shape[0] == self.hidden_size and gate_weight.shape[1] == self.num_experts:
+                gate_weight = gate_weight.T.contiguous()
+            layer_tensors[f"model.layers.{layer_idx}.mlp.router.weight"] = gate_weight
+        if gate_bias_name in tensor_to_file:
+            layer_tensors[f"model.layers.{layer_idx}.mlp.router.bias"] = self._load_tensor(gate_bias_name, tensor_to_file)
 
         # MLP weights - MXFP4 packed
         # mlp1 contains gate_proj + up_proj combined
@@ -428,27 +482,42 @@ class GptOss_Parameter_Server:
         gc.collect()
 
     def _convert_non_layer_tensors(self, tensor_to_file: dict):
-        """Convert non-layer tensors (embeddings, final norm, lm_head)."""
+        """Convert non-layer tensors (embeddings, final norm, lm_head).
+
+        OpenAI checkpoint format:
+        - embedding.weight -> model.embed_tokens.weight
+        - norm.weight -> model.norm.weight (final layer norm)
+        - unembedding.weight -> lm_head.weight
+        """
         output_file = os.path.join(self.converted_ckpt_dir, "non_layer.bin")
         if os.path.exists(output_file):
             return
 
         tensors = {}
 
-        # Embedding
-        embed_name = "embed.weight"
+        # Embedding - OpenAI uses "embedding.weight"
+        embed_name = "embedding.weight"
         if embed_name in tensor_to_file:
             tensors["model.embed_tokens.weight"] = self._load_tensor(embed_name, tensor_to_file)
+            logging.info(f"Loaded embedding: {tensors['model.embed_tokens.weight'].shape}")
 
-        # Final layer norm
-        final_norm_name = "final_layernorm.weight"
+        # Final layer norm - OpenAI uses "norm.weight"
+        final_norm_name = "norm.weight"
         if final_norm_name in tensor_to_file:
             tensors["model.norm.weight"] = self._load_tensor(final_norm_name, tensor_to_file)
+            logging.info(f"Loaded final norm: {tensors['model.norm.weight'].shape}")
 
-        # LM head
-        lm_head_name = "lm_head.weight"
+        # LM head - OpenAI uses "unembedding.weight"
+        lm_head_name = "unembedding.weight"
         if lm_head_name in tensor_to_file:
             tensors["lm_head.weight"] = self._load_tensor(lm_head_name, tensor_to_file)
+            logging.info(f"Loaded lm_head: {tensors['lm_head.weight'].shape}")
+
+        if not tensors:
+            logging.warning("No non-layer tensors found! Check checkpoint tensor names.")
+            # Debug: print available tensor names
+            non_block_tensors = [k for k in tensor_to_file.keys() if not k.startswith("block.")]
+            logging.warning(f"Available non-block tensors: {non_block_tensors}")
 
         self._save_tensors(tensors, output_file)
 
