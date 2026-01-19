@@ -177,7 +177,7 @@
     "input_ids",
     "attention_mask"
   ],
-  "model_max_length": 1000000000000000019884624838656,
+  "model_max_length": 131072,
   "pad_token": "<|endoftext|>",
   "tokenizer_class": "PreTrainedTokenizerFast",
   "chat_template": "{% for message in messages %}{% if message.role == 'system' %}<|start|>system<|message|>{{ message.content }}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>{% elif message.role == 'user' %}<|start|>user<|message|>{{ message.content }}<|end|>{% elif message.role == 'assistant' %}<|start|>assistant<|channel|>final<|message|>{{ message.content }}<|end|>{% endif %}{% endfor %}{% if add_generation_prompt %}<|start|>assistant{% endif %}"
