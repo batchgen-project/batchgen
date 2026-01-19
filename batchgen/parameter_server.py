@@ -755,7 +755,7 @@ class ParameterServer:
 		# Handle converted_ckpt_dir - exactly as in original implementation
 		if converted_ckpt_dir is None:
 			converted_ckpt_dir = os.path.join(
-				cache_dir, "pt_ckpt", huggingface_ckpt_name
+				cache_dir, "converted_ckpt", huggingface_ckpt_name
 			)
 			if not os.path.exists(converted_ckpt_dir):
 				os.makedirs(converted_ckpt_dir)

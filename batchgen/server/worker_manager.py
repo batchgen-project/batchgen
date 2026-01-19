@@ -288,7 +288,7 @@ class WorkerManager:
         self.args.hf_cache_dir = hf_cache_dir
         converted_ckpt_dir = (
             self.args.converted_ckpt_dir
-            or Path(self.args.cache_dir or ".") / "pt_ckpt"
+            or Path(self.args.cache_dir or ".") / "converted_ckpt"
         )
         self.args.converted_ckpt_dir = converted_ckpt_dir
 

@@ -83,7 +83,7 @@ class BatchGenServer:
 		endpoint = os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
 		hf_cache_dir = self.args.hf_cache_dir or os.path.expanduser("~/.cache/huggingface")
 		self.args.hf_cache_dir = hf_cache_dir
-		converted_ckpt_dir = self.args.converted_ckpt_dir or os.path.join(self.args.cache_dir or ".", "pt_ckpt")
+		converted_ckpt_dir = self.args.converted_ckpt_dir or os.path.join(self.args.cache_dir or ".", "converted_ckpt")
 		self.args.converted_ckpt_dir = converted_ckpt_dir
 
 		if not endpoint and self.args.cache_dir is None:
