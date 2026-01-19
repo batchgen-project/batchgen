@@ -118,7 +118,7 @@ class InputArguments:
 	huggingface_ckpt_name: str
 	hf_cache_dir: Optional[str] = None
 	cache_dir: Optional[str] = None
-	pt_ckpt_dir: Optional[str] = None
+	converted_ckpt_dir: Optional[str] = None
 	queries: Optional[List[str]] = None
 	padding_length: int = 512
 	max_decoding_length: int = 128
@@ -199,7 +199,7 @@ class BatchGenWorkerArgs:
 	model_name: str
 	hf_cache_dir: Optional[str]
 	cache_dir: Optional[str]
-	pt_ckpt_dir: Optional[str]
+	converted_ckpt_dir: Optional[str]
 	host_kv_cache_size: int
 	global_host_kv_cache_size_gb: int
 
@@ -288,7 +288,7 @@ class BatchGenWorker:
 		self.huggingface_ckpt_name = args.model_name
 		self.hf_cache_dir = args.hf_cache_dir
 		self.cache_dir = args.cache_dir
-		self.pt_ckpt_dir = args.pt_ckpt_dir
+		self.converted_ckpt_dir = args.converted_ckpt_dir
 		self.skeleton_state_dict = args.skeleton_state_dict
 		
 		# 4. Initialize Shared Memory for Weights (Crucial for multiprocess)
@@ -1052,7 +1052,7 @@ class BatchGenWorker:
 			"huggingface_ckpt_name": self.huggingface_ckpt_name,
 			"hf_cache_dir": self.hf_cache_dir,
 			"cache_dir": self.cache_dir,
-			"pt_ckpt_dir": self.pt_ckpt_dir,
+			"converted_ckpt_dir": self.converted_ckpt_dir,
 			"padding_length": self.max_input_length,
 			"max_decoding_length": self.max_decoding_length,
 			"device": self.device,

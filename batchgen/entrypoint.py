@@ -81,7 +81,7 @@ class BatchGen():
 		engine_config_json_dir: Optional[str] = None,
 		hf_cache_dir: Optional[str] = None,
 		cache_dir: Optional[str] = None,
-		pt_ckpt_dir: Optional[str] = None,
+		converted_ckpt_dir: Optional[str] = None,
 		host_kv_cache_size: Optional[int] = None,  # If not set, use all host memory
 		parameter_server_host: str = 'localhost',
 		parameter_server_port: int = 10900,
@@ -99,7 +99,7 @@ class BatchGen():
 		self.engine_config_json_dir = engine_config_json_dir
 		self.hf_cache_dir = hf_cache_dir
 		self.cache_dir = cache_dir
-		self.pt_ckpt_dir = pt_ckpt_dir
+		self.converted_ckpt_dir = converted_ckpt_dir
 		self.host_kv_cache_size = host_kv_cache_size
 		self.parameter_server_host = parameter_server_host
 		self.parameter_server_port = parameter_server_port
@@ -115,7 +115,7 @@ class BatchGen():
 			self.tensor_meta_shm_name,
 			self.skeleton_state_dict,
 			self.parameter_server_size,
-			self.pt_ckpt_dir,
+			self.converted_ckpt_dir,
 			self.host_kv_cache_size,
 			self.num_devices,
 		) = self.get_metadata()
@@ -156,16 +156,16 @@ class BatchGen():
 		tensor_meta_shm_name = model_info.get('tensor_meta_shm_name')
 		skeleton_state_dict = model_info.get('skeleton_state_dict')  # This now comes from shared memory
 		parameter_server_size = model_info.get('parameter_server_size')
-		if self.pt_ckpt_dir == None:
-			self.pt_ckpt_dir = model_info.get('pt_ckpt_dir')
+		if self.converted_ckpt_dir == None:
+			self.converted_ckpt_dir = model_info.get('converted_ckpt_dir')
 		
-		if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.pt_ckpt_dir]):
+		if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.converted_ckpt_dir]):
 			missing = []
 			if not shm_name: missing.append('shm_name')
 			if not tensor_meta_shm_name: missing.append('tensor_meta_shm_name')
 			if not skeleton_state_dict: missing.append('skeleton_state_dict')
 			if not parameter_server_size: missing.append('parameter_server_size')
-			if not self.pt_ckpt_dir: missing.append('pt_ckpt_dir')
+			if not self.converted_ckpt_dir: missing.append('converted_ckpt_dir')
 			raise RuntimeError(f"Missing required information from parameter server: {', '.join(missing)}")
 		
 		# Calculate host KV cache size if not provided
@@ -188,7 +188,7 @@ class BatchGen():
 		else:
 			raise RuntimeError("No CUDA devices available. Please check your setup.")
 		
-		return (shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.pt_ckpt_dir, self.host_kv_cache_size, num_devices)
+		return (shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, self.converted_ckpt_dir, self.host_kv_cache_size, num_devices)
 	
 	def safe_collect_results(self, futures):
 		all_results = []
@@ -312,7 +312,7 @@ class BatchGen():
 				skeleton_state_dict=self.skeleton_state_dict,
 				shm_name=self.shm_name,
 				tensor_meta_shm_name=self.tensor_meta_shm_name,
-				pt_ckpt_dir=self.pt_ckpt_dir,
+				converted_ckpt_dir=self.converted_ckpt_dir,
 				host_kv_cache_size=per_device_host_kv_cache_size,
 				dist_init_addr = self.dist_init_addr,
 				local_rank = local_rank,

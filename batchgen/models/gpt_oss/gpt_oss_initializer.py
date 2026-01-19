@@ -88,7 +88,7 @@ class GptOssInitializer:
 
         # Cache directory for checkpoint conversion
         self.cache_dir = getattr(input_arguments, 'cache_dir', None)
-        self.pt_ckpt_dir = getattr(input_arguments, 'pt_ckpt_dir', None)
+        self.converted_ckpt_dir = getattr(input_arguments, 'converted_ckpt_dir', None)
 
         self.model_config = self._parse_model_config()
 
@@ -226,7 +226,7 @@ class GptOssInitializer:
         parameter_server = GptOss_Parameter_Server(
             huggingface_ckpt_name=self.loaded_model_config._name_or_path,
             cache_dir=self.cache_dir,
-            pt_ckpt_dir=self.pt_ckpt_dir,
+            converted_ckpt_dir=self.converted_ckpt_dir,
             enable_hugetlbfs=self.enable_hugetlbfs,
         )
         parameter_server.Init()
@@ -262,10 +262,10 @@ class GptOssInitializer:
             logging.info(f"_name_or_path: {self.loaded_model_config._name_or_path}")
 
             # GPT-OSS-120B: ~55GB MXFP4 weights
-            if "gpt-oss" in self.loaded_model_config._name_or_path.lower():
+            if "gpt-oss-120b" in self.loaded_model_config._name_or_path.lower():
                 param_byte_size = 55 * 1024 * 1024 * 1024  # ~55GB for MXFP4
             else:
-                raise ValueError("Unknown huggingface model card for GPT-OSS")
+                raise ValueError("Unknown huggingface model card for GPT-OSS-120B")
 
             self.core_engine.Init()
             logging.info("Core engine initialized")

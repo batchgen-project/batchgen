@@ -71,10 +71,10 @@ class GptOss_Parameter_Server:
     - Mapping checkpoint names to BatchGen format
     """
 
-    def __init__(self, huggingface_ckpt_name, cache_dir, pt_ckpt_dir, enable_hugetlbfs):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
-        self.pt_ckpt_dir = pt_ckpt_dir
+        self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
@@ -138,7 +138,7 @@ class GptOss_Parameter_Server:
             self.shm_name,
             self.tensor_meta_shm_name,
             byte_size,
-            self.pt_ckpt_dir,
+            str(self.converted_ckpt_dir),  # Convert Path to string for C++ binding
             self.state_dict_name_map,
         )
 
@@ -253,15 +253,15 @@ class GptOss_Parameter_Server:
         3. Split mlp1 into gate_proj + up_proj
         4. Save with BatchGen naming convention
         """
-        os.makedirs(self.pt_ckpt_dir, exist_ok=True)
+        os.makedirs(self.converted_ckpt_dir, exist_ok=True)
 
         # Check if already converted
-        converted_marker = os.path.join(self.pt_ckpt_dir, ".gpt_oss_converted")
+        converted_marker = os.path.join(self.converted_ckpt_dir, ".gpt_oss_converted")
         if os.path.exists(converted_marker):
-            logging.info(f"Checkpoint already converted at {self.pt_ckpt_dir}")
+            logging.info(f"Checkpoint already converted at {self.converted_ckpt_dir}")
             return
 
-        logging.info(f"Converting checkpoint from {self.cache_dir} to {self.pt_ckpt_dir}")
+        logging.info(f"Converting checkpoint from {self.cache_dir} to {self.converted_ckpt_dir}")
 
         # Find all safetensor files
         safetensor_files = [
@@ -310,7 +310,7 @@ class GptOss_Parameter_Server:
         - Attention weights (copy as-is)
         - MLP expert weights (slice + split + rename)
         """
-        output_file = os.path.join(self.pt_ckpt_dir, f"layer_{layer_idx}.bin")
+        output_file = os.path.join(self.converted_ckpt_dir, f"layer_{layer_idx}.bin")
         if os.path.exists(output_file):
             return
 
@@ -413,7 +413,7 @@ class GptOss_Parameter_Server:
 
     def _convert_non_layer_tensors(self, tensor_to_file: dict):
         """Convert non-layer tensors (embeddings, final norm, lm_head)."""
-        output_file = os.path.join(self.pt_ckpt_dir, "non_layer.bin")
+        output_file = os.path.join(self.converted_ckpt_dir, "non_layer.bin")
         if os.path.exists(output_file):
             return
 

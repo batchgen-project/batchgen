@@ -42,10 +42,10 @@ except ImportError:
 
 
 class DeepSeek_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, pt_ckpt_dir, enable_hugetlbfs):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
-        self.pt_ckpt_dir = pt_ckpt_dir
+        self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
@@ -121,13 +121,13 @@ class DeepSeek_Parameter_Server:
 
         # Convert checkpoint files to BatchGen format (or validate existing conversion)
         converter = ckpt_converter()
-        self.pt_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
 
         self.parameter_server.Init(
             self.shm_name,
             self.tensor_meta_shm_name,
             byte_size,
-            self.pt_ckpt_dir,
+            self.converted_ckpt_dir,
             self.state_dict_name_map,
         )
         return self.shm_name, self.tensor_meta_shm_name
@@ -233,7 +233,7 @@ class DeepSeek_Parameter_Server:
             ckpt_files, desc="Loading checkpoint files", smoothing=0
         ):
             dst_dir = os.path.join(
-                self.pt_ckpt_dir,
+                self.converted_ckpt_dir,
                 ckpt.split("/")[-1].replace(".safetensors", ".pt"),
             )
             # logging.info(f"dst_dir: {dst_dir}")
@@ -241,7 +241,7 @@ class DeepSeek_Parameter_Server:
                 continue
 
             logging.info(
-                f"Checkpoint file: {ckpt} not found in {self.pt_ckpt_dir}. Dump it now. Will omit this step next time run this model."
+                f"Checkpoint file: {ckpt} not found in {self.converted_ckpt_dir}. Dump it now. Will omit this step next time run this model."
             )
             p = Process(target=self.save_and_load, args=(ckpt, dst_dir))
             p.start()

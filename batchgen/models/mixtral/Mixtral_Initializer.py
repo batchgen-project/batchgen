@@ -243,7 +243,7 @@ class Mixtral_Initializer:
         skeleton_state_dict: dict = None,
         shm_name: str = None,
         tensor_meta_shm_name: str = None,
-        pt_ckpt_dir: str = None,
+        converted_ckpt_dir: str = None,
         host_kv_cache_size: int = 0,
     ):
         self.huggingface_ckpt_name = huggingface_ckpt_name
@@ -269,17 +269,17 @@ class Mixtral_Initializer:
         self.state_dict_name_map = {}
         self.weight_copy_task = {}
 
-        # Use provided pt_ckpt_dir or create default one
-        if pt_ckpt_dir:
-            self.pt_ckpt_dir = pt_ckpt_dir
+        # Use provided converted_ckpt_dir or create default one
+        if converted_ckpt_dir:
+            self.converted_ckpt_dir = converted_ckpt_dir
         else:
-            self.pt_ckpt_dir = os.path.join(
+            self.converted_ckpt_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 self.huggingface_ckpt_name,
             )
 
-        if not os.path.exists(self.pt_ckpt_dir):
-            os.makedirs(self.pt_ckpt_dir)
+        if not os.path.exists(self.converted_ckpt_dir):
+            os.makedirs(self.converted_ckpt_dir)
 
     def _default_engine_config(self):
         props = torch.cuda.get_device_properties(
@@ -581,7 +581,7 @@ class Mixtral_Initializer:
             ckpt_files, desc="Loading checkpoint files", smoothing=0
         ):
             p = Process(
-                target=self.save_and_load, args=(ckpt, self.pt_ckpt_dir)
+                target=self.save_and_load, args=(ckpt, self.converted_ckpt_dir)
             )
             p.start()
             processes.append(p)

@@ -83,8 +83,8 @@ class BatchGenServer:
 		endpoint = os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
 		hf_cache_dir = self.args.hf_cache_dir or os.path.expanduser("~/.cache/huggingface")
 		self.args.hf_cache_dir = hf_cache_dir
-		pt_ckpt_dir = self.args.pt_ckpt_dir or os.path.join(self.args.cache_dir or ".", "pt_ckpt")
-		self.args.pt_ckpt_dir = pt_ckpt_dir
+		converted_ckpt_dir = self.args.converted_ckpt_dir or os.path.join(self.args.cache_dir or ".", "pt_ckpt")
+		self.args.converted_ckpt_dir = converted_ckpt_dir
 
 		if not endpoint and self.args.cache_dir is None:
 			# Check if model download is allowed (disabled by default for production safety)
@@ -98,9 +98,9 @@ class BatchGenServer:
 			self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
 
 		if endpoint:
-			self._load_model_from_remote_server(endpoint, hf_cache_dir, pt_ckpt_dir)
+			self._load_model_from_remote_server(endpoint, hf_cache_dir, converted_ckpt_dir)
 		else:
-			self._load_model_locally(hf_cache_dir, pt_ckpt_dir)
+			self._load_model_locally(hf_cache_dir, converted_ckpt_dir)
 
 		self._configure_host_kv_cache_budget()
 		logging.info("Model Loaded. SHM: %s", self.model_info['shm_name'])
@@ -129,7 +129,7 @@ class BatchGenServer:
 			model_name=self.args.model,
 			hf_cache_dir=self.args.hf_cache_dir,
 			cache_dir=self.args.cache_dir,
-			pt_ckpt_dir=self.args.pt_ckpt_dir,
+			converted_ckpt_dir=self.args.converted_ckpt_dir,
 			kv_dtype=self.args.kv_dtype,
 			dist_init_addr=self.args.dist_init_addr,
 			world_size=self.args.world_size,
@@ -385,21 +385,21 @@ class BatchGenServer:
 		except Exception as exc:  # pragma: no cover - network failure message
 			raise RuntimeError(f"Failed to download model: {exc}") from exc
 
-	def _load_model_locally(self, _hf_cache_dir: str, pt_ckpt_dir: str) -> None:
+	def _load_model_locally(self, _hf_cache_dir: str, converted_ckpt_dir: str) -> None:
 		
 		if "deepseek" in self.args.model.lower():
 			from batchgen.models.deepseek.deepseek_parameter_server import (
 				DeepSeek_Parameter_Server,
 			)
 			ps = DeepSeek_Parameter_Server(
-				self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs
+				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
 			)
 		elif "mixtral" in self.args.model.lower():
 			from batchgen.models.mixtral.mixtral_parameter_server import (
 				Mixtral_Parameter_Server,
 			)
 			ps = Mixtral_Parameter_Server(
-				self.args.model, self.args.cache_dir, pt_ckpt_dir
+				self.args.model, self.args.cache_dir, converted_ckpt_dir
 			)
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")
@@ -412,13 +412,13 @@ class BatchGenServer:
 			"huggingface_ckpt_name": self.args.model,
 			"shm_name": shm_name,
 			"tensor_meta_shm_name": tensor_meta_shm_name,
-			"pt_ckpt_dir": pt_ckpt_dir,
+			"converted_ckpt_dir": converted_ckpt_dir,
 			"parameter_server_size": ps_size,
 		}
 		logging.info("Local parameter server initialized: %s", self.model_info)
 
 	def _load_model_from_remote_server(
-		self, endpoint: str, hf_cache_dir: str, pt_ckpt_dir: str
+		self, endpoint: str, hf_cache_dir: str, converted_ckpt_dir: str
 	) -> None:
 		host, port = self._parse_parameter_server_endpoint(endpoint)
 		logging.info(
@@ -429,7 +429,7 @@ class BatchGenServer:
 			huggingface_ckpt_name=self.args.model,
 			hf_cache_dir=hf_cache_dir,
 			cache_dir=self.args.cache_dir,
-			pt_ckpt_dir=pt_ckpt_dir,
+			converted_ckpt_dir=converted_ckpt_dir,
 		)
 		info = client.get_model_info()
 		for required in ("shm_name", "tensor_meta_shm_name", "parameter_server_size"):
@@ -450,12 +450,12 @@ class BatchGenServer:
 			),
 			"shm_name": info["shm_name"],
 			"tensor_meta_shm_name": info["tensor_meta_shm_name"],
-			"pt_ckpt_dir": info.get("pt_ckpt_dir", pt_ckpt_dir),
+			"converted_ckpt_dir": info.get("converted_ckpt_dir", converted_ckpt_dir),
 			"parameter_server_size": info["parameter_server_size"],
 		}
-		self.args.pt_ckpt_dir = self.model_info["pt_ckpt_dir"]
+		self.args.converted_ckpt_dir = self.model_info["converted_ckpt_dir"]
 		if not self.args.cache_dir:
-			self.args.cache_dir = info.get("cache_dir") or self.args.pt_ckpt_dir
+			self.args.cache_dir = info.get("cache_dir") or self.args.converted_ckpt_dir
 		logging.info("Fetched shared memory handles from remote parameter server")
 
 	def _configure_host_kv_cache_budget(self) -> None:
@@ -501,7 +501,7 @@ class BatchGenServer:
 		huggingface_ckpt_name: str,
 		hf_cache_dir: Optional[str],
 		cache_dir: Optional[str],
-		pt_ckpt_dir: Optional[str],
+		converted_ckpt_dir: Optional[str],
 		queries: List[str],
 		max_input_length: int,
 		max_decoding_length: int,

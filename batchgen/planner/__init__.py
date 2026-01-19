@@ -43,7 +43,7 @@ def get_planner(model_name: str) -> Type[BasePlanner]:
         from batchgen.models.deepseek.deepseekv3.planner import DeepSeekV3Planner
         return DeepSeekV3Planner
 
-    if "gpt-oss" in model_lower or model_lower == "openai/gpt-oss-120b":
+    if "gpt-oss-120b" in model_lower:
         from batchgen.models.gpt_oss.planner import GptOssPlanner
         return GptOssPlanner
 

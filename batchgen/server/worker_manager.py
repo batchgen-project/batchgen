@@ -286,21 +286,21 @@ class WorkerManager:
             os.path.expanduser("~/.cache/huggingface")
         )
         self.args.hf_cache_dir = hf_cache_dir
-        pt_ckpt_dir = (
-            self.args.pt_ckpt_dir
+        converted_ckpt_dir = (
+            self.args.converted_ckpt_dir
             or Path(self.args.cache_dir or ".") / "pt_ckpt"
         )
-        self.args.pt_ckpt_dir = pt_ckpt_dir
+        self.args.converted_ckpt_dir = converted_ckpt_dir
 
         if not endpoint and self.args.cache_dir is None:
             self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
 
         if endpoint:
             self._load_model_from_remote_server(
-                endpoint, hf_cache_dir, pt_ckpt_dir
+                endpoint, hf_cache_dir, converted_ckpt_dir
             )
         else:
-            self._load_model_locally(hf_cache_dir, pt_ckpt_dir)
+            self._load_model_locally(hf_cache_dir, converted_ckpt_dir)
 
         self._configure_host_kv_cache_budget()
         logger.info("Model Loaded. SHM: %s", self.model_info.get("shm_name"))
@@ -324,7 +324,7 @@ class WorkerManager:
             model_name=self.args.model,
             hf_cache_dir=self.args.hf_cache_dir,
             cache_dir=self.args.cache_dir,
-            pt_ckpt_dir=self.args.pt_ckpt_dir,
+            converted_ckpt_dir=self.args.converted_ckpt_dir,
             kv_dtype=self.args.kv_dtype,
             dist_init_addr=self.args.dist_init_addr,
             world_size=world_size,
@@ -464,7 +464,7 @@ class WorkerManager:
         )
 
     def _load_model_locally(
-        self, _hf_cache_dir: Path, pt_ckpt_dir: Path
+        self, _hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
         if "deepseek" in self.args.model.lower():
             from batchgen.models.deepseek.deepseek_parameter_server import (
@@ -474,7 +474,7 @@ class WorkerManager:
             parameter_server = DeepSeek_Parameter_Server(
                 self.args.model,
                 self.args.cache_dir,
-                pt_ckpt_dir,
+                converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
             )
         elif "mixtral" in self.args.model.lower():
@@ -483,9 +483,9 @@ class WorkerManager:
             )
 
             parameter_server = Mixtral_Parameter_Server(
-                self.args.model, self.args.cache_dir, pt_ckpt_dir
+                self.args.model, self.args.cache_dir, converted_ckpt_dir
             )
-        elif "gpt-oss" in self.args.model.lower() or "gpt_oss" in self.args.model.lower():
+        elif "gpt-oss-120b" in self.args.model.lower():
             from batchgen.models.gpt_oss.gpt_oss_parameter_server import (
                 GptOss_Parameter_Server,
             )
@@ -493,7 +493,7 @@ class WorkerManager:
             parameter_server = GptOss_Parameter_Server(
                 self.args.model,
                 self.args.cache_dir,
-                pt_ckpt_dir,
+                converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
             )
         else:
@@ -511,13 +511,13 @@ class WorkerManager:
             "huggingface_ckpt_name": self.args.model,
             "shm_name": shm_name,
             "tensor_meta_shm_name": tensor_meta_shm_name,
-            "pt_ckpt_dir": pt_ckpt_dir,
+            "converted_ckpt_dir": converted_ckpt_dir,
             "parameter_server_size": ps_size,
         }
         logger.info("Local parameter server initialized: %s", self.model_info)
 
     def _load_model_from_remote_server(
-        self, endpoint: str, hf_cache_dir: Path, pt_ckpt_dir: Path
+        self, endpoint: str, hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
         host, port = self._parse_parameter_server_endpoint(endpoint)
         logger.info("Using external parameter server at %s:%d", host, port)
@@ -526,7 +526,7 @@ class WorkerManager:
             huggingface_ckpt_name=self.args.model,
             hf_cache_dir=hf_cache_dir,
             cache_dir=self.args.cache_dir,
-            pt_ckpt_dir=pt_ckpt_dir,
+            converted_ckpt_dir=converted_ckpt_dir,
         )
         info = client.get_model_info()
         for required in (
@@ -551,12 +551,12 @@ class WorkerManager:
             ),
             "shm_name": info["shm_name"],
             "tensor_meta_shm_name": info["tensor_meta_shm_name"],
-            "pt_ckpt_dir": info.get("pt_ckpt_dir", pt_ckpt_dir),
+            "converted_ckpt_dir": info.get("converted_ckpt_dir", converted_ckpt_dir),
             "parameter_server_size": info["parameter_server_size"],
         }
-        self.args.pt_ckpt_dir = Path(self.model_info["pt_ckpt_dir"])
+        self.args.converted_ckpt_dir = Path(self.model_info["converted_ckpt_dir"])
         if not self.args.cache_dir:
-            self.args.cache_dir = info.get("cache_dir") or self.args.pt_ckpt_dir
+            self.args.cache_dir = info.get("cache_dir") or self.args.converted_ckpt_dir
         logger.info(
             "Fetched shared memory handles from remote parameter server"
         )

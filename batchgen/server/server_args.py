@@ -56,7 +56,7 @@ class ServerArgs:
     listen_port: int = 10900
     hf_cache_dir: Optional[Path] = None
     cache_dir: Optional[Path] = None
-    pt_ckpt_dir: Optional[Path] = None
+    converted_ckpt_dir: Optional[Path] = None
     enable_hugetlbfs: bool = False
     dist_init_addr: str = "localhost:12355"
     kv_dtype: str = "bfloat16"
@@ -96,8 +96,8 @@ class ServerArgs:
             self.hf_cache_dir = Path(self.hf_cache_dir)
         if isinstance(self.cache_dir, str):
             self.cache_dir = Path(self.cache_dir)
-        if isinstance(self.pt_ckpt_dir, str):
-            self.pt_ckpt_dir = Path(self.pt_ckpt_dir)
+        if isinstance(self.converted_ckpt_dir, str):
+            self.converted_ckpt_dir = Path(self.converted_ckpt_dir)
         if isinstance(self.storage_path, str):
             self.storage_path = Path(self.storage_path)
 

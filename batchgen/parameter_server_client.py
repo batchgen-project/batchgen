@@ -147,20 +147,20 @@ class ParameterServerClient:
         except:
             return False
     
-    def load_model(self, 
+    def load_model(self,
                  huggingface_ckpt_name: str,
                  hf_cache_dir: Optional[str] = None,
                  cache_dir: Optional[str] = None,
-                 pt_ckpt_dir: Optional[str] = None) -> Dict[str, Any]:
+                 converted_ckpt_dir: Optional[str] = None) -> Dict[str, Any]:
         """
         Request the parameter server to load a model
-        
+
         Args:
             huggingface_ckpt_name: Model name on HuggingFace
             hf_cache_dir: HuggingFace cache directory
             cache_dir: Model cache directory
-            pt_ckpt_dir: Directory for checkpoints in .pt format.
-            
+            converted_ckpt_dir: Directory for converted BatchGen checkpoint files.
+
         Returns:
             Dict containing model information including shared memory names
         """
@@ -168,13 +168,13 @@ class ParameterServerClient:
             'command': 'load_model',
             'huggingface_ckpt_name': huggingface_ckpt_name,
         }
-        
+
         if hf_cache_dir is not None:
             request['hf_cache_dir'] = hf_cache_dir
         if cache_dir is not None:
             request['cache_dir'] = cache_dir
-        if pt_ckpt_dir is not None:
-            request['pt_ckpt_dir'] = pt_ckpt_dir
+        if converted_ckpt_dir is not None:
+            request['converted_ckpt_dir'] = converted_ckpt_dir
         
         response = self.send_request(request)
         
