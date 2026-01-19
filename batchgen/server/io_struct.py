@@ -38,6 +38,11 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
+    # GPT-OSS reasoning effort control (low/medium/high)
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default=None,
+        description="Reasoning effort level for GPT-OSS models (low, medium, high)",
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:

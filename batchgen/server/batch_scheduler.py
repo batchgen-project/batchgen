@@ -245,9 +245,13 @@ class BatchScheduler:
         for request in requests:
             body = request.body
             if isinstance(body, ChatCompletionRequest):
-                prompt = self._format_chat_messages(
-                    [m.dict() for m in body.messages], body.model
+                # Inject reasoning_effort into system message for GPT-OSS models
+                messages = self._inject_reasoning_effort(
+                    [m.dict() for m in body.messages],
+                    body.model,
+                    body.reasoning_effort,
                 )
+                prompt = self._format_chat_messages(messages, body.model)
                 current_max_tokens = body.max_tokens or 128
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
@@ -262,6 +266,47 @@ class BatchScheduler:
         if max_tokens is None:
             max_tokens = 128  # Default max output tokens
         return prompts, max_tokens
+
+    def _inject_reasoning_effort(
+        self,
+        messages: List[dict],
+        model: str,
+        reasoning_effort: Optional[str],
+    ) -> List[dict]:
+        """Inject reasoning_effort into system message for GPT-OSS models.
+
+        GPT-OSS models use the Harmony response format where reasoning effort
+        is specified in the system message as "Reasoning: {low|medium|high}".
+        This follows the OpenAI reference implementation.
+        """
+        # Only apply to GPT-OSS models
+        if "gpt-oss" not in model.lower():
+            return messages
+        # If no reasoning_effort specified, use default (low per OpenAI)
+        if reasoning_effort is None:
+            reasoning_effort = "low"
+
+        # Find system message and prepend reasoning effort
+        modified = []
+        system_found = False
+        for msg in messages:
+            if msg.get("role") == "system" and not system_found:
+                # Prepend reasoning effort to system content
+                original_content = msg.get("content", "")
+                new_content = f"Reasoning: {reasoning_effort}\n{original_content}"
+                modified.append({**msg, "content": new_content})
+                system_found = True
+            else:
+                modified.append(msg)
+
+        # If no system message exists, insert one at the beginning
+        if not system_found:
+            modified.insert(0, {
+                "role": "system",
+                "content": f"Reasoning: {reasoning_effort}",
+            })
+
+        return modified
 
     def _format_chat_messages(self, messages: List[dict], model: str) -> str:
         tokenizer = self._get_tokenizer(model)
