@@ -217,7 +217,7 @@ class GptOss_Parameter_Server:
             ]
             for expert_idx in range(self.num_experts):
                 for name in expert_tensor_names:
-                    tensor_full_name = f"model.layers.{layer_idx}.moe.experts.{expert_idx}.{name}"
+                    tensor_full_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
                     self.state_dict_name_map[tensor_full_name] = {
                         "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
                         "tensor_key": name,
@@ -399,7 +399,7 @@ class GptOss_Parameter_Server:
                 down_bias = mlp2_bias[expert_idx]      # [2880]
 
                 # Store with BatchGen naming
-                prefix = f"model.layers.{layer_idx}.moe.experts.{expert_idx}"
+                prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"
                 layer_tensors[f"{prefix}.gate_proj.weight"] = gate_blocks
                 layer_tensors[f"{prefix}.gate_proj.weight_scales"] = gate_scales
                 layer_tensors[f"{prefix}.gate_proj.bias"] = gate_bias
