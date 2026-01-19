@@ -73,7 +73,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         # GPT-OSS always loads weights (all experts local, no caching)
         super().__init__(
             module, layer_idx, expert_idx, core_engine, engine_config, model_config,
-            get_weights=True
+            persistent=False  # Load weights each forward (MXFP4 dequantization needed)
         )
 
         # Import MXFP4 dequantization
@@ -219,7 +219,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # GPT-OSS attention is BF16, no dequantization needed
         super().__init__(
             module, layer_idx, core_engine, engine_config, model_config,
-            get_weights=True, weight_dequant_scale=None
+            persistent=False, weight_dequant_scale=None  # Load weights each forward
         )
 
         # Determine if this layer uses sliding window
@@ -277,7 +277,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
         )
 
         # Load weights
-        if self.get_weights:
+        if not self.persistent:
             weights = self.load_weights(self.module_key)
             self.apply_weights(weights)
 
