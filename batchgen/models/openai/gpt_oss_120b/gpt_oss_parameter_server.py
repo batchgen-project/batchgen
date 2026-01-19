@@ -50,7 +50,7 @@ import torch
 from safetensors import safe_open
 from tqdm import tqdm, trange
 
-from .modeling_gpt_oss import GptOssForCausalLM
+from .model import GptOssForCausalLM
 from .configuration_gpt_oss import GptOssConfig
 from batchgen.config.model_registry import load_config
 
