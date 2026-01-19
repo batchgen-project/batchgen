@@ -16,124 +16,94 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-"""GPT-OSS-120B model implementation for BatchGen.
+"""GPT-OSS-120B model implementation following OpenAI's reference architecture.
 
-Based on OpenAI's reference PyTorch implementation at:
-https://github.com/openai/gpt-oss
-
-Key architectural features:
+Key features:
 - 36 layers, hidden_size=2880, head_dim=64
 - GQA: 64 attention heads, 8 KV heads (8:1 ratio)
 - 128 experts, Top-4 routing with softmax normalization
-- MXFP4 quantized expert weights
-- Alternating sliding (128 tokens) / full attention
+- Alternating sliding (128 tokens) / full attention per layer
 - YaRN RoPE with theta=150000, factor=32
-- SwiGLU activation with clamping at +/-7.0
+- SwiGLU activation: (x_glu * sigmoid(alpha * x_glu)) * (x_linear + 1)
+- Sink tokens: learnable per-head parameters in attention
+
+Reference: https://github.com/openai/gpt-oss
 """
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
-from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import logging
 
 from .configuration_gpt_oss import GptOssConfig
 
-logger = logging.get_logger(__name__)
+
+# ============================================================================
+# SwiGLU Activation (OpenAI's exact formula)
+# ============================================================================
+
+def swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
+    """SwiGLU activation with OpenAI's formula.
+
+    The input x is interleaved: [gate0, up0, gate1, up1, ...]
+    - x_glu: gating values (even indices)
+    - x_linear: linear values (odd indices)
+
+    Formula: (x_glu * sigmoid(alpha * x_glu)) * (x_linear + 1)
+    with input clamping at ±limit.
+
+    Args:
+        x: Input tensor with interleaved gate/up values
+        alpha: Sigmoid scaling factor (default: 1.702)
+        limit: Clamping limit for inputs (default: 7.0)
+
+    Returns:
+        Activated tensor with half the last dimension
+    """
+    x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    # Clamp the INPUT values (not output)
+    x_glu = x_glu.clamp(max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    # Note: add extra bias of 1 to the linear layer
+    return out_glu * (x_linear + 1)
 
 
 # ============================================================================
-# Helper Functions
+# RMSNorm
 # ============================================================================
 
-def yarn_find_correction_dim(
-    num_rotations: int, dim: int, base: float = 10000, max_position_embeddings: int = 2048
-) -> float:
-    """Inverse dim formula to find dim based on number of rotations."""
-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
-
-
-def yarn_find_correction_range(
-    low_rot: float, high_rot: float, dim: int, base: float = 10000, max_position_embeddings: int = 2048
-) -> Tuple[int, int]:
-    """Find dim range bounds based on rotations."""
-    low = math.floor(yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
-    high = math.ceil(yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
-    return max(low, 0), min(high, dim - 1)
-
-
-def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
-    """Get magnitude scale for YaRN."""
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def yarn_linear_ramp_mask(low: int, high: int, dim: int) -> torch.Tensor:
-    """Create linear ramp mask for YaRN frequency interpolation."""
-    if low == high:
-        high += 0.001
-    linear_func = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
-    return torch.clamp(linear_func, 0, 1)
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: torch.Tensor = None,
-    unsqueeze_dim: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary position embedding to query and key tensors."""
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-# ============================================================================
-# Model Components
-# ============================================================================
-
-class GptOssRMSNorm(nn.Module):
-    """RMSNorm layer as used in GPT-OSS."""
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.eps = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight * x).to(input_dtype)
 
 
-class GptOssYaRNRotaryEmbedding(nn.Module):
-    """YaRN Rotary Position Embedding for GPT-OSS.
+# ============================================================================
+# YaRN Rotary Position Embedding
+# ============================================================================
+
+class YaRNRotaryEmbedding(nn.Module):
+    """YaRN Rotary Position Embedding for extended context.
 
     Implements YaRN (Yet another RoPE extensioN) with:
     - theta=150000
     - factor=32
     - beta_fast=32, beta_slow=1
+
+    Reference: https://arxiv.org/abs/2309.00071
     """
 
     def __init__(
@@ -141,13 +111,11 @@ class GptOssYaRNRotaryEmbedding(nn.Module):
         dim: int,
         max_position_embeddings: int = 131072,
         base: float = 150000.0,
-        device: torch.device = None,
         scaling_factor: float = 32.0,
         original_max_position_embeddings: int = 4096,
         beta_fast: float = 32.0,
         beta_slow: float = 1.0,
-        mscale: float = 1.0,
-        mscale_all_dim: float = 0.0,
+        device: torch.device = None,
     ):
         super().__init__()
         self.dim = dim
@@ -157,79 +125,96 @@ class GptOssYaRNRotaryEmbedding(nn.Module):
         self.original_max_position_embeddings = original_max_position_embeddings
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
-        self.mscale = mscale
-        self.mscale_all_dim = mscale_all_dim
-        self.max_seq_len_cached = None
 
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._compute_inv_freq(device)
+        self._set_cos_sin_cache(max_position_embeddings, device, torch.get_default_dtype())
 
-        self._set_cos_sin_cache(
-            seq_len=max_position_embeddings,
-            device=device if device is not None else torch.device("cpu"),
-            dtype=torch.get_default_dtype(),
+    def _compute_inv_freq(self, device: torch.device):
+        """Compute inverse frequencies with YaRN interpolation."""
+        freq = self.base ** (
+            torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim
         )
+
+        if self.scaling_factor > 1.0:
+            # YaRN concentration
+            concentration = 0.1 * math.log(self.scaling_factor) + 1.0
+
+            d_half = self.dim / 2
+            # NTK by parts
+            low = (
+                d_half
+                * math.log(self.original_max_position_embeddings / (self.beta_slow * 2 * math.pi))
+                / math.log(self.base)
+            )
+            high = (
+                d_half
+                * math.log(self.original_max_position_embeddings / (self.beta_fast * 2 * math.pi))
+                / math.log(self.base)
+            )
+
+            interpolation = 1.0 / (self.scaling_factor * freq)
+            extrapolation = 1.0 / freq
+
+            ramp = (
+                torch.arange(d_half, dtype=torch.float32, device=device) - low
+            ) / (high - low)
+            mask = 1 - ramp.clamp(0, 1)
+
+            inv_freq = interpolation * (1 - mask) + extrapolation * mask
+            self.concentration = concentration
+        else:
+            inv_freq = 1.0 / freq
+            self.concentration = 1.0
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        """Build cos/sin cache with YaRN frequency interpolation."""
+        """Build cos/sin cache for positions."""
         self.max_seq_len_cached = seq_len
-        dim = self.dim
-
-        # Compute frequency bands
-        freq_extra = 1.0 / (self.base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-        freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-        )
-
-        # Find interpolation range
-        low, high = yarn_find_correction_range(
-            self.beta_fast,
-            self.beta_slow,
-            dim,
-            self.base,
-            self.original_max_position_embeddings,
-        )
-
-        # Create interpolation mask
-        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(device=device, dtype=torch.float32)
-
-        # Interpolate frequencies
-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        # Build position embeddings
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-
-        # Apply magnitude scaling
-        _mscale = float(
-            yarn_get_mscale(self.scaling_factor, self.mscale)
-            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
-        )
-
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False)
-        self.register_buffer("sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False)
+        self.register_buffer("cos_cached", (emb.cos() * self.concentration).to(dtype), persistent=False)
+        self.register_buffer("sin_cached", (emb.sin() * self.concentration).to(dtype), persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return cos/sin embeddings for the given sequence length."""
-        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
         return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
+            self.cos_cached[:seq_len].to(x.dtype),
+            self.sin_cached[:seq_len].to(x.dtype),
         )
 
 
-class GptOssAttention(nn.Module):
-    """Grouped Query Attention with alternating sliding/full attention.
+def apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embedding to query and key tensors."""
+    cos = cos.unsqueeze(1)  # [seq, 1, dim]
+    sin = sin.unsqueeze(1)  # [seq, 1, dim]
 
-    GPT-OSS uses:
+    q1, q2 = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2 :]
+    k1, k2 = k[..., : k.shape[-1] // 2], k[..., k.shape[-1] // 2 :]
+
+    q_rot = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+    k_rot = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+
+    return q_rot, k_rot
+
+
+# ============================================================================
+# Attention Block with Sink Tokens
+# ============================================================================
+
+class GptOssAttention(nn.Module):
+    """Grouped Query Attention with sink tokens and alternating sliding/full attention.
+
+    Key features:
     - 64 query heads, 8 KV heads (GQA with 8:1 ratio)
     - Head dim = 64
-    - Alternating sliding window (128 tokens) / full attention per layer
+    - Sink tokens: learnable per-head parameters added to attention softmax
+    - Alternating sliding window (128 tokens on even layers) / full attention (odd layers)
     """
 
     def __init__(self, config: GptOssConfig, layer_idx: int):
@@ -245,7 +230,10 @@ class GptOssAttention(nn.Module):
 
         # Determine if this layer uses sliding window
         self.is_sliding = config.is_sliding_attention(layer_idx)
-        self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.sliding_window = config.sliding_window if self.is_sliding else 0
+
+        # Sink tokens: learnable per-head parameters
+        self.sinks = nn.Parameter(torch.empty(self.num_heads, dtype=torch.bfloat16))
 
         # Projections
         self.q_proj = nn.Linear(
@@ -269,8 +257,11 @@ class GptOssAttention(nn.Module):
             bias=config.attention_bias,
         )
 
+        # Attention scale
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
         # RoPE
-        self.rotary_emb = GptOssYaRNRotaryEmbedding(
+        self.rotary_emb = YaRNRotaryEmbedding(
             dim=self.head_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
@@ -311,13 +302,52 @@ class GptOssAttention(nn.Module):
 
         # Apply RoPE
         if position_ids is not None:
-            cos = cos[position_ids].unsqueeze(1)
-            sin = sin[position_ids].unsqueeze(1)
+            cos = cos[position_ids]
+            sin = sin[position_ids]
         else:
-            cos = cos[:q_len].unsqueeze(0).unsqueeze(0)
-            sin = sin[:q_len].unsqueeze(0).unsqueeze(0)
+            cos = cos[:q_len]
+            sin = sin[:q_len]
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # For GQA: reshape Q to [batch, kv_heads, q_mult, seq, head_dim]
+        query_states = query_states.view(
+            bsz, self.num_kv_heads, self.num_key_value_groups, q_len, self.head_dim
+        )
+        query_states = query_states.transpose(2, 3)  # [batch, kv_heads, seq, q_mult, head_dim]
+
+        # Apply RoPE to Q and K
+        query_flat = query_states.view(bsz * self.num_kv_heads, q_len * self.num_key_value_groups, self.head_dim)
+        key_flat = key_states.view(bsz * self.num_kv_heads, q_len, self.head_dim)
+
+        # Simple RoPE application
+        cos_expanded = cos.unsqueeze(0).expand(bsz, -1, -1)  # [batch, seq, dim]
+        sin_expanded = sin.unsqueeze(0).expand(bsz, -1, -1)
+
+        query_states = query_states.view(bsz, self.num_heads, q_len, self.head_dim)
+        key_states = key_states.view(bsz, self.num_kv_heads, q_len, self.head_dim)
+
+        # Transpose for RoPE: [batch, seq, heads, head_dim]
+        q_for_rope = query_states.transpose(1, 2).contiguous()
+        k_for_rope = key_states.transpose(1, 2).contiguous()
+
+        # Apply rotary embeddings
+        q_for_rope = q_for_rope.view(bsz, q_len, self.num_heads, self.head_dim)
+        k_for_rope = k_for_rope.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+
+        cos_q = cos_expanded.unsqueeze(2)  # [batch, seq, 1, dim]
+        sin_q = sin_expanded.unsqueeze(2)
+
+        q1, q2 = q_for_rope[..., :self.head_dim//2], q_for_rope[..., self.head_dim//2:]
+        k1, k2 = k_for_rope[..., :self.head_dim//2], k_for_rope[..., self.head_dim//2:]
+
+        cos_half = cos_q[..., :self.head_dim//2]
+        sin_half = sin_q[..., :self.head_dim//2]
+
+        q_rot = torch.cat([q1 * cos_half - q2 * sin_half, q2 * cos_half + q1 * sin_half], dim=-1)
+        k_rot = torch.cat([k1 * cos_half - k2 * sin_half, k2 * cos_half + k1 * sin_half], dim=-1)
+
+        query_states = q_rot.transpose(1, 2)  # [batch, heads, seq, head_dim]
+        key_states = k_rot.transpose(1, 2)    # [batch, kv_heads, seq, head_dim]
+        value_states = value_states           # [batch, kv_heads, seq, head_dim]
 
         # Handle KV cache
         if past_key_value is not None:
@@ -327,25 +357,44 @@ class GptOssAttention(nn.Module):
         past_key_value = (key_states, value_states) if use_cache else None
 
         # Repeat KV for GQA
-        key_states = self._repeat_kv(key_states, self.num_key_value_groups)
-        value_states = self._repeat_kv(value_states, self.num_key_value_groups)
+        key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
 
-        # Compute attention
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # Compute attention scores
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
 
-        # Apply causal mask
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+        # Create causal mask
+        kv_len = key_states.shape[-2]
+        causal_mask = torch.triu(
+            torch.ones((q_len, kv_len), dtype=torch.bool, device=attn_weights.device),
+            diagonal=kv_len - q_len + 1
+        )
 
         # Apply sliding window mask if applicable
-        if self.is_sliding and self.sliding_window is not None:
-            causal_mask = self._create_sliding_window_mask(
-                q_len, key_states.shape[-2], self.sliding_window, hidden_states.device
-            )
-            attn_weights = attn_weights + causal_mask
+        if self.is_sliding and self.sliding_window > 0:
+            row_idx = torch.arange(q_len, device=attn_weights.device).unsqueeze(1)
+            col_idx = torch.arange(kv_len, device=attn_weights.device).unsqueeze(0)
+            offset = kv_len - q_len
+            distance = col_idx - (row_idx + offset)
+            sliding_mask = distance < -self.sliding_window
+            causal_mask = causal_mask | sliding_mask
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        # Add sink tokens to attention
+        # Sinks are added as an extra column in the attention scores
+        # Shape: [batch, heads, seq, 1]
+        sink_scores = self.sinks.view(1, self.num_heads, 1, 1).expand(bsz, -1, q_len, 1)
+        attn_weights_with_sinks = torch.cat([attn_weights, sink_scores], dim=-1)
+
+        # Softmax with sinks
+        attn_probs = F.softmax(attn_weights_with_sinks, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # Remove sink column before matmul with values
+        attn_probs = attn_probs[..., :-1]
+
+        # Apply attention to values
+        attn_output = torch.matmul(attn_probs, value_states)
 
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -354,37 +403,15 @@ class GptOssAttention(nn.Module):
 
         return attn_output, None, past_key_value
 
-    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """Repeat KV heads for GQA."""
-        if n_rep == 1:
-            return hidden_states
-        batch, num_kv_heads, slen, head_dim = hidden_states.shape
-        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
-        return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
-    def _create_sliding_window_mask(
-        self, q_len: int, kv_len: int, window_size: int, device: torch.device
-    ) -> torch.Tensor:
-        """Create sliding window attention mask."""
-        row_idx = torch.arange(q_len, device=device).unsqueeze(1)
-        col_idx = torch.arange(kv_len, device=device).unsqueeze(0)
-
-        # Positions outside the sliding window get -inf
-        offset = kv_len - q_len
-        distance = col_idx - (row_idx + offset)
-        mask = torch.where(
-            (distance > 0) | (distance < -window_size),
-            torch.tensor(float("-inf"), device=device),
-            torch.tensor(0.0, device=device),
-        )
-        return mask.unsqueeze(0).unsqueeze(0)
-
+# ============================================================================
+# Expert Module (Single Expert FFN with SwiGLU)
+# ============================================================================
 
 class GptOssExpert(nn.Module):
-    """Single expert FFN with SwiGLU activation.
+    """Single expert FFN with OpenAI's SwiGLU activation.
 
-    Uses clamped SwiGLU: clamp(silu(gate) * up, -limit, limit)
-    Default limit = 7.0
+    Uses fused gate+up projection (mlp1) followed by SwiGLU and down projection (mlp2).
     """
 
     def __init__(self, config: GptOssConfig):
@@ -393,24 +420,35 @@ class GptOssExpert(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.swiglu_limit = config.swiglu_limit
 
-        # SwiGLU: gate and up projections combined
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        # Fused gate+up projection (output is 2x intermediate_size for SwiGLU interleaving)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+        # Down projection
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with clamped SwiGLU activation."""
+        """Forward pass with OpenAI's SwiGLU activation."""
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        # SwiGLU with clamping
-        hidden = torch.clamp(F.silu(gate) * up, min=-self.swiglu_limit, max=self.swiglu_limit)
+
+        # Interleave gate and up for SwiGLU
+        # Create interleaved tensor: [gate0, up0, gate1, up1, ...]
+        interleaved = torch.stack([gate, up], dim=-1).view(*gate.shape[:-1], -1)
+
+        # Apply OpenAI's SwiGLU
+        hidden = swiglu(interleaved, alpha=1.702, limit=self.swiglu_limit)
+
         return self.down_proj(hidden)
 
+
+# ============================================================================
+# MoE Layer (Mixture of Experts)
+# ============================================================================
 
 class GptOssMoE(nn.Module):
     """Mixture of Experts layer with Top-4 routing.
 
-    128 experts total, Top-4 selected per token.
+    128 experts total, Top-4 selected per token with softmax-normalized weights.
     """
 
     def __init__(self, config: GptOssConfig):
@@ -440,7 +478,7 @@ class GptOssMoE(nn.Module):
         # Initialize output
         output = torch.zeros_like(hidden_states_flat)
 
-        # Route tokens to experts (simple loop implementation)
+        # Route tokens to experts
         for i, expert in enumerate(self.experts):
             # Find tokens routed to this expert
             expert_mask = (topk_indices == i).any(dim=-1)
@@ -460,6 +498,10 @@ class GptOssMoE(nn.Module):
         return output.view(batch_size, seq_len, hidden_dim)
 
 
+# ============================================================================
+# Decoder Layer
+# ============================================================================
+
 class GptOssDecoderLayer(nn.Module):
     """Single transformer decoder layer."""
 
@@ -468,9 +510,9 @@ class GptOssDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
-        self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = GptOssAttention(config, layer_idx)
-        self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = GptOssMoE(config)
 
     def forward(
@@ -505,14 +547,15 @@ class GptOssDecoderLayer(nn.Module):
         return hidden_states, attn_weights, present_key_value
 
 
-class GptOssModel(PreTrainedModel):
-    """GPT-OSS transformer model."""
+# ============================================================================
+# Main Model
+# ============================================================================
 
-    config_class = GptOssConfig
-    base_model_prefix = "model"
+class GptOssModel(nn.Module):
+    """GPT-OSS-120B transformer model (OpenAI-style, no HuggingFace dependencies)."""
 
     def __init__(self, config: GptOssConfig):
-        super().__init__(config)
+        super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -521,16 +564,7 @@ class GptOssModel(PreTrainedModel):
         self.layers = nn.ModuleList(
             [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.gradient_checkpointing = False
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -542,15 +576,7 @@ class GptOssModel(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+    ) -> Tuple[torch.Tensor, ...]:
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("Cannot specify both input_ids and inputs_embeds")
         elif input_ids is not None:
@@ -575,17 +601,6 @@ class GptOssModel(PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-
-        # Create causal attention mask
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length + past_key_values_length),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        attention_mask = self._prepare_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
-        )
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -619,88 +634,18 @@ class GptOssModel(PreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        if not return_dict:
-            return tuple(
-                v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None
-            )
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
-
-    def _prepare_attention_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_shape: Tuple[int, int],
-        inputs_embeds: torch.Tensor,
-        past_key_values_length: int,
-    ) -> torch.Tensor:
-        """Prepare 4D causal attention mask."""
-        batch_size, seq_length = input_shape
-        dtype = inputs_embeds.dtype
-        device = inputs_embeds.device
-
-        # Create causal mask
-        causal_mask = torch.triu(
-            torch.ones((seq_length, seq_length), dtype=dtype, device=device) * float("-inf"),
-            diagonal=1,
-        )
-
-        # Expand for past key values
-        if past_key_values_length > 0:
-            causal_mask = torch.cat(
-                [
-                    torch.zeros((seq_length, past_key_values_length), dtype=dtype, device=device),
-                    causal_mask,
-                ],
-                dim=-1,
-            )
-
-        # Expand for batch and heads
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-
-        # Combine with padding mask
-        if attention_mask.dim() == 2:
-            expanded_mask = attention_mask[:, None, None, :].expand(
-                batch_size, 1, seq_length, attention_mask.shape[-1]
-            )
-            inverted_mask = 1.0 - expanded_mask.float()
-            causal_mask = causal_mask + inverted_mask.masked_fill(
-                inverted_mask.bool(), float("-inf")
-            )
-
-        return causal_mask.to(dtype)
+        return (hidden_states, next_cache, all_hidden_states, all_self_attns)
 
 
-class GptOssForCausalLM(PreTrainedModel):
-    """GPT-OSS model with language modeling head."""
-
-    config_class = GptOssConfig
-    base_model_prefix = "model"
-    _tied_weights_keys = ["lm_head.weight"]
+class GptOssForCausalLM(nn.Module):
+    """GPT-OSS-120B model with language modeling head."""
 
     def __init__(self, config: GptOssConfig):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
         self.model = GptOssModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -713,14 +658,7 @@ class GptOssForCausalLM(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+    ) -> Tuple[torch.Tensor, ...]:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -730,7 +668,6 @@ class GptOssForCausalLM(PreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
 
         hidden_states = outputs[0]
@@ -743,17 +680,7 @@ class GptOssForCausalLM(PreTrainedModel):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
 
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        return (loss, logits, outputs[1], outputs[2], outputs[3])
 
     def prepare_inputs_for_generation(
         self,

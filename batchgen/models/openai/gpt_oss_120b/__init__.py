@@ -28,6 +28,6 @@ OpenAI's GPT-OSS-120B is a 117B parameter MoE model (5.1B active) with:
 """
 
 from .configuration_gpt_oss import GptOssConfig
-from .modeling_gpt_oss import GptOssForCausalLM
+from .model import GptOssForCausalLM, GptOssModel
 
-__all__ = ["GptOssConfig", "GptOssForCausalLM"]
+__all__ = ["GptOssConfig", "GptOssForCausalLM", "GptOssModel"]
