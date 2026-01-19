@@ -485,6 +485,17 @@ class WorkerManager:
             parameter_server = Mixtral_Parameter_Server(
                 self.args.model, self.args.cache_dir, pt_ckpt_dir
             )
+        elif "gpt-oss" in self.args.model.lower() or "gpt_oss" in self.args.model.lower():
+            from batchgen.models.gpt_oss.gpt_oss_parameter_server import (
+                GptOss_Parameter_Server,
+            )
+
+            parameter_server = GptOss_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                pt_ckpt_dir,
+                self.args.enable_hugetlbfs,
+            )
         else:
             raise NotImplementedError(
                 f"Model type for {self.args.model} not supported"
