@@ -184,6 +184,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         core_engine,
         engine_config,
         model_config,
+        persistent: bool = False,
     ):
         """Initialize GPT-OSS expert wrapper.
 
@@ -194,12 +195,16 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             core_engine: BatchGen core engine
             engine_config: Engine configuration
             model_config: Model configuration
+            persistent: If True, MXFP4 weights are stored on GPU and reused.
+                       If False, weights are loaded from buffer each forward.
         """
-        # GPT-OSS always loads weights (all experts local, no caching)
         super().__init__(
             module, layer_idx, expert_idx, core_engine, engine_config, model_config,
-            persistent=False  # Load weights each forward (MXFP4 dequantization needed)
+            persistent=persistent
         )
+
+        # Storage for MXFP4 weights in persistent mode
+        self.stored_mxfp4_weights = None
 
         # Import MXFP4 dequantization
         try:
@@ -262,15 +267,48 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         """
         return self.module(hidden_states)
 
+    def _store_mxfp4_weights(self, weights_dict: Dict[str, torch.Tensor]):
+        """Store MXFP4 weights on GPU for persistent mode.
+
+        Args:
+            weights_dict: Dict containing packed weights and scales
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        self.stored_mxfp4_weights = {
+            name: tensor.to(device) for name, tensor in weights_dict.items()
+        }
+
+    def _get_stored_mxfp4_weights(self) -> Dict[str, torch.Tensor]:
+        """Get stored MXFP4 weights for persistent mode.
+
+        Returns:
+            Dict containing packed weights and scales (already on GPU)
+        """
+        return self.stored_mxfp4_weights
+
+    def _pre_store_mxfp4_weights(self):
+        """Load MXFP4 weights from core_engine and store on GPU.
+
+        Called during initialization when persistent=True.
+        Weights remain in MXFP4 format; dequantization happens during forward.
+        """
+        weights = self.core_engine.get_tensor(self.module_key)
+        self._store_mxfp4_weights(weights)
+
+        logging.debug(
+            f"[Layer {self.layer_idx} Expert {self.expert_idx}] "
+            f"Pre-stored MXFP4 weights for persistent mode"
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with MXFP4 dequantization.
 
         Flow:
-        1. Load MXFP4 packed weights from core engine
+        1. Get MXFP4 weights from storage (persistent) or buffer (non-persistent)
         2. Dequantize to BF16
         3. Apply to module
         4. Micro-batch forward through SwiGLU
-        5. Cleanup
+        5. Cleanup (free buffer only if non-persistent, always clear BF16)
 
         Args:
             hidden_states: Input tensor [num_tokens, hidden_size]
@@ -287,18 +325,23 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         rank = self.get_rank_safe()
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
-            f"GPT-OSS expert forward. Phase: {self.phase}"
+            f"GPT-OSS expert forward. Phase: {self.phase}, persistent: {self.persistent}"
         )
 
-        # Load MXFP4 weights from core engine
+        # Get MXFP4 weights from appropriate source
         if do_timing:
             t0 = time.perf_counter()
-        weights = self.load_weights(self.module_key)
+        if self.persistent:
+            # Persistent mode: read from stored GPU attributes
+            weights = self._get_stored_mxfp4_weights()
+        else:
+            # Non-persistent mode: load from buffer
+            weights = self.load_weights(self.module_key)
         if do_timing:
             torch.cuda.synchronize()
             PrefillTimingStats.moe_load_ms += (time.perf_counter() - t0) * 1000
 
-        # Dequantize MXFP4 to BF16
+        # Dequantize MXFP4 to BF16 (always needed)
         if do_timing:
             t0 = time.perf_counter()
         dequant_weights = self.dequantize_weights(weights)
@@ -306,7 +349,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             torch.cuda.synchronize()
             PrefillTimingStats.moe_dequant_ms += (time.perf_counter() - t0) * 1000
 
-        # Apply to module
+        # Apply BF16 to module
         if do_timing:
             t0 = time.perf_counter()
         self.apply_weights(dequant_weights)
@@ -328,7 +371,10 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         torch.cuda.current_stream(
             self.engine_config.Basic_Config.device_torch
         ).synchronize()
-        self.free_weights(self.module_key)
+        if not self.persistent:
+            # Non-persistent: release buffer slot
+            self.free_weights(self.module_key)
+        # Always clear BF16 from module (temporary allocation)
         self.clear_weights()
         if do_timing:
             PrefillTimingStats.moe_cleanup_ms += (time.perf_counter() - t0) * 1000

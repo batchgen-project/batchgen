@@ -92,6 +92,11 @@ class GptOssParallelStrategyManager:
 
         # Step 4: Build weight copy task mappings
         step_start = time.perf_counter()
+
+        # Check if experts need offloading (require dynamic buffer loading)
+        # When enable_offloading=False, experts are persistent (stored on GPU)
+        experts_need_offloading = self.engine_config.EP_Config.enable_offloading
+
         for layer_idx in range(self.model_config.num_hidden_layers):
             # Attention parameters (BF16, not quantized)
             for name, _ in self.model.model.layers[layer_idx].self_attn.named_parameters():
@@ -114,9 +119,12 @@ class GptOssParallelStrategyManager:
                         "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
                         "tensor_key": name,
                     }
-                self.weight_copy_task["routed_expert"].append(
-                    f"routed_expert_{layer_idx}_{expert_idx}"
-                )
+                # Only add to weight_copy_task if offloading is enabled
+                # When not offloading, experts are persistent (MXFP4 stored on GPU)
+                if experts_need_offloading:
+                    self.weight_copy_task["routed_expert"].append(
+                        f"routed_expert_{layer_idx}_{expert_idx}"
+                    )
 
         timings["mapping_build"] = time.perf_counter() - step_start
 
@@ -225,9 +233,17 @@ class GptOssParallelStrategyManager:
         """Configure expert modules with MXFP4 dequantization."""
         logging.info("Configuring expert modules...")
 
+        persistent_count = 0
+        dynamic_count = 0
+
         for layer_idx in range(self.model_config.num_hidden_layers):
             for expert_idx in range(self.model_config.num_local_experts):
                 expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+
+                # Determine persistence: True if NOT in weight_copy_task (like DeepSeek)
+                # When persistent, MXFP4 weights are stored on GPU; no buffer needed
+                persistent = module_key not in self.weight_copy_task.get("routed_expert", [])
 
                 # Wrap expert for BatchGen execution with MXFP4 support
                 # GptOssExpertWrapper handles MXFP4 dequantization internally
@@ -238,11 +254,23 @@ class GptOssParallelStrategyManager:
                     core_engine=self.core_engine,
                     engine_config=self.engine_config,
                     model_config=self.model_config,
+                    persistent=persistent,
                 )
+
+                # Pre-store MXFP4 weights on GPU for persistent experts
+                if persistent:
+                    wrapped_expert._pre_store_mxfp4_weights()
+                    persistent_count += 1
+                else:
+                    dynamic_count += 1
+
                 self.model.model.layers[layer_idx].mlp.experts[expert_idx] = wrapped_expert
 
         total_experts = self.model_config.num_hidden_layers * self.model_config.num_local_experts
-        logging.info(f"Configured {total_experts} expert modules")
+        logging.info(
+            f"Configured {total_experts} expert modules "
+            f"({persistent_count} persistent, {dynamic_count} dynamic)"
+        )
 
     def _config_lm_head_hook(self):
         """Configure LM head for output processing."""
