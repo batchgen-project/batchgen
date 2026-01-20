@@ -19,6 +19,7 @@ from .fa_decode import gqa_decode_fa, gqa_decode_fa_contiguous
 from .sink_correction import apply_sink_correction
 from .reference import attention_ref, attention_ref_no_sinks
 from .gqa_mode3 import gqa_decoding_mode_3_bf16
+from .gqa_attention import gqa_attention_with_sinks
 
 __all__ = [
     'gqa_prefill_fa',
@@ -28,4 +29,5 @@ __all__ = [
     'attention_ref',
     'attention_ref_no_sinks',
     'gqa_decoding_mode_3_bf16',
+    'gqa_attention_with_sinks',
 ]
