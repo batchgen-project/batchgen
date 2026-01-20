@@ -28,6 +28,9 @@ Architecture reference: GPT-OSS-120B
 - 64 query heads, 8 KV heads (8:1 ratio)
 - head_dim = 64
 - Alternating sliding (128 tokens) / full attention per layer
+
+Uses FlashAttention when available for memory-efficient attention.
+Falls back to vanilla PyTorch for debugging/testing only.
 """
 
 import math
@@ -37,6 +40,24 @@ import torch
 import torch.nn.functional as F
 
 from ..sink import softmax_with_sinks
+
+# Detect which flash attention version is available
+_USE_FA3 = False
+_flash_attn_func = None
+
+try:
+    from flash_attn_interface import flash_attn_func as _fa3_func
+    _USE_FA3 = True
+    _flash_attn_func = _fa3_func
+except ImportError:
+    pass
+
+if _flash_attn_func is None:
+    try:
+        from flash_attn import flash_attn_func as _fa2_func
+        _flash_attn_func = _fa2_func
+    except ImportError:
+        pass
 
 
 def gqa_attention_prefill(
@@ -51,6 +72,7 @@ def gqa_attention_prefill(
     """GQA attention for prefill phase.
 
     Computes full sequence attention with optional sliding window and sinks.
+    Uses FlashAttention when available for memory efficiency.
 
     Args:
         query: Query tensor [batch, num_q_heads, seq_q, head_dim]
@@ -65,18 +87,88 @@ def gqa_attention_prefill(
         Attention output [batch, num_q_heads, seq_q, head_dim]
     """
     batch, num_q_heads, seq_q, head_dim = query.shape
-    batch, num_kv_heads, seq_k, head_dim = key.shape
-    num_groups = num_q_heads // num_kv_heads
+    _, num_kv_heads, seq_k, _ = key.shape
 
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
 
+    # Use FlashAttention if available
+    if _flash_attn_func is not None:
+        # FlashAttention expects: [batch, seq, heads, head_dim]
+        # Input is: [batch, heads, seq, head_dim]
+        q_fa = query.transpose(1, 2).contiguous()  # [batch, seq_q, num_q_heads, head_dim]
+        k_fa = key.transpose(1, 2).contiguous()    # [batch, seq_k, num_kv_heads, head_dim]
+        v_fa = value.transpose(1, 2).contiguous()  # [batch, seq_k, num_kv_heads, head_dim]
+
+        # Set up window_size parameter for FlashAttention
+        if sliding_window is not None and sliding_window > 0:
+            window_size = (sliding_window - 1, 0)
+        else:
+            window_size = (-1, -1)
+
+        lse = None
+        if sinks is not None:
+            # Need LSE for sink correction
+            # FA2: return_softmax=True returns (out, softmax_lse, S_dmask)
+            # FA3: has different interface
+            try:
+                result = _flash_attn_func(
+                    q_fa, k_fa, v_fa,
+                    softmax_scale=scale,
+                    causal=True,
+                    window_size=window_size,
+                    return_softmax=True,
+                )
+                if isinstance(result, tuple) and len(result) >= 2:
+                    output = result[0]
+                    lse = result[1]  # softmax_lse: (batch, nheads, seqlen)
+                else:
+                    output = result
+            except TypeError:
+                # FA3 or different API - try without return_softmax
+                output = _flash_attn_func(
+                    q_fa, k_fa, v_fa,
+                    softmax_scale=scale,
+                    causal=True,
+                    window_size=window_size,
+                )
+                import warnings
+                warnings.warn(
+                    "FlashAttention return_softmax not supported, sink correction disabled",
+                    RuntimeWarning
+                )
+        else:
+            output = _flash_attn_func(
+                q_fa, k_fa, v_fa,
+                softmax_scale=scale,
+                causal=True,
+                window_size=window_size,
+            )
+
+        # Apply sink correction if sinks provided and we got LSE
+        if sinks is not None and lse is not None:
+            from .sink_correction import apply_sink_correction
+            output = apply_sink_correction(output, lse, sinks)
+
+        # Transpose back: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
+        attn_output = output.transpose(1, 2).contiguous()
+        return attn_output
+
+    # Fallback to vanilla PyTorch attention (for debugging only - memory intensive!)
+    import warnings
+    warnings.warn(
+        "FlashAttention not available, falling back to vanilla PyTorch attention. "
+        "This will use excessive memory for long sequences!",
+        RuntimeWarning
+    )
+
+    num_groups = num_q_heads // num_kv_heads
+
     # Repeat KV heads to match query heads
-    key = key.repeat_interleave(num_groups, dim=1)  # [batch, num_q_heads, seq_k, head_dim]
+    key = key.repeat_interleave(num_groups, dim=1)
     value = value.repeat_interleave(num_groups, dim=1)
 
     # Compute attention scores
-    # [batch, num_q_heads, seq_q, seq_k]
     attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
 
     # Create causal mask
