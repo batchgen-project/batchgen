@@ -59,6 +59,10 @@ class GptOssPlanner(BasePlanner):
         - experts_per_rank = NUM_EXPERTS // 1 = 128
         - routed_expert_start_idx = 0 * 128 = 0
         - routed_expert_end_idx = 1 * 128 = 128
+
+        GPT-OSS specific settings:
+        - No shared experts (set buffer counts to 0)
+        - Use attn_mode=3 for proper dynamic weight loading
         """
         # Override base planner's num_local_expert calculation
         # Base planner assumes 2.4GB per expert (FP8), but MXFP4 experts are ~0.4GB
@@ -68,6 +72,14 @@ class GptOssPlanner(BasePlanner):
             self.config.EP_Config.num_local_expert_per_layer = self.NUM_EXPERTS
             # No module buffer swapping needed - all experts resident
             self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
+
+        # GPT-OSS does NOT have shared experts - set buffer counts to 0
+        self.config.GPU_Buffer_Config.num_prefill_module_buffer["shared_expert"] = 0
+        self.config.GPU_Buffer_Config.num_decoding_module_buffer["shared_expert"] = 0
+
+        # GPT-OSS uses attn_mode=3 for proper dynamic weight loading
+        # (attn_mode=1 is legacy and doesn't support dynamic loading correctly)
+        self.config.Basic_Config.attn_mode = 3
 
     def get_module_shapes(self) -> dict:
         """Return GPT-OSS-120B specific tensor shapes."""

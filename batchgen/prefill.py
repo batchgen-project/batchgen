@@ -123,11 +123,25 @@ class PrefillExecutor():
 				all_tokens.append(new_tokens)
 				# if self.engine_config.Prefill_Config.return_logits:
 				# 	all_logits.append(outputs.logits[:, -1, :].cpu())
+
+		# Log timing summary for GPT-OSS if timing was enabled
+		self._log_prefill_timing()
+
 		return PrefillResult(
 			sequence_uuids=requests.sequence_uuids,
 			first_tokens=torch.cat(all_tokens, dim=0),
 			# first_token_logits=torch.cat(all_logits, dim=0) if self.engine_config.Prefill_Config.return_logits else None
 		)
+
+	def _log_prefill_timing(self):
+		"""Log prefill timing stats if available (GPT-OSS specific)."""
+		try:
+			from batchgen.models.openai.gpt_oss_120b.wrappers import PrefillTimingStats
+			if PrefillTimingStats.enabled:
+				PrefillTimingStats.log_summary()
+				PrefillTimingStats.reset()  # Reset for next prefill batch
+		except ImportError:
+			pass  # Not GPT-OSS or module not available
 
 	def _cleanup_prefill(self):
 		# TODO: Revise cleanup steps

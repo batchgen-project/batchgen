@@ -23,10 +23,16 @@ Provides wrappers for GPT-OSS-120B model with MXFP4 quantization:
 - GptOssAttnWrapper: Attention wrapper with GQA and sink tokens
 
 Optimized for single H20 GPU deployment (world_size == 1).
+
+Timing instrumentation:
+    Set BATCHGEN_PREFILL_TIMING=1 environment variable to enable per-layer timing.
+    Or call PrefillTimingStats.enable() programmatically.
 """
 
 import logging
 import math
+import os
+import time
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -36,6 +42,97 @@ import torch.nn.functional as F
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.attention.gqa import gqa_attention_with_sinks, gqa_decode_fa
 from batchgen.attention.sink import softmax_with_sinks
+
+
+# Global timing accumulators for profiling
+class PrefillTimingStats:
+    """Timing statistics for prefill phase per module type."""
+
+    # Class-level accumulators for per-layer timing
+    attn_times_ms: Dict[int, float] = {}  # layer_idx -> total time in ms
+    moe_times_ms: Dict[int, float] = {}   # layer_idx -> total time in ms
+    attn_call_counts: Dict[int, int] = {}
+    moe_call_counts: Dict[int, int] = {}
+
+    # Enable/disable timing (add overhead)
+    enabled: bool = False
+
+    @classmethod
+    def reset(cls):
+        """Reset all timing stats."""
+        cls.attn_times_ms = {}
+        cls.moe_times_ms = {}
+        cls.attn_call_counts = {}
+        cls.moe_call_counts = {}
+
+    @classmethod
+    def enable(cls):
+        """Enable timing instrumentation."""
+        cls.enabled = True
+        cls.reset()
+
+    @classmethod
+    def disable(cls):
+        """Disable timing instrumentation."""
+        cls.enabled = False
+
+    @classmethod
+    def record_attn(cls, layer_idx: int, time_ms: float):
+        """Record attention timing for a layer."""
+        if layer_idx not in cls.attn_times_ms:
+            cls.attn_times_ms[layer_idx] = 0.0
+            cls.attn_call_counts[layer_idx] = 0
+        cls.attn_times_ms[layer_idx] += time_ms
+        cls.attn_call_counts[layer_idx] += 1
+
+    @classmethod
+    def record_moe(cls, layer_idx: int, time_ms: float):
+        """Record MoE timing for a layer."""
+        if layer_idx not in cls.moe_times_ms:
+            cls.moe_times_ms[layer_idx] = 0.0
+            cls.moe_call_counts[layer_idx] = 0
+        cls.moe_times_ms[layer_idx] += time_ms
+        cls.moe_call_counts[layer_idx] += 1
+
+    @classmethod
+    def log_summary(cls):
+        """Log timing summary to logging.info."""
+        if not cls.attn_times_ms and not cls.moe_times_ms:
+            return
+
+        total_attn_ms = sum(cls.attn_times_ms.values())
+        total_moe_ms = sum(cls.moe_times_ms.values())
+
+        logging.info("=" * 60)
+        logging.info("GPT-OSS Prefill Timing Summary")
+        logging.info("=" * 60)
+        logging.info(f"Total Attention: {total_attn_ms:.2f} ms")
+        logging.info(f"Total MoE:       {total_moe_ms:.2f} ms")
+        logging.info("-" * 60)
+
+        # Per-layer breakdown
+        all_layers = sorted(set(cls.attn_times_ms.keys()) | set(cls.moe_times_ms.keys()))
+        for layer_idx in all_layers:
+            attn_ms = cls.attn_times_ms.get(layer_idx, 0.0)
+            moe_ms = cls.moe_times_ms.get(layer_idx, 0.0)
+            attn_calls = cls.attn_call_counts.get(layer_idx, 0)
+            moe_calls = cls.moe_call_counts.get(layer_idx, 0)
+            logging.info(
+                f"Layer {layer_idx:2d}: attn={attn_ms:7.2f}ms ({attn_calls} calls), "
+                f"moe={moe_ms:7.2f}ms ({moe_calls} calls)"
+            )
+        logging.info("=" * 60)
+
+    @classmethod
+    def check_env_and_enable(cls):
+        """Check environment variable and enable timing if set."""
+        if os.environ.get("BATCHGEN_PREFILL_TIMING", "0") == "1":
+            cls.enable()
+            logging.info("PrefillTimingStats enabled via BATCHGEN_PREFILL_TIMING=1")
+
+
+# Auto-enable timing if environment variable is set
+PrefillTimingStats.check_env_and_enable()
 
 
 class GptOssExpertWrapper(ExpertWrapperBase):
@@ -157,6 +254,11 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         Returns:
             Output tensor [num_tokens, hidden_size]
         """
+        # Start timing if enabled
+        if PrefillTimingStats.enabled and self.phase == "prefill":
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
         rank = self.get_rank_safe()
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
@@ -186,6 +288,12 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
             f"GPT-OSS expert forward complete. Phase: {self.phase}"
         )
+
+        # Record timing if enabled
+        if PrefillTimingStats.enabled and self.phase == "prefill":
+            torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            PrefillTimingStats.record_moe(self.layer_idx, elapsed_ms)
 
         return result
 
@@ -802,6 +910,11 @@ class GptOssAttnWrapper(AttnWrapperBase):
         Returns:
             Tuple of (output, attn_weights, kv_cache)
         """
+        # Start timing if enabled
+        if PrefillTimingStats.enabled and self.phase == "prefill":
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
         rank = self.get_rank_safe()
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx}] "
@@ -847,7 +960,6 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Cleanup: release weight buffer after forward pass
         if not self.persistent:
-            import torch
             torch.cuda.current_stream(
                 self.engine_config.Basic_Config.device_torch
             ).synchronize()
@@ -858,5 +970,11 @@ class GptOssAttnWrapper(AttnWrapperBase):
             f"[Rank {rank} Layer {self.layer_idx}] "
             f"GPT-OSS attn forward complete. Phase: {self.phase}"
         )
+
+        # Record timing if enabled
+        if PrefillTimingStats.enabled and self.phase == "prefill":
+            torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            PrefillTimingStats.record_attn(self.layer_idx, elapsed_ms)
 
         return result
