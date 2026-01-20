@@ -327,8 +327,13 @@ class BatchGenWorker:
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
 		)
-		
-		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+
+		# Select worker view based on model's KV cache configuration
+		# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
+		if worker_kv_config.num_v_heads == 0:
+			self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		else:
+			self.host_paged_kv_worker_view = core_engine.DefaultHostPagedKVWorkerView(worker_kv_config)
 
 		# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
 		logging.info(f"Rank {self.rank}: Initializing Host KV view with parallel cudaHostRegister (local_rank={self.local_rank})")
