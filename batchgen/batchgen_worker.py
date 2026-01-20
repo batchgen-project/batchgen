@@ -18,7 +18,7 @@ from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 
 from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
-from batchgen.models.wrappers import BaseModuleWrapper
+from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase
 
 from .config.config import EngineConfig
 from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
@@ -5640,6 +5640,10 @@ class BatchGenWorker:
 		Attn_Wrapper.past_value_states = past_value_states
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 
+		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
+		AttnWrapperBase.host_paged_kv_worker_view = worker_view
+
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
 		if gpu_manager and gpu_manager._gpu_page_table_manager:
@@ -5975,6 +5979,10 @@ class BatchGenWorker:
 		Attn_Wrapper.gpu_paged_kv_manager = None
 		Attn_Wrapper.host_paged_kv_worker_view = None
 		Attn_Wrapper.cur_batch = None
+
+		# Also cleanup AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+		AttnWrapperBase.gpu_paged_kv_manager = None
+		AttnWrapperBase.host_paged_kv_worker_view = None
 		
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
