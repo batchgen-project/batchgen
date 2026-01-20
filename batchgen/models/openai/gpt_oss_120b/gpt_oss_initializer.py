@@ -227,6 +227,16 @@ class GptOssInitializer:
             "routed_expert": torch.uint8,
         }
 
+        # Per-tensor dtype overrides for mixed-dtype tensors within a module
+        # routed_expert has uint8 weights/scales but BF16 biases
+        self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
+            "routed_expert": {
+                "gate_proj.bias": torch.bfloat16,
+                "up_proj.bias": torch.bfloat16,
+                "down_proj.bias": torch.bfloat16,
+            },
+        }
+
     def _parse_model_config(self) -> ModelConfig:
         """Parse GPT-OSS model configuration."""
         model_config = ModelConfig()

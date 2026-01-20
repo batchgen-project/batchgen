@@ -49,13 +49,14 @@ struct tensor_meta {
     int64_t offset;
     std::vector<int64_t> tensor_shape;
     int64_t byte_size;
+    std::string dtype;  // Per-tensor dtype: "bfloat16", "uint8", etc.
 
     // default constructor
-    tensor_meta() : offset(0), tensor_shape({}), byte_size(0) {};
+    tensor_meta() : offset(0), tensor_shape({}), byte_size(0), dtype("") {};
     // constructor
     tensor_meta(int64_t offset, std::vector<int64_t> tensor_shape,
-                int64_t byte_size)
-        : offset(offset), tensor_shape(tensor_shape), byte_size(byte_size) {};
+                int64_t byte_size, std::string dtype = "")
+        : offset(offset), tensor_shape(tensor_shape), byte_size(byte_size), dtype(dtype) {};
 };
 
 class Parameter_Server {

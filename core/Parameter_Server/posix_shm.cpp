@@ -529,6 +529,8 @@ size_t compute_serialized_size(
             total_size += sizeof(size_t);  // tensor_shape vector length
             total_size += inner.second.tensor_shape.size() *
                           sizeof(int64_t);  // vector data
+            total_size += sizeof(size_t) +
+                          inner.second.dtype.size();  // tensor_meta.dtype (length + bytes)
         }
     }
     return total_size;
@@ -604,6 +606,17 @@ void serialize_map_to_buffer(
                 std::memcpy(ptr, inner.second.tensor_shape.data(),
                             vec_size * sizeof(int64_t));
                 ptr += vec_size * sizeof(int64_t);
+            }
+
+            // Write tensor_meta.dtype: first its length, then its characters.
+            size_t dtype_len = inner.second.dtype.size();
+            if (ptr + sizeof(size_t) + dtype_len > buffer + buffer_size)
+                throw std::runtime_error("Buffer overflow (tensor_meta dtype)");
+            std::memcpy(ptr, &dtype_len, sizeof(size_t));
+            ptr += sizeof(size_t);
+            if (dtype_len > 0) {
+                std::memcpy(ptr, inner.second.dtype.data(), dtype_len);
+                ptr += dtype_len;
             }
         }
     }
@@ -692,10 +705,27 @@ deserialize_map_from_buffer(const char* buffer, size_t buffer_size) {
                 ptr += vec_size * sizeof(int64_t);
             }
 
+            // Read tensor_meta.dtype.
+            if (ptr + sizeof(size_t) > end)
+                throw std::runtime_error(
+                    "Buffer overflow (reading tensor_meta dtype length)");
+            size_t dtype_len;
+            std::memcpy(&dtype_len, ptr, sizeof(size_t));
+            ptr += sizeof(size_t);
+            std::string dtype;
+            if (dtype_len > 0) {
+                if (ptr + dtype_len > end)
+                    throw std::runtime_error(
+                        "Buffer overflow (reading tensor_meta dtype data)");
+                dtype = std::string(ptr, dtype_len);
+                ptr += dtype_len;
+            }
+
             tensor_meta meta;
             meta.offset = offset;
             meta.byte_size = byte_size;
             meta.tensor_shape = shape;
+            meta.dtype = dtype;
             inner_map[inner_key] = meta;
         }
         result[outer_key] = inner_map;
