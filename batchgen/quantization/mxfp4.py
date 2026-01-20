@@ -265,25 +265,30 @@ def mxfp4_dequantize_triton(
     n_output = n_packed * 2  # 2 FP4 values per byte
     n_scales = scales.shape[-1]
 
-    # Allocate output
-    output = torch.empty((M, n_output), dtype=dtype, device=packed.device)
+    # Get device index for CUDA context
+    device_idx = packed.device.index if packed.device.index is not None else 0
 
-    # Launch kernel with 2D grid: (num_col_blocks, num_rows)
-    BLOCK_SIZE = 256  # Tune based on hardware
-    grid = (triton.cdiv(n_packed, BLOCK_SIZE), M)
+    # Use device guard to ensure Triton launches on correct GPU in multi-GPU setup
+    with torch.cuda.device(device_idx):
+        # Allocate output on the same device
+        output = torch.empty((M, n_output), dtype=dtype, device=packed.device)
 
-    mxfp4_dequant_kernel_2d[grid](
-        packed,
-        scales,
-        output,
-        n_packed,
-        n_scales,
-        n_output,
-        n_packed,   # stride_packed_row (contiguous)
-        n_scales,   # stride_scales_row (contiguous)
-        n_output,   # stride_output_row (contiguous)
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+        # Launch kernel with 2D grid: (num_col_blocks, num_rows)
+        BLOCK_SIZE = 256  # Tune based on hardware
+        grid = (triton.cdiv(n_packed, BLOCK_SIZE), M)
+
+        mxfp4_dequant_kernel_2d[grid](
+            packed,
+            scales,
+            output,
+            n_packed,
+            n_scales,
+            n_output,
+            n_packed,   # stride_packed_row (contiguous)
+            n_scales,   # stride_scales_row (contiguous)
+            n_output,   # stride_output_row (contiguous)
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
 
     # Restore original shape
     if batch_dims is not None:
