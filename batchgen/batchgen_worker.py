@@ -579,6 +579,16 @@ class BatchGenWorker:
 		from batchgen.sampling import sample_tokens
 		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
 
+	def _log_prefill_timing(self):
+		"""Log prefill timing stats if available (GPT-OSS specific)."""
+		try:
+			from batchgen.models.openai.gpt_oss_120b.wrappers import PrefillTimingStats
+			if PrefillTimingStats.enabled:
+				PrefillTimingStats.log_summary()
+				PrefillTimingStats.reset()  # Reset for next prefill batch
+		except ImportError:
+			pass  # Not GPT-OSS or module not available
+
 	def set_watchdog(self, watchdog) -> None:
 		"""
 		Set the watchdog for stuck detection during inference.
@@ -4890,6 +4900,9 @@ class BatchGenWorker:
 		Attn_Wrapper.prepack_max_seqlen = None
 		Attn_Wrapper.prepack_num_sequences = None
 		Attn_Wrapper.prepack_seq_lengths = None
+
+		# Log timing summary for GPT-OSS if timing was enabled
+		self._log_prefill_timing()
 
 		new_tokens = torch.cat(output_tokens, dim=0)
 		self.update_new_token(new_tokens, batch, 0)

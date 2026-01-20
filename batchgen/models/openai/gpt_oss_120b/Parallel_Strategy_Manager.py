@@ -249,8 +249,15 @@ class GptOssParallelStrategyManager:
         logging.info("Configuring LM head...")
         # LM head is in BF16, no special handling needed for MXFP4
 
-    def configure_decoding(self) -> Tuple:
+    def configure_decoding(self, padding_bsz=None, comm=None) -> Tuple:
         """Configure model for decoding phase.
+
+        Args:
+            padding_bsz: Maximum batch size per rank (unused for single GPU)
+            comm: MPI communicator (unused for single GPU)
+
+        Returns:
+            Tuple of (model, weight_copy_task)
 
         Same as prefill for GPT-OSS on single GPU.
         """
