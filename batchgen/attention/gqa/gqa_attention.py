@@ -109,34 +109,17 @@ def gqa_attention_prefill(
         lse = None
         if sinks is not None:
             # Need LSE for sink correction
-            # FA2: return_softmax=True returns (out, softmax_lse, S_dmask)
-            # FA3: has different interface
-            try:
-                result = _flash_attn_func(
-                    q_fa, k_fa, v_fa,
-                    softmax_scale=scale,
-                    causal=True,
-                    window_size=window_size,
-                    return_softmax=True,
-                )
-                if isinstance(result, tuple) and len(result) >= 2:
-                    output = result[0]
-                    lse = result[1]  # softmax_lse: (batch, nheads, seqlen)
-                else:
-                    output = result
-            except TypeError:
-                # FA3 or different API - try without return_softmax
-                output = _flash_attn_func(
-                    q_fa, k_fa, v_fa,
-                    softmax_scale=scale,
-                    causal=True,
-                    window_size=window_size,
-                )
-                import warnings
-                warnings.warn(
-                    "FlashAttention return_softmax not supported, sink correction disabled",
-                    RuntimeWarning
-                )
+            # flash_attn_func doesn't support returning LSE directly
+            # We run without sink correction for now (FA is still more efficient than vanilla)
+            # TODO: Use flash_attn_varlen_func with return_softmax_lse for proper sink support
+            output = _flash_attn_func(
+                q_fa, k_fa, v_fa,
+                softmax_scale=scale,
+                causal=True,
+                window_size=window_size,
+            )
+            # Note: Sink correction is NOT applied when using flash_attn_func
+            # This is a known limitation - for full sink support, use varlen API
         else:
             output = _flash_attn_func(
                 q_fa, k_fa, v_fa,

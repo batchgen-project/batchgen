@@ -703,6 +703,15 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 use_cache=use_cache,
             )
 
+        # Cleanup: release weight buffer after forward pass
+        if not self.persistent:
+            import torch
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
+
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx}] "
             f"GPT-OSS attn forward complete. Phase: {self.phase}"
