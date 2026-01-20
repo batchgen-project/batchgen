@@ -54,6 +54,13 @@ class PrefillTimingStats:
     attn_call_counts: Dict[int, int] = {}
     moe_call_counts: Dict[int, int] = {}
 
+    # Granular MoE timing breakdown
+    moe_load_ms: float = 0.0      # Weight loading from core_engine
+    moe_dequant_ms: float = 0.0   # MXFP4 dequantization
+    moe_apply_ms: float = 0.0     # Apply weights to module
+    moe_forward_ms: float = 0.0   # Actual forward pass
+    moe_cleanup_ms: float = 0.0   # Sync + free + clear
+
     # Enable/disable timing (add overhead)
     enabled: bool = False
 
@@ -64,6 +71,12 @@ class PrefillTimingStats:
         cls.moe_times_ms = {}
         cls.attn_call_counts = {}
         cls.moe_call_counts = {}
+        # Reset granular MoE timing
+        cls.moe_load_ms = 0.0
+        cls.moe_dequant_ms = 0.0
+        cls.moe_apply_ms = 0.0
+        cls.moe_forward_ms = 0.0
+        cls.moe_cleanup_ms = 0.0
 
     @classmethod
     def enable(cls):
@@ -108,6 +121,17 @@ class PrefillTimingStats:
         logging.info("=" * 60)
         logging.info(f"Total Attention: {total_attn_ms:.2f} ms")
         logging.info(f"Total MoE:       {total_moe_ms:.2f} ms")
+
+        # MoE breakdown
+        if cls.moe_load_ms > 0 or cls.moe_forward_ms > 0:
+            logging.info("-" * 60)
+            logging.info("MoE Timing Breakdown:")
+            logging.info(f"  Weight Load:    {cls.moe_load_ms:10.2f} ms ({cls.moe_load_ms/total_moe_ms*100:.1f}%)")
+            logging.info(f"  Dequantize:     {cls.moe_dequant_ms:10.2f} ms ({cls.moe_dequant_ms/total_moe_ms*100:.1f}%)")
+            logging.info(f"  Apply Weights:  {cls.moe_apply_ms:10.2f} ms ({cls.moe_apply_ms/total_moe_ms*100:.1f}%)")
+            logging.info(f"  Forward:        {cls.moe_forward_ms:10.2f} ms ({cls.moe_forward_ms/total_moe_ms*100:.1f}%)")
+            logging.info(f"  Cleanup:        {cls.moe_cleanup_ms:10.2f} ms ({cls.moe_cleanup_ms/total_moe_ms*100:.1f}%)")
+
         logging.info("-" * 60)
 
         # Per-layer breakdown
@@ -255,7 +279,8 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             Output tensor [num_tokens, hidden_size]
         """
         # Start timing if enabled
-        if PrefillTimingStats.enabled and self.phase == "prefill":
+        do_timing = PrefillTimingStats.enabled and self.phase == "prefill"
+        if do_timing:
             torch.cuda.synchronize()
             start_time = time.perf_counter()
 
@@ -266,31 +291,55 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         )
 
         # Load MXFP4 weights from core engine
+        if do_timing:
+            t0 = time.perf_counter()
         weights = self.load_weights(self.module_key)
+        if do_timing:
+            torch.cuda.synchronize()
+            PrefillTimingStats.moe_load_ms += (time.perf_counter() - t0) * 1000
 
         # Dequantize MXFP4 to BF16
+        if do_timing:
+            t0 = time.perf_counter()
         dequant_weights = self.dequantize_weights(weights)
+        if do_timing:
+            torch.cuda.synchronize()
+            PrefillTimingStats.moe_dequant_ms += (time.perf_counter() - t0) * 1000
 
         # Apply to module
+        if do_timing:
+            t0 = time.perf_counter()
         self.apply_weights(dequant_weights)
+        if do_timing:
+            torch.cuda.synchronize()
+            PrefillTimingStats.moe_apply_ms += (time.perf_counter() - t0) * 1000
 
         # Micro-batch forward
+        if do_timing:
+            t0 = time.perf_counter()
         result = self.micro_batch_forward(hidden_states, "expert")
+        if do_timing:
+            torch.cuda.synchronize()
+            PrefillTimingStats.moe_forward_ms += (time.perf_counter() - t0) * 1000
 
         # Cleanup
+        if do_timing:
+            t0 = time.perf_counter()
         torch.cuda.current_stream(
             self.engine_config.Basic_Config.device_torch
         ).synchronize()
         self.free_weights(self.module_key)
         self.clear_weights()
+        if do_timing:
+            PrefillTimingStats.moe_cleanup_ms += (time.perf_counter() - t0) * 1000
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
             f"GPT-OSS expert forward complete. Phase: {self.phase}"
         )
 
-        # Record timing if enabled
-        if PrefillTimingStats.enabled and self.phase == "prefill":
+        # Record total timing if enabled
+        if do_timing:
             torch.cuda.synchronize()
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             PrefillTimingStats.record_moe(self.layer_idx, elapsed_ms)
