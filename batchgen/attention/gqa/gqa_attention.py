@@ -44,11 +44,14 @@ from ..sink import softmax_with_sinks
 # Detect which flash attention version is available
 _USE_FA3 = False
 _flash_attn_func = None
+_flash_attn_forward = None  # FA3 low-level API that returns LSE
 
 try:
     from flash_attn_interface import flash_attn_func as _fa3_func
+    from flash_attn_interface import _flash_attn_forward as _fa3_forward
     _USE_FA3 = True
     _flash_attn_func = _fa3_func
+    _flash_attn_forward = _fa3_forward
 except ImportError:
     pass
 
@@ -107,19 +110,71 @@ def gqa_attention_prefill(
             window_size = (-1, -1)
 
         lse = None
-        if sinks is not None:
-            # Need LSE for sink correction
-            # flash_attn_func doesn't support returning LSE directly
-            # We run without sink correction for now (FA is still more efficient than vanilla)
-            # TODO: Use flash_attn_varlen_func with return_softmax_lse for proper sink support
+        if sinks is not None and _USE_FA3 and _flash_attn_forward is not None:
+            # FA3: Use _flash_attn_forward which returns (out, softmax_lse, *rest)
+            # This allows proper sink correction
+            # Need to convert to varlen format for _flash_attn_forward
+
+            # Create cumulative sequence lengths for uniform batches
+            cu_seqlens_q = torch.arange(
+                0, (batch + 1) * seq_q, seq_q,
+                dtype=torch.int32, device=query.device
+            )
+            cu_seqlens_k = torch.arange(
+                0, (batch + 1) * seq_k, seq_k,
+                dtype=torch.int32, device=query.device
+            )
+
+            # Flatten to varlen format: [batch, seq, heads, dim] -> [total, heads, dim]
+            q_varlen = q_fa.reshape(batch * seq_q, num_q_heads, head_dim)
+            k_varlen = k_fa.reshape(batch * seq_k, num_kv_heads, head_dim)
+            v_varlen = v_fa.reshape(batch * seq_k, num_kv_heads, head_dim)
+
+            output_varlen, lse, *rest = _flash_attn_forward(
+                q_varlen,
+                k_varlen,
+                v_varlen,
+                None, None,  # k_new, v_new
+                None,  # qv
+                None,  # out (let it allocate)
+                cu_seqlens_q,
+                cu_seqlens_k,
+                None,  # cu_seqlens_k_new
+                None,  # seqused_q
+                None,  # seqused_k
+                seq_q,
+                seq_k,
+                None, None, None,  # page_table, kv_batch_idx, leftpad_k
+                None, None, None,  # rotary_cos, rotary_sin, seqlens_rotary
+                None, None, None,  # q_descale, k_descale, v_descale
+                scale,
+                causal=True,
+                window_size=window_size,
+            )
+
+            # Reshape output back to padded format: [total, heads, dim] -> [batch, seq, heads, dim]
+            output = output_varlen.reshape(batch, seq_q, num_q_heads, head_dim)
+
+            # Reshape LSE to match sink_correction expected format
+            # LSE from varlen is (nheads, total_tokens), need (batch, nheads, seqlen)
+            if lse is not None and lse.dim() == 2:
+                # lse is (nheads, total_q) -> reshape to (batch, nheads, seq_q)
+                lse = lse.reshape(num_q_heads, batch, seq_q).permute(1, 0, 2).contiguous()
+        elif sinks is not None:
+            # FA2: flash_attn_func doesn't return LSE, run without sink correction
+            # For full sink support with FA2, use gqa_prefill_fa (varlen API)
+            import warnings
+            warnings.warn(
+                "FA2 flash_attn_func doesn't return LSE. Sink correction skipped. "
+                "Use gqa_prefill_fa for proper sink support with FA2.",
+                RuntimeWarning
+            )
             output = _flash_attn_func(
                 q_fa, k_fa, v_fa,
                 softmax_scale=scale,
                 causal=True,
                 window_size=window_size,
             )
-            # Note: Sink correction is NOT applied when using flash_attn_func
-            # This is a known limitation - for full sink support, use varlen API
         else:
             output = _flash_attn_func(
                 q_fa, k_fa, v_fa,
