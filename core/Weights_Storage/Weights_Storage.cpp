@@ -104,9 +104,10 @@ void Weights_Storage::Init(
     for (auto& [module_key, tensor_map] : weights_map) {
         for (auto& [tensor_key, meta] : tensor_map) {
             this->module_weights_storage_[module_key][tensor_key] =
-                tensor_buffer(static_cast<char*>(weight_ptr) + meta.offset, 
+                tensor_buffer(static_cast<char*>(weight_ptr) + meta.offset,
                               meta.tensor_shape,
-                              meta.byte_size);
+                              meta.byte_size,
+                              meta.dtype);  // Pass dtype from metadata
         }
     }
 }
@@ -173,11 +174,8 @@ Weights_Storage::get_module_weights_storage(std::string module_key) {
 py::dict Weights_Storage::get_tensor(std::string module_key) {
     /* Get the tensor from the weights storage and return as Python dict.
      *
-     * Supports two quantization formats:
-     * 1. MXFP4 (GPT-OSS): packed weights and scales are uint8, biases are bf16
-     * 2. FP8 (DeepSeek): weights are float8_e4m3fn, biases/norms are bf16
-     *
-     * Detection: If any tensor key ends with "_scales", it's MXFP4 format.
+     * Uses stored dtype from tensor metadata instead of guessing from tensor names.
+     * Supports: bfloat16, uint8, float8_e4m3fn, float32, float16
      */
 
     // Check if module key exists
@@ -190,68 +188,43 @@ py::dict Weights_Storage::get_tensor(std::string module_key) {
     // Get module weights
     auto module_weights = this->module_weights_storage_[module_key];
 
-    // Detect quantization format by checking for "_scales" tensors (MXFP4 indicator)
-    bool is_mxfp4 = false;
-    for (const auto& [tensor_key, _] : module_weights) {
-        if (tensor_key.find("_scales") != std::string::npos) {
-            is_mxfp4 = true;
-            break;
-        }
-    }
-
-    // Define tensor options for different dtypes
-    auto bf16_option = torch::TensorOptions()
-        .dtype(torch::kBFloat16)
-        .device(torch::kCPU)
-        .requires_grad(false)
-        .memory_format(torch::MemoryFormat::Contiguous);
-
-    auto fp8_option = torch::TensorOptions()
-        .dtype(torch::kFloat8_e4m3fn)
-        .device(torch::kCPU)
-        .requires_grad(false)
-        .memory_format(torch::MemoryFormat::Contiguous);
-
-    auto uint8_option = torch::TensorOptions()
-        .dtype(torch::kUInt8)
-        .device(torch::kCPU)
-        .requires_grad(false)
-        .memory_format(torch::MemoryFormat::Contiguous);
-
     // Create Python dict to store tensors
     py::dict tensors;
 
     // Iterate through module weights and create tensors
-    for (auto& [tensor_key, tensor_buffer] : module_weights) {
+    for (auto& [tensor_key, tb] : module_weights) {
         torch::Tensor tensor;
 
-        // Determine dtype based on tensor name and quantization format
-        bool is_norm = tensor_key.find("norm") != std::string::npos;
-        bool is_bias = tensor_key.find("bias") != std::string::npos;
-        bool is_scales = tensor_key.find("_scales") != std::string::npos;
-
-        if (is_norm || is_bias) {
-            // Norms and biases are always bf16
-            tensor = torch::from_blob(
-                tensor_buffer.data_ptr,
-                tensor_buffer.tensor_shape,
-                bf16_option
-            );
-        } else if (is_mxfp4) {
-            // MXFP4 format: packed weights and scales are uint8
-            tensor = torch::from_blob(
-                tensor_buffer.data_ptr,
-                tensor_buffer.tensor_shape,
-                uint8_option
-            );
+        // Use stored dtype instead of guessing from tensor name
+        torch::Dtype torch_dtype;
+        if (tb.dtype == "bfloat16") {
+            torch_dtype = torch::kBFloat16;
+        } else if (tb.dtype == "uint8") {
+            torch_dtype = torch::kUInt8;
+        } else if (tb.dtype == "float8_e4m3fn") {
+            torch_dtype = torch::kFloat8_e4m3fn;
+        } else if (tb.dtype == "float32") {
+            torch_dtype = torch::kFloat32;
+        } else if (tb.dtype == "float16") {
+            torch_dtype = torch::kFloat16;
         } else {
-            // FP8 format: weights are float8_e4m3fn
-            tensor = torch::from_blob(
-                tensor_buffer.data_ptr,
-                tensor_buffer.tensor_shape,
-                fp8_option
-            );
+            // Fallback to fp8 for backward compatibility
+            this->logger->warn("Unknown dtype '{}' for tensor '{}', defaulting to fp8",
+                              tb.dtype, tensor_key);
+            torch_dtype = torch::kFloat8_e4m3fn;
         }
+
+        auto options = torch::TensorOptions()
+            .dtype(torch_dtype)
+            .device(torch::kCPU)
+            .requires_grad(false)
+            .memory_format(torch::MemoryFormat::Contiguous);
+
+        tensor = torch::from_blob(
+            tb.data_ptr,
+            tb.tensor_shape,
+            options
+        );
 
         // Add tensor to Python dict
         tensors[tensor_key.c_str()] = tensor;
