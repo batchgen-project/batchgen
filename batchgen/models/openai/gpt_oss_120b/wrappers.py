@@ -643,6 +643,142 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         return q_rot, k_rot
 
+    def _forward_prefill_prepacked(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Prepacked prefill forward using varlen flash attention.
+
+        In prepack mode, hidden_states is [1, total_tokens, hidden_dim] (3D with batch=1),
+        and we use cu_seqlens to track sequence boundaries for attention.
+
+        Args:
+            hidden_states: Input tensor [1, total_tokens, hidden_size] or [total_tokens, hidden_size]
+            position_ids: Position IDs [total_tokens]
+
+        Returns:
+            Tuple of (output, None, None) - KV cache offloaded to host
+        """
+        # Import here to avoid circular imports
+        from batchgen.attention.gqa import gqa_prefill_fa
+
+        # Handle both 2D and 3D input
+        if hidden_states.dim() == 3:
+            assert hidden_states.shape[0] == 1, "Prepack mode expects batch_size=1"
+            hidden_states_2d = hidden_states.squeeze(0)  # [total_tokens, hidden_dim]
+            input_was_3d = True
+        else:
+            hidden_states_2d = hidden_states
+            input_was_3d = False
+
+        total_tokens = hidden_states_2d.shape[0]
+
+        # Get prepack metadata from class variables
+        cu_seqlens = AttnWrapperBase.prepack_cu_seqlens
+        max_seqlen = AttnWrapperBase.prepack_max_seqlen
+        num_sequences = AttnWrapperBase.prepack_num_sequences
+        seq_lengths = AttnWrapperBase.prepack_seq_lengths
+
+        # Project Q, K, V in varlen format
+        # hidden_states_2d: [total_tokens, hidden_size]
+        query = self.module.q_proj(hidden_states_2d)  # [total_tokens, num_heads * head_dim]
+        key = self.module.k_proj(hidden_states_2d)    # [total_tokens, num_kv_heads * head_dim]
+        value = self.module.v_proj(hidden_states_2d)  # [total_tokens, num_kv_heads * head_dim]
+
+        # Reshape to [total_tokens, num_heads, head_dim]
+        query = query.view(total_tokens, self.num_heads, self.head_dim)
+        key = key.view(total_tokens, self.num_kv_heads, self.head_dim)
+        value = value.view(total_tokens, self.num_kv_heads, self.head_dim)
+
+        # Apply RoPE per sequence using position_ids
+        if position_ids is not None:
+            cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+            # Get cos/sin for each position
+            cos = cos[position_ids]  # [total_tokens, head_dim]
+            sin = sin[position_ids]  # [total_tokens, head_dim]
+
+            # Apply RoPE - split heads for rotation
+            half_dim = self.head_dim // 2
+            q1, q2 = query[..., :half_dim], query[..., half_dim:]
+            k1, k2 = key[..., :half_dim], key[..., half_dim:]
+
+            cos_half = cos[..., :half_dim].unsqueeze(1)  # [total_tokens, 1, half_dim]
+            sin_half = sin[..., :half_dim].unsqueeze(1)
+
+            query = torch.cat([
+                q1 * cos_half - q2 * sin_half,
+                q2 * cos_half + q1 * sin_half
+            ], dim=-1)
+
+            key = torch.cat([
+                k1 * cos_half - k2 * sin_half,
+                k2 * cos_half + k1 * sin_half
+            ], dim=-1)
+
+        # Use gqa_prefill_fa for varlen attention with sink correction
+        # q, k, v: [total_tokens, num_heads, head_dim]
+        attn_output, lse = gqa_prefill_fa(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
+            cu_seqlens_k=cu_seqlens.to(hidden_states_2d.device),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            sinks=self.sinks,
+            softmax_scale=self.scale,
+            sliding_window=self.sliding_window,
+        )
+
+        # attn_output: [total_tokens, num_heads, head_dim]
+        # Reshape for output projection
+        attn_output = attn_output.view(total_tokens, self.num_heads * self.head_dim)
+
+        # Output projection
+        attn_output = self.module.o_proj(attn_output)  # [total_tokens, hidden_size]
+
+        # Offload KV cache per sequence to host
+        global_sequence_ids = AttnWrapperBase.cur_batch
+
+        torch.cuda.current_stream().synchronize()  # Make sure KV is ready
+
+        # For GQA, we store both K and V (unlike MLA which only stores K)
+        # Split by cu_seqlens and offload each sequence
+        for seq_idx in range(num_sequences):
+            start_idx = cu_seqlens[seq_idx].item()
+            end_idx = cu_seqlens[seq_idx + 1].item()
+            seq_len = end_idx - start_idx
+
+            # Extract KV for this sequence
+            seq_key = key[start_idx:end_idx]    # [seq_len, num_kv_heads, head_dim]
+            seq_value = value[start_idx:end_idx]  # [seq_len, num_kv_heads, head_dim]
+
+            # Reshape to [1, seq_len, num_kv_heads, head_dim] for KV cache API
+            seq_key = seq_key.unsqueeze(0)
+            seq_value = seq_value.unsqueeze(0)
+
+            seq_global_id = [global_sequence_ids[seq_idx]]
+
+            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=seq_global_id,
+                k_tensor=seq_key,
+                v_tensor=seq_value,
+                sequence_lengths=[seq_len],
+            )
+
+        logging.debug(
+            f"[Layer {self.layer_idx}] GPT-OSS prepacked prefill complete. "
+            f"total_tokens={total_tokens}, num_sequences={num_sequences}"
+        )
+
+        # Reshape output back to 3D if input was 3D
+        if input_was_3d:
+            attn_output = attn_output.unsqueeze(0)  # [1, total_tokens, hidden_size]
+
+        return attn_output, None, None
+
     def forward(
         self,
         hidden_states: torch.Tensor = None,
@@ -684,7 +820,13 @@ class GptOssAttnWrapper(AttnWrapperBase):
             self.sinks = self.sinks.to(hidden_states.device)
 
         # Route to phase handler
-        if self.phase == "prefill":
+        # Check for prepack mode first (takes precedence during prefill)
+        if self.phase == "prefill" and AttnWrapperBase.prepack_mode:
+            result = self._forward_prefill_prepacked(
+                hidden_states,
+                position_ids=AttnWrapperBase.position_ids,
+            )
+        elif self.phase == "prefill":
             result = self._forward_prefill(
                 hidden_states,
                 attention_mask=attention_mask,

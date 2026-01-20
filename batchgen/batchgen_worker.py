@@ -7254,9 +7254,14 @@ class BatchGenWorker:
 			return True
 
 	def _unregister_fp8_weights(self):
+		# Skip FP8 unregistration for models that don't use FP8 (e.g., GPT-OSS uses MXFP4)
+		if not hasattr(self.loaded_model_config, 'first_k_dense_replace'):
+			return
+
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
-			attn_module._unregister_fp8_weights()
+			if hasattr(attn_module, '_unregister_fp8_weights'):
+				attn_module._unregister_fp8_weights()
 			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 				if hasattr(self.model.model.layers[layer_idx].mlp.shared_experts, '_unregister_fp8_weights'):
 					self.model.model.layers[layer_idx].mlp.shared_experts._unregister_fp8_weights()
