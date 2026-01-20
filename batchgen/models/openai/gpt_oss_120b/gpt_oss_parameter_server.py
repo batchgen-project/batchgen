@@ -459,37 +459,44 @@ class GptOss_Parameter_Server:
         qkv_weight_name = f"block.{layer_idx}.attn.qkv.weight"
         qkv_bias_name = f"block.{layer_idx}.attn.qkv.bias"
 
-        if qkv_weight_name in tensor_to_file:
-            qkv_weight = self._load_tensor(qkv_weight_name, tensor_to_file)  # [5120, 2880]
-            # Split: Q=[4096, 2880], K=[512, 2880], V=[512, 2880]
-            q_weight = qkv_weight[:self.q_dim]  # [4096, 2880]
-            k_weight = qkv_weight[self.q_dim:self.q_dim + self.kv_dim]  # [512, 2880]
-            v_weight = qkv_weight[self.q_dim + self.kv_dim:]  # [512, 2880]
+        if qkv_weight_name not in tensor_to_file:
+            raise ValueError(f"Layer {layer_idx}: QKV weight tensor '{qkv_weight_name}' not found in checkpoint!")
 
-            layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = q_weight
-            layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = k_weight
-            layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = v_weight
-            module_tensors.extend([
-                f"model.layers.{layer_idx}.self_attn.q_proj.weight",
-                f"model.layers.{layer_idx}.self_attn.k_proj.weight",
-                f"model.layers.{layer_idx}.self_attn.v_proj.weight",
-            ])
-            logging.debug(f"Layer {layer_idx} QKV weight split: Q={q_weight.shape}, K={k_weight.shape}, V={v_weight.shape}")
+        qkv_weight = self._load_tensor(qkv_weight_name, tensor_to_file)  # [5120, 2880]
+        # Split: Q=[4096, 2880], K=[512, 2880], V=[512, 2880]
+        q_weight = qkv_weight[:self.q_dim]  # [4096, 2880]
+        k_weight = qkv_weight[self.q_dim:self.q_dim + self.kv_dim]  # [512, 2880]
+        v_weight = qkv_weight[self.q_dim + self.kv_dim:]  # [512, 2880]
+
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = q_weight
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = k_weight
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = v_weight
+        module_tensors.extend([
+            f"model.layers.{layer_idx}.self_attn.q_proj.weight",
+            f"model.layers.{layer_idx}.self_attn.k_proj.weight",
+            f"model.layers.{layer_idx}.self_attn.v_proj.weight",
+        ])
+        logging.debug(f"Layer {layer_idx} QKV weight split: Q={q_weight.shape}, K={k_weight.shape}, V={v_weight.shape}")
 
         if qkv_bias_name in tensor_to_file:
             qkv_bias = self._load_tensor(qkv_bias_name, tensor_to_file)  # [5120]
-            q_bias = qkv_bias[:self.q_dim]
-            k_bias = qkv_bias[self.q_dim:self.q_dim + self.kv_dim]
-            v_bias = qkv_bias[self.q_dim + self.kv_dim:]
+        else:
+            # Initialize zero biases if not in checkpoint - required by model
+            logging.debug(f"Layer {layer_idx}: QKV bias not in checkpoint, initializing zeros")
+            qkv_bias = torch.zeros(self.q_dim + 2 * self.kv_dim, dtype=torch.bfloat16)
 
-            layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.bias"] = q_bias
-            layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.bias"] = k_bias
-            layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.bias"] = v_bias
-            module_tensors.extend([
-                f"model.layers.{layer_idx}.self_attn.q_proj.bias",
-                f"model.layers.{layer_idx}.self_attn.k_proj.bias",
-                f"model.layers.{layer_idx}.self_attn.v_proj.bias",
-            ])
+        q_bias = qkv_bias[:self.q_dim]
+        k_bias = qkv_bias[self.q_dim:self.q_dim + self.kv_dim]
+        v_bias = qkv_bias[self.q_dim + self.kv_dim:]
+
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.bias"] = q_bias
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.bias"] = k_bias
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.bias"] = v_bias
+        module_tensors.extend([
+            f"model.layers.{layer_idx}.self_attn.q_proj.bias",
+            f"model.layers.{layer_idx}.self_attn.k_proj.bias",
+            f"model.layers.{layer_idx}.self_attn.v_proj.bias",
+        ])
 
         # Output projection
         out_weight_name = f"block.{layer_idx}.attn.out.weight"
@@ -497,16 +504,28 @@ class GptOss_Parameter_Server:
 
         if out_weight_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.o_proj.weight"] = self._load_tensor(out_weight_name, tensor_to_file)
-            module_tensors.append(f"model.layers.{layer_idx}.self_attn.o_proj.weight")
+        else:
+            # This should not happen - o_proj.weight is required
+            raise ValueError(f"Layer {layer_idx}: o_proj.weight not found in checkpoint!")
+        module_tensors.append(f"model.layers.{layer_idx}.self_attn.o_proj.weight")
+
         if out_bias_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.o_proj.bias"] = self._load_tensor(out_bias_name, tensor_to_file)
-            module_tensors.append(f"model.layers.{layer_idx}.self_attn.o_proj.bias")
+        else:
+            # Initialize zero bias if not in checkpoint - required by model
+            logging.debug(f"Layer {layer_idx}: o_proj bias not in checkpoint, initializing zeros")
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.o_proj.bias"] = torch.zeros(self.hidden_size, dtype=torch.bfloat16)
+        module_tensors.append(f"model.layers.{layer_idx}.self_attn.o_proj.bias")
 
         # Attention sinks
         sinks_name = f"block.{layer_idx}.attn.sinks"
         if sinks_name in tensor_to_file:
             layer_tensors[f"model.layers.{layer_idx}.self_attn.sinks"] = self._load_tensor(sinks_name, tensor_to_file)
-            module_tensors.append(f"model.layers.{layer_idx}.self_attn.sinks")
+        else:
+            # Initialize zero sinks if not in checkpoint
+            logging.debug(f"Layer {layer_idx}: sinks not in checkpoint, initializing zeros")
+            layer_tensors[f"model.layers.{layer_idx}.self_attn.sinks"] = torch.zeros(self.num_attention_heads, dtype=torch.bfloat16)
+        module_tensors.append(f"model.layers.{layer_idx}.self_attn.sinks")
 
         # Layer norms - OpenAI uses .scale instead of .weight
         # block.{n}.attn.norm.scale -> input_layernorm (pre-attention)
