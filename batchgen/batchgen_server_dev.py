@@ -103,7 +103,12 @@ class BatchGenServer:
 			host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
 			model_name=self.args.model
 		)
-		host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+		# Select manager based on model's KV cache configuration
+		# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
+		if config.num_v_heads == 0:
+			host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+		else:
+			host_paged_kv_manager = bg_lib.MHAHostPagedKVManager(config)
 		host_paged_kv_manager.initialize(True)
 		return host_paged_kv_manager
 
