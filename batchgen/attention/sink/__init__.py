@@ -16,15 +16,19 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-"""Attention modules for BatchGen.
+"""Attention sink module for GPT-OSS-style models.
 
-Provides attention implementations for various model architectures:
-- mla/: Multi-head Latent Attention (DeepSeek-style)
-- gqa/: Grouped Query Attention (GPT-OSS-style)
-- sink/: Attention sink tokens
+Provides utilities for integrating learned sink tokens into attention computation.
+Sink tokens act as "attention sinks" that absorb attention weight without
+contributing to the output values.
+
+Reference: OpenAI GPT-OSS-120B architecture
 """
 
-# Import submodules for easy access
-from . import mla
-from . import gqa
-from . import sink
+from .sink_softmax import softmax_with_sinks
+from .sink_correction import apply_sink_correction
+
+__all__ = [
+    "softmax_with_sinks",
+    "apply_sink_correction",
+]

@@ -393,6 +393,14 @@ class Decode():
 									* self.model_config.head_dim
 									* 2
 								)
+							elif "gpt_oss" in self.model_config.model_type:
+								# GPT-OSS GQA: 8 KV heads, head_dim=64, separate K and V
+								past_kv_byte_size = (
+									(self.max_input_length + idx + 1)
+									* self.model_config.num_key_value_heads
+									* self.model_config.head_dim
+									* 2  # K + V
+								)
 							else:
 								raise ValueError(
 									f"Model architecture {self.model_config.model_type} not supported yet."

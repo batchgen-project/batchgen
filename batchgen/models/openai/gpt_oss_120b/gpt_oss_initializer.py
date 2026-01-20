@@ -192,9 +192,15 @@ class GptOssInitializer:
                 # GQA: 64 query heads, 8 KV heads, head_dim=64
                 # Attention weights are in BF16, not MXFP4
                 "q_proj.weight": [4096, 2880],  # [64*64, hidden]
+                "q_proj.bias": [4096],          # [64*64]
                 "k_proj.weight": [512, 2880],   # [8*64, hidden]
+                "k_proj.bias": [512],           # [8*64]
                 "v_proj.weight": [512, 2880],   # [8*64, hidden]
+                "v_proj.bias": [512],           # [8*64]
                 "o_proj.weight": [2880, 4096],  # [hidden, 64*64]
+                "o_proj.bias": [2880],          # [hidden]
+                # Learned attention sinks (per query head)
+                "sinks": [64],                  # [num_attention_heads]
             },
             "routed_expert": {
                 # MXFP4 quantized: packed weights (uint8) + scales (uint8)
