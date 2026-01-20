@@ -89,7 +89,9 @@ void GPU_Weight_Buffer::Init() {
         for (auto& [buffer_name, buffer_shape] : buffer_shapes[module_type]) {
             for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
                  buffer_idx++) {
-                if (buffer_name.find("norm") == std::string::npos) {
+                // Norm and bias tensors are always BF16, even for MXFP4 quantized modules
+                if (buffer_name.find("norm") == std::string::npos &&
+                    buffer_name.find("bias") == std::string::npos) {
                     this->buffers_[module_type][buffer_idx][buffer_name] =
                         torch::zeros(buffer_shape, options);
                 } else {
@@ -136,7 +138,9 @@ void GPU_Weight_Buffer::resize_buffer() {
             module_weight_tensor_map new_buffer;
             for (auto& [buffer_name, buffer_shape] :
                  buffer_shapes["routed_expert"]) {
-                if (buffer_name.find("norm") == std::string::npos) {
+                // Norm and bias tensors are always BF16, even for MXFP4 quantized modules
+                if (buffer_name.find("norm") == std::string::npos &&
+                    buffer_name.find("bias") == std::string::npos) {
                     new_buffer[buffer_name] =
                         torch::zeros(buffer_shape, options);
                 } else {
