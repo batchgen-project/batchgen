@@ -314,7 +314,7 @@ class GptOss_Parameter_Server:
             logging.info(f"Checkpoint already converted at {self.converted_ckpt_dir}")
             # Log what converted files exist
             converted_files = [f for f in os.listdir(self.converted_ckpt_dir) if f.endswith(('.bin', '.json'))]
-            logging.info(f"Converted files: {sorted(converted_files)}")
+            logging.debug(f"Converted files: {sorted(converted_files)}")
 
             # Log tensor names from JSON metadata files - helps debug skeleton loading
             import json
@@ -325,9 +325,9 @@ class GptOss_Parameter_Server:
                     with open(json_path, 'r') as f:
                         meta = json.load(f)
                         tensor_names = list(meta.get('state_dict', {}).keys())
-                        logging.info(f"  {json_file}: {len(tensor_names)} tensors")
+                        logging.debug(f"  {json_file}: {len(tensor_names)} tensors")
                         if tensor_names:
-                            logging.info(f"    Sample tensors: {tensor_names[:5]}")
+                            logging.debug(f"    Sample tensors: {tensor_names[:5]}")
                         # Check which tensors are NOT in state_dict_name_map (these go to skeleton)
                         for tname in tensor_names:
                             if tname not in self.state_dict_name_map:
@@ -337,8 +337,8 @@ class GptOss_Parameter_Server:
 
             # Log expected skeleton tensors
             if skeleton_candidates:
-                logging.info(f"Tensors NOT in state_dict_name_map (should go to skeleton): {len(skeleton_candidates)}")
-                logging.info(f"  Sample skeleton candidates: {skeleton_candidates[:10]}")
+                logging.debug(f"Tensors NOT in state_dict_name_map (should go to skeleton): {len(skeleton_candidates)}")
+                logging.debug(f"  Sample skeleton candidates: {skeleton_candidates[:10]}")
             else:
                 logging.warning("WARNING: No skeleton candidates found! This may cause 'Missing skeleton weight' errors.")
                 logging.warning("  Try deleting the converted checkpoint directory to force re-conversion:")
