@@ -40,6 +40,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
+
+
+def log_gpu_memory(msg: str = ""):
+    """Log current GPU memory usage.
+
+    Args:
+        msg: Context message to include in the log line
+    """
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        logging.info(
+            f"[GPU Memory] {msg}: allocated={allocated:.2f}GB, "
+            f"reserved={reserved:.2f}GB, max_allocated={max_allocated:.2f}GB"
+        )
+
+
 from batchgen.attention.gqa import gqa_attention_with_sinks, gqa_decode_fa
 from batchgen.attention.sink import softmax_with_sinks
 
@@ -270,13 +288,33 @@ class GptOssExpertWrapper(ExpertWrapperBase):
     def _store_mxfp4_weights(self, weights_dict: Dict[str, torch.Tensor]):
         """Store MXFP4 weights on GPU for persistent mode.
 
+        Avoids tensor duplication by checking if tensor is already on target device.
+
         Args:
             weights_dict: Dict containing packed weights and scales
         """
         device = self.engine_config.Basic_Config.device_torch
-        self.stored_mxfp4_weights = {
-            name: tensor.to(device) for name, tensor in weights_dict.items()
-        }
+        result = {}
+        for name, tensor in weights_dict.items():
+            if tensor.device == device:
+                # Already on target device - use as-is (no copy)
+                result[name] = tensor
+            else:
+                # Move to device (creates copy)
+                result[name] = tensor.to(device, non_blocking=True)
+        self.stored_mxfp4_weights = result
+
+    def _clear_stored_mxfp4_weights(self):
+        """Clear stored MXFP4 weights to free GPU memory.
+
+        Call this before reconfiguring to prevent OOM during phase transitions.
+        """
+        if self.stored_mxfp4_weights is not None:
+            logging.debug(
+                f"[Layer {self.layer_idx} Expert {self.expert_idx}] "
+                f"Clearing stored MXFP4 weights"
+            )
+            self.stored_mxfp4_weights = None
 
     def _get_stored_mxfp4_weights(self) -> Dict[str, torch.Tensor]:
         """Get stored MXFP4 weights for persistent mode.

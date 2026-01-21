@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 
 from .model import GptOss
-from .wrappers import GptOssExpertWrapper, GptOssAttnWrapper
+from .wrappers import GptOssExpertWrapper, GptOssAttnWrapper, log_gpu_memory
 
 
 class GptOssParallelStrategyManager:
@@ -299,12 +299,36 @@ class GptOssParallelStrategyManager:
         logging.info("Configuring LM head...")
         # LM head is in BF16, no special handling needed for MXFP4
 
+    def _clear_expert_stored_weights(self):
+        """Clear stored MXFP4 weights from all expert wrappers.
+
+        Call this before reconfiguring experts to free GPU memory.
+        Prevents OOM during phase transitions (prefill -> decode).
+        """
+        log_gpu_memory("Before clearing expert weights")
+
+        cleared_count = 0
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            for expert_idx in range(self.model_config.num_local_experts):
+                wrapper = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+                if hasattr(wrapper, '_clear_stored_mxfp4_weights'):
+                    wrapper._clear_stored_mxfp4_weights()
+                    cleared_count += 1
+
+        # Force garbage collection and CUDA cache cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        log_gpu_memory(f"After clearing {cleared_count} expert weights")
+
     def configure_decoding(self, padding_bsz=None, comm=None) -> Tuple:
         """Configure model for decoding phase (mode 3 + EP-offloading disabled).
 
         Following DeepSeek pattern:
-        - In decode: weight_copy_task is EMPTY → all modules persistent
-        - All weights are pre-loaded on GPU, no buffer loading needed
+        1. Delete prefill model completely to free GPU memory
+        2. Clear CUDA cache
+        3. Create new model instance with decode config
+        4. Re-load skeleton and configure modules
 
         Args:
             padding_bsz: Maximum batch size per rank (unused for single GPU)
@@ -313,20 +337,76 @@ class GptOssParallelStrategyManager:
         Returns:
             Tuple of (model, weight_copy_task)
         """
+        log_gpu_memory("configure_decoding: START")
+
         logging.info("Configuring model for decoding phase...")
+
+        # Step 1: Set phase to decode
         self.loaded_model_config.phase = "decode"
 
+        # Step 2: Delete prefill model completely (DeepSeek pattern)
+        # This releases all GPU memory held by the old model and its wrappers
+        logging.info("Deleting prefill model to free GPU memory...")
+        self.model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        log_gpu_memory("configure_decoding: After deleting prefill model")
+
+        # Step 3: Reset data structures
+        self.state_dict_name_map = {}
+        self.weight_copy_task = {}
+        self.weight_copy_task["attn"] = []
+        self.weight_copy_task["routed_expert"] = []
+
+        # Step 4: Create new model instance with decode config
+        logging.info("Creating new model instance for decode phase...")
+        self.model = GptOss(self.loaded_model_config)
+
+        log_gpu_memory("configure_decoding: After creating new model")
+
+        # Step 5: Rebuild weight copy task mappings
         # For decode with mode 3 and no EP-offloading: empty weight_copy_task
         # All modules are persistent (weights stay on GPU)
-        self.weight_copy_task = {
-            "attn": [],
-            "routed_expert": [],
-        }
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            # Attention parameters (BF16, not quantized)
+            for name, _ in self.model.model.layers[layer_idx].self_attn.named_parameters():
+                tensor_full_name = f"model.layers.{layer_idx}.self_attn.{name}"
+                self.state_dict_name_map[tensor_full_name] = {
+                    "module_key": f"attn_{layer_idx}",
+                    "tensor_key": name,
+                }
+            # Note: attn NOT added to weight_copy_task -> persistent=True
 
-        # Re-configure modules with updated persistent settings
-        # Since weight_copy_task is empty, all modules will be persistent=True
+            # Routed experts (MXFP4 quantized)
+            for expert_idx in range(self.model_config.num_local_experts):
+                for name, _ in (
+                    self.model.model.layers[layer_idx].mlp.experts[expert_idx].named_parameters()
+                ):
+                    tensor_full_name = (
+                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
+                    )
+                    self.state_dict_name_map[tensor_full_name] = {
+                        "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
+                        "tensor_key": name,
+                    }
+            # Note: routed_expert NOT added to weight_copy_task -> persistent=True
+
+        # Step 6: Load skeleton weights
+        torch.cuda.empty_cache()
+        self._load_model_skeleton()
+
+        log_gpu_memory("configure_decoding: After loading skeleton")
+
+        # Step 7: Configure modules (all persistent for decode)
         self._config_attn_module()
         self._config_expert_module()
+        self._config_lm_head_hook()
+
+        self.model.eval()
+        self.model.to(self.engine_config.Basic_Config.device_torch)
+
+        log_gpu_memory("configure_decoding: END")
 
         logging.info(
             f"Decoding configuration complete: "
