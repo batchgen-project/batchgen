@@ -197,22 +197,33 @@ py::dict Weights_Storage::get_tensor(std::string module_key) {
 
         // Use stored dtype instead of guessing from tensor name
         torch::Dtype torch_dtype;
+        std::string resolved_dtype_name;
         if (tb.dtype == "bfloat16") {
             torch_dtype = torch::kBFloat16;
+            resolved_dtype_name = "bfloat16";
         } else if (tb.dtype == "uint8") {
             torch_dtype = torch::kUInt8;
+            resolved_dtype_name = "uint8";
         } else if (tb.dtype == "float8_e4m3fn") {
             torch_dtype = torch::kFloat8_e4m3fn;
+            resolved_dtype_name = "float8_e4m3fn";
         } else if (tb.dtype == "float32") {
             torch_dtype = torch::kFloat32;
+            resolved_dtype_name = "float32";
         } else if (tb.dtype == "float16") {
             torch_dtype = torch::kFloat16;
+            resolved_dtype_name = "float16";
         } else {
             // Fallback to fp8 for backward compatibility
             this->logger->warn("Unknown dtype '{}' for tensor '{}', defaulting to fp8",
                               tb.dtype, tensor_key);
             torch_dtype = torch::kFloat8_e4m3fn;
+            resolved_dtype_name = "float8_e4m3fn (fallback)";
         }
+
+        // Log raw dtype from metadata for debugging (info level for visibility)
+        this->logger->info("[{}] tensor '{}': raw_dtype='{}' -> torch_dtype={}",
+                           module_key, tensor_key, tb.dtype, resolved_dtype_name);
 
         auto options = torch::TensorOptions()
             .dtype(torch_dtype)

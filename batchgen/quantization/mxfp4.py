@@ -37,17 +37,24 @@ def mxfp4_dequantize_reference(
     This follows the OpenAI gpt_oss/torch/weights.py implementation exactly.
 
     Args:
-        packed: Packed FP4 values as uint8 [... , N//2] (2 values per byte)
-        scales: Scale factors as uint8 [..., N//32] (one per 32 elements)
+        packed: Packed FP4 values as uint8 [M, G, B] or [M, N//2] (2 values per byte)
+        scales: Scale factors as uint8 [M, G] or [M, N//32] (one per 32 elements)
         dtype: Output dtype (default: bfloat16)
 
     Returns:
-        Dequantized tensor in the specified dtype [..., N]
+        Dequantized tensor in the specified dtype [M, N]
     """
     device = packed.device
     fp4_table = FP4_LOOKUP_TABLE.to(device)
 
-    # Get original packed shape
+    # Handle 3D packed tensors from GPT-OSS: [rows, blocks, bytes_per_block]
+    # Flatten to 2D: [rows, blocks * bytes_per_block]
+    if packed.dim() == 3:
+        M, G, B = packed.shape
+        packed = packed.view(M, G * B)  # [M, G*B]
+        # scales is already [M, G], no change needed
+
+    # Get packed shape after potential flattening
     packed_shape = packed.shape
 
     # Unpack two FP4 values from each uint8 byte
