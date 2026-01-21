@@ -193,7 +193,13 @@ def fused_mxfp4_single_gemm(
     assert rhs_scales.dtype == torch.uint8, f"rhs_scales must be uint8, got {rhs_scales.dtype}"
 
     M, K = lhs.shape
-    N = rhs_packed.shape[0]  # [N, K//2]
+    N = rhs_packed.shape[0]
+
+    # Handle 3D block format: [N, K//32, bytes_per_block] → [N, K//2]
+    # Weights may be stored as [N, num_scale_blocks, 16] where each block has 16 bytes (32 FP4 values)
+    if rhs_packed.dim() == 3:
+        N, G, B = rhs_packed.shape
+        rhs_packed = rhs_packed.view(N, G * B)  # Flatten to [N, K//2]
 
     # Verify dimensions
     assert rhs_packed.shape[1] == K // 2, f"Expected rhs_packed.shape[1]={K//2}, got {rhs_packed.shape[1]}"
