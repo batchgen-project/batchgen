@@ -60,6 +60,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         core_engine,
         engine_config,
         model_config,
+        persistent: bool = False,
     ):
         """Initialize GPT-OSS expert wrapper.
 
@@ -70,11 +71,14 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             core_engine: BatchGen core engine
             engine_config: Engine configuration
             model_config: Model configuration
+            persistent: Whether weights are pre-loaded on GPU.
+                        True = use cached MXFP4 weights, no buffer fetch needed.
+                        False = load from buffer each forward.
         """
-        # GPT-OSS always loads weights (all experts local, no caching)
+        # Pass persistent to base class
         super().__init__(
             module, layer_idx, expert_idx, core_engine, engine_config, model_config,
-            get_weights=True
+            persistent
         )
 
         # Import MXFP4 dequantization
@@ -84,6 +88,15 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         except ImportError:
             logging.warning("MXFP4 dequantization not available, using identity")
             self.dequant_fn = lambda packed, scales, dtype=torch.bfloat16: packed
+
+        # MXFP4 weight caching for persistent experts
+        # Cached as uint8 packed tensors - dequantization happens in forward()
+        self.mxfp4_gate = None           # gate_proj packed weights (uint8)
+        self.mxfp4_gate_scales = None    # gate_proj scales (uint8)
+        self.mxfp4_up = None             # up_proj packed weights (uint8)
+        self.mxfp4_up_scales = None      # up_proj scales (uint8)
+        self.mxfp4_down = None           # down_proj packed weights (uint8)
+        self.mxfp4_down_scales = None    # down_proj scales (uint8)
 
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
@@ -124,6 +137,65 @@ class GptOssExpertWrapper(ExpertWrapperBase):
 
         return result
 
+    def register_weights(self):
+        """Cache MXFP4 weights for persistent experts.
+
+        Called when persistent=True - stores packed uint8 weights as attributes.
+        The dequantization happens in forward() and BF16 tensors are garbage
+        collected after each forward pass.
+
+        Expected module structure:
+        - self.module.gate_proj.weight.data -> packed MXFP4 (uint8)
+        - self.module.gate_proj.weight_scales -> scales (uint8)
+        - self.module.up_proj.weight.data -> packed MXFP4 (uint8)
+        - self.module.up_proj.weight_scales -> scales (uint8)
+        - self.module.down_proj.weight.data -> packed MXFP4 (uint8)
+        - self.module.down_proj.weight_scales -> scales (uint8)
+        """
+        logging.debug(
+            f"Registering MXFP4 weights. Layer {self.layer_idx}, Expert {self.expert_idx}"
+        )
+
+        # Cache packed weights (uint8)
+        self.mxfp4_gate = self.module.gate_proj.weight.data
+        self.mxfp4_up = self.module.up_proj.weight.data
+        self.mxfp4_down = self.module.down_proj.weight.data
+
+        # Cache scales - check both attribute and registered buffer patterns
+        if hasattr(self.module.gate_proj, 'weight_scales'):
+            self.mxfp4_gate_scales = self.module.gate_proj.weight_scales
+            self.mxfp4_up_scales = self.module.up_proj.weight_scales
+            self.mxfp4_down_scales = self.module.down_proj.weight_scales
+        elif hasattr(self.module, 'gate_proj_weight_scales'):
+            self.mxfp4_gate_scales = self.module.gate_proj_weight_scales
+            self.mxfp4_up_scales = self.module.up_proj_weight_scales
+            self.mxfp4_down_scales = self.module.down_proj_weight_scales
+        else:
+            logging.warning(
+                f"MXFP4 scales not found as module attributes for "
+                f"Layer {self.layer_idx} Expert {self.expert_idx}. "
+                f"Scales may need to be loaded separately."
+            )
+
+    def unregister_weights(self):
+        """Clear cached MXFP4 weights for garbage collection.
+
+        Sets all cached weight references to None so memory can be reclaimed.
+        """
+        logging.debug(
+            f"Unregistering MXFP4 weights. Layer {self.layer_idx}, Expert {self.expert_idx}"
+        )
+
+        # Clear packed weights
+        self.mxfp4_gate = None
+        self.mxfp4_up = None
+        self.mxfp4_down = None
+
+        # Clear scales
+        self.mxfp4_gate_scales = None
+        self.mxfp4_up_scales = None
+        self.mxfp4_down_scales = None
+
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """SwiGLU forward with clamping.
 
@@ -140,12 +212,17 @@ class GptOssExpertWrapper(ExpertWrapperBase):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with MXFP4 dequantization.
 
-        Flow:
+        Flow for persistent=True (weights cached on GPU):
+        1. Use cached MXFP4 weights (uint8)
+        2. Dequantize to BF16 on-the-fly
+        3. Apply to module and run forward
+        4. Dequantized BF16 tensor garbage collected automatically
+
+        Flow for persistent=False (load each forward):
         1. Load MXFP4 packed weights from core engine
         2. Dequantize to BF16
-        3. Apply to module
-        4. Micro-batch forward through SwiGLU
-        5. Cleanup
+        3. Apply to module and run forward
+        4. Cleanup buffer and weights
 
         Args:
             hidden_states: Input tensor [num_tokens, hidden_size]
@@ -156,27 +233,50 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         rank = self.get_rank_safe()
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
-            f"GPT-OSS expert forward. Phase: {self.phase}"
+            f"GPT-OSS expert forward. Phase: {self.phase}, persistent={self.persistent}"
         )
 
-        # Load MXFP4 weights from core engine
-        weights = self.load_weights(self.module_key)
+        if self.persistent:
+            # Persistent mode: dequantize cached MXFP4 weights on-the-fly
+            # BF16 tensors are temporary and will be garbage collected after forward
+            dequant_weights = {
+                "gate_proj.weight": self.dequant_fn(
+                    self.mxfp4_gate, self.mxfp4_gate_scales, torch.bfloat16
+                ),
+                "up_proj.weight": self.dequant_fn(
+                    self.mxfp4_up, self.mxfp4_up_scales, torch.bfloat16
+                ),
+                "down_proj.weight": self.dequant_fn(
+                    self.mxfp4_down, self.mxfp4_down_scales, torch.bfloat16
+                ),
+            }
+            self.apply_weights(dequant_weights)
 
-        # Dequantize MXFP4 to BF16
-        dequant_weights = self.dequantize_weights(weights)
+            # Micro-batch forward
+            result = self.micro_batch_forward(hidden_states, "expert")
 
-        # Apply to module
-        self.apply_weights(dequant_weights)
+            # dequant_weights goes out of scope -> BF16 tensors garbage collected
 
-        # Micro-batch forward
-        result = self.micro_batch_forward(hidden_states, "expert")
+        else:
+            # Non-persistent mode: load from core engine each time
+            # Load MXFP4 weights from core engine
+            weights = self.load_weights(self.module_key)
 
-        # Cleanup
-        torch.cuda.current_stream(
-            self.engine_config.Basic_Config.device_torch
-        ).synchronize()
-        self.free_weights(self.module_key)
-        self.clear_weights()
+            # Dequantize MXFP4 to BF16
+            dequant_weights = self.dequantize_weights(weights)
+
+            # Apply to module
+            self.apply_weights(dequant_weights)
+
+            # Micro-batch forward
+            result = self.micro_batch_forward(hidden_states, "expert")
+
+            # Cleanup
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "

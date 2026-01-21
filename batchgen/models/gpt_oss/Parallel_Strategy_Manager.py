@@ -183,15 +183,42 @@ class GptOssParallelStrategyManager:
         logging.info(f"Configured {self.model_config.num_hidden_layers} attention modules")
 
     def _config_expert_module(self):
-        """Configure expert modules with MXFP4 dequantization."""
+        """Configure expert modules with MXFP4 dequantization.
+
+        Persistence controlled by:
+        - --enable-ep-with-offloading: enables expert offloading
+        - --ep-offloading-ratio: fraction of experts that are offloaded (non-persistent)
+
+        If offloading disabled: all experts are persistent (weights cached on GPU)
+        If offloading enabled: experts in offload range are non-persistent (load each forward)
+        """
         logging.info("Configuring expert modules...")
+
+        # Determine offloading configuration
+        enable_offloading = getattr(self.engine_config.EP_Config, 'enable_offloading', False)
+        offload_ratio = getattr(self.engine_config.EP_Config, 'offloading_ratio', 0.0)
+
+        if enable_offloading:
+            # Calculate number of persistent experts per layer
+            num_experts = self.model_config.num_local_experts
+            num_persistent = int(num_experts * (1 - offload_ratio))
+            logging.info(
+                f"EP offloading enabled: {num_persistent}/{num_experts} experts "
+                f"persistent per layer (offload_ratio={offload_ratio})"
+            )
+        else:
+            num_persistent = self.model_config.num_local_experts
+            logging.info(f"EP offloading disabled: all {num_persistent} experts persistent per layer")
 
         for layer_idx in range(self.model_config.num_hidden_layers):
             for expert_idx in range(self.model_config.num_local_experts):
                 expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
 
+                # Expert is persistent if not in offload range
+                # Offloaded experts: indices >= num_persistent
+                persistent = (expert_idx < num_persistent) if enable_offloading else True
+
                 # Wrap expert for BatchGen execution with MXFP4 support
-                # GptOssExpertWrapper handles MXFP4 dequantization internally
                 wrapped_expert = GptOssExpertWrapper(
                     module=expert,
                     layer_idx=layer_idx,
@@ -199,11 +226,18 @@ class GptOssParallelStrategyManager:
                     core_engine=self.core_engine,
                     engine_config=self.engine_config,
                     model_config=self.model_config,
+                    persistent=persistent,
                 )
+
+                # Register weights for persistent experts
+                if persistent:
+                    wrapped_expert.register_weights()
+
                 self.model.model.layers[layer_idx].mlp.experts[expert_idx] = wrapped_expert
 
         total_experts = self.model_config.num_hidden_layers * self.model_config.num_local_experts
-        logging.info(f"Configured {total_experts} expert modules")
+        persistent_experts = self.model_config.num_hidden_layers * num_persistent
+        logging.info(f"Configured {total_experts} expert modules ({persistent_experts} persistent)")
 
     def _config_lm_head_hook(self):
         """Configure LM head for output processing."""
@@ -224,3 +258,23 @@ class GptOssParallelStrategyManager:
     def get_state_dict_name_map(self) -> Dict[str, Dict[str, str]]:
         """Return the state dict name mapping."""
         return self.state_dict_name_map
+
+    def _unregister_mxfp4_weights(self):
+        """Clear all cached MXFP4 weights for memory reclamation.
+
+        Call this before switching phases or when memory needs to be freed.
+        Only affects persistent experts that have registered weights.
+        """
+        logging.info("Unregistering MXFP4 weights from persistent experts...")
+        unregistered_count = 0
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            for expert_idx in range(self.model_config.num_local_experts):
+                expert_wrapper = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+                if (hasattr(expert_wrapper, 'unregister_weights') and
+                    hasattr(expert_wrapper, 'persistent') and
+                    expert_wrapper.persistent):
+                    expert_wrapper.unregister_weights()
+                    unregistered_count += 1
+
+        logging.info(f"Unregistered MXFP4 weights from {unregistered_count} persistent experts")
