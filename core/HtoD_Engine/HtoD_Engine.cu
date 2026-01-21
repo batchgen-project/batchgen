@@ -412,6 +412,11 @@ void HtoD_Engine::HtoD_Worker() {
 
         for (auto& module_type :
              this->engine_config_.basic_config.module_types) {
+            // Skip if queue is empty (no modules of this type need loading)
+            // This prevents blocking when e.g. experts are persistent and not in queue
+            if (this->weights_copy_task_queue_[module_type].empty()) {
+                continue;
+            }
             auto optional_buffer =
                 this->gpu_weight_buffer_.acquireEmptyBuffer(module_type);
             if (optional_buffer.has_value()) {

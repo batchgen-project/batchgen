@@ -249,22 +249,22 @@ class GptOss_Parameter_Server:
         # into skeleton_state_dict_
 
         # Log comprehensive summary of state_dict_name_map
-        logging.info("=" * 60)
-        logging.info("STATE_DICT_NAME_MAP SUMMARY")
-        logging.info("=" * 60)
-        logging.info(f"Total entries in state_dict_name_map: {len(self.state_dict_name_map)}")
+        logging.debug("=" * 60)
+        logging.debug("STATE_DICT_NAME_MAP SUMMARY")
+        logging.debug("=" * 60)
+        logging.debug(f"Total entries in state_dict_name_map: {len(self.state_dict_name_map)}")
 
         # Count by module type
         attn_count = sum(1 for k in self.state_dict_name_map if "self_attn" in k)
         expert_count = sum(1 for k in self.state_dict_name_map if "mlp.experts" in k)
-        logging.info(f"  Attention tensors: {attn_count}")
-        logging.info(f"  Expert tensors: {expert_count}")
+        logging.debug(f"  Attention tensors: {attn_count}")
+        logging.debug(f"  Expert tensors: {expert_count}")
 
         # Sample entries
         sample_entries = list(self.state_dict_name_map.items())[:5]
-        logging.info(f"Sample state_dict_name_map entries:")
+        logging.debug(f"Sample state_dict_name_map entries:")
         for tensor_name, mapping in sample_entries:
-            logging.info(f"  '{tensor_name}' -> module_key='{mapping['module_key']}', tensor_key='{mapping['tensor_key']}'")
+            logging.debug(f"  '{tensor_name}' -> module_key='{mapping['module_key']}', tensor_key='{mapping['tensor_key']}'")
 
         # Log what model parameters should go to skeleton (NOT in state_dict_name_map)
         skeleton_params = []
@@ -272,11 +272,11 @@ class GptOss_Parameter_Server:
             if name not in self.state_dict_name_map:
                 skeleton_params.append(name)
 
-        logging.info(f"\nModel parameters NOT in state_dict_name_map (should go to skeleton): {len(skeleton_params)}")
+        logging.debug(f"\nModel parameters NOT in state_dict_name_map (should go to skeleton): {len(skeleton_params)}")
         for param_name in skeleton_params[:20]:  # First 20
-            logging.info(f"  SKELETON: {param_name}")
+            logging.debug(f"  SKELETON: {param_name}")
         if len(skeleton_params) > 20:
-            logging.info(f"  ... and {len(skeleton_params) - 20} more")
+            logging.debug(f"  ... and {len(skeleton_params) - 20} more")
 
         # Categorize skeleton params
         embed_params = [p for p in skeleton_params if "embed" in p]
@@ -285,13 +285,13 @@ class GptOss_Parameter_Server:
         router_params = [p for p in skeleton_params if "router" in p]
         lm_head_params = [p for p in skeleton_params if "lm_head" in p]
 
-        logging.info(f"\nSkeleton param categories:")
-        logging.info(f"  Embedding: {len(embed_params)} - {embed_params}")
-        logging.info(f"  Final norm: {len(norm_params)} - {norm_params}")
-        logging.info(f"  Layer norms: {len(layernorm_params)}")
-        logging.info(f"  Routers: {len(router_params)}")
-        logging.info(f"  LM head: {len(lm_head_params)} - {lm_head_params}")
-        logging.info("=" * 60)
+        logging.debug(f"\nSkeleton param categories:")
+        logging.debug(f"  Embedding: {len(embed_params)} - {embed_params}")
+        logging.debug(f"  Final norm: {len(norm_params)} - {norm_params}")
+        logging.debug(f"  Layer norms: {len(layernorm_params)}")
+        logging.debug(f"  Routers: {len(router_params)}")
+        logging.debug(f"  LM head: {len(lm_head_params)} - {lm_head_params}")
+        logging.debug("=" * 60)
 
         del model
         gc.collect()

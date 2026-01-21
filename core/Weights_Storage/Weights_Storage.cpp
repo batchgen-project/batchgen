@@ -221,8 +221,8 @@ py::dict Weights_Storage::get_tensor(std::string module_key) {
             resolved_dtype_name = "float8_e4m3fn (fallback)";
         }
 
-        // Log raw dtype from metadata for debugging (info level for visibility)
-        this->logger->info("[{}] tensor '{}': raw_dtype='{}' -> torch_dtype={}",
+        // Log raw dtype from metadata for debugging
+        this->logger->debug("[{}] tensor '{}': raw_dtype='{}' -> torch_dtype={}",
                            module_key, tensor_key, tb.dtype, resolved_dtype_name);
 
         auto options = torch::TensorOptions()

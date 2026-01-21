@@ -1032,9 +1032,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
             # Log dtype info for layers 0 and 1 (for debugging)
             if self.layer_idx < 2:
-                logging.info(f"[Layer {self.layer_idx}] Module: {self.module_key}")
+                logging.debug(f"[Layer {self.layer_idx}] Module: {self.module_key}")
                 for name, tensor in weights.items():
-                    logging.info(f"  {name}: shape={list(tensor.shape)}, dtype={tensor.dtype}")
+                    logging.debug(f"  {name}: shape={list(tensor.shape)}, dtype={tensor.dtype}")
 
             dequant_weights = self.dequantize_weights(weights)
             self.apply_weights(dequant_weights)

@@ -168,23 +168,22 @@ GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
          buffer_idx < this->buffer_status_[module_type].size(); buffer_idx++) {
         if (this->buffer_status_[module_type][buffer_idx] == 0) {
             this->buffer_status_[module_type][buffer_idx] = 1;
-            // this->logger_->debug("module_type {} acquire buffer_idx: {}",
-            // module_type, buffer_idx);
+            this->logger_->debug("Acquired empty buffer: type={}, idx={}",
+                                module_type, buffer_idx);
             return std::make_pair(
                 std::ref(this->buffers_[module_type][buffer_idx]), buffer_idx);
         }
     }
-    // this->logger_->debug("No available buffer for module_type: {}",
-    // module_type); std::this_thread::sleep_for(std::chrono::milliseconds(10));
     return std::nullopt;
 };
 
 void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    // this->buffer_status_[module_type][buffer_idx] = 0;
     auto [module_type, buffer_idx] = this->module_in_buffers_[module_name];
     this->module_in_buffers_.erase(module_name);
     this->buffer_status_[module_type][buffer_idx] = 0;
+    this->logger_->debug("Released buffer: module={}, type={}, idx={}",
+                         module_name, module_type, buffer_idx);
 };
 
 module_weight_tensor_map GPU_Weight_Buffer::get_weights(
