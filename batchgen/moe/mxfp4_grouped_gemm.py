@@ -11,15 +11,76 @@ MXFP4 Format:
 - Scale exponent: scale_uint8 - 127
 """
 
+import logging
 import torch
 import triton
 import triton.language as tl
 from typing import List, Tuple
 
+# Try to import triton_kernels for optimized MXFP4 GEMM
+# triton_kernels is part of Triton 3.4+ or installed separately from Triton source
+try:
+    from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx
+    from triton_kernels.numerics import InFlexData
+    from triton_kernels.tensor import convert_layout, wrap_torch_tensor, FP4
+    from triton_kernels.tensor_details.layout import HopperMXValueLayout, StridedLayout
+    HAS_TRITON_KERNELS = True
+    logging.info("triton_kernels available - using optimized MXFP4 GEMM")
+except ImportError:
+    HAS_TRITON_KERNELS = False
+    logging.warning("triton_kernels not available - using unfused MXFP4 path (slower)")
+
 
 # MXFP4 configuration
 MXFP4_BLOCK_SIZE = 32  # FP4 values per scale
 MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
+
+
+# =============================================================================
+# Weight Layout Conversion for triton_kernels
+# =============================================================================
+
+def convert_to_hopper_layout(weight_packed: torch.Tensor, weight_scales: torch.Tensor):
+    """Convert BatchGen MXFP4 format to triton_kernels HopperMXValueLayout.
+
+    BatchGen stores MXFP4 weights as:
+    - weight_packed: [N, K//32, 16] uint8 (3D block format) or [N, K//2] uint8 (2D)
+    - weight_scales: [N, K//32] uint8
+
+    triton_kernels expects:
+    - weights: FP4 tensor in HopperMXValueLayout (per-row quantization, mx_axis=1)
+    - scales: uint8 tensor in StridedLayout
+
+    Args:
+        weight_packed: Packed FP4 weights in BatchGen format
+        weight_scales: Scales in BatchGen format
+
+    Returns:
+        Tuple of (converted_weights, converted_scales) ready for matmul_ogs
+    """
+    if not HAS_TRITON_KERNELS:
+        raise RuntimeError("triton_kernels not available for layout conversion")
+
+    # Flatten 3D to 2D if needed: [N, K//32, 16] -> [N, K//2]
+    if weight_packed.dim() == 3:
+        N, G, B = weight_packed.shape
+        weight_packed = weight_packed.view(N, G * B)
+
+    # Wrap and convert to Hopper layout
+    # FP4 is the dtype indicator for 4-bit floating point
+    w = convert_layout(
+        wrap_torch_tensor(weight_packed, dtype=FP4),
+        HopperMXValueLayout,
+        mx_axis=1  # Per-row quantization
+    )
+
+    # Scales stay in strided layout
+    w_scale = convert_layout(
+        wrap_torch_tensor(weight_scales),
+        StridedLayout
+    )
+
+    return w, w_scale
 
 
 @triton.jit
@@ -65,107 +126,20 @@ def _ldexp(mantissa, exponent):
 
 
 # =============================================================================
-# Single-Expert Fused MXFP4 GEMM Kernel
+# Single-Expert Fused MXFP4 GEMM Kernel (DISABLED)
+# =============================================================================
+# NOTE: This kernel is disabled because Triton doesn't support Python slice syntax
+# like [:, 0::2] for strided indexing. The error:
+#   "unsupported tensor index: <triton.language.core.slice object>"
+#
+# Instead, we use triton_kernels.matmul_ogs from OpenAI's library which has
+# production-ready MXFP4 support with proper Hopper optimizations.
 # =============================================================================
 
-@triton.jit
-def fused_mxfp4_single_gemm_kernel(
-    lhs_ptr,                    # BF16 activations [M, K]
-    rhs_packed_ptr,             # Packed FP4 weights [N, K//2] in uint8
-    rhs_scales_ptr,             # Scales [N, K//32] in uint8
-    output_ptr,                 # Output [M, N] in BF16
-    M, N, K,
-    stride_lhs_m, stride_lhs_k,
-    stride_rhs_packed_n, stride_rhs_packed_k,
-    stride_rhs_scales_n, stride_rhs_scales_k,
-    stride_output_m, stride_output_n,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """Fused MXFP4 dequantization and GEMM for single expert.
-
-    Computes: output = lhs @ rhs.T where rhs is MXFP4 quantized.
-
-    This is a simplified version without grouping overhead for single-expert inference.
-
-    Args:
-        lhs_ptr: Input activations [M, K] in BF16
-        rhs_packed_ptr: Packed weights [N, K//2] in uint8 (2 FP4 values per byte)
-        rhs_scales_ptr: Scales [N, K//32] in uint8
-        output_ptr: Output tensor [M, N] in BF16
-    """
-    # 2D tiling: program_id(0) for M tiles, program_id(1) for N tiles
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    # Tile offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # K dimension sizes
-    K_packed = K // 2
-
-    # Iterate over K dimension in blocks
-    for k_block in range(0, tl.cdiv(K, BLOCK_K)):
-        k_start = k_block * BLOCK_K
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-
-        # Load LHS tile [BLOCK_M, BLOCK_K]
-        lhs_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        lhs_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k
-        lhs_tile = tl.load(lhs_ptrs, mask=lhs_mask, other=0.0)
-
-        # Load RHS packed tile [BLOCK_N, BLOCK_K//2]
-        offs_k_packed = k_start // 2 + tl.arange(0, BLOCK_K // 2)
-        rhs_mask = (offs_n[:, None] < N) & (offs_k_packed[None, :] < K_packed)
-        rhs_packed_ptrs = rhs_packed_ptr + offs_n[:, None] * stride_rhs_packed_n + offs_k_packed[None, :] * stride_rhs_packed_k
-        rhs_packed = tl.load(rhs_packed_ptrs, mask=rhs_mask, other=0)
-
-        # Unpack FP4 nibbles
-        idx_lo = (rhs_packed & 0x0F).to(tl.int32)
-        idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
-
-        # Lookup FP4 values
-        val_lo = _fp4_lookup(idx_lo)
-        val_hi = _fp4_lookup(idx_hi)
-
-        # Load scales for this K block
-        # Scale covers 32 consecutive K values, but we need scales for multiple K blocks
-        # For BLOCK_K elements starting at k_start, we need scale at k_start // 32
-        scale_k_idx = k_start // 32
-        scale_ptrs = rhs_scales_ptr + offs_n * stride_rhs_scales_n + scale_k_idx * stride_rhs_scales_k
-        scale_mask = offs_n < N
-        scales_uint8 = tl.load(scale_ptrs, mask=scale_mask, other=127)
-
-        # Convert scale: exponent = scale - 127
-        exponents = scales_uint8.to(tl.int32) - 127
-
-        # Broadcast exponents for ldexp: [BLOCK_N] -> [BLOCK_N, BLOCK_K//2]
-        exponents_broadcast = exponents[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
-        val_lo_scaled = _ldexp(val_lo, exponents_broadcast)
-        val_hi_scaled = _ldexp(val_hi, exponents_broadcast)
-
-        # Convert to BF16 for dot product
-        val_lo_bf16 = val_lo_scaled.to(tl.bfloat16)
-        val_hi_bf16 = val_hi_scaled.to(tl.bfloat16)
-
-        # Split LHS into even/odd K indices
-        lhs_even = lhs_tile[:, 0::2]  # [BLOCK_M, BLOCK_K//2]
-        lhs_odd = lhs_tile[:, 1::2]   # [BLOCK_M, BLOCK_K//2]
-
-        # Compute: lhs_even @ val_lo.T + lhs_odd @ val_hi.T
-        # This handles the interleaved packing where low nibble = even K, high nibble = odd K
-        acc += tl.dot(lhs_even, val_lo_bf16.T)
-        acc += tl.dot(lhs_odd, val_hi_bf16.T)
-
-    # Store output tile
-    out_ptrs = output_ptr + offs_m[:, None] * stride_output_m + offs_n[None, :] * stride_output_n
-    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
+# @triton.jit
+# def fused_mxfp4_single_gemm_kernel(...):
+#     # Disabled - see note above
+#     pass
 
 
 @torch.inference_mode()
@@ -177,11 +151,14 @@ def fused_mxfp4_single_gemm(
 ) -> torch.Tensor:
     """Fused MXFP4 dequantization and GEMM for single expert.
 
+    Uses triton_kernels.matmul_ogs when available (optimized for Hopper architecture).
+    Falls back to unfused dequant + matmul when triton_kernels is not installed.
+
     Computes: output = lhs @ dequant(rhs).T + bias
 
     Args:
         lhs: Input activations [M, K] in BF16
-        rhs_packed: Packed FP4 weights [N, K//2] in uint8
+        rhs_packed: Packed FP4 weights [N, K//2] or [N, K//32, 16] in uint8
         rhs_scales: Scales [N, K//32] in uint8
         bias: Optional bias [N] in BF16
 
@@ -192,48 +169,37 @@ def fused_mxfp4_single_gemm(
     assert rhs_packed.dtype == torch.uint8, f"rhs_packed must be uint8, got {rhs_packed.dtype}"
     assert rhs_scales.dtype == torch.uint8, f"rhs_scales must be uint8, got {rhs_scales.dtype}"
 
-    M, K = lhs.shape
-    N = rhs_packed.shape[0]
+    if HAS_TRITON_KERNELS:
+        # Use OpenAI's optimized triton_kernels.matmul_ogs
+        # This handles MXFP4 dequantization fused into the GEMM kernel
+        w, w_scale = convert_to_hopper_layout(rhs_packed, rhs_scales)
 
-    # Handle 3D block format: [N, K//32, bytes_per_block] → [N, K//2]
-    # Weights may be stored as [N, num_scale_blocks, 16] where each block has 16 bytes (32 FP4 values)
-    if rhs_packed.dim() == 3:
-        N, G, B = rhs_packed.shape
-        rhs_packed = rhs_packed.view(N, G * B)  # Flatten to [N, K//2]
+        # PrecisionConfig with weight_scale enables fused MXFP4 dequant
+        pc = PrecisionConfig(
+            weight_scale=w_scale,
+            flex_ctx=FlexCtx(rhs_data=InFlexData())
+        )
 
-    # Verify dimensions
-    assert rhs_packed.shape[1] == K // 2, f"Expected rhs_packed.shape[1]={K//2}, got {rhs_packed.shape[1]}"
-    assert rhs_scales.shape[0] == N, f"Expected rhs_scales.shape[0]={N}, got {rhs_scales.shape[0]}"
+        # matmul_ogs: output = lhs @ weights.T (with fused dequant)
+        # w.storage.data contains the actual tensor data
+        output = matmul_ogs(lhs, w.storage.data, bias, precision_config=pc)
+    else:
+        # Fallback: unfused path (slower, creates BF16 intermediate)
+        from batchgen.quantization.mxfp4 import mxfp4_dequantize
 
-    # Output tensor
-    output = torch.empty((M, N), dtype=torch.bfloat16, device=lhs.device)
+        # Handle 3D block format: [N, K//32, 16] → [N, K//2]
+        if rhs_packed.dim() == 3:
+            N, G, B = rhs_packed.shape
+            rhs_packed = rhs_packed.view(N, G * B)
 
-    # Tile sizes
-    # BLOCK_K must equal 32 to match MXFP4 scale block size (1 scale per 32 K values)
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 32  # Must equal 32 to match scale block size
+        # Dequantize to BF16
+        weight_bf16 = mxfp4_dequantize(rhs_packed, rhs_scales, dtype=torch.bfloat16)
 
-    # Grid
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        # Standard matmul
+        output = torch.mm(lhs, weight_bf16.T)
 
-    # Launch kernel
-    fused_mxfp4_single_gemm_kernel[grid](
-        lhs, rhs_packed, rhs_scales, output,
-        M, N, K,
-        lhs.stride(0), lhs.stride(1),
-        rhs_packed.stride(0), rhs_packed.stride(1),
-        rhs_scales.stride(0), rhs_scales.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=4,
-    )
-
-    # Add bias
-    if bias is not None:
-        output = output + bias
+        if bias is not None:
+            output = output + bias
 
     return output
 
