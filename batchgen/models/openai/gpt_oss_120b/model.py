@@ -37,6 +37,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
+
 from .configuration_gpt_oss import GptOssConfig
 
 
@@ -673,7 +678,8 @@ class GptOss(nn.Module):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, ...]:
+        return_dict: Optional[bool] = True,
+    ) -> Union[Tuple[torch.Tensor, ...], CausalLMOutputWithPast]:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -695,7 +701,17 @@ class GptOss(nn.Module):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
 
-        return (loss, logits, outputs[1], outputs[2], outputs[3])
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs[1],
+            hidden_states=outputs[2],
+            attentions=outputs[3],
+        )
 
     def prepare_inputs_for_generation(
         self,
