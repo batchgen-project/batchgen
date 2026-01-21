@@ -543,14 +543,13 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with MXFP4 dequantization.
+        """Forward pass with fused MXFP4 dequant + GEMM.
 
-        Flow:
+        Optimized flow using fused kernel:
         1. Get MXFP4 weights from storage (persistent) or buffer (non-persistent)
-        2. Dequantize to BF16
-        3. Apply to module
-        4. Micro-batch forward through SwiGLU
-        5. Cleanup (free buffer only if non-persistent, always clear BF16)
+        2. Fused dequant + GEMM for gate, up, down projections (no BF16 intermediate)
+        3. SwiGLU activation between stage 1 and stage 2
+        4. Cleanup (free buffer only if non-persistent)
 
         Args:
             hidden_states: Input tensor [num_tokens, hidden_size]
@@ -558,6 +557,9 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         Returns:
             Output tensor [num_tokens, hidden_size]
         """
+        # Import fused kernel
+        from batchgen.moe.mxfp4_grouped_gemm import mxfp4_linear
+
         # Start timing if enabled (prefill or decode)
         do_prefill_timing = PrefillTimingStats.enabled and self.phase == "prefill"
         do_decode_timing = DecodeTimingStats.enabled and self.phase == "decode"
@@ -593,28 +595,45 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             for name, tensor in weights.items():
                 logging.debug(f"  {name}: shape={list(tensor.shape)}, dtype={tensor.dtype}")
 
-        # Dequantize MXFP4 to BF16 (always needed)
-        if do_timing:
-            t0 = time.perf_counter()
-        dequant_weights = self.dequantize_weights(weights)
-        if do_timing:
-            torch.cuda.synchronize()
-            timing_stats.moe_dequant_ms += (time.perf_counter() - t0) * 1000
+        # Ensure hidden_states is BF16
+        if hidden_states.dtype != torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
 
-        # Apply BF16 to module
-        if do_timing:
-            t0 = time.perf_counter()
-        self.apply_weights(dequant_weights)
-        if do_timing:
-            torch.cuda.synchronize()
-            timing_stats.moe_apply_ms += (time.perf_counter() - t0) * 1000
+        # === FUSED DEQUANT + GEMM ===
+        # Instead of: dequant -> apply_weights -> forward
+        # We do: mxfp4_linear (fused dequant + GEMM) for each projection
 
-        # Micro-batch forward
         if do_timing:
             t0 = time.perf_counter()
-        result = self.micro_batch_forward(hidden_states, "expert")
+
+        # Stage 1: Gate and Up projections (fused dequant + GEMM)
+        gate_out = mxfp4_linear(
+            hidden_states,
+            weights["gate_proj.weight"],
+            weights["gate_proj.weight_scales"],
+            weights.get("gate_proj.bias"),
+        )
+        up_out = mxfp4_linear(
+            hidden_states,
+            weights["up_proj.weight"],
+            weights["up_proj.weight_scales"],
+            weights.get("up_proj.bias"),
+        )
+
+        # SwiGLU activation: silu(gate) * up
+        intermediate = F.silu(gate_out) * up_out
+
+        # Stage 2: Down projection (fused dequant + GEMM)
+        result = mxfp4_linear(
+            intermediate,
+            weights["down_proj.weight"],
+            weights["down_proj.weight_scales"],
+            weights.get("down_proj.bias"),
+        )
+
         if do_timing:
             torch.cuda.synchronize()
+            # Fused path combines dequant + apply + forward into one measurement
             timing_stats.moe_forward_ms += (time.perf_counter() - t0) * 1000
 
         # Cleanup
@@ -626,8 +645,6 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         if not self.persistent:
             # Non-persistent: release buffer slot
             self.free_weights(self.module_key)
-        # Always clear BF16 from module (temporary allocation)
-        self.clear_weights()
         if do_timing:
             timing_stats.moe_cleanup_ms += (time.perf_counter() - t0) * 1000
 
