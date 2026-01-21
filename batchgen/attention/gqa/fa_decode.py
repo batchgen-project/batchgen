@@ -2,10 +2,20 @@
 
 Uses flash_attn_with_kvcache for efficient decode with paged attention.
 Supports both FA2 (Ampere) and FA3 (Hopper).
+
+SINK TOKEN CONFIGURATION:
+- USE_VANILLA_FOR_SINKS=True: Use vanilla PyTorch decode with inline softmax_with_sinks (correct)
+- USE_VANILLA_FOR_SINKS=False: Use FlashAttention with sigmoid post-correction (may have issues)
+
+Set USE_VANILLA_FOR_SINKS=True (default) to fix gibberish output issues.
 """
 
+import os
 import torch
 from typing import Optional, Tuple
+
+# Import the flag from gqa_attention to ensure consistent behavior
+from .gqa_attention import USE_VANILLA_FOR_SINKS
 
 # Detect which flash attention version is available
 _USE_FA3 = False
@@ -24,6 +34,54 @@ if _flash_with_kvcache is None:
         _flash_with_kvcache = _fa2_with_kvcache
     except ImportError:
         pass
+
+
+def _gather_paged_kv_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather paged KV cache into contiguous format for vanilla attention.
+
+    Args:
+        k_cache: Paged key cache (num_blocks, page_size, nheads_kv, headdim)
+        v_cache: Paged value cache (num_blocks, page_size, nheads_kv, headdim)
+        block_table: Page table mapping (batch, max_blocks_per_seq) int32
+        cache_seqlens: Current sequence lengths (batch,) int32
+
+    Returns:
+        Tuple of:
+            - k_contig: Contiguous key cache (batch, max_seqlen, nheads_kv, headdim)
+            - v_contig: Contiguous value cache (batch, max_seqlen, nheads_kv, headdim)
+    """
+    batch = block_table.shape[0]
+    max_blocks = block_table.shape[1]
+    page_size = k_cache.shape[1]
+    nheads_kv = k_cache.shape[2]
+    headdim = k_cache.shape[3]
+
+    max_seqlen = int(cache_seqlens.max().item())
+
+    # Pre-allocate contiguous buffers
+    k_contig = torch.zeros(batch, max_seqlen, nheads_kv, headdim,
+                           dtype=k_cache.dtype, device=k_cache.device)
+    v_contig = torch.zeros(batch, max_seqlen, nheads_kv, headdim,
+                           dtype=v_cache.dtype, device=v_cache.device)
+
+    # Gather pages for each batch element
+    for b in range(batch):
+        seqlen = int(cache_seqlens[b].item())
+        num_blocks_needed = (seqlen + page_size - 1) // page_size
+        pos = 0
+        for block_idx in range(num_blocks_needed):
+            page_id = block_table[b, block_idx].item()
+            copy_len = min(page_size, seqlen - pos)
+            k_contig[b, pos:pos+copy_len] = k_cache[page_id, :copy_len]
+            v_contig[b, pos:pos+copy_len] = v_cache[page_id, :copy_len]
+            pos += copy_len
+
+    return k_contig, v_contig
 
 
 def gqa_decode_fa(
@@ -54,6 +112,39 @@ def gqa_decode_fa(
             - output: Attention output (batch, seqlen_q, nheads, headdim)
             - lse: Log-sum-exp values or None if sinks not provided
     """
+    # Use vanilla PyTorch path for sinks when configured (correct inline softmax)
+    use_vanilla = (sinks is not None and USE_VANILLA_FOR_SINKS)
+
+    if use_vanilla:
+        from .gqa_attention import gqa_attention_decode
+
+        # Gather paged KV cache into contiguous format
+        k_contig, v_contig = _gather_paged_kv_cache(
+            k_cache, v_cache, block_table, cache_seqlens
+        )
+
+        # Convert from FA format to vanilla format
+        # FA: (batch, seqlen, nheads, headdim) -> Vanilla: (batch, nheads, seqlen, headdim)
+        q_vanilla = q.permute(0, 2, 1, 3)  # [batch, nheads, 1, headdim]
+        k_vanilla = k_contig.permute(0, 2, 1, 3)  # [batch, nheads_kv, max_seqlen, headdim]
+        v_vanilla = v_contig.permute(0, 2, 1, 3)  # [batch, nheads_kv, max_seqlen, headdim]
+
+        # Run vanilla decode with correct inline softmax_with_sinks
+        output_vanilla = gqa_attention_decode(
+            query=q_vanilla,
+            key=k_vanilla,
+            value=v_vanilla,
+            sinks=sinks,
+            scale=softmax_scale,
+            sliding_window=sliding_window,
+            cache_seqlens=cache_seqlens,
+        )
+
+        # Convert back to FA format
+        output = output_vanilla.permute(0, 2, 1, 3)  # [batch, seqlen_q, nheads, headdim]
+        return output, None
+
+    # FlashAttention path
     if _flash_with_kvcache is None:
         raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
 
@@ -138,6 +229,34 @@ def gqa_decode_fa_contiguous(
             - output: Attention output (batch, seqlen_q, nheads, headdim)
             - lse: Log-sum-exp values or None if sinks not provided
     """
+    # Use vanilla PyTorch path for sinks when configured (correct inline softmax)
+    use_vanilla = (sinks is not None and USE_VANILLA_FOR_SINKS)
+
+    if use_vanilla:
+        from .gqa_attention import gqa_attention_decode
+
+        # Convert from FA format to vanilla format
+        # FA: (batch, seqlen, nheads, headdim) -> Vanilla: (batch, nheads, seqlen, headdim)
+        q_vanilla = q.permute(0, 2, 1, 3)  # [batch, nheads, 1, headdim]
+        k_vanilla = k_cache.permute(0, 2, 1, 3)  # [batch, nheads_kv, max_seqlen, headdim]
+        v_vanilla = v_cache.permute(0, 2, 1, 3)  # [batch, nheads_kv, max_seqlen, headdim]
+
+        # Run vanilla decode with correct inline softmax_with_sinks
+        output_vanilla = gqa_attention_decode(
+            query=q_vanilla,
+            key=k_vanilla,
+            value=v_vanilla,
+            sinks=sinks,
+            scale=softmax_scale,
+            sliding_window=sliding_window,
+            cache_seqlens=cache_seqlens,
+        )
+
+        # Convert back to FA format
+        output = output_vanilla.permute(0, 2, 1, 3)  # [batch, seqlen_q, nheads, headdim]
+        return output, None
+
+    # FlashAttention path
     if _flash_with_kvcache is None:
         raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
 

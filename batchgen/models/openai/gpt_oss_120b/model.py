@@ -320,9 +320,6 @@ class GptOssAttention(nn.Module):
         query_states = query_states.transpose(2, 3)  # [batch, kv_heads, seq, q_mult, head_dim]
 
         # Apply RoPE to Q and K
-        query_flat = query_states.view(bsz * self.num_kv_heads, q_len * self.num_key_value_groups, self.head_dim)
-        key_flat = key_states.view(bsz * self.num_kv_heads, q_len, self.head_dim)
-
         # Simple RoPE application
         cos_expanded = cos.unsqueeze(0).expand(bsz, -1, -1)  # [batch, seq, dim]
         sin_expanded = sin.unsqueeze(0).expand(bsz, -1, -1)

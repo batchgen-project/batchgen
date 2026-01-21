@@ -31,15 +31,27 @@ Architecture reference: GPT-OSS-120B
 
 Uses FlashAttention when available for memory-efficient attention.
 Falls back to vanilla PyTorch for debugging/testing only.
+
+SINK TOKEN CONFIGURATION:
+- USE_VANILLA_FOR_SINKS=True: Use vanilla PyTorch with inline softmax_with_sinks (correct)
+- USE_VANILLA_FOR_SINKS=False: Use FlashAttention with sigmoid post-correction (may have issues)
+
+Set USE_VANILLA_FOR_SINKS=True to debug gibberish output issues.
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from ..sink import softmax_with_sinks
+
+# Configuration: Use vanilla PyTorch for sinks to ensure correct inline softmax.
+# Set to False to use FlashAttention + sigmoid post-correction (faster but may have issues).
+# Can be overridden via environment variable: BATCHGEN_VANILLA_SINKS=1
+USE_VANILLA_FOR_SINKS = os.environ.get("BATCHGEN_VANILLA_SINKS", "1") == "1"
 
 # Detect which flash attention version is available
 _USE_FA3 = False
@@ -95,8 +107,13 @@ def gqa_attention_prefill(
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
 
-    # Use FlashAttention if available
-    if _flash_attn_func is not None:
+    # Use FlashAttention if available, UNLESS:
+    # - sinks are present AND USE_VANILLA_FOR_SINKS is True
+    # The vanilla path uses correct inline softmax_with_sinks,
+    # while FA path uses sigmoid post-correction which may have issues.
+    use_vanilla = (sinks is not None and USE_VANILLA_FOR_SINKS)
+
+    if _flash_attn_func is not None and not use_vanilla:
         # Convert padded input to varlen format for gqa_prefill_fa
         # Input: [batch, heads, seq, dim] -> varlen: [total, heads, dim]
         # Use permute to get [batch, seq, heads, dim] then reshape
@@ -133,13 +150,16 @@ def gqa_attention_prefill(
         attn_output = output_varlen.reshape(batch, seq_q, num_q_heads, head_dim).permute(0, 2, 1, 3).contiguous()
         return attn_output
 
-    # Fallback to vanilla PyTorch attention (for debugging only - memory intensive!)
-    import warnings
-    warnings.warn(
-        "FlashAttention not available, falling back to vanilla PyTorch attention. "
-        "This will use excessive memory for long sequences!",
-        RuntimeWarning
-    )
+    # Vanilla PyTorch attention path
+    # Used when: FlashAttention not available, OR (sinks present AND USE_VANILLA_FOR_SINKS=True)
+    # This path uses correct inline softmax_with_sinks for accurate sink handling.
+    if _flash_attn_func is None:
+        import warnings
+        warnings.warn(
+            "FlashAttention not available, falling back to vanilla PyTorch attention. "
+            "This will use excessive memory for long sequences!",
+            RuntimeWarning
+        )
 
     num_groups = num_q_heads // num_kv_heads
 

@@ -177,6 +177,151 @@ class PrefillTimingStats:
 PrefillTimingStats.check_env_and_enable()
 
 
+class DecodeTimingStats:
+    """Timing statistics for decode phase per module type.
+
+    Enable via environment variable: BATCHGEN_DECODE_TIMING=1
+    """
+
+    # Class-level accumulators for per-layer timing
+    attn_times_ms: Dict[int, float] = {}  # layer_idx -> total time in ms
+    moe_times_ms: Dict[int, float] = {}   # layer_idx -> total time in ms
+    attn_call_counts: Dict[int, int] = {}
+    moe_call_counts: Dict[int, int] = {}
+
+    # Granular attention timing breakdown
+    attn_projection_ms: float = 0.0    # Q, K, V projection
+    attn_rope_ms: float = 0.0          # RoPE application
+    attn_kv_update_ms: float = 0.0     # KV cache update
+    attn_forward_ms: float = 0.0       # Attention forward (FA or vanilla)
+    attn_output_proj_ms: float = 0.0   # Output projection
+
+    # Granular MoE timing breakdown
+    moe_routing_ms: float = 0.0        # Router forward
+    moe_load_ms: float = 0.0           # Weight loading from buffer
+    moe_dequant_ms: float = 0.0        # MXFP4 dequantization
+    moe_apply_ms: float = 0.0          # Apply weights to module
+    moe_forward_ms: float = 0.0        # Expert forward pass
+    moe_cleanup_ms: float = 0.0        # Sync + free + clear
+
+    # Enable/disable timing (adds overhead)
+    enabled: bool = False
+
+    @classmethod
+    def reset(cls):
+        """Reset all timing stats."""
+        cls.attn_times_ms = {}
+        cls.moe_times_ms = {}
+        cls.attn_call_counts = {}
+        cls.moe_call_counts = {}
+        # Reset granular attention timing
+        cls.attn_projection_ms = 0.0
+        cls.attn_rope_ms = 0.0
+        cls.attn_kv_update_ms = 0.0
+        cls.attn_forward_ms = 0.0
+        cls.attn_output_proj_ms = 0.0
+        # Reset granular MoE timing
+        cls.moe_routing_ms = 0.0
+        cls.moe_load_ms = 0.0
+        cls.moe_dequant_ms = 0.0
+        cls.moe_apply_ms = 0.0
+        cls.moe_forward_ms = 0.0
+        cls.moe_cleanup_ms = 0.0
+
+    @classmethod
+    def enable(cls):
+        """Enable timing instrumentation."""
+        cls.enabled = True
+        cls.reset()
+
+    @classmethod
+    def disable(cls):
+        """Disable timing instrumentation."""
+        cls.enabled = False
+
+    @classmethod
+    def record_attn(cls, layer_idx: int, time_ms: float):
+        """Record attention timing for a layer."""
+        if layer_idx not in cls.attn_times_ms:
+            cls.attn_times_ms[layer_idx] = 0.0
+            cls.attn_call_counts[layer_idx] = 0
+        cls.attn_times_ms[layer_idx] += time_ms
+        cls.attn_call_counts[layer_idx] += 1
+
+    @classmethod
+    def record_moe(cls, layer_idx: int, time_ms: float):
+        """Record MoE timing for a layer."""
+        if layer_idx not in cls.moe_times_ms:
+            cls.moe_times_ms[layer_idx] = 0.0
+            cls.moe_call_counts[layer_idx] = 0
+        cls.moe_times_ms[layer_idx] += time_ms
+        cls.moe_call_counts[layer_idx] += 1
+
+    @classmethod
+    def log_summary(cls):
+        """Log timing summary to logging.info."""
+        if not cls.attn_times_ms and not cls.moe_times_ms:
+            return
+
+        total_attn_ms = sum(cls.attn_times_ms.values())
+        total_moe_ms = sum(cls.moe_times_ms.values())
+
+        logging.info("=" * 60)
+        logging.info("GPT-OSS Decode Timing Summary")
+        logging.info("=" * 60)
+        logging.info(f"Total Attention: {total_attn_ms:.2f} ms")
+        logging.info(f"Total MoE:       {total_moe_ms:.2f} ms")
+
+        # Attention breakdown
+        if cls.attn_projection_ms > 0 or cls.attn_forward_ms > 0:
+            logging.info("-" * 60)
+            logging.info("Attention Timing Breakdown:")
+            if total_attn_ms > 0:
+                logging.info(f"  Projection:     {cls.attn_projection_ms:10.2f} ms ({cls.attn_projection_ms/total_attn_ms*100:.1f}%)")
+                logging.info(f"  RoPE:           {cls.attn_rope_ms:10.2f} ms ({cls.attn_rope_ms/total_attn_ms*100:.1f}%)")
+                logging.info(f"  KV Update:      {cls.attn_kv_update_ms:10.2f} ms ({cls.attn_kv_update_ms/total_attn_ms*100:.1f}%)")
+                logging.info(f"  Forward:        {cls.attn_forward_ms:10.2f} ms ({cls.attn_forward_ms/total_attn_ms*100:.1f}%)")
+                logging.info(f"  Output Proj:    {cls.attn_output_proj_ms:10.2f} ms ({cls.attn_output_proj_ms/total_attn_ms*100:.1f}%)")
+
+        # MoE breakdown
+        if cls.moe_load_ms > 0 or cls.moe_forward_ms > 0:
+            logging.info("-" * 60)
+            logging.info("MoE Timing Breakdown:")
+            if total_moe_ms > 0:
+                logging.info(f"  Routing:        {cls.moe_routing_ms:10.2f} ms ({cls.moe_routing_ms/total_moe_ms*100:.1f}%)")
+                logging.info(f"  Weight Load:    {cls.moe_load_ms:10.2f} ms ({cls.moe_load_ms/total_moe_ms*100:.1f}%)")
+                logging.info(f"  Dequantize:     {cls.moe_dequant_ms:10.2f} ms ({cls.moe_dequant_ms/total_moe_ms*100:.1f}%)")
+                logging.info(f"  Apply Weights:  {cls.moe_apply_ms:10.2f} ms ({cls.moe_apply_ms/total_moe_ms*100:.1f}%)")
+                logging.info(f"  Forward:        {cls.moe_forward_ms:10.2f} ms ({cls.moe_forward_ms/total_moe_ms*100:.1f}%)")
+                logging.info(f"  Cleanup:        {cls.moe_cleanup_ms:10.2f} ms ({cls.moe_cleanup_ms/total_moe_ms*100:.1f}%)")
+
+        logging.info("-" * 60)
+
+        # Per-layer breakdown
+        all_layers = sorted(set(cls.attn_times_ms.keys()) | set(cls.moe_times_ms.keys()))
+        for layer_idx in all_layers:
+            attn_ms = cls.attn_times_ms.get(layer_idx, 0.0)
+            moe_ms = cls.moe_times_ms.get(layer_idx, 0.0)
+            attn_calls = cls.attn_call_counts.get(layer_idx, 0)
+            moe_calls = cls.moe_call_counts.get(layer_idx, 0)
+            logging.info(
+                f"Layer {layer_idx:2d}: attn={attn_ms:7.2f}ms ({attn_calls} calls), "
+                f"moe={moe_ms:7.2f}ms ({moe_calls} calls)"
+            )
+        logging.info("=" * 60)
+
+    @classmethod
+    def check_env_and_enable(cls):
+        """Check environment variable and enable timing if set."""
+        if os.environ.get("BATCHGEN_DECODE_TIMING", "0") == "1":
+            cls.enable()
+            logging.info("DecodeTimingStats enabled via BATCHGEN_DECODE_TIMING=1")
+
+
+# Auto-enable decode timing if environment variable is set
+DecodeTimingStats.check_env_and_enable()
+
+
 class GptOssExpertWrapper(ExpertWrapperBase):
     """Expert wrapper with MXFP4 dequantization for GPT-OSS-120B.
 
@@ -354,8 +499,12 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         Returns:
             Output tensor [num_tokens, hidden_size]
         """
-        # Start timing if enabled
-        do_timing = PrefillTimingStats.enabled and self.phase == "prefill"
+        # Start timing if enabled (prefill or decode)
+        do_prefill_timing = PrefillTimingStats.enabled and self.phase == "prefill"
+        do_decode_timing = DecodeTimingStats.enabled and self.phase == "decode"
+        do_timing = do_prefill_timing or do_decode_timing
+        timing_stats = PrefillTimingStats if do_prefill_timing else DecodeTimingStats
+
         if do_timing:
             torch.cuda.synchronize()
             start_time = time.perf_counter()
@@ -377,7 +526,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             weights = self.load_weights(self.module_key)
         if do_timing:
             torch.cuda.synchronize()
-            PrefillTimingStats.moe_load_ms += (time.perf_counter() - t0) * 1000
+            timing_stats.moe_load_ms += (time.perf_counter() - t0) * 1000
 
         # Log dtype info for layers 0 and 1 (for debugging MXFP4 handling)
         if self.layer_idx < 2:
@@ -391,7 +540,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         dequant_weights = self.dequantize_weights(weights)
         if do_timing:
             torch.cuda.synchronize()
-            PrefillTimingStats.moe_dequant_ms += (time.perf_counter() - t0) * 1000
+            timing_stats.moe_dequant_ms += (time.perf_counter() - t0) * 1000
 
         # Apply BF16 to module
         if do_timing:
@@ -399,7 +548,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         self.apply_weights(dequant_weights)
         if do_timing:
             torch.cuda.synchronize()
-            PrefillTimingStats.moe_apply_ms += (time.perf_counter() - t0) * 1000
+            timing_stats.moe_apply_ms += (time.perf_counter() - t0) * 1000
 
         # Micro-batch forward
         if do_timing:
@@ -407,7 +556,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         result = self.micro_batch_forward(hidden_states, "expert")
         if do_timing:
             torch.cuda.synchronize()
-            PrefillTimingStats.moe_forward_ms += (time.perf_counter() - t0) * 1000
+            timing_stats.moe_forward_ms += (time.perf_counter() - t0) * 1000
 
         # Cleanup
         if do_timing:
@@ -421,7 +570,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         # Always clear BF16 from module (temporary allocation)
         self.clear_weights()
         if do_timing:
-            PrefillTimingStats.moe_cleanup_ms += (time.perf_counter() - t0) * 1000
+            timing_stats.moe_cleanup_ms += (time.perf_counter() - t0) * 1000
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
@@ -432,7 +581,7 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         if do_timing:
             torch.cuda.synchronize()
             elapsed_ms = (time.perf_counter() - start_time) * 1000
-            PrefillTimingStats.record_moe(self.layer_idx, elapsed_ms)
+            timing_stats.record_moe(self.layer_idx, elapsed_ms)
 
         return result
 
@@ -516,7 +665,17 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # Extract sinks from weights if present
         if "sinks" in weights_dict:
             self.sinks = weights_dict["sinks"]
-            logging.debug(f"Layer {self.layer_idx}: Loaded sinks with shape {self.sinks.shape}")
+            # Log sink info at INFO level when BATCHGEN_DEBUG_SINKS=1
+            if os.environ.get("BATCHGEN_DEBUG_SINKS", "0") == "1":
+                sink_min = float(self.sinks.min().item())
+                sink_max = float(self.sinks.max().item())
+                sink_mean = float(self.sinks.float().mean().item())
+                logging.info(
+                    f"Layer {self.layer_idx}: Loaded sinks shape={self.sinks.shape}, "
+                    f"range=[{sink_min:.4f}, {sink_max:.4f}], mean={sink_mean:.4f}"
+                )
+            else:
+                logging.debug(f"Layer {self.layer_idx}: Loaded sinks with shape {self.sinks.shape}")
             # Remove from dict so it's not applied as a regular parameter
             result = {k: v for k, v in weights_dict.items() if k != "sinks"}
             return result
@@ -524,7 +683,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # If no sinks in weights, initialize with zeros
         if self.sinks is None:
             self.sinks = torch.zeros(self.num_heads, dtype=torch.bfloat16)
-            logging.debug(f"Layer {self.layer_idx}: Initialized zero sinks")
+            logging.warning(f"Layer {self.layer_idx}: No sinks found in weights, initialized to zeros (may cause issues)")
 
         return weights_dict
 
@@ -681,6 +840,12 @@ class GptOssAttnWrapper(AttnWrapperBase):
         Returns:
             Tuple of (output, None, None) - KV cache managed externally
         """
+        # Decode timing instrumentation
+        do_timing = DecodeTimingStats.enabled
+        if do_timing:
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
         batch, seq_len, _ = hidden_states.shape
         assert seq_len == 1, "Decode expects single token"
 
@@ -699,7 +864,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 past_key_value, output_attentions, use_cache, **kwargs
             )
 
-        # Project Q, K, V for the new token
+        # === Stage 1: Project Q, K, V for the new token ===
+        if do_timing:
+            t0 = time.perf_counter()
+
         query = self.module.q_proj(hidden_states)
         key = self.module.k_proj(hidden_states)
         value = self.module.v_proj(hidden_states)
@@ -709,7 +877,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
         key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
         value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Get RoPE for current position
+        if do_timing:
+            torch.cuda.synchronize()
+            DecodeTimingStats.attn_projection_ms += (time.perf_counter() - t0) * 1000
+
+        # === Stage 2: Get and apply RoPE ===
+        if do_timing:
+            t0 = time.perf_counter()
+
         # cache_seqlens contains the current position (0-indexed)
         if cache_seqlens is not None:
             # Apply batch_slice if provided
@@ -738,7 +913,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         query, key = self._apply_rotary(query, key, cos, sin)
 
-        # Write new K, V to paged GPU cache
+        if do_timing:
+            torch.cuda.synchronize()
+            DecodeTimingStats.attn_rope_ms += (time.perf_counter() - t0) * 1000
+
+        # === Stage 3: Write new K, V to paged GPU cache ===
+        if do_timing:
+            t0 = time.perf_counter()
+
         # Shape requirement: [batch, seq_len, num_heads, head_dim]
         gpu_kv_manager.update_layer_decode_new_token(
             k_tensor=key,
@@ -758,7 +940,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
             start_idx, end_idx = batch_slice
             page_table = page_table[start_idx:end_idx]
 
-        # Use FlashAttention with paged KV cache
+        if do_timing:
+            torch.cuda.synchronize()
+            DecodeTimingStats.attn_kv_update_ms += (time.perf_counter() - t0) * 1000
+
+        # === Stage 4: FlashAttention with paged KV cache ===
+        if do_timing:
+            t0 = time.perf_counter()
+
         # gqa_decode_fa expects:
         #   q: [batch, seqlen_q, nheads, headdim]
         #   k_cache: [num_blocks, page_size, nheads_kv, headdim]
@@ -778,11 +967,28 @@ class GptOssAttnWrapper(AttnWrapperBase):
             sliding_window=self.sliding_window,
         )
 
+        if do_timing:
+            torch.cuda.synchronize()
+            DecodeTimingStats.attn_forward_ms += (time.perf_counter() - t0) * 1000
+
+        # === Stage 5: Output projection ===
+        if do_timing:
+            t0 = time.perf_counter()
+
         # Reshape output: [batch, 1, num_heads, head_dim] -> [batch, 1, hidden_size]
         attn_output = attn_output.view(batch, 1, self.num_heads * self.head_dim)
 
         # Output projection
         attn_output = self.module.o_proj(attn_output)
+
+        if do_timing:
+            torch.cuda.synchronize()
+            DecodeTimingStats.attn_output_proj_ms += (time.perf_counter() - t0) * 1000
+
+        # Record total attention timing
+        if do_timing:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            DecodeTimingStats.record_attn(self.layer_idx, elapsed_ms)
 
         # Return None for kv_cache since it's managed by gpu_paged_kv_manager
         return attn_output, None, None
