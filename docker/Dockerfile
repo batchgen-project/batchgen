@@ -16,8 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim tmux htop tree silversearcher-ag lsof unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+# Install uv (with retry and proper error handling)
+RUN set -o pipefail && \
+    for i in 1 2 3 4 5; do \
+      curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh && break || \
+      { echo "Attempt $i failed, retrying in 10s..."; sleep 10; }; \
+    done && \
+    uv --version
 
     
 WORKDIR /root/moegen

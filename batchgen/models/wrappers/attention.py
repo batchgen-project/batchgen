@@ -214,6 +214,15 @@ class AttnWrapperBase(BaseModuleWrapper):
         else:
             result = self._forward_decode(hidden_states, **kwargs)
 
+        # Release buffer for non-persistent attention (following DeepSeek pattern)
+        # This allows the H2D worker to load the next layer's weights
+        if not self.persistent:
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
+
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx}] "
             f"Attn forward complete. Phase: {self.phase}"
