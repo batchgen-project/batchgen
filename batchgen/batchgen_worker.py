@@ -594,6 +594,16 @@ class BatchGenWorker:
 		except ImportError:
 			pass  # Not GPT-OSS or module not available
 
+	def _log_decode_timing(self):
+		"""Log decode timing stats if available (GPT-OSS specific)."""
+		try:
+			from batchgen.models.openai.gpt_oss_120b.wrappers import DecodeTimingStats
+			if DecodeTimingStats.enabled:
+				DecodeTimingStats.log_summary()
+				DecodeTimingStats.reset()  # Reset for next decode batch
+		except ImportError:
+			pass  # Not GPT-OSS or module not available
+
 	def set_watchdog(self, watchdog) -> None:
 		"""
 		Set the watchdog for stuck detection during inference.
@@ -4084,6 +4094,9 @@ class BatchGenWorker:
 				decoded_strings.append(decoded_str)
 			decode_time = time.perf_counter() - decode_start
 			logging.info(f"Detokenization complete: {len(decoded_strings)} sequences in {decode_time:.2f}s")
+
+			# Log decode timing stats (GPT-OSS specific)
+			self._log_decode_timing()
 
 		dist.barrier()
 		self._batch_completed = True

@@ -33,10 +33,12 @@ Uses FlashAttention when available for memory-efficient attention.
 Falls back to vanilla PyTorch for debugging/testing only.
 
 SINK TOKEN CONFIGURATION:
-- USE_VANILLA_FOR_SINKS=True: Use vanilla PyTorch with inline softmax_with_sinks (correct)
-- USE_VANILLA_FOR_SINKS=False: Use FlashAttention with sigmoid post-correction (may have issues)
+- USE_VANILLA_FOR_SINKS=False (default): Use FlashAttention with numerically stable
+  sigmoid post-correction (fast, handles padding correctly)
+- USE_VANILLA_FOR_SINKS=True: Use vanilla PyTorch with inline softmax_with_sinks
+  (slower, for debugging only)
 
-Set USE_VANILLA_FOR_SINKS=True to debug gibberish output issues.
+Set BATCHGEN_VANILLA_SINKS=1 environment variable to enable vanilla path.
 """
 
 import math
@@ -48,10 +50,11 @@ import torch.nn.functional as F
 
 from ..sink import softmax_with_sinks
 
-# Configuration: Use vanilla PyTorch for sinks to ensure correct inline softmax.
-# Set to False to use FlashAttention + sigmoid post-correction (faster but may have issues).
+# Configuration: Use vanilla PyTorch vs FlashAttention for sink attention.
+# - False (default): Use FlashAttention + numerically stable sigmoid post-correction (fast)
+# - True: Use vanilla PyTorch with inline softmax_with_sinks (slower, for debugging)
 # Can be overridden via environment variable: BATCHGEN_VANILLA_SINKS=1
-USE_VANILLA_FOR_SINKS = os.environ.get("BATCHGEN_VANILLA_SINKS", "1") == "1"
+USE_VANILLA_FOR_SINKS = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
 
 # Detect which flash attention version is available
 _USE_FA3 = False

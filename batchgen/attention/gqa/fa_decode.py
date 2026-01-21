@@ -4,10 +4,12 @@ Uses flash_attn_with_kvcache for efficient decode with paged attention.
 Supports both FA2 (Ampere) and FA3 (Hopper).
 
 SINK TOKEN CONFIGURATION:
-- USE_VANILLA_FOR_SINKS=True: Use vanilla PyTorch decode with inline softmax_with_sinks (correct)
-- USE_VANILLA_FOR_SINKS=False: Use FlashAttention with sigmoid post-correction (may have issues)
+- USE_VANILLA_FOR_SINKS=False (default): Use FlashAttention with numerically stable
+  sigmoid post-correction (fast, handles padding correctly)
+- USE_VANILLA_FOR_SINKS=True: Use vanilla PyTorch decode with inline softmax_with_sinks
+  (slower, for debugging only)
 
-Set USE_VANILLA_FOR_SINKS=True (default) to fix gibberish output issues.
+Set BATCHGEN_VANILLA_SINKS=1 environment variable to enable vanilla path.
 """
 
 import os
