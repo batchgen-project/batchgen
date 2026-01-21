@@ -209,6 +209,53 @@ class GptOssParallelStrategyManager:
 
         logging.info(f"Model skeleton loaded: {loaded_count} weights loaded, {missing_count} missing, {skipped_module_weights} skipped (will load via wrappers)")
 
+    def _load_attn_module(self):
+        """Load attention weights from core_engine for decode phase.
+
+        Called when attention is persistent (decode mode).
+        Loads weights directly to module parameters.
+
+        Following DeepSeek pattern where attention weights are pre-loaded
+        for decode phase instead of being fetched on-demand.
+        """
+        logging.info("Loading attention module weights...")
+        device = self.engine_config.Basic_Config.device_torch
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            attn_module = self.model.model.layers[layer_idx].self_attn
+            module_key = f"attn_{layer_idx}"
+
+            # Get weights from core_engine
+            tensors = self.core_engine.get_tensor(module_key)
+
+            # Load projection weights
+            if "q_proj.weight" in tensors:
+                attn_module.q_proj.weight.data = tensors["q_proj.weight"].to(device)
+            if "k_proj.weight" in tensors:
+                attn_module.k_proj.weight.data = tensors["k_proj.weight"].to(device)
+            if "v_proj.weight" in tensors:
+                attn_module.v_proj.weight.data = tensors["v_proj.weight"].to(device)
+            if "o_proj.weight" in tensors:
+                attn_module.o_proj.weight.data = tensors["o_proj.weight"].to(device)
+
+            # Load biases if present
+            if "q_proj.bias" in tensors:
+                attn_module.q_proj.bias.data = tensors["q_proj.bias"].to(device)
+            if "k_proj.bias" in tensors:
+                attn_module.k_proj.bias.data = tensors["k_proj.bias"].to(device)
+            if "v_proj.bias" in tensors:
+                attn_module.v_proj.bias.data = tensors["v_proj.bias"].to(device)
+            if "o_proj.bias" in tensors:
+                attn_module.o_proj.bias.data = tensors["o_proj.bias"].to(device)
+
+            # Load sink tokens
+            if "sinks" in tensors:
+                attn_module.sinks.data = tensors["sinks"].to(device)
+
+            logging.debug(f"Loaded attention weights for layer {layer_idx}")
+
+        logging.info(f"Loaded attention weights for {self.model_config.num_hidden_layers} layers")
+
     def _config_attn_module(self):
         """Configure attention modules with BatchGen wrappers.
 
@@ -396,7 +443,11 @@ class GptOssParallelStrategyManager:
         torch.cuda.empty_cache()
         self._load_model_skeleton()
 
-        log_gpu_memory("configure_decoding: After loading skeleton")
+        # Step 6.5: Load attention weights (persistent for decode)
+        # Following DeepSeek pattern where attention weights are pre-loaded
+        self._load_attn_module()
+
+        log_gpu_memory("configure_decoding: After loading skeleton and attention")
 
         # Step 7: Configure modules (all persistent for decode)
         self._config_attn_module()
