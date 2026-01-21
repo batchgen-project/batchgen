@@ -303,7 +303,7 @@ def mxfp4_dequantize(
     packed: torch.Tensor,
     scales: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
-    use_triton: bool = True
+    use_triton: bool = False  # Disabled: Triton 2D kernel has CUDA issues; use vectorized PyTorch
 ) -> torch.Tensor:
     """Dequantize MXFP4 packed tensor to the specified dtype.
 

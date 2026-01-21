@@ -118,10 +118,29 @@ class BatchGenServer:
 		if local_device_count == 0:
 			logging.error("No CUDA devices found. Exiting.")
 			exit(1)
-			
 
-		logging.info(f"Spawning {local_device_count} DDP workers...")
-		
+		# Respect user-specified world_size (following vLLM/SGLang best practice)
+		# Users should use CUDA_VISIBLE_DEVICES to limit visible GPUs
+		world_size = self.args.world_size
+		if world_size is None or world_size <= 0:
+			# Auto-detect only if not explicitly specified
+			world_size = local_device_count * self.args.nnodes
+
+		# Calculate local world size (workers per node)
+		local_world_size = world_size // self.args.nnodes
+
+		# Validate: can't spawn more workers than visible GPUs
+		if local_world_size > local_device_count:
+			raise ValueError(
+				f"world_size ({world_size}) requires {local_world_size} GPUs per node, "
+				f"but only {local_device_count} GPUs are visible. "
+				f"Use CUDA_VISIBLE_DEVICES to expose more GPUs."
+			)
+
+		logging.info(
+			f"Spawning {local_world_size} DDP workers (world_size={world_size}, nnodes={self.args.nnodes})"
+		)
+
 		self.batchgen_worker_args = BatchGenWorkerArgs(
 			model_name=self.args.model,
 			hf_cache_dir=self.args.hf_cache_dir,
@@ -129,7 +148,7 @@ class BatchGenServer:
 			converted_ckpt_dir=self.args.converted_ckpt_dir,
 			kv_dtype=self.args.kv_dtype,
 			dist_init_addr=self.args.dist_init_addr,
-			world_size=self.args.world_size,
+			world_size=world_size,
 			nnode_rank=self.args.node_rank,
 			nnodes=self.args.nnodes,
 			gpu_arch=self.args.gpu_arch,
@@ -155,7 +174,7 @@ class BatchGenServer:
 				self.response_queue,
 				self.batchgen_worker_args,
 			),
-			nprocs=local_device_count,
+			nprocs=local_world_size,  # Use world_size-derived count, not device_count
 			join=False,
 			daemon=True
 		)

@@ -310,12 +310,28 @@ class WorkerManager:
         if local_device_count == 0:
             raise RuntimeError("No CUDA devices found.")
 
-        logger.info("Spawning %s DDP workers", local_device_count)
-        world_size = self.args.world_size or (
-            local_device_count * self.args.nnodes
-        )
-        if world_size == 1 and local_device_count > 1:
+        # Respect user-specified world_size (following vLLM/SGLang best practice)
+        # Users should use CUDA_VISIBLE_DEVICES to limit visible GPUs
+        world_size = self.args.world_size
+        if world_size is None or world_size <= 0:
+            # Auto-detect only if not explicitly specified
             world_size = local_device_count * self.args.nnodes
+
+        # Calculate local world size (workers per node)
+        local_world_size = world_size // self.args.nnodes
+
+        # Validate: can't spawn more workers than visible GPUs
+        if local_world_size > local_device_count:
+            raise ValueError(
+                f"world_size ({world_size}) requires {local_world_size} GPUs per node, "
+                f"but only {local_device_count} GPUs are visible. "
+                f"Use CUDA_VISIBLE_DEVICES to expose more GPUs."
+            )
+
+        logger.info(
+            "Spawning %d DDP workers (world_size=%d, nnodes=%d)",
+            local_world_size, world_size, self.args.nnodes
+        )
 
         # Auto-detect GPU architecture if not specified
         gpu_arch = self.args.gpu_arch or detect_gpu_arch()
@@ -365,7 +381,7 @@ class WorkerManager:
                 args,
                 self._ready_event,
             ),
-            nprocs=local_device_count,
+            nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
             daemon=True,
         )

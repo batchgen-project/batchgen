@@ -341,6 +341,12 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             torch.cuda.synchronize()
             PrefillTimingStats.moe_load_ms += (time.perf_counter() - t0) * 1000
 
+        # Log dtype info for layers 0 and 1 (for debugging MXFP4 handling)
+        if self.layer_idx < 2:
+            logging.info(f"[Layer {self.layer_idx} Expert {self.expert_idx}] Module: {self.module_key}")
+            for name, tensor in weights.items():
+                logging.info(f"  {name}: shape={list(tensor.shape)}, dtype={tensor.dtype}")
+
         # Dequantize MXFP4 to BF16 (always needed)
         if do_timing:
             t0 = time.perf_counter()
@@ -1020,6 +1026,13 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # Load weights (includes sinks)
         if not self.persistent:
             weights = self.load_weights(self.module_key)
+
+            # Log dtype info for layers 0 and 1 (for debugging)
+            if self.layer_idx < 2:
+                logging.info(f"[Layer {self.layer_idx}] Module: {self.module_key}")
+                for name, tensor in weights.items():
+                    logging.info(f"  {name}: shape={list(tensor.shape)}, dtype={tensor.dtype}")
+
             dequant_weights = self.dequantize_weights(weights)
             self.apply_weights(dequant_weights)
 
