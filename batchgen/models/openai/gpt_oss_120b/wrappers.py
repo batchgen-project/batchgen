@@ -447,6 +447,12 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             else:
                 # Move to device (creates copy)
                 result[name] = tensor.to(device, non_blocking=True)
+
+        # CRITICAL: Sync to ensure H2D transfer is complete before weights are used
+        # Without this, non_blocking=True could cause race conditions where
+        # dequantization reads partially transferred (corrupted) data
+        torch.cuda.synchronize()
+
         self.stored_mxfp4_weights = result
 
     def _clear_stored_mxfp4_weights(self):
@@ -462,15 +468,43 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             self.stored_mxfp4_weights = None
 
     def _get_stored_mxfp4_weights(self) -> Dict[str, torch.Tensor]:
-        """Get stored MXFP4 weights for persistent mode.
+        """Get MXFP4 weights for persistent mode.
+
+        Returns dict from cached pointers (registered via _register_mxfp4_weights).
+        If using legacy _pre_store_mxfp4_weights, falls back to stored_mxfp4_weights.
 
         Returns:
             Dict containing packed weights and scales (already on GPU)
         """
+        # Check if using new registered pointer pattern
+        if hasattr(self, 'mxfp4_gate_packed'):
+            weights = {
+                "gate_proj.weight": self.mxfp4_gate_packed,
+                "gate_proj.weight_scales": self.mxfp4_gate_scales,
+                "up_proj.weight": self.mxfp4_up_packed,
+                "up_proj.weight_scales": self.mxfp4_up_scales,
+                "down_proj.weight": self.mxfp4_down_packed,
+                "down_proj.weight_scales": self.mxfp4_down_scales,
+            }
+
+            # Add biases if present
+            if self.mxfp4_gate_bias is not None:
+                weights["gate_proj.bias"] = self.mxfp4_gate_bias
+            if self.mxfp4_up_bias is not None:
+                weights["up_proj.bias"] = self.mxfp4_up_bias
+            if self.mxfp4_down_bias is not None:
+                weights["down_proj.bias"] = self.mxfp4_down_bias
+
+            return weights
+
+        # Fallback to legacy stored_mxfp4_weights dict
         return self.stored_mxfp4_weights
 
     def _pre_store_mxfp4_weights(self):
         """Load MXFP4 weights from core_engine and store on GPU.
+
+        DEPRECATED: Use _register_mxfp4_weights() instead for decode phase.
+        This method fetches from host each time, which is inefficient.
 
         Called during initialization when persistent=True.
         Weights remain in MXFP4 format; dequantization happens during forward.
@@ -481,6 +515,31 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         logging.debug(
             f"[Layer {self.layer_idx} Expert {self.expert_idx}] "
             f"Pre-stored MXFP4 weights for persistent mode"
+        )
+
+    def _register_mxfp4_weights(self):
+        """Cache pointers to MXFP4 weights already loaded in model.
+
+        Called when persistent=True after weights are loaded by _load_expert_module().
+        Following DeepSeek pattern: weights loaded to model attrs ONCE,
+        wrapper caches pointers for fast O(1) access during forward.
+        """
+        # Cache pointers to MXFP4 weights stored in model by _load_expert_module()
+        self.mxfp4_gate_packed = self.module.mxfp4_gate_packed
+        self.mxfp4_gate_scales = self.module.mxfp4_gate_scales
+        self.mxfp4_up_packed = self.module.mxfp4_up_packed
+        self.mxfp4_up_scales = self.module.mxfp4_up_scales
+        self.mxfp4_down_packed = self.module.mxfp4_down_packed
+        self.mxfp4_down_scales = self.module.mxfp4_down_scales
+
+        # Cache bias pointers if present
+        self.mxfp4_gate_bias = getattr(self.module, 'mxfp4_gate_bias', None)
+        self.mxfp4_up_bias = getattr(self.module, 'mxfp4_up_bias', None)
+        self.mxfp4_down_bias = getattr(self.module, 'mxfp4_down_bias', None)
+
+        logging.debug(
+            f"[Layer {self.layer_idx} Expert {self.expert_idx}] "
+            f"Registered MXFP4 weight pointers for persistent mode"
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

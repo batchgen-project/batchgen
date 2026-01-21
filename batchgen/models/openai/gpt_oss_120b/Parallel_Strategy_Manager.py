@@ -137,6 +137,13 @@ class GptOssParallelStrategyManager:
         self._config_attn_module()
         timings["attn_config"] = time.perf_counter() - step_start
 
+        # Step 5.5: Load expert MXFP4 weights if persistent (offloading disabled)
+        # Must be called before _config_expert_module() so model attrs exist for registration
+        if not experts_need_offloading:
+            step_start = time.perf_counter()
+            self._load_expert_module()
+            timings["expert_load"] = time.perf_counter() - step_start
+
         step_start = time.perf_counter()
         self._config_expert_module()
         timings["expert_config"] = time.perf_counter() - step_start
@@ -256,6 +263,49 @@ class GptOssParallelStrategyManager:
 
         logging.info(f"Loaded attention weights for {self.model_config.num_hidden_layers} layers")
 
+    def _load_expert_module(self):
+        """Load MXFP4 expert weights to model for decode phase.
+
+        Following DeepSeek pattern: load weights to model attributes ONCE,
+        then wrapper caches pointers for fast access during forward.
+
+        For MXFP4 format, we store packed weights and scales as module attributes
+        (can't use .weight.data directly since MXFP4 is packed format).
+        """
+        logging.info("Loading MXFP4 expert module weights...")
+        device = self.engine_config.Basic_Config.device_torch
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            for expert_idx in range(self.model_config.num_local_experts):
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+
+                # Get MXFP4 weights from Weights_Storage
+                tensors = self.core_engine.get_tensor(module_key)
+
+                expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+
+                # Store MXFP4 packed weights as module attributes
+                expert.mxfp4_gate_packed = tensors["gate_proj.weight"].to(device)
+                expert.mxfp4_gate_scales = tensors["gate_proj.weight_scales"].to(device)
+                expert.mxfp4_up_packed = tensors["up_proj.weight"].to(device)
+                expert.mxfp4_up_scales = tensors["up_proj.weight_scales"].to(device)
+                expert.mxfp4_down_packed = tensors["down_proj.weight"].to(device)
+                expert.mxfp4_down_scales = tensors["down_proj.weight_scales"].to(device)
+
+                # Handle biases if present
+                if "gate_proj.bias" in tensors:
+                    expert.mxfp4_gate_bias = tensors["gate_proj.bias"].to(device)
+                if "up_proj.bias" in tensors:
+                    expert.mxfp4_up_bias = tensors["up_proj.bias"].to(device)
+                if "down_proj.bias" in tensors:
+                    expert.mxfp4_down_bias = tensors["down_proj.bias"].to(device)
+
+        # Sync to ensure all H2D transfers complete
+        torch.cuda.synchronize()
+
+        total_experts = self.model_config.num_hidden_layers * self.model_config.num_local_experts
+        logging.info(f"Loaded MXFP4 expert weights for all {total_experts} experts")
+
     def _config_attn_module(self):
         """Configure attention modules with BatchGen wrappers.
 
@@ -326,9 +376,10 @@ class GptOssParallelStrategyManager:
                     persistent=persistent,
                 )
 
-                # Pre-store MXFP4 weights on GPU for persistent experts
+                # Register MXFP4 weight pointers for persistent experts
+                # (Weights already loaded to model attrs by _load_expert_module())
                 if persistent:
-                    wrapped_expert._pre_store_mxfp4_weights()
+                    wrapped_expert._register_mxfp4_weights()
                     persistent_count += 1
                 else:
                     dynamic_count += 1
@@ -447,7 +498,11 @@ class GptOssParallelStrategyManager:
         # Following DeepSeek pattern where attention weights are pre-loaded
         self._load_attn_module()
 
-        log_gpu_memory("configure_decoding: After loading skeleton and attention")
+        # Step 6.6: Load expert MXFP4 weights (persistent for decode)
+        # Following DeepSeek pattern: load to model attrs, wrapper caches pointers
+        self._load_expert_module()
+
+        log_gpu_memory("configure_decoding: After loading skeleton, attention, and experts")
 
         # Step 7: Configure modules (all persistent for decode)
         self._config_attn_module()
