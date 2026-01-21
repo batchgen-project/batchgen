@@ -210,11 +210,29 @@ class GptOssParallelStrategyManager:
         logging.info(f"Model skeleton loaded: {loaded_count} weights loaded, {missing_count} missing, {skipped_module_weights} skipped (will load via wrappers)")
 
     def _config_attn_module(self):
-        """Configure attention modules with BatchGen wrappers."""
+        """Configure attention modules with BatchGen wrappers.
+
+        Following DeepSeek pattern:
+        - persistent = module_key NOT IN weight_copy_task
+        - In prefill: all modules in weight_copy_task → persistent=False → load from buffer
+        - In decode: empty weight_copy_task → persistent=True → pre-loaded on GPU
+        """
         logging.info("Configuring attention modules...")
+
+        persistent_count = 0
+        dynamic_count = 0
 
         for layer_idx in range(self.model_config.num_hidden_layers):
             attn = self.model.model.layers[layer_idx].self_attn
+            module_key = f"attn_{layer_idx}"
+
+            # persistent = NOT IN weight_copy_task (following DeepSeek pattern)
+            persistent = module_key not in self.weight_copy_task.get("attn", [])
+
+            if persistent:
+                persistent_count += 1
+            else:
+                dynamic_count += 1
 
             # Wrap attention for BatchGen execution
             # GptOssAttnWrapper handles GQA and alternating sliding/full attention
@@ -224,10 +242,14 @@ class GptOssParallelStrategyManager:
                 core_engine=self.core_engine,
                 engine_config=self.engine_config,
                 model_config=self.model_config,
+                persistent=persistent,  # Pass calculated persistent
             )
             self.model.model.layers[layer_idx].self_attn = wrapped_attn
 
-        logging.info(f"Configured {self.model_config.num_hidden_layers} attention modules")
+        logging.info(
+            f"Configured {self.model_config.num_hidden_layers} attention modules "
+            f"({persistent_count} persistent, {dynamic_count} dynamic)"
+        )
 
     def _config_expert_module(self):
         """Configure expert modules with MXFP4 dequantization."""
@@ -278,7 +300,11 @@ class GptOssParallelStrategyManager:
         # LM head is in BF16, no special handling needed for MXFP4
 
     def configure_decoding(self, padding_bsz=None, comm=None) -> Tuple:
-        """Configure model for decoding phase.
+        """Configure model for decoding phase (mode 3 + EP-offloading disabled).
+
+        Following DeepSeek pattern:
+        - In decode: weight_copy_task is EMPTY → all modules persistent
+        - All weights are pre-loaded on GPU, no buffer loading needed
 
         Args:
             padding_bsz: Maximum batch size per rank (unused for single GPU)
@@ -286,10 +312,30 @@ class GptOssParallelStrategyManager:
 
         Returns:
             Tuple of (model, weight_copy_task)
-
-        Same as prefill for GPT-OSS on single GPU.
         """
-        return self.configure_prefill()
+        logging.info("Configuring model for decoding phase...")
+        self.loaded_model_config.phase = "decode"
+
+        # For decode with mode 3 and no EP-offloading: empty weight_copy_task
+        # All modules are persistent (weights stay on GPU)
+        self.weight_copy_task = {
+            "attn": [],
+            "routed_expert": [],
+        }
+
+        # Re-configure modules with updated persistent settings
+        # Since weight_copy_task is empty, all modules will be persistent=True
+        self._config_attn_module()
+        self._config_expert_module()
+
+        logging.info(
+            f"Decoding configuration complete: "
+            f"attn_tasks={len(self.weight_copy_task['attn'])}, "
+            f"expert_tasks={len(self.weight_copy_task['routed_expert'])} "
+            f"(all modules persistent)"
+        )
+
+        return self.model, self.weight_copy_task
 
     def get_weight_copy_task(self) -> Dict[str, List[str]]:
         """Return the weight copy task mapping."""

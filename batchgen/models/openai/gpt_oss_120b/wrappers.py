@@ -427,6 +427,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
         core_engine,
         engine_config,
         model_config,
+        persistent: bool = True,  # Default persistent; caller overrides based on weight_copy_task
     ):
         """Initialize GPT-OSS attention wrapper.
 
@@ -436,11 +437,13 @@ class GptOssAttnWrapper(AttnWrapperBase):
             core_engine: BatchGen core engine
             engine_config: Engine configuration
             model_config: Model configuration
+            persistent: If True, weights are pre-loaded on GPU (no buffer fetch).
+                       If False, load from buffer each forward.
         """
         # GPT-OSS attention is BF16, no dequantization needed
         super().__init__(
             module, layer_idx, core_engine, engine_config, model_config,
-            persistent=False, weight_dequant_scale=None  # Load weights each forward
+            persistent=persistent, weight_dequant_scale=None
         )
 
         # Architecture parameters
