@@ -484,14 +484,16 @@ class GptOss_Parameter_Server:
 
         # DEBUG: Print BEFORE the early return check
         if layer_idx == 0:
-            print(f"\n[DEBUG] _convert_layer called for layer {layer_idx}")
-            print(f"[DEBUG] output_file: {output_file}")
-            print(f"[DEBUG] output_file exists: {os.path.exists(output_file)}")
-            print(f"[DEBUG] tensor_to_file has {len(tensor_to_file)} keys")
+            import sys
+            print(f"\n[DEBUG] _convert_layer called for layer {layer_idx}", flush=True)
+            print(f"[DEBUG] output_file: {output_file}", flush=True)
+            print(f"[DEBUG] output_file exists: {os.path.exists(output_file)}", flush=True)
+            print(f"[DEBUG] tensor_to_file has {len(tensor_to_file)} keys", flush=True)
+            sys.stdout.flush()
 
         if os.path.exists(output_file):
             if layer_idx == 0:
-                print(f"[DEBUG] Layer {layer_idx} SKIPPED - file already exists!")
+                print(f"[DEBUG] Layer {layer_idx} SKIPPED - file already exists!", flush=True)
             logging.debug(f"Layer {layer_idx} already converted, skipping")
             return
 
