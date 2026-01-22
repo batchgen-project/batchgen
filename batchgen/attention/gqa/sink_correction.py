@@ -50,6 +50,8 @@ def apply_sink_correction(
     Returns:
         Corrected output with same shape as input.
     """
+    global _debug_call_count  # Declare global at function start
+
     nheads = sinks.shape[0]
     sinks = sinks.float()  # Ensure float32 for numerical stability
 
@@ -86,7 +88,6 @@ def apply_sink_correction(
         factor = torch.sigmoid(diff_clamped)  # (total_tokens, nheads)
 
         # DEBUG: Print sink correction details for prefill
-        global _debug_call_count
         if os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1" and _debug_call_count < 3:
             _debug_call_count += 1
             with torch.no_grad():
@@ -130,7 +131,6 @@ def apply_sink_correction(
         factor = torch.sigmoid(diff_clamped)  # (batch, nheads, seqlen)
 
         # DEBUG: Print sink correction details
-        global _debug_call_count
         if os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1" and _debug_call_count < 5:
             _debug_call_count += 1
             with torch.no_grad():
