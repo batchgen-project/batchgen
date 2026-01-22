@@ -79,6 +79,9 @@ def mxfp4_dequantize_reference(
     # scales shape: [..., N//32], unpacked shape: [..., N]
     # Expand scales to match unpacked: each scale repeats 32 times
     exponents = scales.to(torch.int32) - 127
+    # Clamp to valid float32 exponent range to prevent overflow/underflow
+    # (matches Triton kernel clamping for numerical consistency)
+    exponents = exponents.clamp(min=-126, max=127)
 
     # Broadcast scales: [..., N//32] -> [..., N]
     # Each scale value is used for 32 consecutive elements

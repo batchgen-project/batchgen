@@ -238,7 +238,8 @@ class GptOssAttention(nn.Module):
         self.sliding_window = config.sliding_window if self.is_sliding else 0
 
         # Sink tokens: learnable per-head parameters
-        self.sinks = nn.Parameter(torch.empty(self.num_heads, dtype=torch.bfloat16))
+        # NOTE: Must be zeros (not empty) - uninitialized values corrupt attention
+        self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.bfloat16))
 
         # Projections
         self.q_proj = nn.Linear(
