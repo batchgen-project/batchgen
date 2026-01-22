@@ -1389,6 +1389,25 @@ class GptOssAttnWrapper(AttnWrapperBase):
         num_sequences = AttnWrapperBase.prepack_num_sequences
         seq_lengths = AttnWrapperBase.prepack_seq_lengths
 
+        # DEBUG: Check input hidden_states before projection
+        if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
+            print(f"\n[PREFILL L0] === INPUT HIDDEN STATES DEBUG ===")
+            print(f"[PREFILL L0] hidden_states_2d.shape = {hidden_states_2d.shape}")
+            print(f"[PREFILL L0] cu_seqlens = {cu_seqlens.tolist() if cu_seqlens is not None else 'None'}")
+            if cu_seqlens is not None and len(cu_seqlens) >= 3:
+                # Check hidden states at start of each sequence
+                for i in range(min(3, num_sequences)):
+                    s_idx = cu_seqlens[i].item()
+                    h_sample = hidden_states_2d[s_idx, :4].cpu().tolist()
+                    print(f"[PREFILL L0] seq{i}: hidden[{s_idx},:4] = {h_sample}")
+                # Check if inputs differ
+                h0 = hidden_states_2d[cu_seqlens[0].item(), :4].cpu().tolist()
+                h1 = hidden_states_2d[cu_seqlens[1].item(), :4].cpu().tolist()
+                if h0 == h1:
+                    print(f"[PREFILL L0] *** WARNING: seq0 and seq1 have IDENTICAL hidden_states at position 0! ***")
+                else:
+                    print(f"[PREFILL L0] OK: seq0 and seq1 have DIFFERENT hidden_states")
+
         # Project Q, K, V in varlen format
         # hidden_states_2d: [total_tokens, hidden_size]
         query = self.module.q_proj(hidden_states_2d)  # [total_tokens, num_heads * head_dim]
@@ -1399,6 +1418,19 @@ class GptOssAttnWrapper(AttnWrapperBase):
         query = query.view(total_tokens, self.num_heads, self.head_dim)
         key = key.view(total_tokens, self.num_kv_heads, self.head_dim)
         value = value.view(total_tokens, self.num_kv_heads, self.head_dim)
+
+        # DEBUG: Check K after projection, before RoPE
+        if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
+            print(f"\n[PREFILL L0] === AFTER K_PROJ (before RoPE) ===")
+            if cu_seqlens is not None and num_sequences >= 2:
+                k0_pre = key[cu_seqlens[0].item(), 0, :4].cpu().tolist()
+                k1_pre = key[cu_seqlens[1].item(), 0, :4].cpu().tolist()
+                print(f"[PREFILL L0] K_pre_rope seq0[0,:4] = {k0_pre}")
+                print(f"[PREFILL L0] K_pre_rope seq1[0,:4] = {k1_pre}")
+                if k0_pre == k1_pre:
+                    print(f"[PREFILL L0] *** K already IDENTICAL before RoPE! ***")
+                else:
+                    print(f"[PREFILL L0] OK: K differs before RoPE")
 
         # Apply RoPE per sequence using position_ids
         if position_ids is not None:
@@ -1424,6 +1456,24 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 k1 * cos_half - k2 * sin_half,
                 k2 * cos_half + k1 * sin_half
             ], dim=-1)
+
+            # DEBUG: Check K after RoPE
+            if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
+                print(f"\n[PREFILL L0] === AFTER RoPE ===")
+                print(f"[PREFILL L0] position_ids[:10] = {position_ids[:10].cpu().tolist()}")
+                print(f"[PREFILL L0] position_ids at seq boundaries:")
+                for i in range(min(3, num_sequences)):
+                    s_idx = cu_seqlens[i].item()
+                    print(f"[PREFILL L0]   position_ids[{s_idx}] = {position_ids[s_idx].item()}")
+                if num_sequences >= 2:
+                    k0_post = key[cu_seqlens[0].item(), 0, :4].cpu().tolist()
+                    k1_post = key[cu_seqlens[1].item(), 0, :4].cpu().tolist()
+                    print(f"[PREFILL L0] K_post_rope seq0[0,:4] = {k0_post}")
+                    print(f"[PREFILL L0] K_post_rope seq1[0,:4] = {k1_post}")
+                    if k0_post == k1_post:
+                        print(f"[PREFILL L0] *** K became IDENTICAL after RoPE! ***")
+                    else:
+                        print(f"[PREFILL L0] OK: K differs after RoPE")
 
         # Use gqa_prefill_fa for varlen attention with sink correction
         # q, k, v: [total_tokens, num_heads, head_dim]
@@ -1451,6 +1501,28 @@ class GptOssAttnWrapper(AttnWrapperBase):
         global_sequence_ids = AttnWrapperBase.cur_batch
 
         torch.cuda.current_stream().synchronize()  # Make sure KV is ready
+
+        # DEBUG: Check if K values differ across sequences before offload
+        if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
+            print(f"\n[PREFILL L0] === KV OFFLOAD DEBUG ===")
+            print(f"[PREFILL L0] cu_seqlens = {cu_seqlens.tolist()}")
+            print(f"[PREFILL L0] global_sequence_ids = {global_sequence_ids}")
+            print(f"[PREFILL L0] key.shape = {key.shape}")
+            print(f"[PREFILL L0] num_sequences = {num_sequences}")
+            # Check first 4 K values for each sequence at position 0
+            for i in range(min(3, num_sequences)):
+                s_idx = cu_seqlens[i].item()
+                e_idx = cu_seqlens[i+1].item()
+                seq_k = key[s_idx:e_idx]
+                print(f"[PREFILL L0] seq{i}: range=[{s_idx}:{e_idx}], seq_k.shape={seq_k.shape}, K[0,0,:4]={seq_k[0,0,:4].cpu().tolist()}")
+            # Check if any two sequences have different K at position 0
+            if num_sequences >= 2:
+                k0 = key[cu_seqlens[0].item(), 0, :4].cpu().tolist()
+                k1 = key[cu_seqlens[1].item(), 0, :4].cpu().tolist()
+                if k0 == k1:
+                    print(f"[PREFILL L0] *** WARNING: seq0 and seq1 have IDENTICAL K at position 0! ***")
+                else:
+                    print(f"[PREFILL L0] OK: seq0 and seq1 have DIFFERENT K at position 0")
 
         # For GQA, we store both K and V (unlike MLA which only stores K)
         # Split by cu_seqlens and offload each sequence
