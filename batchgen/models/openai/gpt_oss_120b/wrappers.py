@@ -688,6 +688,8 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         """
         from batchgen.quantization.mxfp4 import mxfp4_dequantize
 
+        debug_expert = os.environ.get("BATCHGEN_DEBUG_EXPERT", "0") == "1"
+
         # Ensure 2D input
         x = hidden_states
         if x.dim() == 3:
@@ -709,6 +711,20 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             weights["down_proj.weight_scales"],
             dtype=torch.bfloat16
         )
+
+        # Debug: Print dequantized weight statistics
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0 REF] === DEQUANTIZED WEIGHT STATS ===")
+                print(f"[EXPERT L0 E0 REF] gate_weight: shape={gate_weight.shape}, std={gate_weight.float().std().item():.6f}, max={gate_weight.abs().max().item():.4f}")
+                print(f"[EXPERT L0 E0 REF] up_weight: shape={up_weight.shape}, std={up_weight.float().std().item():.6f}, max={up_weight.abs().max().item():.4f}")
+                print(f"[EXPERT L0 E0 REF] down_weight: shape={down_weight.shape}, std={down_weight.float().std().item():.6f}, max={down_weight.abs().max().item():.4f}")
+                print(f"[EXPERT L0 E0 REF] input x: std={x.float().std().item():.4f}, max={x.abs().max().item():.4f}")
+                # Verify gate and up are different (they should be from different mlp1 rows)
+                print(f"[EXPERT L0 E0 REF] gate_weight[0,:8]: {gate_weight[0,:8].tolist()}")
+                print(f"[EXPERT L0 E0 REF] up_weight[0,:8]: {up_weight[0,:8].tolist()}")
+                same = torch.allclose(gate_weight, up_weight, atol=1e-4)
+                print(f"[EXPERT L0 E0 REF] gate==up? {same} (should be False - they're from different mlp1 rows)")
 
         # Stage 1: Gate and Up projections
         gate_out = torch.mm(x, gate_weight.T)
