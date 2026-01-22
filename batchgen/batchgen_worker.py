@@ -5656,6 +5656,7 @@ class BatchGenWorker:
 		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 		AttnWrapperBase.host_paged_kv_worker_view = worker_view
+		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
@@ -5906,7 +5907,22 @@ class BatchGenWorker:
 					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
 					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
 					Attn_Wrapper.max_seqlen = max_ctx
-					
+
+					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+					# Without this, GPT-OSS attention uses stale cache_seqlens (always None),
+					# causing same KV positions to be read/written every decode step.
+					AttnWrapperBase.attention_mask = attention_mask
+					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+					AttnWrapperBase.max_seqlen = max_ctx
+
+					# DEBUG: Print cache_seqlens and input tokens
+					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
+						print(f"\n[DECODE DEBUG] Iteration {local_iteration}")
+						print(f"[DECODE DEBUG] cache_seqlens[:5]: {Attn_Wrapper.cache_seqlens[:5].tolist()}")
+						print(f"[DECODE DEBUG] position_ids[:5]: {Attn_Wrapper.position_ids[:5].flatten().tolist()}")
+						print(f"[DECODE DEBUG] new_tokens[:5]: {new_tokens[:5].flatten().tolist()}")
+
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
 				else:
@@ -5916,9 +5932,16 @@ class BatchGenWorker:
 					Attn_Wrapper.max_seqlen = 0
 					Attn_Wrapper.cur_batch = []
 					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+					# Also bind empty state to AttnWrapperBase for GPT-OSS
+					AttnWrapperBase.attention_mask = Attn_Wrapper.attention_mask
+					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+					AttnWrapperBase.max_seqlen = 0
+					AttnWrapperBase.cur_batch = []
 				
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+					AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 					# OPTIMIZATION: Only check page table if not already verified this batch
 					# Between boundaries, batch doesn't change so page table stays valid
@@ -5949,6 +5972,10 @@ class BatchGenWorker:
 				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
+
+			# DEBUG: Print sampled tokens
+			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
+				print(f"[DECODE DEBUG] sampled_tokens[:5]: {new_tokens[:5].flatten().tolist()}")
 
 			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
 			# This avoids N GPU synchronizations which cause heavy CPU overhead
@@ -5996,6 +6023,11 @@ class BatchGenWorker:
 		# Also cleanup AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 		AttnWrapperBase.gpu_paged_kv_manager = None
 		AttnWrapperBase.host_paged_kv_worker_view = None
+		AttnWrapperBase.cache_seqlens = None
+		AttnWrapperBase.attention_mask = None
+		AttnWrapperBase.position_ids = None
+		AttnWrapperBase.max_seqlen = None
+		AttnWrapperBase.cur_batch = None
 		
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG

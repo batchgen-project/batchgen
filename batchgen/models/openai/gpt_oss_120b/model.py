@@ -634,6 +634,17 @@ class GptOssModel(nn.Module):
 
             hidden_states = layer_outputs[0]
 
+            # Debug: Track hidden state statistics per layer
+            if os.environ.get("BATCHGEN_DEBUG_HIDDEN", "0") == "1":
+                with torch.no_grad():
+                    h_min = hidden_states.min().item()
+                    h_max = hidden_states.max().item()
+                    h_mean = hidden_states.float().mean().item()
+                    h_std = hidden_states.float().std().item()
+                    has_nan = torch.isnan(hidden_states).any().item()
+                    has_inf = torch.isinf(hidden_states).any().item()
+                    print(f"[Layer {idx}] hidden: min={h_min:.4f}, max={h_max:.4f}, mean={h_mean:.6f}, std={h_std:.4f}, nan={has_nan}, inf={has_inf}")
+
             if use_cache:
                 next_cache += (layer_outputs[2],)
 
