@@ -110,21 +110,25 @@ def main():
             print(f"Expert 0 blocks shape: {expert0_blocks.shape}")
             print(f"Expert 0 scales shape: {expert0_scales.shape}")
 
-            # Take first group
-            group0_blocks = expert0_blocks[0]  # [B] = [16 bytes]
-            group0_scale = expert0_scales[0]    # scalar
+            # Shape is [5760, 90, 16] for blocks, [5760, 90] for scales
+            # 5760 = intermediate_size * 2 (rows)
+            # 90 = hidden_size / 32 (groups, each group has 32 elements)
+            # 16 = bytes per group (32 nibbles)
 
-            print(f"\nGroup 0:")
-            print(f"  blocks (16 bytes): {group0_blocks.tolist()}")
-            print(f"  scale: {group0_scale.item()}")
-            print(f"  exponent: {group0_scale.item() - 127}")
+            # Take first row, first group
+            row0_group0_blocks = expert0_blocks[0, 0]  # [16 bytes]
+            row0_group0_scale = expert0_scales[0, 0]   # scalar
+
+            print(f"\nRow 0, Group 0:")
+            print(f"  blocks (16 bytes): {row0_group0_blocks.tolist()}")
+            print(f"  scale: {row0_group0_scale.item()}")
+            print(f"  exponent: {row0_group0_scale.item() - 127}")
 
             # Manual dequant of this group
-            lut = torch.tensor(FP4_VALUES, dtype=torch.float32)
-            exp = group0_scale.to(torch.int32).item() - 127
+            exp = row0_group0_scale.to(torch.int32).item() - 127
 
             values = []
-            for byte in group0_blocks:
+            for byte in row0_group0_blocks:
                 byte_val = byte.item()
                 lo = byte_val & 0x0F
                 hi = byte_val >> 4
@@ -132,7 +136,7 @@ def main():
                 val_hi = FP4_VALUES[hi] * (2.0 ** exp)
                 values.extend([val_lo, val_hi])
 
-            print(f"\n  Dequantized values (first 32 elements of expert 0):")
+            print(f"\n  Dequantized values (first 32 elements of row 0):")
             print(f"  {values}")
             print(f"  min: {min(values):.6f}, max: {max(values):.6f}")
 
