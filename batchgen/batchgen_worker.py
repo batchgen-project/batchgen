@@ -3914,7 +3914,12 @@ class BatchGenWorker:
 							else:
 								self.prefill(local_prefill_indices)
 						prefill_time += time.perf_counter() - prefill_start
-					
+
+						# CRITICAL: Wait for all async KV offloads to complete before decode
+						# The async_offload_layer_kv_to_host() calls during prefill are fire-and-forget.
+						# Decode reads KV from host, so offloads MUST complete first.
+						torch.cuda.synchronize(self.torch_device)
+
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
