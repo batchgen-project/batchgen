@@ -1094,15 +1094,13 @@ class GptOssAttnWrapper(AttnWrapperBase):
             cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
 
             # Apply RoPE at each sequence's current position (cache_seqlens - 1)
-            if position_ids is not None:
-                cos = cos[position_ids]
-                sin = sin[position_ids]
-            else:
-                # Use current_token_position (cache_seqlens - 1) for RoPE
-                # Indexing by [batch] tensor gives [batch, head_dim]
-                # Need to add seq dimension: [batch, head_dim] -> [batch, 1, head_dim]
-                cos = cos[current_token_position].unsqueeze(1)
-                sin = sin[current_token_position].unsqueeze(1)
+            # CRITICAL: Always use current_token_position from cache_seqlens, ignore model's position_ids.
+            # The model may generate wrong position_ids (e.g., [[0]]) if not properly configured.
+            # Using cache_seqlens ensures correctness regardless of what the model passes.
+            # Indexing by [batch] tensor gives [batch, head_dim]
+            # Need to add seq dimension: [batch, head_dim] -> [batch, 1, head_dim]
+            cos = cos[current_token_position].unsqueeze(1)
+            sin = sin[current_token_position].unsqueeze(1)
         else:
             # Fallback if cache_seqlens not set
             cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
