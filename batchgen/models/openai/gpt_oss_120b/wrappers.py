@@ -745,6 +745,8 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         """
         from batchgen.moe.mxfp4_grouped_gemm import mxfp4_linear
 
+        debug_expert = os.environ.get("BATCHGEN_DEBUG_EXPERT", "0") == "1"
+
         # Stage 1: Gate and Up projections (fused dequant + GEMM)
         gate_out = mxfp4_linear(
             hidden_states,
@@ -759,10 +761,22 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             weights.get("up_proj.bias"),
         )
 
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0] gate_out: std={gate_out.float().std().item():.4f}, max={gate_out.abs().max().item():.4f}")
+                print(f"[EXPERT L0 E0] up_out: std={up_out.float().std().item():.4f}, max={up_out.abs().max().item():.4f}")
+                # Check weight scales
+                gate_scales = weights["gate_proj.weight_scales"]
+                print(f"[EXPERT L0 E0] gate_scales: min={gate_scales.min().item():.6f}, max={gate_scales.max().item():.6f}, mean={gate_scales.mean().item():.6f}")
+
         # Stage 2: OpenAI SwiGLU activation (FIXED!)
         # Formula: gate * sigmoid(1.702 * gate) * (up + 1)
         # NOT the standard F.silu(gate) * up
         intermediate = openai_swiglu(gate_out, up_out, alpha=1.702, limit=7.0)
+
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0] intermediate (after SwiGLU): std={intermediate.float().std().item():.4f}, max={intermediate.abs().max().item():.4f}")
 
         # Stage 3: Down projection (fused dequant + GEMM)
         result = mxfp4_linear(
@@ -771,6 +785,12 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             weights["down_proj.weight_scales"],
             weights.get("down_proj.bias"),
         )
+
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0] result (after down_proj): std={result.float().std().item():.4f}, max={result.abs().max().item():.4f}")
+                down_scales = weights["down_proj.weight_scales"]
+                print(f"[EXPERT L0 E0] down_scales: min={down_scales.min().item():.6f}, max={down_scales.max().item():.6f}, mean={down_scales.mean().item():.6f}")
 
         return result
 
