@@ -710,16 +710,6 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             dtype=torch.bfloat16
         )
 
-        # Log weight statistics after dequantization (for debugging numerical issues)
-        if self.layer_idx == 0:  # Only log for first layer
-            logging.info(f"[Layer {self.layer_idx} Expert {self.expert_idx}] WEIGHT STATS:")
-            logging.info(f"  x input: shape={x.shape}, min={x.min():.4f}, max={x.max():.4f}, mean={x.float().mean():.4f}")
-            logging.info(f"  gate_weight: shape={gate_weight.shape}, min={gate_weight.min():.4f}, max={gate_weight.max():.4f}, mean={gate_weight.float().mean():.4f}")
-            logging.info(f"  up_weight: shape={up_weight.shape}, min={up_weight.min():.4f}, max={up_weight.max():.4f}")
-            logging.info(f"  down_weight: shape={down_weight.shape}, min={down_weight.min():.4f}, max={down_weight.max():.4f}")
-            # Check for NaN/Inf
-            logging.info(f"  any_nan: gate={torch.isnan(gate_weight).any()}, up={torch.isnan(up_weight).any()}, down={torch.isnan(down_weight).any()}")
-
         # Stage 1: Gate and Up projections
         gate_out = torch.mm(x, gate_weight.T)
         if weights.get("gate_proj.bias") is not None:
@@ -729,26 +719,14 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         if weights.get("up_proj.bias") is not None:
             up_out = up_out + weights["up_proj.bias"]
 
-        # Log activation statistics (for debugging numerical issues)
-        if self.layer_idx == 0:
-            logging.info(f"[Layer {self.layer_idx} Expert {self.expert_idx}] ACTIVATION STATS:")
-            logging.info(f"  gate_out: min={gate_out.min():.4f}, max={gate_out.max():.4f}, any_nan={torch.isnan(gate_out).any()}")
-            logging.info(f"  up_out: min={up_out.min():.4f}, max={up_out.max():.4f}, any_nan={torch.isnan(up_out).any()}")
-
         # Stage 2: OpenAI SwiGLU activation (CRITICAL!)
         # Formula: gate * sigmoid(1.702 * gate) * (up + 1)
         intermediate = openai_swiglu(gate_out, up_out, alpha=1.702, limit=7.0)
-
-        if self.layer_idx == 0:
-            logging.info(f"  intermediate (after SwiGLU): min={intermediate.min():.4f}, max={intermediate.max():.4f}, any_nan={torch.isnan(intermediate).any()}")
 
         # Stage 3: Down projection
         result = torch.mm(intermediate, down_weight.T)
         if weights.get("down_proj.bias") is not None:
             result = result + weights["down_proj.bias"]
-
-        if self.layer_idx == 0:
-            logging.info(f"  result (after down_proj): min={result.min():.4f}, max={result.max():.4f}, any_nan={torch.isnan(result).any()}")
 
         return result
 
@@ -1142,12 +1120,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
             t0 = time.perf_counter()
 
         # Shape requirement: [batch, seq_len, num_heads, head_dim]
-        # DEBUG: Check tensor shapes before KV update
+        # DEBUG: Check KV positions and semantics
         if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1":
-            print(f"[KV DEBUG] key.shape={key.shape}, value.shape={value.shape}")
-            print(f"[KV DEBUG] cache_seqlens type={type(cache_seqlens)}, micro_cache_seqlens type={type(micro_cache_seqlens)}")
+            print(f"\n[DECODE ATTN L0] === KV Write Debug ===")
+            print(f"[DECODE ATTN L0] key.shape={key.shape}, value.shape={value.shape}")
             if micro_cache_seqlens is not None:
-                print(f"[KV DEBUG] micro_cache_seqlens.shape={micro_cache_seqlens.shape}, values[:5]={micro_cache_seqlens[:5].tolist()}")
+                print(f"[DECODE ATTN L0] cache_seqlens[:5]={micro_cache_seqlens[:5].tolist()}")
+                print(f"[DECODE ATTN L0] current_token_position[:5]={current_token_position[:5].tolist()} (KV write position)")
+            print(f"[DECODE ATTN L0] Expected: write_pos = cache_seqlens - 1")
 
         # Write KV at position current_token_position (cache_seqlens - 1)
         # This matches DeepSeek which uses position_ids = cache_seqlens - 1 for KV write
@@ -1186,6 +1166,11 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # After writing KV at position (cache_seqlens - 1), we have cache_seqlens total tokens
         # e.g., if cache_seqlens=11, we wrote at position 10, so we have 11 valid KV entries (0-10)
         cache_seqlens_for_attn = micro_cache_seqlens if cache_seqlens is not None else torch.ones(batch, dtype=torch.int32, device=hidden_states.device)
+
+        # DEBUG: Show attention seqlens
+        if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1":
+            print(f"[DECODE ATTN L0] cache_seqlens_for_attn[:5]={cache_seqlens_for_attn[:5].tolist()} (attention reads)")
+            print(f"[DECODE ATTN L0] Expected: attention reads cache_seqlens tokens (0 to cache_seqlens-1)")
 
         attn_output, _ = gqa_decode_fa(
             q=query,  # [batch, 1, num_heads, head_dim]
