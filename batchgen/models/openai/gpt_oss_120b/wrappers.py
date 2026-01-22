@@ -1175,7 +1175,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
             print(f"[DECODE ATTN L0] === KV CACHE CONTENT CHECK (prefilled data) ===")
             num_to_check = min(3, batch)
             for i in range(num_to_check):
-                slot_idx = int(slot_indices[i].item()) if batch_slice is None else int(slot_indices[i].item())
+                # page_table is already sliced to match batch, so slot_idx = i
+                slot_idx = i
                 # Get gpu_page for position 0
                 gpu_page_pos0 = int(page_table[slot_idx, 0].item())
                 # Read K at position 0 (prefilled token)
