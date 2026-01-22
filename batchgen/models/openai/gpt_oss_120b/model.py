@@ -461,8 +461,8 @@ class GptOssMoE(nn.Module):
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
 
-        # Router
-        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        # Router (OpenAI's gate uses bias=True)
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=True)
 
         # Experts
         self.experts = nn.ModuleList([GptOssExpert(config) for _ in range(self.num_experts)])
@@ -528,10 +528,17 @@ class GptOssDecoderLayer(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        debug_layer = os.environ.get("BATCHGEN_DEBUG_LAYER", "0") == "1"
+
         residual = hidden_states
 
         # Pre-norm + attention
         hidden_states = self.input_layernorm(hidden_states)
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after input_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+
         hidden_states, attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -540,13 +547,36 @@ class GptOssDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after attention (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+
         hidden_states = residual + hidden_states
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after attn+residual: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
         # Pre-norm + MoE
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+
         hidden_states = self.mlp(hidden_states)
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after MLP (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+
         hidden_states = residual + hidden_states
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after MLP+residual (final): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
         return hidden_states, attn_weights, present_key_value
 
