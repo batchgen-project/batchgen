@@ -184,6 +184,23 @@ def gqa_decode_fa(
             lse = result[1]
         else:
             output = result
+
+        # DEBUG: Print raw LSE from FlashAttention before sink correction
+        if os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1":
+            import torch as _torch
+            with _torch.no_grad():
+                if lse is not None:
+                    print(f"\n[FA DECODE] Raw LSE from FlashAttention:")
+                    print(f"[FA DECODE] LSE shape={lse.shape}, dtype={lse.dtype}")
+                    print(f"[FA DECODE] LSE min={lse.min().item():.4f}, max={lse.max().item():.4f}, mean={lse.float().mean().item():.4f}")
+                    print(f"[FA DECODE] Output shape={output.shape}, dtype={output.dtype}")
+                    print(f"[FA DECODE] Output (pre-sink) min={output.min().item():.4f}, max={output.max().item():.4f}")
+                    # Check for NaN/Inf
+                    has_nan = _torch.isnan(lse).any().item()
+                    has_inf = _torch.isinf(lse).any().item()
+                    print(f"[FA DECODE] LSE has NaN={has_nan}, has Inf={has_inf}")
+                else:
+                    print(f"[FA DECODE] WARNING: LSE is None despite return_softmax_lse=True!")
     else:
         output = _flash_with_kvcache(
             q,
