@@ -1053,6 +1053,47 @@ class GPUPagedKVCacheManager:
 				v_match = all(abs(w - r) < 1e-3 for w, r in zip(v_written, v_read))
 				print(f"[GPU KV WRITE L0] V write {'SUCCEEDED' if v_match else 'FAILED'}: written={v_written[:4]}, read={v_read[:4]}")
 
+			# CHECK FOR PAGE TABLE CONFLICTS - are different sequences writing to the same gpu_page?
+			print(f"[GPU KV WRITE L0] === PAGE TABLE CONFLICT CHECK ===")
+			print(f"[GPU KV WRITE L0] page_table_view.shape={page_table_view.shape}")
+			gpu_pages_used = {}  # gpu_page -> list of (slot, page_idx)
+			num_seqs_to_check = min(batch_size, 10)
+			for i in range(num_seqs_to_check):
+				slot_i = int(slot_indices[i].item())
+				pos_i = int(token_indices[i].item())
+				page_idx_i = pos_i // self.config.page_size_tokens
+				offset_i = pos_i % self.config.page_size_tokens
+				gpu_page_i = int(page_table_view[slot_i, page_idx_i].item())
+				if gpu_page_i not in gpu_pages_used:
+					gpu_pages_used[gpu_page_i] = []
+				gpu_pages_used[gpu_page_i].append((slot_i, page_idx_i, pos_i, offset_i))
+				print(f"[GPU KV WRITE L0] seq{i}: slot={slot_i}, pos={pos_i}, page_idx={page_idx_i}, offset={offset_i}, gpu_page={gpu_page_i}")
+
+			# Report conflicts
+			conflicts_found = False
+			for gpu_page_id, users in gpu_pages_used.items():
+				if len(users) > 1:
+					conflicts_found = True
+					print(f"[GPU KV WRITE L0] CONFLICT: gpu_page={gpu_page_id} used by {len(users)} sequences: {users}")
+			if not conflicts_found:
+				print(f"[GPU KV WRITE L0] No page conflicts detected among first {num_seqs_to_check} sequences")
+
+			# Also check: Are all sequences using SAME page_idx (and thus potentially same cache)?
+			# This could happen if cache_seqlens are all the same (from same prefill)
+			unique_positions = set(int(token_indices[i].item()) for i in range(min(batch_size, 10)))
+			print(f"[GPU KV WRITE L0] Unique token positions among first 10 seqs: {sorted(unique_positions)}")
+
+			# Print full page table for first 3 sequences to see their page allocations
+			print(f"[GPU KV WRITE L0] === FULL PAGE TABLE FOR FIRST 3 SEQUENCES ===")
+			for i in range(min(3, batch_size)):
+				slot_i = int(slot_indices[i].item())
+				# Get all pages for this slot up to page_idx + 1
+				max_page_idx = (int(token_indices[i].item()) // self.config.page_size_tokens) + 1
+				pages_for_seq = []
+				for p in range(min(max_page_idx, page_table_view.shape[1])):
+					pages_for_seq.append(int(page_table_view[slot_i, p].item()))
+				print(f"[GPU KV WRITE L0] seq{i} (slot={slot_i}): pages[:10]={pages_for_seq[:10]}")
+
 	def get_layer_kv_with_page_table(
 		self, layer_idx: int
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
