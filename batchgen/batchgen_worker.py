@@ -1340,12 +1340,59 @@ class BatchGenWorker:
 		load_task.wait()
 		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
 		torch.cuda.synchronize(self.torch_device)
-		
+
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
+
+		# DEBUG: Verify KV content is different across sequences after host→GPU load
+		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1" and len(global_sequence_ids) >= 2:
+			k_cache, v_cache = manager.get_kv_tensors()
+			# k_cache shape: [num_layers, num_pages, page_size, num_kv_heads, head_dim]
+			print(f"\n[KV LOAD DEBUG] === After Host→GPU Load ===")
+			print(f"[KV LOAD DEBUG] Loaded {len(global_sequence_ids)} sequences: {global_sequence_ids[:5]}...")
+			print(f"[KV LOAD DEBUG] k_cache.shape={k_cache.shape}")
+
+			# Get page table to find physical pages for each sequence
+			page_table = manager._gpu_page_table_manager.gpu_table
+			print(f"[KV LOAD DEBUG] page_table.shape={page_table.shape}")
+
+			# Compare KV content at position 0 (first token) for first 3 sequences
+			# Layer 0, position 0 should contain different values if prefill worked correctly
+			num_to_check = min(3, len(global_sequence_ids))
+			kv_samples = []
+			for i in range(num_to_check):
+				# Get the GPU page for this sequence's position 0
+				slot_idx = i  # slot_indices are 0, 1, 2, ...
+				page_idx = 0  # position 0
+				gpu_page = int(page_table[slot_idx, page_idx].item())
+				offset = 0  # position 0 within page
+
+				# Read K at layer 0, this page, position 0, head 0, first 4 dims
+				k_sample = k_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
+				v_sample = None
+				if v_cache is not None:
+					v_sample = v_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
+
+				kv_samples.append({
+					'seq': i,
+					'global_idx': global_sequence_ids[i],
+					'slot': slot_idx,
+					'gpu_page': gpu_page,
+					'k_sample': k_sample,
+					'v_sample': v_sample,
+				})
+				print(f"[KV LOAD DEBUG] seq{i} (global={global_sequence_ids[i]}): slot={slot_idx}, gpu_page={gpu_page}, K[0,:4]={k_sample}")
+
+			# Check if all K samples are identical (BAD)
+			all_k_same = all(s['k_sample'] == kv_samples[0]['k_sample'] for s in kv_samples)
+			if all_k_same:
+				print(f"[KV LOAD DEBUG] *** WARNING: ALL {num_to_check} SEQUENCES HAVE IDENTICAL K VALUES! ***")
+				print(f"[KV LOAD DEBUG] This indicates prefill wrote identical KV or host→GPU load is corrupted!")
+			else:
+				print(f"[KV LOAD DEBUG] OK: K values differ across sequences (expected for different prompts)")
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:	
 		"""Return GPU KV pages associated with the provided local sequence ids."""

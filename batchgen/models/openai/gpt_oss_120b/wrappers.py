@@ -1170,6 +1170,25 @@ class GptOssAttnWrapper(AttnWrapperBase):
             print(f"[DECODE ATTN L0] cache_seqlens_for_attn[:5]={cache_seqlens_for_attn[:5].tolist()} (attention reads)")
             print(f"[DECODE ATTN L0] Expected: attention reads cache_seqlens tokens (0 to cache_seqlens-1)")
 
+            # DEBUG: Check KV cache content at position 0 for first 3 sequences (prefill data)
+            # If all sequences have identical K at position 0, that confirms prefill bug
+            print(f"[DECODE ATTN L0] === KV CACHE CONTENT CHECK (prefilled data) ===")
+            num_to_check = min(3, batch)
+            for i in range(num_to_check):
+                slot_idx = int(slot_indices[i].item()) if batch_slice is None else int(slot_indices[i].item())
+                # Get gpu_page for position 0
+                gpu_page_pos0 = int(page_table[slot_idx, 0].item())
+                # Read K at position 0 (prefilled token)
+                k_at_pos0 = k_cache_layer[gpu_page_pos0, 0, 0, :4].cpu().tolist()  # head 0, first 4 dims
+                v_at_pos0 = v_cache_layer[gpu_page_pos0, 0, 0, :4].cpu().tolist() if v_cache_layer is not None else None
+                print(f"[DECODE ATTN L0] seq{i}: slot={slot_idx}, gpu_page_for_pos0={gpu_page_pos0}, K[pos0,:4]={k_at_pos0}")
+
+            # Also check query values - if queries are identical, output will be identical regardless of KV
+            print(f"[DECODE ATTN L0] === QUERY CHECK ===")
+            for i in range(min(3, batch)):
+                q_sample = query[i, 0, 0, :4].cpu().tolist()  # batch i, seq 0, head 0, first 4 dims
+                print(f"[DECODE ATTN L0] seq{i}: Q[:4]={q_sample}")
+
         attn_output, _ = gqa_decode_fa(
             q=query,  # [batch, 1, num_heads, head_dim]
             k_cache=k_cache_layer,  # [num_pages, page_size, num_kv_heads, head_dim]

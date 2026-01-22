@@ -1034,24 +1034,44 @@ class GPUPagedKVCacheManager:
 			page_idx = seq0_pos // self.config.page_size_tokens
 			offset = seq0_pos % self.config.page_size_tokens
 			gpu_page = int(page_table_view[seq0_slot, page_idx].item())
-			# Read back K
-			k_read_back = k_cache_layer[gpu_page, offset, :, :4].flatten().tolist()
+
+			# k_tokens shape: [batch, num_heads * head_dim] = [batch, 8*64] = [batch, 512]
+			# k_tokens[0] layout: [head0_dim0..63, head1_dim0..63, ..., head7_dim0..63]
+			# k_cache_layer shape: [num_pages, page_size, num_heads, head_dim]
+			# To compare head 0, we need:
+			#   k_tokens[0, 0:64] = head 0, all dims
+			#   k_cache_layer[gpu_page, offset, 0, :] = head 0, all dims
+			head_dim = self.config.k_head_dim  # 64
+			k_written_head0 = k_tokens[0, 0:head_dim].tolist()  # head 0, all 64 dims
+			k_read_head0 = k_cache_layer[gpu_page, offset, 0, :].tolist()  # head 0, all 64 dims
+
 			print(f"[GPU KV WRITE L0] === After Triton Kernel ===")
 			print(f"[GPU KV WRITE L0] seq0: slot={seq0_slot}, pos={seq0_pos}, page_idx={page_idx}, offset={offset}, gpu_page={gpu_page}")
-			print(f"[GPU KV WRITE L0] k_cache[{gpu_page}][{offset}][:,:4] read_back={k_read_back[:8]}")
-			print(f"[GPU KV WRITE L0] k_tokens[0,:8] original={k_tokens[0,:8].tolist()}")
-			# Check if write succeeded
-			k_written = k_tokens[0,:8].tolist()
-			k_read = k_read_back[:8]
-			match = all(abs(w - r) < 1e-3 for w, r in zip(k_written, k_read))
-			print(f"[GPU KV WRITE L0] K write {'SUCCEEDED' if match else 'FAILED'}: written={k_written[:4]}, read={k_read[:4]}")
+			print(f"[GPU KV WRITE L0] k_tokens[0, 0:8] (head0 dims 0-7) = {k_written_head0[:8]}")
+			print(f"[GPU KV WRITE L0] k_cache[{gpu_page}][{offset}][0,:8] (head0 dims 0-7) = {k_read_head0[:8]}")
+
+			# Check if ALL dims of head 0 match
+			k_match = all(abs(w - r) < 1e-3 for w, r in zip(k_written_head0, k_read_head0))
+			print(f"[GPU KV WRITE L0] K head0 write {'SUCCEEDED' if k_match else 'FAILED'}")
+			if not k_match:
+				# Find first mismatch
+				for i, (w, r) in enumerate(zip(k_written_head0, k_read_head0)):
+					if abs(w - r) >= 1e-3:
+						print(f"[GPU KV WRITE L0] K head0 MISMATCH at dim {i}: written={w}, read={r}")
+						break
+
 			if v_cache_layer is not None and v_tokens is not None:
-				v_read_back = v_cache_layer[gpu_page, offset, :, :4].flatten().tolist()
-				print(f"[GPU KV WRITE L0] v_cache[{gpu_page}][{offset}][:,:4] read_back={v_read_back[:8]}")
-				v_written = v_tokens[0,:8].tolist()
-				v_read = v_read_back[:8]
-				v_match = all(abs(w - r) < 1e-3 for w, r in zip(v_written, v_read))
-				print(f"[GPU KV WRITE L0] V write {'SUCCEEDED' if v_match else 'FAILED'}: written={v_written[:4]}, read={v_read[:4]}")
+				v_written_head0 = v_tokens[0, 0:head_dim].tolist()
+				v_read_head0 = v_cache_layer[gpu_page, offset, 0, :].tolist()
+				print(f"[GPU KV WRITE L0] v_tokens[0, 0:8] (head0 dims 0-7) = {v_written_head0[:8]}")
+				print(f"[GPU KV WRITE L0] v_cache[{gpu_page}][{offset}][0,:8] (head0 dims 0-7) = {v_read_head0[:8]}")
+				v_match = all(abs(w - r) < 1e-3 for w, r in zip(v_written_head0, v_read_head0))
+				print(f"[GPU KV WRITE L0] V head0 write {'SUCCEEDED' if v_match else 'FAILED'}")
+				if not v_match:
+					for i, (w, r) in enumerate(zip(v_written_head0, v_read_head0)):
+						if abs(w - r) >= 1e-3:
+							print(f"[GPU KV WRITE L0] V head0 MISMATCH at dim {i}: written={w}, read={r}")
+							break
 
 			# CHECK FOR PAGE TABLE CONFLICTS - are different sequences writing to the same gpu_page?
 			print(f"[GPU KV WRITE L0] === PAGE TABLE CONFLICT CHECK ===")
