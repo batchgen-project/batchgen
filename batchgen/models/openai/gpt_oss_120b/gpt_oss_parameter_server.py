@@ -403,8 +403,18 @@ class GptOss_Parameter_Server:
 
         logging.info(f"Found {len(tensor_to_file)} tensors in checkpoint")
 
-        # Debug: Print first few tensor names from each category to verify naming convention
+        # DEBUG: Print tensor names with print() to ensure visibility
+        print(f"\n[DEBUG] Found {len(tensor_to_file)} tensors in checkpoint")
         sample_tensors = list(tensor_to_file.keys())[:30]
+        print(f"[DEBUG] Sample checkpoint tensor names (first 30):")
+        for t in sample_tensors:
+            print(f"  - {t}")
+
+        # Check for mlp1 related tensors
+        mlp1_tensors = [k for k in tensor_to_file.keys() if 'mlp1' in k.lower() or 'mlp.1' in k.lower()][:10]
+        print(f"[DEBUG] mlp1-related tensors: {mlp1_tensors}")
+
+        # Debug: Print first few tensor names from each category to verify naming convention
         logging.info(f"Sample checkpoint tensor names (first 30): {sample_tensors}")
 
         # Print layer 0 tensor names for verification
@@ -455,6 +465,12 @@ class GptOss_Parameter_Server:
         if os.path.exists(output_file):
             logging.debug(f"Layer {layer_idx} already converted, skipping")
             return
+
+        # DEBUG: Confirm _convert_layer is being called
+        if layer_idx == 0:
+            print(f"\n[DEBUG] _convert_layer called for layer {layer_idx}")
+            print(f"[DEBUG] output_file: {output_file}")
+            print(f"[DEBUG] tensor_to_file has {len(tensor_to_file)} keys")
 
         layer_tensors = {}
         skeleton_tensors = []  # Track which tensors should go to skeleton
@@ -572,6 +588,14 @@ class GptOss_Parameter_Server:
         mlp2_scales_name = f"block.{layer_idx}.mlp.mlp2_weight.scales"
         mlp2_bias_name = f"block.{layer_idx}.mlp.mlp2_bias"
 
+        # DEBUG: Unconditional print to trace code path
+        if layer_idx == 0:
+            print(f"\n[DEBUG] Layer {layer_idx}: Looking for '{mlp1_blocks_name}'")
+            print(f"[DEBUG] mlp1_blocks_name in tensor_to_file: {mlp1_blocks_name in tensor_to_file}")
+            if tensor_to_file:
+                sample_keys = [k for k in tensor_to_file.keys() if 'mlp1' in k][:5]
+                print(f"[DEBUG] Sample mlp1-related keys in tensor_to_file: {sample_keys}")
+
         if mlp1_blocks_name in tensor_to_file:
             # Load stacked tensors [128, out_dim, in_dim//2]
             mlp1_blocks = self._load_tensor(mlp1_blocks_name, tensor_to_file)  # [128, 5760, K//2]
@@ -582,15 +606,17 @@ class GptOss_Parameter_Server:
             mlp2_scales = self._load_tensor(mlp2_scales_name, tensor_to_file)  # [128, 2880, K//32]
             mlp2_bias = self._load_tensor(mlp2_bias_name, tensor_to_file)      # [128, 2880]
 
-            # Log raw tensor shapes at INFO level for debugging
+            # Log raw tensor shapes - use print() to ensure visibility
             if layer_idx == 0:  # Only log for first layer to avoid spam
-                logging.info(f"Layer {layer_idx} RAW TENSORS:")
-                logging.info(f"  mlp1_blocks: {mlp1_blocks.shape}, dtype={mlp1_blocks.dtype}")
-                logging.info(f"  mlp1_scales: {mlp1_scales.shape}, dtype={mlp1_scales.dtype}")
-                logging.info(f"  mlp1_bias: {mlp1_bias.shape}, dtype={mlp1_bias.dtype}")
-                logging.info(f"  mlp2_blocks: {mlp2_blocks.shape}, dtype={mlp2_blocks.dtype}")
-                logging.info(f"  mlp2_scales: {mlp2_scales.shape}, dtype={mlp2_scales.dtype}")
-                logging.info(f"  mlp2_bias: {mlp2_bias.shape}, dtype={mlp2_bias.dtype}")
+                print(f"\n{'='*60}")
+                print(f"[GPT-OSS CHECKPOINT CONVERSION] Layer {layer_idx} RAW TENSORS:")
+                print(f"  mlp1_blocks: {mlp1_blocks.shape}, dtype={mlp1_blocks.dtype}")
+                print(f"  mlp1_scales: {mlp1_scales.shape}, dtype={mlp1_scales.dtype}")
+                print(f"  mlp1_bias: {mlp1_bias.shape}, dtype={mlp1_bias.dtype}")
+                print(f"  mlp2_blocks: {mlp2_blocks.shape}, dtype={mlp2_blocks.dtype}")
+                print(f"  mlp2_scales: {mlp2_scales.shape}, dtype={mlp2_scales.dtype}")
+                print(f"  mlp2_bias: {mlp2_bias.shape}, dtype={mlp2_bias.dtype}")
+                print(f"{'='*60}\n")
 
             logging.debug(f"Layer {layer_idx} mlp1_blocks shape: {mlp1_blocks.shape}")
             logging.debug(f"Layer {layer_idx} mlp2_blocks shape: {mlp2_blocks.shape}")
@@ -615,15 +641,16 @@ class GptOss_Parameter_Server:
                 up_scales = expert_mlp1_scales[1::2].contiguous()     # odd rows [2880, K//32]
                 up_bias = expert_mlp1_bias[1::2].contiguous()         # odd indices [2880]
 
-                # Log sliced shapes for layer 0, expert 0 only
+                # Log sliced shapes for layer 0, expert 0 only - use print() for visibility
                 if layer_idx == 0 and expert_idx == 0:
-                    logging.info(f"Layer {layer_idx} Expert {expert_idx} SLICED TENSORS:")
-                    logging.info(f"  gate_blocks: {gate_blocks.shape}, contiguous={gate_blocks.is_contiguous()}")
-                    logging.info(f"  gate_scales: {gate_scales.shape}, contiguous={gate_scales.is_contiguous()}")
-                    logging.info(f"  gate_bias: {gate_bias.shape}")
-                    logging.info(f"  up_blocks: {up_blocks.shape}, contiguous={up_blocks.is_contiguous()}")
-                    logging.info(f"  up_scales: {up_scales.shape}, contiguous={up_scales.is_contiguous()}")
-                    logging.info(f"  up_bias: {up_bias.shape}")
+                    print(f"\n[GPT-OSS CHECKPOINT CONVERSION] Layer {layer_idx} Expert {expert_idx} SLICED TENSORS:")
+                    print(f"  gate_blocks: {gate_blocks.shape}, contiguous={gate_blocks.is_contiguous()}")
+                    print(f"  gate_scales: {gate_scales.shape}, contiguous={gate_scales.is_contiguous()}")
+                    print(f"  gate_bias: {gate_bias.shape}")
+                    print(f"  up_blocks: {up_blocks.shape}, contiguous={up_blocks.is_contiguous()}")
+                    print(f"  up_scales: {up_scales.shape}, contiguous={up_scales.is_contiguous()}")
+                    print(f"  up_bias: {up_bias.shape}")
+                    print(f"  INTERLEAVED SLICING: gate=[::2] (even rows), up=[1::2] (odd rows)\n")
 
                 # mlp2 -> down_proj
                 down_blocks = mlp2_blocks[expert_idx]  # [2880, K//2]
