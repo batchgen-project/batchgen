@@ -96,9 +96,6 @@ def main():
     from gpt_oss.torch.weights import Checkpoint
     from dataclasses import fields
 
-    original_from_checkpoint = Transformer.from_checkpoint.__func__
-
-    @staticmethod
     def patched_from_checkpoint(path: str, device: str = "cuda"):
         """Load model, filtering unknown config fields."""
         if not isinstance(device, torch.device):
@@ -128,7 +125,7 @@ def main():
 
         return model
 
-    Transformer.from_checkpoint = patched_from_checkpoint
+    Transformer.from_checkpoint = staticmethod(patched_from_checkpoint)
 
     device = torch.device(args.device)
 
