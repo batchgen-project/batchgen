@@ -1173,6 +1173,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
             # DEBUG: Check KV cache content at position 0 for first 3 sequences (prefill data)
             # If all sequences have identical K at position 0, that confirms prefill bug
             print(f"[DECODE ATTN L0] === KV CACHE CONTENT CHECK (prefilled data) ===")
+            page_size = k_cache_layer.shape[1]  # page_size_tokens
             num_to_check = min(3, batch)
             for i in range(num_to_check):
                 # page_table is already sliced to match batch, so slot_idx = i
@@ -1183,6 +1184,20 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 k_at_pos0 = k_cache_layer[gpu_page_pos0, 0, 0, :4].cpu().tolist()  # head 0, first 4 dims
                 v_at_pos0 = v_cache_layer[gpu_page_pos0, 0, 0, :4].cpu().tolist() if v_cache_layer is not None else None
                 print(f"[DECODE ATTN L0] seq{i}: slot={slot_idx}, gpu_page_for_pos0={gpu_page_pos0}, K[pos0,:4]={k_at_pos0}")
+
+            # CRITICAL: Check K at QUESTION positions (near end of sequence)
+            # Position 0 is shared system prompt, but positions ~1000+ should differ
+            print(f"[DECODE ATTN L0] === KV CACHE CHECK at QUESTION POSITION (pos ~1000) ===")
+            for i in range(num_to_check):
+                slot_idx = i
+                cache_len = int(cache_seqlens_for_attn[i].item())
+                # Check position near end (in question portion)
+                check_pos = max(0, cache_len - 50)
+                page_idx = check_pos // page_size
+                offset = check_pos % page_size
+                gpu_page = int(page_table[slot_idx, page_idx].item())
+                k_at_question = k_cache_layer[gpu_page, offset, 0, :4].cpu().tolist()
+                print(f"[DECODE ATTN L0] seq{i}: cache_len={cache_len}, pos={check_pos}, page_idx={page_idx}, gpu_page={gpu_page}, K[pos,:4]={k_at_question}")
 
             # Also check query values - if queries are identical, output will be identical regardless of KV
             print(f"[DECODE ATTN L0] === QUERY CHECK ===")
