@@ -1225,9 +1225,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # This ensures host KV is updated when sequences go ON_HOLD
         kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
         if kv_append_callback is not None:
-            # Reshape key for host append: [batch, 1, num_kv_heads, head_dim] -> [batch, 1, num_kv_heads * head_dim]
-            # Then squeeze seq dim: -> [batch, num_kv_heads * head_dim]
-            k_for_host = key.view(batch, 1, self.num_kv_heads * self.head_dim)
+            # Host KV manager expects [B, T, H, D] shape (4D tensor)
+            # key is already [batch, 1, num_kv_heads, head_dim] - pass directly
+            k_for_host = key  # [batch, 1, num_kv_heads, head_dim]
             kv_append_callback(self.layer_idx, k_for_host)
 
         # Return None for kv_cache since it's managed by gpu_paged_kv_manager
