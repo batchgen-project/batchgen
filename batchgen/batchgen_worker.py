@@ -1323,12 +1323,26 @@ class BatchGenWorker:
 		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
-		
+
+		# DEBUG: Check what's being passed to the host→GPU load
+		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1":
+			print(f"\n[HOST->GPU DEBUG] === Before async_load_layer_paged_kv_to_device ===")
+			print(f"[HOST->GPU DEBUG] global_sequence_ids = {global_sequence_ids[:10]}... (total={len(global_sequence_ids)})")
+			print(f"[HOST->GPU DEBUG] sequence_tensor = {sequence_tensor[:10].tolist()}...")
+			print(f"[HOST->GPU DEBUG] active_sequence_page_counts = {active_sequence_page_counts[:10].tolist()}...")
+			print(f"[HOST->GPU DEBUG] k_ptrs.shape = {k_ptrs.shape}")
+			# Check if global_sequence_ids are all the same (BUG)
+			unique_ids = set(global_sequence_ids)
+			if len(unique_ids) < len(global_sequence_ids):
+				print(f"[HOST->GPU DEBUG] *** WARNING: DUPLICATE sequence IDs! Unique: {len(unique_ids)}, Total: {len(global_sequence_ids)} ***")
+			else:
+				print(f"[HOST->GPU DEBUG] OK: All {len(global_sequence_ids)} sequence IDs are unique")
+
 		logging.debug(
 			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
 			f"{len(global_sequence_ids)} sequences..."
 		)
-		
+
 		load_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_sequence_page_counts,

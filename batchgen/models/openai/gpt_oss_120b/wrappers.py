@@ -1509,6 +1509,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
             print(f"[PREFILL L0] global_sequence_ids = {global_sequence_ids}")
             print(f"[PREFILL L0] key.shape = {key.shape}")
             print(f"[PREFILL L0] num_sequences = {num_sequences}")
+            # Check if global_sequence_ids are unique (BUG if not)
+            if global_sequence_ids is not None:
+                unique_ids = set(global_sequence_ids)
+                if len(unique_ids) < len(global_sequence_ids):
+                    print(f"[PREFILL L0] *** CRITICAL BUG: DUPLICATE global_sequence_ids! ***")
+                    print(f"[PREFILL L0] Unique: {len(unique_ids)}, Total: {len(global_sequence_ids)}")
+                else:
+                    print(f"[PREFILL L0] OK: All {len(global_sequence_ids)} global_sequence_ids are unique")
             # Check first 4 K values for each sequence at position 0
             for i in range(min(3, num_sequences)):
                 s_idx = cu_seqlens[i].item()
@@ -1540,6 +1548,11 @@ class GptOssAttnWrapper(AttnWrapperBase):
             seq_value = seq_value.unsqueeze(0)
 
             seq_global_id = [global_sequence_ids[seq_idx]]
+
+            # DEBUG: Print what's being offloaded per sequence
+            if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1" and seq_idx < 3:
+                k_sample = seq_key[0, 0, 0, :4].cpu().tolist()  # [1, seq_len, heads, dim] -> position 0, head 0
+                print(f"[PREFILL L0 OFFLOAD] seq{seq_idx}: global_id={seq_global_id[0]}, seq_len={seq_len}, K[0,0,:4]={k_sample}")
 
             self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
