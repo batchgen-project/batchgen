@@ -4,7 +4,10 @@ This script tests the same MMLU Pro prompts through the original OpenAI
 reference implementation to verify correctness.
 
 Usage:
-    python gpt_oss_reference_comparison.py --checkpoint /path/to/model --max_prompts 3
+    python gpt_oss_reference_comparison.py \
+        --checkpoint /path/to/model \
+        --gpt_oss_path /data2/tairan/workspace/gpt-oss \
+        --max_prompts 3
 """
 
 import argparse
@@ -15,12 +18,6 @@ from typing import List, Dict
 import pandas as pd
 import torch
 
-# Add gpt-oss to path
-GPT_OSS_ROOT = Path(__file__).parent.parent.parent.parent.parent / "gpt-oss"
-sys.path.insert(0, str(GPT_OSS_ROOT))
-
-from gpt_oss.torch.model import Transformer, TokenGenerator, ModelConfig
-from gpt_oss.tokenizer import get_tokenizer
 
 # GPT-OSS special tokens
 GPT_OSS_SPECIAL_TOKENS = {
@@ -74,10 +71,24 @@ def form_options(options: List[str]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="GPT-OSS Reference Implementation Comparison")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--gpt_oss_path", type=str, default="/data2/tairan/workspace/gpt-oss",
+                        help="Path to gpt-oss repository")
     parser.add_argument("--max_prompts", type=int, default=3, help="Number of prompts to test")
     parser.add_argument("--max_tokens", type=int, default=50, help="Max tokens to generate")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     args = parser.parse_args()
+
+    # Setup gpt-oss path BEFORE importing from it
+    gpt_oss_path = Path(args.gpt_oss_path)
+    if not gpt_oss_path.exists():
+        print(f"ERROR: gpt-oss path does not exist: {gpt_oss_path}")
+        sys.exit(1)
+    sys.path.insert(0, str(gpt_oss_path))
+    print(f"Using gpt-oss from: {gpt_oss_path}")
+
+    # Now import from gpt_oss
+    from gpt_oss.torch.model import TokenGenerator
+    from gpt_oss.tokenizer import get_tokenizer
 
     device = torch.device(args.device)
 
