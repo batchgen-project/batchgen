@@ -1427,9 +1427,33 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     h1_50 = hidden_states_2d[s1 + pos1, :4].cpu().tolist()
                     if h0_50 == h1_50:
                         print(f"[PREFILL L0] *** WARNING: seq0 and seq1 have IDENTICAL hidden_states at position 50! ***")
-                        print(f"[PREFILL L0] *** BUG IS UPSTREAM - embedding or input packing! ***")
+                        print(f"[PREFILL L0] *** This is expected if system prompt is >50 tokens ***")
                     else:
                         print(f"[PREFILL L0] OK: seq0 and seq1 DIFFER at position 50 (common prefix is expected)")
+
+                # Check near END of each sequence (question-specific content)
+                print(f"[PREFILL L0] --- Position (seq_len - 30) check (QUESTION CONTENT) ---")
+                for i in range(min(3, num_sequences)):
+                    s_idx = cu_seqlens[i].item()
+                    e_idx = cu_seqlens[i+1].item()
+                    seq_len = e_idx - s_idx
+                    check_pos = max(0, seq_len - 30)
+                    h_sample = hidden_states_2d[s_idx + check_pos, :4].cpu().tolist()
+                    print(f"[PREFILL L0] seq{i} (len={seq_len}): hidden[{s_idx}+{check_pos},:4] = {h_sample}")
+                # Check if question content differs
+                if num_sequences >= 2:
+                    s0, e0 = cu_seqlens[0].item(), cu_seqlens[1].item()
+                    s1, e1 = cu_seqlens[1].item(), cu_seqlens[2].item()
+                    len0, len1 = e0 - s0, e1 - s1
+                    pos0_end = max(0, len0 - 30)
+                    pos1_end = max(0, len1 - 30)
+                    h0_end = hidden_states_2d[s0 + pos0_end, :4].cpu().tolist()
+                    h1_end = hidden_states_2d[s1 + pos1_end, :4].cpu().tolist()
+                    if h0_end == h1_end:
+                        print(f"[PREFILL L0] *** CRITICAL BUG: seq0 and seq1 have IDENTICAL hidden at END! ***")
+                        print(f"[PREFILL L0] *** Questions should differ but embeddings are same! ***")
+                    else:
+                        print(f"[PREFILL L0] OK: seq0 and seq1 DIFFER at end (different questions)")
 
         # Project Q, K, V in varlen format
         # hidden_states_2d: [total_tokens, hidden_size]
