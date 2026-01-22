@@ -87,8 +87,48 @@ def main():
     print(f"Using gpt-oss from: {gpt_oss_path}")
 
     # Now import from gpt_oss
-    from gpt_oss.torch.model import TokenGenerator
+    from gpt_oss.torch.model import TokenGenerator, Transformer, ModelConfig
     from gpt_oss.tokenizer import get_tokenizer
+
+    # Monkey-patch Transformer.from_checkpoint to handle extra config fields
+    import json
+    import os
+    from gpt_oss.torch.weights import Checkpoint
+    from dataclasses import fields
+
+    original_from_checkpoint = Transformer.from_checkpoint.__func__
+
+    @staticmethod
+    def patched_from_checkpoint(path: str, device: str = "cuda"):
+        """Load model, filtering unknown config fields."""
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+
+        config_path = os.path.join(path, "config.json")
+        with open(config_path, "r") as f:
+            json_config = json.load(f)
+
+        # Filter to only known ModelConfig fields
+        valid_fields = {f.name for f in fields(ModelConfig)}
+        filtered_config = {k: v for k, v in json_config.items() if k in valid_fields}
+        config = ModelConfig(**filtered_config)
+
+        model = Transformer(config=config, device=device)
+        model.eval()
+
+        checkpoint = Checkpoint(path, device)
+
+        for name, param in model.named_parameters():
+            loaded_tensor = checkpoint.get(name)
+            try:
+                param.data.copy_(loaded_tensor)
+            except:
+                print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
+                raise
+
+        return model
+
+    Transformer.from_checkpoint = patched_from_checkpoint
 
     device = torch.device(args.device)
 
