@@ -1408,6 +1408,29 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 else:
                     print(f"[PREFILL L0] OK: seq0 and seq1 have DIFFERENT hidden_states")
 
+                # Also check position 50 (past any common prefix like system prompt)
+                print(f"[PREFILL L0] --- Position 50 check (past common prefix) ---")
+                for i in range(min(3, num_sequences)):
+                    s_idx = cu_seqlens[i].item()
+                    e_idx = cu_seqlens[i+1].item()
+                    seq_len = e_idx - s_idx
+                    check_pos = min(50, seq_len - 1)
+                    h_sample = hidden_states_2d[s_idx + check_pos, :4].cpu().tolist()
+                    print(f"[PREFILL L0] seq{i}: hidden[{s_idx}+{check_pos},:4] = {h_sample}")
+                # Check if position 50 differs
+                if num_sequences >= 2:
+                    s0, e0 = cu_seqlens[0].item(), cu_seqlens[1].item()
+                    s1, e1 = cu_seqlens[1].item(), cu_seqlens[2].item()
+                    pos0 = min(50, e0 - s0 - 1)
+                    pos1 = min(50, e1 - s1 - 1)
+                    h0_50 = hidden_states_2d[s0 + pos0, :4].cpu().tolist()
+                    h1_50 = hidden_states_2d[s1 + pos1, :4].cpu().tolist()
+                    if h0_50 == h1_50:
+                        print(f"[PREFILL L0] *** WARNING: seq0 and seq1 have IDENTICAL hidden_states at position 50! ***")
+                        print(f"[PREFILL L0] *** BUG IS UPSTREAM - embedding or input packing! ***")
+                    else:
+                        print(f"[PREFILL L0] OK: seq0 and seq1 DIFFER at position 50 (common prefix is expected)")
+
         # Project Q, K, V in varlen format
         # hidden_states_2d: [total_tokens, hidden_size]
         query = self.module.q_proj(hidden_states_2d)  # [total_tokens, num_heads * head_dim]
