@@ -1114,8 +1114,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 sin = sin[position_ids]
             else:
                 # Use cache_seqlens as position_ids (current token position)
-                cos = cos[micro_cache_seqlens]
-                sin = sin[micro_cache_seqlens]
+                # Indexing by [batch] tensor gives [batch, head_dim]
+                # Need to add seq dimension: [batch, head_dim] -> [batch, 1, head_dim]
+                cos = cos[micro_cache_seqlens].unsqueeze(1)
+                sin = sin[micro_cache_seqlens].unsqueeze(1)
         else:
             # Fallback if cache_seqlens not set
             cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
@@ -1133,6 +1135,13 @@ class GptOssAttnWrapper(AttnWrapperBase):
             t0 = time.perf_counter()
 
         # Shape requirement: [batch, seq_len, num_heads, head_dim]
+        # DEBUG: Check tensor shapes before KV update
+        if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1":
+            print(f"[KV DEBUG] key.shape={key.shape}, value.shape={value.shape}")
+            print(f"[KV DEBUG] cache_seqlens type={type(cache_seqlens)}, micro_cache_seqlens type={type(micro_cache_seqlens)}")
+            if micro_cache_seqlens is not None:
+                print(f"[KV DEBUG] micro_cache_seqlens.shape={micro_cache_seqlens.shape}, values[:5]={micro_cache_seqlens[:5].tolist()}")
+
         gpu_kv_manager.update_layer_decode_new_token(
             k_tensor=key,
             v_tensor=value,  # GQA needs V cache (unlike MLA)
@@ -1278,17 +1287,25 @@ class GptOssAttnWrapper(AttnWrapperBase):
         Args:
             query: [batch, seq, num_heads, head_dim]
             key: [batch, seq, num_kv_heads, head_dim]
-            cos: [seq, head_dim]
-            sin: [seq, head_dim]
+            cos: [seq, head_dim] for prefill, [batch, 1, head_dim] for decode
+            sin: [seq, head_dim] for prefill, [batch, 1, head_dim] for decode
 
         Returns:
             Tuple of rotated (query, key)
         """
         half_dim = self.head_dim // 2
 
-        # Expand cos/sin for broadcasting: [seq, head_dim] -> [1, seq, 1, head_dim]
-        cos = cos.unsqueeze(0).unsqueeze(2)
-        sin = sin.unsqueeze(0).unsqueeze(2)
+        # Expand cos/sin for broadcasting with query/key
+        if cos.dim() == 2:
+            # Prefill: [seq, head_dim] -> [1, seq, 1, head_dim]
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            sin = sin.unsqueeze(0).unsqueeze(2)
+        elif cos.dim() == 3:
+            # Decode: [batch, 1, head_dim] -> [batch, 1, 1, head_dim]
+            cos = cos.unsqueeze(2)
+            sin = sin.unsqueeze(2)
+        else:
+            raise ValueError(f"Unexpected cos shape: {cos.shape}")
 
         # Split heads
         q1, q2 = query[..., :half_dim], query[..., half_dim:]
