@@ -675,6 +675,20 @@ class GptOssModel(nn.Module):
                     has_inf = torch.isinf(hidden_states).any().item()
                     print(f"[Layer {idx}] hidden: min={h_min:.4f}, max={h_max:.4f}, mean={h_mean:.6f}, std={h_std:.4f}, nan={has_nan}, inf={has_inf}")
 
+                    # Check sequence convergence at layers 0, 17, 35 (first, middle, last)
+                    if idx in [0, 17, 35] and hidden_states.shape[0] >= 3:
+                        # Compare first 3 sequences at last position (for decode: seq_len=1)
+                        h0 = hidden_states[0, -1, :8].tolist()  # seq 0, last pos, first 8 dims
+                        h1 = hidden_states[1, -1, :8].tolist()  # seq 1
+                        h2 = hidden_states[2, -1, :8].tolist()  # seq 2
+                        print(f"[Layer {idx}] seq0[:8]: {[f'{v:.2f}' for v in h0]}")
+                        print(f"[Layer {idx}] seq1[:8]: {[f'{v:.2f}' for v in h1]}")
+                        print(f"[Layer {idx}] seq2[:8]: {[f'{v:.2f}' for v in h2]}")
+                        # Check if sequences are identical
+                        diff_01 = (hidden_states[0, -1] - hidden_states[1, -1]).abs().max().item()
+                        diff_02 = (hidden_states[0, -1] - hidden_states[2, -1]).abs().max().item()
+                        print(f"[Layer {idx}] max_diff: seq0-seq1={diff_01:.4f}, seq0-seq2={diff_02:.4f}")
+
             if use_cache:
                 next_cache += (layer_outputs[2],)
 
@@ -682,6 +696,23 @@ class GptOssModel(nn.Module):
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+
+        # Debug: Check normalized hidden states before lm_head
+        if os.environ.get("BATCHGEN_DEBUG_HIDDEN", "0") == "1":
+            with torch.no_grad():
+                h_std = hidden_states.float().std().item()
+                h_max = hidden_states.abs().max().item()
+                print(f"[After final norm] std={h_std:.4f}, max_abs={h_max:.4f}")
+                if hidden_states.shape[0] >= 3:
+                    h0 = hidden_states[0, -1, :8].tolist()
+                    h1 = hidden_states[1, -1, :8].tolist()
+                    h2 = hidden_states[2, -1, :8].tolist()
+                    print(f"[After norm] seq0[:8]: {[f'{v:.4f}' for v in h0]}")
+                    print(f"[After norm] seq1[:8]: {[f'{v:.4f}' for v in h1]}")
+                    print(f"[After norm] seq2[:8]: {[f'{v:.4f}' for v in h2]}")
+                    diff_01 = (hidden_states[0, -1] - hidden_states[1, -1]).abs().max().item()
+                    diff_02 = (hidden_states[0, -1] - hidden_states[2, -1]).abs().max().item()
+                    print(f"[After norm] max_diff: seq0-seq1={diff_01:.6f}, seq0-seq2={diff_02:.6f}")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
