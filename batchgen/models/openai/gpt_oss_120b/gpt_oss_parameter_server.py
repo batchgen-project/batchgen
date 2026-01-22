@@ -481,15 +481,19 @@ class GptOss_Parameter_Server:
         - block.{n}.mlp.gate.weight/bias - Router
         """
         output_file = os.path.join(self.converted_ckpt_dir, f"layer_{layer_idx}.bin")
-        if os.path.exists(output_file):
-            logging.debug(f"Layer {layer_idx} already converted, skipping")
-            return
 
-        # DEBUG: Confirm _convert_layer is being called
+        # DEBUG: Print BEFORE the early return check
         if layer_idx == 0:
             print(f"\n[DEBUG] _convert_layer called for layer {layer_idx}")
             print(f"[DEBUG] output_file: {output_file}")
+            print(f"[DEBUG] output_file exists: {os.path.exists(output_file)}")
             print(f"[DEBUG] tensor_to_file has {len(tensor_to_file)} keys")
+
+        if os.path.exists(output_file):
+            if layer_idx == 0:
+                print(f"[DEBUG] Layer {layer_idx} SKIPPED - file already exists!")
+            logging.debug(f"Layer {layer_idx} already converted, skipping")
+            return
 
         layer_tensors = {}
         skeleton_tensors = []  # Track which tensors should go to skeleton
