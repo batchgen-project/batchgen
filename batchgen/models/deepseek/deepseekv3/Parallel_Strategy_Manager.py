@@ -2,7 +2,8 @@ from .modeling_deepseek_v3 import (
 	DeepseekV3ForCausalLM
 )
 from .wrappers import DeepSeekExpertWrapper
-from ...Wrapper import Attn_Wrapper
+# Use new wrapper system - Attn_Wrapper is alias for backward compatibility
+from batchgen.models.wrappers import AttnWrapperBase as Attn_Wrapper
 import logging
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 import types
