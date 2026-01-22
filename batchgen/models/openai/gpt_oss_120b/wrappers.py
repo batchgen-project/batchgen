@@ -1096,10 +1096,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         if do_timing:
             t0 = time.perf_counter()
 
-        # cache_seqlens contains the total number of tokens in the sequence (count, not position).
-        # The current token being processed is at position (cache_seqlens - 1) (0-indexed).
-        # Example: If cache_seqlens = 11, the sequence has 11 tokens at positions 0-10,
-        # and the current input token is at position 10.
+        # cache_seqlens represents the total context length (including the current token to be processed).
+        # The current token's KV should be written at position cache_seqlens - 1 (0-indexed).
+        # This matches DeepSeek which uses position_ids = cache_seqlens - 1.
         if cache_seqlens is not None:
             # Apply batch_slice if provided
             if batch_slice is not None:
@@ -1108,13 +1107,15 @@ class GptOssAttnWrapper(AttnWrapperBase):
             else:
                 micro_cache_seqlens = cache_seqlens
 
-            # Current token position is cache_seqlens - 1 (0-indexed)
+            # CRITICAL: cache_seqlens is the token COUNT (e.g., 11).
+            # The current token's position is cache_seqlens - 1 (e.g., 10).
+            # This matches DeepSeek which uses position_ids = cache_seqlens - 1.
             current_token_position = micro_cache_seqlens - 1
 
-            max_seqlen = int(micro_cache_seqlens.max().item())
+            max_seqlen = int(micro_cache_seqlens.max().item())  # No +1 needed since we use current position
             cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
 
-            # Apply RoPE at each sequence's current token position
+            # Apply RoPE at each sequence's current position (cache_seqlens - 1)
             if position_ids is not None:
                 cos = cos[position_ids]
                 sin = sin[position_ids]
@@ -1147,10 +1148,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
             print(f"[KV DEBUG] cache_seqlens type={type(cache_seqlens)}, micro_cache_seqlens type={type(micro_cache_seqlens)}")
             if micro_cache_seqlens is not None:
                 print(f"[KV DEBUG] micro_cache_seqlens.shape={micro_cache_seqlens.shape}, values[:5]={micro_cache_seqlens[:5].tolist()}")
-                print(f"[KV DEBUG] current_token_position[:5]={current_token_position[:5].tolist()}")
 
-        # Write KV at current_token_position (cache_seqlens - 1), NOT cache_seqlens.
-        # The current input token is at position (cache_seqlens - 1), so its KV goes there.
+        # Write KV at position current_token_position (cache_seqlens - 1)
+        # This matches DeepSeek which uses position_ids = cache_seqlens - 1 for KV write
         gpu_kv_manager.update_layer_decode_new_token(
             k_tensor=key,
             v_tensor=value,  # GQA needs V cache (unlike MLA)
@@ -1182,9 +1182,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         #   k_cache: [num_blocks, page_size, nheads_kv, headdim]
         #   v_cache: [num_blocks, page_size, nheads_kv, headdim]
         #   block_table: [batch, max_blocks_per_seq]
-        #   cache_seqlens: [batch] - total tokens to attend over
-        # After writing KV at position (cache_seqlens - 1), total tokens = cache_seqlens
-        # (positions 0 to cache_seqlens - 1, inclusive)
+        #   cache_seqlens: [batch] - total tokens to attend over (including newly written KV)
+        # After writing KV at position (cache_seqlens - 1), we have cache_seqlens total tokens
+        # e.g., if cache_seqlens=11, we wrote at position 10, so we have 11 valid KV entries (0-10)
         cache_seqlens_for_attn = micro_cache_seqlens if cache_seqlens is not None else torch.ones(batch, dtype=torch.int32, device=hidden_states.device)
 
         attn_output, _ = gqa_decode_fa(
@@ -1220,6 +1220,15 @@ class GptOssAttnWrapper(AttnWrapperBase):
         if do_timing:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             DecodeTimingStats.record_attn(self.layer_idx, elapsed_ms)
+
+        # Append KV to host for continuous batching (async operation)
+        # This ensures host KV is updated when sequences go ON_HOLD
+        kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
+        if kv_append_callback is not None:
+            # Reshape key for host append: [batch, 1, num_kv_heads, head_dim] -> [batch, 1, num_kv_heads * head_dim]
+            # Then squeeze seq dim: -> [batch, num_kv_heads * head_dim]
+            k_for_host = key.view(batch, 1, self.num_kv_heads * self.head_dim)
+            kv_append_callback(self.layer_idx, k_for_host)
 
         # Return None for kv_cache since it's managed by gpu_paged_kv_manager
         return attn_output, None, None

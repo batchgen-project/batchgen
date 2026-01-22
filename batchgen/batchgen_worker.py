@@ -5989,7 +5989,9 @@ class BatchGenWorker:
 				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor):
 					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor)
 				Attn_Wrapper.kv_append_callback = kv_append_callback
-				
+				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+				AttnWrapperBase.kv_append_callback = kv_append_callback
+
 				# Forward
 				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
 				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
@@ -6051,6 +6053,7 @@ class BatchGenWorker:
 		AttnWrapperBase.position_ids = None
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
+		AttnWrapperBase.kv_append_callback = None
 		
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
