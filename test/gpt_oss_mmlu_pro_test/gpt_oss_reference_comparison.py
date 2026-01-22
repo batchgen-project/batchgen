@@ -110,12 +110,18 @@ def main():
         filtered_config = {k: v for k, v in json_config.items() if k in valid_fields}
         config = ModelConfig(**filtered_config)
 
+        print(f"Creating model on device: {device}")
         model = Transformer(config=config, device=device)
         model.eval()
 
+        print(f"Loading checkpoint from: {path}")
         checkpoint = Checkpoint(path, device)
 
-        for name, param in model.named_parameters():
+        param_list = list(model.named_parameters())
+        total_params = len(param_list)
+        for idx, (name, param) in enumerate(param_list):
+            if idx % 50 == 0:
+                print(f"  Loading parameter {idx}/{total_params}: {name[:50]}...")
             loaded_tensor = checkpoint.get(name)
             try:
                 param.data.copy_(loaded_tensor)
@@ -123,6 +129,7 @@ def main():
                 print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
                 raise
 
+        print(f"Model loaded successfully!")
         return model
 
     Transformer.from_checkpoint = staticmethod(patched_from_checkpoint)
