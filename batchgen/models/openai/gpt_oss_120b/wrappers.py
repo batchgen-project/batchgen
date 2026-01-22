@@ -42,6 +42,37 @@ import torch.nn.functional as F
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 
 
+# =============================================================================
+# OpenAI SwiGLU Activation (correct formula from gpt-oss/triton/moe.py)
+# =============================================================================
+
+def openai_swiglu(gate: torch.Tensor, up: torch.Tensor,
+                  alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
+    """OpenAI's SwiGLU activation (from gpt-oss/gpt_oss/triton/moe.py).
+
+    Formula: gate * sigmoid(alpha * gate) * (up + 1)
+
+    This is DIFFERENT from standard SwiGLU which is: silu(gate) * up
+    The +1 bias and alpha=1.702 are critical for correct output.
+
+    Args:
+        gate: Gate projection output [*, intermediate_size]
+        up: Up projection output [*, intermediate_size]
+        alpha: Sigmoid scaling factor (default 1.702)
+        limit: Input clamping limit (default 7.0)
+
+    Returns:
+        Activated intermediate [*, intermediate_size]
+    """
+    # Clamp inputs to prevent overflow (as done in OpenAI's reference)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+
+    # OpenAI formula: gate * sigmoid(alpha * gate) * (up + 1)
+    out_glu = gate * torch.sigmoid(alpha * gate)
+    return out_glu * (up + 1)
+
+
 def log_gpu_memory(msg: str = ""):
     """Log current GPU memory usage.
 
@@ -543,13 +574,14 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with fused MXFP4 dequant + GEMM.
+        """Forward pass with MXFP4 dequant + GEMM.
 
-        Optimized flow using fused kernel:
-        1. Get MXFP4 weights from storage (persistent) or buffer (non-persistent)
-        2. Fused dequant + GEMM for gate, up, down projections (no BF16 intermediate)
-        3. SwiGLU activation between stage 1 and stage 2
-        4. Cleanup (free buffer only if non-persistent)
+        Supports two modes:
+        - Reference mode (BATCHGEN_USE_REFERENCE=1): Pure PyTorch for debugging
+        - Fused mode (default): Uses mxfp4_linear with triton_kernels if available
+
+        Both modes now use the correct OpenAI SwiGLU activation:
+            gate * sigmoid(1.702 * gate) * (up + 1)
 
         Args:
             hidden_states: Input tensor [num_tokens, hidden_size]
@@ -557,9 +589,6 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         Returns:
             Output tensor [num_tokens, hidden_size]
         """
-        # Import fused kernel
-        from batchgen.moe.mxfp4_grouped_gemm import mxfp4_linear
-
         # Start timing if enabled (prefill or decode)
         do_prefill_timing = PrefillTimingStats.enabled and self.phase == "prefill"
         do_decode_timing = DecodeTimingStats.enabled and self.phase == "decode"
@@ -599,41 +628,20 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         if hidden_states.dtype != torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
 
-        # === FUSED DEQUANT + GEMM ===
-        # Instead of: dequant -> apply_weights -> forward
-        # We do: mxfp4_linear (fused dequant + GEMM) for each projection
+        # Check for reference mode (for debugging)
+        use_reference = os.environ.get("BATCHGEN_USE_REFERENCE", "0") == "1"
 
         if do_timing:
             t0 = time.perf_counter()
 
-        # Stage 1: Gate and Up projections (fused dequant + GEMM)
-        gate_out = mxfp4_linear(
-            hidden_states,
-            weights["gate_proj.weight"],
-            weights["gate_proj.weight_scales"],
-            weights.get("gate_proj.bias"),
-        )
-        up_out = mxfp4_linear(
-            hidden_states,
-            weights["up_proj.weight"],
-            weights["up_proj.weight_scales"],
-            weights.get("up_proj.bias"),
-        )
-
-        # SwiGLU activation: silu(gate) * up
-        intermediate = F.silu(gate_out) * up_out
-
-        # Stage 2: Down projection (fused dequant + GEMM)
-        result = mxfp4_linear(
-            intermediate,
-            weights["down_proj.weight"],
-            weights["down_proj.weight_scales"],
-            weights.get("down_proj.bias"),
-        )
+        # Route to appropriate implementation
+        if use_reference:
+            result = self._forward_reference(hidden_states, weights)
+        else:
+            result = self._forward_fused(hidden_states, weights)
 
         if do_timing:
             torch.cuda.synchronize()
-            # Fused path combines dequant + apply + forward into one measurement
             timing_stats.moe_forward_ms += (time.perf_counter() - t0) * 1000
 
         # Cleanup
@@ -658,6 +666,111 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             torch.cuda.synchronize()
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             timing_stats.record_moe(self.layer_idx, elapsed_ms)
+
+        return result
+
+    def _forward_reference(self, hidden_states: torch.Tensor, weights: dict) -> torch.Tensor:
+        """Pure PyTorch reference implementation for debugging.
+
+        Uses:
+        - PyTorch mxfp4_dequantize (no Triton kernels)
+        - torch.mm for GEMM
+        - Correct OpenAI SwiGLU activation: gate * sigmoid(1.702 * gate) * (up + 1)
+
+        This is slower but provides a correct baseline for debugging.
+
+        Args:
+            hidden_states: Input [num_tokens, hidden_size] in BF16
+            weights: Dict with gate_proj, up_proj, down_proj weights and scales
+
+        Returns:
+            Output [num_tokens, hidden_size] in BF16
+        """
+        from batchgen.quantization.mxfp4 import mxfp4_dequantize
+
+        # Ensure 2D input
+        x = hidden_states
+        if x.dim() == 3:
+            x = x.view(-1, x.shape[-1])  # [batch*seq, hidden]
+
+        # Dequantize all weights to BF16 (slow but correct)
+        gate_weight = mxfp4_dequantize(
+            weights["gate_proj.weight"],
+            weights["gate_proj.weight_scales"],
+            dtype=torch.bfloat16
+        )
+        up_weight = mxfp4_dequantize(
+            weights["up_proj.weight"],
+            weights["up_proj.weight_scales"],
+            dtype=torch.bfloat16
+        )
+        down_weight = mxfp4_dequantize(
+            weights["down_proj.weight"],
+            weights["down_proj.weight_scales"],
+            dtype=torch.bfloat16
+        )
+
+        # Stage 1: Gate and Up projections
+        gate_out = torch.mm(x, gate_weight.T)
+        if weights.get("gate_proj.bias") is not None:
+            gate_out = gate_out + weights["gate_proj.bias"]
+
+        up_out = torch.mm(x, up_weight.T)
+        if weights.get("up_proj.bias") is not None:
+            up_out = up_out + weights["up_proj.bias"]
+
+        # Stage 2: OpenAI SwiGLU activation (CRITICAL!)
+        # Formula: gate * sigmoid(1.702 * gate) * (up + 1)
+        intermediate = openai_swiglu(gate_out, up_out, alpha=1.702, limit=7.0)
+
+        # Stage 3: Down projection
+        result = torch.mm(intermediate, down_weight.T)
+        if weights.get("down_proj.bias") is not None:
+            result = result + weights["down_proj.bias"]
+
+        return result
+
+    def _forward_fused(self, hidden_states: torch.Tensor, weights: dict) -> torch.Tensor:
+        """Fused MXFP4 dequant + GEMM path (optimized).
+
+        Uses mxfp4_linear which tries triton_kernels.matmul_ogs first,
+        falls back to unfused dequant + matmul.
+
+        Args:
+            hidden_states: Input [num_tokens, hidden_size] in BF16
+            weights: Dict with gate_proj, up_proj, down_proj weights and scales
+
+        Returns:
+            Output [num_tokens, hidden_size] in BF16
+        """
+        from batchgen.moe.mxfp4_grouped_gemm import mxfp4_linear
+
+        # Stage 1: Gate and Up projections (fused dequant + GEMM)
+        gate_out = mxfp4_linear(
+            hidden_states,
+            weights["gate_proj.weight"],
+            weights["gate_proj.weight_scales"],
+            weights.get("gate_proj.bias"),
+        )
+        up_out = mxfp4_linear(
+            hidden_states,
+            weights["up_proj.weight"],
+            weights["up_proj.weight_scales"],
+            weights.get("up_proj.bias"),
+        )
+
+        # Stage 2: OpenAI SwiGLU activation (FIXED!)
+        # Formula: gate * sigmoid(1.702 * gate) * (up + 1)
+        # NOT the standard F.silu(gate) * up
+        intermediate = openai_swiglu(gate_out, up_out, alpha=1.702, limit=7.0)
+
+        # Stage 3: Down projection (fused dequant + GEMM)
+        result = mxfp4_linear(
+            intermediate,
+            weights["down_proj.weight"],
+            weights["down_proj.weight_scales"],
+            weights.get("down_proj.bias"),
+        )
 
         return result
 
