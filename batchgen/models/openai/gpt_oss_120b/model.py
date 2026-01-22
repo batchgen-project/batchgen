@@ -31,6 +31,7 @@ Reference: https://github.com/openai/gpt-oss
 """
 
 import math
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -691,6 +692,23 @@ class GptOss(nn.Module):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+
+        # Debug logging for logits analysis
+        if os.environ.get("BATCHGEN_DEBUG_LOGITS", "0") == "1":
+            with torch.no_grad():
+                # Get stats for last token position (for autoregressive generation)
+                last_logits = logits[:, -1, :]  # [batch, vocab_size]
+                top_vals, top_ids = torch.topk(last_logits, k=10, dim=-1)
+                print(f"\n[LOGITS DEBUG] Shape: {logits.shape}")
+                print(f"[LOGITS DEBUG] Last token logits: min={last_logits.min():.4f}, max={last_logits.max():.4f}, mean={last_logits.mean():.4f}")
+                print(f"[LOGITS DEBUG] Top-10 token IDs: {top_ids[0].tolist()}")
+                print(f"[LOGITS DEBUG] Top-10 logit values: {[f'{v:.4f}' for v in top_vals[0].tolist()]}")
+                # Check for common newline tokens
+                print(f"[LOGITS DEBUG] Token 10 (LF) logit: {last_logits[0, 10].item():.4f}")
+                print(f"[LOGITS DEBUG] Token 13 (CR) logit: {last_logits[0, 13].item():.4f}")
+                # Check if logits are uniform (std close to 0)
+                std = last_logits.std().item()
+                print(f"[LOGITS DEBUG] Logits std: {std:.4f} (uniform if ~0)")
 
         loss = None
         if labels is not None:
