@@ -1096,7 +1096,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
         if do_timing:
             t0 = time.perf_counter()
 
-        # cache_seqlens contains the current position (0-indexed)
+        # cache_seqlens contains the total number of tokens in the sequence (count, not position).
+        # The current token being processed is at position (cache_seqlens - 1) (0-indexed).
+        # Example: If cache_seqlens = 11, the sequence has 11 tokens at positions 0-10,
+        # and the current input token is at position 10.
         if cache_seqlens is not None:
             # Apply batch_slice if provided
             if batch_slice is not None:
@@ -1105,19 +1108,22 @@ class GptOssAttnWrapper(AttnWrapperBase):
             else:
                 micro_cache_seqlens = cache_seqlens
 
-            max_seqlen = int(micro_cache_seqlens.max().item()) + 1
+            # Current token position is cache_seqlens - 1 (0-indexed)
+            current_token_position = micro_cache_seqlens - 1
+
+            max_seqlen = int(micro_cache_seqlens.max().item())
             cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
 
-            # Apply RoPE at each sequence's current position
+            # Apply RoPE at each sequence's current token position
             if position_ids is not None:
                 cos = cos[position_ids]
                 sin = sin[position_ids]
             else:
-                # Use cache_seqlens as position_ids (current token position)
+                # Use current_token_position (cache_seqlens - 1) for RoPE
                 # Indexing by [batch] tensor gives [batch, head_dim]
                 # Need to add seq dimension: [batch, head_dim] -> [batch, 1, head_dim]
-                cos = cos[micro_cache_seqlens].unsqueeze(1)
-                sin = sin[micro_cache_seqlens].unsqueeze(1)
+                cos = cos[current_token_position].unsqueeze(1)
+                sin = sin[current_token_position].unsqueeze(1)
         else:
             # Fallback if cache_seqlens not set
             cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
@@ -1141,11 +1147,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
             print(f"[KV DEBUG] cache_seqlens type={type(cache_seqlens)}, micro_cache_seqlens type={type(micro_cache_seqlens)}")
             if micro_cache_seqlens is not None:
                 print(f"[KV DEBUG] micro_cache_seqlens.shape={micro_cache_seqlens.shape}, values[:5]={micro_cache_seqlens[:5].tolist()}")
+                print(f"[KV DEBUG] current_token_position[:5]={current_token_position[:5].tolist()}")
 
+        # Write KV at current_token_position (cache_seqlens - 1), NOT cache_seqlens.
+        # The current input token is at position (cache_seqlens - 1), so its KV goes there.
         gpu_kv_manager.update_layer_decode_new_token(
             k_tensor=key,
             v_tensor=value,  # GQA needs V cache (unlike MLA)
-            sequence_lengths=micro_cache_seqlens if cache_seqlens is not None else torch.zeros(batch, dtype=torch.int32, device=hidden_states.device),
+            sequence_lengths=current_token_position if cache_seqlens is not None else torch.zeros(batch, dtype=torch.int32, device=hidden_states.device),
             layer_idx=self.layer_idx,
             batch_slice=batch_slice,
         )
@@ -1173,8 +1182,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
         #   k_cache: [num_blocks, page_size, nheads_kv, headdim]
         #   v_cache: [num_blocks, page_size, nheads_kv, headdim]
         #   block_table: [batch, max_blocks_per_seq]
-        #   cache_seqlens: [batch] - needs +1 because we just wrote new token
-        cache_seqlens_for_attn = micro_cache_seqlens + 1 if cache_seqlens is not None else torch.ones(batch, dtype=torch.int32, device=hidden_states.device)
+        #   cache_seqlens: [batch] - total tokens to attend over
+        # After writing KV at position (cache_seqlens - 1), total tokens = cache_seqlens
+        # (positions 0 to cache_seqlens - 1, inclusive)
+        cache_seqlens_for_attn = micro_cache_seqlens if cache_seqlens is not None else torch.ones(batch, dtype=torch.int32, device=hidden_states.device)
 
         attn_output, _ = gqa_decode_fa(
             q=query,  # [batch, 1, num_heads, head_dim]
