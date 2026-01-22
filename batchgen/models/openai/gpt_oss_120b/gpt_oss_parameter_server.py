@@ -622,25 +622,55 @@ class GptOss_Parameter_Server:
                 print(f"[DEBUG] Sample mlp1-related keys in tensor_to_file: {sample_keys}")
 
         if mlp1_blocks_name in tensor_to_file:
-            # Load stacked tensors [128, out_dim, in_dim//2]
-            mlp1_blocks = self._load_tensor(mlp1_blocks_name, tensor_to_file)  # [128, 5760, K//2]
-            mlp1_scales = self._load_tensor(mlp1_scales_name, tensor_to_file)  # [128, 5760, K//32]
+            # Load stacked tensors
+            # RAW format from checkpoint: [128, rows, num_blocks, bytes_per_block]
+            # e.g., mlp1_blocks: [128, 5760, 90, 16] where 90*16=1440 bytes = 2880 FP4 values
+            mlp1_blocks_raw = self._load_tensor(mlp1_blocks_name, tensor_to_file)
+            mlp1_scales = self._load_tensor(mlp1_scales_name, tensor_to_file)  # [128, 5760, 90]
             mlp1_bias = self._load_tensor(mlp1_bias_name, tensor_to_file)      # [128, 5760]
 
-            mlp2_blocks = self._load_tensor(mlp2_blocks_name, tensor_to_file)  # [128, 2880, K//2]
-            mlp2_scales = self._load_tensor(mlp2_scales_name, tensor_to_file)  # [128, 2880, K//32]
+            mlp2_blocks_raw = self._load_tensor(mlp2_blocks_name, tensor_to_file)
+            mlp2_scales = self._load_tensor(mlp2_scales_name, tensor_to_file)  # [128, 2880, 90]
             mlp2_bias = self._load_tensor(mlp2_bias_name, tensor_to_file)      # [128, 2880]
 
-            # Log raw tensor shapes - use print() to ensure visibility
-            if layer_idx == 0:  # Only log for first layer to avoid spam
+            # Log raw tensor shapes BEFORE reshape
+            if layer_idx == 0:
                 print(f"\n{'='*60}")
-                print(f"[GPT-OSS CHECKPOINT CONVERSION] Layer {layer_idx} RAW TENSORS:")
-                print(f"  mlp1_blocks: {mlp1_blocks.shape}, dtype={mlp1_blocks.dtype}")
+                print(f"[GPT-OSS CHECKPOINT CONVERSION] Layer {layer_idx} RAW TENSORS (before reshape):")
+                print(f"  mlp1_blocks_raw: {mlp1_blocks_raw.shape}, dtype={mlp1_blocks_raw.dtype}")
                 print(f"  mlp1_scales: {mlp1_scales.shape}, dtype={mlp1_scales.dtype}")
-                print(f"  mlp1_bias: {mlp1_bias.shape}, dtype={mlp1_bias.dtype}")
-                print(f"  mlp2_blocks: {mlp2_blocks.shape}, dtype={mlp2_blocks.dtype}")
+                print(f"  mlp2_blocks_raw: {mlp2_blocks_raw.shape}, dtype={mlp2_blocks_raw.dtype}")
                 print(f"  mlp2_scales: {mlp2_scales.shape}, dtype={mlp2_scales.dtype}")
-                print(f"  mlp2_bias: {mlp2_bias.shape}, dtype={mlp2_bias.dtype}")
+
+            # Reshape blocks from [experts, rows, num_blocks, bytes_per_block] to [experts, rows, total_bytes]
+            # This flattens the last two dimensions: [128, 5760, 90, 16] -> [128, 5760, 1440]
+            if mlp1_blocks_raw.dim() == 4:
+                mlp1_blocks = mlp1_blocks_raw.reshape(
+                    mlp1_blocks_raw.shape[0],  # experts
+                    mlp1_blocks_raw.shape[1],  # rows
+                    -1  # flatten num_blocks * bytes_per_block
+                )
+                if layer_idx == 0:
+                    print(f"  mlp1_blocks RESHAPED: {mlp1_blocks.shape}")
+            else:
+                mlp1_blocks = mlp1_blocks_raw
+                if layer_idx == 0:
+                    print(f"  mlp1_blocks (no reshape needed): {mlp1_blocks.shape}")
+
+            if mlp2_blocks_raw.dim() == 4:
+                mlp2_blocks = mlp2_blocks_raw.reshape(
+                    mlp2_blocks_raw.shape[0],
+                    mlp2_blocks_raw.shape[1],
+                    -1
+                )
+                if layer_idx == 0:
+                    print(f"  mlp2_blocks RESHAPED: {mlp2_blocks.shape}")
+            else:
+                mlp2_blocks = mlp2_blocks_raw
+                if layer_idx == 0:
+                    print(f"  mlp2_blocks (no reshape needed): {mlp2_blocks.shape}")
+
+            if layer_idx == 0:
                 print(f"{'='*60}\n")
 
             logging.debug(f"Layer {layer_idx} mlp1_blocks shape: {mlp1_blocks.shape}")
