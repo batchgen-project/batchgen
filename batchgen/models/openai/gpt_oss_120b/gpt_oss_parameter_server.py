@@ -417,11 +417,16 @@ class GptOss_Parameter_Server:
         # Check specifically for block.0, block.1, block.2, block.3 tensors
         print(f"\n[DEBUG] Checking for early layer tensors:")
         for blk_idx in range(4):
-            blk_tensors = [k for k in tensor_to_file.keys() if f'block.{blk_idx}.' in k]
-            if blk_tensors:
-                print(f"  block.{blk_idx}: {len(blk_tensors)} tensors - {blk_tensors[:3]}...")
-            else:
-                print(f"  block.{blk_idx}: NO TENSORS FOUND!")
+            blk_tensors = sorted([k for k in tensor_to_file.keys() if f'block.{blk_idx}.' in k])
+            print(f"  block.{blk_idx}: {len(blk_tensors)} tensors:")
+            for t in blk_tensors:
+                print(f"    - {t}")
+
+        # Also check block.4 for comparison (MoE layer)
+        blk4_tensors = sorted([k for k in tensor_to_file.keys() if 'block.4.' in k])
+        print(f"\n  block.4 (for comparison): {len(blk4_tensors)} tensors:")
+        for t in blk4_tensors:
+            print(f"    - {t}")
 
         # Check if there's a different naming pattern (e.g., layers vs blocks)
         layer_tensors = [k for k in tensor_to_file.keys() if 'layer' in k.lower()][:5]
