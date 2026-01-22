@@ -1206,12 +1206,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Append KV to host for continuous batching (async operation)
         # This ensures host KV is updated when sequences go ON_HOLD
+        # CRITICAL: GPT-OSS uses GQA with separate K and V caches, so we MUST pass both!
         kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
         if kv_append_callback is not None:
             # Host KV manager expects [B, T, H, D] shape (4D tensor)
-            # key is already [batch, 1, num_kv_heads, head_dim] - pass directly
-            k_for_host = key  # [batch, 1, num_kv_heads, head_dim]
-            kv_append_callback(self.layer_idx, k_for_host)
+            # key/value are already [batch, 1, num_kv_heads, head_dim] - pass directly
+            k_for_host = key    # [batch, 1, num_kv_heads, head_dim]
+            v_for_host = value  # [batch, 1, num_kv_heads, head_dim]
+            kv_append_callback(self.layer_idx, k_for_host, v_for_host)
 
         # Return None for kv_cache since it's managed by gpu_paged_kv_manager
         return attn_output, None, None

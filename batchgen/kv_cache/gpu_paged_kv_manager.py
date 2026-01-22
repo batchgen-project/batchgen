@@ -602,13 +602,11 @@ class GPUPagedKVCacheManager:
 			self.config.num_k_heads,
 			self.config.k_head_dim,
 		)
-		# DEBUG: Use torch.full(9999) to detect if KV cache is being properly written
-		# If output changes from 1.0 -> 9999, it means KV is NOT being written properly
-		# and decode is reading uninitialized values
-		self._k_cache = torch.full(
-			shape, 9999.0, dtype=self.config.kv_dtype, device=self.device
+		# Initialize KV cache with zeros
+		self._k_cache = torch.zeros(
+			shape, dtype=self.config.kv_dtype, device=self.device
 		)
-		logging.debug("Initialized K cache %s (with 9999 for debugging)", tuple(self._k_cache.shape))
+		logging.debug("Initialized K cache %s", tuple(self._k_cache.shape))
 
 		if self.config.has_v_cache:
 			v_shape = (
@@ -618,10 +616,10 @@ class GPUPagedKVCacheManager:
 				self.config.num_v_heads,
 				self.config.v_head_dim,
 			)
-			self._v_cache = torch.full(
-				v_shape, 9999.0, dtype=self.config.kv_dtype, device=self.device
+			self._v_cache = torch.zeros(
+				v_shape, dtype=self.config.kv_dtype, device=self.device
 			)
-			logging.debug("Initialized V cache %s (with 9999 for debugging)", tuple(self._v_cache.shape))
+			logging.debug("Initialized V cache %s", tuple(self._v_cache.shape))
 		else:
 			self._v_cache = None
 
