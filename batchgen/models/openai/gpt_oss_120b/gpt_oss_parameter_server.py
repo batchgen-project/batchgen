@@ -20,11 +20,16 @@
 
 Handles MXFP4 weight loading with:
 - Expert tensor slicing (128 experts per layer stored as single tensor)
-- mlp1 splitting into gate_proj + up_proj (SwiGLU combined weights)
+- mlp1 INTERLEAVED splitting into gate_proj + up_proj (SwiGLU combined weights)
 - Name mapping from checkpoint to BatchGen format
 
+IMPORTANT: mlp1 weights are INTERLEAVED, not concatenated!
+OpenAI's swiglu extracts x[::2] (gate) and x[1::2] (up), so mlp1 rows are:
+    Row 0 -> gate[0], Row 1 -> up[0], Row 2 -> gate[1], Row 3 -> up[1], ...
+We extract gate from even rows (::2) and up from odd rows (1::2).
+
 Checkpoint format (OpenAI):
-    block.{L}.mlp.mlp1_weight.blocks: [128, 5760, K//2] packed uint8
+    block.{L}.mlp.mlp1_weight.blocks: [128, 5760, K//2] packed uint8 (INTERLEAVED gate/up)
     block.{L}.mlp.mlp1_weight.scales: [128, 5760, K//32] uint8
     block.{L}.mlp.mlp1_bias: [128, 5760] BF16
     block.{L}.mlp.mlp2_weight.blocks: [128, 2880, K//2] packed uint8
@@ -32,9 +37,9 @@ Checkpoint format (OpenAI):
     block.{L}.mlp.mlp2_bias: [128, 2880] BF16
 
 BatchGen format (per expert):
-    routed_expert_{L}_{E}/gate_proj.weight: [2880, K//2] packed
+    routed_expert_{L}_{E}/gate_proj.weight: [2880, K//2] packed (even rows from mlp1)
     routed_expert_{L}_{E}/gate_proj.weight_scales: [2880, K//32]
-    routed_expert_{L}_{E}/up_proj.weight: [2880, K//2] packed
+    routed_expert_{L}_{E}/up_proj.weight: [2880, K//2] packed (odd rows from mlp1)
     routed_expert_{L}_{E}/up_proj.weight_scales: [2880, K//32]
     routed_expert_{L}_{E}/down_proj.weight: [2880, K//2] packed
     routed_expert_{L}_{E}/down_proj.weight_scales: [2880, K//32]
@@ -367,9 +372,10 @@ class GptOss_Parameter_Server:
         logging.info("  block.{L}.mlp.gate.bias   -> model.layers.{L}.mlp.router.bias")
         logging.info("")
         logging.info("Expert MLP (MXFP4, per expert E=0..127):")
-        logging.info("  block.{L}.mlp.mlp1_weight.blocks[E,:2880,:] -> model.layers.{L}.mlp.experts.{E}.gate_proj.weight")
-        logging.info("  block.{L}.mlp.mlp1_weight.blocks[E,2880:,:] -> model.layers.{L}.mlp.experts.{E}.up_proj.weight")
-        logging.info("  block.{L}.mlp.mlp2_weight.blocks[E]         -> model.layers.{L}.mlp.experts.{E}.down_proj.weight")
+        logging.info("  block.{L}.mlp.mlp1_weight.blocks[E,::2,:]  -> model.layers.{L}.mlp.experts.{E}.gate_proj.weight (even rows)")
+        logging.info("  block.{L}.mlp.mlp1_weight.blocks[E,1::2,:] -> model.layers.{L}.mlp.experts.{E}.up_proj.weight (odd rows)")
+        logging.info("  (NOTE: mlp1 is INTERLEAVED [gate_0, up_0, gate_1, up_1, ...] to match OpenAI's swiglu)")
+        logging.info("  block.{L}.mlp.mlp2_weight.blocks[E]        -> model.layers.{L}.mlp.experts.{E}.down_proj.weight")
         logging.info("  (same pattern for scales and biases)")
         logging.info("")
         logging.info("Non-layer tensors (SKELETON - NOT in state_dict_name_map):")
@@ -586,14 +592,16 @@ class GptOss_Parameter_Server:
                 expert_mlp1_scales = mlp1_scales[expert_idx]  # [5760, K//32]
                 expert_mlp1_bias = mlp1_bias[expert_idx]      # [5760]
 
-                # Split at intermediate_size (2880)
-                gate_blocks = expert_mlp1_blocks[:self.intermediate_size]  # [2880, K//2]
-                gate_scales = expert_mlp1_scales[:self.intermediate_size]  # [2880, K//32]
-                gate_bias = expert_mlp1_bias[:self.intermediate_size]      # [2880]
+                # IMPORTANT: mlp1 weights are INTERLEAVED, not concatenated!
+                # OpenAI's swiglu extracts x[::2] (gate) and x[1::2] (up), so:
+                # Row 0 -> gate[0], Row 1 -> up[0], Row 2 -> gate[1], Row 3 -> up[1], ...
+                gate_blocks = expert_mlp1_blocks[::2]    # even rows [2880, K//2]
+                gate_scales = expert_mlp1_scales[::2]    # even rows [2880, K//32]
+                gate_bias = expert_mlp1_bias[::2]        # even indices [2880]
 
-                up_blocks = expert_mlp1_blocks[self.intermediate_size:]    # [2880, K//2]
-                up_scales = expert_mlp1_scales[self.intermediate_size:]    # [2880, K//32]
-                up_bias = expert_mlp1_bias[self.intermediate_size:]        # [2880]
+                up_blocks = expert_mlp1_blocks[1::2]     # odd rows [2880, K//2]
+                up_scales = expert_mlp1_scales[1::2]     # odd rows [2880, K//32]
+                up_bias = expert_mlp1_bias[1::2]         # odd indices [2880]
 
                 # mlp2 -> down_proj
                 down_blocks = mlp2_blocks[expert_idx]  # [2880, K//2]
