@@ -36,7 +36,10 @@ try:
 except ImportError:
     # jit compile
     from core_engine import batchgen as core_engine
-from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+# Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
+from batchgen.models.wrappers import AttnWrapperBase, ExpertWrapperBase
+Attn_Wrapper = AttnWrapperBase
+Expert_Wrapper = ExpertWrapperBase
 
 # current_dir = os.path.dirname(os.path.abspath(__file__))
 # sys.append(current_dir)

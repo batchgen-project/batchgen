@@ -27,7 +27,9 @@ import tqdm
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine as bg
-from batchgen.models.Wrapper import Attn_Wrapper
+# Use new wrapper system - Attn_Wrapper is alias for backward compatibility
+from batchgen.models.wrappers import AttnWrapperBase
+Attn_Wrapper = AttnWrapperBase
 from batchgen.sampling import greedy_decode, sample_with_temperature_top_p
 from batchgen.sequence import SequenceBatch
 from batchgen.utils import create_position_ids_from_attention_mask

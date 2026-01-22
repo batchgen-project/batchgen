@@ -33,7 +33,10 @@ from transformers.models.qwen2_moe.modeling_qwen2_moe import (
 
 from batchgen.core_engine import batchgen as core_engine
 from batchgen.engine import EngineConfig, ModelConfig
-from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+# Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
+from batchgen.models.wrappers import AttnWrapperBase, ExpertWrapperBase
+Attn_Wrapper = AttnWrapperBase
+Expert_Wrapper = ExpertWrapperBase
 
 
 def _QKV_Proj(self, hidden_states, position_ids, kv_seq_len):

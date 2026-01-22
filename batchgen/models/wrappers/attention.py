@@ -83,6 +83,10 @@ class AttnWrapperBase(BaseModuleWrapper):
     cache_seqlens: ClassVar[Optional[torch.Tensor]] = None
     max_seqlen: ClassVar[Optional[int]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
+    host_paged_kv_worker_view: ClassVar[Optional[object]] = None
+
+    # Execution phase
+    phase: ClassVar[str] = "prefill"
 
     def __init__(
         self,

@@ -17,8 +17,11 @@ from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 
-from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
-from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase
+# Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
+from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
+# Aliases for backward compatibility with existing code
+Attn_Wrapper = AttnWrapperBase
+Expert_Wrapper = ExpertWrapperBase
 
 from .config.config import EngineConfig
 from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server

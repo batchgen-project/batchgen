@@ -21,7 +21,9 @@ import torch
 import torch.distributed as dist
 import tqdm
 
-from batchgen.models.Wrapper import Attn_Wrapper
+# Use new wrapper system - Attn_Wrapper is alias for backward compatibility
+from batchgen.models.wrappers import AttnWrapperBase
+Attn_Wrapper = AttnWrapperBase
 from batchgen.sequence import SequenceBatch, SequenceStatus
 from batchgen.utils import create_position_ids_from_attention_mask, deep_free_model_memory
 
