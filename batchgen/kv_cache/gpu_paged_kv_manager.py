@@ -1000,6 +1000,21 @@ class GPUPagedKVCacheManager:
 		if self._v_cache is not None:
 			v_cache_layer = self._v_cache[layer_idx]
 
+		# DEBUG: Verify GPU KV write parameters before kernel
+		debug_kv_write = layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_KV_WRITE", "0") == "1"
+		if debug_kv_write:
+			print(f"\n[GPU KV WRITE L0] === Before Triton Kernel ===")
+			print(f"[GPU KV WRITE L0] batch_size={batch_size}, k_tokens.shape={k_tokens.shape}")
+			print(f"[GPU KV WRITE L0] slot_indices[:5]={slot_indices[:min(5,len(slot_indices))].tolist()}")
+			print(f"[GPU KV WRITE L0] token_indices[:5]={token_indices[:min(5,len(token_indices))].tolist()}")
+			print(f"[GPU KV WRITE L0] page_table.shape={page_table_view.shape}")
+			print(f"[GPU KV WRITE L0] page_size_tokens={self.config.page_size_tokens}")
+			print(f"[GPU KV WRITE L0] k_tokens[0,:8]={k_tokens[0,:8].tolist()}")
+			if v_tokens is not None:
+				print(f"[GPU KV WRITE L0] v_tokens[0,:8]={v_tokens[0,:8].tolist()}")
+			else:
+				print(f"[GPU KV WRITE L0] v_tokens=None (BUG: V should be written for GQA!)")
+
 		run_paged_kv_token_update_fused(
 			k_cache=k_cache_layer,
 			k_tokens=k_tokens,
@@ -1010,6 +1025,33 @@ class GPUPagedKVCacheManager:
 			v_cache=v_cache_layer,
 			v_tokens=v_tokens,
 		)
+
+		# DEBUG: Verify write happened by reading back from cache
+		if debug_kv_write:
+			torch.cuda.synchronize()
+			seq0_slot = int(slot_indices[0].item())
+			seq0_pos = int(token_indices[0].item())
+			page_idx = seq0_pos // self.config.page_size_tokens
+			offset = seq0_pos % self.config.page_size_tokens
+			gpu_page = int(page_table_view[seq0_slot, page_idx].item())
+			# Read back K
+			k_read_back = k_cache_layer[gpu_page, offset, :, :4].flatten().tolist()
+			print(f"[GPU KV WRITE L0] === After Triton Kernel ===")
+			print(f"[GPU KV WRITE L0] seq0: slot={seq0_slot}, pos={seq0_pos}, page_idx={page_idx}, offset={offset}, gpu_page={gpu_page}")
+			print(f"[GPU KV WRITE L0] k_cache[{gpu_page}][{offset}][:,:4] read_back={k_read_back[:8]}")
+			print(f"[GPU KV WRITE L0] k_tokens[0,:8] original={k_tokens[0,:8].tolist()}")
+			# Check if write succeeded
+			k_written = k_tokens[0,:8].tolist()
+			k_read = k_read_back[:8]
+			match = all(abs(w - r) < 1e-3 for w, r in zip(k_written, k_read))
+			print(f"[GPU KV WRITE L0] K write {'SUCCEEDED' if match else 'FAILED'}: written={k_written[:4]}, read={k_read[:4]}")
+			if v_cache_layer is not None and v_tokens is not None:
+				v_read_back = v_cache_layer[gpu_page, offset, :, :4].flatten().tolist()
+				print(f"[GPU KV WRITE L0] v_cache[{gpu_page}][{offset}][:,:4] read_back={v_read_back[:8]}")
+				v_written = v_tokens[0,:8].tolist()
+				v_read = v_read_back[:8]
+				v_match = all(abs(w - r) < 1e-3 for w, r in zip(v_written, v_read))
+				print(f"[GPU KV WRITE L0] V write {'SUCCEEDED' if v_match else 'FAILED'}: written={v_written[:4]}, read={v_read[:4]}")
 
 	def get_layer_kv_with_page_table(
 		self, layer_idx: int
