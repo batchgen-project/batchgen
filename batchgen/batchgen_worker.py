@@ -4882,6 +4882,17 @@ class BatchGenWorker:
 				batch_local_indices = batch[seq_start:seq_end]
 				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch_local_indices)
 
+				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
+				# which does NOT offload KV to host, causing decode to read garbage.
+				AttnWrapperBase.prepack_mode = True
+				AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
+				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
+				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
+				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
+				AttnWrapperBase.position_ids = batch_position_ids_flat
+				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+
 				# Embed tokens
 				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
@@ -4923,6 +4934,13 @@ class BatchGenWorker:
 		Attn_Wrapper.prepack_max_seqlen = None
 		Attn_Wrapper.prepack_num_sequences = None
 		Attn_Wrapper.prepack_seq_lengths = None
+
+		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
+		AttnWrapperBase.prepack_mode = False
+		AttnWrapperBase.prepack_cu_seqlens = None
+		AttnWrapperBase.prepack_max_seqlen = None
+		AttnWrapperBase.prepack_num_sequences = None
+		AttnWrapperBase.prepack_seq_lengths = None
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
