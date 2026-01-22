@@ -710,6 +710,16 @@ class GptOssExpertWrapper(ExpertWrapperBase):
             dtype=torch.bfloat16
         )
 
+        # Log weight statistics after dequantization (for debugging numerical issues)
+        if self.layer_idx == 0:  # Only log for first layer
+            logging.info(f"[Layer {self.layer_idx} Expert {self.expert_idx}] WEIGHT STATS:")
+            logging.info(f"  x input: shape={x.shape}, min={x.min():.4f}, max={x.max():.4f}, mean={x.float().mean():.4f}")
+            logging.info(f"  gate_weight: shape={gate_weight.shape}, min={gate_weight.min():.4f}, max={gate_weight.max():.4f}, mean={gate_weight.float().mean():.4f}")
+            logging.info(f"  up_weight: shape={up_weight.shape}, min={up_weight.min():.4f}, max={up_weight.max():.4f}")
+            logging.info(f"  down_weight: shape={down_weight.shape}, min={down_weight.min():.4f}, max={down_weight.max():.4f}")
+            # Check for NaN/Inf
+            logging.info(f"  any_nan: gate={torch.isnan(gate_weight).any()}, up={torch.isnan(up_weight).any()}, down={torch.isnan(down_weight).any()}")
+
         # Stage 1: Gate and Up projections
         gate_out = torch.mm(x, gate_weight.T)
         if weights.get("gate_proj.bias") is not None:
@@ -719,14 +729,26 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         if weights.get("up_proj.bias") is not None:
             up_out = up_out + weights["up_proj.bias"]
 
+        # Log activation statistics (for debugging numerical issues)
+        if self.layer_idx == 0:
+            logging.info(f"[Layer {self.layer_idx} Expert {self.expert_idx}] ACTIVATION STATS:")
+            logging.info(f"  gate_out: min={gate_out.min():.4f}, max={gate_out.max():.4f}, any_nan={torch.isnan(gate_out).any()}")
+            logging.info(f"  up_out: min={up_out.min():.4f}, max={up_out.max():.4f}, any_nan={torch.isnan(up_out).any()}")
+
         # Stage 2: OpenAI SwiGLU activation (CRITICAL!)
         # Formula: gate * sigmoid(1.702 * gate) * (up + 1)
         intermediate = openai_swiglu(gate_out, up_out, alpha=1.702, limit=7.0)
+
+        if self.layer_idx == 0:
+            logging.info(f"  intermediate (after SwiGLU): min={intermediate.min():.4f}, max={intermediate.max():.4f}, any_nan={torch.isnan(intermediate).any()}")
 
         # Stage 3: Down projection
         result = torch.mm(intermediate, down_weight.T)
         if weights.get("down_proj.bias") is not None:
             result = result + weights["down_proj.bias"]
+
+        if self.layer_idx == 0:
+            logging.info(f"  result (after down_proj): min={result.min():.4f}, max={result.max():.4f}, any_nan={torch.isnan(result).any()}")
 
         return result
 

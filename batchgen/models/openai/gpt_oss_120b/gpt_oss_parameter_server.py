@@ -582,6 +582,16 @@ class GptOss_Parameter_Server:
             mlp2_scales = self._load_tensor(mlp2_scales_name, tensor_to_file)  # [128, 2880, K//32]
             mlp2_bias = self._load_tensor(mlp2_bias_name, tensor_to_file)      # [128, 2880]
 
+            # Log raw tensor shapes at INFO level for debugging
+            if layer_idx == 0:  # Only log for first layer to avoid spam
+                logging.info(f"Layer {layer_idx} RAW TENSORS:")
+                logging.info(f"  mlp1_blocks: {mlp1_blocks.shape}, dtype={mlp1_blocks.dtype}")
+                logging.info(f"  mlp1_scales: {mlp1_scales.shape}, dtype={mlp1_scales.dtype}")
+                logging.info(f"  mlp1_bias: {mlp1_bias.shape}, dtype={mlp1_bias.dtype}")
+                logging.info(f"  mlp2_blocks: {mlp2_blocks.shape}, dtype={mlp2_blocks.dtype}")
+                logging.info(f"  mlp2_scales: {mlp2_scales.shape}, dtype={mlp2_scales.dtype}")
+                logging.info(f"  mlp2_bias: {mlp2_bias.shape}, dtype={mlp2_bias.dtype}")
+
             logging.debug(f"Layer {layer_idx} mlp1_blocks shape: {mlp1_blocks.shape}")
             logging.debug(f"Layer {layer_idx} mlp2_blocks shape: {mlp2_blocks.shape}")
 
@@ -595,13 +605,25 @@ class GptOss_Parameter_Server:
                 # IMPORTANT: mlp1 weights are INTERLEAVED, not concatenated!
                 # OpenAI's swiglu extracts x[::2] (gate) and x[1::2] (up), so:
                 # Row 0 -> gate[0], Row 1 -> up[0], Row 2 -> gate[1], Row 3 -> up[1], ...
-                gate_blocks = expert_mlp1_blocks[::2]    # even rows [2880, K//2]
-                gate_scales = expert_mlp1_scales[::2]    # even rows [2880, K//32]
-                gate_bias = expert_mlp1_bias[::2]        # even indices [2880]
+                # NOTE: .contiguous() is CRITICAL - strided slices must be made contiguous
+                # before saving to ensure correct memory layout after load
+                gate_blocks = expert_mlp1_blocks[::2].contiguous()    # even rows [2880, K//2]
+                gate_scales = expert_mlp1_scales[::2].contiguous()    # even rows [2880, K//32]
+                gate_bias = expert_mlp1_bias[::2].contiguous()        # even indices [2880]
 
-                up_blocks = expert_mlp1_blocks[1::2]     # odd rows [2880, K//2]
-                up_scales = expert_mlp1_scales[1::2]     # odd rows [2880, K//32]
-                up_bias = expert_mlp1_bias[1::2]         # odd indices [2880]
+                up_blocks = expert_mlp1_blocks[1::2].contiguous()     # odd rows [2880, K//2]
+                up_scales = expert_mlp1_scales[1::2].contiguous()     # odd rows [2880, K//32]
+                up_bias = expert_mlp1_bias[1::2].contiguous()         # odd indices [2880]
+
+                # Log sliced shapes for layer 0, expert 0 only
+                if layer_idx == 0 and expert_idx == 0:
+                    logging.info(f"Layer {layer_idx} Expert {expert_idx} SLICED TENSORS:")
+                    logging.info(f"  gate_blocks: {gate_blocks.shape}, contiguous={gate_blocks.is_contiguous()}")
+                    logging.info(f"  gate_scales: {gate_scales.shape}, contiguous={gate_scales.is_contiguous()}")
+                    logging.info(f"  gate_bias: {gate_bias.shape}")
+                    logging.info(f"  up_blocks: {up_blocks.shape}, contiguous={up_blocks.is_contiguous()}")
+                    logging.info(f"  up_scales: {up_scales.shape}, contiguous={up_scales.is_contiguous()}")
+                    logging.info(f"  up_bias: {up_bias.shape}")
 
                 # mlp2 -> down_proj
                 down_blocks = mlp2_blocks[expert_idx]  # [2880, K//2]

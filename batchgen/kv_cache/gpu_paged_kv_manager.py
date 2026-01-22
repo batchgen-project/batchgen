@@ -602,10 +602,13 @@ class GPUPagedKVCacheManager:
 			self.config.num_k_heads,
 			self.config.k_head_dim,
 		)
-		self._k_cache = torch.empty(
+		# DEBUG: Use torch.ones() instead of torch.empty() to detect KV cache pollution
+		# If uninitialized memory is being read, ones will produce different (wrong) results
+		# than the "all newlines" we're seeing. If results are the same, issue is elsewhere.
+		self._k_cache = torch.ones(
 			shape, dtype=self.config.kv_dtype, device=self.device
 		)
-		logging.debug("Initialized K cache %s", tuple(self._k_cache.shape))
+		logging.debug("Initialized K cache %s (with ones for debugging)", tuple(self._k_cache.shape))
 
 		if self.config.has_v_cache:
 			v_shape = (
@@ -615,10 +618,10 @@ class GPUPagedKVCacheManager:
 				self.config.num_v_heads,
 				self.config.v_head_dim,
 			)
-			self._v_cache = torch.empty(
+			self._v_cache = torch.ones(
 				v_shape, dtype=self.config.kv_dtype, device=self.device
 			)
-			logging.debug("Initialized V cache %s", tuple(self._v_cache.shape))
+			logging.debug("Initialized V cache %s (with ones for debugging)", tuple(self._v_cache.shape))
 		else:
 			self._v_cache = None
 
