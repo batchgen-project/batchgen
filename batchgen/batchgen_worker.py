@@ -5996,7 +5996,15 @@ class BatchGenWorker:
 				AttnWrapperBase.kv_append_callback = kv_append_callback
 
 				# Forward
-				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
+				# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
+				# Without this, the model generates position_ids = [[0]] for all decode steps,
+				# causing RoPE to be applied at position 0 instead of the actual token position.
+				outputs = self.model(
+					new_tokens,
+					attention_mask=Attn_Wrapper.attention_mask,
+					position_ids=Attn_Wrapper.position_ids,
+					use_cache=False
+				)
 				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
