@@ -6157,11 +6157,13 @@ class BatchGenWorker:
 		layer_idx: int,
 		batch: List[int],
 		k_tensor: torch.Tensor,
+		v_tensor: torch.Tensor = None,
 	) -> None:  # Returns None, not the task
 		"""
 		Async append - adds task to pending list, does NOT wait.
-		
+
 		CRITICAL: Must keep tensor references alive until async operation completes!
+		GPT-OSS uses GQA with separate K and V caches, so v_tensor must be passed.
 		"""
 		if not batch:
 			return
@@ -6181,7 +6183,9 @@ class BatchGenWorker:
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
-		
+		if v_tensor is not None and v_tensor.dim() == 3:
+			v_tensor = v_tensor.unsqueeze(2)
+
 		# NaN DETECTION: Check for NaN in KV tensor BEFORE appending to host
 		# This catches attention computation issues that would propagate to host KV
 		if layer_idx == 0 and torch.isnan(k_tensor).any():
@@ -6217,16 +6221,19 @@ class BatchGenWorker:
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
 			k_tensor=k_tensor,
-			v_tensor=None,
+			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
 			sequence_lengths=sequence_lengths,
 		)
-		
-		# CRITICAL FIX: Store tensor reference alongside task to prevent GC
+
+		# CRITICAL FIX: Store tensor references alongside task to prevent GC
 		# PyTorch's CUDA caching allocator can reuse memory if tensor is dereferenced
 		# while async operation is still reading from it!
+		# Must store BOTH k and v tensors for GQA models
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 		self._pending_kv_append_tensors.append(k_tensor)
+		if v_tensor is not None:
+			self._pending_kv_append_tensors.append(v_tensor)
 		
 		# Add to pending list - will be waited at page boundary
 		self._pending_kv_append_tasks.append(task)
