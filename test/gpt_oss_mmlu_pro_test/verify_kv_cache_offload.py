@@ -460,13 +460,19 @@ def test_basic_tensor_values():
     print(f"V shape: {v.shape}")
 
     # Verify encoding scheme
+    # Note: bfloat16 has ~3 decimal digits precision, so allow 1% relative tolerance
     print("\nVerifying encoding:")
     all_correct = True
     for b in range(batch_size):
         for s in range(seq_len):
             expected_val = b * 1000 + s * 10 + 0 + 0 * 0.01  # h=0, d=0
             actual_val = k[b, s, 0, 0].item()
-            match = abs(actual_val - expected_val) < 0.1
+            # Use relative tolerance for large values, absolute for small
+            if expected_val == 0:
+                match = abs(actual_val) < 0.1
+            else:
+                rel_error = abs(actual_val - expected_val) / abs(expected_val)
+                match = rel_error < 0.01  # 1% relative error for bfloat16
             print(f"  K[{b},{s},0,0] = {actual_val:.2f} (expected: {expected_val:.2f}) {'✓' if match else '✗'}")
             if not match:
                 all_correct = False
