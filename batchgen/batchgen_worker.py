@@ -4994,6 +4994,24 @@ class BatchGenWorker:
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
+				# DEBUG: Verify per-sequence hidden states after prefill
+				import os
+				if os.environ.get("BATCHGEN_DEBUG_PREFILL_OUTPUT", "0") == "1":
+					print(f"\n[PREFILL OUTPUT DEBUG] === Micro-batch {batch_idx} ===")
+					print(f"[PREFILL OUTPUT DEBUG] hidden_states.shape = {hidden_states.shape}")
+					print(f"[PREFILL OUTPUT DEBUG] batch_cu_seqlens = {batch_cu_seqlens.tolist()}")
+					print(f"[PREFILL OUTPUT DEBUG] last_token_indices = {last_token_indices.tolist()}")
+					print(f"[PREFILL OUTPUT DEBUG] last_token_hidden.shape = {last_token_hidden.shape}")
+					# Check if hidden states differ across sequences
+					for i in range(min(3, batch_num_seqs)):
+						h = last_token_hidden[i, :8].tolist()
+						print(f"[PREFILL OUTPUT DEBUG] seq{i} (pos={last_token_indices[i].item()}): hidden[:8] = {[f'{v:.4f}' for v in h]}")
+					if batch_num_seqs >= 2:
+						diff = (last_token_hidden[0] - last_token_hidden[1]).abs().max().item()
+						print(f"[PREFILL OUTPUT DEBUG] max_diff seq0-seq1: {diff:.6f}")
+						if diff < 1e-4:
+							print(f"[PREFILL OUTPUT DEBUG] *** CRITICAL: seq0 and seq1 have IDENTICAL hidden states! ***")
+
 				# Call lm_head directly using F.linear to bypass the hook
 				logits = torch.nn.functional.linear(
 					last_token_hidden,
@@ -5003,6 +5021,17 @@ class BatchGenWorker:
 
 				batch_new_tokens = self._select_tokens(logits)
 				output_tokens.append(batch_new_tokens)
+
+				# DEBUG: Show logits and sampled tokens
+				if os.environ.get("BATCHGEN_DEBUG_PREFILL_OUTPUT", "0") == "1":
+					print(f"[PREFILL OUTPUT DEBUG] logits.shape = {logits.shape}")
+					for i in range(min(3, batch_num_seqs)):
+						top_vals, top_ids = torch.topk(logits[i], k=5)
+						print(f"[PREFILL OUTPUT DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
+					print(f"[PREFILL OUTPUT DEBUG] sampled_tokens[:5] = {batch_new_tokens[:5].flatten().tolist()}")
+					if batch_num_seqs >= 2:
+						if batch_new_tokens[0].item() == batch_new_tokens[1].item():
+							print(f"[PREFILL OUTPUT DEBUG] *** WARNING: seq0 and seq1 sampled SAME token! ***")
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
