@@ -2831,6 +2831,31 @@ class BatchGenWorker:
 		local_tokenize_time = time.perf_counter() - tokenize_start
 		logging.debug(f"Rank {self.rank}: Local tokenization of {len(my_texts)} sequences in {local_tokenize_time:.2f}s")
 
+		# DEBUG: Print tokenized prompts
+		if os.environ.get("BATCHGEN_DEBUG_TOKENIZE", "0") == "1" and self.rank == 0 and my_tokenized:
+			print(f"\n[TOKENIZE DEBUG] === First 3 tokenized prompts ===")
+			for i in range(min(3, len(my_tokenized))):
+				item = my_tokenized[i]
+				token_ids = item["input_ids"]
+				print(f"\n[TOKENIZE DEBUG] Sequence {item['global_idx']} (length={item['length']})")
+				# Show first 50 tokens
+				print(f"[TOKENIZE DEBUG] First 50 tokens: {token_ids[:50]}")
+				# Show last 50 tokens (includes question end)
+				print(f"[TOKENIZE DEBUG] Last 50 tokens: {token_ids[-50:]}")
+				# Decode first 200 chars of prompt
+				try:
+					decoded_start = self.tokenizer.decode(token_ids[:100])
+					decoded_end = self.tokenizer.decode(token_ids[-100:])
+					print(f"[TOKENIZE DEBUG] Start of prompt (decoded): {repr(decoded_start[:300])}")
+					print(f"[TOKENIZE DEBUG] End of prompt (decoded): {repr(decoded_end[-300:])}")
+				except Exception as e:
+					print(f"[TOKENIZE DEBUG] Decode error: {e}")
+				# Check for special tokens
+				special_token_ids = [199998, 199999, 200000, 200001, 200002, 200003, 200004, 200005, 200006, 200007, 200008, 200012]
+				found_special = [tid for tid in token_ids if tid in special_token_ids]
+				if found_special:
+					print(f"[TOKENIZE DEBUG] Special tokens found: {found_special}")
+
 		# Phase 1.5: Gather all tokenized results to all ranks
 		# This keeps NCCL alive and shares results efficiently
 		gather_start = time.perf_counter()
@@ -6113,9 +6138,21 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 
-			# DEBUG: Print sampled tokens
+			# DEBUG: Print sampled tokens and logits comparison
 			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
+				print(f"\n[DECODE DEBUG] === Iteration {local_iteration} ===")
 				print(f"[DECODE DEBUG] sampled_tokens[:5]: {new_tokens[:5].flatten().tolist()}")
+				# Check if all tokens are the same
+				if len(new_tokens) >= 2:
+					all_same = all(new_tokens[i].item() == new_tokens[0].item() for i in range(min(5, len(new_tokens))))
+					if all_same:
+						print(f"[DECODE DEBUG] *** WARNING: All sequences sampled SAME token! ***")
+				# Show logits for first 3 sequences
+				if os.environ.get("BATCHGEN_DEBUG_DECODE_LOGITS", "0") == "1":
+					logits = outputs.logits[:, -1, :]
+					for i in range(min(3, len(logits))):
+						top_vals, top_ids = torch.topk(logits[i], k=5)
+						print(f"[DECODE DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
 
 			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
 			# This avoids N GPU synchronizations which cause heavy CPU overhead
