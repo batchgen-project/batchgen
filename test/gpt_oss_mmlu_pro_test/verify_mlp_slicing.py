@@ -23,14 +23,14 @@ BatchGen approach:
 - swiglu(gate_out, up_out)
 
 These should be mathematically equivalent.
+
+Usage:
+    python verify_mlp_slicing.py --checkpoint /path/to/checkpoint
 """
 
+import argparse
 import sys
 from pathlib import Path
-
-# Add gpt-oss to path
-GPT_OSS_PATH = "/data2/tairan/workspace/gpt-oss"
-sys.path.insert(0, GPT_OSS_PATH)
 
 import torch
 from safetensors import safe_open
@@ -101,41 +101,73 @@ def batchgen_swiglu(gate: torch.Tensor, up: torch.Tensor, alpha: float = 1.702, 
 
 
 def main():
-    checkpoint_path = "/data2/tairan/modelscope/hub/models/openai/gpt-oss-120b/original"
+    parser = argparse.ArgumentParser(description="Verify MLP1 weight slicing equivalence")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to checkpoint directory")
+    args = parser.parse_args()
+
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        print(f"ERROR: Checkpoint path does not exist: {checkpoint_path}")
+        return
 
     # Find safetensor files
-    safetensor_files = list(Path(checkpoint_path).glob("*.safetensors"))
+    safetensor_files = list(checkpoint_path.glob("*.safetensors"))
     print(f"Found {len(safetensor_files)} safetensor files")
 
     if not safetensor_files:
         print("No safetensor files found!")
         return
 
-    # Load MLP1 weights for one expert
-    print(f"\nLoading MLP1 weights from {safetensor_files[0].name}...")
-    with safe_open(safetensor_files[0], framework="pt", device="cpu") as f:
-        keys = list(f.keys())
+    # Build tensor name to file mapping (search across all files)
+    print("\nBuilding tensor index across all files...")
+    tensor_to_file = {}
+    for sf_file in safetensor_files:
+        with safe_open(sf_file, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                tensor_to_file[key] = sf_file
 
-        # Find MLP1 blocks and scales for first expert
-        mlp1_blocks_key = None
-        mlp1_scales_key = None
-        mlp1_bias_key = None
+    print(f"Total tensors found: {len(tensor_to_file)}")
 
-        for key in keys:
-            if "block.0.mlp.mlp1_weight.blocks" in key:
-                mlp1_blocks_key = key
-            if "block.0.mlp.mlp1_weight.scales" in key:
-                mlp1_scales_key = key
-            if "block.0.mlp.mlp1_bias" in key:
-                mlp1_bias_key = key
+    # Find MLP1 blocks and scales for first layer (block.0)
+    mlp1_blocks_key = None
+    mlp1_scales_key = None
+    mlp1_bias_key = None
 
-        if not mlp1_blocks_key or not mlp1_scales_key:
-            print("MLP1 weight not found!")
-            return
+    for key in tensor_to_file.keys():
+        if "block.0.mlp.mlp1_weight.blocks" in key:
+            mlp1_blocks_key = key
+        if "block.0.mlp.mlp1_weight.scales" in key:
+            mlp1_scales_key = key
+        if "block.0.mlp.mlp1_bias" in key:
+            mlp1_bias_key = key
 
+    if not mlp1_blocks_key or not mlp1_scales_key:
+        print("MLP1 weight not found!")
+        print("Available keys containing 'mlp1':")
+        for key in sorted(tensor_to_file.keys()):
+            if "mlp1" in key:
+                print(f"  {key}")
+        return
+
+    print(f"\nFound MLP1 weights:")
+    print(f"  blocks: {mlp1_blocks_key} in {tensor_to_file[mlp1_blocks_key].name}")
+    print(f"  scales: {mlp1_scales_key} in {tensor_to_file[mlp1_scales_key].name}")
+    if mlp1_bias_key:
+        print(f"  bias: {mlp1_bias_key} in {tensor_to_file[mlp1_bias_key].name}")
+
+    # Load MLP1 weights
+    print("\nLoading MLP1 weights...")
+    with safe_open(tensor_to_file[mlp1_blocks_key], framework="pt", device="cpu") as f:
         mlp1_blocks = f.get_tensor(mlp1_blocks_key)  # [128, 5760, 90, 16]
+
+    with safe_open(tensor_to_file[mlp1_scales_key], framework="pt", device="cpu") as f:
         mlp1_scales = f.get_tensor(mlp1_scales_key)  # [128, 5760, 90]
-        mlp1_bias = f.get_tensor(mlp1_bias_key) if mlp1_bias_key else None
+
+    mlp1_bias = None
+    if mlp1_bias_key:
+        with safe_open(tensor_to_file[mlp1_bias_key], framework="pt", device="cpu") as f:
+            mlp1_bias = f.get_tensor(mlp1_bias_key)
 
         print(f"MLP1 blocks shape: {mlp1_blocks.shape}")
         print(f"MLP1 scales shape: {mlp1_scales.shape}")
