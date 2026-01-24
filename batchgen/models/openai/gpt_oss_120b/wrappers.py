@@ -1719,6 +1719,18 @@ class GptOssAttnWrapper(AttnWrapperBase):
             dequant_weights = self.dequantize_weights(weights)
             self.apply_weights(dequant_weights)
 
+        # For persistent mode, get sinks from module since dequantize_weights wasn't called
+        if self.sinks is None and self.persistent and hasattr(self.module, 'sinks'):
+            self.sinks = self.module.sinks.data
+            if os.environ.get("BATCHGEN_DEBUG_SINKS", "0") == "1":
+                sink_min = float(self.sinks.min().item())
+                sink_max = float(self.sinks.max().item())
+                sink_mean = float(self.sinks.float().mean().item())
+                logging.info(
+                    f"Layer {self.layer_idx}: Loaded sinks from module (persistent mode), "
+                    f"shape={self.sinks.shape}, range=[{sink_min:.4f}, {sink_max:.4f}], mean={sink_mean:.4f}"
+                )
+
         # Move sinks to correct device
         if self.sinks is not None and hidden_states is not None:
             self.sinks = self.sinks.to(hidden_states.device)
