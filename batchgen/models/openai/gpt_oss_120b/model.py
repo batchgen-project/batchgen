@@ -147,16 +147,21 @@ class YaRNRotaryEmbedding(nn.Module):
 
             d_half = self.dim / 2
             # NTK by parts
+            # CRITICAL: beta_fast (32.0) is used for LOW (interpolation boundary)
+            #           beta_slow (1.0) is used for HIGH (extrapolation boundary)
+            # This matches OpenAI's ntk_beta=32 for low, ntk_alpha=1 for high
             low = (
-                d_half
-                * math.log(self.original_max_position_embeddings / (self.beta_slow * 2 * math.pi))
-                / math.log(self.base)
-            )
-            high = (
                 d_half
                 * math.log(self.original_max_position_embeddings / (self.beta_fast * 2 * math.pi))
                 / math.log(self.base)
             )
+            high = (
+                d_half
+                * math.log(self.original_max_position_embeddings / (self.beta_slow * 2 * math.pi))
+                / math.log(self.base)
+            )
+            # Sanity check: low < high (same assertion as OpenAI reference)
+            assert 0 < low < high < d_half - 1, f"YaRN params invalid: low={low}, high={high}, d_half={d_half}"
 
             interpolation = 1.0 / (self.scaling_factor * freq)
             extrapolation = 1.0 / freq
