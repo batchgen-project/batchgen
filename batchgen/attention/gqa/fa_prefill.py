@@ -75,9 +75,9 @@ def gqa_prefill_fa(
     use_vanilla_for_sinks = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
     use_vanilla = (sinks is not None and use_vanilla_for_sinks)
 
-    # Debug: Log which attention path is being used
-    if os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1":
-        print(f"[GQA PREFILL] BATCHGEN_VANILLA_SINKS={os.environ.get('BATCHGEN_VANILLA_SINKS', '0')}, sinks={sinks is not None}, use_vanilla={use_vanilla}")
+    # ALWAYS print to confirm env var is reaching worker (temporary debug)
+    import sys
+    print(f"[GQA PREFILL] ENV CHECK: BATCHGEN_VANILLA_SINKS={os.environ.get('BATCHGEN_VANILLA_SINKS', 'NOT_SET')}, sinks={sinks is not None}, use_vanilla={use_vanilla}", file=sys.stderr, flush=True)
 
     if use_vanilla:
         print(f"[GQA PREFILL] >>> ENTERING VANILLA ATTENTION PATH <<<")

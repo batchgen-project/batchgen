@@ -115,10 +115,12 @@ def gqa_attention_prefill(
         scale = 1.0 / math.sqrt(head_dim)
 
     # Use FlashAttention if available, UNLESS:
-    # - sinks are present AND USE_VANILLA_FOR_SINKS is True
+    # - sinks are present AND BATCHGEN_VANILLA_SINKS=1
     # The vanilla path uses correct inline softmax_with_sinks,
     # while FA path uses sigmoid post-correction which may have issues.
-    use_vanilla = (sinks is not None and USE_VANILLA_FOR_SINKS)
+    # Check env var at runtime (not import time) for worker process compatibility
+    use_vanilla_for_sinks = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
+    use_vanilla = (sinks is not None and use_vanilla_for_sinks)
 
     if _flash_attn_func is not None and not use_vanilla:
         # Convert padded input to varlen format for gqa_prefill_fa
