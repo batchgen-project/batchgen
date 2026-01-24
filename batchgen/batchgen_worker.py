@@ -6141,7 +6141,14 @@ class BatchGenWorker:
 			# DEBUG: Print sampled tokens and logits comparison
 			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
 				print(f"\n[DECODE DEBUG] === Iteration {local_iteration} ===")
-				print(f"[DECODE DEBUG] sampled_tokens[:5]: {new_tokens[:5].flatten().tolist()}")
+				token_ids = new_tokens[:5].flatten().tolist()
+				print(f"[DECODE DEBUG] sampled_tokens[:5]: {token_ids}")
+				# Decode tokens to show actual text
+				try:
+					decoded_tokens = [self.tokenizer.decode([tid]) for tid in token_ids]
+					print(f"[DECODE DEBUG] decoded_text[:5]: {decoded_tokens}")
+				except Exception as e:
+					print(f"[DECODE DEBUG] decode error: {e}")
 				# Check if all tokens are the same
 				if len(new_tokens) >= 2:
 					all_same = all(new_tokens[i].item() == new_tokens[0].item() for i in range(min(5, len(new_tokens))))
