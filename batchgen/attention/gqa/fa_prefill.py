@@ -14,7 +14,8 @@ import os
 import torch
 from typing import Optional, Tuple
 
-from .gqa_attention import USE_VANILLA_FOR_SINKS
+# Read the flag directly to avoid circular import with gqa_attention.py
+USE_VANILLA_FOR_SINKS = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
 
 # Detect which flash attention version is available
 _USE_FA3 = False
