@@ -124,7 +124,6 @@ def gqa_decode_fa(
         print(f"[GQA DECODE] BATCHGEN_VANILLA_SINKS={os.environ.get('BATCHGEN_VANILLA_SINKS', '0')}, sinks={sinks is not None}, use_vanilla={use_vanilla}")
 
     if use_vanilla:
-        print(f"[GQA DECODE] >>> ENTERING VANILLA ATTENTION PATH <<<")  # Always print when vanilla
         from .gqa_attention import gqa_attention_decode
 
         # Gather paged KV cache into contiguous format
