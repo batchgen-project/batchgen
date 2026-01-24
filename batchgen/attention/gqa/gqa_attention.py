@@ -122,6 +122,9 @@ def gqa_attention_prefill(
     use_vanilla_for_sinks = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
     use_vanilla = (sinks is not None and use_vanilla_for_sinks)
 
+    # DEBUG: Log which path is taken
+    print(f"[gqa_attention_prefill] use_vanilla={use_vanilla}, _flash_attn_func={_flash_attn_func is not None}, will_use_FA={_flash_attn_func is not None and not use_vanilla}", flush=True)
+
     if _flash_attn_func is not None and not use_vanilla:
         # Convert padded input to varlen format for gqa_prefill_fa
         # Input: [batch, heads, seq, dim] -> varlen: [total, heads, dim]
@@ -162,6 +165,7 @@ def gqa_attention_prefill(
     # Vanilla PyTorch attention path
     # Used when: FlashAttention not available, OR (sinks present AND USE_VANILLA_FOR_SINKS=True)
     # This path uses correct inline softmax_with_sinks for accurate sink handling.
+    print(f"[gqa_attention_prefill] >>> EXECUTING VANILLA PYTORCH ATTENTION with softmax_with_sinks <<<", flush=True)
     if _flash_attn_func is None:
         import warnings
         warnings.warn(
