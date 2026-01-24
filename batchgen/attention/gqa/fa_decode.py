@@ -117,7 +117,12 @@ def gqa_decode_fa(
     # Use vanilla PyTorch path for sinks when configured (correct inline softmax)
     use_vanilla = (sinks is not None and USE_VANILLA_FOR_SINKS)
 
+    # Debug: Log which attention path is being used
+    if os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1":
+        print(f"[GQA DECODE] USE_VANILLA_FOR_SINKS={USE_VANILLA_FOR_SINKS}, sinks={sinks is not None}, use_vanilla={use_vanilla}")
+
     if use_vanilla:
+        print(f"[GQA DECODE] >>> ENTERING VANILLA ATTENTION PATH <<<")  # Always print when vanilla
         from .gqa_attention import gqa_attention_decode
 
         # Gather paged KV cache into contiguous format

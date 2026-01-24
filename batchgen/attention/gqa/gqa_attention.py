@@ -56,6 +56,10 @@ from ..sink import softmax_with_sinks
 # Can be overridden via environment variable: BATCHGEN_VANILLA_SINKS=1
 USE_VANILLA_FOR_SINKS = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
 
+# Log the flag value at import time for debugging
+if os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1" or os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1":
+    print(f"[GQA ATTENTION] BATCHGEN_VANILLA_SINKS={os.environ.get('BATCHGEN_VANILLA_SINKS', '0')}, USE_VANILLA_FOR_SINKS={USE_VANILLA_FOR_SINKS}")
+
 # Detect which flash attention version is available
 _USE_FA3 = False
 _flash_attn_func = None
