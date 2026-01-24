@@ -54,9 +54,9 @@ echo ""
 echo "=== Duplicate Position Check ==="
 if grep -q "\[GPU KV WRITE L0\] token_indices" "$LOG_FILE"; then
     dup_lines=$(grep "\[GPU KV WRITE L0\] token_indices" "$LOG_FILE" | sort | uniq -d)
-    dup_count=$(echo "$dup_lines" | grep -c . || echo "0")
+    dup_count=$(echo "$dup_lines" | grep -c . 2>/dev/null || echo "0")
 
-    if [ "$dup_count" -gt 0 ] && [ -n "$dup_lines" ]; then
+    if [ "$dup_count" -gt 0 ] 2>/dev/null && [ -n "$dup_lines" ]; then
         echo "❌ BUG CONFIRMED: Found duplicate KV write positions!"
         echo ""
         echo "Duplicate lines:"
