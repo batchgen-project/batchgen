@@ -26,6 +26,57 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def parse_harmony_output(text: str) -> Tuple[str, str]:
+    """Parse GPT-OSS Harmony format output.
+
+    GPT-OSS models use the Harmony response format with special tokens to
+    separate chain-of-thought reasoning (analysis channel) from user-facing
+    output (final channel).
+
+    Format: <|channel|>channel_name<|message|>content...
+
+    Args:
+        text: Raw model output (may contain Harmony special tokens)
+
+    Returns:
+        Tuple of (analysis_content, final_content)
+    """
+    # If no Harmony tokens, return text as final content (plain text output)
+    if "<|channel|>" not in text:
+        return "", text
+
+    # Parse channel sections
+    # Format: <|channel|>channel_name<|message|>content...
+    analysis_parts = []
+    final_parts = []
+
+    # Split by <|channel|> and process each section
+    # Match: <|channel|>channelname<|message|>content (until next <|channel|> or end tokens)
+    pattern = r"<\|channel\|>(\w+)<\|message\|>(.*?)(?=<\|channel\|>|<\|end\|>|<\|return\|>|$)"
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    for channel, content in matches:
+        if channel == "analysis":
+            analysis_parts.append(content.strip())
+        elif channel == "final":
+            final_parts.append(content.strip())
+
+    # Handle malformed cases where <|message|> comes after multiple <|channel|> tags
+    # e.g., <|channel|>analysis<|channel|>final<|message|>content
+    if not matches:
+        # Fallback: find the last <|message|> and extract content after it
+        message_idx = text.rfind("<|message|>")
+        if message_idx != -1:
+            content = text[message_idx + len("<|message|>") :]
+            # Clean up any trailing special tokens
+            for token in ["<|end|>", "<|return|>", "<|channel|>"]:
+                if token in content:
+                    content = content[: content.find(token)]
+            final_parts.append(content.strip())
+
+    return "\n".join(analysis_parts), "\n".join(final_parts)
+
+
 def form_options(options: List[str]) -> str:
     """Format multiple choice options."""
     option_str = "Options are:\n"
@@ -36,21 +87,50 @@ def form_options(options: List[str]) -> str:
 
 
 def extract_prediction(model_output: str) -> Optional[str]:
-    """Extract the predicted letter answer from a model output string.
+    """Extract the predicted letter answer from model output.
 
-    GPT-OSS-120B is a standard chat model without thinking tags.
-    Look for patterns like "answer is (A)" or "The answer is A".
+    For GPT-OSS models using Harmony format:
+    1. Parse the output to extract 'final' channel content
+    2. Apply answer extraction patterns to final content only
+    3. Fall back to full output if parsing fails
+
+    Args:
+        model_output: Raw model output string (may contain Harmony tokens)
+
+    Returns:
+        Extracted answer letter (A-J) or None if not found
     """
-    # Try multiple patterns
+    # Parse Harmony format to get final channel content
+    analysis_content, final_content = parse_harmony_output(model_output)
+
+    # Prefer final channel content, fall back to full output
+    search_text = final_content if final_content else model_output
+
+    # Answer extraction patterns (adapted from OpenAI's abcd_grader.py)
+    # Extended to support A-J for MMLU-Pro's 10-choice questions
     patterns = [
-        r"answer is \(?([ABCDEFGHIJ])\)?",
-        r"correct answer is \(?([ABCDEFGHIJ])\)?",
-        r"(?:^|\s)\(?([ABCDEFGHIJ])\)?\s*$",  # Letter at end of response
-        r"(?:^|\s)([ABCDEFGHIJ])\.",  # Letter followed by period
+        # "Answer: A" or "Answers: B" with optional markdown wrappers
+        r"(?i)(?:\*{1,2}|_{1,2})?Answer[s]?\s*[:\-–]?(?:\*{1,2}|_{1,2})?\s*\(?([ABCDEFGHIJ])\)?",
+        # "correct answer is (A)"
+        r"(?i)correct answer is \(?([ABCDEFGHIJ])\)?",
+        # "Option B" or "Choice: C"
+        r"(?i)\b(?:Option|Choice)\b\s*[:\-–]?\s*([ABCDEFGHIJ])\b",
+        # LaTeX \boxed{...A...}
+        r"\\boxed\{[^}]*?([ABCDEFGHIJ])[^}]*\}",
+        # Standalone letter in parens/brackets: "(A)" or "[B]"
+        r"(?<![A-Za-z0-9])[\(\[]\s*([ABCDEFGHIJ])\s*[\)\]](?![A-Za-z0-9])",
+        # Markdown-wrapped: *A* or **B** or _C_ or __D__
+        r"(?<![A-Za-z0-9])(?:\*{1,2}|_{1,2})([ABCDEFGHIJ])(?:\*{1,2}|_{1,2})(?![A-Za-z0-9])",
+        # Letter at end of line (common pattern)
+        r"(?:^|\s)\(?([ABCDEFGHIJ])\)?\s*$",
+        # Letter followed by period or colon
+        r"(?:^|\s)([ABCDEFGHIJ])[\.\:]",
+        # Final fallback: bare letter on its own line
+        r"^\s*([ABCDEFGHIJ])\s*$",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, model_output, re.IGNORECASE | re.MULTILINE)
+        match = re.search(pattern, search_text, re.IGNORECASE | re.MULTILINE)
         if match:
             return match.group(1).upper()
 
@@ -335,14 +415,20 @@ if __name__ == "__main__":
         else:
             answer_set.append("")
 
-    # Print results
+    # Print results with Harmony format parsing info
     print_result = True
     if print_result:
         for idx in range(min(5, len(answer_set))):  # Print first 5 for brevity
             print("==================================================================")
             print(f"Query {idx}: {queries[idx][:500]}...")
             print("\n")
-            print(f"Answer {idx}: {answer_set[idx][:1000]}")
+            print(f"Raw Answer {idx}: {answer_set[idx][:1000]}")
+            # Show parsed Harmony channels
+            analysis, final = parse_harmony_output(answer_set[idx])
+            if analysis or "<|channel|>" in answer_set[idx]:
+                print(f"\n--- Harmony Format Parsing ---")
+                print(f"Analysis channel: {analysis[:300]}..." if analysis else "Analysis: (none)")
+                print(f"Final channel: {final[:300]}..." if final else "Final: (none)")
             print("==================================================================\n")
 
     # Evaluate accuracy
