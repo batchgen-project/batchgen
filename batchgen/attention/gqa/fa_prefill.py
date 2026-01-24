@@ -14,8 +14,8 @@ import os
 import torch
 from typing import Optional, Tuple
 
-# Read the flag directly to avoid circular import with gqa_attention.py
-USE_VANILLA_FOR_SINKS = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
+# Note: We check env var at runtime in the function, not at import time,
+# because worker processes may import modules before env vars are set.
 
 # Detect which flash attention version is available
 _USE_FA3 = False
@@ -71,11 +71,13 @@ def gqa_prefill_fa(
             - lse: Log-sum-exp values or None if sinks not provided
     """
     # Use vanilla PyTorch path for sinks when configured (correct inline softmax)
-    use_vanilla = (sinks is not None and USE_VANILLA_FOR_SINKS)
+    # Check env var at runtime (not import time) for worker process compatibility
+    use_vanilla_for_sinks = os.environ.get("BATCHGEN_VANILLA_SINKS", "0") == "1"
+    use_vanilla = (sinks is not None and use_vanilla_for_sinks)
 
     # Debug: Log which attention path is being used
     if os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1":
-        print(f"[GQA PREFILL] USE_VANILLA_FOR_SINKS={USE_VANILLA_FOR_SINKS}, sinks={sinks is not None}, use_vanilla={use_vanilla}")
+        print(f"[GQA PREFILL] BATCHGEN_VANILLA_SINKS={os.environ.get('BATCHGEN_VANILLA_SINKS', '0')}, sinks={sinks is not None}, use_vanilla={use_vanilla}")
 
     if use_vanilla:
         print(f"[GQA PREFILL] >>> ENTERING VANILLA ATTENTION PATH <<<")
