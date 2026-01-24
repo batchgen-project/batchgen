@@ -2,10 +2,19 @@
 
 Uses flash_attn_varlen_func for variable-length (unpadded) sequences.
 Supports both FA2 (Ampere) and FA3 (Hopper).
+
+SINK TOKEN CONFIGURATION:
+- USE_VANILLA_FOR_SINKS=False (default): Use FlashAttention with sigmoid post-correction
+- USE_VANILLA_FOR_SINKS=True: Use vanilla PyTorch with inline softmax_with_sinks
+
+Set BATCHGEN_VANILLA_SINKS=1 environment variable to enable vanilla path.
 """
 
+import os
 import torch
 from typing import Optional, Tuple
+
+from .gqa_attention import USE_VANILLA_FOR_SINKS
 
 # Detect which flash attention version is available
 _USE_FA3 = False
@@ -60,6 +69,67 @@ def gqa_prefill_fa(
             - output: Attention output (total_q, nheads, headdim)
             - lse: Log-sum-exp values or None if sinks not provided
     """
+    # Use vanilla PyTorch path for sinks when configured (correct inline softmax)
+    use_vanilla = (sinks is not None and USE_VANILLA_FOR_SINKS)
+
+    # Debug: Log which attention path is being used
+    if os.environ.get("BATCHGEN_DEBUG_SINK", "0") == "1":
+        print(f"[GQA PREFILL] USE_VANILLA_FOR_SINKS={USE_VANILLA_FOR_SINKS}, sinks={sinks is not None}, use_vanilla={use_vanilla}")
+
+    if use_vanilla:
+        print(f"[GQA PREFILL] >>> ENTERING VANILLA ATTENTION PATH <<<")
+        from .gqa_attention import gqa_attention_prefill
+
+        # Convert varlen format to padded batch format for vanilla attention
+        # q: (total_q, nheads, headdim) -> padded: (batch, nheads, max_seqlen, headdim)
+        batch = len(cu_seqlens_q) - 1
+        nheads = q.shape[1]
+        nheads_kv = k.shape[1]
+        headdim = q.shape[2]
+
+        if softmax_scale is None:
+            softmax_scale = headdim ** -0.5
+
+        # Pad each sequence to max_seqlen
+        q_padded = torch.zeros(batch, nheads, max_seqlen_q, headdim, dtype=q.dtype, device=q.device)
+        k_padded = torch.zeros(batch, nheads_kv, max_seqlen_k, headdim, dtype=k.dtype, device=k.device)
+        v_padded = torch.zeros(batch, nheads_kv, max_seqlen_k, headdim, dtype=v.dtype, device=v.device)
+
+        for i in range(batch):
+            q_start = cu_seqlens_q[i].item()
+            q_end = cu_seqlens_q[i + 1].item()
+            q_len = q_end - q_start
+            # varlen: (total, heads, dim) -> padded: (batch, heads, seq, dim)
+            q_padded[i, :, :q_len, :] = q[q_start:q_end].permute(1, 0, 2)
+
+            k_start = cu_seqlens_k[i].item()
+            k_end = cu_seqlens_k[i + 1].item()
+            k_len = k_end - k_start
+            k_padded[i, :, :k_len, :] = k[k_start:k_end].permute(1, 0, 2)
+            v_padded[i, :, :k_len, :] = v[k_start:k_end].permute(1, 0, 2)
+
+        # Run vanilla prefill with correct inline softmax_with_sinks
+        output_padded = gqa_attention_prefill(
+            query=q_padded,
+            key=k_padded,
+            value=v_padded,
+            sinks=sinks,
+            scale=softmax_scale,
+            sliding_window=sliding_window,
+        )
+
+        # Convert back to varlen format: (batch, heads, seq, dim) -> (total, heads, dim)
+        output_list = []
+        for i in range(batch):
+            q_start = cu_seqlens_q[i].item()
+            q_end = cu_seqlens_q[i + 1].item()
+            q_len = q_end - q_start
+            # padded: (batch, heads, seq, dim) -> varlen: (seq, heads, dim)
+            output_list.append(output_padded[i, :, :q_len, :].permute(1, 0, 2))
+
+        output = torch.cat(output_list, dim=0)
+        return output, None
+
     if _flash_varlen_func is None:
         raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")
 
