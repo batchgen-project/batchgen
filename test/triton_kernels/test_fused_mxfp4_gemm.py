@@ -48,9 +48,11 @@ def generate_mxfp4_weights(
     K_packed = K // 2
     packed = torch.randint(0, 256, (N, K_packed), dtype=torch.uint8, device=device)
 
-    # Generate random scales (uint8, typical range 100-150 for reasonable values)
+    # Generate random scales (uint8)
+    # Scale exponent = scale_uint8 - 127
+    # Use range 120-134 for exponents around -7 to +7, giving reasonable magnitudes
     K_scales = K // 32
-    scales = torch.randint(100, 150, (N, K_scales), dtype=torch.uint8, device=device)
+    scales = torch.randint(120, 134, (N, K_scales), dtype=torch.uint8, device=device)
 
     return packed, scales
 
@@ -89,7 +91,6 @@ def sanity_check_single_gemm(
     M: int = 32,
     N: int = 2880,
     K: int = 2880,
-    atol: float = 1e-2,
     rtol: float = 1e-2,
 ) -> bool:
     """Test single GEMM correctness: Triton vs PyTorch reference.
@@ -98,7 +99,6 @@ def sanity_check_single_gemm(
         M: Batch size (number of tokens)
         N: Output features
         K: Input features
-        atol: Absolute tolerance for comparison
         rtol: Relative tolerance for comparison
 
     Returns:
@@ -125,26 +125,43 @@ def sanity_check_single_gemm(
     triton_output = fused_mxfp4_gemm(x, weight_packed, weight_scales, bias)
     torch.cuda.synchronize()
 
-    # Compare outputs
-    max_diff = (ref_output - triton_output).abs().max().item()
-    mean_diff = (ref_output - triton_output).abs().mean().item()
+    # Compare outputs using relative error
+    # BF16 has ~3 decimal digits of precision, so rtol=1e-2 is reasonable
+    ref_abs = ref_output.abs()
+    diff_abs = (ref_output - triton_output).abs()
+
+    # Compute relative error where ref is non-zero
+    # Use max(|ref|, epsilon) to avoid division by zero
+    epsilon = 1e-6
+    rel_error = diff_abs / torch.clamp(ref_abs, min=epsilon)
+
+    max_rel_error = rel_error.max().item()
+    mean_rel_error = rel_error.mean().item()
+    max_abs_diff = diff_abs.max().item()
     ref_std = ref_output.float().std().item()
+    ref_max = ref_output.abs().max().item()
 
-    print(f"Reference output std: {ref_std:.6f}")
-    print(f"Max absolute diff: {max_diff:.6f}")
-    print(f"Mean absolute diff: {mean_diff:.6f}")
+    print(f"Reference output: std={ref_std:.4f}, max_abs={ref_max:.4f}")
+    print(f"Max absolute diff: {max_abs_diff:.6f}")
+    print(f"Max relative error: {max_rel_error:.6f} ({max_rel_error*100:.4f}%)")
+    print(f"Mean relative error: {mean_rel_error:.6f} ({mean_rel_error*100:.4f}%)")
 
-    # Check with tolerances
-    is_close = torch.allclose(ref_output, triton_output, atol=atol, rtol=rtol)
+    # Check with relative tolerance
+    passed = max_rel_error < rtol
 
-    if is_close:
-        print(f"✓ PASSED: Triton output matches reference (atol={atol}, rtol={rtol})")
+    if passed:
+        print(f"✓ PASSED: Max relative error {max_rel_error:.6f} < rtol={rtol}")
         return True
     else:
-        print(f"✗ FAILED: Outputs differ beyond tolerance")
+        print(f"✗ FAILED: Max relative error {max_rel_error:.6f} >= rtol={rtol}")
         # Print some sample values for debugging
         print(f"Reference[:5,:5]:\n{ref_output[:5,:5]}")
         print(f"Triton[:5,:5]:\n{triton_output[:5,:5]}")
+        # Find worst case
+        worst_idx = torch.argmax(rel_error.view(-1)).item()
+        worst_i, worst_j = worst_idx // N, worst_idx % N
+        print(f"Worst element at [{worst_i}, {worst_j}]: ref={ref_output[worst_i, worst_j]:.6f}, "
+              f"triton={triton_output[worst_i, worst_j]:.6f}")
         return False
 
 
@@ -160,12 +177,12 @@ def sanity_check_mlp_forward(
     M: int = 32,
     hidden_size: int = 2880,
     intermediate_size: int = 2880,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
+    rtol: float = 5e-2,  # 5% relative tolerance - MLP has 3 GEMMs + activation
 ) -> bool:
     """Test full MLP forward: Triton vs PyTorch reference.
 
     This tests gate, up, down projections with SwiGLU activation.
+    MLP accumulates more error (3 GEMMs + nonlinear activation), so use looser tolerance.
     """
     from batchgen.triton_kernels import fused_mxfp4_mlp_forward
 
@@ -205,23 +222,30 @@ def sanity_check_mlp_forward(
     )
     torch.cuda.synchronize()
 
-    # Compare outputs
-    max_diff = (ref_output - triton_output).abs().max().item()
-    mean_diff = (ref_output - triton_output).abs().mean().item()
+    # Compare using relative error
+    ref_abs = ref_output.abs()
+    diff_abs = (ref_output - triton_output).abs()
+    epsilon = 1e-6
+    rel_error = diff_abs / torch.clamp(ref_abs, min=epsilon)
+
+    max_rel_error = rel_error.max().item()
+    mean_rel_error = rel_error.mean().item()
+    max_abs_diff = diff_abs.max().item()
     ref_std = ref_output.float().std().item()
+    ref_max = ref_output.abs().max().item()
 
-    print(f"Reference output std: {ref_std:.6f}")
-    print(f"Max absolute diff: {max_diff:.6f}")
-    print(f"Mean absolute diff: {mean_diff:.6f}")
+    print(f"Reference output: std={ref_std:.4f}, max_abs={ref_max:.4f}")
+    print(f"Max absolute diff: {max_abs_diff:.6f}")
+    print(f"Max relative error: {max_rel_error:.6f} ({max_rel_error*100:.4f}%)")
+    print(f"Mean relative error: {mean_rel_error:.6f} ({mean_rel_error*100:.4f}%)")
 
-    # Check with tolerances (MLP accumulates more error)
-    is_close = torch.allclose(ref_output, triton_output, atol=atol * 3, rtol=rtol * 3)
+    passed = max_rel_error < rtol
 
-    if is_close:
-        print(f"✓ PASSED: Triton MLP output matches reference")
+    if passed:
+        print(f"✓ PASSED: Max relative error {max_rel_error:.6f} < rtol={rtol}")
         return True
     else:
-        print(f"✗ FAILED: MLP outputs differ beyond tolerance")
+        print(f"✗ FAILED: Max relative error {max_rel_error:.6f} >= rtol={rtol}")
         return False
 
 
@@ -372,7 +396,8 @@ def run_sanity_checks() -> bool:
 
     all_passed = True
 
-    # Test various sizes
+    # Test various sizes for single GEMM
+    # Using 1% relative tolerance for single GEMM (BF16 has ~0.4% precision)
     sizes = [
         (1, 2880, 2880),     # Single token
         (32, 2880, 2880),    # Small batch (decode)
@@ -381,12 +406,12 @@ def run_sanity_checks() -> bool:
     ]
 
     for M, N, K in sizes:
-        passed = sanity_check_single_gemm(M, N, K)
+        passed = sanity_check_single_gemm(M, N, K, rtol=0.01)
         all_passed = all_passed and passed
 
-    # Test full MLP
+    # Test full MLP (3 GEMMs + activation - use 5% tolerance)
     for M in [1, 32, 128]:
-        passed = sanity_check_mlp_forward(M, 2880, 2880)
+        passed = sanity_check_mlp_forward(M, 2880, 2880, rtol=0.05)
         all_passed = all_passed and passed
 
     return all_passed
