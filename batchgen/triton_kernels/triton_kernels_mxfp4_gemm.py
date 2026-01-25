@@ -75,9 +75,11 @@ def triton_kernels_mxfp4_gemm(
     # which is required by triton_kernels (stride(-2) == 1)
     weight_T = weight_packed.T  # [K//2, N] uint8, column-major (strides: 1, K//2)
 
-    # Similarly transpose scales: [N, K//32] -> [K//32, N]
-    # Keep as column-major view (no .contiguous())
-    scales_T = weight_scales.T  # [K//32, N] uint8, column-major
+    # Transpose scales: [N, K//32] -> [K//32, N]
+    # IMPORTANT: Use .contiguous() to make scales row-major (stride[-1] == 1)
+    # This enables TMA (Tensor Memory Accelerator) in triton_kernels (matmul.py:327-332)
+    # Without TMA, large tensors fail with ~33% error
+    scales_T = weight_scales.T.contiguous()  # [K//32, N] uint8, row-major (strides: N, 1)
 
     # Wrap scales as triton_kernels Tensor
     scales_tensor = wrap_torch_tensor(scales_T)
@@ -94,7 +96,12 @@ def triton_kernels_mxfp4_gemm(
     output = matmul(x_2d, weight_T, None, precision_config=pc)
 
     # Add bias manually (workaround for triton_kernels type mismatch bug)
+    # Ensure proper dtype handling: output may be FP32 (accumulator), bias is BF16
     if bias is not None:
+        # Convert output to match input dtype (BF16) before adding bias
+        # This ensures numerical consistency with the expected output format
+        if output.dtype != x.dtype:
+            output = output.to(x.dtype)
         output = output + bias
 
     # Reshape output to match input batch dimensions
