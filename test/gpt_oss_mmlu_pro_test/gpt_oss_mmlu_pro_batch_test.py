@@ -304,6 +304,11 @@ if __name__ == "__main__":
         default="low",
         help="GPT-OSS reasoning effort level (default: low per OpenAI standard)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed output for every sample (query, raw answer, parsed choice, ground truth)",
+    )
     args = parser.parse_args()
 
     # Construct base URL
@@ -416,9 +421,30 @@ if __name__ == "__main__":
             answer_set.append("")
 
     # Print results with Harmony format parsing info
-    print_result = True
-    if print_result:
-        for idx in range(min(5, len(answer_set))):  # Print first 5 for brevity
+    ground_truths = dataset["answer"].tolist()
+    if args.verbose:
+        # Verbose mode: print all samples with extracted vs ground truth
+        for idx in range(len(answer_set)):
+            print("=" * 70)
+            print(f"[Sample {idx}]")
+            print(f"Query: {queries[idx][:500]}...")
+            print(f"\nRaw Answer: {answer_set[idx][:1000]}")
+            # Show parsed Harmony channels
+            analysis, final = parse_harmony_output(answer_set[idx])
+            if analysis or "<|channel|>" in answer_set[idx]:
+                print(f"\n--- Harmony Format Parsing ---")
+                print(f"Analysis channel: {analysis[:300]}..." if analysis else "Analysis: (none)")
+                print(f"Final channel: {final[:300]}..." if final else "Final: (none)")
+            # Show parsed choice vs ground truth
+            extracted = extract_prediction(answer_set[idx])
+            print(f"\n--- Extracted vs Ground Truth ---")
+            print(f"Extracted Choice: {extracted if extracted else '(FAILED)'}")
+            print(f"Ground Truth: {ground_truths[idx]}")
+            print(f"Result: {'CORRECT' if extracted == ground_truths[idx] else 'WRONG'}")
+            print("=" * 70 + "\n")
+    else:
+        # Print first 5 samples for brevity (default behavior)
+        for idx in range(min(5, len(answer_set))):
             print("==================================================================")
             print(f"Query {idx}: {queries[idx][:500]}...")
             print("\n")
@@ -429,13 +455,12 @@ if __name__ == "__main__":
                 print(f"\n--- Harmony Format Parsing ---")
                 print(f"Analysis channel: {analysis[:300]}..." if analysis else "Analysis: (none)")
                 print(f"Final channel: {final[:300]}..." if final else "Final: (none)")
-            print("==================================================================\n")
+            print("==================================================================")
 
     # Evaluate accuracy
     success = 0
     extraction_failures = 0
     predictions: List[str] = []
-    ground_truths = dataset["answer"].tolist()
     total_samples = len(answer_set)
     incorrect_samples: List[Dict[str, Any]] = []
 
@@ -471,3 +496,12 @@ if __name__ == "__main__":
     print(
         f"Extraction Failures: {extraction_failures} ({extraction_failures / total_samples:.2%})"
     )
+
+    # Print all incorrect samples
+    print("\n--- Incorrect Answers Summary ---")
+    print(f"Total Wrong: {len(incorrect_samples)}")
+    print("-" * 50)
+    for sample in incorrect_samples:
+        status = "(extraction failed)" if sample["extraction_failed"] else ""
+        print(f"Q{sample['id']:4d}: Chose {sample['extracted']}, Correct {sample['ground_truth']} {status}")
+    print("-" * 50)
