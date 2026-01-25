@@ -419,6 +419,82 @@ class GptOssParallelStrategyManager:
 
         log_gpu_memory(f"After clearing {cleared_count} expert weights")
 
+    def _swap_to_quantized_moe(self):
+        """Swap GptOssMoE to GptOssMoEQuantized for grouped GEMM execution.
+
+        Collects MXFP4 weights from wrapped experts into GptOssMoEQuantized format,
+        then replaces layer.mlp with the quantized version.
+
+        This enables grouped GEMM which reduces kernel launches from 384 (3 × 128 experts)
+        to just 3 per layer, achieving ~5x speedup for MoE execution.
+        """
+        from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEQuantized
+
+        device = self.engine_config.Basic_Config.device_torch
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            old_moe = self.model.model.layers[layer_idx].mlp
+
+            # Create quantized MoE
+            quantized_moe = GptOssMoEQuantized(self.model_config)
+            quantized_moe.router = old_moe.router  # Copy router weights
+            quantized_moe.to(device)
+
+            # Collect MXFP4 weights from wrapped experts
+            gate_weights, gate_scales = [], []
+            up_weights, up_scales = [], []
+            down_weights, down_scales = [], []
+            gate_biases, up_biases, down_biases = [], [], []
+
+            for expert_idx in range(self.model_config.num_local_experts):
+                wrapper = old_moe.experts[expert_idx]
+
+                # Get MXFP4 weights from wrapper (registered by _register_mxfp4_weights)
+                gate_weights.append(wrapper.mxfp4_gate_packed)
+                gate_scales.append(wrapper.mxfp4_gate_scales)
+                up_weights.append(wrapper.mxfp4_up_packed)
+                up_scales.append(wrapper.mxfp4_up_scales)
+                down_weights.append(wrapper.mxfp4_down_packed)
+                down_scales.append(wrapper.mxfp4_down_scales)
+
+                # Collect biases if present
+                if hasattr(wrapper, 'mxfp4_gate_bias') and wrapper.mxfp4_gate_bias is not None:
+                    gate_biases.append(wrapper.mxfp4_gate_bias)
+                if hasattr(wrapper, 'mxfp4_up_bias') and wrapper.mxfp4_up_bias is not None:
+                    up_biases.append(wrapper.mxfp4_up_bias)
+                if hasattr(wrapper, 'mxfp4_down_bias') and wrapper.mxfp4_down_bias is not None:
+                    down_biases.append(wrapper.mxfp4_down_bias)
+
+            # Store in quantized MoE (as lists, not stacked tensors)
+            quantized_moe.gate_weights = gate_weights
+            quantized_moe.gate_scales = gate_scales
+            quantized_moe.up_weights = up_weights
+            quantized_moe.up_scales = up_scales
+            quantized_moe.down_weights = down_weights
+            quantized_moe.down_scales = down_scales
+
+            # Stack biases if present (as [num_experts, N] tensors)
+            if gate_biases:
+                quantized_moe.gate_biases = torch.stack(gate_biases)
+                quantized_moe.up_biases = torch.stack(up_biases)
+                quantized_moe.down_biases = torch.stack(down_biases)
+
+            # Set up pointer arrays for grouped GEMM
+            quantized_moe.setup_pointer_arrays()
+
+            # All experts persistent (mode 3 + EP-offloading disabled)
+            quantized_moe.persistent_mask = torch.ones(
+                self.model_config.num_local_experts, dtype=torch.bool, device=device
+            )
+
+            # Swap MoE layer
+            self.model.model.layers[layer_idx].mlp = quantized_moe
+
+        logging.info(
+            f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoEQuantized "
+            f"(grouped GEMM: 3 kernel launches per layer instead of 384)"
+        )
+
     def configure_decoding(self, padding_bsz=None, comm=None) -> Tuple:
         """Configure model for decoding phase (mode 3 + EP-offloading disabled).
 
@@ -508,6 +584,10 @@ class GptOssParallelStrategyManager:
         self._config_attn_module()
         self._config_expert_module()
         self._config_lm_head_hook()
+
+        # Step 7.5: Swap to quantized MoE for grouped GEMM execution
+        # This reduces kernel launches from 384 to 3 per layer (~5x speedup)
+        self._swap_to_quantized_moe()
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)

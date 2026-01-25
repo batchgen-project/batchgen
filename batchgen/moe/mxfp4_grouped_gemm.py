@@ -1153,40 +1153,11 @@ def mxfp4_expert_forward_single(
     N_inter = gate_packed.shape[0]  # intermediate_size
     N_hidden = down_packed.shape[0]  # hidden_size
 
-    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
-
-    device = x.device
-
-    # Gate projection
-    gate_out = torch.empty(M, N_inter, dtype=torch.bfloat16, device=device)
-    grid_inter = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_inter, BLOCK_N))
-
-    fused_mxfp4_single_gemm_kernel_optimized[grid_inter](
-        x, gate_packed, gate_scales, gate_out, gate_bias,
-        M, N_inter, K,
-        x.stride(0), x.stride(1),
-        gate_packed.stride(0), gate_packed.stride(1),
-        gate_scales.stride(0), gate_scales.stride(1),
-        gate_out.stride(0), gate_out.stride(1),
-        HAS_BIAS=gate_bias is not None,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=8,
-    )
+    # Gate projection - use working fused_mxfp4_single_gemm (not buggy custom kernel)
+    gate_out = fused_mxfp4_single_gemm(x, gate_packed, gate_scales, gate_bias)
 
     # Up projection
-    up_out = torch.empty(M, N_inter, dtype=torch.bfloat16, device=device)
-
-    fused_mxfp4_single_gemm_kernel_optimized[grid_inter](
-        x, up_packed, up_scales, up_out, up_bias,
-        M, N_inter, K,
-        x.stride(0), x.stride(1),
-        up_packed.stride(0), up_packed.stride(1),
-        up_scales.stride(0), up_scales.stride(1),
-        up_out.stride(0), up_out.stride(1),
-        HAS_BIAS=up_bias is not None,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=8,
-    )
+    up_out = fused_mxfp4_single_gemm(x, up_packed, up_scales, up_bias)
 
     # SwiGLU activation
     gate_clamped = gate_out.clamp(max=swiglu_limit)
@@ -1194,20 +1165,7 @@ def mxfp4_expert_forward_single(
     intermediate = gate_clamped * torch.sigmoid(swiglu_alpha * gate_clamped) * (up_clamped + 1)
 
     # Down projection
-    output = torch.empty(M, N_hidden, dtype=torch.bfloat16, device=device)
-    grid_hidden = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_hidden, BLOCK_N))
-
-    fused_mxfp4_single_gemm_kernel_optimized[grid_hidden](
-        intermediate, down_packed, down_scales, output, down_bias,
-        M, N_hidden, N_inter,
-        intermediate.stride(0), intermediate.stride(1),
-        down_packed.stride(0), down_packed.stride(1),
-        down_scales.stride(0), down_scales.stride(1),
-        output.stride(0), output.stride(1),
-        HAS_BIAS=down_bias is not None,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=8,
-    )
+    output = fused_mxfp4_single_gemm(intermediate, down_packed, down_scales, down_bias)
 
     return output
 
