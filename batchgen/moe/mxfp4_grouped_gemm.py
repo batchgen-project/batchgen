@@ -1006,6 +1006,212 @@ def mxfp4_mlp_forward(
     return output
 
 
+# =============================================================================
+# Optimized Single-Expert MXFP4 GEMM Kernel (Same Tiling as Grouped)
+# =============================================================================
+
+@triton.jit
+def fused_mxfp4_single_gemm_kernel_optimized(
+    # Input [M, K] BF16
+    lhs_ptr,
+    # Weight [N, K//2] uint8
+    rhs_ptr,
+    # Scale [N, K//32] uint8
+    scale_ptr,
+    # Output [M, N] BF16
+    output_ptr,
+    # Bias (optional)
+    bias_ptr,
+    # Dimensions
+    M, N, K,
+    # Strides
+    stride_lhs_m, stride_lhs_k,
+    stride_rhs_n, stride_rhs_k,
+    stride_scale_n, stride_scale_k,
+    stride_out_m, stride_out_n,
+    # Config
+    HAS_BIAS: tl.constexpr,
+    # Block sizes (same as grouped kernel)
+    BLOCK_M: tl.constexpr,  # 64
+    BLOCK_N: tl.constexpr,  # 64
+    BLOCK_K: tl.constexpr,  # 32
+):
+    """Optimized single-expert MXFP4 GEMM with same tiling as grouped kernel.
+
+    Grid: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+    - axis 0: M-block index
+    - axis 1: N-block index
+
+    Uses identical MXFP4 dequantization and accumulation pattern as the grouped
+    kernel for consistent performance characteristics.
+    """
+    m_pid = tl.program_id(axis=0)
+    n_pid = tl.program_id(axis=1)
+
+    offs_m = m_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = n_pid * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop with MXFP4 dequantization (BLOCK_K=32 matches scale block size)
+    num_k_blocks = K // BLOCK_K
+
+    for k_block in range(num_k_blocks):
+        k_start = k_block * BLOCK_K
+
+        # Load packed FP4 weights [BLOCK_N, BLOCK_K//2]
+        k_packed_start = k_start // 2
+        offs_k_packed = tl.arange(0, BLOCK_K // 2)
+        rhs_ptrs = rhs_ptr + offs_n[:, None] * stride_rhs_n + \
+                   (k_packed_start + offs_k_packed[None, :]) * stride_rhs_k
+        rhs_packed = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0)
+
+        # Unpack FP4 (lo = even K indices, hi = odd K indices)
+        idx_lo = (rhs_packed & 0x0F).to(tl.int32)
+        idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
+        val_lo = _fp4_lookup(idx_lo)  # [BLOCK_N, BLOCK_K//2]
+        val_hi = _fp4_lookup(idx_hi)  # [BLOCK_N, BLOCK_K//2]
+
+        # Load and apply scales
+        scale_ptrs = scale_ptr + offs_n * stride_scale_n + k_block * stride_scale_k
+        scales = tl.load(scale_ptrs, mask=n_mask, other=127).to(tl.int32) - 127
+
+        # Apply ldexp: val * 2^scale
+        exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
+        val_lo_scaled = _ldexp(val_lo, exp_broadcast)
+        val_hi_scaled = _ldexp(val_hi, exp_broadcast)
+
+        # Load LHS at even/odd K positions
+        offs_k_even = tl.arange(0, BLOCK_K // 2) * 2
+        offs_k_odd = offs_k_even + 1
+        lhs_even_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_even[None, :]) * stride_lhs_k
+        lhs_odd_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_odd[None, :]) * stride_lhs_k
+
+        lhs_even = tl.load(lhs_even_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
+        lhs_odd = tl.load(lhs_odd_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
+
+        # Accumulate: lhs_even @ val_lo.T + lhs_odd @ val_hi.T
+        acc += tl.dot(lhs_even.to(tl.bfloat16), tl.trans(val_lo_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+        acc += tl.dot(lhs_odd.to(tl.bfloat16), tl.trans(val_hi_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+        acc += bias[None, :]
+
+    # Store output [BLOCK_M, BLOCK_N]
+    out_ptrs = output_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
+
+
+@torch.inference_mode()
+def mxfp4_expert_forward_single(
+    x: torch.Tensor,
+    gate_packed: torch.Tensor,
+    gate_scales: torch.Tensor,
+    up_packed: torch.Tensor,
+    up_scales: torch.Tensor,
+    down_packed: torch.Tensor,
+    down_scales: torch.Tensor,
+    gate_bias: torch.Tensor = None,
+    up_bias: torch.Tensor = None,
+    down_bias: torch.Tensor = None,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+) -> torch.Tensor:
+    """Single expert forward with optimized MXFP4 kernel.
+
+    Uses the same tiling pattern as the grouped GEMM kernel (BLOCK_M=64,
+    BLOCK_N=64, BLOCK_K=32) for consistent performance.
+
+    This function is intended for non-persistent experts that are loaded
+    on-demand, while persistent experts use the grouped GEMM kernel.
+
+    Args:
+        x: Input [M, hidden] in BF16
+        gate_packed: Gate weights [N_inter, hidden//2] uint8
+        gate_scales: Gate scales [N_inter, hidden//32] uint8
+        up_packed: Up weights [N_inter, hidden//2] uint8
+        up_scales: Up scales [N_inter, hidden//32] uint8
+        down_packed: Down weights [hidden, N_inter//2] uint8
+        down_scales: Down scales [hidden, N_inter//32] uint8
+        gate_bias: Optional gate bias [N_inter] BF16
+        up_bias: Optional up bias [N_inter] BF16
+        down_bias: Optional down bias [hidden] BF16
+        swiglu_alpha: SwiGLU alpha (default 1.702)
+        swiglu_limit: Clamping limit (default 7.0)
+
+    Returns:
+        Output [M, hidden] in BF16
+    """
+    M = x.shape[0]
+    K = x.shape[1]  # hidden_size
+    N_inter = gate_packed.shape[0]  # intermediate_size
+    N_hidden = down_packed.shape[0]  # hidden_size
+
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+
+    device = x.device
+
+    # Gate projection
+    gate_out = torch.empty(M, N_inter, dtype=torch.bfloat16, device=device)
+    grid_inter = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_inter, BLOCK_N))
+
+    fused_mxfp4_single_gemm_kernel_optimized[grid_inter](
+        x, gate_packed, gate_scales, gate_out, gate_bias,
+        M, N_inter, K,
+        x.stride(0), x.stride(1),
+        gate_packed.stride(0), gate_packed.stride(1),
+        gate_scales.stride(0), gate_scales.stride(1),
+        gate_out.stride(0), gate_out.stride(1),
+        HAS_BIAS=gate_bias is not None,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+    )
+
+    # Up projection
+    up_out = torch.empty(M, N_inter, dtype=torch.bfloat16, device=device)
+
+    fused_mxfp4_single_gemm_kernel_optimized[grid_inter](
+        x, up_packed, up_scales, up_out, up_bias,
+        M, N_inter, K,
+        x.stride(0), x.stride(1),
+        up_packed.stride(0), up_packed.stride(1),
+        up_scales.stride(0), up_scales.stride(1),
+        up_out.stride(0), up_out.stride(1),
+        HAS_BIAS=up_bias is not None,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+    )
+
+    # SwiGLU activation
+    gate_clamped = gate_out.clamp(max=swiglu_limit)
+    up_clamped = up_out.clamp(min=-swiglu_limit, max=swiglu_limit)
+    intermediate = gate_clamped * torch.sigmoid(swiglu_alpha * gate_clamped) * (up_clamped + 1)
+
+    # Down projection
+    output = torch.empty(M, N_hidden, dtype=torch.bfloat16, device=device)
+    grid_hidden = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_hidden, BLOCK_N))
+
+    fused_mxfp4_single_gemm_kernel_optimized[grid_hidden](
+        intermediate, down_packed, down_scales, output, down_bias,
+        M, N_hidden, N_inter,
+        intermediate.stride(0), intermediate.stride(1),
+        down_packed.stride(0), down_packed.stride(1),
+        down_scales.stride(0), down_scales.stride(1),
+        output.stride(0), output.stride(1),
+        HAS_BIAS=down_bias is not None,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+    )
+
+    return output
+
+
 def mxfp4_linear(
     x: torch.Tensor,
     weight_packed: torch.Tensor,

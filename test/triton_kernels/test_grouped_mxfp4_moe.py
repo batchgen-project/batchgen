@@ -26,6 +26,7 @@ try:
         grouped_mxfp4_moe_forward_3d,  # New true grouped implementation
         setup_expert_weight_pointers,   # Pointer array setup
         fused_mxfp4_single_gemm,
+        mxfp4_expert_forward_single,    # Optimized single-expert kernel
         HAS_TRITON_KERNELS,
     )
 except ImportError as e:
@@ -314,10 +315,61 @@ def test_grouped_moe_forward_3d():
         return False
 
 
+def test_single_expert_optimized():
+    """Test mxfp4_expert_forward_single (optimized single-expert kernel) vs reference."""
+    print("\n" + "=" * 60)
+    print("TEST 5: mxfp4_expert_forward_single (Optimized Single Expert)")
+    print("=" * 60)
+
+    if not HAS_TRITON_KERNELS:
+        print("SKIPPED: triton_kernels not installed")
+        return None
+
+    device = "cuda"
+    M, hidden, intermediate = 32, 128, 256
+
+    x = torch.randn(M, hidden, dtype=torch.bfloat16, device=device)
+    gate_packed = torch.randint(0, 256, (intermediate, hidden // 2), dtype=torch.uint8, device=device)
+    gate_scales = torch.randint(120, 134, (intermediate, hidden // 32), dtype=torch.uint8, device=device)
+    gate_bias = torch.randn(intermediate, dtype=torch.bfloat16, device=device)
+    up_packed = torch.randint(0, 256, (intermediate, hidden // 2), dtype=torch.uint8, device=device)
+    up_scales = torch.randint(120, 134, (intermediate, hidden // 32), dtype=torch.uint8, device=device)
+    up_bias = torch.randn(intermediate, dtype=torch.bfloat16, device=device)
+    down_packed = torch.randint(0, 256, (hidden, intermediate // 2), dtype=torch.uint8, device=device)
+    down_scales = torch.randint(120, 134, (hidden, intermediate // 32), dtype=torch.uint8, device=device)
+    down_bias = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+
+    ref_output = reference_mlp_forward(
+        x, gate_packed, gate_scales, gate_bias,
+        up_packed, up_scales, up_bias,
+        down_packed, down_scales, down_bias,
+    )
+
+    test_output = mxfp4_expert_forward_single(
+        x,
+        gate_packed, gate_scales,
+        up_packed, up_scales,
+        down_packed, down_scales,
+        gate_bias, up_bias, down_bias,
+    )
+
+    diff = (ref_output.float() - test_output.float()).abs()
+    rel_error = (diff / ref_output.abs().clamp(min=1e-6)).max().item()
+
+    print(f"Max relative error: {rel_error:.6f} ({rel_error*100:.4f}%)")
+
+    if rel_error < 0.05:  # 5% tolerance
+        print("PASSED")
+        return True
+    else:
+        print("FAILED")
+        return False
+
+
 def test_performance_benchmark():
     """Benchmark all implementations: reference, per-expert triton_kernels, true grouped 3D."""
     print("\n" + "=" * 60)
-    print("TEST 5: Performance Benchmark (GPT-OSS-120B dimensions)")
+    print("TEST 6: Performance Benchmark (GPT-OSS-120B dimensions)")
     print("=" * 60)
 
     if not HAS_TRITON_KERNELS:
@@ -480,6 +532,7 @@ def main():
         ("MLP forward", test_mlp_forward()),
         ("Grouped MoE forward (per-expert)", test_grouped_moe_forward()),
         ("Grouped MoE forward 3D (true grouped)", test_grouped_moe_forward_3d()),
+        ("Single expert optimized kernel", test_single_expert_optimized()),
         ("Performance benchmark", test_performance_benchmark()),
     ]
 
