@@ -23,6 +23,8 @@ try:
         moe_token_dispatch,
         mxfp4_mlp_forward,
         grouped_mxfp4_moe_forward,
+        grouped_mxfp4_moe_forward_3d,  # New true grouped implementation
+        setup_expert_weight_pointers,   # Pointer array setup
         fused_mxfp4_single_gemm,
         HAS_TRITON_KERNELS,
     )
@@ -233,10 +235,89 @@ def test_grouped_moe_forward():
         return False
 
 
-def test_performance_benchmark():
-    """Benchmark grouped GEMM vs per-expert loop."""
+def test_grouped_moe_forward_3d():
+    """Test grouped_mxfp4_moe_forward_3d (true grouped GEMM) vs reference."""
     print("\n" + "=" * 60)
-    print("TEST 4: Performance Benchmark (GPT-OSS-120B dimensions)")
+    print("TEST 4: grouped_mxfp4_moe_forward_3d (True Grouped GEMM)")
+    print("=" * 60)
+
+    if not HAS_TRITON_KERNELS:
+        print("SKIPPED: triton_kernels not installed")
+        return None
+
+    device = "cuda"
+    num_tokens = 32
+    hidden = 128
+    intermediate = 256
+    num_experts = 8
+    k = 2
+
+    hidden_states = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=device)
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    topk_weights, topk_indices = torch.topk(router_logits, k=k, dim=-1)
+    topk_weights = F.softmax(topk_weights, dim=-1).to(torch.bfloat16)
+
+    # Create random expert weights
+    gate_weights = [torch.randint(0, 256, (intermediate, hidden // 2), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    gate_scales = [torch.randint(120, 134, (intermediate, hidden // 32), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    gate_biases = [torch.randn(intermediate, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+    up_weights = [torch.randint(0, 256, (intermediate, hidden // 2), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    up_scales = [torch.randint(120, 134, (intermediate, hidden // 32), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    up_biases = [torch.randn(intermediate, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+    down_weights = [torch.randint(0, 256, (hidden, intermediate // 2), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    down_scales = [torch.randint(120, 134, (hidden, intermediate // 32), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    down_biases = [torch.randn(hidden, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+
+    # Reference output
+    ref_output = reference_moe_forward(
+        hidden_states, topk_indices, topk_weights,
+        gate_weights, gate_scales, gate_biases,
+        up_weights, up_scales, up_biases,
+        down_weights, down_scales, down_biases,
+    )
+
+    # Setup pointer arrays (one-time at model init)
+    gate_ptrs, gate_scale_ptrs = setup_expert_weight_pointers(gate_weights, gate_scales)
+    up_ptrs, up_scale_ptrs = setup_expert_weight_pointers(up_weights, up_scales)
+    down_ptrs, down_scale_ptrs = setup_expert_weight_pointers(down_weights, down_scales)
+
+    # Stack biases for broadcasting [E, N]
+    gate_biases_stacked = torch.stack(gate_biases, dim=0)  # [E, intermediate]
+    up_biases_stacked = torch.stack(up_biases, dim=0)
+    down_biases_stacked = torch.stack(down_biases, dim=0)  # [E, hidden]
+
+    # Test the new 3D grouped implementation
+    test_output = grouped_mxfp4_moe_forward_3d(
+        hidden_states, topk_indices, topk_weights,
+        gate_ptrs, gate_scale_ptrs,
+        up_ptrs, up_scale_ptrs,
+        down_ptrs, down_scale_ptrs,
+        gate_weights[0], gate_scales[0],  # Reference weights for strides
+        up_weights[0], up_scales[0],
+        down_weights[0], down_scales[0],
+        gate_biases=gate_biases_stacked,
+        up_biases=up_biases_stacked,
+        down_biases=down_biases_stacked,
+        num_experts=num_experts,
+    )
+
+    diff = (ref_output.float() - test_output.float()).abs()
+    rel_error = (diff / ref_output.abs().clamp(min=1e-6)).max().item()
+
+    print(f"Max relative error: {rel_error:.6f} ({rel_error*100:.4f}%)")
+
+    if rel_error < 0.05:  # 5% tolerance for grouped kernel (may have more numerical diff)
+        print("PASSED")
+        return True
+    else:
+        print("FAILED")
+        return False
+
+
+def test_performance_benchmark():
+    """Benchmark all implementations: reference, per-expert triton_kernels, true grouped 3D."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Performance Benchmark (GPT-OSS-120B dimensions)")
     print("=" * 60)
 
     if not HAS_TRITON_KERNELS:
@@ -272,11 +353,22 @@ def test_performance_benchmark():
     down_scales = [torch.randint(120, 134, (hidden, intermediate // 32), dtype=torch.uint8, device=device) for _ in range(num_experts)]
     down_biases = [torch.randn(hidden, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
 
+    # Setup pointer arrays for 3D implementation (one-time at model init)
+    print("Setting up pointer arrays for true grouped GEMM...")
+    gate_ptrs, gate_scale_ptrs = setup_expert_weight_pointers(gate_weights, gate_scales)
+    up_ptrs, up_scale_ptrs = setup_expert_weight_pointers(up_weights, up_scales)
+    down_ptrs, down_scale_ptrs = setup_expert_weight_pointers(down_weights, down_scales)
+
+    # Stack biases for 3D implementation
+    gate_biases_stacked = torch.stack(gate_biases, dim=0)
+    up_biases_stacked = torch.stack(up_biases, dim=0)
+    down_biases_stacked = torch.stack(down_biases, dim=0)
+
     n_warmup = 3
     n_iters = 10
 
-    # ========== Benchmark: Per-expert loop (reference) ==========
-    print(f"\nWarming up per-expert loop ({n_warmup} iters)...")
+    # ========== Benchmark: Per-expert loop (reference dequant+matmul) ==========
+    print(f"\nWarming up reference per-expert loop ({n_warmup} iters)...")
     for _ in range(n_warmup):
         _ = reference_moe_forward(
             hidden_states, topk_indices, topk_weights,
@@ -286,7 +378,7 @@ def test_performance_benchmark():
         )
     torch.cuda.synchronize()
 
-    print(f"Timing per-expert loop ({n_iters} iters)...")
+    print(f"Timing reference per-expert loop ({n_iters} iters)...")
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(n_iters):
@@ -297,10 +389,10 @@ def test_performance_benchmark():
             down_weights, down_scales, down_biases,
         )
     torch.cuda.synchronize()
-    loop_time_ms = (time.perf_counter() - start) / n_iters * 1000
+    ref_time_ms = (time.perf_counter() - start) / n_iters * 1000
 
-    # ========== Benchmark: Grouped GEMM ==========
-    print(f"\nWarming up grouped GEMM ({n_warmup} iters)...")
+    # ========== Benchmark: Per-expert loop with triton_kernels (old grouped) ==========
+    print(f"\nWarming up per-expert triton_kernels ({n_warmup} iters)...")
     for _ in range(n_warmup):
         _ = grouped_mxfp4_moe_forward(
             hidden_states, topk_indices, topk_weights,
@@ -310,7 +402,7 @@ def test_performance_benchmark():
         )
     torch.cuda.synchronize()
 
-    print(f"Timing grouped GEMM ({n_iters} iters)...")
+    print(f"Timing per-expert triton_kernels ({n_iters} iters)...")
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(n_iters):
@@ -321,16 +413,54 @@ def test_performance_benchmark():
             down_weights, down_scales, down_biases,
         )
     torch.cuda.synchronize()
-    grouped_time_ms = (time.perf_counter() - start) / n_iters * 1000
+    old_grouped_time_ms = (time.perf_counter() - start) / n_iters * 1000
+
+    # ========== Benchmark: True Grouped 3D (new implementation) ==========
+    print(f"\nWarming up true grouped 3D GEMM ({n_warmup} iters)...")
+    for _ in range(n_warmup):
+        _ = grouped_mxfp4_moe_forward_3d(
+            hidden_states, topk_indices, topk_weights,
+            gate_ptrs, gate_scale_ptrs,
+            up_ptrs, up_scale_ptrs,
+            down_ptrs, down_scale_ptrs,
+            gate_weights[0], gate_scales[0],
+            up_weights[0], up_scales[0],
+            down_weights[0], down_scales[0],
+            gate_biases=gate_biases_stacked,
+            up_biases=up_biases_stacked,
+            down_biases=down_biases_stacked,
+            num_experts=num_experts,
+        )
+    torch.cuda.synchronize()
+
+    print(f"Timing true grouped 3D GEMM ({n_iters} iters)...")
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        _ = grouped_mxfp4_moe_forward_3d(
+            hidden_states, topk_indices, topk_weights,
+            gate_ptrs, gate_scale_ptrs,
+            up_ptrs, up_scale_ptrs,
+            down_ptrs, down_scale_ptrs,
+            gate_weights[0], gate_scales[0],
+            up_weights[0], up_scales[0],
+            down_weights[0], down_scales[0],
+            gate_biases=gate_biases_stacked,
+            up_biases=up_biases_stacked,
+            down_biases=down_biases_stacked,
+            num_experts=num_experts,
+        )
+    torch.cuda.synchronize()
+    grouped_3d_time_ms = (time.perf_counter() - start) / n_iters * 1000
 
     # ========== Results ==========
-    print(f"\n{'Method':<25} {'Time (ms)':<12} {'Speedup':<10}")
-    print("-" * 50)
-    print(f"{'Per-expert loop':<25} {loop_time_ms:<12.2f} {'1.00x':<10}")
-    print(f"{'Grouped GEMM':<25} {grouped_time_ms:<12.2f} {loop_time_ms/grouped_time_ms:.2f}x")
+    print(f"\n{'Method':<35} {'Time (ms)':<12} {'Speedup':<10} {'Kernel Launches'}")
+    print("-" * 75)
+    print(f"{'Reference (dequant+matmul)':<35} {ref_time_ms:<12.2f} {'1.00x':<10} {num_experts}*3 = {num_experts*3}")
+    print(f"{'Per-expert triton_kernels':<35} {old_grouped_time_ms:<12.2f} {ref_time_ms/old_grouped_time_ms:.2f}x{'':<5} {num_experts}*3 = {num_experts*3}")
+    print(f"{'True Grouped 3D (NEW)':<35} {grouped_3d_time_ms:<12.2f} {ref_time_ms/grouped_3d_time_ms:.2f}x{'':<5} 3")
 
-    speedup = loop_time_ms / grouped_time_ms
-    print(f"\nSpeedup: {speedup:.2f}x")
+    print(f"\n*** Speedup of True Grouped 3D vs Per-expert triton_kernels: {old_grouped_time_ms/grouped_3d_time_ms:.2f}x ***")
 
     print("PASSED (informational)")
     return True
@@ -348,7 +478,8 @@ def main():
     results = [
         ("Token dispatch", test_token_dispatch()),
         ("MLP forward", test_mlp_forward()),
-        ("Grouped MoE forward", test_grouped_moe_forward()),
+        ("Grouped MoE forward (per-expert)", test_grouped_moe_forward()),
+        ("Grouped MoE forward 3D (true grouped)", test_grouped_moe_forward_3d()),
         ("Performance benchmark", test_performance_benchmark()),
     ]
 

@@ -438,6 +438,405 @@ def moe_token_dispatch(
     return sorted_hidden, expert_offsets, sorted_token_indices, sorted_k_indices, sorted_weights
 
 
+# =============================================================================
+# True Grouped MXFP4 GEMM with 3D Layout (DeepSeek-V3 Pattern)
+# =============================================================================
+
+@triton.jit
+def fused_mxfp4_grouped_gemm_kernel_3d(
+    # Input [E, M_max, K] BF16
+    lhs_ptr,
+    # Weight pointer arrays [num_experts] int64
+    rhs_ptrs_ptr,           # -> [N, K//2] uint8 packed FP4
+    rhs_scale_ptrs_ptr,     # -> [N, K//32] uint8
+    # Per-expert token counts [num_experts] int32
+    expert_tokens_ptr,
+    # Output [E, M_max, N] BF16
+    output_ptr,
+    # Dimensions
+    M_max, N, K,
+    # Strides for lhs [E, M_max, K]
+    stride_lhs_e, stride_lhs_m, stride_lhs_k,
+    # Strides for rhs weights [N, K//2]
+    stride_rhs_n, stride_rhs_k_packed,
+    # Strides for scales [N, K//32]
+    stride_scale_n, stride_scale_k,
+    # Strides for output [E, M_max, N]
+    stride_out_e, stride_out_m, stride_out_n,
+    # Stride for pointer arrays
+    stride_ptrs,
+    # Block sizes
+    BLOCK_M: tl.constexpr,  # 64
+    BLOCK_N: tl.constexpr,  # 64
+    BLOCK_K: tl.constexpr,  # 32 (must match MXFP4 scale block size)
+):
+    """True grouped MXFP4 GEMM following DeepSeek-V3 pattern.
+
+    Grid: (num_experts, cdiv(N, BLOCK_N))
+    - axis 0: expert index
+    - axis 1: N-block index
+
+    Each thread block handles one (expert, N-block) pair and loops over:
+    - M-blocks (tokens for that expert)
+    - K-blocks (reduction dimension)
+    """
+    expert_idx = tl.program_id(axis=0)
+    n_pid = tl.program_id(axis=1)
+
+    # Early exit for empty experts (critical for performance)
+    gm = tl.load(expert_tokens_ptr + expert_idx).to(tl.int32)
+    if gm == 0:
+        return
+
+    # Get base pointers for this expert's input/output slices
+    cur_lhs_ptr = lhs_ptr + expert_idx * stride_lhs_e
+    cur_out_ptr = output_ptr + expert_idx * stride_out_e
+
+    # Load weight pointers for this expert from pointer arrays
+    rhs_base_ptr = tl.load(rhs_ptrs_ptr + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base_ptr = tl.load(rhs_scale_ptrs_ptr + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+
+    # N-block offset
+    offs_n = n_pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+
+    # Process all M-blocks for this expert (tokens)
+    num_m_blocks = tl.cdiv(gm, BLOCK_M)
+
+    for m_block in range(num_m_blocks):
+        offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_mask = offs_m < gm
+
+        # Initialize accumulator
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # K-loop (BLOCK_K=32 matches MXFP4 scale block size)
+        num_k_blocks = K // BLOCK_K
+
+        for k_block in range(num_k_blocks):
+            k_start = k_block * BLOCK_K
+
+            # Load packed FP4 [BLOCK_N, BLOCK_K//2] uint8
+            k_packed_start = k_start // 2
+            offs_k_packed = tl.arange(0, BLOCK_K // 2)
+            rhs_ptrs = rhs_base_ptr + offs_n[:, None] * stride_rhs_n + \
+                       (k_packed_start + offs_k_packed[None, :]) * stride_rhs_k_packed
+            rhs_packed = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0)
+
+            # Unpack FP4 (lo = even K indices, hi = odd K indices)
+            idx_lo = (rhs_packed & 0x0F).to(tl.int32)
+            idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
+            val_lo = _fp4_lookup(idx_lo)  # [BLOCK_N, BLOCK_K//2]
+            val_hi = _fp4_lookup(idx_hi)  # [BLOCK_N, BLOCK_K//2]
+
+            # Load scale for this K-block (one scale per N row per K-block)
+            scale_ptrs = scale_base_ptr + offs_n * stride_scale_n + k_block * stride_scale_k
+            scales = tl.load(scale_ptrs, mask=n_mask, other=127).to(tl.int32) - 127
+
+            # Apply ldexp: val * 2^scale
+            exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
+            val_lo_scaled = _ldexp(val_lo, exp_broadcast)
+            val_hi_scaled = _ldexp(val_hi, exp_broadcast)
+
+            # Load LHS at even/odd K positions (interleaved FP4 packing)
+            # Triton doesn't support slice syntax like [:, 0::2], so we use explicit indices
+            offs_k_even = tl.arange(0, BLOCK_K // 2) * 2      # [0, 2, 4, ...]
+            offs_k_odd = tl.arange(0, BLOCK_K // 2) * 2 + 1   # [1, 3, 5, ...]
+
+            lhs_even_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_even[None, :]) * stride_lhs_k
+            lhs_odd_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_odd[None, :]) * stride_lhs_k
+
+            lhs_even = tl.load(lhs_even_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)  # [BLOCK_M, BLOCK_K//2]
+            lhs_odd = tl.load(lhs_odd_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)   # [BLOCK_M, BLOCK_K//2]
+
+            # Accumulate: lhs_even @ val_lo.T + lhs_odd @ val_hi.T
+            # [BLOCK_M, BLOCK_K//2] @ [BLOCK_K//2, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+            acc += tl.dot(lhs_even.to(tl.bfloat16), tl.trans(val_lo_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+            acc += tl.dot(lhs_odd.to(tl.bfloat16), tl.trans(val_hi_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+
+        # Store output [BLOCK_M, BLOCK_N]
+        out_ptrs = cur_out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
+        out_mask = m_mask[:, None] & n_mask[None, :]
+        tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
+
+
+def reshape_to_3d_expert_layout(
+    sorted_hidden: torch.Tensor,      # [total_tokens, hidden]
+    expert_counts: torch.Tensor,      # [num_experts] int32/int64
+    num_experts: int,
+) -> Tuple[torch.Tensor, int]:
+    """Reshape sorted tokens to 3D layout [E, M_max, K] for grouped GEMM.
+
+    Args:
+        sorted_hidden: Tokens sorted by expert [total_tokens_routed, hidden]
+        expert_counts: Number of tokens per expert [num_experts]
+        num_experts: Total number of experts
+
+    Returns:
+        hidden_3d: [num_experts, max_tokens_per_expert, hidden] - zero-padded
+        max_tokens: Maximum tokens assigned to any single expert
+    """
+    max_tokens = expert_counts.max().item()
+    if max_tokens == 0:
+        # No tokens routed to any expert (edge case)
+        hidden_size = sorted_hidden.shape[-1]
+        return torch.zeros(num_experts, 1, hidden_size, dtype=sorted_hidden.dtype, device=sorted_hidden.device), 1
+
+    hidden_size = sorted_hidden.shape[-1]
+    device = sorted_hidden.device
+    dtype = sorted_hidden.dtype
+
+    # Allocate 3D tensor (padded with zeros for empty slots)
+    hidden_3d = torch.zeros(num_experts, max_tokens, hidden_size, dtype=dtype, device=device)
+
+    # Copy tokens to their expert slots
+    # This can be optimized with a Triton scatter kernel later
+    offset = 0
+    for e in range(num_experts):
+        count = expert_counts[e].item()
+        if count > 0:
+            hidden_3d[e, :count] = sorted_hidden[offset:offset+count]
+            offset += count
+
+    return hidden_3d, max_tokens
+
+
+def gather_from_3d_expert_layout(
+    output_3d: torch.Tensor,          # [E, M_max, hidden]
+    expert_counts: torch.Tensor,      # [num_experts] int32/int64
+    total_tokens: int,
+) -> torch.Tensor:
+    """Gather outputs from 3D layout back to sorted 1D layout.
+
+    Args:
+        output_3d: Expert outputs [num_experts, M_max, hidden]
+        expert_counts: Number of tokens per expert
+        total_tokens: Total number of tokens to gather
+
+    Returns:
+        sorted_output: [total_tokens, hidden]
+    """
+    num_experts = output_3d.shape[0]
+    hidden_size = output_3d.shape[-1]
+    device = output_3d.device
+    dtype = output_3d.dtype
+
+    sorted_output = torch.zeros(total_tokens, hidden_size, dtype=dtype, device=device)
+
+    offset = 0
+    for e in range(num_experts):
+        count = expert_counts[e].item()
+        if count > 0:
+            sorted_output[offset:offset+count] = output_3d[e, :count]
+            offset += count
+
+    return sorted_output
+
+
+def setup_expert_weight_pointers(
+    weight_list: List[torch.Tensor],  # [num_experts] of [N, K//2] uint8 or similar
+    scale_list: List[torch.Tensor],   # [num_experts] of [N, K//32] uint8
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create pointer arrays for expert weights (one-time setup at model init).
+
+    Args:
+        weight_list: List of weight tensors, one per expert
+        scale_list: List of scale tensors, one per expert
+
+    Returns:
+        weight_ptrs: [num_experts] int64 - data pointers to each weight tensor
+        scale_ptrs: [num_experts] int64 - data pointers to each scale tensor
+    """
+    device = weight_list[0].device
+
+    weight_ptrs = torch.tensor(
+        [w.data_ptr() for w in weight_list],
+        dtype=torch.int64, device=device
+    )
+    scale_ptrs = torch.tensor(
+        [s.data_ptr() for s in scale_list],
+        dtype=torch.int64, device=device
+    )
+
+    return weight_ptrs, scale_ptrs
+
+
+def grouped_mxfp4_gemm_3d(
+    hidden_3d: torch.Tensor,          # [E, M_max, K] BF16
+    weight_ptrs: torch.Tensor,        # [num_experts] int64
+    scale_ptrs: torch.Tensor,         # [num_experts] int64
+    expert_counts: torch.Tensor,      # [num_experts] int32
+    N: int,                           # Output dimension
+    weight_ref: torch.Tensor,         # Reference weight for strides [N, K//2]
+    scale_ref: torch.Tensor,          # Reference scale for strides [N, K//32]
+    BLOCK_M: int = 64,
+    BLOCK_N: int = 64,
+    BLOCK_K: int = 32,
+) -> torch.Tensor:
+    """Launch grouped MXFP4 GEMM kernel with 3D layout.
+
+    Args:
+        hidden_3d: Input tensor [E, M_max, K] in BF16
+        weight_ptrs: Pointer array [num_experts] to weight tensors
+        scale_ptrs: Pointer array [num_experts] to scale tensors
+        expert_counts: Token counts per expert [num_experts]
+        N: Output dimension (number of output features)
+        weight_ref: Reference weight tensor for computing strides
+        scale_ref: Reference scale tensor for computing strides
+
+    Returns:
+        output_3d: [E, M_max, N] in BF16
+    """
+    num_experts = hidden_3d.shape[0]
+    M_max = hidden_3d.shape[1]
+    K = hidden_3d.shape[2]
+    device = hidden_3d.device
+
+    # Ensure expert_counts is int32 for kernel
+    if expert_counts.dtype != torch.int32:
+        expert_counts = expert_counts.to(torch.int32)
+
+    # Allocate output
+    output_3d = torch.empty(num_experts, M_max, N, dtype=torch.bfloat16, device=device)
+
+    # Grid: (num_experts, cdiv(N, BLOCK_N))
+    grid = (num_experts, triton.cdiv(N, BLOCK_N))
+
+    fused_mxfp4_grouped_gemm_kernel_3d[grid](
+        hidden_3d,
+        weight_ptrs, scale_ptrs,
+        expert_counts,
+        output_3d,
+        M_max, N, K,
+        hidden_3d.stride(0), hidden_3d.stride(1), hidden_3d.stride(2),
+        weight_ref.stride(0), weight_ref.stride(1),
+        scale_ref.stride(0), scale_ref.stride(1),
+        output_3d.stride(0), output_3d.stride(1), output_3d.stride(2),
+        1,  # stride_ptrs (contiguous pointer array)
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+    )
+
+    return output_3d
+
+
+def grouped_mxfp4_moe_forward_3d(
+    hidden_states: torch.Tensor,          # [batch*seq, hidden]
+    topk_indices: torch.Tensor,           # [batch*seq, num_experts_per_tok]
+    topk_weights: torch.Tensor,           # [batch*seq, num_experts_per_tok]
+    # Pre-computed pointer arrays (from setup_expert_weight_pointers)
+    gate_ptrs: torch.Tensor,              # [num_experts] int64
+    gate_scale_ptrs: torch.Tensor,
+    up_ptrs: torch.Tensor,
+    up_scale_ptrs: torch.Tensor,
+    down_ptrs: torch.Tensor,
+    down_scale_ptrs: torch.Tensor,
+    # Reference weights for strides (any expert's weight works)
+    gate_weight_ref: torch.Tensor,        # [N_inter, hidden//2]
+    gate_scale_ref: torch.Tensor,         # [N_inter, hidden//32]
+    up_weight_ref: torch.Tensor,
+    up_scale_ref: torch.Tensor,
+    down_weight_ref: torch.Tensor,        # [hidden, N_inter//2]
+    down_scale_ref: torch.Tensor,         # [hidden, N_inter//32]
+    # Biases (optional, stacked as [num_experts, N])
+    gate_biases: torch.Tensor = None,     # [num_experts, N_inter] or None
+    up_biases: torch.Tensor = None,
+    down_biases: torch.Tensor = None,
+    num_experts: int = 128,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+) -> torch.Tensor:
+    """True grouped MXFP4 MoE forward with 3D layout (DeepSeek-V3 pattern).
+
+    This implementation uses a single kernel launch per projection stage,
+    processing all experts in parallel instead of looping over them.
+
+    Kernel launches per MoE layer:
+    - Before: 128 experts × 3 projections = 384 launches
+    - After: 3 launches (gate, up, down)
+
+    Args:
+        hidden_states: Input [batch*seq, hidden] in BF16
+        topk_indices: Expert indices [batch*seq, num_experts_per_tok]
+        topk_weights: Routing weights [batch*seq, num_experts_per_tok]
+        gate_ptrs, gate_scale_ptrs: Pointer arrays for gate projection
+        up_ptrs, up_scale_ptrs: Pointer arrays for up projection
+        down_ptrs, down_scale_ptrs: Pointer arrays for down projection
+        gate_weight_ref, etc.: Reference tensors for computing strides
+        gate_biases, up_biases, down_biases: Optional stacked biases [E, N]
+        num_experts: Number of experts (default 128)
+        swiglu_alpha: SwiGLU alpha (default 1.702)
+        swiglu_limit: Clamping limit (default 7.0)
+
+    Returns:
+        Output [batch*seq, hidden] in BF16
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    device = hidden_states.device
+
+    # Dimensions from reference weights
+    N_intermediate = gate_weight_ref.shape[0]  # Intermediate size (e.g., 5760)
+
+    # Step 1: Dispatch tokens to experts (sort by expert)
+    sorted_hidden, expert_offsets, original_indices, original_k, routing_weights = moe_token_dispatch(
+        hidden_states, topk_indices, topk_weights, num_experts
+    )
+
+    total_tokens_routed = sorted_hidden.shape[0]
+
+    # Compute per-expert token counts
+    expert_counts = (expert_offsets[1:] - expert_offsets[:-1]).to(torch.int32)
+
+    # Step 2: Reshape to 3D layout [E, M_max, K]
+    hidden_3d, M_max = reshape_to_3d_expert_layout(sorted_hidden, expert_counts, num_experts)
+
+    # Step 3: Gate projection (SINGLE kernel for all experts)
+    gate_out_3d = grouped_mxfp4_gemm_3d(
+        hidden_3d, gate_ptrs, gate_scale_ptrs, expert_counts,
+        N_intermediate, gate_weight_ref, gate_scale_ref
+    )
+
+    # Step 4: Up projection (SINGLE kernel for all experts)
+    up_out_3d = grouped_mxfp4_gemm_3d(
+        hidden_3d, up_ptrs, up_scale_ptrs, expert_counts,
+        N_intermediate, up_weight_ref, up_scale_ref
+    )
+
+    # Add biases if present (broadcasted over [E, M_max, N])
+    if gate_biases is not None:
+        gate_out_3d = gate_out_3d + gate_biases.unsqueeze(1)
+    if up_biases is not None:
+        up_out_3d = up_out_3d + up_biases.unsqueeze(1)
+
+    # Step 5: SwiGLU activation (in-place on 3D tensors)
+    gate_clamped = gate_out_3d.clamp(max=swiglu_limit)
+    up_clamped = up_out_3d.clamp(min=-swiglu_limit, max=swiglu_limit)
+    intermediate_3d = gate_clamped * torch.sigmoid(swiglu_alpha * gate_clamped) * (up_clamped + 1)
+
+    # Step 6: Down projection (SINGLE kernel for all experts)
+    output_3d = grouped_mxfp4_gemm_3d(
+        intermediate_3d, down_ptrs, down_scale_ptrs, expert_counts,
+        hidden_size, down_weight_ref, down_scale_ref
+    )
+
+    if down_biases is not None:
+        output_3d = output_3d + down_biases.unsqueeze(1)
+
+    # Step 7: Gather back from 3D to sorted 1D
+    sorted_output = gather_from_3d_expert_layout(output_3d, expert_counts, total_tokens_routed)
+
+    # Step 8: Scatter back to original order with routing weights
+    output = torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype, device=device)
+    weighted_output = sorted_output * routing_weights.unsqueeze(-1)
+    output.scatter_add_(0, original_indices.unsqueeze(-1).expand_as(weighted_output), weighted_output)
+
+    return output
+
+
+# =============================================================================
+# Original Per-Expert Loop Implementation (for comparison/fallback)
+# =============================================================================
+
 def grouped_mxfp4_moe_forward(
     hidden_states: torch.Tensor,          # [batch*seq, hidden]
     topk_indices: torch.Tensor,           # [batch*seq, num_experts_per_tok]
