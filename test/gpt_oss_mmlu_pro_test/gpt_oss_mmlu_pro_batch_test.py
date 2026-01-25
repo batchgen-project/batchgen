@@ -109,6 +109,8 @@ def extract_prediction(model_output: str) -> Optional[str]:
     # Answer extraction patterns (adapted from OpenAI's abcd_grader.py)
     # Extended to support A-J for MMLU-Pro's 10-choice questions
     patterns = [
+        # "The answer is (A)" or "the answer is A" - matches system prompt format
+        r"(?i)\b(?:the\s+)?answer\s+is\s*\(?([ABCDEFGHIJ])\)?",
         # "Answer: A" or "Answers: B" with optional markdown wrappers
         r"(?i)(?:\*{1,2}|_{1,2})?Answer[s]?\s*[:\-–]?(?:\*{1,2}|_{1,2})?\s*\(?([ABCDEFGHIJ])\)?",
         # "correct answer is (A)"
@@ -346,32 +348,34 @@ if __name__ == "__main__":
         "psychology",
         "history",
     ]
+    # Build few-shot examples (limit to 5 per category, append answer format)
     prompts = {c: "" for c in categories}
+    example_counts = {c: 0 for c in categories}
+    MAX_EXAMPLES = 5
+
     for _, row in validation_set.iterrows():
-        prompts[row["category"]] += (
-            "Q:"
-            + " "
-            + row["question"]
-            + "\n"
-            + form_options(row["options"])
-            + "\n"
-            + row["cot_content"]
-            + "\n\n"
-        )
+        cat = row["category"]
+        if example_counts[cat] < MAX_EXAMPLES:
+            # Format: Q + Options + CoT + Final Answer (demonstrating expected format)
+            answer_letter = row["answer"]  # Ground truth letter
+            prompts[cat] += (
+                "Q: " + row["question"] + "\n"
+                + form_options(row["options"])
+                + row["cot_content"] + "\n"
+                + f"The answer is ({answer_letter}).\n\n"
+            )
+            example_counts[cat] += 1
 
     # Build queries (raw prompts without chat template - batch API applies it)
     queries: List[str] = []
     for _, entry in dataset.iterrows():
         prefix = prompts[entry["category"]]
         prompt = (
-            "Please read the following 5 examples: \n"
+            "The following are example questions with step-by-step solutions:\n\n"
             + prefix
-            + "Please answer the following question: \n"
-            + "Q: "
-            + entry["question"]
-            + "\n"
+            + "Now answer the following question:\n"
+            + "Q: " + entry["question"] + "\n"
             + form_options(entry["options"])
-            + "\n"
         )
         queries.append(prompt)
 
