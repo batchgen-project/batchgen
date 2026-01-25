@@ -71,10 +71,13 @@ def triton_kernels_mxfp4_gemm(
     # triton_kernels expects column-major weights with shape [K, N]
     # Our weights are [N, K//2] with packed FP4, so effective shape is [N, K]
     # We need to transpose to [K//2, N] for the packed representation
-    weight_T = weight_packed.T.contiguous()  # [K//2, N] uint8
+    # IMPORTANT: Do NOT call .contiguous() - transpose creates column-major view
+    # which is required by triton_kernels (stride(-2) == 1)
+    weight_T = weight_packed.T  # [K//2, N] uint8, column-major (strides: 1, K//2)
 
     # Similarly transpose scales: [N, K//32] -> [K//32, N]
-    scales_T = weight_scales.T.contiguous()  # [K//32, N] uint8
+    # Keep as column-major view (no .contiguous())
+    scales_T = weight_scales.T  # [K//32, N] uint8, column-major
 
     # Wrap scales as triton_kernels Tensor
     scales_tensor = wrap_torch_tensor(scales_T)
