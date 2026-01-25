@@ -697,7 +697,7 @@ class GptOssMoEQuantized(nn.Module):
 
         # SwiGLU parameters
         self.swiglu_alpha = 1.702
-        self.swiglu_limit = config.swiglu_limit
+        self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
 
     def setup_pointer_arrays(self):
         """Create pointer arrays for grouped GEMM. Call after loading weights."""
