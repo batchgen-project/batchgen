@@ -720,6 +720,75 @@ def grouped_mxfp4_gemm_3d(
     return output_3d
 
 
+def grouped_mxfp4_gemm_3d_tunable(
+    hidden_3d: torch.Tensor,          # [E, M_max, K] BF16
+    weight_ptrs: torch.Tensor,        # [num_experts] int64
+    scale_ptrs: torch.Tensor,         # [num_experts] int64
+    expert_counts: torch.Tensor,      # [num_experts] int32
+    N: int,                           # Output dimension
+    weight_ref: torch.Tensor,         # Reference weight for strides [N, K//2]
+    scale_ref: torch.Tensor,          # Reference scale for strides [N, K//32]
+    BLOCK_M: int = 64,
+    BLOCK_N: int = 64,
+    BLOCK_K: int = 32,
+    num_warps: int = 8,
+    num_stages: int = 1,
+) -> torch.Tensor:
+    """Tunable variant of grouped MXFP4 GEMM for hyperparameter search.
+
+    Same as grouped_mxfp4_gemm_3d but with configurable num_warps and num_stages.
+
+    Args:
+        hidden_3d: Input tensor [E, M_max, K] in BF16
+        weight_ptrs: Pointer array [num_experts] to weight tensors
+        scale_ptrs: Pointer array [num_experts] to scale tensors
+        expert_counts: Token counts per expert [num_experts]
+        N: Output dimension (number of output features)
+        weight_ref: Reference weight tensor for computing strides
+        scale_ref: Reference scale tensor for computing strides
+        BLOCK_M: Tile size for M dimension (default 64)
+        BLOCK_N: Tile size for N dimension (default 64)
+        BLOCK_K: Tile size for K dimension (default 32, must match MXFP4 scale block)
+        num_warps: Number of warps per block (default 8)
+        num_stages: Number of pipeline stages (default 1)
+
+    Returns:
+        output_3d: [E, M_max, N] in BF16
+    """
+    num_experts = hidden_3d.shape[0]
+    M_max = hidden_3d.shape[1]
+    K = hidden_3d.shape[2]
+    device = hidden_3d.device
+
+    # Ensure expert_counts is int32 for kernel
+    if expert_counts.dtype != torch.int32:
+        expert_counts = expert_counts.to(torch.int32)
+
+    # Allocate output
+    output_3d = torch.empty(num_experts, M_max, N, dtype=torch.bfloat16, device=device)
+
+    # Grid: (num_experts, cdiv(N, BLOCK_N))
+    grid = (num_experts, triton.cdiv(N, BLOCK_N))
+
+    fused_mxfp4_grouped_gemm_kernel_3d[grid](
+        hidden_3d,
+        weight_ptrs, scale_ptrs,
+        expert_counts,
+        output_3d,
+        M_max, N, K,
+        hidden_3d.stride(0), hidden_3d.stride(1), hidden_3d.stride(2),
+        weight_ref.stride(0), weight_ref.stride(1),
+        scale_ref.stride(0), scale_ref.stride(1),
+        output_3d.stride(0), output_3d.stride(1), output_3d.stride(2),
+        1,  # stride_ptrs (contiguous pointer array)
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    return output_3d
+
+
 def grouped_mxfp4_moe_forward_3d(
     hidden_states: torch.Tensor,          # [batch*seq, hidden]
     topk_indices: torch.Tensor,           # [batch*seq, num_experts_per_tok]
