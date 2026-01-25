@@ -32,6 +32,8 @@ Reference: https://github.com/openai/gpt-oss
 
 import math
 import os
+import time
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -44,6 +46,111 @@ from transformers.modeling_outputs import (
 )
 
 from .configuration_gpt_oss import GptOssConfig
+
+
+# ============================================================================
+# Decode Layer Timing Infrastructure
+# ============================================================================
+
+@dataclass
+class LayerTimingStats:
+    """Per-layer timing statistics for decode."""
+    layer_idx: int
+    attn_ms: float = 0.0
+    moe_ms: float = 0.0
+    moe_router_ms: float = 0.0
+    moe_dispatch_ms: float = 0.0
+    moe_gemm_ms: float = 0.0
+    moe_combine_ms: float = 0.0
+
+
+class DecodeLayerTiming:
+    """Global timing collector for decode layers.
+
+    Enable with: export BATCHGEN_LAYER_TIMING=1
+
+    Usage:
+        DecodeLayerTiming.start_layer(layer_idx)
+        # ... do attention ...
+        DecodeLayerTiming.record_attn(elapsed_ms)
+        # ... do MoE ...
+        DecodeLayerTiming.record_moe(elapsed_ms)
+        DecodeLayerTiming.end_layer()
+
+        # At end of forward pass:
+        DecodeLayerTiming.print_summary()
+    """
+    enabled: bool = os.environ.get("BATCHGEN_LAYER_TIMING", "0") == "1"
+    layer_stats: List[LayerTimingStats] = []
+    current_layer: Optional[LayerTimingStats] = None
+    _iteration_count: int = 0
+
+    @classmethod
+    def start_layer(cls, layer_idx: int):
+        if cls.enabled:
+            cls.current_layer = LayerTimingStats(layer_idx=layer_idx)
+
+    @classmethod
+    def record_attn(cls, elapsed_ms: float):
+        if cls.enabled and cls.current_layer:
+            cls.current_layer.attn_ms = elapsed_ms
+
+    @classmethod
+    def record_moe(cls, elapsed_ms: float):
+        if cls.enabled and cls.current_layer:
+            cls.current_layer.moe_ms = elapsed_ms
+
+    @classmethod
+    def record_moe_component(cls, component: str, elapsed_ms: float):
+        if cls.enabled and cls.current_layer:
+            setattr(cls.current_layer, f"moe_{component}_ms", elapsed_ms)
+
+    @classmethod
+    def end_layer(cls):
+        if cls.enabled and cls.current_layer:
+            cls.layer_stats.append(cls.current_layer)
+            cls.current_layer = None
+
+    @classmethod
+    def print_summary(cls):
+        """Print timing summary and reset stats."""
+        if not cls.layer_stats:
+            return
+
+        cls._iteration_count += 1
+
+        # Calculate totals
+        total_attn = sum(s.attn_ms for s in cls.layer_stats)
+        total_moe = sum(s.moe_ms for s in cls.layer_stats)
+        total_router = sum(s.moe_router_ms for s in cls.layer_stats)
+        total_gemm = sum(s.moe_gemm_ms for s in cls.layer_stats)
+        total_combine = sum(s.moe_combine_ms for s in cls.layer_stats)
+        total_time = total_attn + total_moe
+
+        num_layers = len(cls.layer_stats)
+
+        print(f"\n=== Decode Timing (iter {cls._iteration_count}, {num_layers} layers) ===")
+        print(f"Total: {total_time:.2f} ms ({1000/total_time:.1f} tokens/sec)")
+        print(f"  Attention: {total_attn:.2f} ms ({100*total_attn/total_time:.1f}%)")
+        print(f"  MoE:       {total_moe:.2f} ms ({100*total_moe/total_time:.1f}%)")
+        if total_router > 0 or total_gemm > 0:
+            print(f"    Router:  {total_router:.2f} ms")
+            print(f"    GEMM:    {total_gemm:.2f} ms")
+            print(f"    Combine: {total_combine:.2f} ms")
+
+        # Per-layer breakdown (first 3 layers)
+        print(f"\nPer-layer (first 3):")
+        for s in cls.layer_stats[:3]:
+            print(f"  L{s.layer_idx}: attn={s.attn_ms:.2f}ms, moe={s.moe_ms:.2f}ms")
+
+        cls.layer_stats.clear()
+
+    @classmethod
+    def reset(cls):
+        """Reset all stats."""
+        cls.layer_stats.clear()
+        cls.current_layer = None
+        cls._iteration_count = 0
 
 
 # ============================================================================
@@ -474,8 +581,14 @@ class GptOssMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with Top-K expert routing."""
+        timing_enabled = DecodeLayerTiming.enabled
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
+
+        # ========== ROUTER TIMING ==========
+        if timing_enabled:
+            torch.cuda.synchronize()
+            router_start = time.perf_counter()
 
         # Compute routing logits
         router_logits = self.router(hidden_states_flat)  # [batch*seq, num_experts]
@@ -484,8 +597,17 @@ class GptOssMoE(nn.Module):
         topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1)
 
+        if timing_enabled:
+            torch.cuda.synchronize()
+            DecodeLayerTiming.record_moe_component("router", (time.perf_counter() - router_start) * 1000)
+
         # Initialize output
         output = torch.zeros_like(hidden_states_flat)
+
+        # ========== GEMM TIMING (per-expert loop) ==========
+        if timing_enabled:
+            torch.cuda.synchronize()
+            gemm_start = time.perf_counter()
 
         # Route tokens to experts
         for i, expert in enumerate(self.experts):
@@ -503,6 +625,10 @@ class GptOssMoE(nn.Module):
                 expert_input = hidden_states_flat[expert_mask]
                 expert_output = expert(expert_input)
                 output[expert_mask] += expert_output * expert_weights[expert_mask].unsqueeze(-1)
+
+        if timing_enabled:
+            torch.cuda.synchronize()
+            DecodeLayerTiming.record_moe_component("gemm", (time.perf_counter() - gemm_start) * 1000)
 
         return output.view(batch_size, seq_len, hidden_dim)
 
@@ -534,6 +660,10 @@ class GptOssDecoderLayer(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         debug_layer = os.environ.get("BATCHGEN_DEBUG_LAYER", "0") == "1"
+        timing_enabled = DecodeLayerTiming.enabled
+
+        # Start layer timing
+        DecodeLayerTiming.start_layer(self.layer_idx)
 
         residual = hidden_states
 
@@ -544,6 +674,11 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after input_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
+        # ========== ATTENTION TIMING ==========
+        if timing_enabled:
+            torch.cuda.synchronize()
+            attn_start = time.perf_counter()
+
         hidden_states, attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -552,6 +687,10 @@ class GptOssDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+
+        if timing_enabled:
+            torch.cuda.synchronize()
+            DecodeLayerTiming.record_attn((time.perf_counter() - attn_start) * 1000)
 
         if debug_layer and self.layer_idx < 3:
             with torch.no_grad():
@@ -571,7 +710,16 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
+        # ========== MoE TIMING ==========
+        if timing_enabled:
+            torch.cuda.synchronize()
+            moe_start = time.perf_counter()
+
         hidden_states = self.mlp(hidden_states)
+
+        if timing_enabled:
+            torch.cuda.synchronize()
+            DecodeLayerTiming.record_moe((time.perf_counter() - moe_start) * 1000)
 
         if debug_layer and self.layer_idx < 3:
             with torch.no_grad():
@@ -582,6 +730,9 @@ class GptOssDecoderLayer(nn.Module):
         if debug_layer and self.layer_idx < 3:
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after MLP+residual (final): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+
+        # End layer timing
+        DecodeLayerTiming.end_layer()
 
         return hidden_states, attn_weights, present_key_value
 
@@ -721,6 +872,9 @@ class GptOssModel(nn.Module):
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+
+        # Print timing summary if enabled
+        DecodeLayerTiming.print_summary()
 
         return (hidden_states, next_cache, all_hidden_states, all_self_attns)
 

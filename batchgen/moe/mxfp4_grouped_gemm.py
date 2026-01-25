@@ -385,6 +385,228 @@ def fused_mxfp4_grouped_gemm(
     return output
 
 
+# =============================================================================
+# Grouped MXFP4 MoE Forward (Single Kernel Launch Per Stage)
+# =============================================================================
+
+def moe_token_dispatch(
+    hidden_states: torch.Tensor,      # [batch*seq, hidden]
+    topk_indices: torch.Tensor,       # [batch*seq, num_experts_per_tok]
+    topk_weights: torch.Tensor,       # [batch*seq, num_experts_per_tok]
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch tokens to experts and create batched layout.
+
+    Instead of 3D layout, we create sorted token lists per expert for efficient
+    batched processing with triton_kernels.
+
+    Returns:
+        sorted_hidden: [total_tokens_routed, hidden] - tokens sorted by expert
+        expert_offsets: [num_experts + 1] - start offset for each expert
+        original_indices: [total_tokens_routed] - maps back to original token position
+        original_k_indices: [total_tokens_routed] - which topk slot (0 to k-1)
+        routing_weights: [total_tokens_routed] - routing weight for each entry
+    """
+    num_tokens, hidden = hidden_states.shape
+    num_experts_per_tok = topk_indices.shape[1]
+    device = hidden_states.device
+
+    # Flatten topk_indices to get all (token, expert) pairs
+    flat_indices = topk_indices.view(-1)  # [num_tokens * k]
+    flat_weights = topk_weights.view(-1)  # [num_tokens * k]
+
+    # Create token indices for each flattened entry
+    token_indices = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, num_experts_per_tok).reshape(-1)
+    k_indices = torch.arange(num_experts_per_tok, device=device).unsqueeze(0).expand(num_tokens, -1).reshape(-1)
+
+    # Sort by expert index to group tokens by expert
+    sorted_expert_indices, sort_order = flat_indices.sort()
+
+    # Reorder everything by expert
+    sorted_token_indices = token_indices[sort_order]
+    sorted_k_indices = k_indices[sort_order]
+    sorted_weights = flat_weights[sort_order]
+
+    # Gather hidden states in sorted order
+    sorted_hidden = hidden_states[sorted_token_indices]
+
+    # Compute expert offsets using bincount
+    expert_counts = torch.bincount(sorted_expert_indices, minlength=num_experts)
+    expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    expert_offsets[1:] = expert_counts.cumsum(0)
+
+    return sorted_hidden, expert_offsets, sorted_token_indices, sorted_k_indices, sorted_weights
+
+
+def grouped_mxfp4_moe_forward(
+    hidden_states: torch.Tensor,          # [batch*seq, hidden]
+    topk_indices: torch.Tensor,           # [batch*seq, num_experts_per_tok]
+    topk_weights: torch.Tensor,           # [batch*seq, num_experts_per_tok]
+    gate_weights: List[torch.Tensor],     # [num_experts] of [N, K//2] uint8
+    gate_scales: List[torch.Tensor],      # [num_experts] of [N, K//32] uint8
+    gate_biases: List[torch.Tensor],      # [num_experts] of [N] BF16 (or None)
+    up_weights: List[torch.Tensor],       # [num_experts] of [N, K//2] uint8
+    up_scales: List[torch.Tensor],        # [num_experts] of [N, K//32] uint8
+    up_biases: List[torch.Tensor],        # [num_experts] of [N] BF16 (or None)
+    down_weights: List[torch.Tensor],     # [num_experts] of [hidden, N//2] uint8
+    down_scales: List[torch.Tensor],      # [num_experts] of [hidden, N//32] uint8
+    down_biases: List[torch.Tensor],      # [num_experts] of [hidden] BF16 (or None)
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+) -> torch.Tensor:
+    """Full MoE forward with grouped MXFP4 GEMM using triton_kernels.
+
+    This implementation groups tokens by expert and processes each expert's
+    tokens in a batch, significantly reducing per-token overhead compared
+    to the naive per-expert loop.
+
+    Stages:
+    1. Dispatch tokens to experts (sort by expert)
+    2. Process each expert's tokens in batch:
+       - Gate projection: x @ gate.T + gate_bias
+       - Up projection: x @ up.T + up_bias
+       - SwiGLU: gate * sigmoid(alpha * gate) * (up + 1)
+       - Down projection: intermediate @ down.T + down_bias
+    3. Combine results back to original order
+
+    Args:
+        hidden_states: Input [batch*seq, hidden] in BF16
+        topk_indices: Expert indices [batch*seq, num_experts_per_tok]
+        topk_weights: Routing weights [batch*seq, num_experts_per_tok]
+        gate_weights, gate_scales, gate_biases: Gate projection per expert
+        up_weights, up_scales, up_biases: Up projection per expert
+        down_weights, down_scales, down_biases: Down projection per expert
+        swiglu_alpha: SwiGLU alpha parameter (default 1.702 for OpenAI)
+        swiglu_limit: Clamping limit (default 7.0)
+
+    Returns:
+        Output [batch*seq, hidden] in BF16
+    """
+    if not HAS_TRITON_KERNELS:
+        raise ImportError("grouped_mxfp4_moe_forward requires triton_kernels")
+
+    num_tokens, hidden = hidden_states.shape
+    num_experts = len(gate_weights)
+    num_experts_per_tok = topk_indices.shape[1]
+    device = hidden_states.device
+    intermediate_size = gate_weights[0].shape[0]  # N dimension
+
+    # Step 1: Dispatch tokens to experts
+    sorted_hidden, expert_offsets, original_indices, original_k, routing_weights = moe_token_dispatch(
+        hidden_states, topk_indices, topk_weights, num_experts
+    )
+
+    # Step 2: Process each expert's tokens in batch
+    # Allocate output for all sorted tokens
+    sorted_output = torch.zeros_like(sorted_hidden)
+
+    for expert_idx in range(num_experts):
+        start = expert_offsets[expert_idx].item()
+        end = expert_offsets[expert_idx + 1].item()
+
+        if start == end:
+            continue  # No tokens for this expert
+
+        expert_input = sorted_hidden[start:end]  # [num_tokens_for_expert, hidden]
+
+        # Get expert weights
+        gate_packed = gate_weights[expert_idx]
+        gate_scale = gate_scales[expert_idx]
+        gate_bias = gate_biases[expert_idx] if gate_biases else None
+
+        up_packed = up_weights[expert_idx]
+        up_scale = up_scales[expert_idx]
+        up_bias = up_biases[expert_idx] if up_biases else None
+
+        down_packed = down_weights[expert_idx]
+        down_scale = down_scales[expert_idx]
+        down_bias = down_biases[expert_idx] if down_biases else None
+
+        # Stage 1a: Gate projection
+        gate_out = fused_mxfp4_single_gemm(expert_input, gate_packed, gate_scale, gate_bias)
+
+        # Stage 1b: Up projection
+        up_out = fused_mxfp4_single_gemm(expert_input, up_packed, up_scale, up_bias)
+
+        # Stage 1c: SwiGLU activation
+        gate_clamped = gate_out.clamp(max=swiglu_limit)
+        up_clamped = up_out.clamp(min=-swiglu_limit, max=swiglu_limit)
+        glu = gate_clamped * torch.sigmoid(swiglu_alpha * gate_clamped)
+        intermediate = glu * (up_clamped + 1)
+
+        # Stage 2: Down projection
+        expert_output = fused_mxfp4_single_gemm(intermediate, down_packed, down_scale, down_bias)
+
+        # Store in sorted output
+        sorted_output[start:end] = expert_output
+
+    # Step 3: Combine results back to original order with routing weights
+    # Each original token position accumulates weighted outputs from its top-k experts
+    output = torch.zeros(num_tokens, hidden, dtype=hidden_states.dtype, device=device)
+
+    # Apply routing weights and scatter back
+    weighted_output = sorted_output * routing_weights.unsqueeze(-1)
+    output.scatter_add_(0, original_indices.unsqueeze(-1).expand_as(weighted_output), weighted_output)
+
+    return output
+
+
+def mxfp4_mlp_forward(
+    x: torch.Tensor,
+    gate_packed: torch.Tensor,
+    gate_scales: torch.Tensor,
+    gate_bias: torch.Tensor,
+    up_packed: torch.Tensor,
+    up_scales: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_packed: torch.Tensor,
+    down_scales: torch.Tensor,
+    down_bias: torch.Tensor,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+) -> torch.Tensor:
+    """Single expert MLP forward with MXFP4 weights.
+
+    Implements: down(SwiGLU(gate(x), up(x)))
+
+    This is the optimized path for a single expert using triton_kernels.
+
+    Args:
+        x: Input [M, hidden] in BF16
+        gate_packed, gate_scales, gate_bias: Gate projection weights
+        up_packed, up_scales, up_bias: Up projection weights
+        down_packed, down_scales, down_bias: Down projection weights
+        swiglu_alpha: SwiGLU alpha (default 1.702)
+        swiglu_limit: Clamping limit (default 7.0)
+
+    Returns:
+        Output [M, hidden] in BF16
+    """
+    # Ensure 2D input
+    original_shape = x.shape
+    if x.dim() > 2:
+        x = x.view(-1, x.shape[-1])
+
+    # Stage 1: Gate and Up projections (can be parallelized on GPU)
+    gate_out = fused_mxfp4_single_gemm(x, gate_packed, gate_scales, gate_bias)
+    up_out = fused_mxfp4_single_gemm(x, up_packed, up_scales, up_bias)
+
+    # Stage 2: SwiGLU activation
+    gate_clamped = gate_out.clamp(max=swiglu_limit)
+    up_clamped = up_out.clamp(min=-swiglu_limit, max=swiglu_limit)
+    glu = gate_clamped * torch.sigmoid(swiglu_alpha * gate_clamped)
+    intermediate = glu * (up_clamped + 1)
+
+    # Stage 3: Down projection
+    output = fused_mxfp4_single_gemm(intermediate, down_packed, down_scales, down_bias)
+
+    # Restore original shape
+    if len(original_shape) > 2:
+        output = output.view(*original_shape[:-1], -1)
+
+    return output
+
+
 def mxfp4_linear(
     x: torch.Tensor,
     weight_packed: torch.Tensor,
