@@ -89,8 +89,13 @@ def triton_kernels_mxfp4_gemm(
     # Call triton_kernels.matmul
     # - x: [M, K] BF16
     # - weight_T: [K//2, N] uint8 (auto-detected as FP4 because dtype is uint8)
-    # - bias: [N] BF16 or None
-    output = matmul(x_2d, weight_T, bias, precision_config=pc)
+    # NOTE: Don't pass bias to matmul - triton_kernels has a type mismatch bug when
+    # bias is BF16 but accumulator is FP32 (the else branch creates FP32 zeros)
+    output = matmul(x_2d, weight_T, None, precision_config=pc)
+
+    # Add bias manually (workaround for triton_kernels type mismatch bug)
+    if bias is not None:
+        output = output + bias
 
     # Reshape output to match input batch dimensions
     output = output.view(*original_shape[:-1], N)
