@@ -174,8 +174,9 @@ def fused_mxfp4_gemm_kernel(
         val_lo_scaled = ldexp_triton(val_lo, exp_broadcast)  # [BLOCK_N, 16] float32
         val_hi_scaled = ldexp_triton(val_hi, exp_broadcast)  # [BLOCK_N, 16] float32
 
-        # NOTE: Keep weights in FP32 for precision (no BF16 conversion here)
-        # This avoids TF32 precision loss in tl.dot
+        # Convert to BF16 for efficient tensor core matmul
+        val_lo_bf16 = val_lo_scaled.to(tl.bfloat16)  # [BLOCK_N, 16]
+        val_hi_bf16 = val_hi_scaled.to(tl.bfloat16)  # [BLOCK_N, 16]
 
         # Load LHS even positions: lhs[:, k_start+0], lhs[:, k_start+2], ..., lhs[:, k_start+30]
         offs_k_even = k_start + tl.arange(0, BLOCK_K_HALF) * 2
@@ -190,10 +191,10 @@ def fused_mxfp4_gemm_kernel(
         lhs_odd = tl.load(lhs_odd_ptrs, mask=lhs_odd_mask, other=0.0)  # [BLOCK_M, 16]
 
         # Compute: lhs_even @ val_lo.T + lhs_odd @ val_hi.T
-        # Use FP32 for inputs to avoid TF32 precision loss
-        # val_lo_scaled.T: [16, BLOCK_N]
-        acc += tl.dot(lhs_even.to(tl.float32), tl.trans(val_lo_scaled))
-        acc += tl.dot(lhs_odd.to(tl.float32), tl.trans(val_hi_scaled))
+        # Use BF16 inputs for tensor core efficiency, disable TF32 for FP32 accumulation precision
+        # val_lo_bf16.T: [16, BLOCK_N]
+        acc += tl.dot(lhs_even.to(tl.bfloat16), tl.trans(val_lo_bf16), allow_tf32=False)
+        acc += tl.dot(lhs_odd.to(tl.bfloat16), tl.trans(val_hi_bf16), allow_tf32=False)
 
     # Add bias if present
     if HAS_BIAS:
