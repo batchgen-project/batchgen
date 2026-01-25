@@ -13,6 +13,7 @@ Usage:
 import sys
 sys.path.insert(0, "/Users/andrew/Desktop/MS application/Documentations/MoE-Gen/BatchGen")
 
+import time
 import torch
 import torch.nn.functional as F
 from batchgen.quantization.mxfp4 import mxfp4_dequantize
@@ -232,6 +233,109 @@ def test_grouped_moe_forward():
         return False
 
 
+def test_performance_benchmark():
+    """Benchmark grouped GEMM vs per-expert loop."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Performance Benchmark (GPT-OSS-120B dimensions)")
+    print("=" * 60)
+
+    if not HAS_TRITON_KERNELS:
+        print("SKIPPED: triton_kernels not installed")
+        return None
+
+    device = "cuda"
+
+    # GPT-OSS-120B realistic dimensions
+    num_tokens = 32          # Typical decode batch
+    hidden = 2880            # GPT-OSS hidden size
+    intermediate = 5760      # GPT-OSS intermediate (2x hidden)
+    num_experts = 128        # GPT-OSS num experts
+    k = 4                    # GPT-OSS top-k
+
+    print(f"Config: {num_tokens} tokens, {num_experts} experts, top-{k}")
+    print(f"Dimensions: hidden={hidden}, intermediate={intermediate}")
+
+    hidden_states = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=device)
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    topk_weights, topk_indices = torch.topk(router_logits, k=k, dim=-1)
+    topk_weights = F.softmax(topk_weights, dim=-1).to(torch.bfloat16)
+
+    # Create expert weights
+    print(f"\nAllocating {num_experts} expert weights...")
+    gate_weights = [torch.randint(0, 256, (intermediate, hidden // 2), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    gate_scales = [torch.randint(120, 134, (intermediate, hidden // 32), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    gate_biases = [torch.randn(intermediate, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+    up_weights = [torch.randint(0, 256, (intermediate, hidden // 2), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    up_scales = [torch.randint(120, 134, (intermediate, hidden // 32), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    up_biases = [torch.randn(intermediate, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+    down_weights = [torch.randint(0, 256, (hidden, intermediate // 2), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    down_scales = [torch.randint(120, 134, (hidden, intermediate // 32), dtype=torch.uint8, device=device) for _ in range(num_experts)]
+    down_biases = [torch.randn(hidden, dtype=torch.bfloat16, device=device) for _ in range(num_experts)]
+
+    n_warmup = 3
+    n_iters = 10
+
+    # ========== Benchmark: Per-expert loop (reference) ==========
+    print(f"\nWarming up per-expert loop ({n_warmup} iters)...")
+    for _ in range(n_warmup):
+        _ = reference_moe_forward(
+            hidden_states, topk_indices, topk_weights,
+            gate_weights, gate_scales, gate_biases,
+            up_weights, up_scales, up_biases,
+            down_weights, down_scales, down_biases,
+        )
+    torch.cuda.synchronize()
+
+    print(f"Timing per-expert loop ({n_iters} iters)...")
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        _ = reference_moe_forward(
+            hidden_states, topk_indices, topk_weights,
+            gate_weights, gate_scales, gate_biases,
+            up_weights, up_scales, up_biases,
+            down_weights, down_scales, down_biases,
+        )
+    torch.cuda.synchronize()
+    loop_time_ms = (time.perf_counter() - start) / n_iters * 1000
+
+    # ========== Benchmark: Grouped GEMM ==========
+    print(f"\nWarming up grouped GEMM ({n_warmup} iters)...")
+    for _ in range(n_warmup):
+        _ = grouped_mxfp4_moe_forward(
+            hidden_states, topk_indices, topk_weights,
+            gate_weights, gate_scales, gate_biases,
+            up_weights, up_scales, up_biases,
+            down_weights, down_scales, down_biases,
+        )
+    torch.cuda.synchronize()
+
+    print(f"Timing grouped GEMM ({n_iters} iters)...")
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        _ = grouped_mxfp4_moe_forward(
+            hidden_states, topk_indices, topk_weights,
+            gate_weights, gate_scales, gate_biases,
+            up_weights, up_scales, up_biases,
+            down_weights, down_scales, down_biases,
+        )
+    torch.cuda.synchronize()
+    grouped_time_ms = (time.perf_counter() - start) / n_iters * 1000
+
+    # ========== Results ==========
+    print(f"\n{'Method':<25} {'Time (ms)':<12} {'Speedup':<10}")
+    print("-" * 50)
+    print(f"{'Per-expert loop':<25} {loop_time_ms:<12.2f} {'1.00x':<10}")
+    print(f"{'Grouped GEMM':<25} {grouped_time_ms:<12.2f} {loop_time_ms/grouped_time_ms:.2f}x")
+
+    speedup = loop_time_ms / grouped_time_ms
+    print(f"\nSpeedup: {speedup:.2f}x")
+
+    print("PASSED (informational)")
+    return True
+
+
 def main():
     if not torch.cuda.is_available():
         print("ERROR: CUDA required")
@@ -245,6 +349,7 @@ def main():
         ("Token dispatch", test_token_dispatch()),
         ("MLP forward", test_mlp_forward()),
         ("Grouped MoE forward", test_grouped_moe_forward()),
+        ("Performance benchmark", test_performance_benchmark()),
     ]
 
     print("\n" + "=" * 60)
