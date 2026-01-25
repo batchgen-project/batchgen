@@ -20,10 +20,8 @@ from typing import List, Tuple
 # Try to import triton_kernels for optimized MXFP4 GEMM
 # triton_kernels is part of Triton 3.4+ or installed separately from Triton source
 try:
-    from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.tensor import convert_layout, wrap_torch_tensor, FP4
-    from triton_kernels.tensor_details.layout import HopperMXValueLayout, StridedLayout
+    from triton_kernels.matmul import matmul as triton_kernels_matmul, PrecisionConfig
+    from triton_kernels.tensor import wrap_torch_tensor
     HAS_TRITON_KERNELS = True
     logging.info("triton_kernels available - using optimized MXFP4 GEMM")
 except ImportError:
@@ -34,53 +32,6 @@ except ImportError:
 # MXFP4 configuration
 MXFP4_BLOCK_SIZE = 32  # FP4 values per scale
 MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
-
-
-# =============================================================================
-# Weight Layout Conversion for triton_kernels
-# =============================================================================
-
-def convert_to_hopper_layout(weight_packed: torch.Tensor, weight_scales: torch.Tensor):
-    """Convert BatchGen MXFP4 format to triton_kernels HopperMXValueLayout.
-
-    BatchGen stores MXFP4 weights as:
-    - weight_packed: [N, K//32, 16] uint8 (3D block format) or [N, K//2] uint8 (2D)
-    - weight_scales: [N, K//32] uint8
-
-    triton_kernels expects:
-    - weights: FP4 tensor in HopperMXValueLayout (per-row quantization, mx_axis=1)
-    - scales: uint8 tensor in StridedLayout
-
-    Args:
-        weight_packed: Packed FP4 weights in BatchGen format
-        weight_scales: Scales in BatchGen format
-
-    Returns:
-        Tuple of (converted_weights, converted_scales) ready for matmul_ogs
-    """
-    if not HAS_TRITON_KERNELS:
-        raise RuntimeError("triton_kernels not available for layout conversion")
-
-    # Flatten 3D to 2D if needed: [N, K//32, 16] -> [N, K//2]
-    if weight_packed.dim() == 3:
-        N, G, B = weight_packed.shape
-        weight_packed = weight_packed.view(N, G * B)
-
-    # Wrap and convert to Hopper layout
-    # FP4 is the dtype indicator for 4-bit floating point
-    w = convert_layout(
-        wrap_torch_tensor(weight_packed, dtype=FP4),
-        HopperMXValueLayout,
-        mx_axis=1  # Per-row quantization
-    )
-
-    # Scales stay in strided layout
-    w_scale = convert_layout(
-        wrap_torch_tensor(weight_scales),
-        StridedLayout
-    )
-
-    return w, w_scale
 
 
 @triton.jit
@@ -151,7 +102,7 @@ def fused_mxfp4_single_gemm(
 ) -> torch.Tensor:
     """Fused MXFP4 dequantization and GEMM for single expert.
 
-    Uses triton_kernels.matmul_ogs when available (optimized for Hopper architecture).
+    Uses triton_kernels.matmul when available (optimized for Hopper architecture).
     Falls back to unfused dequant + matmul when triton_kernels is not installed.
 
     Computes: output = lhs @ dequant(rhs).T + bias
@@ -170,19 +121,42 @@ def fused_mxfp4_single_gemm(
     assert rhs_scales.dtype == torch.uint8, f"rhs_scales must be uint8, got {rhs_scales.dtype}"
 
     if HAS_TRITON_KERNELS:
-        # Use OpenAI's optimized triton_kernels.matmul_ogs
-        # This handles MXFP4 dequantization fused into the GEMM kernel
-        w, w_scale = convert_to_hopper_layout(rhs_packed, rhs_scales)
+        # Handle 3D block format: [N, K//32, 16] -> [N, K//2]
+        if rhs_packed.dim() == 3:
+            N, G, B = rhs_packed.shape
+            rhs_packed = rhs_packed.view(N, G * B)
 
-        # PrecisionConfig with weight_scale enables fused MXFP4 dequant
-        pc = PrecisionConfig(
-            weight_scale=w_scale,
-            flex_ctx=FlexCtx(rhs_data=InFlexData())
-        )
+        N = rhs_packed.shape[0]
 
-        # matmul_ogs: output = lhs @ weights.T (with fused dequant)
-        # w.storage.data contains the actual tensor data
-        output = matmul_ogs(lhs, w.storage.data, bias, precision_config=pc)
+        # triton_kernels expects column-major weights with shape [K//2, N]
+        # IMPORTANT: Do NOT call .contiguous() - transpose creates column-major view
+        # which is required by triton_kernels (stride(-2) == 1)
+        weight_T = rhs_packed.T  # [K//2, N] uint8, column-major (strides: 1, K//2)
+
+        # Transpose scales: [N, K//32] -> [K//32, N]
+        # IMPORTANT: Use .contiguous() to make scales row-major (stride[-1] == 1)
+        # This enables TMA (Tensor Memory Accelerator) in triton_kernels
+        # Without TMA, large tensors fail with ~33% error
+        scales_T = rhs_scales.T.contiguous()  # [K//32, N] uint8, row-major (strides: N, 1)
+
+        # Wrap scales as triton_kernels Tensor
+        scales_tensor = wrap_torch_tensor(scales_T)
+
+        # Configure MXFP4 scales
+        # b_mx_scale tells triton_kernels to treat weight as MXFP4 and apply scales
+        pc = PrecisionConfig(b_mx_scale=scales_tensor)
+
+        # Call triton_kernels.matmul
+        # NOTE: Don't pass bias to matmul - triton_kernels has a type mismatch bug when
+        # bias is BF16 but accumulator is FP32 (the else branch creates FP32 zeros)
+        output = triton_kernels_matmul(lhs, weight_T, None, precision_config=pc)
+
+        # Add bias manually (workaround for triton_kernels type mismatch bug)
+        # Ensure proper dtype handling: output may be FP32 (accumulator), bias is BF16
+        if bias is not None:
+            if output.dtype != lhs.dtype:
+                output = output.to(lhs.dtype)
+            output = output + bias
     else:
         # Fallback: unfused path (slower, creates BF16 intermediate)
         from batchgen.quantization.mxfp4 import mxfp4_dequantize
