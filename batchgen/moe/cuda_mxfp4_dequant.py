@@ -372,6 +372,22 @@ void batch_mxfp4_dequant_cuda_impl(
         );
     }
 }
+'''
+
+# C++ declaration for the CUDA function
+CPP_SOURCE = r'''
+#include <torch/extension.h>
+
+void batch_mxfp4_dequant_cuda_impl(
+    torch::Tensor packed_ptrs,
+    torch::Tensor scale_ptrs,
+    torch::Tensor output,
+    int64_t stride_packed_n,
+    int64_t stride_packed_k,
+    int64_t stride_scale_n,
+    int64_t stride_scale_k,
+    int kernel_version
+);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("batch_mxfp4_dequant_cuda_impl", &batch_mxfp4_dequant_cuda_impl,
@@ -382,18 +398,44 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 # Compile and cache the CUDA extension
 _cuda_module = None
 
+def clear_cuda_cache():
+    """Clear the cached CUDA extension to force recompilation."""
+    import shutil
+    cache_dir = os.path.expanduser("~/.cache/torch_extensions")
+    cuda_cache = os.path.join(cache_dir, f"py{torch.__version__.split('.')[0]}*", "cuda_mxfp4_dequant")
+    # Also try the exact path pattern
+    import glob
+    for path in glob.glob(os.path.join(cache_dir, "*", "cuda_mxfp4_dequant")):
+        try:
+            shutil.rmtree(path)
+            print(f"Cleared cache: {path}")
+        except Exception as e:
+            print(f"Failed to clear {path}: {e}")
+
 def _get_cuda_module():
     """Lazy-load and compile the CUDA module."""
     global _cuda_module
     if _cuda_module is None:
-        _cuda_module = load_inline(
-            name='cuda_mxfp4_dequant',
-            cpp_sources='',
-            cuda_sources=[CUDA_SOURCE],
-            functions=['batch_mxfp4_dequant_cuda_impl'],
-            extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo'],
-            verbose=False,
-        )
+        try:
+            _cuda_module = load_inline(
+                name='cuda_mxfp4_dequant',
+                cpp_sources=[CPP_SOURCE],
+                cuda_sources=[CUDA_SOURCE],
+                extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo'],
+                verbose=os.environ.get('CUDA_DEBUG', '0') == '1',
+            )
+        except Exception as e:
+            # If compilation fails, try clearing cache and retrying
+            print(f"CUDA compilation failed: {e}")
+            print("Clearing cache and retrying...")
+            clear_cuda_cache()
+            _cuda_module = load_inline(
+                name='cuda_mxfp4_dequant',
+                cpp_sources=[CPP_SOURCE],
+                cuda_sources=[CUDA_SOURCE],
+                extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo'],
+                verbose=True,
+            )
     return _cuda_module
 
 
