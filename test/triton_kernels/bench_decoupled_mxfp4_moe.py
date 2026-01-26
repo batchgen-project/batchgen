@@ -124,6 +124,117 @@ def benchmark_fused_mxfp4_gemm(
         return float('inf')
 
 
+def benchmark_dequant_only(
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    K: int,
+    num_experts: int,
+    device: str = "cuda",
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+) -> float:
+    """Benchmark ONLY the batch dequant kernel (isolated test).
+
+    Returns time in milliseconds, or float('inf') on failure.
+    """
+    try:
+        from batchgen.moe.decoupled_mxfp4_moe import batch_mxfp4_dequant
+    except ImportError as e:
+        print(f"  batch_mxfp4_dequant not available: {e}")
+        return float('inf')
+
+    # Setup pointer arrays
+    weight_ptrs = torch.tensor(
+        [w.data_ptr() for w in weights], dtype=torch.int64, device=device
+    )
+    scale_ptrs = torch.tensor(
+        [s.data_ptr() for s in scales], dtype=torch.int64, device=device
+    )
+
+    # Allocate BF16 buffer
+    bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
+
+    try:
+        print("    Testing dequant kernel in isolation...")
+
+        # Warmup with explicit sync and error checking
+        for i in range(warmup_iters):
+            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0])
+            torch.cuda.synchronize()
+            print(f"      Warmup {i+1}/{warmup_iters} OK")
+
+        # Benchmark
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0])
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+        print(f"    Dequant kernel passed! Time: {elapsed:.3f} ms")
+        return elapsed
+    except Exception as e:
+        print(f"    Dequant kernel FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
+def benchmark_gemm_only(
+    hidden_3d: torch.Tensor,
+    N: int,
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+) -> float:
+    """Benchmark ONLY the BF16 grouped GEMM kernel (isolated test).
+
+    Uses random BF16 buffer instead of dequantized weights.
+    Returns time in milliseconds, or float('inf') on failure.
+    """
+    try:
+        from batchgen.moe.decoupled_mxfp4_moe import bf16_grouped_gemm_3d
+    except ImportError as e:
+        print(f"  bf16_grouped_gemm_3d not available: {e}")
+        return float('inf')
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+    K = hidden_3d.shape[2]
+    device = hidden_3d.device
+
+    # Create random BF16 buffer (skip dequant)
+    bf16_buffer = torch.randn(num_experts, N, K, dtype=torch.bfloat16, device=device)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=device
+    )
+
+    try:
+        print("    Testing GEMM kernel in isolation...")
+
+        # Warmup with explicit sync and error checking
+        for i in range(warmup_iters):
+            _ = bf16_grouped_gemm_3d(hidden_3d, bf16_buffer, expert_counts, N)
+            torch.cuda.synchronize()
+            print(f"      Warmup {i+1}/{warmup_iters} OK")
+
+        # Benchmark
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            _ = bf16_grouped_gemm_3d(hidden_3d, bf16_buffer, expert_counts, N)
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+        print(f"    GEMM kernel passed! Time: {elapsed:.3f} ms")
+        return elapsed
+    except Exception as e:
+        print(f"    GEMM kernel FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
 def benchmark_decoupled(
     hidden_3d: torch.Tensor,
     weights: List[torch.Tensor],
@@ -338,8 +449,15 @@ def run_benchmark(
     tokens_per_expert: int,
     config: Dict,
     detailed: bool = False,
+    isolate_kernels: bool = True,
 ) -> Dict[str, float]:
     """Run full benchmark comparison.
+
+    Args:
+        tokens_per_expert: Number of tokens per expert
+        config: Model configuration dict
+        detailed: If True, show component timing breakdown
+        isolate_kernels: If True, test each kernel in isolation first
 
     Returns dict with timing results.
     """
@@ -371,8 +489,34 @@ def run_benchmark(
     results["fused_mxfp4"] = fused_time
     print(f"  Time: {fused_time:.3f} ms")
 
-    # Benchmark decoupled
-    print("\nBenchmarking decoupled (dequant + BF16 GEMM)...")
+    # Isolated kernel tests (helps debug which kernel is failing)
+    if isolate_kernels:
+        print("\n--- ISOLATED KERNEL TESTS ---")
+
+        # Test dequant kernel alone
+        print("\n[1/2] Testing batch dequant kernel in isolation...")
+        dequant_isolated = benchmark_dequant_only(
+            weights, scales, config["intermediate_size"], config["hidden_size"],
+            config["num_experts"], device
+        )
+        results["dequant_isolated"] = dequant_isolated
+
+        # Test GEMM kernel alone (with random BF16, no dequant)
+        print("\n[2/2] Testing BF16 GEMM kernel in isolation...")
+        gemm_isolated = benchmark_gemm_only(
+            hidden_3d, config["intermediate_size"]
+        )
+        results["gemm_isolated"] = gemm_isolated
+
+        if dequant_isolated == float('inf') or gemm_isolated == float('inf'):
+            print("\n*** ISOLATED KERNEL TEST FAILED - Skipping combined benchmark ***")
+            results["decoupled"] = float('inf')
+            return results
+
+        print("\n--- ISOLATED TESTS PASSED ---")
+
+    # Benchmark decoupled (combined)
+    print("\nBenchmarking decoupled (dequant + BF16 GEMM) combined...")
     decoupled_time, component_times = benchmark_decoupled(
         hidden_3d, weights, scales, config["intermediate_size"], detailed=detailed
     )
@@ -481,6 +625,10 @@ Examples:
         "--intermediate-size", type=int, default=DEFAULT_CONFIG["intermediate_size"],
         help=f"Intermediate size (default: {DEFAULT_CONFIG['intermediate_size']})"
     )
+    parser.add_argument(
+        "--no-isolate", action="store_true",
+        help="Skip isolated kernel tests (test dequant/GEMM separately)"
+    )
 
     args = parser.parse_args()
 
@@ -502,7 +650,7 @@ Examples:
 
     all_results = {}
     for tpe in args.tokens:
-        results = run_benchmark(tpe, config, detailed=args.detailed)
+        results = run_benchmark(tpe, config, detailed=args.detailed, isolate_kernels=not args.no_isolate)
         all_results[tpe] = results
 
     # Final summary if multiple token counts

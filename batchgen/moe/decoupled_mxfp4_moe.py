@@ -98,6 +98,8 @@ def batch_mxfp4_dequant_kernel(
     stride_scale_n, stride_scale_k,
     # Strides for output [num_experts, N, K]
     stride_out_e, stride_out_n, stride_out_k,
+    # Stride for pointer arrays (should be 1 for contiguous)
+    stride_ptrs,
     # Block sizes
     BLOCK_N: tl.constexpr,  # 64
     BLOCK_K: tl.constexpr,  # 32 (matches scale block)
@@ -115,9 +117,9 @@ def batch_mxfp4_dequant_kernel(
     n_block = tl.program_id(axis=1)
     k_block = tl.program_id(axis=2)
 
-    # Get base pointers for this expert
-    packed_base = tl.load(packed_ptrs + expert_idx).to(tl.pointer_type(tl.uint8))
-    scale_base = tl.load(scale_ptrs + expert_idx).to(tl.pointer_type(tl.uint8))
+    # Get base pointers for this expert (use stride_ptrs like working kernel)
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
 
     # Compute offsets for this tile
     offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -212,6 +214,7 @@ def batch_mxfp4_dequant(
         packed_ref.stride(0), packed_ref.stride(1),
         scale_ref.stride(0), scale_ref.stride(1),
         output.stride(0), output.stride(1), output.stride(2),
+        1,  # stride_ptrs (contiguous pointer array, same as working kernel)
         BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         num_warps=4,
     )
