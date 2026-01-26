@@ -42,7 +42,7 @@ MXFP4_BLOCK_SIZE = 32  # FP4 values per scale
 MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
 
 # =============================================================================
-# FP4 E2M1 Arithmetic Decoding (OPTIMIZED: pure compute, no memory loads)
+# FP4 Decode Functions - Multiple Versions for Benchmarking
 # =============================================================================
 #
 # FP4 is E2M1 format (2 exponent bits, 1 mantissa bit):
@@ -51,22 +51,70 @@ MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
 #   - Bits 1-2: Exponent (0-3)
 #   - Bit 0: Mantissa (0 or 1)
 #
-# Values: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives)
+# FP4 LUT (index → value):
+#   0: 0.0,  1: 0.5,  2: 1.0,  3: 1.5,  4: 2.0,  5: 3.0,  6: 4.0,  7: 6.0
+#   8: -0.0, 9: -0.5, 10: -1.0, 11: -1.5, 12: -2.0, 13: -3.0, 14: -4.0, 15: -6.0
 #
-# E2M1 formula:
-#   exp=0 (subnormal): val = mant * 0.5  → {0.0, 0.5}
-#   exp>0 (normal):    val = (1 + mant*0.5) * 2^(exp-1)
+# Available decode versions:
+#   v1_sequential: 16 tl.where() (baseline, slowest)
+#   v2_e2m1: E2M1 arithmetic (5-6 tl.where)
+#   v3_binary_tree: Binary tree lookup (4 tl.where, optimized branching)
+#   v4_branchless: Branchless bit manipulation (construct IEEE float directly)
+
+# Version names for benchmarking
+FP4_DECODE_VERSIONS = ["v1_sequential", "v2_e2m1", "v3_binary_tree", "v4_branchless"]
+
+# =============================================================================
+# V1: Sequential 16 tl.where() - BASELINE (slowest)
+# =============================================================================
 
 @triton.jit
-def _fp4_e2m1_decode(idx):
-    """Decode FP4 E2M1 format using pure arithmetic (no LUT, no memory loads).
+def _fp4_decode_v1_sequential(idx):
+    """Original FP4 decode with 16 sequential tl.where() calls.
 
-    This is much faster than 16 sequential tl.where() or LUT memory loads.
-    Only uses bit operations and 2-3 tl.where() calls.
+    This is the baseline/slowest implementation.
+    16 sequential conditionals per FP4 value.
 
     Args:
-        idx: 4-bit FP4 index (0-15), can be tensor of any shape
+        idx: 4-bit FP4 index (0-15)
+    Returns:
+        Decoded float32 values
+    """
+    val = tl.where(idx == 0, 0.0, 0.0)
+    val = tl.where(idx == 1, 0.5, val)
+    val = tl.where(idx == 2, 1.0, val)
+    val = tl.where(idx == 3, 1.5, val)
+    val = tl.where(idx == 4, 2.0, val)
+    val = tl.where(idx == 5, 3.0, val)
+    val = tl.where(idx == 6, 4.0, val)
+    val = tl.where(idx == 7, 6.0, val)
+    val = tl.where(idx == 8, -0.0, val)
+    val = tl.where(idx == 9, -0.5, val)
+    val = tl.where(idx == 10, -1.0, val)
+    val = tl.where(idx == 11, -1.5, val)
+    val = tl.where(idx == 12, -2.0, val)
+    val = tl.where(idx == 13, -3.0, val)
+    val = tl.where(idx == 14, -4.0, val)
+    val = tl.where(idx == 15, -6.0, val)
+    return val.to(tl.float32)
 
+
+# =============================================================================
+# V2: E2M1 Arithmetic Decode (5-6 tl.where)
+# =============================================================================
+
+@triton.jit
+def _fp4_decode_v2_e2m1(idx):
+    """Decode FP4 E2M1 format using pure arithmetic.
+
+    E2M1 formula:
+      exp=0 (subnormal): val = mant * 0.5  → {0.0, 0.5}
+      exp>0 (normal):    val = (1 + mant*0.5) * 2^(exp-1)
+
+    Uses 5-6 tl.where() calls (faster than v1_sequential).
+
+    Args:
+        idx: 4-bit FP4 index (0-15)
     Returns:
         Decoded float32 values
     """
@@ -79,15 +127,11 @@ def _fp4_e2m1_decode(idx):
     mant_f = mant.to(tl.float32)
 
     # Compute 2^(exp-1) for normal values
-    # exp=1 → 2^0=1, exp=2 → 2^1=2, exp=3 → 2^2=4
-    # Use bit shift: (1 << (exp-1)) but need to handle exp=0 case
     pow2 = tl.where(exp == 1, 1.0,
            tl.where(exp == 2, 2.0,
-           tl.where(exp == 3, 4.0, 1.0)))  # exp=0 case handled separately
+           tl.where(exp == 3, 4.0, 1.0)))
 
-    # E2M1 decode:
-    # exp=0: subnormal → mant * 0.5 (gives 0.0 or 0.5)
-    # exp>0: normal → (1 + mant*0.5) * 2^(exp-1)
+    # E2M1 decode
     val = tl.where(exp == 0,
                    mant_f * 0.5,                    # Subnormal: 0.0 or 0.5
                    (1.0 + mant_f * 0.5) * pow2)     # Normal: (1+M/2) * 2^(E-1)
@@ -95,6 +139,132 @@ def _fp4_e2m1_decode(idx):
     # Apply sign (bit 3)
     sign = (idx >> 3) & 1
     return tl.where(sign, -val, val)
+
+
+# =============================================================================
+# V3: Binary Tree Lookup (4 tl.where - optimized branching)
+# =============================================================================
+
+@triton.jit
+def _fp4_decode_v3_binary_tree(idx):
+    """Decode FP4 using binary tree lookup (4 tl.where calls).
+
+    Binary search through values: O(log2(8)) = 3 comparisons for magnitude,
+    plus 1 for sign = 4 total.
+
+    FP4 absolute values (idx & 0x7):
+      0: 0.0, 1: 0.5, 2: 1.0, 3: 1.5, 4: 2.0, 5: 3.0, 6: 4.0, 7: 6.0
+
+    Tree structure (split at median values):
+      Level 1: idx < 4? → [0,1,2,3] vs [4,5,6,7]
+      Level 2: idx < 2? or idx < 6? → further splits
+      Level 3: final selection
+
+    Args:
+        idx: 4-bit FP4 index (0-15)
+    Returns:
+        Decoded float32 values
+    """
+    abs_idx = idx & 0x7  # Get absolute value index (0-7)
+
+    # Binary tree lookup for absolute value (3 levels)
+    # Level 1: split at 4 (values 0-3 vs 4-7)
+    # Level 2: split at 2 and 6
+    # Level 3: split at 1, 3, 5, 7
+
+    # Use nested ternary pattern for binary tree
+    # Left subtree (0-3): 0.0, 0.5, 1.0, 1.5
+    # Right subtree (4-7): 2.0, 3.0, 4.0, 6.0
+
+    val = tl.where(abs_idx < 4,
+        # Left subtree: [0, 1, 2, 3] → [0.0, 0.5, 1.0, 1.5]
+        tl.where(abs_idx < 2,
+            tl.where(abs_idx == 0, 0.0, 0.5),     # 0→0.0, 1→0.5
+            tl.where(abs_idx == 2, 1.0, 1.5)      # 2→1.0, 3→1.5
+        ),
+        # Right subtree: [4, 5, 6, 7] → [2.0, 3.0, 4.0, 6.0]
+        tl.where(abs_idx < 6,
+            tl.where(abs_idx == 4, 2.0, 3.0),     # 4→2.0, 5→3.0
+            tl.where(abs_idx == 6, 4.0, 6.0)      # 6→4.0, 7→6.0
+        )
+    )
+
+    # Apply sign (bit 3): 1 more tl.where
+    sign = (idx >> 3) & 1
+    return tl.where(sign, -val, val)
+
+
+# =============================================================================
+# V4: Branchless Bit Manipulation (construct IEEE float directly)
+# =============================================================================
+
+@triton.jit
+def _fp4_decode_v4_branchless(idx):
+    """Decode FP4 using branchless bit manipulation.
+
+    Constructs IEEE 754 float32 representation directly from FP4 bits.
+    Minimizes conditional branches by using arithmetic on bit fields.
+
+    FP4 E2M1 layout: [S][E1][E0][M]
+    IEEE 754 float32: [S][8-bit exp][23-bit mantissa]
+
+    Strategy:
+    - Handle subnormals (exp=0) and normals separately with select
+    - Use bitcast for final conversion
+
+    Args:
+        idx: 4-bit FP4 index (0-15)
+    Returns:
+        Decoded float32 values
+    """
+    # Extract FP4 fields
+    sign_bit = (idx >> 3) & 1          # Bit 3
+    exp_field = (idx >> 1) & 0x3       # Bits 1-2 (0-3)
+    mant_bit = idx & 1                 # Bit 0
+
+    # Convert to int32 for bit operations
+    sign_bit = sign_bit.to(tl.int32)
+    exp_field = exp_field.to(tl.int32)
+    mant_bit = mant_bit.to(tl.int32)
+
+    # IEEE 754 float32 construction:
+    # For E2M1 normal values (exp > 0):
+    #   Value = (1 + M/2) * 2^(E-1)
+    #   IEEE exp = 127 + (E-1) = 126 + E
+    #   IEEE mantissa = M << 22 (1 mantissa bit in position 22)
+    #
+    # For E2M1 subnormal (exp = 0):
+    #   Value = M * 0.5 = M * 2^(-1)
+    #   If M=0: 0.0 (IEEE: all zeros except sign)
+    #   If M=1: 0.5 (IEEE exp=126, mantissa=0)
+
+    # Normal case: exp > 0
+    ieee_exp_normal = (126 + exp_field) << 23  # Exponent field shifted
+    ieee_mant_normal = mant_bit << 22          # Mantissa in bit 22
+    ieee_normal = (sign_bit << 31) | ieee_exp_normal | ieee_mant_normal
+
+    # Subnormal case: exp = 0
+    # M=0 → 0.0: all zeros (or negative zero)
+    # M=1 → 0.5: exp=126, mant=0
+    ieee_half = (sign_bit << 31) | (126 << 23)  # 0.5 or -0.5
+    ieee_zero = (sign_bit << 31)                 # 0.0 or -0.0
+    ieee_subnormal = tl.where(mant_bit == 1, ieee_half, ieee_zero)
+
+    # Select normal vs subnormal (1 branch)
+    ieee_bits = tl.where(exp_field > 0, ieee_normal, ieee_subnormal)
+
+    # Bitcast to float32
+    return ieee_bits.to(tl.float32, bitcast=True)
+
+
+# =============================================================================
+# Legacy alias for backward compatibility
+# =============================================================================
+
+@triton.jit
+def _fp4_e2m1_decode(idx):
+    """Legacy alias for v2_e2m1 decode (default implementation)."""
+    return _fp4_decode_v2_e2m1(idx)
 
 
 @triton.jit
@@ -208,6 +378,208 @@ def batch_mxfp4_dequant_kernel(
     tl.store(out_ptrs, val_interleaved, mask=out_mask)
 
 
+# =============================================================================
+# Versioned Dequantization Kernels for Benchmarking
+# =============================================================================
+# Each kernel uses a different FP4 decode function for performance comparison.
+
+@triton.jit
+def batch_mxfp4_dequant_kernel_v1_sequential(
+    packed_ptrs, scale_ptrs, output_ptr,
+    N, K, K_packed, K_scale,
+    stride_packed_n, stride_packed_k,
+    stride_scale_n, stride_scale_k,
+    stride_out_e, stride_out_n, stride_out_k,
+    stride_ptrs,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """V1: 16 sequential tl.where() - baseline (slowest)."""
+    expert_idx = tl.program_id(axis=0)
+    n_block = tl.program_id(axis=1)
+    k_block = tl.program_id(axis=2)
+    expert_idx_64 = expert_idx.to(tl.int64)
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    scale_ptrs_tile = scale_base + offs_n * stride_scale_n + k_block * stride_scale_k
+    scales = tl.load(scale_ptrs_tile, mask=n_mask, other=127).to(tl.int32) - 127
+    offs_k_packed = tl.arange(0, BLOCK_K // 2)
+    k_packed_start = k_block * (BLOCK_K // 2)
+    packed_ptrs_tile = packed_base + offs_n[:, None] * stride_packed_n + \
+                       (k_packed_start + offs_k_packed[None, :]) * stride_packed_k
+    packed_mask = n_mask[:, None] & (offs_k_packed[None, :] < K_packed - k_packed_start)
+    packed = tl.load(packed_ptrs_tile, mask=packed_mask, other=0)
+    idx_lo = (packed & 0x0F).to(tl.int32)
+    idx_hi = ((packed >> 4) & 0x0F).to(tl.int32)
+    # V1: Use sequential 16 tl.where() decode
+    val_lo = _fp4_decode_v1_sequential(idx_lo)
+    val_hi = _fp4_decode_v1_sequential(idx_hi)
+    exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
+    val_lo_scaled = _ldexp(val_lo, exp_broadcast).to(tl.bfloat16)
+    val_hi_scaled = _ldexp(val_hi, exp_broadcast).to(tl.bfloat16)
+    val_joined = tl.join(val_lo_scaled, val_hi_scaled)
+    val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))
+    k_start = k_block * BLOCK_K
+    offs_k_full = tl.arange(0, BLOCK_K)
+    out_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
+               offs_n[:, None] * stride_out_n + \
+               (k_start + offs_k_full[None, :]) * stride_out_k
+    out_mask = n_mask[:, None] & ((k_start + offs_k_full[None, :]) < K)
+    tl.store(out_ptrs, val_interleaved, mask=out_mask)
+
+
+@triton.jit
+def batch_mxfp4_dequant_kernel_v2_e2m1(
+    packed_ptrs, scale_ptrs, output_ptr,
+    N, K, K_packed, K_scale,
+    stride_packed_n, stride_packed_k,
+    stride_scale_n, stride_scale_k,
+    stride_out_e, stride_out_n, stride_out_k,
+    stride_ptrs,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """V2: E2M1 arithmetic decode (5-6 tl.where)."""
+    expert_idx = tl.program_id(axis=0)
+    n_block = tl.program_id(axis=1)
+    k_block = tl.program_id(axis=2)
+    expert_idx_64 = expert_idx.to(tl.int64)
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    scale_ptrs_tile = scale_base + offs_n * stride_scale_n + k_block * stride_scale_k
+    scales = tl.load(scale_ptrs_tile, mask=n_mask, other=127).to(tl.int32) - 127
+    offs_k_packed = tl.arange(0, BLOCK_K // 2)
+    k_packed_start = k_block * (BLOCK_K // 2)
+    packed_ptrs_tile = packed_base + offs_n[:, None] * stride_packed_n + \
+                       (k_packed_start + offs_k_packed[None, :]) * stride_packed_k
+    packed_mask = n_mask[:, None] & (offs_k_packed[None, :] < K_packed - k_packed_start)
+    packed = tl.load(packed_ptrs_tile, mask=packed_mask, other=0)
+    idx_lo = (packed & 0x0F).to(tl.int32)
+    idx_hi = ((packed >> 4) & 0x0F).to(tl.int32)
+    # V2: Use E2M1 arithmetic decode
+    val_lo = _fp4_decode_v2_e2m1(idx_lo)
+    val_hi = _fp4_decode_v2_e2m1(idx_hi)
+    exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
+    val_lo_scaled = _ldexp(val_lo, exp_broadcast).to(tl.bfloat16)
+    val_hi_scaled = _ldexp(val_hi, exp_broadcast).to(tl.bfloat16)
+    val_joined = tl.join(val_lo_scaled, val_hi_scaled)
+    val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))
+    k_start = k_block * BLOCK_K
+    offs_k_full = tl.arange(0, BLOCK_K)
+    out_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
+               offs_n[:, None] * stride_out_n + \
+               (k_start + offs_k_full[None, :]) * stride_out_k
+    out_mask = n_mask[:, None] & ((k_start + offs_k_full[None, :]) < K)
+    tl.store(out_ptrs, val_interleaved, mask=out_mask)
+
+
+@triton.jit
+def batch_mxfp4_dequant_kernel_v3_binary_tree(
+    packed_ptrs, scale_ptrs, output_ptr,
+    N, K, K_packed, K_scale,
+    stride_packed_n, stride_packed_k,
+    stride_scale_n, stride_scale_k,
+    stride_out_e, stride_out_n, stride_out_k,
+    stride_ptrs,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """V3: Binary tree lookup (4 tl.where - optimized branching)."""
+    expert_idx = tl.program_id(axis=0)
+    n_block = tl.program_id(axis=1)
+    k_block = tl.program_id(axis=2)
+    expert_idx_64 = expert_idx.to(tl.int64)
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    scale_ptrs_tile = scale_base + offs_n * stride_scale_n + k_block * stride_scale_k
+    scales = tl.load(scale_ptrs_tile, mask=n_mask, other=127).to(tl.int32) - 127
+    offs_k_packed = tl.arange(0, BLOCK_K // 2)
+    k_packed_start = k_block * (BLOCK_K // 2)
+    packed_ptrs_tile = packed_base + offs_n[:, None] * stride_packed_n + \
+                       (k_packed_start + offs_k_packed[None, :]) * stride_packed_k
+    packed_mask = n_mask[:, None] & (offs_k_packed[None, :] < K_packed - k_packed_start)
+    packed = tl.load(packed_ptrs_tile, mask=packed_mask, other=0)
+    idx_lo = (packed & 0x0F).to(tl.int32)
+    idx_hi = ((packed >> 4) & 0x0F).to(tl.int32)
+    # V3: Use binary tree lookup
+    val_lo = _fp4_decode_v3_binary_tree(idx_lo)
+    val_hi = _fp4_decode_v3_binary_tree(idx_hi)
+    exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
+    val_lo_scaled = _ldexp(val_lo, exp_broadcast).to(tl.bfloat16)
+    val_hi_scaled = _ldexp(val_hi, exp_broadcast).to(tl.bfloat16)
+    val_joined = tl.join(val_lo_scaled, val_hi_scaled)
+    val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))
+    k_start = k_block * BLOCK_K
+    offs_k_full = tl.arange(0, BLOCK_K)
+    out_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
+               offs_n[:, None] * stride_out_n + \
+               (k_start + offs_k_full[None, :]) * stride_out_k
+    out_mask = n_mask[:, None] & ((k_start + offs_k_full[None, :]) < K)
+    tl.store(out_ptrs, val_interleaved, mask=out_mask)
+
+
+@triton.jit
+def batch_mxfp4_dequant_kernel_v4_branchless(
+    packed_ptrs, scale_ptrs, output_ptr,
+    N, K, K_packed, K_scale,
+    stride_packed_n, stride_packed_k,
+    stride_scale_n, stride_scale_k,
+    stride_out_e, stride_out_n, stride_out_k,
+    stride_ptrs,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """V4: Branchless bit manipulation (construct IEEE float directly)."""
+    expert_idx = tl.program_id(axis=0)
+    n_block = tl.program_id(axis=1)
+    k_block = tl.program_id(axis=2)
+    expert_idx_64 = expert_idx.to(tl.int64)
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    scale_ptrs_tile = scale_base + offs_n * stride_scale_n + k_block * stride_scale_k
+    scales = tl.load(scale_ptrs_tile, mask=n_mask, other=127).to(tl.int32) - 127
+    offs_k_packed = tl.arange(0, BLOCK_K // 2)
+    k_packed_start = k_block * (BLOCK_K // 2)
+    packed_ptrs_tile = packed_base + offs_n[:, None] * stride_packed_n + \
+                       (k_packed_start + offs_k_packed[None, :]) * stride_packed_k
+    packed_mask = n_mask[:, None] & (offs_k_packed[None, :] < K_packed - k_packed_start)
+    packed = tl.load(packed_ptrs_tile, mask=packed_mask, other=0)
+    idx_lo = (packed & 0x0F).to(tl.int32)
+    idx_hi = ((packed >> 4) & 0x0F).to(tl.int32)
+    # V4: Use branchless bit manipulation
+    val_lo = _fp4_decode_v4_branchless(idx_lo)
+    val_hi = _fp4_decode_v4_branchless(idx_hi)
+    exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
+    val_lo_scaled = _ldexp(val_lo, exp_broadcast).to(tl.bfloat16)
+    val_hi_scaled = _ldexp(val_hi, exp_broadcast).to(tl.bfloat16)
+    val_joined = tl.join(val_lo_scaled, val_hi_scaled)
+    val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))
+    k_start = k_block * BLOCK_K
+    offs_k_full = tl.arange(0, BLOCK_K)
+    out_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
+               offs_n[:, None] * stride_out_n + \
+               (k_start + offs_k_full[None, :]) * stride_out_k
+    out_mask = n_mask[:, None] & ((k_start + offs_k_full[None, :]) < K)
+    tl.store(out_ptrs, val_interleaved, mask=out_mask)
+
+
+# Mapping from version name to kernel function (for Python wrapper)
+_DEQUANT_KERNELS = {
+    "v1_sequential": batch_mxfp4_dequant_kernel_v1_sequential,
+    "v2_e2m1": batch_mxfp4_dequant_kernel_v2_e2m1,
+    "v3_binary_tree": batch_mxfp4_dequant_kernel_v3_binary_tree,
+    "v4_branchless": batch_mxfp4_dequant_kernel_v4_branchless,
+}
+
+
 def batch_mxfp4_dequant(
     packed_ptrs: torch.Tensor,    # [num_experts] int64
     scale_ptrs: torch.Tensor,     # [num_experts] int64
@@ -216,6 +588,7 @@ def batch_mxfp4_dequant(
     scale_ref: torch.Tensor,      # Reference tensor for strides [N, K//32]
     BLOCK_N: int = 128,
     BLOCK_K: int = 32,
+    version: str = "v2_e2m1",     # FP4 decode version: v1_sequential, v2_e2m1, v3_binary_tree, v4_branchless
 ) -> None:
     """Batch dequantize all experts' MXFP4 weights into BF16 buffer.
 
@@ -227,6 +600,11 @@ def batch_mxfp4_dequant(
         scale_ref: Reference scale tensor for computing strides
         BLOCK_N: Tile size for N dimension (default 128, larger = fewer blocks)
         BLOCK_K: Tile size for K dimension (default 32, MUST match MXFP4 scale block)
+        version: FP4 decode version for benchmarking:
+            - "v1_sequential": 16 sequential tl.where() (baseline, slowest)
+            - "v2_e2m1": E2M1 arithmetic decode (5-6 tl.where)
+            - "v3_binary_tree": Binary tree lookup (4 tl.where)
+            - "v4_branchless": Branchless bit manipulation (IEEE float construction)
     """
     num_experts = packed_ptrs.shape[0]
     N = output.shape[1]
@@ -235,11 +613,15 @@ def batch_mxfp4_dequant(
     K_scale = K // 32
 
     # Grid: (num_experts, cdiv(N, BLOCK_N), cdiv(K, BLOCK_K))
-    # With BLOCK_N=128, BLOCK_K=32: (128, 108, 160) = 2.2M blocks (vs 4.4M with BLOCK_N=64)
     grid = (num_experts, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
 
-    # No LUT needed - using E2M1 arithmetic decoding (pure compute)
-    batch_mxfp4_dequant_kernel[grid](
+    # Select kernel based on version (use default kernel for backward compatibility)
+    if version == "default":
+        kernel = batch_mxfp4_dequant_kernel
+    else:
+        kernel = _DEQUANT_KERNELS.get(version, batch_mxfp4_dequant_kernel_v2_e2m1)
+
+    kernel[grid](
         packed_ptrs, scale_ptrs,
         output,
         N, K, K_packed, K_scale,
@@ -758,10 +1140,21 @@ def benchmark_batch_dequant(
     device: str = "cuda",
     warmup_iters: int = 3,
     bench_iters: int = 10,
+    version: str = "v2_e2m1",
 ) -> float:
     """Benchmark batch MXFP4 dequantization kernel.
 
-    Returns time in milliseconds.
+    Args:
+        num_experts: Number of experts
+        N: Output dimension (rows)
+        K: Input dimension (columns)
+        device: CUDA device
+        warmup_iters: Warmup iterations
+        bench_iters: Benchmark iterations
+        version: FP4 decode version (v1_sequential, v2_e2m1, v3_binary_tree, v4_branchless)
+
+    Returns:
+        Time in milliseconds.
     """
     # Create test weights
     weights = [torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=device)
@@ -780,17 +1173,112 @@ def benchmark_batch_dequant(
 
     # Warmup
     for _ in range(warmup_iters):
-        batch_mxfp4_dequant(weight_ptrs, scale_ptrs, output, weights[0], scales[0])
+        batch_mxfp4_dequant(weight_ptrs, scale_ptrs, output, weights[0], scales[0], version=version)
     torch.cuda.synchronize()
 
     # Benchmark
     start = time.perf_counter()
     for _ in range(bench_iters):
-        batch_mxfp4_dequant(weight_ptrs, scale_ptrs, output, weights[0], scales[0])
+        batch_mxfp4_dequant(weight_ptrs, scale_ptrs, output, weights[0], scales[0], version=version)
     torch.cuda.synchronize()
     elapsed = (time.perf_counter() - start) / bench_iters * 1000
 
     return elapsed
+
+
+def benchmark_all_dequant_versions(
+    num_experts: int = 128,
+    N: int = 13824,
+    K: int = 5120,
+    device: str = "cuda",
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+    print_results: bool = True,
+) -> dict:
+    """Benchmark all FP4 decode versions and compare performance.
+
+    Args:
+        num_experts: Number of experts (default 128 for GPT-OSS-120B)
+        N: Output dimension (default 13824 intermediate_size)
+        K: Input dimension (default 5120 hidden_size)
+        device: CUDA device
+        warmup_iters: Warmup iterations
+        bench_iters: Benchmark iterations
+        print_results: Whether to print comparison table
+
+    Returns:
+        Dictionary mapping version name to time in milliseconds.
+    """
+    # Create shared test data
+    weights = [torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=device)
+               for _ in range(num_experts)]
+    scales = [torch.randint(120, 134, (N, K // 32), dtype=torch.uint8, device=device)
+              for _ in range(num_experts)]
+
+    weight_ptrs = torch.tensor([w.data_ptr() for w in weights],
+                               dtype=torch.int64, device=device)
+    scale_ptrs = torch.tensor([s.data_ptr() for s in scales],
+                              dtype=torch.int64, device=device)
+
+    output = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
+
+    results = {}
+
+    for version in FP4_DECODE_VERSIONS:
+        # Warmup (compile kernel)
+        for _ in range(warmup_iters):
+            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, output, weights[0], scales[0], version=version)
+        torch.cuda.synchronize()
+
+        # Benchmark
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, output, weights[0], scales[0], version=version)
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+        results[version] = elapsed
+
+    # Print results table
+    if print_results:
+        # Get GPU name
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
+
+        print(f"\n{'='*70}")
+        print(f"FP4 Decode Version Comparison")
+        print(f"{'='*70}")
+        print(f"GPU: {gpu_name}")
+        print(f"Config: {num_experts} experts, N={N}, K={K}")
+        print(f"Output size: {num_experts * N * K * 2 / 1e9:.2f} GB BF16")
+        print(f"{'='*70}")
+
+        # Find best
+        best_version = min(results, key=results.get)
+        best_time = results[best_version]
+
+        print(f"{'Version':<20} {'Time (ms)':<12} {'Speedup':<10} {'Notes'}")
+        print(f"{'-'*70}")
+
+        version_notes = {
+            "v1_sequential": "16 tl.where() - baseline",
+            "v2_e2m1": "E2M1 arithmetic (5-6 where)",
+            "v3_binary_tree": "Binary tree (4 where)",
+            "v4_branchless": "IEEE bitcast (2 where)",
+        }
+
+        for version in FP4_DECODE_VERSIONS:
+            time_ms = results[version]
+            speedup = results["v1_sequential"] / time_ms if version != "v1_sequential" else 1.0
+            marker = " <-- BEST" if version == best_version else ""
+            notes = version_notes.get(version, "")
+            print(f"{version:<20} {time_ms:<12.3f} {speedup:<10.2f}x {notes}{marker}")
+
+        print(f"{'='*70}")
+        print(f"Best: {best_version} at {best_time:.3f} ms")
+        print(f"Speedup over baseline: {results['v1_sequential'] / best_time:.2f}x")
+        print(f"{'='*70}\n")
+
+    return results
 
 
 def benchmark_bf16_grouped_gemm(

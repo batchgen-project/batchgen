@@ -133,8 +133,20 @@ def benchmark_dequant_only(
     device: str = "cuda",
     warmup_iters: int = 3,
     bench_iters: int = 10,
+    version: str = "v2_e2m1",
 ) -> float:
     """Benchmark ONLY the batch dequant kernel (isolated test).
+
+    Args:
+        weights: List of packed FP4 weights [N, K//2]
+        scales: List of scales [N, K//32]
+        N: Output dimension
+        K: Input dimension
+        num_experts: Number of experts
+        device: CUDA device
+        warmup_iters: Warmup iterations
+        bench_iters: Benchmark iterations
+        version: FP4 decode version (v1_sequential, v2_e2m1, v3_binary_tree, v4_branchless)
 
     Returns time in milliseconds, or float('inf') on failure.
     """
@@ -156,11 +168,11 @@ def benchmark_dequant_only(
     bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
 
     try:
-        print("    Testing dequant kernel in isolation...")
+        print(f"    Testing dequant kernel ({version}) in isolation...")
 
         # Warmup with explicit sync and error checking
         for i in range(warmup_iters):
-            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0])
+            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0], version=version)
             torch.cuda.synchronize()
             print(f"      Warmup {i+1}/{warmup_iters} OK")
 
@@ -168,17 +180,131 @@ def benchmark_dequant_only(
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(bench_iters):
-            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0])
+            batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0], version=version)
         torch.cuda.synchronize()
         elapsed = (time.perf_counter() - start) / bench_iters * 1000
 
-        print(f"    Dequant kernel passed! Time: {elapsed:.3f} ms")
+        print(f"    Dequant kernel ({version}) passed! Time: {elapsed:.3f} ms")
         return elapsed
     except Exception as e:
-        print(f"    Dequant kernel FAILED: {e}")
+        print(f"    Dequant kernel ({version}) FAILED: {e}")
         import traceback
         traceback.print_exc()
         return float('inf')
+
+
+def benchmark_all_dequant_versions(
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    K: int,
+    num_experts: int,
+    device: str = "cuda",
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+    print_results: bool = True,
+) -> Dict[str, float]:
+    """Benchmark all FP4 decode versions for comparison.
+
+    Args:
+        weights: List of packed FP4 weights
+        scales: List of scales
+        N: Output dimension
+        K: Input dimension
+        num_experts: Number of experts
+        device: CUDA device
+        warmup_iters: Warmup iterations
+        bench_iters: Benchmark iterations
+        print_results: Whether to print comparison table
+
+    Returns:
+        Dictionary mapping version name to time in milliseconds.
+    """
+    try:
+        from batchgen.moe.decoupled_mxfp4_moe import (
+            batch_mxfp4_dequant,
+            FP4_DECODE_VERSIONS,
+        )
+    except ImportError as e:
+        print(f"  Cannot import FP4_DECODE_VERSIONS: {e}")
+        return {}
+
+    # Setup pointer arrays
+    weight_ptrs = torch.tensor(
+        [w.data_ptr() for w in weights], dtype=torch.int64, device=device
+    )
+    scale_ptrs = torch.tensor(
+        [s.data_ptr() for s in scales], dtype=torch.int64, device=device
+    )
+
+    # Allocate BF16 buffer
+    bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
+
+    results = {}
+    version_notes = {
+        "v1_sequential": "16 tl.where() - baseline",
+        "v2_e2m1": "E2M1 arithmetic (5-6 where)",
+        "v3_binary_tree": "Binary tree (4 where)",
+        "v4_branchless": "IEEE bitcast (2 where)",
+    }
+
+    print(f"\n{'='*70}")
+    print("FP4 DECODE VERSION COMPARISON")
+    print(f"{'='*70}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Config: {num_experts} experts, N={N}, K={K}")
+    print(f"Output size: {num_experts * N * K * 2 / 1e9:.2f} GB BF16")
+    print(f"{'='*70}")
+
+    for version in FP4_DECODE_VERSIONS:
+        try:
+            # Warmup (compile kernel)
+            for _ in range(warmup_iters):
+                batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0], version=version)
+            torch.cuda.synchronize()
+
+            # Benchmark
+            start = time.perf_counter()
+            for _ in range(bench_iters):
+                batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0], version=version)
+            torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+            results[version] = elapsed
+            print(f"  {version}: {elapsed:.3f} ms")
+        except Exception as e:
+            print(f"  {version}: FAILED - {e}")
+            results[version] = float('inf')
+
+    # Print comparison table
+    if print_results and results:
+        # Find best
+        valid_results = {k: v for k, v in results.items() if v != float('inf')}
+        if valid_results:
+            best_version = min(valid_results, key=valid_results.get)
+            best_time = valid_results[best_version]
+            baseline_time = results.get("v1_sequential", results[best_version])
+
+            print(f"\n{'Version':<20} {'Time (ms)':<12} {'vs Baseline':<12} {'Notes'}")
+            print(f"{'-'*70}")
+
+            for version in FP4_DECODE_VERSIONS:
+                time_ms = results.get(version, float('inf'))
+                if time_ms != float('inf'):
+                    speedup = baseline_time / time_ms if baseline_time != float('inf') else 1.0
+                    marker = " <-- BEST" if version == best_version else ""
+                    notes = version_notes.get(version, "")
+                    print(f"{version:<20} {time_ms:<12.3f} {speedup:<12.2f}x {notes}{marker}")
+                else:
+                    print(f"{version:<20} {'FAILED':<12} {'-':<12} {version_notes.get(version, '')}")
+
+            print(f"{'='*70}")
+            print(f"Best: {best_version} at {best_time:.3f} ms")
+            if baseline_time != float('inf'):
+                print(f"Speedup over baseline (v1_sequential): {baseline_time / best_time:.2f}x")
+            print(f"{'='*70}")
+
+    return results
 
 
 def benchmark_cuda_dequant_only(
@@ -785,6 +911,10 @@ Examples:
         "--test-gemm", action="store_true",
         help="Run minimal GEMM kernel test only (for debugging)"
     )
+    parser.add_argument(
+        "--compare-versions", action="store_true",
+        help="Compare all FP4 decode versions (v1_sequential, v2_e2m1, v3_binary_tree, v4_branchless)"
+    )
 
     args = parser.parse_args()
 
@@ -797,6 +927,75 @@ Examples:
     if args.test_gemm:
         success = test_gemm_only_minimal()
         sys.exit(0 if success else 1)
+
+    # Compare all FP4 decode versions
+    if args.compare_versions:
+        print(f"\n{'#'*70}")
+        print("# FP4 DECODE VERSION COMPARISON")
+        print(f"{'#'*70}")
+
+        # Create test data
+        device = "cuda"
+        N = args.intermediate_size
+        K = args.hidden_size
+        num_experts = args.num_experts
+
+        print(f"\nCreating test data: {num_experts} experts, N={N}, K={K}...")
+        weights = [
+            torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=device)
+            for _ in range(num_experts)
+        ]
+        scales = [
+            torch.randint(120, 134, (N, K // 32), dtype=torch.uint8, device=device)
+            for _ in range(num_experts)
+        ]
+
+        # Run version comparison
+        results = benchmark_all_dequant_versions(
+            weights, scales, N, K, num_experts, device
+        )
+
+        # Also include CUDA kernels in comparison
+        print("\n--- CUDA Shared Memory LUT (for reference) ---")
+        cuda_results = benchmark_cuda_dequant_only(
+            weights, scales, N, K, num_experts, device
+        )
+
+        # Final summary
+        print(f"\n{'='*70}")
+        print("COMPREHENSIVE DEQUANT COMPARISON")
+        print(f"{'='*70}")
+        print(f"{'Approach':<35} {'Time (ms)':<12} {'Notes'}")
+        print("-" * 70)
+
+        # Triton versions
+        for version, time_ms in results.items():
+            if time_ms != float('inf'):
+                notes = {
+                    "v1_sequential": "16 tl.where()",
+                    "v2_e2m1": "E2M1 arithmetic",
+                    "v3_binary_tree": "Binary tree lookup",
+                    "v4_branchless": "IEEE bitcast",
+                }.get(version, "")
+                print(f"Triton {version:<26} {time_ms:<12.3f} {notes}")
+
+        # CUDA versions
+        for name, time_ms in cuda_results.items():
+            if time_ms != float('inf'):
+                print(f"CUDA {name:<29} {time_ms:<12.3f} Shared memory LUT")
+
+        # Find overall best
+        all_results = {f"triton_{k}": v for k, v in results.items()}
+        all_results.update({f"cuda_{k}": v for k, v in cuda_results.items()})
+        valid = {k: v for k, v in all_results.items() if v != float('inf')}
+
+        if valid:
+            best = min(valid, key=valid.get)
+            print("-" * 70)
+            print(f"BEST: {best} at {valid[best]:.3f} ms")
+
+        print(f"{'='*70}")
+        sys.exit(0)
 
     config = {
         "num_experts": args.num_experts,
