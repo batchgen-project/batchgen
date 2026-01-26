@@ -14,6 +14,15 @@ Usage:
 
     # Detailed component timing
     python bench_decoupled_mxfp4_moe.py --quick --tokens 4 --detailed
+
+    # Validate correctness only (no timing)
+    python bench_decoupled_mxfp4_moe.py --validate-only
+
+    # Compare versions with validation
+    python bench_decoupled_mxfp4_moe.py --compare-versions
+
+    # Compare versions without validation (fast iteration)
+    python bench_decoupled_mxfp4_moe.py --compare-versions --skip-validation
 """
 
 import argparse
@@ -33,6 +42,169 @@ DEFAULT_CONFIG = {
     "intermediate_size": 13824,
     "num_experts_per_tok": 8,
 }
+
+
+# =============================================================================
+# Numerical Sanity Check Functions
+# =============================================================================
+
+def reference_mxfp4_dequant(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference implementation for MXFP4 dequantization.
+
+    Args:
+        packed: [N, K//2] uint8 - packed FP4 values
+        scales: [N, K//32] uint8 - scale factors (biased by 127)
+
+    Returns:
+        [N, K] BF16 - dequantized values
+    """
+    from batchgen.quantization.mxfp4 import mxfp4_dequantize
+    return mxfp4_dequantize(packed, scales, dtype=torch.bfloat16)
+
+
+def validate_dequant_versions(
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    num_experts: int,
+    N: int,
+    K: int,
+    device: str = "cuda",
+    num_experts_to_check: int = 3,
+    tolerance: float = 0.01,  # 1% relative tolerance for BF16
+) -> bool:
+    """Validate all dequant kernel versions produce correct output.
+
+    Compares each Triton kernel version against the PyTorch reference.
+
+    Args:
+        weights: List of packed FP4 weights [N, K//2]
+        scales: List of scales [N, K//32]
+        num_experts: Total number of experts
+        N: Output dimension (rows)
+        K: Input dimension (columns)
+        device: CUDA device
+        num_experts_to_check: How many experts to validate (first N)
+        tolerance: Maximum relative error allowed (default 1% for BF16)
+
+    Returns:
+        True if all versions pass validation, False otherwise.
+    """
+    try:
+        from batchgen.moe.decoupled_mxfp4_moe import (
+            batch_mxfp4_dequant,
+            FP4_DECODE_VERSIONS,
+        )
+    except ImportError as e:
+        print(f"  Cannot import batch_mxfp4_dequant: {e}")
+        return False
+
+    print(f"\n{'='*70}")
+    print("NUMERICAL SANITY CHECK")
+    print(f"{'='*70}")
+    print(f"Checking {num_experts_to_check} experts against PyTorch reference")
+    print(f"Tolerance: {tolerance*100:.1f}% relative error")
+    print(f"{'='*70}")
+
+    # Generate reference outputs using PyTorch
+    print("\nGenerating reference outputs...")
+    ref_outputs = []
+    for i in range(min(num_experts_to_check, num_experts)):
+        ref = reference_mxfp4_dequant(weights[i], scales[i])
+        ref_outputs.append(ref)
+    print(f"  Reference shape: {ref_outputs[0].shape}")
+
+    # Setup pointer arrays for Triton kernels
+    weight_ptrs = torch.tensor(
+        [w.data_ptr() for w in weights], dtype=torch.int64, device=device
+    )
+    scale_ptrs = torch.tensor(
+        [s.data_ptr() for s in scales], dtype=torch.int64, device=device
+    )
+
+    # For v6_scale_transpose, create transposed scales [K//32, N] (K-major layout)
+    # This enables coalesced memory access for scale loading
+    K_scale = K // 32
+    scales_transposed = [s.t().contiguous() for s in scales]  # [K//32, N]
+    scale_ptrs_transposed = torch.tensor(
+        [s.data_ptr() for s in scales_transposed], dtype=torch.int64, device=device
+    )
+
+    # Allocate BF16 buffer
+    bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
+
+    all_pass = True
+    results_summary = []
+
+    for version in FP4_DECODE_VERSIONS:
+        print(f"\nValidating {version}...")
+        try:
+            # For v6_scale_transpose, use transposed scales
+            if version == "v6_scale_transpose":
+                curr_scale_ptrs = scale_ptrs_transposed
+                curr_scale_ref = scales_transposed[0]
+            else:
+                curr_scale_ptrs = scale_ptrs
+                curr_scale_ref = scales[0]
+
+            # Run kernel
+            batch_mxfp4_dequant(
+                weight_ptrs, curr_scale_ptrs, bf16_buffer,
+                weights[0], curr_scale_ref, version=version
+            )
+            torch.cuda.synchronize()
+
+            # Check each expert
+            version_pass = True
+            max_rel_errors = []
+            for i in range(min(num_experts_to_check, num_experts)):
+                kernel_out = bf16_buffer[i]
+                ref_out = ref_outputs[i]
+
+                # Compute errors
+                diff = (kernel_out.float() - ref_out.float()).abs()
+                max_abs_diff = diff.max().item()
+                rel_diff = (diff / ref_out.float().abs().clamp(min=1e-6)).max().item()
+                max_rel_errors.append(rel_diff)
+
+                if rel_diff > tolerance:
+                    print(f"  FAIL expert {i}: max_rel_error={rel_diff:.4f} ({rel_diff*100:.2f}%) > {tolerance*100:.1f}%")
+                    version_pass = False
+                else:
+                    print(f"  PASS expert {i}: max_rel_error={rel_diff:.6f} ({rel_diff*100:.4f}%)")
+
+            avg_rel_error = sum(max_rel_errors) / len(max_rel_errors)
+            status = "PASS" if version_pass else "FAIL"
+            results_summary.append((version, status, avg_rel_error))
+
+            if not version_pass:
+                all_pass = False
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            results_summary.append((version, "ERROR", float('nan')))
+            all_pass = False
+
+    # Print summary table
+    print(f"\n{'='*70}")
+    print("VALIDATION SUMMARY")
+    print(f"{'='*70}")
+    print(f"{'Version':<20} {'Status':<10} {'Avg Rel Error':<15}")
+    print("-" * 70)
+    for version, status, avg_err in results_summary:
+        if status == "ERROR":
+            print(f"{version:<20} {status:<10} {'N/A':<15}")
+        else:
+            print(f"{version:<20} {status:<10} {avg_err:.6f} ({avg_err*100:.4f}%)")
+    print(f"{'='*70}")
+
+    if all_pass:
+        print("ALL VERSIONS PASSED VALIDATION")
+    else:
+        print("SOME VERSIONS FAILED VALIDATION")
+
+    print(f"{'='*70}\n")
+
+    return all_pass
 
 
 def create_test_tensors(
@@ -237,6 +409,13 @@ def benchmark_all_dequant_versions(
         [s.data_ptr() for s in scales], dtype=torch.int64, device=device
     )
 
+    # For v6_scale_transpose, create transposed scales [K//32, N] (K-major layout)
+    K_scale = K // 32
+    scales_transposed = [s.t().contiguous() for s in scales]  # [K//32, N]
+    scale_ptrs_transposed = torch.tensor(
+        [s.data_ptr() for s in scales_transposed], dtype=torch.int64, device=device
+    )
+
     # Allocate BF16 buffer
     bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
 
@@ -247,27 +426,57 @@ def benchmark_all_dequant_versions(
         "v3_binary_tree": "Binary tree (4 where)",
         "v4_branchless": "IEEE bitcast (2 where)",
         "v5_memopt": "BLOCK_K=64, 2x fewer K-blocks",
+        "v6_scale_transpose": "K-major scales, coalesced loads",
     }
 
-    print(f"\n{'='*70}")
+    # Calculate total data movement for HBM bandwidth
+    # Input: packed FP4 (num_experts × N × K//2) + scales (num_experts × N × K//32)
+    # Output: BF16 (num_experts × N × K × 2)
+    packed_bytes = num_experts * N * (K // 2)
+    scale_bytes = num_experts * N * (K // 32)
+    output_bytes = num_experts * N * K * 2
+    total_bytes = packed_bytes + scale_bytes + output_bytes
+    total_gb = total_bytes / 1e9
+
+    # GPU-specific peak bandwidth (adjust based on actual GPU)
+    gpu_name = torch.cuda.get_device_name(0)
+    if "H100" in gpu_name:
+        peak_bw_gb_s = 3350  # H100 SXM: 3.35 TB/s
+    elif "H20" in gpu_name:
+        peak_bw_gb_s = 4000  # H20: 4.0 TB/s
+    elif "A100" in gpu_name:
+        peak_bw_gb_s = 2039  # A100 SXM: 2.0 TB/s
+    else:
+        peak_bw_gb_s = 2000  # Default assumption
+
+    print(f"\n{'='*90}")
     print("FP4 DECODE VERSION COMPARISON")
-    print(f"{'='*70}")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"{'='*90}")
+    print(f"GPU: {gpu_name}")
     print(f"Config: {num_experts} experts, N={N}, K={K}")
-    print(f"Output size: {num_experts * N * K * 2 / 1e9:.2f} GB BF16")
-    print(f"{'='*70}")
+    print(f"Data movement: {packed_bytes/1e9:.2f} GB packed + {scale_bytes/1e9:.2f} GB scales + {output_bytes/1e9:.2f} GB output = {total_gb:.2f} GB")
+    print(f"Peak HBM bandwidth: {peak_bw_gb_s} GB/s ({peak_bw_gb_s/1000:.1f} TB/s)")
+    print(f"{'='*90}")
 
     for version in FP4_DECODE_VERSIONS:
         try:
+            # For v6_scale_transpose, use transposed scales
+            if version == "v6_scale_transpose":
+                curr_scale_ptrs = scale_ptrs_transposed
+                curr_scale_ref = scales_transposed[0]
+            else:
+                curr_scale_ptrs = scale_ptrs
+                curr_scale_ref = scales[0]
+
             # Warmup (compile kernel)
             for _ in range(warmup_iters):
-                batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0], version=version)
+                batch_mxfp4_dequant(weight_ptrs, curr_scale_ptrs, bf16_buffer, weights[0], curr_scale_ref, version=version)
             torch.cuda.synchronize()
 
             # Benchmark
             start = time.perf_counter()
             for _ in range(bench_iters):
-                batch_mxfp4_dequant(weight_ptrs, scale_ptrs, bf16_buffer, weights[0], scales[0], version=version)
+                batch_mxfp4_dequant(weight_ptrs, curr_scale_ptrs, bf16_buffer, weights[0], curr_scale_ref, version=version)
             torch.cuda.synchronize()
             elapsed = (time.perf_counter() - start) / bench_iters * 1000
 
@@ -277,7 +486,7 @@ def benchmark_all_dequant_versions(
             print(f"  {version}: FAILED - {e}")
             results[version] = float('inf')
 
-    # Print comparison table
+    # Print comparison table with HBM bandwidth
     if print_results and results:
         # Find best
         valid_results = {k: v for k, v in results.items() if v != float('inf')}
@@ -286,24 +495,30 @@ def benchmark_all_dequant_versions(
             best_time = valid_results[best_version]
             baseline_time = results.get("v1_sequential", results[best_version])
 
-            print(f"\n{'Version':<20} {'Time (ms)':<12} {'vs Baseline':<12} {'Notes'}")
-            print(f"{'-'*70}")
+            print(f"\n{'Version':<20} {'Time (ms)':<10} {'BW (GB/s)':<10} {'HBM %':<8} {'Speedup':<10} {'Notes'}")
+            print(f"{'-'*90}")
 
             for version in FP4_DECODE_VERSIONS:
                 time_ms = results.get(version, float('inf'))
                 if time_ms != float('inf'):
+                    # Calculate realized bandwidth
+                    bandwidth_gb_s = total_gb / (time_ms / 1000)
+                    hbm_util = bandwidth_gb_s / peak_bw_gb_s * 100
                     speedup = baseline_time / time_ms if baseline_time != float('inf') else 1.0
                     marker = " <-- BEST" if version == best_version else ""
                     notes = version_notes.get(version, "")
-                    print(f"{version:<20} {time_ms:<12.3f} {speedup:<12.2f}x {notes}{marker}")
+                    print(f"{version:<20} {time_ms:<10.3f} {bandwidth_gb_s:<10.0f} {hbm_util:<8.1f} {speedup:<10.2f}x {notes}{marker}")
                 else:
-                    print(f"{version:<20} {'FAILED':<12} {'-':<12} {version_notes.get(version, '')}")
+                    print(f"{version:<20} {'FAILED':<10} {'-':<10} {'-':<8} {'-':<10} {version_notes.get(version, '')}")
 
-            print(f"{'='*70}")
-            print(f"Best: {best_version} at {best_time:.3f} ms")
+            print(f"{'='*90}")
+            # Best result summary with bandwidth
+            best_bw = total_gb / (best_time / 1000)
+            best_util = best_bw / peak_bw_gb_s * 100
+            print(f"Best: {best_version} at {best_time:.3f} ms ({best_bw:.0f} GB/s = {best_util:.1f}% HBM)")
             if baseline_time != float('inf'):
                 print(f"Speedup over baseline (v1_sequential): {baseline_time / best_time:.2f}x")
-            print(f"{'='*70}")
+            print(f"{'='*90}")
 
     return results
 
@@ -916,6 +1131,14 @@ Examples:
         "--compare-versions", action="store_true",
         help="Compare all FP4 decode versions (v1_sequential, v2_e2m1, v3_binary_tree, v4_branchless)"
     )
+    parser.add_argument(
+        "--validate-only", action="store_true",
+        help="Run numerical validation only (no timing benchmark)"
+    )
+    parser.add_argument(
+        "--skip-validation", action="store_true",
+        help="Skip numerical validation before benchmarking (faster iteration)"
+    )
 
     args = parser.parse_args()
 
@@ -927,6 +1150,35 @@ Examples:
     # Minimal GEMM test mode
     if args.test_gemm:
         success = test_gemm_only_minimal()
+        sys.exit(0 if success else 1)
+
+    # Validate-only mode: run numerical sanity check and exit
+    if args.validate_only:
+        print(f"\n{'#'*70}")
+        print("# NUMERICAL VALIDATION ONLY")
+        print(f"{'#'*70}")
+
+        # Create test data
+        device = "cuda"
+        N = args.intermediate_size
+        K = args.hidden_size
+        num_experts = args.num_experts
+
+        print(f"\nCreating test data: {num_experts} experts, N={N}, K={K}...")
+        weights = [
+            torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=device)
+            for _ in range(num_experts)
+        ]
+        scales = [
+            torch.randint(120, 134, (N, K // 32), dtype=torch.uint8, device=device)
+            for _ in range(num_experts)
+        ]
+
+        # Run validation
+        success = validate_dequant_versions(
+            weights, scales, num_experts, N, K, device
+        )
+
         sys.exit(0 if success else 1)
 
     # Compare all FP4 decode versions
@@ -951,7 +1203,26 @@ Examples:
             for _ in range(num_experts)
         ]
 
-        # Run version comparison
+        # Run numerical validation first (unless --skip-validation)
+        if not args.skip_validation:
+            print("\n" + "="*70)
+            print("STEP 1: NUMERICAL VALIDATION")
+            print("="*70)
+            validation_passed = validate_dequant_versions(
+                weights, scales, num_experts, N, K, device
+            )
+            if not validation_passed:
+                print("ERROR: Numerical validation failed! Stopping benchmark.")
+                print("Use --skip-validation to bypass this check.")
+                sys.exit(1)
+            print("Validation passed. Proceeding to timing benchmark...\n")
+        else:
+            print("\n[Skipping numerical validation (--skip-validation)]")
+
+        # Run version comparison (timing benchmark)
+        print("\n" + "="*70)
+        print("STEP 2: PERFORMANCE BENCHMARK")
+        print("="*70)
         results = benchmark_all_dequant_versions(
             weights, scales, N, K, num_experts, device
         )
