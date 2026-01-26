@@ -181,6 +181,72 @@ def benchmark_dequant_only(
         return float('inf')
 
 
+def benchmark_cuda_dequant_only(
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    K: int,
+    num_experts: int,
+    device: str = "cuda",
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+) -> Dict[str, float]:
+    """Benchmark CUDA dequant kernels with shared memory LUT.
+
+    Returns dict with timing for each kernel version, or empty dict on failure.
+    """
+    try:
+        from batchgen.moe.cuda_mxfp4_dequant import batch_mxfp4_dequant_cuda
+    except ImportError as e:
+        print(f"  CUDA batch_mxfp4_dequant not available: {e}")
+        return {}
+
+    # Setup pointer arrays
+    weight_ptrs = torch.tensor(
+        [w.data_ptr() for w in weights], dtype=torch.int64, device=device
+    )
+    scale_ptrs = torch.tensor(
+        [s.data_ptr() for s in scales], dtype=torch.int64, device=device
+    )
+
+    # Allocate BF16 buffer
+    bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
+
+    results = {}
+    kernel_names = ['basic', 'vec4', 'coalesced']
+
+    print("    Testing CUDA dequant kernels...")
+
+    for version, name in enumerate(kernel_names):
+        try:
+            # Warmup
+            for i in range(warmup_iters):
+                batch_mxfp4_dequant_cuda(
+                    weight_ptrs, scale_ptrs, bf16_buffer,
+                    weights[0], scales[0], kernel_version=version
+                )
+                torch.cuda.synchronize()
+
+            # Benchmark
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            for _ in range(bench_iters):
+                batch_mxfp4_dequant_cuda(
+                    weight_ptrs, scale_ptrs, bf16_buffer,
+                    weights[0], scales[0], kernel_version=version
+                )
+            torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+            results[name] = elapsed
+            print(f"      CUDA {name}: {elapsed:.3f} ms")
+        except Exception as e:
+            print(f"      CUDA {name} FAILED: {e}")
+            results[name] = float('inf')
+
+    return results
+
+
 def benchmark_gemm_only(
     hidden_3d: torch.Tensor,
     N: int,
@@ -493,16 +559,30 @@ def run_benchmark(
     if isolate_kernels:
         print("\n--- ISOLATED KERNEL TESTS ---")
 
-        # Test dequant kernel alone
-        print("\n[1/2] Testing batch dequant kernel in isolation...")
+        # Test dequant kernel alone (Triton E2M1)
+        print("\n[1/3] Testing Triton E2M1 dequant kernel in isolation...")
         dequant_isolated = benchmark_dequant_only(
             weights, scales, config["intermediate_size"], config["hidden_size"],
             config["num_experts"], device
         )
-        results["dequant_isolated"] = dequant_isolated
+        results["dequant_triton"] = dequant_isolated
+
+        # Test CUDA dequant kernels with shared memory LUT
+        print("\n[2/3] Testing CUDA shared memory LUT dequant kernels...")
+        cuda_results = benchmark_cuda_dequant_only(
+            weights, scales, config["intermediate_size"], config["hidden_size"],
+            config["num_experts"], device
+        )
+        results["dequant_cuda_basic"] = cuda_results.get("basic", float('inf'))
+        results["dequant_cuda_vec4"] = cuda_results.get("vec4", float('inf'))
+        results["dequant_cuda_coalesced"] = cuda_results.get("coalesced", float('inf'))
+        if cuda_results:
+            results["dequant_cuda_best"] = min(cuda_results.values())
+        else:
+            results["dequant_cuda_best"] = float('inf')
 
         # Test GEMM kernel alone (with random BF16, no dequant)
-        print("\n[2/2] Testing BF16 GEMM kernel in isolation...")
+        print("\n[3/3] Testing BF16 GEMM kernel in isolation...")
         gemm_isolated = benchmark_gemm_only(
             hidden_3d, config["intermediate_size"]
         )
@@ -566,6 +646,36 @@ def run_benchmark(
 
     print("-" * 70)
     print("* Single weight reused for all experts - not a fair comparison")
+
+    # Print dequant kernel comparison
+    if isolate_kernels and "dequant_triton" in results:
+        print(f"\n{'='*70}")
+        print("DEQUANT KERNEL COMPARISON")
+        print(f"{'='*70}")
+        print(f"{'Kernel':<40} {'Time (ms)':>12} {'vs Triton':>12}")
+        print("-" * 70)
+
+        triton_time = results.get("dequant_triton", float('inf'))
+        for name, key in [
+            ("Triton E2M1 (5-6 tl.where)", "dequant_triton"),
+            ("CUDA basic (shared mem LUT)", "dequant_cuda_basic"),
+            ("CUDA vec4 (4 bytes/thread)", "dequant_cuda_vec4"),
+            ("CUDA coalesced (best)", "dequant_cuda_coalesced"),
+        ]:
+            time_ms = results.get(key, float('inf'))
+            if time_ms != float('inf') and triton_time != float('inf'):
+                speedup = triton_time / time_ms if time_ms > 0 else 0
+                print(f"{name:<40} {time_ms:>12.3f} {speedup:>11.2f}x")
+            else:
+                print(f"{name:<40} {'N/A':>12} {'N/A':>12}")
+
+        print("-" * 70)
+        cuda_best = results.get("dequant_cuda_best", float('inf'))
+        gemm_time = results.get("gemm_isolated", float('inf'))
+        if cuda_best != float('inf') and gemm_time != float('inf'):
+            projected_total = cuda_best + gemm_time
+            projected_speedup = baseline / projected_total if projected_total > 0 else 0
+            print(f"\nProjected total with CUDA dequant: {projected_total:.3f} ms ({projected_speedup:.2f}x speedup)")
 
     # Compute metrics for decoupled
     if results["decoupled"] != float('inf'):
