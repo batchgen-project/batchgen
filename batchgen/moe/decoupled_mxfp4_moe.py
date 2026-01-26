@@ -278,43 +278,42 @@ def bf16_grouped_gemm_kernel_3d(
     n_mask = offs_n < N
 
     # Process each M-block (fixed loop bound for Triton)
-    # Note: Triton doesn't support 'continue', so we use conditional execution
+    # Triton doesn't support runtime conditionals in loops, so we always execute
+    # the full loop body and rely on masking to handle invalid positions.
+    # The mask ensures loads return 0 for invalid rows and stores are no-ops.
     for m_block in range(M_MAX_BLOCKS):
         offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
         m_mask = offs_m < num_tokens
 
-        # Only process if this M-block has valid tokens
-        # (Triton doesn't support continue, so wrap body in conditional)
-        if m_block * BLOCK_M < num_tokens:
-            # Initialize accumulator
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # Initialize accumulator (always, even for invalid blocks - will be masked on store)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-            # K-loop (fixed bound)
-            for k_block in range(K_BLOCKS):
-                k_start = k_block * BLOCK_K
-                offs_k = tl.arange(0, BLOCK_K)
+        # K-loop (fixed bound)
+        for k_block in range(K_BLOCKS):
+            k_start = k_block * BLOCK_K
+            offs_k = tl.arange(0, BLOCK_K)
 
-                # Load LHS [BLOCK_M, BLOCK_K]
-                lhs_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + \
-                           (k_start + offs_k[None, :]) * stride_lhs_k
-                lhs = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)
+            # Load LHS [BLOCK_M, BLOCK_K] - masked loads return 0 for invalid rows
+            lhs_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + \
+                       (k_start + offs_k[None, :]) * stride_lhs_k
+            lhs = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)
 
-                # Load RHS [BLOCK_N, BLOCK_K] (weights are stored as [N, K])
-                rhs_ptrs = cur_rhs_ptr + offs_n[:, None] * stride_rhs_n + \
-                           (k_start + offs_k[None, :]) * stride_rhs_k
-                rhs = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0.0)
+            # Load RHS [BLOCK_N, BLOCK_K] (weights are stored as [N, K])
+            rhs_ptrs = cur_rhs_ptr + offs_n[:, None] * stride_rhs_n + \
+                       (k_start + offs_k[None, :]) * stride_rhs_k
+            rhs = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0.0)
 
-                # Accumulate: lhs @ rhs.T
-                # lhs: [BLOCK_M, BLOCK_K], rhs: [BLOCK_N, BLOCK_K]
-                # Result: [BLOCK_M, BLOCK_N]
-                acc += tl.dot(lhs.to(tl.bfloat16), tl.trans(rhs.to(tl.bfloat16)),
-                              allow_tf32=True).to(tl.float32)
+            # Accumulate: lhs @ rhs.T
+            # lhs: [BLOCK_M, BLOCK_K], rhs: [BLOCK_N, BLOCK_K]
+            # Result: [BLOCK_M, BLOCK_N]
+            acc += tl.dot(lhs.to(tl.bfloat16), tl.trans(rhs.to(tl.bfloat16)),
+                          allow_tf32=True).to(tl.float32)
 
-            # Store output [BLOCK_M, BLOCK_N]
-            out_ptrs = cur_out_ptr + offs_m[:, None] * stride_out_m + \
-                       offs_n[None, :] * stride_out_n
-            out_mask = m_mask[:, None] & n_mask[None, :]
-            tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
+        # Store output [BLOCK_M, BLOCK_N] - masked store is a no-op for invalid positions
+        out_ptrs = cur_out_ptr + offs_m[:, None] * stride_out_m + \
+                   offs_n[None, :] * stride_out_n
+        out_mask = m_mask[:, None] & n_mask[None, :]
+        tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
 
 
 def bf16_grouped_gemm_3d(
