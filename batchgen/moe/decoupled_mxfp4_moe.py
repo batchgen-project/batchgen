@@ -10,7 +10,7 @@ dequantization from the grouped GEMM computation:
    weights using optimal tensor core patterns (no FP4 lookup overhead)
 
 This approach is 3-5x faster than the fused MXFP4 GEMM because:
-- FP4 lookup uses a single LUT load (not 16 tl.where() conditionals)
+- FP4 decoding uses E2M1 arithmetic (pure compute, no memory loads)
 - Scale application is done once during dequant
 - BF16 GEMM can use larger BLOCK_K (64/128 vs 32)
 - Optimal tensor core utilization without dequant overhead in inner loop
@@ -42,51 +42,59 @@ MXFP4_BLOCK_SIZE = 32  # FP4 values per scale
 MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
 
 # =============================================================================
-# FP4 Lookup Table (OPTIMIZED: 1 load vs 16 tl.where() conditionals)
+# FP4 E2M1 Arithmetic Decoding (OPTIMIZED: pure compute, no memory loads)
 # =============================================================================
-
-# Global FP4 lookup table: 16 float32 values indexed by 4-bit FP4 code
-# Values: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
-_FP4_LUT_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-
-# Cached LUT tensor (created on first use, stays on GPU)
-_FP4_LUT_CACHE = {}
-
-
-def _get_fp4_lut(device):
-    """Get or create the FP4 lookup table tensor for the given device."""
-    if device not in _FP4_LUT_CACHE:
-        _FP4_LUT_CACHE[device] = torch.tensor(
-            _FP4_LUT_VALUES, dtype=torch.float32, device=device
-        )
-    return _FP4_LUT_CACHE[device]
-
-
-# =============================================================================
-# Legacy FP4 Lookup (kept for reference, no longer used in kernel)
-# =============================================================================
+#
+# FP4 is E2M1 format (2 exponent bits, 1 mantissa bit):
+#   4-bit layout: [Sign][Exp1][Exp0][Mant]
+#   - Bit 3: Sign (0=positive, 1=negative)
+#   - Bits 1-2: Exponent (0-3)
+#   - Bit 0: Mantissa (0 or 1)
+#
+# Values: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives)
+#
+# E2M1 formula:
+#   exp=0 (subnormal): val = mant * 0.5  → {0.0, 0.5}
+#   exp>0 (normal):    val = (1 + mant*0.5) * 2^(exp-1)
 
 @triton.jit
-def _fp4_lookup(idx):
-    """Lookup FP4 value from 4-bit index. DEPRECATED: Use LUT-based lookup instead."""
-    val = tl.where(idx == 0, 0.0, 0.0)
-    val = tl.where(idx == 1, 0.5, val)
-    val = tl.where(idx == 2, 1.0, val)
-    val = tl.where(idx == 3, 1.5, val)
-    val = tl.where(idx == 4, 2.0, val)
-    val = tl.where(idx == 5, 3.0, val)
-    val = tl.where(idx == 6, 4.0, val)
-    val = tl.where(idx == 7, 6.0, val)
-    val = tl.where(idx == 8, -0.0, val)
-    val = tl.where(idx == 9, -0.5, val)
-    val = tl.where(idx == 10, -1.0, val)
-    val = tl.where(idx == 11, -1.5, val)
-    val = tl.where(idx == 12, -2.0, val)
-    val = tl.where(idx == 13, -3.0, val)
-    val = tl.where(idx == 14, -4.0, val)
-    val = tl.where(idx == 15, -6.0, val)
-    return val.to(tl.float32)
+def _fp4_e2m1_decode(idx):
+    """Decode FP4 E2M1 format using pure arithmetic (no LUT, no memory loads).
+
+    This is much faster than 16 sequential tl.where() or LUT memory loads.
+    Only uses bit operations and 2-3 tl.where() calls.
+
+    Args:
+        idx: 4-bit FP4 index (0-15), can be tensor of any shape
+
+    Returns:
+        Decoded float32 values
+    """
+    # Extract fields from 4-bit index
+    abs_idx = idx & 0x7           # Remove sign bit (bits 0-2)
+    exp = abs_idx >> 1            # Exponent: bits 1-2 (values 0-3)
+    mant = abs_idx & 1            # Mantissa: bit 0 (0 or 1)
+
+    # Convert to float for arithmetic
+    mant_f = mant.to(tl.float32)
+
+    # Compute 2^(exp-1) for normal values
+    # exp=1 → 2^0=1, exp=2 → 2^1=2, exp=3 → 2^2=4
+    # Use bit shift: (1 << (exp-1)) but need to handle exp=0 case
+    pow2 = tl.where(exp == 1, 1.0,
+           tl.where(exp == 2, 2.0,
+           tl.where(exp == 3, 4.0, 1.0)))  # exp=0 case handled separately
+
+    # E2M1 decode:
+    # exp=0: subnormal → mant * 0.5 (gives 0.0 or 0.5)
+    # exp>0: normal → (1 + mant*0.5) * 2^(exp-1)
+    val = tl.where(exp == 0,
+                   mant_f * 0.5,                    # Subnormal: 0.0 or 0.5
+                   (1.0 + mant_f * 0.5) * pow2)     # Normal: (1+M/2) * 2^(E-1)
+
+    # Apply sign (bit 3)
+    sign = (idx >> 3) & 1
+    return tl.where(sign, -val, val)
 
 
 @triton.jit
@@ -107,8 +115,6 @@ def batch_mxfp4_dequant_kernel(
     # Input pointers (arrays of pointers to expert weights)
     packed_ptrs,        # [num_experts] int64 pointers to packed FP4 [N, K//2]
     scale_ptrs,         # [num_experts] int64 pointers to scales [N, K//32]
-    # FP4 lookup table pointer [16] float32
-    fp4_lut_ptr,
     # Output buffer [num_experts, N, K] BF16
     output_ptr,
     # Dimensions
@@ -174,11 +180,11 @@ def batch_mxfp4_dequant_kernel(
     idx_lo = (packed & 0x0F).to(tl.int32)
     idx_hi = ((packed >> 4) & 0x0F).to(tl.int32)
 
-    # Lookup FP4 values using LUT (1 load vs 16 tl.where() conditionals)
-    # This is the key optimization: direct memory lookup is much faster than
-    # 16 sequential conditional operations
-    val_lo = tl.load(fp4_lut_ptr + idx_lo)  # [BLOCK_N, BLOCK_K//2]
-    val_hi = tl.load(fp4_lut_ptr + idx_hi)  # [BLOCK_N, BLOCK_K//2]
+    # Decode FP4 values using E2M1 arithmetic (pure compute, no memory loads)
+    # This is the key optimization: arithmetic decode is much faster than
+    # 16 sequential tl.where() or LUT memory loads
+    val_lo = _fp4_e2m1_decode(idx_lo)  # [BLOCK_N, BLOCK_K//2]
+    val_hi = _fp4_e2m1_decode(idx_hi)  # [BLOCK_N, BLOCK_K//2]
 
     # Apply scales: val * 2^scale
     # Broadcast scale [BLOCK_N] -> [BLOCK_N, BLOCK_K//2]
@@ -228,16 +234,13 @@ def batch_mxfp4_dequant(
     K_packed = K // 2
     K_scale = K // 32
 
-    # Get FP4 lookup table (cached, stays on GPU)
-    fp4_lut = _get_fp4_lut(output.device)
-
     # Grid: (num_experts, cdiv(N, BLOCK_N), cdiv(K, BLOCK_K))
     # With BLOCK_N=128, BLOCK_K=32: (128, 108, 160) = 2.2M blocks (vs 4.4M with BLOCK_N=64)
     grid = (num_experts, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
 
+    # No LUT needed - using E2M1 arithmetic decoding (pure compute)
     batch_mxfp4_dequant_kernel[grid](
         packed_ptrs, scale_ptrs,
-        fp4_lut,  # FP4 lookup table pointer
         output,
         N, K, K_packed, K_scale,
         packed_ref.stride(0), packed_ref.stride(1),
