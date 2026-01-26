@@ -117,6 +117,10 @@ def batch_mxfp4_dequant_kernel(
     n_block = tl.program_id(axis=1)
     k_block = tl.program_id(axis=2)
 
+    # Cast expert_idx to int64 to prevent overflow when computing large strides
+    # For [128, 13824, 5120] output: stride_out_e = 70,778,880 which exceeds int32 max
+    expert_idx_64 = expert_idx.to(tl.int64)
+
     # Get base pointers for this expert (use stride_ptrs like working kernel)
     packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
     scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
@@ -163,15 +167,15 @@ def batch_mxfp4_dequant_kernel(
     offs_k_even = tl.arange(0, BLOCK_K // 2) * 2
     offs_k_odd = offs_k_even + 1
 
-    # Store even positions
-    out_even_ptrs = output_ptr + expert_idx * stride_out_e + \
+    # Store even positions (use expert_idx_64 to avoid int32 overflow)
+    out_even_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
                     offs_n[:, None] * stride_out_n + \
                     (k_start + offs_k_even[None, :]) * stride_out_k
     out_even_mask = n_mask[:, None] & ((k_start + offs_k_even[None, :]) < K)
     tl.store(out_even_ptrs, val_lo_scaled.to(tl.bfloat16), mask=out_even_mask)
 
-    # Store odd positions
-    out_odd_ptrs = output_ptr + expert_idx * stride_out_e + \
+    # Store odd positions (use expert_idx_64 to avoid int32 overflow)
+    out_odd_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
                    offs_n[:, None] * stride_out_n + \
                    (k_start + offs_k_odd[None, :]) * stride_out_k
     out_odd_mask = n_mask[:, None] & ((k_start + offs_k_odd[None, :]) < K)
