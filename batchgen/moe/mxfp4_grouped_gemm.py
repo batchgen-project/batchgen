@@ -36,40 +36,31 @@ MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
 
 @triton.jit
 def _fp4_lookup(idx):
-    """Lookup FP4 value from 4-bit index using vectorized operations.
+    """Lookup FP4 value from 4-bit index.
 
     FP4 table:
     0: 0.0,  1: 0.5,  2: 1.0,  3: 1.5,  4: 2.0,  5: 3.0,  6: 4.0,  7: 6.0
     8: -0.0, 9: -0.5, 10: -1.0, 11: -1.5, 12: -2.0, 13: -3.0, 14: -4.0, 15: -6.0
-
-    Optimized: Uses arithmetic to compute values instead of 16 conditionals.
-    - idx 0-3: direct value (idx * 0.5)
-    - idx 4-7: special values [2.0, 3.0, 4.0, 6.0]
-    - idx 8-15: negative of idx 0-7
     """
-    # Extract magnitude index (0-7) and sign bit (bit 3)
-    mag_idx = idx & 0x7
-    sign = (idx >> 3) & 1  # 0 for positive, 1 for negative
+    # Positive values (idx 0-7)
+    val = tl.where(idx == 0, 0.0, 0.0)
+    val = tl.where(idx == 1, 0.5, val)
+    val = tl.where(idx == 2, 1.0, val)
+    val = tl.where(idx == 3, 1.5, val)
+    val = tl.where(idx == 4, 2.0, val)
+    val = tl.where(idx == 5, 3.0, val)
+    val = tl.where(idx == 6, 4.0, val)
+    val = tl.where(idx == 7, 6.0, val)
 
-    # Compute magnitude based on index pattern
-    # idx 0-3: 0.0, 0.5, 1.0, 1.5 (linear: idx * 0.5)
-    # idx 4-7: 2.0, 3.0, 4.0, 6.0 (non-linear)
-    is_linear = mag_idx < 4
-    linear_val = mag_idx.to(tl.float32) * 0.5
-
-    # Non-linear lookup for idx 4-7 using minimal conditionals
-    # Pattern: 2.0, 3.0, 4.0, 6.0 -> base 2.0, then +1, +2, +4 for idx 5,6,7
-    nonlinear_base = 2.0
-    nonlinear_offset = tl.where(mag_idx == 5, 1.0,
-                       tl.where(mag_idx == 6, 2.0,
-                       tl.where(mag_idx == 7, 4.0, 0.0)))
-    nonlinear_val = nonlinear_base + nonlinear_offset
-
-    # Select linear or non-linear value
-    magnitude = tl.where(is_linear, linear_val, nonlinear_val)
-
-    # Apply sign
-    val = tl.where(sign == 1, -magnitude, magnitude)
+    # Negative values (idx 8-15)
+    val = tl.where(idx == 8, -0.0, val)
+    val = tl.where(idx == 9, -0.5, val)
+    val = tl.where(idx == 10, -1.0, val)
+    val = tl.where(idx == 11, -1.5, val)
+    val = tl.where(idx == 12, -2.0, val)
+    val = tl.where(idx == 13, -3.0, val)
+    val = tl.where(idx == 14, -4.0, val)
+    val = tl.where(idx == 15, -6.0, val)
 
     return val.to(tl.float32)
 
@@ -554,17 +545,13 @@ def fused_mxfp4_grouped_gemm_kernel_3d(
             lhs_even_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_even[None, :]) * stride_lhs_k
             lhs_odd_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_odd[None, :]) * stride_lhs_k
 
-            lhs_even = tl.load(lhs_even_ptrs, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, BLOCK_K//2] BF16
-            lhs_odd = tl.load(lhs_odd_ptrs, mask=m_mask[:, None], other=0.0)   # [BLOCK_M, BLOCK_K//2] BF16
+            lhs_even = tl.load(lhs_even_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)  # [BLOCK_M, BLOCK_K//2]
+            lhs_odd = tl.load(lhs_odd_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)   # [BLOCK_M, BLOCK_K//2]
 
-            # Convert dequantized weights to BF16 for tensor core matmul
-            rhs_even_bf16 = val_lo_scaled.to(tl.bfloat16)  # [BLOCK_N, BLOCK_K//2]
-            rhs_odd_bf16 = val_hi_scaled.to(tl.bfloat16)   # [BLOCK_N, BLOCK_K//2]
-
-            # Accumulate using tensor cores (TF32 enabled by default on Hopper)
+            # Accumulate: lhs_even @ val_lo.T + lhs_odd @ val_hi.T
             # [BLOCK_M, BLOCK_K//2] @ [BLOCK_K//2, BLOCK_N] -> [BLOCK_M, BLOCK_N]
-            acc += tl.dot(lhs_even, tl.trans(rhs_even_bf16))
-            acc += tl.dot(lhs_odd, tl.trans(rhs_odd_bf16))
+            acc += tl.dot(lhs_even.to(tl.bfloat16), tl.trans(val_lo_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+            acc += tl.dot(lhs_odd.to(tl.bfloat16), tl.trans(val_hi_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
 
         # Store output [BLOCK_M, BLOCK_N]
         out_ptrs = cur_out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
