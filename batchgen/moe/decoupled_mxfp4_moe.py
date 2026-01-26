@@ -245,7 +245,7 @@ def bf16_grouped_gemm_kernel_3d(
     # Block sizes (constexpr for Triton)
     BLOCK_M: tl.constexpr,  # 64
     BLOCK_N: tl.constexpr,  # 64
-    BLOCK_K: tl.constexpr,  # 64 (can be larger than MXFP4's 32!)
+    BLOCK_K: tl.constexpr,  # 32 (match working fused kernel)
 ):
     """BF16 grouped GEMM on pre-dequantized weights.
 
@@ -254,7 +254,6 @@ def bf16_grouped_gemm_kernel_3d(
     - axis 1: N-block index
 
     Key advantage over fused MXFP4:
-    - BLOCK_K can be 64/128 (not limited to 32 by scale blocks)
     - Pure BF16 operations → optimal tensor core utilization
     - No FP4 lookup or scale loads in inner loop
 
@@ -265,8 +264,8 @@ def bf16_grouped_gemm_kernel_3d(
     n_pid = tl.program_id(axis=1)
 
     # Early exit for empty experts
-    num_tokens = tl.load(expert_tokens_ptr + expert_idx).to(tl.int32)
-    if num_tokens == 0:
+    gm = tl.load(expert_tokens_ptr + expert_idx).to(tl.int32)
+    if gm == 0:
         return
 
     # Get base pointers for this expert
@@ -279,33 +278,33 @@ def bf16_grouped_gemm_kernel_3d(
     n_mask = offs_n < N
 
     # Compute dynamic loop bounds (same pattern as working fused kernel)
-    num_m_blocks = tl.cdiv(num_tokens, BLOCK_M)
+    num_m_blocks = tl.cdiv(gm, BLOCK_M)
     num_k_blocks = K // BLOCK_K
 
-    # Process each M-block
+    # Process each M-block (same structure as working fused_mxfp4_grouped_gemm_kernel_3d)
     for m_block in range(num_m_blocks):
         offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-        m_mask = offs_m < num_tokens
+        m_mask = offs_m < gm
 
         # Initialize accumulator
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # K-loop
+        # K-loop (matches working fused kernel pattern)
         for k_block in range(num_k_blocks):
             k_start = k_block * BLOCK_K
             offs_k = tl.arange(0, BLOCK_K)
 
-            # Load LHS [BLOCK_M, BLOCK_K]
+            # Load LHS [BLOCK_M, BLOCK_K] and convert to float32 (like working kernel)
             lhs_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + \
                        (k_start + offs_k[None, :]) * stride_lhs_k
-            lhs = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)
+            lhs = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
 
-            # Load RHS [BLOCK_N, BLOCK_K] (weights are stored as [N, K])
+            # Load RHS [BLOCK_N, BLOCK_K] and convert to float32
             rhs_ptrs = cur_rhs_ptr + offs_n[:, None] * stride_rhs_n + \
                        (k_start + offs_k[None, :]) * stride_rhs_k
-            rhs = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0.0)
+            rhs = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
 
-            # Accumulate: lhs @ rhs.T (use allow_tf32=False like working kernel)
+            # Accumulate: lhs @ rhs.T (exact pattern from working kernel)
             acc += tl.dot(lhs.to(tl.bfloat16), tl.trans(rhs.to(tl.bfloat16)),
                           allow_tf32=False).to(tl.float32)
 
@@ -323,7 +322,7 @@ def bf16_grouped_gemm_3d(
     N: int,
     BLOCK_M: int = 64,
     BLOCK_N: int = 64,
-    BLOCK_K: int = 64,
+    BLOCK_K: int = 32,  # Use 32 like working fused kernel (smaller working set)
     num_warps: int = 8,
 ) -> torch.Tensor:
     """BF16 grouped GEMM on pre-dequantized weights.
@@ -343,6 +342,9 @@ def bf16_grouped_gemm_3d(
     M_max = hidden_3d.shape[1]
     K = hidden_3d.shape[2]
     device = hidden_3d.device
+
+    # Ensure K is divisible by BLOCK_K
+    assert K % BLOCK_K == 0, f"K ({K}) must be divisible by BLOCK_K ({BLOCK_K})"
 
     # Ensure expert_counts is int32
     if expert_counts.dtype != torch.int32:

@@ -585,6 +585,45 @@ def run_benchmark(
     return results
 
 
+def test_gemm_only_minimal():
+    """Minimal test of GEMM kernel only (no dequant) - for debugging."""
+    print("\n" + "=" * 70)
+    print("MINIMAL GEMM KERNEL TEST (no dequant)")
+    print("=" * 70)
+
+    try:
+        from batchgen.moe.decoupled_mxfp4_moe import bf16_grouped_gemm_3d
+    except ImportError as e:
+        print(f"Import failed: {e}")
+        return False
+
+    # Use smaller dimensions for minimal test
+    num_experts = 4  # Start small
+    tokens_per_expert = 4
+    K = 128  # Must be divisible by BLOCK_K=32
+    N = 128  # Must be divisible by BLOCK_N=64
+
+    device = "cuda"
+    print(f"Config: {num_experts} experts, {tokens_per_expert} tokens, K={K}, N={N}")
+
+    # Create test tensors
+    hidden_3d = torch.randn(num_experts, tokens_per_expert, K, dtype=torch.bfloat16, device=device)
+    weight_buffer = torch.randn(num_experts, N, K, dtype=torch.bfloat16, device=device)
+    expert_counts = torch.full((num_experts,), tokens_per_expert, dtype=torch.int32, device=device)
+
+    print("Testing GEMM kernel...")
+    try:
+        output = bf16_grouped_gemm_3d(hidden_3d, weight_buffer, expert_counts, N)
+        torch.cuda.synchronize()
+        print(f"SUCCESS! Output shape: {output.shape}")
+        return True
+    except Exception as e:
+        print(f"FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark Decoupled MXFP4 MoE",
@@ -599,6 +638,9 @@ Examples:
 
     # Detailed component timing
     python bench_decoupled_mxfp4_moe.py --quick --tokens 4 --detailed
+
+    # Test GEMM kernel only (minimal, for debugging)
+    python bench_decoupled_mxfp4_moe.py --test-gemm
 """
     )
     parser.add_argument(
@@ -629,6 +671,10 @@ Examples:
         "--no-isolate", action="store_true",
         help="Skip isolated kernel tests (test dequant/GEMM separately)"
     )
+    parser.add_argument(
+        "--test-gemm", action="store_true",
+        help="Run minimal GEMM kernel test only (for debugging)"
+    )
 
     args = parser.parse_args()
 
@@ -636,6 +682,11 @@ Examples:
     if not torch.cuda.is_available():
         print("ERROR: CUDA not available")
         sys.exit(1)
+
+    # Minimal GEMM test mode
+    if args.test_gemm:
+        success = test_gemm_only_minimal()
+        sys.exit(0 if success else 1)
 
     config = {
         "num_experts": args.num_experts,
