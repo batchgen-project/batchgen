@@ -267,15 +267,19 @@ def bf16_grouped_gemm_kernel_3d(
     expert_idx = tl.program_id(axis=0)
     n_pid = tl.program_id(axis=1)
 
+    # Cast expert_idx to int64 to prevent overflow when computing large strides
+    # For weight_buffer [128, 13824, 5120]: stride_rhs_e = 70,778,880 which exceeds int32 max
+    expert_idx_64 = expert_idx.to(tl.int64)
+
     # Early exit for empty experts
     gm = tl.load(expert_tokens_ptr + expert_idx).to(tl.int32)
     if gm == 0:
         return
 
-    # Get base pointers for this expert
-    cur_lhs_ptr = lhs_ptr + expert_idx * stride_lhs_e
-    cur_rhs_ptr = rhs_ptr + expert_idx * stride_rhs_e
-    cur_out_ptr = output_ptr + expert_idx * stride_out_e
+    # Get base pointers for this expert (use expert_idx_64 for large stride multiplication)
+    cur_lhs_ptr = lhs_ptr + expert_idx_64 * stride_lhs_e
+    cur_rhs_ptr = rhs_ptr + expert_idx_64 * stride_rhs_e
+    cur_out_ptr = output_ptr + expert_idx_64 * stride_out_e
 
     # N-block offset
     offs_n = n_pid * BLOCK_N + tl.arange(0, BLOCK_N)
