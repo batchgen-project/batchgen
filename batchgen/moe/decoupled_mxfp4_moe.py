@@ -158,28 +158,23 @@ def batch_mxfp4_dequant_kernel(
     # Apply scales: val * 2^scale
     # Broadcast scale [BLOCK_N] -> [BLOCK_N, BLOCK_K//2]
     exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
-    val_lo_scaled = _ldexp(val_lo, exp_broadcast)
-    val_hi_scaled = _ldexp(val_hi, exp_broadcast)
+    val_lo_scaled = _ldexp(val_lo, exp_broadcast).to(tl.bfloat16)
+    val_hi_scaled = _ldexp(val_hi, exp_broadcast).to(tl.bfloat16)
 
-    # Interleave to [BLOCK_N, BLOCK_K]: [lo0, hi0, lo1, hi1, ...]
-    # Output positions: even K = val_lo, odd K = val_hi
+    # Interleave lo/hi to create contiguous [BLOCK_N, BLOCK_K] output
+    # Using tl.join to combine [BLOCK_N, BLOCK_K//2] + [BLOCK_N, BLOCK_K//2] -> [BLOCK_N, BLOCK_K//2, 2]
+    # Then reshape to [BLOCK_N, BLOCK_K] for contiguous memory access
+    val_joined = tl.join(val_lo_scaled, val_hi_scaled)  # [BLOCK_N, BLOCK_K//2, 2]
+    val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))  # [BLOCK_N, BLOCK_K]
+
+    # Single contiguous store (much faster than two strided stores)
     k_start = k_block * BLOCK_K
-    offs_k_even = tl.arange(0, BLOCK_K // 2) * 2
-    offs_k_odd = offs_k_even + 1
-
-    # Store even positions (use expert_idx_64 to avoid int32 overflow)
-    out_even_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
-                    offs_n[:, None] * stride_out_n + \
-                    (k_start + offs_k_even[None, :]) * stride_out_k
-    out_even_mask = n_mask[:, None] & ((k_start + offs_k_even[None, :]) < K)
-    tl.store(out_even_ptrs, val_lo_scaled.to(tl.bfloat16), mask=out_even_mask)
-
-    # Store odd positions (use expert_idx_64 to avoid int32 overflow)
-    out_odd_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
-                   offs_n[:, None] * stride_out_n + \
-                   (k_start + offs_k_odd[None, :]) * stride_out_k
-    out_odd_mask = n_mask[:, None] & ((k_start + offs_k_odd[None, :]) < K)
-    tl.store(out_odd_ptrs, val_hi_scaled.to(tl.bfloat16), mask=out_odd_mask)
+    offs_k_full = tl.arange(0, BLOCK_K)
+    out_ptrs = output_ptr + expert_idx_64 * stride_out_e + \
+               offs_n[:, None] * stride_out_n + \
+               (k_start + offs_k_full[None, :]) * stride_out_k
+    out_mask = n_mask[:, None] & ((k_start + offs_k_full[None, :]) < K)
+    tl.store(out_ptrs, val_interleaved, mask=out_mask)
 
 
 def batch_mxfp4_dequant(
@@ -188,7 +183,7 @@ def batch_mxfp4_dequant(
     output: torch.Tensor,         # [num_experts, N, K] BF16
     packed_ref: torch.Tensor,     # Reference tensor for strides [N, K//2]
     scale_ref: torch.Tensor,      # Reference tensor for strides [N, K//32]
-    BLOCK_N: int = 64,
+    BLOCK_N: int = 128,
     BLOCK_K: int = 32,
 ) -> None:
     """Batch dequantize all experts' MXFP4 weights into BF16 buffer.
@@ -199,8 +194,8 @@ def batch_mxfp4_dequant(
         output: Pre-allocated output buffer [num_experts, N, K] BF16
         packed_ref: Reference weight tensor for computing strides
         scale_ref: Reference scale tensor for computing strides
-        BLOCK_N: Tile size for N dimension (default 64)
-        BLOCK_K: Tile size for K dimension (default 32, must match scale block)
+        BLOCK_N: Tile size for N dimension (default 128, larger = fewer blocks)
+        BLOCK_K: Tile size for K dimension (default 32, MUST match MXFP4 scale block)
     """
     num_experts = packed_ptrs.shape[0]
     N = output.shape[1]
@@ -209,6 +204,7 @@ def batch_mxfp4_dequant(
     K_scale = K // 32
 
     # Grid: (num_experts, cdiv(N, BLOCK_N), cdiv(K, BLOCK_K))
+    # With BLOCK_N=128, BLOCK_K=32: (128, 108, 160) = 2.2M blocks (vs 4.4M with BLOCK_N=64)
     grid = (num_experts, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
 
     batch_mxfp4_dequant_kernel[grid](
@@ -220,7 +216,7 @@ def batch_mxfp4_dequant(
         output.stride(0), output.stride(1), output.stride(2),
         1,  # stride_ptrs (contiguous pointer array, same as working kernel)
         BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=4,
+        num_warps=8,  # More warps for larger tiles
     )
 
 
