@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
 GEMM_SEARCH_SPACE = {
     "BLOCK_M": [32, 64, 128, 256],
     "BLOCK_N": [32, 64, 128, 256],
-    "BLOCK_K": [32],  # Fixed for MXFP4 (must match scale block size)
+    "BLOCK_K": [32, 64],  # 64 processes 2 scale blocks per K-tile (default)
     "num_warps": [2, 4, 8],
     "num_stages": [1, 2, 3, 4],
 }

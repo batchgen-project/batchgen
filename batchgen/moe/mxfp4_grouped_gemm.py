@@ -522,7 +522,7 @@ def fused_mxfp4_grouped_gemm_kernel_3d(
     # Block sizes
     BLOCK_M: tl.constexpr,  # 64
     BLOCK_N: tl.constexpr,  # 64
-    BLOCK_K: tl.constexpr,  # 32 (must match MXFP4 scale block size)
+    BLOCK_K: tl.constexpr,  # 64 (processes 2 scale blocks per K-tile)
 ):
     """True grouped MXFP4 GEMM following DeepSeek-V3 pattern.
 
@@ -533,6 +533,9 @@ def fused_mxfp4_grouped_gemm_kernel_3d(
     Each thread block handles one (expert, N-block) pair and loops over:
     - M-blocks (tokens for that expert)
     - K-blocks (reduction dimension)
+
+    BLOCK_K=64 optimization: Each K-tile spans 2 MXFP4 scale blocks (32 each).
+    This halves the number of K-loop iterations for better performance.
     """
     expert_idx = tl.program_id(axis=0)
     n_pid = tl.program_id(axis=1)
@@ -564,48 +567,84 @@ def fused_mxfp4_grouped_gemm_kernel_3d(
         # Initialize accumulator
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # K-loop (BLOCK_K=32 matches MXFP4 scale block size)
+        # K-loop with BLOCK_K=64 (processes 2 scale blocks per iteration)
+        # Each iteration handles K positions [k_block*64, k_block*64 + 64)
         num_k_blocks = K // BLOCK_K
 
         for k_block in range(num_k_blocks):
-            k_start = k_block * BLOCK_K
+            k_start = k_block * BLOCK_K  # K starting position (0, 64, 128, ...)
 
-            # Load packed FP4 [BLOCK_N, BLOCK_K//2] uint8
-            k_packed_start = k_start // 2
-            offs_k_packed = tl.arange(0, BLOCK_K // 2)
-            rhs_ptrs = rhs_base_ptr + offs_n[:, None] * stride_rhs_n + \
-                       (k_packed_start + offs_k_packed[None, :]) * stride_rhs_k_packed
-            rhs_packed = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0)
+            # With BLOCK_K=64, we process 2 scale blocks:
+            # - First 32 K values use scale_k_lo
+            # - Second 32 K values use scale_k_hi
+            scale_k_lo = k_block * 2      # Scale block index for K[0:32]
+            scale_k_hi = k_block * 2 + 1  # Scale block index for K[32:64]
 
-            # Unpack FP4 (lo = even K indices, hi = odd K indices)
-            # Use optimized v4_branchless decode (2 tl.where vs 16 for _fp4_lookup)
-            idx_lo = (rhs_packed & 0x0F).to(tl.int32)
-            idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
-            val_lo = _fp4_decode_v4_branchless(idx_lo)  # [BLOCK_N, BLOCK_K//2]
-            val_hi = _fp4_decode_v4_branchless(idx_hi)  # [BLOCK_N, BLOCK_K//2]
+            # ===== FIRST HALF: K positions [k_start, k_start+32) =====
+            # Load packed FP4 [BLOCK_N, 16] for first 32 K values
+            k_packed_lo = k_start // 2
+            offs_k_packed_lo = tl.arange(0, 16)  # 32 values / 2 per byte = 16 bytes
+            rhs_ptrs_lo = rhs_base_ptr + offs_n[:, None] * stride_rhs_n + \
+                         (k_packed_lo + offs_k_packed_lo[None, :]) * stride_rhs_k_packed
+            rhs_packed_lo = tl.load(rhs_ptrs_lo, mask=n_mask[:, None], other=0)
 
-            # Load scale for this K-block (one scale per N row per K-block)
-            scale_ptrs = scale_base_ptr + offs_n * stride_scale_n + k_block * stride_scale_k
-            scales = tl.load(scale_ptrs, mask=n_mask, other=127).to(tl.int32) - 127
+            # Unpack first half
+            idx_lo_lo = (rhs_packed_lo & 0x0F).to(tl.int32)
+            idx_hi_lo = ((rhs_packed_lo >> 4) & 0x0F).to(tl.int32)
+            val_lo_lo = _fp4_decode_v4_branchless(idx_lo_lo)  # [BLOCK_N, 16]
+            val_hi_lo = _fp4_decode_v4_branchless(idx_hi_lo)  # [BLOCK_N, 16]
 
-            # Apply ldexp: val * 2^scale
-            exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
-            val_lo_scaled = _ldexp(val_lo, exp_broadcast)
-            val_hi_scaled = _ldexp(val_hi, exp_broadcast)
+            # Load scale for first 32 K values
+            scale_ptrs_lo = scale_base_ptr + offs_n * stride_scale_n + scale_k_lo * stride_scale_k
+            scales_lo = tl.load(scale_ptrs_lo, mask=n_mask, other=127).to(tl.int32) - 127
 
-            # Interleave lo/hi to get contiguous K dimension [BLOCK_N, BLOCK_K]
-            # val_lo has K indices [0, 2, 4, ...], val_hi has [1, 3, 5, ...]
-            # Interleave to get [0, 1, 2, 3, 4, 5, ...]
-            # Use tl.join to create [BLOCK_N, BLOCK_K//2, 2] then reshape
-            val_joined = tl.join(val_lo_scaled, val_hi_scaled)  # [BLOCK_N, BLOCK_K//2, 2]
-            val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))  # [BLOCK_N, BLOCK_K]
+            # Apply ldexp to first half
+            exp_broadcast_lo = scales_lo[:, None] + tl.zeros((1, 16), dtype=tl.int32)
+            val_lo_lo_scaled = _ldexp(val_lo_lo, exp_broadcast_lo)
+            val_hi_lo_scaled = _ldexp(val_hi_lo, exp_broadcast_lo)
 
-            # Load LHS contiguously (coalesced access - much faster!)
+            # Interleave first half: [BLOCK_N, 32]
+            val_joined_lo = tl.join(val_lo_lo_scaled, val_hi_lo_scaled)
+            val_interleaved_lo = tl.reshape(val_joined_lo, (BLOCK_N, 32))
+
+            # ===== SECOND HALF: K positions [k_start+32, k_start+64) =====
+            # Load packed FP4 [BLOCK_N, 16] for second 32 K values
+            k_packed_hi = (k_start + 32) // 2
+            offs_k_packed_hi = tl.arange(0, 16)
+            rhs_ptrs_hi = rhs_base_ptr + offs_n[:, None] * stride_rhs_n + \
+                         (k_packed_hi + offs_k_packed_hi[None, :]) * stride_rhs_k_packed
+            rhs_packed_hi = tl.load(rhs_ptrs_hi, mask=n_mask[:, None], other=0)
+
+            # Unpack second half
+            idx_lo_hi = (rhs_packed_hi & 0x0F).to(tl.int32)
+            idx_hi_hi = ((rhs_packed_hi >> 4) & 0x0F).to(tl.int32)
+            val_lo_hi = _fp4_decode_v4_branchless(idx_lo_hi)  # [BLOCK_N, 16]
+            val_hi_hi = _fp4_decode_v4_branchless(idx_hi_hi)  # [BLOCK_N, 16]
+
+            # Load scale for second 32 K values
+            scale_ptrs_hi = scale_base_ptr + offs_n * stride_scale_n + scale_k_hi * stride_scale_k
+            scales_hi = tl.load(scale_ptrs_hi, mask=n_mask, other=127).to(tl.int32) - 127
+
+            # Apply ldexp to second half
+            exp_broadcast_hi = scales_hi[:, None] + tl.zeros((1, 16), dtype=tl.int32)
+            val_lo_hi_scaled = _ldexp(val_lo_hi, exp_broadcast_hi)
+            val_hi_hi_scaled = _ldexp(val_hi_hi, exp_broadcast_hi)
+
+            # Interleave second half: [BLOCK_N, 32]
+            val_joined_hi = tl.join(val_lo_hi_scaled, val_hi_hi_scaled)
+            val_interleaved_hi = tl.reshape(val_joined_hi, (BLOCK_N, 32))
+
+            # ===== COMBINE: Concatenate both halves [BLOCK_N, 64] =====
+            # Join the two 32-wide halves into one 64-wide tile
+            val_full = tl.join(val_interleaved_lo, val_interleaved_hi)
+            val_interleaved = tl.reshape(val_full, (BLOCK_N, BLOCK_K))
+
+            # Load LHS contiguously [BLOCK_M, 64]
             offs_k = tl.arange(0, BLOCK_K)
             lhs_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k[None, :]) * stride_lhs_k
             lhs_tile = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, BLOCK_K]
 
-            # Single full-size dot product (vs two half-size before)
+            # Single full-size dot product
             # [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
             acc += tl.dot(lhs_tile.to(tl.bfloat16), tl.trans(val_interleaved.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
 
@@ -726,7 +765,7 @@ def grouped_mxfp4_gemm_3d(
     scale_ref: torch.Tensor,          # Reference scale for strides [N, K//32]
     BLOCK_M: int = 64,
     BLOCK_N: int = 64,
-    BLOCK_K: int = 32,
+    BLOCK_K: int = 64,  # Changed from 32 to 64: process 2 scale blocks per K-tile
 ) -> torch.Tensor:
     """Launch grouped MXFP4 GEMM kernel with 3D layout.
 
@@ -785,7 +824,7 @@ def grouped_mxfp4_gemm_3d_tunable(
     scale_ref: torch.Tensor,          # Reference scale for strides [N, K//32]
     BLOCK_M: int = 64,
     BLOCK_N: int = 64,
-    BLOCK_K: int = 32,
+    BLOCK_K: int = 64,  # Changed from 32 to 64: processes 2 scale blocks per K-tile
     num_warps: int = 8,
     num_stages: int = 1,
 ) -> torch.Tensor:
@@ -803,7 +842,7 @@ def grouped_mxfp4_gemm_3d_tunable(
         scale_ref: Reference scale tensor for computing strides
         BLOCK_M: Tile size for M dimension (default 64)
         BLOCK_N: Tile size for N dimension (default 64)
-        BLOCK_K: Tile size for K dimension (default 32, must match MXFP4 scale block)
+        BLOCK_K: Tile size for K dimension (default 64, processes 2 scale blocks)
         num_warps: Number of warps per block (default 8)
         num_stages: Number of pipeline stages (default 1)
 
@@ -1158,7 +1197,7 @@ def fused_mxfp4_single_gemm_kernel_optimized(
     # Block sizes (same as grouped kernel)
     BLOCK_M: tl.constexpr,  # 64
     BLOCK_N: tl.constexpr,  # 64
-    BLOCK_K: tl.constexpr,  # 32
+    BLOCK_K: tl.constexpr,  # 64 (processes 2 scale blocks per K-tile)
 ):
     """Optimized single-expert MXFP4 GEMM with same tiling as grouped kernel.
 
@@ -1168,6 +1207,8 @@ def fused_mxfp4_single_gemm_kernel_optimized(
 
     Uses identical MXFP4 dequantization and accumulation pattern as the grouped
     kernel for consistent performance characteristics.
+
+    BLOCK_K=64 optimization: Each K-tile spans 2 MXFP4 scale blocks (32 each).
     """
     m_pid = tl.program_id(axis=0)
     n_pid = tl.program_id(axis=1)
@@ -1180,45 +1221,72 @@ def fused_mxfp4_single_gemm_kernel_optimized(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # K-loop with MXFP4 dequantization (BLOCK_K=32 matches scale block size)
+    # K-loop with BLOCK_K=64 (processes 2 scale blocks per iteration)
     num_k_blocks = K // BLOCK_K
 
     for k_block in range(num_k_blocks):
         k_start = k_block * BLOCK_K
 
-        # Load packed FP4 weights [BLOCK_N, BLOCK_K//2]
-        k_packed_start = k_start // 2
-        offs_k_packed = tl.arange(0, BLOCK_K // 2)
-        rhs_ptrs = rhs_ptr + offs_n[:, None] * stride_rhs_n + \
-                   (k_packed_start + offs_k_packed[None, :]) * stride_rhs_k
-        rhs_packed = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0)
+        # With BLOCK_K=64, we process 2 scale blocks:
+        # - First 32 K values use scale_k_lo
+        # - Second 32 K values use scale_k_hi
+        scale_k_lo = k_block * 2      # Scale block index for K[0:32]
+        scale_k_hi = k_block * 2 + 1  # Scale block index for K[32:64]
 
-        # Unpack FP4 (lo = even K indices, hi = odd K indices)
-        # Use optimized v4_branchless decode (2 tl.where vs 16 for _fp4_lookup)
-        idx_lo = (rhs_packed & 0x0F).to(tl.int32)
-        idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
-        val_lo = _fp4_decode_v4_branchless(idx_lo)  # [BLOCK_N, BLOCK_K//2]
-        val_hi = _fp4_decode_v4_branchless(idx_hi)  # [BLOCK_N, BLOCK_K//2]
+        # ===== FIRST HALF: K positions [k_start, k_start+32) =====
+        k_packed_lo = k_start // 2
+        offs_k_packed_lo = tl.arange(0, 16)
+        rhs_ptrs_lo = rhs_ptr + offs_n[:, None] * stride_rhs_n + \
+                     (k_packed_lo + offs_k_packed_lo[None, :]) * stride_rhs_k
+        rhs_packed_lo = tl.load(rhs_ptrs_lo, mask=n_mask[:, None], other=0)
 
-        # Load and apply scales
-        scale_ptrs = scale_ptr + offs_n * stride_scale_n + k_block * stride_scale_k
-        scales = tl.load(scale_ptrs, mask=n_mask, other=127).to(tl.int32) - 127
+        idx_lo_lo = (rhs_packed_lo & 0x0F).to(tl.int32)
+        idx_hi_lo = ((rhs_packed_lo >> 4) & 0x0F).to(tl.int32)
+        val_lo_lo = _fp4_decode_v4_branchless(idx_lo_lo)
+        val_hi_lo = _fp4_decode_v4_branchless(idx_hi_lo)
 
-        # Apply ldexp: val * 2^scale
-        exp_broadcast = scales[:, None] + tl.zeros((1, BLOCK_K // 2), dtype=tl.int32)
-        val_lo_scaled = _ldexp(val_lo, exp_broadcast)
-        val_hi_scaled = _ldexp(val_hi, exp_broadcast)
+        scale_ptrs_lo = scale_ptr + offs_n * stride_scale_n + scale_k_lo * stride_scale_k
+        scales_lo = tl.load(scale_ptrs_lo, mask=n_mask, other=127).to(tl.int32) - 127
 
-        # Interleave lo/hi to get contiguous K dimension [BLOCK_N, BLOCK_K]
-        val_joined = tl.join(val_lo_scaled, val_hi_scaled)
-        val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))
+        exp_broadcast_lo = scales_lo[:, None] + tl.zeros((1, 16), dtype=tl.int32)
+        val_lo_lo_scaled = _ldexp(val_lo_lo, exp_broadcast_lo)
+        val_hi_lo_scaled = _ldexp(val_hi_lo, exp_broadcast_lo)
 
-        # Load LHS contiguously (coalesced access - much faster!)
+        val_joined_lo = tl.join(val_lo_lo_scaled, val_hi_lo_scaled)
+        val_interleaved_lo = tl.reshape(val_joined_lo, (BLOCK_N, 32))
+
+        # ===== SECOND HALF: K positions [k_start+32, k_start+64) =====
+        k_packed_hi = (k_start + 32) // 2
+        offs_k_packed_hi = tl.arange(0, 16)
+        rhs_ptrs_hi = rhs_ptr + offs_n[:, None] * stride_rhs_n + \
+                     (k_packed_hi + offs_k_packed_hi[None, :]) * stride_rhs_k
+        rhs_packed_hi = tl.load(rhs_ptrs_hi, mask=n_mask[:, None], other=0)
+
+        idx_lo_hi = (rhs_packed_hi & 0x0F).to(tl.int32)
+        idx_hi_hi = ((rhs_packed_hi >> 4) & 0x0F).to(tl.int32)
+        val_lo_hi = _fp4_decode_v4_branchless(idx_lo_hi)
+        val_hi_hi = _fp4_decode_v4_branchless(idx_hi_hi)
+
+        scale_ptrs_hi = scale_ptr + offs_n * stride_scale_n + scale_k_hi * stride_scale_k
+        scales_hi = tl.load(scale_ptrs_hi, mask=n_mask, other=127).to(tl.int32) - 127
+
+        exp_broadcast_hi = scales_hi[:, None] + tl.zeros((1, 16), dtype=tl.int32)
+        val_lo_hi_scaled = _ldexp(val_lo_hi, exp_broadcast_hi)
+        val_hi_hi_scaled = _ldexp(val_hi_hi, exp_broadcast_hi)
+
+        val_joined_hi = tl.join(val_lo_hi_scaled, val_hi_hi_scaled)
+        val_interleaved_hi = tl.reshape(val_joined_hi, (BLOCK_N, 32))
+
+        # ===== COMBINE: Concatenate both halves [BLOCK_N, 64] =====
+        val_full = tl.join(val_interleaved_lo, val_interleaved_hi)
+        val_interleaved = tl.reshape(val_full, (BLOCK_N, BLOCK_K))
+
+        # Load LHS contiguously [BLOCK_M, 64]
         offs_k = tl.arange(0, BLOCK_K)
         lhs_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k[None, :]) * stride_lhs_k
         lhs_tile = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, BLOCK_K]
 
-        # Single full-size dot product (vs two half-size before)
+        # Single full-size dot product
         acc += tl.dot(lhs_tile.to(tl.bfloat16), tl.trans(val_interleaved.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
 
     # Add bias if present
@@ -1250,7 +1318,7 @@ def mxfp4_expert_forward_single(
     """Single expert forward with optimized MXFP4 kernel.
 
     Uses the same tiling pattern as the grouped GEMM kernel (BLOCK_M=64,
-    BLOCK_N=64, BLOCK_K=32) for consistent performance.
+    BLOCK_N=64, BLOCK_K=64) for consistent performance.
 
     This function is intended for non-persistent experts that are loaded
     on-demand, while persistent experts use the grouped GEMM kernel.
