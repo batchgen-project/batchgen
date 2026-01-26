@@ -1,11 +1,15 @@
-"""Hyperparameter search for MXFP4 grouped GEMM kernel tile sizes.
+"""Hyperparameter search and quick benchmark for MXFP4 grouped GEMM kernel.
 
-This script searches for optimal BLOCK_M, BLOCK_N, num_warps, and num_stages
-configurations for the MXFP4 grouped GEMM kernel used in GPT-OSS-120B MoE layers.
+This script supports two modes:
+1. Quick mode (--quick): Fast A/B comparison with default config vs baseline
+2. Search mode (default): Grid search for optimal tile sizes
 
 Note: BLOCK_K=32 is fixed due to MXFP4 scale block size constraint.
 
 Usage:
+    # Quick benchmark - compare optimized vs baseline
+    python bench_mxfp4_grouped_gemm.py --quick --tokens 4
+
     # Quick search with default batch sizes
     python bench_mxfp4_grouped_gemm.py --tokens 1 8 32
 
@@ -239,13 +243,212 @@ def run_search(
     return results
 
 
+def benchmark_baseline(
+    hidden_3d: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    N: int,
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+) -> float:
+    """Benchmark unfused baseline: dequantize + torch.mm per expert.
+
+    Args:
+        hidden_3d: Input [E, M_max, K] BF16
+        weight: MXFP4 weights [N, K//2] uint8
+        scale: Scales [N, K//32] uint8
+        N: Output dimension
+        warmup_iters: Warmup iterations
+        bench_iters: Benchmark iterations
+
+    Returns:
+        Average time in ms
+    """
+    from batchgen.quantization.mxfp4 import mxfp4_dequantize
+
+    num_experts = hidden_3d.shape[0]
+
+    try:
+        # Warmup
+        for _ in range(warmup_iters):
+            weight_bf16 = mxfp4_dequantize(weight, scale, dtype=torch.bfloat16)
+            for e in range(num_experts):
+                _ = torch.mm(hidden_3d[e], weight_bf16.T)
+        torch.cuda.synchronize()
+
+        # Benchmark
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            weight_bf16 = mxfp4_dequantize(weight, scale, dtype=torch.bfloat16)
+            for e in range(num_experts):
+                _ = torch.mm(hidden_3d[e], weight_bf16.T)
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / bench_iters * 1000  # ms
+
+        return elapsed
+    except Exception as e:
+        print(f"  Baseline benchmark failed: {e}")
+        return float('inf')
+
+
+def compute_metrics(
+    time_ms: float,
+    num_experts: int,
+    tokens_per_expert: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> Dict[str, float]:
+    """Compute performance metrics.
+
+    Args:
+        time_ms: Execution time in milliseconds
+        num_experts: Number of experts
+        tokens_per_expert: Tokens per expert
+        hidden_size: K dimension
+        intermediate_size: N dimension
+
+    Returns:
+        Dictionary with TFLOPS, bandwidth, arithmetic intensity
+    """
+    # Total FLOPs: 2 * M * N * K per expert (for single GEMM)
+    M = tokens_per_expert
+    N = intermediate_size
+    K = hidden_size
+    flops_per_expert = 2 * M * N * K
+    total_flops = flops_per_expert * num_experts
+
+    # Data movement (bytes):
+    # - LHS: E * M * K * 2 (BF16)
+    # - RHS (packed): N * K/2 * 1 (shared across experts)
+    # - Scales: N * K/32 * 1 (shared)
+    # - Output: E * M * N * 2 (BF16)
+    lhs_bytes = num_experts * M * K * 2
+    rhs_bytes = N * (K // 2) * 1  # Shared weights
+    scale_bytes = N * (K // 32) * 1
+    output_bytes = num_experts * M * N * 2
+    total_bytes = lhs_bytes + rhs_bytes + scale_bytes + output_bytes
+
+    time_s = time_ms / 1000.0
+    tflops = total_flops / time_s / 1e12
+    bandwidth_tb_s = total_bytes / time_s / 1e12
+    arithmetic_intensity = total_flops / total_bytes
+
+    return {
+        'tflops': tflops,
+        'bandwidth_tb_s': bandwidth_tb_s,
+        'arithmetic_intensity': arithmetic_intensity,
+        'total_flops': total_flops,
+        'total_bytes': total_bytes,
+    }
+
+
+def run_quick_benchmark(
+    tokens_per_expert: int,
+    device: str = "cuda",
+) -> None:
+    """Run quick A/B comparison with default config.
+
+    Args:
+        tokens_per_expert: Number of tokens per expert
+        device: CUDA device
+    """
+    cfg = DEFAULT_CONFIGS
+
+    # Default configuration
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    num_warps, num_stages = 8, 1
+
+    print(f"\n{'='*70}")
+    print("QUICK BENCHMARK: Optimized vs Baseline")
+    print(f"{'='*70}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Tokens per expert: {tokens_per_expert}")
+    print(f"Hidden: {cfg['hidden_size']}, Intermediate: {cfg['intermediate_size']}")
+    print(f"Num experts: {cfg['num_experts']}")
+    print(f"Config: BLOCK_M={BLOCK_M}, BLOCK_N={BLOCK_N}, BLOCK_K={BLOCK_K}, "
+          f"warps={num_warps}, stages={num_stages}")
+    print(f"{'='*70}")
+
+    # Create test tensors
+    hidden_3d, weight, scale, expert_counts = create_test_tensors(
+        cfg['num_experts'], tokens_per_expert,
+        cfg['hidden_size'], cfg['intermediate_size'], device
+    )
+
+    # Setup weight pointers
+    from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+    weight_list = [weight] * cfg['num_experts']
+    scale_list = [scale] * cfg['num_experts']
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weight_list, scale_list)
+
+    N = cfg['intermediate_size']
+
+    # Benchmark optimized grouped GEMM
+    print("\nBenchmarking optimized grouped GEMM...")
+    optimized_time, success = benchmark_config(
+        hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+        N, weight, scale,
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages,
+        warmup_iters=5, bench_iters=20,
+    )
+
+    if not success:
+        print("ERROR: Optimized kernel failed!")
+        return
+
+    # Benchmark baseline (unfused)
+    print("Benchmarking unfused baseline...")
+    baseline_time = benchmark_baseline(
+        hidden_3d, weight, scale, N,
+        warmup_iters=3, bench_iters=10,
+    )
+
+    # Compute metrics
+    optimized_metrics = compute_metrics(
+        optimized_time, cfg['num_experts'], tokens_per_expert,
+        cfg['hidden_size'], cfg['intermediate_size']
+    )
+
+    # Print results
+    print(f"\n{'='*70}")
+    print("RESULTS")
+    print(f"{'='*70}")
+    print(f"Optimized grouped GEMM:  {optimized_time:8.3f} ms")
+    print(f"Unfused baseline:        {baseline_time:8.3f} ms")
+
+    if baseline_time != float('inf'):
+        speedup = baseline_time / optimized_time
+        print(f"Speedup:                 {speedup:8.2f}x")
+    else:
+        print("Speedup:                 N/A (baseline failed)")
+
+    print(f"\n--- Performance Metrics (Optimized) ---")
+    print(f"Effective TFLOPS:        {optimized_metrics['tflops']:8.2f}")
+    print(f"Effective bandwidth:     {optimized_metrics['bandwidth_tb_s']:8.3f} TB/s")
+    print(f"Arithmetic intensity:    {optimized_metrics['arithmetic_intensity']:8.2f} FLOPs/byte")
+
+    # H100 peak bandwidth for reference
+    H100_PEAK_BW = 3.35  # TB/s
+    bw_utilization = optimized_metrics['bandwidth_tb_s'] / H100_PEAK_BW * 100
+    print(f"Bandwidth utilization:   {bw_utilization:8.1f}% of H100 peak ({H100_PEAK_BW} TB/s)")
+
+    # Theoretical minimum time (memory-bound)
+    theoretical_time_ms = optimized_metrics['total_bytes'] / (H100_PEAK_BW * 1e12) * 1000
+    print(f"\nTheoretical minimum:     {theoretical_time_ms:8.3f} ms (at {H100_PEAK_BW} TB/s)")
+    print(f"Gap to theoretical:      {optimized_time / theoretical_time_ms:8.1f}x")
+    print(f"{'='*70}")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="MXFP4 Grouped GEMM Hyperparameter Search",
+        description="MXFP4 Grouped GEMM Benchmark and Hyperparameter Search",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Quick search
+    # Quick benchmark - compare optimized vs baseline (RECOMMENDED)
+    python bench_mxfp4_grouped_gemm.py --quick --tokens 4
+
+    # Quick search with default batch sizes
     python bench_mxfp4_grouped_gemm.py --tokens 1 8 32
 
     # Full search with all batch sizes
@@ -254,6 +457,10 @@ Examples:
     # Single batch size, quick test
     python bench_mxfp4_grouped_gemm.py --tokens 8
 """
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="Quick A/B comparison with default config vs baseline (no grid search)"
     )
     parser.add_argument(
         "--tokens", type=int, nargs='+', default=[1, 8, 32],
@@ -274,6 +481,13 @@ Examples:
         print("ERROR: CUDA not available")
         sys.exit(1)
 
+    # Quick mode: A/B comparison with default config
+    if args.quick:
+        for tpe in args.tokens:
+            run_quick_benchmark(tpe)
+        return
+
+    # Full search mode
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Search space: BLOCK_M={BLOCK_M_VALUES}, BLOCK_N={BLOCK_N_VALUES}")
     print(f"              num_warps={NUM_WARPS_VALUES}, num_stages={NUM_STAGES_VALUES}")
