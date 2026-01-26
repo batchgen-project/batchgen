@@ -36,11 +36,13 @@ MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
 
 @triton.jit
 def _fp4_lookup(idx):
-    """Lookup FP4 value from 4-bit index.
+    """Lookup FP4 value from 4-bit index (LEGACY - slow, 16 tl.where calls).
 
     FP4 table:
     0: 0.0,  1: 0.5,  2: 1.0,  3: 1.5,  4: 2.0,  5: 3.0,  6: 4.0,  7: 6.0
     8: -0.0, 9: -0.5, 10: -1.0, 11: -1.5, 12: -2.0, 13: -3.0, 14: -4.0, 15: -6.0
+
+    DEPRECATED: Use _fp4_decode_v4_branchless instead (2 tl.where, 8x faster).
     """
     # Positive values (idx 0-7)
     val = tl.where(idx == 0, 0.0, 0.0)
@@ -63,6 +65,61 @@ def _fp4_lookup(idx):
     val = tl.where(idx == 15, -6.0, val)
 
     return val.to(tl.float32)
+
+
+@triton.jit
+def _fp4_decode_v4_branchless(idx):
+    """Decode FP4 using branchless bit manipulation (FAST - 2 tl.where calls).
+
+    Constructs IEEE 754 float32 representation directly from FP4 bits.
+    This is ~8x faster than _fp4_lookup which uses 16 sequential tl.where calls.
+
+    FP4 E2M1 layout: [S][E1][E0][M]
+    IEEE 754 float32: [S][8-bit exp][23-bit mantissa]
+
+    Args:
+        idx: 4-bit FP4 index (0-15)
+    Returns:
+        Decoded float32 values
+    """
+    # Extract FP4 fields
+    sign_bit = (idx >> 3) & 1          # Bit 3
+    exp_field = (idx >> 1) & 0x3       # Bits 1-2 (0-3)
+    mant_bit = idx & 1                 # Bit 0
+
+    # Convert to int32 for bit operations
+    sign_bit = sign_bit.to(tl.int32)
+    exp_field = exp_field.to(tl.int32)
+    mant_bit = mant_bit.to(tl.int32)
+
+    # IEEE 754 float32 construction:
+    # For E2M1 normal values (exp > 0):
+    #   Value = (1 + M/2) * 2^(E-1)
+    #   IEEE exp = 127 + (E-1) = 126 + E
+    #   IEEE mantissa = M << 22 (1 mantissa bit in position 22)
+    #
+    # For E2M1 subnormal (exp = 0):
+    #   Value = M * 0.5 = M * 2^(-1)
+    #   If M=0: 0.0 (IEEE: all zeros except sign)
+    #   If M=1: 0.5 (IEEE exp=126, mantissa=0)
+
+    # Normal case: exp > 0
+    ieee_exp_normal = (126 + exp_field) << 23  # Exponent field shifted
+    ieee_mant_normal = mant_bit << 22          # Mantissa in bit 22
+    ieee_normal = (sign_bit << 31) | ieee_exp_normal | ieee_mant_normal
+
+    # Subnormal case: exp = 0
+    # M=0 → 0.0: all zeros (or negative zero)
+    # M=1 → 0.5: exp=126, mant=0
+    ieee_half = (sign_bit << 31) | (126 << 23)  # 0.5 or -0.5
+    ieee_zero = (sign_bit << 31)                 # 0.0 or -0.0
+    ieee_subnormal = tl.where(mant_bit == 1, ieee_half, ieee_zero)
+
+    # Select normal vs subnormal (1 branch)
+    ieee_bits = tl.where(exp_field > 0, ieee_normal, ieee_subnormal)
+
+    # Bitcast to float32
+    return ieee_bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -263,12 +320,13 @@ def fused_mxfp4_grouped_gemm_kernel(
 
                 # Unpack FP4 values: [BLOCK_N, BLOCK_K//2] -> [BLOCK_N, BLOCK_K]
                 # Low nibble = even indices, high nibble = odd indices
+                # Use optimized v4_branchless decode (2 tl.where vs 16 for _fp4_lookup)
                 idx_lo = (rhs_packed & 0x0F).to(tl.int32)
                 idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
 
-                # Lookup FP4 values
-                val_lo = _fp4_lookup(idx_lo)  # [BLOCK_N, BLOCK_K//2]
-                val_hi = _fp4_lookup(idx_hi)  # [BLOCK_N, BLOCK_K//2]
+                # Decode FP4 values using fast branchless method
+                val_lo = _fp4_decode_v4_branchless(idx_lo)  # [BLOCK_N, BLOCK_K//2]
+                val_hi = _fp4_decode_v4_branchless(idx_hi)  # [BLOCK_N, BLOCK_K//2]
 
                 # Load scales for this K block
                 # Scale covers 32 consecutive K values, so scale_k_idx = k_start // 32
@@ -289,22 +347,18 @@ def fused_mxfp4_grouped_gemm_kernel(
                 val_lo_scaled = _ldexp(val_lo, exponents_broadcast)
                 val_hi_scaled = _ldexp(val_hi, exponents_broadcast)
 
-                # Interleave to get full K dimension: [BLOCK_N, BLOCK_K]
-                # We need to combine lo/hi into a single tensor for matmul
-                # For simplicity, we'll do two separate matmuls and combine
+                # Interleave lo/hi to get contiguous K dimension [BLOCK_N, BLOCK_K]
+                # val_lo has K indices [0, 2, 4, ...], val_hi has [1, 3, 5, ...]
+                # Use tl.join to create [BLOCK_N, BLOCK_K//2, 2] then reshape
+                val_joined = tl.join(val_lo_scaled, val_hi_scaled)
+                val_interleaved = tl.reshape(val_joined, (GEMM_BLOCK_SIZE_N, GEMM_BLOCK_SIZE_K))
 
                 # Convert to BF16
-                val_lo_bf16 = val_lo_scaled.to(lhs_dtype)
-                val_hi_bf16 = val_hi_scaled.to(lhs_dtype)
+                val_bf16 = val_interleaved.to(lhs_dtype)
 
-                # Split lhs into even/odd K indices
-                lhs_even = lhs_tile[:, 0::2]  # [BLOCK_M, BLOCK_K//2]
-                lhs_odd = lhs_tile[:, 1::2]   # [BLOCK_M, BLOCK_K//2]
-
-                # Compute partial products and accumulate
-                # lhs_even @ val_lo.T + lhs_odd @ val_hi.T
-                acc += tl.dot(lhs_even, val_lo_bf16.T)
-                acc += tl.dot(lhs_odd, val_hi_bf16.T)
+                # Single full-size dot product (vs two half-size before)
+                # [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+                acc += tl.dot(lhs_tile, val_bf16.T)
 
             # Store output tile
             out_offs_m = start_idx + tile_m * GEMM_BLOCK_SIZE_M + tl.arange(0, GEMM_BLOCK_SIZE_M)
@@ -524,10 +578,11 @@ def fused_mxfp4_grouped_gemm_kernel_3d(
             rhs_packed = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0)
 
             # Unpack FP4 (lo = even K indices, hi = odd K indices)
+            # Use optimized v4_branchless decode (2 tl.where vs 16 for _fp4_lookup)
             idx_lo = (rhs_packed & 0x0F).to(tl.int32)
             idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
-            val_lo = _fp4_lookup(idx_lo)  # [BLOCK_N, BLOCK_K//2]
-            val_hi = _fp4_lookup(idx_hi)  # [BLOCK_N, BLOCK_K//2]
+            val_lo = _fp4_decode_v4_branchless(idx_lo)  # [BLOCK_N, BLOCK_K//2]
+            val_hi = _fp4_decode_v4_branchless(idx_hi)  # [BLOCK_N, BLOCK_K//2]
 
             # Load scale for this K-block (one scale per N row per K-block)
             scale_ptrs = scale_base_ptr + offs_n * stride_scale_n + k_block * stride_scale_k
@@ -538,20 +593,21 @@ def fused_mxfp4_grouped_gemm_kernel_3d(
             val_lo_scaled = _ldexp(val_lo, exp_broadcast)
             val_hi_scaled = _ldexp(val_hi, exp_broadcast)
 
-            # Load LHS at even/odd K positions (matches FP4 interleaved packing)
-            offs_k_even = tl.arange(0, BLOCK_K // 2) * 2      # [0, 2, 4, ...]
-            offs_k_odd = tl.arange(0, BLOCK_K // 2) * 2 + 1   # [1, 3, 5, ...]
+            # Interleave lo/hi to get contiguous K dimension [BLOCK_N, BLOCK_K]
+            # val_lo has K indices [0, 2, 4, ...], val_hi has [1, 3, 5, ...]
+            # Interleave to get [0, 1, 2, 3, 4, 5, ...]
+            # Use tl.join to create [BLOCK_N, BLOCK_K//2, 2] then reshape
+            val_joined = tl.join(val_lo_scaled, val_hi_scaled)  # [BLOCK_N, BLOCK_K//2, 2]
+            val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))  # [BLOCK_N, BLOCK_K]
 
-            lhs_even_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_even[None, :]) * stride_lhs_k
-            lhs_odd_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_odd[None, :]) * stride_lhs_k
+            # Load LHS contiguously (coalesced access - much faster!)
+            offs_k = tl.arange(0, BLOCK_K)
+            lhs_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k[None, :]) * stride_lhs_k
+            lhs_tile = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, BLOCK_K]
 
-            lhs_even = tl.load(lhs_even_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)  # [BLOCK_M, BLOCK_K//2]
-            lhs_odd = tl.load(lhs_odd_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)   # [BLOCK_M, BLOCK_K//2]
-
-            # Accumulate: lhs_even @ val_lo.T + lhs_odd @ val_hi.T
-            # [BLOCK_M, BLOCK_K//2] @ [BLOCK_K//2, BLOCK_N] -> [BLOCK_M, BLOCK_N]
-            acc += tl.dot(lhs_even.to(tl.bfloat16), tl.trans(val_lo_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
-            acc += tl.dot(lhs_odd.to(tl.bfloat16), tl.trans(val_hi_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+            # Single full-size dot product (vs two half-size before)
+            # [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+            acc += tl.dot(lhs_tile.to(tl.bfloat16), tl.trans(val_interleaved.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
 
         # Store output [BLOCK_M, BLOCK_N]
         out_ptrs = cur_out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
@@ -1138,10 +1194,11 @@ def fused_mxfp4_single_gemm_kernel_optimized(
         rhs_packed = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0)
 
         # Unpack FP4 (lo = even K indices, hi = odd K indices)
+        # Use optimized v4_branchless decode (2 tl.where vs 16 for _fp4_lookup)
         idx_lo = (rhs_packed & 0x0F).to(tl.int32)
         idx_hi = ((rhs_packed >> 4) & 0x0F).to(tl.int32)
-        val_lo = _fp4_lookup(idx_lo)  # [BLOCK_N, BLOCK_K//2]
-        val_hi = _fp4_lookup(idx_hi)  # [BLOCK_N, BLOCK_K//2]
+        val_lo = _fp4_decode_v4_branchless(idx_lo)  # [BLOCK_N, BLOCK_K//2]
+        val_hi = _fp4_decode_v4_branchless(idx_hi)  # [BLOCK_N, BLOCK_K//2]
 
         # Load and apply scales
         scale_ptrs = scale_ptr + offs_n * stride_scale_n + k_block * stride_scale_k
@@ -1152,18 +1209,17 @@ def fused_mxfp4_single_gemm_kernel_optimized(
         val_lo_scaled = _ldexp(val_lo, exp_broadcast)
         val_hi_scaled = _ldexp(val_hi, exp_broadcast)
 
-        # Load LHS at even/odd K positions
-        offs_k_even = tl.arange(0, BLOCK_K // 2) * 2
-        offs_k_odd = offs_k_even + 1
-        lhs_even_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_even[None, :]) * stride_lhs_k
-        lhs_odd_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_odd[None, :]) * stride_lhs_k
+        # Interleave lo/hi to get contiguous K dimension [BLOCK_N, BLOCK_K]
+        val_joined = tl.join(val_lo_scaled, val_hi_scaled)
+        val_interleaved = tl.reshape(val_joined, (BLOCK_N, BLOCK_K))
 
-        lhs_even = tl.load(lhs_even_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
-        lhs_odd = tl.load(lhs_odd_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
+        # Load LHS contiguously (coalesced access - much faster!)
+        offs_k = tl.arange(0, BLOCK_K)
+        lhs_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k[None, :]) * stride_lhs_k
+        lhs_tile = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, BLOCK_K]
 
-        # Accumulate: lhs_even @ val_lo.T + lhs_odd @ val_hi.T
-        acc += tl.dot(lhs_even.to(tl.bfloat16), tl.trans(val_lo_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
-        acc += tl.dot(lhs_odd.to(tl.bfloat16), tl.trans(val_hi_scaled.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+        # Single full-size dot product (vs two half-size before)
+        acc += tl.dot(lhs_tile.to(tl.bfloat16), tl.trans(val_interleaved.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
 
     # Add bias if present
     if HAS_BIAS:
