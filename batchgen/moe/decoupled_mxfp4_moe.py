@@ -239,10 +239,12 @@ def bf16_grouped_gemm_kernel_3d(
     stride_rhs_e, stride_rhs_n, stride_rhs_k,
     # Strides for output [E, M_max, N]
     stride_out_e, stride_out_m, stride_out_n,
-    # Block sizes
+    # Block sizes (must be constexpr for Triton)
     BLOCK_M: tl.constexpr,  # 64
     BLOCK_N: tl.constexpr,  # 64
     BLOCK_K: tl.constexpr,  # 64 (can be larger than MXFP4's 32!)
+    M_MAX_BLOCKS: tl.constexpr,  # cdiv(M_max, BLOCK_M) - compile-time constant
+    K_BLOCKS: tl.constexpr,      # K // BLOCK_K - compile-time constant
 ):
     """BF16 grouped GEMM on pre-dequantized weights.
 
@@ -256,6 +258,7 @@ def bf16_grouped_gemm_kernel_3d(
     - No FP4 lookup or scale loads in inner loop
 
     This kernel loops over M-blocks internally to handle variable tokens per expert.
+    M_MAX_BLOCKS and K_BLOCKS must be compile-time constants for Triton.
     """
     expert_idx = tl.program_id(axis=0)
     n_pid = tl.program_id(axis=1)
@@ -274,20 +277,20 @@ def bf16_grouped_gemm_kernel_3d(
     offs_n = n_pid * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
 
-    # Number of M-blocks to process
-    num_m_blocks = tl.cdiv(num_tokens, BLOCK_M)
-
-    # Process each M-block
-    for m_block in range(num_m_blocks):
+    # Process each M-block (fixed loop bound for Triton)
+    for m_block in range(M_MAX_BLOCKS):
         offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
         m_mask = offs_m < num_tokens
+
+        # Skip if this entire M-block is beyond num_tokens
+        if m_block * BLOCK_M >= num_tokens:
+            continue
 
         # Initialize accumulator
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # K-loop
-        num_k_blocks = K // BLOCK_K
-        for k_block in range(num_k_blocks):
+        # K-loop (fixed bound)
+        for k_block in range(K_BLOCKS):
             k_start = k_block * BLOCK_K
             offs_k = tl.arange(0, BLOCK_K)
 
@@ -346,6 +349,10 @@ def bf16_grouped_gemm_3d(
     if expert_counts.dtype != torch.int32:
         expert_counts = expert_counts.to(torch.int32)
 
+    # Compute compile-time loop bounds
+    M_MAX_BLOCKS = triton.cdiv(M_max, BLOCK_M)
+    K_BLOCKS = K // BLOCK_K
+
     # Allocate output
     output_3d = torch.empty(num_experts, M_max, N, dtype=torch.bfloat16, device=device)
 
@@ -359,6 +366,7 @@ def bf16_grouped_gemm_3d(
         weight_buffer.stride(0), weight_buffer.stride(1), weight_buffer.stride(2),
         output_3d.stride(0), output_3d.stride(1), output_3d.stride(2),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        M_MAX_BLOCKS=M_MAX_BLOCKS, K_BLOCKS=K_BLOCKS,
         num_warps=num_warps,
     )
 
