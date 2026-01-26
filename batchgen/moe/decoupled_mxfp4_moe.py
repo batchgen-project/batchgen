@@ -62,7 +62,7 @@ MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
 #   v4_branchless: Branchless bit manipulation (construct IEEE float directly)
 
 # Version names for benchmarking
-FP4_DECODE_VERSIONS = ["v1_sequential", "v2_e2m1", "v3_binary_tree", "v4_branchless"]
+FP4_DECODE_VERSIONS = ["v1_sequential", "v2_e2m1", "v3_binary_tree", "v4_branchless", "v5_memopt"]
 
 # =============================================================================
 # V1: Sequential 16 tl.where() - BASELINE (slowest)
@@ -571,12 +571,139 @@ def batch_mxfp4_dequant_kernel_v4_branchless(
     tl.store(out_ptrs, val_interleaved, mask=out_mask)
 
 
+# =============================================================================
+# V5: Memory-Optimized with BLOCK_K=64 (2x scale blocks per tile)
+# =============================================================================
+# Key optimizations:
+# 1. BLOCK_K=64 reduces grid from 160 to 80 K-blocks (2x less overhead)
+# 2. Load two scales per tile, apply to respective 32-value halves
+# 3. Process packed weights in two phases (32 values each)
+# 4. Uses v4_branchless decode (fastest)
+#
+# Expected improvement: ~1.3x from reduced grid overhead
+
+@triton.jit
+def batch_mxfp4_dequant_kernel_v5_memopt(
+    packed_ptrs, scale_ptrs, output_ptr,
+    N, K, K_packed, K_scale,
+    stride_packed_n, stride_packed_k,
+    stride_scale_n, stride_scale_k,
+    stride_out_e, stride_out_n, stride_out_k,
+    stride_ptrs,
+    BLOCK_N: tl.constexpr,   # 128
+    BLOCK_K: tl.constexpr,   # 64 (processes 2 scale blocks)
+):
+    """V5: Memory-optimized with BLOCK_K=64.
+
+    This kernel processes 64 K values per tile instead of 32, which:
+    - Reduces grid size by 2x (from ~2M to ~1M blocks)
+    - Better amortizes kernel launch overhead
+    - Improves cache locality for packed weights
+
+    Each tile loads TWO scales (for K positions 0-31 and 32-63).
+    """
+    expert_idx = tl.program_id(axis=0)
+    n_block = tl.program_id(axis=1)
+    k_block = tl.program_id(axis=2)
+    expert_idx_64 = expert_idx.to(tl.int64)
+
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+
+    # With BLOCK_K=64, each tile spans 2 scale blocks
+    # Scale block 0: covers K positions [0, 32)
+    # Scale block 1: covers K positions [32, 64)
+    scale_k_lo = k_block * 2       # Scale for first 32 K values
+    scale_k_hi = k_block * 2 + 1   # Scale for second 32 K values
+
+    # Load scales for both halves
+    scale_ptrs_lo = scale_base + offs_n * stride_scale_n + scale_k_lo * stride_scale_k
+    scale_ptrs_hi = scale_base + offs_n * stride_scale_n + scale_k_hi * stride_scale_k
+
+    # Only load second scale if within bounds
+    scales_lo = tl.load(scale_ptrs_lo, mask=n_mask, other=127).to(tl.int32) - 127
+    hi_scale_mask = n_mask & (scale_k_hi < K_scale)
+    scales_hi = tl.load(scale_ptrs_hi, mask=hi_scale_mask, other=127).to(tl.int32) - 127
+
+    # === First half: K positions [k_block*64, k_block*64 + 32) ===
+    # Packed offset: k_block * 32 (since 64 K values = 32 packed bytes)
+    k_packed_start_lo = k_block * 32  # BLOCK_K=64, first half is 32 packed bytes
+    offs_k_packed = tl.arange(0, 16)  # 16 bytes = 32 FP4 values
+
+    packed_ptrs_lo = packed_base + offs_n[:, None] * stride_packed_n + \
+                     (k_packed_start_lo + offs_k_packed[None, :]) * stride_packed_k
+    packed_mask_lo = n_mask[:, None] & ((k_packed_start_lo + offs_k_packed[None, :]) < K_packed)
+    packed_lo = tl.load(packed_ptrs_lo, mask=packed_mask_lo, other=0)
+
+    # Unpack first half
+    idx_lo_0 = (packed_lo & 0x0F).to(tl.int32)
+    idx_hi_0 = ((packed_lo >> 4) & 0x0F).to(tl.int32)
+
+    val_lo_0 = _fp4_decode_v4_branchless(idx_lo_0)
+    val_hi_0 = _fp4_decode_v4_branchless(idx_hi_0)
+
+    # Apply first scale (covers K positions 0-31)
+    exp_lo = scales_lo[:, None] + tl.zeros((1, 16), dtype=tl.int32)
+    val_lo_0_scaled = _ldexp(val_lo_0, exp_lo).to(tl.bfloat16)
+    val_hi_0_scaled = _ldexp(val_hi_0, exp_lo).to(tl.bfloat16)
+
+    # Interleave first half: [BLOCK_N, 32]
+    val_joined_0 = tl.join(val_lo_0_scaled, val_hi_0_scaled)  # [BLOCK_N, 16, 2]
+    val_first_half = tl.reshape(val_joined_0, (BLOCK_N, 32))
+
+    # Store first half
+    k_start = k_block * BLOCK_K
+    offs_k_first = tl.arange(0, 32)
+    out_ptrs_first = output_ptr + expert_idx_64 * stride_out_e + \
+                     offs_n[:, None] * stride_out_n + \
+                     (k_start + offs_k_first[None, :]) * stride_out_k
+    out_mask_first = n_mask[:, None] & ((k_start + offs_k_first[None, :]) < K)
+    tl.store(out_ptrs_first, val_first_half, mask=out_mask_first)
+
+    # === Second half: K positions [k_block*64 + 32, k_block*64 + 64) ===
+    k_packed_start_hi = k_packed_start_lo + 16  # Next 16 bytes
+
+    packed_ptrs_hi = packed_base + offs_n[:, None] * stride_packed_n + \
+                     (k_packed_start_hi + offs_k_packed[None, :]) * stride_packed_k
+    packed_mask_hi = n_mask[:, None] & ((k_packed_start_hi + offs_k_packed[None, :]) < K_packed)
+    packed_hi = tl.load(packed_ptrs_hi, mask=packed_mask_hi, other=0)
+
+    # Unpack second half
+    idx_lo_1 = (packed_hi & 0x0F).to(tl.int32)
+    idx_hi_1 = ((packed_hi >> 4) & 0x0F).to(tl.int32)
+
+    val_lo_1 = _fp4_decode_v4_branchless(idx_lo_1)
+    val_hi_1 = _fp4_decode_v4_branchless(idx_hi_1)
+
+    # Apply second scale (covers K positions 32-63)
+    exp_hi = scales_hi[:, None] + tl.zeros((1, 16), dtype=tl.int32)
+    val_lo_1_scaled = _ldexp(val_lo_1, exp_hi).to(tl.bfloat16)
+    val_hi_1_scaled = _ldexp(val_hi_1, exp_hi).to(tl.bfloat16)
+
+    # Interleave second half: [BLOCK_N, 32]
+    val_joined_1 = tl.join(val_lo_1_scaled, val_hi_1_scaled)  # [BLOCK_N, 16, 2]
+    val_second_half = tl.reshape(val_joined_1, (BLOCK_N, 32))
+
+    # Store second half
+    k_start_hi = k_start + 32
+    offs_k_second = tl.arange(0, 32)
+    out_ptrs_second = output_ptr + expert_idx_64 * stride_out_e + \
+                      offs_n[:, None] * stride_out_n + \
+                      (k_start_hi + offs_k_second[None, :]) * stride_out_k
+    out_mask_second = n_mask[:, None] & ((k_start_hi + offs_k_second[None, :]) < K)
+    tl.store(out_ptrs_second, val_second_half, mask=out_mask_second)
+
+
 # Mapping from version name to kernel function (for Python wrapper)
 _DEQUANT_KERNELS = {
     "v1_sequential": batch_mxfp4_dequant_kernel_v1_sequential,
     "v2_e2m1": batch_mxfp4_dequant_kernel_v2_e2m1,
     "v3_binary_tree": batch_mxfp4_dequant_kernel_v3_binary_tree,
     "v4_branchless": batch_mxfp4_dequant_kernel_v4_branchless,
+    "v5_memopt": batch_mxfp4_dequant_kernel_v5_memopt,
 }
 
 
@@ -588,7 +715,7 @@ def batch_mxfp4_dequant(
     scale_ref: torch.Tensor,      # Reference tensor for strides [N, K//32]
     BLOCK_N: int = 128,
     BLOCK_K: int = 32,
-    version: str = "v2_e2m1",     # FP4 decode version: v1_sequential, v2_e2m1, v3_binary_tree, v4_branchless
+    version: str = "v2_e2m1",     # FP4 decode version: v1_sequential, v2_e2m1, v3_binary_tree, v4_branchless, v5_memopt
 ) -> None:
     """Batch dequantize all experts' MXFP4 weights into BF16 buffer.
 
@@ -600,17 +727,24 @@ def batch_mxfp4_dequant(
         scale_ref: Reference scale tensor for computing strides
         BLOCK_N: Tile size for N dimension (default 128, larger = fewer blocks)
         BLOCK_K: Tile size for K dimension (default 32, MUST match MXFP4 scale block)
+                 For v5_memopt, this is automatically set to 64.
         version: FP4 decode version for benchmarking:
             - "v1_sequential": 16 sequential tl.where() (baseline, slowest)
             - "v2_e2m1": E2M1 arithmetic decode (5-6 tl.where)
             - "v3_binary_tree": Binary tree lookup (4 tl.where)
             - "v4_branchless": Branchless bit manipulation (IEEE float construction)
+            - "v5_memopt": Memory-optimized with BLOCK_K=64 (2x fewer K-blocks)
     """
     num_experts = packed_ptrs.shape[0]
     N = output.shape[1]
     K = output.shape[2]
     K_packed = K // 2
     K_scale = K // 32
+
+    # v5_memopt uses BLOCK_K=64 (processes 2 scale blocks per tile)
+    if version == "v5_memopt":
+        BLOCK_K = 64
+        assert K % 64 == 0, f"K ({K}) must be divisible by 64 for v5_memopt"
 
     # Grid: (num_experts, cdiv(N, BLOCK_N), cdiv(K, BLOCK_K))
     grid = (num_experts, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
@@ -1264,6 +1398,7 @@ def benchmark_all_dequant_versions(
             "v2_e2m1": "E2M1 arithmetic (5-6 where)",
             "v3_binary_tree": "Binary tree (4 where)",
             "v4_branchless": "IEEE bitcast (2 where)",
+            "v5_memopt": "BLOCK_K=64, 2x fewer K-blocks",
         }
 
         for version in FP4_DECODE_VERSIONS:

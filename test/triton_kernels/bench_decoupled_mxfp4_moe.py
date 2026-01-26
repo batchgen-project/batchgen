@@ -246,6 +246,7 @@ def benchmark_all_dequant_versions(
         "v2_e2m1": "E2M1 arithmetic (5-6 where)",
         "v3_binary_tree": "Binary tree (4 where)",
         "v4_branchless": "IEEE bitcast (2 where)",
+        "v5_memopt": "BLOCK_K=64, 2x fewer K-blocks",
     }
 
     print(f"\n{'='*70}")
@@ -976,6 +977,7 @@ Examples:
                     "v2_e2m1": "E2M1 arithmetic",
                     "v3_binary_tree": "Binary tree lookup",
                     "v4_branchless": "IEEE bitcast",
+                    "v5_memopt": "BLOCK_K=64, 2x fewer blocks",
                 }.get(version, "")
                 print(f"Triton {version:<26} {time_ms:<12.3f} {notes}")
 
