@@ -239,12 +239,10 @@ def bf16_grouped_gemm_kernel_3d(
     stride_rhs_e, stride_rhs_n, stride_rhs_k,
     # Strides for output [E, M_max, N]
     stride_out_e, stride_out_m, stride_out_n,
-    # Block sizes (must be constexpr for Triton)
+    # Block sizes (constexpr for Triton)
     BLOCK_M: tl.constexpr,  # 64
     BLOCK_N: tl.constexpr,  # 64
     BLOCK_K: tl.constexpr,  # 64 (can be larger than MXFP4's 32!)
-    M_MAX_BLOCKS: tl.constexpr,  # cdiv(M_max, BLOCK_M) - compile-time constant
-    K_BLOCKS: tl.constexpr,      # K // BLOCK_K - compile-time constant
 ):
     """BF16 grouped GEMM on pre-dequantized weights.
 
@@ -258,7 +256,7 @@ def bf16_grouped_gemm_kernel_3d(
     - No FP4 lookup or scale loads in inner loop
 
     This kernel loops over M-blocks internally to handle variable tokens per expert.
-    M_MAX_BLOCKS and K_BLOCKS must be compile-time constants for Triton.
+    Uses dynamic loop bounds (like the working fused MXFP4 kernel).
     """
     expert_idx = tl.program_id(axis=0)
     n_pid = tl.program_id(axis=1)
@@ -277,23 +275,24 @@ def bf16_grouped_gemm_kernel_3d(
     offs_n = n_pid * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
 
-    # Process each M-block (fixed loop bound for Triton)
-    # Triton doesn't support runtime conditionals in loops, so we always execute
-    # the full loop body and rely on masking to handle invalid positions.
-    # The mask ensures loads return 0 for invalid rows and stores are no-ops.
-    for m_block in range(M_MAX_BLOCKS):
+    # Compute dynamic loop bounds (same pattern as working fused kernel)
+    num_m_blocks = tl.cdiv(num_tokens, BLOCK_M)
+    num_k_blocks = K // BLOCK_K
+
+    # Process each M-block
+    for m_block in range(num_m_blocks):
         offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
         m_mask = offs_m < num_tokens
 
-        # Initialize accumulator (always, even for invalid blocks - will be masked on store)
+        # Initialize accumulator
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # K-loop (fixed bound)
-        for k_block in range(K_BLOCKS):
+        # K-loop
+        for k_block in range(num_k_blocks):
             k_start = k_block * BLOCK_K
             offs_k = tl.arange(0, BLOCK_K)
 
-            # Load LHS [BLOCK_M, BLOCK_K] - masked loads return 0 for invalid rows
+            # Load LHS [BLOCK_M, BLOCK_K]
             lhs_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + \
                        (k_start + offs_k[None, :]) * stride_lhs_k
             lhs = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)
@@ -303,13 +302,11 @@ def bf16_grouped_gemm_kernel_3d(
                        (k_start + offs_k[None, :]) * stride_rhs_k
             rhs = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0.0)
 
-            # Accumulate: lhs @ rhs.T
-            # lhs: [BLOCK_M, BLOCK_K], rhs: [BLOCK_N, BLOCK_K]
-            # Result: [BLOCK_M, BLOCK_N]
+            # Accumulate: lhs @ rhs.T (use allow_tf32=False like working kernel)
             acc += tl.dot(lhs.to(tl.bfloat16), tl.trans(rhs.to(tl.bfloat16)),
-                          allow_tf32=True).to(tl.float32)
+                          allow_tf32=False).to(tl.float32)
 
-        # Store output [BLOCK_M, BLOCK_N] - masked store is a no-op for invalid positions
+        # Store output [BLOCK_M, BLOCK_N]
         out_ptrs = cur_out_ptr + offs_m[:, None] * stride_out_m + \
                    offs_n[None, :] * stride_out_n
         out_mask = m_mask[:, None] & n_mask[None, :]
@@ -348,10 +345,6 @@ def bf16_grouped_gemm_3d(
     if expert_counts.dtype != torch.int32:
         expert_counts = expert_counts.to(torch.int32)
 
-    # Compute compile-time loop bounds
-    M_MAX_BLOCKS = triton.cdiv(M_max, BLOCK_M)
-    K_BLOCKS = K // BLOCK_K
-
     # Allocate output
     output_3d = torch.empty(num_experts, M_max, N, dtype=torch.bfloat16, device=device)
 
@@ -365,7 +358,6 @@ def bf16_grouped_gemm_3d(
         weight_buffer.stride(0), weight_buffer.stride(1), weight_buffer.stride(2),
         output_3d.stride(0), output_3d.stride(1), output_3d.stride(2),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        M_MAX_BLOCKS=M_MAX_BLOCKS, K_BLOCKS=K_BLOCKS,
         num_warps=num_warps,
     )
 
