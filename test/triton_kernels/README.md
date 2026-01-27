@@ -24,8 +24,11 @@ python bench_mxfp4_moe.py --compare-cuda
 # GEMM hyperparameter tuning (grid search)
 python bench_mxfp4_moe.py --tune-gemm --tokens 4
 
-# Numerical validation only
+# Numerical validation only (Triton + CuTe)
 python bench_mxfp4_moe.py --validate
+
+# Skip validation (faster benchmarking)
+python bench_mxfp4_moe.py --compare-fp4 --skip-validation
 
 # Export results to CSV
 python bench_mxfp4_moe.py --compare-all --output results.csv
@@ -94,12 +97,14 @@ The dequantization kernel has multiple decode implementations with different per
 | **v7_fast_scale** | **19.8** | **29.0%** | **tl.exp2** | **BEST Triton** |
 | v8_ieee_pow2 | 22.0 | 26.0% | Direct IEEE | Slower than v7 |
 
-### CuTe CUDA Kernels (Experimental)
+### CuTe CUDA Kernels
 
-| Version | Target | Method | Notes |
-|---------|--------|--------|-------|
-| cute_simple | ~10 ms | Vectorized 128-bit I/O | smem LUT, hw ldexp |
-| cute_swizzle | ~10 ms | + Swizzled smem | 0 bank conflicts |
+| Version | Time (ms)* | HBM % | Method | Notes |
+|---------|-----------|-------|--------|-------|
+| **cute_simple** | **15.9** | **36.1%** | Vectorized 128-bit I/O | **BEST** - smem LUT, hw ldexp |
+| cute_swizzle | 17.8 | 32.3% | + Swizzled smem | Slightly slower on H20 |
+
+**CuTe is 1.24x faster than Triton v7** (15.9 ms vs 19.8 ms)
 
 *Benchmarked on H20 with 128 experts, 4 tokens/expert, GPT-OSS-120B dimensions
 

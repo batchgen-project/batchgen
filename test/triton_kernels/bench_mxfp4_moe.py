@@ -406,6 +406,125 @@ def validate_dequant_versions(
     return all_pass
 
 
+def validate_cute_dequant_versions(
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    num_experts: int,
+    N: int,
+    K: int,
+    device: str = "cuda",
+    num_experts_to_check: int = 3,
+    tolerance: float = 0.01,
+) -> bool:
+    """Validate CuTe CUDA dequant kernel versions produce correct output.
+
+    Returns True if all versions pass validation, False otherwise.
+    """
+    try:
+        from batchgen.moe.cute_mxfp4_dequant import batch_mxfp4_dequant_cute
+    except ImportError as e:
+        print(f"  Cannot import CuTe kernel: {e}")
+        return False
+
+    print(f"\n{'='*70}")
+    print("CUTE CUDA NUMERICAL VALIDATION")
+    print(f"{'='*70}")
+    print(f"Checking {num_experts_to_check} experts against PyTorch reference")
+    print(f"Tolerance: {tolerance*100:.1f}% relative error")
+    print(f"{'='*70}")
+
+    # Generate reference outputs
+    print("\nGenerating reference outputs...")
+    ref_outputs = []
+    for i in range(min(num_experts_to_check, num_experts)):
+        ref = reference_mxfp4_dequant(weights[i], scales[i])
+        ref_outputs.append(ref)
+    print(f"  Reference shape: {ref_outputs[0].shape}")
+
+    # Setup pointer arrays
+    weight_ptrs = torch.tensor(
+        [w.data_ptr() for w in weights], dtype=torch.int64, device=device
+    )
+
+    # CuTe uses K-major scales: [K//32, N] (transposed)
+    scales_transposed = [s.t().contiguous() for s in scales]
+    scale_ptrs = torch.tensor(
+        [s.data_ptr() for s in scales_transposed], dtype=torch.int64, device=device
+    )
+
+    # Allocate BF16 buffer
+    bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
+
+    all_pass = True
+    results_summary = []
+
+    cute_versions = [
+        ("cute_simple", 0),
+        ("cute_swizzle", 1),
+    ]
+
+    for version_name, kernel_ver in cute_versions:
+        print(f"\nValidating {version_name}...")
+        try:
+            # Run kernel
+            batch_mxfp4_dequant_cute(
+                weight_ptrs, scale_ptrs, bf16_buffer,
+                weights[0], scales_transposed[0], kernel_version=kernel_ver
+            )
+            torch.cuda.synchronize()
+
+            # Check each expert
+            version_pass = True
+            max_rel_errors = []
+            for i in range(min(num_experts_to_check, num_experts)):
+                kernel_out = bf16_buffer[i]
+                ref_out = ref_outputs[i]
+
+                diff = (kernel_out.float() - ref_out.float()).abs()
+                rel_diff = (diff / ref_out.float().abs().clamp(min=1e-6)).max().item()
+                max_rel_errors.append(rel_diff)
+
+                if rel_diff > tolerance:
+                    print(f"  FAIL expert {i}: max_rel_error={rel_diff:.4f} > {tolerance*100:.1f}%")
+                    version_pass = False
+                else:
+                    print(f"  PASS expert {i}: max_rel_error={rel_diff:.6f}")
+
+            avg_rel_error = sum(max_rel_errors) / len(max_rel_errors)
+            status = "PASS" if version_pass else "FAIL"
+            results_summary.append((version_name, status, avg_rel_error))
+
+            if not version_pass:
+                all_pass = False
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            results_summary.append((version_name, "ERROR", float('nan')))
+            all_pass = False
+
+    # Print summary
+    print(f"\n{'='*70}")
+    print("CUTE VALIDATION SUMMARY")
+    print(f"{'='*70}")
+    print(f"{'Version':<20} {'Status':<10} {'Avg Rel Error':<15}")
+    print("-" * 70)
+    for version, status, avg_err in results_summary:
+        if status == "ERROR":
+            print(f"{version:<20} {status:<10} {'N/A':<15}")
+        else:
+            print(f"{version:<20} {status:<10} {avg_err:.6f} ({avg_err*100:.4f}%)")
+    print(f"{'='*70}")
+
+    if all_pass:
+        print("ALL CUTE VERSIONS PASSED VALIDATION")
+    else:
+        print("SOME CUTE VERSIONS FAILED VALIDATION")
+
+    return all_pass
+
+
 # =============================================================================
 # Benchmark Functions: Fused MXFP4 Grouped GEMM
 # =============================================================================
@@ -1284,10 +1403,16 @@ def run_fp4_comparison(
     # Validate first
     if not skip_validation:
         print("\nRunning numerical validation...")
-        if not validate_dequant_versions(weights, scales, num_experts, N, K, device):
-            print("ERROR: Validation failed!")
+        triton_pass = validate_dequant_versions(weights, scales, num_experts, N, K, device)
+        if not triton_pass:
+            print("ERROR: Triton validation failed!")
             return {}
-        print("Validation passed.\n")
+
+        if include_cuda:
+            cute_pass = validate_cute_dequant_versions(weights, scales, num_experts, N, K, device)
+            if not cute_pass:
+                print("WARNING: CuTe validation failed! Continuing with benchmark...")
+        print("Validation completed.\n")
 
     # Benchmark Triton versions
     print("\nBenchmarking Triton versions...")
@@ -1468,7 +1593,21 @@ Examples:
             for _ in range(num_experts)
         ]
 
-        success = validate_dequant_versions(weights, scales, num_experts, N, K, device)
+        # Validate Triton kernels
+        triton_success = validate_dequant_versions(weights, scales, num_experts, N, K, device)
+
+        # Validate CuTe CUDA kernels
+        cute_success = validate_cute_dequant_versions(weights, scales, num_experts, N, K, device)
+
+        # Overall summary
+        print(f"\n{'='*70}")
+        print("OVERALL VALIDATION SUMMARY")
+        print(f"{'='*70}")
+        print(f"Triton kernels: {'PASS' if triton_success else 'FAIL'}")
+        print(f"CuTe CUDA kernels: {'PASS' if cute_success else 'FAIL'}")
+        print(f"{'='*70}")
+
+        success = triton_success and cute_success
         sys.exit(0 if success else 1)
 
     # FP4 comparison mode
@@ -1499,6 +1638,14 @@ Examples:
             torch.randint(120, 134, (N, K // 32), dtype=torch.uint8, device="cuda")
             for _ in range(num_experts)
         ]
+
+        # Validate CuTe kernels first
+        if not args.skip_validation:
+            print("\nRunning CuTe numerical validation...")
+            if not validate_cute_dequant_versions(weights, scales, num_experts, N, K, "cuda"):
+                print("ERROR: CuTe validation failed!")
+                sys.exit(1)
+            print("CuTe validation passed.\n")
 
         # Benchmark CuTe CUDA versions
         print("\nBenchmarking CuTe CUDA versions...")
