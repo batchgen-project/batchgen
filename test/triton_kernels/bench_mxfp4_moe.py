@@ -1896,7 +1896,7 @@ Examples:
     )
     mode_group.add_argument(
         "--compare-cute-fused-v2", action="store_true",
-        help="CuTe fused MXFP4 GEMM V2 (routed-only, vectorized) vs Triton comparison"
+        help="CuTe fused MXFP4 GEMM V3 (routed-only, vectorized, FP32 accum) vs Triton comparison"
     )
 
     # Common options
@@ -2158,11 +2158,11 @@ Examples:
 
         sys.exit(0)
 
-    # CuTe fused GEMM V2 comparison mode (routed-only, vectorized)
+    # CuTe fused GEMM V3 comparison mode (routed-only, vectorized, FP32 accum)
     if args.compare_cute_fused_v2:
         print(f"\n{'='*70}")
-        print("CUTE FUSED MXFP4 GEMM V2 vs TRITON COMPARISON")
-        print("(Routed-Only + Vectorized Dequant)")
+        print("CUTE FUSED MXFP4 GEMM V3 vs TRITON COMPARISON")
+        print("(Routed-Only + Vectorized Dequant + FP32 Accumulator)")
         print(f"{'='*70}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"Config: {config['num_experts']} experts")
@@ -2185,17 +2185,17 @@ Examples:
                 num_experts, tpe, K, N, "cuda", per_expert_weights=True
             )
 
-            # Validate CuTe fused GEMM V2 first (unless skipped)
+            # Validate CuTe fused GEMM V3 first (unless skipped)
             if not args.skip_validation:
-                print("\nRunning CuTe fused GEMM V2 validation...")
+                print("\nRunning CuTe fused GEMM V3 validation...")
                 validation_pass = validate_cute_fused_gemm_v2(
                     hidden_3d, weights, scales, N, "cuda"
                 )
                 if not validation_pass:
-                    print("\nWARNING: CuTe fused GEMM V2 validation FAILED!")
+                    print("\nWARNING: CuTe fused GEMM V3 validation FAILED!")
                     print("Continuing with benchmark, but results may be incorrect...")
                 else:
-                    print("\nCuTe fused GEMM V2 validation passed.\n")
+                    print("\nCuTe fused GEMM V3 validation passed.\n")
 
             # Benchmark Triton fused GEMM
             print("\nBenchmarking Triton fused MXFP4 GEMM...")
@@ -2207,8 +2207,8 @@ Examples:
                 hidden_3d, weights, scales, N, kernel_version=1
             )
 
-            # Benchmark CuTe fused GEMM V2 (routed-only, vectorized)
-            print("Benchmarking CuTe fused MXFP4 GEMM V2 (routed-only)...")
+            # Benchmark CuTe fused GEMM V3 (routed-only, vectorized, FP32 accum)
+            print("Benchmarking CuTe fused MXFP4 GEMM V3 (routed-only, FP32 accum)...")
             cute_v2_time = benchmark_cute_fused_mxfp4_gemm_v2(
                 hidden_3d, weights, scales, N
             )
@@ -2235,21 +2235,21 @@ Examples:
 
             if cute_v2_time != float('inf') and triton_time != float('inf'):
                 speedup = triton_time / cute_v2_time
-                v1_v2_speedup = cute_v1_wmma_time / cute_v2_time if cute_v1_wmma_time != float('inf') else 0
-                print(f"{'CuTe fused MXFP4 V2 (routed+vectorized)':<40} {cute_v2_time:>12.3f} {speedup:>11.2f}x")
+                v1_v3_speedup = cute_v1_wmma_time / cute_v2_time if cute_v1_wmma_time != float('inf') else 0
+                print(f"{'CuTe fused MXFP4 V3 (routed+FP32 accum)':<40} {cute_v2_time:>12.3f} {speedup:>11.2f}x")
                 if cute_v1_wmma_time != float('inf'):
-                    print(f"  V2 vs V1 speedup: {v1_v2_speedup:.2f}x")
+                    print(f"  V3 vs V1 speedup: {v1_v3_speedup:.2f}x")
             elif cute_v2_time != float('inf'):
-                print(f"{'CuTe fused MXFP4 V2 (routed+vectorized)':<40} {cute_v2_time:>12.3f}")
+                print(f"{'CuTe fused MXFP4 V3 (routed+FP32 accum)':<40} {cute_v2_time:>12.3f}")
             else:
-                print(f"{'CuTe fused MXFP4 V2 (routed+vectorized)':<40} {'FAILED':>12}")
+                print(f"{'CuTe fused MXFP4 V3 (routed+FP32 accum)':<40} {'FAILED':>12}")
 
             print(f"{'='*70}")
 
             results[tpe] = {
                 "triton": triton_time,
                 "cute_v1_wmma": cute_v1_wmma_time,
-                "cute_v2": cute_v2_time,
+                "cute_v3": cute_v2_time,  # V3 = fixed FP32 accumulator version
             }
 
         sys.exit(0)
