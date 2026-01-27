@@ -18,9 +18,12 @@
 
 import io
 import os
+import shutil
 import sys
+from pathlib import Path
 
 from setuptools import find_packages, setup
+from setuptools.command.build_py import build_py
 
 torch_available = True
 try:
@@ -69,6 +72,40 @@ def read_readme() -> str:
         return ""
 
 
+class CustomBuildPy(build_py):
+    """Custom build that copies source directories into batchgen/ for packaging."""
+
+    def run(self):
+        self._prepare_package_data()
+        super().run()
+
+    def _prepare_package_data(self):
+        root = Path(ROOT_DIR)
+        batchgen_dir = root / "batchgen"
+
+        # Directories to copy into batchgen/
+        for src_name in ["core", "external", "op_builder"]:
+            src = root / src_name
+            dst = batchgen_dir / src_name
+
+            if not src.exists():
+                print(f"[WARNING] Source directory {src} does not exist, skipping")
+                continue
+
+            # Remove symlink if exists
+            if dst.is_symlink():
+                print(f"Removing symlink {dst}")
+                dst.unlink()
+
+            # Remove existing directory to get fresh copy
+            if dst.exists() and dst.is_dir():
+                shutil.rmtree(dst)
+
+            # Copy the directory
+            print(f"Copying {src} -> {dst}")
+            shutil.copytree(src, dst)
+
+
 install_requires = fetch_requirements("requirements.txt")
 
 ext_modules = []
@@ -88,7 +125,8 @@ if BUILD_OP_DEFAULT:
             ext_modules.append(builder.builder())
 
 cmdclass = {
-    "build_ext": cpp_extension.BuildExtension.with_options(use_ninja=True)
+    "build_py": CustomBuildPy,
+    "build_ext": cpp_extension.BuildExtension.with_options(use_ninja=True),
 }
 
 print(f"find_packages: {find_packages()}")
@@ -98,26 +136,32 @@ setup(
     name="batchgen",
     version=os.getenv("MOEGEN_VERSION", "0.1"),
     packages=find_packages(
-        exclude=["op_builder", "op_builder.*", "external/*"],
         include=[
             "batchgen",
-            "batchgen.core_engine",
             "batchgen.*",
-            "batchgen.models",
-            "batchgen.models.**",
         ],
     ),
     package_data={
         "batchgen": [
-            "**/*.cpp",
-            "**/*.h",
-            "**/*.cc",
-            "**/*.hpp",
-            "**/*.cu",
-            "**/*.py",
+            # C++ source files for JIT compilation
+            "core/**/*.cpp",
+            "core/**/*.cu",
+            "core/**/*.h",
+            "core/**/*.hpp",
+            "core/**/*.cc",
+            "external/**/*.h",
+            "external/**/*.hpp",
+            "external/**/*.cpp",
+            "external/**/*.cc",
+            "external/**/*.rst",
+            # Op builder Python files
+            "op_builder/**/*.py",
+            # Data files (tokenizers, configs, etc.)
+            "**/*.json",
+            "**/*.parquet",
+            # Compiled binaries
             "**/*.so",
         ],
-        "batchgen.core_engine": ["**/*.so"],
     },
     include_package_data=True,
     install_requires=install_requires,
