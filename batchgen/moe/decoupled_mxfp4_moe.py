@@ -1080,8 +1080,8 @@ def batch_mxfp4_dequant_kernel_v8_ieee_pow2(
     expert_idx_64 = expert_idx.to(tl.int64)
 
     # Get base pointers for this expert
-    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.uint64)
-    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.uint64)
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.pointer_type(tl.uint8))
 
     # Block offsets
     n_start = n_block * BLOCK_N
