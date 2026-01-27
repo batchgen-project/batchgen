@@ -535,6 +535,117 @@ def validate_cute_fused_gemm(
     return all_pass
 
 
+def validate_cute_fused_gemm_v2(
+    hidden_3d: torch.Tensor,
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    device: str = "cuda",
+    num_experts_to_check: int = 3,
+    tolerance: float = 0.02,
+) -> bool:
+    """Validate CuTe fused MXFP4 GEMM V2 (routed-only) produces correct output.
+
+    Compares CuTe fused GEMM V2 output against reference (PyTorch dequant + matmul).
+
+    Returns True if validation passes, False otherwise.
+    """
+    try:
+        from batchgen.moe.cute_fused_mxfp4_gemm_v2 import cute_grouped_mxfp4_gemm_3d_v2
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+        from batchgen.quantization.mxfp4 import mxfp4_dequantize
+    except ImportError as e:
+        print(f"  Cannot import CuTe fused GEMM V2: {e}")
+        return False
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+    K = hidden_3d.shape[2]
+
+    print(f"\n{'='*70}")
+    print("CUTE FUSED MXFP4 GEMM V2 VALIDATION (Routed-Only)")
+    print(f"{'='*70}")
+    print(f"Checking {min(num_experts_to_check, num_experts)} experts against PyTorch reference")
+    print(f"Config: {tokens_per_expert} tokens/expert, N={N}, K={K}")
+    print(f"Tolerance: {tolerance*100:.1f}% relative error")
+    print(f"{'='*70}")
+
+    # Generate reference outputs using PyTorch
+    print("\nGenerating reference outputs (PyTorch dequant + matmul)...")
+    ref_outputs = []
+    for i in range(min(num_experts_to_check, num_experts)):
+        # Dequantize weight
+        weight_bf16 = mxfp4_dequantize(weights[i], scales[i], dtype=torch.bfloat16)
+        # Compute matmul: [M, K] @ [K, N] -> [M, N]
+        ref_out = torch.mm(hidden_3d[i], weight_bf16.T)
+        ref_outputs.append(ref_out)
+    print(f"  Reference shape: {ref_outputs[0].shape}")
+
+    # Setup pointer arrays
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=device
+    )
+
+    print("\nValidating cute_fused_v2...")
+    try:
+        # Run kernel
+        output = cute_grouped_mxfp4_gemm_3d_v2(
+            hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+            N, weights[0], scales[0]
+        )
+        torch.cuda.synchronize()
+
+        # Check each expert
+        all_pass = True
+        max_rel_errors = []
+        for i in range(min(num_experts_to_check, num_experts)):
+            kernel_out = output[i]
+            ref_out = ref_outputs[i]
+
+            # Compute relative error
+            diff = (kernel_out.float() - ref_out.float()).abs()
+            ref_abs = ref_out.float().abs().clamp(min=1e-6)
+            rel_diff = (diff / ref_abs).max().item()
+            max_rel_errors.append(rel_diff)
+
+            # Also compute absolute max difference
+            abs_diff = diff.max().item()
+
+            if rel_diff > tolerance:
+                print(f"  FAIL expert {i}: max_rel_error={rel_diff:.4f} ({rel_diff*100:.2f}%), "
+                      f"abs_diff={abs_diff:.6f}")
+                all_pass = False
+            else:
+                print(f"  PASS expert {i}: max_rel_error={rel_diff:.6f} ({rel_diff*100:.4f}%), "
+                      f"abs_diff={abs_diff:.6f}")
+
+        avg_rel_error = sum(max_rel_errors) / len(max_rel_errors)
+        status = "PASS" if all_pass else "FAIL"
+
+        # Print summary
+        print(f"\n{'='*70}")
+        print("CUTE FUSED GEMM V2 VALIDATION SUMMARY")
+        print(f"{'='*70}")
+        print(f"{'Version':<25} {'Status':<10} {'Avg Rel Error':<15}")
+        print("-" * 70)
+        print(f"{'cute_fused_v2':<25} {status:<10} {avg_rel_error:.6f} ({avg_rel_error*100:.4f}%)")
+        print(f"{'='*70}")
+
+        if all_pass:
+            print("CUTE FUSED GEMM V2 PASSED VALIDATION")
+        else:
+            print("CUTE FUSED GEMM V2 FAILED VALIDATION")
+
+        return all_pass
+
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def validate_cute_dequant_versions(
     weights: List[torch.Tensor],
     scales: List[torch.Tensor],
@@ -765,6 +876,66 @@ def benchmark_cute_fused_mxfp4_gemm(
         return elapsed
     except Exception as e:
         print(f"  CuTe fused MXFP4 GEMM failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
+def benchmark_cute_fused_mxfp4_gemm_v2(
+    hidden_3d: torch.Tensor,
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    warmup_iters: int = 5,
+    bench_iters: int = 20,
+) -> float:
+    """Benchmark CuTe fused MXFP4 grouped GEMM V2 (routed-only, vectorized dequant).
+
+    V2 improvements:
+    - Only processes routed experts (not all 128)
+    - Vectorized 64-bit loads for packed FP4 to smem
+    - Vectorized decode from smem to smem
+    - WMMA tensor cores for GEMM
+
+    Returns time in milliseconds.
+    """
+    try:
+        from batchgen.moe.cute_fused_mxfp4_gemm_v2 import cute_grouped_mxfp4_gemm_3d_v2
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+    except ImportError as e:
+        print(f"  CuTe fused MXFP4 GEMM V2 not available: {e}")
+        return float('inf')
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=hidden_3d.device
+    )
+
+    try:
+        # Warmup
+        for _ in range(warmup_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v2(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+
+        # Benchmark
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v2(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+        return elapsed
+    except Exception as e:
+        print(f"  CuTe fused MXFP4 GEMM V2 failed: {e}")
         import traceback
         traceback.print_exc()
         return float('inf')
@@ -1721,7 +1892,11 @@ Examples:
     )
     mode_group.add_argument(
         "--compare-cute-fused", action="store_true",
-        help="CuTe fused MXFP4 GEMM vs Triton comparison"
+        help="CuTe fused MXFP4 GEMM V1 vs Triton comparison"
+    )
+    mode_group.add_argument(
+        "--compare-cute-fused-v2", action="store_true",
+        help="CuTe fused MXFP4 GEMM V2 (routed-only, vectorized) vs Triton comparison"
     )
 
     # Common options
@@ -1764,7 +1939,7 @@ Examples:
     }
 
     # Default to --quick if no mode specified
-    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate, args.compare_cuda, args.compare_cute_fused]):
+    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate, args.compare_cuda, args.compare_cute_fused, args.compare_cute_fused_v2]):
         args.quick = True
 
     # Validation only mode
@@ -1979,6 +2154,102 @@ Examples:
                 "triton": triton_time,
                 "cute_simple": cute_simple_time,
                 "cute_wmma": cute_wmma_time,
+            }
+
+        sys.exit(0)
+
+    # CuTe fused GEMM V2 comparison mode (routed-only, vectorized)
+    if args.compare_cute_fused_v2:
+        print(f"\n{'='*70}")
+        print("CUTE FUSED MXFP4 GEMM V2 vs TRITON COMPARISON")
+        print("(Routed-Only + Vectorized Dequant)")
+        print(f"{'='*70}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Config: {config['num_experts']} experts")
+        print(f"Dimensions: K={config['hidden_size']}, N={config['intermediate_size']}")
+
+        N = config['intermediate_size']
+        K = config['hidden_size']
+        num_experts = config['num_experts']
+
+        results = {}
+
+        for tpe in args.tokens:
+            print(f"\n{'='*70}")
+            print(f"TOKENS PER EXPERT: {tpe}")
+            print(f"{'='*70}")
+
+            # Create test data
+            print("Creating test data...")
+            hidden_3d, weights, scales, expert_counts = create_test_tensors(
+                num_experts, tpe, K, N, "cuda", per_expert_weights=True
+            )
+
+            # Validate CuTe fused GEMM V2 first (unless skipped)
+            if not args.skip_validation:
+                print("\nRunning CuTe fused GEMM V2 validation...")
+                validation_pass = validate_cute_fused_gemm_v2(
+                    hidden_3d, weights, scales, N, "cuda"
+                )
+                if not validation_pass:
+                    print("\nWARNING: CuTe fused GEMM V2 validation FAILED!")
+                    print("Continuing with benchmark, but results may be incorrect...")
+                else:
+                    print("\nCuTe fused GEMM V2 validation passed.\n")
+
+            # Benchmark Triton fused GEMM
+            print("\nBenchmarking Triton fused MXFP4 GEMM...")
+            triton_time = benchmark_fused_mxfp4_gemm(hidden_3d, weights, scales, N)
+
+            # Benchmark CuTe fused GEMM V1 WMMA (for comparison)
+            print("Benchmarking CuTe fused MXFP4 GEMM V1 (WMMA)...")
+            cute_v1_wmma_time = benchmark_cute_fused_mxfp4_gemm(
+                hidden_3d, weights, scales, N, kernel_version=1
+            )
+
+            # Benchmark CuTe fused GEMM V2 (routed-only, vectorized)
+            print("Benchmarking CuTe fused MXFP4 GEMM V2 (routed-only)...")
+            cute_v2_time = benchmark_cute_fused_mxfp4_gemm_v2(
+                hidden_3d, weights, scales, N
+            )
+
+            # Results
+            print(f"\n{'='*70}")
+            print(f"RESULTS (tokens_per_expert={tpe})")
+            print(f"{'='*70}")
+            print(f"{'Kernel':<40} {'Time (ms)':>12} {'vs Triton':>12}")
+            print("-" * 70)
+
+            if triton_time != float('inf'):
+                print(f"{'Triton fused MXFP4 GEMM':<40} {triton_time:>12.3f} {'(baseline)':>12}")
+            else:
+                print(f"{'Triton fused MXFP4 GEMM':<40} {'FAILED':>12}")
+
+            if cute_v1_wmma_time != float('inf') and triton_time != float('inf'):
+                speedup = triton_time / cute_v1_wmma_time
+                print(f"{'CuTe fused MXFP4 V1 (WMMA)':<40} {cute_v1_wmma_time:>12.3f} {speedup:>11.2f}x")
+            elif cute_v1_wmma_time != float('inf'):
+                print(f"{'CuTe fused MXFP4 V1 (WMMA)':<40} {cute_v1_wmma_time:>12.3f}")
+            else:
+                print(f"{'CuTe fused MXFP4 V1 (WMMA)':<40} {'FAILED':>12}")
+
+            if cute_v2_time != float('inf') and triton_time != float('inf'):
+                speedup = triton_time / cute_v2_time
+                v1_v2_speedup = cute_v1_wmma_time / cute_v2_time if cute_v1_wmma_time != float('inf') else 0
+                print(f"{'CuTe fused MXFP4 V2 (routed+vectorized)':<40} {cute_v2_time:>12.3f} {speedup:>11.2f}x")
+                if cute_v1_wmma_time != float('inf'):
+                    print(f"  V2 vs V1 speedup: {v1_v2_speedup:.2f}x")
+            elif cute_v2_time != float('inf'):
+                print(f"{'CuTe fused MXFP4 V2 (routed+vectorized)':<40} {cute_v2_time:>12.3f}")
+            else:
+                print(f"{'CuTe fused MXFP4 V2 (routed+vectorized)':<40} {'FAILED':>12}")
+
+            print(f"{'='*70}")
+
+            results[tpe] = {
+                "triton": triton_time,
+                "cute_v1_wmma": cute_v1_wmma_time,
+                "cute_v2": cute_v2_time,
             }
 
         sys.exit(0)
