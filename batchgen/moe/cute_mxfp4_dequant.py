@@ -442,21 +442,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 '''
 
-# Compile and cache the CUDA extension
-_cute_module = None
+# Compile CuTe CUDA extension on module import (not lazy)
+# This ensures compilation happens during warmup/initialization
+_cute_module = load_inline(
+    name='cute_mxfp4_dequant',
+    cpp_sources=[],
+    cuda_sources=[CUDA_SOURCE],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo'],
+    verbose=os.environ.get('CUDA_DEBUG', '0') == '1',
+)
 
 
 def _get_cute_module():
-    """Lazy-load and compile the CuTe-style CUDA module."""
-    global _cute_module
-    if _cute_module is None:
-        _cute_module = load_inline(
-            name='cute_mxfp4_dequant',
-            cpp_sources=[],
-            cuda_sources=[CUDA_SOURCE],
-            extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo'],
-            verbose=os.environ.get('CUDA_DEBUG', '0') == '1',
-        )
+    """Return the pre-compiled CuTe-style CUDA module."""
     return _cute_module
 
 
