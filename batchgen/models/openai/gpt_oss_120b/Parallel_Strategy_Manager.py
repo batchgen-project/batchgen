@@ -148,6 +148,12 @@ class GptOssParallelStrategyManager:
         self._config_expert_module()
         timings["expert_config"] = time.perf_counter() - step_start
 
+        # Step 6: Swap to prefill MoE for CuTe dequant + torch.matmul (only when persistent)
+        if not experts_need_offloading:
+            step_start = time.perf_counter()
+            self._swap_to_prefill_moe()
+            timings["prefill_moe_swap"] = time.perf_counter() - step_start
+
         step_start = time.perf_counter()
         self._config_lm_head_hook()
         timings["lm_head_config"] = time.perf_counter() - step_start
@@ -493,6 +499,82 @@ class GptOssParallelStrategyManager:
         logging.info(
             f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoEQuantized "
             f"(grouped GEMM: 3 kernel launches per layer instead of 384)"
+        )
+
+    def _swap_to_prefill_moe(self):
+        """Swap GptOssMoE to GptOssMoEPrefill for per-expert CuTe dequant + torch.matmul.
+
+        Collects MXFP4 weights from wrapped experts into GptOssMoEPrefill format,
+        then replaces layer.mlp with the prefill version.
+
+        This uses sequential per-expert processing:
+        - CuTe dequant one expert's weight to BF16 buffer (~142 MB)
+        - torch.matmul for that expert
+        - Repeat for all projections (gate, up, down)
+
+        Note: Scales must be transposed to K-major format [K//32, N] for CuTe kernel.
+        Original storage is typically [N, K//32] (N-major).
+        """
+        from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEPrefill
+
+        device = self.engine_config.Basic_Config.device_torch
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            old_moe = self.model.model.layers[layer_idx].mlp
+
+            # Create prefill MoE
+            prefill_moe = GptOssMoEPrefill(self.model_config)
+            prefill_moe.router = old_moe.router  # Copy router weights
+            prefill_moe.to(device)
+
+            # Collect MXFP4 weights from wrapped experts
+            gate_weights, gate_scales = [], []
+            up_weights, up_scales = [], []
+            down_weights, down_scales = [], []
+            gate_biases, up_biases, down_biases = [], [], []
+
+            for expert_idx in range(self.model_config.num_local_experts):
+                wrapper = old_moe.experts[expert_idx]
+
+                # Get MXFP4 weights from wrapper (registered by _register_mxfp4_weights)
+                gate_weights.append(wrapper.mxfp4_gate_packed)
+                up_weights.append(wrapper.mxfp4_up_packed)
+                down_weights.append(wrapper.mxfp4_down_packed)
+
+                # Transpose scales to K-major format [K//32, N] for CuTe kernel
+                # Original format is [N, K//32], so we need to transpose and make contiguous
+                gate_scales.append(wrapper.mxfp4_gate_scales.T.contiguous())
+                up_scales.append(wrapper.mxfp4_up_scales.T.contiguous())
+                down_scales.append(wrapper.mxfp4_down_scales.T.contiguous())
+
+                # Collect biases if present
+                if hasattr(wrapper, 'mxfp4_gate_bias') and wrapper.mxfp4_gate_bias is not None:
+                    gate_biases.append(wrapper.mxfp4_gate_bias)
+                if hasattr(wrapper, 'mxfp4_up_bias') and wrapper.mxfp4_up_bias is not None:
+                    up_biases.append(wrapper.mxfp4_up_bias)
+                if hasattr(wrapper, 'mxfp4_down_bias') and wrapper.mxfp4_down_bias is not None:
+                    down_biases.append(wrapper.mxfp4_down_bias)
+
+            # Store in prefill MoE (as lists, not stacked tensors)
+            prefill_moe.gate_weights = gate_weights
+            prefill_moe.gate_scales = gate_scales
+            prefill_moe.up_weights = up_weights
+            prefill_moe.up_scales = up_scales
+            prefill_moe.down_weights = down_weights
+            prefill_moe.down_scales = down_scales
+
+            # Stack biases if present (as [num_experts, N] tensors)
+            if gate_biases:
+                prefill_moe.gate_biases = torch.stack(gate_biases)
+                prefill_moe.up_biases = torch.stack(up_biases)
+                prefill_moe.down_biases = torch.stack(down_biases)
+
+            # Swap MoE layer
+            self.model.model.layers[layer_idx].mlp = prefill_moe
+
+        logging.info(
+            f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoEPrefill "
+            f"(per-expert CuTe dequant + torch.matmul)"
         )
 
     def configure_decoding(self, padding_bsz=None, comm=None) -> Tuple:

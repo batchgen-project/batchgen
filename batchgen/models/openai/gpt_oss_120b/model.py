@@ -845,6 +845,169 @@ class GptOssMoEQuantized(nn.Module):
 
 
 # ============================================================================
+# Prefill MoE Layer (MXFP4 with CuTe Dequant + torch.matmul)
+# ============================================================================
+
+class GptOssMoEPrefill(nn.Module):
+    """MoE layer for prefill using CuTe dequant + per-expert torch.matmul.
+
+    This implements sequential per-expert processing:
+    1. For each activated expert:
+       a. CuTe dequant gate weight → BF16 buffer
+       b. torch.matmul(tokens, gate_weight.T) → gate output
+       c. CuTe dequant up weight → BF16 buffer
+       d. torch.matmul(tokens, up_weight.T) → up output
+       e. SwiGLU(gate, up) → intermediate
+       f. CuTe dequant down weight → BF16 buffer
+       g. torch.matmul(intermediate, down_weight.T) → expert output
+       h. Accumulate weighted output
+
+    Memory usage:
+    - Single-expert BF16 buffer: ~142 MB (reused across projections)
+      - gate/up: [intermediate_size, hidden_size] = [13824, 5120] × 2 bytes = 141.6 MB
+      - down: [hidden_size, intermediate_size] = [5120, 13824] × 2 bytes = 141.6 MB
+
+    Note: This class requires K-major scales layout [K//32, N] for the CuTe kernel.
+    """
+
+    def __init__(self, config: GptOssConfig):
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_local_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+
+        # Router (same as original)
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=True)
+
+        # MXFP4 quantized weights - stored as lists of tensors (one per expert)
+        # Packed weights: [N, K//2] uint8
+        # K-major scales: [K//32, N] uint8
+        self.gate_weights = None  # List[Tensor[intermediate_size, hidden_size//2]]
+        self.gate_scales = None   # List[Tensor[hidden_size//32, intermediate_size]]
+        self.up_weights = None
+        self.up_scales = None
+        self.down_weights = None  # List[Tensor[hidden_size, intermediate_size//2]]
+        self.down_scales = None   # List[Tensor[intermediate_size//32, hidden_size]]
+
+        # Optional biases
+        self.gate_biases = None  # [num_experts, intermediate_size]
+        self.up_biases = None
+        self.down_biases = None
+
+        # Reusable BF16 buffer for dequantized weights (allocated on first forward)
+        # Size: max(gate, up, down) = max(13824×5120, 5120×13824) = 141.6 MB
+        self._bf16_buffer = None
+        self._buffer_shape = None
+
+        # SwiGLU parameters
+        self.swiglu_alpha = 1.702
+        self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
+
+    def _get_bf16_buffer(self, shape: Tuple[int, int], device: torch.device) -> torch.Tensor:
+        """Get or allocate BF16 buffer for dequantized weights."""
+        if self._bf16_buffer is None or self._buffer_shape != shape or self._bf16_buffer.device != device:
+            self._bf16_buffer = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            self._buffer_shape = shape
+        return self._bf16_buffer
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Forward pass with per-expert CuTe dequant + torch.matmul."""
+        from batchgen.moe.cute_mxfp4_dequant import mxfp4_dequant_single_expert_cute
+
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, hidden_dim)  # [total_tokens, hidden_size]
+        total_tokens = hidden_flat.shape[0]
+
+        # Compute routing logits
+        router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
+
+        # Select Top-K experts per token
+        topk_weights, topk_indices = torch.topk(
+            router_logits, k=self.num_experts_per_tok, dim=-1
+        )  # [total_tokens, top_k]
+        topk_weights = F.softmax(topk_weights, dim=-1)
+
+        # Initialize output
+        output = torch.zeros_like(hidden_flat)
+
+        # Find all unique experts that are activated
+        unique_experts = topk_indices.unique().tolist()
+
+        # Process each activated expert
+        for expert_idx in unique_experts:
+            # Find tokens routed to this expert
+            expert_mask = (topk_indices == expert_idx).any(dim=-1)  # [total_tokens]
+            if not expert_mask.any():
+                continue
+
+            expert_input = hidden_flat[expert_mask]  # [num_tokens, hidden_size]
+            num_tokens = expert_input.shape[0]
+
+            # Get routing weight for this expert
+            expert_weights = torch.where(
+                topk_indices[expert_mask] == expert_idx,
+                topk_weights[expert_mask],
+                torch.zeros_like(topk_weights[expert_mask])
+            ).sum(dim=-1)  # [num_tokens]
+
+            # === Gate projection ===
+            # Dequant gate weight: [intermediate_size, hidden_size//2] -> [intermediate_size, hidden_size]
+            gate_buffer = self._get_bf16_buffer(
+                (self.intermediate_size, self.hidden_size),
+                expert_input.device
+            )
+            mxfp4_dequant_single_expert_cute(
+                self.gate_weights[expert_idx],
+                self.gate_scales[expert_idx],
+                gate_buffer,
+            )
+            # matmul: [num_tokens, hidden_size] @ [hidden_size, intermediate_size] -> [num_tokens, intermediate_size]
+            gate_out = torch.matmul(expert_input, gate_buffer.T)
+            if self.gate_biases is not None:
+                gate_out = gate_out + self.gate_biases[expert_idx]
+
+            # === Up projection ===
+            up_buffer = self._get_bf16_buffer(
+                (self.intermediate_size, self.hidden_size),
+                expert_input.device
+            )
+            mxfp4_dequant_single_expert_cute(
+                self.up_weights[expert_idx],
+                self.up_scales[expert_idx],
+                up_buffer,
+            )
+            up_out = torch.matmul(expert_input, up_buffer.T)
+            if self.up_biases is not None:
+                up_out = up_out + self.up_biases[expert_idx]
+
+            # === SwiGLU activation ===
+            # Interleave gate and up: [gate0, up0, gate1, up1, ...]
+            interleaved = torch.stack([gate_out, up_out], dim=-1).view(num_tokens, -1)
+            intermediate = swiglu(interleaved, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
+
+            # === Down projection ===
+            down_buffer = self._get_bf16_buffer(
+                (self.hidden_size, self.intermediate_size),
+                expert_input.device
+            )
+            mxfp4_dequant_single_expert_cute(
+                self.down_weights[expert_idx],
+                self.down_scales[expert_idx],
+                down_buffer,
+            )
+            down_out = torch.matmul(intermediate, down_buffer.T)
+            if self.down_biases is not None:
+                down_out = down_out + self.down_biases[expert_idx]
+
+            # Accumulate weighted output
+            output[expert_mask] += down_out * expert_weights.unsqueeze(-1)
+
+        return output.view(batch_size, seq_len, hidden_dim)
+
+
+# ============================================================================
 # Decoder Layer
 # ============================================================================
 

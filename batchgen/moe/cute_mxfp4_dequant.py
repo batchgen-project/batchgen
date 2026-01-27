@@ -460,6 +460,59 @@ def _get_cute_module():
     return _cute_module
 
 
+def mxfp4_dequant_single_expert_cute(
+    packed: torch.Tensor,         # [N, K//2] uint8 packed FP4
+    scales: torch.Tensor,         # [K//32, N] uint8 scales (K-major)
+    output: torch.Tensor,         # [N, K] BF16 output buffer
+    kernel_version: int = 0,      # 0=simple, 1=swizzle
+) -> None:
+    """CuTe-style dequantize a single expert's MXFP4 weights.
+
+    This is the per-expert dequant function for prefill, matching the user's requirement:
+    "dequant an expert, call the matmul" - sequential per-expert processing.
+
+    Args:
+        packed: Packed FP4 weights [N, K//2] uint8 (row-major, 2 FP4 per byte)
+        scales: K-major scales [K//32, N] uint8 (one scale per 32 K values)
+        output: Pre-allocated output buffer [N, K] BF16
+        kernel_version: 0=simple vectorized, 1=swizzled smem
+
+    Note:
+        The output buffer should be reused across projections to minimize memory.
+        Example: ~142 MB buffer for GPT-OSS-120B (max of gate/up/down dimensions)
+    """
+    assert packed.dtype == torch.uint8, f"packed must be uint8, got {packed.dtype}"
+    assert scales.dtype == torch.uint8, f"scales must be uint8, got {scales.dtype}"
+    assert output.dtype == torch.bfloat16, f"output must be bfloat16, got {output.dtype}"
+    assert packed.is_contiguous(), "packed must be contiguous"
+    assert scales.is_contiguous(), "scales must be contiguous"
+    assert output.is_contiguous(), "output must be contiguous"
+
+    N, K_half = packed.shape
+    K = K_half * 2
+    assert output.shape == (N, K), f"output shape mismatch: expected ({N}, {K}), got {output.shape}"
+    assert scales.shape == (K // 32, N), f"scales shape mismatch: expected ({K // 32}, {N}), got {scales.shape}"
+
+    # Wrap as single-element pointer arrays to reuse the batch kernel
+    packed_ptr = torch.tensor([packed.data_ptr()], dtype=torch.int64, device=packed.device)
+    scale_ptr = torch.tensor([scales.data_ptr()], dtype=torch.int64, device=scales.device)
+
+    # Reshape output to [1, N, K] for the batch kernel
+    output_3d = output.unsqueeze(0)
+
+    cute_mod = _get_cute_module()
+    cute_mod.batch_mxfp4_dequant_cute_impl(
+        packed_ptr,
+        scale_ptr,
+        output_3d,
+        packed.stride(0),  # stride_packed_n
+        packed.stride(1),  # stride_packed_k
+        scales.stride(0),  # stride_scale_k (K-major)
+        scales.stride(1),  # stride_scale_n
+        kernel_version,
+    )
+
+
 def batch_mxfp4_dequant_cute(
     packed_ptrs: torch.Tensor,    # [num_experts] int64
     scale_ptrs: torch.Tensor,     # [num_experts] int64
