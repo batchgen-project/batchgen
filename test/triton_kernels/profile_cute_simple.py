@@ -50,8 +50,8 @@ def main():
     # Output buffer
     output = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
 
-    # Warmup (compile and cache)
-    print("Warming up...")
+    # Warmup (compile and cache) - outside NCU capture
+    print("Warming up (run WITHOUT ncu first, then with ncu)...")
     for _ in range(3):
         batch_mxfp4_dequant_cute(
             weight_ptrs, scale_ptrs, output,
@@ -59,13 +59,20 @@ def main():
         )
     torch.cuda.synchronize()
 
-    # Profile run
-    print("Running kernel for profiling...")
+    # Signal ready for profiling
+    print("Warmup done. Starting profiled run...")
+
+    # Use CUDA profiler API to mark the region of interest
+    torch.cuda.cudart().cudaProfilerStart()
+
+    # Profile run - single kernel invocation
     batch_mxfp4_dequant_cute(
         weight_ptrs, scale_ptrs, output,
         weights[0], scales[0], kernel_version=0
     )
     torch.cuda.synchronize()
+
+    torch.cuda.cudart().cudaProfilerStop()
 
     print("Done. Check NCU output for metrics.")
 

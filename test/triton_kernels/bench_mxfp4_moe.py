@@ -583,6 +583,64 @@ def benchmark_fused_mxfp4_gemm(
         return float('inf')
 
 
+def benchmark_cute_fused_mxfp4_gemm(
+    hidden_3d: torch.Tensor,
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    kernel_version: int = 1,
+    warmup_iters: int = 5,
+    bench_iters: int = 20,
+) -> float:
+    """Benchmark CuTe fused MXFP4 grouped GEMM (inline dequantization).
+
+    Args:
+        kernel_version: 0=simple scalar, 1=WMMA tensor cores
+
+    Returns time in milliseconds.
+    """
+    try:
+        from batchgen.moe.cute_fused_mxfp4_gemm import cute_grouped_mxfp4_gemm_3d
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+    except ImportError as e:
+        print(f"  CuTe fused MXFP4 GEMM not available: {e}")
+        return float('inf')
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=hidden_3d.device
+    )
+
+    try:
+        # Warmup
+        for _ in range(warmup_iters):
+            _ = cute_grouped_mxfp4_gemm_3d(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0], kernel_version=kernel_version
+            )
+        torch.cuda.synchronize()
+
+        # Benchmark
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            _ = cute_grouped_mxfp4_gemm_3d(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0], kernel_version=kernel_version
+            )
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+        return elapsed
+    except Exception as e:
+        print(f"  CuTe fused MXFP4 GEMM failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
 def benchmark_fused_gemm_config(
     hidden_3d: torch.Tensor,
     weight_ptrs: torch.Tensor,
@@ -1530,7 +1588,11 @@ Examples:
     )
     mode_group.add_argument(
         "--compare-cuda", action="store_true",
-        help="CuTe CUDA kernel comparison only"
+        help="CuTe CUDA kernel comparison only (dequant)"
+    )
+    mode_group.add_argument(
+        "--compare-cute-fused", action="store_true",
+        help="CuTe fused MXFP4 GEMM vs Triton comparison"
     )
 
     # Common options
@@ -1573,7 +1635,7 @@ Examples:
     }
 
     # Default to --quick if no mode specified
-    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate, args.compare_cuda]):
+    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate, args.compare_cuda, args.compare_cute_fused]):
         args.quick = True
 
     # Validation only mode
@@ -1698,6 +1760,86 @@ Examples:
             best_data = cuda_results[best_version]
             print(f"BEST: {best_version} at {best_time:.3f} ms ({best_data['bandwidth_gb_s']:.0f} GB/s = {best_data['hbm_util_pct']:.1f}% HBM)")
         print(f"{'='*100}")
+        sys.exit(0)
+
+    # CuTe fused GEMM comparison mode
+    if args.compare_cute_fused:
+        print(f"\n{'='*70}")
+        print("CUTE FUSED MXFP4 GEMM vs TRITON COMPARISON")
+        print(f"{'='*70}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Config: {config['num_experts']} experts")
+        print(f"Dimensions: K={config['hidden_size']}, N={config['intermediate_size']}")
+
+        N = config['intermediate_size']
+        K = config['hidden_size']
+        num_experts = config['num_experts']
+
+        results = {}
+
+        for tpe in args.tokens:
+            print(f"\n{'='*70}")
+            print(f"TOKENS PER EXPERT: {tpe}")
+            print(f"{'='*70}")
+
+            # Create test data
+            print("Creating test data...")
+            hidden_3d, weights, scales, expert_counts = create_test_tensors(
+                num_experts, tpe, K, N, "cuda", per_expert_weights=True
+            )
+
+            # Benchmark Triton fused GEMM
+            print("\nBenchmarking Triton fused MXFP4 GEMM...")
+            triton_time = benchmark_fused_mxfp4_gemm(hidden_3d, weights, scales, N)
+
+            # Benchmark CuTe fused GEMM (simple version)
+            print("Benchmarking CuTe fused MXFP4 GEMM (simple)...")
+            cute_simple_time = benchmark_cute_fused_mxfp4_gemm(
+                hidden_3d, weights, scales, N, kernel_version=0
+            )
+
+            # Benchmark CuTe fused GEMM (WMMA version)
+            print("Benchmarking CuTe fused MXFP4 GEMM (WMMA)...")
+            cute_wmma_time = benchmark_cute_fused_mxfp4_gemm(
+                hidden_3d, weights, scales, N, kernel_version=1
+            )
+
+            # Results
+            print(f"\n{'='*70}")
+            print(f"RESULTS (tokens_per_expert={tpe})")
+            print(f"{'='*70}")
+            print(f"{'Kernel':<30} {'Time (ms)':>12} {'vs Triton':>12}")
+            print("-" * 70)
+
+            if triton_time != float('inf'):
+                print(f"{'Triton fused MXFP4 GEMM':<30} {triton_time:>12.3f} {'(baseline)':>12}")
+            else:
+                print(f"{'Triton fused MXFP4 GEMM':<30} {'FAILED':>12}")
+
+            if cute_simple_time != float('inf') and triton_time != float('inf'):
+                speedup = triton_time / cute_simple_time
+                print(f"{'CuTe fused MXFP4 (simple)':<30} {cute_simple_time:>12.3f} {speedup:>11.2f}x")
+            elif cute_simple_time != float('inf'):
+                print(f"{'CuTe fused MXFP4 (simple)':<30} {cute_simple_time:>12.3f}")
+            else:
+                print(f"{'CuTe fused MXFP4 (simple)':<30} {'FAILED':>12}")
+
+            if cute_wmma_time != float('inf') and triton_time != float('inf'):
+                speedup = triton_time / cute_wmma_time
+                print(f"{'CuTe fused MXFP4 (WMMA)':<30} {cute_wmma_time:>12.3f} {speedup:>11.2f}x")
+            elif cute_wmma_time != float('inf'):
+                print(f"{'CuTe fused MXFP4 (WMMA)':<30} {cute_wmma_time:>12.3f}")
+            else:
+                print(f"{'CuTe fused MXFP4 (WMMA)':<30} {'FAILED':>12}")
+
+            print(f"{'='*70}")
+
+            results[tpe] = {
+                "triton": triton_time,
+                "cute_simple": cute_simple_time,
+                "cute_wmma": cute_wmma_time,
+            }
+
         sys.exit(0)
 
     # GEMM tuning mode
