@@ -19,6 +19,149 @@ from batchgen.moe.mxfp4_grouped_gemm import (
 )
 
 
+def validate_triton_gemm_directly():
+    """
+    Validate Triton grouped_mxfp4_gemm_3d using the EXACT same pattern
+    as validate_cute_fused_gemm in bench_mxfp4_moe.py (which passes).
+    """
+    print("=" * 70)
+    print("TRITON GROUPED MXFP4 GEMM DIRECT VALIDATION")
+    print("Using same pattern as CuTe validation (which passed with 0% error)")
+    print("=" * 70)
+
+    # Diagnostic: show which kernel is being used
+    import batchgen.moe.mxfp4_grouped_gemm as gemm_module
+    print(f"\nKernel module: {gemm_module.__file__}")
+    print(f"grouped_mxfp4_gemm_3d: {gemm_module.grouped_mxfp4_gemm_3d}")
+
+    device = "cuda"
+    num_experts = 4
+    tokens_per_expert = 2
+    K = 128      # hidden size (small for testing)
+    N = 256      # output size (intermediate)
+
+    print(f"\nConfig: {num_experts} experts, {tokens_per_expert} tokens/expert")
+    print(f"Dimensions: K={K}, N={N}")
+
+    # Create input hidden states [E, M_max, K]
+    hidden_3d = torch.randn(num_experts, tokens_per_expert, K,
+                            dtype=torch.bfloat16, device=device)
+
+    # Create weights [N, K//2] and scales [N, K//32] - SAME PATTERN as bench
+    weights = [torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=device)
+               for _ in range(num_experts)]
+    scales = [torch.randint(120, 134, (N, K // 32), dtype=torch.uint8, device=device)
+              for _ in range(num_experts)]
+
+    print(f"\nWeight shape: {weights[0].shape}, Scale shape: {scales[0].shape}")
+    print(f"Weight strides: {weights[0].stride()}, Scale strides: {scales[0].stride()}")
+
+    # Setup pointer arrays - SAME as bench
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+
+    # Expert counts - SAME as bench
+    expert_counts = torch.full((num_experts,), tokens_per_expert,
+                               dtype=torch.int32, device=device)
+
+    # Generate reference outputs - EXACT same code as bench_mxfp4_moe.py lines 447-452
+    print("\nGenerating reference outputs (PyTorch dequant + matmul)...")
+    ref_outputs = []
+    for i in range(num_experts):
+        # Dequantize weight
+        weight_bf16 = mxfp4_dequantize(weights[i], scales[i], dtype=torch.bfloat16)
+        # Compute matmul: [M, K] @ [K, N] -> [M, N]
+        ref_out = torch.mm(hidden_3d[i], weight_bf16.T)
+        ref_outputs.append(ref_out)
+    print(f"  Reference shape: {ref_outputs[0].shape}")
+
+    # Run Triton kernel
+    print("\nRunning Triton grouped_mxfp4_gemm_3d...")
+    try:
+        output = grouped_mxfp4_gemm_3d(
+            hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+            N, weights[0], scales[0]
+        )
+        torch.cuda.synchronize()
+    except Exception as e:
+        print(f"  ERROR: Kernel failed with: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    print(f"  Kernel output shape: {output.shape}")
+
+    # Compare - SAME tolerance check as bench
+    tolerance = 0.05  # 5% tolerance (same as test_grouped_moe_forward_3d)
+    all_pass = True
+    max_rel_errors = []
+
+    print(f"\nValidation (tolerance: {tolerance*100:.1f}%):")
+    for i in range(num_experts):
+        kernel_out = output[i]
+        ref_out = ref_outputs[i]
+
+        # Compute relative error - SAME formula as bench
+        diff = (kernel_out.float() - ref_out.float()).abs()
+        ref_abs = ref_out.float().abs().clamp(min=1e-6)
+        rel_diff = (diff / ref_abs).max().item()
+        abs_diff = diff.max().item()
+        max_rel_errors.append(rel_diff)
+
+        if rel_diff > tolerance:
+            print(f"  FAIL expert {i}: max_rel_error={rel_diff:.4f} ({rel_diff*100:.2f}%), "
+                  f"abs_diff={abs_diff:.6f}")
+            all_pass = False
+        else:
+            print(f"  PASS expert {i}: max_rel_error={rel_diff:.6f} ({rel_diff*100:.4f}%), "
+                  f"abs_diff={abs_diff:.6f}")
+
+    avg_rel_error = sum(max_rel_errors) / len(max_rel_errors)
+    print(f"\n  Average relative error: {avg_rel_error:.6f} ({avg_rel_error*100:.4f}%)")
+
+    # Show sample values
+    print(f"\nSample values (expert 0, token 0, first 4 outputs):")
+    print(f"  Reference: {[f'{v:.4f}' for v in ref_outputs[0][0, :4].tolist()]}")
+    print(f"  Kernel:    {[f'{v:.4f}' for v in output[0, 0, :4].tolist()]}")
+
+    if all_pass:
+        print("\n✓ TRITON GEMM PASSED VALIDATION")
+    else:
+        print("\n✗ TRITON GEMM FAILED VALIDATION")
+
+        # Additional diagnostics if failed
+        print("\n" + "=" * 70)
+        print("FAILURE DIAGNOSTICS")
+        print("=" * 70)
+
+        # Check if dequantization works correctly
+        print("\n1. Testing mxfp4_dequantize directly...")
+        test_weight = torch.full((4, 2), 0x22, dtype=torch.uint8, device=device)  # FP4=1.0
+        test_scale = torch.full((4, 1), 127, dtype=torch.uint8, device=device)  # exp=0
+        dequant_result = mxfp4_dequantize(test_weight, test_scale, dtype=torch.bfloat16)
+        print(f"   Input: FP4=1.0 everywhere, scale=127 (exp=0)")
+        print(f"   Expected: all 1.0")
+        print(f"   Actual: {dequant_result[0, :8].tolist()}")
+        dequant_ok = torch.allclose(dequant_result.float(), torch.ones_like(dequant_result).float(), rtol=0.01)
+        print(f"   Dequantize: {'PASS' if dequant_ok else 'FAIL'}")
+
+        # Check hidden_3d and output shapes/strides
+        print(f"\n2. Tensor shapes and strides:")
+        print(f"   hidden_3d: shape={hidden_3d.shape}, stride={hidden_3d.stride()}, contiguous={hidden_3d.is_contiguous()}")
+        print(f"   output:    shape={output.shape}, stride={output.stride()}, contiguous={output.is_contiguous()}")
+        print(f"   weights[0]: shape={weights[0].shape}, stride={weights[0].stride()}, contiguous={weights[0].is_contiguous()}")
+        print(f"   scales[0]:  shape={scales[0].shape}, stride={scales[0].stride()}, contiguous={scales[0].is_contiguous()}")
+
+        # Check expert_counts
+        print(f"\n3. Expert counts: {expert_counts.tolist()}")
+
+        # Check pointer values
+        print(f"\n4. Pointer arrays:")
+        print(f"   weight_ptrs: {weight_ptrs.tolist()}")
+        print(f"   scale_ptrs: {scale_ptrs.tolist()}")
+
+    return all_pass
+
+
 def reference_gemm(hidden_3d, weights, scales, expert_counts, N):
     """Reference: dequantize each expert's weight + torch.matmul.
 
@@ -342,10 +485,14 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print()
 
-    # Run diagnostic test first
-    sanity_check_single_element()
-
     results = []
+
+    # First: Run the direct validation that matches the passing CuTe pattern
+    results.append(("Triton direct validation", validate_triton_gemm_directly()))
+
+    # Then run diagnostic test
+    print("\n")
+    sanity_check_single_element()
 
     # Run all sanity checks
     results.append(("Small dimensions", sanity_check_small()))
