@@ -1118,7 +1118,8 @@ def batch_mxfp4_dequant_kernel_v8_ieee_pow2(
     val_hi_0 = _fp4_decode_v4_branchless(idx_hi_0)
 
     # Apply first scale using _scale_by_pow2 (direct IEEE construction)
-    exp_lo = (scales_lo - 127).to(tl.int32)[:, None]  # Unbias scale
+    # IMPORTANT: Convert to int32 BEFORE subtracting to avoid uint8 wrap-around
+    exp_lo = (scales_lo.to(tl.int32) - 127)[:, None]  # Unbias scale
     val_lo_0_scaled = _scale_by_pow2(val_lo_0, exp_lo).to(tl.bfloat16)
     val_hi_0_scaled = _scale_by_pow2(val_hi_0, exp_lo).to(tl.bfloat16)
 
@@ -1159,7 +1160,8 @@ def batch_mxfp4_dequant_kernel_v8_ieee_pow2(
     val_hi_1 = _fp4_decode_v4_branchless(idx_hi_1)
 
     # Apply second scale using _scale_by_pow2 (direct IEEE construction)
-    exp_hi = (scales_hi - 127).to(tl.int32)[:, None]
+    # IMPORTANT: Convert to int32 BEFORE subtracting to avoid uint8 wrap-around
+    exp_hi = (scales_hi.to(tl.int32) - 127)[:, None]
     val_lo_1_scaled = _scale_by_pow2(val_lo_1, exp_hi).to(tl.bfloat16)
     val_hi_1_scaled = _scale_by_pow2(val_hi_1, exp_hi).to(tl.bfloat16)
 
