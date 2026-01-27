@@ -50,9 +50,79 @@ def reference_gemm(hidden_3d, weights, scales, expert_counts, N):
     return output
 
 
+def sanity_check_single_element():
+    """Minimal test with 1 expert, 1 token, to diagnose the issue."""
+    print("=" * 60)
+    print("DIAGNOSTIC: Single element test (1 expert, 1 token, K=64, N=64)")
+    print("=" * 60)
+
+    device = "cuda"
+
+    # Minimal dimensions
+    num_experts = 1
+    M_max = 1
+    K = 64
+    N = 64
+
+    print(f"Config: {num_experts} experts, M_max={M_max}, K={K}, N={N}")
+
+    # Simple input: all ones
+    hidden_3d = torch.ones(num_experts, M_max, K, dtype=torch.bfloat16, device=device)
+
+    # Simple weights: all zeros (FP4 index 0 = 0.0)
+    # This should give output of all zeros
+    weights = [torch.zeros((N, K // 2), dtype=torch.uint8, device=device)
+               for _ in range(num_experts)]
+    # Neutral scale (127 -> exponent 0 -> 2^0 = 1)
+    scales = [torch.full((N, K // 32), 127, dtype=torch.uint8, device=device)
+              for _ in range(num_experts)]
+
+    expert_counts = torch.full((num_experts,), M_max, dtype=torch.int32, device=device)
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+
+    # Test 1: All zeros weight -> output should be all zeros
+    print("\nTest 1: Zero weights (FP4 index 0 = 0.0)")
+    ref_output = reference_gemm(hidden_3d, weights, scales, expert_counts, N)
+    kernel_output = grouped_mxfp4_gemm_3d(
+        hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+        N, weights[0], scales[0]
+    )
+    print(f"  Reference sum: {ref_output.sum().item():.6f} (should be ~0)")
+    print(f"  Kernel sum:    {kernel_output.sum().item():.6f} (should be ~0)")
+
+    # Test 2: Weight with FP4 index 2 = 1.0 in all positions
+    # Packed: low nibble=2, high nibble=2 -> byte = 0x22
+    print("\nTest 2: Weight with FP4=1.0 everywhere (index 2)")
+    weights_ones = [torch.full((N, K // 2), 0x22, dtype=torch.uint8, device=device)
+                    for _ in range(num_experts)]
+    weight_ptrs_ones, _ = setup_expert_weight_pointers(weights_ones, scales)
+
+    # Dequant reference: each K position = 1.0, so row sum = K = 64
+    # Output = input @ weight.T = [1,1,1,...] @ [1,1,1,...].T = K = 64
+    ref_output2 = reference_gemm(hidden_3d, weights_ones, scales, expert_counts, N)
+    kernel_output2 = grouped_mxfp4_gemm_3d(
+        hidden_3d, weight_ptrs_ones, scale_ptrs, expert_counts,
+        N, weights_ones[0], scales[0]
+    )
+    print(f"  Expected output: all 64.0 (K * 1.0)")
+    print(f"  Reference [0,0,0]: {ref_output2[0, 0, 0].item():.2f}")
+    print(f"  Kernel [0,0,0]:    {kernel_output2[0, 0, 0].item():.2f}")
+    print(f"  Reference sum: {ref_output2.sum().item():.2f} (should be {N * 64})")
+    print(f"  Kernel sum:    {kernel_output2.sum().item():.2f}")
+
+    # Test 3: Check dequantization directly
+    print("\nTest 3: Direct dequantization check")
+    weight_bf16 = mxfp4_dequantize(weights_ones[0], scales[0], torch.bfloat16)
+    print(f"  Dequantized weight shape: {weight_bf16.shape}")
+    print(f"  Dequantized weight [0, :8]: {weight_bf16[0, :8].tolist()}")
+    print(f"  Expected: all 1.0")
+
+    return True
+
+
 def sanity_check_small():
     """Test with small dimensions for easy debugging."""
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("SANITY CHECK: Small dimensions (4 experts, 2 tokens)")
     print("=" * 60)
 
@@ -271,6 +341,9 @@ def main():
 
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print()
+
+    # Run diagnostic test first
+    sanity_check_single_element()
 
     results = []
 
