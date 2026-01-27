@@ -406,6 +406,135 @@ def validate_dequant_versions(
     return all_pass
 
 
+def validate_cute_fused_gemm(
+    hidden_3d: torch.Tensor,
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    device: str = "cuda",
+    num_experts_to_check: int = 3,
+    tolerance: float = 0.02,
+) -> bool:
+    """Validate CuTe fused MXFP4 GEMM produces correct output.
+
+    Compares CuTe fused GEMM output against reference (PyTorch dequant + matmul).
+
+    Returns True if all versions pass validation, False otherwise.
+    """
+    try:
+        from batchgen.moe.cute_fused_mxfp4_gemm import cute_grouped_mxfp4_gemm_3d
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+        from batchgen.quantization.mxfp4 import mxfp4_dequantize
+    except ImportError as e:
+        print(f"  Cannot import CuTe fused GEMM: {e}")
+        return False
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+    K = hidden_3d.shape[2]
+
+    print(f"\n{'='*70}")
+    print("CUTE FUSED MXFP4 GEMM VALIDATION")
+    print(f"{'='*70}")
+    print(f"Checking {min(num_experts_to_check, num_experts)} experts against PyTorch reference")
+    print(f"Config: {tokens_per_expert} tokens/expert, N={N}, K={K}")
+    print(f"Tolerance: {tolerance*100:.1f}% relative error")
+    print(f"{'='*70}")
+
+    # Generate reference outputs using PyTorch
+    print("\nGenerating reference outputs (PyTorch dequant + matmul)...")
+    ref_outputs = []
+    for i in range(min(num_experts_to_check, num_experts)):
+        # Dequantize weight
+        weight_bf16 = mxfp4_dequantize(weights[i], scales[i], dtype=torch.bfloat16)
+        # Compute matmul: [M, K] @ [K, N] -> [M, N]
+        ref_out = torch.mm(hidden_3d[i], weight_bf16.T)
+        ref_outputs.append(ref_out)
+    print(f"  Reference shape: {ref_outputs[0].shape}")
+
+    # Setup pointer arrays
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=device
+    )
+
+    all_pass = True
+    results_summary = []
+
+    cute_versions = [
+        ("cute_fused_simple", 0),
+        ("cute_fused_wmma", 1),
+    ]
+
+    for version_name, kernel_ver in cute_versions:
+        print(f"\nValidating {version_name}...")
+        try:
+            # Run kernel
+            output = cute_grouped_mxfp4_gemm_3d(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0], kernel_version=kernel_ver
+            )
+            torch.cuda.synchronize()
+
+            # Check each expert
+            version_pass = True
+            max_rel_errors = []
+            for i in range(min(num_experts_to_check, num_experts)):
+                kernel_out = output[i]
+                ref_out = ref_outputs[i]
+
+                # Compute relative error
+                diff = (kernel_out.float() - ref_out.float()).abs()
+                ref_abs = ref_out.float().abs().clamp(min=1e-6)
+                rel_diff = (diff / ref_abs).max().item()
+                max_rel_errors.append(rel_diff)
+
+                # Also compute absolute max difference
+                abs_diff = diff.max().item()
+
+                if rel_diff > tolerance:
+                    print(f"  FAIL expert {i}: max_rel_error={rel_diff:.4f} ({rel_diff*100:.2f}%), "
+                          f"abs_diff={abs_diff:.6f}")
+                    version_pass = False
+                else:
+                    print(f"  PASS expert {i}: max_rel_error={rel_diff:.6f} ({rel_diff*100:.4f}%), "
+                          f"abs_diff={abs_diff:.6f}")
+
+            avg_rel_error = sum(max_rel_errors) / len(max_rel_errors)
+            status = "PASS" if version_pass else "FAIL"
+            results_summary.append((version_name, status, avg_rel_error))
+
+            if not version_pass:
+                all_pass = False
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            results_summary.append((version_name, "ERROR", float('nan')))
+            all_pass = False
+
+    # Print summary
+    print(f"\n{'='*70}")
+    print("CUTE FUSED GEMM VALIDATION SUMMARY")
+    print(f"{'='*70}")
+    print(f"{'Version':<25} {'Status':<10} {'Avg Rel Error':<15}")
+    print("-" * 70)
+    for version, status, avg_err in results_summary:
+        if status == "ERROR":
+            print(f"{version:<25} {status:<10} {'N/A':<15}")
+        else:
+            print(f"{version:<25} {status:<10} {avg_err:.6f} ({avg_err*100:.4f}%)")
+    print(f"{'='*70}")
+
+    if all_pass:
+        print("ALL CUTE FUSED GEMM VERSIONS PASSED VALIDATION")
+    else:
+        print("SOME CUTE FUSED GEMM VERSIONS FAILED VALIDATION")
+
+    return all_pass
+
+
 def validate_cute_dequant_versions(
     weights: List[torch.Tensor],
     scales: List[torch.Tensor],
@@ -1787,6 +1916,18 @@ Examples:
             hidden_3d, weights, scales, expert_counts = create_test_tensors(
                 num_experts, tpe, K, N, "cuda", per_expert_weights=True
             )
+
+            # Validate CuTe fused GEMM first (unless skipped)
+            if not args.skip_validation:
+                print("\nRunning CuTe fused GEMM validation...")
+                validation_pass = validate_cute_fused_gemm(
+                    hidden_3d, weights, scales, N, "cuda"
+                )
+                if not validation_pass:
+                    print("\nWARNING: CuTe fused GEMM validation FAILED!")
+                    print("Continuing with benchmark, but results may be incorrect...")
+                else:
+                    print("\nCuTe fused GEMM validation passed.\n")
 
             # Benchmark Triton fused GEMM
             print("\nBenchmarking Triton fused MXFP4 GEMM...")
