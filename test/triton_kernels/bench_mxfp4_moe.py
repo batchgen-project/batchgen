@@ -1112,6 +1112,147 @@ def benchmark_cute_fused_mxfp4_gemm_v4(
         return float('inf')
 
 
+def benchmark_cute_fused_mxfp4_gemm_v5(
+    hidden_3d: torch.Tensor,
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    warmup_iters: int = 5,
+    bench_iters: int = 20,
+) -> float:
+    """Benchmark CuTe fused MXFP4 grouped GEMM V5 (fused load+decode)."""
+    try:
+        from batchgen.moe.cute_fused_mxfp4_gemm_v5 import cute_grouped_mxfp4_gemm_3d_v5
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+    except ImportError as e:
+        print(f"  CuTe fused MXFP4 GEMM V5 not available: {e}")
+        return float('inf')
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=hidden_3d.device
+    )
+
+    try:
+        for _ in range(warmup_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v5(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v5(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) / bench_iters * 1000
+    except Exception as e:
+        print(f"  CuTe fused MXFP4 GEMM V5 failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
+def benchmark_cute_fused_mxfp4_gemm_v6(
+    hidden_3d: torch.Tensor,
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    warmup_iters: int = 5,
+    bench_iters: int = 20,
+) -> float:
+    """Benchmark CuTe fused MXFP4 grouped GEMM V6 (simple CTAs, no double buffering)."""
+    try:
+        from batchgen.moe.cute_fused_mxfp4_gemm_v6 import cute_grouped_mxfp4_gemm_3d_v6
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+    except ImportError as e:
+        print(f"  CuTe fused MXFP4 GEMM V6 not available: {e}")
+        return float('inf')
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=hidden_3d.device
+    )
+
+    try:
+        for _ in range(warmup_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v6(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v6(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) / bench_iters * 1000
+    except Exception as e:
+        print(f"  CuTe fused MXFP4 GEMM V6 failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
+def benchmark_cute_fused_mxfp4_gemm_v7(
+    hidden_3d: torch.Tensor,
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    warmup_iters: int = 5,
+    bench_iters: int = 20,
+) -> float:
+    """Benchmark CuTe fused MXFP4 grouped GEMM V7 (warp specialization + persistent CTA)."""
+    try:
+        from batchgen.moe.cute_fused_mxfp4_gemm_v7 import cute_grouped_mxfp4_gemm_3d_v7
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+    except ImportError as e:
+        print(f"  CuTe fused MXFP4 GEMM V7 not available: {e}")
+        return float('inf')
+
+    num_experts = hidden_3d.shape[0]
+    tokens_per_expert = hidden_3d.shape[1]
+
+    weight_ptrs, scale_ptrs = setup_expert_weight_pointers(weights, scales)
+    expert_counts = torch.full(
+        (num_experts,), tokens_per_expert, dtype=torch.int32, device=hidden_3d.device
+    )
+
+    try:
+        for _ in range(warmup_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v7(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            _ = cute_grouped_mxfp4_gemm_3d_v7(
+                hidden_3d, weight_ptrs, scale_ptrs, expert_counts,
+                N, weights[0], scales[0]
+            )
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) / bench_iters * 1000
+    except Exception as e:
+        print(f"  CuTe fused MXFP4 GEMM V7 failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
 def benchmark_fused_gemm_config(
     hidden_3d: torch.Tensor,
     weight_ptrs: torch.Tensor,
@@ -2073,6 +2214,10 @@ Examples:
         "--compare-cute-fused-v4", action="store_true",
         help="CuTe fused MXFP4 GEMM V4 (double-buffered pipelined) vs Triton comparison"
     )
+    mode_group.add_argument(
+        "--compare-cute-fused-v567", action="store_true",
+        help="CuTe fused MXFP4 GEMM V5/V6/V7 comparison (fused load, simple CTAs, warp specialization)"
+    )
 
     # Common options
     parser.add_argument(
@@ -2114,7 +2259,7 @@ Examples:
     }
 
     # Default to --quick if no mode specified
-    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate, args.compare_cuda, args.compare_cute_fused, args.compare_cute_fused_v2, args.compare_cute_fused_v4]):
+    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate, args.compare_cuda, args.compare_cute_fused, args.compare_cute_fused_v2, args.compare_cute_fused_v4, args.compare_cute_fused_v567]):
         args.quick = True
 
     # Validation only mode
@@ -2521,6 +2666,108 @@ Examples:
                 "triton": triton_time,
                 "cute_v3": cute_v3_time,
                 "cute_v4": cute_v4_time,
+            }
+
+        sys.exit(0)
+
+    # CuTe fused GEMM V5/V6/V7 comparison mode
+    if args.compare_cute_fused_v567:
+        print(f"\n{'='*70}")
+        print("CUTE FUSED MXFP4 GEMM V5/V6/V7 COMPARISON")
+        print("V5: Fused load+decode (no smem_packed, 1 sync/K-iter)")
+        print("V6: Simple CTAs, no double buffering (let hardware overlap)")
+        print("V7: Warp specialization + persistent CTA (producer/consumer)")
+        print(f"{'='*70}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Config: {config['num_experts']} experts")
+        print(f"Dimensions: K={config['hidden_size']}, N={config['intermediate_size']}")
+
+        N = config['intermediate_size']
+        K = config['hidden_size']
+        num_experts = config['num_experts']
+
+        results = {}
+
+        for tpe in args.tokens:
+            print(f"\n{'='*70}")
+            print(f"TOKENS PER EXPERT: {tpe}")
+            print(f"{'='*70}")
+
+            # Create test data
+            print("Creating test data...")
+            hidden_3d, weights, scales, expert_counts = create_test_tensors(
+                num_experts, tpe, K, N, "cuda", per_expert_weights=True
+            )
+
+            # Benchmark Triton fused GEMM
+            print("\nBenchmarking Triton fused MXFP4 GEMM...")
+            triton_time = benchmark_fused_mxfp4_gemm(hidden_3d, weights, scales, N)
+
+            # Benchmark CuTe V5 (fused load+decode)
+            print("Benchmarking CuTe V5 (fused load+decode)...")
+            cute_v5_time = benchmark_cute_fused_mxfp4_gemm_v5(
+                hidden_3d, weights, scales, N
+            )
+
+            # Benchmark CuTe V6 (simple CTAs)
+            print("Benchmarking CuTe V6 (simple CTAs, no double buffering)...")
+            cute_v6_time = benchmark_cute_fused_mxfp4_gemm_v6(
+                hidden_3d, weights, scales, N
+            )
+
+            # Benchmark CuTe V7 (warp specialization + persistent)
+            print("Benchmarking CuTe V7 (warp specialization + persistent CTA)...")
+            cute_v7_time = benchmark_cute_fused_mxfp4_gemm_v7(
+                hidden_3d, weights, scales, N
+            )
+
+            # Results
+            print(f"\n{'='*70}")
+            print(f"RESULTS (tokens_per_expert={tpe})")
+            print(f"{'='*70}")
+            print(f"{'Kernel':<50} {'Time (ms)':>12} {'vs Triton':>12}")
+            print("-" * 74)
+
+            if triton_time != float('inf'):
+                print(f"{'Triton fused MXFP4 GEMM':<50} {triton_time:>12.3f} {'(baseline)':>12}")
+            else:
+                print(f"{'Triton fused MXFP4 GEMM':<50} {'FAILED':>12}")
+
+            kernel_results = [
+                ("CuTe V5 (fused load+decode)", cute_v5_time),
+                ("CuTe V6 (simple CTAs, no double buf)", cute_v6_time),
+                ("CuTe V7 (warp specialization + persistent)", cute_v7_time),
+            ]
+
+            best_cute_time = float('inf')
+            best_cute_name = None
+
+            for name, ktime in kernel_results:
+                if ktime != float('inf') and triton_time != float('inf'):
+                    speedup = triton_time / ktime
+                    print(f"{name:<50} {ktime:>12.3f} {speedup:>11.2f}x")
+                    if ktime < best_cute_time:
+                        best_cute_time = ktime
+                        best_cute_name = name
+                elif ktime != float('inf'):
+                    print(f"{name:<50} {ktime:>12.3f}")
+                    if ktime < best_cute_time:
+                        best_cute_time = ktime
+                        best_cute_name = name
+                else:
+                    print(f"{name:<50} {'FAILED':>12}")
+
+            print(f"{'='*74}")
+            if best_cute_name and triton_time != float('inf'):
+                speedup = triton_time / best_cute_time
+                print(f"BEST CuTe: {best_cute_name} at {best_cute_time:.3f}ms ({speedup:.2f}x vs Triton)")
+            print(f"{'='*74}")
+
+            results[tpe] = {
+                "triton": triton_time,
+                "cute_v5": cute_v5_time,
+                "cute_v6": cute_v6_time,
+                "cute_v7": cute_v7_time,
             }
 
         sys.exit(0)
