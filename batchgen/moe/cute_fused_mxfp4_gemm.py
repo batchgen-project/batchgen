@@ -343,6 +343,8 @@ __global__ void cute_fused_mxfp4_grouped_gemm_wmma_kernel(
     __shared__ float fp4_lut[16];
     __shared__ __nv_bfloat16 smem_lhs[BLOCK_M][BLOCK_K + 8];  // Padding to avoid bank conflicts
     __shared__ __nv_bfloat16 smem_rhs[BLOCK_N][BLOCK_K + 8];
+    // Temporary buffer for accumulator conversion (one tile per warp at a time)
+    __shared__ float smem_acc_temp[NUM_WARPS][WMMA_M * WMMA_N];
 
     // Load FP4 LUT
     if (threadIdx.x < 16) {
@@ -491,7 +493,7 @@ __global__ void cute_fused_mxfp4_grouped_gemm_wmma_kernel(
         }  // K-loop
 
         // =========================================================
-        // Store output
+        // Store output - convert FP32 accumulator to BF16 via smem
         // =========================================================
         #pragma unroll
         for (int n_tile_offset = 0; n_tile_offset < 2; n_tile_offset++) {
@@ -499,24 +501,32 @@ __global__ void cute_fused_mxfp4_grouped_gemm_wmma_kernel(
             const int m_out_start = m_start + warp_m * WMMA_M;
             const int n_out_start = n_start + n_tile * WMMA_N;
 
-            // Convert FP32 accumulator to BF16
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16> out_frag;
+            // Store FP32 accumulator to shared memory (row major)
+            wmma::store_matrix_sync(
+                smem_acc_temp[warp_id],
+                acc_frag[n_tile_offset],
+                WMMA_N,
+                wmma::mem_row_major
+            );
+            __syncwarp();
 
-            // Manual conversion from float to bf16
+            // Cooperatively convert to BF16 and store to global memory
+            // Each lane handles 8 elements (256 elements / 32 lanes)
+            const int elements_per_lane = (WMMA_M * WMMA_N) / WARP_SIZE;  // 8
+
             #pragma unroll
-            for (int i = 0; i < acc_frag[n_tile_offset].num_elements; i++) {
-                out_frag.x[i] = __float2bfloat16(acc_frag[n_tile_offset].x[i]);
-            }
+            for (int i = 0; i < elements_per_lane; i++) {
+                // Coalesced access pattern: lane_id gives column, i gives row batch
+                const int elem_idx = lane_id + i * WARP_SIZE;
+                const int row = elem_idx / WMMA_N;
+                const int col = elem_idx % WMMA_N;
+                const int m_global = m_out_start + row;
+                const int n_global = n_out_start + col;
 
-            // Store with bounds checking
-            if (m_out_start < gm && n_out_start < N) {
-                // Store to global memory (row major)
-                wmma::store_matrix_sync(
-                    &out_base[m_out_start * stride_out_m + n_out_start * stride_out_n],
-                    out_frag,
-                    stride_out_n,
-                    wmma::mem_row_major
-                );
+                if (m_global < gm && n_global < N) {
+                    out_base[m_global * stride_out_m + n_global * stride_out_n] =
+                        __float2bfloat16(smem_acc_temp[warp_id][elem_idx]);
+                }
             }
         }
     }  // M-loop
