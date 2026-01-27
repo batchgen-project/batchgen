@@ -634,19 +634,28 @@ def fused_mxfp4_grouped_gemm_kernel_3d(
             val_joined_hi = tl.join(val_lo_hi_scaled, val_hi_hi_scaled)
             val_interleaved_hi = tl.reshape(val_joined_hi, (BLOCK_N, 32))
 
-            # ===== COMBINE: Concatenate both halves [BLOCK_N, 64] =====
-            # Join the two 32-wide halves into one 64-wide tile
-            val_full = tl.join(val_interleaved_lo, val_interleaved_hi)
-            val_interleaved = tl.reshape(val_full, (BLOCK_N, BLOCK_K))
+            # ===== GEMM: Two separate dot products (one per 32-K half) =====
+            # FIX: Previously used tl.join+tl.reshape which INTERLEAVED the halves
+            # instead of CONCATENATING them. This caused wrong K ordering:
+            #   Wrong: [K0, K32, K1, K33, K2, K34, ...]
+            #   Correct: [K0, K1, ..., K31, K32, K33, ..., K63]
+            # Solution: Do two separate dot products, one per 32-K half.
 
-            # Load LHS contiguously [BLOCK_M, 64]
-            offs_k = tl.arange(0, BLOCK_K)
-            lhs_ptrs = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k[None, :]) * stride_lhs_k
-            lhs_tile = tl.load(lhs_ptrs, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, BLOCK_K]
+            # Load LHS first half [BLOCK_M, 32] for K[k_start:k_start+32]
+            offs_k_lo = tl.arange(0, 32)
+            lhs_ptrs_lo = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + offs_k_lo[None, :]) * stride_lhs_k
+            lhs_tile_lo = tl.load(lhs_ptrs_lo, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, 32]
 
-            # Single full-size dot product
-            # [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
-            acc += tl.dot(lhs_tile.to(tl.bfloat16), tl.trans(val_interleaved.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+            # First dot product: [BLOCK_M, 32] @ [32, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+            acc += tl.dot(lhs_tile_lo.to(tl.bfloat16), tl.trans(val_interleaved_lo.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
+
+            # Load LHS second half [BLOCK_M, 32] for K[k_start+32:k_start+64]
+            offs_k_hi = tl.arange(0, 32)
+            lhs_ptrs_hi = cur_lhs_ptr + offs_m[:, None] * stride_lhs_m + (k_start + 32 + offs_k_hi[None, :]) * stride_lhs_k
+            lhs_tile_hi = tl.load(lhs_ptrs_hi, mask=m_mask[:, None], other=0.0)  # [BLOCK_M, 32]
+
+            # Second dot product: [BLOCK_M, 32] @ [32, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+            acc += tl.dot(lhs_tile_hi.to(tl.bfloat16), tl.trans(val_interleaved_hi.to(tl.bfloat16)), allow_tf32=False).to(tl.float32)
 
         # Store output [BLOCK_M, BLOCK_N]
         out_ptrs = cur_out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n

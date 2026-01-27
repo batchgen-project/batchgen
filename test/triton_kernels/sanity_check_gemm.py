@@ -90,8 +90,8 @@ def validate_triton_gemm_directly():
 
     print(f"  Kernel output shape: {output.shape}")
 
-    # Compare - SAME tolerance check as bench
-    tolerance = 0.05  # 5% tolerance (same as test_grouped_moe_forward_3d)
+    # Compare - 1% tolerance for BF16
+    tolerance = 0.01  # 1% tolerance for BF16 precision
     all_pass = True
     max_rel_errors = []
 
@@ -318,11 +318,11 @@ def sanity_check_small():
     print(f"  Reference: {ref_output[0, 0, :4].tolist()}")
     print(f"  Kernel:    {kernel_output[0, 0, :4].tolist()}")
 
-    if rel_error < 0.02:  # 2% tolerance
-        print("\n✓ PASSED: Kernel matches reference within 2% tolerance")
+    if rel_error < 0.01:  # 1% tolerance for BF16
+        print("\n✓ PASSED: Kernel matches reference within 1% tolerance")
         return True
     else:
-        print(f"\n✗ FAILED: Relative error {rel_error*100:.2f}% exceeds 2% tolerance")
+        print(f"\n✗ FAILED: Relative error {rel_error*100:.2f}% exceeds 1% tolerance")
 
         # Debug: check each expert separately
         print("\nPer-expert analysis:")
@@ -392,11 +392,11 @@ def sanity_check_production():
     print(f"  Reference: {ref_output[0, 0, :4].tolist()}")
     print(f"  Kernel:    {kernel_output[0, 0, :4].tolist()}")
 
-    if rel_error < 0.02:  # 2% tolerance
-        print("\n✓ PASSED: Kernel matches reference within 2% tolerance")
+    if rel_error < 0.01:  # 1% tolerance for BF16
+        print("\n✓ PASSED: Kernel matches reference within 1% tolerance")
         return True
     else:
-        print(f"\n✗ FAILED: Relative error {rel_error*100:.2f}% exceeds 2% tolerance")
+        print(f"\n✗ FAILED: Relative error {rel_error*100:.2f}% exceeds 1% tolerance")
 
         # Debug: check each expert separately
         print("\nPer-expert analysis (first 2 experts):")
@@ -469,11 +469,11 @@ def sanity_check_sparse():
 
     print(f"\nOverall max relative error: {max_rel_error*100:.4f}%")
 
-    if max_rel_error < 0.02:  # 2% tolerance
-        print("\n✓ PASSED: Kernel matches reference within 2% tolerance")
+    if max_rel_error < 0.01:  # 1% tolerance for BF16
+        print("\n✓ PASSED: Kernel matches reference within 1% tolerance")
         return True
     else:
-        print(f"\n✗ FAILED: Relative error {max_rel_error*100:.2f}% exceeds 2% tolerance")
+        print(f"\n✗ FAILED: Relative error {max_rel_error*100:.2f}% exceeds 1% tolerance")
         return False
 
 
