@@ -708,6 +708,119 @@ def benchmark_all_dequant_versions(
     return results
 
 
+def benchmark_cute_dequant_kernel(
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    K: int,
+    num_experts: int,
+    device: str = "cuda",
+    kernel_version: int = 0,
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+) -> float:
+    """Benchmark CuTe-style CUDA dequantization kernel.
+
+    Args:
+        kernel_version: 0=simple vectorized, 1=swizzled smem
+
+    Returns time in milliseconds.
+    """
+    try:
+        from batchgen.moe.cute_mxfp4_dequant import batch_mxfp4_dequant_cute
+    except ImportError as e:
+        print(f"  CuTe kernel not available: {e}")
+        return float('inf')
+
+    # Setup pointer arrays
+    weight_ptrs = torch.tensor(
+        [w.data_ptr() for w in weights], dtype=torch.int64, device=device
+    )
+
+    # CuTe uses K-major scales: [K//32, N]
+    scales_transposed = [s.t().contiguous() for s in scales]
+    scale_ptrs = torch.tensor(
+        [s.data_ptr() for s in scales_transposed], dtype=torch.int64, device=device
+    )
+
+    bf16_buffer = torch.empty(num_experts, N, K, dtype=torch.bfloat16, device=device)
+
+    try:
+        # Warmup
+        for _ in range(warmup_iters):
+            batch_mxfp4_dequant_cute(
+                weight_ptrs, scale_ptrs, bf16_buffer,
+                weights[0], scales_transposed[0], kernel_version=kernel_version
+            )
+            torch.cuda.synchronize()
+
+        # Benchmark
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            batch_mxfp4_dequant_cute(
+                weight_ptrs, scale_ptrs, bf16_buffer,
+                weights[0], scales_transposed[0], kernel_version=kernel_version
+            )
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / bench_iters * 1000
+
+        return elapsed
+    except Exception as e:
+        print(f"  CuTe kernel failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
+def benchmark_all_cuda_versions(
+    weights: List[torch.Tensor],
+    scales: List[torch.Tensor],
+    N: int,
+    K: int,
+    num_experts: int,
+    device: str = "cuda",
+    warmup_iters: int = 3,
+    bench_iters: int = 10,
+) -> Dict[str, Dict[str, float]]:
+    """Benchmark all CUDA dequant kernel versions (CuTe-style).
+
+    Returns dict mapping version name to {time_ms, bandwidth_gb_s, hbm_util_pct}.
+    """
+    results = {}
+    version_notes = {
+        "cute_simple": "CuTe-style: vectorized 128-bit loads/stores, smem LUT",
+        "cute_swizzle": "CuTe-style: + swizzled smem for 0 bank conflicts",
+    }
+
+    versions = [
+        ("cute_simple", 0),
+        ("cute_swizzle", 1),
+    ]
+
+    for name, kernel_ver in versions:
+        time_ms = benchmark_cute_dequant_kernel(
+            weights, scales, N, K, num_experts, device, kernel_ver, warmup_iters, bench_iters
+        )
+
+        if time_ms != float('inf'):
+            metrics = compute_dequant_metrics(time_ms, num_experts, N, K)
+            results[name] = {
+                "time_ms": time_ms,
+                "bandwidth_gb_s": metrics["bandwidth_gb_s"],
+                "hbm_util_pct": metrics["hbm_util_pct"],
+                "notes": version_notes.get(name, ""),
+            }
+        else:
+            results[name] = {
+                "time_ms": float('inf'),
+                "bandwidth_gb_s": 0,
+                "hbm_util_pct": 0,
+                "notes": "FAILED",
+            }
+
+    return results
+
+
 def benchmark_bf16_gemm_kernel(
     hidden_3d: torch.Tensor,
     N: int,
@@ -1143,6 +1256,7 @@ def run_fp4_comparison(
     config: Dict,
     device: str = "cuda",
     skip_validation: bool = False,
+    include_cuda: bool = True,
 ) -> Dict[str, Dict[str, float]]:
     """Run FP4 decode version comparison only."""
     print(f"\n{'='*70}")
@@ -1175,23 +1289,37 @@ def run_fp4_comparison(
             return {}
         print("Validation passed.\n")
 
-    # Benchmark all versions
+    # Benchmark Triton versions
+    print("\nBenchmarking Triton versions...")
     results = benchmark_all_dequant_versions(
         weights, scales, N, K, num_experts, device
     )
 
+    # Benchmark CuTe CUDA versions
+    if include_cuda:
+        print("\nBenchmarking CuTe CUDA versions...")
+        cuda_results = benchmark_all_cuda_versions(
+            weights, scales, N, K, num_experts, device
+        )
+        results.update(cuda_results)
+
     # Print results table
-    print(f"\n{'='*90}")
+    print(f"\n{'='*100}")
     print("FP4 DECODE VERSION RESULTS")
-    print(f"{'='*90}")
+    print(f"{'='*100}")
     print(f"{'Version':<20} {'Time (ms)':>10} {'BW (GB/s)':>10} {'HBM %':>8} {'vs v1':>10} {'Notes'}")
-    print("-" * 90)
+    print("-" * 100)
 
     baseline_time = results.get("v1_sequential", {}).get("time_ms", 1.0)
     best_version = None
     best_time = float('inf')
 
-    for version, data in results.items():
+    # Sort: Triton versions first, then CuTe
+    triton_versions = [k for k in results.keys() if not k.startswith("cute")]
+    cuda_versions = [k for k in results.keys() if k.startswith("cute")]
+
+    for version in triton_versions + cuda_versions:
+        data = results[version]
         time_ms = data.get("time_ms", float('inf'))
         bw = data.get("bandwidth_gb_s", 0)
         hbm = data.get("hbm_util_pct", 0)
@@ -1208,11 +1336,17 @@ def run_fp4_comparison(
         else:
             print(f"{version:<20} {'FAILED':>10} {'N/A':>10} {'N/A':>8} {'N/A':>10} {notes}")
 
-    print(f"{'='*90}")
+        # Add separator between Triton and CuTe
+        if version == triton_versions[-1] if triton_versions else None and cuda_versions:
+            print("-" * 100)
+            print("CuTe CUDA kernels:")
+            print("-" * 100)
+
+    print(f"{'='*100}")
     if best_version:
         best_data = results[best_version]
         print(f"BEST: {best_version} at {best_time:.3f} ms ({best_data['bandwidth_gb_s']:.0f} GB/s = {best_data['hbm_util_pct']:.1f}% HBM)")
-    print(f"{'='*90}")
+    print(f"{'='*100}")
 
     return results
 
@@ -1269,6 +1403,10 @@ Examples:
         "--validate", action="store_true",
         help="Numerical validation only (no timing)"
     )
+    mode_group.add_argument(
+        "--compare-cuda", action="store_true",
+        help="CuTe CUDA kernel comparison only"
+    )
 
     # Common options
     parser.add_argument(
@@ -1310,7 +1448,7 @@ Examples:
     }
 
     # Default to --quick if no mode specified
-    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate]):
+    if not any([args.quick, args.compare_all, args.compare_fp4, args.tune_gemm, args.validate, args.compare_cuda]):
         args.quick = True
 
     # Validation only mode
@@ -1335,7 +1473,84 @@ Examples:
 
     # FP4 comparison mode
     if args.compare_fp4:
-        results = run_fp4_comparison(config, skip_validation=args.skip_validation)
+        results = run_fp4_comparison(config, skip_validation=args.skip_validation, include_cuda=True)
+        sys.exit(0)
+
+    # CuTe CUDA comparison mode
+    if args.compare_cuda:
+        print(f"\n{'='*70}")
+        print("CUTE CUDA KERNEL COMPARISON")
+        print(f"{'='*70}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Config: {config['num_experts']} experts")
+        print(f"Dimensions: K={config['hidden_size']}, N={config['intermediate_size']}")
+
+        N = config['intermediate_size']
+        K = config['hidden_size']
+        num_experts = config['num_experts']
+
+        # Create test data
+        print("\nCreating test data...")
+        weights = [
+            torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device="cuda")
+            for _ in range(num_experts)
+        ]
+        scales = [
+            torch.randint(120, 134, (N, K // 32), dtype=torch.uint8, device="cuda")
+            for _ in range(num_experts)
+        ]
+
+        # Benchmark CuTe CUDA versions
+        print("\nBenchmarking CuTe CUDA versions...")
+        cuda_results = benchmark_all_cuda_versions(
+            weights, scales, N, K, num_experts, "cuda"
+        )
+
+        # Also get best Triton for comparison
+        print("\nBenchmarking Triton v7 for comparison...")
+        triton_time = benchmark_dequant_kernel(
+            weights, scales, N, K, num_experts, "cuda", "v7_fast_scale"
+        )
+        if triton_time != float('inf'):
+            triton_metrics = compute_dequant_metrics(triton_time, num_experts, N, K)
+            cuda_results["triton_v7_ref"] = {
+                "time_ms": triton_time,
+                "bandwidth_gb_s": triton_metrics["bandwidth_gb_s"],
+                "hbm_util_pct": triton_metrics["hbm_util_pct"],
+                "notes": "Triton v7 (best Triton) for reference",
+            }
+
+        # Print results
+        print(f"\n{'='*100}")
+        print("CUTE CUDA vs TRITON COMPARISON")
+        print(f"{'='*100}")
+        print(f"{'Version':<20} {'Time (ms)':>10} {'BW (GB/s)':>10} {'HBM %':>8} {'Notes'}")
+        print("-" * 100)
+
+        best_version = None
+        best_time = float('inf')
+
+        for version, data in cuda_results.items():
+            time_ms = data.get("time_ms", float('inf'))
+            bw = data.get("bandwidth_gb_s", 0)
+            hbm = data.get("hbm_util_pct", 0)
+            notes = data.get("notes", "")
+
+            if time_ms < best_time:
+                best_time = time_ms
+                best_version = version
+
+            if time_ms != float('inf'):
+                marker = " <-- BEST" if version == best_version else ""
+                print(f"{version:<20} {time_ms:>10.3f} {bw:>10.0f} {hbm:>7.1f}% {notes}{marker}")
+            else:
+                print(f"{version:<20} {'FAILED':>10} {'N/A':>10} {'N/A':>8} {notes}")
+
+        print(f"{'='*100}")
+        if best_version:
+            best_data = cuda_results[best_version]
+            print(f"BEST: {best_version} at {best_time:.3f} ms ({best_data['bandwidth_gb_s']:.0f} GB/s = {best_data['hbm_util_pct']:.1f}% HBM)")
+        print(f"{'='*100}")
         sys.exit(0)
 
     # GEMM tuning mode
