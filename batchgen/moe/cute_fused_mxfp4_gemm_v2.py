@@ -1,10 +1,10 @@
 """CuTe-style fused MXFP4 grouped GEMM V3 - Routed Experts Only.
 
-V3 improvements over V2:
-1. Reduced smem from 28KB to 24KB (BF16 buffer for partial tiles vs FP32)
-2. For full tiles: Convert FP32 accumulator to BF16 in registers, store directly to global
-3. For partial tiles: Use smaller BF16 smem buffer (4KB vs 8KB FP32 in V2)
-4. Better occupancy: expected 4-6 blocks/SM vs 2-3 blocks/SM in V2
+V3 fixes (from V3-broken):
+1. WMMA doesn't support BF16 accumulator fragments - must use FP32
+2. Reverted to FP32 smem_acc_temp (8KB) with optimized FP32→BF16 conversion
+3. Vectorized output conversion: 4 floats → 4 BF16 using __floats2bfloat162_rn
+4. Target architecture: SM90a (H20 Hopper) for best performance
 
 V2 improvements over V1:
 1. Only processing routed experts (not all 128)
@@ -17,17 +17,23 @@ Key optimizations:
 - Shared memory LUT for FP4 decode (no ALU)
 - Hardware ldexpf() for scale application
 - WMMA tensor cores for BF16 GEMM
-- Direct register→global output for full tiles (V3)
-- BF16 smem buffer for partial tiles saves 4KB (V3)
+- FP32 accumulator (required by WMMA) with vectorized BF16 output
 
-Target: 40-60ms for 128 experts with 4 tokens each (vs Triton's 27ms)
+Shared memory layout (~28KB):
+- LUT: 64 bytes (16 floats)
+- smem_lhs: 9216 bytes [64 × 72] BF16
+- smem_rhs: 9216 bytes [64 × 72] BF16
+- smem_packed: 2048 bytes [64 × 32] uint8
+- smem_acc_temp: 8192 bytes [8 warps × 16 × 16] FP32
+
+Target: Match or beat Triton's 27ms for 128 experts with 4 tokens each
 """
 
 import torch
 from torch.utils.cpp_extension import load_inline
 import os
 
-# CuTe-style fused MXFP4 GEMM V2 CUDA source
+# CuTe-style fused MXFP4 GEMM V3 CUDA source (fixed: FP32 accumulator required by WMMA)
 CUDA_SOURCE = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -82,7 +88,7 @@ __device__ __forceinline__ __nv_bfloat16 float_to_bf16(float x) {
 }
 
 // ============================================================================
-// V2 Kernel: Vectorized Dequant + WMMA GEMM for Routed Experts
+// V3 Kernel: Vectorized Dequant + WMMA GEMM for Routed Experts
 // ============================================================================
 /*
  * Grid: (num_routed_experts, cdiv(N, BLOCK_N))
@@ -91,10 +97,16 @@ __device__ __forceinline__ __nv_bfloat16 float_to_bf16(float x) {
  * This kernel only processes experts that have tokens routed to them.
  * Uses CSR-style indexing with expert_ids and token_offsets.
  *
- * Key improvements over V1:
+ * V3 fixes from broken V3:
+ * - WMMA only supports FP32/FP16/INT accumulators, NOT BF16
+ * - Uses FP32 smem buffer + vectorized FP32→BF16 conversion
+ * - Target: SM90a (H20 Hopper) for best performance
+ *
+ * Key optimizations:
  * 1. Vectorized 64-bit loads for packed FP4 -> smem_packed
  * 2. Vectorized decode from smem_packed -> smem_rhs
- * 3. Vectorized 128-bit stores for decoded BF16
+ * 3. WMMA tensor cores for BF16 input, FP32 accumulator
+ * 4. Vectorized FP32→BF16 conversion during output store
  */
 __global__ void cute_fused_mxfp4_gemm_v3_kernel(
     // Input tokens [total_tokens, K] BF16
@@ -118,16 +130,20 @@ __global__ void cute_fused_mxfp4_gemm_v3_kernel(
     const int64_t stride_scale_n,
     const int64_t stride_scale_k
 ) {
-    // Shared memory layout (V3: reduced smem from 28KB to 24KB)
-    // V2: used FP32 smem_acc_temp (8KB) for all output
-    // V3: uses BF16 smem_partial (4KB) only for partial tiles at edges
+    // Shared memory layout (~28KB total)
+    // - LUT: 64 bytes (16 floats)
+    // - smem_lhs: 9216 bytes [64, 72] BF16 (padded for bank conflicts)
+    // - smem_rhs: 9216 bytes [64, 72] BF16
+    // - smem_packed: 2048 bytes [64, 32] uint8
+    // - smem_acc_temp: 8192 bytes [8 warps × 16 × 16] FP32 (WMMA requires FP32 accumulator)
     extern __shared__ char smem[];
     float* lut = reinterpret_cast<float*>(smem);  // 16 floats = 64 bytes
     __nv_bfloat16* smem_lhs = reinterpret_cast<__nv_bfloat16*>(smem + 64);  // [64, 72]
     __nv_bfloat16* smem_rhs = reinterpret_cast<__nv_bfloat16*>(smem + 64 + SMEM_LHS_SIZE * sizeof(__nv_bfloat16));  // [64, 72]
     uint8_t* smem_packed = reinterpret_cast<uint8_t*>(smem + 64 + (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16));  // [64, 32]
-    // V3: BF16 buffer for partial tiles (4KB vs V2's 8KB FP32)
-    __nv_bfloat16* smem_partial = reinterpret_cast<__nv_bfloat16*>(smem + 64 + (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16) + SMEM_PACKED_SIZE);
+    // FP32 temp buffer for WMMA output (8 warps × 16 × 16 × 4 bytes = 8KB)
+    // WMMA only supports FP32/FP16/INT accumulators, NOT BF16!
+    float* smem_acc_temp = reinterpret_cast<float*>(smem + 64 + (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16) + SMEM_PACKED_SIZE);
 
     // Load FP4 LUT to shared memory
     if (threadIdx.x < 16) {
@@ -348,9 +364,10 @@ __global__ void cute_fused_mxfp4_gemm_v3_kernel(
         }  // K-loop
 
         // =========================================================
-        // Store output (V3: direct register -> global, no smem staging)
+        // Store output (V3-fixed: FP32 smem -> vectorized BF16 conversion -> global)
         // =========================================================
-        // No __syncthreads() needed - each warp stores its own output
+        // WMMA only supports FP32 accumulator fragments, NOT BF16!
+        // We store FP32 to smem, then convert to BF16 during global store.
 
         #pragma unroll
         for (int n_tile_offset = 0; n_tile_offset < 2; n_tile_offset++) {
@@ -358,51 +375,67 @@ __global__ void cute_fused_mxfp4_gemm_v3_kernel(
             const int m_out_start = m_start + warp_m * WMMA_M;
             const int n_out_start = n_start + n_tile * WMMA_N;
 
-            // Check if this is a full tile (can use direct WMMA store)
+            // Store FP32 accumulator to per-warp smem buffer
+            float* temp_ptr = &smem_acc_temp[warp_id * WMMA_M * WMMA_N];
+            wmma::store_matrix_sync(temp_ptr, acc_frag[n_tile_offset], WMMA_N, wmma::mem_row_major);
+
+            // Check if this is a full tile (can use vectorized store)
             const bool full_m = (m_out_start + WMMA_M <= actual_m);
             const bool full_n = (n_out_start + WMMA_N <= N);
 
+            // 256 elements (16x16), 32 threads per warp, 8 elements per thread
+            const int elements_per_lane = (WMMA_M * WMMA_N) / WARP_SIZE;  // 8
+
             if (full_m && full_n) {
-                // V3 optimization: Convert FP32 -> BF16 in registers and store directly
-                // Create BF16 accumulator fragment from FP32 values
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16> acc_bf16;
+                // Full tile: vectorized FP32→BF16 conversion + store
+                // Process 8 elements per thread, 4 at a time using __floats2bfloat162_rn
                 #pragma unroll
-                for (int i = 0; i < acc_frag[n_tile_offset].num_elements; i++) {
-                    acc_bf16.x[i] = __float2bfloat16(acc_frag[n_tile_offset].x[i]);
-                }
+                for (int i = 0; i < elements_per_lane; i += 4) {
+                    // Linear index in the 16x16 tile
+                    // Layout: threads 0-31 cover elements [0,32), [32,64), ... with stride 32
+                    const int base_idx = lane_id * elements_per_lane + i;
 
-                // Store BF16 directly to global memory (no smem!)
-                const int out_row = token_start + m_out_start;
-                wmma::store_matrix_sync(&output[out_row * N + n_out_start], acc_bf16, N, wmma::mem_row_major);
+                    // Load 4 floats from smem
+                    float f0 = temp_ptr[base_idx];
+                    float f1 = temp_ptr[base_idx + 1];
+                    float f2 = temp_ptr[base_idx + 2];
+                    float f3 = temp_ptr[base_idx + 3];
+
+                    // Convert to BF16 (2 floats -> 1 bfloat162)
+                    __nv_bfloat162 bf2_0 = __floats2bfloat162_rn(f0, f1);
+                    __nv_bfloat162 bf2_1 = __floats2bfloat162_rn(f2, f3);
+
+                    // Calculate output positions
+                    const int row0 = base_idx / WMMA_N;
+                    const int col0 = base_idx % WMMA_N;
+                    const int m_global = token_start + m_out_start + row0;
+                    const int n_global = n_out_start + col0;
+
+                    // Store 4 BF16 values (vectorized as 2x bfloat162 = 8 bytes)
+                    // Note: elements may not be contiguous in output due to tile layout
+                    // Fall back to scalar stores for correctness
+                    output[m_global * N + n_global] = __low2bfloat16(bf2_0);
+                    output[m_global * N + n_global + 1] = __high2bfloat16(bf2_0);
+
+                    const int row2 = (base_idx + 2) / WMMA_N;
+                    const int col2 = (base_idx + 2) % WMMA_N;
+                    const int m_global2 = token_start + m_out_start + row2;
+                    const int n_global2 = n_out_start + col2;
+                    output[m_global2 * N + n_global2] = __low2bfloat16(bf2_1);
+                    output[m_global2 * N + n_global2 + 1] = __high2bfloat16(bf2_1);
+                }
             } else {
-                // Partial tile: need element-wise bounds checking
-                // V3: Use small BF16 smem buffer (4KB total vs V2's 8KB FP32)
-                // Convert FP32 -> BF16 in fragment and store to smem, then scatter to global
-
-                // Create BF16 accumulator fragment from FP32 values
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16> acc_bf16;
-                #pragma unroll
-                for (int i = 0; i < acc_frag[n_tile_offset].num_elements; i++) {
-                    acc_bf16.x[i] = __float2bfloat16(acc_frag[n_tile_offset].x[i]);
-                }
-
-                // Store BF16 fragment to per-warp smem buffer
-                __nv_bfloat16* partial_ptr = &smem_partial[warp_id * WMMA_M * WMMA_N];
-                wmma::store_matrix_sync(partial_ptr, acc_bf16, WMMA_N, wmma::mem_row_major);
-
-                // Copy from smem to global with bounds checking
-                // 256 elements (16x16), 32 threads per warp, 8 elements per thread
-                const int elements_per_lane = (WMMA_M * WMMA_N) / WARP_SIZE;  // 8
+                // Partial tile: element-wise bounds checking
                 #pragma unroll
                 for (int i = 0; i < elements_per_lane; i++) {
-                    const int elem_idx = lane_id + i * WARP_SIZE;
+                    const int elem_idx = lane_id * elements_per_lane + i;
                     const int local_row = elem_idx / WMMA_N;
                     const int local_col = elem_idx % WMMA_N;
                     const int m_global = token_start + m_out_start + local_row;
                     const int n_global = n_out_start + local_col;
 
                     if (m_out_start + local_row < actual_m && n_global < N) {
-                        output[m_global * N + n_global] = partial_ptr[elem_idx];
+                        output[m_global * N + n_global] = __float2bfloat16(temp_ptr[elem_idx]);
                     }
                 }
             }
@@ -435,14 +468,14 @@ void cute_fused_mxfp4_gemm_v3_impl(
     dim3 grid(num_routed, (N + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
 
-    // Shared memory size (V3: reduced from 28KB to 24KB)
-    // V2 total: 64 + 9216 + 9216 + 2048 + 8192 = 28736 bytes (~28KB) - FP32 temp
-    // V3 total: 64 + 9216 + 9216 + 2048 + 4096 = 24640 bytes (~24KB) - BF16 partial
+    // Shared memory size (~28KB)
+    // Total: 64 + 9216 + 9216 + 2048 + 8192 = 28736 bytes (~28KB)
+    // Note: WMMA requires FP32 accumulator - BF16 accumulator fragments don't exist!
     const size_t smem_size = 64 +  // LUT (16 floats)
                              SMEM_LHS_SIZE * sizeof(__nv_bfloat16) +  // 9216 bytes
                              SMEM_RHS_SIZE * sizeof(__nv_bfloat16) +  // 9216 bytes
                              SMEM_PACKED_SIZE +                       // 2048 bytes
-                             NUM_WARPS * WMMA_M * WMMA_N * sizeof(__nv_bfloat16);  // 4096 bytes (vs 8KB FP32 in V2)
+                             NUM_WARPS * WMMA_M * WMMA_N * sizeof(float);  // 8192 bytes (FP32 required by WMMA)
 
     cute_fused_mxfp4_gemm_v3_kernel<<<grid, block, smem_size>>>(
         reinterpret_cast<const __nv_bfloat16*>(hidden_states.data_ptr()),
@@ -459,7 +492,7 @@ void cute_fused_mxfp4_gemm_v3_impl(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cute_fused_mxfp4_gemm_v3_impl", &cute_fused_mxfp4_gemm_v3_impl,
-          "CuTe-style fused MXFP4 GEMM V2 - routed experts only");
+          "CuTe-style fused MXFP4 GEMM V3 - routed experts only (FP32 accumulator)");
 }
 '''
 
@@ -476,7 +509,7 @@ def _get_cute_gemm_v3_module():
             cpp_sources=[],
             cuda_sources=[CUDA_SOURCE],
             extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo',
-                              '-arch=sm_80'],  # Ampere+ for WMMA BF16
+                              '-arch=sm_90a'],  # H20 Hopper for best performance
             verbose=os.environ.get('CUDA_DEBUG', '0') == '1',
         )
     return _cute_gemm_v3_module
@@ -633,11 +666,11 @@ def cute_grouped_mxfp4_gemm_3d_v2(
 if __name__ == "__main__":
     import time
 
-    print("CuTe-Style Fused MXFP4 Grouped GEMM V3")
+    print("CuTe-Style Fused MXFP4 Grouped GEMM V3 (Fixed: FP32 accumulator)")
     print("=" * 60)
 
     # Compile
-    print("Compiling CuTe GEMM V3 kernel...")
+    print("Compiling CuTe GEMM V3 kernel (SM90a for H20)...")
     _get_cute_gemm_v3_module()
     print("Compilation successful!")
 
