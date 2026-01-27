@@ -1,6 +1,12 @@
-"""CuTe-style fused MXFP4 grouped GEMM V2 - Routed Experts Only.
+"""CuTe-style fused MXFP4 grouped GEMM V3 - Routed Experts Only.
 
-This kernel improves on V1 by:
+V3 improvements over V2:
+1. Reduced smem from 28KB to 24KB (BF16 buffer for partial tiles vs FP32)
+2. For full tiles: Convert FP32 accumulator to BF16 in registers, store directly to global
+3. For partial tiles: Use smaller BF16 smem buffer (4KB vs 8KB FP32 in V2)
+4. Better occupancy: expected 4-6 blocks/SM vs 2-3 blocks/SM in V2
+
+V2 improvements over V1:
 1. Only processing routed experts (not all 128)
 2. Vectorized dequantization (64-bit loads, 128-bit stores like cute_simple)
 3. Proper staging: global -> smem_packed -> decode -> smem_rhs -> WMMA
@@ -11,8 +17,10 @@ Key optimizations:
 - Shared memory LUT for FP4 decode (no ALU)
 - Hardware ldexpf() for scale application
 - WMMA tensor cores for BF16 GEMM
+- Direct register→global output for full tiles (V3)
+- BF16 smem buffer for partial tiles saves 4KB (V3)
 
-Target: 15-20ms for 128 experts with 4 tokens each (vs Triton's 27ms)
+Target: 40-60ms for 128 experts with 4 tokens each (vs Triton's 27ms)
 """
 
 import torch
@@ -88,7 +96,7 @@ __device__ __forceinline__ __nv_bfloat16 float_to_bf16(float x) {
  * 2. Vectorized decode from smem_packed -> smem_rhs
  * 3. Vectorized 128-bit stores for decoded BF16
  */
-__global__ void cute_fused_mxfp4_gemm_v2_kernel(
+__global__ void cute_fused_mxfp4_gemm_v3_kernel(
     // Input tokens [total_tokens, K] BF16
     const __nv_bfloat16* __restrict__ hidden_states,
     // Routed expert info
@@ -110,13 +118,16 @@ __global__ void cute_fused_mxfp4_gemm_v2_kernel(
     const int64_t stride_scale_n,
     const int64_t stride_scale_k
 ) {
-    // Shared memory layout
+    // Shared memory layout (V3: reduced smem from 28KB to 24KB)
+    // V2: used FP32 smem_acc_temp (8KB) for all output
+    // V3: uses BF16 smem_partial (4KB) only for partial tiles at edges
     extern __shared__ char smem[];
     float* lut = reinterpret_cast<float*>(smem);  // 16 floats = 64 bytes
     __nv_bfloat16* smem_lhs = reinterpret_cast<__nv_bfloat16*>(smem + 64);  // [64, 72]
     __nv_bfloat16* smem_rhs = reinterpret_cast<__nv_bfloat16*>(smem + 64 + SMEM_LHS_SIZE * sizeof(__nv_bfloat16));  // [64, 72]
     uint8_t* smem_packed = reinterpret_cast<uint8_t*>(smem + 64 + (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16));  // [64, 32]
-    float* smem_acc_temp = reinterpret_cast<float*>(smem + 64 + (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16) + SMEM_PACKED_SIZE);  // For WMMA output
+    // V3: BF16 buffer for partial tiles (4KB vs V2's 8KB FP32)
+    __nv_bfloat16* smem_partial = reinterpret_cast<__nv_bfloat16*>(smem + 64 + (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16) + SMEM_PACKED_SIZE);
 
     // Load FP4 LUT to shared memory
     if (threadIdx.x < 16) {
@@ -337,9 +348,9 @@ __global__ void cute_fused_mxfp4_gemm_v2_kernel(
         }  // K-loop
 
         // =========================================================
-        // Store output
+        // Store output (V3: direct register -> global, no smem staging)
         // =========================================================
-        __syncthreads();
+        // No __syncthreads() needed - each warp stores its own output
 
         #pragma unroll
         for (int n_tile_offset = 0; n_tile_offset < 2; n_tile_offset++) {
@@ -347,23 +358,52 @@ __global__ void cute_fused_mxfp4_gemm_v2_kernel(
             const int m_out_start = m_start + warp_m * WMMA_M;
             const int n_out_start = n_start + n_tile * WMMA_N;
 
-            // Store to temp smem buffer
-            float* temp_ptr = &smem_acc_temp[warp_id * WMMA_M * WMMA_N];
-            wmma::store_matrix_sync(temp_ptr, acc_frag[n_tile_offset], WMMA_N, wmma::mem_row_major);
-            __syncwarp();
+            // Check if this is a full tile (can use direct WMMA store)
+            const bool full_m = (m_out_start + WMMA_M <= actual_m);
+            const bool full_n = (n_out_start + WMMA_N <= N);
 
-            // Convert and store to global memory
-            const int elements_per_lane = (WMMA_M * WMMA_N) / WARP_SIZE;  // 8
-            #pragma unroll
-            for (int i = 0; i < elements_per_lane; i++) {
-                const int elem_idx = lane_id + i * WARP_SIZE;
-                const int row = elem_idx / WMMA_N;
-                const int col = elem_idx % WMMA_N;
-                const int m_global = token_start + m_out_start + row;
-                const int n_global = n_out_start + col;
+            if (full_m && full_n) {
+                // V3 optimization: Convert FP32 -> BF16 in registers and store directly
+                // Create BF16 accumulator fragment from FP32 values
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16> acc_bf16;
+                #pragma unroll
+                for (int i = 0; i < acc_frag[n_tile_offset].num_elements; i++) {
+                    acc_bf16.x[i] = __float2bfloat16(acc_frag[n_tile_offset].x[i]);
+                }
 
-                if (m_out_start + row < actual_m && n_global < N) {
-                    output[m_global * N + n_global] = __float2bfloat16(temp_ptr[elem_idx]);
+                // Store BF16 directly to global memory (no smem!)
+                const int out_row = token_start + m_out_start;
+                wmma::store_matrix_sync(&output[out_row * N + n_out_start], acc_bf16, N, wmma::mem_row_major);
+            } else {
+                // Partial tile: need element-wise bounds checking
+                // V3: Use small BF16 smem buffer (4KB total vs V2's 8KB FP32)
+                // Convert FP32 -> BF16 in fragment and store to smem, then scatter to global
+
+                // Create BF16 accumulator fragment from FP32 values
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16> acc_bf16;
+                #pragma unroll
+                for (int i = 0; i < acc_frag[n_tile_offset].num_elements; i++) {
+                    acc_bf16.x[i] = __float2bfloat16(acc_frag[n_tile_offset].x[i]);
+                }
+
+                // Store BF16 fragment to per-warp smem buffer
+                __nv_bfloat16* partial_ptr = &smem_partial[warp_id * WMMA_M * WMMA_N];
+                wmma::store_matrix_sync(partial_ptr, acc_bf16, WMMA_N, wmma::mem_row_major);
+
+                // Copy from smem to global with bounds checking
+                // 256 elements (16x16), 32 threads per warp, 8 elements per thread
+                const int elements_per_lane = (WMMA_M * WMMA_N) / WARP_SIZE;  // 8
+                #pragma unroll
+                for (int i = 0; i < elements_per_lane; i++) {
+                    const int elem_idx = lane_id + i * WARP_SIZE;
+                    const int local_row = elem_idx / WMMA_N;
+                    const int local_col = elem_idx % WMMA_N;
+                    const int m_global = token_start + m_out_start + local_row;
+                    const int n_global = n_out_start + local_col;
+
+                    if (m_out_start + local_row < actual_m && n_global < N) {
+                        output[m_global * N + n_global] = partial_ptr[elem_idx];
+                    }
                 }
             }
         }
@@ -374,7 +414,7 @@ __global__ void cute_fused_mxfp4_gemm_v2_kernel(
 // ============================================================================
 // Launch wrapper
 // ============================================================================
-void cute_fused_mxfp4_gemm_v2_impl(
+void cute_fused_mxfp4_gemm_v3_impl(
     torch::Tensor hidden_states,    // [total_tokens, K] BF16
     torch::Tensor expert_ids,       // [num_routed] int32
     torch::Tensor token_offsets,    // [num_routed + 1] int32
@@ -395,14 +435,16 @@ void cute_fused_mxfp4_gemm_v2_impl(
     dim3 grid(num_routed, (N + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
 
-    // Shared memory size
-    const size_t smem_size = 64 +  // LUT
-                             SMEM_LHS_SIZE * sizeof(__nv_bfloat16) +
-                             SMEM_RHS_SIZE * sizeof(__nv_bfloat16) +
-                             SMEM_PACKED_SIZE +
-                             NUM_WARPS * WMMA_M * WMMA_N * sizeof(float);  // Temp for WMMA output
+    // Shared memory size (V3: reduced from 28KB to 24KB)
+    // V2 total: 64 + 9216 + 9216 + 2048 + 8192 = 28736 bytes (~28KB) - FP32 temp
+    // V3 total: 64 + 9216 + 9216 + 2048 + 4096 = 24640 bytes (~24KB) - BF16 partial
+    const size_t smem_size = 64 +  // LUT (16 floats)
+                             SMEM_LHS_SIZE * sizeof(__nv_bfloat16) +  // 9216 bytes
+                             SMEM_RHS_SIZE * sizeof(__nv_bfloat16) +  // 9216 bytes
+                             SMEM_PACKED_SIZE +                       // 2048 bytes
+                             NUM_WARPS * WMMA_M * WMMA_N * sizeof(__nv_bfloat16);  // 4096 bytes (vs 8KB FP32 in V2)
 
-    cute_fused_mxfp4_gemm_v2_kernel<<<grid, block, smem_size>>>(
+    cute_fused_mxfp4_gemm_v3_kernel<<<grid, block, smem_size>>>(
         reinterpret_cast<const __nv_bfloat16*>(hidden_states.data_ptr()),
         expert_ids.data_ptr<int>(),
         token_offsets.data_ptr<int>(),
@@ -416,28 +458,28 @@ void cute_fused_mxfp4_gemm_v2_impl(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("cute_fused_mxfp4_gemm_v2_impl", &cute_fused_mxfp4_gemm_v2_impl,
+    m.def("cute_fused_mxfp4_gemm_v3_impl", &cute_fused_mxfp4_gemm_v3_impl,
           "CuTe-style fused MXFP4 GEMM V2 - routed experts only");
 }
 '''
 
 # Compile and cache
-_cute_gemm_v2_module = None
+_cute_gemm_v3_module = None
 
 
-def _get_cute_gemm_v2_module():
+def _get_cute_gemm_v3_module():
     """Lazy-load and compile the CuTe GEMM V2 module."""
-    global _cute_gemm_v2_module
-    if _cute_gemm_v2_module is None:
-        _cute_gemm_v2_module = load_inline(
-            name='cute_fused_mxfp4_gemm_v2',
+    global _cute_gemm_v3_module
+    if _cute_gemm_v3_module is None:
+        _cute_gemm_v3_module = load_inline(
+            name='cute_fused_mxfp4_gemm_v3',
             cpp_sources=[],
             cuda_sources=[CUDA_SOURCE],
             extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo',
                               '-arch=sm_80'],  # Ampere+ for WMMA BF16
             verbose=os.environ.get('CUDA_DEBUG', '0') == '1',
         )
-    return _cute_gemm_v2_module
+    return _cute_gemm_v3_module
 
 
 def cute_routed_mxfp4_gemm(
@@ -495,8 +537,8 @@ def cute_routed_mxfp4_gemm(
     output = torch.empty(total_tokens, N, dtype=torch.bfloat16, device=device)
 
     # Get module and launch
-    mod = _get_cute_gemm_v2_module()
-    mod.cute_fused_mxfp4_gemm_v2_impl(
+    mod = _get_cute_gemm_v3_module()
+    mod.cute_fused_mxfp4_gemm_v3_impl(
         hidden_states,
         expert_ids,
         token_offsets,
@@ -591,12 +633,12 @@ def cute_grouped_mxfp4_gemm_3d_v2(
 if __name__ == "__main__":
     import time
 
-    print("CuTe-Style Fused MXFP4 Grouped GEMM V2")
+    print("CuTe-Style Fused MXFP4 Grouped GEMM V3")
     print("=" * 60)
 
     # Compile
-    print("Compiling CuTe GEMM V2 kernel...")
-    _get_cute_gemm_v2_module()
+    print("Compiling CuTe GEMM V3 kernel...")
+    _get_cute_gemm_v3_module()
     print("Compilation successful!")
 
     # Test parameters (GPT-OSS-120B, simulating production with few routed experts)
@@ -654,7 +696,7 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - start) / bench_iters * 1000
 
-    print(f"\nV2 kernel (routed-only):")
+    print(f"\nV3 kernel (routed-only):")
     print(f"  Routed experts: {num_routed} (of {total_experts})")
     print(f"  Total tokens: {total_tokens}")
     print(f"  Time: {elapsed_ms:.3f} ms")
@@ -662,7 +704,7 @@ if __name__ == "__main__":
 
     # Also test 3D interface for comparison
     print("\n" + "=" * 60)
-    print("Testing 3D interface (for comparison with V1)...")
+    print("Testing 3D interface (for comparison with V2)...")
 
     hidden_3d = torch.randn(total_experts, tokens_per_expert, K,
                             dtype=torch.bfloat16, device=device)
@@ -690,6 +732,6 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     elapsed_ms_3d = (time.perf_counter() - start) / bench_iters * 1000
 
-    print(f"\nV2 kernel (3D interface):")
+    print(f"\nV3 kernel (3D interface):")
     print(f"  Time: {elapsed_ms_3d:.3f} ms")
     print(f"  Output shape: {output_3d.shape}")
