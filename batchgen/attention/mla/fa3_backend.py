@@ -549,13 +549,13 @@ def w8a16_gemm(
 	n, _ = weight_data_fp8.size()
 	out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
 	y_fp8 = (weight_data_fp8, weight_scale_inv_fp32)
-	
+
 	# x_fp8 = per_token_cast_to_fp8(x)
 	# x_fp8 = act_quant(x)
 	x_fp8 = act_quant(x)
 	# x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 	# deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out)
+	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, disable_ue8m0_cast=True)
 	if activation_bf16.dim() == 3:
 		out = out.view(n_group, l, n)
 	else:

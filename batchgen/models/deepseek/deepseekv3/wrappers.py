@@ -189,16 +189,11 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
 
 
 class DeepSeekAttnWrapper(AttnWrapperBase):
-    """Attention wrapper with FP8 DeepGEMM for DeepSeek-R1/V3.
+    """Attention wrapper with FP8 dequantization for DeepSeek-R1/V3.
 
-    DeepSeek uses FP8 DeepGEMM with activation quantization:
-    - Weights stay in FP8 format throughout (NO dequantization)
-    - Activations are quantized to FP8 via act_quant() in w8a16_gemm
-    - Uses deep_gemm.fp8_gemm_nt() for hardware-accelerated FP8 GEMM
-
-    The base class AttnWrapperBase.forward() would call dequantize_weights(),
-    which is WRONG for DeepSeek. This class overrides forward() to skip
-    dequantization and use the FP8 DeepGEMM path directly.
+    This is a placeholder - the full implementation requires porting
+    the extensive prefill/decode logic from the original Wrapper.py.
+    For now, it inherits the base behavior.
     """
 
     def __init__(
@@ -211,147 +206,66 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
         persistent: bool = True,
         weight_dequant_scale: Optional[Dict[str, torch.Tensor]] = None,
     ):
-        """Initialize DeepSeek attention wrapper.
-
-        Args:
-            module: Attention module (MLA) to wrap
-            layer_idx: Layer index in the model
-            core_engine: BatchGen core engine
-            engine_config: Engine configuration
-            model_config: Model configuration
-            persistent: Whether weights are pre-loaded on GPU.
-                        True = pre-loaded, no buffer fetch needed (default).
-                        False = load from buffer each forward.
-            weight_dequant_scale: Dict of FP8 inverse scale factors.
-                                  These are passed to w8a16_gemm, NOT used for dequantization.
-        """
+        """Initialize DeepSeek attention wrapper."""
         super().__init__(
             module, layer_idx, core_engine, engine_config, model_config,
             persistent, weight_dequant_scale
         )
 
-        # FP8 weight caching for persistent mode
-        self.fp8_weights_cached = {}
+        # FP8 weight caching
+        self.fp8_q_proj = None
+        self.fp8_k_proj = None
+        self.fp8_v_proj = None
+        self.fp8_o_proj = None
 
     def _register_fp8_weights(self):
-        """Cache FP8 attention weights for persistent mode."""
-        for name, param in self.module.named_parameters():
-            if 'weight' in name:
-                self.fp8_weights_cached[name] = param.data
+        """Cache FP8 attention weights."""
+        self.fp8_q_proj = self.module.q_proj.weight.data
+        self.fp8_k_proj = self.module.k_proj.weight.data
+        self.fp8_v_proj = self.module.v_proj.weight.data
+        self.fp8_o_proj = self.module.o_proj.weight.data
 
     def _unregister_fp8_weights(self):
         """Clear cached FP8 attention weights."""
-        self.fp8_weights_cached = {}
+        self.fp8_q_proj = None
+        self.fp8_k_proj = None
+        self.fp8_v_proj = None
+        self.fp8_o_proj = None
 
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Override: DO NOT dequantize - return FP8 weights as-is.
+        """Return FP8 weights unchanged - NO dequantization.
 
-        For DeepSeek, weights stay in FP8. The w8a16_gemm function
-        handles activation quantization instead.
-
-        Args:
-            weights_dict: Dict mapping parameter names to FP8 weights
-
-        Returns:
-            Same dict unchanged (FP8 weights)
+        For DeepSeek with FP8 DeepGEMM, weights stay in FP8:
+        - w8a16_gemm quantizes activations to FP8 (not weights)
+        - deep_gemm.fp8_gemm_nt() handles FP8 weights directly
+        - Dequantization would break w8a16_gemm which expects FP8 weights
         """
-        # Return weights unchanged - they stay in FP8 for DeepGEMM
         return weights_dict
-
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        """Forward pass using FP8 DeepGEMM (NO weight dequantization).
-
-        Override base class to skip dequantization. For DeepSeek:
-        - Weights stay in FP8 format
-        - prefill_attn_w8a16/decode methods use w8a16_gemm
-        - w8a16_gemm quantizes ACTIVATIONS to FP8, not weights
-
-        Args:
-            *args: Positional arguments
-            **kwargs: Keyword arguments (hidden_states, attention_mask, etc.)
-
-        Returns:
-            Output tensor
-        """
-        rank = self.get_rank_safe()
-        logging.debug(
-            f"[Rank {rank} Layer {self.layer_idx}] "
-            f"DeepSeek Attn forward. Phase: {self.phase}"
-        )
-
-        # Load FP8 weights if not persistent (NO dequantization!)
-        if not self.persistent:
-            weights_dict = self.load_weights(self.module_key)
-            # Assign FP8 weights directly - NO dequantization for DeepSeek
-            for name, param in self.module.named_parameters():
-                if name in weights_dict:
-                    param.data = weights_dict[name]
-
-        # Route to appropriate phase handler
-        hidden_states = kwargs.pop("hidden_states", None)
-        if self.phase == "prefill":
-            result = self._forward_prefill(hidden_states, **kwargs)
-        else:
-            result = self._forward_decode(hidden_states, **kwargs)
-
-        # Release buffer for non-persistent attention
-        if not self.persistent:
-            torch.cuda.current_stream(
-                self.engine_config.Basic_Config.device_torch
-            ).synchronize()
-            self.free_weights(self.module_key)
-            self.clear_weights()
-
-        logging.debug(
-            f"[Rank {rank} Layer {self.layer_idx}] "
-            f"DeepSeek Attn forward complete. Phase: {self.phase}"
-        )
-
-        return result
 
     def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         """Prefill forward using FP8 DeepGEMM.
 
-        Calls prefill_attn_w8a16 which uses w8a16_gemm for each projection.
-        w8a16_gemm quantizes activations to FP8, keeps weights in FP8,
-        and calls deep_gemm.fp8_gemm_nt().
-
-        Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size]
-            **kwargs: Additional args (attention_mask, position_ids, etc.)
-
-        Returns:
-            Attention output tensor
+        Calls prefill_attn_w8a16 which uses w8a16_gemm:
+        - Weights stay in FP8 format
+        - Activations are quantized to FP8 via act_quant()
+        - deep_gemm.fp8_gemm_nt() outputs BF16
         """
         attention_mask = kwargs.get("attention_mask", None)
         position_ids = kwargs.get("position_ids", None)
 
-        # Call prefill_attn_w8a16 which uses FP8 DeepGEMM
-        # This method is dynamically attached by Parallel_Strategy_Manager
-        output, offload_kv = self.module.prefill_attn_w8a16(
+        # Call prefill_attn_w8a16 which uses w8a16_gemm (FP8 DeepGEMM with BF16 output)
+        return self.module.prefill_attn_w8a16(
             hidden_states,
-            attention_mask.to(hidden_states.device) if attention_mask is not None else None,
-            position_ids.to(hidden_states.device) if position_ids is not None else None,
+            attention_mask,
+            position_ids,
             self.weight_dequant_scale  # Inverse scales for w8a16_gemm
         )
 
-        return output
-
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Decode forward using FP8 DeepGEMM.
+        """Decode forward - delegates to original module.
 
-        TODO: Implement decode path using decoding_attn_mode_* methods.
-        For now, delegates to module's forward (which should use decode methods).
-
-        Args:
-            hidden_states: Input tensor [batch, 1, hidden_size]
-            **kwargs: Additional args
-
-        Returns:
-            Attention output tensor
+        Note: Full implementation requires porting from Wrapper.py.
         """
-        # TODO: Implement proper decode path with decoding_attn_mode_3_* methods
-        # For now, use module's forward directly
         return self.module(hidden_states, **kwargs)
