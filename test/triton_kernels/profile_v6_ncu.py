@@ -4,20 +4,21 @@
 This script runs the V6 kernel in a way suitable for NVIDIA Nsight Compute profiling.
 
 Usage:
-    # Profile with default metrics (recommended first)
-    ncu --set full -o v6_profile python profile_v6_ncu.py
+    # IMPORTANT: Filter by kernel name to avoid profiling PyTorch setup kernels
+    # The V6 kernel name contains "fused_mxfp4_grouped_gemm_kernel_v6"
 
-    # Profile specific metrics
-    ncu --metrics \
-        sm__warps_active.avg.pct_of_peak_sustained_active,\
-        sm__cycles_active.avg,\
-        dram__throughput.avg.pct_of_peak_sustained_elapsed,\
-        l2__throughput.avg.pct_of_peak_sustained_elapsed,\
-        gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed \
+    # Quick metrics (filtered to V6 kernel only):
+    ncu --kernel-name "fused_mxfp4" --launch-skip 0 --launch-count 1 \
+        --metrics sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active \
         python profile_v6_ncu.py
 
-    # Detailed memory analysis
-    ncu --section MemoryWorkloadAnalysis \
+    # Full profile (filtered):
+    ncu --kernel-name "fused_mxfp4" --launch-skip 0 --launch-count 1 \
+        --set full -o v6_profile python profile_v6_ncu.py
+
+    # Detailed sections:
+    ncu --kernel-name "fused_mxfp4" --launch-skip 0 --launch-count 1 \
+        --section MemoryWorkloadAnalysis \
         --section ComputeWorkloadAnalysis \
         --section Occupancy \
         --section WarpStateStatistics \
