@@ -62,7 +62,7 @@ MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
 #   v4_branchless: Branchless bit manipulation (construct IEEE float directly)
 
 # Version names for benchmarking
-FP4_DECODE_VERSIONS = ["v1_sequential", "v2_e2m1", "v3_binary_tree", "v4_branchless", "v5_memopt", "v6_scale_transpose", "v7_fast_scale"]
+FP4_DECODE_VERSIONS = ["v1_sequential", "v2_e2m1", "v3_binary_tree", "v4_branchless", "v5_memopt", "v6_scale_transpose", "v7_fast_scale", "v8_ieee_pow2"]
 
 # =============================================================================
 # V1: Sequential 16 tl.where() - BASELINE (slowest)
@@ -303,6 +303,42 @@ def _fast_scale(mantissa, exponent):
     # tl.exp2 uses the SFU (Special Function Unit), not integer ALU
     # This frees the ALU pipeline and should eliminate the compute bottleneck
     scale = tl.exp2(exponent.to(tl.float32))
+    return mantissa * scale
+
+
+@triton.jit
+def _scale_by_pow2(mantissa, exponent):
+    """Compute mantissa * 2^exponent by constructing IEEE float directly.
+
+    Alternative to _fast_scale that avoids tl.exp2 entirely. Instead of calling
+    exp2, we construct 2^exponent directly by setting the IEEE 754 exponent field.
+
+    IEEE 754 float32 format:
+      - Sign: bit 31
+      - Exponent: bits 23-30 (biased by 127)
+      - Mantissa: bits 0-22
+
+    For 2^exponent (a power of 2 with no fractional part):
+      - Sign = 0
+      - Exponent field = 127 + exponent
+      - Mantissa = 0
+
+    This uses only 2 integer ops (add, shift) + 1 multiply, compared to:
+      - _ldexp: 9 integer ops (saturates ALU at 86.7%)
+      - _fast_scale: tl.exp2 (may still have overhead)
+
+    Args:
+        mantissa: Float32 values to scale
+        exponent: Integer exponent (scale factor from MXFP4 scales, typically -7 to 7)
+
+    Returns:
+        mantissa * 2^exponent as float32
+    """
+    # Construct 2^exponent directly as IEEE float32
+    # Exponent field = 127 + exponent (IEEE bias)
+    # No clamping needed: MXFP4 scales are uint8 biased by 127, so exponent is -127 to 128
+    ieee_bits = ((127 + exponent).to(tl.int32) << 23).to(tl.uint32)
+    scale = ieee_bits.to(tl.float32, bitcast=True)
     return mantissa * scale
 
 
@@ -1001,6 +1037,146 @@ def batch_mxfp4_dequant_kernel_v7_fast_scale(
     tl.store(out_ptrs_second, val_second_half, mask=out_mask_second)
 
 
+# =============================================================================
+# V8: IEEE Power-of-2 Construction (Alternative to tl.exp2)
+# =============================================================================
+#
+# If v7_fast_scale doesn't provide expected speedup (NCU shows tl.exp2 has
+# overhead), this version constructs 2^exponent directly via IEEE bit manipulation.
+# Uses only 2 integer ops (add, shift) + 1 multiply, avoiding both _ldexp's
+# 9-op overhead and any potential tl.exp2 overhead.
+
+@triton.jit
+def batch_mxfp4_dequant_kernel_v8_ieee_pow2(
+    packed_ptrs, scale_ptrs, output_ptr,
+    N, K, K_packed, K_scale,
+    stride_packed_n, stride_packed_k,
+    stride_scale_k, stride_scale_n,
+    stride_out_e, stride_out_n, stride_out_k,
+    stride_ptrs,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """V8: Direct IEEE 754 power-of-2 construction for scale application.
+
+    Same structure as v7_fast_scale, but uses _scale_by_pow2 instead of _fast_scale.
+    This constructs 2^exponent directly by setting the IEEE exponent field, using
+    only 2 integer ops (add, shift) + 1 multiply.
+
+    If NCU profiling shows v7's tl.exp2 still has significant overhead, this
+    version may be faster by avoiding the exp2 instruction entirely.
+
+    REQUIRES: Scales in K-major layout [K//32, N] (same as v6/v7)
+
+    Grid: (num_experts, cdiv(N, BLOCK_N), cdiv(K, BLOCK_K))
+          With BLOCK_K=64, K_blocks = K // 64 (half as many as v4)
+    """
+    # Program IDs
+    expert_idx = tl.program_id(0)
+    n_block = tl.program_id(1)
+    k_block = tl.program_id(2)
+
+    # Cast to int64 for large stride calculations (avoid int32 overflow)
+    expert_idx_64 = expert_idx.to(tl.int64)
+
+    # Get base pointers for this expert
+    packed_base = tl.load(packed_ptrs + expert_idx * stride_ptrs).to(tl.uint64)
+    scale_base = tl.load(scale_ptrs + expert_idx * stride_ptrs).to(tl.uint64)
+
+    # Block offsets
+    n_start = n_block * BLOCK_N
+    k_start = k_block * BLOCK_K
+
+    # N dimension offsets
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+
+    # =========================================================================
+    # FIRST HALF: K positions 0-31 (scale block 0)
+    # =========================================================================
+    scale_k_lo = k_block * 2  # First scale block within this K-tile
+
+    # Load scales for first half (K-major layout: [K//32, N])
+    # scale_ptrs = scale_base + scale_k_lo * stride_scale_k + offs_n * stride_scale_n
+    # With K-major: stride_scale_k = N, stride_scale_n = 1 -> COALESCED!
+    scale_ptrs_lo = scale_base + scale_k_lo * stride_scale_k + offs_n * stride_scale_n
+    scales_lo = tl.load(scale_ptrs_lo, mask=n_mask, other=127)
+
+    # Load packed FP4 for first half: positions 0-31 -> packed bytes 0-15
+    offs_k_lo = tl.arange(0, 16)  # 16 bytes = 32 FP4 values
+    packed_ptrs_lo = packed_base + offs_n[:, None] * stride_packed_n + \
+                     ((k_start // 2) + offs_k_lo[None, :]) * stride_packed_k
+    packed_mask_lo = n_mask[:, None] & (((k_start // 2) + offs_k_lo[None, :]) < K_packed)
+    packed_lo = tl.load(packed_ptrs_lo, mask=packed_mask_lo, other=0)
+
+    # Unpack FP4 values
+    idx_lo_0 = packed_lo & 0x0F
+    idx_hi_0 = (packed_lo >> 4) & 0x0F
+
+    # Decode using branchless IEEE construction
+    val_lo_0 = _fp4_decode_v4_branchless(idx_lo_0)
+    val_hi_0 = _fp4_decode_v4_branchless(idx_hi_0)
+
+    # Apply first scale using _scale_by_pow2 (direct IEEE construction)
+    exp_lo = (scales_lo - 127).to(tl.int32)[:, None]  # Unbias scale
+    val_lo_0_scaled = _scale_by_pow2(val_lo_0, exp_lo).to(tl.bfloat16)
+    val_hi_0_scaled = _scale_by_pow2(val_hi_0, exp_lo).to(tl.bfloat16)
+
+    # Interleave first half: [lo_0, hi_0, lo_1, hi_1, ...]
+    val_joined_0 = tl.join(val_lo_0_scaled, val_hi_0_scaled)
+    val_first_half = tl.reshape(val_joined_0, (BLOCK_N, 32))
+
+    # Store first half
+    offs_k_first = tl.arange(0, 32)
+    out_ptrs_first = output_ptr + expert_idx_64 * stride_out_e + \
+                     offs_n[:, None] * stride_out_n + \
+                     (k_start + offs_k_first[None, :]) * stride_out_k
+    out_mask_first = n_mask[:, None] & ((k_start + offs_k_first[None, :]) < K)
+    tl.store(out_ptrs_first, val_first_half, mask=out_mask_first)
+
+    # =========================================================================
+    # SECOND HALF: K positions 32-63 (scale block 1)
+    # =========================================================================
+    scale_k_hi = k_block * 2 + 1  # Second scale block within this K-tile
+
+    # Load scales for second half
+    scale_ptrs_hi = scale_base + scale_k_hi * stride_scale_k + offs_n * stride_scale_n
+    scales_hi = tl.load(scale_ptrs_hi, mask=n_mask, other=127)
+
+    # Load packed FP4 for second half: positions 32-63 -> packed bytes 16-31
+    offs_k_hi = tl.arange(0, 16)
+    packed_ptrs_hi = packed_base + offs_n[:, None] * stride_packed_n + \
+                     ((k_start // 2 + 16) + offs_k_hi[None, :]) * stride_packed_k
+    packed_mask_hi = n_mask[:, None] & (((k_start // 2 + 16) + offs_k_hi[None, :]) < K_packed)
+    packed_hi = tl.load(packed_ptrs_hi, mask=packed_mask_hi, other=0)
+
+    # Unpack FP4 values
+    idx_lo_1 = packed_hi & 0x0F
+    idx_hi_1 = (packed_hi >> 4) & 0x0F
+
+    # Decode
+    val_lo_1 = _fp4_decode_v4_branchless(idx_lo_1)
+    val_hi_1 = _fp4_decode_v4_branchless(idx_hi_1)
+
+    # Apply second scale using _scale_by_pow2 (direct IEEE construction)
+    exp_hi = (scales_hi - 127).to(tl.int32)[:, None]
+    val_lo_1_scaled = _scale_by_pow2(val_lo_1, exp_hi).to(tl.bfloat16)
+    val_hi_1_scaled = _scale_by_pow2(val_hi_1, exp_hi).to(tl.bfloat16)
+
+    # Interleave second half
+    val_joined_1 = tl.join(val_lo_1_scaled, val_hi_1_scaled)
+    val_second_half = tl.reshape(val_joined_1, (BLOCK_N, 32))
+
+    # Store second half
+    k_start_hi = k_start + 32
+    offs_k_second = tl.arange(0, 32)
+    out_ptrs_second = output_ptr + expert_idx_64 * stride_out_e + \
+                      offs_n[:, None] * stride_out_n + \
+                      (k_start_hi + offs_k_second[None, :]) * stride_out_k
+    out_mask_second = n_mask[:, None] & ((k_start_hi + offs_k_second[None, :]) < K)
+    tl.store(out_ptrs_second, val_second_half, mask=out_mask_second)
+
+
 # Mapping from version name to kernel function (for Python wrapper)
 _DEQUANT_KERNELS = {
     "v1_sequential": batch_mxfp4_dequant_kernel_v1_sequential,
@@ -1010,6 +1186,7 @@ _DEQUANT_KERNELS = {
     "v5_memopt": batch_mxfp4_dequant_kernel_v5_memopt,
     "v6_scale_transpose": batch_mxfp4_dequant_kernel_v6_scale_transpose,
     "v7_fast_scale": batch_mxfp4_dequant_kernel_v7_fast_scale,
+    "v8_ieee_pow2": batch_mxfp4_dequant_kernel_v8_ieee_pow2,
 }
 
 
@@ -1032,7 +1209,7 @@ def batch_mxfp4_dequant(
         packed_ref: Reference weight tensor for computing strides
         scale_ref: Reference scale tensor for computing strides
             - For v1-v5: [N, K//32] layout (N-major)
-            - For v6_scale_transpose: [K//32, N] layout (K-major, transposed)
+            - For v6/v7/v8: [K//32, N] layout (K-major, transposed)
         BLOCK_N: Tile size for N dimension (default 128, larger = fewer blocks)
         BLOCK_K: Tile size for K dimension (default 32, MUST match MXFP4 scale block)
                  For v5_memopt and v6_scale_transpose, this is automatically set to 64.
@@ -1047,6 +1224,10 @@ def batch_mxfp4_dequant(
             - "v7_fast_scale": Uses tl.exp2 (SFU) instead of _ldexp (ALU) for scaling.
               REQUIRES scales to be transposed to [K//32, N] layout (same as v6)!
               This eliminates ALU saturation bottleneck (86% → <40% ALU).
+            - "v8_ieee_pow2": Direct IEEE 754 power-of-2 construction for scaling.
+              REQUIRES scales to be transposed to [K//32, N] layout (same as v6/v7)!
+              Uses only 2 integer ops (add, shift) + 1 multiply. Alternative if
+              v7's tl.exp2 doesn't provide expected speedup.
     """
     num_experts = packed_ptrs.shape[0]
     N = output.shape[1]
@@ -1054,8 +1235,8 @@ def batch_mxfp4_dequant(
     K_packed = K // 2
     K_scale = K // 32
 
-    # v5_memopt, v6_scale_transpose, and v7_fast_scale use BLOCK_K=64 (processes 2 scale blocks per tile)
-    if version in ("v5_memopt", "v6_scale_transpose", "v7_fast_scale"):
+    # v5_memopt and later use BLOCK_K=64 (processes 2 scale blocks per tile)
+    if version in ("v5_memopt", "v6_scale_transpose", "v7_fast_scale", "v8_ieee_pow2"):
         BLOCK_K = 64
         assert K % 64 == 0, f"K ({K}) must be divisible by 64 for {version}"
 
@@ -1714,6 +1895,7 @@ def benchmark_all_dequant_versions(
             "v5_memopt": "BLOCK_K=64, 2x fewer K-blocks",
             "v6_scale_transpose": "K-major scales, coalesced loads",
             "v7_fast_scale": "tl.exp2 (SFU) instead of _ldexp (ALU)",
+            "v8_ieee_pow2": "Direct IEEE pow2 (2 int ops + 1 mul)",
         }
 
         for version in FP4_DECODE_VERSIONS:

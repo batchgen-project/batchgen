@@ -341,8 +341,8 @@ def validate_dequant_versions(
     for version in FP4_DECODE_VERSIONS:
         print(f"\nValidating {version}...")
         try:
-            # Use transposed scales for v6 and v7 (they use K-major scale layout)
-            if version in ("v6_scale_transpose", "v7_fast_scale"):
+            # Use transposed scales for v6, v7, v8 (they use K-major scale layout)
+            if version in ("v6_scale_transpose", "v7_fast_scale", "v8_ieee_pow2"):
                 curr_scale_ptrs = scale_ptrs_transposed
                 curr_scale_ref = scales_transposed[0]
             else:
@@ -622,8 +622,8 @@ def benchmark_dequant_kernel(
 
     weight_ptrs, scale_ptrs = setup_pointer_arrays(weights, scales, device)
 
-    # For v6_scale_transpose and v7_fast_scale, use transposed scales (K-major layout)
-    if version in ("v6_scale_transpose", "v7_fast_scale"):
+    # For v6, v7, v8, use transposed scales (K-major layout)
+    if version in ("v6_scale_transpose", "v7_fast_scale", "v8_ieee_pow2"):
         scales_transposed = [s.t().contiguous() for s in scales]
         scale_ptrs = torch.tensor(
             [s.data_ptr() for s in scales_transposed], dtype=torch.int64, device=device
@@ -681,6 +681,7 @@ def benchmark_all_dequant_versions(
         "v5_memopt": "BLOCK_K=64, 2x fewer blocks",
         "v6_scale_transpose": "K-major scales, coalesced loads",
         "v7_fast_scale": "tl.exp2 (SFU) instead of _ldexp (ALU)",
+        "v8_ieee_pow2": "Direct IEEE pow2 (2 int ops + 1 mul)",
     }
 
     for version in FP4_DECODE_VERSIONS:
@@ -782,8 +783,8 @@ def benchmark_decoupled_combined(
 
     weight_ptrs, scale_ptrs = setup_pointer_arrays(weights, scales, device)
 
-    # For v6 and v7, use transposed scales (K-major layout)
-    if dequant_version in ("v6_scale_transpose", "v7_fast_scale"):
+    # For v6, v7, v8, use transposed scales (K-major layout)
+    if dequant_version in ("v6_scale_transpose", "v7_fast_scale", "v8_ieee_pow2"):
         scales_transposed = [s.t().contiguous() for s in scales]
         scale_ptrs = torch.tensor(
             [s.data_ptr() for s in scales_transposed], dtype=torch.int64, device=device
