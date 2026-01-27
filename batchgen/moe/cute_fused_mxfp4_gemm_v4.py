@@ -15,11 +15,12 @@ Key architecture changes:
 
 Target: ~25-30ms for 128 experts with 4 tokens each (vs V3's 115ms, Triton's 27ms)
 
-Shared memory layout (~40KB):
+Shared memory layout (~47KB):
 - LUT: 64 bytes (16 floats)
 - smem_lhs[2]: 18432 bytes [2 × 64 × 72] BF16 (double-buffered)
 - smem_rhs[2]: 18432 bytes [2 × 64 × 72] BF16 (double-buffered)
 - smem_packed: 2048 bytes [64 × 32] uint8 (single buffer, reused)
+- smem_acc_temp: 8192 bytes [8 × 16 × 16] FP32 (WMMA requires FP32 accumulator)
 """
 
 import torch
@@ -256,7 +257,7 @@ __global__ void cute_fused_mxfp4_gemm_v4_kernel(
     const int64_t stride_scale_k
 ) {
     // =========================================================================
-    // Shared memory layout (~40KB total for double buffering)
+    // Shared memory layout (~47KB total for double buffering + FP32 temp)
     // =========================================================================
     extern __shared__ char smem[];
 
@@ -271,8 +272,12 @@ __global__ void cute_fused_mxfp4_gemm_v4_kernel(
     __nv_bfloat16* smem_rhs_0 = reinterpret_cast<__nv_bfloat16*>(smem + 64 + 2 * SMEM_LHS_SIZE * sizeof(__nv_bfloat16));
     __nv_bfloat16* smem_rhs_1 = reinterpret_cast<__nv_bfloat16*>(smem + 64 + 2 * SMEM_LHS_SIZE * sizeof(__nv_bfloat16) + SMEM_RHS_SIZE * sizeof(__nv_bfloat16));
 
-    // Packed buffer (single, reused between iterations)
+    // Packed buffer (single, reused between iterations): 2048 bytes
     uint8_t* smem_packed = reinterpret_cast<uint8_t*>(smem + 64 + 2 * (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16));
+
+    // FP32 accumulator temp buffer: 8 warps × 16 × 16 × 4 = 8192 bytes
+    // WMMA only supports FP32/FP16/INT accumulators, NOT BF16!
+    float* smem_acc_temp = reinterpret_cast<float*>(smem + 64 + 2 * (SMEM_LHS_SIZE + SMEM_RHS_SIZE) * sizeof(__nv_bfloat16) + SMEM_PACKED_SIZE);
 
     // Buffer pointers for ping-pong
     __nv_bfloat16* smem_lhs[2] = {smem_lhs_0, smem_lhs_1};
@@ -404,9 +409,10 @@ __global__ void cute_fused_mxfp4_gemm_v4_kernel(
         }  // K-loop
 
         // =========================================================================
-        // STORE OUTPUT: Coalesced writes with thread-to-output mapping
+        // STORE OUTPUT: FP32→BF16 conversion via smem + coalesced global writes
         // =========================================================================
-        // Each warp stores its 16x32 output tile (16 M rows × 32 N cols = 2 WMMA tiles)
+        // WMMA only supports FP32/FP16/INT accumulators, NOT BF16!
+        // We store FP32 to smem_acc_temp, then convert to BF16 during global store.
 
         #pragma unroll
         for (int n_tile_offset = 0; n_tile_offset < 2; n_tile_offset++) {
@@ -414,24 +420,13 @@ __global__ void cute_fused_mxfp4_gemm_v4_kernel(
             const int m_out_start = m_start + warp_m * WMMA_M;
             const int n_out_start = n_start + n_tile * WMMA_N;
 
-            // Direct store from accumulator to global memory
-            // WMMA accumulator has 8 elements per thread for 16x16 tile
-            // Fragment element layout varies by GPU architecture, so we use store_matrix_sync
+            // Store FP32 accumulator fragment to per-warp smem buffer
+            // Each warp stores to its own 256-float region (16x16)
+            float* temp_ptr = &smem_acc_temp[warp_id * WMMA_M * WMMA_N];
+            wmma::store_matrix_sync(temp_ptr, acc_frag[n_tile_offset], WMMA_N, wmma::mem_row_major);
 
-            // Use a small smem buffer for coalesced stores (256 bytes per warp)
-            // Store location in smem_packed (reuse, no longer needed)
-            __nv_bfloat16* warp_out_buf = reinterpret_cast<__nv_bfloat16*>(smem_packed) + warp_id * WMMA_M * WMMA_N;
-
-            // Convert FP32 fragment to BF16 and store to smem
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16> acc_bf16;
-            #pragma unroll
-            for (int i = 0; i < acc_frag[n_tile_offset].num_elements; i++) {
-                acc_bf16.x[i] = __float2bfloat16(acc_frag[n_tile_offset].x[i]);
-            }
-            wmma::store_matrix_sync(warp_out_buf, acc_bf16, WMMA_N, wmma::mem_row_major);
-
-            // Cooperative store to global memory (coalesced)
-            // 32 threads, 256 elements = 8 elements per thread
+            // Convert FP32→BF16 and store to global memory
+            // 32 threads per warp, 256 elements = 8 elements per thread
             const int elements_per_lane = (WMMA_M * WMMA_N) / WARP_SIZE;  // 8
 
             #pragma unroll
@@ -443,7 +438,7 @@ __global__ void cute_fused_mxfp4_gemm_v4_kernel(
                 const int n_global = n_out_start + local_col;
 
                 if (m_out_start + local_row < actual_m && n_global < N) {
-                    output[m_global * N + n_global] = warp_out_buf[elem_idx];
+                    output[m_global * N + n_global] = __float2bfloat16(temp_ptr[elem_idx]);
                 }
             }
         }
@@ -475,16 +470,18 @@ void cute_fused_mxfp4_gemm_v4_impl(
     dim3 grid(num_routed, (N + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
 
-    // Shared memory size (~40KB for double buffering)
+    // Shared memory size (~47KB for double buffering + FP32 temp)
     // LUT: 64 bytes
     // smem_lhs[2]: 2 × 64 × 72 × 2 = 18432 bytes
     // smem_rhs[2]: 2 × 64 × 72 × 2 = 18432 bytes
     // smem_packed: 2048 bytes
-    // Total: 64 + 18432 + 18432 + 2048 = 38976 bytes (~38KB)
+    // smem_acc_temp: 8 × 16 × 16 × 4 = 8192 bytes
+    // Total: 64 + 18432 + 18432 + 2048 + 8192 = 47168 bytes (~46KB)
     const size_t smem_size = 64 +  // LUT (16 floats)
                              2 * SMEM_LHS_SIZE * sizeof(__nv_bfloat16) +  // Double-buffered LHS
                              2 * SMEM_RHS_SIZE * sizeof(__nv_bfloat16) +  // Double-buffered RHS
-                             SMEM_PACKED_SIZE;                            // Packed buffer (reused)
+                             SMEM_PACKED_SIZE +                           // Packed buffer
+                             NUM_WARPS * WMMA_M * WMMA_N * sizeof(float); // FP32 temp for WMMA output
 
     cute_fused_mxfp4_gemm_v4_kernel<<<grid, block, smem_size>>>(
         reinterpret_cast<const __nv_bfloat16*>(hidden_states.data_ptr()),
