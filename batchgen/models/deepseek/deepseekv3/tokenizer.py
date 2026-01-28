@@ -23,8 +23,8 @@ models, which use the same tokenizer architecture.
 
 DeepSeek tokenizer specifications:
 - Vocabulary size: 129,280 tokens
-- BOS token: <|begin▁of▁sentence|> (ID: 100000)
-- EOS token: <|end▁of▁sentence|> (ID: 100001)
+- BOS token: <｜begin▁of▁sentence｜> (ID: 0)
+- EOS token: <｜end▁of▁sentence｜> (ID: 1)
 - Uses HuggingFace tokenizer.json format
 
 The tokenizer.json file is bundled with BatchGen in this directory.
@@ -44,8 +44,8 @@ TOKENIZER_DIR = Path(__file__).parent
 
 
 # DeepSeek-V3/R1 special token IDs
-DEEPSEEK_V3_BOS_TOKEN_ID = 100000  # <|begin▁of▁sentence|>
-DEEPSEEK_V3_EOS_TOKEN_ID = 100001  # <|end▁of▁sentence|>
+DEEPSEEK_V3_BOS_TOKEN_ID = 0  # <｜begin▁of▁sentence｜>
+DEEPSEEK_V3_EOS_TOKEN_ID = 1  # <｜end▁of▁sentence｜>
 DEEPSEEK_V3_VOCAB_SIZE = 129280
 
 
@@ -56,9 +56,9 @@ class DeepSeekV3Tokenizer(FastTokenizer):
     Loads tokenizer.json from package directory (not user cache).
 
     Attributes:
-        bos_token_id: 100000 (<|begin▁of▁sentence|>)
-        eos_token_id: 100001 (<|end▁of▁sentence|>)
-        pad_token_id: 100001 (uses EOS as pad token)
+        bos_token_id: 0 (<｜begin▁of▁sentence｜>)
+        eos_token_id: 1 (<｜end▁of▁sentence｜>)
+        pad_token_id: 1 (uses EOS as pad token)
         vocab_size: 129,280
     """
 
