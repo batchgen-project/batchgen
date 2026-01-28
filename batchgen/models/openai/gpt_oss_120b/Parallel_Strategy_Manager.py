@@ -896,9 +896,19 @@ class GptOssParallelStrategyManager:
         if ep_enabled:
             # EP: Use GptOssMoE_EP with AllGather/AllReduce communication
             self._swap_to_ep_moe()
+
+            # Pre-dequant for better HBM utilization when enough GPUs
+            # With 4+ GPUs, each rank has ≤32 experts, so memory is less constrained
+            # BF16 GEMM is faster than per-forward MXFP4 dequant + GEMM
+            if self.world_size >= 4:
+                self._dequant_experts_to_bf16()
+                self.use_bf16_experts = True
+            else:
+                self.use_bf16_experts = False
         else:
             # Single GPU: Use grouped GEMM (3 kernel launches per layer)
             self._swap_to_quantized_moe()
+            self.use_bf16_experts = False
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
@@ -935,3 +945,81 @@ class GptOssParallelStrategyManager:
             layer = self.model.model.layers[layer_idx].mlp
             if hasattr(layer, "set_num_tokens_per_rank"):
                 layer.set_num_tokens_per_rank(num_tokens_per_rank)
+
+    def _dequant_experts_to_bf16(self):
+        """Pre-dequantize MXFP4 expert weights to BF16 for EP mode.
+
+        Called when world_size >= 4 for better HBM utilization.
+        Pre-dequantizing allows direct BF16 GEMM during inference,
+        avoiding the overhead of per-forward MXFP4 dequantization.
+
+        Memory impact for 4-way EP (32 experts per rank × 36 layers):
+        - MXFP4 per expert: ~35 MB (gate + up + down in MXFP4)
+        - BF16 per expert: ~142 MB (gate + up + down in BF16)
+        - Total increase per rank: ~4.3 GB (acceptable with 4+ GPUs)
+        """
+        from batchgen.quantization.mxfp4 import mxfp4_dequantize
+
+        device = self.engine_config.Basic_Config.device_torch
+        dequant_count = 0
+
+        logging.info(
+            f"Pre-dequantizing MXFP4 expert weights to BF16 for EP mode "
+            f"(world_size={self.world_size}, {self.num_local_expert_per_layer} experts per layer)"
+        )
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            for local_e in range(self.num_local_expert_per_layer):
+                global_e = self.routed_expert_gpu_start_idx + local_e
+                expert_wrapper = self.model.model.layers[layer_idx].mlp.experts[global_e]
+
+                # Dequant gate: [intermediate_size, hidden_size]
+                gate_weight_bf16 = mxfp4_dequantize(
+                    expert_wrapper.mxfp4_gate_packed,
+                    expert_wrapper.mxfp4_gate_scales,
+                    dtype=torch.bfloat16
+                )
+                # Dequant up: [intermediate_size, hidden_size]
+                up_weight_bf16 = mxfp4_dequantize(
+                    expert_wrapper.mxfp4_up_packed,
+                    expert_wrapper.mxfp4_up_scales,
+                    dtype=torch.bfloat16
+                )
+                # Dequant down: [hidden_size, intermediate_size]
+                down_weight_bf16 = mxfp4_dequantize(
+                    expert_wrapper.mxfp4_down_packed,
+                    expert_wrapper.mxfp4_down_scales,
+                    dtype=torch.bfloat16
+                )
+
+                # Store BF16 weights on the wrapper
+                expert_wrapper.gate_weight_bf16 = gate_weight_bf16
+                expert_wrapper.up_weight_bf16 = up_weight_bf16
+                expert_wrapper.down_weight_bf16 = down_weight_bf16
+
+                # Copy biases if present
+                expert_wrapper.gate_bias = expert_wrapper.mxfp4_gate_bias
+                expert_wrapper.up_bias = expert_wrapper.mxfp4_up_bias
+                expert_wrapper.down_bias = expert_wrapper.mxfp4_down_bias
+
+                # Free MXFP4 weights to reclaim memory
+                del expert_wrapper.mxfp4_gate_packed
+                del expert_wrapper.mxfp4_gate_scales
+                del expert_wrapper.mxfp4_up_packed
+                del expert_wrapper.mxfp4_up_scales
+                del expert_wrapper.mxfp4_down_packed
+                del expert_wrapper.mxfp4_down_scales
+
+                # Mark wrapper as using BF16 weights
+                expert_wrapper.use_bf16_weights = True
+
+                dequant_count += 1
+
+        # Force garbage collection and CUDA cache cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        logging.info(
+            f"Pre-dequantized {dequant_count} experts to BF16 "
+            f"({self.num_local_expert_per_layer} experts × {self.model_config.num_hidden_layers} layers)"
+        )

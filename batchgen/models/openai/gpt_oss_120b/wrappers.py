@@ -574,13 +574,14 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with MXFP4 dequant + GEMM.
+        """Forward pass with MXFP4 dequant + GEMM or direct BF16 GEMM.
 
-        Supports two modes:
+        Supports three modes:
+        - BF16 mode (use_bf16_weights=True): Direct BF16 GEMM (pre-dequantized weights)
         - Reference mode (BATCHGEN_USE_REFERENCE=1): Pure PyTorch for debugging
         - Fused mode (default): Uses mxfp4_linear with triton_kernels if available
 
-        Both modes now use the correct OpenAI SwiGLU activation:
+        All modes use the correct OpenAI SwiGLU activation:
             gate * sigmoid(1.702 * gate) * (up + 1)
 
         Args:
@@ -589,6 +590,11 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         Returns:
             Output tensor [num_tokens, hidden_size]
         """
+        # Check for BF16 weights (pre-dequantized for EP with world_size >= 4)
+        # This is the fastest path - no per-forward dequantization needed
+        if getattr(self, 'use_bf16_weights', False):
+            return self._forward_bf16(hidden_states)
+
         # Start timing if enabled (prefill or decode)
         do_prefill_timing = PrefillTimingStats.enabled and self.phase == "prefill"
         do_decode_timing = DecodeTimingStats.enabled and self.phase == "decode"
@@ -807,6 +813,63 @@ class GptOssExpertWrapper(ExpertWrapperBase):
                 print(f"[EXPERT L0 E0] result (after down_proj): std={result.float().std().item():.4f}, max={result.abs().max().item():.4f}")
                 down_scales = weights["down_proj.weight_scales"]
                 print(f"[EXPERT L0 E0] down_scales: min={down_scales.min().item():.6f}, max={down_scales.max().item():.6f}, mean={down_scales.mean().item():.6f}")
+
+        return result
+
+    def _forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Direct BF16 GEMM path for pre-dequantized weights.
+
+        Used when world_size >= 4 and weights have been pre-dequantized
+        to BF16 during configuration. This avoids per-forward MXFP4
+        dequantization overhead.
+
+        Args:
+            hidden_states: Input [num_tokens, hidden_size] in BF16
+
+        Returns:
+            Output [num_tokens, hidden_size] in BF16
+        """
+        debug_expert = os.environ.get("BATCHGEN_DEBUG_EXPERT", "0") == "1"
+
+        # Ensure 2D input
+        x = hidden_states
+        if x.dim() == 3:
+            x = x.view(-1, x.shape[-1])  # [batch*seq, hidden]
+
+        # Ensure BF16
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+
+        # Stage 1: Gate and Up projections (direct BF16 GEMM)
+        gate_out = torch.mm(x, self.gate_weight_bf16.T)
+        if self.gate_bias is not None:
+            gate_out = gate_out + self.gate_bias
+
+        up_out = torch.mm(x, self.up_weight_bf16.T)
+        if self.up_bias is not None:
+            up_out = up_out + self.up_bias
+
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0 BF16] gate_out: std={gate_out.float().std().item():.4f}, max={gate_out.abs().max().item():.4f}")
+                print(f"[EXPERT L0 E0 BF16] up_out: std={up_out.float().std().item():.4f}, max={up_out.abs().max().item():.4f}")
+
+        # Stage 2: OpenAI SwiGLU activation
+        # Formula: gate * sigmoid(1.702 * gate) * (up + 1)
+        intermediate = openai_swiglu(gate_out, up_out, alpha=1.702, limit=7.0)
+
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0 BF16] intermediate (after SwiGLU): std={intermediate.float().std().item():.4f}, max={intermediate.abs().max().item():.4f}")
+
+        # Stage 3: Down projection (direct BF16 GEMM)
+        result = torch.mm(intermediate, self.down_weight_bf16.T)
+        if self.down_bias is not None:
+            result = result + self.down_bias
+
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0 BF16] result (after down_proj): std={result.float().std().item():.4f}, max={result.abs().max().item():.4f}")
 
         return result
 
