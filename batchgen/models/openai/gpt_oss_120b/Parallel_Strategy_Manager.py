@@ -427,7 +427,8 @@ class GptOssParallelStrategyManager:
         dynamic_count = 0
 
         # Determine expert range based on EP mode
-        ep_enabled = self.world_size > 1
+        # EP mode only active when ranges are computed (decode phase)
+        ep_enabled = self.world_size > 1 and self.routed_expert_gpu_start_idx is not None
         if ep_enabled:
             # EP mode: only configure local experts
             expert_start = self.routed_expert_gpu_start_idx
