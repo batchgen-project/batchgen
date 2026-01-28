@@ -3875,80 +3875,84 @@ class BatchGenWorker:
 				assert self.rank == dist.get_rank(), \
 					f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
 
-			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+			# Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
+			if self.world_size == 1:
+				logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
+			else:
+				comm_master_addr = os.getenv("COMM_MASTER_ADDR")
 
-			# Coordinate PyNccl initialization across all ranks
-			# Use all_reduce to check if ANY rank needs to (re)init the communicator
-			need_init = 1 if self.comm is None else 0
-			need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
-			dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
-			any_rank_needs_init = need_init_tensor.item() > 0
+				# Coordinate PyNccl initialization across all ranks
+				# Use all_reduce to check if ANY rank needs to (re)init the communicator
+				need_init = 1 if self.comm is None else 0
+				need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
+				dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
+				any_rank_needs_init = need_init_tensor.item() > 0
 
-			if any_rank_needs_init:
-				# All ranks must participate in init - destroy any existing comm first
-				if self.comm is not None:
-					logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
-					try:
-						self.comm.destroy()
-					except Exception:
-						pass
-					self.comm = None
-					if hasattr(self, '_nccl_group') and self._nccl_group is not None:
-						del self._nccl_group
-						self._nccl_group = None
-
-				device = torch.device("cuda", self.local_rank)
-
-				if comm_master_addr is None:
-					logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
-				elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
-					# Track port - incremented in _check_and_reinit_pynccl on failures
-					if not hasattr(self, '_nccl_port'):
-						self._nccl_port = 20003
-
-					# Rank 0 finds an available port, then broadcasts to all ranks
-					if self.rank == 0:
+				if any_rank_needs_init:
+					# All ranks must participate in init - destroy any existing comm first
+					if self.comm is not None:
+						logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
 						try:
-							self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
-							logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
-						except RuntimeError as e:
-							logging.error(f"Rank 0: Failed to find available port: {e}")
-							raise
+							self.comm.destroy()
+						except Exception:
+							pass
+						self.comm = None
+						if hasattr(self, '_nccl_group') and self._nccl_group is not None:
+							del self._nccl_group
+							self._nccl_group = None
 
-					# Broadcast the chosen port from rank 0 to all ranks
-					port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
-					dist.broadcast(port_tensor, src=0)
-					self._nccl_port = port_tensor.item()
+					device = torch.device("cuda", self.local_rank)
 
-					# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
-					# is ready before other ranks try to connect. Different ranks may reach
-					# this point at very different times due to tokenization workload.
-					logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
-					dist.barrier()
+					if comm_master_addr is None:
+						logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
+					elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
+						# Track port - incremented in _check_and_reinit_pynccl on failures
+						if not hasattr(self, '_nccl_port'):
+							self._nccl_port = 20003
 
-					try:
-						logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
-
-						# Store group separately so we can properly destroy it on reinit
-						self._nccl_group = StatelessProcessGroup.create(
-							host=comm_master_addr,
-							port=self._nccl_port,
-							rank=self.rank,
-							world_size=self.world_size,
-							data_expiration_seconds=36000,  # 10 hours
-						)
-						self.comm = PyNcclCommunicator(
-							group=self._nccl_group,
-							device=device
-						)
-						# Only rank 0 logs at INFO level to reduce verbosity
+						# Rank 0 finds an available port, then broadcasts to all ranks
 						if self.rank == 0:
-							logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
-						else:
-							logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
-					except Exception as e:
-						logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-						raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+							try:
+								self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
+								logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
+							except RuntimeError as e:
+								logging.error(f"Rank 0: Failed to find available port: {e}")
+								raise
+
+						# Broadcast the chosen port from rank 0 to all ranks
+						port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+						dist.broadcast(port_tensor, src=0)
+						self._nccl_port = port_tensor.item()
+
+						# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
+						# is ready before other ranks try to connect. Different ranks may reach
+						# this point at very different times due to tokenization workload.
+						logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
+						dist.barrier()
+
+						try:
+							logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
+
+							# Store group separately so we can properly destroy it on reinit
+							self._nccl_group = StatelessProcessGroup.create(
+								host=comm_master_addr,
+								port=self._nccl_port,
+								rank=self.rank,
+								world_size=self.world_size,
+								data_expiration_seconds=36000,  # 10 hours
+							)
+							self.comm = PyNcclCommunicator(
+								group=self._nccl_group,
+								device=device
+							)
+							# Only rank 0 logs at INFO level to reduce verbosity
+							if self.rank == 0:
+								logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
+							else:
+								logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
+						except Exception as e:
+							logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+							raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 
 		iteration = 0
 
