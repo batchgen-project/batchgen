@@ -67,6 +67,20 @@ class GptOssParallelStrategyManager:
         self.world_size = world_size
         self.rank = global_rank
 
+        # EP (Expert Parallelism) state variables
+        self.local_routed_experts = []
+        self.host_routed_experts = []
+        self.experts_per_rank = None
+        self.routed_expert_gpu_start_idx = None
+        self.routed_expert_gpu_end_idx = None
+        self.routed_expert_host_start_idx = None
+        self.routed_expert_host_end_idx = None
+        self.enable_ep_offloading = False
+        self.num_local_expert_per_layer = None
+
+        # Communication handler for EP (set during configure_decoding)
+        self.comm = None
+
     def configure_prefill(self) -> Tuple:
         """Configure model skeleton for prefill phase.
 
@@ -311,6 +325,57 @@ class GptOssParallelStrategyManager:
 
         total_experts = self.model_config.num_hidden_layers * self.model_config.num_local_experts
         logging.info(f"Loaded MXFP4 expert weights for all {total_experts} experts")
+
+    def _load_expert_module_ep(self):
+        """Load MXFP4 expert weights for EP mode (local experts only).
+
+        Following DeepSeek pattern: only load experts owned by this rank.
+        Expert range: [routed_expert_gpu_start_idx, routed_expert_gpu_end_idx)
+
+        For MXFP4 format, we store packed weights and scales as module attributes.
+        """
+        logging.info(
+            f"Loading MXFP4 expert module weights for EP mode. "
+            f"Rank {self.rank}: experts [{self.routed_expert_gpu_start_idx}, {self.routed_expert_gpu_end_idx})"
+        )
+        device = self.engine_config.Basic_Config.device_torch
+        loaded_count = 0
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            # Only load GPU-resident experts for this rank
+            for expert_idx in range(self.routed_expert_gpu_start_idx, self.routed_expert_gpu_end_idx):
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+
+                # Get MXFP4 weights from Weights_Storage
+                tensors = self.core_engine.get_tensor(module_key)
+
+                expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+
+                # Store MXFP4 packed weights as module attributes
+                expert.mxfp4_gate_packed = tensors["gate_proj.weight"].to(device)
+                expert.mxfp4_gate_scales = tensors["gate_proj.weight_scales"].to(device)
+                expert.mxfp4_up_packed = tensors["up_proj.weight"].to(device)
+                expert.mxfp4_up_scales = tensors["up_proj.weight_scales"].to(device)
+                expert.mxfp4_down_packed = tensors["down_proj.weight"].to(device)
+                expert.mxfp4_down_scales = tensors["down_proj.weight_scales"].to(device)
+
+                # Handle biases if present
+                if "gate_proj.bias" in tensors:
+                    expert.mxfp4_gate_bias = tensors["gate_proj.bias"].to(device)
+                if "up_proj.bias" in tensors:
+                    expert.mxfp4_up_bias = tensors["up_proj.bias"].to(device)
+                if "down_proj.bias" in tensors:
+                    expert.mxfp4_down_bias = tensors["down_proj.bias"].to(device)
+
+                loaded_count += 1
+
+        # Sync to ensure all H2D transfers complete
+        torch.cuda.synchronize()
+
+        logging.info(
+            f"Loaded MXFP4 expert weights for {loaded_count} local experts "
+            f"(EP mode, rank {self.rank})"
+        )
 
     def _config_attn_module(self):
         """Configure attention modules with BatchGen wrappers.
@@ -577,8 +642,132 @@ class GptOssParallelStrategyManager:
             f"(per-expert CuTe dequant + torch.matmul)"
         )
 
+    def _swap_to_ep_moe(self):
+        """Swap GptOssMoE to GptOssMoE_EP for Expert Parallelism.
+
+        Replaces each layer's MoE with EP-enabled version that:
+        - AllGathers tokens from all ranks
+        - Routes globally (all 128 experts)
+        - Processes only local experts
+        - AllReduces to combine results
+
+        Expert wrappers from old MoE are transferred to EP MoE.
+        """
+        from .model import GptOssMoE_EP
+
+        device = self.engine_config.Basic_Config.device_torch
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            old_moe = self.model.model.layers[layer_idx].mlp
+
+            # Create EP MoE
+            ep_moe = GptOssMoE_EP(self.loaded_model_config, self.comm)
+            ep_moe.router = old_moe.router  # Copy router weights (replicated)
+            ep_moe.enable_ep_offloading = self.enable_ep_offloading
+
+            # Transfer local expert wrappers (GPU-resident experts only)
+            for local_e in range(self.num_local_expert_per_layer):
+                global_e = self.routed_expert_gpu_start_idx + local_e
+                ep_moe.experts[global_e] = old_moe.experts[global_e]
+
+            ep_moe.to(device)
+
+            # Swap MoE layer
+            self.model.model.layers[layer_idx].mlp = ep_moe
+
+        logging.info(
+            f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoE_EP "
+            f"(AllGather → Route → Local experts → AllReduce). "
+            f"Rank {self.rank}: experts [{self.routed_expert_gpu_start_idx}, {self.routed_expert_gpu_end_idx})"
+        )
+
+    def _compute_expert_ranges(self):
+        """Compute expert range assignment for Expert Parallelism (EP).
+
+        Following DeepSeek pattern (lines 330-387):
+        - Each rank owns 128 // world_size experts
+        - GPU-resident experts: [gpu_start, gpu_end)
+        - Host-resident experts: [host_start, host_end) if offloading enabled
+
+        Sets:
+            self.experts_per_rank: Number of experts per rank
+            self.routed_expert_gpu_start_idx: First GPU-resident expert index
+            self.routed_expert_gpu_end_idx: Last GPU-resident expert index (exclusive)
+            self.routed_expert_host_start_idx: First host-resident expert index
+            self.routed_expert_host_end_idx: Last host-resident expert index (exclusive)
+            self.local_routed_experts: List of GPU-resident expert keys
+            self.host_routed_experts: List of host-resident expert keys
+        """
+        NUM_TOTAL_EXPERTS = 128
+        NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
+
+        # Determine offloading behavior based on deployment scenario
+        if self.world_size > 8:
+            # Multi-node: all experts persistent (no offloading across nodes)
+            NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
+            self.enable_ep_offloading = False
+            logging.info(
+                f"Rank {self.rank}: Multi-node mode (world_size={self.world_size}). "
+                f"All {NUM_EXPERT_PER_RANK} experts per rank are persistent."
+            )
+        elif self.engine_config.EP_Config.enable_offloading:
+            # Single-node with EP offloading
+            offload_ratio = self.engine_config.EP_Config.offloading_ratio
+            NUM_LOCAL_EXPERT_PER_LAYER = int(NUM_EXPERT_PER_RANK * (1 - offload_ratio))
+            self.enable_ep_offloading = True
+            logging.info(
+                f"Rank {self.rank}: EP with offloading enabled. "
+                f"Experts per rank: {NUM_EXPERT_PER_RANK}, "
+                f"Persistent (GPU): {NUM_LOCAL_EXPERT_PER_LAYER}, "
+                f"Offloaded (host): {NUM_EXPERT_PER_RANK - NUM_LOCAL_EXPERT_PER_LAYER}"
+            )
+        else:
+            # Single-node without offloading: all experts persistent
+            NUM_LOCAL_EXPERT_PER_LAYER = NUM_EXPERT_PER_RANK
+            self.enable_ep_offloading = False
+            logging.info(
+                f"Rank {self.rank}: EP without offloading. "
+                f"All {NUM_LOCAL_EXPERT_PER_LAYER} experts persistent per rank."
+            )
+
+        # Store for later use
+        self.num_local_expert_per_layer = NUM_LOCAL_EXPERT_PER_LAYER
+        self.experts_per_rank = NUM_EXPERT_PER_RANK
+
+        # Compute expert ranges for this rank
+        self.routed_expert_gpu_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
+        self.routed_expert_gpu_end_idx = self.routed_expert_gpu_start_idx + NUM_LOCAL_EXPERT_PER_LAYER
+        self.routed_expert_host_start_idx = self.routed_expert_gpu_end_idx
+        self.routed_expert_host_end_idx = (self.global_rank + 1) * NUM_EXPERT_PER_RANK
+
+        # Build expert lists for all layers
+        self.local_routed_experts = []
+        self.host_routed_experts = []
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            # GPU-resident experts (persistent)
+            for expert_idx in range(self.routed_expert_gpu_start_idx, self.routed_expert_gpu_end_idx):
+                self.local_routed_experts.append(f"routed_expert_{layer_idx}_{expert_idx}")
+            # Host-resident experts (offloaded)
+            for expert_idx in range(self.routed_expert_host_start_idx, self.routed_expert_host_end_idx):
+                self.host_routed_experts.append(f"routed_expert_{layer_idx}_{expert_idx}")
+
+        logging.info(
+            f"Rank {self.rank}: Expert range [{self.routed_expert_gpu_start_idx}, {self.routed_expert_host_end_idx}), "
+            f"GPU experts: {len(self.local_routed_experts)}, Host experts: {len(self.host_routed_experts)}"
+        )
+
     def configure_decoding(self, padding_bsz=None, comm=None) -> Tuple:
-        """Configure model for decoding phase (mode 3 + EP-offloading disabled).
+        """Configure model for decoding phase.
+
+        For single GPU (world_size=1):
+        - Mode 3 + EP-offloading disabled
+        - All modules persistent, grouped GEMM
+
+        For multi-GPU (world_size>1):
+        - Expert Parallelism (EP) enabled
+        - Each rank owns 128 // world_size experts
+        - AllGather → Route → Process local experts → AllReduce
 
         Following DeepSeek pattern:
         1. Delete prefill model completely to free GPU memory
@@ -587,8 +776,8 @@ class GptOssParallelStrategyManager:
         4. Re-load skeleton and configure modules
 
         Args:
-            padding_bsz: Maximum batch size per rank (unused for single GPU)
-            comm: MPI communicator (unused for single GPU)
+            padding_bsz: Maximum batch size per rank (for EP token buffers)
+            comm: MPI communicator (for EP communication)
 
         Returns:
             Tuple of (model, weight_copy_task)
@@ -596,6 +785,15 @@ class GptOssParallelStrategyManager:
         log_gpu_memory("configure_decoding: START")
 
         logging.info("Configuring model for decoding phase...")
+
+        # Store comm for EP communication
+        self.comm = comm
+
+        # Check if EP is enabled (world_size > 1)
+        ep_enabled = self.world_size > 1
+        if ep_enabled:
+            logging.info(f"Expert Parallelism enabled: world_size={self.world_size}")
+            self._compute_expert_ranges()
 
         # Step 1: Set phase to decode
         self.loaded_model_config.phase = "decode"
@@ -622,8 +820,8 @@ class GptOssParallelStrategyManager:
         log_gpu_memory("configure_decoding: After creating new model")
 
         # Step 5: Rebuild weight copy task mappings
-        # For decode with mode 3 and no EP-offloading: empty weight_copy_task
-        # All modules are persistent (weights stay on GPU)
+        # For EP: only host-resident experts need dynamic loading
+        # For single GPU: all modules persistent
         for layer_idx in range(self.model_config.num_hidden_layers):
             # Attention parameters (BF16, not quantized)
             for name, _ in self.model.model.layers[layer_idx].self_attn.named_parameters():
@@ -646,7 +844,14 @@ class GptOssParallelStrategyManager:
                         "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
                         "tensor_key": name,
                     }
-            # Note: routed_expert NOT added to weight_copy_task -> persistent=True
+
+        # For EP with offloading: add host-resident experts to weight_copy_task
+        if ep_enabled and self.enable_ep_offloading:
+            self.weight_copy_task["routed_expert"] = self.host_routed_experts.copy()
+            logging.info(
+                f"EP offloading: {len(self.host_routed_experts)} host-resident experts "
+                f"will be loaded dynamically"
+            )
 
         # Step 6: Load skeleton weights
         torch.cuda.empty_cache()
@@ -656,9 +861,13 @@ class GptOssParallelStrategyManager:
         # Following DeepSeek pattern where attention weights are pre-loaded
         self._load_attn_module()
 
-        # Step 6.6: Load expert MXFP4 weights (persistent for decode)
-        # Following DeepSeek pattern: load to model attrs, wrapper caches pointers
-        self._load_expert_module()
+        # Step 6.6: Load expert MXFP4 weights
+        # For EP: only load local experts (GPU-resident)
+        # For single GPU: load all experts
+        if ep_enabled:
+            self._load_expert_module_ep()
+        else:
+            self._load_expert_module()
 
         log_gpu_memory("configure_decoding: After loading skeleton, attention, and experts")
 
@@ -667,9 +876,13 @@ class GptOssParallelStrategyManager:
         self._config_expert_module()
         self._config_lm_head_hook()
 
-        # Step 7.5: Swap to quantized MoE for grouped GEMM execution
-        # This reduces kernel launches from 384 to 3 per layer (~5x speedup)
-        self._swap_to_quantized_moe()
+        # Step 7.5: Swap MoE based on parallelism mode
+        if ep_enabled:
+            # EP: Use GptOssMoE_EP with AllGather/AllReduce communication
+            self._swap_to_ep_moe()
+        else:
+            # Single GPU: Use grouped GEMM (3 kernel launches per layer)
+            self._swap_to_quantized_moe()
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
@@ -680,7 +893,7 @@ class GptOssParallelStrategyManager:
             f"Decoding configuration complete: "
             f"attn_tasks={len(self.weight_copy_task['attn'])}, "
             f"expert_tasks={len(self.weight_copy_task['routed_expert'])} "
-            f"(all modules persistent)"
+            f"(EP={ep_enabled}, offloading={self.enable_ep_offloading if ep_enabled else False})"
         )
 
         return self.model, self.weight_copy_task

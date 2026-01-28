@@ -845,6 +845,204 @@ class GptOssMoEQuantized(nn.Module):
 
 
 # ============================================================================
+# EP-Enabled MoE Layer (Expert Parallelism with AllGather/AllReduce)
+# ============================================================================
+
+class GptOssMoE_EP(nn.Module):
+    """EP-enabled MoE for GPT-OSS-120B with MXFP4 quantization.
+
+    Distributes 128 experts across multiple ranks using Expert Parallelism:
+    - Each rank owns 128 // world_size experts
+    - Communication: AllGather tokens → Route globally → Process local experts → AllReduce
+
+    Based on DeepSeek's DeepseekV3MoE_Decoding_FP8 pattern (modeling_deepseek_v3.py:1757-2066).
+    """
+
+    def __init__(self, config: GptOssConfig, comm=None):
+        super().__init__()
+        self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok  # 4
+        self.hidden_size = config.hidden_size
+        self.comm = comm
+
+        # Import distributed after checking availability
+        import torch.distributed as dist
+
+        # Distributed metadata
+        if not dist.is_initialized():
+            self.rank, self.world_size = 0, 1
+        else:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+
+        self.experts_per_rank = 128 // self.world_size
+        self.total_experts = 128
+        self.routed_expert_start_idx = self.rank * self.experts_per_rank
+        self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
+
+        # Router (replicated across all ranks - routes to all 128 experts)
+        self.router = nn.Linear(config.hidden_size, 128, bias=True)
+
+        # Experts placeholder - only local experts will be non-None
+        # Populated by Parallel_Strategy_Manager._swap_to_ep_moe()
+        self.experts = nn.ModuleList([None] * 128)
+
+        # Communication setup
+        self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
+        self.num_tokens_per_rank = None
+
+        # EP offloading flag (set by Parallel_Strategy_Manager)
+        self.enable_ep_offloading = False
+
+        # SwiGLU parameters
+        self.swiglu_alpha = getattr(config, 'swiglu_alpha', 1.702)
+        self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
+
+    def init_num_tokens(self, num_tokens_per_rank: int):
+        """Initialize communication buffers for given batch size."""
+        self.num_tokens_per_rank = num_tokens_per_rank
+
+    def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
+        """Update num_tokens_per_rank for dynamic batch size."""
+        self.num_tokens_per_rank = num_tokens_per_rank
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Forward pass with EP communication."""
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        # Use loop-based execution (simpler, works with MXFP4 wrappers)
+        out = self.moe_infer_loop_with_offloading(hidden_states)
+
+        return out.view(*orig_shape)
+
+    @torch.inference_mode()
+    def moe_infer_loop_with_offloading(self, x: torch.Tensor) -> torch.Tensor:
+        """Loop-based expert execution with AllGather/AllReduce.
+
+        Following DeepSeek's moe_infer_loop_with_offloading (lines 1933-2066):
+        1. AllGather tokens from all ranks
+        2. Route globally (router logits for all 128 experts)
+        3. Loop through local experts, process tokens
+        4. AllReduce to combine results
+        5. Extract local rank's results
+
+        Args:
+            x: Input tensor [num_tokens, hidden_size]
+
+        Returns:
+            Output tensor [num_tokens, hidden_size]
+        """
+        import torch.distributed as dist
+
+        num_tokens, hidden_size = x.shape
+        device = x.device
+
+        # Safety check
+        if self.num_tokens_per_rank is None:
+            raise RuntimeError("num_tokens_per_rank not set. Call init_num_tokens() first.")
+
+        if num_tokens > self.num_tokens_per_rank:
+            raise RuntimeError(
+                f"MoE buffer overflow: num_tokens={num_tokens} > num_tokens_per_rank={self.num_tokens_per_rank}"
+            )
+
+        # ---- 1) AllGather: Collect tokens from all ranks ----
+        all_tokens = torch.zeros(
+            (self.world_size * self.num_tokens_per_rank, hidden_size),
+            device=self.device,
+            dtype=torch.bfloat16
+        )
+
+        # Pad local tokens to num_tokens_per_rank
+        padded_hidden_states = torch.zeros(
+            (self.num_tokens_per_rank, hidden_size),
+            device=self.device,
+            dtype=x.dtype
+        )
+        if num_tokens > 0:
+            padded_hidden_states[:num_tokens] = x
+
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                all_tokens,
+                padded_hidden_states,
+                stream=torch.cuda.default_stream(self.device)
+            )
+
+        # ---- 2) Router: Compute routing for ALL global tokens ----
+        router_logits = self.router(all_tokens)  # [global_tokens, 128]
+        topk_weights, topk_indices = torch.topk(
+            router_logits, k=self.num_experts_per_tok, dim=-1
+        )
+        topk_weights = F.softmax(topk_weights, dim=-1)
+
+        # ---- 3) Process local experts ----
+        num_global_tokens = all_tokens.shape[0]
+        K = self.num_experts_per_tok
+
+        # Flat view of expert assignments
+        flat_expert_idx = topk_indices.view(-1)  # [global_tokens * K]
+
+        # Token and topk position indices for scatter
+        token_indices = torch.arange(num_global_tokens, device=device).repeat_interleave(K)
+        topk_positions = torch.arange(K, device=device).repeat(num_global_tokens)
+
+        # Initialize output buffer
+        global_results = torch.zeros(
+            (num_global_tokens, hidden_size),
+            device=device,
+            dtype=torch.float32
+        )
+
+        # Loop through local experts only
+        for local_e in range(self.experts_per_rank):
+            global_e = self.routed_expert_start_idx + local_e
+
+            # Find tokens routed to this expert
+            mask = flat_expert_idx == global_e
+            if not mask.any():
+                continue
+
+            # Get token indices and topk positions for this expert
+            expert_token_idx = token_indices[mask]
+            expert_topk_pos = topk_positions[mask]
+
+            # Gather tokens for this expert
+            tokens_for_expert = all_tokens[expert_token_idx]
+
+            # Call expert forward (wrapper handles MXFP4 dequant)
+            expert = self.experts[global_e]
+            if expert is None:
+                continue  # Expert not loaded on this rank (shouldn't happen)
+
+            expert_output = expert(tokens_for_expert)
+
+            # Get weights for these tokens at these topk positions
+            expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
+
+            # Weighted accumulation into results
+            weighted_output = expert_output * expert_weights.unsqueeze(-1)
+            global_results.index_add_(0, expert_token_idx, weighted_output.to(global_results.dtype))
+
+        global_results = global_results.to(torch.bfloat16)
+
+        # ---- 4) AllReduce: Combine results from all ranks ----
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                global_results,
+                op=dist.ReduceOp.SUM,
+                stream=torch.cuda.default_stream(self.device)
+            )
+
+        # ---- 5) Extract results for local tokens ----
+        start_token_idx = self.rank * self.num_tokens_per_rank
+        end_token_idx = start_token_idx + num_tokens
+
+        return global_results[start_token_idx:end_token_idx].to(x.dtype)
+
+
+# ============================================================================
 # Prefill MoE Layer (MXFP4 with CuTe Dequant + torch.matmul)
 # ============================================================================
 
