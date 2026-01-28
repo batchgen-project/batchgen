@@ -684,6 +684,9 @@ class GptOssParallelStrategyManager:
 
             ep_moe.to(device)
 
+            # Initialize num_tokens_per_rank for AllGather/AllReduce buffers
+            ep_moe.init_num_tokens(self.padding_bsz)
+
             # Swap MoE layer
             self.model.model.layers[layer_idx].mlp = ep_moe
 
@@ -798,8 +801,9 @@ class GptOssParallelStrategyManager:
 
         logging.info("Configuring model for decoding phase...")
 
-        # Store comm for EP communication
+        # Store comm and padding_bsz for EP communication
         self.comm = comm
+        self.padding_bsz = padding_bsz
 
         # Check if EP is enabled (world_size > 1)
         ep_enabled = self.world_size > 1
