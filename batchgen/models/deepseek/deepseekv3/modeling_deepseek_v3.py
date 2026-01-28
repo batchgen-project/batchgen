@@ -595,7 +595,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 from ....moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 from ....attention.mla.fa3_backend import w8a16_gemm
-from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+
 class DeepseekV3MLP(nn.Module):
 	def __init__(self, config, hidden_size=None, intermediate_size=None):
 		super().__init__()
