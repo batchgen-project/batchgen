@@ -24,7 +24,7 @@ Provides wrappers for DeepSeek-R1 and DeepSeek-V3 models with FP8 quantization:
 """
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -244,24 +244,94 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
         """
         return weights_dict
 
-    def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Prefill forward using FP8 DeepGEMM.
+
+        In prepack mode (cu_seqlens-based batching), calls prepacked attention
+        which doesn't need attention_mask. In regular mode, calls standard
+        attention which requires attention_mask for unpadding.
 
         Calls prefill_attn_w8a16 which uses w8a16_gemm:
         - Weights stay in FP8 format
         - Activations are quantized to FP8 via act_quant()
         - deep_gemm.fp8_gemm_nt() outputs BF16
-        """
-        attention_mask = kwargs.get("attention_mask", None)
-        position_ids = kwargs.get("position_ids", None)
 
-        # Call prefill_attn_w8a16 which uses w8a16_gemm (FP8 DeepGEMM with BF16 output)
-        return self.module.prefill_attn_w8a16(
-            hidden_states,
-            attention_mask,
-            position_ids,
-            self.weight_dequant_scale  # Inverse scales for w8a16_gemm
-        )
+        Returns:
+            Tuple of (attn_output, attn_weights, kv_cache) to match decoder_layer's
+            expected unpacking.
+        """
+        if self.prepack_mode:
+            # Prepack mode: hidden_states is [1, total_tokens, hidden_dim]
+            # Prepacked attention expects [total_tokens, hidden_dim]
+            hidden_states_2d = hidden_states.squeeze(0)
+
+            attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
+                hidden_states_2d,
+                self.position_ids.to(hidden_states_2d.device),
+                self.prepack_cu_seqlens.to(hidden_states_2d.device),
+                self.prepack_max_seqlen,
+                self.prepack_num_sequences,
+                self.weight_dequant_scale
+            )
+
+            # Offload KV cache per-sequence to host
+            # offload_kv is [total_tokens, kv_lora_rank + qk_rope_head_dim]
+            self._offload_prepacked_kv(offload_kv)
+
+            # Reshape back to [1, total_tokens, hidden_dim] for decoder_layer
+            attn_output = attn_output.unsqueeze(0)
+
+            # Return 3-tuple to match decoder_layer's expected unpacking
+            return (attn_output, None, None)
+        else:
+            # Regular mode: use attention_mask-based unpadding
+            attention_mask = kwargs.get("attention_mask", None)
+            position_ids = kwargs.get("position_ids", None)
+
+            attn_output, offload_kv = self.module.prefill_attn_w8a16(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                self.weight_dequant_scale  # Inverse scales for w8a16_gemm
+            )
+
+            # Return 3-tuple for consistency
+            return (attn_output, None, offload_kv)
+
+    def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
+        """Offload KV cache per-sequence to host memory.
+
+        For MLA, offload_kv contains [compressed_kv, k_pe] for each token.
+        Split by cu_seqlens and offload each sequence.
+
+        Args:
+            offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
+        """
+        cu_seqlens = self.prepack_cu_seqlens
+        num_sequences = self.prepack_num_sequences
+        global_sequence_ids = self.cur_batch
+
+        for seq_idx in range(num_sequences):
+            start_idx = cu_seqlens[seq_idx].item()
+            end_idx = cu_seqlens[seq_idx + 1].item()
+            seq_len = end_idx - start_idx
+
+            # Extract KV for this sequence
+            seq_kv = offload_kv[start_idx:end_idx]  # [seq_len, kv_dim]
+
+            # Reshape to [1, seq_len, 1, kv_dim] for KV cache API
+            seq_kv = seq_kv.unsqueeze(0).unsqueeze(2)
+
+            seq_global_id = [global_sequence_ids[seq_idx]]
+
+            # MLA has no V (K contains compressed KV + k_pe)
+            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=seq_global_id,
+                k_tensor=seq_kv,
+                v_tensor=None,
+                sequence_lengths=[seq_len],
+            )
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         """Decode forward - delegates to original module.
