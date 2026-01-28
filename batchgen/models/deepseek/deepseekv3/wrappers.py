@@ -337,9 +337,68 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
                 sequence_lengths=[seq_len],
             )
 
-    def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Decode forward - delegates to original module.
+    def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
+        """Decode forward using FlashMLA backend.
 
-        Note: Full implementation requires porting from Wrapper.py.
+        FlashMLA decode functions handle FP8 weights correctly via w8a8_deepgemm,
+        unlike vanilla DeepseekV3Attention.forward() which expects BF16 weights.
+
+        Routes to appropriate decode backend based on KV cache management:
+        - If gpu_paged_kv_manager is set: Use decoding_attn_mode_3_bf16 (paged KV)
+        - Otherwise: Use decoding_attn_mode_3_fp8 (FP8 KV with tensor references)
+
+        Args:
+            hidden_states: Input tensor [batch, 1, hidden_size]
+            **kwargs: Unused (all state from class-level attributes)
+
+        Returns:
+            Tuple of (attn_output, past_key_states, scale) for KV cache update.
         """
-        return self.module(hidden_states, **kwargs)
+        # Get class-level decode state
+        past_key_states = AttnWrapperBase.past_key_states
+        attention_mask = AttnWrapperBase.attention_mask
+        position_ids = AttnWrapperBase.position_ids  # q_position_ids for decode
+        scale = AttnWrapperBase.scale
+        cache_seqlens = AttnWrapperBase.cache_seqlens
+        max_seqlen = AttnWrapperBase.max_seqlen
+        gpu_paged_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+
+        # Check if using paged KV (GPUPagedKVCacheManager)
+        if gpu_paged_kv_manager is not None:
+            # BF16 paged KV path
+            attn_output, k_tensor = self.module.decoding_attn_mode_3_bf16(
+                hidden_states,
+                position_ids,
+                cache_seqlens,
+                max_seqlen,
+                self.weight_dequant_scale,
+                gpu_paged_kv_manager,
+                self.layer_idx,
+                None  # batch_slice (handled by gpu_paged_kv_manager)
+            )
+
+            # Offload k_tensor via KV append callback if available
+            if AttnWrapperBase.kv_append_callback is not None:
+                AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
+
+            # Return tuple (attn_output is all that's needed - KV managed externally)
+            return (attn_output, None, None)
+        else:
+            # FP8 KV cache with tensor references
+            # Get layer-specific KV cache slice
+            layer_past_key = past_key_states[self.layer_idx] if past_key_states else None
+            layer_scale = scale[self.layer_idx] if scale else None
+
+            attn_output, updated_past_key, updated_scale = self.module.decoding_attn_mode_3_fp8(
+                hidden_states,
+                layer_past_key,
+                None,  # past_value_states (None for MLA - K contains compressed KV)
+                attention_mask,
+                position_ids,
+                layer_scale,
+                cache_seqlens,
+                max_seqlen,
+                self.weight_dequant_scale  # FP8 weight scales for w8a8_deepgemm
+            )
+
+            return (attn_output, updated_past_key, updated_scale)
