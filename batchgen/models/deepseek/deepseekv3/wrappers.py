@@ -212,24 +212,28 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
             persistent, weight_dequant_scale
         )
 
-        # FP8 weight caching
-        self.fp8_q_proj = None
-        self.fp8_k_proj = None
-        self.fp8_v_proj = None
+        # FP8 weight caching for MLA architecture
+        # DeepSeek V3 uses: q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj, o_proj
+        self.fp8_q_a_proj = None
+        self.fp8_q_b_proj = None
+        self.fp8_kv_a_proj = None
+        self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
 
     def _register_fp8_weights(self):
-        """Cache FP8 attention weights."""
-        self.fp8_q_proj = self.module.q_proj.weight.data
-        self.fp8_k_proj = self.module.k_proj.weight.data
-        self.fp8_v_proj = self.module.v_proj.weight.data
+        """Cache FP8 attention weights for MLA architecture."""
+        self.fp8_q_a_proj = self.module.q_a_proj.weight.data
+        self.fp8_q_b_proj = self.module.q_b_proj.weight.data
+        self.fp8_kv_a_proj = self.module.kv_a_proj_with_mqa.weight.data
+        self.fp8_kv_b_proj = self.module.kv_b_proj.weight.data
         self.fp8_o_proj = self.module.o_proj.weight.data
 
     def _unregister_fp8_weights(self):
         """Clear cached FP8 attention weights."""
-        self.fp8_q_proj = None
-        self.fp8_k_proj = None
-        self.fp8_v_proj = None
+        self.fp8_q_a_proj = None
+        self.fp8_q_b_proj = None
+        self.fp8_kv_a_proj = None
+        self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
 
     def dequantize_weights(
