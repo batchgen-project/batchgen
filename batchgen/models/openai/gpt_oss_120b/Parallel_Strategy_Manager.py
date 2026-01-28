@@ -921,3 +921,17 @@ class GptOssParallelStrategyManager:
     def get_state_dict_name_map(self) -> Dict[str, Dict[str, str]]:
         """Return the state dict name mapping."""
         return self.state_dict_name_map
+
+    def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
+        """Dynamically update num_tokens_per_rank for all MoE layers.
+
+        Called by worker after AllReduce(MAX) to synchronize buffer size
+        across all ranks before each decode step.
+
+        Args:
+            num_tokens_per_rank: The max batch size across all ranks for this page
+        """
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            layer = self.model.model.layers[layer_idx].mlp
+            if hasattr(layer, "set_num_tokens_per_rank"):
+                layer.set_num_tokens_per_rank(num_tokens_per_rank)
