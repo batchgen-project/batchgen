@@ -426,8 +426,19 @@ class GptOssParallelStrategyManager:
         persistent_count = 0
         dynamic_count = 0
 
+        # Determine expert range based on EP mode
+        ep_enabled = self.world_size > 1
+        if ep_enabled:
+            # EP mode: only configure local experts
+            expert_start = self.routed_expert_gpu_start_idx
+            expert_end = self.routed_expert_gpu_end_idx
+        else:
+            # Single GPU: configure all experts
+            expert_start = 0
+            expert_end = self.model_config.num_local_experts
+
         for layer_idx in range(self.model_config.num_hidden_layers):
-            for expert_idx in range(self.model_config.num_local_experts):
+            for expert_idx in range(expert_start, expert_end):
                 expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
                 module_key = f"routed_expert_{layer_idx}_{expert_idx}"
 
@@ -457,7 +468,7 @@ class GptOssParallelStrategyManager:
 
                 self.model.model.layers[layer_idx].mlp.experts[expert_idx] = wrapped_expert
 
-        total_experts = self.model_config.num_hidden_layers * self.model_config.num_local_experts
+        total_experts = self.model_config.num_hidden_layers * (expert_end - expert_start)
         logging.info(
             f"Configured {total_experts} expert modules "
             f"({persistent_count} persistent, {dynamic_count} dynamic)"
