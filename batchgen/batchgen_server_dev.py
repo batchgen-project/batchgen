@@ -64,11 +64,31 @@ class BatchGenServer:
 		signal.signal(signal.SIGINT, self.handle_shutdown)
 		signal.signal(signal.SIGTERM, self.handle_shutdown)
 
-	def config_hugepages(self):
-		"""Configure hugepages for shared memory usage."""
+	def config_hugepages(self, model_name: str = None):
+		"""Configure hugepages for shared memory usage.
+
+		Args:
+			model_name: HuggingFace model name to determine required hugepages.
+		"""
+		from batchgen.server.process_utils import get_hugepage_size, get_model_byte_size
+
+		hugepage_size = get_hugepage_size()
+
+		if model_name is not None:
+			byte_size = get_model_byte_size(model_name)
+			num_hugepages = (byte_size + hugepage_size - 1) // hugepage_size
+			logging.info(
+				f"Calculating hugepages for {model_name}: "
+				f"{byte_size / (1024**3):.1f} GB model, "
+				f"{num_hugepages} pages ({hugepage_size / (1024**2):.0f} MB each)"
+			)
+		else:
+			num_hugepages = 350000
+			logging.warning("No model_name provided, using default 350000 hugepages")
+
 		try:
 			commands = [
-				['sysctl', '-w', 'vm.nr_hugepages=350000'],
+				['sysctl', '-w', f'vm.nr_hugepages={num_hugepages}'],
 				['mkdir', '-p', '/dev/hugepages'],
 				['mount', '-t', 'hugetlbfs', 'none', '/dev/hugepages']
 			]
@@ -83,16 +103,16 @@ class BatchGenServer:
 		endpoint = os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
 		hf_cache_dir = self.args.hf_cache_dir or os.path.expanduser("~/.cache/huggingface")
 		self.args.hf_cache_dir = hf_cache_dir
-		pt_ckpt_dir = self.args.pt_ckpt_dir or os.path.join(self.args.cache_dir or ".", "pt_ckpt")
-		self.args.pt_ckpt_dir = pt_ckpt_dir
+		converted_ckpt_dir = self.args.converted_ckpt_dir or os.path.join(self.args.cache_dir or ".", "converted_ckpt")
+		self.args.converted_ckpt_dir = converted_ckpt_dir
 
 		if not endpoint and self.args.cache_dir is None:
 			self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
 
 		if endpoint:
-			self._load_model_from_remote_server(endpoint, hf_cache_dir, pt_ckpt_dir)
+			self._load_model_from_remote_server(endpoint, hf_cache_dir, converted_ckpt_dir)
 		else:
-			self._load_model_locally(hf_cache_dir, pt_ckpt_dir)
+			self._load_model_locally(hf_cache_dir, converted_ckpt_dir)
 
 		self._configure_host_kv_cache_budget()
 		logging.info("Model Loaded. SHM: %s", self.model_info['shm_name'])
@@ -103,7 +123,12 @@ class BatchGenServer:
 			host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
 			model_name=self.args.model
 		)
-		host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+		# Select manager based on model's KV cache configuration
+		# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
+		if config.num_v_heads == 0:
+			host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+		else:
+			host_paged_kv_manager = bg_lib.MHAHostPagedKVManager(config)
 		host_paged_kv_manager.initialize(True)
 		return host_paged_kv_manager
 
@@ -113,18 +138,37 @@ class BatchGenServer:
 		if local_device_count == 0:
 			logging.error("No CUDA devices found. Exiting.")
 			exit(1)
-			
 
-		logging.info(f"Spawning {local_device_count} DDP workers...")
-		
+		# Respect user-specified world_size (following vLLM/SGLang best practice)
+		# Users should use CUDA_VISIBLE_DEVICES to limit visible GPUs
+		world_size = self.args.world_size
+		if world_size is None or world_size <= 0:
+			# Auto-detect only if not explicitly specified
+			world_size = local_device_count * self.args.nnodes
+
+		# Calculate local world size (workers per node)
+		local_world_size = world_size // self.args.nnodes
+
+		# Validate: can't spawn more workers than visible GPUs
+		if local_world_size > local_device_count:
+			raise ValueError(
+				f"world_size ({world_size}) requires {local_world_size} GPUs per node, "
+				f"but only {local_device_count} GPUs are visible. "
+				f"Use CUDA_VISIBLE_DEVICES to expose more GPUs."
+			)
+
+		logging.info(
+			f"Spawning {local_world_size} DDP workers (world_size={world_size}, nnodes={self.args.nnodes})"
+		)
+
 		self.batchgen_worker_args = BatchGenWorkerArgs(
 			model_name=self.args.model,
 			hf_cache_dir=self.args.hf_cache_dir,
 			cache_dir=self.args.cache_dir,
-			pt_ckpt_dir=self.args.pt_ckpt_dir,
+			converted_ckpt_dir=self.args.converted_ckpt_dir,
 			kv_dtype=self.args.kv_dtype,
 			dist_init_addr=self.args.dist_init_addr,
-			world_size=self.args.world_size,
+			world_size=world_size,
 			nnode_rank=self.args.node_rank,
 			nnodes=self.args.nnodes,
 			gpu_arch=self.args.gpu_arch,
@@ -150,7 +194,7 @@ class BatchGenServer:
 				self.response_queue,
 				self.batchgen_worker_args,
 			),
-			nprocs=local_device_count,
+			nprocs=local_world_size,  # Use world_size-derived count, not device_count
 			join=False,
 			daemon=True
 		)
@@ -159,7 +203,7 @@ class BatchGenServer:
 		"""Start the TCP Server loop"""
 		try:
 			if self.args.enable_hugetlbfs:
-				self.config_hugepages()
+				self.config_hugepages(self.args.model)
 			
 			# Initialize custom torch modules if needed
 			config_torch_module_initializer()
@@ -358,21 +402,21 @@ class BatchGenServer:
 		except Exception as exc:  # pragma: no cover - network failure message
 			raise RuntimeError(f"Failed to download model: {exc}") from exc
 
-	def _load_model_locally(self, _hf_cache_dir: str, pt_ckpt_dir: str) -> None:
+	def _load_model_locally(self, _hf_cache_dir: str, converted_ckpt_dir: str) -> None:
 		
 		if "deepseek" in self.args.model.lower():
 			from batchgen.models.deepseek.deepseek_parameter_server import (
 				DeepSeek_Parameter_Server,
 			)
 			ps = DeepSeek_Parameter_Server(
-				self.args.model, self.args.cache_dir, pt_ckpt_dir, self.args.enable_hugetlbfs
+				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
 			)
 		elif "mixtral" in self.args.model.lower():
 			from batchgen.models.mixtral.mixtral_parameter_server import (
 				Mixtral_Parameter_Server,
 			)
 			ps = Mixtral_Parameter_Server(
-				self.args.model, self.args.cache_dir, pt_ckpt_dir
+				self.args.model, self.args.cache_dir, converted_ckpt_dir
 			)
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")
@@ -385,13 +429,13 @@ class BatchGenServer:
 			"huggingface_ckpt_name": self.args.model,
 			"shm_name": shm_name,
 			"tensor_meta_shm_name": tensor_meta_shm_name,
-			"pt_ckpt_dir": pt_ckpt_dir,
+			"converted_ckpt_dir": converted_ckpt_dir,
 			"parameter_server_size": ps_size,
 		}
 		logging.info("Local parameter server initialized: %s", self.model_info)
 
 	def _load_model_from_remote_server(
-		self, endpoint: str, hf_cache_dir: str, pt_ckpt_dir: str
+		self, endpoint: str, hf_cache_dir: str, converted_ckpt_dir: str
 	) -> None:
 		host, port = self._parse_parameter_server_endpoint(endpoint)
 		logging.info(
@@ -402,7 +446,7 @@ class BatchGenServer:
 			huggingface_ckpt_name=self.args.model,
 			hf_cache_dir=hf_cache_dir,
 			cache_dir=self.args.cache_dir,
-			pt_ckpt_dir=pt_ckpt_dir,
+			converted_ckpt_dir=converted_ckpt_dir,
 		)
 		info = client.get_model_info()
 		for required in ("shm_name", "tensor_meta_shm_name", "parameter_server_size"):
@@ -423,12 +467,12 @@ class BatchGenServer:
 			),
 			"shm_name": info["shm_name"],
 			"tensor_meta_shm_name": info["tensor_meta_shm_name"],
-			"pt_ckpt_dir": info.get("pt_ckpt_dir", pt_ckpt_dir),
+			"converted_ckpt_dir": info.get("converted_ckpt_dir", converted_ckpt_dir),
 			"parameter_server_size": info["parameter_server_size"],
 		}
-		self.args.pt_ckpt_dir = self.model_info["pt_ckpt_dir"]
+		self.args.converted_ckpt_dir = self.model_info["converted_ckpt_dir"]
 		if not self.args.cache_dir:
-			self.args.cache_dir = info.get("cache_dir") or self.args.pt_ckpt_dir
+			self.args.cache_dir = info.get("cache_dir") or self.args.converted_ckpt_dir
 		logging.info("Fetched shared memory handles from remote parameter server")
 
 	def _configure_host_kv_cache_budget(self) -> None:
@@ -474,7 +518,7 @@ class BatchGenServer:
 		huggingface_ckpt_name: str,
 		hf_cache_dir: Optional[str],
 		cache_dir: Optional[str],
-		pt_ckpt_dir: Optional[str],
+		converted_ckpt_dir: Optional[str],
 		queries: List[str],
 		max_input_length: int,
 		max_decoding_length: int,

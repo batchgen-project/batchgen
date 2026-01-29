@@ -7,8 +7,10 @@ import torch.distributed as dist
 from dataclasses import dataclass
 
 from batchgen.get_parallel_strategy_manager import get_parallel_strategy_manager
-from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
-from batchgen.models.wrappers import BaseModuleWrapper
+# Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
+from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
+Attn_Wrapper = AttnWrapperBase
+Expert_Wrapper = ExpertWrapperBase
 from batchgen.model_instance import ModelForwardInput, ModelForwardOutput
 from batchgen.utils import deep_free_model_memory
 

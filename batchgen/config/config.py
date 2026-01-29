@@ -117,6 +117,10 @@ class GPUBufferConfig:
     num_v_buffer: int = 0
     kv_buffer_num_tokens: int = 0
     module_shapes: Dict[str, Any] = field(default_factory=dict)
+    weight_dtypes: Dict[str, Any] = field(default_factory=dict)  # Per-module dtype (torch.dtype)
+    # Per-tensor dtype override: {module_type: {tensor_name: torch.dtype}}
+    # Takes precedence over weight_dtypes when specified
+    tensor_dtypes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def __str__(self):
         return (
@@ -126,7 +130,9 @@ class GPUBufferConfig:
             f"  num_k_buffer: {self.num_k_buffer}\n"
             f"  num_v_buffer: {self.num_v_buffer}\n"
             f"  kv_buffer_num_tokens: {self.kv_buffer_num_tokens}\n"
-            f"  module_shapes: {self.module_shapes}"
+            f"  module_shapes: {self.module_shapes}\n"
+            f"  weight_dtypes: {self.weight_dtypes}\n"
+            f"  tensor_dtypes: {self.tensor_dtypes}"
         )
 
 

@@ -17,8 +17,11 @@ from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 
-from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
-from batchgen.models.wrappers import BaseModuleWrapper
+# Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
+from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
+# Aliases for backward compatibility with existing code
+Attn_Wrapper = AttnWrapperBase
+Expert_Wrapper = ExpertWrapperBase
 
 from .config.config import EngineConfig
 from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
@@ -118,7 +121,7 @@ class InputArguments:
 	huggingface_ckpt_name: str
 	hf_cache_dir: Optional[str] = None
 	cache_dir: Optional[str] = None
-	pt_ckpt_dir: Optional[str] = None
+	converted_ckpt_dir: Optional[str] = None
 	queries: Optional[List[str]] = None
 	padding_length: int = 512
 	max_decoding_length: int = 128
@@ -199,7 +202,7 @@ class BatchGenWorkerArgs:
 	model_name: str
 	hf_cache_dir: Optional[str]
 	cache_dir: Optional[str]
-	pt_ckpt_dir: Optional[str]
+	converted_ckpt_dir: Optional[str]
 	host_kv_cache_size: int
 	global_host_kv_cache_size_gb: int
 
@@ -288,7 +291,7 @@ class BatchGenWorker:
 		self.huggingface_ckpt_name = args.model_name
 		self.hf_cache_dir = args.hf_cache_dir
 		self.cache_dir = args.cache_dir
-		self.pt_ckpt_dir = args.pt_ckpt_dir
+		self.converted_ckpt_dir = args.converted_ckpt_dir
 		self.skeleton_state_dict = args.skeleton_state_dict
 		
 		# 4. Initialize Shared Memory for Weights (Crucial for multiprocess)
@@ -327,8 +330,13 @@ class BatchGenWorker:
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
 		)
-		
-		self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+
+		# Select worker view based on model's KV cache configuration
+		# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
+		if worker_kv_config.num_v_heads == 0:
+			self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		else:
+			self.host_paged_kv_worker_view = core_engine.DefaultHostPagedKVWorkerView(worker_kv_config)
 
 		# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
 		logging.info(f"Rank {self.rank}: Initializing Host KV view with parallel cudaHostRegister (local_rank={self.local_rank})")
@@ -578,6 +586,26 @@ class BatchGenWorker:
 			self._logged_sampling = True
 		from batchgen.sampling import sample_tokens
 		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
+
+	def _log_prefill_timing(self):
+		"""Log prefill timing stats if available (GPT-OSS specific)."""
+		try:
+			from batchgen.models.openai.gpt_oss_120b.wrappers import PrefillTimingStats
+			if PrefillTimingStats.enabled:
+				PrefillTimingStats.log_summary()
+				PrefillTimingStats.reset()  # Reset for next prefill batch
+		except ImportError:
+			pass  # Not GPT-OSS or module not available
+
+	def _log_decode_timing(self):
+		"""Log decode timing stats if available (GPT-OSS specific)."""
+		try:
+			from batchgen.models.openai.gpt_oss_120b.wrappers import DecodeTimingStats
+			if DecodeTimingStats.enabled:
+				DecodeTimingStats.log_summary()
+				DecodeTimingStats.reset()  # Reset for next decode batch
+		except ImportError:
+			pass  # Not GPT-OSS or module not available
 
 	def set_watchdog(self, watchdog) -> None:
 		"""
@@ -899,18 +927,25 @@ class BatchGenWorker:
 		layer_idx: int,
 		batch: List[int],
 		k_tensor: torch.Tensor,
+		v_tensor: torch.Tensor = None,
 	) -> None:
 		"""
 		Fire-and-forget KV append to host.
-		
+
 		Adds task to pending list, does NOT wait.
 		Tasks are waited at page boundary via _wait_pending_kv_append_tasks().
-		
+
 		Safety: Host writes don't race with GPU reads (different memory spaces).
-		
+
 		CRITICAL: Must keep tensor references alive until async operation completes!
 		PyTorch's CUDA caching allocator can reuse memory if tensor is dereferenced
 		while async operation is still reading from it.
+
+		Args:
+			layer_idx: Layer index
+			batch: List of local indices in the batch
+			k_tensor: Key tensor to append
+			v_tensor: Value tensor to append (optional, for GQA models like GPT-OSS)
 		"""
 		if not batch:
 			return
@@ -949,9 +984,11 @@ class BatchGenWorker:
 				f"Rank {self.rank}: layer=0 append positions: first_3_resumed_seqs={append_diag}"
 			)
 		
-		# Reshape for MLA if needed
+		# Reshape for MLA if needed (MLA has 3D tensors, GQA has 4D)
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)  # [B, 1, D] -> [B, 1, 1, D]
+		if v_tensor is not None and v_tensor.dim() == 3:
+			v_tensor = v_tensor.unsqueeze(2)  # [B, 1, D] -> [B, 1, 1, D]
 		
 		# Optional NaN/Inf detection (disabled by default to avoid redundant checks/logs)
 		if BATCHGEN_ENABLE_NAN_CHECK and layer_idx == 0 and torch.isnan(k_tensor).any():
@@ -986,14 +1023,17 @@ class BatchGenWorker:
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
 			k_tensor=k_tensor,
-			v_tensor=None,  # MLA doesn't have separate V
+			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
 			sequence_lengths=sequence_lengths,
 		)
-		
-		# CRITICAL FIX: Store tensor reference alongside task to prevent GC
+
+		# CRITICAL FIX: Store tensor references alongside task to prevent GC
+		# Must store BOTH k and v tensors to prevent memory reuse during async D2H copy
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 		self._pending_kv_append_tensors.append(k_tensor)
+		if v_tensor is not None:
+			self._pending_kv_append_tensors.append(v_tensor)
 		
 		# Add to pending list - will be waited at page boundary
 		if task is not None:
@@ -1052,7 +1092,7 @@ class BatchGenWorker:
 			"huggingface_ckpt_name": self.huggingface_ckpt_name,
 			"hf_cache_dir": self.hf_cache_dir,
 			"cache_dir": self.cache_dir,
-			"pt_ckpt_dir": self.pt_ckpt_dir,
+			"converted_ckpt_dir": self.converted_ckpt_dir,
 			"padding_length": self.max_input_length,
 			"max_decoding_length": self.max_decoding_length,
 			"device": self.device,
@@ -1283,12 +1323,26 @@ class BatchGenWorker:
 		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
-		
+
+		# DEBUG: Check what's being passed to the host→GPU load
+		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1":
+			print(f"\n[HOST->GPU DEBUG] === Before async_load_layer_paged_kv_to_device ===")
+			print(f"[HOST->GPU DEBUG] global_sequence_ids = {global_sequence_ids[:10]}... (total={len(global_sequence_ids)})")
+			print(f"[HOST->GPU DEBUG] sequence_tensor = {sequence_tensor[:10].tolist()}...")
+			print(f"[HOST->GPU DEBUG] active_sequence_page_counts = {active_sequence_page_counts[:10].tolist()}...")
+			print(f"[HOST->GPU DEBUG] k_ptrs.shape = {k_ptrs.shape}")
+			# Check if global_sequence_ids are all the same (BUG)
+			unique_ids = set(global_sequence_ids)
+			if len(unique_ids) < len(global_sequence_ids):
+				print(f"[HOST->GPU DEBUG] *** WARNING: DUPLICATE sequence IDs! Unique: {len(unique_ids)}, Total: {len(global_sequence_ids)} ***")
+			else:
+				print(f"[HOST->GPU DEBUG] OK: All {len(global_sequence_ids)} sequence IDs are unique")
+
 		logging.debug(
 			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
 			f"{len(global_sequence_ids)} sequences..."
 		)
-		
+
 		load_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_sequence_page_counts,
@@ -1300,12 +1354,59 @@ class BatchGenWorker:
 		load_task.wait()
 		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
 		torch.cuda.synchronize(self.torch_device)
-		
+
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
+
+		# DEBUG: Verify KV content is different across sequences after host→GPU load
+		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1" and len(global_sequence_ids) >= 2:
+			k_cache, v_cache = manager.get_kv_tensors()
+			# k_cache shape: [num_layers, num_pages, page_size, num_kv_heads, head_dim]
+			print(f"\n[KV LOAD DEBUG] === After Host→GPU Load ===")
+			print(f"[KV LOAD DEBUG] Loaded {len(global_sequence_ids)} sequences: {global_sequence_ids[:5]}...")
+			print(f"[KV LOAD DEBUG] k_cache.shape={k_cache.shape}")
+
+			# Get page table to find physical pages for each sequence
+			page_table = manager._gpu_page_table_manager.gpu_table
+			print(f"[KV LOAD DEBUG] page_table.shape={page_table.shape}")
+
+			# Compare KV content at position 0 (first token) for first 3 sequences
+			# Layer 0, position 0 should contain different values if prefill worked correctly
+			num_to_check = min(3, len(global_sequence_ids))
+			kv_samples = []
+			for i in range(num_to_check):
+				# Get the GPU page for this sequence's position 0
+				slot_idx = i  # slot_indices are 0, 1, 2, ...
+				page_idx = 0  # position 0
+				gpu_page = int(page_table[slot_idx, page_idx].item())
+				offset = 0  # position 0 within page
+
+				# Read K at layer 0, this page, position 0, head 0, first 4 dims
+				k_sample = k_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
+				v_sample = None
+				if v_cache is not None:
+					v_sample = v_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
+
+				kv_samples.append({
+					'seq': i,
+					'global_idx': global_sequence_ids[i],
+					'slot': slot_idx,
+					'gpu_page': gpu_page,
+					'k_sample': k_sample,
+					'v_sample': v_sample,
+				})
+				print(f"[KV LOAD DEBUG] seq{i} (global={global_sequence_ids[i]}): slot={slot_idx}, gpu_page={gpu_page}, K[0,:4]={k_sample}")
+
+			# Check if all K samples are identical (BAD)
+			all_k_same = all(s['k_sample'] == kv_samples[0]['k_sample'] for s in kv_samples)
+			if all_k_same:
+				print(f"[KV LOAD DEBUG] *** WARNING: ALL {num_to_check} SEQUENCES HAVE IDENTICAL K VALUES! ***")
+				print(f"[KV LOAD DEBUG] This indicates prefill wrote identical KV or host→GPU load is corrupted!")
+			else:
+				print(f"[KV LOAD DEBUG] OK: K values differ across sequences (expected for different prompts)")
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:	
 		"""Return GPU KV pages associated with the provided local sequence ids."""
@@ -2730,6 +2831,31 @@ class BatchGenWorker:
 		local_tokenize_time = time.perf_counter() - tokenize_start
 		logging.debug(f"Rank {self.rank}: Local tokenization of {len(my_texts)} sequences in {local_tokenize_time:.2f}s")
 
+		# DEBUG: Print tokenized prompts
+		if os.environ.get("BATCHGEN_DEBUG_TOKENIZE", "0") == "1" and self.rank == 0 and my_tokenized:
+			print(f"\n[TOKENIZE DEBUG] === First 3 tokenized prompts ===")
+			for i in range(min(3, len(my_tokenized))):
+				item = my_tokenized[i]
+				token_ids = item["input_ids"]
+				print(f"\n[TOKENIZE DEBUG] Sequence {item['global_idx']} (length={item['length']})")
+				# Show first 50 tokens
+				print(f"[TOKENIZE DEBUG] First 50 tokens: {token_ids[:50]}")
+				# Show last 50 tokens (includes question end)
+				print(f"[TOKENIZE DEBUG] Last 50 tokens: {token_ids[-50:]}")
+				# Decode first 200 chars of prompt
+				try:
+					decoded_start = self.tokenizer.decode(token_ids[:100])
+					decoded_end = self.tokenizer.decode(token_ids[-100:])
+					print(f"[TOKENIZE DEBUG] Start of prompt (decoded): {repr(decoded_start[:300])}")
+					print(f"[TOKENIZE DEBUG] End of prompt (decoded): {repr(decoded_end[-300:])}")
+				except Exception as e:
+					print(f"[TOKENIZE DEBUG] Decode error: {e}")
+				# Check for special tokens
+				special_token_ids = [199998, 199999, 200000, 200001, 200002, 200003, 200004, 200005, 200006, 200007, 200008, 200012]
+				found_special = [tid for tid in token_ids if tid in special_token_ids]
+				if found_special:
+					print(f"[TOKENIZE DEBUG] Special tokens found: {found_special}")
+
 		# Phase 1.5: Gather all tokenized results to all ranks
 		# This keeps NCCL alive and shares results efficiently
 		gather_start = time.perf_counter()
@@ -3749,80 +3875,84 @@ class BatchGenWorker:
 				assert self.rank == dist.get_rank(), \
 					f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
 
-			comm_master_addr = os.getenv("COMM_MASTER_ADDR")
+			# Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
+			if self.world_size == 1:
+				logging.debug("Single GPU mode: skipping PyNccl communicator initialization")
+			else:
+				comm_master_addr = os.getenv("COMM_MASTER_ADDR")
 
-			# Coordinate PyNccl initialization across all ranks
-			# Use all_reduce to check if ANY rank needs to (re)init the communicator
-			need_init = 1 if self.comm is None else 0
-			need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
-			dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
-			any_rank_needs_init = need_init_tensor.item() > 0
+				# Coordinate PyNccl initialization across all ranks
+				# Use all_reduce to check if ANY rank needs to (re)init the communicator
+				need_init = 1 if self.comm is None else 0
+				need_init_tensor = torch.tensor([need_init], dtype=torch.int32, device=self.torch_device)
+				dist.all_reduce(need_init_tensor, op=dist.ReduceOp.MAX)
+				any_rank_needs_init = need_init_tensor.item() > 0
 
-			if any_rank_needs_init:
-				# All ranks must participate in init - destroy any existing comm first
-				if self.comm is not None:
-					logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
-					try:
-						self.comm.destroy()
-					except Exception:
-						pass
-					self.comm = None
-					if hasattr(self, '_nccl_group') and self._nccl_group is not None:
-						del self._nccl_group
-						self._nccl_group = None
-
-				device = torch.device("cuda", self.local_rank)
-
-				if comm_master_addr is None:
-					logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
-				elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
-					# Track port - incremented in _check_and_reinit_pynccl on failures
-					if not hasattr(self, '_nccl_port'):
-						self._nccl_port = 20003
-
-					# Rank 0 finds an available port, then broadcasts to all ranks
-					if self.rank == 0:
+				if any_rank_needs_init:
+					# All ranks must participate in init - destroy any existing comm first
+					if self.comm is not None:
+						logging.info(f"Rank {self.rank}: Destroying existing comm for coordinated reinit")
 						try:
-							self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
-							logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
-						except RuntimeError as e:
-							logging.error(f"Rank 0: Failed to find available port: {e}")
-							raise
+							self.comm.destroy()
+						except Exception:
+							pass
+						self.comm = None
+						if hasattr(self, '_nccl_group') and self._nccl_group is not None:
+							del self._nccl_group
+							self._nccl_group = None
 
-					# Broadcast the chosen port from rank 0 to all ranks
-					port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
-					dist.broadcast(port_tensor, src=0)
-					self._nccl_port = port_tensor.item()
+					device = torch.device("cuda", self.local_rank)
 
-					# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
-					# is ready before other ranks try to connect. Different ranks may reach
-					# this point at very different times due to tokenization workload.
-					logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
-					dist.barrier()
+					if comm_master_addr is None:
+						logging.warning(f"Rank {self.rank}: COMM_MASTER_ADDR not set, skipping PyNccl init")
+					elif StatelessProcessGroup is not None and PyNcclCommunicator is not None:
+						# Track port - incremented in _check_and_reinit_pynccl on failures
+						if not hasattr(self, '_nccl_port'):
+							self._nccl_port = 20003
 
-					try:
-						logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
-
-						# Store group separately so we can properly destroy it on reinit
-						self._nccl_group = StatelessProcessGroup.create(
-							host=comm_master_addr,
-							port=self._nccl_port,
-							rank=self.rank,
-							world_size=self.world_size,
-							data_expiration_seconds=36000,  # 10 hours
-						)
-						self.comm = PyNcclCommunicator(
-							group=self._nccl_group,
-							device=device
-						)
-						# Only rank 0 logs at INFO level to reduce verbosity
+						# Rank 0 finds an available port, then broadcasts to all ranks
 						if self.rank == 0:
-							logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
-						else:
-							logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
-					except Exception as e:
-						logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
-						raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+							try:
+								self._nccl_port = _find_available_port(comm_master_addr, self._nccl_port)
+								logging.debug(f"Rank 0: Found available port {self._nccl_port} for PyNccl")
+							except RuntimeError as e:
+								logging.error(f"Rank 0: Failed to find available port: {e}")
+								raise
+
+						# Broadcast the chosen port from rank 0 to all ranks
+						port_tensor = torch.tensor([self._nccl_port], dtype=torch.int32, device=self.torch_device)
+						dist.broadcast(port_tensor, src=0)
+						self._nccl_port = port_tensor.item()
+
+						# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
+						# is ready before other ranks try to connect. Different ranks may reach
+						# this point at very different times due to tokenization workload.
+						logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
+						dist.barrier()
+
+						try:
+							logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
+
+							# Store group separately so we can properly destroy it on reinit
+							self._nccl_group = StatelessProcessGroup.create(
+								host=comm_master_addr,
+								port=self._nccl_port,
+								rank=self.rank,
+								world_size=self.world_size,
+								data_expiration_seconds=36000,  # 10 hours
+							)
+							self.comm = PyNcclCommunicator(
+								group=self._nccl_group,
+								device=device
+							)
+							# Only rank 0 logs at INFO level to reduce verbosity
+							if self.rank == 0:
+								logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
+							else:
+								logging.debug(f"Rank {self.rank}: PyNccl communicator initialized on port {self._nccl_port}")
+						except Exception as e:
+							logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+							raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 
 		iteration = 0
 
@@ -3889,7 +4019,12 @@ class BatchGenWorker:
 							else:
 								self.prefill(local_prefill_indices)
 						prefill_time += time.perf_counter() - prefill_start
-					
+
+						# CRITICAL: Wait for all async KV offloads to complete before decode
+						# The async_offload_layer_kv_to_host() calls during prefill are fire-and-forget.
+						# Decode reads KV from host, so offloads MUST complete first.
+						torch.cuda.synchronize(self.torch_device)
+
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
@@ -4070,6 +4205,9 @@ class BatchGenWorker:
 			decode_time = time.perf_counter() - decode_start
 			logging.info(f"Detokenization complete: {len(decoded_strings)} sequences in {decode_time:.2f}s")
 
+			# Log decode timing stats (GPT-OSS specific)
+			self._log_decode_timing()
+
 		dist.barrier()
 		self._batch_completed = True
 
@@ -4151,6 +4289,17 @@ class BatchGenWorker:
 		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
 		# to ensure batch selection uses accurate post-migration capacities.
 
+		# CRITICAL: Deep free decode model memory BEFORE configuring prefill (Bug Fix 7)
+		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
+		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
+		logging.info("Deep freeing model memory before prefill config...")
+		self.deep_free_model_memory()
+
+		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
+		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
+		# Previously this was called AFTER configure_prefill() which caused OOM
+		self._destroy_gpu_paged_kv_cache()
+
 		# STEP 1: Configure model for prefill
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
@@ -4161,7 +4310,7 @@ class BatchGenWorker:
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 		self.core_engine.start_h2d_worker()
 
-		self._destroy_gpu_paged_kv_cache()
+		# NOTE: _destroy_gpu_paged_kv_cache() moved before configure_prefill() (Bug Fix 7.2)
 
 		# STEP 3: Allocate host KV pages for new sequences (only THIS RANK's sequences)
 		# Check by assigned_rank, NOT by _uuid_to_local_map (which may not have new sequences yet)
@@ -4849,6 +4998,17 @@ class BatchGenWorker:
 				batch_local_indices = batch[seq_start:seq_end]
 				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch_local_indices)
 
+				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
+				# which does NOT offload KV to host, causing decode to read garbage.
+				AttnWrapperBase.prepack_mode = True
+				AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
+				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
+				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
+				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
+				AttnWrapperBase.position_ids = batch_position_ids_flat
+				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+
 				# Embed tokens
 				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
@@ -4874,6 +5034,24 @@ class BatchGenWorker:
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
+				# DEBUG: Verify per-sequence hidden states after prefill
+				import os
+				if os.environ.get("BATCHGEN_DEBUG_PREFILL_OUTPUT", "0") == "1":
+					print(f"\n[PREFILL OUTPUT DEBUG] === Micro-batch {batch_idx} ===")
+					print(f"[PREFILL OUTPUT DEBUG] hidden_states.shape = {hidden_states.shape}")
+					print(f"[PREFILL OUTPUT DEBUG] batch_cu_seqlens = {batch_cu_seqlens.tolist()}")
+					print(f"[PREFILL OUTPUT DEBUG] last_token_indices = {last_token_indices.tolist()}")
+					print(f"[PREFILL OUTPUT DEBUG] last_token_hidden.shape = {last_token_hidden.shape}")
+					# Check if hidden states differ across sequences
+					for i in range(min(3, batch_num_seqs)):
+						h = last_token_hidden[i, :8].tolist()
+						print(f"[PREFILL OUTPUT DEBUG] seq{i} (pos={last_token_indices[i].item()}): hidden[:8] = {[f'{v:.4f}' for v in h]}")
+					if batch_num_seqs >= 2:
+						diff = (last_token_hidden[0] - last_token_hidden[1]).abs().max().item()
+						print(f"[PREFILL OUTPUT DEBUG] max_diff seq0-seq1: {diff:.6f}")
+						if diff < 1e-4:
+							print(f"[PREFILL OUTPUT DEBUG] *** CRITICAL: seq0 and seq1 have IDENTICAL hidden states! ***")
+
 				# Call lm_head directly using F.linear to bypass the hook
 				logits = torch.nn.functional.linear(
 					last_token_hidden,
@@ -4884,12 +5062,33 @@ class BatchGenWorker:
 				batch_new_tokens = self._select_tokens(logits)
 				output_tokens.append(batch_new_tokens)
 
+				# DEBUG: Show logits and sampled tokens
+				if os.environ.get("BATCHGEN_DEBUG_PREFILL_OUTPUT", "0") == "1":
+					print(f"[PREFILL OUTPUT DEBUG] logits.shape = {logits.shape}")
+					for i in range(min(3, batch_num_seqs)):
+						top_vals, top_ids = torch.topk(logits[i], k=5)
+						print(f"[PREFILL OUTPUT DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
+					print(f"[PREFILL OUTPUT DEBUG] sampled_tokens[:5] = {batch_new_tokens[:5].flatten().tolist()}")
+					if batch_num_seqs >= 2:
+						if batch_new_tokens[0].item() == batch_new_tokens[1].item():
+							print(f"[PREFILL OUTPUT DEBUG] *** WARNING: seq0 and seq1 sampled SAME token! ***")
+
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
 		Attn_Wrapper.prepack_cu_seqlens = None
 		Attn_Wrapper.prepack_max_seqlen = None
 		Attn_Wrapper.prepack_num_sequences = None
 		Attn_Wrapper.prepack_seq_lengths = None
+
+		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
+		AttnWrapperBase.prepack_mode = False
+		AttnWrapperBase.prepack_cu_seqlens = None
+		AttnWrapperBase.prepack_max_seqlen = None
+		AttnWrapperBase.prepack_num_sequences = None
+		AttnWrapperBase.prepack_seq_lengths = None
+
+		# Log timing summary for GPT-OSS if timing was enabled
+		self._log_prefill_timing()
 
 		new_tokens = torch.cat(output_tokens, dim=0)
 		self.update_new_token(new_tokens, batch, 0)
@@ -5622,6 +5821,11 @@ class BatchGenWorker:
 		Attn_Wrapper.past_value_states = past_value_states
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 
+		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
+		AttnWrapperBase.host_paged_kv_worker_view = worker_view
+		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions
 		if gpu_manager and gpu_manager._gpu_page_table_manager:
@@ -5871,7 +6075,22 @@ class BatchGenWorker:
 					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
 					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
 					Attn_Wrapper.max_seqlen = max_ctx
-					
+
+					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+					# Without this, GPT-OSS attention uses stale cache_seqlens (always None),
+					# causing same KV positions to be read/written every decode step.
+					AttnWrapperBase.attention_mask = attention_mask
+					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+					AttnWrapperBase.max_seqlen = max_ctx
+
+					# DEBUG: Print cache_seqlens and input tokens
+					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
+						print(f"\n[DECODE DEBUG] Iteration {local_iteration}")
+						print(f"[DECODE DEBUG] cache_seqlens[:5]: {Attn_Wrapper.cache_seqlens[:5].tolist()}")
+						print(f"[DECODE DEBUG] position_ids[:5]: {Attn_Wrapper.position_ids[:5].flatten().tolist()}")
+						print(f"[DECODE DEBUG] new_tokens[:5]: {new_tokens[:5].flatten().tolist()}")
+
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
 				else:
@@ -5881,9 +6100,16 @@ class BatchGenWorker:
 					Attn_Wrapper.max_seqlen = 0
 					Attn_Wrapper.cur_batch = []
 					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+					# Also bind empty state to AttnWrapperBase for GPT-OSS
+					AttnWrapperBase.attention_mask = Attn_Wrapper.attention_mask
+					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+					AttnWrapperBase.max_seqlen = 0
+					AttnWrapperBase.cur_batch = []
 				
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+					AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 					# OPTIMIZATION: Only check page table if not already verified this batch
 					# Between boundaries, batch doesn't change so page table stays valid
@@ -5904,16 +6130,51 @@ class BatchGenWorker:
 				# Skipping would cause deadlock as other ranks wait for this rank.
 				
 				# KV append callback
+				# NOTE: v_tensor is optional for backward compatibility with MLA models (DeepSeek)
+				# GPT-OSS uses GQA with separate K and V, so it passes both tensors
 				current_batch = list(batch)
-				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor):
-					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor)
+				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor, v_tensor)
 				Attn_Wrapper.kv_append_callback = kv_append_callback
-				
+				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+				AttnWrapperBase.kv_append_callback = kv_append_callback
+
 				# Forward
-				outputs = self.model(new_tokens, attention_mask=Attn_Wrapper.attention_mask, use_cache=False)
+				# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
+				# Without this, the model generates position_ids = [[0]] for all decode steps,
+				# causing RoPE to be applied at position 0 instead of the actual token position.
+				outputs = self.model(
+					new_tokens,
+					attention_mask=Attn_Wrapper.attention_mask,
+					position_ids=Attn_Wrapper.position_ids,
+					use_cache=False
+				)
 				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
+
+			# DEBUG: Print sampled tokens and logits comparison
+			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
+				print(f"\n[DECODE DEBUG] === Iteration {local_iteration} ===")
+				token_ids = new_tokens[:5].flatten().tolist()
+				print(f"[DECODE DEBUG] sampled_tokens[:5]: {token_ids}")
+				# Decode tokens to show actual text
+				try:
+					decoded_tokens = [self.tokenizer.decode([tid]) for tid in token_ids]
+					print(f"[DECODE DEBUG] decoded_text[:5]: {decoded_tokens}")
+				except Exception as e:
+					print(f"[DECODE DEBUG] decode error: {e}")
+				# Check if all tokens are the same
+				if len(new_tokens) >= 2:
+					all_same = all(new_tokens[i].item() == new_tokens[0].item() for i in range(min(5, len(new_tokens))))
+					if all_same:
+						print(f"[DECODE DEBUG] *** WARNING: All sequences sampled SAME token! ***")
+				# Show logits for first 3 sequences
+				if os.environ.get("BATCHGEN_DEBUG_DECODE_LOGITS", "0") == "1":
+					logits = outputs.logits[:, -1, :]
+					for i in range(min(3, len(logits))):
+						top_vals, top_ids = torch.topk(logits[i], k=5)
+						print(f"[DECODE DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
 
 			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
 			# This avoids N GPU synchronizations which cause heavy CPU overhead
@@ -5957,6 +6218,16 @@ class BatchGenWorker:
 		Attn_Wrapper.gpu_paged_kv_manager = None
 		Attn_Wrapper.host_paged_kv_worker_view = None
 		Attn_Wrapper.cur_batch = None
+
+		# Also cleanup AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+		AttnWrapperBase.gpu_paged_kv_manager = None
+		AttnWrapperBase.host_paged_kv_worker_view = None
+		AttnWrapperBase.cache_seqlens = None
+		AttnWrapperBase.attention_mask = None
+		AttnWrapperBase.position_ids = None
+		AttnWrapperBase.max_seqlen = None
+		AttnWrapperBase.cur_batch = None
+		AttnWrapperBase.kv_append_callback = None
 		
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
@@ -6035,11 +6306,13 @@ class BatchGenWorker:
 		layer_idx: int,
 		batch: List[int],
 		k_tensor: torch.Tensor,
+		v_tensor: torch.Tensor = None,
 	) -> None:  # Returns None, not the task
 		"""
 		Async append - adds task to pending list, does NOT wait.
-		
+
 		CRITICAL: Must keep tensor references alive until async operation completes!
+		GPT-OSS uses GQA with separate K and V caches, so v_tensor must be passed.
 		"""
 		if not batch:
 			return
@@ -6059,7 +6332,9 @@ class BatchGenWorker:
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
-		
+		if v_tensor is not None and v_tensor.dim() == 3:
+			v_tensor = v_tensor.unsqueeze(2)
+
 		# NaN DETECTION: Check for NaN in KV tensor BEFORE appending to host
 		# This catches attention computation issues that would propagate to host KV
 		if layer_idx == 0 and torch.isnan(k_tensor).any():
@@ -6095,16 +6370,19 @@ class BatchGenWorker:
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
 			k_tensor=k_tensor,
-			v_tensor=None,
+			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
 			sequence_lengths=sequence_lengths,
 		)
-		
-		# CRITICAL FIX: Store tensor reference alongside task to prevent GC
+
+		# CRITICAL FIX: Store tensor references alongside task to prevent GC
 		# PyTorch's CUDA caching allocator can reuse memory if tensor is dereferenced
 		# while async operation is still reading from it!
+		# Must store BOTH k and v tensors for GQA models
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 		self._pending_kv_append_tensors.append(k_tensor)
+		if v_tensor is not None:
+			self._pending_kv_append_tensors.append(v_tensor)
 		
 		# Add to pending list - will be waited at page boundary
 		self._pending_kv_append_tasks.append(task)
@@ -7254,9 +7532,14 @@ class BatchGenWorker:
 			return True
 
 	def _unregister_fp8_weights(self):
+		# Skip FP8 unregistration for models that don't use FP8 (e.g., GPT-OSS uses MXFP4)
+		if not hasattr(self.loaded_model_config, 'first_k_dense_replace'):
+			return
+
 		for layer_idx in range(len(self.model.model.layers)):
 			attn_module = self.model.model.layers[layer_idx].self_attn
-			attn_module._unregister_fp8_weights()
+			if hasattr(attn_module, '_unregister_fp8_weights'):
+				attn_module._unregister_fp8_weights()
 			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
 				if hasattr(self.model.model.layers[layer_idx].mlp.shared_experts, '_unregister_fp8_weights'):
 					self.model.model.layers[layer_idx].mlp.shared_experts._unregister_fp8_weights()

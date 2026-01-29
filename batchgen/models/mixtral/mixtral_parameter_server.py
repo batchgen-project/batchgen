@@ -41,10 +41,10 @@ except ImportError:
 
 
 class Mixtral_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, pt_ckpt_dir):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
-        self.pt_ckpt_dir = pt_ckpt_dir
+        self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         # Use BatchGen's unified config system instead of HuggingFace AutoConfig
@@ -86,7 +86,7 @@ class Mixtral_Parameter_Server:
             self.shm_name,
             self.tensor_meta_shm_name,
             byte_size,
-            self.pt_ckpt_dir,
+            self.converted_ckpt_dir,
             self.state_dict_name_map,
         )
         return self.shm_name, self.tensor_meta_shm_name
@@ -161,7 +161,7 @@ class Mixtral_Parameter_Server:
             ckpt_files, desc="Loading checkpoint files", smoothing=0
         ):
             dst_dir = os.path.join(
-                self.pt_ckpt_dir,
+                self.converted_ckpt_dir,
                 ckpt.split("/")[-1].replace(".safetensors", ".pt"),
             )
             # logging.info(f"dst_dir: {dst_dir}")
@@ -169,7 +169,7 @@ class Mixtral_Parameter_Server:
                 continue
 
             logging.info(
-                f"Checkpoint file: {ckpt} not found in {self.pt_ckpt_dir}. Dump it now. Will omit this step next time run this model."
+                f"Checkpoint file: {ckpt} not found in {self.converted_ckpt_dir}. Dump it now. Will omit this step next time run this model."
             )
             p = Process(target=self.save_and_load, args=(ckpt, dst_dir))
             p.start()

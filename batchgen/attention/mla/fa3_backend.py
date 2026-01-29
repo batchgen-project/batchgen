@@ -549,13 +549,13 @@ def w8a16_gemm(
 	n, _ = weight_data_fp8.size()
 	out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
 	y_fp8 = (weight_data_fp8, weight_scale_inv_fp32)
-	
+
 	# x_fp8 = per_token_cast_to_fp8(x)
 	# x_fp8 = act_quant(x)
 	x_fp8 = act_quant(x)
 	# x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
 	# deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out)
+	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, disable_ue8m0_cast=True)
 	if activation_bf16.dim() == 3:
 		out = out.view(n_group, l, n)
 	else:
@@ -576,11 +576,22 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		Materialize QKV and call flash_attn_varlen_func(). (flash_attn_3 backend)
 	"""
 	bsz, seq_len, _ = hidden_states.shape
+	# Debug: Log dtypes before w8a16_gemm
+	logging.info(f"[DEBUG w8a16_gemm inputs] hidden_states.dtype={hidden_states.dtype}, "
+				 f"q_a_proj.weight.dtype={self.q_a_proj.weight.data.dtype}, "
+				 f"scale.dtype={weight_scale['q_a_proj.weight_scale_inv'].dtype}")
+
 	query_states = w8a16_gemm(
 		self.q_a_proj.weight.data,
 		weight_scale["q_a_proj.weight_scale_inv"],
 		hidden_states
 	)
+
+	# Debug: Log dtype after w8a16_gemm, before layernorm
+	logging.info(f"[DEBUG after w8a16_gemm] query_states.dtype={query_states.dtype}, "
+				 f"q_a_layernorm.weight.dtype={self.q_a_layernorm.weight.dtype}, "
+				 f"variance_epsilon={self.q_a_layernorm.variance_epsilon}")
+
 	# Check if NaN or Inf in query_states
 	# if torch.isnan(query_states).any() or torch.isinf(query_states).any():
 	# 	logging.error("NaN or Inf detected in query_states after first GEMM.")

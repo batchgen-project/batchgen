@@ -602,7 +602,8 @@ class GPUPagedKVCacheManager:
 			self.config.num_k_heads,
 			self.config.k_head_dim,
 		)
-		self._k_cache = torch.empty(
+		# Initialize KV cache with zeros
+		self._k_cache = torch.zeros(
 			shape, dtype=self.config.kv_dtype, device=self.device
 		)
 		logging.debug("Initialized K cache %s", tuple(self._k_cache.shape))
@@ -615,7 +616,7 @@ class GPUPagedKVCacheManager:
 				self.config.num_v_heads,
 				self.config.v_head_dim,
 			)
-			self._v_cache = torch.empty(
+			self._v_cache = torch.zeros(
 				v_shape, dtype=self.config.kv_dtype, device=self.device
 			)
 			logging.debug("Initialized V cache %s", tuple(self._v_cache.shape))
@@ -999,6 +1000,21 @@ class GPUPagedKVCacheManager:
 		if self._v_cache is not None:
 			v_cache_layer = self._v_cache[layer_idx]
 
+		# DEBUG: Verify GPU KV write parameters before kernel
+		debug_kv_write = layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_KV_WRITE", "0") == "1"
+		if debug_kv_write:
+			print(f"\n[GPU KV WRITE L0] === Before Triton Kernel ===")
+			print(f"[GPU KV WRITE L0] batch_size={batch_size}, k_tokens.shape={k_tokens.shape}")
+			print(f"[GPU KV WRITE L0] slot_indices[:5]={slot_indices[:min(5,len(slot_indices))].tolist()}")
+			print(f"[GPU KV WRITE L0] token_indices[:5]={token_indices[:min(5,len(token_indices))].tolist()}")
+			print(f"[GPU KV WRITE L0] page_table.shape={page_table_view.shape}")
+			print(f"[GPU KV WRITE L0] page_size_tokens={self.config.page_size_tokens}")
+			print(f"[GPU KV WRITE L0] k_tokens[0,:8]={k_tokens[0,:8].tolist()}")
+			if v_tokens is not None:
+				print(f"[GPU KV WRITE L0] v_tokens[0,:8]={v_tokens[0,:8].tolist()}")
+			else:
+				print(f"[GPU KV WRITE L0] v_tokens=None (BUG: V should be written for GQA!)")
+
 		run_paged_kv_token_update_fused(
 			k_cache=k_cache_layer,
 			k_tokens=k_tokens,
@@ -1009,6 +1025,94 @@ class GPUPagedKVCacheManager:
 			v_cache=v_cache_layer,
 			v_tokens=v_tokens,
 		)
+
+		# DEBUG: Verify write happened by reading back from cache
+		if debug_kv_write:
+			torch.cuda.synchronize()
+			seq0_slot = int(slot_indices[0].item())
+			seq0_pos = int(token_indices[0].item())
+			page_idx = seq0_pos // self.config.page_size_tokens
+			offset = seq0_pos % self.config.page_size_tokens
+			gpu_page = int(page_table_view[seq0_slot, page_idx].item())
+
+			# k_tokens shape: [batch, num_heads * head_dim] = [batch, 8*64] = [batch, 512]
+			# k_tokens[0] layout: [head0_dim0..63, head1_dim0..63, ..., head7_dim0..63]
+			# k_cache_layer shape: [num_pages, page_size, num_heads, head_dim]
+			# To compare head 0, we need:
+			#   k_tokens[0, 0:64] = head 0, all dims
+			#   k_cache_layer[gpu_page, offset, 0, :] = head 0, all dims
+			head_dim = self.config.k_head_dim  # 64
+			k_written_head0 = k_tokens[0, 0:head_dim].tolist()  # head 0, all 64 dims
+			k_read_head0 = k_cache_layer[gpu_page, offset, 0, :].tolist()  # head 0, all 64 dims
+
+			print(f"[GPU KV WRITE L0] === After Triton Kernel ===")
+			print(f"[GPU KV WRITE L0] seq0: slot={seq0_slot}, pos={seq0_pos}, page_idx={page_idx}, offset={offset}, gpu_page={gpu_page}")
+			print(f"[GPU KV WRITE L0] k_tokens[0, 0:8] (head0 dims 0-7) = {k_written_head0[:8]}")
+			print(f"[GPU KV WRITE L0] k_cache[{gpu_page}][{offset}][0,:8] (head0 dims 0-7) = {k_read_head0[:8]}")
+
+			# Check if ALL dims of head 0 match
+			k_match = all(abs(w - r) < 1e-3 for w, r in zip(k_written_head0, k_read_head0))
+			print(f"[GPU KV WRITE L0] K head0 write {'SUCCEEDED' if k_match else 'FAILED'}")
+			if not k_match:
+				# Find first mismatch
+				for i, (w, r) in enumerate(zip(k_written_head0, k_read_head0)):
+					if abs(w - r) >= 1e-3:
+						print(f"[GPU KV WRITE L0] K head0 MISMATCH at dim {i}: written={w}, read={r}")
+						break
+
+			if v_cache_layer is not None and v_tokens is not None:
+				v_written_head0 = v_tokens[0, 0:head_dim].tolist()
+				v_read_head0 = v_cache_layer[gpu_page, offset, 0, :].tolist()
+				print(f"[GPU KV WRITE L0] v_tokens[0, 0:8] (head0 dims 0-7) = {v_written_head0[:8]}")
+				print(f"[GPU KV WRITE L0] v_cache[{gpu_page}][{offset}][0,:8] (head0 dims 0-7) = {v_read_head0[:8]}")
+				v_match = all(abs(w - r) < 1e-3 for w, r in zip(v_written_head0, v_read_head0))
+				print(f"[GPU KV WRITE L0] V head0 write {'SUCCEEDED' if v_match else 'FAILED'}")
+				if not v_match:
+					for i, (w, r) in enumerate(zip(v_written_head0, v_read_head0)):
+						if abs(w - r) >= 1e-3:
+							print(f"[GPU KV WRITE L0] V head0 MISMATCH at dim {i}: written={w}, read={r}")
+							break
+
+			# CHECK FOR PAGE TABLE CONFLICTS - are different sequences writing to the same gpu_page?
+			print(f"[GPU KV WRITE L0] === PAGE TABLE CONFLICT CHECK ===")
+			print(f"[GPU KV WRITE L0] page_table_view.shape={page_table_view.shape}")
+			gpu_pages_used = {}  # gpu_page -> list of (slot, page_idx)
+			num_seqs_to_check = min(batch_size, 10)
+			for i in range(num_seqs_to_check):
+				slot_i = int(slot_indices[i].item())
+				pos_i = int(token_indices[i].item())
+				page_idx_i = pos_i // self.config.page_size_tokens
+				offset_i = pos_i % self.config.page_size_tokens
+				gpu_page_i = int(page_table_view[slot_i, page_idx_i].item())
+				if gpu_page_i not in gpu_pages_used:
+					gpu_pages_used[gpu_page_i] = []
+				gpu_pages_used[gpu_page_i].append((slot_i, page_idx_i, pos_i, offset_i))
+				print(f"[GPU KV WRITE L0] seq{i}: slot={slot_i}, pos={pos_i}, page_idx={page_idx_i}, offset={offset_i}, gpu_page={gpu_page_i}")
+
+			# Report conflicts
+			conflicts_found = False
+			for gpu_page_id, users in gpu_pages_used.items():
+				if len(users) > 1:
+					conflicts_found = True
+					print(f"[GPU KV WRITE L0] CONFLICT: gpu_page={gpu_page_id} used by {len(users)} sequences: {users}")
+			if not conflicts_found:
+				print(f"[GPU KV WRITE L0] No page conflicts detected among first {num_seqs_to_check} sequences")
+
+			# Also check: Are all sequences using SAME page_idx (and thus potentially same cache)?
+			# This could happen if cache_seqlens are all the same (from same prefill)
+			unique_positions = set(int(token_indices[i].item()) for i in range(min(batch_size, 10)))
+			print(f"[GPU KV WRITE L0] Unique token positions among first 10 seqs: {sorted(unique_positions)}")
+
+			# Print full page table for first 3 sequences to see their page allocations
+			print(f"[GPU KV WRITE L0] === FULL PAGE TABLE FOR FIRST 3 SEQUENCES ===")
+			for i in range(min(3, batch_size)):
+				slot_i = int(slot_indices[i].item())
+				# Get all pages for this slot up to page_idx + 1
+				max_page_idx = (int(token_indices[i].item()) // self.config.page_size_tokens) + 1
+				pages_for_seq = []
+				for p in range(min(max_page_idx, page_table_view.shape[1])):
+					pages_for_seq.append(int(page_table_view[slot_i, p].item()))
+				print(f"[GPU KV WRITE L0] seq{i} (slot={slot_i}): pages[:10]={pages_for_seq[:10]}")
 
 	def get_layer_kv_with_page_table(
 		self, layer_idx: int

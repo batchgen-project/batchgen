@@ -145,7 +145,7 @@ def _import_tokenizers():
         pass
 
     try:
-        from batchgen.models.gpt_oss import tokenizer as _  # noqa: F401
+        from batchgen.models.openai.gpt_oss_120b import tokenizer as _  # noqa: F401
     except ImportError:
         pass
 

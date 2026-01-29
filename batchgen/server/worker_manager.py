@@ -19,7 +19,11 @@ from batchgen.batchgen_worker import BatchGenWorkerArgs
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
-from batchgen.server.process_utils import cleanup_resources
+from batchgen.server.process_utils import (
+    cleanup_resources,
+    get_hugepage_size,
+    get_model_byte_size,
+)
 from batchgen.server.server_args import ServerArgs
 from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
@@ -136,7 +140,8 @@ class WorkerManager:
         self._monitor_stop_event.clear()
         self._ready_event.clear()
         if self.args.enable_hugetlbfs:
-            self._config_hugepages()
+            byte_size = get_model_byte_size(self.args.model)
+            self._config_hugepages(byte_size)
             self._hugepages_enabled = True
 
         config_torch_module_initializer()
@@ -265,9 +270,29 @@ class WorkerManager:
         return result
 
     # ---------------------- Startup helpers ----------------------
-    def _config_hugepages(self) -> None:
+    def _config_hugepages(self, byte_size: int = None) -> None:
+        """Configure hugepages for shared memory.
+
+        Args:
+            byte_size: Model size in bytes. If None, uses default 700GB.
+        """
+        hugepage_size = get_hugepage_size()
+
+        if byte_size is not None:
+            # Model byte_size already includes buffer
+            num_hugepages = (byte_size + hugepage_size - 1) // hugepage_size
+        else:
+            # Fallback to old default (for backwards compatibility)
+            num_hugepages = 350000
+
+        logger.info(
+            f"Configuring hugepages: {num_hugepages} pages "
+            f"({num_hugepages * hugepage_size / (1024**3):.1f} GB, "
+            f"{hugepage_size / (1024**2):.0f} MB pages)"
+        )
+
         commands = [
-            ["sysctl", "-w", "vm.nr_hugepages=350000"],
+            ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"],
             ["mkdir", "-p", "/dev/hugepages"],
             ["mount", "-t", "hugetlbfs", "none", "/dev/hugepages"],
         ]
@@ -286,21 +311,21 @@ class WorkerManager:
             os.path.expanduser("~/.cache/huggingface")
         )
         self.args.hf_cache_dir = hf_cache_dir
-        pt_ckpt_dir = (
-            self.args.pt_ckpt_dir
-            or Path(self.args.cache_dir or ".") / "pt_ckpt"
+        converted_ckpt_dir = (
+            self.args.converted_ckpt_dir
+            or Path(self.args.cache_dir or ".") / "converted_ckpt"
         )
-        self.args.pt_ckpt_dir = pt_ckpt_dir
+        self.args.converted_ckpt_dir = converted_ckpt_dir
 
         if not endpoint and self.args.cache_dir is None:
             self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
 
         if endpoint:
             self._load_model_from_remote_server(
-                endpoint, hf_cache_dir, pt_ckpt_dir
+                endpoint, hf_cache_dir, converted_ckpt_dir
             )
         else:
-            self._load_model_locally(hf_cache_dir, pt_ckpt_dir)
+            self._load_model_locally(hf_cache_dir, converted_ckpt_dir)
 
         self._configure_host_kv_cache_budget()
         logger.info("Model Loaded. SHM: %s", self.model_info.get("shm_name"))
@@ -310,12 +335,28 @@ class WorkerManager:
         if local_device_count == 0:
             raise RuntimeError("No CUDA devices found.")
 
-        logger.info("Spawning %s DDP workers", local_device_count)
-        world_size = self.args.world_size or (
-            local_device_count * self.args.nnodes
-        )
-        if world_size == 1 and local_device_count > 1:
+        # Respect user-specified world_size (following vLLM/SGLang best practice)
+        # Users should use CUDA_VISIBLE_DEVICES to limit visible GPUs
+        world_size = self.args.world_size
+        if world_size is None or world_size <= 0:
+            # Auto-detect only if not explicitly specified
             world_size = local_device_count * self.args.nnodes
+
+        # Calculate local world size (workers per node)
+        local_world_size = world_size // self.args.nnodes
+
+        # Validate: can't spawn more workers than visible GPUs
+        if local_world_size > local_device_count:
+            raise ValueError(
+                f"world_size ({world_size}) requires {local_world_size} GPUs per node, "
+                f"but only {local_device_count} GPUs are visible. "
+                f"Use CUDA_VISIBLE_DEVICES to expose more GPUs."
+            )
+
+        logger.info(
+            "Spawning %d DDP workers (world_size=%d, nnodes=%d)",
+            local_world_size, world_size, self.args.nnodes
+        )
 
         # Auto-detect GPU architecture if not specified
         gpu_arch = self.args.gpu_arch or detect_gpu_arch()
@@ -324,7 +365,7 @@ class WorkerManager:
             model_name=self.args.model,
             hf_cache_dir=self.args.hf_cache_dir,
             cache_dir=self.args.cache_dir,
-            pt_ckpt_dir=self.args.pt_ckpt_dir,
+            converted_ckpt_dir=self.args.converted_ckpt_dir,
             kv_dtype=self.args.kv_dtype,
             dist_init_addr=self.args.dist_init_addr,
             world_size=world_size,
@@ -365,7 +406,7 @@ class WorkerManager:
                 args,
                 self._ready_event,
             ),
-            nprocs=local_device_count,
+            nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
             daemon=True,
         )
@@ -464,7 +505,7 @@ class WorkerManager:
         )
 
     def _load_model_locally(
-        self, _hf_cache_dir: Path, pt_ckpt_dir: Path
+        self, _hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
         if "deepseek" in self.args.model.lower():
             from batchgen.models.deepseek.deepseek_parameter_server import (
@@ -474,7 +515,7 @@ class WorkerManager:
             parameter_server = DeepSeek_Parameter_Server(
                 self.args.model,
                 self.args.cache_dir,
-                pt_ckpt_dir,
+                converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
             )
         elif "mixtral" in self.args.model.lower():
@@ -483,7 +524,18 @@ class WorkerManager:
             )
 
             parameter_server = Mixtral_Parameter_Server(
-                self.args.model, self.args.cache_dir, pt_ckpt_dir
+                self.args.model, self.args.cache_dir, converted_ckpt_dir
+            )
+        elif "gpt-oss-120b" in self.args.model.lower():
+            from batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server import (
+                GptOss_Parameter_Server,
+            )
+
+            parameter_server = GptOss_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
+                self.args.enable_hugetlbfs,
             )
         else:
             raise NotImplementedError(
@@ -500,13 +552,13 @@ class WorkerManager:
             "huggingface_ckpt_name": self.args.model,
             "shm_name": shm_name,
             "tensor_meta_shm_name": tensor_meta_shm_name,
-            "pt_ckpt_dir": pt_ckpt_dir,
+            "converted_ckpt_dir": converted_ckpt_dir,
             "parameter_server_size": ps_size,
         }
         logger.info("Local parameter server initialized: %s", self.model_info)
 
     def _load_model_from_remote_server(
-        self, endpoint: str, hf_cache_dir: Path, pt_ckpt_dir: Path
+        self, endpoint: str, hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
         host, port = self._parse_parameter_server_endpoint(endpoint)
         logger.info("Using external parameter server at %s:%d", host, port)
@@ -515,7 +567,7 @@ class WorkerManager:
             huggingface_ckpt_name=self.args.model,
             hf_cache_dir=hf_cache_dir,
             cache_dir=self.args.cache_dir,
-            pt_ckpt_dir=pt_ckpt_dir,
+            converted_ckpt_dir=converted_ckpt_dir,
         )
         info = client.get_model_info()
         for required in (
@@ -540,12 +592,12 @@ class WorkerManager:
             ),
             "shm_name": info["shm_name"],
             "tensor_meta_shm_name": info["tensor_meta_shm_name"],
-            "pt_ckpt_dir": info.get("pt_ckpt_dir", pt_ckpt_dir),
+            "converted_ckpt_dir": info.get("converted_ckpt_dir", converted_ckpt_dir),
             "parameter_server_size": info["parameter_server_size"],
         }
-        self.args.pt_ckpt_dir = Path(self.model_info["pt_ckpt_dir"])
+        self.args.converted_ckpt_dir = Path(self.model_info["converted_ckpt_dir"])
         if not self.args.cache_dir:
-            self.args.cache_dir = info.get("cache_dir") or self.args.pt_ckpt_dir
+            self.args.cache_dir = info.get("cache_dir") or self.args.converted_ckpt_dir
         logger.info(
             "Fetched shared memory handles from remote parameter server"
         )
@@ -593,14 +645,9 @@ class WorkerManager:
 
         if available_mem <= 0:
             raise RuntimeError("Unable to determine host KV cache budget")
-        num_devices = torch.cuda.device_count()
+        # Host KV cache is per-node shared - no division needed
         self.args_dict = vars(self.args)
-        if num_devices > 0:
-            self.args_dict["host_kv_cache_size_per_rank"] = (
-                available_mem // num_devices
-            )
-        else:
-            self.args_dict["host_kv_cache_size_per_rank"] = available_mem
+        self.args_dict["host_kv_cache_size_per_rank"] = available_mem
 
     @staticmethod
     def allocate_host_kv_cache(
@@ -610,7 +657,12 @@ class WorkerManager:
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
         )
-        host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+        # Select manager based on model's KV cache configuration
+        # MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
+        if config.num_v_heads == 0:
+            host_paged_kv_manager = bg_lib.MLAHostPagedKVManager(config)
+        else:
+            host_paged_kv_manager = bg_lib.MHAHostPagedKVManager(config)
         host_paged_kv_manager.initialize(True)
         return host_paged_kv_manager
 

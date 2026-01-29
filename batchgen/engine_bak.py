@@ -856,7 +856,7 @@ def batchgen(
 	engine_config_json_dir: Optional[str] = None,
 	hf_cache_dir: Optional[str] = None,
 	cache_dir: Optional[str] = None,
-	pt_ckpt_dir: Optional[str] = None,
+	converted_ckpt_dir: Optional[str] = None,
 	host_kv_cache_size: Optional[int] = None,  # If not set, use all host memory
 	parameter_server_host: str = 'localhost',
 	parameter_server_port: int = 10900,
@@ -878,7 +878,7 @@ def batchgen(
 		engine_config: Engine configuration
 		hf_cache_dir: HuggingFace cache directory
 		cache_dir: Model cache directory
-		pt_ckpt_dir: Directory for PyTorch checkpoints
+		converted_ckpt_dir: Directory for PyTorch checkpoints
 		host_kv_cache_size: Host KV cache size in bytes
 		parameter_server_host: Host of the parameter server
 		parameter_server_port: Port of the parameter server
@@ -925,16 +925,16 @@ def batchgen(
 	tensor_meta_shm_name = model_info.get('tensor_meta_shm_name')
 	skeleton_state_dict = model_info.get('skeleton_state_dict')  # This now comes from shared memory
 	parameter_server_size = model_info.get('parameter_server_size')
-	if pt_ckpt_dir == None:
-		pt_ckpt_dir = model_info.get('pt_ckpt_dir')
+	if converted_ckpt_dir == None:
+		converted_ckpt_dir = model_info.get('converted_ckpt_dir')
 	
-	if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, pt_ckpt_dir]):
+	if not all([shm_name, tensor_meta_shm_name, skeleton_state_dict, parameter_server_size, converted_ckpt_dir]):
 		missing = []
 		if not shm_name: missing.append('shm_name')
 		if not tensor_meta_shm_name: missing.append('tensor_meta_shm_name')
 		if not skeleton_state_dict: missing.append('skeleton_state_dict')
 		if not parameter_server_size: missing.append('parameter_server_size')
-		if not pt_ckpt_dir: missing.append('pt_ckpt_dir')
+		if not converted_ckpt_dir: missing.append('converted_ckpt_dir')
 		raise RuntimeError(f"Missing required information from parameter server: {', '.join(missing)}")
 	
 	# Calculate host KV cache size if not provided
@@ -997,7 +997,7 @@ def batchgen(
 			skeleton_state_dict=skeleton_state_dict,
 			shm_name=shm_name,
 			tensor_meta_shm_name=tensor_meta_shm_name,
-			pt_ckpt_dir=pt_ckpt_dir,
+			converted_ckpt_dir=converted_ckpt_dir,
 			host_kv_cache_size=per_device_host_kv_cache_size,
 			dist_init_addr = dist_init_addr,
 			local_rank = local_rank,
@@ -1051,7 +1051,7 @@ class BatchGen:
 		huggingface_ckpt_name: str,
 		hf_cache_dir: Optional[str],
 		cache_dir: Optional[str],
-		pt_ckpt_dir: Optional[str],
+		converted_ckpt_dir: Optional[str],
 		queries: List[str],
 		max_input_length: int,
 		max_decoding_length: int,
@@ -1073,7 +1073,7 @@ class BatchGen:
 			self.hf_cache_dir = cache_dir
 		self.huggingface_ckpt_name = huggingface_ckpt_name
 		self.cache_dir = cache_dir
-		self.pt_ckpt_dir = pt_ckpt_dir
+		self.converted_ckpt_dir = converted_ckpt_dir
 		self.queries = queries
 		self.num_queries = len(queries)
 		self.max_input_length = max_input_length
@@ -1173,7 +1173,7 @@ class BatchGen:
 				self.skeleton_state_dict,
 				self.shm_name,
 				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
+				self.converted_ckpt_dir,
 				self.host_kv_cache_size,
 			)
 		elif self.model_config.architectures[0] == "Qwen2MoeForCausalLM":
@@ -1184,7 +1184,7 @@ class BatchGen:
 				self.hf_cache_dir,
 				self.cache_dir,
 				self.engine_config,
-				self.pt_ckpt_dir,
+				self.converted_ckpt_dir,
 			)
 		elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
 			from batchgen.models.deepseek.deepseekv3.deepseekv3_initializer import (
@@ -1199,7 +1199,7 @@ class BatchGen:
 				self.skeleton_state_dict,
 				self.shm_name,
 				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
+				self.converted_ckpt_dir,
 				self.host_kv_cache_size,
 				self.local_rank,
 				self.global_rank,
@@ -1219,7 +1219,7 @@ class BatchGen:
 				self.skeleton_state_dict,
 				self.shm_name,
 				self.tensor_meta_shm_name,
-				self.pt_ckpt_dir,
+				self.converted_ckpt_dir,
 				self.host_kv_cache_size,
 			)
 

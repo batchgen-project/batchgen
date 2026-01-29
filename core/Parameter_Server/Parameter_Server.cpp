@@ -364,7 +364,7 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                     [state_dict_name_map[tensor_name]["module_key"]]
                     [state_dict_name_map[tensor_name]["tensor_key"]] =
                     tensor_meta(tensor_global_offset, tensor_shape,
-                                tensor_info.byte_size);
+                                tensor_info.byte_size, tensor_info.dtype);
             } else {
                 // If it does not exist, update skeleton_state_dict_
                 torch::Dtype dtype;
@@ -376,6 +376,8 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                     dtype = torch::kBFloat16;
                 } else if (tensor_info.dtype == "float8_e4m3fn") {
                     dtype = torch::kFloat8_e4m3fn;
+                } else if (tensor_info.dtype == "uint8") {
+                    dtype = torch::kUInt8;
                 } else {
                     throw std::runtime_error("Unsupported dtype: " + tensor_info.dtype);
                 }

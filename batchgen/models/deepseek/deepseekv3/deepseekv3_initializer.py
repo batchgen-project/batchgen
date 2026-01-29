@@ -229,6 +229,14 @@ class DeepseekV3Initializer:
             },
         }
 
+        # Per-tensor dtype overrides: layernorm weights must be BF16
+        self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
+            "attn": {
+                "q_a_layernorm.weight": torch.bfloat16,
+                "kv_a_layernorm.weight": torch.bfloat16,
+            },
+        }
+
     def _parse_model_config(self):
         model_config = ModelConfig()
 

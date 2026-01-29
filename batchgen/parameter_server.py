@@ -35,7 +35,7 @@ logging.basicConfig(
 
 class ParameterServer:
 	def __init__(self, host='localhost', port=10900, model_name=None,
-				 hf_cache_dir=None, cache_dir=None, pt_ckpt_dir=None, enable_hugetlbfs=False):
+				 hf_cache_dir=None, cache_dir=None, converted_ckpt_dir=None, enable_hugetlbfs=False):
 		"""
 		Initialize the Parameter Server.
 		
@@ -45,7 +45,7 @@ class ParameterServer:
 			model_name: HuggingFace model name to load at startup
 			hf_cache_dir: HuggingFace cache directory
 			cache_dir: Model cache directory
-			pt_ckpt_dir: Directory for PyTorch checkpoints
+			converted_ckpt_dir: Directory for PyTorch checkpoints
 		"""
 		self.host = host
 		self.port = port
@@ -59,9 +59,9 @@ class ParameterServer:
 		self.initial_model_name = model_name
 		self.hf_cache_dir = hf_cache_dir
 		self.cache_dir = cache_dir
-		self.pt_ckpt_dir = pt_ckpt_dir
-		# if self.pt_ckpt_dir is None:
-		# 	self.pt_ckpt_dir = os.path.join(cache_dir, "converted_ckpt")
+		self.converted_ckpt_dir = converted_ckpt_dir
+		# if self.converted_ckpt_dir is None:
+		# 	self.converted_ckpt_dir = os.path.join(cache_dir, "converted_ckpt")
 		
 		# State tracking
 		self.current_model = None
@@ -248,19 +248,32 @@ class ParameterServer:
 			logging.error(f"Error creating shared memory: {e}")
 			return None
 
-	def config_hugepages(self):
+	def config_hugepages(self, model_name: str = None):
 		"""
 		Configure hugepages for shared memory usage.
-		Call the following commands in python:
-			sysctl -w vm.nr_hugepages=350000
-			cat /proc/meminfo | grep -i huge
-			mkdir -p /dev/hugepages
-			mount -t hugetlbfs none /dev/hugepages
+
+		Args:
+			model_name: HuggingFace model name to determine required hugepages.
 		"""
-		# Fix: different size for different models.
+		from batchgen.server.process_utils import get_hugepage_size, get_model_byte_size
+
+		hugepage_size = get_hugepage_size()
+
+		if model_name is not None:
+			byte_size = get_model_byte_size(model_name)
+			num_hugepages = (byte_size + hugepage_size - 1) // hugepage_size
+			logging.info(
+				f"Calculating hugepages for {model_name}: "
+				f"{byte_size / (1024**3):.1f} GB model, "
+				f"{num_hugepages} pages ({hugepage_size / (1024**2):.0f} MB each)"
+			)
+		else:
+			num_hugepages = 350000
+			logging.warning("No model_name provided, using default 350000 hugepages")
+
 		try:
 			commands = [
-				['sysctl', '-w', 'vm.nr_hugepages=350000'],
+				['sysctl', '-w', f'vm.nr_hugepages={num_hugepages}'],
 				['mkdir', '-p', '/dev/hugepages'],
 				['mount', '-t', 'hugetlbfs', 'none', '/dev/hugepages']
 			]
@@ -288,12 +301,12 @@ class ParameterServer:
 			try:
 				start_time = time.time()
 				if self.enable_hugetlbfs:
-					self.config_hugepages()
+					self.config_hugepages(self.initial_model_name)
 				result = self._preload_model(
 					self.initial_model_name,
 					self.hf_cache_dir,
 					self.cache_dir,
-					self.pt_ckpt_dir
+					self.converted_ckpt_dir
 				)
 				end_time = time.time()
 				if result['status'] == 'success':
@@ -644,7 +657,7 @@ class ParameterServer:
 				'tensor_meta_shm_name': self.model_info.get('tensor_meta_shm_name'),
 				'parameter_server_size': self.model_info.get('parameter_server_size'),
 				'huggingface_ckpt_name': self.model_info.get('huggingface_ckpt_name'),
-				'pt_ckpt_dir': self.model_info.get('pt_ckpt_dir'),
+				'converted_ckpt_dir': self.model_info.get('converted_ckpt_dir'),
 				'skeleton_state_dict_file': getattr(self, 'skeleton_state_dict_file', None),
 				# Keep for backward compatibility, but it's just the file name now
 				'skeleton_state_dict_shm_name': self.skeleton_state_dict_shm_name
@@ -678,7 +691,7 @@ class ParameterServer:
 				'tensor_meta_shm_name': self.model_info.get('tensor_meta_shm_name'),
 				'parameter_server_size': self.model_info.get('parameter_server_size'),
 				'huggingface_ckpt_name': self.model_info.get('huggingface_ckpt_name'),
-				'pt_ckpt_dir': self.model_info.get('pt_ckpt_dir'),
+				'converted_ckpt_dir': self.model_info.get('converted_ckpt_dir'),
 				'skeleton_state_dict_shm_name': self.skeleton_state_dict_shm_name,
 				'skeleton_state_dict_backup_file': getattr(self, 'skeleton_state_dict_backup_file', None)
 			}
@@ -706,14 +719,14 @@ class ParameterServer:
 				'tensor_meta_shm_name': self.model_info.get('tensor_meta_shm_name'),
 				'parameter_server_size': self.model_info.get('parameter_server_size'),
 				'huggingface_ckpt_name': self.model_info.get('huggingface_ckpt_name'),
-				'pt_ckpt_dir': self.model_info.get('pt_ckpt_dir'),
+				'converted_ckpt_dir': self.model_info.get('converted_ckpt_dir'),
 				'skeleton_state_dict_shm_name': self.skeleton_state_dict_shm_name
 			}
 		
 		# Extract additional parameters
 		hf_cache_dir = request.get('hf_cache_dir')
 		cache_dir = request.get('cache_dir')
-		pt_ckpt_dir = request.get('pt_ckpt_dir')
+		converted_ckpt_dir = request.get('converted_ckpt_dir')
 		
 		# Handle HF cache dir - exactly as in original implementation
 		if hf_cache_dir is None:
@@ -752,31 +765,31 @@ class ParameterServer:
 				logging.error(error_msg)
 				return {'status': 'error', 'message': error_msg}
 		
-		# Handle pt_ckpt_dir - exactly as in original implementation
-		if pt_ckpt_dir is None:
-			pt_ckpt_dir = os.path.join(
-				cache_dir, "pt_ckpt", huggingface_ckpt_name
+		# Handle converted_ckpt_dir - exactly as in original implementation
+		if converted_ckpt_dir is None:
+			converted_ckpt_dir = os.path.join(
+				cache_dir, "converted_ckpt", huggingface_ckpt_name
 			)
-			if not os.path.exists(pt_ckpt_dir):
-				os.makedirs(pt_ckpt_dir)
+			if not os.path.exists(converted_ckpt_dir):
+				os.makedirs(converted_ckpt_dir)
 		else:
-			pt_ckpt_dir = os.path.join(pt_ckpt_dir, huggingface_ckpt_name)
-			if not os.path.exists(pt_ckpt_dir):
-				os.makedirs(pt_ckpt_dir)
+			converted_ckpt_dir = os.path.join(converted_ckpt_dir, huggingface_ckpt_name)
+			if not os.path.exists(converted_ckpt_dir):
+				os.makedirs(converted_ckpt_dir)
 		
-		logging.info(f"Will dump model parameters to: {pt_ckpt_dir}")
+		logging.info(f"Will dump model parameters to: {converted_ckpt_dir}")
 		
 		# Create the appropriate parameter server based on model name
 		try:
 			if "deepseek" in huggingface_ckpt_name:
 				from batchgen.models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 				self.parameter_server_instance = DeepSeek_Parameter_Server(
-					huggingface_ckpt_name, cache_dir, pt_ckpt_dir, self.enable_hugetlbfs
+					huggingface_ckpt_name, cache_dir, converted_ckpt_dir, self.enable_hugetlbfs
 				)
 			elif "Mixtral" in huggingface_ckpt_name:
 				from batchgen.models.mixtral.mixtral_parameter_server import Mixtral_Parameter_Server
 				self.parameter_server_instance = Mixtral_Parameter_Server(
-					huggingface_ckpt_name, cache_dir, pt_ckpt_dir
+					huggingface_ckpt_name, cache_dir, converted_ckpt_dir
 				)
 			else:
 				error_msg = f"Model architecture {huggingface_ckpt_name} not supported yet."
@@ -804,7 +817,7 @@ class ParameterServer:
 				'tensor_meta_shm_name': tensor_meta_shm_name,
 				'parameter_server_size': parameter_server_size,
 				'huggingface_ckpt_name': huggingface_ckpt_name,
-				'pt_ckpt_dir': pt_ckpt_dir
+				'converted_ckpt_dir': converted_ckpt_dir
 			}
 			
 			# Update the currently loaded model
@@ -819,7 +832,7 @@ class ParameterServer:
 				'tensor_meta_shm_name': tensor_meta_shm_name,
 				'parameter_server_size': parameter_server_size,
 				'huggingface_ckpt_name': huggingface_ckpt_name,
-				'pt_ckpt_dir': pt_ckpt_dir,
+				'converted_ckpt_dir': converted_ckpt_dir,
 				'skeleton_state_dict_shm_name': skeleton_state_dict_shm_name
 			}
 			
@@ -828,7 +841,7 @@ class ParameterServer:
 			logging.error(error_msg)
 			return {'status': 'error', 'message': error_msg}
 	
-	def _preload_model(self, huggingface_ckpt_name, hf_cache_dir=None, cache_dir=None, pt_ckpt_dir=None):
+	def _preload_model(self, huggingface_ckpt_name, hf_cache_dir=None, cache_dir=None, converted_ckpt_dir=None):
 		"""
 		Preload a model at server startup
 		
@@ -836,14 +849,14 @@ class ParameterServer:
 			huggingface_ckpt_name: Model name on HuggingFace
 			hf_cache_dir: HuggingFace cache directory
 			cache_dir: Model cache directory
-			pt_ckpt_dir: Directory for PyTorch checkpoints
+			converted_ckpt_dir: Directory for PyTorch checkpoints
 		"""
 		# Create a mock request to reuse the handle_load_model method
 		request = {
 			'huggingface_ckpt_name': huggingface_ckpt_name,
 			'hf_cache_dir': hf_cache_dir,
 			'cache_dir': cache_dir,
-			'pt_ckpt_dir': pt_ckpt_dir
+			'converted_ckpt_dir': converted_ckpt_dir
 		}
 		
 		# Use the existing method to load the model
@@ -916,7 +929,7 @@ if __name__ == "__main__":
 		model_name=args.model,
 		hf_cache_dir=args.hf_cache_dir,
 		cache_dir=args.cache_dir,
-		pt_ckpt_dir=args.pt_ckpt_dir,
+		converted_ckpt_dir=args.converted_ckpt_dir,
 		enable_hugetlbfs=args.enable_hugetlbfs
 	)
 	

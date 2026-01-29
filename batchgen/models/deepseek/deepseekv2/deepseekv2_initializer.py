@@ -36,7 +36,10 @@ try:
 except ImportError:
     # jit compile
     from core_engine import batchgen as core_engine
-from batchgen.models.Wrapper import Attn_Wrapper, Expert_Wrapper
+# Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
+from batchgen.models.wrappers import AttnWrapperBase, ExpertWrapperBase
+Attn_Wrapper = AttnWrapperBase
+Expert_Wrapper = ExpertWrapperBase
 
 # current_dir = os.path.dirname(os.path.abspath(__file__))
 # sys.append(current_dir)
@@ -478,12 +481,12 @@ class DeepSeek_Initializer:
         skeleton_state_dict: Optional[dict],
         shm_name: str,
         tensor_meta_shm_name: str,
-        pt_ckpt_dir,
+        converted_ckpt_dir,
         host_kv_cache_size,
     ):
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.cache_dir = cache_dir
-        self.pt_ckpt_dir = pt_ckpt_dir
+        self.converted_ckpt_dir = converted_ckpt_dir
         self.engine_config = engine_config
         self.skeleton_state_dict = skeleton_state_dict
         self.host_kv_cache_size = host_kv_cache_size
@@ -822,7 +825,7 @@ class DeepSeek_Initializer:
             ckpt_files, desc="Loading checkpoint files", smoothing=0
         ):
             dst_dir = os.path.join(
-                self.pt_ckpt_dir,
+                self.converted_ckpt_dir,
                 ckpt.split("/")[-1].replace(".safetensors", ".pt"),
             )
             if os.path.exists(dst_dir):

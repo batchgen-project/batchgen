@@ -42,15 +42,17 @@ struct tensor_buffer {
     void* data_ptr;
     std::vector<int64_t> tensor_shape;
     int64_t byte_size;
+    std::string dtype;  // Per-tensor dtype: "bfloat16", "uint8", "float8_e4m3fn", etc.
 
     // default constructor
-    tensor_buffer() : data_ptr(nullptr), tensor_shape({}), byte_size(0) {};
+    tensor_buffer() : data_ptr(nullptr), tensor_shape({}), byte_size(0), dtype("") {};
     // constructor
     tensor_buffer(void* data_ptr, std::vector<int64_t> tensor_shape,
-                  int64_t byte_size)
+                  int64_t byte_size, std::string dtype = "")
         : data_ptr(data_ptr),
           tensor_shape(tensor_shape),
-          byte_size(byte_size) {};
+          byte_size(byte_size),
+          dtype(dtype) {};
 };
 
 class Weights_Storage {

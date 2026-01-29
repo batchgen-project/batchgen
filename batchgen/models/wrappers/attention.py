@@ -83,6 +83,10 @@ class AttnWrapperBase(BaseModuleWrapper):
     cache_seqlens: ClassVar[Optional[torch.Tensor]] = None
     max_seqlen: ClassVar[Optional[int]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
+    host_paged_kv_worker_view: ClassVar[Optional[object]] = None
+
+    # Execution phase
+    phase: ClassVar[str] = "prefill"
 
     def __init__(
         self,
@@ -213,6 +217,15 @@ class AttnWrapperBase(BaseModuleWrapper):
             result = self._forward_prefill(hidden_states, **kwargs)
         else:
             result = self._forward_decode(hidden_states, **kwargs)
+
+        # Release buffer for non-persistent attention (following DeepSeek pattern)
+        # This allows the H2D worker to load the next layer's weights
+        if not self.persistent:
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx}] "

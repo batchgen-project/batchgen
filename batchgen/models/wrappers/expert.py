@@ -25,7 +25,7 @@ Provides common functionality for expert module wrappers:
 """
 
 import logging
-from typing import Dict, Optional
+from typing import ClassVar, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -51,6 +51,9 @@ class ExpertWrapperBase(BaseModuleWrapper):
         module_key: Key for weight loading from core engine
         persistent: Whether weights are pre-loaded on GPU (no buffer fetch needed)
     """
+
+    # Execution phase (shared across all instances)
+    phase: ClassVar[str] = "prefill"
 
     def __init__(
         self,

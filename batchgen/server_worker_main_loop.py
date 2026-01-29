@@ -336,37 +336,46 @@ def _server_worker_main_impl(
 			inference_error = str(e)
 			local_results = []
 
-		# --- STEP 5: Gather Results back to Rank 0 ---
-		gather_list = [None for _ in range(world_size)] if global_rank == 0 else None
-		dist.gather_object(local_results, gather_list, dst=0)
-		
-		# Also gather any errors from all ranks
-		error_list = [None for _ in range(world_size)] if global_rank == 0 else None
-		dist.gather_object(inference_error, error_list, dst=0)
+		# --- STEP 5: Synchronize and check for errors ---
+		# Sync CUDA to catch any async errors
+		try:
+			torch.cuda.synchronize()
+		except RuntimeError as e:
+			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank}: {e}")
+			inference_error = str(e)
+
+		# Barrier to ensure all ranks complete inference
+		dist.barrier()
+
+		# Check for errors across all ranks using all_reduce
+		# Each rank contributes 1 if it has an error, 0 otherwise
+		error_flag = torch.tensor([1 if inference_error else 0], dtype=torch.int32, device='cuda')
+		dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
+		has_any_error = error_flag.item() > 0
+
+		if has_any_error:
+			# Gather error messages from all ranks
+			error_list = [None for _ in range(world_size)] if global_rank == 0 else None
+			dist.gather_object(inference_error, error_list, dst=0)
+
+			if global_rank == 0:
+				errors = [e for e in error_list if e is not None]
+				logging.error(f"Inference failed with errors from ranks: {errors}")
+				response_queue.put({"error": errors[0], "all_errors": errors})
+			continue
 
 		# --- STEP 6: Response (Rank 0 Only) ---
+		# Results are already on rank 0 (local_results), no gather needed
+		# Other ranks have empty results by design
 		if global_rank == 0:
-			# Check for errors first
-			errors = [e for e in error_list if e is not None] if error_list else []
-			if errors:
-				logging.error(f"Inference failed with errors from ranks: {errors}")
-				# Return error to client
-				response_queue.put({"error": errors[0], "all_errors": errors})
-				continue
-			
-			# Flatten results
-			final_results = []
-			if gather_list:
-				for batch_res in gather_list:
-					if batch_res:
-						final_results.extend(batch_res)
-			
+			final_results = local_results if local_results else []
+
 			# Safeguard: if results are empty but no errors, something went wrong
 			if not final_results and len(task_data.get("prompts", [])) > 0:
-				logging.error(f"Results are unexpectedly empty! gather_list={[type(x) for x in gather_list]}")
+				logging.error(f"Results are unexpectedly empty!")
 				response_queue.put({"error": "Results unexpectedly empty after inference"})
 				continue
-				
+
 			response_queue.put(final_results)
 
 		# NOTE: Watchdog is fed within prefill/decode phases in the worker,

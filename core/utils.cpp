@@ -53,7 +53,8 @@ torch::ScalarType str_to_torch_dtype(const std::string& dtype_str) {
         {"float32", torch::kFloat32},
         {"bfloat16", torch::kBFloat16},
         {"float8_e4m3fn", torch::kFloat8_e4m3fn},
-        {"float8_e5m2", torch::kFloat8_e5m2}
+        {"float8_e5m2", torch::kFloat8_e5m2},
+        {"uint8", torch::kUInt8}
     };
 
     auto it = dtype_map.find(dtype_str);
@@ -208,6 +209,35 @@ GPU_Buffer_Config parse_gpu_buffer_config(const py::object& engine_config) {
         }
         gpu_buffer_config.module_shapes[module_type] = module_shape;
     }
+
+    // Parse per-module weight dtypes (optional, for mixed-dtype models like GPT-OSS)
+    if (py::hasattr(gpu_buffer_config_obj, "weight_dtypes")) {
+        py::dict weight_dtypes_py = gpu_buffer_config_obj.attr("weight_dtypes").cast<py::dict>();
+        for (auto item : weight_dtypes_py) {
+            std::string module_type = item.first.cast<std::string>();
+            // PyTorch dtype is passed as torch.dtype object, cast to ScalarType
+            torch::Dtype dtype = item.second.cast<torch::Dtype>();
+            gpu_buffer_config.weight_dtypes[module_type] = dtype;
+        }
+    }
+
+    // Parse per-tensor dtype overrides (optional, for mixed-dtype tensors within a module)
+    // Format: {module_type: {tensor_name: torch.dtype}}
+    if (py::hasattr(gpu_buffer_config_obj, "tensor_dtypes")) {
+        py::dict tensor_dtypes_py = gpu_buffer_config_obj.attr("tensor_dtypes").cast<py::dict>();
+        for (auto module_item : tensor_dtypes_py) {
+            std::string module_type = module_item.first.cast<std::string>();
+            py::dict tensors_dict = module_item.second.cast<py::dict>();
+            std::unordered_map<std::string, torch::Dtype> tensor_dtypes_map;
+            for (auto tensor_item : tensors_dict) {
+                std::string tensor_name = tensor_item.first.cast<std::string>();
+                torch::Dtype dtype = tensor_item.second.cast<torch::Dtype>();
+                tensor_dtypes_map[tensor_name] = dtype;
+            }
+            gpu_buffer_config.tensor_dtypes[module_type] = tensor_dtypes_map;
+        }
+    }
+
     return gpu_buffer_config;
 };
 
