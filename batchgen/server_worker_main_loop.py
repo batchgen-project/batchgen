@@ -337,6 +337,14 @@ def _server_worker_main_impl(
 			local_results = []
 
 		# --- STEP 5: Gather Results back to Rank 0 ---
+		# DEBUG: Sync CUDA to catch any async errors before NCCL gather
+		# This will raise the actual CUDA error here instead of at gather_object
+		try:
+			torch.cuda.synchronize()
+		except RuntimeError as e:
+			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank} before gather: {e}")
+			raise
+
 		gather_list = [None for _ in range(world_size)] if global_rank == 0 else None
 		dist.gather_object(local_results, gather_list, dst=0)
 		
