@@ -1137,6 +1137,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
         batch, seq_len, _ = hidden_states.shape
         assert seq_len == 1, "Decode expects single token"
 
+        # Handle empty batch (happens when batch < world_size in EP mode)
+        if batch == 0 or hidden_states.numel() == 0:
+            return (hidden_states, None, None)
+
         # Get gpu_paged_kv_manager and cache_seqlens from class-level state
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
         cache_seqlens = AttnWrapperBase.cache_seqlens
@@ -1183,6 +1187,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 micro_cache_seqlens = cache_seqlens[start_idx:end_idx]
             else:
                 micro_cache_seqlens = cache_seqlens
+
+            # Handle empty batch slice (happens when batch < world_size in EP mode)
+            if micro_cache_seqlens.numel() == 0:
+                return (
+                    torch.empty((0, 1, hidden_states.shape[-1]), device=hidden_states.device, dtype=hidden_states.dtype),
+                    None,
+                    None
+                )
 
             # CRITICAL: cache_seqlens is the token COUNT (e.g., 11).
             # The current token's position is cache_seqlens - 1 (e.g., 10).

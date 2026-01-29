@@ -899,12 +899,47 @@ class GptOssMoE_EP(nn.Module):
         self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
 
     def init_num_tokens(self, num_tokens_per_rank: int):
-        """Initialize communication buffers for given batch size."""
+        """Initialize communication buffers for given batch size.
+
+        Pre-allocates all buffers to avoid per-forward allocation overhead.
+        """
         self.num_tokens_per_rank = num_tokens_per_rank
+        global_num_tokens = num_tokens_per_rank * self.world_size
+        K = self.num_experts_per_tok
+        hidden_size = self.config.hidden_size
+
+        # Pre-allocate index tensors (following DeepSeek pattern)
+        self.token_idx_buffer = torch.arange(
+            global_num_tokens, dtype=torch.int64, device=self.device
+        ).repeat_interleave(K)
+        self.topk_pos_buffer = torch.arange(
+            K, dtype=torch.int64, device=self.device
+        ).repeat(global_num_tokens)
+
+        # Pre-allocate communication buffers
+        self.all_tokens_buffer = torch.zeros(
+            (global_num_tokens, hidden_size), device=self.device, dtype=torch.bfloat16
+        )
+        self.padded_hidden_buffer = torch.zeros(
+            (num_tokens_per_rank, hidden_size), device=self.device, dtype=torch.bfloat16
+        )
+        self.global_results_buffer = torch.zeros(
+            (global_num_tokens, hidden_size), device=self.device, dtype=torch.bfloat16
+        )
+
+        # Pre-allocate expert counts buffer
+        self.expert_counts_buffer = torch.zeros(128, dtype=torch.int32, device=self.device)
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
-        """Update num_tokens_per_rank for dynamic batch size."""
-        self.num_tokens_per_rank = num_tokens_per_rank
+        """Update num_tokens_per_rank for dynamic batch size.
+
+        Reallocates buffers only when size changes.
+        """
+        if num_tokens_per_rank == self.num_tokens_per_rank:
+            return  # No reallocation needed
+
+        # Reallocate all buffers with new size
+        self.init_num_tokens(num_tokens_per_rank)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with EP communication."""
@@ -948,18 +983,13 @@ class GptOssMoE_EP(nn.Module):
             )
 
         # ---- 1) AllGather: Collect tokens from all ranks ----
-        all_tokens = torch.zeros(
-            (self.world_size * self.num_tokens_per_rank, hidden_size),
-            device=self.device,
-            dtype=torch.bfloat16
-        )
+        # Reuse pre-allocated buffers (avoid per-forward allocation)
+        all_tokens = self.all_tokens_buffer
+        all_tokens.zero_()
 
         # Pad local tokens to num_tokens_per_rank
-        padded_hidden_states = torch.zeros(
-            (self.num_tokens_per_rank, hidden_size),
-            device=self.device,
-            dtype=x.dtype
-        )
+        padded_hidden_states = self.padded_hidden_buffer
+        padded_hidden_states.zero_()
         if num_tokens > 0:
             padded_hidden_states[:num_tokens] = x
 
@@ -984,25 +1014,35 @@ class GptOssMoE_EP(nn.Module):
         # Flat view of expert assignments
         flat_expert_idx = topk_indices.view(-1)  # [global_tokens * K]
 
-        # Token and topk position indices for scatter
-        token_indices = torch.arange(num_global_tokens, device=device).repeat_interleave(K)
-        topk_positions = torch.arange(K, device=device).repeat(num_global_tokens)
+        # Use pre-allocated index tensors
+        token_indices = self.token_idx_buffer
+        topk_positions = self.topk_pos_buffer
 
-        # Initialize output buffer
-        global_results = torch.zeros(
-            (num_global_tokens, hidden_size),
-            device=device,
-            dtype=torch.float32
+        # Pre-compute expert token counts ONCE to avoid per-expert .any() sync
+        # This reduces GPU→CPU syncs from 32 per layer to 1 per layer
+        expert_counts = self.expert_counts_buffer
+        expert_counts.zero_()
+        expert_counts.scatter_add_(
+            0, flat_expert_idx.to(torch.int64),
+            torch.ones_like(flat_expert_idx, dtype=torch.int32)
         )
+        # Single CPU transfer for all counts
+        expert_counts_cpu = expert_counts.cpu()
+
+        # Use pre-allocated output buffer (BF16 to avoid dtype conversion in loop)
+        global_results = self.global_results_buffer
+        global_results.zero_()
 
         # Loop through local experts only
         for local_e in range(self.experts_per_rank):
             global_e = self.routed_expert_start_idx + local_e
 
+            # Check token count without GPU sync (already on CPU)
+            if expert_counts_cpu[global_e].item() == 0:
+                continue
+
             # Find tokens routed to this expert
             mask = flat_expert_idx == global_e
-            if not mask.any():
-                continue
 
             # Get token indices and topk positions for this expert
             expert_token_idx = token_indices[mask]
@@ -1021,11 +1061,9 @@ class GptOssMoE_EP(nn.Module):
             # Get weights for these tokens at these topk positions
             expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
 
-            # Weighted accumulation into results
+            # Weighted accumulation into results (no dtype conversion needed - both BF16)
             weighted_output = expert_output * expert_weights.unsqueeze(-1)
-            global_results.index_add_(0, expert_token_idx, weighted_output.to(global_results.dtype))
-
-        global_results = global_results.to(torch.bfloat16)
+            global_results.index_add_(0, expert_token_idx, weighted_output)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
         with self.comm.change_state(enable=True):
