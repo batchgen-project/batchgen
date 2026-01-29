@@ -16,6 +16,15 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
+# Known BatchGen shared memory prefixes
+# These are used for safe cleanup to avoid deleting files from other applications
+BATCHGEN_SHM_PREFIXES = (
+    "shm_",           # Parameter server main memory: /shm_<uuid>
+    "skel_",          # Skeleton state dict: skel_<timestamp>_<random>
+    "batchgen_skel_", # Temp skeleton files: batchgen_skel_*.pt
+    "batchgen_",      # General BatchGen prefix
+)
+
 
 def kill_process_tree(
     parent_pid, include_parent: bool = True, skip_pid: int = None
@@ -59,90 +68,110 @@ def kill_process_tree(
 
 
 def cleanup_shm_files(shm_prefix: Optional[str] = "batchgen") -> int:
-    """Clean up shared memory files in /dev/shm.
+    """Clean up shared memory files in /dev/shm safely using Python.
+
+    This function only deletes files matching known BatchGen prefixes,
+    avoiding the unsafe 'rm -rf /dev/shm/*' pattern that could affect
+    other applications.
 
     Args:
-        shm_prefix: Prefix to match shared memory files. If None, clean all
-                   files using rm -rf for aggressive cleanup. Default is 'batchgen'.
+        shm_prefix: Prefix to match shared memory files. If None, matches all
+                   known BATCHGEN_SHM_PREFIXES. Default is 'batchgen'.
 
     Returns:
-        Number of files removed (approximate for rm -rf).
+        Number of files removed.
     """
     shm_dir = Path("/dev/shm")
     if not shm_dir.exists():
+        logger.debug("/dev/shm does not exist")
         return 0
 
-    # If no prefix specified, use aggressive rm -rf cleanup
-    if shm_prefix is None:
-        try:
-            result = subprocess.run(
-                ["rm", "-rf", "/dev/shm/*"],
-                shell=False,
-                capture_output=True,
-                timeout=30,
-            )
-            # rm with glob doesn't work directly, use shell
-            result = subprocess.run(
-                "rm -rf /dev/shm/*",
-                shell=True,
-                capture_output=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                logger.info("Cleaned up all shared memory files from /dev/shm")
-                return 1  # Approximate
-            else:
-                logger.warning(f"rm -rf /dev/shm/* failed: {result.stderr}")
-        except Exception as e:
-            logger.warning(f"Error cleaning /dev/shm with rm -rf: {e}")
-        return 0
+    # Determine which prefixes to match
+    if shm_prefix is not None:
+        prefixes = (shm_prefix,)
+    else:
+        # Clean all known BatchGen prefixes (NOT all files in /dev/shm)
+        prefixes = BATCHGEN_SHM_PREFIXES
 
-    # Prefix-based cleanup
     removed = 0
+
     try:
-        for shm_file in shm_dir.iterdir():
-            if shm_file.is_file():
-                if shm_file.name.startswith(shm_prefix):
-                    try:
-                        shm_file.unlink()
-                        logger.debug(f"Removed /dev/shm/{shm_file.name}")
-                        removed += 1
-                    except (PermissionError, OSError) as e:
-                        logger.warning(f"Failed to remove {shm_file}: {e}")
-    except Exception as e:
-        logger.warning(f"Error cleaning /dev/shm: {e}")
+        for entry in shm_dir.iterdir():
+            # Skip non-files (directories, sockets, etc.)
+            if not entry.is_file():
+                continue
+
+            # Only delete files matching our prefixes
+            if not any(entry.name.startswith(p) for p in prefixes):
+                continue
+
+            try:
+                entry.unlink()
+                logger.debug(f"Removed /dev/shm/{entry.name}")
+                removed += 1
+            except PermissionError:
+                logger.warning(f"Permission denied: /dev/shm/{entry.name}")
+            except OSError as e:
+                logger.warning(f"Failed to remove /dev/shm/{entry.name}: {e}")
+
+    except (PermissionError, OSError) as e:
+        logger.warning(f"Error accessing /dev/shm: {e}")
 
     if removed > 0:
         logger.info(f"Cleaned up {removed} shared memory files from /dev/shm")
+
     return removed
 
 
-def cleanup_hugepages_files() -> int:
-    """Clean up files in /dev/hugepages using rm -rf for aggressive cleanup.
+def cleanup_hugepages_files(prefix: Optional[str] = None) -> int:
+    """Clean up files in /dev/hugepages safely using Python.
+
+    This function only deletes files matching known BatchGen prefixes,
+    avoiding the unsafe 'rm -rf /dev/hugepages/*' pattern.
+
+    Args:
+        prefix: Specific prefix to match. If None, matches all
+               known BATCHGEN_SHM_PREFIXES.
 
     Returns:
-        Number of files removed (approximate).
+        Number of files removed.
     """
+    import shutil
+
     hugepages_dir = Path("/dev/hugepages")
     if not hugepages_dir.exists():
+        logger.debug("/dev/hugepages does not exist")
         return 0
 
-    try:
-        result = subprocess.run(
-            "rm -rf /dev/hugepages/*",
-            shell=True,
-            capture_output=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            logger.info("Cleaned up all files from /dev/hugepages")
-            return 1  # Approximate
-        else:
-            logger.warning(f"rm -rf /dev/hugepages/* failed: {result.stderr}")
-    except Exception as e:
-        logger.warning(f"Error cleaning /dev/hugepages: {e}")
+    # Determine which prefixes to match
+    prefixes = (prefix,) if prefix else BATCHGEN_SHM_PREFIXES
+    removed = 0
 
-    return 0
+    try:
+        for entry in hugepages_dir.iterdir():
+            # Only delete entries matching our prefixes
+            if not any(entry.name.startswith(p) for p in prefixes):
+                continue
+
+            try:
+                if entry.is_file() or entry.is_symlink():
+                    entry.unlink()
+                elif entry.is_dir():
+                    shutil.rmtree(entry)
+                logger.debug(f"Removed /dev/hugepages/{entry.name}")
+                removed += 1
+            except PermissionError:
+                logger.warning(f"Permission denied: /dev/hugepages/{entry.name}")
+            except OSError as e:
+                logger.warning(f"Failed to remove /dev/hugepages/{entry.name}: {e}")
+
+    except (PermissionError, OSError) as e:
+        logger.warning(f"Error accessing /dev/hugepages: {e}")
+
+    if removed > 0:
+        logger.info(f"Cleaned up {removed} files from /dev/hugepages")
+
+    return removed
 
 
 def unmount_hugetlbfs() -> bool:
