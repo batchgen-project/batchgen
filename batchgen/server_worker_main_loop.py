@@ -345,8 +345,20 @@ def _server_worker_main_impl(
 			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank} before gather: {e}")
 			raise
 
+		# DEBUG: Add barrier to ensure all ranks are synchronized before gather
+		# This helps identify if any rank is stuck or has crashed
+		logging.info(f"[DEBUG] Rank {global_rank}: Entering barrier before gather...")
+		try:
+			dist.barrier()
+			logging.info(f"[DEBUG] Rank {global_rank}: Barrier passed, proceeding to gather")
+		except Exception as e:
+			logging.error(f"[DEBUG] Rank {global_rank}: Barrier FAILED: {e}")
+			raise
+
 		gather_list = [None for _ in range(world_size)] if global_rank == 0 else None
+		logging.info(f"[DEBUG] Rank {global_rank}: Calling gather_object with {len(local_results) if local_results else 0} results")
 		dist.gather_object(local_results, gather_list, dst=0)
+		logging.info(f"[DEBUG] Rank {global_rank}: gather_object completed")
 		
 		# Also gather any errors from all ranks
 		error_list = [None for _ in range(world_size)] if global_rank == 0 else None
