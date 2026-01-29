@@ -94,7 +94,7 @@ class GptOssParallelStrategyManager:
 
         # CRITICAL: Delete previous model to free GPU memory
         # This is essential for decode→prefill transitions (Bug Fix 7)
-        if self.model is not None:
+        if getattr(self, 'model', None) is not None:
             logging.info("Deleting previous model to free GPU memory...")
             self.model = None
             gc.collect()
