@@ -64,11 +64,31 @@ class BatchGenServer:
 		signal.signal(signal.SIGINT, self.handle_shutdown)
 		signal.signal(signal.SIGTERM, self.handle_shutdown)
 
-	def config_hugepages(self):
-		"""Configure hugepages for shared memory usage."""
+	def config_hugepages(self, model_name: str = None):
+		"""Configure hugepages for shared memory usage.
+
+		Args:
+			model_name: HuggingFace model name to determine required hugepages.
+		"""
+		from batchgen.server.process_utils import get_hugepage_size, get_model_byte_size
+
+		hugepage_size = get_hugepage_size()
+
+		if model_name is not None:
+			byte_size = get_model_byte_size(model_name)
+			num_hugepages = (byte_size + hugepage_size - 1) // hugepage_size
+			logging.info(
+				f"Calculating hugepages for {model_name}: "
+				f"{byte_size / (1024**3):.1f} GB model, "
+				f"{num_hugepages} pages ({hugepage_size / (1024**2):.0f} MB each)"
+			)
+		else:
+			num_hugepages = 350000
+			logging.warning("No model_name provided, using default 350000 hugepages")
+
 		try:
 			commands = [
-				['sysctl', '-w', 'vm.nr_hugepages=350000'],
+				['sysctl', '-w', f'vm.nr_hugepages={num_hugepages}'],
 				['mkdir', '-p', '/dev/hugepages'],
 				['mount', '-t', 'hugetlbfs', 'none', '/dev/hugepages']
 			]
@@ -195,7 +215,7 @@ class BatchGenServer:
 		"""Start the TCP Server loop"""
 		try:
 			if self.args.enable_hugetlbfs:
-				self.config_hugepages()
+				self.config_hugepages(self.args.model)
 			
 			# Initialize custom torch modules if needed
 			config_torch_module_initializer()

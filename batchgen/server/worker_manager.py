@@ -19,7 +19,11 @@ from batchgen.batchgen_worker import BatchGenWorkerArgs
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
-from batchgen.server.process_utils import cleanup_resources
+from batchgen.server.process_utils import (
+    cleanup_resources,
+    get_hugepage_size,
+    get_model_byte_size,
+)
 from batchgen.server.server_args import ServerArgs
 from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
@@ -136,7 +140,8 @@ class WorkerManager:
         self._monitor_stop_event.clear()
         self._ready_event.clear()
         if self.args.enable_hugetlbfs:
-            self._config_hugepages()
+            byte_size = get_model_byte_size(self.args.model)
+            self._config_hugepages(byte_size)
             self._hugepages_enabled = True
 
         config_torch_module_initializer()
@@ -265,9 +270,29 @@ class WorkerManager:
         return result
 
     # ---------------------- Startup helpers ----------------------
-    def _config_hugepages(self) -> None:
+    def _config_hugepages(self, byte_size: int = None) -> None:
+        """Configure hugepages for shared memory.
+
+        Args:
+            byte_size: Model size in bytes. If None, uses default 700GB.
+        """
+        hugepage_size = get_hugepage_size()
+
+        if byte_size is not None:
+            # Model byte_size already includes buffer
+            num_hugepages = (byte_size + hugepage_size - 1) // hugepage_size
+        else:
+            # Fallback to old default (for backwards compatibility)
+            num_hugepages = 350000
+
+        logger.info(
+            f"Configuring hugepages: {num_hugepages} pages "
+            f"({num_hugepages * hugepage_size / (1024**3):.1f} GB, "
+            f"{hugepage_size / (1024**2):.0f} MB pages)"
+        )
+
         commands = [
-            ["sysctl", "-w", "vm.nr_hugepages=350000"],
+            ["sysctl", "-w", f"vm.nr_hugepages={num_hugepages}"],
             ["mkdir", "-p", "/dev/hugepages"],
             ["mount", "-t", "hugetlbfs", "none", "/dev/hugepages"],
         ]

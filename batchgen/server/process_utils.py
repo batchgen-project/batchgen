@@ -25,6 +25,102 @@ BATCHGEN_SHM_PREFIXES = (
     "batchgen_",      # General BatchGen prefix
 )
 
+# Default hugepage size (2MB) used as fallback if detection fails
+DEFAULT_HUGEPAGE_SIZE = 2 * 1024 * 1024
+
+# Model byte_size lookup table
+# These values are from each model's parameter_server.py
+# Used to calculate required hugepages before model loading
+MODEL_BYTE_SIZES = {
+    # GPT-OSS-120B: ~65GB total (61GB MXFP4 experts + 4GB BF16 attn/embed)
+    "openai/gpt-oss-120b": 70 * 1024**3,
+    # DeepSeek models
+    "deepseek-ai/DeepSeek-V2-Lite": 32 * 1024**3,
+    "deepseek-ai/DeepSeek-V2": 472 * 1024**3,
+    "deepseek-ai/DeepSeek-V3": 675 * 1024**3,
+    "deepseek-ai/DeepSeek-R1": 675 * 1024**3,  # Same as V3
+    # Mixtral models
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 96 * 1024**3,
+    "mistralai/Mixtral-8x22B-Instruct-v0.1": 286 * 1024**3,
+}
+
+# Default byte_size when model not in lookup (700GB for backwards compatibility)
+DEFAULT_MODEL_BYTE_SIZE = 700 * 1024**3
+
+
+def get_model_byte_size(model_name: str) -> int:
+    """Get model byte_size from lookup table.
+
+    Args:
+        model_name: HuggingFace model name (e.g., "openai/gpt-oss-120b")
+
+    Returns:
+        Byte size for the model. Returns DEFAULT_MODEL_BYTE_SIZE if not found.
+    """
+    # Try exact match first
+    if model_name in MODEL_BYTE_SIZES:
+        return MODEL_BYTE_SIZES[model_name]
+
+    # Try case-insensitive partial match
+    model_lower = model_name.lower()
+    for key, value in MODEL_BYTE_SIZES.items():
+        if key.lower() in model_lower or model_lower in key.lower():
+            return value
+
+    logger.warning(
+        f"Model '{model_name}' not in byte_size lookup, using default {DEFAULT_MODEL_BYTE_SIZE / (1024**3):.0f} GB"
+    )
+    return DEFAULT_MODEL_BYTE_SIZE
+
+
+def get_hugepage_size() -> int:
+    """Get system hugepage size in bytes from /proc/meminfo.
+
+    Hugepage sizes vary by architecture:
+    - x86_64: 2 MB (default) or 1 GB
+    - ARM64: 2 MB (default) or 1 GB
+    - ARM64 (64K pages): 512 MB
+
+    Returns:
+        Hugepage size in bytes. Defaults to 2MB if detection fails.
+    """
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("Hugepagesize:"):
+                    # Format: "Hugepagesize:     2048 kB"
+                    parts = line.split()
+                    size_kb = int(parts[1])
+                    return size_kb * 1024  # Convert KB to bytes
+    except (IOError, ValueError, IndexError) as e:
+        logger.debug(f"Failed to read hugepage size from /proc/meminfo: {e}")
+
+    # Default to 2MB if detection fails
+    return DEFAULT_HUGEPAGE_SIZE
+
+
+def calculate_hugepages(byte_size: int) -> int:
+    """Calculate required hugepages for given model size.
+
+    NOTE: byte_size values from model configs (70GB, 675GB, etc.)
+    already include buffer, so no additional buffer is added.
+
+    Args:
+        byte_size: Model size in bytes (already includes buffer)
+
+    Returns:
+        Number of hugepages required
+    """
+    hugepage_size = get_hugepage_size()
+    num_pages = (byte_size + hugepage_size - 1) // hugepage_size  # ceil division
+
+    logger.info(
+        f"Hugepages: {byte_size / (1024**3):.1f} GB model, "
+        f"{hugepage_size / (1024**2):.0f} MB pages, "
+        f"{num_pages} pages required"
+    )
+    return num_pages
+
 
 def kill_process_tree(
     parent_pid, include_parent: bool = True, skip_pid: int = None
