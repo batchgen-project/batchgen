@@ -4295,6 +4295,11 @@ class BatchGenWorker:
 		logging.info("Deep freeing model memory before prefill config...")
 		self.deep_free_model_memory()
 
+		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
+		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
+		# Previously this was called AFTER configure_prefill() which caused OOM
+		self._destroy_gpu_paged_kv_cache()
+
 		# STEP 1: Configure model for prefill
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
@@ -4305,7 +4310,7 @@ class BatchGenWorker:
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 		self.core_engine.start_h2d_worker()
 
-		self._destroy_gpu_paged_kv_cache()
+		# NOTE: _destroy_gpu_paged_kv_cache() moved before configure_prefill() (Bug Fix 7.2)
 
 		# STEP 3: Allocate host KV pages for new sequences (only THIS RANK's sequences)
 		# Check by assigned_rank, NOT by _uuid_to_local_map (which may not have new sequences yet)
