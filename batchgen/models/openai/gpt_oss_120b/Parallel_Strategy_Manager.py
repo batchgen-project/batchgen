@@ -90,6 +90,17 @@ class GptOssParallelStrategyManager:
         start_time = time.perf_counter()
         timings = {}
 
+        log_gpu_memory("configure_prefill: START")
+
+        # CRITICAL: Delete previous model to free GPU memory
+        # This is essential for decode→prefill transitions (Bug Fix 7)
+        if self.model is not None:
+            logging.info("Deleting previous model to free GPU memory...")
+            self.model = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_gpu_memory("configure_prefill: After deleting previous model")
+
         # Step 1: Set phase
         self.loaded_model_config.phase = "prefill"
 
@@ -146,10 +157,12 @@ class GptOssParallelStrategyManager:
         step_start = time.perf_counter()
         self._load_model_skeleton()
         timings["skeleton_load"] = time.perf_counter() - step_start
+        log_gpu_memory("configure_prefill: After skeleton load")
 
         step_start = time.perf_counter()
         self._config_attn_module()
         timings["attn_config"] = time.perf_counter() - step_start
+        log_gpu_memory("configure_prefill: After attention config")
 
         # Step 5.5: Load expert MXFP4 weights if persistent (offloading disabled)
         # Must be called before _config_expert_module() so model attrs exist for registration
@@ -157,16 +170,19 @@ class GptOssParallelStrategyManager:
             step_start = time.perf_counter()
             self._load_expert_module()
             timings["expert_load"] = time.perf_counter() - step_start
+            log_gpu_memory("configure_prefill: After expert module load")
 
         step_start = time.perf_counter()
         self._config_expert_module()
         timings["expert_config"] = time.perf_counter() - step_start
+        log_gpu_memory("configure_prefill: After expert config")
 
         # Step 6: Swap to prefill MoE for CuTe dequant + torch.matmul (only when persistent)
         if not experts_need_offloading:
             step_start = time.perf_counter()
             self._swap_to_prefill_moe()
             timings["prefill_moe_swap"] = time.perf_counter() - step_start
+            log_gpu_memory("configure_prefill: After prefill MoE swap")
 
         step_start = time.perf_counter()
         self._config_lm_head_hook()
@@ -178,6 +194,7 @@ class GptOssParallelStrategyManager:
         total_time = time.perf_counter() - start_time
         logging.info(f"Model configuration complete in {total_time:.2f}s")
         logging.info(f"Timings: {timings}")
+        log_gpu_memory("configure_prefill: END")
 
         return self.model, self.weight_copy_task
 

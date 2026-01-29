@@ -4289,6 +4289,12 @@ class BatchGenWorker:
 		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
 		# to ensure batch selection uses accurate post-migration capacities.
 
+		# CRITICAL: Deep free decode model memory BEFORE configuring prefill (Bug Fix 7)
+		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
+		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
+		logging.info("Deep freeing model memory before prefill config...")
+		self.deep_free_model_memory()
+
 		# STEP 1: Configure model for prefill
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
