@@ -537,6 +537,17 @@ class WorkerManager:
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
             )
+        elif "moonshotai" in self.args.model.lower() or "kimi" in self.args.model.lower():
+            from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
+                KimiK25_Parameter_Server,
+            )
+
+            parameter_server = KimiK25_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
+                self.args.enable_hugetlbfs,
+            )
         else:
             raise NotImplementedError(
                 f"Model type for {self.args.model} not supported"
