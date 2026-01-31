@@ -42,12 +42,12 @@ INT4_PACKED_BLOCK_SIZE = 16  # Bytes per scale group (32 values / 2 per byte)
 # =============================================================================
 
 @triton.jit
-def _int4_sign_extend(nibble):
-    """Sign-extend unsigned 4-bit nibble [0,15] to signed [-8,+7].
+def _int4_offset_decode(nibble):
+    """Decode unsigned 4-bit nibble [0,15] to signed [-8,+7].
 
-    INT4 two's complement: 0-7 are positive, 8-15 represent -8 to -1.
+    Offset encoding (compressed-tensors standard): signed = nibble - 8.
     """
-    return tl.where(nibble >= 8, nibble - 16, nibble)
+    return nibble - 8
 
 
 # =============================================================================
@@ -93,7 +93,7 @@ def fused_int4_grouped_gemm_kernel_3d(
     - K-blocks (32-wide, matching INT4 scale granularity)
 
     INT4 dequant is simpler than MXFP4:
-    - Sign-extend nibble (1 tl.where) vs FP4 decode (2 tl.where + IEEE754 bitcast)
+    - Offset-decode nibble (1 subtract) vs FP4 decode (2 tl.where + IEEE754 bitcast)
     - bf16 multiply vs ldexp (exponent bit manipulation)
     - bf16 scale direct load vs uint8→int32 exponent conversion
     """
@@ -140,9 +140,9 @@ def fused_int4_grouped_gemm_kernel_3d(
                        (k_packed + offs_k_packed[None, :]) * stride_rhs_k_packed
             rhs_packed = tl.load(rhs_ptrs, mask=n_mask[:, None], other=0)
 
-            # ===== Extract and sign-extend nibbles =====
-            lo = _int4_sign_extend((rhs_packed & 0x0F).to(tl.int32))   # [BLOCK_N, 16]
-            hi = _int4_sign_extend(((rhs_packed >> 4) & 0x0F).to(tl.int32))  # [BLOCK_N, 16]
+            # ===== Extract nibbles and offset-decode =====
+            lo = _int4_offset_decode((rhs_packed & 0x0F).to(tl.int32))   # [BLOCK_N, 16]
+            hi = _int4_offset_decode(((rhs_packed >> 4) & 0x0F).to(tl.int32))  # [BLOCK_N, 16]
 
             # ===== Load bf16 scale (one per 32 K values, per N row) =====
             # Direct bf16 load — no uint8→exponent conversion needed

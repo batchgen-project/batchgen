@@ -3,7 +3,7 @@
 INT4 Format (compressed-tensors pack-quantized, symmetric):
 - Block size: 32 INT4 values per scale group (group_size=32)
 - Packing: 2 INT4 values per uint8 byte (low nibble = first, high nibble = second)
-- INT4 range: signed [-8, +7] (4-bit two's complement)
+- INT4 range: signed [-8, +7] (4-bit offset encoding, nibble - 8)
 - Scales: bf16, one per group of 32 elements
 - Symmetric: no zero-point needed
 - Tensor names: .weight_packed (uint8), .weight_scale (bf16)
@@ -47,20 +47,16 @@ def int4_dequantize_reference(
     # Extract nibbles from packed uint8 bytes
     # Low nibble (bits 0-3) = first value (even positions)
     # High nibble (bits 4-7) = second value (odd positions)
-    lo = (packed & 0x0F).to(torch.int8)
-    hi = (packed >> 4).to(torch.int8)
-
-    # Sign-extend: unsigned nibble [0,15] → signed INT4 [-8, +7]
-    # Values 0-7 are positive, values 8-15 represent -8 to -1
-    lo = torch.where(lo >= 8, lo - 16, lo)
-    hi = torch.where(hi >= 8, hi - 16, hi)
+    # Offset encoding (compressed-tensors standard): signed = nibble - 8
+    lo = (packed & 0x0F).to(torch.int32) - 8
+    hi = (packed >> 4).to(torch.int32) - 8
 
     # Interleave lo/hi to reconstruct original element order [M, K]
     # lo goes to even positions (0, 2, 4, ...), hi to odd positions (1, 3, 5, ...)
     M = packed.shape[0]
     K_half = packed.shape[-1]
     K = K_half * 2
-    unpacked = torch.empty(M, K, dtype=torch.int8, device=device)
+    unpacked = torch.empty(M, K, dtype=torch.int32, device=device)
     unpacked[:, 0::2] = lo
     unpacked[:, 1::2] = hi
 
@@ -117,13 +113,9 @@ def int4_dequant_kernel_2d(
     packed = tl.load(packed_ptr + packed_row_offset + offsets, mask=mask, other=0)
     packed = packed.to(tl.uint8)
 
-    # Extract nibbles
-    lo = (packed & 0x0F).to(tl.int32)
-    hi = ((packed >> 4) & 0x0F).to(tl.int32)
-
-    # Sign-extend: [0,7] stay positive, [8,15] become [-8,-1]
-    lo = tl.where(lo >= 8, lo - 16, lo)
-    hi = tl.where(hi >= 8, hi - 16, hi)
+    # Extract nibbles and apply offset encoding (compressed-tensors standard)
+    lo = (packed & 0x0F).to(tl.int32) - 8
+    hi = ((packed >> 4) & 0x0F).to(tl.int32) - 8
 
     # Convert to bf16 for scaling
     lo_bf16 = lo.to(tl.bfloat16)
