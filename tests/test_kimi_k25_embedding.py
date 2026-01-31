@@ -44,6 +44,10 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
+# Workaround for PyTorch 2.9 CPU allocator bug (Allocator.h:201).
+# MKLDNN conv2d triggers the same raw_deallocate assertion as gelu_out_cpu.
+torch.backends.mkldnn.enabled = False
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -323,12 +327,13 @@ def test_forward_with_mock_vision():
     with torch.no_grad():
         embedder = make_mock_embedder(enable_vision=True)
 
-        seq_len = 32
         num_vision_tokens = 64  # 16x16 patches after 2x2 merge
+        pad_start = 10
+        seq_len = pad_start + num_vision_tokens + 10  # Room for pads + suffix
 
         # Build input_ids with media pad tokens
         input_ids = torch.randint(0, VOCAB_SIZE, (1, seq_len))
-        input_ids[0, 10:10 + num_vision_tokens] = MEDIA_PAD_TOKEN_ID
+        input_ids[0, pad_start:pad_start + num_vision_tokens] = MEDIA_PAD_TOKEN_ID
 
         # Create fake vision embeddings that encode_vision would produce
         mock_vision = torch.randn(num_vision_tokens, HIDDEN_SIZE)
@@ -351,10 +356,10 @@ def test_forward_with_mock_vision():
         # Vision positions should contain the mock vision embeddings
         for i in range(num_vision_tokens):
             assert torch.allclose(
-                result[0, 10 + i],
+                result[0, pad_start + i],
                 mock_vision[i].to(result.dtype),
                 atol=1e-5,
-            ), f"Vision position {10 + i} not correctly replaced"
+            ), f"Vision position {pad_start + i} not correctly replaced"
 
     print("PASS: forward() with mock vision produces correct output")
 
