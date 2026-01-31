@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -121,6 +123,7 @@ class WorkerManager:
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
         self.skeleton_state_dict = None
+        self.skeleton_state_dict_file = None
         self._lock = threading.Lock()
         self._worker_exit_state = worker_exit_state or WorkerExitState()
         self._monitor_stop_event = threading.Event()
@@ -129,7 +132,20 @@ class WorkerManager:
         self._stopping = False
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
+
+        # Register cleanup for skeleton state dict temp file
+        atexit.register(self._cleanup_skeleton_state_dict_file)
         self._hugepages_enabled = False  # Track if hugepages were configured
+
+    def _cleanup_skeleton_state_dict_file(self) -> None:
+        """Clean up temporary skeleton state dict file."""
+        if self.skeleton_state_dict_file and os.path.exists(self.skeleton_state_dict_file):
+            try:
+                logging.debug(f"Cleaning up skeleton state dict temp file: {self.skeleton_state_dict_file}")
+                os.remove(self.skeleton_state_dict_file)
+                self.skeleton_state_dict_file = None
+            except Exception as e:
+                logging.warning(f"Failed to cleanup temp file {self.skeleton_state_dict_file}: {e}")
 
     # ---------------------- Public API ----------------------
     def start(self) -> None:
@@ -380,7 +396,7 @@ class WorkerManager:
                 "host_kv_cache_size_per_rank"
             ),
             global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
-            skeleton_state_dict=self.skeleton_state_dict,
+            skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,
             global_rank=-1,
@@ -555,9 +571,21 @@ class WorkerManager:
 
         shm_name, tensor_meta_shm_name = parameter_server.Init()
         ps_size = parameter_server.parameter_server.byte_size()
-        self.skeleton_state_dict = (
-            parameter_server.parameter_server.get_skeleton_state_dict()
-        )
+
+        # Get skeleton_state_dict and save to temp file to avoid passing tensors through mp.spawn
+        skeleton_state_dict = parameter_server.parameter_server.get_skeleton_state_dict()
+        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton_state_dict)} keys)...")
+
+        # Create temp file for skeleton state dict
+        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
+        os.close(fd)  # Close fd, torch.save will open its own handle
+
+        torch.save(skeleton_state_dict, file_path)
+        actual_size = os.path.getsize(file_path)
+        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
+
+        self.skeleton_state_dict_file = file_path
+        self.skeleton_state_dict = None  # Don't keep tensors in memory
         self.parameter_server_instance = parameter_server
         self.model_info = {
             "huggingface_ckpt_name": self.args.model,
@@ -595,7 +623,18 @@ class WorkerManager:
             raise RuntimeError(
                 "Remote parameter server did not return a skeleton_state_dict"
             )
-        self.skeleton_state_dict = skeleton
+
+        # Save skeleton_state_dict to temp file to avoid passing tensors through mp.spawn
+        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton)} keys)...")
+        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
+        os.close(fd)  # Close fd, torch.save will open its own handle
+
+        torch.save(skeleton, file_path)
+        actual_size = os.path.getsize(file_path)
+        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
+
+        self.skeleton_state_dict_file = file_path
+        self.skeleton_state_dict = None  # Don't keep tensors in memory
         self.parameter_server_instance = None
         self.model_info = {
             "huggingface_ckpt_name": info.get(
