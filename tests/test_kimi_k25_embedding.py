@@ -326,6 +326,8 @@ def test_forward_with_mock_vision():
     """End-to-end forward with mock vision encoder."""
     with torch.no_grad():
         embedder = make_mock_embedder(enable_vision=True)
+        # Override class token ID to match test constant (class default is 163605)
+        embedder.MEDIA_PAD_TOKEN_ID = MEDIA_PAD_TOKEN_ID
 
         num_vision_tokens = 64  # 16x16 patches after 2x2 merge
         pad_start = 10
