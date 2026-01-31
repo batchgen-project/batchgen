@@ -158,7 +158,7 @@ class MoonViTEncoder(nn.Module):
         - 27 transformer layers
         - 1152-dim hidden, 16 attention heads
         - 14x14 pixel patch size
-        - MLP dim: 4 * 1152 = 4608
+        - MLP dim: 4304 (non-standard ratio, per config.json)
         - Position encoding: learnable 2D (2D RoPE deferred)
 
     This is a structural stub: all nn.Module layers are defined so weights
@@ -175,7 +175,7 @@ class MoonViTEncoder(nn.Module):
         hidden_dim: int = 1152,
         num_layers: int = 27,
         num_heads: int = 16,
-        mlp_dim: int = 4608,
+        mlp_dim: int = 4304,
         patch_size: int = 14,
         image_channels: int = 3,
     ):

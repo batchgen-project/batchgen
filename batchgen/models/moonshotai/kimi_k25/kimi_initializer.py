@@ -256,8 +256,8 @@ class KimiK25Initializer:
         model_config.model_type = "kimi_k25"
         model_config.num_hidden_layers = 61
         model_config.num_local_experts = 384
-        model_config.num_attention_heads = 128
-        model_config.num_key_value_heads = 128
+        model_config.num_attention_heads = 64
+        model_config.num_key_value_heads = 64
         model_config.head_dim = 192  # qk_nope_head_dim + qk_rope_head_dim
         model_config.compressed_kv_dim = 576  # kv_lora_rank + qk_rope_head_dim
         return model_config

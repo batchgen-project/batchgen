@@ -50,8 +50,8 @@ class KimiK25Planner(BasePlanner):
         """Return Kimi K2.5 specific tensor shapes."""
         return {
             "hidden_size": 7168,
-            "num_attention_heads": 128,
-            "num_kv_heads": 128,  # MLA — all heads compress KV
+            "num_attention_heads": 64,
+            "num_kv_heads": 64,  # MLA — all heads compress KV
             "num_layers": 61,
             "num_experts": 384,
             "num_experts_per_tok": 8,

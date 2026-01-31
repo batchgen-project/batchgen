@@ -66,8 +66,8 @@ class KimiK25Config(BaseModelConfig):
 
     # ==================== Attention Type: MLA with low-rank compression ====================
     attention_type: str = "mla"
-    num_attention_heads: int = 128
-    num_key_value_heads: int = 128  # Not used in MLA (uses lora_rank instead)
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 64  # Not used in MLA (uses lora_rank instead)
     head_dim: int = 192  # qk_nope_head_dim + qk_rope_head_dim
     attention_bias: bool = False
     attention_dropout: float = 0.0
