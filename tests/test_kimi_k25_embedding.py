@@ -56,13 +56,15 @@ from batchgen.models.moonshotai.kimi_k25.embedding import (
 
 
 # ============================================================================ #
-# Test Constants (K2.5 dimensions)
+# Test Constants
 # ============================================================================ #
+# Small dimensions for testing — tests verify shapes and logic, not weight values.
+# Full K2.5 dims (vocab=164000, hidden=7168, encoder=1152) are not needed and
+# trigger a PyTorch 2.9 CPU GELU allocator bug at large sizes.
 
-# Use small vocab for testing — full K2.5 vocab (164000) would allocate 4.4 GB
 VOCAB_SIZE = 1024
-HIDDEN_SIZE = 7168
-ENCODER_DIM = 1152
+HIDDEN_SIZE = 256
+ENCODER_DIM = 64
 PATCH_SIZE = 14
 MEDIA_PAD_TOKEN_ID = 1000
 
@@ -396,8 +398,8 @@ def test_moonvit_encoder_shapes():
         encoder = MoonViTEncoder(
             hidden_dim=ENCODER_DIM,
             num_layers=2,  # Use fewer layers for test speed
-            num_heads=16,
-            mlp_dim=4608,
+            num_heads=4,
+            mlp_dim=ENCODER_DIM * 4,
             patch_size=PATCH_SIZE,
         )
         encoder.eval()
