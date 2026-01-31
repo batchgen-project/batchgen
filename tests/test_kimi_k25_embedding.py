@@ -74,6 +74,20 @@ MEDIA_PAD_TOKEN_ID = 1000
 # ============================================================================ #
 
 
+def _replace_gelu_with_silu(module: nn.Module):
+    """Replace nn.GELU with nn.SiLU in a module tree.
+
+    Workaround for PyTorch 2.9 CPU gelu_out_cpu allocator bug
+    (c10::Error INTERNAL ASSERT FAILED at Allocator.h:201).
+    Tests only verify shapes, so the activation function is irrelevant.
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.GELU):
+            setattr(module, name, nn.SiLU())
+        else:
+            _replace_gelu_with_silu(child)
+
+
 def make_mock_embed_tokens(vocab_size: int = VOCAB_SIZE, hidden_size: int = HIDDEN_SIZE):
     """Create a mock nn.Embedding for testing."""
     return nn.Embedding(vocab_size, hidden_size)
@@ -136,6 +150,7 @@ def test_patch_merger_mlp_shapes():
     """Verify PatchMergerMLP produces correct output shapes at multiple resolutions."""
     with torch.no_grad():
         merger = PatchMergerMLP(encoder_dim=ENCODER_DIM, llm_hidden_size=HIDDEN_SIZE)
+        _replace_gelu_with_silu(merger)  # PyTorch 2.9 CPU GELU bug workaround
         merger.eval()
 
         # Test grid sizes: (H_patches, W_patches) -> (H/2 * W/2, hidden_size)
@@ -402,6 +417,7 @@ def test_moonvit_encoder_shapes():
             mlp_dim=ENCODER_DIM * 4,
             patch_size=PATCH_SIZE,
         )
+        _replace_gelu_with_silu(encoder)  # PyTorch 2.9 CPU GELU bug workaround
         encoder.eval()
 
         # 224x224 image -> 16x16 patches
