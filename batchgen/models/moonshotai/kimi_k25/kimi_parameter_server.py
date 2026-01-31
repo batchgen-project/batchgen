@@ -235,5 +235,11 @@ class KimiK25_Parameter_Server:
             f"(attn={attn_count}, routed_expert={expert_count}, shared_expert={shared_count})"
         )
 
+        # Debug: Show first 10 keys to verify naming pattern
+        sample_keys = list(self.state_dict_name_map.keys())[:10]
+        logging.info(f"state_dict_name_map sample keys (first 10):")
+        for key in sample_keys:
+            logging.info(f"  {key}")
+
         gc.collect()
         torch.cuda.empty_cache()

@@ -99,6 +99,11 @@ class ckpt_converter:
 					"offset": offset,
 					"byte_size": tensor_byte_size
 				}
+
+				# Debug: Log first 10 tensor names to verify naming pattern
+				if tensor_idx < 10:
+					logging.info(f"Checkpoint tensor #{tensor_idx}: {tensor_name}")
+
 				# Write tensor to file
 				data_ptr = tensor.data_ptr()
 				buf = (ctypes.c_char * tensor_byte_size).from_address(data_ptr)
