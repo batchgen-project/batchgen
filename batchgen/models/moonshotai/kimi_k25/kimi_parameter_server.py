@@ -191,7 +191,7 @@ class KimiK25_Parameter_Server:
         for layer_idx in trange(self.num_layers, desc="Parsing state_dict"):
             # --- Attention weights (BF16 MLA) ---
             for name in _MLA_ATTN_TENSOR_NAMES:
-                tensor_full_name = f"model.layers.{layer_idx}.self_attn.{name}"
+                tensor_full_name = f"language_model.model.layers.{layer_idx}.self_attn.{name}"
                 self.state_dict_name_map[tensor_full_name] = {
                     "module_key": f"attn_{layer_idx}",
                     "tensor_key": name,
@@ -202,7 +202,7 @@ class KimiK25_Parameter_Server:
             if layer_idx >= self.first_k_dense_replace:
                 # --- Shared expert weights (BF16, not quantized) ---
                 for name in _SHARED_EXPERT_TENSOR_NAMES:
-                    tensor_full_name = f"model.layers.{layer_idx}.mlp.shared_experts.{name}"
+                    tensor_full_name = f"language_model.model.layers.{layer_idx}.mlp.shared_experts.{name}"
                     self.state_dict_name_map[tensor_full_name] = {
                         "module_key": f"shared_expert_{layer_idx}",
                         "tensor_key": name,
@@ -215,7 +215,7 @@ class KimiK25_Parameter_Server:
                 for expert_idx in range(self.num_experts):
                     for name in _INT4_EXPERT_TENSOR_NAMES:
                         tensor_full_name = (
-                            f"model.layers.{layer_idx}.mlp.experts."
+                            f"language_model.model.layers.{layer_idx}.mlp.experts."
                             f"{expert_idx}.{name}"
                         )
                         self.state_dict_name_map[tensor_full_name] = {
