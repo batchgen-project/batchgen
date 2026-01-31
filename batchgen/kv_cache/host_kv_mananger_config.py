@@ -100,6 +100,11 @@ for canonical, aliases in {
 		"deepseek/deepseek-v3",
 		"deepseek-r1",
 		"deepseek-v3",
+		"moonshotai/kimi-k2.5",
+		"moonshotai/kimi-k25",
+		"kimi-k2.5",
+		"kimi-k25",
+		"kimi",
 	),
 	"gpt_oss_gqa": (
 		"openai/gpt-oss-120b",
