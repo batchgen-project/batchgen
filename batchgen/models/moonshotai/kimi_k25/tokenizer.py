@@ -127,6 +127,31 @@ class KimiK25Tokenizer(BaseTokenizer):
         """
         return self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
+    def apply_chat_template(
+        self,
+        conversation,
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        **kwargs,
+    ) -> Union[str, List[int]]:
+        """Apply chat template to format conversation.
+
+        Args:
+            conversation: List of message dicts with "role" and "content"
+            tokenize: Whether to tokenize the output
+            add_generation_prompt: Whether to add generation prompt
+            **kwargs: Additional arguments passed to underlying tokenizer
+
+        Returns:
+            Formatted string or token IDs if tokenize=True
+        """
+        return self._tokenizer.apply_chat_template(
+            conversation,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
     def __call__(
         self,
         texts: Union[str, List[str]],
