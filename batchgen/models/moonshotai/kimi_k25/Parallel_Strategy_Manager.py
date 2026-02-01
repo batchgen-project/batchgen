@@ -690,11 +690,14 @@ class KimiK25ParallelStrategyManager:
         to access via _register_int4_weights().
         """
         device = self.engine_config.Basic_Config.device_torch
+        num_experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
         for routed_expert_idx in self.local_routed_experts:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
             layer_idx = int(routed_expert_idx.split("_")[2])
-            expert_idx = int(routed_expert_idx.split("_")[3])
-            expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+            global_expert_idx = int(routed_expert_idx.split("_")[3])
+            # Convert global expert index to local index (model only has local experts with EP)
+            local_expert_idx = global_expert_idx - (self.global_rank * num_experts_per_rank)
+            expert = self.model.model.layers[layer_idx].mlp.experts[local_expert_idx]
 
             # Store INT4 packed/scale tensors as module attributes
             # The KimiK25ExpertWrapper._register_int4_weights() reads these
