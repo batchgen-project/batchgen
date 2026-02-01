@@ -593,8 +593,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 	k_embed = (k * cos) + (rotate_half(k) * sin)
 	return q_embed, k_embed
 
-from ....moe.fused_dequant_gemm import fused_fp8_bf16_gemm
-from ....attention.mla.fa3_backend import w8a16_gemm
+from batchgen.moe.fused_dequant_gemm import fused_fp8_bf16_gemm
+from batchgen.attention.mla.fa3_backend import w8a16_gemm
 
 class DeepseekV3MLP(nn.Module):
 	def __init__(self, config, hidden_size=None, intermediate_size=None):
@@ -1226,19 +1226,19 @@ class DeepseekV3MoE_Prefill(nn.Module):
 		)
 		return final_out
 
-from ....moe.fused_grouped_dequant_gemm import (
+from batchgen.moe.fused_grouped_dequant_gemm import (
 	fused_dequant_grouped_gemm_bf16_fp8_triton,
 	fused_dequant_grouped_gemm_bf16_fp8_triton_v2,
 	fused_dequant_grouped_gemm_fp8_fp8_triton,
 	fused_dequant_grouped_gemm_fp8_tma
 )
-from ....moe.fused_dequant_moe import (
-	fused_dequant_weighted_moe_stage_1, 
+from batchgen.moe.fused_dequant_moe import (
+	fused_dequant_weighted_moe_stage_1,
 	fused_fp8_moe_stage_1
 )
 from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_optimized, fused_fp8_moe_stage_1_baseline_v2, fused_fp8_moe_stage_1_tma
 from batchgen.gemm.w8a8_grouped_gemm_stage_2 import fused_dequant_grouped_gemm_fp8_fp8_triton_optimized, fused_dequant_grouped_gemm_fp8_fp8_fp32_triton
-from ....attention.mla.fa3_backend import act_quant
+from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.quantization.block_quantization import act_quant_transposed_scale
 class DeepseekV3MoE_Decoding(nn.Module):
 	def __init__(self, config):
