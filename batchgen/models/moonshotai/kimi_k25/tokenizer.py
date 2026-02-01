@@ -104,12 +104,14 @@ class KimiK25Tokenizer(BaseTokenizer):
 
         Args:
             text: Input text to tokenize
-            add_special_tokens: Whether to add BOS/EOS tokens
+            add_special_tokens: Whether to add BOS/EOS tokens (mapped to allow_special_tokens)
 
         Returns:
             List of token IDs
         """
-        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens)
+        # TikTokenTokenizer uses allow_special_tokens, not add_special_tokens
+        # When add_special_tokens=True, allow all special tokens
+        return self._tokenizer.encode(text, allow_special_tokens=add_special_tokens)
 
     def decode(
         self,

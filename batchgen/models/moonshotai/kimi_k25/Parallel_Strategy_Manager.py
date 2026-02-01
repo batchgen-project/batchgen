@@ -706,10 +706,18 @@ class KimiK25ParallelStrategyManager:
         """Load skeleton weights (norms, embeddings, router) to model.
 
         K2.5: No FP8 dequantization needed — all skeleton weights are BF16.
+
+        Note: Checkpoint has 'language_model.' prefix (from KimiK25ForConditionalGeneration),
+        but BatchGen uses only the language model (DeepseekV3ForCausalLM), so we strip the prefix.
         """
         for key, param in self.model.named_parameters():
-            if key in self.skeleton_state_dict:
+            # Try with and without language_model. prefix
+            checkpoint_key = f"language_model.{key}"
+            if checkpoint_key in self.skeleton_state_dict:
                 # K2.5: direct BF16 assignment (no FP8 dequant)
+                param.data = self.skeleton_state_dict[checkpoint_key]
+            elif key in self.skeleton_state_dict:
+                # Fallback: try without prefix
                 param.data = self.skeleton_state_dict[key]
 
         model_skeleton_byte_size = (
