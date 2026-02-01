@@ -77,10 +77,14 @@ class KimiK25Tokenizer(BaseTokenizer):
             for k, v in added_tokens_decoder_raw.items()
         }
 
-        # Load tokenizer from tiktoken.model with added_tokens_decoder
+        # Load tokenizer from tiktoken.model with added_tokens_decoder and special tokens
         vocab_file = str(TOKENIZER_DIR / "tiktoken.model")
         self._tokenizer = TikTokenTokenizer(
             vocab_file,
+            bos_token="[BOS]",
+            eos_token="[EOS]",
+            pad_token="[PAD]",
+            unk_token="[UNK]",
             added_tokens_decoder=added_tokens_decoder
         )
 
