@@ -245,7 +245,9 @@ class KimiK25ParallelStrategyManager:
         logging.info(f"Rank {self.rank}: GPU memory AFTER deep free: {free_mem_after / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total")
         logging.info(f"Rank {self.rank}: Memory freed by deep free: {(free_mem_after - free_mem_before) / 1e9:.2f} GB")
 
-        self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
+        # Create model on CPU first to avoid GPU memory allocation
+        with torch.device('cpu'):
+            self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
 
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
@@ -705,7 +707,8 @@ class KimiK25ParallelStrategyManager:
         These are stored as custom attributes on the expert module for the wrapper
         to access via _register_int4_weights().
         """
-        device = self.engine_config.Basic_Config.device_torch
+        # Use model's current device (CPU during initial load, GPU after .to(device))
+        device = next(self.model.parameters()).device
         num_experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
         for routed_expert_idx in self.local_routed_experts:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
