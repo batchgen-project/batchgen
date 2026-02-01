@@ -24,10 +24,12 @@ and registers it with BatchGen's tokenizer registry.
 The Kimi K2.5 tokenizer uses TikToken format with 163,840 tokens.
 """
 
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import torch
+from tokenizers import AddedToken
 
 from batchgen.config.base_tokenizer import BaseTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
@@ -63,9 +65,24 @@ class KimiK25Tokenizer(BaseTokenizer):
             TikTokenTokenizer,
         )
 
-        # Load tokenizer from tiktoken.model
+        # Load tokenizer config
+        config_file = TOKENIZER_DIR / "tokenizer_config.json"
+        with open(config_file) as f:
+            config = json.load(f)
+
+        # Get added_tokens_decoder and convert to AddedToken format
+        added_tokens_decoder_raw = config.get("added_tokens_decoder", {})
+        added_tokens_decoder = {
+            int(k): AddedToken(v["content"], special=v.get("special", False))
+            for k, v in added_tokens_decoder_raw.items()
+        }
+
+        # Load tokenizer from tiktoken.model with added_tokens_decoder
         vocab_file = str(TOKENIZER_DIR / "tiktoken.model")
-        self._tokenizer = TikTokenTokenizer(vocab_file)
+        self._tokenizer = TikTokenTokenizer(
+            vocab_file,
+            added_tokens_decoder=added_tokens_decoder
+        )
 
         # Set special token IDs
         self.bos_token_id = KIMI_K25_BOS_TOKEN_ID
