@@ -224,6 +224,63 @@ def int4_dequantize_triton(
     return output
 
 
+def int4_dequantize_int32_reference(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """Reference implementation of INT4 W4A16 dequantization for int32 packed format.
+
+    Kimi K2.5 uses int32 packing: 8 INT4 values per int32 word (32 bits / 4 bits = 8).
+
+    Bit layout in each int32 word:
+    - bits 0-3:   value 0
+    - bits 4-7:   value 1
+    - bits 8-11:  value 2
+    - bits 12-15: value 3
+    - bits 16-19: value 4
+    - bits 20-23: value 5
+    - bits 24-27: value 6
+    - bits 28-31: value 7
+
+    Args:
+        packed: Packed INT4 values as int32 [M, K//8] (8 values per word)
+        scales: Scale factors as bf16 [M, K//32] (one per group of 32 elements)
+        dtype: Output dtype (default: bfloat16)
+
+    Returns:
+        Dequantized tensor [M, K] in the specified dtype
+    """
+    device = packed.device
+    M = packed.shape[0]
+    K_div8 = packed.shape[-1]
+    K = K_div8 * 8
+
+    # Extract 8 nibbles from each int32 word
+    # Use bit shifts and mask to extract 4-bit values
+    unpacked = torch.empty(M, K_div8, 8, dtype=torch.int32, device=device)
+
+    for i in range(8):
+        # Extract nibble at position i (bits i*4 to i*4+3)
+        nibble = (packed >> (i * 4)) & 0xF
+        # Apply offset encoding: signed = nibble - 8
+        unpacked[:, :, i] = nibble.to(torch.int32) - 8
+
+    # Reshape to [M, K]
+    unpacked_flat = unpacked.view(M, K)
+
+    # Apply group scales: each scale covers 32 consecutive elements
+    n_groups = scales.shape[-1]
+    unpacked_float = unpacked_flat.to(dtype)  # [M, K] in target dtype
+
+    # Reshape for grouped broadcast multiply
+    unpacked_grouped = unpacked_float.view(M, n_groups, INT4_GROUP_SIZE)  # [M, G, 32]
+    scales_expanded = scales.to(dtype).unsqueeze(-1)  # [M, G, 1]
+
+    result = unpacked_grouped * scales_expanded  # [M, G, 32]
+    return result.view(M, K).to(dtype)
+
+
 def int4_dequantize(
     packed: torch.Tensor,
     scales: torch.Tensor,
@@ -232,13 +289,17 @@ def int4_dequantize(
 ) -> torch.Tensor:
     """Dequantize INT4 W4A16 packed tensor to the specified dtype.
 
+    Automatically detects packing format:
+    - uint8: 2 INT4 values per byte (standard format)
+    - int32: 8 INT4 values per word (Kimi K2.5 format)
+
     Use cases:
     1. Pre-dequant persistent experts to BF16 at init (EP mode, world_size >= 4)
     2. On-the-fly dequant for offloaded experts (host → device → dequant → BF16 GEMM)
     3. Validation: compare fused kernel output against this reference
 
     Args:
-        packed: Packed INT4 values as uint8 (2 values per byte)
+        packed: Packed INT4 values as uint8 or int32
         scales: Scale factors as bf16 (one per group of 32 elements)
         dtype: Output dtype (default: bfloat16)
         use_triton: Whether to use Triton kernel (default: False)
@@ -246,7 +307,18 @@ def int4_dequantize(
     Returns:
         Dequantized tensor in the specified dtype
     """
-    if use_triton and packed.is_cuda:
-        return int4_dequantize_triton(packed, scales, dtype)
+    # Detect packing format by dtype
+    if packed.dtype == torch.int32:
+        # Kimi K2.5 format: 8 INT4 values per int32 word
+        return int4_dequantize_int32_reference(packed, scales, dtype)
+    elif packed.dtype == torch.uint8:
+        # Standard format: 2 INT4 values per uint8 byte
+        if use_triton and packed.is_cuda:
+            return int4_dequantize_triton(packed, scales, dtype)
+        else:
+            return int4_dequantize_reference(packed, scales, dtype)
     else:
-        return int4_dequantize_reference(packed, scales, dtype)
+        raise ValueError(
+            f"Unsupported packed dtype: {packed.dtype}. "
+            f"Expected torch.uint8 or torch.int32"
+        )
