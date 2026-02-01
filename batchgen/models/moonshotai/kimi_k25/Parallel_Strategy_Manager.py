@@ -227,24 +227,23 @@ class KimiK25ParallelStrategyManager:
         self.loaded_model_config._attn_implementation = "eager"
         self.loaded_model_config.ep_size = self.world_size
 
+        # Log GPU memory before deep free
+        free_mem_before, total_mem = torch.cuda.mem_get_info(self.engine_config.Basic_Config.device)
+        logging.info(f"Rank {self.rank}: GPU memory BEFORE deep free: {free_mem_before / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total")
+
         # Deep free prefill model before loading decode model
-        import gc
-        import logging
         if self.model is not None:
-            logging.info(f"Rank {self.rank}: Freeing prefill model before decode...")
-            # Move model to CPU first to free GPU memory
-            self.model.cpu()
-            # Delete model and clear any cached references
             del self.model
             self.model = None
-        # Force garbage collection multiple times
-        for _ in range(3):
-            gc.collect()
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        # Check memory after cleanup
-        free_mem, total_mem = torch.cuda.mem_get_info(self.engine_config.Basic_Config.device)
-        logging.info(f"Rank {self.rank}: GPU memory after prefill cleanup: {free_mem / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total")
+
+        # Log GPU memory after deep free
+        free_mem_after, _ = torch.cuda.mem_get_info(self.engine_config.Basic_Config.device)
+        logging.info(f"Rank {self.rank}: GPU memory AFTER deep free: {free_mem_after / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total")
+        logging.info(f"Rank {self.rank}: Memory freed by deep free: {(free_mem_after - free_mem_before) / 1e9:.2f} GB")
 
         self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
 
