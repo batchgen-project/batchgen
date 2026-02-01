@@ -682,10 +682,43 @@ class KimiK25ParallelStrategyManager:
             f"Attn module configuration time: {end_time - start_time:.2f} seconds"
         )
 
+    def _reinterpret_uint8_as_int32(self, uint8_tensor: torch.Tensor, target_shape) -> torch.Tensor:
+        """Reinterpret uint8 bytes as int32 tensor.
+
+        Parameter_Server loads int32 checkpoint tensors as uint8 bytes (4 bytes per int32).
+        This method reinterprets those bytes as int32 with the correct shape.
+
+        Args:
+            uint8_tensor: Tensor loaded as uint8 bytes
+            target_shape: Expected int32 shape [M, N]
+
+        Returns:
+            Reinterpreted tensor as int32 with target_shape
+        """
+        # Reshape uint8 bytes to [M, N, 4] then view as int32 [M, N]
+        M, N = target_shape
+        expected_uint8_shape = M * N * 4  # 4 bytes per int32
+
+        # Check if tensor is already int32 (should not happen but safe)
+        if uint8_tensor.dtype == torch.int32:
+            return uint8_tensor.view(target_shape)
+
+        # Flatten and verify size
+        flat_bytes = uint8_tensor.flatten()
+        assert flat_bytes.numel() == expected_uint8_shape, \
+            f"Expected {expected_uint8_shape} bytes, got {flat_bytes.numel()}"
+
+        # Reshape to [M, N, 4] and reinterpret as int32
+        reshaped = flat_bytes.view(M, N, 4)
+        # Use frombuffer equivalent - view bytes as int32
+        int32_tensor = reshaped.view(torch.int32).view(M, N)
+
+        return int32_tensor
+
     def _load_local_routed_experts(self):
         """Load INT4 packed/scale tensors for persistent (GPU-resident) routed experts.
 
-        For K2.5, routed expert weights are INT4 packed (uint8) + scale (bf16).
+        For K2.5, routed expert weights are INT4 packed (int32) + scale (bf16).
         These are stored as custom attributes on the expert module for the wrapper
         to access via _register_int4_weights().
         """
@@ -701,11 +734,19 @@ class KimiK25ParallelStrategyManager:
 
             # Store INT4 packed/scale tensors as module attributes
             # The KimiK25ExpertWrapper._register_int4_weights() reads these
-            expert.int4_gate_packed = tensors["gate_proj.weight_packed"].to(device)
+            # NOTE: Packed tensors are int32 in checkpoint but loaded as uint8 by Parameter_Server
+            # Need to reinterpret bytes as int32
+            expert.int4_gate_packed = self._reinterpret_uint8_as_int32(
+                tensors["gate_proj.weight_packed"], [2048, 896]
+            ).to(device)
             expert.int4_gate_scale = tensors["gate_proj.weight_scale"].to(device)
-            expert.int4_up_packed = tensors["up_proj.weight_packed"].to(device)
+            expert.int4_up_packed = self._reinterpret_uint8_as_int32(
+                tensors["up_proj.weight_packed"], [2048, 896]
+            ).to(device)
             expert.int4_up_scale = tensors["up_proj.weight_scale"].to(device)
-            expert.int4_down_packed = tensors["down_proj.weight_packed"].to(device)
+            expert.int4_down_packed = self._reinterpret_uint8_as_int32(
+                tensors["down_proj.weight_packed"], [7168, 256]
+            ).to(device)
             expert.int4_down_scale = tensors["down_proj.weight_scale"].to(device)
 
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")

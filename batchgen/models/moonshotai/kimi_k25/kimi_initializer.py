@@ -243,11 +243,8 @@ class KimiK25Initializer:
                 "kv_a_layernorm.weight": torch.bfloat16,
             },
             "routed_expert": {
-                # INT4 packed tensors are int32 (8 INT4 values per word)
-                "gate_proj.weight_packed": torch.int32,
-                "up_proj.weight_packed": torch.int32,
-                "down_proj.weight_packed": torch.int32,
                 # Scale tensors are BF16
+                # Note: weight_packed tensors are int32 in checkpoint - loaded with native dtype
                 "gate_proj.weight_scale": torch.bfloat16,
                 "up_proj.weight_scale": torch.bfloat16,
                 "down_proj.weight_scale": torch.bfloat16,
