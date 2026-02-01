@@ -190,9 +190,10 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         """Forward pass with INT4 dequant + BF16 GEMM.
 
         Routes to appropriate implementation:
-        - Shared expert (expert_idx == -1): Use module's native BF16 forward
-        - BF16 mode: Pre-dequantized weights (EP with world_size >= 4)
-        - INT4 mode: Dequant + BF16 GEMM (standard path)
+        - BF16 mode: Pre-loaded BF16 weights (persistent shared/routed experts)
+        - INT4 mode: Dequant + BF16 GEMM (non-persistent routed experts)
+
+        Shared experts (expert_idx == -1) are BF16 and use the BF16 path.
 
         K2.5 activation: silu(gate) * up (standard, not OpenAI SwiGLU)
 
@@ -202,11 +203,7 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         Returns:
             Output [num_tokens, hidden_size]
         """
-        # Shared experts (expert_idx == -1) use native BF16 weights, not INT4
-        if self.expert_idx == -1:
-            return self.module(hidden_states)
-
-        # Fast path: pre-dequantized BF16 weights (EP mode)
+        # Fast path: pre-loaded/dequantized BF16 weights (persistent mode or shared experts)
         if getattr(self, 'use_bf16_weights', False):
             return self._forward_bf16(hidden_states)
 
@@ -216,7 +213,7 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             f"K2.5 expert forward. Phase: {self.phase}, persistent: {self.persistent}"
         )
 
-        # Get INT4 weights
+        # Load weights from storage
         if self.persistent:
             weights = self._get_stored_int4_weights()
         else:
@@ -226,8 +223,16 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         if hidden_states.dtype != torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
 
-        # Dequant INT4 → BF16 and do GEMM
-        result = self._forward_int4(hidden_states, weights)
+        # Shared experts (expert_idx == -1) have BF16 weights, not INT4
+        if self.expert_idx == -1:
+            # Load BF16 weights and assign to module
+            self.module.gate_proj.weight.data = weights["gate_proj.weight"]
+            self.module.up_proj.weight.data = weights["up_proj.weight"]
+            self.module.down_proj.weight.data = weights["down_proj.weight"]
+            result = self.module(hidden_states)
+        else:
+            # Routed experts: Dequant INT4 → BF16 and do GEMM
+            result = self._forward_int4(hidden_states, weights)
 
         # Cleanup for non-persistent experts
         torch.cuda.current_stream(
