@@ -42,9 +42,20 @@ class KimiK25Planner(BasePlanner):
     def _adjust_config_for_model(self):
         """K2.5-specific config adjustments.
 
-        Most config is set by base class. This handles K2.5 overrides if needed.
+        K2.5 uses INT4 W4A16 experts which are ~30MB each (not 2.4GB like FP8/BF16).
+        Override expert memory calculations.
         """
-        pass
+        # INT4 expert size: ~30MB per expert (vs 2.4GB for FP8/BF16)
+        # With 384 experts / 8 ranks = 48 experts per rank
+        # 48 * 0.03GB = 1.44GB total expert cache (fits easily in GPU memory)
+        expert_per_rank = self.NUM_EXPERTS // self.world_size  # 48
+
+        # For K2.5 INT4, all experts can fit in GPU memory
+        # Override the memory-based calculation from base class
+        self.config.EP_Config.num_local_expert_per_layer = expert_per_rank
+
+        # No need for expert offloading buffers - all experts are persistent
+        self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
 
     def get_module_shapes(self) -> dict:
         """Return Kimi K2.5 specific tensor shapes."""
