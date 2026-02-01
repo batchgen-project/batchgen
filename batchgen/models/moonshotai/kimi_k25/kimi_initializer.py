@@ -228,14 +228,16 @@ class KimiK25Initializer:
             },
         }
 
-        # Per-module default weight dtypes
+        # Per-module default weight dtypes (for buffer allocation)
+        # These determine GPU buffer sizes but individual tensors load with their native dtype
         self.engine_config.GPU_Buffer_Config.weight_dtypes = {
             "attn": torch.bfloat16,
-            # routed_expert: Use native dtype from checkpoint (int32 for packed, bf16 for scale)
+            "routed_expert": torch.int32,  # Default for buffer allocation (most tensors are int32)
             "shared_expert": torch.bfloat16,
         }
 
-        # Per-tensor dtype overrides for mixed-dtype modules
+        # Per-tensor dtype overrides for loading from checkpoint
+        # Tensors load with their native checkpoint dtype
         self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
             "attn": {
                 # Layernorm weights must be BF16
@@ -243,8 +245,10 @@ class KimiK25Initializer:
                 "kv_a_layernorm.weight": torch.bfloat16,
             },
             "routed_expert": {
-                # Scale tensors are BF16
-                # Note: weight_packed tensors are int32 in checkpoint - loaded with native dtype
+                # Explicitly specify all tensor dtypes to match checkpoint
+                "gate_proj.weight_packed": torch.int32,
+                "up_proj.weight_packed": torch.int32,
+                "down_proj.weight_packed": torch.int32,
                 "gate_proj.weight_scale": torch.bfloat16,
                 "up_proj.weight_scale": torch.bfloat16,
                 "down_proj.weight_scale": torch.bfloat16,
