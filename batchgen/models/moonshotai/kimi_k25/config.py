@@ -88,7 +88,7 @@ class KimiK25Config(BaseModelConfig):
     n_routed_experts: int = 384        # vs 256
     n_shared_experts: int = 1
     num_experts_per_tok: int = 8
-    first_k_dense_replace: int = 3     # First 3 layers are dense
+    first_k_dense_replace: int = 1     # First layer (layer 0) is dense, rest are MoE
     moe_intermediate_size: int = 2048
     moe_layer_freq: int = 1
 

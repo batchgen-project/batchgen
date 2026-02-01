@@ -63,6 +63,7 @@ class KimiK25Initializer:
             n_group=1,
             topk_group=1,
             rope_theta=50000.0,
+            first_k_dense_replace=1,  # K2.5 has 1 dense layer (layer 0), not 3
         )
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
         self.loaded_model_config.architectures = ["DeepseekV3ForCausalLM"]
