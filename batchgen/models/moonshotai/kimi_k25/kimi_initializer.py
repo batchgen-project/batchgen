@@ -231,7 +231,7 @@ class KimiK25Initializer:
         # Per-module default weight dtypes
         self.engine_config.GPU_Buffer_Config.weight_dtypes = {
             "attn": torch.bfloat16,
-            "routed_expert": torch.uint8,      # Default for INT4 packed weights
+            # routed_expert: Use native dtype from checkpoint (int32 for packed, bf16 for scale)
             "shared_expert": torch.bfloat16,
         }
 
