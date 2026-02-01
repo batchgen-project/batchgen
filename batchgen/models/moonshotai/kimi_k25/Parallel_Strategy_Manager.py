@@ -226,8 +226,15 @@ class KimiK25ParallelStrategyManager:
         self.loaded_model_config.phase = "decode"
         self.loaded_model_config._attn_implementation = "eager"
         self.loaded_model_config.ep_size = self.world_size
-        self.model = None
+
+        # Deep free prefill model before loading decode model
+        if self.model is not None:
+            del self.model
+            self.model = None
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
         self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
 
