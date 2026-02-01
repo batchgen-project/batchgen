@@ -210,7 +210,7 @@ class BatchGenWorkerArgs:
 	tensor_meta_shm_name: str
 	enable_hugetlbfs: bool
 	weight_byte_size: int
-	skeleton_state_dict_file: Optional[str]
+	skeleton_state_dict: Optional[Dict]
 
 	device: int
 	kv_dtype: str
@@ -292,14 +292,7 @@ class BatchGenWorker:
 		self.hf_cache_dir = args.hf_cache_dir
 		self.cache_dir = args.cache_dir
 		self.converted_ckpt_dir = args.converted_ckpt_dir
-
-		# Load skeleton_state_dict from temp file (avoids passing tensors through mp.spawn)
-		if args.skeleton_state_dict_file:
-			logging.info(f"Rank {args.global_rank}: Loading skeleton state dict from {args.skeleton_state_dict_file}")
-			self.skeleton_state_dict = torch.load(args.skeleton_state_dict_file)
-			logging.info(f"Rank {args.global_rank}: Loaded skeleton state dict with {len(self.skeleton_state_dict)} keys")
-		else:
-			self.skeleton_state_dict = None
+		self.skeleton_state_dict = args.skeleton_state_dict
 
 		# 4. Initialize Shared Memory for Weights (Crucial for multiprocess)
 		self.shm_name = args.shm_name
