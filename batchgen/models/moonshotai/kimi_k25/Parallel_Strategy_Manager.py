@@ -77,8 +77,9 @@ class KimiK25ParallelStrategyManager:
         start_time = time.perf_counter()
         timings = {}
 
-        # Step 1: Set phase
+        # Step 1: Set phase and EP size
         self.loaded_model_config.phase = "prefill"
+        self.loaded_model_config.ep_size = self.world_size
 
         # Step 2: Initialize model
         # K2.5 reuses DeepseekV3ForCausalLM with K2.5 config overrides
@@ -129,17 +130,21 @@ class KimiK25ParallelStrategyManager:
                 )
 
                 # Routed experts — module keys only (INT4 tensors handled by wrappers)
-                for expert_idx in range(self.model_config.num_local_experts):
+                # Loop over this rank's experts (global indices → local indices)
+                expert_start_idx = self.global_rank * (NUM_TOTAL_EXPERTS // self.world_size)
+                expert_end_idx = expert_start_idx + (NUM_TOTAL_EXPERTS // self.world_size)
+                for global_expert_idx in range(expert_start_idx, expert_end_idx):
+                    local_expert_idx = global_expert_idx - expert_start_idx
                     for name, _ in (
                         self.model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
+                        .mlp.experts[local_expert_idx]
                         .named_parameters()
                     ):
                         tensor_full_name = (
                             "model.layers."
                             + str(layer_idx)
                             + ".mlp.experts."
-                            + str(expert_idx)
+                            + str(global_expert_idx)
                             + "."
                             + name
                         )
@@ -147,7 +152,7 @@ class KimiK25ParallelStrategyManager:
                             "module_key": "routed_expert_"
                             + str(layer_idx)
                             + "_"
-                            + str(expert_idx),
+                            + str(global_expert_idx),
                             "tensor_key": name,
                         }
                     self.weight_copy_task["routed_expert"].append(
@@ -223,6 +228,7 @@ class KimiK25ParallelStrategyManager:
         """
         self.loaded_model_config.phase = "decode"
         self.loaded_model_config._attn_implementation = "eager"
+        self.loaded_model_config.ep_size = self.world_size
         self.model = None
         torch.cuda.empty_cache()
 
@@ -318,17 +324,21 @@ class KimiK25ParallelStrategyManager:
                         "tensor_key": name,
                     }
 
-                for expert_idx in range(self.model_config.num_local_experts):
+                # Loop over this rank's experts (global indices → local indices)
+                expert_start_idx = self.global_rank * (NUM_TOTAL_EXPERTS // self.world_size)
+                expert_end_idx = expert_start_idx + (NUM_TOTAL_EXPERTS // self.world_size)
+                for global_expert_idx in range(expert_start_idx, expert_end_idx):
+                    local_expert_idx = global_expert_idx - expert_start_idx
                     for name, _ in (
                         self.model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
+                        .mlp.experts[local_expert_idx]
                         .named_parameters()
                     ):
                         tensor_full_name = (
                             "model.layers."
                             + str(layer_idx)
                             + ".mlp.experts."
-                            + str(expert_idx)
+                            + str(global_expert_idx)
                             + "."
                             + name
                         )
@@ -336,7 +346,7 @@ class KimiK25ParallelStrategyManager:
                             "module_key": "routed_expert_"
                             + str(layer_idx)
                             + "_"
-                            + str(expert_idx),
+                            + str(global_expert_idx),
                             "tensor_key": name,
                         }
 
