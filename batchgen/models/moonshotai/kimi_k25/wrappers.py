@@ -190,6 +190,7 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         """Forward pass with INT4 dequant + BF16 GEMM.
 
         Routes to appropriate implementation:
+        - Shared expert (expert_idx == -1): Use module's native BF16 forward
         - BF16 mode: Pre-dequantized weights (EP with world_size >= 4)
         - INT4 mode: Dequant + BF16 GEMM (standard path)
 
@@ -201,6 +202,10 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         Returns:
             Output [num_tokens, hidden_size]
         """
+        # Shared experts (expert_idx == -1) use native BF16 weights, not INT4
+        if self.expert_idx == -1:
+            return self.module(hidden_states)
+
         # Fast path: pre-dequantized BF16 weights (EP mode)
         if getattr(self, 'use_bf16_weights', False):
             return self._forward_bf16(hidden_states)
