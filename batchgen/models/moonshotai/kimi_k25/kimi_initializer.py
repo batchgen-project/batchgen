@@ -36,8 +36,7 @@ import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
-from .assets.configuration_kimi_k25 import KimiK25Config
-from .assets.configuration_deepseek import DeepseekV3Config
+from batchgen.models.deepseek.deepseekv3.configuration_deepseek_v3 import DeepseekV3Config
 from .planner import KimiK25Planner
 
 try:
@@ -57,17 +56,15 @@ class KimiK25Initializer:
     """
 
     def __init__(self, input_arguments):
-        # Load Kimi K2.5 config from assets and extract text_config for language model
-        # K2.5 uses DeepseekV3ForCausalLM for the language model
-        import os
-        from pathlib import Path
-
-        config_path = Path(__file__).parent / "assets" / "config.json"
-        full_config = KimiK25Config.from_pretrained(str(config_path.parent))
-
-        # Extract text_config (DeepseekV3Config) for the language model
-        # This has the correct K2.5 parameters (n_routed_experts=384, first_k_dense_replace=1, etc.)
-        self.loaded_model_config = full_config.text_config
+        # Create HuggingFace config for model instantiation.
+        # K2.5 uses DeepseekV3ForCausalLM, so use DeepseekV3Config with K2.5 overrides.
+        self.loaded_model_config = DeepseekV3Config(
+            n_routed_experts=384,
+            n_group=1,
+            topk_group=1,
+            rope_theta=50000.0,
+            first_k_dense_replace=1,  # K2.5 has 1 dense layer (layer 0), not 3
+        )
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
         self.loaded_model_config.architectures = ["DeepseekV3ForCausalLM"]
 
