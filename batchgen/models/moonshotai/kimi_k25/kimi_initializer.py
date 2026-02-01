@@ -191,12 +191,12 @@ class KimiK25Initializer:
             )
         )
 
-        # INT4 packing dimensions
+        # INT4 packing dimensions (int32 format: 8 INT4 values per word)
         hidden_size = 7168
         moe_intermediate = 2048
-        packed_hidden = hidden_size // 2       # 3584 (INT4 packed)
+        packed_hidden = hidden_size // 8       # 896 (INT4 packed in int32)
         scale_hidden = hidden_size // 32       # 224  (INT4 scale groups)
-        packed_intermediate = moe_intermediate // 2   # 1024
+        packed_intermediate = moe_intermediate // 8   # 256 (INT4 packed in int32)
         scale_intermediate = moe_intermediate // 32   # 64
 
         # Module shapes
@@ -211,7 +211,7 @@ class KimiK25Initializer:
                 "kv_b_proj.weight": [32768, 512],
                 "o_proj.weight": [7168, 16384],
             },
-            # Routed experts — INT4 packed (uint8) + scale (bf16)
+            # Routed experts — INT4 packed (int32) + scale (bf16)
             "routed_expert": {
                 "gate_proj.weight_packed": [moe_intermediate, packed_hidden],
                 "gate_proj.weight_scale": [moe_intermediate, scale_hidden],
