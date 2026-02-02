@@ -1254,14 +1254,15 @@ class DeepseekV3MoE_Decoding(nn.Module):
 			self.world_size  = dist.get_world_size()
 
 		self.experts_per_rank   = config.n_routed_experts // self.world_size
-		self.total_experts      = self.world_size * self.experts_per_rank
+		self.total_experts      = config.n_routed_experts
 		self.routed_expert_start_idx = self.rank * self.experts_per_rank
 		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
 
 		# --- experts, gate, shared MLP --------------------------------------
+		# EP: Each rank only creates its local experts
 		self.experts = nn.ModuleList([
 			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
-			for _ in range(self.total_experts)
+			for _ in range(self.experts_per_rank)
 		])
 		self.gate = MoEGate(config)
 		if config.n_shared_experts:
@@ -1773,14 +1774,15 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.world_size = dist.get_world_size()
 
 		self.experts_per_rank   = config.n_routed_experts // self.world_size
-		self.total_experts      = self.world_size * self.experts_per_rank
+		self.total_experts      = config.n_routed_experts
 		self.routed_expert_start_idx = self.rank * self.experts_per_rank
 		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
 
 		# --- experts, gate, shared MLP --------------------------------------
+		# EP: Each rank only creates its local experts
 		self.experts = nn.ModuleList([
 			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
-			for _ in range(self.total_experts)
+			for _ in range(self.experts_per_rank)
 		])
 		self.gate = MoEGate(config)
 		if config.n_shared_experts:
