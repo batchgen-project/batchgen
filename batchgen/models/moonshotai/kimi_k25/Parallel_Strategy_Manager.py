@@ -802,23 +802,24 @@ class KimiK25ParallelStrategyManager:
                 layer.mlp.shared_experts.up_weight_bf16 = layer.mlp.shared_experts.module.up_proj.weight.data
                 layer.mlp.shared_experts.down_weight_bf16 = layer.mlp.shared_experts.module.down_proj.weight.data
 
-            num_experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
-            # Debug: Log weight_copy_task size and indexing mode (only first MoE layer)
+            # Debug: Log weight_copy_task size (only first MoE layer)
             if layer_idx == self.loaded_model_config.first_k_dense_replace:
                 logging.info(f"Rank {self.rank} Layer {layer_idx}: weight_copy_task['routed_expert'] has {len(self.weight_copy_task['routed_expert'])} entries")
-                logging.info(f"Rank {self.rank} Layer {layer_idx}: layer.mlp.experts has {len(layer.mlp.experts)} experts")
+                logging.info(f"Rank {self.rank} Layer {layer_idx}: layer.mlp.experts has {len(layer.mlp.experts)} total slots")
                 logging.info(f"Rank {self.rank} Layer {layer_idx}: Phase={self.loaded_model_config.phase}")
-                if self.loaded_model_config.phase == "prefill":
-                    logging.info(f"Rank {self.rank} Layer {layer_idx}: Using pure DP indexing (global_expert_idx = local_expert_idx)")
-                else:
-                    logging.info(f"Rank {self.rank} Layer {layer_idx}: Using EP indexing (global_expert_idx = local_expert_idx + {self.global_rank * num_experts_per_rank})")
-            for local_expert_idx in range(len(layer.mlp.experts)):
-                # In prefill (pure DP): global_expert_idx = local_expert_idx (all ranks have experts 0-383)
-                # In decode (DP+EP): global_expert_idx = local_expert_idx + rank_offset
-                if self.loaded_model_config.phase == "prefill":
-                    global_expert_idx = local_expert_idx
-                else:
-                    global_expert_idx = local_expert_idx + (self.global_rank * num_experts_per_rank)
+
+            # Loop through all expert slots (384 total)
+            # In prefill: all slots are instantiated
+            # In decode: only local expert slots are instantiated (rest are None)
+            for expert_idx in range(len(layer.mlp.experts)):
+                expert = layer.mlp.experts[expert_idx]
+
+                # Skip None placeholders (EP mode - non-local experts)
+                if expert is None:
+                    continue
+
+                # Index in ModuleList IS the global expert index
+                global_expert_idx = expert_idx
 
                 # Routed expert: persistent if NOT in weight_copy_task
                 module_key = "routed_expert_" + str(layer_idx) + "_" + str(global_expert_idx)
@@ -827,12 +828,12 @@ class KimiK25ParallelStrategyManager:
                 else:
                     persistent = True
                     # Debug: Log first few persistent experts
-                    if layer_idx == self.loaded_model_config.first_k_dense_replace and local_expert_idx < 3:
+                    if layer_idx == self.loaded_model_config.first_k_dense_replace and global_expert_idx < 3:
                         logging.info(f"Rank {self.rank} Layer {layer_idx}: Expert {module_key} is PERSISTENT (not in weight_copy_task)")
 
                 # K2.5: No FP8 weight_dequant_scales
-                layer.mlp.experts[local_expert_idx] = KimiK25ExpertWrapper(
-                    layer.mlp.experts[local_expert_idx],
+                layer.mlp.experts[expert_idx] = KimiK25ExpertWrapper(
+                    expert,
                     layer_idx,
                     global_expert_idx,  # Use global index for wrapper
                     self.core_engine,
@@ -842,12 +843,12 @@ class KimiK25ParallelStrategyManager:
                 )
                 if persistent:
                     # Register INT4 weight pointers for persistent access
-                    layer.mlp.experts[local_expert_idx]._register_int4_weights()
+                    layer.mlp.experts[expert_idx]._register_int4_weights()
 
                     # Pre-dequant to BF16 if world_size >= 4
                     if pre_dequant:
                         from batchgen.quantization.int4 import int4_dequantize
-                        wrapper = layer.mlp.experts[local_expert_idx]
+                        wrapper = layer.mlp.experts[expert_idx]
                         wrapper.gate_weight_bf16 = int4_dequantize(
                             wrapper.int4_gate_packed, wrapper.int4_gate_scale
                         )

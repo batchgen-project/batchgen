@@ -1259,10 +1259,12 @@ class DeepseekV3MoE_Decoding(nn.Module):
 		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
 
 		# --- experts, gate, shared MLP --------------------------------------
-		# EP: Each rank only creates its local experts
+		# EP: Create placeholders for all experts, only instantiate local ones
 		self.experts = nn.ModuleList([
 			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
-			for _ in range(self.experts_per_rank)
+			if i >= self.routed_expert_start_idx and i < self.routed_expert_end_idx
+			else None
+			for i in range(self.total_experts)
 		])
 		self.gate = MoEGate(config)
 		if config.n_shared_experts:
@@ -1779,10 +1781,12 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
 
 		# --- experts, gate, shared MLP --------------------------------------
-		# EP: Each rank only creates its local experts
+		# EP: Create placeholders for all experts, only instantiate local ones
 		self.experts = nn.ModuleList([
 			DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
-			for _ in range(self.experts_per_rank)
+			if i >= self.routed_expert_start_idx and i < self.routed_expert_end_idx
+			else None
+			for i in range(self.total_experts)
 		])
 		self.gate = MoEGate(config)
 		if config.n_shared_experts:
