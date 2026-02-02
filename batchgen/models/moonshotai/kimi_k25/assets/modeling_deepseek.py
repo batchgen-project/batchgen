@@ -4193,8 +4193,9 @@ class DeepseekV3DecoderLayer(nn.Module):
 		if config.phase == "prefill":
 			cls = DeepseekV3MoE_Prefill
 		elif config.phase == "decode":
-			# K2.5 uses INT4 W4A16, not FP8 - use non-FP8 decoding class
-			cls = DeepseekV3MoE_Decoding
+			# K2.5 uses INT4 W4A16, not FP8
+			# Use FP8 class but with loop-based execution (works with any wrapper type)
+			cls = DeepseekV3MoE_Decoding_FP8
 		else:
 			cls = DeepseekV3MoE_Prefill
 		

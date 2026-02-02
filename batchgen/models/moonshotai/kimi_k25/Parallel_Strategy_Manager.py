@@ -377,18 +377,19 @@ class KimiK25ParallelStrategyManager:
         self._config_expert_module()
         self._config_lm_head_hook()
 
-        # Set EP offloading flag on MoE layers
-        if self.enable_ep_offloading:
-            for layer_idx in range(
-                self.loaded_model_config.first_k_dense_replace,
-                self.model_config.num_hidden_layers,
-            ):
-                layer = self.model.model.layers[layer_idx]
-                layer.mlp.enable_ep_offloading = True
-            logging.info(
-                f"Rank {self.rank}: Set enable_ep_offloading=True on MoE layers "
-                f"(layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1})"
-            )
+        # K2.5: Always use loop-based execution (not grouped GEMM)
+        # Loop-based execution works with INT4 wrappers (calls wrapper.forward())
+        # Grouped GEMM expects FP8 attributes which K2.5 doesn't have
+        for layer_idx in range(
+            self.loaded_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            layer = self.model.model.layers[layer_idx]
+            layer.mlp.enable_ep_offloading = True  # Forces loop-based execution
+        logging.info(
+            f"Rank {self.rank}: K2.5 using loop-based MoE execution (INT4 wrapper-compatible) "
+            f"for layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1}"
+        )
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
