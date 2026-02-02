@@ -339,16 +339,18 @@ class KimiK25ParallelStrategyManager:
                         "tensor_key": name,
                     }
 
-                # Loop over this rank's experts (global indices → local indices)
+                # Loop over this rank's experts (use global indices with placeholder structure)
                 expert_start_idx = self.global_rank * (NUM_TOTAL_EXPERTS // self.world_size)
                 expert_end_idx = expert_start_idx + (NUM_TOTAL_EXPERTS // self.world_size)
                 for global_expert_idx in range(expert_start_idx, expert_end_idx):
-                    local_expert_idx = global_expert_idx - expert_start_idx
-                    for name, _ in (
-                        self.model.model.layers[layer_idx]
-                        .mlp.experts[local_expert_idx]
-                        .named_parameters()
-                    ):
+                    # With placeholder structure, use global index directly
+                    expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
+
+                    # Skip None placeholders (shouldn't happen in this range, but defensive)
+                    if expert is None:
+                        continue
+
+                    for name, _ in expert.named_parameters():
                         tensor_full_name = (
                             "model.layers."
                             + str(layer_idx)
