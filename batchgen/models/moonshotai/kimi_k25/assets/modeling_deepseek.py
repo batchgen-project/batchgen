@@ -1253,7 +1253,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 			self.rank        = dist.get_rank()
 			self.world_size  = dist.get_world_size()
 
-		self.experts_per_rank   = 256 // self.world_size
+		self.experts_per_rank   = config.n_routed_experts // self.world_size
 		self.total_experts      = self.world_size * self.experts_per_rank
 		self.routed_expert_start_idx = self.rank * self.experts_per_rank
 		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank
@@ -1763,7 +1763,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		self.config = config
 		self.num_experts_per_tok = config.num_experts_per_tok
 		self.comm = comm
-		
+
 
 		# --- distributed/world metadata -------------------------------------
 		if not dist.is_initialized():
@@ -1772,7 +1772,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.rank = dist.get_rank()
 			self.world_size = dist.get_world_size()
 
-		self.experts_per_rank   = 256 // self.world_size
+		self.experts_per_rank   = config.n_routed_experts // self.world_size
 		self.total_experts      = self.world_size * self.experts_per_rank
 		self.routed_expert_start_idx = self.rank * self.experts_per_rank
 		self.routed_expert_end_idx   = (self.rank + 1) * self.experts_per_rank

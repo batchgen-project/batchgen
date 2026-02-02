@@ -847,7 +847,7 @@ class KimiK25ParallelStrategyManager:
                     # Pre-dequant to BF16 if world_size >= 4
                     if pre_dequant:
                         from batchgen.quantization.int4 import int4_dequantize
-                        wrapper = layer.mlp.experts[expert_idx]
+                        wrapper = layer.mlp.experts[local_expert_idx]
                         wrapper.gate_weight_bf16 = int4_dequantize(
                             wrapper.int4_gate_packed, wrapper.int4_gate_scale
                         )
