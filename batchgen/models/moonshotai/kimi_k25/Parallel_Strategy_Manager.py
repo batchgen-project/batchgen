@@ -380,12 +380,18 @@ class KimiK25ParallelStrategyManager:
         # K2.5: Always use loop-based execution (not grouped GEMM)
         # Loop-based execution works with INT4 wrappers (calls wrapper.forward())
         # Grouped GEMM expects FP8 attributes which K2.5 doesn't have
+
+        # Set PSM flag to skip grouped GEMM init in _init_mode_decoding
+        self.enable_ep_offloading = True
+
+        # Set per-layer flags to use loop-based execution in forward()
         for layer_idx in range(
             self.loaded_model_config.first_k_dense_replace,
             self.model_config.num_hidden_layers,
         ):
             layer = self.model.model.layers[layer_idx]
-            layer.mlp.enable_ep_offloading = True  # Forces loop-based execution
+            layer.mlp.enable_ep_offloading = True
+
         logging.info(
             f"Rank {self.rank}: K2.5 using loop-based MoE execution (INT4 wrapper-compatible) "
             f"for layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1}"
