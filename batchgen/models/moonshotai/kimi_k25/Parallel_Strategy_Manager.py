@@ -711,14 +711,19 @@ class KimiK25ParallelStrategyManager:
         """
         # Use model's current device (CPU during initial load, GPU after .to(device))
         device = next(self.model.parameters()).device
-        num_experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
         for routed_expert_idx in self.local_routed_experts:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
             layer_idx = int(routed_expert_idx.split("_")[2])
             global_expert_idx = int(routed_expert_idx.split("_")[3])
-            # Convert global expert index to local index (model only has local experts with EP)
-            local_expert_idx = global_expert_idx - (self.global_rank * num_experts_per_rank)
-            expert = self.model.model.layers[layer_idx].mlp.experts[local_expert_idx]
+
+            # With placeholder structure, use global index directly
+            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
+
+            if expert is None:
+                raise RuntimeError(
+                    f"Expert at global index {global_expert_idx} is None - "
+                    f"placeholder structure mismatch for rank {self.global_rank}"
+                )
 
             # Store INT4 packed/scale tensors as module attributes
             # The KimiK25ExpertWrapper._register_int4_weights() reads these
