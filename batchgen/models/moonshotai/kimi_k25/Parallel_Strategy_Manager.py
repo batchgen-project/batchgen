@@ -311,18 +311,6 @@ class KimiK25ParallelStrategyManager:
 
         self.weight_copy_task["routed_expert"] = self.host_routed_experts
 
-        # Log expert distribution
-        num_layers = self.model_config.num_hidden_layers - self.loaded_model_config.first_k_dense_replace
-        gpu_experts_per_layer = len(self.local_routed_experts) // num_layers
-        host_experts_per_layer = len(self.host_routed_experts) // num_layers
-        expert_size_mb = 23.6  # INT4 packed expert size
-        gpu_memory_gb = len(self.local_routed_experts) * expert_size_mb / 1024
-        logging.info(
-            f"Rank {self.rank}: Expert distribution - "
-            f"GPU: {gpu_experts_per_layer} experts/layer ({len(self.local_routed_experts)} total, {gpu_memory_gb:.1f} GB), "
-            f"Host: {host_experts_per_layer} experts/layer ({len(self.host_routed_experts)} total)"
-        )
-
         # Build state_dict_name_map (internal use only)
         for layer_idx in range(self.model_config.num_hidden_layers):
             for name, _ in self.model.model.layers[

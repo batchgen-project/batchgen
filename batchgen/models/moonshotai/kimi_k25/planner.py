@@ -42,44 +42,27 @@ class KimiK25Planner(BasePlanner):
     def _adjust_config_for_model(self):
         """K2.5-specific config adjustments.
 
-        K2.5 uses INT4 W4A16 experts which are ~23.6 MB each (not 2.4GB like FP8/BF16).
-        Calculate GPU-resident experts based on available memory.
+        K2.5 uses INT4 W4A16 experts which are ~30MB each (not 2.4GB like FP8/BF16).
+        Override expert memory calculations.
         """
-        # INT4 expert size per expert
-        expert_size_mb = 23.6
-        expert_per_rank = self.NUM_EXPERTS // self.world_size  # 48 per layer
-        num_moe_layers = 60  # Layers 1-60 have MoE
+        # INT4 expert size: ~30MB per expert (vs 2.4GB for FP8/BF16)
+        # With 384 experts / 8 ranks = 48 experts per rank
+        # 48 * 0.03GB = 1.44GB total expert cache (fits easily in GPU memory)
+        expert_per_rank = self.NUM_EXPERTS // self.world_size  # 48
 
-        # Total memory for all experts per rank
-        total_expert_memory_gb = (expert_per_rank * num_moe_layers * expert_size_mb) / 1024
-        # 48 * 60 * 23.6 MB = 68 GB for all experts
+        # For K2.5 INT4, all experts can fit in GPU memory
+        # Override the memory-based calculation from base class
+        self.config.EP_Config.num_local_expert_per_layer = expert_per_rank
 
-        # Estimate available GPU memory (conservative: 20 GB for experts after model/activations)
-        # In practice, adjust based on actual free memory at runtime
-        available_expert_memory_gb = 20.0
-
-        if total_expert_memory_gb <= available_expert_memory_gb:
-            # All experts fit on GPU
-            num_local_expert_per_layer = expert_per_rank
-            enable_offloading = False
-        else:
-            # Need offloading - calculate how many experts fit on GPU per layer
-            max_total_experts = int((available_expert_memory_gb * 1024) / expert_size_mb)
-            num_local_expert_per_layer = max_total_experts // num_moe_layers
-            enable_offloading = True
-
-        self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
-        self.config.EP_Config.enable_offloading = enable_offloading
-        self.config.EP_Config.offloading_ratio = (expert_per_rank - num_local_expert_per_layer) / expert_per_rank
-
-        # Offloading buffers for non-persistent experts
-        if enable_offloading:
-            self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 2
-        else:
-            self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
+        # No need for expert offloading buffers - all experts are persistent
+        self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
 
         # K2.5 requires attn_mode=3 for modern decoding path (decoding_continuous)
+        # Override base planner logic that sets attn_mode=1 when enable_offloading=False
         self.config.Basic_Config.attn_mode = 3
+
+        # EP offloading is disabled for K2.5 (all experts resident on GPU)
+        self.config.EP_Config.enable_offloading = False
 
     def get_module_shapes(self) -> dict:
         """Return Kimi K2.5 specific tensor shapes."""
