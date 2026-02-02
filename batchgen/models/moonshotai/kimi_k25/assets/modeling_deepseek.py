@@ -891,13 +891,18 @@ class MoEGate(nn.Module):
 	def moe_gate_forward_hybrid(self, hidden_states):
 		"""Hybrid: PyTorch matmul + sigmoid, then custom kernel"""
 		bsz, seq_len, h = hidden_states.shape
-		
+
+		# K2.5 uses n_group=1, topk_group=1 which the custom kernel doesn't support
+		# Fall back to pure PyTorch implementation
+		if self.n_group == 1 and self.topk_group == 1:
+			return self._decoding_forward(hidden_states)
+
 		# PyTorch handles heavy lifting
 		hidden_states_flat = hidden_states.view(-1, h)
 		logits = F.linear(hidden_states_flat.float(), self.weight.float(), None)
 		scores = torch.sigmoid(logits)
-		
-		# Custom kernel handles MoE routing
+
+		# Custom kernel handles MoE routing (DeepSeek-V3: n_group=8, topk_group=4)
 		topk_idx, topk_weight = moe_fused_gate(
 			scores,
 			self.e_score_correction_bias,
@@ -907,7 +912,7 @@ class MoEGate(nn.Module):
 			self.top_k,
 			self.routed_scaling_factor
 		)
-		
+
 		return topk_idx, topk_weight
 	
 	@torch.inference_mode()
