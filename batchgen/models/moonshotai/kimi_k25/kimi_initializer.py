@@ -202,15 +202,15 @@ class KimiK25Initializer:
 
         # Module shapes
         self.engine_config.GPU_Buffer_Config.module_shapes = {
-            # MLA attention — same as DeepSeek-V3 (BF16)
+            # MLA attention — K2.5 has 64 heads (vs DeepSeek-V3's 128 heads)
             "attn": {
-                "q_a_proj.weight": [1536, 7168],
+                "q_a_proj.weight": [1536, 7168],  # q_lora_rank × hidden_size
                 "q_a_layernorm.weight": [1536],
-                "q_b_proj.weight": [24576, 1536],
-                "kv_a_proj_with_mqa.weight": [576, 7168],
+                "q_b_proj.weight": [12288, 1536],  # (64 heads × 192 dim) × q_lora_rank
+                "kv_a_proj_with_mqa.weight": [576, 7168],  # compressed_kv_dim × hidden_size
                 "kv_a_layernorm.weight": [512],
-                "kv_b_proj.weight": [32768, 512],
-                "o_proj.weight": [7168, 16384],
+                "kv_b_proj.weight": [16384, 512],  # (64 heads × 256 dim) × kv_lora_rank
+                "o_proj.weight": [7168, 8192],  # hidden_size × (64 heads × 128 v_dim)
             },
             # Routed experts — INT4 packed (int32) + scale (bf16)
             "routed_expert": {
