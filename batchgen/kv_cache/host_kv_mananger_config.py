@@ -246,9 +246,10 @@ def build_gpu_kv_config_fixed_size(
 	from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 	
 	# Get model-specific KV dimensions
-	if "deepseek" in model_name.lower():
-		# DeepSeek MLA: compressed KV
-		kv_dim = 512  # compressed_kv_dim
+	if "deepseek" in model_name.lower() or "kimi" in model_name.lower():
+		# DeepSeek-V3 / Kimi K2.5 MLA: compressed KV
+		# compressed_kv_dim = kv_lora_rank + qk_rope_head_dim = 512 + 64 = 576
+		kv_dim = 576  # compressed_kv_dim (was 512 - bug fix)
 		num_layers = 61
 		dtype_bytes = 2  # bfloat16
 	elif "gpt-oss-120b" in model_name.lower():
