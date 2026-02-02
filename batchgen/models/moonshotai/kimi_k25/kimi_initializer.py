@@ -64,6 +64,7 @@ class KimiK25Initializer:
             topk_group=1,
             rope_theta=50000.0,
             first_k_dense_replace=1,  # K2.5 has 1 dense layer (layer 0), not 3
+            num_attention_heads=64,  # K2.5 has 64 heads (vs 128 for DeepSeek-V3)
         )
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
         self.loaded_model_config.architectures = ["DeepseekV3ForCausalLM"]
