@@ -803,18 +803,23 @@ class KimiK25ParallelStrategyManager:
                 layer.mlp.shared_experts.down_weight_bf16 = layer.mlp.shared_experts.module.down_proj.weight.data
 
             num_experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
+            # Debug: Log weight_copy_task size
+            if layer_idx == 1 and self.rank == 0:
+                logging.info(f"Rank {self.rank}: weight_copy_task['routed_expert'] has {len(self.weight_copy_task['routed_expert'])} entries")
+                logging.info(f"Rank {self.rank}: layer.mlp.experts has {len(layer.mlp.experts)} experts")
             for local_expert_idx in range(len(layer.mlp.experts)):
                 # Convert local expert index to global index for weight_copy_task lookup
                 global_expert_idx = local_expert_idx + (self.global_rank * num_experts_per_rank)
 
                 # Routed expert: persistent if NOT in weight_copy_task
-                if (
-                    "routed_expert_" + str(layer_idx) + "_" + str(global_expert_idx)
-                    in self.weight_copy_task["routed_expert"]
-                ):
+                module_key = "routed_expert_" + str(layer_idx) + "_" + str(global_expert_idx)
+                if module_key in self.weight_copy_task["routed_expert"]:
                     persistent = False
                 else:
                     persistent = True
+                    # Debug: Log why expert is persistent
+                    if layer_idx == 1 and local_expert_idx < 5:
+                        logging.info(f"Rank {self.rank}: Expert {module_key} is PERSISTENT (not in weight_copy_task)")
 
                 # K2.5: No FP8 weight_dequant_scales
                 layer.mlp.experts[local_expert_idx] = KimiK25ExpertWrapper(
