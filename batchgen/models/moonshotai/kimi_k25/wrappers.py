@@ -265,22 +265,23 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         if x.dim() == 3:
             x = x.view(-1, x.shape[-1])
 
-        # Dequantize INT4 → BF16
+        # Dequantize INT4 → BF16 and move to input device
+        device = x.device
         gate_weight = self.dequant_fn(
             weights["gate_proj.weight_packed"],
             weights["gate_proj.weight_scale"],
             torch.bfloat16,
-        )
+        ).to(device)
         up_weight = self.dequant_fn(
             weights["up_proj.weight_packed"],
             weights["up_proj.weight_scale"],
             torch.bfloat16,
-        )
+        ).to(device)
         down_weight = self.dequant_fn(
             weights["down_proj.weight_packed"],
             weights["down_proj.weight_scale"],
             torch.bfloat16,
-        )
+        ).to(device)
 
         # Gate and Up projections
         gate_out = torch.mm(x, gate_weight.T)
