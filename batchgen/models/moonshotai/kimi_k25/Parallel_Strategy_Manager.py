@@ -400,6 +400,9 @@ class KimiK25ParallelStrategyManager:
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
 
+        # Move INT4 custom attributes to GPU (they don't auto-move with model.to())
+        self._move_int4_weights_to_gpu()
+
         if self.rank == 0:
             used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
             logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
@@ -743,6 +746,34 @@ class KimiK25ParallelStrategyManager:
             expert.int4_down_scale = tensors["down_proj.weight_scale"].to(device)
 
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
+
+    def _move_int4_weights_to_gpu(self):
+        """Move INT4 packed/scale attributes to GPU after model.to(device).
+
+        INT4 attributes are custom attributes (not nn.Parameters), so they don't
+        get automatically moved when model.to(device) is called. We must manually
+        move them after the model is placed on GPU.
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        for routed_expert_idx in self.local_routed_experts:
+            layer_idx = int(routed_expert_idx.split("_")[2])
+            global_expert_idx = int(routed_expert_idx.split("_")[3])
+
+            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
+
+            if expert is None:
+                continue
+
+            # Move INT4 attributes to GPU if they exist and are on CPU
+            if hasattr(expert, 'int4_gate_packed') and expert.int4_gate_packed.device.type == 'cpu':
+                expert.int4_gate_packed = expert.int4_gate_packed.to(device)
+                expert.int4_gate_scale = expert.int4_gate_scale.to(device)
+                expert.int4_up_packed = expert.int4_up_packed.to(device)
+                expert.int4_up_scale = expert.int4_up_scale.to(device)
+                expert.int4_down_packed = expert.int4_down_packed.to(device)
+                expert.int4_down_scale = expert.int4_down_scale.to(device)
+
+        logging.debug(f"INT4 weights moved to GPU for {len(self.local_routed_experts)} experts")
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, router) to model.
