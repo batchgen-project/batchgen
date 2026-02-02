@@ -802,10 +802,14 @@ class KimiK25ParallelStrategyManager:
                 layer.mlp.shared_experts.up_weight_bf16 = layer.mlp.shared_experts.module.up_proj.weight.data
                 layer.mlp.shared_experts.down_weight_bf16 = layer.mlp.shared_experts.module.down_proj.weight.data
 
-            for expert_idx in range(len(layer.mlp.experts)):
+            num_experts_per_rank = NUM_TOTAL_EXPERTS // self.world_size
+            for local_expert_idx in range(len(layer.mlp.experts)):
+                # Convert local expert index to global index for weight_copy_task lookup
+                global_expert_idx = local_expert_idx + (self.global_rank * num_experts_per_rank)
+
                 # Routed expert: persistent if NOT in weight_copy_task
                 if (
-                    "routed_expert_" + str(layer_idx) + "_" + str(expert_idx)
+                    "routed_expert_" + str(layer_idx) + "_" + str(global_expert_idx)
                     in self.weight_copy_task["routed_expert"]
                 ):
                     persistent = False
@@ -813,10 +817,10 @@ class KimiK25ParallelStrategyManager:
                     persistent = True
 
                 # K2.5: No FP8 weight_dequant_scales
-                layer.mlp.experts[expert_idx] = KimiK25ExpertWrapper(
-                    layer.mlp.experts[expert_idx],
+                layer.mlp.experts[local_expert_idx] = KimiK25ExpertWrapper(
+                    layer.mlp.experts[local_expert_idx],
                     layer_idx,
-                    expert_idx,
+                    global_expert_idx,  # Use global index for wrapper
                     self.core_engine,
                     self.engine_config,
                     self.model_config,
@@ -824,7 +828,7 @@ class KimiK25ParallelStrategyManager:
                 )
                 if persistent:
                     # Register INT4 weight pointers for persistent access
-                    layer.mlp.experts[expert_idx]._register_int4_weights()
+                    layer.mlp.experts[local_expert_idx]._register_int4_weights()
 
                     # Pre-dequant to BF16 if world_size >= 4
                     if pre_dequant:
