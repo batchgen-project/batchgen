@@ -775,7 +775,10 @@ class KimiK25ParallelStrategyManager:
         - Pre-dequant to BF16 when world_size >= 4 (via use_bf16_weights flag)
         """
         start_time = time.perf_counter()
-        pre_dequant = (self.world_size >= 4)  # Pre-dequant for EP with many GPUs
+        # DISABLED: Pre-dequant on CPU is extremely slow (1-2s per expert)
+        # With 48 experts * 60 layers = 2880 experts per rank, this would take hours
+        # Dequantization happens on-demand during inference via wrapper
+        pre_dequant = False
 
         for layer_idx in range(
             self.loaded_model_config.first_k_dense_replace,
