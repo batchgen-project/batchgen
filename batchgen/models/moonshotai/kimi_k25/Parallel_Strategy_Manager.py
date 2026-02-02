@@ -398,14 +398,32 @@ class KimiK25ParallelStrategyManager:
         )
 
         self.model.eval()
+
+        # Log memory before model.to(device)
+        if self.rank == 0:
+            mem_before = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
+            logging.info(f"[MODEL] GPU memory BEFORE model.to(device): {mem_before / (1024**3):.2f} GB")
+
         self.model.to(self.engine_config.Basic_Config.device_torch)
 
+        # Log memory after model.to(device)
+        if self.rank == 0:
+            mem_after = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
+            model_size = (mem_after - mem_before) / (1024**3)
+            logging.info(f"[MODEL] GPU memory AFTER model.to(device): {mem_after / (1024**3):.2f} GB (model size: {model_size:.2f} GB)")
+
+            # Log what's in the model
+            total_params = sum(p.numel() * p.element_size() for p in self.model.parameters()) / (1024**3)
+            logging.info(f"[MODEL] Total model parameters size: {total_params:.2f} GB")
+
         # Move INT4 custom attributes to GPU (they don't auto-move with model.to())
+        if self.rank == 0:
+            logging.info(f"[MODEL] Moving INT4 weights to GPU (expected: ~68 GB for 2880 experts)")
         self._move_int4_weights_to_gpu()
 
         if self.rank == 0:
             used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-            logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
+            logging.info(f"[MODEL] GPU memory after INT4 weights moved: {used_memory / (1024**3):.2f} GB")
 
         # Initialize MoE layers for decoding
         self._init_mode_decoding()
@@ -744,6 +762,17 @@ class KimiK25ParallelStrategyManager:
             expert.int4_up_scale = tensors["up_proj.weight_scale"].to(device)
             expert.int4_down_packed = tensors["down_proj.weight_packed"].to(device)
             expert.int4_down_scale = tensors["down_proj.weight_scale"].to(device)
+
+            # Delete unused nn.Linear default weights to save memory
+            # These are created during DeepseekV3MLP.__init__ but never used
+            # (we use INT4 weights instead). Each expert has ~84 MB of unused BF16 weights.
+            # Deleting them saves: 2880 experts × 84 MB = 241 GB
+            del expert.gate_proj.weight
+            del expert.up_proj.weight
+            del expert.down_proj.weight
+            expert.gate_proj.weight = None
+            expert.up_proj.weight = None
+            expert.down_proj.weight = None
 
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
 
