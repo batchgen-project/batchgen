@@ -57,6 +57,13 @@ class KimiK25Planner(BasePlanner):
         # No need for expert offloading buffers - all experts are persistent
         self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
 
+        # K2.5 requires attn_mode=3 for modern decoding path (decoding_continuous)
+        # Override base planner logic that sets attn_mode=1 when enable_offloading=False
+        self.config.Basic_Config.attn_mode = 3
+
+        # EP offloading is disabled for K2.5 (all experts resident on GPU)
+        self.config.EP_Config.enable_offloading = False
+
     def get_module_shapes(self) -> dict:
         """Return Kimi K2.5 specific tensor shapes."""
         return {
