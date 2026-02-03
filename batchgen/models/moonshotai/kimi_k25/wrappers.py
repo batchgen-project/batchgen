@@ -125,10 +125,10 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         return result
 
     def _get_stored_int4_weights(self) -> Dict[str, torch.Tensor]:
-        """Get INT4 weights from module buffers (persistent mode).
+        """Get INT4 weights from the underlying expert module (persistent mode).
 
         Accesses weights through self.module to always get the current device
-        tensors — buffers are moved by model.to(device) automatically.
+        tensors (GPU views after _move_int4_to_gpu_contiguous).
         """
         return {
             "gate_proj.weight_packed": self.module.int4_gate_packed,

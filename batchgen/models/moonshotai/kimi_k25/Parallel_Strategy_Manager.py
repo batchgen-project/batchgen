@@ -431,54 +431,22 @@ class KimiK25ParallelStrategyManager:
 
         self.model.eval()
 
-        # Log model component sizes on CPU before moving to GPU
-        if self.rank == 0:
-            param_bytes = 0
-            buf_bytes = 0
-            int4_buf_bytes = 0
-            other_buf_bytes = 0
-            for name, p in self.model.named_parameters():
-                param_bytes += p.numel() * p.element_size()
-            for name, b in self.model.named_buffers():
-                size = b.numel() * b.element_size()
-                buf_bytes += size
-                if 'int4' in name:
-                    int4_buf_bytes += size
-                else:
-                    other_buf_bytes += size
-            logging.info(
-                f"[MODEL] CPU model breakdown before .to(device): "
-                f"params={param_bytes / (1024**3):.2f} GiB, "
-                f"INT4 buffers={int4_buf_bytes / (1024**3):.2f} GiB, "
-                f"other buffers={other_buf_bytes / (1024**3):.2f} GiB, "
-                f"total={( param_bytes + buf_bytes) / (1024**3):.2f} GiB"
-            )
-
         device = self.engine_config.Basic_Config.device_torch
-        alloc_pre = torch.cuda.memory_allocated(device)
-        reserved_pre = torch.cuda.memory_reserved(device)
-        logging.info(
-            f"Rank {self.rank}: HBM before model.to(): "
-            f"allocated={alloc_pre / (1024**3):.2f} GiB, "
-            f"reserved={reserved_pre / (1024**3):.2f} GiB"
-        )
 
-        # INT4 weights are registered as buffers, so model.to(device) moves
-        # everything (params + INT4 buffers) to GPU in a single efficient pass.
+        # model.to(device) moves only nn.Parameters (skeleton params still on CPU).
+        # Attn + shared expert params are already on GPU from _load_*_module().
+        # INT4 weights are plain attributes — NOT moved by model.to().
         self.model.to(device)
+        _log_hbm("model.to (params only)")
+
+        # Move INT4 weights to GPU using 2 contiguous allocations (not 17,280 individual ones).
+        # This avoids ~20 GiB CUDA allocator fragmentation from small scale tensors.
+        self._move_int4_to_gpu_contiguous()
+        _log_hbm("_move_int4_to_gpu_contiguous")
 
         # Pre-dequant persistent experts to BF16 (if world_size >= 4).
-        # Must happen after model.to(device) so dequant runs on GPU.
+        # Must happen after INT4 weights are on GPU.
         self._pre_dequant_experts()
-
-        alloc_post = torch.cuda.memory_allocated(device)
-        reserved_post = torch.cuda.memory_reserved(device)
-        logging.info(
-            f"Rank {self.rank}: HBM after model.to(): "
-            f"allocated={alloc_post / (1024**3):.2f} GiB, "
-            f"reserved={reserved_post / (1024**3):.2f} GiB, "
-            f"model_on_gpu={(alloc_post - alloc_pre) / (1024**3):.2f} GiB"
-        )
 
         # Initialize MoE layers for decoding
         self._init_mode_decoding()
@@ -789,8 +757,8 @@ class KimiK25ParallelStrategyManager:
         """Load INT4 packed/scale tensors for persistent (GPU-resident) routed experts.
 
         For K2.5, routed expert weights are INT4 packed (int32) + scale (bf16).
-        Following the DeepSeek V3 pattern: weights are registered as module buffers
-        so model.to(device) moves them to GPU in a single efficient pass.
+        Weights are loaded to CPU first, then moved to GPU in bulk via
+        _move_int4_to_gpu_contiguous() to avoid CUDA allocator fragmentation.
         """
         for routed_expert_idx in self.local_routed_experts:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
@@ -806,7 +774,7 @@ class KimiK25ParallelStrategyManager:
                     f"placeholder structure mismatch for rank {self.global_rank}"
                 )
 
-            # Delete unused nn.Linear default weights before registering INT4 buffers.
+            # Delete unused nn.Linear default weights.
             # These are created during DeepseekV3MLP.__init__ but never used
             # (we use INT4 weights instead).
             del expert.gate_proj.weight
@@ -816,16 +784,86 @@ class KimiK25ParallelStrategyManager:
             expert.up_proj.weight = None
             expert.down_proj.weight = None
 
-            # Register INT4 packed/scale tensors as non-persistent buffers.
-            # persistent=False: moved by model.to(device), but not in state_dict.
-            expert.register_buffer('int4_gate_packed', tensors["gate_proj.weight_packed"], persistent=False)
-            expert.register_buffer('int4_gate_scale', tensors["gate_proj.weight_scale"], persistent=False)
-            expert.register_buffer('int4_up_packed', tensors["up_proj.weight_packed"], persistent=False)
-            expert.register_buffer('int4_up_scale', tensors["up_proj.weight_scale"], persistent=False)
-            expert.register_buffer('int4_down_packed', tensors["down_proj.weight_packed"], persistent=False)
-            expert.register_buffer('int4_down_scale', tensors["down_proj.weight_scale"], persistent=False)
+            # Store INT4 packed/scale tensors on CPU as plain attributes.
+            # They will be moved to GPU in bulk by _move_int4_to_gpu_contiguous().
+            expert.int4_gate_packed = tensors["gate_proj.weight_packed"]
+            expert.int4_gate_scale = tensors["gate_proj.weight_scale"]
+            expert.int4_up_packed = tensors["up_proj.weight_packed"]
+            expert.int4_up_scale = tensors["up_proj.weight_scale"]
+            expert.int4_down_packed = tensors["down_proj.weight_packed"]
+            expert.int4_down_scale = tensors["down_proj.weight_scale"]
 
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
+
+    def _move_int4_to_gpu_contiguous(self):
+        """Move all INT4 expert weights to GPU using 2 contiguous allocations.
+
+        Instead of 17,280 individual .to(device) calls (which fragments the CUDA
+        allocator by ~20 GiB due to block rounding on small scale tensors), we:
+        1. Pre-allocate one contiguous int32 buffer for all packed weights
+        2. Pre-allocate one contiguous bf16 buffer for all scale weights
+        3. Copy CPU tensors into slices, replace attributes with GPU views
+
+        This reduces GPU allocations from 17,280 to 2, eliminating fragmentation.
+        """
+        device = self.engine_config.Basic_Config.device_torch
+
+        # Collect all INT4 tensors and compute total sizes
+        # Each entry: (expert_module, attr_name, cpu_tensor)
+        packed_entries = []
+        scale_entries = []
+
+        for routed_expert_idx in self.local_routed_experts:
+            layer_idx = int(routed_expert_idx.split("_")[2])
+            global_expert_idx = int(routed_expert_idx.split("_")[3])
+            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
+            if expert is None:
+                continue
+            # After wrapping, expert is a KimiK25ExpertWrapper — get underlying module
+            module = expert.module if hasattr(expert, 'module') else expert
+
+            for proj in ('gate', 'up', 'down'):
+                packed_attr = f'int4_{proj}_packed'
+                scale_attr = f'int4_{proj}_scale'
+                packed_entries.append((module, packed_attr, getattr(module, packed_attr)))
+                scale_entries.append((module, scale_attr, getattr(module, scale_attr)))
+
+        # Pre-allocate contiguous GPU buffers
+        total_packed_numel = sum(t.numel() for _, _, t in packed_entries)
+        total_scale_numel = sum(t.numel() for _, _, t in scale_entries)
+
+        packed_gpu_buf = torch.empty(total_packed_numel, dtype=torch.int32, device=device)
+        scale_gpu_buf = torch.empty(total_scale_numel, dtype=torch.bfloat16, device=device)
+
+        if self.rank == 0:
+            logging.info(
+                f"[MODEL] INT4 contiguous GPU buffers: "
+                f"packed={total_packed_numel * 4 / (1024**3):.2f} GiB, "
+                f"scale={total_scale_numel * 2 / (1024**3):.2f} GiB"
+            )
+
+        # Copy CPU tensors into GPU buffer slices, replace attributes with views
+        offset = 0
+        for module, attr_name, cpu_tensor in packed_entries:
+            n = cpu_tensor.numel()
+            gpu_view = packed_gpu_buf[offset:offset + n].view(cpu_tensor.shape)
+            gpu_view.copy_(cpu_tensor)
+            setattr(module, attr_name, gpu_view)
+            offset += n
+
+        offset = 0
+        for module, attr_name, cpu_tensor in scale_entries:
+            n = cpu_tensor.numel()
+            gpu_view = scale_gpu_buf[offset:offset + n].view(cpu_tensor.shape)
+            gpu_view.copy_(cpu_tensor)
+            setattr(module, attr_name, gpu_view)
+            offset += n
+
+        # Keep references to prevent GC of the backing buffers
+        self._int4_packed_gpu_buf = packed_gpu_buf
+        self._int4_scale_gpu_buf = scale_gpu_buf
+
+        logging.debug(f"INT4 weights moved to GPU contiguously for {len(self.local_routed_experts)} experts")
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, router) to model.
