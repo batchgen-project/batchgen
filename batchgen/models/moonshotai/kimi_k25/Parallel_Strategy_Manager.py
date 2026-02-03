@@ -444,10 +444,6 @@ class KimiK25ParallelStrategyManager:
         self._move_int4_to_gpu_contiguous()
         _log_hbm("_move_int4_to_gpu_contiguous")
 
-        # Pre-dequant persistent experts to BF16 (if world_size >= 4).
-        # Must happen after INT4 weights are on GPU.
-        self._pre_dequant_experts()
-
         # Initialize MoE layers for decoding
         self._init_mode_decoding()
         effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
@@ -983,46 +979,6 @@ class KimiK25ParallelStrategyManager:
         logging.debug(
             f"Expert module configuration time: {end_time - start_time:.2f} seconds"
         )
-
-    def _pre_dequant_experts(self):
-        """Pre-dequantize persistent INT4 expert weights to BF16.
-
-        Called AFTER model.to(device) so INT4 buffers are on GPU and
-        the dequantized BF16 weights are created directly on GPU.
-        Only used when world_size >= 4.
-        """
-        if self.world_size < 4:
-            return
-
-        from batchgen.quantization.int4 import int4_dequantize
-        count = 0
-        for layer_idx in range(
-            self.loaded_model_config.first_k_dense_replace,
-            self.model_config.num_hidden_layers,
-        ):
-            layer = self.model.model.layers[layer_idx]
-            for expert_idx in range(len(layer.mlp.experts)):
-                wrapper = layer.mlp.experts[expert_idx]
-                if wrapper is None:
-                    continue
-                if not getattr(wrapper, 'persistent', False):
-                    continue
-                # Access INT4 buffers via the underlying module (now on GPU)
-                module = wrapper.module
-                wrapper.gate_weight_bf16 = int4_dequantize(
-                    module.int4_gate_packed, module.int4_gate_scale
-                )
-                wrapper.up_weight_bf16 = int4_dequantize(
-                    module.int4_up_packed, module.int4_up_scale
-                )
-                wrapper.down_weight_bf16 = int4_dequantize(
-                    module.int4_down_packed, module.int4_down_scale
-                )
-                wrapper.use_bf16_weights = True
-                count += 1
-
-        if count > 0:
-            logging.info(f"Rank {self.rank}: Pre-dequantized {count} experts to BF16")
 
     def _lm_head_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)
