@@ -378,15 +378,36 @@ class KimiK25ParallelStrategyManager:
                             "tensor_key": name,
                         }
 
-        # Load weights and configure modules
+        # Load weights and configure modules — log HBM after each step to find leaks
+        device = self.engine_config.Basic_Config.device_torch
+        def _log_hbm(step_name):
+            a = torch.cuda.memory_allocated(device) / (1024**3)
+            r = torch.cuda.memory_reserved(device) / (1024**3)
+            logging.info(f"Rank {self.rank}: HBM after {step_name}: allocated={a:.2f} GiB, reserved={r:.2f} GiB")
+
         torch.cuda.empty_cache()
+        _log_hbm("empty_cache")
+
         self._load_model_skeleton()
+        _log_hbm("_load_model_skeleton")
+
         self._load_local_routed_experts()
+        _log_hbm("_load_local_routed_experts")
+
         self._load_attn_module()
+        _log_hbm("_load_attn_module")
+
         self._load_shared_expert_module()
+        _log_hbm("_load_shared_expert_module")
+
         self._config_attn_module()
+        _log_hbm("_config_attn_module")
+
         self._config_expert_module()
+        _log_hbm("_config_expert_module")
+
         self._config_lm_head_hook()
+        _log_hbm("_config_lm_head_hook")
 
         # K2.5: Always use loop-based execution (not grouped GEMM)
         # Loop-based execution works with INT4 wrappers (calls wrapper.forward())
