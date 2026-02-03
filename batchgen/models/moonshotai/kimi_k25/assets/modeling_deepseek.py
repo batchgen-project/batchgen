@@ -2057,7 +2057,7 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 
 			# Weighted accumulation into results
 			weighted_output = expert_output * expert_weights.unsqueeze(-1)
-			global_results.index_add_(0, expert_token_idx, weighted_output)
+			global_results.index_add_(0, expert_token_idx, weighted_output.float())
 
 		global_results = global_results.to(torch.bfloat16)
 
