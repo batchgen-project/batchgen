@@ -227,9 +227,15 @@ class KimiK25ParallelStrategyManager:
         self.loaded_model_config._attn_implementation = "eager"
         self.loaded_model_config.ep_size = self.world_size
 
-        # Log GPU memory before deep free
-        free_mem_before, total_mem = torch.cuda.mem_get_info(self.engine_config.Basic_Config.device)
-        logging.info(f"Rank {self.rank}: GPU memory BEFORE deep free: {free_mem_before / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total")
+        # Log GPU memory before deep free (use GiB = /1024^3, matching PyTorch OOM messages)
+        device = self.engine_config.Basic_Config.device_torch
+        alloc_before = torch.cuda.memory_allocated(device)
+        reserved_before = torch.cuda.memory_reserved(device)
+        logging.info(
+            f"Rank {self.rank}: HBM BEFORE deep free: "
+            f"allocated={alloc_before / (1024**3):.2f} GiB, "
+            f"reserved={reserved_before / (1024**3):.2f} GiB"
+        )
 
         # Deep free prefill model before loading decode model
         if self.model is not None:
@@ -241,9 +247,14 @@ class KimiK25ParallelStrategyManager:
         torch.cuda.synchronize()
 
         # Log GPU memory after deep free
-        free_mem_after, _ = torch.cuda.mem_get_info(self.engine_config.Basic_Config.device)
-        logging.info(f"Rank {self.rank}: GPU memory AFTER deep free: {free_mem_after / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total")
-        logging.info(f"Rank {self.rank}: Memory freed by deep free: {(free_mem_after - free_mem_before) / 1e9:.2f} GB")
+        alloc_after = torch.cuda.memory_allocated(device)
+        reserved_after = torch.cuda.memory_reserved(device)
+        logging.info(
+            f"Rank {self.rank}: HBM AFTER deep free: "
+            f"allocated={alloc_after / (1024**3):.2f} GiB, "
+            f"reserved={reserved_after / (1024**3):.2f} GiB, "
+            f"freed={(alloc_before - alloc_after) / (1024**3):.2f} GiB"
+        )
 
         # Create model on CPU first to avoid GPU memory allocation
         with torch.device('cpu'):
@@ -399,17 +410,54 @@ class KimiK25ParallelStrategyManager:
 
         self.model.eval()
 
+        # Log model component sizes on CPU before moving to GPU
+        if self.rank == 0:
+            param_bytes = 0
+            buf_bytes = 0
+            int4_buf_bytes = 0
+            other_buf_bytes = 0
+            for name, p in self.model.named_parameters():
+                param_bytes += p.numel() * p.element_size()
+            for name, b in self.model.named_buffers():
+                size = b.numel() * b.element_size()
+                buf_bytes += size
+                if 'int4' in name:
+                    int4_buf_bytes += size
+                else:
+                    other_buf_bytes += size
+            logging.info(
+                f"[MODEL] CPU model breakdown before .to(device): "
+                f"params={param_bytes / (1024**3):.2f} GiB, "
+                f"INT4 buffers={int4_buf_bytes / (1024**3):.2f} GiB, "
+                f"other buffers={other_buf_bytes / (1024**3):.2f} GiB, "
+                f"total={( param_bytes + buf_bytes) / (1024**3):.2f} GiB"
+            )
+
+        device = self.engine_config.Basic_Config.device_torch
+        alloc_pre = torch.cuda.memory_allocated(device)
+        reserved_pre = torch.cuda.memory_reserved(device)
+        logging.info(
+            f"Rank {self.rank}: HBM before model.to(): "
+            f"allocated={alloc_pre / (1024**3):.2f} GiB, "
+            f"reserved={reserved_pre / (1024**3):.2f} GiB"
+        )
+
         # INT4 weights are registered as buffers, so model.to(device) moves
         # everything (params + INT4 buffers) to GPU in a single efficient pass.
-        self.model.to(self.engine_config.Basic_Config.device_torch)
+        self.model.to(device)
 
         # Pre-dequant persistent experts to BF16 (if world_size >= 4).
         # Must happen after model.to(device) so dequant runs on GPU.
         self._pre_dequant_experts()
 
-        if self.rank == 0:
-            used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-            logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
+        alloc_post = torch.cuda.memory_allocated(device)
+        reserved_post = torch.cuda.memory_reserved(device)
+        logging.info(
+            f"Rank {self.rank}: HBM after model.to(): "
+            f"allocated={alloc_post / (1024**3):.2f} GiB, "
+            f"reserved={reserved_post / (1024**3):.2f} GiB, "
+            f"model_on_gpu={(alloc_post - alloc_pre) / (1024**3):.2f} GiB"
+        )
 
         # Initialize MoE layers for decoding
         self._init_mode_decoding()
