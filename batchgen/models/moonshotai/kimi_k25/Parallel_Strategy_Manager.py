@@ -241,6 +241,11 @@ class KimiK25ParallelStrategyManager:
         if self.model is not None:
             del self.model
             self.model = None
+        # Free INT4 contiguous GPU buffers (PSM attributes, not on model)
+        if hasattr(self, '_int4_packed_gpu_buf'):
+            del self._int4_packed_gpu_buf
+        if hasattr(self, '_int4_scale_gpu_buf'):
+            del self._int4_scale_gpu_buf
         import gc
         gc.collect()
         torch.cuda.empty_cache()
