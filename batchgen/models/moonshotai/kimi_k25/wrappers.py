@@ -124,34 +124,19 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
 
         return result
 
-    def _register_int4_weights(self):
-        """Cache pointers to INT4 weights already loaded in model.
-
-        Called when persistent=True after weights are loaded by PSM.
-        Follows GPT-OSS pattern: weights loaded to model attrs ONCE,
-        wrapper caches pointers for O(1) access during forward.
-        """
-        self.int4_gate_packed = self.module.int4_gate_packed
-        self.int4_gate_scale = self.module.int4_gate_scale
-        self.int4_up_packed = self.module.int4_up_packed
-        self.int4_up_scale = self.module.int4_up_scale
-        self.int4_down_packed = self.module.int4_down_packed
-        self.int4_down_scale = self.module.int4_down_scale
-
-        logging.debug(
-            f"[Layer {self.layer_idx} Expert {self.expert_idx}] "
-            f"Registered INT4 weight pointers for persistent mode"
-        )
-
     def _get_stored_int4_weights(self) -> Dict[str, torch.Tensor]:
-        """Get INT4 weights from cached pointers (persistent mode)."""
+        """Get INT4 weights from module buffers (persistent mode).
+
+        Accesses weights through self.module to always get the current device
+        tensors — buffers are moved by model.to(device) automatically.
+        """
         return {
-            "gate_proj.weight_packed": self.int4_gate_packed,
-            "gate_proj.weight_scale": self.int4_gate_scale,
-            "up_proj.weight_packed": self.int4_up_packed,
-            "up_proj.weight_scale": self.int4_up_scale,
-            "down_proj.weight_packed": self.int4_down_packed,
-            "down_proj.weight_scale": self.int4_down_scale,
+            "gate_proj.weight_packed": self.module.int4_gate_packed,
+            "gate_proj.weight_scale": self.module.int4_gate_scale,
+            "up_proj.weight_packed": self.module.int4_up_packed,
+            "up_proj.weight_scale": self.module.int4_up_scale,
+            "down_proj.weight_packed": self.module.int4_down_packed,
+            "down_proj.weight_scale": self.module.int4_down_scale,
         }
 
     def _forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:

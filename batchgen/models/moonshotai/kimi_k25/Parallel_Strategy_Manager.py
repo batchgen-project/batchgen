@@ -399,31 +399,17 @@ class KimiK25ParallelStrategyManager:
 
         self.model.eval()
 
-        # Log memory before model.to(device)
-        if self.rank == 0:
-            mem_before = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-            logging.info(f"[MODEL] GPU memory BEFORE model.to(device): {mem_before / (1024**3):.2f} GB")
-
+        # INT4 weights are registered as buffers, so model.to(device) moves
+        # everything (params + INT4 buffers) to GPU in a single efficient pass.
         self.model.to(self.engine_config.Basic_Config.device_torch)
 
-        # Log memory after model.to(device)
-        if self.rank == 0:
-            mem_after = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-            model_size = (mem_after - mem_before) / (1024**3)
-            logging.info(f"[MODEL] GPU memory AFTER model.to(device): {mem_after / (1024**3):.2f} GB (model size: {model_size:.2f} GB)")
-
-            # Log what's in the model
-            total_params = sum(p.numel() * p.element_size() for p in self.model.parameters()) / (1024**3)
-            logging.info(f"[MODEL] Total model parameters size: {total_params:.2f} GB")
-
-        # Move INT4 custom attributes to GPU (they don't auto-move with model.to())
-        if self.rank == 0:
-            logging.info(f"[MODEL] Moving INT4 weights to GPU (expected: ~68 GB for 2880 experts)")
-        self._move_int4_weights_to_gpu()
+        # Pre-dequant persistent experts to BF16 (if world_size >= 4).
+        # Must happen after model.to(device) so dequant runs on GPU.
+        self._pre_dequant_experts()
 
         if self.rank == 0:
             used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-            logging.info(f"[MODEL] GPU memory after INT4 weights moved: {used_memory / (1024**3):.2f} GB")
+            logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
 
         # Initialize MoE layers for decoding
         self._init_mode_decoding()
@@ -734,11 +720,9 @@ class KimiK25ParallelStrategyManager:
         """Load INT4 packed/scale tensors for persistent (GPU-resident) routed experts.
 
         For K2.5, routed expert weights are INT4 packed (int32) + scale (bf16).
-        These are stored as custom attributes on the expert module for the wrapper
-        to access via _register_int4_weights().
+        Following the DeepSeek V3 pattern: weights are registered as module buffers
+        so model.to(device) moves them to GPU in a single efficient pass.
         """
-        # Use model's current device (CPU during initial load, GPU after .to(device))
-        device = next(self.model.parameters()).device
         for routed_expert_idx in self.local_routed_experts:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
             layer_idx = int(routed_expert_idx.split("_")[2])
@@ -753,20 +737,9 @@ class KimiK25ParallelStrategyManager:
                     f"placeholder structure mismatch for rank {self.global_rank}"
                 )
 
-            # Store INT4 packed/scale tensors as module attributes
-            # The KimiK25ExpertWrapper._register_int4_weights() reads these
-            # Packed tensors are int32 in checkpoint - loaded with native dtype
-            expert.int4_gate_packed = tensors["gate_proj.weight_packed"].to(device)
-            expert.int4_gate_scale = tensors["gate_proj.weight_scale"].to(device)
-            expert.int4_up_packed = tensors["up_proj.weight_packed"].to(device)
-            expert.int4_up_scale = tensors["up_proj.weight_scale"].to(device)
-            expert.int4_down_packed = tensors["down_proj.weight_packed"].to(device)
-            expert.int4_down_scale = tensors["down_proj.weight_scale"].to(device)
-
-            # Delete unused nn.Linear default weights to save memory
+            # Delete unused nn.Linear default weights before registering INT4 buffers.
             # These are created during DeepseekV3MLP.__init__ but never used
-            # (we use INT4 weights instead). Each expert has ~84 MB of unused BF16 weights.
-            # Deleting them saves: 2880 experts × 84 MB = 241 GB
+            # (we use INT4 weights instead).
             del expert.gate_proj.weight
             del expert.up_proj.weight
             del expert.down_proj.weight
@@ -774,35 +747,16 @@ class KimiK25ParallelStrategyManager:
             expert.up_proj.weight = None
             expert.down_proj.weight = None
 
+            # Register INT4 packed/scale tensors as non-persistent buffers.
+            # persistent=False: moved by model.to(device), but not in state_dict.
+            expert.register_buffer('int4_gate_packed', tensors["gate_proj.weight_packed"], persistent=False)
+            expert.register_buffer('int4_gate_scale', tensors["gate_proj.weight_scale"], persistent=False)
+            expert.register_buffer('int4_up_packed', tensors["up_proj.weight_packed"], persistent=False)
+            expert.register_buffer('int4_up_scale', tensors["up_proj.weight_scale"], persistent=False)
+            expert.register_buffer('int4_down_packed', tensors["down_proj.weight_packed"], persistent=False)
+            expert.register_buffer('int4_down_scale', tensors["down_proj.weight_scale"], persistent=False)
+
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
-
-    def _move_int4_weights_to_gpu(self):
-        """Move INT4 packed/scale attributes to GPU after model.to(device).
-
-        INT4 attributes are custom attributes (not nn.Parameters), so they don't
-        get automatically moved when model.to(device) is called. We must manually
-        move them after the model is placed on GPU.
-        """
-        device = self.engine_config.Basic_Config.device_torch
-        for routed_expert_idx in self.local_routed_experts:
-            layer_idx = int(routed_expert_idx.split("_")[2])
-            global_expert_idx = int(routed_expert_idx.split("_")[3])
-
-            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
-
-            if expert is None:
-                continue
-
-            # Move INT4 attributes to GPU if they exist and are on CPU
-            if hasattr(expert, 'int4_gate_packed') and expert.int4_gate_packed.device.type == 'cpu':
-                expert.int4_gate_packed = expert.int4_gate_packed.to(device)
-                expert.int4_gate_scale = expert.int4_gate_scale.to(device)
-                expert.int4_up_packed = expert.int4_up_packed.to(device)
-                expert.int4_up_scale = expert.int4_up_scale.to(device)
-                expert.int4_down_packed = expert.int4_down_packed.to(device)
-                expert.int4_down_scale = expert.int4_down_scale.to(device)
-
-        logging.debug(f"INT4 weights moved to GPU for {len(self.local_routed_experts)} experts")
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, router) to model.
@@ -833,19 +787,16 @@ class KimiK25ParallelStrategyManager:
         """Replace expert modules with K2.5 wrappers.
 
         persistent flag:
-        - True: INT4 weights pre-loaded on GPU, wrapper uses _register_int4_weights()
+        - True: INT4 weights pre-loaded on GPU via registered buffers
         - False: INT4 weights loaded from core_engine buffer each forward
 
         K2.5 differences from DeepSeek-V3:
         - No FP8 weight_dequant_scales (K2.5 uses INT4 W4A16)
-        - Uses KimiK25ExpertWrapper with _register_int4_weights() for persistent mode
-        - Pre-dequant to BF16 when world_size >= 4 (via use_bf16_weights flag)
+        - INT4 weights registered as module buffers, moved by model.to(device)
+        - Wrapper accesses INT4 weights through self.module (no cached pointers)
+        - Pre-dequant to BF16 handled by _pre_dequant_experts() after model.to()
         """
         start_time = time.perf_counter()
-        # DISABLED: Pre-dequant on CPU is extremely slow (1-2s per expert)
-        # With 48 experts * 60 layers = 2880 experts per rank, this would take hours
-        # Dequantization happens on-demand during inference via wrapper
-        pre_dequant = False
 
         for layer_idx in range(
             self.loaded_model_config.first_k_dense_replace,
@@ -918,29 +869,53 @@ class KimiK25ParallelStrategyManager:
                     self.model_config,
                     persistent,
                 )
-                if persistent:
-                    # Register INT4 weight pointers for persistent access
-                    layer.mlp.experts[expert_idx]._register_int4_weights()
-
-                    # Pre-dequant to BF16 if world_size >= 4
-                    if pre_dequant:
-                        from batchgen.quantization.int4 import int4_dequantize
-                        wrapper = layer.mlp.experts[expert_idx]
-                        wrapper.gate_weight_bf16 = int4_dequantize(
-                            wrapper.int4_gate_packed, wrapper.int4_gate_scale
-                        )
-                        wrapper.up_weight_bf16 = int4_dequantize(
-                            wrapper.int4_up_packed, wrapper.int4_up_scale
-                        )
-                        wrapper.down_weight_bf16 = int4_dequantize(
-                            wrapper.int4_down_packed, wrapper.int4_down_scale
-                        )
-                        wrapper.use_bf16_weights = True
+                # Note: pre-dequant (INT4→BF16) is deferred to _pre_dequant_experts()
+                # which runs AFTER model.to(device), so dequant happens on GPU.
 
         end_time = time.perf_counter()
         logging.debug(
             f"Expert module configuration time: {end_time - start_time:.2f} seconds"
         )
+
+    def _pre_dequant_experts(self):
+        """Pre-dequantize persistent INT4 expert weights to BF16.
+
+        Called AFTER model.to(device) so INT4 buffers are on GPU and
+        the dequantized BF16 weights are created directly on GPU.
+        Only used when world_size >= 4.
+        """
+        if self.world_size < 4:
+            return
+
+        from batchgen.quantization.int4 import int4_dequantize
+        count = 0
+        for layer_idx in range(
+            self.loaded_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            layer = self.model.model.layers[layer_idx]
+            for expert_idx in range(len(layer.mlp.experts)):
+                wrapper = layer.mlp.experts[expert_idx]
+                if wrapper is None:
+                    continue
+                if not getattr(wrapper, 'persistent', False):
+                    continue
+                # Access INT4 buffers via the underlying module (now on GPU)
+                module = wrapper.module
+                wrapper.gate_weight_bf16 = int4_dequantize(
+                    module.int4_gate_packed, module.int4_gate_scale
+                )
+                wrapper.up_weight_bf16 = int4_dequantize(
+                    module.int4_up_packed, module.int4_up_scale
+                )
+                wrapper.down_weight_bf16 = int4_dequantize(
+                    module.int4_down_packed, module.int4_down_scale
+                )
+                wrapper.use_bf16_weights = True
+                count += 1
+
+        if count > 0:
+            logging.info(f"Rank {self.rank}: Pre-dequantized {count} experts to BF16")
 
     def _lm_head_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)
