@@ -56,18 +56,22 @@ class KimiK25Initializer:
     """
 
     def __init__(self, input_arguments):
-        # Create HuggingFace config for model instantiation.
-        # K2.5 uses DeepseekV3ForCausalLM, so use DeepseekV3Config with K2.5 overrides.
+        # Load BatchGen config (single source of truth for K2.5 params)
+        self.batchgen_config = load_config(input_arguments.huggingface_ckpt_name)
+
+        # Create HuggingFace config for DeepseekV3ForCausalLM model instantiation.
+        # K2.5 reuses V3's model class but with different params — derive from BatchGen config.
+        cfg = self.batchgen_config
         self.loaded_model_config = DeepseekV3Config(
-            n_routed_experts=384,
-            n_group=1,
-            topk_group=1,
-            rope_theta=50000.0,
-            first_k_dense_replace=1,  # K2.5 has 1 dense layer (layer 0), not 3
-            num_attention_heads=64,  # K2.5 has 64 heads (vs 128 for DeepSeek-V3)
+            n_routed_experts=cfg.n_routed_experts,
+            n_group=cfg.n_group,
+            topk_group=cfg.topk_group,
+            rope_theta=cfg.rope_theta,
+            first_k_dense_replace=cfg.first_k_dense_replace,
+            num_attention_heads=cfg.num_attention_heads,
         )
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
-        self.loaded_model_config.architectures = ["DeepseekV3ForCausalLM"]
+        self.loaded_model_config.architectures = cfg.architectures
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
@@ -193,24 +197,33 @@ class KimiK25Initializer:
         )
 
         # INT4 packing dimensions (int32 format: 8 INT4 values per word)
-        hidden_size = 7168
-        moe_intermediate = 2048
-        packed_hidden = hidden_size // 8       # 896 (INT4 packed in int32)
-        scale_hidden = hidden_size // 32       # 224  (INT4 scale groups)
-        packed_intermediate = moe_intermediate // 8   # 256 (INT4 packed in int32)
-        scale_intermediate = moe_intermediate // 32   # 64
+        cfg = self.batchgen_config
+        hidden_size = cfg.hidden_size
+        moe_intermediate = cfg.moe_intermediate_size
+        packed_hidden = hidden_size // 8       # INT4 packed in int32
+        scale_hidden = hidden_size // 32       # INT4 scale groups
+        packed_intermediate = moe_intermediate // 8
+        scale_intermediate = moe_intermediate // 32
+
+        # MLA dimensions
+        q_lora_rank = cfg.q_lora_rank
+        kv_lora_rank = cfg.kv_lora_rank
+        compressed_kv_dim = cfg.compressed_kv_dim
+        num_heads = cfg.num_attention_heads
+        head_dim = cfg.head_dim               # qk_nope_head_dim + qk_rope_head_dim
+        v_head_dim = cfg.v_head_dim
 
         # Module shapes
         self.engine_config.GPU_Buffer_Config.module_shapes = {
-            # MLA attention — K2.5 has 64 heads (vs DeepSeek-V3's 128 heads)
+            # MLA attention
             "attn": {
-                "q_a_proj.weight": [1536, 7168],  # q_lora_rank × hidden_size
-                "q_a_layernorm.weight": [1536],
-                "q_b_proj.weight": [12288, 1536],  # (64 heads × 192 dim) × q_lora_rank
-                "kv_a_proj_with_mqa.weight": [576, 7168],  # compressed_kv_dim × hidden_size
-                "kv_a_layernorm.weight": [512],
-                "kv_b_proj.weight": [16384, 512],  # (64 heads × 256 dim) × kv_lora_rank
-                "o_proj.weight": [7168, 8192],  # hidden_size × (64 heads × 128 v_dim)
+                "q_a_proj.weight": [q_lora_rank, hidden_size],
+                "q_a_layernorm.weight": [q_lora_rank],
+                "q_b_proj.weight": [num_heads * head_dim, q_lora_rank],
+                "kv_a_proj_with_mqa.weight": [compressed_kv_dim, hidden_size],
+                "kv_a_layernorm.weight": [kv_lora_rank],
+                "kv_b_proj.weight": [num_heads * (v_head_dim + cfg.qk_nope_head_dim), kv_lora_rank],
+                "o_proj.weight": [hidden_size, num_heads * v_head_dim],
             },
             # Routed experts — INT4 packed (int32) + scale (bf16)
             "routed_expert": {
@@ -257,16 +270,17 @@ class KimiK25Initializer:
         }
 
     def _parse_model_config(self) -> ModelConfig:
-        """Parse K2.5 model configuration."""
+        """Parse K2.5 model configuration from BatchGen config."""
+        cfg = self.batchgen_config
         model_config = ModelConfig()
 
-        model_config.model_type = "kimi_k25"
-        model_config.num_hidden_layers = 61
-        model_config.num_local_experts = 384
-        model_config.num_attention_heads = 64
-        model_config.num_key_value_heads = 64
-        model_config.head_dim = 192  # qk_nope_head_dim + qk_rope_head_dim
-        model_config.compressed_kv_dim = 576  # kv_lora_rank + qk_rope_head_dim
+        model_config.model_type = cfg.model_type
+        model_config.num_hidden_layers = cfg.num_hidden_layers
+        model_config.num_local_experts = cfg.num_local_experts
+        model_config.num_attention_heads = cfg.num_attention_heads
+        model_config.num_key_value_heads = cfg.num_key_value_heads
+        model_config.head_dim = cfg.head_dim
+        model_config.compressed_kv_dim = cfg.compressed_kv_dim
         return model_config
 
     def Init(self, weights_storage) -> Tuple:

@@ -27,7 +27,7 @@ Kimi K2.5 is a 1.04T parameter MoE model (DeepSeek-V3 variant) with:
 - INT4 W4A16 quantization (weight-only, group_size=32, symmetric)
 - BF16 attention (no FP8 quantization on attention)
 - Full attention (no sliding window)
-- First 3 layers are dense (no MoE)
+- First layer (layer 0) is dense (no MoE)
 
 Key deltas from DeepSeek-V3:
 - 384 routed experts (vs 256), n_group=1 (vs 8)
