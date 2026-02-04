@@ -34,7 +34,7 @@ Key deltas from DeepSeek-V3:
 - INT4 quantization (vs FP8) — needs W4A16 dequant kernel
 - RoPE theta=50000 (vs 10000)
 - BF16 attention (vs FP8)
-- Same HF architecture class: DeepseekV3ForCausalLM
+- HF architecture class: KimiK25ForCausalLM (alias for DeepseekV3ForCausalLM)
 """
 
 from dataclasses import dataclass, field
@@ -51,12 +51,12 @@ class KimiK25Config(BaseModelConfig):
 
     Attention: MLA (Multi-head Latent Attention with low-rank KV compression)
     Context: Full attention (no sliding window)
-    Architecture: DeepseekV3ForCausalLM (reuses DeepSeek-V3 model code)
+    Architecture: KimiK25ForCausalLM (DeepSeek-V3 model code with K2.5 config)
     """
 
     # ==================== Identity ====================
     model_type: str = "kimi_k25"
-    architectures: List[str] = field(default_factory=lambda: ["DeepseekV3ForCausalLM"])
+    architectures: List[str] = field(default_factory=lambda: ["KimiK25ForCausalLM"])
 
     # ==================== Core Architecture ====================
     vocab_size: int = 129280

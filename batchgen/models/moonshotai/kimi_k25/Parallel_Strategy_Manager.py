@@ -28,7 +28,7 @@ Key differences from DeepSeek-V3 PSM:
 - Loads INT4 packed/scale tensors for persistent experts
 """
 
-from .assets.modeling_deepseek import DeepseekV3ForCausalLM
+from .assets.modeling_deepseek import KimiK25ForCausalLM
 from .wrappers import KimiK25ExpertWrapper, KimiK25AttnWrapper
 import logging
 import types
@@ -82,9 +82,9 @@ class KimiK25ParallelStrategyManager:
         # Don't set ep_size - prefill uses pure DP (all experts on each rank)
 
         # Step 2: Initialize model
-        # K2.5 reuses DeepseekV3ForCausalLM with K2.5 config overrides
+        # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides
         step_start = time.perf_counter()
-        self.model = DeepseekV3ForCausalLM(self.loaded_model_config)
+        self.model = KimiK25ForCausalLM(self.loaded_model_config)
         timings['model_init'] = time.perf_counter() - step_start
 
         # Step 3: Initialize data structures
@@ -263,7 +263,7 @@ class KimiK25ParallelStrategyManager:
 
         # Create model on CPU first to avoid GPU memory allocation
         with torch.device('cpu'):
-            self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
+            self.model = KimiK25ForCausalLM(self.loaded_model_config, comm)
 
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
@@ -872,7 +872,7 @@ class KimiK25ParallelStrategyManager:
         K2.5: No FP8 dequantization needed — all skeleton weights are BF16.
 
         Note: Checkpoint has 'language_model.' prefix (from KimiK25ForConditionalGeneration),
-        but BatchGen uses only the language model (DeepseekV3ForCausalLM), so we strip the prefix.
+        but BatchGen uses only the language model (KimiK25ForCausalLM), so we strip the prefix.
         """
         for key, param in self.model.named_parameters():
             # Try with and without language_model. prefix

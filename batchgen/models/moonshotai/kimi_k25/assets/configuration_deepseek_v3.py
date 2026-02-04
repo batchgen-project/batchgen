@@ -236,6 +236,16 @@ DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 #         )
 
 class DeepseekV3Config(PretrainedConfig):
+    """HuggingFace config for Kimi K2.5 (DeepSeek-V3 architecture variant).
+
+    All defaults are K2.5 values. Key differences from DeepSeek-V3:
+    - 384 routed experts (vs 256), n_group=1 (vs 8), topk_group=1 (vs 4)
+    - 64 attention heads (vs 128)
+    - first_k_dense_replace=1 (vs 3)
+    - rope_theta=50000 (vs 10000)
+    - vocab_size=163840 (vs 129280)
+    - INT4 W4A16 quantization (vs FP8)
+    """
     def __init__(
         self,
         architectures=None,
@@ -245,24 +255,24 @@ class DeepseekV3Config(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=1,
         ep_size=1,
-        first_k_dense_replace=3,
+        first_k_dense_replace=1,
         hidden_act="silu",
         hidden_size=7168,
         initializer_range=0.02,
         intermediate_size=18432,
         kv_lora_rank=512,
         max_position_embeddings=163840,
-        model_type="deepseek_v3",
+        model_type="kimi_k25",
         moe_intermediate_size=2048,
         moe_layer_freq=1,
-        n_group=8,
-        n_routed_experts=256,
+        n_group=1,
+        n_routed_experts=384,
         n_shared_experts=1,
         norm_topk_prob=True,
-        num_attention_heads=128,
+        num_attention_heads=64,
         num_experts_per_tok=8,
         num_hidden_layers=61,
-        num_key_value_heads=128,
+        num_key_value_heads=64,
         num_nextn_predict_layers=1,
         q_lora_rank=1536,
         qk_nope_head_dim=128,
@@ -270,17 +280,17 @@ class DeepseekV3Config(PretrainedConfig):
         quantization_config=None,
         rms_norm_eps=1e-6,
         rope_scaling=None,
-        rope_theta=10000.0,
+        rope_theta=50000.0,
         routed_scaling_factor=2.5,
         scoring_func="sigmoid",
         tie_word_embeddings=False,
-        topk_group=4,
+        topk_group=1,
         topk_method="noaux_tc",
         torch_dtype=None,
         transformers_version=None,
         use_cache=True,
         v_head_dim=128,
-        vocab_size=129280,
+        vocab_size=163840,
         # Additional parameters not in JSON but in original init
         aux_loss_alpha=0.001,
         seq_aux=True,
@@ -289,14 +299,10 @@ class DeepseekV3Config(PretrainedConfig):
         **kwargs,
     ):
         # Set attributes in the same order as JSON
-        self.architectures = architectures or ["DeepseekV3ForCausalLM"]
+        self.architectures = architectures or ["KimiK25ForCausalLM"]
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.auto_map = auto_map or {
-            "AutoConfig": "configuration_deepseek.DeepseekV3Config",
-            "AutoModel": "modeling_deepseek.DeepseekV3Model",
-            "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM"
-        }
+        self.auto_map = auto_map
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.ep_size = ep_size
@@ -323,10 +329,14 @@ class DeepseekV3Config(PretrainedConfig):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.quantization_config = quantization_config or {
-            "activation_scheme": "dynamic",
-            "fmt": "e4m3",
-            "quant_method": "fp8",
-            "weight_block_size": [128, 128]
+            "quant_method": "compressed-tensors",
+            "weights": {
+                "num_bits": 4,
+                "group_size": 32,
+                "symmetric": True,
+            },
+            "input_activations": None,
+            "output_activations": None,
         }
         self.rms_norm_eps = rms_norm_eps
         self.rope_scaling = rope_scaling or {
@@ -349,17 +359,17 @@ class DeepseekV3Config(PretrainedConfig):
         self.use_cache = use_cache
         self.v_head_dim = v_head_dim
         self.vocab_size = vocab_size
-        
+
         # Additional attributes from original class not in JSON
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
         self.pad_token_id = pad_token_id
         self.pretraining_tp = pretraining_tp
-        
+
         # Class-level attributes from original
         self.phase = None
-        self._name_or_path = "deepseek-ai/DeepSeek-R1"
-        
+        self._name_or_path = ""
+
         # Call parent init
         super().__init__(
             pad_token_id=pad_token_id,
@@ -368,3 +378,7 @@ class DeepseekV3Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+
+# Alias for K2.5-specific naming
+KimiK25ModelConfig = DeepseekV3Config

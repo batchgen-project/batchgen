@@ -54,7 +54,7 @@ from transformers.utils import (
 	replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
-from batchgen.models.deepseek.deepseekv3.configuration_deepseek_v3 import DeepseekV3Config
+from .configuration_deepseek_v3 import DeepseekV3Config
 import torch.distributed as dist
 import numpy as np
 import os
@@ -702,33 +702,6 @@ def compiled_moe_gate_forward(hidden_states, weight, e_score_correction_bias,
 	# return topk_idx, topk_weight.to(hidden_states.dtype)
 	return topk_idx, topk_weight
 
-from torch._inductor import config as ind_config
-# ind_config.triton.force_cudagraphs_warmup = True
-# ind_config.triton.cudagraphs = True
-# ind_config.triton.cudagraphs
-def warmup_compiled_moe_gate(device):
-	
-	dummy_weight = nn.Parameter(
-		torch.zeros(256, 7168, dtype=torch.bfloat16, device=device)
-	)
-	dummy_e_score_correction_bias = torch.nn.Parameter(
-		torch.zeros(256, dtype=torch.float32, device=device)
-	)
-	
-	with torch.inference_mode(): 
-		for t in range(5):
-			dummy_hidden_states = torch.randn(128, 1, 7168, dtype=torch.bfloat16, device=device)
-			_ = compiled_moe_gate_forward(
-				dummy_hidden_states, 
-				dummy_weight,
-				dummy_e_score_correction_bias,
-				8, 
-				4, 
-				256, 
-				8, 
-				2.5
-			)
-			torch.cuda.synchronize(device=device)
 
 # from torch.utils.cpp_extension import load
 # current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3571,7 +3544,7 @@ class DeepseekV3Attention(nn.Module):
 		# self.softmax_scale = self.q_head_dim ** (-0.5)
 		# self.softmax_scale = 576 ** (-0.5)  # use fixed scale to match DeepseekV3
 		self.qkv_materialized_softmax_scale = (self.q_head_dim) ** -0.5
-		self.qkv_unmaterialized_softmax_scale = (576) ** -0.5
+		self.qkv_unmaterialized_softmax_scale = (self.config.kv_lora_rank + self.config.qk_rope_head_dim) ** -0.5
 		if self.config.rope_scaling is not None:
 			mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
 			scaling_factor = self.config.rope_scaling["factor"]
@@ -4978,3 +4951,7 @@ class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
 			hidden_states=transformer_outputs.hidden_states,
 			attentions=transformer_outputs.attentions,
 		)
+
+
+# K2.5-specific aliases for external code
+KimiK25ForCausalLM = DeepseekV3ForCausalLM

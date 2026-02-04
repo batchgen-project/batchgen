@@ -36,7 +36,7 @@ import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
-from batchgen.models.deepseek.deepseekv3.configuration_deepseek_v3 import DeepseekV3Config
+from .assets.configuration_deepseek_v3 import KimiK25ModelConfig
 from .planner import KimiK25Planner
 
 try:
@@ -59,19 +59,10 @@ class KimiK25Initializer:
         # Load BatchGen config (single source of truth for K2.5 params)
         self.batchgen_config = load_config(input_arguments.huggingface_ckpt_name)
 
-        # Create HuggingFace config for DeepseekV3ForCausalLM model instantiation.
-        # K2.5 reuses V3's model class but with different params — derive from BatchGen config.
-        cfg = self.batchgen_config
-        self.loaded_model_config = DeepseekV3Config(
-            n_routed_experts=cfg.n_routed_experts,
-            n_group=cfg.n_group,
-            topk_group=cfg.topk_group,
-            rope_theta=cfg.rope_theta,
-            first_k_dense_replace=cfg.first_k_dense_replace,
-            num_attention_heads=cfg.num_attention_heads,
-        )
+        # Create HF config for model instantiation.
+        # KimiK25ModelConfig defaults are already K2.5 values.
+        self.loaded_model_config = KimiK25ModelConfig()
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
-        self.loaded_model_config.architectures = cfg.architectures
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
