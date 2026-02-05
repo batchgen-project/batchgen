@@ -1150,6 +1150,7 @@ class GptOssMoEPrefill(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with fused WGMMA kernels (or CuTe fallback)."""
+        import os
         from batchgen.moe.fused_wgmma_expert import (
             fused_mxfp4_expert_forward,
             is_wgmma_available,
@@ -1174,7 +1175,11 @@ class GptOssMoEPrefill(nn.Module):
         unique_experts = topk_indices.unique().tolist()
 
         # Check if we can use fused WGMMA kernels
-        use_fused = is_wgmma_available()
+        # BATCHGEN_PREFILL_USE_CUTE=1 forces CuTe fallback for debugging
+        use_fused = (
+            is_wgmma_available()
+            and os.environ.get("BATCHGEN_PREFILL_USE_CUTE", "0") != "1"
+        )
 
         # Process each activated expert
         for expert_idx in unique_experts:
