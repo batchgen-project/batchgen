@@ -915,13 +915,25 @@ class GptOssParallelStrategyManager:
             self._swap_to_ep_moe()
 
             # Pre-dequant for better HBM utilization when enough GPUs
-            # With 4+ GPUs, each rank has ≤32 experts, so memory is less constrained
-            # BF16 GEMM is faster than per-forward MXFP4 dequant + GEMM
-            if self.world_size >= 4:
+            # Pre-dequantization is controlled by model_config.pre_dequantize_weights
+            # For GPT-OSS-120B, this defaults to False (always use MXFP4 fused kernels)
+            # The fused WGMMA kernels handle in-register dequant with 2.2-4.0x speedup
+            pre_dequant = getattr(self.model_config, 'pre_dequantize_weights', False)
+
+            # Only dequantize if explicitly enabled AND world_size >= 4 (memory feasible)
+            if pre_dequant and self.world_size >= 4:
                 self._dequant_experts_to_bf16()
                 self.use_bf16_experts = True
+                logging.info("Using pre-dequantized BF16 expert weights (pre_dequantize_weights=True)")
             else:
                 self.use_bf16_experts = False
+                if pre_dequant and self.world_size < 4:
+                    logging.warning(
+                        "pre_dequantize_weights=True but world_size < 4. "
+                        "Keeping MXFP4 weights to avoid OOM."
+                    )
+                else:
+                    logging.info("Using MXFP4 fused expert kernels (pre_dequantize_weights=False)")
         else:
             # Single GPU: Use grouped GEMM (3 kernel launches per layer)
             self._swap_to_quantized_moe()

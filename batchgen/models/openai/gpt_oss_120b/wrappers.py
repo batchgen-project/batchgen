@@ -41,6 +41,26 @@ import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 
+# Fused WGMMA MoE kernels (SM90+ only)
+_wgmma_fused_available = None
+
+def _check_wgmma_fused_available():
+    """Check if WGMMA fused MoE kernels are available."""
+    global _wgmma_fused_available
+    if _wgmma_fused_available is not None:
+        return _wgmma_fused_available
+
+    try:
+        from batchgen.moe.fused_wgmma_expert import is_wgmma_available
+        _wgmma_fused_available = is_wgmma_available()
+        if _wgmma_fused_available:
+            logging.info("WGMMA fused MoE kernels available (2.2-4.0x speedup)")
+    except ImportError:
+        _wgmma_fused_available = False
+        logging.debug("WGMMA fused MoE kernels not available (import failed)")
+
+    return _wgmma_fused_available
+
 
 # =============================================================================
 # OpenAI SwiGLU Activation (correct formula from gpt-oss/triton/moe.py)
@@ -636,6 +656,12 @@ class GptOssExpertWrapper(ExpertWrapperBase):
 
         # Check for reference mode (for debugging)
         use_reference = os.environ.get("BATCHGEN_USE_REFERENCE", "0") == "1"
+        # Check for WGMMA fused mode (SM90+ with optimized kernels)
+        use_wgmma_fused = (
+            not use_reference
+            and os.environ.get("BATCHGEN_USE_WGMMA_FUSED", "1") == "1"
+            and _check_wgmma_fused_available()
+        )
 
         if do_timing:
             t0 = time.perf_counter()
@@ -643,6 +669,8 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         # Route to appropriate implementation
         if use_reference:
             result = self._forward_reference(hidden_states, weights)
+        elif use_wgmma_fused:
+            result = self._forward_fused_wgmma(hidden_states, weights)
         else:
             result = self._forward_fused(hidden_states, weights)
 
@@ -813,6 +841,39 @@ class GptOssExpertWrapper(ExpertWrapperBase):
                 print(f"[EXPERT L0 E0] result (after down_proj): std={result.float().std().item():.4f}, max={result.abs().max().item():.4f}")
                 down_scales = weights["down_proj.weight_scales"]
                 print(f"[EXPERT L0 E0] down_scales: min={down_scales.min().item():.6f}, max={down_scales.max().item():.6f}, mean={down_scales.mean().item():.6f}")
+
+        return result
+
+    def _forward_fused_wgmma(self, hidden_states: torch.Tensor, weights: dict) -> torch.Tensor:
+        """Fused MXFP4 MoE using WGMMA m64n64k16 kernels (optimized for SM90+).
+
+        Uses highly optimized CUDA kernels that fuse:
+        - Stage 1: gate projection + up projection + SwiGLU activation
+        - Stage 2: down projection with optional bias
+
+        Performance: 2.2-4.0x faster than unfused path (3× mxfp4_linear + SwiGLU)
+
+        Args:
+            hidden_states: Input [num_tokens, hidden_size] in BF16
+            weights: Dict with gate_proj, up_proj, down_proj weights and scales
+
+        Returns:
+            Output [num_tokens, hidden_size] in BF16
+        """
+        from batchgen.moe.fused_wgmma_expert import fused_mxfp4_expert_forward_from_dict
+
+        debug_expert = os.environ.get("BATCHGEN_DEBUG_EXPERT", "0") == "1"
+
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0 WGMMA] Using fused WGMMA kernels")
+                print(f"[EXPERT L0 E0 WGMMA] hidden_states: shape={list(hidden_states.shape)}")
+
+        result = fused_mxfp4_expert_forward_from_dict(hidden_states, weights)
+
+        if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
+            with torch.no_grad():
+                print(f"[EXPERT L0 E0 WGMMA] result: std={result.float().std().item():.4f}, max={result.abs().max().item():.4f}")
 
         return result
 
