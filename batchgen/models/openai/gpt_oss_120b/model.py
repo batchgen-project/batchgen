@@ -1244,6 +1244,10 @@ class GptOssMoEPrefill(nn.Module):
                             nan_count = nan_mask.sum().item()
                             total = expert_output.numel()
                             print(f"  NaN count: {nan_count}/{total} ({100*nan_count/total:.1f}%)")
+                            # Check scale values for this expert
+                            gate_s = weights['gate_proj.weight_scales']
+                            print(f"  Gate scales: min={gate_s.min().item()}, max={gate_s.max().item()}, "
+                                  f"count>=250: {(gate_s >= 250).sum().item()}")
             else:
                 # === CuTe fallback path ===
                 expert_output = self._forward_expert_cute(expert_input, expert_idx)
