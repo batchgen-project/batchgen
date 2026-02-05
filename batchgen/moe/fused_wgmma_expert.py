@@ -556,13 +556,14 @@ mxfp4_moe_stage1_kernel(
             float sig = __frcp_rn(1.0f + expf(-SWIGLU_ALPHA * g_c));
             float result = g_c * sig * (u_c + 1.0f);
 
-            // DEBUG: Check for NaN at m=0 (first row of each M tile)
+            // DEBUG: Check for NaN anywhere in output
             #ifdef DEBUG_KERNEL_NAN
-            if (m == 0 && isnan(result) && blockIdx.x == 0) {
-                printf("[KERNEL NaN] blk=(%d,%d) m_start=%d n_start=%d m=%d n=%d: "
-                       "gate_acc=%.4f up_acc=%.4f g=%.4f u=%.4f result=%.4f\\n",
+            if (isnan(result)) {
+                printf("[KERNEL NaN] blk=(%d,%d) m_start=%d n_start=%d m=%d n=%d global=(%d,%d): "
+                       "gate_acc=%.4f up_acc=%.4f g=%.4f u=%.4f\\n",
                        blockIdx.x, blockIdx.y, m_start, n_start, m, n,
-                       gate_acc[i], up_acc[i], g, u, result);
+                       m_start + m, n_start + n,
+                       gate_acc[i], up_acc[i], g, u);
             }
             #endif
 
