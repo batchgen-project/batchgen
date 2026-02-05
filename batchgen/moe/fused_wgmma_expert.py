@@ -353,7 +353,7 @@ mxfp4_moe_stage1_kernel(
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    const int m_start = 0;
+    const int m_start = blockIdx.y * BLOCK_M;
     const int n_start = blockIdx.x * BLOCK_N;
 
     extern __shared__ __align__(128) char smem_buf[];
@@ -582,7 +582,7 @@ mxfp4_moe_stage2_kernel(
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    const int m_start = 0;
+    const int m_start = blockIdx.y * BLOCK_M;
     const int k_start = blockIdx.x * BLOCK_N;
 
     extern __shared__ __align__(128) char smem_buf[];
@@ -781,7 +781,8 @@ torch::Tensor mxfp4_moe_stage1(
     const int64_t stride_scale_n = K / 32;
 
     const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    dim3 grid(num_n_tiles);
+    const int num_m_tiles = (M + BLOCK_M - 1) / BLOCK_M;
+    dim3 grid(num_n_tiles, num_m_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
@@ -831,7 +832,8 @@ torch::Tensor mxfp4_moe_stage2(
     const int64_t stride_scale_n = N / 32;
 
     const int num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;
-    dim3 grid(num_k_tiles);
+    const int num_m_tiles = (M + BLOCK_M - 1) / BLOCK_M;
+    dim3 grid(num_k_tiles, num_m_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
