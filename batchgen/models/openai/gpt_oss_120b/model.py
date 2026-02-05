@@ -1119,9 +1119,9 @@ class GptOssMoEPrefill(nn.Module):
 
         # MXFP4 quantized weights - stored as lists of tensors (one per expert)
         # Packed weights: [N, K//2] uint8
-        # K-major scales: [K//32, N] uint8
+        # N-major scales: [N, K//32] uint8 (same as decode path)
         self.gate_weights = None  # List[Tensor[intermediate_size, hidden_size//2]]
-        self.gate_scales = None   # List[Tensor[hidden_size//32, intermediate_size]]
+        self.gate_scales = None   # List[Tensor[intermediate_size, hidden_size//32]]
         self.up_weights = None
         self.up_scales = None
         self.down_weights = None  # List[Tensor[hidden_size, intermediate_size//2]]
@@ -1199,8 +1199,7 @@ class GptOssMoEPrefill(nn.Module):
 
             if use_fused:
                 # === Fused WGMMA path ===
-                # Scales are stored as K-major [K//32, N] for CuTe, but fused kernel
-                # expects N-major [N, K//32], so transpose back
+                # Scales are stored in N-major [N, K//32] format (same as decode)
                 gate_bias = self.gate_biases[expert_idx] if self.gate_biases is not None else None
                 up_bias = self.up_biases[expert_idx] if self.up_biases is not None else None
                 down_bias = self.down_biases[expert_idx] if self.down_biases is not None else None
@@ -1208,11 +1207,11 @@ class GptOssMoEPrefill(nn.Module):
                 expert_output = fused_mxfp4_expert_forward(
                     expert_input,
                     self.gate_weights[expert_idx],
-                    self.gate_scales[expert_idx].T.contiguous(),  # K-major -> N-major
+                    self.gate_scales[expert_idx],
                     self.up_weights[expert_idx],
-                    self.up_scales[expert_idx].T.contiguous(),    # K-major -> N-major
+                    self.up_scales[expert_idx],
                     self.down_weights[expert_idx],
-                    self.down_scales[expert_idx].T.contiguous(),  # K-major -> N-major
+                    self.down_scales[expert_idx],
                     gate_bias=gate_bias,
                     up_bias=up_bias,
                     down_bias=down_bias,
@@ -1232,6 +1231,11 @@ class GptOssMoEPrefill(nn.Module):
 
         num_tokens = expert_input.shape[0]
 
+        # Scales are stored N-major [N, K//32], CuTe needs K-major [K//32, N]
+        gate_scales_kmajor = self.gate_scales[expert_idx].T.contiguous()
+        up_scales_kmajor = self.up_scales[expert_idx].T.contiguous()
+        down_scales_kmajor = self.down_scales[expert_idx].T.contiguous()
+
         # === Gate projection ===
         gate_buffer = self._get_bf16_buffer(
             (self.intermediate_size, self.hidden_size),
@@ -1239,7 +1243,7 @@ class GptOssMoEPrefill(nn.Module):
         )
         mxfp4_dequant_single_expert_cute(
             self.gate_weights[expert_idx],
-            self.gate_scales[expert_idx],
+            gate_scales_kmajor,
             gate_buffer,
         )
         gate_out = torch.matmul(expert_input, gate_buffer.T)
@@ -1253,7 +1257,7 @@ class GptOssMoEPrefill(nn.Module):
         )
         mxfp4_dequant_single_expert_cute(
             self.up_weights[expert_idx],
-            self.up_scales[expert_idx],
+            up_scales_kmajor,
             up_buffer,
         )
         up_out = torch.matmul(expert_input, up_buffer.T)
@@ -1271,7 +1275,7 @@ class GptOssMoEPrefill(nn.Module):
         )
         mxfp4_dequant_single_expert_cute(
             self.down_weights[expert_idx],
-            self.down_scales[expert_idx],
+            down_scales_kmajor,
             down_buffer,
         )
         down_out = torch.matmul(intermediate, down_buffer.T)

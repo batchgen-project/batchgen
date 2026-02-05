@@ -635,11 +635,11 @@ class GptOssParallelStrategyManager:
                 up_weights.append(wrapper.mxfp4_up_packed)
                 down_weights.append(wrapper.mxfp4_down_packed)
 
-                # Transpose scales to K-major format [K//32, N] for CuTe kernel
-                # Original format is [N, K//32], so we need to transpose and make contiguous
-                gate_scales.append(wrapper.mxfp4_gate_scales.T.contiguous())
-                up_scales.append(wrapper.mxfp4_up_scales.T.contiguous())
-                down_scales.append(wrapper.mxfp4_down_scales.T.contiguous())
+                # Keep scales in original N-major format [N, K//32] (same as decode)
+                # CuTe fallback path will transpose to K-major when needed
+                gate_scales.append(wrapper.mxfp4_gate_scales)
+                up_scales.append(wrapper.mxfp4_up_scales)
+                down_scales.append(wrapper.mxfp4_down_scales)
 
                 # Collect biases if present
                 if hasattr(wrapper, 'mxfp4_gate_bias') and wrapper.mxfp4_gate_bias is not None:
