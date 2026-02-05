@@ -558,12 +558,16 @@ mxfp4_moe_stage1_kernel(
 
             // DEBUG: Check for NaN anywhere in output
             #ifdef DEBUG_KERNEL_NAN
-            if (isnan(result)) {
+            // Print once per block to confirm debug is enabled
+            if (tid == 0 && i == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+                printf("[KERNEL DEBUG] Stage1 kernel running with NaN debug enabled, M=%d N=%d\\n", M, N);
+            }
+            if (isnan(result) || isnan(gate_acc[i]) || isnan(up_acc[i])) {
                 printf("[KERNEL NaN] blk=(%d,%d) m_start=%d n_start=%d m=%d n=%d global=(%d,%d): "
-                       "gate_acc=%.4f up_acc=%.4f g=%.4f u=%.4f\\n",
+                       "gate_acc=%.4f up_acc=%.4f g=%.4f u=%.4f result=%.4f\\n",
                        blockIdx.x, blockIdx.y, m_start, n_start, m, n,
                        m_start + m, n_start + n,
-                       gate_acc[i], up_acc[i], g, u);
+                       gate_acc[i], up_acc[i], g, u, result);
             }
             #endif
 
@@ -709,6 +713,20 @@ mxfp4_moe_stage2_kernel(
             if (has_bias && (k_start + k) < K) {
                 val_bf16 = __hadd(val_bf16, bias[k_start + k]);
             }
+
+            // DEBUG: Check for NaN in Stage 2
+            #ifdef DEBUG_KERNEL_NAN
+            if (tid == 0 && i == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+                printf("[KERNEL DEBUG] Stage2 kernel running with NaN debug enabled, M=%d K=%d\\n", M, K);
+            }
+            if (isnan(acc[i]) || isnan(__bfloat162float(val_bf16))) {
+                printf("[KERNEL NaN Stage2] blk=(%d,%d) m_start=%d k_start=%d m=%d k=%d global=(%d,%d): "
+                       "acc=%.4f val=%.4f\\n",
+                       blockIdx.x, blockIdx.y, m_start, k_start, m, k,
+                       m_start + m, k_start + k,
+                       acc[i], __bfloat162float(val_bf16));
+            }
+            #endif
 
             if ((m_start + m) < M && (k_start + k) < K) {
                 C[(m_start + m) * K + (k_start + k)] = val_bf16;
