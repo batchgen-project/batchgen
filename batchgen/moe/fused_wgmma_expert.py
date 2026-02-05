@@ -988,6 +988,15 @@ def fused_mxfp4_expert_forward(
     if x.dtype != torch.bfloat16:
         x = x.to(torch.bfloat16)
 
+    # Ensure all tensors are contiguous (TMA requires row-major contiguous layout)
+    x = x.contiguous()
+    gate_packed = gate_packed.contiguous()
+    gate_scales = gate_scales.contiguous()
+    up_packed = up_packed.contiguous()
+    up_scales = up_scales.contiguous()
+    down_packed = down_packed.contiguous()
+    down_scales = down_scales.contiguous()
+
     # Prepare bias tensors (empty tensor = no bias)
     empty = torch.empty(0, dtype=torch.bfloat16, device=x.device)
     gate_bias_t = gate_bias if gate_bias is not None else empty
@@ -1001,6 +1010,18 @@ def fused_mxfp4_expert_forward(
         up_packed, up_scales,
         gate_bias_t, up_bias_t
     )
+
+    # DEBUG: Check Stage 1 output for NaN
+    import os
+    if os.environ.get("DEBUG_FUSED_WGMMA", "0") == "1":
+        if intermediate.isnan().any().item():
+            nan_mask = intermediate.isnan()
+            flat_idx = nan_mask.view(-1).int().argmax().item()
+            row = flat_idx // intermediate.shape[-1]
+            col = flat_idx % intermediate.shape[-1]
+            nan_count = nan_mask.sum().item()
+            print(f"[STAGE1 NaN] M={x.shape[0]}, N={intermediate.shape[-1]} - "
+                  f"NaN at [{row}, {col}], col%32={col%32}, count={nan_count}")
 
     # Stage 2: down projection
     output = mod.mxfp4_moe_stage2(
