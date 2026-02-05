@@ -1181,6 +1181,9 @@ class GptOssMoEPrefill(nn.Module):
             and os.environ.get("BATCHGEN_PREFILL_USE_CUTE", "0") != "1"
         )
 
+        # Debug: compare fused vs CuTe for first expert in first layer
+        debug_prefill = os.environ.get("BATCHGEN_DEBUG_PREFILL", "0") == "1"
+
         # Process each activated expert
         for expert_idx in unique_experts:
             # Find tokens routed to this expert
@@ -1188,7 +1191,7 @@ class GptOssMoEPrefill(nn.Module):
             if not expert_mask.any():
                 continue
 
-            expert_input = hidden_flat[expert_mask]  # [num_tokens, hidden_size]
+            expert_input = hidden_flat[expert_mask].contiguous()  # [num_tokens, hidden_size]
 
             # Get routing weight for this expert
             expert_weights = torch.where(
@@ -1216,6 +1219,35 @@ class GptOssMoEPrefill(nn.Module):
                     weights["down_proj.bias"] = self.down_biases[expert_idx]
 
                 expert_output = fused_mxfp4_expert_forward_from_dict(expert_input, weights)
+
+                # Debug: compare fused vs CuTe for first expert
+                if debug_prefill and expert_idx == unique_experts[0]:
+                    with torch.no_grad():
+                        cute_output = self._forward_expert_cute(expert_input, expert_idx)
+                        diff = (expert_output.float() - cute_output.float()).abs()
+                        print(f"[PREFILL DEBUG] Expert {expert_idx}: M={expert_input.shape[0]}")
+                        print(f"  Input: std={expert_input.float().std().item():.4f}, "
+                              f"max={expert_input.abs().max().item():.4f}")
+                        print(f"  Fused: std={expert_output.float().std().item():.6f}, "
+                              f"max={expert_output.abs().max().item():.4f}, "
+                              f"min={expert_output.min().item():.4f}")
+                        print(f"  CuTe:  std={cute_output.float().std().item():.6f}, "
+                              f"max={cute_output.abs().max().item():.4f}, "
+                              f"min={cute_output.min().item():.4f}")
+                        print(f"  Diff:  max={diff.max().item():.6f}, mean={diff.mean().item():.6f}")
+                        # Check weight shapes
+                        print(f"  Weights: gate={list(weights['gate_proj.weight'].shape)}, "
+                              f"gate_scales={list(weights['gate_proj.weight_scales'].shape)}")
+                        # Check for NaN/Inf
+                        if expert_output.isnan().any():
+                            print(f"  WARNING: Fused output contains NaN!")
+                        if expert_output.isinf().any():
+                            print(f"  WARNING: Fused output contains Inf!")
+                        if (expert_output == 0).all():
+                            print(f"  WARNING: Fused output is all zeros!")
+                        # Sample values comparison
+                        print(f"  Sample fused[0,:5]: {expert_output[0,:5].tolist()}")
+                        print(f"  Sample cute[0,:5]:  {cute_output[0,:5].tolist()}")
             else:
                 # === CuTe fallback path ===
                 expert_output = self._forward_expert_cute(expert_input, expert_idx)
