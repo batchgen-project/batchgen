@@ -686,9 +686,6 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         # Cleanup
         if do_timing:
             t0 = time.perf_counter()
-        torch.cuda.current_stream(
-            self.engine_config.Basic_Config.device_torch
-        ).synchronize()
         if not self.persistent:
             # Non-persistent: release buffer slot
             self.free_weights(self.module_key)
