@@ -1220,8 +1220,8 @@ class GptOssMoEPrefill(nn.Module):
 
                 expert_output = fused_mxfp4_expert_forward_from_dict(expert_input, weights)
 
-                # Debug: compare fused vs CuTe for first expert
-                if debug_prefill and expert_idx == unique_experts[0]:
+                # Debug: compare fused vs CuTe (first 3 experts only to limit output)
+                if debug_prefill and expert_idx in unique_experts[:3]:
                     with torch.no_grad():
                         cute_output = self._forward_expert_cute(expert_input, expert_idx)
                         diff = (expert_output.float() - cute_output.float()).abs()
@@ -1235,6 +1235,12 @@ class GptOssMoEPrefill(nn.Module):
                               f"max={cute_output.abs().max().item():.4f}, "
                               f"min={cute_output.min().item():.4f}")
                         print(f"  Diff:  max={diff.max().item():.6f}, mean={diff.mean().item():.6f}")
+                        # Find location of max diff
+                        flat_idx = diff.argmax().item()
+                        row = flat_idx // expert_output.shape[-1]
+                        col = flat_idx % expert_output.shape[-1]
+                        print(f"  Max diff at [{row}, {col}]: fused={expert_output.view(-1)[flat_idx].item():.4f}, "
+                              f"cute={cute_output.view(-1)[flat_idx].item():.4f}")
                         # Check weight shapes
                         print(f"  Weights: gate={list(weights['gate_proj.weight'].shape)}, "
                               f"gate_scales={list(weights['gate_proj.weight_scales'].shape)}")
