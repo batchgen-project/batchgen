@@ -1194,6 +1194,8 @@ class GptOssMoEPrefill(nn.Module):
 
             if use_fused:
                 # === Fused WGMMA path ===
+                # Scales are stored as K-major [K//32, N] for CuTe, but fused kernel
+                # expects N-major [N, K//32], so transpose back
                 gate_bias = self.gate_biases[expert_idx] if self.gate_biases is not None else None
                 up_bias = self.up_biases[expert_idx] if self.up_biases is not None else None
                 down_bias = self.down_biases[expert_idx] if self.down_biases is not None else None
@@ -1201,11 +1203,11 @@ class GptOssMoEPrefill(nn.Module):
                 expert_output = fused_mxfp4_expert_forward(
                     expert_input,
                     self.gate_weights[expert_idx],
-                    self.gate_scales[expert_idx],
+                    self.gate_scales[expert_idx].T.contiguous(),  # K-major -> N-major
                     self.up_weights[expert_idx],
-                    self.up_scales[expert_idx],
+                    self.up_scales[expert_idx].T.contiguous(),    # K-major -> N-major
                     self.down_weights[expert_idx],
-                    self.down_scales[expert_idx],
+                    self.down_scales[expert_idx].T.contiguous(),  # K-major -> N-major
                     gate_bias=gate_bias,
                     up_bias=up_bias,
                     down_bias=down_bias,
