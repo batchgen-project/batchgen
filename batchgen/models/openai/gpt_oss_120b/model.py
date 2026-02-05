@@ -1149,12 +1149,14 @@ class GptOssMoEPrefill(nn.Module):
         return self._bf16_buffer
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with per-expert CuTe dequant + torch.matmul."""
-        from batchgen.moe.cute_mxfp4_dequant import mxfp4_dequant_single_expert_cute
+        """Forward pass with fused WGMMA kernels (or CuTe fallback)."""
+        from batchgen.moe.fused_wgmma_expert import (
+            fused_mxfp4_expert_forward,
+            is_wgmma_available,
+        )
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)  # [total_tokens, hidden_size]
-        total_tokens = hidden_flat.shape[0]
 
         # Compute routing logits
         router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
@@ -1171,6 +1173,9 @@ class GptOssMoEPrefill(nn.Module):
         # Find all unique experts that are activated
         unique_experts = topk_indices.unique().tolist()
 
+        # Check if we can use fused WGMMA kernels
+        use_fused = is_wgmma_available()
+
         # Process each activated expert
         for expert_idx in unique_experts:
             # Find tokens routed to this expert
@@ -1179,7 +1184,6 @@ class GptOssMoEPrefill(nn.Module):
                 continue
 
             expert_input = hidden_flat[expert_mask]  # [num_tokens, hidden_size]
-            num_tokens = expert_input.shape[0]
 
             # Get routing weight for this expert
             expert_weights = torch.where(
@@ -1188,59 +1192,86 @@ class GptOssMoEPrefill(nn.Module):
                 torch.zeros_like(topk_weights[expert_mask])
             ).sum(dim=-1)  # [num_tokens]
 
-            # === Gate projection ===
-            # Dequant gate weight: [intermediate_size, hidden_size//2] -> [intermediate_size, hidden_size]
-            gate_buffer = self._get_bf16_buffer(
-                (self.intermediate_size, self.hidden_size),
-                expert_input.device
-            )
-            mxfp4_dequant_single_expert_cute(
-                self.gate_weights[expert_idx],
-                self.gate_scales[expert_idx],
-                gate_buffer,
-            )
-            # matmul: [num_tokens, hidden_size] @ [hidden_size, intermediate_size] -> [num_tokens, intermediate_size]
-            gate_out = torch.matmul(expert_input, gate_buffer.T)
-            if self.gate_biases is not None:
-                gate_out = gate_out + self.gate_biases[expert_idx]
+            if use_fused:
+                # === Fused WGMMA path ===
+                gate_bias = self.gate_biases[expert_idx] if self.gate_biases is not None else None
+                up_bias = self.up_biases[expert_idx] if self.up_biases is not None else None
+                down_bias = self.down_biases[expert_idx] if self.down_biases is not None else None
 
-            # === Up projection ===
-            up_buffer = self._get_bf16_buffer(
-                (self.intermediate_size, self.hidden_size),
-                expert_input.device
-            )
-            mxfp4_dequant_single_expert_cute(
-                self.up_weights[expert_idx],
-                self.up_scales[expert_idx],
-                up_buffer,
-            )
-            up_out = torch.matmul(expert_input, up_buffer.T)
-            if self.up_biases is not None:
-                up_out = up_out + self.up_biases[expert_idx]
-
-            # === SwiGLU activation ===
-            # Interleave gate and up: [gate0, up0, gate1, up1, ...]
-            interleaved = torch.stack([gate_out, up_out], dim=-1).view(num_tokens, -1)
-            intermediate = swiglu(interleaved, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
-
-            # === Down projection ===
-            down_buffer = self._get_bf16_buffer(
-                (self.hidden_size, self.intermediate_size),
-                expert_input.device
-            )
-            mxfp4_dequant_single_expert_cute(
-                self.down_weights[expert_idx],
-                self.down_scales[expert_idx],
-                down_buffer,
-            )
-            down_out = torch.matmul(intermediate, down_buffer.T)
-            if self.down_biases is not None:
-                down_out = down_out + self.down_biases[expert_idx]
+                expert_output = fused_mxfp4_expert_forward(
+                    expert_input,
+                    self.gate_weights[expert_idx],
+                    self.gate_scales[expert_idx],
+                    self.up_weights[expert_idx],
+                    self.up_scales[expert_idx],
+                    self.down_weights[expert_idx],
+                    self.down_scales[expert_idx],
+                    gate_bias=gate_bias,
+                    up_bias=up_bias,
+                    down_bias=down_bias,
+                )
+            else:
+                # === CuTe fallback path ===
+                expert_output = self._forward_expert_cute(expert_input, expert_idx)
 
             # Accumulate weighted output
-            output[expert_mask] += down_out * expert_weights.unsqueeze(-1)
+            output[expert_mask] += expert_output * expert_weights.unsqueeze(-1)
 
         return output.view(batch_size, seq_len, hidden_dim)
+
+    def _forward_expert_cute(self, expert_input: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        """Fallback path using CuTe dequant + torch.matmul."""
+        from batchgen.moe.cute_mxfp4_dequant import mxfp4_dequant_single_expert_cute
+
+        num_tokens = expert_input.shape[0]
+
+        # === Gate projection ===
+        gate_buffer = self._get_bf16_buffer(
+            (self.intermediate_size, self.hidden_size),
+            expert_input.device
+        )
+        mxfp4_dequant_single_expert_cute(
+            self.gate_weights[expert_idx],
+            self.gate_scales[expert_idx],
+            gate_buffer,
+        )
+        gate_out = torch.matmul(expert_input, gate_buffer.T)
+        if self.gate_biases is not None:
+            gate_out = gate_out + self.gate_biases[expert_idx]
+
+        # === Up projection ===
+        up_buffer = self._get_bf16_buffer(
+            (self.intermediate_size, self.hidden_size),
+            expert_input.device
+        )
+        mxfp4_dequant_single_expert_cute(
+            self.up_weights[expert_idx],
+            self.up_scales[expert_idx],
+            up_buffer,
+        )
+        up_out = torch.matmul(expert_input, up_buffer.T)
+        if self.up_biases is not None:
+            up_out = up_out + self.up_biases[expert_idx]
+
+        # === SwiGLU activation ===
+        interleaved = torch.stack([gate_out, up_out], dim=-1).view(num_tokens, -1)
+        intermediate = swiglu(interleaved, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
+
+        # === Down projection ===
+        down_buffer = self._get_bf16_buffer(
+            (self.hidden_size, self.intermediate_size),
+            expert_input.device
+        )
+        mxfp4_dequant_single_expert_cute(
+            self.down_weights[expert_idx],
+            self.down_scales[expert_idx],
+            down_buffer,
+        )
+        down_out = torch.matmul(intermediate, down_buffer.T)
+        if self.down_biases is not None:
+            down_out = down_out + self.down_biases[expert_idx]
+
+        return down_out
 
 
 # ============================================================================
