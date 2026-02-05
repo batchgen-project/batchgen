@@ -556,6 +556,16 @@ mxfp4_moe_stage1_kernel(
             float sig = __frcp_rn(1.0f + expf(-SWIGLU_ALPHA * g_c));
             float result = g_c * sig * (u_c + 1.0f);
 
+            // DEBUG: Check for NaN at m=0 (first row of each M tile)
+            #ifdef DEBUG_KERNEL_NAN
+            if (m == 0 && isnan(result) && blockIdx.x == 0) {
+                printf("[KERNEL NaN] blk=(%d,%d) m_start=%d n_start=%d m=%d n=%d: "
+                       "gate_acc=%.4f up_acc=%.4f g=%.4f u=%.4f result=%.4f\\n",
+                       blockIdx.x, blockIdx.y, m_start, n_start, m, n,
+                       gate_acc[i], up_acc[i], g, u, result);
+            }
+            #endif
+
             if ((m_start + m) < M && (n_start + n) < N) {
                 C[(m_start + m) * N + (n_start + n)] = __float2bfloat16(result);
             }
@@ -891,11 +901,23 @@ def _load_mxfp4_module():
         return _module_mxfp4_moe
 
     try:
+        # Base CUDA flags
+        cuda_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v"]
+
+        # Add kernel NaN debug flag if requested
+        debug_kernel = os.environ.get("DEBUG_KERNEL_NAN", "0") == "1"
+        if debug_kernel:
+            cuda_flags.append("-DDEBUG_KERNEL_NAN")
+            logging.info("Enabled kernel NaN debug (DEBUG_KERNEL_NAN=1)")
+
+        # Use different module name for debug build to avoid cache conflicts
+        module_name = "batchgen_fused_mxfp4_moe_wgmma_debug" if debug_kernel else "batchgen_fused_mxfp4_moe_wgmma"
+
         _module_mxfp4_moe = load_inline(
-            name="batchgen_fused_mxfp4_moe_wgmma",
+            name=module_name,
             cpp_sources=[""],
             cuda_sources=[CUDA_SOURCE_MXFP4_MOE],
-            extra_cuda_cflags=["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v"],
+            extra_cuda_cflags=cuda_flags,
             verbose=False
         )
         logging.info("Loaded WGMMA fused MXFP4 MoE kernels")
