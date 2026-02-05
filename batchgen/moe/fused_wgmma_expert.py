@@ -556,14 +556,14 @@ mxfp4_moe_stage1_kernel(
             float sig = __frcp_rn(1.0f + expf(-SWIGLU_ALPHA * g_c));
             float result = g_c * sig * (u_c + 1.0f);
 
-            // DEBUG: Check for NaN anywhere in output
+            // DEBUG: Check for NaN anywhere in output (limit to first block only)
             #ifdef DEBUG_KERNEL_NAN
-            // Print once per block to confirm debug is enabled
             if (tid == 0 && i == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
                 printf("[KERNEL DEBUG] Stage1 kernel running with NaN debug enabled, M=%d N=%d\n", M, N);
             }
-            if (isnan(result) || isnan(gate_acc[i]) || isnan(up_acc[i])) {
-                // Print hex to see actual bit pattern
+            // Only print from first few blocks to avoid log flood
+            if ((isnan(result) || isnan(gate_acc[i]) || isnan(up_acc[i])) &&
+                blockIdx.x == 0 && blockIdx.y < 2 && i < 8) {
                 unsigned int gate_bits = __float_as_uint(gate_acc[i]);
                 unsigned int up_bits = __float_as_uint(up_acc[i]);
                 unsigned int result_bits = __float_as_uint(result);
