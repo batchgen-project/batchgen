@@ -84,13 +84,18 @@ def openai_swiglu(gate: torch.Tensor, up: torch.Tensor,
     Returns:
         Activated intermediate [*, intermediate_size]
     """
-    # Clamp inputs to prevent overflow (as done in OpenAI's reference)
-    gate = gate.clamp(max=limit)
-    up = up.clamp(min=-limit, max=limit)
+    # Store original dtype to restore after FP32 computation
+    orig_dtype = gate.dtype
+
+    # Convert to FP32 for numerical stability (matches kernel behavior)
+    g = gate.float().clamp(max=limit)
+    u = up.float().clamp(min=-limit, max=limit)
 
     # OpenAI formula: gate * sigmoid(alpha * gate) * (up + 1)
-    out_glu = gate * torch.sigmoid(alpha * gate)
-    return out_glu * (up + 1)
+    out_glu = g * torch.sigmoid(alpha * g)
+    result = out_glu * (u + 1.0)
+
+    return result.to(orig_dtype)
 
 
 def log_gpu_memory(msg: str = ""):
@@ -874,6 +879,32 @@ class GptOssExpertWrapper(ExpertWrapperBase):
         if debug_expert and self.layer_idx == 0 and self.expert_idx == 0:
             with torch.no_grad():
                 print(f"[EXPERT L0 E0 WGMMA] result: std={result.float().std().item():.4f}, max={result.abs().max().item():.4f}")
+
+        # Debug precision comparison: compare fused vs reference
+        debug_precision = os.environ.get("BATCHGEN_DEBUG_PRECISION", "0") == "1"
+        if debug_precision:
+            with torch.no_grad():
+                ref_result = self._forward_reference(hidden_states, weights)
+                diff = (result.float() - ref_result.float()).abs()
+                max_diff = diff.max().item()
+                mean_diff = diff.mean().item()
+
+                # Only print if significant difference (threshold 0.01)
+                if max_diff > 0.01:
+                    print(f"[PRECISION] L{self.layer_idx} E{self.expert_idx}: "
+                          f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+                    # Find location of max diff
+                    flat_idx = diff.argmax().item()
+                    row = flat_idx // result.shape[-1]
+                    col = flat_idx % result.shape[-1]
+                    print(f"  Max diff at [{row}, {col}]: "
+                          f"fused={result.view(-1)[flat_idx].item():.6f}, "
+                          f"ref={ref_result.view(-1)[flat_idx].item():.6f}")
+
+                    # Also show input stats for context
+                    print(f"  Input: shape={list(hidden_states.shape)}, "
+                          f"std={hidden_states.float().std().item():.4f}, "
+                          f"max={hidden_states.abs().max().item():.4f}")
 
         return result
 
