@@ -1061,12 +1061,16 @@ def fused_mxfp4_expert_forward(
     if os.environ.get("DEBUG_FUSED_WGMMA", "0") == "1":
         if intermediate.isnan().any().item():
             nan_mask = intermediate.isnan()
-            flat_idx = nan_mask.view(-1).int().argmax().item()
-            row = flat_idx // intermediate.shape[-1]
-            col = flat_idx % intermediate.shape[-1]
             nan_count = nan_mask.sum().item()
-            print(f"[STAGE1 NaN] M={x.shape[0]}, N={intermediate.shape[-1]} - "
-                  f"NaN at [{row}, {col}], col%32={col%32}, count={nan_count}")
+            # Find first few NaN positions
+            nan_indices = torch.nonzero(nan_mask)[:5]  # First 5
+            print(f"[STAGE1 OUTPUT NaN] M={x.shape[0]}, N={intermediate.shape[-1]}, count={nan_count}")
+            for idx in nan_indices:
+                row, col = idx[0].item(), idx[1].item()
+                val_bits = intermediate[row, col].view(torch.int16).item() & 0xFFFF
+                print(f"  [{row}, {col}] = 0x{val_bits:04x} (col%64={col%64})")
+        else:
+            print(f"[STAGE1 OUTPUT OK] M={x.shape[0]}, N={intermediate.shape[-1]} - no NaN")
 
     # Stage 2: down projection
     output = mod.mxfp4_moe_stage2(
