@@ -1220,40 +1220,30 @@ class GptOssMoEPrefill(nn.Module):
 
                 expert_output = fused_mxfp4_expert_forward_from_dict(expert_input, weights)
 
-                # Debug: compare fused vs CuTe (first 3 experts only to limit output)
+                # Debug: detect NaN in fused output (first 3 experts only)
                 if debug_prefill and expert_idx in unique_experts[:3]:
                     with torch.no_grad():
-                        cute_output = self._forward_expert_cute(expert_input, expert_idx)
-                        diff = (expert_output.float() - cute_output.float()).abs()
-                        print(f"[PREFILL DEBUG] Expert {expert_idx}: M={expert_input.shape[0]}")
-                        print(f"  Input: std={expert_input.float().std().item():.4f}, "
-                              f"max={expert_input.abs().max().item():.4f}")
-                        print(f"  Fused: std={expert_output.float().std().item():.6f}, "
-                              f"max={expert_output.abs().max().item():.4f}, "
-                              f"min={expert_output.min().item():.4f}")
-                        print(f"  CuTe:  std={cute_output.float().std().item():.6f}, "
-                              f"max={cute_output.abs().max().item():.4f}, "
-                              f"min={cute_output.min().item():.4f}")
-                        print(f"  Diff:  max={diff.max().item():.6f}, mean={diff.mean().item():.6f}")
-                        # Find location of max diff
-                        flat_idx = diff.argmax().item()
-                        row = flat_idx // expert_output.shape[-1]
-                        col = flat_idx % expert_output.shape[-1]
-                        print(f"  Max diff at [{row}, {col}]: fused={expert_output.view(-1)[flat_idx].item():.4f}, "
-                              f"cute={cute_output.view(-1)[flat_idx].item():.4f}")
-                        # Check weight shapes
-                        print(f"  Weights: gate={list(weights['gate_proj.weight'].shape)}, "
-                              f"gate_scales={list(weights['gate_proj.weight_scales'].shape)}")
-                        # Check for NaN/Inf
-                        if expert_output.isnan().any():
-                            print(f"  WARNING: Fused output contains NaN!")
-                        if expert_output.isinf().any():
-                            print(f"  WARNING: Fused output contains Inf!")
-                        if (expert_output == 0).all():
-                            print(f"  WARNING: Fused output is all zeros!")
-                        # Sample values comparison
-                        print(f"  Sample fused[0,:5]: {expert_output[0,:5].tolist()}")
-                        print(f"  Sample cute[0,:5]:  {cute_output[0,:5].tolist()}")
+                        has_nan = expert_output.isnan().any().item()
+                        has_inf = expert_output.isinf().any().item()
+                        input_has_nan = expert_input.isnan().any().item()
+                        if has_nan or has_inf:
+                            # Find first NaN/Inf position
+                            nan_mask = expert_output.isnan() | expert_output.isinf()
+                            flat_idx = nan_mask.view(-1).int().argmax().item()
+                            row = flat_idx // expert_output.shape[-1]
+                            col = flat_idx % expert_output.shape[-1]
+                            print(f"[PREFILL DEBUG] Expert {expert_idx}: M={expert_input.shape[0]} - "
+                                  f"{'NaN' if has_nan else 'Inf'} at [{row}, {col}]")
+                            if not input_has_nan:
+                                print(f"  Input VALID: std={expert_input.float().std().item():.4f}, "
+                                      f"max={expert_input.abs().max().item():.4f}")
+                            else:
+                                print(f"  Input has NaN (propagated from previous layer)")
+                            print(f"  col%32={col%32}, col%64={col%64} (scale/tile boundary check)")
+                            # Check total NaN count
+                            nan_count = nan_mask.sum().item()
+                            total = expert_output.numel()
+                            print(f"  NaN count: {nan_count}/{total} ({100*nan_count/total:.1f}%)")
             else:
                 # === CuTe fallback path ===
                 expert_output = self._forward_expert_cute(expert_input, expert_idx)
