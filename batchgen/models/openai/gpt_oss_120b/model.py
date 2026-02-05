@@ -1152,7 +1152,7 @@ class GptOssMoEPrefill(nn.Module):
         """Forward pass with fused WGMMA kernels (or CuTe fallback)."""
         import os
         from batchgen.moe.fused_wgmma_expert import (
-            fused_mxfp4_expert_forward,
+            fused_mxfp4_expert_forward_from_dict,
             is_wgmma_available,
         )
 
@@ -1199,23 +1199,23 @@ class GptOssMoEPrefill(nn.Module):
 
             if use_fused:
                 # === Fused WGMMA path ===
-                # Scales are stored in N-major [N, K//32] format (same as decode)
-                gate_bias = self.gate_biases[expert_idx] if self.gate_biases is not None else None
-                up_bias = self.up_biases[expert_idx] if self.up_biases is not None else None
-                down_bias = self.down_biases[expert_idx] if self.down_biases is not None else None
+                # Build weights dict (same format as decode path)
+                weights = {
+                    "gate_proj.weight": self.gate_weights[expert_idx],
+                    "gate_proj.weight_scales": self.gate_scales[expert_idx],
+                    "up_proj.weight": self.up_weights[expert_idx],
+                    "up_proj.weight_scales": self.up_scales[expert_idx],
+                    "down_proj.weight": self.down_weights[expert_idx],
+                    "down_proj.weight_scales": self.down_scales[expert_idx],
+                }
+                if self.gate_biases is not None:
+                    weights["gate_proj.bias"] = self.gate_biases[expert_idx]
+                if self.up_biases is not None:
+                    weights["up_proj.bias"] = self.up_biases[expert_idx]
+                if self.down_biases is not None:
+                    weights["down_proj.bias"] = self.down_biases[expert_idx]
 
-                expert_output = fused_mxfp4_expert_forward(
-                    expert_input,
-                    self.gate_weights[expert_idx],
-                    self.gate_scales[expert_idx],
-                    self.up_weights[expert_idx],
-                    self.up_scales[expert_idx],
-                    self.down_weights[expert_idx],
-                    self.down_scales[expert_idx],
-                    gate_bias=gate_bias,
-                    up_bias=up_bias,
-                    down_bias=down_bias,
-                )
+                expert_output = fused_mxfp4_expert_forward_from_dict(expert_input, weights)
             else:
                 # === CuTe fallback path ===
                 expert_output = self._forward_expert_cute(expert_input, expert_idx)
