@@ -413,6 +413,7 @@ mxfp4_moe_stage1_kernel(
                 wg_tid, byte_lut);
 
             bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+            __threadfence_block();  // Flush smem writes before signaling consumer
             if (wg_tid == 0) {
                 mbarrier_arrive(&full_barriers[s]);
             }
@@ -449,6 +450,7 @@ mxfp4_moe_stage1_kernel(
                 wg_tid, byte_lut);
 
             bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+            __threadfence_block();  // Flush smem writes before signaling consumer
             if (wg_tid == 0) {
                 mbarrier_arrive(&full_barriers[s]);
             }
@@ -661,6 +663,7 @@ mxfp4_moe_stage2_kernel(
                 wg_tid, byte_lut);
 
             bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+            __threadfence_block();  // Flush smem writes before signaling consumer
             if (wg_tid == 0) {
                 mbarrier_arrive(&full_barriers[s]);
             }
