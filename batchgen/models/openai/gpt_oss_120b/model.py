@@ -54,6 +54,19 @@ try:
 except ImportError:
     _HAS_CUDA_ROUTING = False
 
+# WGMMA grouped kernels (fused gate+up+SwiGLU + down, 1D+offsets layout)
+try:
+    from batchgen.moe.fused_wgmma_grouped import (
+        fused_mxfp4_grouped_moe_forward_cuda_routing,
+        is_grouped_wgmma_available,
+    )
+    _HAS_WGMMA_GROUPED = (
+        os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") != "1"
+        and is_grouped_wgmma_available()
+    )
+except ImportError:
+    _HAS_WGMMA_GROUPED = False
+
 
 # ============================================================================
 # Decode Layer Timing Infrastructure
@@ -785,8 +798,20 @@ class GptOssMoEQuantized(nn.Module):
 
         # === Part A: Grouped GEMM for all experts (or persistent only) ===
         if not has_non_persistent:
-            if _HAS_CUDA_ROUTING:
-                # CUDA routing: dispatch + 3D GEMM + reduce
+            if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING:
+                # WGMMA grouped: fastest path (4 kernel launches)
+                output = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    self.gate_weights[0], self.gate_scales[0],
+                    self.down_weights[0], self.down_scales[0],
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                )
+            elif _HAS_CUDA_ROUTING:
+                # Triton grouped fallback: CUDA routing + 3D GEMM + reduce
                 output = grouped_mxfp4_moe_forward_cuda_routing(
                     hidden_flat, topk_indices, topk_weights,
                     self.gate_ptrs, self.gate_scale_ptrs,
