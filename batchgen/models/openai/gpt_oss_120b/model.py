@@ -30,6 +30,7 @@ Key features:
 Reference: https://github.com/openai/gpt-oss
 """
 
+import logging
 import math
 import os
 import time
@@ -60,12 +61,20 @@ try:
         fused_mxfp4_grouped_moe_forward_cuda_routing,
         is_grouped_wgmma_available,
     )
-    _HAS_WGMMA_GROUPED = (
-        os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") != "1"
-        and is_grouped_wgmma_available()
-    )
-except ImportError:
+    if os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") == "1":
+        _HAS_WGMMA_GROUPED = False
+        logging.info("WGMMA grouped kernels disabled by BATCHGEN_DISABLE_WGMMA_GROUPED")
+    else:
+        _HAS_WGMMA_GROUPED = is_grouped_wgmma_available()
+        if _HAS_WGMMA_GROUPED:
+            logging.info("WGMMA grouped MoE kernels available (3.6-4.1x speedup)")
+        else:
+            logging.info("WGMMA grouped MoE kernels not available (SM90 required)")
+except Exception as e:
     _HAS_WGMMA_GROUPED = False
+    logging.warning(f"WGMMA grouped MoE kernels failed to load: {e}")
+
+_WGMMA_GROUPED_LOGGED = False  # one-time invocation log
 
 
 # ============================================================================
@@ -800,6 +809,10 @@ class GptOssMoEQuantized(nn.Module):
         if not has_non_persistent:
             if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING:
                 # WGMMA grouped: fastest path (4 kernel launches)
+                global _WGMMA_GROUPED_LOGGED
+                if not _WGMMA_GROUPED_LOGGED:
+                    logging.info("MoE using WGMMA grouped path (dispatch -> S1 -> S2 -> reduce, 4 launches)")
+                    _WGMMA_GROUPED_LOGGED = True
                 output = fused_mxfp4_grouped_moe_forward_cuda_routing(
                     hidden_flat, topk_indices, topk_weights,
                     self.gate_ptrs, self.gate_scale_ptrs,
