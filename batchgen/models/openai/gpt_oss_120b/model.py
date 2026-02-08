@@ -63,16 +63,18 @@ try:
     )
     if os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") == "1":
         _HAS_WGMMA_GROUPED = False
-        logging.info("WGMMA grouped kernels disabled by BATCHGEN_DISABLE_WGMMA_GROUPED")
+        print("[WGMMA grouped] disabled by BATCHGEN_DISABLE_WGMMA_GROUPED", flush=True)
     else:
         _HAS_WGMMA_GROUPED = is_grouped_wgmma_available()
         if _HAS_WGMMA_GROUPED:
-            logging.info("WGMMA grouped MoE kernels available (3.6-4.1x speedup)")
+            print("[WGMMA grouped] available (3.6-4.1x speedup)", flush=True)
         else:
-            logging.info("WGMMA grouped MoE kernels not available (SM90 required)")
+            print("[WGMMA grouped] not available (SM90 required or compilation failed)", flush=True)
 except Exception as e:
+    import traceback
     _HAS_WGMMA_GROUPED = False
-    logging.warning(f"WGMMA grouped MoE kernels failed to load: {e}")
+    print(f"[WGMMA grouped] failed to load: {e}", flush=True)
+    traceback.print_exc()
 
 _WGMMA_GROUPED_LOGGED = False  # one-time invocation log
 
@@ -811,7 +813,7 @@ class GptOssMoEQuantized(nn.Module):
                 # WGMMA grouped: fastest path (4 kernel launches)
                 global _WGMMA_GROUPED_LOGGED
                 if not _WGMMA_GROUPED_LOGGED:
-                    logging.info("MoE using WGMMA grouped path (dispatch -> S1 -> S2 -> reduce, 4 launches)")
+                    print("[WGMMA grouped] MoE forward using grouped path (4 launches)", flush=True)
                     _WGMMA_GROUPED_LOGGED = True
                 output = fused_mxfp4_grouped_moe_forward_cuda_routing(
                     hidden_flat, topk_indices, topk_weights,
