@@ -47,12 +47,12 @@ from transformers.modeling_outputs import (
 
 from .configuration_gpt_oss import GptOssConfig
 
-# CUDA routing kernels (fused top-k + softmax gate)
+# CUDA routing kernels (fused gate + dispatch + reduce)
 try:
     from batchgen.moe.routing import gate_topk_softmax_cuda
-    _HAS_CUDA_GATE = True
+    _HAS_CUDA_ROUTING = True
 except ImportError:
-    _HAS_CUDA_GATE = False
+    _HAS_CUDA_ROUTING = False
 
 
 # ============================================================================
@@ -601,11 +601,11 @@ class GptOssMoE(nn.Module):
         router_logits = self.router(hidden_states_flat)  # [batch*seq, num_experts]
 
         # Select Top-K experts with fused CUDA gate (topk + softmax in one kernel)
-        if _HAS_CUDA_GATE:
+        if _HAS_CUDA_ROUTING:
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
-            topk_indices = topk_indices.to(torch.int64)  # downstream expects int64
+
         else:
             topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
             topk_weights = F.softmax(topk_weights, dim=-1)
@@ -736,6 +736,8 @@ class GptOssMoEQuantized(nn.Module):
             grouped_mxfp4_moe_forward_3d,
             mxfp4_expert_forward_single,
         )
+        if _HAS_CUDA_ROUTING:
+            from batchgen.moe.mxfp4_grouped_gemm import grouped_mxfp4_moe_forward_cuda_routing
 
         timing_enabled = DecodeLayerTiming.enabled
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -750,11 +752,10 @@ class GptOssMoEQuantized(nn.Module):
         router_logits = self.router(hidden_flat)
 
         # Select Top-K experts with fused CUDA gate (topk + softmax in one kernel)
-        if _HAS_CUDA_GATE:
+        if _HAS_CUDA_ROUTING:
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
-            topk_indices = topk_indices.to(torch.int64)  # downstream expects int64
         else:
             topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
             topk_weights = F.softmax(topk_weights, dim=-1)
@@ -784,20 +785,36 @@ class GptOssMoEQuantized(nn.Module):
 
         # === Part A: Grouped GEMM for all experts (or persistent only) ===
         if not has_non_persistent:
-            # All experts are persistent - use grouped GEMM
-            output = grouped_mxfp4_moe_forward_3d(
-                hidden_flat, topk_indices, topk_weights,
-                self.gate_ptrs, self.gate_scale_ptrs,
-                self.up_ptrs, self.up_scale_ptrs,
-                self.down_ptrs, self.down_scale_ptrs,
-                self.gate_weights[0], self.gate_scales[0],  # ref for strides
-                self.up_weights[0], self.up_scales[0],
-                self.down_weights[0], self.down_scales[0],
-                self.gate_biases, self.up_biases, self.down_biases,
-                num_experts=self.num_experts,
-                swiglu_alpha=self.swiglu_alpha,
-                swiglu_limit=self.swiglu_limit,
-            )
+            if _HAS_CUDA_ROUTING:
+                # CUDA routing: dispatch + 3D GEMM + reduce
+                output = grouped_mxfp4_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    self.gate_weights[0], self.gate_scales[0],
+                    self.up_weights[0], self.up_scales[0],
+                    self.down_weights[0], self.down_scales[0],
+                    self.gate_biases, self.up_biases, self.down_biases,
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                    swiglu_alpha=self.swiglu_alpha,
+                    swiglu_limit=self.swiglu_limit,
+                )
+            else:
+                output = grouped_mxfp4_moe_forward_3d(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    self.gate_weights[0], self.gate_scales[0],
+                    self.up_weights[0], self.up_scales[0],
+                    self.down_weights[0], self.down_scales[0],
+                    self.gate_biases, self.up_biases, self.down_biases,
+                    num_experts=self.num_experts,
+                    swiglu_alpha=self.swiglu_alpha,
+                    swiglu_limit=self.swiglu_limit,
+                )
         else:
             # Hybrid execution: grouped for persistent, single for non-persistent
             persistent_experts = self.persistent_mask.nonzero(as_tuple=True)[0]
@@ -1021,11 +1038,11 @@ class GptOssMoE_EP(nn.Module):
 
         # ---- 2) Router: Compute routing for ALL global tokens ----
         router_logits = self.router(all_tokens)  # [global_tokens, 128]
-        if _HAS_CUDA_GATE:
+        if _HAS_CUDA_ROUTING:
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
-            topk_indices = topk_indices.to(torch.int64)
+
         else:
             topk_weights, topk_indices = torch.topk(
                 router_logits, k=self.num_experts_per_tok, dim=-1
@@ -1188,11 +1205,11 @@ class GptOssMoEPrefill(nn.Module):
         router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
 
         # Select Top-K experts per token
-        if _HAS_CUDA_GATE:
+        if _HAS_CUDA_ROUTING:
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
-            topk_indices = topk_indices.to(torch.int64)
+
         else:
             topk_weights, topk_indices = torch.topk(
                 router_logits, k=self.num_experts_per_tok, dim=-1

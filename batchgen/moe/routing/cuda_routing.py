@@ -97,6 +97,11 @@ def dispatch_count_gather_cuda(
         topk_pos: [N*K] int32
     """
     ext = _cuda_ext
+
+    # Kernel requires int32 indices
+    if topk_indices.dtype != torch.int32:
+        topk_indices = topk_indices.to(torch.int32)
+
     N, K = topk_indices.shape
     H = x.shape[1]
     NK = N * K
@@ -152,6 +157,10 @@ def reduce_weighted_scatter_cuda(
         output: [N, H] BF16
     """
     ext = _cuda_ext
+
+    # Kernel requires FP32 weights for accumulation precision
+    if topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.float()
 
     if H is None:
         H = expert_output.shape[1]
