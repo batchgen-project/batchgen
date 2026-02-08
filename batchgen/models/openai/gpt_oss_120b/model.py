@@ -77,6 +77,9 @@ except Exception as e:
     traceback.print_exc()
 
 _WGMMA_GROUPED_LOGGED = False  # one-time invocation log
+_COMPARE_GROUPED = os.environ.get("BATCHGEN_COMPARE_GROUPED", "0") == "1"
+_COMPARE_COUNT = 0
+_COMPARE_MAX = int(os.environ.get("BATCHGEN_COMPARE_MAX", "5"))
 
 
 # ============================================================================
@@ -809,7 +812,12 @@ class GptOssMoEQuantized(nn.Module):
 
         # === Part A: Grouped GEMM for all experts (or persistent only) ===
         if not has_non_persistent:
-            if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING:
+            # Comparison diagnostic: run both WGMMA and Triton, compare outputs
+            global _COMPARE_COUNT
+            run_compare = (_COMPARE_GROUPED and _HAS_WGMMA_GROUPED
+                           and _HAS_CUDA_ROUTING and _COMPARE_COUNT < _COMPARE_MAX)
+
+            if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING and not run_compare:
                 # WGMMA grouped: fastest path (4 kernel launches)
                 global _WGMMA_GROUPED_LOGGED
                 if not _WGMMA_GROUPED_LOGGED:
@@ -825,8 +833,108 @@ class GptOssMoEQuantized(nn.Module):
                     num_experts=self.num_experts,
                     num_local_experts=self.num_experts,
                 )
+            elif run_compare:
+                # DIAGNOSTIC: run both paths and compare
+                _COMPARE_COUNT += 1
+                torch.cuda.synchronize()
+
+                # Print context on first comparison
+                if _COMPARE_COUNT == 1:
+                    gw = self.gate_weights[0]
+                    gs = self.gate_scales[0]
+                    dw = self.down_weights[0]
+                    ds = self.down_scales[0]
+                    print(f"[COMPARE] Context: input={hidden_flat.shape} "
+                          f"experts={self.num_experts} topk={topk_indices.shape[1]}",
+                          flush=True)
+                    print(f"  gate_w={gw.shape} stride={gw.stride()} contig={gw.is_contiguous()} "
+                          f"gate_s={gs.shape} stride={gs.stride()} contig={gs.is_contiguous()}",
+                          flush=True)
+                    print(f"  down_w={dw.shape} stride={dw.stride()} contig={dw.is_contiguous()} "
+                          f"down_s={ds.shape} stride={ds.stride()} contig={ds.is_contiguous()}",
+                          flush=True)
+                    print(f"  gate_w.shape[0]={gw.shape[0]} (N_intermediate) "
+                          f"gate_w.shape[1]={gw.shape[1]} (s1_stride_weight_n) "
+                          f"gate_s.shape[1]={gs.shape[1]} (s1_stride_scale_n)",
+                          flush=True)
+                    print(f"  down_w.shape[1]={dw.shape[1]} (s2_stride_weight_n) "
+                          f"down_s.shape[1]={ds.shape[1]} (s2_stride_scale_n)",
+                          flush=True)
+
+                # 1) WGMMA grouped output
+                wgmma_out = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    self.gate_weights[0], self.gate_scales[0],
+                    self.down_weights[0], self.down_scales[0],
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                )
+                torch.cuda.synchronize()
+
+                # 2) Triton grouped output (known correct)
+                triton_out = grouped_mxfp4_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    self.gate_weights[0], self.gate_scales[0],
+                    self.up_weights[0], self.up_scales[0],
+                    self.down_weights[0], self.down_scales[0],
+                    self.gate_biases, self.up_biases, self.down_biases,
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                    swiglu_alpha=self.swiglu_alpha,
+                    swiglu_limit=self.swiglu_limit,
+                )
+                torch.cuda.synchronize()
+
+                # 3) Compare
+                diff = (wgmma_out.float() - triton_out.float()).abs()
+                ref_abs = triton_out.float().abs()
+                max_diff = diff.max().item()
+                mean_diff = diff.mean().item()
+                max_ref = ref_abs.max().item()
+                rel_err = (diff / (ref_abs + 1e-8)).max().item()
+
+                # Check with BF16 WGMMA tolerance
+                tol = 1e-5 + 1.6e-2 * ref_abs
+                n_fail = (diff > tol).sum().item()
+                n_total = diff.numel()
+                fail_pct = n_fail / n_total * 100
+
+                # Output range stats
+                w_min = wgmma_out.float().min().item()
+                w_max = wgmma_out.float().max().item()
+                w_nan = torch.isnan(wgmma_out).sum().item()
+                w_inf = torch.isinf(wgmma_out).sum().item()
+                t_min = triton_out.float().min().item()
+                t_max = triton_out.float().max().item()
+
+                print(f"[COMPARE #{_COMPARE_COUNT}] "
+                      f"max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} "
+                      f"rel_err={rel_err:.6f} fail={n_fail}/{n_total} ({fail_pct:.4f}%)",
+                      flush=True)
+                print(f"  WGMMA range: [{w_min:.4f}, {w_max:.4f}] nan={w_nan} inf={w_inf} "
+                      f"Triton range: [{t_min:.4f}, {t_max:.4f}] "
+                      f"ref_max={max_ref:.4f}", flush=True)
+
+                if max_diff > 1.0:
+                    # Large divergence — dump more detail
+                    nonzero_w = (wgmma_out.float().abs() > 1e-8).sum().item()
+                    nonzero_t = (triton_out.float().abs() > 1e-8).sum().item()
+                    all_zero_w = (wgmma_out == 0).all().item()
+                    print(f"  WARNING: large divergence! "
+                          f"nonzero WGMMA={nonzero_w} Triton={nonzero_t} "
+                          f"total_elements={n_total} all_zero_w={all_zero_w}",
+                          flush=True)
+
+                # Use Triton output (known correct) for model
+                output = triton_out
+
             elif _HAS_CUDA_ROUTING:
-                # Triton grouped fallback: CUDA routing + 3D GEMM + reduce
                 output = grouped_mxfp4_moe_forward_cuda_routing(
                     hidden_flat, topk_indices, topk_weights,
                     self.gate_ptrs, self.gate_scale_ptrs,
