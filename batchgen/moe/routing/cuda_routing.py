@@ -61,6 +61,10 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
     N = router_logits.shape[0]
     device = router_logits.device
 
+    # Kernel requires FP32 for numerical stability in softmax
+    if router_logits.dtype != torch.float32:
+        router_logits = router_logits.float()
+
     if topk_indices is None:
         topk_indices = torch.empty(N, k, dtype=torch.int32, device=device)
     if topk_weights is None:
