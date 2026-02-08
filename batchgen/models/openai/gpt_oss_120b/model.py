@@ -1086,8 +1086,8 @@ class GptOssMoE_EP(nn.Module):
             # Get weights for these tokens at these topk positions
             expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
 
-            # Weighted accumulation into results (no dtype conversion needed - both BF16)
-            weighted_output = expert_output * expert_weights.unsqueeze(-1)
+            # Weighted accumulation into results
+            weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(global_results.dtype)
             global_results.index_add_(0, expert_token_idx, weighted_output)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
