@@ -2,66 +2,41 @@
 CUDA routing kernels for GPT-OSS-120B MoE.
 
 JIT-compiled CUDA extension providing gate, dispatch, and reduce kernels.
-These are CUDA equivalents of the Triton routing kernels for benchmarking.
+Compiled eagerly at import time so the first kernel call has no compilation stall.
 
 Usage:
-    from moe.gptoss.routing.cuda_routing import (
+    from batchgen.moe.routing import (
         gate_topk_softmax_cuda,
         dispatch_count_gather_cuda,
         reduce_weighted_scatter_cuda,
     )
 """
 
-import os
 import torch
 from pathlib import Path
+from torch.utils.cpp_extension import load
 
 # ──────────────────────────────────────────────────────────────────────────────
-# JIT compilation
+# Compile at import time
 # ──────────────────────────────────────────────────────────────────────────────
 
-_cuda_ext = None
-_compile_error = None
+_csrc_dir = Path(__file__).parent / "csrc"
 
-
-def _get_cuda_ext():
-    """Lazily compile and load the CUDA extension."""
-    global _cuda_ext, _compile_error
-
-    if _cuda_ext is not None:
-        return _cuda_ext
-
-    if _compile_error is not None:
-        raise _compile_error
-
-    try:
-        from torch.utils.cpp_extension import load
-
-        csrc_dir = Path(__file__).parent / "csrc"
-
-        _cuda_ext = load(
-            name="routing_cuda",
-            sources=[
-                str(csrc_dir / "routing_extension.cc"),
-                str(csrc_dir / "gate_topk_softmax.cu"),
-                str(csrc_dir / "dispatch_count_gather.cu"),
-                str(csrc_dir / "reduce_weighted_scatter.cu"),
-            ],
-            extra_cuda_cflags=[
-                "-O3",
-                "--use_fast_math",
-                "-std=c++17",
-            ],
-            verbose=False,
-        )
-        return _cuda_ext
-
-    except Exception as e:
-        _compile_error = RuntimeError(
-            f"Failed to compile CUDA routing kernels: {e}\n"
-            "Make sure CUDA toolkit is installed and nvcc is available."
-        )
-        raise _compile_error
+_cuda_ext = load(
+    name="routing_cuda",
+    sources=[
+        str(_csrc_dir / "routing_extension.cc"),
+        str(_csrc_dir / "gate_topk_softmax.cu"),
+        str(_csrc_dir / "dispatch_count_gather.cu"),
+        str(_csrc_dir / "reduce_weighted_scatter.cu"),
+    ],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-std=c++17",
+    ],
+    verbose=False,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -82,7 +57,7 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
         topk_indices: [N, K] int32
         topk_weights: [N, K] FP32
     """
-    ext = _get_cuda_ext()
+    ext = _cuda_ext
     N = router_logits.shape[0]
     device = router_logits.device
 
@@ -117,7 +92,7 @@ def dispatch_count_gather_cuda(
         expert_offsets: [E_local+1] int32
         topk_pos: [N*K] int32
     """
-    ext = _get_cuda_ext()
+    ext = _cuda_ext
     N, K = topk_indices.shape
     H = x.shape[1]
     NK = N * K
@@ -172,7 +147,7 @@ def reduce_weighted_scatter_cuda(
     Returns:
         output: [N, H] BF16
     """
-    ext = _get_cuda_ext()
+    ext = _cuda_ext
 
     if H is None:
         H = expert_output.shape[1]
