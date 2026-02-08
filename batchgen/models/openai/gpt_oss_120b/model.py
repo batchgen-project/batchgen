@@ -974,6 +974,20 @@ class GptOssMoE_EP(nn.Module):
         self.swiglu_alpha = getattr(config, 'swiglu_alpha', 1.702)
         self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
 
+        # Grouped WGMMA pointer arrays (set by Parallel_Strategy_Manager)
+        self.gate_ptrs = None
+        self.gate_scale_ptrs = None
+        self.up_ptrs = None
+        self.up_scale_ptrs = None
+        self.down_ptrs = None
+        self.down_scale_ptrs = None
+        self.gate_weight_ref = None
+        self.gate_scale_ref = None
+        self.down_weight_ref = None
+        self.down_scale_ref = None
+        self._use_grouped_wgmma = False
+        self._grouped_logged = False
+
     def init_num_tokens(self, num_tokens_per_rank: int):
         """Initialize communication buffers for given batch size.
 
@@ -1093,59 +1107,82 @@ class GptOssMoE_EP(nn.Module):
         num_global_tokens = all_tokens.shape[0]
         K = self.num_experts_per_tok
 
-        # Flat view of expert assignments
-        flat_expert_idx = topk_indices.view(-1)  # [global_tokens * K]
-
-        # Use pre-allocated index tensors
-        token_indices = self.token_idx_buffer
-        topk_positions = self.topk_pos_buffer
-
-        # Pre-compute expert token counts ONCE to avoid per-expert .any() sync
-        # This reduces GPU→CPU syncs from 32 per layer to 1 per layer
-        expert_counts = self.expert_counts_buffer
-        expert_counts.zero_()
-        expert_counts.scatter_add_(
-            0, flat_expert_idx.to(torch.int64),
-            torch.ones_like(flat_expert_idx, dtype=torch.int32)
-        )
-        # Single CPU transfer for all counts
-        expert_counts_cpu = expert_counts.cpu()
-
         # Use pre-allocated output buffer (BF16 to avoid dtype conversion in loop)
         global_results = self.global_results_buffer
         global_results.zero_()
 
-        # Loop through local experts only
-        for local_e in range(self.experts_per_rank):
-            global_e = self.routed_expert_start_idx + local_e
+        if self._use_grouped_wgmma and _HAS_CUDA_ROUTING:
+            # Grouped WGMMA: 4 kernel launches for all local experts
+            if not self._grouped_logged:
+                logging.info(
+                    f"[WGMMA grouped] EP rank {self.rank}: using grouped path "
+                    f"(experts [{self.routed_expert_start_idx}, "
+                    f"{self.routed_expert_start_idx + self.experts_per_rank}), 4 launches)"
+                )
+                self._grouped_logged = True
 
-            # Check token count without GPU sync (already on CPU)
-            if expert_counts_cpu[global_e].item() == 0:
-                continue
+            global_results[:num_global_tokens] = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                all_tokens, topk_indices, topk_weights,
+                self.gate_ptrs, self.gate_scale_ptrs,
+                self.up_ptrs, self.up_scale_ptrs,
+                self.down_ptrs, self.down_scale_ptrs,
+                self.gate_weight_ref, self.gate_scale_ref,
+                self.down_weight_ref, self.down_scale_ref,
+                num_experts=self.total_experts,
+                expert_start=self.routed_expert_start_idx,
+                num_local_experts=self.experts_per_rank,
+            )
+        else:
+            # Per-expert loop fallback
+            # Flat view of expert assignments
+            flat_expert_idx = topk_indices.view(-1)  # [global_tokens * K]
 
-            # Find tokens routed to this expert
-            mask = flat_expert_idx == global_e
+            # Use pre-allocated index tensors
+            token_indices = self.token_idx_buffer
+            topk_positions = self.topk_pos_buffer
 
-            # Get token indices and topk positions for this expert
-            expert_token_idx = token_indices[mask]
-            expert_topk_pos = topk_positions[mask]
+            # Pre-compute expert token counts ONCE to avoid per-expert .any() sync
+            # This reduces GPU→CPU syncs from 32 per layer to 1 per layer
+            expert_counts = self.expert_counts_buffer
+            expert_counts.zero_()
+            expert_counts.scatter_add_(
+                0, flat_expert_idx.to(torch.int64),
+                torch.ones_like(flat_expert_idx, dtype=torch.int32)
+            )
+            # Single CPU transfer for all counts
+            expert_counts_cpu = expert_counts.cpu()
 
-            # Gather tokens for this expert
-            tokens_for_expert = all_tokens[expert_token_idx]
+            # Loop through local experts only
+            for local_e in range(self.experts_per_rank):
+                global_e = self.routed_expert_start_idx + local_e
 
-            # Call expert forward (wrapper handles MXFP4 dequant)
-            expert = self.experts[global_e]
-            if expert is None:
-                continue  # Expert not loaded on this rank (shouldn't happen)
+                # Check token count without GPU sync (already on CPU)
+                if expert_counts_cpu[global_e].item() == 0:
+                    continue
 
-            expert_output = expert(tokens_for_expert)
+                # Find tokens routed to this expert
+                mask = flat_expert_idx == global_e
 
-            # Get weights for these tokens at these topk positions
-            expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
+                # Get token indices and topk positions for this expert
+                expert_token_idx = token_indices[mask]
+                expert_topk_pos = topk_positions[mask]
 
-            # Weighted accumulation into results
-            weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(global_results.dtype)
-            global_results.index_add_(0, expert_token_idx, weighted_output)
+                # Gather tokens for this expert
+                tokens_for_expert = all_tokens[expert_token_idx]
+
+                # Call expert forward (wrapper handles MXFP4 dequant)
+                expert = self.experts[global_e]
+                if expert is None:
+                    continue  # Expert not loaded on this rank (shouldn't happen)
+
+                expert_output = expert(tokens_for_expert)
+
+                # Get weights for these tokens at these topk positions
+                expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
+
+                # Weighted accumulation into results
+                weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(global_results.dtype)
+                global_results.index_add_(0, expert_token_idx, weighted_output)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
         with self.comm.change_state(enable=True):

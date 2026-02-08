@@ -681,10 +681,15 @@ class GptOssParallelStrategyManager:
         - AllReduces to combine results
 
         Expert wrappers from old MoE are transferred to EP MoE.
+        When WGMMA grouped kernels are available, sets up pointer arrays
+        for grouped GEMM execution (4 launches vs per-expert loop).
         """
-        from .model import GptOssMoE_EP
+        from .model import GptOssMoE_EP, _HAS_WGMMA_GROUPED
 
         device = self.engine_config.Basic_Config.device_torch
+
+        # Check if grouped WGMMA is available for all layers
+        use_grouped = _HAS_WGMMA_GROUPED and not self.enable_ep_offloading
 
         for layer_idx in range(self.model_config.num_hidden_layers):
             old_moe = self.model.model.layers[layer_idx].mlp
@@ -699,6 +704,38 @@ class GptOssParallelStrategyManager:
                 global_e = self.routed_expert_gpu_start_idx + local_e
                 ep_moe.experts[global_e] = old_moe.experts[global_e]
 
+            # Set up grouped WGMMA pointer arrays if available
+            if use_grouped:
+                from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
+
+                gate_weights, gate_scales = [], []
+                up_weights, up_scales = [], []
+                down_weights, down_scales = [], []
+
+                for local_e in range(self.num_local_expert_per_layer):
+                    global_e = self.routed_expert_gpu_start_idx + local_e
+                    wrapper = ep_moe.experts[global_e]
+                    gate_weights.append(wrapper.mxfp4_gate_packed)
+                    gate_scales.append(wrapper.mxfp4_gate_scales)
+                    up_weights.append(wrapper.mxfp4_up_packed)
+                    up_scales.append(wrapper.mxfp4_up_scales)
+                    down_weights.append(wrapper.mxfp4_down_packed)
+                    down_scales.append(wrapper.mxfp4_down_scales)
+
+                ep_moe.gate_ptrs, ep_moe.gate_scale_ptrs = setup_expert_weight_pointers(
+                    gate_weights, gate_scales)
+                ep_moe.up_ptrs, ep_moe.up_scale_ptrs = setup_expert_weight_pointers(
+                    up_weights, up_scales)
+                ep_moe.down_ptrs, ep_moe.down_scale_ptrs = setup_expert_weight_pointers(
+                    down_weights, down_scales)
+
+                # Reference weights for stride computation
+                ep_moe.gate_weight_ref = gate_weights[0]
+                ep_moe.gate_scale_ref = gate_scales[0]
+                ep_moe.down_weight_ref = down_weights[0]
+                ep_moe.down_scale_ref = down_scales[0]
+                ep_moe._use_grouped_wgmma = True
+
             ep_moe.to(device)
 
             # Initialize num_tokens_per_rank for AllGather/AllReduce buffers
@@ -707,9 +744,10 @@ class GptOssParallelStrategyManager:
             # Swap MoE layer
             self.model.model.layers[layer_idx].mlp = ep_moe
 
+        grouped_str = " + WGMMA grouped (4 launches)" if use_grouped else ""
         logging.info(
             f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoE_EP "
-            f"(AllGather → Route → Local experts → AllReduce). "
+            f"(AllGather → Route → Local experts → AllReduce{grouped_str}). "
             f"Rank {self.rank}: experts [{self.routed_expert_gpu_start_idx}, {self.routed_expert_gpu_end_idx})"
         )
 
