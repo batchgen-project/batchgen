@@ -47,6 +47,13 @@ from transformers.modeling_outputs import (
 
 from .configuration_gpt_oss import GptOssConfig
 
+# CUDA routing kernels (fused top-k + softmax gate)
+try:
+    from batchgen.moe.routing import gate_topk_softmax_cuda
+    _HAS_CUDA_GATE = True
+except ImportError:
+    _HAS_CUDA_GATE = False
+
 
 # ============================================================================
 # Decode Layer Timing Infrastructure
@@ -593,9 +600,15 @@ class GptOssMoE(nn.Module):
         # Compute routing logits
         router_logits = self.router(hidden_states_flat)  # [batch*seq, num_experts]
 
-        # Select Top-K experts
-        topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        # Select Top-K experts with fused CUDA gate (topk + softmax in one kernel)
+        if _HAS_CUDA_GATE:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+            topk_indices = topk_indices.to(torch.int64)  # downstream expects int64
+        else:
+            topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         if timing_enabled:
             torch.cuda.synchronize()
@@ -736,9 +749,15 @@ class GptOssMoEQuantized(nn.Module):
         # Compute routing logits
         router_logits = self.router(hidden_flat)
 
-        # Select Top-K experts
-        topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        # Select Top-K experts with fused CUDA gate (topk + softmax in one kernel)
+        if _HAS_CUDA_GATE:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+            topk_indices = topk_indices.to(torch.int64)  # downstream expects int64
+        else:
+            topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         if timing_enabled:
             torch.cuda.synchronize()
@@ -1002,10 +1021,16 @@ class GptOssMoE_EP(nn.Module):
 
         # ---- 2) Router: Compute routing for ALL global tokens ----
         router_logits = self.router(all_tokens)  # [global_tokens, 128]
-        topk_weights, topk_indices = torch.topk(
-            router_logits, k=self.num_experts_per_tok, dim=-1
-        )
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        if _HAS_CUDA_GATE:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+            topk_indices = topk_indices.to(torch.int64)
+        else:
+            topk_weights, topk_indices = torch.topk(
+                router_logits, k=self.num_experts_per_tok, dim=-1
+            )
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         # ---- 3) Process local experts ----
         num_global_tokens = all_tokens.shape[0]
@@ -1163,10 +1188,16 @@ class GptOssMoEPrefill(nn.Module):
         router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
 
         # Select Top-K experts per token
-        topk_weights, topk_indices = torch.topk(
-            router_logits, k=self.num_experts_per_tok, dim=-1
-        )  # [total_tokens, top_k]
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        if _HAS_CUDA_GATE:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+            topk_indices = topk_indices.to(torch.int64)
+        else:
+            topk_weights, topk_indices = torch.topk(
+                router_logits, k=self.num_experts_per_tok, dim=-1
+            )  # [total_tokens, top_k]
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         # Initialize output
         output = torch.zeros_like(hidden_flat)
