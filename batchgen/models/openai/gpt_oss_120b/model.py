@@ -1792,17 +1792,33 @@ class GptOssMoE_EP(nn.Module):
                     else:
                         print(f"    E2) WARNING: expert has no mxfp4_gate_packed attr!", flush=True)
 
-                    # E3: Direct kernel comparison with BOTH weight sources
+                    # E3: Direct kernel comparison — CORRUPTION ISOLATION TEST
                     e_token_idx = _token_indices[mask_e]
-                    e_topk_pos_v = _topk_positions_buf[mask_e]
-                    e_tokens = all_tokens[e_token_idx]
-                    # Deduplicate tokens (same token may appear via different topk slots)
                     unique_tokens, inverse = torch.unique(e_token_idx, return_inverse=True)
                     e_unique_tokens = all_tokens[unique_tokens]
 
                     from batchgen.moe.fused_wgmma_expert import fused_mxfp4_expert_forward
-                    # E3a: Call single-expert kernel with WRAPPER weights
+
+                    # Save a hash of input tokens for corruption detection
+                    _token_snapshot = e_unique_tokens.clone()
+                    _token_hash_before = e_unique_tokens.view(-1).float().sum().item()
+
                     w = expert_e._get_stored_mxfp4_weights()
+
+                    # Verify E2 holds: all weight data_ptrs match
+                    if hasattr(self, '_local_gate_weights'):
+                        _ptrs_match = all([
+                            w["gate_proj.weight"].data_ptr() == self._local_gate_weights[local_e].data_ptr(),
+                            w["gate_proj.weight_scales"].data_ptr() == self._local_gate_scales[local_e].data_ptr(),
+                            w["up_proj.weight"].data_ptr() == self._local_up_weights[local_e].data_ptr(),
+                            w["up_proj.weight_scales"].data_ptr() == self._local_up_scales[local_e].data_ptr(),
+                            w["down_proj.weight"].data_ptr() == self._local_down_weights[local_e].data_ptr(),
+                            w["down_proj.weight_scales"].data_ptr() == self._local_down_scales[local_e].data_ptr(),
+                        ])
+                        print(f"    E3-pre) All 6 weight data_ptrs match: {_ptrs_match}",
+                              flush=True)
+
+                    # E3a: Call kernel with wrapper weights
                     direct_wrapper = fused_mxfp4_expert_forward(
                         e_unique_tokens,
                         w["gate_proj.weight"], w["gate_proj.weight_scales"],
@@ -1814,10 +1830,38 @@ class GptOssMoE_EP(nn.Module):
                     )
                     torch.cuda.synchronize()
 
-                    # E3b: Call single-expert kernel with _local weights (same as pointer arrays)
+                    # CHECK: Did E3a corrupt the input tokens?
+                    _token_hash_after_a = e_unique_tokens.view(-1).float().sum().item()
+                    _tokens_corrupted = not torch.equal(e_unique_tokens, _token_snapshot)
+                    if _tokens_corrupted:
+                        _diff_elems = (e_unique_tokens != _token_snapshot).sum().item()
+                        _total_elems = e_unique_tokens.numel()
+                        print(f"    E3-CORRUPTION) e_unique_tokens MODIFIED by E3a! "
+                              f"{_diff_elems}/{_total_elems} elements changed "
+                              f"hash_before={_token_hash_before:.4f} "
+                              f"hash_after={_token_hash_after_a:.4f}",
+                              flush=True)
+                    else:
+                        print(f"    E3-integrity) tokens intact after E3a",
+                              flush=True)
+
+                    # E3b-CLONE: Call kernel with local weights using CLONED tokens
+                    # (isolates input corruption from weight difference)
                     if hasattr(self, '_local_gate_weights'):
-                        direct_local = fused_mxfp4_expert_forward(
-                            e_unique_tokens,
+                        direct_local_cloned = fused_mxfp4_expert_forward(
+                            _token_snapshot.clone(),  # FRESH COPY — immune to corruption
+                            self._local_gate_weights[local_e],
+                            self._local_gate_scales[local_e],
+                            self._local_up_weights[local_e],
+                            self._local_up_scales[local_e],
+                            self._local_down_weights[local_e],
+                            self._local_down_scales[local_e],
+                        )
+                        torch.cuda.synchronize()
+
+                        # E3b-ORIG: Also call with possibly-corrupted original tokens
+                        direct_local_orig = fused_mxfp4_expert_forward(
+                            e_unique_tokens,  # may be corrupted
                             self._local_gate_weights[local_e],
                             self._local_gate_scales[local_e],
                             self._local_up_weights[local_e],
@@ -1827,13 +1871,24 @@ class GptOssMoE_EP(nn.Module):
                         )
                         torch.cuda.synchronize()
                     else:
-                        direct_local = None
+                        direct_local_cloned = None
+                        direct_local_orig = None
 
-                    # E3c: Get grouped kernel output for same unique tokens
-                    # For the first topk slot of each unique token
+                    # E3-repeat: Call with wrapper weights AGAIN (determinism check)
+                    direct_wrapper2 = fused_mxfp4_expert_forward(
+                        _token_snapshot.clone(),  # FRESH COPY
+                        w["gate_proj.weight"], w["gate_proj.weight_scales"],
+                        w["up_proj.weight"], w["up_proj.weight_scales"],
+                        w["down_proj.weight"], w["down_proj.weight_scales"],
+                        gate_bias=w.get("gate_proj.bias"),
+                        up_bias=w.get("up_proj.bias"),
+                        down_bias=w.get("down_proj.bias"),
+                    )
+                    torch.cuda.synchronize()
+
+                    # E3c: Get grouped kernel output positions
                     _first_slot_pos = []
                     for ui, ut in enumerate(unique_tokens):
-                        # Find first slot for this token that maps to this expert
                         for slot in range(K):
                             flat_i = ut.item() * K + slot
                             if topk_indices.view(-1)[flat_i].item() == global_e:
@@ -1842,7 +1897,7 @@ class GptOssMoE_EP(nn.Module):
                                     _first_slot_pos.append(sp)
                                     break
                         else:
-                            _first_slot_pos.append(-1)  # shouldn't happen
+                            _first_slot_pos.append(-1)
 
                     valid_e3 = [p for p in _first_slot_pos if p >= 0]
                     if valid_e3:
@@ -1850,49 +1905,44 @@ class GptOssMoE_EP(nn.Module):
                         valid_mask = torch.tensor([p >= 0 for p in _first_slot_pos],
                                                   device=self.device)
 
-                        # Compare: grouped vs wrapper-weights
-                        diff_gw = (sorted_e3.float() - direct_wrapper[valid_mask].float()).abs()
-                        max_gw = diff_gw.max().item()
+                        max_gw = (sorted_e3.float() - direct_wrapper[valid_mask].float()).abs().max().item()
 
-                        # Compare: grouped vs local-weights
-                        if direct_local is not None:
-                            diff_gl = (sorted_e3.float() - direct_local[valid_mask].float()).abs()
-                            max_gl = diff_gl.max().item()
+                        if direct_local_cloned is not None:
+                            max_gl_cloned = (sorted_e3.float() - direct_local_cloned[valid_mask].float()).abs().max().item()
+                            max_gl_orig = (sorted_e3.float() - direct_local_orig[valid_mask].float()).abs().max().item()
+                            max_wl_cloned = (direct_wrapper.float() - direct_local_cloned.float()).abs().max().item()
+                            max_wl_orig = (direct_wrapper.float() - direct_local_orig.float()).abs().max().item()
                         else:
-                            max_gl = -1.0
+                            max_gl_cloned = max_gl_orig = max_wl_cloned = max_wl_orig = -1.0
 
-                        # Compare: wrapper-weights vs local-weights
-                        if direct_local is not None:
-                            diff_wl = (direct_wrapper.float() - direct_local.float()).abs()
-                            max_wl = diff_wl.max().item()
-                        else:
-                            max_wl = -1.0
-
-                        # Compare: wrapper output vs expert.forward() output
-                        expert_via_forward = expert_e(e_unique_tokens)
-                        torch.cuda.synchronize()
-                        diff_fw = (direct_wrapper.float() - expert_via_forward.float()).abs()
-                        max_fw = diff_fw.max().item()
+                        # Determinism: wrapper call 1 vs wrapper call 2
+                        max_det = (direct_wrapper.float() - direct_wrapper2.float()).abs().max().item()
 
                         print(f"    E3) expert {global_e} M={e_unique_tokens.shape[0]}:",
                               flush=True)
-                        print(f"      grouped vs wrapper_weights: max_diff={max_gw:.6f}",
+                        print(f"      grouped vs wrapper:      max_diff={max_gw:.6f}",
                               flush=True)
-                        print(f"      grouped vs local_weights:   max_diff={max_gl:.6f}",
+                        print(f"      grouped vs local(CLONE):  max_diff={max_gl_cloned:.6f}",
                               flush=True)
-                        print(f"      wrapper_weights vs local:   max_diff={max_wl:.6f}",
+                        print(f"      grouped vs local(ORIG):   max_diff={max_gl_orig:.6f}",
                               flush=True)
-                        print(f"      fused_direct vs forward():  max_diff={max_fw:.6f}",
+                        print(f"      wrapper vs local(CLONE):  max_diff={max_wl_cloned:.6f}",
+                              flush=True)
+                        print(f"      wrapper vs local(ORIG):   max_diff={max_wl_orig:.6f}",
+                              flush=True)
+                        print(f"      wrapper call1 vs call2:   max_diff={max_det:.6f} (determinism)",
                               flush=True)
                         print(f"      grouped range: [{sorted_e3.float().min():.4f}, "
                               f"{sorted_e3.float().max():.4f}]", flush=True)
                         print(f"      wrapper range: [{direct_wrapper[valid_mask].float().min():.4f}, "
                               f"{direct_wrapper[valid_mask].float().max():.4f}]", flush=True)
-                        if direct_local is not None:
-                            print(f"      local   range: [{direct_local[valid_mask].float().min():.4f}, "
-                                  f"{direct_local[valid_mask].float().max():.4f}]", flush=True)
-                        print(f"      forward range: [{expert_via_forward.float().min():.4f}, "
-                              f"{expert_via_forward.float().max():.4f}]", flush=True)
+                        if direct_local_cloned is not None:
+                            print(f"      local(CLONE): [{direct_local_cloned[valid_mask].float().min():.4f}, "
+                                  f"{direct_local_cloned[valid_mask].float().max():.4f}]", flush=True)
+                            print(f"      local(ORIG):  [{direct_local_orig[valid_mask].float().min():.4f}, "
+                                  f"{direct_local_orig[valid_mask].float().max():.4f}]", flush=True)
+                        print(f"      wrapper2:     [{direct_wrapper2.float().min():.4f}, "
+                              f"{direct_wrapper2.float().max():.4f}]", flush=True)
 
             print(flush=True)
 
