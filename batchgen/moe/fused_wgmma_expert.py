@@ -1120,3 +1120,108 @@ def fused_mxfp4_expert_forward_from_dict(
         up_bias=weights.get("up_proj.bias"),
         down_bias=weights.get("down_proj.bias"),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WGMMA Single-Expert MoE Forward with CUDA Routing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def wgmma_single_expert_moe_forward_cuda_routing(
+    hidden_states: torch.Tensor,          # [batch*seq, hidden] BF16
+    topk_indices: torch.Tensor,           # [batch*seq, K] int32
+    topk_weights: torch.Tensor,           # [batch*seq, K] FP32
+    gate_weights: list,                   # List[Tensor] per expert
+    gate_scales: list,                    # List[Tensor] per expert
+    up_weights: list,
+    up_scales: list,
+    down_weights: list,
+    down_scales: list,
+    gate_biases=None,                     # [num_experts, N] BF16 stacked or None
+    up_biases=None,
+    down_biases=None,
+    num_experts: int = 128,
+    expert_start: int = 0,
+    num_local_experts: int = 128,
+) -> torch.Tensor:
+    """WGMMA single-expert MoE forward with CUDA routing.
+
+    Uses CUDA dispatch/reduce kernels for routing and per-expert WGMMA kernels
+    for the MoE computation. This is the highest-priority decode path when
+    WGMMA is available.
+
+    Pipeline: dispatch_count_gather_cuda → per-expert fused_mxfp4_expert_forward
+    loop → reduce_weighted_scatter_cuda
+
+    Args:
+        hidden_states: Input [batch*seq, hidden] in BF16
+        topk_indices: Expert indices [batch*seq, K] in int32
+        topk_weights: Routing weights [batch*seq, K] in FP32
+        gate_weights: List of per-expert gate packed weights
+        gate_scales: List of per-expert gate scales
+        up_weights: List of per-expert up packed weights
+        up_scales: List of per-expert up scales
+        down_weights: List of per-expert down packed weights
+        down_scales: List of per-expert down scales
+        gate_biases: Optional stacked biases [num_experts, N] BF16
+        up_biases: Optional stacked biases [num_experts, N] BF16
+        down_biases: Optional stacked biases [num_experts, K] BF16
+        num_experts: Total number of experts
+        expert_start: First local expert index (for EP)
+        num_local_experts: Number of local experts on this rank
+
+    Returns:
+        Output tensor [batch*seq, hidden] in BF16
+    """
+    from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+
+    num_tokens, hidden_size = hidden_states.shape
+    K = topk_indices.shape[1]
+
+    # Step 1: CUDA dispatch
+    dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+        hidden_states, topk_indices,
+        expert_start, num_local_experts,
+    )
+
+    # Trim to actual dispatched tokens
+    total_dispatched = expert_offsets[num_local_experts].item()
+    dispatched_x = dispatched_x[:total_dispatched]
+
+    # Step 2: Per-expert WGMMA forward
+    # Allocate output buffer for all dispatched tokens
+    expert_output = torch.empty(
+        total_dispatched, hidden_size,
+        dtype=torch.bfloat16, device=hidden_states.device,
+    )
+
+    for e_local in range(num_local_experts):
+        start = expert_offsets[e_local].item()
+        end = expert_offsets[e_local + 1].item()
+        if start == end:
+            continue  # Skip empty experts
+
+        global_e = expert_start + e_local
+        expert_input = dispatched_x[start:end]
+
+        # Extract per-expert biases from stacked tensors
+        g_bias = gate_biases[global_e] if gate_biases is not None else None
+        u_bias = up_biases[global_e] if up_biases is not None else None
+        d_bias = down_biases[global_e] if down_biases is not None else None
+
+        expert_output[start:end] = fused_mxfp4_expert_forward(
+            expert_input,
+            gate_weights[global_e], gate_scales[global_e],
+            up_weights[global_e], up_scales[global_e],
+            down_weights[global_e], down_scales[global_e],
+            gate_bias=g_bias,
+            up_bias=u_bias,
+            down_bias=d_bias,
+        )
+
+    # Step 3: CUDA reduce
+    output = reduce_weighted_scatter_cuda(
+        expert_output, topk_pos, topk_weights,
+        num_tokens, hidden_size, K,
+    )
+
+    return output

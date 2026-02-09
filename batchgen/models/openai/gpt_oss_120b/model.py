@@ -55,6 +55,28 @@ try:
 except ImportError:
     _HAS_CUDA_ROUTING = False
 
+# WGMMA single-expert kernels (per-expert WGMMA, highest priority decode path)
+try:
+    from batchgen.moe.fused_wgmma_expert import (
+        fused_mxfp4_expert_forward,
+        wgmma_single_expert_moe_forward_cuda_routing,
+        is_wgmma_available,
+    )
+    if os.environ.get("BATCHGEN_DISABLE_WGMMA_SINGLE", "0") == "1":
+        _HAS_WGMMA_SINGLE = False
+        print("[WGMMA single] disabled by BATCHGEN_DISABLE_WGMMA_SINGLE", flush=True)
+    else:
+        _HAS_WGMMA_SINGLE = is_wgmma_available()
+        if _HAS_WGMMA_SINGLE:
+            print("[WGMMA single] available (confirmed correct, highest priority)", flush=True)
+        else:
+            print("[WGMMA single] not available (SM90 required)", flush=True)
+except Exception as e:
+    _HAS_WGMMA_SINGLE = False
+    print(f"[WGMMA single] failed to load: {e}", flush=True)
+
+_WGMMA_SINGLE_LOGGED = False
+
 # WGMMA grouped kernels (fused gate+up+SwiGLU + down, 1D+offsets layout)
 try:
     from batchgen.moe.fused_wgmma_grouped import (
@@ -817,8 +839,25 @@ class GptOssMoEQuantized(nn.Module):
             run_compare = (_COMPARE_GROUPED and _HAS_WGMMA_GROUPED
                            and _HAS_CUDA_ROUTING and _COMPARE_COUNT < _COMPARE_MAX)
 
-            if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING and not run_compare:
-                # WGMMA grouped: fastest path (4 kernel launches)
+            if _HAS_WGMMA_SINGLE and _HAS_CUDA_ROUTING:
+                # WGMMA single-expert: per-expert WGMMA + CUDA routing (highest priority)
+                global _WGMMA_SINGLE_LOGGED
+                if not _WGMMA_SINGLE_LOGGED:
+                    print("[WGMMA single] MoE forward using per-expert WGMMA path", flush=True)
+                    _WGMMA_SINGLE_LOGGED = True
+                output = wgmma_single_expert_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_weights, self.gate_scales,
+                    self.up_weights, self.up_scales,
+                    self.down_weights, self.down_scales,
+                    gate_biases=self.gate_biases,
+                    up_biases=self.up_biases,
+                    down_biases=self.down_biases,
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                )
+            elif _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING and not run_compare:
+                # WGMMA grouped: fast path (4 kernel launches)
                 global _WGMMA_GROUPED_LOGGED
                 if not _WGMMA_GROUPED_LOGGED:
                     print("[WGMMA grouped] MoE forward using grouped path (4 launches)", flush=True)
@@ -999,18 +1038,29 @@ class GptOssMoEQuantized(nn.Module):
                 if expert_mask.any():
                     expert_input = hidden_flat[expert_mask]
 
-                    # Use optimized single-expert kernel
-                    expert_output = mxfp4_expert_forward_single(
-                        expert_input,
-                        self.gate_weights[expert_idx], self.gate_scales[expert_idx],
-                        self.up_weights[expert_idx], self.up_scales[expert_idx],
-                        self.down_weights[expert_idx], self.down_scales[expert_idx],
-                        self.gate_biases[expert_idx] if self.gate_biases is not None else None,
-                        self.up_biases[expert_idx] if self.up_biases is not None else None,
-                        self.down_biases[expert_idx] if self.down_biases is not None else None,
-                        swiglu_alpha=self.swiglu_alpha,
-                        swiglu_limit=self.swiglu_limit,
-                    )
+                    # Use WGMMA single-expert if available, else Triton
+                    if _HAS_WGMMA_SINGLE:
+                        expert_output = fused_mxfp4_expert_forward(
+                            expert_input,
+                            self.gate_weights[expert_idx], self.gate_scales[expert_idx],
+                            self.up_weights[expert_idx], self.up_scales[expert_idx],
+                            self.down_weights[expert_idx], self.down_scales[expert_idx],
+                            gate_bias=self.gate_biases[expert_idx] if self.gate_biases is not None else None,
+                            up_bias=self.up_biases[expert_idx] if self.up_biases is not None else None,
+                            down_bias=self.down_biases[expert_idx] if self.down_biases is not None else None,
+                        )
+                    else:
+                        expert_output = mxfp4_expert_forward_single(
+                            expert_input,
+                            self.gate_weights[expert_idx], self.gate_scales[expert_idx],
+                            self.up_weights[expert_idx], self.up_scales[expert_idx],
+                            self.down_weights[expert_idx], self.down_scales[expert_idx],
+                            self.gate_biases[expert_idx] if self.gate_biases is not None else None,
+                            self.up_biases[expert_idx] if self.up_biases is not None else None,
+                            self.down_biases[expert_idx] if self.down_biases is not None else None,
+                            swiglu_alpha=self.swiglu_alpha,
+                            swiglu_limit=self.swiglu_limit,
+                        )
 
                     # Get routing weight for this expert
                     expert_weight = torch.where(
