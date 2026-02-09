@@ -1293,7 +1293,7 @@ class GptOssMoE_EP(nn.Module):
         global_results.zero_()
 
         # Comparison diagnostic: compare WGMMA grouped vs per-expert loop
-        global _COMPARE_COUNT
+        global _COMPARE_COUNT, _FULL_COMPARE_COUNT
         run_compare = (_COMPARE_GROUPED and self._use_grouped_wgmma
                        and _HAS_CUDA_ROUTING and _COMPARE_COUNT < _COMPARE_MAX)
 
@@ -1536,7 +1536,6 @@ class GptOssMoE_EP(nn.Module):
                 global_results.index_add_(0, expert_token_idx, weighted_output)
 
         # ── Full-pipeline comparison: grouped reduce vs same-kernel index_add (pre-AllReduce) ──
-        global _FULL_COMPARE_COUNT
         if (_FULL_COMPARE and self._use_grouped_wgmma
                 and _FULL_COMPARE_COUNT < _FULL_COMPARE_MAX):
             _FULL_COMPARE_COUNT += 1
