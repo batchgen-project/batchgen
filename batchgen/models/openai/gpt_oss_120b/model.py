@@ -1700,6 +1700,181 @@ class GptOssMoE_EP(nn.Module):
                     if mx > 0.01 or len(_d_per_expert) <= 5:
                         print(f"    expert {ge}: M={m} max_raw_diff={mx:.6f} mean={mn:.6f}",
                               flush=True)
+
+            # ── Method E: Root-cause diagnostic (first call only) ──
+            if _FULL_COMPARE_COUNT == 1 and has_sorted:
+                print(f"  E) ROOT CAUSE DIAGNOSTIC:", flush=True)
+                # 1. Check code path for first expert with tokens
+                _first_expert_done = False
+                for local_e in range(self.experts_per_rank):
+                    if _first_expert_done:
+                        break
+                    global_e = self.routed_expert_start_idx + local_e
+                    mask_e = flat_expert_idx == global_e
+                    if not mask_e.any():
+                        continue
+                    expert_e = self.experts[global_e]
+                    if expert_e is None:
+                        continue
+                    _first_expert_done = True
+
+                    # E1: Code path check
+                    is_bf16 = getattr(expert_e, 'use_bf16_weights', False)
+                    try:
+                        from batchgen.moe.fused_wgmma_expert import is_wgmma_available
+                        has_wgmma = is_wgmma_available() if not is_bf16 else False
+                    except ImportError:
+                        has_wgmma = False
+                    use_ref = os.environ.get("BATCHGEN_USE_REFERENCE", "0") == "1"
+                    use_wgmma_env = os.environ.get("BATCHGEN_USE_WGMMA_FUSED", "1") == "1"
+                    is_persistent = getattr(expert_e, 'persistent', False)
+                    if is_bf16:
+                        path = "BF16"
+                    elif use_ref:
+                        path = "REFERENCE"
+                    elif use_wgmma_env and has_wgmma:
+                        path = "WGMMA"
+                    else:
+                        path = "Triton/mxfp4_linear"
+                    print(f"    E1) expert.forward() code path: {path} "
+                          f"(bf16={is_bf16} wgmma={has_wgmma} persistent={is_persistent})",
+                          flush=True)
+
+                    # E2: Pointer comparison
+                    if hasattr(expert_e, 'mxfp4_gate_packed') and expert_e.mxfp4_gate_packed is not None:
+                        wrapper_gate_ptr = expert_e.mxfp4_gate_packed.data_ptr()
+                        grouped_gate_ptr = self.gate_ptrs[local_e].item()
+                        ptr_match = (wrapper_gate_ptr == grouped_gate_ptr)
+                        wrapper_down_ptr = expert_e.mxfp4_down_packed.data_ptr()
+                        grouped_down_ptr = self.down_ptrs[local_e].item()
+                        down_match = (wrapper_down_ptr == grouped_down_ptr)
+                        print(f"    E2) gate_ptr: wrapper={wrapper_gate_ptr} grouped={grouped_gate_ptr} "
+                              f"match={ptr_match}", flush=True)
+                        print(f"        down_ptr: wrapper={wrapper_down_ptr} grouped={grouped_down_ptr} "
+                              f"match={down_match}", flush=True)
+
+                        # Also check shapes and contiguity
+                        wg = expert_e.mxfp4_gate_packed
+                        wd = expert_e.mxfp4_down_packed
+                        print(f"    E2b) gate: shape={list(wg.shape)} stride={wg.stride()} "
+                              f"contig={wg.is_contiguous()}", flush=True)
+                        print(f"         down: shape={list(wd.shape)} stride={wd.stride()} "
+                              f"contig={wd.is_contiguous()}", flush=True)
+
+                        # Check _local_gate_weights if available
+                        if hasattr(self, '_local_gate_weights'):
+                            lgw = self._local_gate_weights[local_e]
+                            print(f"    E2c) _local_gate: ptr={lgw.data_ptr()} "
+                                  f"shape={list(lgw.shape)} stride={lgw.stride()} "
+                                  f"contig={lgw.is_contiguous()}", flush=True)
+                            print(f"         same_as_wrapper={lgw.data_ptr() == wrapper_gate_ptr} "
+                                  f"same_as_grouped={lgw.data_ptr() == grouped_gate_ptr}",
+                                  flush=True)
+                    else:
+                        print(f"    E2) WARNING: expert has no mxfp4_gate_packed attr!", flush=True)
+
+                    # E3: Direct kernel comparison with BOTH weight sources
+                    e_token_idx = _token_indices[mask_e]
+                    e_topk_pos_v = _topk_positions_buf[mask_e]
+                    e_tokens = all_tokens[e_token_idx]
+                    # Deduplicate tokens (same token may appear via different topk slots)
+                    unique_tokens, inverse = torch.unique(e_token_idx, return_inverse=True)
+                    e_unique_tokens = all_tokens[unique_tokens]
+
+                    from batchgen.moe.fused_wgmma_expert import fused_mxfp4_expert_forward
+                    # E3a: Call single-expert kernel with WRAPPER weights
+                    w = expert_e._get_stored_mxfp4_weights()
+                    direct_wrapper = fused_mxfp4_expert_forward(
+                        e_unique_tokens,
+                        w["gate_proj.weight"], w["gate_proj.weight_scales"],
+                        w["up_proj.weight"], w["up_proj.weight_scales"],
+                        w["down_proj.weight"], w["down_proj.weight_scales"],
+                        gate_bias=w.get("gate_proj.bias"),
+                        up_bias=w.get("up_proj.bias"),
+                        down_bias=w.get("down_proj.bias"),
+                    )
+                    torch.cuda.synchronize()
+
+                    # E3b: Call single-expert kernel with _local weights (same as pointer arrays)
+                    if hasattr(self, '_local_gate_weights'):
+                        direct_local = fused_mxfp4_expert_forward(
+                            e_unique_tokens,
+                            self._local_gate_weights[local_e],
+                            self._local_gate_scales[local_e],
+                            self._local_up_weights[local_e],
+                            self._local_up_scales[local_e],
+                            self._local_down_weights[local_e],
+                            self._local_down_scales[local_e],
+                        )
+                        torch.cuda.synchronize()
+                    else:
+                        direct_local = None
+
+                    # E3c: Get grouped kernel output for same unique tokens
+                    # For the first topk slot of each unique token
+                    _first_slot_pos = []
+                    for ui, ut in enumerate(unique_tokens):
+                        # Find first slot for this token that maps to this expert
+                        for slot in range(K):
+                            flat_i = ut.item() * K + slot
+                            if topk_indices.view(-1)[flat_i].item() == global_e:
+                                sp = _topk_pos[flat_i].item()
+                                if sp >= 0:
+                                    _first_slot_pos.append(sp)
+                                    break
+                        else:
+                            _first_slot_pos.append(-1)  # shouldn't happen
+
+                    valid_e3 = [p for p in _first_slot_pos if p >= 0]
+                    if valid_e3:
+                        sorted_e3 = _sorted_output[torch.tensor(valid_e3, device=self.device)]
+                        valid_mask = torch.tensor([p >= 0 for p in _first_slot_pos],
+                                                  device=self.device)
+
+                        # Compare: grouped vs wrapper-weights
+                        diff_gw = (sorted_e3.float() - direct_wrapper[valid_mask].float()).abs()
+                        max_gw = diff_gw.max().item()
+
+                        # Compare: grouped vs local-weights
+                        if direct_local is not None:
+                            diff_gl = (sorted_e3.float() - direct_local[valid_mask].float()).abs()
+                            max_gl = diff_gl.max().item()
+                        else:
+                            max_gl = -1.0
+
+                        # Compare: wrapper-weights vs local-weights
+                        if direct_local is not None:
+                            diff_wl = (direct_wrapper.float() - direct_local.float()).abs()
+                            max_wl = diff_wl.max().item()
+                        else:
+                            max_wl = -1.0
+
+                        # Compare: wrapper output vs expert.forward() output
+                        expert_via_forward = expert_e(e_unique_tokens)
+                        torch.cuda.synchronize()
+                        diff_fw = (direct_wrapper.float() - expert_via_forward.float()).abs()
+                        max_fw = diff_fw.max().item()
+
+                        print(f"    E3) expert {global_e} M={e_unique_tokens.shape[0]}:",
+                              flush=True)
+                        print(f"      grouped vs wrapper_weights: max_diff={max_gw:.6f}",
+                              flush=True)
+                        print(f"      grouped vs local_weights:   max_diff={max_gl:.6f}",
+                              flush=True)
+                        print(f"      wrapper_weights vs local:   max_diff={max_wl:.6f}",
+                              flush=True)
+                        print(f"      fused_direct vs forward():  max_diff={max_fw:.6f}",
+                              flush=True)
+                        print(f"      grouped range: [{sorted_e3.float().min():.4f}, "
+                              f"{sorted_e3.float().max():.4f}]", flush=True)
+                        print(f"      wrapper range: [{direct_wrapper[valid_mask].float().min():.4f}, "
+                              f"{direct_wrapper[valid_mask].float().max():.4f}]", flush=True)
+                        if direct_local is not None:
+                            print(f"      local   range: [{direct_local[valid_mask].float().min():.4f}, "
+                                  f"{direct_local[valid_mask].float().max():.4f}]", flush=True)
+                        print(f"      forward range: [{expert_via_forward.float().min():.4f}, "
+                              f"{expert_via_forward.float().max():.4f}]", flush=True)
+
             print(flush=True)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
