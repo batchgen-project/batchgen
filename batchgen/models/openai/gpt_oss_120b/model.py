@@ -1805,18 +1805,39 @@ class GptOssMoE_EP(nn.Module):
 
                     w = expert_e._get_stored_mxfp4_weights()
 
-                    # Verify E2 holds: all weight data_ptrs match
+                    # Verify: all weight tensors are IDENTICAL objects with IDENTICAL metadata
                     if hasattr(self, '_local_gate_weights'):
-                        _ptrs_match = all([
-                            w["gate_proj.weight"].data_ptr() == self._local_gate_weights[local_e].data_ptr(),
-                            w["gate_proj.weight_scales"].data_ptr() == self._local_gate_scales[local_e].data_ptr(),
-                            w["up_proj.weight"].data_ptr() == self._local_up_weights[local_e].data_ptr(),
-                            w["up_proj.weight_scales"].data_ptr() == self._local_up_scales[local_e].data_ptr(),
-                            w["down_proj.weight"].data_ptr() == self._local_down_weights[local_e].data_ptr(),
-                            w["down_proj.weight_scales"].data_ptr() == self._local_down_scales[local_e].data_ptr(),
-                        ])
-                        print(f"    E3-pre) All 6 weight data_ptrs match: {_ptrs_match}",
-                              flush=True)
+                        _w_pairs = [
+                            ("gate_w", w["gate_proj.weight"], self._local_gate_weights[local_e]),
+                            ("gate_s", w["gate_proj.weight_scales"], self._local_gate_scales[local_e]),
+                            ("up_w",   w["up_proj.weight"], self._local_up_weights[local_e]),
+                            ("up_s",   w["up_proj.weight_scales"], self._local_up_scales[local_e]),
+                            ("down_w", w["down_proj.weight"], self._local_down_weights[local_e]),
+                            ("down_s", w["down_proj.weight_scales"], self._local_down_scales[local_e]),
+                        ]
+                        _all_identical = True
+                        for _name, _wt, _lt in _w_pairs:
+                            _same_obj = _wt is _lt
+                            _ptr_ok = _wt.data_ptr() == _lt.data_ptr()
+                            _shape_ok = list(_wt.shape) == list(_lt.shape)
+                            _stride_ok = _wt.stride() == _lt.stride()
+                            _dtype_ok = _wt.dtype == _lt.dtype
+                            _offset_ok = _wt.storage_offset() == _lt.storage_offset()
+                            _all_ok = _same_obj and _ptr_ok and _shape_ok and _stride_ok and _dtype_ok
+                            if not _all_ok:
+                                _all_identical = False
+                                print(f"    E3-META MISMATCH) {_name}: "
+                                      f"same_obj={_same_obj} ptr={_ptr_ok} "
+                                      f"w_shape={list(_wt.shape)} l_shape={list(_lt.shape)} "
+                                      f"w_stride={_wt.stride()} l_stride={_lt.stride()} "
+                                      f"w_dtype={_wt.dtype} l_dtype={_lt.dtype} "
+                                      f"w_offset={_wt.storage_offset()} l_offset={_lt.storage_offset()}",
+                                      flush=True)
+                        if _all_identical:
+                            print(f"    E3-pre) All 6 tensors: SAME Python object, identical metadata",
+                                  flush=True)
+                        else:
+                            print(f"    E3-pre) METADATA MISMATCH FOUND — see above", flush=True)
 
                     # E3a: Call kernel with wrapper weights
                     direct_wrapper = fused_mxfp4_expert_forward(
