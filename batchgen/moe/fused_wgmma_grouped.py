@@ -1095,6 +1095,7 @@ def fused_mxfp4_grouped_stage2(
 
 _debug_grouped_call_count = 0
 _DEBUG_GROUPED_MAX = 3
+_debug_reduce_call_count = 0
 
 
 def fused_mxfp4_grouped_moe_forward_cuda_routing(
@@ -1227,6 +1228,52 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         sorted_output, topk_pos, topk_weights,
         num_tokens, hidden_size, K_topk,
     )
+
+    # ── Diagnostic: reduce kernel vs PyTorch reference ──
+    if os.environ.get("BATCHGEN_DEBUG_REDUCE", "0") == "1":
+        global _debug_reduce_call_count
+        _debug_reduce_call_count += 1
+        if _debug_reduce_call_count <= _DEBUG_GROUPED_MAX:
+            torch.cuda.synchronize()
+            # PyTorch reference: same math as reduce kernel (FP32 accum, BF16 output)
+            topk_pos_2d = topk_pos.view(num_tokens, K_topk)
+            ref_fp32 = torch.zeros(num_tokens, hidden_size, dtype=torch.float32,
+                                   device=sorted_output.device)
+            for k in range(K_topk):
+                valid = topk_pos_2d[:, k] >= 0
+                if valid.any():
+                    pos = topk_pos_2d[valid, k].long()
+                    ref_fp32[valid] += sorted_output[pos].float() * topk_weights[valid, k:k+1]
+            ref_bf16 = ref_fp32.to(torch.bfloat16)
+
+            diff = (output.float() - ref_bf16.float()).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            n_nonzero_out = (output != 0).any(dim=1).sum().item()
+            n_nonzero_ref = (ref_bf16 != 0).any(dim=1).sum().item()
+            n_valid_pos = (topk_pos >= 0).sum().item()
+
+            print(f"\n[REDUCE DIAG #{_debug_reduce_call_count}] reduce kernel vs PyTorch reference:",
+                  flush=True)
+            print(f"  max_diff={max_diff:.6f} mean_diff={mean_diff:.6f}", flush=True)
+            print(f"  num_tokens={num_tokens} total_dispatched={total_dispatched} "
+                  f"valid_topk_pos={n_valid_pos}/{num_tokens * K_topk}", flush=True)
+            print(f"  output: nonzero_rows={n_nonzero_out} "
+                  f"range=[{output.float().min():.4f}, {output.float().max():.4f}]", flush=True)
+            print(f"  ref:    nonzero_rows={n_nonzero_ref} "
+                  f"range=[{ref_bf16.float().min():.4f}, {ref_bf16.float().max():.4f}]", flush=True)
+
+            if max_diff > 0.001:
+                # Find worst tokens
+                per_token = diff.max(dim=1).values
+                _, worst = per_token.topk(min(5, num_tokens))
+                for idx in worst:
+                    i = idx.item()
+                    slots = topk_pos_2d[i].cpu().tolist()
+                    wts = topk_weights[i].cpu().tolist()
+                    print(f"  token {i}: diff={per_token[i]:.6f} "
+                          f"topk_pos={slots} topk_wts={[f'{w:.4f}' for w in wts]}", flush=True)
+            print(flush=True)
 
     # ── Diagnostic: per-expert comparison with single-expert kernel ──
     if _debug_weight_lists is not None:

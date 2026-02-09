@@ -104,6 +104,9 @@ _WGMMA_GROUPED_LOGGED = False  # one-time invocation log
 _COMPARE_GROUPED = os.environ.get("BATCHGEN_COMPARE_GROUPED", "0") == "1"
 _COMPARE_COUNT = 0
 _COMPARE_MAX = int(os.environ.get("BATCHGEN_COMPARE_MAX", "5"))
+_FULL_COMPARE = os.environ.get("BATCHGEN_DEBUG_FULL_COMPARE", "0") == "1"
+_FULL_COMPARE_COUNT = 0
+_FULL_COMPARE_MAX = 3
 
 
 # ============================================================================
@@ -1523,6 +1526,84 @@ class GptOssMoE_EP(nn.Module):
                 # Weighted accumulation into results
                 weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(global_results.dtype)
                 global_results.index_add_(0, expert_token_idx, weighted_output)
+
+        # ── Full-pipeline comparison: grouped vs per-expert loop (pre-AllReduce) ──
+        global _FULL_COMPARE_COUNT
+        if (_FULL_COMPARE and self._use_grouped_wgmma
+                and _FULL_COMPARE_COUNT < _FULL_COMPARE_MAX):
+            _FULL_COMPARE_COUNT += 1
+            torch.cuda.synchronize()
+
+            # Run the per-expert loop on the same inputs to get reference output
+            ref_results = torch.zeros_like(global_results)
+            flat_expert_idx = topk_indices.view(-1)
+            _token_indices = self.token_idx_buffer
+            _topk_positions = self.topk_pos_buffer
+
+            for local_e in range(self.experts_per_rank):
+                global_e = self.routed_expert_start_idx + local_e
+                mask = flat_expert_idx == global_e
+                if not mask.any():
+                    continue
+                expert_token_idx = _token_indices[mask]
+                expert_topk_pos = _topk_positions[mask]
+                tokens_for_expert = all_tokens[expert_token_idx]
+
+                expert = self.experts[global_e]
+                if expert is None:
+                    continue
+                expert_output = expert(tokens_for_expert)
+                expert_weights_val = topk_weights[expert_token_idx, expert_topk_pos]
+                weighted_output = (expert_output * expert_weights_val.unsqueeze(-1)).to(ref_results.dtype)
+                ref_results.index_add_(0, expert_token_idx, weighted_output)
+
+            torch.cuda.synchronize()
+
+            # Compare grouped output (in global_results) vs per-expert loop output (ref_results)
+            grouped_slice = global_results[:num_global_tokens]
+            ref_slice = ref_results[:num_global_tokens]
+            diff = (grouped_slice.float() - ref_slice.float()).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            # Per-token breakdown
+            per_token_max = diff.max(dim=1).values  # [N]
+            n_bad_tokens = (per_token_max > 0.01).sum().item()
+            worst_token = per_token_max.argmax().item()
+            worst_token_diff = per_token_max[worst_token].item()
+
+            # Check if grouped output has unexpected values
+            g_nonzero = (grouped_slice != 0).any(dim=1).sum().item()
+            r_nonzero = (ref_slice != 0).any(dim=1).sum().item()
+            g_nan = torch.isnan(grouped_slice).sum().item()
+            r_nan = torch.isnan(ref_slice).sum().item()
+
+            print(f"\n[FULL COMPARE #{_FULL_COMPARE_COUNT}] rank {self.rank}: "
+                  f"grouped vs per-expert loop (pre-AllReduce)", flush=True)
+            print(f"  max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} "
+                  f"bad_tokens(>0.01)={n_bad_tokens}/{num_global_tokens}", flush=True)
+            print(f"  worst_token={worst_token} diff={worst_token_diff:.6f}", flush=True)
+            print(f"  grouped: nonzero_rows={g_nonzero} nan={g_nan} "
+                  f"range=[{grouped_slice.float().min():.4f}, {grouped_slice.float().max():.4f}]",
+                  flush=True)
+            print(f"  ref:     nonzero_rows={r_nonzero} nan={r_nan} "
+                  f"range=[{ref_slice.float().min():.4f}, {ref_slice.float().max():.4f}]",
+                  flush=True)
+
+            if max_diff > 0.01:
+                # Dump worst 5 tokens
+                _, worst_indices = per_token_max.topk(min(5, num_global_tokens))
+                for idx in worst_indices:
+                    i = idx.item()
+                    g_row = grouped_slice[i]
+                    r_row = ref_slice[i]
+                    row_diff = (g_row.float() - r_row.float()).abs()
+                    print(f"  token {i}: max_diff={row_diff.max():.6f} "
+                          f"grouped=[{g_row.float().min():.4f},{g_row.float().max():.4f}] "
+                          f"ref=[{r_row.float().min():.4f},{r_row.float().max():.4f}] "
+                          f"topk_experts={topk_indices[i].cpu().tolist()} "
+                          f"topk_wts={topk_weights[i].cpu().tolist()}", flush=True)
+            print(flush=True)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
         with self.comm.change_state(enable=True):
