@@ -1,21 +1,14 @@
 """
 Fused grouped MoE kernels using WGMMA for GPT-OSS-120B decode.
 
-Provides grouped MXFP4 WGMMA kernels that operate on 1D+offsets layout
-directly from CUDA dispatch, eliminating the 3D reshape overhead of the
-Triton grouped path.
+Ported from the validated kernel in batchgen_kernels/moe/gptoss/grouped_mxfp4_moe_wgmma.py
+which achieved 54/54 PASS with max_err=0.000000 against per-row reference.
 
-Two CUDA kernels:
-- Stage 1: gate projection + up projection + SwiGLU activation (fused)
-- Stage 2: down projection
+Two CUDA kernels (manual global loads, no TMA):
+- Stage 1: gate + up + SwiGLU (2D grid: experts × N-tiles, M-loop inside)
+- Stage 2: down projection (1D grid: K-tiles, expert+M loops inside)
 
 Pipeline: dispatch -> WGMMA S1 -> WGMMA S2 -> reduce (4 kernel launches)
-vs Triton: dispatch -> reshape -> gate_gemm -> up_gemm -> swiglu -> down_gemm -> gather -> reduce (9+)
-
-Performance (E=16, K=7168, N=14336, decode M=1-64):
-- Stage 1: 4.0-4.1x over for-loop baseline
-- Stage 2: 4.8-4.9x over for-loop baseline
-- Full pipeline: 3.6-3.7x over for-loop baseline
 
 Usage:
     from batchgen.moe.fused_wgmma_grouped import (
@@ -43,8 +36,8 @@ _grouped_module = None
 # ──────────────────────────────────────────────────────────────────────────────
 # CUDA Source Code (merged Stage 1 + Stage 2)
 # ──────────────────────────────────────────────────────────────────────────────
-# Ported from batchgen_kernels/moe/gptoss/grouped_bf16_moe_wgmma.py
-# CUDA_SOURCE_GROUPED_MXFP4_PHASE2A (Stage 1) + CUDA_SOURCE_GROUPED_MXFP4_STAGE2 (Stage 2)
+# Ported from batchgen_kernels/moe/gptoss/grouped_mxfp4_moe_wgmma.py
+# Validated kernel: 54/54 PASS, max_err=0.000000 with per-row reference
 
 CUDA_SOURCE_GROUPED_MXFP4_MOE = r'''
 #include <torch/extension.h>
@@ -249,28 +242,62 @@ __device__ __forceinline__ void mbarrier_wait_parity(
 }
 
 // ============================================================================
-// TMA load 2D
-// ============================================================================
-__device__ __forceinline__ void tma_load_2d(
-    const void* desc, uint64_t* mbar, void* smem_ptr,
-    int32_t coord_0, int32_t coord_1
-) {
-    uint64_t desc_addr = reinterpret_cast<uint64_t>(desc);
-    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%3, %4}], [%2];"
-        :: "r"(smem_addr), "l"(desc_addr), "r"(mbar_addr),
-           "r"(coord_0), "r"(coord_1)
-        : "memory");
-}
-
-// ============================================================================
 // Named barrier sync (producer WG internal)
 // ============================================================================
 __device__ __forceinline__ void bar_sync(uint32_t bar_id, uint32_t num_threads) {
     asm volatile("bar.sync %0, %1;" :: "r"(bar_id), "r"(num_threads));
+}
+
+// ============================================================================
+// Global memory load for A with 128B swizzle (matching TMA pattern)
+// Uses vectorized loads (uint4) matching the B matrix load pattern
+// ============================================================================
+__device__ __forceinline__ void load_a_tile_global(
+    __nv_bfloat16* smem_a,
+    const __nv_bfloat16* A,
+    int m_start, int k_start,
+    int M, int K,
+    int64_t stride_a_m,
+    int tid,
+    int num_threads
+) {
+    const int m_local = tid / 2;        // 0-63
+    const int k_half = tid & 1;         // 0 or 1
+    const int k_local_start = k_half * 32;
+
+    const int m_global = m_start + m_local;
+
+    if (m_local >= BLOCK_M) return;
+
+    const int m_mod8 = m_local & 7;
+    const int m_base = m_local * BLOCK_K;  // m_local * 64
+
+    #pragma unroll
+    for (int g = 0; g < 4; g++) {
+        const int k_local = k_local_start + g * 8;
+        const int k_global = k_start + k_local;
+
+        uint4 data;
+        if (m_global < M && k_global + 7 < K) {
+            data = *reinterpret_cast<const uint4*>(&A[m_global * stride_a_m + k_global]);
+        } else {
+            __nv_bfloat16 tmp[8];
+            for (int i = 0; i < 8; i++) {
+                if (m_global < M && k_global + i < K) {
+                    tmp[i] = A[m_global * stride_a_m + k_global + i];
+                } else {
+                    tmp[i] = __float2bfloat16(0.0f);
+                }
+            }
+            data = *reinterpret_cast<uint4*>(tmp);
+        }
+
+        const int grp = (k_local_start + g * 8) >> 3;
+        const int swz = grp ^ m_mod8;
+        const int addr = m_base + (swz << 3);
+
+        *reinterpret_cast<uint4*>(&smem_a[addr]) = data;
+    }
 }
 
 // ============================================================================
@@ -341,32 +368,34 @@ __device__ __forceinline__ void load_decode_rhs_swizzled_batched(
 
 // ============================================================================
 // Stage 1 Kernel: Gate + Up + SwiGLU (grouped MXFP4)
-//   Output = SwiGLU(A @ dequant(Gate).T, A @ dequant(Up).T)
-//   Grid: (num_experts, num_n_tiles, max_m_tiles)
-//   TMA: desc_a for activations (BF16), Phase 10a byte-LUT for weights (MXFP4)
+//   Grid: (num_experts, num_n_tiles) - 2D grid, M-tile loop inside
+//   Manual global load for A, Phase 10a byte-LUT for weights (MXFP4)
 // ============================================================================
 __global__ void __launch_bounds__(TOTAL_THREADS, 1)
-grouped_mxfp4_stage1_tma_kernel(
-    const __grid_constant__ CUtensorMap desc_a,
+grouped_mxfp4_moe_stage1_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    int64_t stride_a_m,
+    const int32_t* __restrict__ expert_offsets,
     const int64_t* __restrict__ gate_ptrs,
     const int64_t* __restrict__ gate_scale_ptrs,
     const int64_t* __restrict__ up_ptrs,
     const int64_t* __restrict__ up_scale_ptrs,
-    const int32_t* __restrict__ expert_offsets,
+    const int64_t* __restrict__ gate_bias_ptrs,
+    const int64_t* __restrict__ up_bias_ptrs,
     __nv_bfloat16* __restrict__ C,
     int64_t stride_c_m,
     int total_tokens, int N, int K, int num_experts,
     int64_t stride_weight_n,
-    int64_t stride_scale_n
+    int64_t stride_scale_n,
+    int has_gate_bias, int has_up_bias
 ) {
     const int tid = threadIdx.x;
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    // 3D grid: (expert_idx, n_tile, m_tile)
+    // 2D grid: (expert_idx, n_tile)
     const int expert_idx = blockIdx.x;
     const int n_tile = blockIdx.y;
-    const int m_tile = blockIdx.z;
     const int n_start = n_tile * BLOCK_N;
 
     if (n_start >= N) return;
@@ -376,19 +405,10 @@ grouped_mxfp4_stage1_tma_kernel(
     const int expert_end = expert_offsets[expert_idx + 1];
     const int expert_tokens = expert_end - expert_start;
 
-    const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
-    if (m_tile >= num_m_tiles) return;
+    // Early exit for empty experts
+    if (expert_tokens == 0) return;
 
-    const int m_start = expert_start + m_tile * BLOCK_M;
-    const int m_size = min(BLOCK_M, expert_end - m_start);
-
-    // Load expert's weight pointers
-    const uint8_t* gate_weight = reinterpret_cast<const uint8_t*>(gate_ptrs[expert_idx]);
-    const uint8_t* gate_scale = reinterpret_cast<const uint8_t*>(gate_scale_ptrs[expert_idx]);
-    const uint8_t* up_weight = reinterpret_cast<const uint8_t*>(up_ptrs[expert_idx]);
-    const uint8_t* up_scale = reinterpret_cast<const uint8_t*>(up_scale_ptrs[expert_idx]);
-
-    // Shared memory layout: 2 stages × 2 tiles (A + B) + 4 barrier sets + LUT
+    // Shared memory layout: tiles + barriers + byte LUT
     extern __shared__ __align__(128) char smem_buf[];
     __nv_bfloat16* smem_a[NUM_STAGES];
     __nv_bfloat16* smem_b[NUM_STAGES];
@@ -397,7 +417,6 @@ grouped_mxfp4_stage1_tma_kernel(
         smem_b[s] = reinterpret_cast<__nv_bfloat16*>(smem_buf + (2*s + 1) * TILE_BYTES);
     }
     const int bar_offset = 2 * NUM_STAGES * TILE_BYTES;
-    // Separate barrier sets for gate and up (no re-init needed)
     uint64_t* gate_full_barriers  = reinterpret_cast<uint64_t*>(smem_buf + bar_offset);
     uint64_t* gate_empty_barriers = gate_full_barriers + NUM_STAGES;
     uint64_t* up_full_barriers    = gate_empty_barriers + NUM_STAGES;
@@ -407,247 +426,258 @@ grouped_mxfp4_stage1_tma_kernel(
 
     const int num_k_blocks = (K + BLOCK_K - 1) / BLOCK_K;
 
-    // Init all barriers at kernel start
-    if (tid == 0) {
-        for (int s = 0; s < NUM_STAGES; s++) {
-            mbarrier_init(&gate_full_barriers[s], 2);   // TMA + decode
-            mbarrier_init(&gate_empty_barriers[s], 1);  // consumer
-            mbarrier_init(&up_full_barriers[s], 2);     // TMA + decode
-            mbarrier_init(&up_empty_barriers[s], 1);    // consumer
-        }
-    }
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    __syncthreads();
+    // Load expert's weight pointers
+    const uint8_t* gate_weight = reinterpret_cast<const uint8_t*>(gate_ptrs[expert_idx]);
+    const uint8_t* gate_scale = reinterpret_cast<const uint8_t*>(gate_scale_ptrs[expert_idx]);
+    const uint8_t* up_weight = reinterpret_cast<const uint8_t*>(up_ptrs[expert_idx]);
+    const uint8_t* up_scale = reinterpret_cast<const uint8_t*>(up_scale_ptrs[expert_idx]);
 
-    if (wg_id == 0) {
-        // ════════════════════════════════════════════════════════════════
-        // PRODUCER WG: TMA A + batched byte-LUT decode B (gate, then up)
-        // ════════════════════════════════════════════════════════════════
+    const __nv_bfloat16* gate_bias = has_gate_bias ?
+        reinterpret_cast<const __nv_bfloat16*>(gate_bias_ptrs[expert_idx]) : nullptr;
+    const __nv_bfloat16* up_bias = has_up_bias ?
+        reinterpret_cast<const __nv_bfloat16*>(up_bias_ptrs[expert_idx]) : nullptr;
 
-        // Initialize byte-level LUT
-        for (int i = wg_tid; i < LUT_ENTRIES; i += PRODUCER_THREADS) {
-            __nv_bfloat16 lo = __float2bfloat16(FP4_LUT[i & 0xF]);
-            __nv_bfloat16 hi = __float2bfloat16(FP4_LUT[i >> 4]);
-            byte_lut[i] = __halves2bfloat162(lo, hi);
-        }
-        bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+    const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
 
-        if (wg_tid == 0) {
-            asm volatile("prefetch.tensormap [%0];" :: "l"(&desc_a) : "memory");
-        }
+    {  // Scope for M-tile loop
 
-        // GATE K-LOOP
-        for (int kb = 0; kb < num_k_blocks; kb++) {
-            const int s = kb % NUM_STAGES;
-            const int empty_phase = ((kb / NUM_STAGES) + 1) & 1;
+    // M-TILE LOOP
+    for (int m_tile = 0; m_tile < num_m_tiles; m_tile++) {
+        const int m_start = expert_start + m_tile * BLOCK_M;
+        const int m_size = min(BLOCK_M, expert_end - m_start);
 
-            mbarrier_wait_parity(&gate_empty_barriers[s], empty_phase);
-
-            if (wg_tid == 0) {
-                mbarrier_arrive_expect_tx(&gate_full_barriers[s], TILE_BYTES);
-                tma_load_2d(&desc_a, &gate_full_barriers[s], smem_a[s],
-                            kb * BLOCK_K, m_start);
-            }
-
-            load_decode_rhs_swizzled_batched(
-                smem_b[s],
-                gate_weight, gate_scale,
-                n_start, kb * BLOCK_K,
-                N, K,
-                stride_weight_n, stride_scale_n,
-                wg_tid, byte_lut);
-
-            bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
-            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            if (wg_tid == 0) {
-                mbarrier_arrive(&gate_full_barriers[s]);
+        // Init barriers for this M-tile
+        if (tid == 0) {
+            for (int s = 0; s < NUM_STAGES; s++) {
+                mbarrier_init(&gate_full_barriers[s], 1);   // producer only (no TMA)
+                mbarrier_init(&gate_empty_barriers[s], 1);  // consumer
+                mbarrier_init(&up_full_barriers[s], 1);
+                mbarrier_init(&up_empty_barriers[s], 1);
             }
         }
-
-        // SYNC BETWEEN GATE AND UP K-LOOPS
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
 
-        // UP K-LOOP
-        for (int kb = 0; kb < num_k_blocks; kb++) {
-            const int s = kb % NUM_STAGES;
-            const int empty_phase = ((kb / NUM_STAGES) + 1) & 1;
+        if (wg_id == 0) {
+            // ════════════════════════════════════════════════════════════
+            // PRODUCER WG: Load A + decode B
+            // ════════════════════════════════════════════════════════════
 
-            mbarrier_wait_parity(&up_empty_barriers[s], empty_phase);
-
-            if (wg_tid == 0) {
-                mbarrier_arrive_expect_tx(&up_full_barriers[s], TILE_BYTES);
-                tma_load_2d(&desc_a, &up_full_barriers[s], smem_a[s],
-                            kb * BLOCK_K, m_start);
+            for (int i = wg_tid; i < LUT_ENTRIES; i += PRODUCER_THREADS) {
+                __nv_bfloat16 lo = __float2bfloat16(FP4_LUT[i & 0xF]);
+                __nv_bfloat16 hi = __float2bfloat16(FP4_LUT[i >> 4]);
+                byte_lut[i] = __halves2bfloat162(lo, hi);
             }
-
-            load_decode_rhs_swizzled_batched(
-                smem_b[s],
-                up_weight, up_scale,
-                n_start, kb * BLOCK_K,
-                N, K,
-                stride_weight_n, stride_scale_n,
-                wg_tid, byte_lut);
-
             bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
-            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            if (wg_tid == 0) {
-                mbarrier_arrive(&up_full_barriers[s]);
-            }
-        }
 
-    } else {
-        // ════════════════════════════════════════════════════════════════
-        // MATH WG: gate GEMM -> up GEMM -> SwiGLU epilogue
-        // ════════════════════════════════════════════════════════════════
-        float gate_acc[WGMMA_NUM_ACCUM];
-        float up_acc[WGMMA_NUM_ACCUM];
-        for (int i = 0; i < WGMMA_NUM_ACCUM; i++) gate_acc[i] = 0.0f;
-        for (int i = 0; i < WGMMA_NUM_ACCUM; i++) up_acc[i] = 0.0f;
+            // GATE K-LOOP
+            for (int kb = 0; kb < num_k_blocks; kb++) {
+                const int s = kb % NUM_STAGES;
+                const int empty_phase = ((kb / NUM_STAGES) + 1) & 1;
 
-        const int warp_in_wg = wg_tid / WARP_SIZE;
-        const int lane_id = wg_tid % WARP_SIZE;
+                mbarrier_wait_parity(&gate_empty_barriers[s], empty_phase);
 
-        // GATE K-LOOP
-        for (int kb = 0; kb < num_k_blocks; kb++) {
-            const int s = kb % NUM_STAGES;
-            const int full_phase = (kb / NUM_STAGES) & 1;
+                load_a_tile_global(smem_a[s], A, m_start, kb * BLOCK_K,
+                                   total_tokens, K, stride_a_m, wg_tid, PRODUCER_THREADS);
 
-            mbarrier_wait_parity(&gate_full_barriers[s], full_phase);
+                load_decode_rhs_swizzled_batched(
+                    smem_b[s],
+                    gate_weight, gate_scale,
+                    n_start, kb * BLOCK_K,
+                    N, K,
+                    stride_weight_n, stride_scale_n,
+                    wg_tid, byte_lut);
 
-            #pragma unroll
-            for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
-                warpgroup_fence_operand(gate_acc[i]);
-
-            warpgroup_arrive();
-
-            #pragma unroll
-            for (int t = 0; t < TILES_K; t++) {
-                GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
-                GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
-                wgmma_bf16_ss(da.desc_, db.desc_, gate_acc, 1);
+                bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                if (wg_tid == 0) {
+                    mbarrier_arrive(&gate_full_barriers[s]);
+                }
             }
 
-            warpgroup_commit_batch();
+            // SYNC BETWEEN GATE AND UP
+            __syncthreads();
 
-            #pragma unroll
-            for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
-                warpgroup_fence_operand(gate_acc[i]);
+            // UP K-LOOP
+            for (int kb = 0; kb < num_k_blocks; kb++) {
+                const int s = kb % NUM_STAGES;
+                const int empty_phase = ((kb / NUM_STAGES) + 1) & 1;
 
-            warpgroup_wait<0>();
+                mbarrier_wait_parity(&up_empty_barriers[s], empty_phase);
 
-            if (wg_tid == 0) {
-                mbarrier_arrive(&gate_empty_barriers[s]);
-            }
-        }
+                load_a_tile_global(smem_a[s], A, m_start, kb * BLOCK_K,
+                                   total_tokens, K, stride_a_m, wg_tid, PRODUCER_THREADS);
 
-        // SYNC BETWEEN GATE AND UP K-LOOPS
-        __syncthreads();
+                load_decode_rhs_swizzled_batched(
+                    smem_b[s],
+                    up_weight, up_scale,
+                    n_start, kb * BLOCK_K,
+                    N, K,
+                    stride_weight_n, stride_scale_n,
+                    wg_tid, byte_lut);
 
-        // UP K-LOOP
-        for (int kb = 0; kb < num_k_blocks; kb++) {
-            const int s = kb % NUM_STAGES;
-            const int full_phase = (kb / NUM_STAGES) & 1;
-
-            mbarrier_wait_parity(&up_full_barriers[s], full_phase);
-
-            #pragma unroll
-            for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
-                warpgroup_fence_operand(up_acc[i]);
-
-            warpgroup_arrive();
-
-            #pragma unroll
-            for (int t = 0; t < TILES_K; t++) {
-                GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
-                GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
-                wgmma_bf16_ss(da.desc_, db.desc_, up_acc, 1);
+                bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                if (wg_tid == 0) {
+                    mbarrier_arrive(&up_full_barriers[s]);
+                }
             }
 
-            warpgroup_commit_batch();
+        } else {
+            // ════════════════════════════════════════════════════════════
+            // MATH WG: gate GEMM -> up GEMM -> SwiGLU epilogue
+            // ════════════════════════════════════════════════════════════
+            float gate_acc[WGMMA_NUM_ACCUM];
+            float up_acc[WGMMA_NUM_ACCUM];
+            for (int i = 0; i < WGMMA_NUM_ACCUM; i++) gate_acc[i] = 0.0f;
+            for (int i = 0; i < WGMMA_NUM_ACCUM; i++) up_acc[i] = 0.0f;
 
-            #pragma unroll
-            for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
-                warpgroup_fence_operand(up_acc[i]);
+            const int warp_in_wg = wg_tid / WARP_SIZE;
+            const int lane_id = wg_tid % WARP_SIZE;
 
-            warpgroup_wait<0>();
+            // GATE K-LOOP
+            for (int kb = 0; kb < num_k_blocks; kb++) {
+                const int s = kb % NUM_STAGES;
+                const int full_phase = (kb / NUM_STAGES) & 1;
 
-            if (wg_tid == 0) {
-                mbarrier_arrive(&up_empty_barriers[s]);
+                mbarrier_wait_parity(&gate_full_barriers[s], full_phase);
+
+                #pragma unroll
+                for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
+                    warpgroup_fence_operand(gate_acc[i]);
+
+                warpgroup_arrive();
+
+                #pragma unroll
+                for (int t = 0; t < TILES_K; t++) {
+                    GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
+                    GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
+                    wgmma_bf16_ss(da.desc_, db.desc_, gate_acc, 1);
+                }
+
+                warpgroup_commit_batch();
+
+                #pragma unroll
+                for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
+                    warpgroup_fence_operand(gate_acc[i]);
+
+                warpgroup_wait<0>();
+
+                if (wg_tid == 0) {
+                    mbarrier_arrive(&gate_empty_barriers[s]);
+                }
             }
-        }
 
-        // SwiGLU EPILOGUE
-        #pragma unroll
-        for (int i = 0; i < WGMMA_NUM_ACCUM; i++) {
-            int m, n;
-            reg_to_mn(i, warp_in_wg, lane_id, m, n);
-            const int m_global = m_start + m;
-            const int n_global = n_start + n;
+            // SYNC
+            __syncthreads();
 
-            if (m < m_size && n_global < N) {
-                float g = __bfloat162float(__float2bfloat16(gate_acc[i]));
-                float u = __bfloat162float(__float2bfloat16(up_acc[i]));
+            // UP K-LOOP
+            for (int kb = 0; kb < num_k_blocks; kb++) {
+                const int s = kb % NUM_STAGES;
+                const int full_phase = (kb / NUM_STAGES) & 1;
 
-                g = fminf(g, SWIGLU_LIMIT);
-                u = fmaxf(fminf(u, SWIGLU_LIMIT), -SWIGLU_LIMIT);
+                mbarrier_wait_parity(&up_full_barriers[s], full_phase);
 
-                float sig = __frcp_rn(1.0f + expf(-SWIGLU_ALPHA * g));
-                float result = g * sig * (u + 1.0f);
+                #pragma unroll
+                for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
+                    warpgroup_fence_operand(up_acc[i]);
+
+                warpgroup_arrive();
+
+                #pragma unroll
+                for (int t = 0; t < TILES_K; t++) {
+                    GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
+                    GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
+                    wgmma_bf16_ss(da.desc_, db.desc_, up_acc, 1);
+                }
+
+                warpgroup_commit_batch();
+
+                #pragma unroll
+                for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
+                    warpgroup_fence_operand(up_acc[i]);
+
+                warpgroup_wait<0>();
+
+                if (wg_tid == 0) {
+                    mbarrier_arrive(&up_empty_barriers[s]);
+                }
+            }
+
+            // SwiGLU EPILOGUE
+            #pragma unroll 1
+            for (int i = 0; i < WGMMA_NUM_ACCUM; i++) {
+                int m, n;
+                reg_to_mn(i, warp_in_wg, lane_id, m, n);
+
+                const int m_global = m_start + m;
+                const int n_global = n_start + n;
+
+                if (m_global >= expert_end || n_global >= N) continue;
+
+                __nv_bfloat16 g_bf16 = __float2bfloat16(gate_acc[i]);
+                __nv_bfloat16 u_bf16 = __float2bfloat16(up_acc[i]);
+
+                if (has_gate_bias && gate_bias != nullptr) {
+                    g_bf16 = __hadd(g_bf16, gate_bias[n_global]);
+                }
+                if (has_up_bias && up_bias != nullptr) {
+                    u_bf16 = __hadd(u_bf16, up_bias[n_global]);
+                }
+
+                float g = __bfloat162float(g_bf16);
+                float u = __bfloat162float(u_bf16);
+
+                float g_c = fminf(g, SWIGLU_LIMIT);
+                float u_c = fmaxf(fminf(u, SWIGLU_LIMIT), -SWIGLU_LIMIT);
+                float sig = __frcp_rn(1.0f + expf(-SWIGLU_ALPHA * g_c));
+                float result = g_c * sig * (u_c + 1.0f);
 
                 C[m_global * stride_c_m + n_global] = __float2bfloat16(result);
             }
         }
-    }
+
+        // Sync before next M-tile (barrier re-init)
+        __syncthreads();
+
+    }  // M-tile loop
+    }  // Scope for M-tile loop
 }
 
 // ============================================================================
 // Stage 2 Kernel: Down projection (grouped MXFP4)
-//   output[total_tokens, K] = intermediate[total_tokens, N] x dequant(B_down)[K, N]^T
-//   Grid: (num_experts, num_k_tiles, max_m_tiles)
+//   Grid: (num_k_tiles,) - 1D grid with expert+M loop inside
+//   output[total_tokens, K] = intermediate[total_tokens, N] @ down[K, N]^T
 // ============================================================================
 __global__ void __launch_bounds__(TOTAL_THREADS, 1)
-grouped_mxfp4_stage2_tma_kernel(
-    const __grid_constant__ CUtensorMap desc_input,
+grouped_mxfp4_moe_stage2_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    int64_t stride_input_m,
+    const int32_t* __restrict__ expert_offsets,
     const int64_t* __restrict__ down_ptrs,
     const int64_t* __restrict__ down_scale_ptrs,
-    const int32_t* __restrict__ expert_offsets,
+    const int64_t* __restrict__ down_bias_ptrs,
     __nv_bfloat16* __restrict__ C,
     int64_t stride_c_m,
     int total_tokens, int N, int K, int num_experts,
     int64_t stride_weight_n,
-    int64_t stride_scale_n
+    int64_t stride_scale_n,
+    int has_down_bias
 ) {
     const int tid = threadIdx.x;
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    // 3D grid: (expert_idx, k_tile, m_tile)
-    const int expert_idx = blockIdx.x;
-    const int k_tile = blockIdx.y;
-    const int m_tile = blockIdx.z;
-    const int k_start = k_tile * BLOCK_N;  // output K dimension
+    // 1D grid over K-tiles (output dimension)
+    const int k_tile = blockIdx.x;
+    const int k_start = k_tile * BLOCK_N;
 
     if (k_start >= K) return;
 
-    // Load expert's token range
-    const int expert_start = expert_offsets[expert_idx];
-    const int expert_end = expert_offsets[expert_idx + 1];
-    const int expert_tokens = expert_end - expert_start;
-
-    const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
-    if (m_tile >= num_m_tiles) return;
-
-    const int m_start = expert_start + m_tile * BLOCK_M;
-    const int m_size = min(BLOCK_M, expert_end - m_start);
-
-    // Load expert's weight pointers
-    const uint8_t* down_weight = reinterpret_cast<const uint8_t*>(down_ptrs[expert_idx]);
-    const uint8_t* down_scale = reinterpret_cast<const uint8_t*>(down_scale_ptrs[expert_idx]);
-
-    // Shared memory layout: 2 stages x 2 tiles + 2 barrier sets + LUT
+    // Shared memory layout
     extern __shared__ __align__(128) char smem_buf[];
-    __nv_bfloat16* smem_a[NUM_STAGES];  // input tile
-    __nv_bfloat16* smem_b[NUM_STAGES];  // B_down decoded
+    __nv_bfloat16* smem_a[NUM_STAGES];
+    __nv_bfloat16* smem_b[NUM_STAGES];
     for (int s = 0; s < NUM_STAGES; s++) {
         smem_a[s] = reinterpret_cast<__nv_bfloat16*>(smem_buf + (2*s)     * TILE_BYTES);
         smem_b[s] = reinterpret_cast<__nv_bfloat16*>(smem_buf + (2*s + 1) * TILE_BYTES);
@@ -660,183 +690,154 @@ grouped_mxfp4_stage2_tma_kernel(
 
     const int num_n_blocks = (N + BLOCK_K - 1) / BLOCK_K;
 
-    // Init barriers
-    if (tid == 0) {
-        for (int s = 0; s < NUM_STAGES; s++) {
-            mbarrier_init(&full_barriers[s], 2);   // TMA + decode
-            mbarrier_init(&empty_barriers[s], 1);  // consumer
-        }
-    }
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    __syncthreads();
+    // EXPERT LOOP
+    for (int expert_idx = 0; expert_idx < num_experts; expert_idx++) {
+        const int expert_start = expert_offsets[expert_idx];
+        const int expert_end = expert_offsets[expert_idx + 1];
+        const int expert_tokens = expert_end - expert_start;
 
-    if (wg_id == 0) {
-        // ════════════════════════════════════════════════════════════════
-        // PRODUCER WG: TMA input + batched byte-LUT decode B_down
-        // ════════════════════════════════════════════════════════════════
+        if (expert_tokens == 0) continue;
 
-        // Initialize byte-level LUT
-        for (int i = wg_tid; i < LUT_ENTRIES; i += PRODUCER_THREADS) {
-            __nv_bfloat16 lo = __float2bfloat16(FP4_LUT[i & 0xF]);
-            __nv_bfloat16 hi = __float2bfloat16(FP4_LUT[i >> 4]);
-            byte_lut[i] = __halves2bfloat162(lo, hi);
-        }
-        bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+        const uint8_t* down_weight = reinterpret_cast<const uint8_t*>(down_ptrs[expert_idx]);
+        const uint8_t* down_scale = reinterpret_cast<const uint8_t*>(down_scale_ptrs[expert_idx]);
+        const __nv_bfloat16* down_bias = has_down_bias ?
+            reinterpret_cast<const __nv_bfloat16*>(down_bias_ptrs[expert_idx]) : nullptr;
 
-        if (wg_tid == 0) {
-            asm volatile("prefetch.tensormap [%0];" :: "l"(&desc_input) : "memory");
-        }
+        const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
 
-        // N-REDUCTION LOOP
-        for (int nb = 0; nb < num_n_blocks; nb++) {
-            const int s = nb % NUM_STAGES;
-            const int empty_phase = ((nb / NUM_STAGES) + 1) & 1;
+        // M-TILE LOOP
+        for (int m_tile = 0; m_tile < num_m_tiles; m_tile++) {
+            const int m_start = expert_start + m_tile * BLOCK_M;
 
-            mbarrier_wait_parity(&empty_barriers[s], empty_phase);
-
-            // TMA load input tile [BLOCK_M, BLOCK_K] from [total_tokens, N]
-            if (wg_tid == 0) {
-                mbarrier_arrive_expect_tx(&full_barriers[s], TILE_BYTES);
-                tma_load_2d(&desc_input, &full_barriers[s], smem_a[s],
-                            nb * BLOCK_K, m_start);
+            // Init barriers
+            if (tid == 0) {
+                for (int s = 0; s < NUM_STAGES; s++) {
+                    mbarrier_init(&full_barriers[s], 1);
+                    mbarrier_init(&empty_barriers[s], 1);
+                }
             }
-
-            // Dequant B_down tile
-            load_decode_rhs_swizzled_batched(
-                smem_b[s],
-                down_weight, down_scale,
-                k_start, nb * BLOCK_K,
-                K, N,
-                stride_weight_n, stride_scale_n,
-                wg_tid, byte_lut);
-
-            bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            if (wg_tid == 0) {
-                mbarrier_arrive(&full_barriers[s]);
+            __syncthreads();
+
+            if (wg_id == 0) {
+                // PRODUCER WG
+
+                for (int i = wg_tid; i < LUT_ENTRIES; i += PRODUCER_THREADS) {
+                    __nv_bfloat16 lo = __float2bfloat16(FP4_LUT[i & 0xF]);
+                    __nv_bfloat16 hi = __float2bfloat16(FP4_LUT[i >> 4]);
+                    byte_lut[i] = __halves2bfloat162(lo, hi);
+                }
+                bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+
+                // N-loop (reduction)
+                for (int nb = 0; nb < num_n_blocks; nb++) {
+                    const int s = nb % NUM_STAGES;
+                    const int empty_phase = ((nb / NUM_STAGES) + 1) & 1;
+
+                    mbarrier_wait_parity(&empty_barriers[s], empty_phase);
+
+                    load_a_tile_global(smem_a[s], input, m_start, nb * BLOCK_K,
+                                       total_tokens, N, stride_input_m, wg_tid, PRODUCER_THREADS);
+
+                    load_decode_rhs_swizzled_batched(
+                        smem_b[s],
+                        down_weight, down_scale,
+                        k_start, nb * BLOCK_K,
+                        K, N,
+                        stride_weight_n, stride_scale_n,
+                        wg_tid, byte_lut);
+
+                    bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    if (wg_tid == 0) {
+                        mbarrier_arrive(&full_barriers[s]);
+                    }
+                }
+
+            } else {
+                // MATH WG
+                float acc[WGMMA_NUM_ACCUM];
+                for (int i = 0; i < WGMMA_NUM_ACCUM; i++) acc[i] = 0.0f;
+
+                const int warp_in_wg = wg_tid / WARP_SIZE;
+                const int lane_id = wg_tid % WARP_SIZE;
+
+                // N-loop
+                for (int nb = 0; nb < num_n_blocks; nb++) {
+                    const int s = nb % NUM_STAGES;
+                    const int full_phase = (nb / NUM_STAGES) & 1;
+
+                    mbarrier_wait_parity(&full_barriers[s], full_phase);
+
+                    #pragma unroll
+                    for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
+                        warpgroup_fence_operand(acc[i]);
+
+                    warpgroup_arrive();
+
+                    #pragma unroll
+                    for (int t = 0; t < TILES_K; t++) {
+                        GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
+                        GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
+                        wgmma_bf16_ss(da.desc_, db.desc_, acc, 1);
+                    }
+
+                    warpgroup_commit_batch();
+
+                    #pragma unroll
+                    for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
+                        warpgroup_fence_operand(acc[i]);
+
+                    warpgroup_wait<0>();
+
+                    if (wg_tid == 0) {
+                        mbarrier_arrive(&empty_barriers[s]);
+                    }
+                }
+
+                // EPILOGUE: store with optional bias
+                #pragma unroll 1
+                for (int i = 0; i < WGMMA_NUM_ACCUM; i++) {
+                    int m, n;
+                    reg_to_mn(i, warp_in_wg, lane_id, m, n);
+
+                    const int m_global = m_start + m;
+                    const int k_global = k_start + n;
+
+                    if (m_global >= expert_end || k_global >= K) continue;
+
+                    float result = acc[i];
+
+                    if (has_down_bias && down_bias != nullptr) {
+                        result += __bfloat162float(down_bias[k_global]);
+                    }
+
+                    C[m_global * stride_c_m + k_global] = __float2bfloat16(result);
+                }
             }
-        }
 
-    } else {
-        // ════════════════════════════════════════════════════════════════
-        // MATH WG: WGMMA compute + store epilogue
-        // ════════════════════════════════════════════════════════════════
-        float acc[WGMMA_NUM_ACCUM];
-        for (int i = 0; i < WGMMA_NUM_ACCUM; i++) acc[i] = 0.0f;
+            __syncthreads();
 
-        const int warp_in_wg = wg_tid / WARP_SIZE;
-        const int lane_id = wg_tid % WARP_SIZE;
+        }  // M-tile loop
 
-        // N-REDUCTION LOOP
-        for (int nb = 0; nb < num_n_blocks; nb++) {
-            const int s = nb % NUM_STAGES;
-            const int full_phase = (nb / NUM_STAGES) & 1;
-
-            mbarrier_wait_parity(&full_barriers[s], full_phase);
-
-            #pragma unroll
-            for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
-                warpgroup_fence_operand(acc[i]);
-
-            warpgroup_arrive();
-
-            #pragma unroll
-            for (int t = 0; t < TILES_K; t++) {
-                GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
-                GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
-                wgmma_bf16_ss(da.desc_, db.desc_, acc, 1);
-            }
-
-            warpgroup_commit_batch();
-
-            #pragma unroll
-            for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
-                warpgroup_fence_operand(acc[i]);
-
-            warpgroup_wait<0>();
-
-            if (wg_tid == 0) {
-                mbarrier_arrive(&empty_barriers[s]);
-            }
-        }
-
-        // EPILOGUE: FP32 -> BF16 store (no SwiGLU, no bias)
-        #pragma unroll 1
-        for (int i = 0; i < WGMMA_NUM_ACCUM; i++) {
-            int m, n;
-            reg_to_mn(i, warp_in_wg, lane_id, m, n);
-            const int m_global = m_start + m;
-            const int k_global = k_start + n;
-
-            if (m < m_size && k_global < K) {
-                C[m_global * stride_c_m + k_global] = __float2bfloat16(acc[i]);
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Host utilities: TMA descriptor creation
-// ============================================================================
-static PFN_cuTensorMapEncodeTiled get_cuTensorMapEncodeTiled() {
-    cudaDriverEntryPointQueryResult driver_status;
-    void* ptr = nullptr;
-#if CUDA_VERSION >= 12050
-    cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &ptr, 12000,
-                                     cudaEnableDefault, &driver_status);
-#else
-    cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &ptr,
-                            cudaEnableDefault, &driver_status);
-#endif
-    if (driver_status != cudaDriverEntryPointSuccess)
-        throw std::runtime_error("Failed to get cuTensorMapEncodeTiled");
-    return reinterpret_cast<PFN_cuTensorMapEncodeTiled>(ptr);
-}
-
-static CUtensorMap make_2d_tma_desc_bf16(
-    __nv_bfloat16* global_address,
-    uint64_t gmem_rows, uint64_t gmem_cols,
-    uint32_t smem_rows, uint32_t smem_cols,
-    PFN_cuTensorMapEncodeTiled encode_func
-) {
-    CUtensorMap tensor_map = {};
-    uint64_t gmem_dim[2] = {gmem_cols, gmem_rows};
-    uint64_t global_stride[1] = {gmem_cols * sizeof(__nv_bfloat16)};
-    uint32_t smem_dim[2] = {smem_cols, smem_rows};
-    uint32_t elem_strides[2] = {1, 1};
-
-    auto result = encode_func(
-        &tensor_map,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        2,
-        global_address,
-        gmem_dim,
-        global_stride,
-        smem_dim,
-        elem_strides,
-        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
-    if (result != CUDA_SUCCESS)
-        throw std::runtime_error("cuTensorMapEncodeTiled failed");
-    return tensor_map;
+    }  // Expert loop
 }
 
 // ============================================================================
 // C++ wrapper: Stage 1 (gate + up + SwiGLU)
 // ============================================================================
-torch::Tensor grouped_mxfp4_stage1_tma(
+torch::Tensor grouped_mxfp4_moe_stage1(
     torch::Tensor A,
     torch::Tensor expert_offsets,
     torch::Tensor gate_ptrs,
     torch::Tensor gate_scale_ptrs,
     torch::Tensor up_ptrs,
     torch::Tensor up_scale_ptrs,
+    torch::Tensor gate_bias_ptrs,
+    torch::Tensor up_bias_ptrs,
     int N,
     int64_t stride_weight_n,
-    int64_t stride_scale_n,
-    int max_m_tiles
+    int64_t stride_scale_n
 ) {
     TORCH_CHECK(A.is_cuda() && A.dtype() == torch::kBFloat16);
     TORCH_CHECK(expert_offsets.is_cuda() && expert_offsets.dtype() == torch::kInt32);
@@ -848,33 +849,35 @@ torch::Tensor grouped_mxfp4_stage1_tma(
 
     auto C = torch::empty({total_tokens, N}, A.options());
 
-    auto encode_func = get_cuTensorMapEncodeTiled();
-
-    CUtensorMap desc_a = make_2d_tma_desc_bf16(
-        reinterpret_cast<__nv_bfloat16*>(A.data_ptr()),
-        total_tokens, K, BLOCK_M, BLOCK_K, encode_func);
-
+    // 2D grid: (num_experts, num_n_tiles)
     const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    dim3 grid(num_experts, num_n_tiles, max_m_tiles);
+    dim3 grid(num_experts, num_n_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
                                4 * NUM_STAGES * sizeof(uint64_t) + LUT_BYTES;
 
-    cudaFuncSetAttribute(grouped_mxfp4_stage1_tma_kernel,
+    cudaFuncSetAttribute(grouped_mxfp4_moe_stage1_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
-    grouped_mxfp4_stage1_tma_kernel<<<grid, block, smem_bytes>>>(
-        desc_a,
+    int has_gate_bias = gate_bias_ptrs.numel() > 0 ? 1 : 0;
+    int has_up_bias = up_bias_ptrs.numel() > 0 ? 1 : 0;
+
+    grouped_mxfp4_moe_stage1_kernel<<<grid, block, smem_bytes>>>(
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+        A.stride(0),
+        expert_offsets.data_ptr<int32_t>(),
         gate_ptrs.data_ptr<int64_t>(),
         gate_scale_ptrs.data_ptr<int64_t>(),
         up_ptrs.data_ptr<int64_t>(),
         up_scale_ptrs.data_ptr<int64_t>(),
-        expert_offsets.data_ptr<int32_t>(),
+        has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
         total_tokens, N, K, num_experts,
-        stride_weight_n, stride_scale_n);
+        stride_weight_n, stride_scale_n,
+        has_gate_bias, has_up_bias);
 
     return C;
 }
@@ -882,15 +885,15 @@ torch::Tensor grouped_mxfp4_stage1_tma(
 // ============================================================================
 // C++ wrapper: Stage 2 (down projection)
 // ============================================================================
-torch::Tensor grouped_mxfp4_stage2_tma(
+torch::Tensor grouped_mxfp4_moe_stage2(
     torch::Tensor input,
     torch::Tensor expert_offsets,
     torch::Tensor down_ptrs,
     torch::Tensor down_scale_ptrs,
+    torch::Tensor down_bias_ptrs,
     int K,
     int64_t stride_weight_n,
-    int64_t stride_scale_n,
-    int max_m_tiles
+    int64_t stride_scale_n
 ) {
     TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kBFloat16);
     TORCH_CHECK(expert_offsets.is_cuda() && expert_offsets.dtype() == torch::kInt32);
@@ -902,41 +905,40 @@ torch::Tensor grouped_mxfp4_stage2_tma(
 
     auto C = torch::empty({total_tokens, K}, input.options());
 
-    auto encode_func = get_cuTensorMapEncodeTiled();
-
-    // TMA descriptor for input [total_tokens, N], tile [BLOCK_M, BLOCK_K]
-    CUtensorMap desc_input = make_2d_tma_desc_bf16(
-        reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
-        total_tokens, N, BLOCK_M, BLOCK_K, encode_func);
-
+    // 1D grid over K-tiles
     const int num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;
-    dim3 grid(num_experts, num_k_tiles, max_m_tiles);
+    dim3 grid(num_k_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
                                2 * NUM_STAGES * sizeof(uint64_t) + LUT_BYTES;
 
-    cudaFuncSetAttribute(grouped_mxfp4_stage2_tma_kernel,
+    cudaFuncSetAttribute(grouped_mxfp4_moe_stage2_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
-    grouped_mxfp4_stage2_tma_kernel<<<grid, block, smem_bytes>>>(
-        desc_input,
+    int has_down_bias = down_bias_ptrs.numel() > 0 ? 1 : 0;
+
+    grouped_mxfp4_moe_stage2_kernel<<<grid, block, smem_bytes>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        input.stride(0),
+        expert_offsets.data_ptr<int32_t>(),
         down_ptrs.data_ptr<int64_t>(),
         down_scale_ptrs.data_ptr<int64_t>(),
-        expert_offsets.data_ptr<int32_t>(),
+        has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
         total_tokens, N, K, num_experts,
-        stride_weight_n, stride_scale_n);
+        stride_weight_n, stride_scale_n,
+        has_down_bias);
 
     return C;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("grouped_mxfp4_stage1_tma", &grouped_mxfp4_stage1_tma,
-          "Grouped MXFP4 Stage 1 (gate+up+SwiGLU) with TMA");
-    m.def("grouped_mxfp4_stage2_tma", &grouped_mxfp4_stage2_tma,
-          "Grouped MXFP4 Stage 2 (down projection) with TMA");
+    m.def("grouped_mxfp4_moe_stage1", &grouped_mxfp4_moe_stage1,
+          "Grouped MXFP4 Stage 1 (gate+up+SwiGLU) - validated kernel");
+    m.def("grouped_mxfp4_moe_stage2", &grouped_mxfp4_moe_stage2,
+          "Grouped MXFP4 Stage 2 (down projection) - validated kernel");
 }
 '''
 
@@ -968,7 +970,7 @@ def _load_grouped_module():
         cuda_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v"]
 
         _grouped_module = load_inline(
-            name="batchgen_fused_mxfp4_grouped_wgmma",
+            name="batchgen_fused_mxfp4_grouped_wgmma_v2",
             cpp_sources=[""],
             cuda_sources=[CUDA_SOURCE_GROUPED_MXFP4_MOE],
             extra_cuda_cflags=cuda_flags,
@@ -1020,7 +1022,7 @@ def fused_mxfp4_grouped_stage1(
     """Grouped MXFP4 Stage 1: gate + up + SwiGLU via WGMMA.
 
     Operates on 1D+offsets layout directly from CUDA dispatch.
-    No 3D reshape needed.
+    2D grid (experts, N-tiles) with M-tile loop inside kernel.
 
     Args:
         sorted_hidden: Dispatched tokens [total_tokens, K] BF16
@@ -1037,21 +1039,15 @@ def fused_mxfp4_grouped_stage1(
     mod = _load_grouped_module()
     assert mod is not None, "WGMMA grouped module not available"
 
-    num_experts = expert_offsets.shape[0] - 1
-    total_tokens = sorted_hidden.shape[0]
+    # Empty bias tensors (GPT-OSS-120B has no biases)
+    empty_bias = torch.empty(0, dtype=torch.int64, device=sorted_hidden.device)
 
-    # Compute max_m_tiles from expert_offsets
-    # Each expert may have different token counts; max_m_tiles covers the largest
-    if total_tokens > 0:
-        max_m_tiles = (total_tokens + 63) // 64  # conservative upper bound
-    else:
-        max_m_tiles = 1
-
-    return mod.grouped_mxfp4_stage1_tma(
+    return mod.grouped_mxfp4_moe_stage1(
         sorted_hidden, expert_offsets,
         gate_ptrs, gate_scale_ptrs,
         up_ptrs, up_scale_ptrs,
-        N, stride_weight_n, stride_scale_n, max_m_tiles,
+        empty_bias, empty_bias,
+        N, stride_weight_n, stride_scale_n,
     )
 
 
@@ -1065,6 +1061,8 @@ def fused_mxfp4_grouped_stage2(
     stride_scale_n: int,               # N // 32
 ) -> torch.Tensor:                     # [total_tokens, K] BF16
     """Grouped MXFP4 Stage 2: down projection via WGMMA.
+
+    1D grid (K-tiles) with expert+M loop inside kernel.
 
     Args:
         intermediate: Stage 1 output [total_tokens, N] BF16
@@ -1080,17 +1078,14 @@ def fused_mxfp4_grouped_stage2(
     mod = _load_grouped_module()
     assert mod is not None, "WGMMA grouped module not available"
 
-    total_tokens = intermediate.shape[0]
+    # Empty bias tensor (GPT-OSS-120B has no biases)
+    empty_bias = torch.empty(0, dtype=torch.int64, device=intermediate.device)
 
-    if total_tokens > 0:
-        max_m_tiles = (total_tokens + 63) // 64
-    else:
-        max_m_tiles = 1
-
-    return mod.grouped_mxfp4_stage2_tma(
+    return mod.grouped_mxfp4_moe_stage2(
         intermediate, expert_offsets,
         down_ptrs, down_scale_ptrs,
-        K, stride_weight_n, stride_scale_n, max_m_tiles,
+        empty_bias,
+        K, stride_weight_n, stride_scale_n,
     )
 
 
