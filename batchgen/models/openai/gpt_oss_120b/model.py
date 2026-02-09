@@ -1330,11 +1330,14 @@ class GptOssMoE_EP(nn.Module):
                 _debug_weight_lists=_debug_lists,
                 _return_internals=_need_internals,
             )
-            if _need_internals:
+            if _need_internals and isinstance(_result, tuple):
                 _grouped_output, _sorted_output, _topk_pos, _expert_offsets = _result
                 global_results[:num_global_tokens] = _grouped_output
             else:
-                global_results[:num_global_tokens] = _result
+                if isinstance(_result, tuple):
+                    global_results[:num_global_tokens] = _result[0]
+                else:
+                    global_results[:num_global_tokens] = _result
         elif run_compare:
             # DIAGNOSTIC: stage-by-stage comparison of grouped vs single-expert
             _COMPARE_COUNT += 1
