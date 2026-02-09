@@ -1120,6 +1120,7 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     expert_start: int = 0,
     num_local_experts: int = 128,
     _debug_weight_lists=None,
+    _return_internals=False,
 ) -> torch.Tensor:
     """End-to-end grouped MXFP4 MoE forward using WGMMA + CUDA routing.
 
@@ -1575,6 +1576,8 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
                 _debug_grouped_call_count,
             )
 
+    if _return_internals:
+        return output, sorted_output, topk_pos, expert_offsets
     return output
 
 

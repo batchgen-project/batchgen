@@ -1315,7 +1315,9 @@ class GptOssMoE_EP(nn.Module):
                         self._local_up_weights, self._local_up_scales,
                         self._local_down_weights, self._local_down_scales,
                     )
-            global_results[:num_global_tokens] = fused_mxfp4_grouped_moe_forward_cuda_routing(
+            _need_internals = (_FULL_COMPARE
+                               and _FULL_COMPARE_COUNT < _FULL_COMPARE_MAX)
+            _result = fused_mxfp4_grouped_moe_forward_cuda_routing(
                 all_tokens, topk_indices, topk_weights,
                 self.gate_ptrs, self.gate_scale_ptrs,
                 self.up_ptrs, self.up_scale_ptrs,
@@ -1326,7 +1328,13 @@ class GptOssMoE_EP(nn.Module):
                 expert_start=self.routed_expert_start_idx,
                 num_local_experts=self.experts_per_rank,
                 _debug_weight_lists=_debug_lists,
+                _return_internals=_need_internals,
             )
+            if _need_internals:
+                _grouped_output, _sorted_output, _topk_pos, _expert_offsets = _result
+                global_results[:num_global_tokens] = _grouped_output
+            else:
+                global_results[:num_global_tokens] = _result
         elif run_compare:
             # DIAGNOSTIC: stage-by-stage comparison of grouped vs single-expert
             _COMPARE_COUNT += 1
@@ -1527,30 +1535,53 @@ class GptOssMoE_EP(nn.Module):
                 weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(global_results.dtype)
                 global_results.index_add_(0, expert_token_idx, weighted_output)
 
-        # ── Full-pipeline comparison: grouped vs per-expert loop (pre-AllReduce) ──
+        # ── Full-pipeline comparison: grouped reduce vs same-kernel index_add (pre-AllReduce) ──
         global _FULL_COMPARE_COUNT
         if (_FULL_COMPARE and self._use_grouped_wgmma
                 and _FULL_COMPARE_COUNT < _FULL_COMPARE_MAX):
             _FULL_COMPARE_COUNT += 1
             torch.cuda.synchronize()
 
-            # Identify which forward path the per-expert loop uses
-            first_expert = self.experts[self.routed_expert_start_idx]
-            if first_expert is not None:
-                is_bf16 = getattr(first_expert, 'use_bf16_weights', False)
-                print(f"[FULL COMPARE #{_FULL_COMPARE_COUNT}] rank {self.rank}: "
-                      f"per-expert loop uses {'BF16 matmul (_forward_bf16)' if is_bf16 else 'MXFP4 WGMMA (_forward_fused_wgmma)'} | "
-                      f"grouped path uses MXFP4 WGMMA (pointer arrays)",
-                      flush=True)
-                if is_bf16:
-                    print(f"  WARNING: BF16 vs MXFP4 mismatch — comparison is NOT apples-to-apples! "
-                          f"(pre_dequantize_weights is likely enabled)", flush=True)
+            hidden = all_tokens.shape[1]
 
-            # Run the per-expert loop on the same inputs to get reference output
-            ref_results = torch.zeros_like(global_results)
+            # ── Method A: Re-reduce using per-expert-loop-style accumulation ──
+            # Uses SAME sorted_output from grouped kernel (exact same data),
+            # but accumulates per-expert using mask + index_add_ (like the for-loop path)
+            ref_from_sorted = torch.zeros(num_global_tokens, hidden,
+                                          dtype=torch.bfloat16, device=self.device)
+
+            # _sorted_output was set above when _need_internals=True
+            has_sorted_output = ('_sorted_output' in dir() or
+                                 '_sorted_output' in locals())
+            try:
+                _sorted_output_check = _sorted_output
+                has_sorted_output = _sorted_output_check is not None
+            except NameError:
+                has_sorted_output = False
+
+            if has_sorted_output:
+                # Per-expert accumulation using sorted_output + topk_pos
+                _tpos_2d = _topk_pos.view(num_global_tokens, K)
+                for k_slot in range(K):
+                    valid = _tpos_2d[:, k_slot] >= 0
+                    if valid.any():
+                        pos = _tpos_2d[valid, k_slot].long()
+                        expert_out = _sorted_output[pos]
+                        wt = topk_weights[valid, k_slot:k_slot+1]
+                        weighted = (expert_out.float() * wt).to(torch.bfloat16)
+                        valid_idx = torch.where(valid)[0]
+                        ref_from_sorted.index_add_(0, valid_idx, weighted)
+                has_sorted = True
+            else:
+                has_sorted = False
+                _sorted_output = None  # ensure defined
+
+            # ── Method B: Per-expert loop with expert.forward() (original reference) ──
+            ref_from_loop = torch.zeros(num_global_tokens, hidden,
+                                        dtype=torch.bfloat16, device=self.device)
             flat_expert_idx = topk_indices.view(-1)
             _token_indices = self.token_idx_buffer
-            _topk_positions = self.topk_pos_buffer
+            _topk_positions_buf = self.topk_pos_buffer
 
             for local_e in range(self.experts_per_rank):
                 global_e = self.routed_expert_start_idx + local_e
@@ -1558,7 +1589,7 @@ class GptOssMoE_EP(nn.Module):
                 if not mask.any():
                     continue
                 expert_token_idx = _token_indices[mask]
-                expert_topk_pos = _topk_positions[mask]
+                expert_topk_pos = _topk_positions_buf[mask]
                 tokens_for_expert = all_tokens[expert_token_idx]
 
                 expert = self.experts[global_e]
@@ -1566,55 +1597,64 @@ class GptOssMoE_EP(nn.Module):
                     continue
                 expert_output = expert(tokens_for_expert)
                 expert_weights_val = topk_weights[expert_token_idx, expert_topk_pos]
-                weighted_output = (expert_output * expert_weights_val.unsqueeze(-1)).to(ref_results.dtype)
-                ref_results.index_add_(0, expert_token_idx, weighted_output)
+                weighted_output = (expert_output * expert_weights_val.unsqueeze(-1)).to(torch.bfloat16)
+                ref_from_loop.index_add_(0, expert_token_idx, weighted_output)
 
             torch.cuda.synchronize()
 
-            # Compare grouped output (in global_results) vs per-expert loop output (ref_results)
             grouped_slice = global_results[:num_global_tokens]
-            ref_slice = ref_results[:num_global_tokens]
-            diff = (grouped_slice.float() - ref_slice.float()).abs()
-            max_diff = diff.max().item()
-            mean_diff = diff.mean().item()
 
-            # Per-token breakdown
-            per_token_max = diff.max(dim=1).values  # [N]
-            n_bad_tokens = (per_token_max > 0.01).sum().item()
-            worst_token = per_token_max.argmax().item()
-            worst_token_diff = per_token_max[worst_token].item()
+            # Compare A: grouped reduce vs index_add on SAME sorted_output
+            if has_sorted:
+                diff_A = (grouped_slice.float() - ref_from_sorted.float()).abs()
+                max_A = diff_A.max().item()
+                mean_A = diff_A.mean().item()
+                bad_A = (diff_A.max(dim=1).values > 0.01).sum().item()
+            else:
+                max_A = -1.0
+                mean_A = -1.0
+                bad_A = -1
 
-            # Check if grouped output has unexpected values
+            # Compare B: grouped reduce vs expert.forward() loop
+            diff_B = (grouped_slice.float() - ref_from_loop.float()).abs()
+            max_B = diff_B.max().item()
+            mean_B = diff_B.mean().item()
+            bad_B = (diff_B.max(dim=1).values > 0.01).sum().item()
+
+            # Compare C: index_add on sorted_output vs expert.forward() loop
+            if has_sorted:
+                diff_C = (ref_from_sorted.float() - ref_from_loop.float()).abs()
+                max_C = diff_C.max().item()
+                mean_C = diff_C.mean().item()
+                bad_C = (diff_C.max(dim=1).values > 0.01).sum().item()
+            else:
+                max_C = -1.0
+                mean_C = -1.0
+                bad_C = -1
+
             g_nonzero = (grouped_slice != 0).any(dim=1).sum().item()
-            r_nonzero = (ref_slice != 0).any(dim=1).sum().item()
-            g_nan = torch.isnan(grouped_slice).sum().item()
-            r_nan = torch.isnan(ref_slice).sum().item()
 
-            print(f"\n[FULL COMPARE #{_FULL_COMPARE_COUNT}] rank {self.rank}: "
-                  f"grouped vs per-expert loop (pre-AllReduce)", flush=True)
-            print(f"  max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} "
-                  f"bad_tokens(>0.01)={n_bad_tokens}/{num_global_tokens}", flush=True)
-            print(f"  worst_token={worst_token} diff={worst_token_diff:.6f}", flush=True)
-            print(f"  grouped: nonzero_rows={g_nonzero} nan={g_nan} "
+            print(f"\n[FULL COMPARE #{_FULL_COMPARE_COUNT}] rank {self.rank} "
+                  f"(expert_start={self.routed_expert_start_idx}):", flush=True)
+            print(f"  A) grouped_reduce vs index_add(sorted_output): "
+                  f"max={max_A:.6f} mean={mean_A:.6f} bad={bad_A}", flush=True)
+            print(f"  B) grouped_reduce vs expert.forward() loop:    "
+                  f"max={max_B:.6f} mean={mean_B:.6f} bad={bad_B}", flush=True)
+            print(f"  C) index_add(sorted_output) vs expert.forward(): "
+                  f"max={max_C:.6f} mean={mean_C:.6f} bad={bad_C}", flush=True)
+            print(f"  grouped: nonzero={g_nonzero} "
                   f"range=[{grouped_slice.float().min():.4f}, {grouped_slice.float().max():.4f}]",
                   flush=True)
-            print(f"  ref:     nonzero_rows={r_nonzero} nan={r_nan} "
-                  f"range=[{ref_slice.float().min():.4f}, {ref_slice.float().max():.4f}]",
-                  flush=True)
 
-            if max_diff > 0.01:
-                # Dump worst 5 tokens
-                _, worst_indices = per_token_max.topk(min(5, num_global_tokens))
-                for idx in worst_indices:
+            if max_B > 0.01:
+                per_token = diff_B.max(dim=1).values
+                _, worst = per_token.topk(min(3, num_global_tokens))
+                for idx in worst:
                     i = idx.item()
-                    g_row = grouped_slice[i]
-                    r_row = ref_slice[i]
-                    row_diff = (g_row.float() - r_row.float()).abs()
-                    print(f"  token {i}: max_diff={row_diff.max():.6f} "
-                          f"grouped=[{g_row.float().min():.4f},{g_row.float().max():.4f}] "
-                          f"ref=[{r_row.float().min():.4f},{r_row.float().max():.4f}] "
-                          f"topk_experts={topk_indices[i].cpu().tolist()} "
-                          f"topk_wts={topk_weights[i].cpu().tolist()}", flush=True)
+                    print(f"  worst token {i}: B_diff={per_token[i]:.4f} "
+                          f"grouped=[{grouped_slice[i].float().min():.4f},{grouped_slice[i].float().max():.4f}] "
+                          f"loop=[{ref_from_loop[i].float().min():.4f},{ref_from_loop[i].float().max():.4f}] "
+                          f"experts={topk_indices[i].cpu().tolist()}", flush=True)
             print(flush=True)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
