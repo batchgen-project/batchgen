@@ -715,12 +715,12 @@ class GptOssParallelStrategyManager:
                 for local_e in range(self.num_local_expert_per_layer):
                     global_e = self.routed_expert_gpu_start_idx + local_e
                     wrapper = ep_moe.experts[global_e]
-                    gate_weights.append(wrapper.mxfp4_gate_packed)
-                    gate_scales.append(wrapper.mxfp4_gate_scales)
-                    up_weights.append(wrapper.mxfp4_up_packed)
-                    up_scales.append(wrapper.mxfp4_up_scales)
-                    down_weights.append(wrapper.mxfp4_down_packed)
-                    down_scales.append(wrapper.mxfp4_down_scales)
+                    gate_weights.append(wrapper.mxfp4_gate_packed.contiguous())
+                    gate_scales.append(wrapper.mxfp4_gate_scales.contiguous())
+                    up_weights.append(wrapper.mxfp4_up_packed.contiguous())
+                    up_scales.append(wrapper.mxfp4_up_scales.contiguous())
+                    down_weights.append(wrapper.mxfp4_down_packed.contiguous())
+                    down_scales.append(wrapper.mxfp4_down_scales.contiguous())
 
                 ep_moe.gate_ptrs, ep_moe.gate_scale_ptrs = setup_expert_weight_pointers(
                     gate_weights, gate_scales)

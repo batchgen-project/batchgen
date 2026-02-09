@@ -770,7 +770,17 @@ class GptOssMoEQuantized(nn.Module):
         if self.gate_weights is None:
             raise RuntimeError("Weights not loaded. Call setup_pointer_arrays() after loading weights.")
 
-        # Create pointer arrays for each projection
+        # Ensure all weight/scale tensors are contiguous before capturing pointers.
+        # The grouped kernel reads via raw pointers with stride = shape[1], so
+        # non-contiguous tensors would cause incorrect data access.
+        self.gate_weights = [w.contiguous() for w in self.gate_weights]
+        self.gate_scales = [s.contiguous() for s in self.gate_scales]
+        self.up_weights = [w.contiguous() for w in self.up_weights]
+        self.up_scales = [s.contiguous() for s in self.up_scales]
+        self.down_weights = [w.contiguous() for w in self.down_weights]
+        self.down_scales = [s.contiguous() for s in self.down_scales]
+
+        # Create pointer arrays (now guaranteed contiguous)
         self.gate_ptrs, self.gate_scale_ptrs = setup_expert_weight_pointers(
             self.gate_weights, self.gate_scales
         )
@@ -864,6 +874,13 @@ class GptOssMoEQuantized(nn.Module):
                 if not _WGMMA_GROUPED_LOGGED:
                     print("[WGMMA grouped] MoE forward using grouped path (4 launches)", flush=True)
                     _WGMMA_GROUPED_LOGGED = True
+                _debug_lists = None
+                if os.environ.get("BATCHGEN_DEBUG_GROUPED", "0") == "1":
+                    _debug_lists = (
+                        self.gate_weights, self.gate_scales,
+                        self.up_weights, self.up_scales,
+                        self.down_weights, self.down_scales,
+                    )
                 output = fused_mxfp4_grouped_moe_forward_cuda_routing(
                     hidden_flat, topk_indices, topk_weights,
                     self.gate_ptrs, self.gate_scale_ptrs,
@@ -873,6 +890,7 @@ class GptOssMoEQuantized(nn.Module):
                     self.down_weights[0], self.down_scales[0],
                     num_experts=self.num_experts,
                     num_local_experts=self.num_experts,
+                    _debug_weight_lists=_debug_lists,
                 )
             elif run_compare:
                 # DIAGNOSTIC: run both paths and compare

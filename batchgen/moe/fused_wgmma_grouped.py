@@ -1093,6 +1093,10 @@ def fused_mxfp4_grouped_stage2(
 # End-to-End API with CUDA Routing
 # ──────────────────────────────────────────────────────────────────────────────
 
+_debug_grouped_call_count = 0
+_DEBUG_GROUPED_MAX = 3
+
+
 def fused_mxfp4_grouped_moe_forward_cuda_routing(
     hidden_states: torch.Tensor,       # [batch*seq, hidden] BF16
     topk_indices: torch.Tensor,        # [batch*seq, K] int32
@@ -1112,6 +1116,7 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     num_experts: int = 128,
     expert_start: int = 0,
     num_local_experts: int = 128,
+    _debug_weight_lists=None,
 ) -> torch.Tensor:
     """End-to-end grouped MXFP4 MoE forward using WGMMA + CUDA routing.
 
@@ -1223,4 +1228,135 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         num_tokens, hidden_size, K_topk,
     )
 
+    # ── Diagnostic: per-expert comparison with single-expert kernel ──
+    if _debug_weight_lists is not None:
+        global _debug_grouped_call_count
+        _debug_grouped_call_count += 1
+        if _debug_grouped_call_count <= _DEBUG_GROUPED_MAX:
+            _run_grouped_diagnostic(
+                _debug_weight_lists,
+                dispatched_x, expert_offsets, intermediate, sorted_output,
+                gate_ptrs, gate_scale_ptrs, up_ptrs, up_scale_ptrs,
+                down_ptrs, down_scale_ptrs,
+                gate_weight_ref, gate_scale_ref, down_weight_ref, down_scale_ref,
+                num_local_experts, N_intermediate, hidden_size,
+                s1_stride_weight_n, s1_stride_scale_n,
+                s2_stride_weight_n, s2_stride_scale_n,
+                _debug_grouped_call_count,
+            )
+
     return output
+
+
+def _run_grouped_diagnostic(
+    weight_lists, dispatched_x, expert_offsets, grouped_intermediate, grouped_output,
+    gate_ptrs, gate_scale_ptrs, up_ptrs, up_scale_ptrs,
+    down_ptrs, down_scale_ptrs,
+    gate_weight_ref, gate_scale_ref, down_weight_ref, down_scale_ref,
+    num_local_experts, N_intermediate, hidden_size,
+    s1_stride_weight_n, s1_stride_scale_n,
+    s2_stride_weight_n, s2_stride_scale_n,
+    call_count,
+):
+    """Per-expert comparison diagnostic for grouped WGMMA debugging."""
+    from batchgen.moe.fused_wgmma_expert import fused_mxfp4_expert_forward
+
+    gate_ws, gate_ss, up_ws, up_ss, down_ws, down_ss = weight_lists
+
+    torch.cuda.synchronize()
+    offsets_cpu = expert_offsets.cpu()
+    print(f"\n[GROUPED DIAG] === Call #{call_count} ===", flush=True)
+
+    # First call: print stride/shape info
+    if call_count == 1:
+        print(f"  gate_ref: shape={gate_weight_ref.shape} stride={gate_weight_ref.stride()} "
+              f"contig={gate_weight_ref.is_contiguous()}", flush=True)
+        print(f"  down_ref: shape={down_weight_ref.shape} stride={down_weight_ref.stride()} "
+              f"contig={down_weight_ref.is_contiguous()}", flush=True)
+        print(f"  s1_stride_w={s1_stride_weight_n} s1_stride_s={s1_stride_scale_n} "
+              f"s2_stride_w={s2_stride_weight_n} s2_stride_s={s2_stride_scale_n}", flush=True)
+
+    # Pointer validation
+    ptr_bugs = 0
+    contig_bugs = 0
+    for e in range(num_local_experts):
+        for name, ptrs, ws, ss in [
+            ("gate", gate_ptrs, gate_ws, gate_ss),
+            ("up", up_ptrs, up_ws, up_ss),
+            ("down", down_ptrs, down_ws, down_ss),
+        ]:
+            w_expected = ws[e].data_ptr()
+            w_actual = ptrs[e].item()
+            if w_expected != w_actual:
+                print(f"  [BUG] Expert {e} {name}_ptr MISMATCH: "
+                      f"expected=0x{w_expected:x} got=0x{w_actual:x}", flush=True)
+                ptr_bugs += 1
+            if not ws[e].is_contiguous():
+                print(f"  [BUG] Expert {e} {name}_weight NOT CONTIGUOUS "
+                      f"shape={ws[e].shape} stride={ws[e].stride()}", flush=True)
+                contig_bugs += 1
+
+        for name, ptrs, ss in [
+            ("gate_scale", gate_scale_ptrs, gate_ss),
+            ("up_scale", up_scale_ptrs, up_ss),
+            ("down_scale", down_scale_ptrs, down_ss),
+        ]:
+            s_expected = ss[e].data_ptr()
+            s_actual = ptrs[e].item()
+            if s_expected != s_actual:
+                print(f"  [BUG] Expert {e} {name}_ptr MISMATCH: "
+                      f"expected=0x{s_expected:x} got=0x{s_actual:x}", flush=True)
+                ptr_bugs += 1
+            if not ss[e].is_contiguous():
+                print(f"  [BUG] Expert {e} {name} NOT CONTIGUOUS "
+                      f"shape={ss[e].shape} stride={ss[e].stride()}", flush=True)
+                contig_bugs += 1
+
+    if ptr_bugs == 0 and contig_bugs == 0:
+        print(f"  Pointer/contiguity check: ALL OK ({num_local_experts} experts × 6 tensors)",
+              flush=True)
+    else:
+        print(f"  Pointer/contiguity check: {ptr_bugs} ptr mismatches, {contig_bugs} non-contiguous",
+              flush=True)
+
+    # Per-expert comparison (full pipeline: single-expert vs grouped)
+    print(f"  Per-expert comparison (single-expert vs grouped full pipeline):", flush=True)
+    max_diffs_s1 = []
+    max_diffs_full = []
+    for e in range(num_local_experts):
+        start = offsets_cpu[e].item()
+        end = offsets_cpu[e + 1].item()
+        if start == end:
+            continue
+
+        expert_input = dispatched_x[start:end].contiguous()
+
+        # Run single-expert full pipeline (Stage 1 + Stage 2)
+        ref_out = fused_mxfp4_expert_forward(
+            expert_input,
+            gate_ws[e], gate_ss[e],
+            up_ws[e], up_ss[e],
+            down_ws[e], down_ss[e],
+        )
+        torch.cuda.synchronize()
+
+        # Compare Stage 1 (grouped intermediate vs... we can't easily get single-expert S1 here,
+        # but we can compare full pipeline output)
+        grouped_slice = grouped_output[start:end]
+        diff = (ref_out.float() - grouped_slice.float()).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        max_diffs_full.append(max_diff)
+
+        if max_diff > 0.01 or e < 3:  # Always print first 3 + any with large diff
+            print(f"    Expert {e}: M={end-start} max_diff={max_diff:.6f} mean_diff={mean_diff:.6f}",
+                  flush=True)
+
+    if max_diffs_full:
+        overall_max = max(max_diffs_full)
+        num_bad = sum(1 for d in max_diffs_full if d > 0.01)
+        print(f"  Summary: {len(max_diffs_full)} experts tested, "
+              f"overall_max_diff={overall_max:.6f}, "
+              f"{num_bad}/{len(max_diffs_full)} experts with diff>0.01",
+              flush=True)
+    print(flush=True)
