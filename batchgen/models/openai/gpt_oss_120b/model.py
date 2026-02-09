@@ -1585,6 +1585,9 @@ class GptOssMoE_EP(nn.Module):
             _token_indices = self.token_idx_buffer
             _topk_positions_buf = self.topk_pos_buffer
 
+            # Also collect per-expert RAW output comparison (Method D)
+            _d_per_expert = []  # (global_e, M, max_diff_raw)
+
             for local_e in range(self.experts_per_rank):
                 global_e = self.routed_expert_start_idx + local_e
                 mask = flat_expert_idx == global_e
@@ -1601,6 +1604,34 @@ class GptOssMoE_EP(nn.Module):
                 expert_weights_val = topk_weights[expert_token_idx, expert_topk_pos]
                 weighted_output = (expert_output * expert_weights_val.unsqueeze(-1)).to(torch.bfloat16)
                 ref_from_loop.index_add_(0, expert_token_idx, weighted_output)
+
+                # Method D: Compare RAW expert output with sorted_output
+                if has_sorted:
+                    M_expert = expert_output.shape[0]
+                    # Get sorted_output positions for these tokens+slots
+                    flat_pos = expert_token_idx * K + expert_topk_pos
+                    sorted_pos = _topk_pos[flat_pos].long()
+                    valid_pos = sorted_pos >= 0
+                    if valid_pos.any():
+                        sorted_vals = _sorted_output[sorted_pos[valid_pos]]
+                        expert_vals = expert_output[valid_pos]
+                        raw_diff = (sorted_vals.float() - expert_vals.float()).abs()
+                        max_raw = raw_diff.max().item()
+                        mean_raw = raw_diff.mean().item()
+                        _d_per_expert.append((global_e, M_expert, max_raw, mean_raw))
+                        if max_raw > 0.01:
+                            # Show details for first few bad tokens
+                            per_token_raw = raw_diff.max(dim=1).values
+                            _, worst_raw = per_token_raw.topk(min(3, per_token_raw.shape[0]))
+                            for idx in worst_raw:
+                                i = idx.item()
+                                pos_i = sorted_pos[valid_pos][i].item()
+                                print(f"  [RAW D] expert {global_e} local_token {i}: "
+                                      f"sorted_output[{pos_i}] range="
+                                      f"[{sorted_vals[i].float().min():.4f},{sorted_vals[i].float().max():.4f}] "
+                                      f"expert_output range="
+                                      f"[{expert_vals[i].float().min():.4f},{expert_vals[i].float().max():.4f}] "
+                                      f"max_diff={per_token_raw[i]:.6f}", flush=True)
 
             torch.cuda.synchronize()
 
@@ -1657,6 +1688,18 @@ class GptOssMoE_EP(nn.Module):
                           f"grouped=[{grouped_slice[i].float().min():.4f},{grouped_slice[i].float().max():.4f}] "
                           f"loop=[{ref_from_loop[i].float().min():.4f},{ref_from_loop[i].float().max():.4f}] "
                           f"experts={topk_indices[i].cpu().tolist()}", flush=True)
+
+            # Method D summary: per-expert RAW output comparison
+            if _d_per_expert:
+                d_max_overall = max(d[2] for d in _d_per_expert)
+                d_bad = sum(1 for d in _d_per_expert if d[2] > 0.01)
+                print(f"  D) per-expert RAW sorted_output vs expert.forward(): "
+                      f"overall_max={d_max_overall:.6f} bad_experts={d_bad}/{len(_d_per_expert)}",
+                      flush=True)
+                for ge, m, mx, mn in _d_per_expert:
+                    if mx > 0.01 or len(_d_per_expert) <= 5:
+                        print(f"    expert {ge}: M={m} max_raw_diff={mx:.6f} mean={mn:.6f}",
+                              flush=True)
             print(flush=True)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
