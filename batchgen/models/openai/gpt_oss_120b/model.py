@@ -1304,6 +1304,14 @@ class GptOssMoE_EP(nn.Module):
                 )
                 self._grouped_logged = True
 
+            _debug_lists = None
+            if os.environ.get("BATCHGEN_DEBUG_GROUPED", "0") == "1":
+                if hasattr(self, '_local_gate_weights'):
+                    _debug_lists = (
+                        self._local_gate_weights, self._local_gate_scales,
+                        self._local_up_weights, self._local_up_scales,
+                        self._local_down_weights, self._local_down_scales,
+                    )
             global_results[:num_global_tokens] = fused_mxfp4_grouped_moe_forward_cuda_routing(
                 all_tokens, topk_indices, topk_weights,
                 self.gate_ptrs, self.gate_scale_ptrs,
@@ -1314,6 +1322,7 @@ class GptOssMoE_EP(nn.Module):
                 num_experts=self.total_experts,
                 expert_start=self.routed_expert_start_idx,
                 num_local_experts=self.experts_per_rank,
+                _debug_weight_lists=_debug_lists,
             )
         elif run_compare:
             # DIAGNOSTIC: stage-by-stage comparison of grouped vs single-expert
