@@ -1094,7 +1094,7 @@ def fused_mxfp4_grouped_stage2(
 # ──────────────────────────────────────────────────────────────────────────────
 
 _debug_grouped_call_count = 0
-_DEBUG_GROUPED_MAX = 3
+_DEBUG_GROUPED_MAX = 300
 _debug_reduce_call_count = 0
 _debug_dispatch_call_count = 0
 _debug_routing_match_count = 0

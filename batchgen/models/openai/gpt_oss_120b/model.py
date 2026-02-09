@@ -106,7 +106,7 @@ _COMPARE_COUNT = 0
 _COMPARE_MAX = int(os.environ.get("BATCHGEN_COMPARE_MAX", "5"))
 _FULL_COMPARE = os.environ.get("BATCHGEN_DEBUG_FULL_COMPARE", "0") == "1"
 _FULL_COMPARE_COUNT = 0
-_FULL_COMPARE_MAX = 3
+_FULL_COMPARE_MAX = 300
 
 
 # ============================================================================
