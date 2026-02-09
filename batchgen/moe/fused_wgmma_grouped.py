@@ -1176,7 +1176,6 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     debug_stages = os.environ.get("BATCHGEN_DEBUG_WGMMA_STAGES", "0") == "1"
 
     if debug_stages:
-        import torch
         torch.cuda.synchronize()
         offsets_cpu = expert_offsets.cpu()
         counts = offsets_cpu[1:] - offsets_cpu[:-1]
