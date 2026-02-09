@@ -1147,6 +1147,8 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         Output [batch*seq, hidden] BF16
     """
     from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+    global _debug_dispatch_call_count, _debug_routing_match_count
+    global _debug_reduce_call_count, _debug_grouped_call_count
 
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1]
@@ -1169,7 +1171,6 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
 
     # ── Diagnostic: validate dispatch (tokens + topk_pos mapping) ──
     if os.environ.get("BATCHGEN_DEBUG_DISPATCH", "0") == "1":
-        global _debug_dispatch_call_count
         _debug_dispatch_call_count += 1
         if _debug_dispatch_call_count <= _DEBUG_GROUPED_MAX:
             torch.cuda.synchronize()
@@ -1253,7 +1254,6 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
 
     # ── Diagnostic: routing match (grouped dispatch vs per-expert-loop mask) ──
     if os.environ.get("BATCHGEN_DEBUG_ROUTING_MATCH", "0") == "1":
-        global _debug_routing_match_count
         _debug_routing_match_count += 1
         if _debug_routing_match_count <= _DEBUG_GROUPED_MAX:
             torch.cuda.synchronize()
@@ -1480,7 +1480,6 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
                               f"after={topk_weights[r, c].item():.6f}", flush=True)
             print(flush=True)
         else:
-            global _debug_routing_match_count
             # Only print OK message on first few calls to avoid log spam
             if _debug_routing_match_count <= 5:
                 print(f"[CORRUPTION CHECK] OK — topk_pos, topk_weights, expert_offsets "
@@ -1515,7 +1514,6 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
 
     # ── Diagnostic: reduce kernel vs PyTorch reference ──
     if os.environ.get("BATCHGEN_DEBUG_REDUCE", "0") == "1":
-        global _debug_reduce_call_count
         _debug_reduce_call_count += 1
         if _debug_reduce_call_count <= _DEBUG_GROUPED_MAX:
             torch.cuda.synchronize()
@@ -1561,7 +1559,6 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
 
     # ── Diagnostic: per-expert comparison with single-expert kernel ──
     if _debug_weight_lists is not None:
-        global _debug_grouped_call_count
         _debug_grouped_call_count += 1
         if _debug_grouped_call_count <= _DEBUG_GROUPED_MAX:
             _run_grouped_diagnostic(
