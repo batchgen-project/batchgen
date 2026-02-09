@@ -1172,6 +1172,24 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     s2_stride_weight_n = down_weight_ref.shape[1]   # N // 2
     s2_stride_scale_n = down_scale_ref.shape[1]     # N // 32
 
+    # Debug: stage-level logging
+    debug_stages = os.environ.get("BATCHGEN_DEBUG_WGMMA_STAGES", "0") == "1"
+
+    if debug_stages:
+        import torch
+        torch.cuda.synchronize()
+        offsets_cpu = expert_offsets.cpu()
+        counts = offsets_cpu[1:] - offsets_cpu[:-1]
+        print(f"[WGMMA DEBUG] dispatch: total={total_dispatched} experts={num_local_experts} "
+              f"expert_start={expert_start} "
+              f"counts={counts.tolist()} "
+              f"input_range=[{dispatched_x.float().min():.4f}, {dispatched_x.float().max():.4f}]",
+              flush=True)
+        print(f"  N_intermediate={N_intermediate} hidden_size={hidden_size} "
+              f"s1_stride_w={s1_stride_weight_n} s1_stride_s={s1_stride_scale_n} "
+              f"s2_stride_w={s2_stride_weight_n} s2_stride_s={s2_stride_scale_n}",
+              flush=True)
+
     # Step 2: WGMMA Stage 1 (gate + up + SwiGLU)
     intermediate = fused_mxfp4_grouped_stage1(
         dispatched_x, expert_offsets,
@@ -1180,12 +1198,30 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         N_intermediate, s1_stride_weight_n, s1_stride_scale_n,
     )
 
+    if debug_stages:
+        torch.cuda.synchronize()
+        print(f"[WGMMA DEBUG] stage1 output: shape={intermediate.shape} "
+              f"range=[{intermediate.float().min():.4f}, {intermediate.float().max():.4f}] "
+              f"nan={torch.isnan(intermediate).sum().item()} "
+              f"inf={torch.isinf(intermediate).sum().item()} "
+              f"nonzero={(intermediate != 0).sum().item()}",
+              flush=True)
+
     # Step 3: WGMMA Stage 2 (down projection)
     sorted_output = fused_mxfp4_grouped_stage2(
         intermediate, expert_offsets,
         down_ptrs, down_scale_ptrs,
         hidden_size, s2_stride_weight_n, s2_stride_scale_n,
     )
+
+    if debug_stages:
+        torch.cuda.synchronize()
+        print(f"[WGMMA DEBUG] stage2 output: shape={sorted_output.shape} "
+              f"range=[{sorted_output.float().min():.4f}, {sorted_output.float().max():.4f}] "
+              f"nan={torch.isnan(sorted_output).sum().item()} "
+              f"inf={torch.isinf(sorted_output).sum().item()} "
+              f"nonzero={(sorted_output != 0).sum().item()}",
+              flush=True)
 
     # Step 4: CUDA reduce (weighted scatter-add back to original order)
     output = reduce_weighted_scatter_cuda(
