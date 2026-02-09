@@ -1097,6 +1097,7 @@ _debug_grouped_call_count = 0
 _DEBUG_GROUPED_MAX = 3
 _debug_reduce_call_count = 0
 _debug_dispatch_call_count = 0
+_debug_routing_match_count = 0
 
 
 def fused_mxfp4_grouped_moe_forward_cuda_routing(
@@ -1247,6 +1248,130 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
             else:
                 print(f"  Dispatch validation: BUGS FOUND "
                       f"(dispatch_ok={dispatch_ok} topk_pos_ok={topk_pos_ok})", flush=True)
+            print(flush=True)
+
+    # ── Diagnostic: routing match (grouped dispatch vs per-expert-loop mask) ──
+    if os.environ.get("BATCHGEN_DEBUG_ROUTING_MATCH", "0") == "1":
+        global _debug_routing_match_count
+        _debug_routing_match_count += 1
+        if _debug_routing_match_count <= _DEBUG_GROUPED_MAX:
+            torch.cuda.synchronize()
+            print(f"\n[ROUTING MATCH #{_debug_routing_match_count}] "
+                  f"num_tokens={num_tokens} K={K_topk} "
+                  f"expert_start={expert_start} num_local={num_local_experts} "
+                  f"total_dispatched={total_dispatched}", flush=True)
+
+            # ─── A. Per-assignment verification ───
+            # For EVERY flat index itopk, verify dispatch vs mask-based routing
+            flat_indices = topk_indices.view(-1)  # [N*K]
+            NK = num_tokens * K_topk
+            offsets_cpu = expert_offsets.cpu()
+            topk_pos_cpu = topk_pos.cpu()
+            flat_indices_cpu = flat_indices.cpu()
+
+            n_local_assignments = 0
+            n_pos_mismatch = 0
+            n_expert_mismatch = 0
+            n_token_mismatch = 0
+            n_weight_mismatch = 0
+            first_bugs = []
+
+            for itopk in range(NK):
+                eid = flat_indices_cpu[itopk].item()
+                local_e = eid - expert_start
+                token_id = itopk // K_topk
+                slot_k = itopk % K_topk
+                pos = topk_pos_cpu[itopk].item()
+
+                if local_e < 0 or local_e >= num_local_experts:
+                    # Non-local expert: pos should be -1
+                    if pos != -1:
+                        n_pos_mismatch += 1
+                        if len(first_bugs) < 5:
+                            first_bugs.append(
+                                f"  [BUG] itopk={itopk} token={token_id} slot={slot_k}: "
+                                f"expert {eid} is NON-LOCAL but topk_pos={pos} (should be -1)")
+                    continue
+
+                # Local expert: pos should be in [expert_offsets[local_e], expert_offsets[local_e+1])
+                n_local_assignments += 1
+                e_start = offsets_cpu[local_e].item()
+                e_end = offsets_cpu[local_e + 1].item()
+
+                if pos < e_start or pos >= e_end:
+                    n_expert_mismatch += 1
+                    if len(first_bugs) < 5:
+                        first_bugs.append(
+                            f"  [BUG] itopk={itopk} token={token_id} slot={slot_k}: "
+                            f"expert {eid} (local {local_e}) pos={pos} "
+                            f"OUT OF expert range [{e_start}, {e_end})")
+                    continue
+
+                # Verify dispatched token content matches original
+                d_tok = dispatched_x[pos]
+                o_tok = hidden_states[token_id]
+                tok_diff = (d_tok.float() - o_tok.float()).abs().max().item()
+                if tok_diff > 0:
+                    n_token_mismatch += 1
+                    if len(first_bugs) < 5:
+                        first_bugs.append(
+                            f"  [BUG] itopk={itopk} token={token_id} slot={slot_k}: "
+                            f"dispatched_x[{pos}] != hidden_states[{token_id}], diff={tok_diff:.6f}")
+
+            # ─── B. Expert count verification ───
+            ref_counts = []
+            counts_cpu = expert_counts.cpu()
+            count_mismatch = False
+            for e_local in range(num_local_experts):
+                global_e = expert_start + e_local
+                ref_n = (flat_indices_cpu == global_e).sum().item()
+                cuda_n = counts_cpu[e_local].item()
+                ref_counts.append(ref_n)
+                if ref_n != cuda_n:
+                    count_mismatch = True
+                    if len(first_bugs) < 5:
+                        first_bugs.append(
+                            f"  [BUG] Expert {e_local} (global {global_e}): "
+                            f"CUDA count={cuda_n} != PyTorch mask count={ref_n}")
+
+            # ─── C. Weight consistency check ───
+            # In reduce, weight for (token, slot_k) = topk_weights[token, slot_k]
+            # In per-expert loop, weight for (token, slot_k) = topk_weights[token, slot_k]
+            # These are the SAME tensor — but verify topk_weights shape/content is sane
+            w_nan = torch.isnan(topk_weights).sum().item()
+            w_inf = torch.isinf(topk_weights).sum().item()
+            w_neg = (topk_weights < 0).sum().item()
+            w_sum_per_token = topk_weights.sum(dim=1)
+            w_sum_min = w_sum_per_token.min().item()
+            w_sum_max = w_sum_per_token.max().item()
+
+            # ─── D. Print results ───
+            all_ok = (n_pos_mismatch == 0 and n_expert_mismatch == 0
+                      and n_token_mismatch == 0 and not count_mismatch)
+
+            print(f"  local_assignments={n_local_assignments}/{NK} "
+                  f"(non-local={NK - n_local_assignments})", flush=True)
+            print(f"  pos_mismatch={n_pos_mismatch} expert_range_mismatch={n_expert_mismatch} "
+                  f"token_content_mismatch={n_token_mismatch} count_mismatch={count_mismatch}",
+                  flush=True)
+            print(f"  topk_weights: nan={w_nan} inf={w_inf} neg={w_neg} "
+                  f"sum_range=[{w_sum_min:.4f}, {w_sum_max:.4f}]", flush=True)
+            print(f"  expert_counts(cuda)={counts_cpu.tolist()}", flush=True)
+            print(f"  expert_counts(ref) ={ref_counts}", flush=True)
+
+            # Show first few topk_indices for sanity
+            n_show = min(5, num_tokens)
+            print(f"  topk_indices[:{n_show}]={topk_indices[:n_show].cpu().tolist()}", flush=True)
+            print(f"  topk_weights[:{n_show}]={topk_weights[:n_show].cpu().tolist()}", flush=True)
+
+            for bug in first_bugs:
+                print(bug, flush=True)
+
+            if all_ok:
+                print(f"  ROUTING MATCH: ALL OK ({n_local_assignments} assignments verified)",
+                      flush=True)
+            else:
+                print(f"  ROUTING MATCH: BUGS FOUND", flush=True)
             print(flush=True)
 
     # Compute strides from reference weights

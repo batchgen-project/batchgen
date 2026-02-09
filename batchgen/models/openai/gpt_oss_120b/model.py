@@ -1534,6 +1534,18 @@ class GptOssMoE_EP(nn.Module):
             _FULL_COMPARE_COUNT += 1
             torch.cuda.synchronize()
 
+            # Identify which forward path the per-expert loop uses
+            first_expert = self.experts[self.routed_expert_start_idx]
+            if first_expert is not None:
+                is_bf16 = getattr(first_expert, 'use_bf16_weights', False)
+                print(f"[FULL COMPARE #{_FULL_COMPARE_COUNT}] rank {self.rank}: "
+                      f"per-expert loop uses {'BF16 matmul (_forward_bf16)' if is_bf16 else 'MXFP4 WGMMA (_forward_fused_wgmma)'} | "
+                      f"grouped path uses MXFP4 WGMMA (pointer arrays)",
+                      flush=True)
+                if is_bf16:
+                    print(f"  WARNING: BF16 vs MXFP4 mismatch — comparison is NOT apples-to-apples! "
+                          f"(pre_dequantize_weights is likely enabled)", flush=True)
+
             # Run the per-expert loop on the same inputs to get reference output
             ref_results = torch.zeros_like(global_results)
             flat_expert_idx = topk_indices.view(-1)
