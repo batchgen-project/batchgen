@@ -1223,11 +1223,29 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
               f"nonzero={(sorted_output != 0).sum().item()}",
               flush=True)
 
-    # Step 4: CUDA reduce (weighted scatter-add back to original order)
-    output = reduce_weighted_scatter_cuda(
-        sorted_output, topk_pos, topk_weights,
-        num_tokens, hidden_size, K_topk,
-    )
+    # Step 4: Reduce (weighted scatter-add back to original order)
+    _use_index_add = os.environ.get("BATCHGEN_USE_INDEX_ADD_REDUCE", "0") == "1"
+
+    if _use_index_add:
+        # PyTorch index_add_ reduce: known-correct, matches per-expert loop fallback
+        output = torch.zeros(num_tokens, hidden_size, dtype=sorted_output.dtype,
+                             device=sorted_output.device)
+        topk_pos_2d = topk_pos.view(num_tokens, K_topk)
+        for k in range(K_topk):
+            valid = topk_pos_2d[:, k] >= 0
+            if valid.any():
+                pos = topk_pos_2d[valid, k].long()
+                token_vals = sorted_output[pos]
+                weights_k = topk_weights[valid, k:k+1]
+                weighted = (token_vals.float() * weights_k).to(sorted_output.dtype)
+                valid_indices = torch.where(valid)[0]
+                output.index_add_(0, valid_indices, weighted)
+    else:
+        # CUDA reduce kernel
+        output = reduce_weighted_scatter_cuda(
+            sorted_output, topk_pos, topk_weights,
+            num_tokens, hidden_size, K_topk,
+        )
 
     # ── Diagnostic: reduce kernel vs PyTorch reference ──
     if os.environ.get("BATCHGEN_DEBUG_REDUCE", "0") == "1":
