@@ -1400,6 +1400,13 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
               f"s2_stride_w={s2_stride_weight_n} s2_stride_s={s2_stride_scale_n}",
               flush=True)
 
+    # ── Snapshot topk_pos and topk_weights BEFORE kernel stages (corruption detection) ──
+    _check_corruption = os.environ.get("BATCHGEN_DEBUG_CORRUPTION", "0") == "1"
+    if _check_corruption:
+        _topk_pos_snapshot = topk_pos.clone()
+        _topk_weights_snapshot = topk_weights.clone()
+        _expert_offsets_snapshot = expert_offsets.clone()
+
     # Step 2: WGMMA Stage 1 (gate + up + SwiGLU)
     intermediate = fused_mxfp4_grouped_stage1(
         dispatched_x, expert_offsets,
@@ -1432,6 +1439,54 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
               f"inf={torch.isinf(sorted_output).sum().item()} "
               f"nonzero={(sorted_output != 0).sum().item()}",
               flush=True)
+
+    # ── Check if kernel stages corrupted topk_pos / topk_weights / expert_offsets ──
+    if _check_corruption:
+        torch.cuda.synchronize()
+        pos_changed = (topk_pos != _topk_pos_snapshot).sum().item()
+        wts_changed = (topk_weights != _topk_weights_snapshot).sum().item()
+        off_changed = (expert_offsets != _expert_offsets_snapshot).sum().item()
+
+        if pos_changed > 0 or wts_changed > 0 or off_changed > 0:
+            print(f"\n[CORRUPTION DETECTED] expert_start={expert_start} "
+                  f"total_dispatched={total_dispatched}", flush=True)
+            print(f"  topk_pos changed: {pos_changed}/{topk_pos.numel()} elements", flush=True)
+            print(f"  topk_weights changed: {wts_changed}/{topk_weights.numel()} elements",
+                  flush=True)
+            print(f"  expert_offsets changed: {off_changed}/{expert_offsets.numel()} elements",
+                  flush=True)
+
+            if pos_changed > 0:
+                diff_mask = topk_pos != _topk_pos_snapshot
+                diff_indices = torch.where(diff_mask)[0][:10]
+                for idx in diff_indices:
+                    i = idx.item()
+                    print(f"    topk_pos[{i}]: before={_topk_pos_snapshot[i].item()} "
+                          f"after={topk_pos[i].item()} "
+                          f"(token={i // K_topk} slot={i % K_topk})", flush=True)
+
+            if wts_changed > 0:
+                diff_mask = topk_weights != _topk_weights_snapshot
+                n_show = min(10, diff_mask.sum().item())
+                if n_show > 0:
+                    flat_diff = diff_mask.view(-1)
+                    diff_indices = torch.where(flat_diff)[0][:10]
+                    for idx in diff_indices:
+                        i = idx.item()
+                        r, c = i // K_topk, i % K_topk
+                        print(f"    topk_weights[{r},{c}]: "
+                              f"before={_topk_weights_snapshot[r, c].item():.6f} "
+                              f"after={topk_weights[r, c].item():.6f}", flush=True)
+            print(flush=True)
+        else:
+            global _debug_routing_match_count
+            # Only print OK message on first few calls to avoid log spam
+            if _debug_routing_match_count <= 5:
+                print(f"[CORRUPTION CHECK] OK — topk_pos, topk_weights, expert_offsets "
+                      f"unchanged after kernel stages "
+                      f"(dispatched={total_dispatched})", flush=True)
+
+        del _topk_pos_snapshot, _topk_weights_snapshot, _expert_offsets_snapshot
 
     # Step 4: Reduce (weighted scatter-add back to original order)
     _use_index_add = os.environ.get("BATCHGEN_USE_INDEX_ADD_REDUCE", "0") == "1"
