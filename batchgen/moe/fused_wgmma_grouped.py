@@ -1166,8 +1166,13 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     dispatched_x = dispatched_x[:total_dispatched]
 
     if total_dispatched == 0:
-        return torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype,
-                           device=hidden_states.device)
+        zero_output = torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype,
+                                  device=hidden_states.device)
+        if _return_internals:
+            empty_sorted = torch.zeros(0, hidden_size, dtype=hidden_states.dtype,
+                                       device=hidden_states.device)
+            return zero_output, empty_sorted, topk_pos, expert_offsets
+        return zero_output
 
     # ── Diagnostic: validate dispatch (tokens + topk_pos mapping) ──
     if os.environ.get("BATCHGEN_DEBUG_DISPATCH", "0") == "1":
