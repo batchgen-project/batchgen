@@ -1246,11 +1246,19 @@ class GptOssMoE_EP(nn.Module):
                 num_local_experts=self.experts_per_rank,
             )
         elif run_compare:
-            # DIAGNOSTIC: run WGMMA grouped, then per-expert loop, compare
+            # DIAGNOSTIC: stage-by-stage comparison of grouped vs single-expert
             _COMPARE_COUNT += 1
             torch.cuda.synchronize()
 
-            # Print context on first comparison
+            from batchgen.moe.fused_wgmma_grouped import (
+                fused_mxfp4_grouped_stage1, fused_mxfp4_grouped_stage2,
+            )
+            from batchgen.moe.fused_wgmma_expert import _load_mxfp4_module
+            from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+
+            mod_single = _load_mxfp4_module()
+
+            # ─── 1. POINTER VALIDATION ───
             if _COMPARE_COUNT == 1:
                 gw = self.gate_weight_ref
                 gs = self.gate_scale_ref
@@ -1260,97 +1268,131 @@ class GptOssMoE_EP(nn.Module):
                       f"experts=[{self.routed_expert_start_idx}, "
                       f"{self.routed_expert_start_idx + self.experts_per_rank}) "
                       f"topk={topk_indices.shape[1]}", flush=True)
-                print(f"  gate_w={gw.shape} stride={gw.stride()} contig={gw.is_contiguous()} "
-                      f"gate_s={gs.shape} stride={gs.stride()} contig={gs.is_contiguous()}",
+                print(f"  gate_w={gw.shape} stride={gw.stride()} "
+                      f"gate_s={gs.shape} stride={gs.stride()}", flush=True)
+                print(f"  down_w={dw.shape} stride={dw.stride()} "
+                      f"down_s={ds.shape} stride={ds.stride()}", flush=True)
+
+                ptr_ok = True
+                for e_local in range(min(3, self.experts_per_rank)):
+                    global_e = self.routed_expert_start_idx + e_local
+                    w = self.experts[global_e]
+                    checks = [
+                        ("gate_w", self.gate_ptrs, w.mxfp4_gate_packed),
+                        ("gate_s", self.gate_scale_ptrs, w.mxfp4_gate_scales),
+                        ("up_w", self.up_ptrs, w.mxfp4_up_packed),
+                        ("up_s", self.up_scale_ptrs, w.mxfp4_up_scales),
+                        ("down_w", self.down_ptrs, w.mxfp4_down_packed),
+                        ("down_s", self.down_scale_ptrs, w.mxfp4_down_scales),
+                    ]
+                    for name, ptr_arr, tensor in checks:
+                        ptr_val = ptr_arr[e_local].item()
+                        expected = tensor.data_ptr()
+                        if ptr_val != expected:
+                            print(f"  PTR MISMATCH e{e_local} {name}: "
+                                  f"ptr={ptr_val} expected={expected} "
+                                  f"tensor.shape={tensor.shape}", flush=True)
+                            ptr_ok = False
+                if ptr_ok:
+                    print(f"  All pointers OK ({min(3, self.experts_per_rank)} experts checked)",
+                          flush=True)
+
+            # ─── 2. DISPATCH ───
+            dispatched_x, expert_counts, expert_offsets, topk_pos = \
+                dispatch_count_gather_cuda(
+                    all_tokens, topk_indices,
+                    self.routed_expert_start_idx, self.experts_per_rank,
+                )
+            total = expert_offsets[self.experts_per_rank].item()
+            dispatched_x = dispatched_x[:total]
+
+            if total > 0:
+                N_inter = self.gate_weight_ref.shape[0]
+                hidden = dispatched_x.shape[1]
+                s1_sw = self.gate_weight_ref.shape[1]
+                s1_ss = self.gate_scale_ref.shape[1]
+                s2_sw = self.down_weight_ref.shape[1]
+                s2_ss = self.down_scale_ref.shape[1]
+                offsets_cpu = expert_offsets.cpu()
+                empty_bias = torch.empty(0, dtype=torch.bfloat16,
+                                         device=dispatched_x.device)
+
+                if _COMPARE_COUNT == 1:
+                    print(f"  N_inter={N_inter} hidden={hidden} "
+                          f"s1_stride_w={s1_sw} s1_stride_s={s1_ss} "
+                          f"s2_stride_w={s2_sw} s2_stride_s={s2_ss}",
+                          flush=True)
+
+                # ─── 3. STAGE 1 COMPARISON ───
+                grouped_s1 = fused_mxfp4_grouped_stage1(
+                    dispatched_x, expert_offsets,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    N_inter, s1_sw, s1_ss,
+                )
+                ref_s1 = torch.zeros_like(grouped_s1)
+                for e_local in range(self.experts_per_rank):
+                    s = offsets_cpu[e_local].item()
+                    e = offsets_cpu[e_local + 1].item()
+                    if e <= s:
+                        continue
+                    global_e = self.routed_expert_start_idx + e_local
+                    w = self.experts[global_e]
+                    tok = dispatched_x[s:e].contiguous()
+                    ref_s1[s:e] = mod_single.mxfp4_moe_stage1(
+                        tok,
+                        w.mxfp4_gate_packed, w.mxfp4_gate_scales,
+                        w.mxfp4_up_packed, w.mxfp4_up_scales,
+                        empty_bias, empty_bias,
+                    )
+                torch.cuda.synchronize()
+                s1d = (grouped_s1.float() - ref_s1.float()).abs()
+                print(f"[S1 COMPARE #{_COMPARE_COUNT}] rank {self.rank}: "
+                      f"max_diff={s1d.max():.6f} mean={s1d.mean():.6f}",
                       flush=True)
-                print(f"  down_w={dw.shape} stride={dw.stride()} contig={dw.is_contiguous()} "
-                      f"down_s={ds.shape} stride={ds.stride()} contig={ds.is_contiguous()}",
+                print(f"  grouped: [{grouped_s1.float().min():.4f}, "
+                      f"{grouped_s1.float().max():.4f}]  "
+                      f"single: [{ref_s1.float().min():.4f}, "
+                      f"{ref_s1.float().max():.4f}]", flush=True)
+
+                # ─── 4. STAGE 2 COMPARISON (using grouped S1 as input) ───
+                grouped_s2 = fused_mxfp4_grouped_stage2(
+                    grouped_s1, expert_offsets,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    hidden, s2_sw, s2_ss,
+                )
+                ref_s2 = torch.zeros_like(grouped_s2)
+                for e_local in range(self.experts_per_rank):
+                    s = offsets_cpu[e_local].item()
+                    e = offsets_cpu[e_local + 1].item()
+                    if e <= s:
+                        continue
+                    global_e = self.routed_expert_start_idx + e_local
+                    w = self.experts[global_e]
+                    tok = grouped_s1[s:e].contiguous()
+                    ref_s2[s:e] = mod_single.mxfp4_moe_stage2(
+                        tok,
+                        w.mxfp4_down_packed, w.mxfp4_down_scales,
+                        empty_bias,
+                    )
+                torch.cuda.synchronize()
+                s2d = (grouped_s2.float() - ref_s2.float()).abs()
+                print(f"[S2 COMPARE #{_COMPARE_COUNT}] rank {self.rank}: "
+                      f"max_diff={s2d.max():.6f} mean={s2d.mean():.6f}",
                       flush=True)
+                print(f"  grouped: [{grouped_s2.float().min():.4f}, "
+                      f"{grouped_s2.float().max():.4f}]  "
+                      f"single: [{ref_s2.float().min():.4f}, "
+                      f"{ref_s2.float().max():.4f}]", flush=True)
 
-            # 1) WGMMA grouped output
-            wgmma_result = fused_mxfp4_grouped_moe_forward_cuda_routing(
-                all_tokens, topk_indices, topk_weights,
-                self.gate_ptrs, self.gate_scale_ptrs,
-                self.up_ptrs, self.up_scale_ptrs,
-                self.down_ptrs, self.down_scale_ptrs,
-                self.gate_weight_ref, self.gate_scale_ref,
-                self.down_weight_ref, self.down_scale_ref,
-                num_experts=self.total_experts,
-                expert_start=self.routed_expert_start_idx,
-                num_local_experts=self.experts_per_rank,
-            )
-            torch.cuda.synchronize()
-
-            # 2) Per-expert loop (known correct reference)
-            loop_results = torch.zeros_like(global_results)
-            flat_expert_idx = topk_indices.view(-1)
-            token_indices = self.token_idx_buffer
-            topk_positions = self.topk_pos_buffer
-            expert_counts = self.expert_counts_buffer
-            expert_counts.zero_()
-            expert_counts.scatter_add_(
-                0, flat_expert_idx.to(torch.int64),
-                torch.ones_like(flat_expert_idx, dtype=torch.int32)
-            )
-            expert_counts_cpu = expert_counts.cpu()
-
-            for local_e in range(self.experts_per_rank):
-                global_e = self.routed_expert_start_idx + local_e
-                if expert_counts_cpu[global_e].item() == 0:
-                    continue
-                mask = flat_expert_idx == global_e
-                expert_token_idx = token_indices[mask]
-                expert_topk_pos = topk_positions[mask]
-                tokens_for_expert = all_tokens[expert_token_idx]
-                expert = self.experts[global_e]
-                if expert is None:
-                    continue
-                expert_output = expert(tokens_for_expert)
-                expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
-                weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(loop_results.dtype)
-                loop_results.index_add_(0, expert_token_idx, weighted_output)
-            torch.cuda.synchronize()
-
-            # 3) Compare (only local rank's contribution, before AllReduce)
-            w_out = wgmma_result[:num_global_tokens]
-            l_out = loop_results[:num_global_tokens]
-            diff = (w_out.float() - l_out.float()).abs()
-            ref_abs = l_out.float().abs()
-            max_diff = diff.max().item()
-            mean_diff = diff.mean().item()
-            max_ref = ref_abs.max().item()
-            rel_err = (diff / (ref_abs + 1e-8)).max().item()
-
-            tol = 1e-5 + 1.6e-2 * ref_abs
-            n_fail = (diff > tol).sum().item()
-            n_total = diff.numel()
-            fail_pct = n_fail / n_total * 100
-
-            w_min = w_out.float().min().item()
-            w_max = w_out.float().max().item()
-            w_nan = torch.isnan(w_out).sum().item()
-            w_inf = torch.isinf(w_out).sum().item()
-            l_min = l_out.float().min().item()
-            l_max = l_out.float().max().item()
-
-            print(f"[COMPARE #{_COMPARE_COUNT}] rank {self.rank}: "
-                  f"max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} "
-                  f"rel_err={rel_err:.6f} fail={n_fail}/{n_total} ({fail_pct:.4f}%)",
-                  flush=True)
-            print(f"  WGMMA range: [{w_min:.4f}, {w_max:.4f}] nan={w_nan} inf={w_inf} "
-                  f"Loop range: [{l_min:.4f}, {l_max:.4f}] ref_max={max_ref:.4f}",
-                  flush=True)
-
-            if max_diff > 1.0:
-                nonzero_w = (w_out.float().abs() > 1e-8).sum().item()
-                nonzero_l = (l_out.float().abs() > 1e-8).sum().item()
-                all_zero_w = (w_out == 0).all().item()
-                print(f"  WARNING: large divergence! "
-                      f"nonzero WGMMA={nonzero_w} Loop={nonzero_l} "
-                      f"total={n_total} all_zero_w={all_zero_w}", flush=True)
-
-            # Use per-expert loop output (known correct)
-            global_results[:num_global_tokens] = loop_results[:num_global_tokens]
+                # ─── 5. REDUCE + use reference output ───
+                output = reduce_weighted_scatter_cuda(
+                    ref_s2, topk_pos, topk_weights,
+                    num_global_tokens, hidden, topk_indices.shape[1],
+                )
+                global_results[:num_global_tokens] = output
+            else:
+                pass  # no tokens dispatched
         else:
             # Per-expert loop fallback
             # Flat view of expert assignments
