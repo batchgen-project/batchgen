@@ -1740,35 +1740,54 @@ class GptOssMoE_EP(nn.Module):
                           f"(bf16={is_bf16} wgmma={has_wgmma} persistent={is_persistent})",
                           flush=True)
 
-                    # E2: Pointer comparison
+                    # E2: Full pointer + data comparison for ALL 6 weight/scale tensors
                     if hasattr(expert_e, 'mxfp4_gate_packed') and expert_e.mxfp4_gate_packed is not None:
-                        wrapper_gate_ptr = expert_e.mxfp4_gate_packed.data_ptr()
-                        grouped_gate_ptr = self.gate_ptrs[local_e].item()
-                        ptr_match = (wrapper_gate_ptr == grouped_gate_ptr)
-                        wrapper_down_ptr = expert_e.mxfp4_down_packed.data_ptr()
-                        grouped_down_ptr = self.down_ptrs[local_e].item()
-                        down_match = (wrapper_down_ptr == grouped_down_ptr)
-                        print(f"    E2) gate_ptr: wrapper={wrapper_gate_ptr} grouped={grouped_gate_ptr} "
-                              f"match={ptr_match}", flush=True)
-                        print(f"        down_ptr: wrapper={wrapper_down_ptr} grouped={grouped_down_ptr} "
-                              f"match={down_match}", flush=True)
-
-                        # Also check shapes and contiguity
-                        wg = expert_e.mxfp4_gate_packed
-                        wd = expert_e.mxfp4_down_packed
-                        print(f"    E2b) gate: shape={list(wg.shape)} stride={wg.stride()} "
-                              f"contig={wg.is_contiguous()}", flush=True)
-                        print(f"         down: shape={list(wd.shape)} stride={wd.stride()} "
-                              f"contig={wd.is_contiguous()}", flush=True)
-
-                        # Check _local_gate_weights if available
+                        w_tensors = {
+                            "gate_w": (expert_e.mxfp4_gate_packed, self.gate_ptrs[local_e].item()),
+                            "gate_s": (expert_e.mxfp4_gate_scales, self.gate_scale_ptrs[local_e].item()),
+                            "up_w":   (expert_e.mxfp4_up_packed,   self.up_ptrs[local_e].item()),
+                            "up_s":   (expert_e.mxfp4_up_scales,   self.up_scale_ptrs[local_e].item()),
+                            "down_w": (expert_e.mxfp4_down_packed, self.down_ptrs[local_e].item()),
+                            "down_s": (expert_e.mxfp4_down_scales, self.down_scale_ptrs[local_e].item()),
+                        }
+                        _local_tensors = {}
                         if hasattr(self, '_local_gate_weights'):
-                            lgw = self._local_gate_weights[local_e]
-                            print(f"    E2c) _local_gate: ptr={lgw.data_ptr()} "
-                                  f"shape={list(lgw.shape)} stride={lgw.stride()} "
-                                  f"contig={lgw.is_contiguous()}", flush=True)
-                            print(f"         same_as_wrapper={lgw.data_ptr() == wrapper_gate_ptr} "
-                                  f"same_as_grouped={lgw.data_ptr() == grouped_gate_ptr}",
+                            _local_tensors = {
+                                "gate_w": self._local_gate_weights[local_e],
+                                "gate_s": self._local_gate_scales[local_e],
+                                "up_w":   self._local_up_weights[local_e],
+                                "up_s":   self._local_up_scales[local_e],
+                                "down_w": self._local_down_weights[local_e],
+                                "down_s": self._local_down_scales[local_e],
+                            }
+
+                        print(f"    E2) ALL tensor pointer + data comparison:", flush=True)
+                        for name, (wrapper_t, grouped_ptr) in w_tensors.items():
+                            wp = wrapper_t.data_ptr()
+                            ptr_ok = (wp == grouped_ptr)
+                            local_t = _local_tensors.get(name)
+                            lp = local_t.data_ptr() if local_t is not None else -1
+                            local_ok = (wp == lp) if local_t is not None else "N/A"
+
+                            # Check contiguity
+                            w_contig = wrapper_t.is_contiguous()
+                            l_contig = local_t.is_contiguous() if local_t is not None else "N/A"
+
+                            # Check actual data match (compare first+last 100 bytes)
+                            data_match = "N/A"
+                            if local_t is not None:
+                                w_flat = wrapper_t.contiguous().view(-1)
+                                l_flat = local_t.contiguous().view(-1)
+                                n_check = min(100, w_flat.shape[0])
+                                head_ok = torch.equal(w_flat[:n_check], l_flat[:n_check])
+                                tail_ok = torch.equal(w_flat[-n_check:], l_flat[-n_check:])
+                                data_match = f"head={head_ok} tail={tail_ok}"
+
+                            status = "OK" if ptr_ok and local_ok == True else "MISMATCH"
+                            print(f"      {name:7s}: wrapper_ptr={wp} grouped_ptr={grouped_ptr} "
+                                  f"local_ptr={lp} ptr_match={ptr_ok} local_match={local_ok} "
+                                  f"w_contig={w_contig} l_contig={l_contig} "
+                                  f"shape={list(wrapper_t.shape)} data={data_match} [{status}]",
                                   flush=True)
                     else:
                         print(f"    E2) WARNING: expert has no mxfp4_gate_packed attr!", flush=True)
