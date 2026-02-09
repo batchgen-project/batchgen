@@ -1096,6 +1096,7 @@ def fused_mxfp4_grouped_stage2(
 _debug_grouped_call_count = 0
 _DEBUG_GROUPED_MAX = 3
 _debug_reduce_call_count = 0
+_debug_dispatch_call_count = 0
 
 
 def fused_mxfp4_grouped_moe_forward_cuda_routing(
@@ -1163,6 +1164,90 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     if total_dispatched == 0:
         return torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype,
                            device=hidden_states.device)
+
+    # ── Diagnostic: validate dispatch (tokens + topk_pos mapping) ──
+    if os.environ.get("BATCHGEN_DEBUG_DISPATCH", "0") == "1":
+        global _debug_dispatch_call_count
+        _debug_dispatch_call_count += 1
+        if _debug_dispatch_call_count <= _DEBUG_GROUPED_MAX:
+            torch.cuda.synchronize()
+            print(f"\n[DISPATCH DIAG #{_debug_dispatch_call_count}] "
+                  f"num_tokens={num_tokens} K={K_topk} total_dispatched={total_dispatched} "
+                  f"expert_start={expert_start} num_local={num_local_experts}", flush=True)
+
+            # Build reference: what PyTorch masking would gather for each expert
+            flat_expert_idx = topk_indices.view(-1)  # [N*K]
+            ref_token_ids = torch.arange(num_tokens, device=hidden_states.device
+                                         ).repeat_interleave(K_topk)  # [N*K]
+            offsets_cpu = expert_offsets.cpu()
+
+            dispatch_ok = True
+            topk_pos_ok = True
+
+            for e_local in range(num_local_experts):
+                global_e = expert_start + e_local
+                start = offsets_cpu[e_local].item()
+                end = offsets_cpu[e_local + 1].item()
+                n_dispatch = end - start
+
+                # Reference: tokens that should be in this expert's segment
+                mask = flat_expert_idx == global_e
+                ref_tids = ref_token_ids[mask]  # original token IDs for this expert
+                n_ref = ref_tids.shape[0]
+
+                if n_dispatch != n_ref:
+                    print(f"  [BUG] Expert {e_local} (global {global_e}): "
+                          f"dispatch count={n_dispatch} != ref count={n_ref}", flush=True)
+                    dispatch_ok = False
+                    continue
+
+                if n_dispatch == 0:
+                    continue
+
+                # Check dispatched tokens match original tokens
+                # dispatched_x[start:end] should contain hidden_states[ref_tids] (in some order)
+                disp_set = dispatched_x[start:end]  # [n_dispatch, H]
+                ref_set = hidden_states[ref_tids]    # [n_ref, H]
+
+                # Sort both sets by first element for comparison (order may differ)
+                disp_sorted, disp_idx = disp_set[:, 0].sort()
+                ref_sorted, ref_idx = ref_set[:, 0].sort()
+
+                token_diff = (disp_set[disp_idx].float() - ref_set[ref_idx].float()).abs().max().item()
+                if token_diff > 0:
+                    print(f"  [BUG] Expert {e_local} (global {global_e}): "
+                          f"dispatched tokens MISMATCH ref, max_diff={token_diff:.6f}", flush=True)
+                    dispatch_ok = False
+
+                # Validate topk_pos: for each assignment in mask, check topk_pos points
+                # to a valid position in [start, end) and the token at that position
+                # matches the original token
+                mask_indices = torch.where(mask)[0]  # flat indices where mask is True
+                for flat_idx in mask_indices[:5]:  # check first 5 per expert
+                    fi = flat_idx.item()
+                    pos = topk_pos[fi].item()
+                    orig_token = fi // K_topk
+
+                    if pos < start or pos >= end:
+                        print(f"  [BUG] topk_pos[{fi}]={pos} OUT OF RANGE "
+                              f"[{start},{end}) for expert {e_local}", flush=True)
+                        topk_pos_ok = False
+                    else:
+                        # Token at dispatched_x[pos] should be hidden_states[orig_token]
+                        d_tok = dispatched_x[pos]
+                        o_tok = hidden_states[orig_token]
+                        tok_diff = (d_tok.float() - o_tok.float()).abs().max().item()
+                        if tok_diff > 0:
+                            print(f"  [BUG] topk_pos[{fi}]={pos}: dispatched_x[{pos}] != "
+                                  f"hidden_states[{orig_token}], diff={tok_diff:.6f}", flush=True)
+                            topk_pos_ok = False
+
+            if dispatch_ok and topk_pos_ok:
+                print(f"  Dispatch validation: ALL OK", flush=True)
+            else:
+                print(f"  Dispatch validation: BUGS FOUND "
+                      f"(dispatch_ok={dispatch_ok} topk_pos_ok={topk_pos_ok})", flush=True)
+            print(flush=True)
 
     # Compute strides from reference weights
     # Stage 1 (gate/up): weight is [N, K//2], scale is [N, K//32]
