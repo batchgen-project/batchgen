@@ -78,20 +78,22 @@ except Exception as e:
 _WGMMA_SINGLE_LOGGED = False
 
 # WGMMA grouped kernels (fused gate+up+SwiGLU + down, 1D+offsets layout)
+# NOTE: Disabled by default — produces gibberish in production (routing/layout bug).
+# Use BATCHGEN_ENABLE_WGMMA_GROUPED=1 to explicitly enable for debugging.
 try:
     from batchgen.moe.fused_wgmma_grouped import (
         fused_mxfp4_grouped_moe_forward_cuda_routing,
         is_grouped_wgmma_available,
     )
-    if os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") == "1":
-        _HAS_WGMMA_GROUPED = False
-        print("[WGMMA grouped] disabled by BATCHGEN_DISABLE_WGMMA_GROUPED", flush=True)
-    else:
+    if os.environ.get("BATCHGEN_ENABLE_WGMMA_GROUPED", "0") == "1":
         _HAS_WGMMA_GROUPED = is_grouped_wgmma_available()
         if _HAS_WGMMA_GROUPED:
-            print("[WGMMA grouped] available (3.6-4.1x speedup)", flush=True)
+            print("[WGMMA grouped] explicitly enabled via BATCHGEN_ENABLE_WGMMA_GROUPED", flush=True)
         else:
-            print("[WGMMA grouped] not available (SM90 required or compilation failed)", flush=True)
+            print("[WGMMA grouped] requested but not available (SM90 required)", flush=True)
+    else:
+        _HAS_WGMMA_GROUPED = False
+        print("[WGMMA grouped] disabled by default (use BATCHGEN_ENABLE_WGMMA_GROUPED=1 to enable)", flush=True)
 except Exception as e:
     import traceback
     _HAS_WGMMA_GROUPED = False
