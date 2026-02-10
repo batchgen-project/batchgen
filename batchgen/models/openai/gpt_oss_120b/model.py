@@ -78,22 +78,21 @@ except Exception as e:
 _WGMMA_SINGLE_LOGGED = False
 
 # WGMMA grouped kernels (fused gate+up+SwiGLU + down, 1D+offsets layout)
-# NOTE: Disabled by default — produces gibberish in production (routing/layout bug).
-# Use BATCHGEN_ENABLE_WGMMA_GROUPED=1 to explicitly enable for debugging.
+# Default: enabled on SM90+ (Hopper). Use BATCHGEN_DISABLE_WGMMA_GROUPED=1 to force-disable.
 try:
     from batchgen.moe.fused_wgmma_grouped import (
         fused_mxfp4_grouped_moe_forward_cuda_routing,
         is_grouped_wgmma_available,
     )
-    if os.environ.get("BATCHGEN_ENABLE_WGMMA_GROUPED", "0") == "1":
+    if os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") == "1":
+        _HAS_WGMMA_GROUPED = False
+        print("[WGMMA grouped] disabled via BATCHGEN_DISABLE_WGMMA_GROUPED", flush=True)
+    else:
         _HAS_WGMMA_GROUPED = is_grouped_wgmma_available()
         if _HAS_WGMMA_GROUPED:
-            print("[WGMMA grouped] explicitly enabled via BATCHGEN_ENABLE_WGMMA_GROUPED", flush=True)
+            print("[WGMMA grouped] enabled (SM90 detected)", flush=True)
         else:
-            print("[WGMMA grouped] requested but not available (SM90 required)", flush=True)
-    else:
-        _HAS_WGMMA_GROUPED = False
-        print("[WGMMA grouped] disabled by default (use BATCHGEN_ENABLE_WGMMA_GROUPED=1 to enable)", flush=True)
+            print("[WGMMA grouped] not available (SM90 required)", flush=True)
 except Exception as e:
     import traceback
     _HAS_WGMMA_GROUPED = False
@@ -872,25 +871,8 @@ class GptOssMoEQuantized(nn.Module):
 
         # === Part A: Grouped GEMM for all experts (or persistent only) ===
         if not has_non_persistent:
-            if _HAS_WGMMA_SINGLE and _HAS_CUDA_ROUTING:
-                # WGMMA single-expert: per-expert WGMMA + CUDA routing (highest priority)
-                global _WGMMA_SINGLE_LOGGED
-                if not _WGMMA_SINGLE_LOGGED:
-                    print("[WGMMA single] MoE forward using per-expert WGMMA path", flush=True)
-                    _WGMMA_SINGLE_LOGGED = True
-                output = wgmma_single_expert_moe_forward_cuda_routing(
-                    hidden_flat, topk_indices, topk_weights,
-                    self.gate_weights, self.gate_scales,
-                    self.up_weights, self.up_scales,
-                    self.down_weights, self.down_scales,
-                    gate_biases=self.gate_biases,
-                    up_biases=self.up_biases,
-                    down_biases=self.down_biases,
-                    num_experts=self.num_experts,
-                    num_local_experts=self.num_experts,
-                )
-            elif _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING:
-                # WGMMA grouped: fast path (4 kernel launches)
+            if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING:
+                # WGMMA grouped: fast path (4 kernel launches, highest priority)
                 global _WGMMA_GROUPED_LOGGED
                 if not _WGMMA_GROUPED_LOGGED:
                     print("[WGMMA grouped] MoE forward using grouped path (4 launches)", flush=True)
@@ -907,6 +889,23 @@ class GptOssMoEQuantized(nn.Module):
                     gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
                     up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
                     down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
+                )
+            elif _HAS_WGMMA_SINGLE and _HAS_CUDA_ROUTING:
+                # WGMMA single-expert: per-expert WGMMA + CUDA routing (fallback)
+                global _WGMMA_SINGLE_LOGGED
+                if not _WGMMA_SINGLE_LOGGED:
+                    print("[WGMMA single] MoE forward using per-expert WGMMA path", flush=True)
+                    _WGMMA_SINGLE_LOGGED = True
+                output = wgmma_single_expert_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_weights, self.gate_scales,
+                    self.up_weights, self.up_scales,
+                    self.down_weights, self.down_scales,
+                    gate_biases=self.gate_biases,
+                    up_biases=self.up_biases,
+                    down_biases=self.down_biases,
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
                 )
             elif _HAS_CUDA_ROUTING:
                 output = grouped_mxfp4_moe_forward_cuda_routing(
@@ -938,9 +937,10 @@ class GptOssMoEQuantized(nn.Module):
                     swiglu_limit=self.swiglu_limit,
                 )
         else:
-            # Hybrid execution: grouped for persistent, single for non-persistent
+            # Hybrid execution: grouped WGMMA for persistent, single for non-persistent
             persistent_experts = self.persistent_mask.nonzero(as_tuple=True)[0]
             non_persistent_experts = (~self.persistent_mask).nonzero(as_tuple=True)[0]
+            num_persistent = persistent_experts.numel()
 
             # Part A: Grouped GEMM for persistent experts
             # Create mask for tokens routed to persistent experts only
@@ -949,22 +949,37 @@ class GptOssMoEQuantized(nn.Module):
                 persistent_routing_mask |= (topk_indices == pe)
 
             if persistent_routing_mask.any():
-                # Use grouped GEMM for persistent experts
-                # Note: grouped_mxfp4_moe_forward_3d handles all experts but only
-                # processes tokens routed to experts in the pointer arrays
-                persistent_output = grouped_mxfp4_moe_forward_3d(
-                    hidden_flat, topk_indices, topk_weights,
-                    self.gate_ptrs, self.gate_scale_ptrs,
-                    self.up_ptrs, self.up_scale_ptrs,
-                    self.down_ptrs, self.down_scale_ptrs,
-                    self.gate_weights[0], self.gate_scales[0],
-                    self.up_weights[0], self.up_scales[0],
-                    self.down_weights[0], self.down_scales[0],
-                    self.gate_biases, self.up_biases, self.down_biases,
-                    num_experts=self.num_experts,
-                    swiglu_alpha=self.swiglu_alpha,
-                    swiglu_limit=self.swiglu_limit,
-                )
+                if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING and self.gate_ptrs is not None:
+                    # WGMMA grouped for persistent experts (4 kernel launches)
+                    # dispatch_count_gather routes only to [0, num_persistent)
+                    persistent_output = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                        hidden_flat, topk_indices, topk_weights,
+                        self.gate_ptrs, self.gate_scale_ptrs,
+                        self.up_ptrs, self.up_scale_ptrs,
+                        self.down_ptrs, self.down_scale_ptrs,
+                        self.gate_weights[0], self.gate_scales[0],
+                        self.down_weights[0], self.down_scales[0],
+                        num_experts=self.num_experts,
+                        num_local_experts=num_persistent,
+                        gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
+                        up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
+                        down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
+                    )
+                else:
+                    # Triton grouped fallback for persistent experts
+                    persistent_output = grouped_mxfp4_moe_forward_3d(
+                        hidden_flat, topk_indices, topk_weights,
+                        self.gate_ptrs, self.gate_scale_ptrs,
+                        self.up_ptrs, self.up_scale_ptrs,
+                        self.down_ptrs, self.down_scale_ptrs,
+                        self.gate_weights[0], self.gate_scales[0],
+                        self.up_weights[0], self.up_scales[0],
+                        self.down_weights[0], self.down_scales[0],
+                        self.gate_biases, self.up_biases, self.down_biases,
+                        num_experts=self.num_experts,
+                        swiglu_alpha=self.swiglu_alpha,
+                        swiglu_limit=self.swiglu_limit,
+                    )
                 output += persistent_output
 
             # Part B: Single-expert kernel for non-persistent experts
