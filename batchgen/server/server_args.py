@@ -240,6 +240,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Ratio of experts per layer to offload (0.0-1.0). E.g., 0.2 means 20%% of experts loaded/freed at runtime",
     )
+    parser.add_argument(
+        "--pre-dequantize-weights",
+        action="store_true",
+        default=False,
+        help="Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected.",
+    )
     return parser
 
 
