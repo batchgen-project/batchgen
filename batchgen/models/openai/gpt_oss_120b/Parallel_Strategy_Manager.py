@@ -770,14 +770,6 @@ class GptOssParallelStrategyManager:
                 ep_moe.down_scale_ref = down_scales[0]
                 ep_moe._use_grouped_wgmma = True
 
-                # Store weight lists for diagnostic comparison
-                ep_moe._local_gate_weights = gate_weights
-                ep_moe._local_gate_scales = gate_scales
-                ep_moe._local_up_weights = up_weights
-                ep_moe._local_up_scales = up_scales
-                ep_moe._local_down_weights = down_weights
-                ep_moe._local_down_scales = down_scales
-
             ep_moe.to(device)
 
             # Initialize num_tokens_per_rank for AllGather/AllReduce buffers
