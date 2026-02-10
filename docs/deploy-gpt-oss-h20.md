@@ -96,7 +96,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m batchgen.launch_http_server \
     --node-rank 0 \
     --world-size 8 \
     --kv-dtype "bf16" \
-    --host-kv-cache-size 1800 \
+    --host-kv-cache-size 1600 \
     --enable-hugetlbfs \
     --gpu-memory-frac 0.96 \
     --storage-path /storage \
