@@ -143,6 +143,7 @@ class InputArguments:
 	# EP with offloading settings
 	enable_ep_with_offloading: bool = False
 	ep_offloading_ratio: float = 0.0
+	pre_dequantize_weights: bool = False
 
 	def get(self, key, default=None):
 		return getattr(self, key, default)
@@ -237,6 +238,7 @@ class BatchGenWorkerArgs:
 	# EP with offloading settings
 	enable_ep_with_offloading: bool = False  # Enable Expert Parallelism with offloading
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
+	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 
 
 class BatchGenWorker:
@@ -1112,6 +1114,7 @@ class BatchGenWorker:
 			# EP with offloading settings
 			"enable_ep_with_offloading": self.args.enable_ep_with_offloading,
 			"ep_offloading_ratio": self.args.ep_offloading_ratio,
+			"pre_dequantize_weights": self.args.pre_dequantize_weights,
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 			
@@ -1128,6 +1131,10 @@ class BatchGenWorker:
 		# Set EP offloading config from command-line args
 		self.engine_config.EP_Config.enable_offloading = self.args.enable_ep_with_offloading
 		self.engine_config.EP_Config.offloading_ratio = self.args.ep_offloading_ratio
+
+		# Set pre-dequantize flag on model config (affects MoE routed expert weights only)
+		if hasattr(self.model_config, 'pre_dequantize_weights'):
+			self.model_config.pre_dequantize_weights = self.args.pre_dequantize_weights
 		if self.engine_config.EP_Config.enable_offloading:
 			logging.info(
 				f"Rank {self.rank}: EP with offloading enabled, "

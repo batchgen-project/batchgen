@@ -937,23 +937,24 @@ class GptOssParallelStrategyManager:
         self._config_lm_head_hook()
 
         # Step 7.5: Set up unified decode MoE
-        # Determine weight format
+        # Determine MoE routed expert weight format
         pre_dequant = getattr(self.model_config, 'pre_dequantize_weights', False)
-        if ep_enabled and pre_dequant and self.world_size >= 4:
+        if pre_dequant:
             weight_format = "bf16"
+            logging.info(
+                "MoE routed expert weights will be pre-dequantized from MXFP4 to BF16 "
+                "(--pre-dequantize-weights). Other weights (attention, router, layernorm, lm_head) are unaffected."
+            )
         else:
             weight_format = "mxfp4"
-            if ep_enabled and pre_dequant and self.world_size < 4:
-                logging.warning(
-                    "pre_dequantize_weights=True but world_size < 4. "
-                    "Keeping MXFP4 weights to avoid OOM."
-                )
+            logging.info(
+                "MoE routed expert weights kept as MXFP4 (on-the-fly dequant via fused WGMMA kernels)."
+            )
 
         self._setup_decode_moe(ep_enabled, weight_format)
 
         if weight_format == "bf16":
             self._dequant_experts_to_bf16()
-            logging.info("Using pre-dequantized BF16 expert weights")
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
