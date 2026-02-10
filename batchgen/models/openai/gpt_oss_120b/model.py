@@ -434,18 +434,8 @@ class GptOssAttention(nn.Module):
         # Attention scale
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
-        # RoPE
-        self.rotary_emb = YaRNRotaryEmbedding(
-            dim=self.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-            scaling_factor=config.rope_scaling.get("factor", 32.0),
-            original_max_position_embeddings=config.rope_scaling.get(
-                "original_max_position_embeddings", 4096
-            ),
-            beta_fast=config.rope_scaling.get("beta_fast", 32.0),
-            beta_slow=config.rope_scaling.get("beta_slow", 1.0),
-        )
+        # RoPE — shared instance assigned by GptOssModel.__init__()
+        self.rotary_emb = None
 
     def forward(
         self,
@@ -1407,9 +1397,27 @@ class GptOssModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
 
+        # Create shared RoPE instance (identical for all 36 layers — avoids 35× redundant
+        # CPU trig computation on [131072, 64] tensors during init)
+        self._shared_rotary_emb = YaRNRotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+            scaling_factor=config.rope_scaling.get("factor", 32.0),
+            original_max_position_embeddings=config.rope_scaling.get(
+                "original_max_position_embeddings", 4096
+            ),
+            beta_fast=config.rope_scaling.get("beta_fast", 32.0),
+            beta_slow=config.rope_scaling.get("beta_slow", 1.0),
+        )
+
         self.layers = nn.ModuleList(
             [GptOssDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        # Assign shared RoPE to all attention layers
+        for layer in self.layers:
+            layer.self_attn.rotary_emb = self._shared_rotary_emb
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
