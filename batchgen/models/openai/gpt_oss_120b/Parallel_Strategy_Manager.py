@@ -742,6 +742,14 @@ class GptOssParallelStrategyManager:
                 prefill_moe.down_weight_ref = down_weights[0]
                 prefill_moe.down_scale_ref = down_scales[0]
 
+                # Keep references alive so pointer arrays don't dangle
+                prefill_moe._persistent_gate_weights = gate_weights
+                prefill_moe._persistent_gate_scales = gate_scales
+                prefill_moe._persistent_up_weights = up_weights
+                prefill_moe._persistent_up_scales = up_scales
+                prefill_moe._persistent_down_weights = down_weights
+                prefill_moe._persistent_down_scales = down_scales
+
                 if has_biases:
                     prefill_moe.gate_bias_ptrs = torch.tensor(
                         [b.data_ptr() for b in gate_biases], dtype=torch.int64, device=device)
@@ -749,6 +757,9 @@ class GptOssParallelStrategyManager:
                         [b.data_ptr() for b in up_biases], dtype=torch.int64, device=device)
                     prefill_moe.down_bias_ptrs = torch.tensor(
                         [b.data_ptr() for b in down_biases], dtype=torch.int64, device=device)
+                    prefill_moe._persistent_gate_biases = gate_biases
+                    prefill_moe._persistent_up_biases = up_biases
+                    prefill_moe._persistent_down_biases = down_biases
 
             self.model.model.layers[layer_idx].mlp = prefill_moe
 
