@@ -665,60 +665,57 @@ class GptOssParallelStrategyManager:
         )
 
     def _swap_to_prefill_moe(self):
-        """Swap GptOssMoE to GptOssMoEPrefill for per-expert CuTe dequant + torch.matmul.
+        """Swap GptOssMoE to GptOssMoEPrefill.
 
-        Collects MXFP4 weights from wrapped experts into GptOssMoEPrefill format,
-        then replaces layer.mlp with the prefill version.
-
-        This uses sequential per-expert processing:
-        - CuTe dequant one expert's weight to BF16 buffer (~142 MB)
-        - torch.matmul for that expert
-        - Repeat for all projections (gate, up, down)
-
-        Note: Scales must be transposed to K-major format [K//32, N] for CuTe kernel.
-        Original storage is typically [N, K//32] (N-major).
+        Sets up grouped WGMMA for persistent experts and per-expert fallback
+        for non-persistent experts. Currently called only when all experts are
+        persistent (experts_need_offloading=False).
         """
-        from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEPrefill
+        from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEPrefill, _HAS_WGMMA_GROUPED
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
 
         device = self.engine_config.Basic_Config.device_torch
+        num_experts = self.model_config.num_local_experts
+
+        # All experts are persistent (this method is only called when not offloading)
+        persistent_indices = list(range(num_experts))
+        non_persistent_indices = []
 
         for layer_idx in range(self.model_config.num_hidden_layers):
             old_moe = self.model.model.layers[layer_idx].mlp
 
-            # Create prefill MoE
             prefill_moe = GptOssMoEPrefill(self.model_config)
-            prefill_moe.router = old_moe.router  # Copy router weights
+            prefill_moe.router = old_moe.router
             prefill_moe.to(device)
+
+            prefill_moe.persistent_expert_indices = persistent_indices
+            prefill_moe.non_persistent_expert_indices = non_persistent_indices
 
             # Collect MXFP4 weights from wrapped experts
             gate_weights, gate_scales = [], []
             up_weights, up_scales = [], []
             down_weights, down_scales = [], []
             gate_biases, up_biases, down_biases = [], [], []
+            has_biases = False
 
-            for expert_idx in range(self.model_config.num_local_experts):
+            for expert_idx in range(num_experts):
                 wrapper = old_moe.experts[expert_idx]
 
-                # Get MXFP4 weights from wrapper (registered by _register_mxfp4_weights)
-                gate_weights.append(wrapper.mxfp4_gate_packed)
-                up_weights.append(wrapper.mxfp4_up_packed)
-                down_weights.append(wrapper.mxfp4_down_packed)
+                gate_weights.append(wrapper.mxfp4_gate_packed.contiguous())
+                gate_scales.append(wrapper.mxfp4_gate_scales.contiguous())
+                up_weights.append(wrapper.mxfp4_up_packed.contiguous())
+                up_scales.append(wrapper.mxfp4_up_scales.contiguous())
+                down_weights.append(wrapper.mxfp4_down_packed.contiguous())
+                down_scales.append(wrapper.mxfp4_down_scales.contiguous())
 
-                # Keep scales in original N-major format [N, K//32] (same as decode)
-                # CuTe fallback path will transpose to K-major when needed
-                gate_scales.append(wrapper.mxfp4_gate_scales)
-                up_scales.append(wrapper.mxfp4_up_scales)
-                down_scales.append(wrapper.mxfp4_down_scales)
+                gb = getattr(wrapper, 'mxfp4_gate_bias', None)
+                if gb is not None:
+                    has_biases = True
+                    gate_biases.append(gb.contiguous())
+                    up_biases.append(getattr(wrapper, 'mxfp4_up_bias').contiguous())
+                    down_biases.append(getattr(wrapper, 'mxfp4_down_bias').contiguous())
 
-                # Collect biases if present
-                if hasattr(wrapper, 'mxfp4_gate_bias') and wrapper.mxfp4_gate_bias is not None:
-                    gate_biases.append(wrapper.mxfp4_gate_bias)
-                if hasattr(wrapper, 'mxfp4_up_bias') and wrapper.mxfp4_up_bias is not None:
-                    up_biases.append(wrapper.mxfp4_up_bias)
-                if hasattr(wrapper, 'mxfp4_down_bias') and wrapper.mxfp4_down_bias is not None:
-                    down_biases.append(wrapper.mxfp4_down_bias)
-
-            # Store in prefill MoE (as lists, not stacked tensors)
+            # Store weight lists (needed for per-expert fallback path)
             prefill_moe.gate_weights = gate_weights
             prefill_moe.gate_scales = gate_scales
             prefill_moe.up_weights = up_weights
@@ -726,18 +723,39 @@ class GptOssParallelStrategyManager:
             prefill_moe.down_weights = down_weights
             prefill_moe.down_scales = down_scales
 
-            # Stack biases if present (as [num_experts, N] tensors)
-            if gate_biases:
+            if has_biases:
                 prefill_moe.gate_biases = torch.stack(gate_biases)
                 prefill_moe.up_biases = torch.stack(up_biases)
                 prefill_moe.down_biases = torch.stack(down_biases)
 
-            # Swap MoE layer
+            # Set up grouped WGMMA pointer arrays for persistent experts
+            if _HAS_WGMMA_GROUPED:
+                prefill_moe.gate_ptrs, prefill_moe.gate_scale_ptrs = setup_expert_weight_pointers(
+                    gate_weights, gate_scales)
+                prefill_moe.up_ptrs, prefill_moe.up_scale_ptrs = setup_expert_weight_pointers(
+                    up_weights, up_scales)
+                prefill_moe.down_ptrs, prefill_moe.down_scale_ptrs = setup_expert_weight_pointers(
+                    down_weights, down_scales)
+
+                prefill_moe.gate_weight_ref = gate_weights[0]
+                prefill_moe.gate_scale_ref = gate_scales[0]
+                prefill_moe.down_weight_ref = down_weights[0]
+                prefill_moe.down_scale_ref = down_scales[0]
+
+                if has_biases:
+                    prefill_moe.gate_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in gate_biases], dtype=torch.int64, device=device)
+                    prefill_moe.up_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in up_biases], dtype=torch.int64, device=device)
+                    prefill_moe.down_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in down_biases], dtype=torch.int64, device=device)
+
             self.model.model.layers[layer_idx].mlp = prefill_moe
 
+        grouped_str = " + grouped WGMMA" if _HAS_WGMMA_GROUPED else ""
         logging.info(
-            f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoEPrefill "
-            f"(per-expert CuTe dequant + torch.matmul)"
+            f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoEPrefill"
+            f" (persistent={len(persistent_indices)}{grouped_str})"
         )
 
     def _compute_expert_ranges(self):

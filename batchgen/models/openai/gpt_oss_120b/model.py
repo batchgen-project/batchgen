@@ -1088,6 +1088,25 @@ class GptOssMoEPrefill(nn.Module):
         self.swiglu_alpha = 1.702
         self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
 
+        # Persistent / non-persistent expert indices (set by PSM)
+        self.persistent_expert_indices = []
+        self.non_persistent_expert_indices = []
+
+        # Grouped WGMMA pointer arrays for persistent experts (set by PSM)
+        self.gate_ptrs = None
+        self.gate_scale_ptrs = None
+        self.up_ptrs = None
+        self.up_scale_ptrs = None
+        self.down_ptrs = None
+        self.down_scale_ptrs = None
+        self.gate_bias_ptrs = None
+        self.up_bias_ptrs = None
+        self.down_bias_ptrs = None
+        self.gate_weight_ref = None
+        self.gate_scale_ref = None
+        self.down_weight_ref = None
+        self.down_scale_ref = None
+
     def _get_bf16_buffer(self, shape: Tuple[int, int], device: torch.device) -> torch.Tensor:
         """Get or allocate BF16 buffer for dequantized weights."""
         if self._bf16_buffer is None or self._buffer_shape != shape or self._bf16_buffer.device != device:
@@ -1096,7 +1115,7 @@ class GptOssMoEPrefill(nn.Module):
         return self._bf16_buffer
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with fused WGMMA kernels (or CuTe fallback)."""
+        """Forward pass: grouped WGMMA for persistent experts, per-expert loop for the rest."""
         import os
         from batchgen.moe.fused_wgmma_expert import (
             fused_mxfp4_expert_forward_from_dict,
@@ -1114,48 +1133,62 @@ class GptOssMoEPrefill(nn.Module):
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
-
         else:
             topk_weights, topk_indices = torch.topk(
                 router_logits, k=self.num_experts_per_tok, dim=-1
-            )  # [total_tokens, top_k]
+            )
             topk_weights = F.softmax(topk_weights, dim=-1)
 
         # Initialize output
         output = torch.zeros_like(hidden_flat)
 
-        # Find all unique experts that are activated
-        unique_experts = topk_indices.unique().tolist()
+        # Phase 1: Grouped WGMMA for persistent experts
+        num_persistent = len(self.persistent_expert_indices)
+        if num_persistent > 0 and _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING and self.gate_ptrs is not None:
+            output = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                hidden_flat, topk_indices, topk_weights,
+                self.gate_ptrs, self.gate_scale_ptrs,
+                self.up_ptrs, self.up_scale_ptrs,
+                self.down_ptrs, self.down_scale_ptrs,
+                self.gate_weight_ref, self.gate_scale_ref,
+                self.down_weight_ref, self.down_scale_ref,
+                num_experts=self.num_experts,
+                num_local_experts=num_persistent,
+                gate_bias_ptrs=self.gate_bias_ptrs,
+                up_bias_ptrs=self.up_bias_ptrs,
+                down_bias_ptrs=self.down_bias_ptrs,
+            )
+            # If all experts are persistent, we're done
+            if not self.non_persistent_expert_indices:
+                return output.view(batch_size, seq_len, hidden_dim)
 
-        # Check if we can use fused WGMMA kernels
-        # BATCHGEN_PREFILL_USE_CUTE=1 forces CuTe fallback for debugging
+        # Phase 2: Per-expert loop for non-persistent experts (or all if grouped unavailable)
+        if self.non_persistent_expert_indices:
+            loop_experts = self.non_persistent_expert_indices
+        else:
+            # Grouped WGMMA not available — fall back to per-expert for all
+            loop_experts = topk_indices.unique().tolist()
+
+        # Check if we can use fused WGMMA single-expert kernels
         use_fused = (
             is_wgmma_available()
             and os.environ.get("BATCHGEN_PREFILL_USE_CUTE", "0") != "1"
         )
 
-        # Debug: compare fused vs CuTe for first expert in first layer
-        debug_prefill = os.environ.get("BATCHGEN_DEBUG_PREFILL", "0") == "1"
-
-        # Process each activated expert
-        for expert_idx in unique_experts:
-            # Find tokens routed to this expert
-            expert_mask = (topk_indices == expert_idx).any(dim=-1)  # [total_tokens]
+        for expert_idx in loop_experts:
+            expert_mask = (topk_indices == expert_idx).any(dim=-1)
             if not expert_mask.any():
                 continue
 
-            expert_input = hidden_flat[expert_mask].contiguous()  # [num_tokens, hidden_size]
+            expert_input = hidden_flat[expert_mask].contiguous()
 
-            # Get routing weight for this expert
             expert_weights = torch.where(
                 topk_indices[expert_mask] == expert_idx,
                 topk_weights[expert_mask],
                 torch.zeros_like(topk_weights[expert_mask])
-            ).sum(dim=-1)  # [num_tokens]
+            ).sum(dim=-1)
 
             if use_fused:
-                # === Fused WGMMA path ===
-                # Build weights dict (same format as decode path)
                 weights = {
                     "gate_proj.weight": self.gate_weights[expert_idx],
                     "gate_proj.weight_scales": self.gate_scales[expert_idx],
@@ -1172,40 +1205,9 @@ class GptOssMoEPrefill(nn.Module):
                     weights["down_proj.bias"] = self.down_biases[expert_idx]
 
                 expert_output = fused_mxfp4_expert_forward_from_dict(expert_input, weights)
-
-                # Debug: detect NaN in fused output (first 3 experts only)
-                if debug_prefill and expert_idx in unique_experts[:3]:
-                    with torch.no_grad():
-                        has_nan = expert_output.isnan().any().item()
-                        has_inf = expert_output.isinf().any().item()
-                        input_has_nan = expert_input.isnan().any().item()
-                        if has_nan or has_inf:
-                            # Find first NaN/Inf position
-                            nan_mask = expert_output.isnan() | expert_output.isinf()
-                            flat_idx = nan_mask.view(-1).int().argmax().item()
-                            row = flat_idx // expert_output.shape[-1]
-                            col = flat_idx % expert_output.shape[-1]
-                            print(f"[PREFILL DEBUG] Expert {expert_idx}: M={expert_input.shape[0]} - "
-                                  f"{'NaN' if has_nan else 'Inf'} at [{row}, {col}]")
-                            if not input_has_nan:
-                                print(f"  Input VALID: std={expert_input.float().std().item():.4f}, "
-                                      f"max={expert_input.abs().max().item():.4f}")
-                            else:
-                                print(f"  Input has NaN (propagated from previous layer)")
-                            print(f"  col%32={col%32}, col%64={col%64} (scale/tile boundary check)")
-                            # Check total NaN count
-                            nan_count = nan_mask.sum().item()
-                            total = expert_output.numel()
-                            print(f"  NaN count: {nan_count}/{total} ({100*nan_count/total:.1f}%)")
-                            # Check scale values for this expert
-                            gate_s = weights['gate_proj.weight_scales']
-                            print(f"  Gate scales: min={gate_s.min().item()}, max={gate_s.max().item()}, "
-                                  f"count>=250: {(gate_s >= 250).sum().item()}")
             else:
-                # === CuTe fallback path ===
                 expert_output = self._forward_expert_cute(expert_input, expert_idx)
 
-            # Accumulate weighted output
             output[expert_mask] += expert_output * expert_weights.unsqueeze(-1)
 
         return output.view(batch_size, seq_len, hidden_dim)
