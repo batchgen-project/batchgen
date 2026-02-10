@@ -794,6 +794,23 @@ class GptOssMoEQuantized(nn.Module):
             self.down_weights, self.down_scales
         )
 
+        # Create bias pointer arrays if biases exist
+        if self.gate_biases is not None:
+            device = self.gate_weights[0].device
+            self.gate_bias_ptrs = torch.tensor(
+                [b.data_ptr() for b in self.gate_biases],
+                dtype=torch.int64, device=device)
+            self.up_bias_ptrs = torch.tensor(
+                [b.data_ptr() for b in self.up_biases],
+                dtype=torch.int64, device=device)
+            self.down_bias_ptrs = torch.tensor(
+                [b.data_ptr() for b in self.down_biases],
+                dtype=torch.int64, device=device)
+        else:
+            self.gate_bias_ptrs = None
+            self.up_bias_ptrs = None
+            self.down_bias_ptrs = None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Hybrid forward: grouped GEMM for persistent, single for non-persistent."""
         from batchgen.moe.mxfp4_grouped_gemm import (
@@ -893,6 +910,9 @@ class GptOssMoEQuantized(nn.Module):
                     self.down_weights[0], self.down_scales[0],
                     num_experts=self.num_experts,
                     num_local_experts=self.num_experts,
+                    gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
+                    up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
+                    down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
                     _debug_weight_lists=_debug_lists,
                 )
             elif run_compare:
@@ -933,6 +953,9 @@ class GptOssMoEQuantized(nn.Module):
                     self.down_weights[0], self.down_scales[0],
                     num_experts=self.num_experts,
                     num_local_experts=self.num_experts,
+                    gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
+                    up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
+                    down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
                 )
                 torch.cuda.synchronize()
 
@@ -1327,6 +1350,9 @@ class GptOssMoE_EP(nn.Module):
                 num_experts=self.total_experts,
                 expert_start=self.routed_expert_start_idx,
                 num_local_experts=self.experts_per_rank,
+                gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
+                up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
+                down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
                 _debug_weight_lists=_debug_lists,
                 _return_internals=_need_internals,
             )

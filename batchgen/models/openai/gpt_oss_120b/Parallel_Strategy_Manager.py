@@ -729,6 +729,40 @@ class GptOssParallelStrategyManager:
                 ep_moe.down_ptrs, ep_moe.down_scale_ptrs = setup_expert_weight_pointers(
                     down_weights, down_scales)
 
+                # Collect bias tensors and create pointer arrays
+                gate_biases, up_biases, down_biases = [], [], []
+                has_biases = False
+                for local_e in range(self.num_local_expert_per_layer):
+                    global_e = self.routed_expert_gpu_start_idx + local_e
+                    wrapper = ep_moe.experts[global_e]
+                    gb = getattr(wrapper, 'mxfp4_gate_bias', None)
+                    ub = getattr(wrapper, 'mxfp4_up_bias', None)
+                    db = getattr(wrapper, 'mxfp4_down_bias', None)
+                    if gb is not None:
+                        has_biases = True
+                        gate_biases.append(gb.contiguous())
+                        up_biases.append(ub.contiguous())
+                        down_biases.append(db.contiguous())
+
+                if has_biases:
+                    ep_moe.gate_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in gate_biases],
+                        dtype=torch.int64, device=device)
+                    ep_moe.up_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in up_biases],
+                        dtype=torch.int64, device=device)
+                    ep_moe.down_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in down_biases],
+                        dtype=torch.int64, device=device)
+                    # Keep references so tensors aren't garbage-collected
+                    ep_moe._local_gate_biases = gate_biases
+                    ep_moe._local_up_biases = up_biases
+                    ep_moe._local_down_biases = down_biases
+                else:
+                    ep_moe.gate_bias_ptrs = None
+                    ep_moe.up_bias_ptrs = None
+                    ep_moe.down_bias_ptrs = None
+
                 # Reference weights for stride computation
                 ep_moe.gate_weight_ref = gate_weights[0]
                 ep_moe.gate_scale_ref = gate_scales[0]

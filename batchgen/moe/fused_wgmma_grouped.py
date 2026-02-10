@@ -1018,6 +1018,8 @@ def fused_mxfp4_grouped_stage1(
     N: int,                            # intermediate_size
     stride_weight_n: int,              # K // 2
     stride_scale_n: int,               # K // 32
+    gate_bias_ptrs: torch.Tensor = None,  # [num_experts] int64 or None
+    up_bias_ptrs: torch.Tensor = None,    # [num_experts] int64 or None
 ) -> torch.Tensor:                     # [total_tokens, N] BF16
     """Grouped MXFP4 Stage 1: gate + up + SwiGLU via WGMMA.
 
@@ -1032,6 +1034,8 @@ def fused_mxfp4_grouped_stage1(
         N: Intermediate dimension (gate/up output width)
         stride_weight_n: Weight stride along N (= K // 2 for MXFP4)
         stride_scale_n: Scale stride along N (= K // 32 for MXFP4)
+        gate_bias_ptrs: Pointer array for gate biases [num_experts] int64, or None
+        up_bias_ptrs: Pointer array for up biases [num_experts] int64, or None
 
     Returns:
         Intermediate activations [total_tokens, N] BF16 after SwiGLU
@@ -1039,14 +1043,15 @@ def fused_mxfp4_grouped_stage1(
     mod = _load_grouped_module()
     assert mod is not None, "WGMMA grouped module not available"
 
-    # Empty bias tensors (GPT-OSS-120B has no biases)
     empty_bias = torch.empty(0, dtype=torch.int64, device=sorted_hidden.device)
+    gb = gate_bias_ptrs if gate_bias_ptrs is not None else empty_bias
+    ub = up_bias_ptrs if up_bias_ptrs is not None else empty_bias
 
     return mod.grouped_mxfp4_moe_stage1(
         sorted_hidden, expert_offsets,
         gate_ptrs, gate_scale_ptrs,
         up_ptrs, up_scale_ptrs,
-        empty_bias, empty_bias,
+        gb, ub,
         N, stride_weight_n, stride_scale_n,
     )
 
@@ -1059,6 +1064,7 @@ def fused_mxfp4_grouped_stage2(
     K: int,                            # hidden_size (output width)
     stride_weight_n: int,              # N // 2
     stride_scale_n: int,               # N // 32
+    down_bias_ptrs: torch.Tensor = None,  # [num_experts] int64 or None
 ) -> torch.Tensor:                     # [total_tokens, K] BF16
     """Grouped MXFP4 Stage 2: down projection via WGMMA.
 
@@ -1071,6 +1077,7 @@ def fused_mxfp4_grouped_stage2(
         K: Hidden size (output width)
         stride_weight_n: Weight stride along N (= N // 2 for MXFP4)
         stride_scale_n: Scale stride along N (= N // 32 for MXFP4)
+        down_bias_ptrs: Pointer array for down biases [num_experts] int64, or None
 
     Returns:
         Output activations [total_tokens, K] BF16
@@ -1078,13 +1085,13 @@ def fused_mxfp4_grouped_stage2(
     mod = _load_grouped_module()
     assert mod is not None, "WGMMA grouped module not available"
 
-    # Empty bias tensor (GPT-OSS-120B has no biases)
     empty_bias = torch.empty(0, dtype=torch.int64, device=intermediate.device)
+    db = down_bias_ptrs if down_bias_ptrs is not None else empty_bias
 
     return mod.grouped_mxfp4_moe_stage2(
         intermediate, expert_offsets,
         down_ptrs, down_scale_ptrs,
-        empty_bias,
+        db,
         K, stride_weight_n, stride_scale_n,
     )
 
@@ -1119,6 +1126,10 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     num_experts: int = 128,
     expert_start: int = 0,
     num_local_experts: int = 128,
+    # Bias pointer arrays (None = no biases)
+    gate_bias_ptrs: torch.Tensor = None,
+    up_bias_ptrs: torch.Tensor = None,
+    down_bias_ptrs: torch.Tensor = None,
     _debug_weight_lists=None,
     _return_internals=False,
 ) -> torch.Tensor:
@@ -1127,8 +1138,6 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     Full pipeline: dispatch -> WGMMA S1 -> WGMMA S2 -> reduce (4 kernel launches).
     Drop-in replacement for grouped_mxfp4_moe_forward_cuda_routing in
     mxfp4_grouped_gemm.py which uses 9+ launches.
-
-    Biases are not supported (GPT-OSS-120B biases are None by default).
 
     Args:
         hidden_states: Input [batch*seq, hidden] BF16
@@ -1142,6 +1151,9 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         num_experts: Total number of experts
         expert_start: First local expert index (for EP)
         num_local_experts: Number of local experts
+        gate_bias_ptrs: Gate bias pointer array [num_experts] int64, or None
+        up_bias_ptrs: Up bias pointer array [num_experts] int64, or None
+        down_bias_ptrs: Down bias pointer array [num_experts] int64, or None
 
     Returns:
         Output [batch*seq, hidden] BF16
@@ -1419,6 +1431,8 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         gate_ptrs, gate_scale_ptrs,
         up_ptrs, up_scale_ptrs,
         N_intermediate, s1_stride_weight_n, s1_stride_scale_n,
+        gate_bias_ptrs=gate_bias_ptrs,
+        up_bias_ptrs=up_bias_ptrs,
     )
 
     if debug_stages:
@@ -1435,6 +1449,7 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         intermediate, expert_offsets,
         down_ptrs, down_scale_ptrs,
         hidden_size, s2_stride_weight_n, s2_stride_scale_n,
+        down_bias_ptrs=down_bias_ptrs,
     )
 
     if debug_stages:
