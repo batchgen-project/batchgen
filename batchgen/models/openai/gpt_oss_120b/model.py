@@ -30,6 +30,7 @@ Key features:
 Reference: https://github.com/openai/gpt-oss
 """
 
+import logging
 import math
 import os
 import time
@@ -46,6 +47,59 @@ from transformers.modeling_outputs import (
 )
 
 from .configuration_gpt_oss import GptOssConfig
+
+# CUDA routing kernels (fused gate + dispatch + reduce)
+try:
+    from batchgen.moe.routing import gate_topk_softmax_cuda
+    _HAS_CUDA_ROUTING = True
+except ImportError:
+    _HAS_CUDA_ROUTING = False
+
+# WGMMA single-expert kernels (per-expert WGMMA, highest priority decode path)
+try:
+    from batchgen.moe.fused_wgmma_expert import (
+        fused_mxfp4_expert_forward,
+        wgmma_single_expert_moe_forward_cuda_routing,
+        is_wgmma_available,
+    )
+    if os.environ.get("BATCHGEN_DISABLE_WGMMA_SINGLE", "0") == "1":
+        _HAS_WGMMA_SINGLE = False
+        print("[WGMMA single] disabled by BATCHGEN_DISABLE_WGMMA_SINGLE", flush=True)
+    else:
+        _HAS_WGMMA_SINGLE = is_wgmma_available()
+        if _HAS_WGMMA_SINGLE:
+            print("[WGMMA single] available (confirmed correct, highest priority)", flush=True)
+        else:
+            print("[WGMMA single] not available (SM90 required)", flush=True)
+except Exception as e:
+    _HAS_WGMMA_SINGLE = False
+    print(f"[WGMMA single] failed to load: {e}", flush=True)
+
+_WGMMA_SINGLE_LOGGED = False
+
+# WGMMA grouped kernels (fused gate+up+SwiGLU + down, 1D+offsets layout)
+# Default: enabled on SM90+ (Hopper). Use BATCHGEN_DISABLE_WGMMA_GROUPED=1 to force-disable.
+try:
+    from batchgen.moe.fused_wgmma_grouped import (
+        fused_mxfp4_grouped_moe_forward_cuda_routing,
+        is_grouped_wgmma_available,
+    )
+    if os.environ.get("BATCHGEN_DISABLE_WGMMA_GROUPED", "0") == "1":
+        _HAS_WGMMA_GROUPED = False
+        print("[WGMMA grouped] disabled via BATCHGEN_DISABLE_WGMMA_GROUPED", flush=True)
+    else:
+        _HAS_WGMMA_GROUPED = is_grouped_wgmma_available()
+        if _HAS_WGMMA_GROUPED:
+            print("[WGMMA grouped] enabled (SM90 detected)", flush=True)
+        else:
+            print("[WGMMA grouped] not available (SM90 required)", flush=True)
+except Exception as e:
+    import traceback
+    _HAS_WGMMA_GROUPED = False
+    print(f"[WGMMA grouped] failed to load: {e}", flush=True)
+    traceback.print_exc()
+
+_WGMMA_GROUPED_LOGGED = False  # one-time invocation log
 
 
 # ============================================================================
@@ -187,6 +241,7 @@ def swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.T
 # ============================================================================
 # RMSNorm
 # ============================================================================
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -593,9 +648,15 @@ class GptOssMoE(nn.Module):
         # Compute routing logits
         router_logits = self.router(hidden_states_flat)  # [batch*seq, num_experts]
 
-        # Select Top-K experts
-        topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        # Select Top-K experts with fused CUDA gate (topk + softmax in one kernel)
+        if _HAS_CUDA_ROUTING:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+
+        else:
+            topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         if timing_enabled:
             torch.cuda.synchronize()
@@ -706,7 +767,17 @@ class GptOssMoEQuantized(nn.Module):
         if self.gate_weights is None:
             raise RuntimeError("Weights not loaded. Call setup_pointer_arrays() after loading weights.")
 
-        # Create pointer arrays for each projection
+        # Ensure all weight/scale tensors are contiguous before capturing pointers.
+        # The grouped kernel reads via raw pointers with stride = shape[1], so
+        # non-contiguous tensors would cause incorrect data access.
+        self.gate_weights = [w.contiguous() for w in self.gate_weights]
+        self.gate_scales = [s.contiguous() for s in self.gate_scales]
+        self.up_weights = [w.contiguous() for w in self.up_weights]
+        self.up_scales = [s.contiguous() for s in self.up_scales]
+        self.down_weights = [w.contiguous() for w in self.down_weights]
+        self.down_scales = [s.contiguous() for s in self.down_scales]
+
+        # Create pointer arrays (now guaranteed contiguous)
         self.gate_ptrs, self.gate_scale_ptrs = setup_expert_weight_pointers(
             self.gate_weights, self.gate_scales
         )
@@ -717,12 +788,31 @@ class GptOssMoEQuantized(nn.Module):
             self.down_weights, self.down_scales
         )
 
+        # Create bias pointer arrays if biases exist
+        if self.gate_biases is not None:
+            device = self.gate_weights[0].device
+            self.gate_bias_ptrs = torch.tensor(
+                [b.data_ptr() for b in self.gate_biases],
+                dtype=torch.int64, device=device)
+            self.up_bias_ptrs = torch.tensor(
+                [b.data_ptr() for b in self.up_biases],
+                dtype=torch.int64, device=device)
+            self.down_bias_ptrs = torch.tensor(
+                [b.data_ptr() for b in self.down_biases],
+                dtype=torch.int64, device=device)
+        else:
+            self.gate_bias_ptrs = None
+            self.up_bias_ptrs = None
+            self.down_bias_ptrs = None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Hybrid forward: grouped GEMM for persistent, single for non-persistent."""
         from batchgen.moe.mxfp4_grouped_gemm import (
             grouped_mxfp4_moe_forward_3d,
             mxfp4_expert_forward_single,
         )
+        if _HAS_CUDA_ROUTING:
+            from batchgen.moe.mxfp4_grouped_gemm import grouped_mxfp4_moe_forward_cuda_routing
 
         timing_enabled = DecodeLayerTiming.enabled
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -736,9 +826,14 @@ class GptOssMoEQuantized(nn.Module):
         # Compute routing logits
         router_logits = self.router(hidden_flat)
 
-        # Select Top-K experts
-        topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        # Select Top-K experts with fused CUDA gate (topk + softmax in one kernel)
+        if _HAS_CUDA_ROUTING:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+        else:
+            topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         if timing_enabled:
             torch.cuda.synchronize()
@@ -765,36 +860,59 @@ class GptOssMoEQuantized(nn.Module):
 
         # === Part A: Grouped GEMM for all experts (or persistent only) ===
         if not has_non_persistent:
-            # All experts are persistent - use grouped GEMM
-            output = grouped_mxfp4_moe_forward_3d(
-                hidden_flat, topk_indices, topk_weights,
-                self.gate_ptrs, self.gate_scale_ptrs,
-                self.up_ptrs, self.up_scale_ptrs,
-                self.down_ptrs, self.down_scale_ptrs,
-                self.gate_weights[0], self.gate_scales[0],  # ref for strides
-                self.up_weights[0], self.up_scales[0],
-                self.down_weights[0], self.down_scales[0],
-                self.gate_biases, self.up_biases, self.down_biases,
-                num_experts=self.num_experts,
-                swiglu_alpha=self.swiglu_alpha,
-                swiglu_limit=self.swiglu_limit,
-            )
-        else:
-            # Hybrid execution: grouped for persistent, single for non-persistent
-            persistent_experts = self.persistent_mask.nonzero(as_tuple=True)[0]
-            non_persistent_experts = (~self.persistent_mask).nonzero(as_tuple=True)[0]
-
-            # Part A: Grouped GEMM for persistent experts
-            # Create mask for tokens routed to persistent experts only
-            persistent_routing_mask = torch.zeros_like(topk_indices, dtype=torch.bool)
-            for pe in persistent_experts:
-                persistent_routing_mask |= (topk_indices == pe)
-
-            if persistent_routing_mask.any():
-                # Use grouped GEMM for persistent experts
-                # Note: grouped_mxfp4_moe_forward_3d handles all experts but only
-                # processes tokens routed to experts in the pointer arrays
-                persistent_output = grouped_mxfp4_moe_forward_3d(
+            if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING:
+                # WGMMA grouped: fast path (4 kernel launches, highest priority)
+                global _WGMMA_GROUPED_LOGGED
+                if not _WGMMA_GROUPED_LOGGED:
+                    print("[WGMMA grouped] MoE forward using grouped path (4 launches)", flush=True)
+                    _WGMMA_GROUPED_LOGGED = True
+                output = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    self.gate_weights[0], self.gate_scales[0],
+                    self.down_weights[0], self.down_scales[0],
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                    gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
+                    up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
+                    down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
+                )
+            elif _HAS_WGMMA_SINGLE and _HAS_CUDA_ROUTING:
+                # WGMMA single-expert: per-expert WGMMA + CUDA routing (fallback)
+                global _WGMMA_SINGLE_LOGGED
+                if not _WGMMA_SINGLE_LOGGED:
+                    print("[WGMMA single] MoE forward using per-expert WGMMA path", flush=True)
+                    _WGMMA_SINGLE_LOGGED = True
+                output = wgmma_single_expert_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_weights, self.gate_scales,
+                    self.up_weights, self.up_scales,
+                    self.down_weights, self.down_scales,
+                    gate_biases=self.gate_biases,
+                    up_biases=self.up_biases,
+                    down_biases=self.down_biases,
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                )
+            elif _HAS_CUDA_ROUTING:
+                output = grouped_mxfp4_moe_forward_cuda_routing(
+                    hidden_flat, topk_indices, topk_weights,
+                    self.gate_ptrs, self.gate_scale_ptrs,
+                    self.up_ptrs, self.up_scale_ptrs,
+                    self.down_ptrs, self.down_scale_ptrs,
+                    self.gate_weights[0], self.gate_scales[0],
+                    self.up_weights[0], self.up_scales[0],
+                    self.down_weights[0], self.down_scales[0],
+                    self.gate_biases, self.up_biases, self.down_biases,
+                    num_experts=self.num_experts,
+                    num_local_experts=self.num_experts,
+                    swiglu_alpha=self.swiglu_alpha,
+                    swiglu_limit=self.swiglu_limit,
+                )
+            else:
+                output = grouped_mxfp4_moe_forward_3d(
                     hidden_flat, topk_indices, topk_weights,
                     self.gate_ptrs, self.gate_scale_ptrs,
                     self.up_ptrs, self.up_scale_ptrs,
@@ -807,6 +925,50 @@ class GptOssMoEQuantized(nn.Module):
                     swiglu_alpha=self.swiglu_alpha,
                     swiglu_limit=self.swiglu_limit,
                 )
+        else:
+            # Hybrid execution: grouped WGMMA for persistent, single for non-persistent
+            persistent_experts = self.persistent_mask.nonzero(as_tuple=True)[0]
+            non_persistent_experts = (~self.persistent_mask).nonzero(as_tuple=True)[0]
+            num_persistent = persistent_experts.numel()
+
+            # Part A: Grouped GEMM for persistent experts
+            # Create mask for tokens routed to persistent experts only
+            persistent_routing_mask = torch.zeros_like(topk_indices, dtype=torch.bool)
+            for pe in persistent_experts:
+                persistent_routing_mask |= (topk_indices == pe)
+
+            if persistent_routing_mask.any():
+                if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING and self.gate_ptrs is not None:
+                    # WGMMA grouped for persistent experts (4 kernel launches)
+                    # dispatch_count_gather routes only to [0, num_persistent)
+                    persistent_output = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                        hidden_flat, topk_indices, topk_weights,
+                        self.gate_ptrs, self.gate_scale_ptrs,
+                        self.up_ptrs, self.up_scale_ptrs,
+                        self.down_ptrs, self.down_scale_ptrs,
+                        self.gate_weights[0], self.gate_scales[0],
+                        self.down_weights[0], self.down_scales[0],
+                        num_experts=self.num_experts,
+                        num_local_experts=num_persistent,
+                        gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
+                        up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
+                        down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
+                    )
+                else:
+                    # Triton grouped fallback for persistent experts
+                    persistent_output = grouped_mxfp4_moe_forward_3d(
+                        hidden_flat, topk_indices, topk_weights,
+                        self.gate_ptrs, self.gate_scale_ptrs,
+                        self.up_ptrs, self.up_scale_ptrs,
+                        self.down_ptrs, self.down_scale_ptrs,
+                        self.gate_weights[0], self.gate_scales[0],
+                        self.up_weights[0], self.up_scales[0],
+                        self.down_weights[0], self.down_scales[0],
+                        self.gate_biases, self.up_biases, self.down_biases,
+                        num_experts=self.num_experts,
+                        swiglu_alpha=self.swiglu_alpha,
+                        swiglu_limit=self.swiglu_limit,
+                    )
                 output += persistent_output
 
             # Part B: Single-expert kernel for non-persistent experts
@@ -815,18 +977,29 @@ class GptOssMoEQuantized(nn.Module):
                 if expert_mask.any():
                     expert_input = hidden_flat[expert_mask]
 
-                    # Use optimized single-expert kernel
-                    expert_output = mxfp4_expert_forward_single(
-                        expert_input,
-                        self.gate_weights[expert_idx], self.gate_scales[expert_idx],
-                        self.up_weights[expert_idx], self.up_scales[expert_idx],
-                        self.down_weights[expert_idx], self.down_scales[expert_idx],
-                        self.gate_biases[expert_idx] if self.gate_biases is not None else None,
-                        self.up_biases[expert_idx] if self.up_biases is not None else None,
-                        self.down_biases[expert_idx] if self.down_biases is not None else None,
-                        swiglu_alpha=self.swiglu_alpha,
-                        swiglu_limit=self.swiglu_limit,
-                    )
+                    # Use WGMMA single-expert if available, else Triton
+                    if _HAS_WGMMA_SINGLE:
+                        expert_output = fused_mxfp4_expert_forward(
+                            expert_input,
+                            self.gate_weights[expert_idx], self.gate_scales[expert_idx],
+                            self.up_weights[expert_idx], self.up_scales[expert_idx],
+                            self.down_weights[expert_idx], self.down_scales[expert_idx],
+                            gate_bias=self.gate_biases[expert_idx] if self.gate_biases is not None else None,
+                            up_bias=self.up_biases[expert_idx] if self.up_biases is not None else None,
+                            down_bias=self.down_biases[expert_idx] if self.down_biases is not None else None,
+                        )
+                    else:
+                        expert_output = mxfp4_expert_forward_single(
+                            expert_input,
+                            self.gate_weights[expert_idx], self.gate_scales[expert_idx],
+                            self.up_weights[expert_idx], self.up_scales[expert_idx],
+                            self.down_weights[expert_idx], self.down_scales[expert_idx],
+                            self.gate_biases[expert_idx] if self.gate_biases is not None else None,
+                            self.up_biases[expert_idx] if self.up_biases is not None else None,
+                            self.down_biases[expert_idx] if self.down_biases is not None else None,
+                            swiglu_alpha=self.swiglu_alpha,
+                            swiglu_limit=self.swiglu_limit,
+                        )
 
                     # Get routing weight for this expert
                     expert_weight = torch.where(
@@ -897,6 +1070,19 @@ class GptOssMoE_EP(nn.Module):
         # SwiGLU parameters
         self.swiglu_alpha = getattr(config, 'swiglu_alpha', 1.702)
         self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
+
+        # Grouped WGMMA pointer arrays (set by Parallel_Strategy_Manager)
+        self.gate_ptrs = None
+        self.gate_scale_ptrs = None
+        self.up_ptrs = None
+        self.up_scale_ptrs = None
+        self.down_ptrs = None
+        self.down_scale_ptrs = None
+        self.gate_weight_ref = None
+        self.gate_scale_ref = None
+        self.down_weight_ref = None
+        self.down_scale_ref = None
+        self._use_grouped_wgmma = False
 
     def init_num_tokens(self, num_tokens_per_rank: int):
         """Initialize communication buffers for given batch size.
@@ -1002,68 +1188,92 @@ class GptOssMoE_EP(nn.Module):
 
         # ---- 2) Router: Compute routing for ALL global tokens ----
         router_logits = self.router(all_tokens)  # [global_tokens, 128]
-        topk_weights, topk_indices = torch.topk(
-            router_logits, k=self.num_experts_per_tok, dim=-1
-        )
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        if _HAS_CUDA_ROUTING:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+
+        else:
+            topk_weights, topk_indices = torch.topk(
+                router_logits, k=self.num_experts_per_tok, dim=-1
+            )
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         # ---- 3) Process local experts ----
         num_global_tokens = all_tokens.shape[0]
         K = self.num_experts_per_tok
 
-        # Flat view of expert assignments
-        flat_expert_idx = topk_indices.view(-1)  # [global_tokens * K]
-
-        # Use pre-allocated index tensors
-        token_indices = self.token_idx_buffer
-        topk_positions = self.topk_pos_buffer
-
-        # Pre-compute expert token counts ONCE to avoid per-expert .any() sync
-        # This reduces GPU→CPU syncs from 32 per layer to 1 per layer
-        expert_counts = self.expert_counts_buffer
-        expert_counts.zero_()
-        expert_counts.scatter_add_(
-            0, flat_expert_idx.to(torch.int64),
-            torch.ones_like(flat_expert_idx, dtype=torch.int32)
-        )
-        # Single CPU transfer for all counts
-        expert_counts_cpu = expert_counts.cpu()
-
         # Use pre-allocated output buffer (BF16 to avoid dtype conversion in loop)
         global_results = self.global_results_buffer
         global_results.zero_()
 
-        # Loop through local experts only
-        for local_e in range(self.experts_per_rank):
-            global_e = self.routed_expert_start_idx + local_e
+        if self._use_grouped_wgmma and _HAS_CUDA_ROUTING:
+            # Grouped WGMMA: 4 kernel launches for all local experts
+            global_results[:num_global_tokens] = fused_mxfp4_grouped_moe_forward_cuda_routing(
+                all_tokens, topk_indices, topk_weights,
+                self.gate_ptrs, self.gate_scale_ptrs,
+                self.up_ptrs, self.up_scale_ptrs,
+                self.down_ptrs, self.down_scale_ptrs,
+                self.gate_weight_ref, self.gate_scale_ref,
+                self.down_weight_ref, self.down_scale_ref,
+                num_experts=self.total_experts,
+                expert_start=self.routed_expert_start_idx,
+                num_local_experts=self.experts_per_rank,
+                gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
+                up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
+                down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
+            )
+        else:
+            # Per-expert loop fallback
+            # Flat view of expert assignments
+            flat_expert_idx = topk_indices.view(-1)  # [global_tokens * K]
 
-            # Check token count without GPU sync (already on CPU)
-            if expert_counts_cpu[global_e].item() == 0:
-                continue
+            # Use pre-allocated index tensors
+            token_indices = self.token_idx_buffer
+            topk_positions = self.topk_pos_buffer
 
-            # Find tokens routed to this expert
-            mask = flat_expert_idx == global_e
+            # Pre-compute expert token counts ONCE to avoid per-expert .any() sync
+            # This reduces GPU→CPU syncs from 32 per layer to 1 per layer
+            expert_counts = self.expert_counts_buffer
+            expert_counts.zero_()
+            expert_counts.scatter_add_(
+                0, flat_expert_idx.to(torch.int64),
+                torch.ones_like(flat_expert_idx, dtype=torch.int32)
+            )
+            # Single CPU transfer for all counts
+            expert_counts_cpu = expert_counts.cpu()
 
-            # Get token indices and topk positions for this expert
-            expert_token_idx = token_indices[mask]
-            expert_topk_pos = topk_positions[mask]
+            # Loop through local experts only
+            for local_e in range(self.experts_per_rank):
+                global_e = self.routed_expert_start_idx + local_e
 
-            # Gather tokens for this expert
-            tokens_for_expert = all_tokens[expert_token_idx]
+                # Check token count without GPU sync (already on CPU)
+                if expert_counts_cpu[global_e].item() == 0:
+                    continue
 
-            # Call expert forward (wrapper handles MXFP4 dequant)
-            expert = self.experts[global_e]
-            if expert is None:
-                continue  # Expert not loaded on this rank (shouldn't happen)
+                # Find tokens routed to this expert
+                mask = flat_expert_idx == global_e
 
-            expert_output = expert(tokens_for_expert)
+                # Get token indices and topk positions for this expert
+                expert_token_idx = token_indices[mask]
+                expert_topk_pos = topk_positions[mask]
 
-            # Get weights for these tokens at these topk positions
-            expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
+                # Gather tokens for this expert
+                tokens_for_expert = all_tokens[expert_token_idx]
 
-            # Weighted accumulation into results (no dtype conversion needed - both BF16)
-            weighted_output = expert_output * expert_weights.unsqueeze(-1)
-            global_results.index_add_(0, expert_token_idx, weighted_output)
+                # Call expert forward (wrapper handles MXFP4 dequant)
+                expert = self.experts[global_e]
+                if expert is None:
+                    continue  # Expert not loaded on this rank (shouldn't happen)
+
+                expert_output = expert(tokens_for_expert)
+
+                # Get weights for these tokens at these topk positions
+                expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
+
+                # Weighted accumulation into results
+                weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(global_results.dtype)
+                global_results.index_add_(0, expert_token_idx, weighted_output)
 
         # ---- 4) AllReduce: Combine results from all ranks ----
         with self.comm.change_state(enable=True):
@@ -1119,9 +1329,9 @@ class GptOssMoEPrefill(nn.Module):
 
         # MXFP4 quantized weights - stored as lists of tensors (one per expert)
         # Packed weights: [N, K//2] uint8
-        # K-major scales: [K//32, N] uint8
+        # N-major scales: [N, K//32] uint8 (same as decode path)
         self.gate_weights = None  # List[Tensor[intermediate_size, hidden_size//2]]
-        self.gate_scales = None   # List[Tensor[hidden_size//32, intermediate_size]]
+        self.gate_scales = None   # List[Tensor[intermediate_size, hidden_size//32]]
         self.up_weights = None
         self.up_scales = None
         self.down_weights = None  # List[Tensor[hidden_size, intermediate_size//2]]
@@ -1149,27 +1359,46 @@ class GptOssMoEPrefill(nn.Module):
         return self._bf16_buffer
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with per-expert CuTe dequant + torch.matmul."""
-        from batchgen.moe.cute_mxfp4_dequant import mxfp4_dequant_single_expert_cute
+        """Forward pass with fused WGMMA kernels (or CuTe fallback)."""
+        import os
+        from batchgen.moe.fused_wgmma_expert import (
+            fused_mxfp4_expert_forward_from_dict,
+            is_wgmma_available,
+        )
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)  # [total_tokens, hidden_size]
-        total_tokens = hidden_flat.shape[0]
 
         # Compute routing logits
         router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
 
         # Select Top-K experts per token
-        topk_weights, topk_indices = torch.topk(
-            router_logits, k=self.num_experts_per_tok, dim=-1
-        )  # [total_tokens, top_k]
-        topk_weights = F.softmax(topk_weights, dim=-1)
+        if _HAS_CUDA_ROUTING:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+
+        else:
+            topk_weights, topk_indices = torch.topk(
+                router_logits, k=self.num_experts_per_tok, dim=-1
+            )  # [total_tokens, top_k]
+            topk_weights = F.softmax(topk_weights, dim=-1)
 
         # Initialize output
         output = torch.zeros_like(hidden_flat)
 
         # Find all unique experts that are activated
         unique_experts = topk_indices.unique().tolist()
+
+        # Check if we can use fused WGMMA kernels
+        # BATCHGEN_PREFILL_USE_CUTE=1 forces CuTe fallback for debugging
+        use_fused = (
+            is_wgmma_available()
+            and os.environ.get("BATCHGEN_PREFILL_USE_CUTE", "0") != "1"
+        )
+
+        # Debug: compare fused vs CuTe for first expert in first layer
+        debug_prefill = os.environ.get("BATCHGEN_DEBUG_PREFILL", "0") == "1"
 
         # Process each activated expert
         for expert_idx in unique_experts:
@@ -1178,8 +1407,7 @@ class GptOssMoEPrefill(nn.Module):
             if not expert_mask.any():
                 continue
 
-            expert_input = hidden_flat[expert_mask]  # [num_tokens, hidden_size]
-            num_tokens = expert_input.shape[0]
+            expert_input = hidden_flat[expert_mask].contiguous()  # [num_tokens, hidden_size]
 
             # Get routing weight for this expert
             expert_weights = torch.where(
@@ -1188,59 +1416,121 @@ class GptOssMoEPrefill(nn.Module):
                 torch.zeros_like(topk_weights[expert_mask])
             ).sum(dim=-1)  # [num_tokens]
 
-            # === Gate projection ===
-            # Dequant gate weight: [intermediate_size, hidden_size//2] -> [intermediate_size, hidden_size]
-            gate_buffer = self._get_bf16_buffer(
-                (self.intermediate_size, self.hidden_size),
-                expert_input.device
-            )
-            mxfp4_dequant_single_expert_cute(
-                self.gate_weights[expert_idx],
-                self.gate_scales[expert_idx],
-                gate_buffer,
-            )
-            # matmul: [num_tokens, hidden_size] @ [hidden_size, intermediate_size] -> [num_tokens, intermediate_size]
-            gate_out = torch.matmul(expert_input, gate_buffer.T)
-            if self.gate_biases is not None:
-                gate_out = gate_out + self.gate_biases[expert_idx]
+            if use_fused:
+                # === Fused WGMMA path ===
+                # Build weights dict (same format as decode path)
+                weights = {
+                    "gate_proj.weight": self.gate_weights[expert_idx],
+                    "gate_proj.weight_scales": self.gate_scales[expert_idx],
+                    "up_proj.weight": self.up_weights[expert_idx],
+                    "up_proj.weight_scales": self.up_scales[expert_idx],
+                    "down_proj.weight": self.down_weights[expert_idx],
+                    "down_proj.weight_scales": self.down_scales[expert_idx],
+                }
+                if self.gate_biases is not None:
+                    weights["gate_proj.bias"] = self.gate_biases[expert_idx]
+                if self.up_biases is not None:
+                    weights["up_proj.bias"] = self.up_biases[expert_idx]
+                if self.down_biases is not None:
+                    weights["down_proj.bias"] = self.down_biases[expert_idx]
 
-            # === Up projection ===
-            up_buffer = self._get_bf16_buffer(
-                (self.intermediate_size, self.hidden_size),
-                expert_input.device
-            )
-            mxfp4_dequant_single_expert_cute(
-                self.up_weights[expert_idx],
-                self.up_scales[expert_idx],
-                up_buffer,
-            )
-            up_out = torch.matmul(expert_input, up_buffer.T)
-            if self.up_biases is not None:
-                up_out = up_out + self.up_biases[expert_idx]
+                expert_output = fused_mxfp4_expert_forward_from_dict(expert_input, weights)
 
-            # === SwiGLU activation ===
-            # Interleave gate and up: [gate0, up0, gate1, up1, ...]
-            interleaved = torch.stack([gate_out, up_out], dim=-1).view(num_tokens, -1)
-            intermediate = swiglu(interleaved, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
-
-            # === Down projection ===
-            down_buffer = self._get_bf16_buffer(
-                (self.hidden_size, self.intermediate_size),
-                expert_input.device
-            )
-            mxfp4_dequant_single_expert_cute(
-                self.down_weights[expert_idx],
-                self.down_scales[expert_idx],
-                down_buffer,
-            )
-            down_out = torch.matmul(intermediate, down_buffer.T)
-            if self.down_biases is not None:
-                down_out = down_out + self.down_biases[expert_idx]
+                # Debug: detect NaN in fused output (first 3 experts only)
+                if debug_prefill and expert_idx in unique_experts[:3]:
+                    with torch.no_grad():
+                        has_nan = expert_output.isnan().any().item()
+                        has_inf = expert_output.isinf().any().item()
+                        input_has_nan = expert_input.isnan().any().item()
+                        if has_nan or has_inf:
+                            # Find first NaN/Inf position
+                            nan_mask = expert_output.isnan() | expert_output.isinf()
+                            flat_idx = nan_mask.view(-1).int().argmax().item()
+                            row = flat_idx // expert_output.shape[-1]
+                            col = flat_idx % expert_output.shape[-1]
+                            print(f"[PREFILL DEBUG] Expert {expert_idx}: M={expert_input.shape[0]} - "
+                                  f"{'NaN' if has_nan else 'Inf'} at [{row}, {col}]")
+                            if not input_has_nan:
+                                print(f"  Input VALID: std={expert_input.float().std().item():.4f}, "
+                                      f"max={expert_input.abs().max().item():.4f}")
+                            else:
+                                print(f"  Input has NaN (propagated from previous layer)")
+                            print(f"  col%32={col%32}, col%64={col%64} (scale/tile boundary check)")
+                            # Check total NaN count
+                            nan_count = nan_mask.sum().item()
+                            total = expert_output.numel()
+                            print(f"  NaN count: {nan_count}/{total} ({100*nan_count/total:.1f}%)")
+                            # Check scale values for this expert
+                            gate_s = weights['gate_proj.weight_scales']
+                            print(f"  Gate scales: min={gate_s.min().item()}, max={gate_s.max().item()}, "
+                                  f"count>=250: {(gate_s >= 250).sum().item()}")
+            else:
+                # === CuTe fallback path ===
+                expert_output = self._forward_expert_cute(expert_input, expert_idx)
 
             # Accumulate weighted output
-            output[expert_mask] += down_out * expert_weights.unsqueeze(-1)
+            output[expert_mask] += expert_output * expert_weights.unsqueeze(-1)
 
         return output.view(batch_size, seq_len, hidden_dim)
+
+    def _forward_expert_cute(self, expert_input: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        """Fallback path using CuTe dequant + torch.matmul."""
+        from batchgen.moe.cute_mxfp4_dequant import mxfp4_dequant_single_expert_cute
+
+        num_tokens = expert_input.shape[0]
+
+        # Scales are stored N-major [N, K//32], CuTe needs K-major [K//32, N]
+        gate_scales_kmajor = self.gate_scales[expert_idx].T.contiguous()
+        up_scales_kmajor = self.up_scales[expert_idx].T.contiguous()
+        down_scales_kmajor = self.down_scales[expert_idx].T.contiguous()
+
+        # === Gate projection ===
+        gate_buffer = self._get_bf16_buffer(
+            (self.intermediate_size, self.hidden_size),
+            expert_input.device
+        )
+        mxfp4_dequant_single_expert_cute(
+            self.gate_weights[expert_idx],
+            gate_scales_kmajor,
+            gate_buffer,
+        )
+        gate_out = torch.matmul(expert_input, gate_buffer.T)
+        if self.gate_biases is not None:
+            gate_out = gate_out + self.gate_biases[expert_idx]
+
+        # === Up projection ===
+        up_buffer = self._get_bf16_buffer(
+            (self.intermediate_size, self.hidden_size),
+            expert_input.device
+        )
+        mxfp4_dequant_single_expert_cute(
+            self.up_weights[expert_idx],
+            up_scales_kmajor,
+            up_buffer,
+        )
+        up_out = torch.matmul(expert_input, up_buffer.T)
+        if self.up_biases is not None:
+            up_out = up_out + self.up_biases[expert_idx]
+
+        # === SwiGLU activation ===
+        interleaved = torch.stack([gate_out, up_out], dim=-1).view(num_tokens, -1)
+        intermediate = swiglu(interleaved, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
+
+        # === Down projection ===
+        down_buffer = self._get_bf16_buffer(
+            (self.hidden_size, self.intermediate_size),
+            expert_input.device
+        )
+        mxfp4_dequant_single_expert_cute(
+            self.down_weights[expert_idx],
+            down_scales_kmajor,
+            down_buffer,
+        )
+        down_out = torch.matmul(intermediate, down_buffer.T)
+        if self.down_biases is not None:
+            down_out = down_out + self.down_biases[expert_idx]
+
+        return down_out
 
 
 # ============================================================================

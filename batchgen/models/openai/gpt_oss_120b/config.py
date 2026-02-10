@@ -114,6 +114,13 @@ class GptOss120BConfig(BaseModelConfig):
         ],
     })
 
+    # ==================== Weight Handling ====================
+    # If True, dequantize MXFP4 weights to BF16 at model instantiation.
+    # If False (default), keep weights in MXFP4 format and use fused kernels.
+    # For GPT-OSS-120B, always False to minimize memory usage (128 experts).
+    # The fused WGMMA kernels handle MXFP4 dequant in-register with minimal overhead.
+    pre_dequantize_weights: bool = False
+
     # ==================== Tokenizer ====================
     pad_token_id: int = 199999
     eos_token_id: int = 200002

@@ -429,6 +429,9 @@ class BatchGenHttpClient:
         logger.info("Waiting for batch to complete...")
         batch = self.wait_for_batch(batch_id, poll_interval, timeout)
         logger.info(f"Batch completed: {batch['status']}")
+        if batch.get("output_file_id"):
+            output_fid = batch["output_file_id"]
+            logger.info(f"Result file: {output_fid}.jsonl (in server storage_path/outputs/)")
 
         # 4. Download results if output path specified
         if output_file_path and batch.get("output_file_id"):

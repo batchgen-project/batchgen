@@ -484,8 +484,11 @@ def moe_token_dispatch(
     # Gather hidden states in sorted order
     sorted_hidden = hidden_states[sorted_token_indices]
 
-    # Compute expert offsets using bincount
-    expert_counts = torch.bincount(sorted_expert_indices, minlength=num_experts)
+    # Compute expert offsets using bincount (requires int64)
+    expert_counts = torch.bincount(
+        sorted_expert_indices.to(torch.int64) if sorted_expert_indices.dtype != torch.int64 else sorted_expert_indices,
+        minlength=num_experts,
+    )
     expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     expert_offsets[1:] = expert_counts.cumsum(0)
 
@@ -963,6 +966,122 @@ def grouped_mxfp4_moe_forward_3d(
     output = torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype, device=device)
     weighted_output = sorted_output * routing_weights.unsqueeze(-1)
     output.scatter_add_(0, original_indices.unsqueeze(-1).expand_as(weighted_output), weighted_output)
+
+    return output
+
+
+# =============================================================================
+# Grouped MXFP4 MoE Forward with CUDA Routing Kernels
+# =============================================================================
+
+def grouped_mxfp4_moe_forward_cuda_routing(
+    hidden_states: torch.Tensor,          # [batch*seq, hidden] BF16
+    topk_indices: torch.Tensor,           # [batch*seq, num_experts_per_tok] int32
+    topk_weights: torch.Tensor,           # [batch*seq, num_experts_per_tok] FP32
+    # Pre-computed pointer arrays (from setup_expert_weight_pointers)
+    gate_ptrs: torch.Tensor,
+    gate_scale_ptrs: torch.Tensor,
+    up_ptrs: torch.Tensor,
+    up_scale_ptrs: torch.Tensor,
+    down_ptrs: torch.Tensor,
+    down_scale_ptrs: torch.Tensor,
+    # Reference weights for strides
+    gate_weight_ref: torch.Tensor,
+    gate_scale_ref: torch.Tensor,
+    up_weight_ref: torch.Tensor,
+    up_scale_ref: torch.Tensor,
+    down_weight_ref: torch.Tensor,
+    down_scale_ref: torch.Tensor,
+    # Optional biases
+    gate_biases: torch.Tensor = None,
+    up_biases: torch.Tensor = None,
+    down_biases: torch.Tensor = None,
+    num_experts: int = 128,
+    expert_start: int = 0,
+    num_local_experts: int = 128,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+) -> torch.Tensor:
+    """Grouped MXFP4 MoE forward with CUDA routing (dispatch + reduce).
+
+    Replaces PyTorch sort/bincount dispatch and scatter_add_ reduce with
+    fused CUDA kernels. The 3D GEMM stages are unchanged.
+
+    Key differences from grouped_mxfp4_moe_forward_3d:
+    - CUDA dispatch: count + prefix_sum + gather (3 sub-kernels vs PyTorch sort)
+    - CUDA reduce: weighted scatter-add via topk_pos (vs scatter_add_ with index expansion)
+    - No int64 conversions: all routing indices stay int32 throughout
+
+    Args:
+        hidden_states: Input [batch*seq, hidden] in BF16
+        topk_indices: Expert indices [batch*seq, K] in int32 (from gate_topk_softmax_cuda)
+        topk_weights: Routing weights [batch*seq, K] in FP32
+        expert_start: First local expert index (for EP)
+        num_local_experts: Number of local experts
+        Other args: Same as grouped_mxfp4_moe_forward_3d
+    """
+    from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+
+    num_tokens, hidden_size = hidden_states.shape
+    K = topk_indices.shape[1]
+    device = hidden_states.device
+    N_intermediate = gate_weight_ref.shape[0]
+
+    # Step 1: CUDA dispatch (replaces moe_token_dispatch)
+    dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+        hidden_states, topk_indices,
+        expert_start, num_local_experts,
+    )
+
+    # Trim to actual dispatched tokens
+    total_dispatched = expert_offsets[num_local_experts].item()
+    dispatched_x = dispatched_x[:total_dispatched]
+
+    # Step 2: Reshape to 3D layout for GEMM
+    hidden_3d, M_max = reshape_to_3d_expert_layout(
+        dispatched_x, expert_counts, num_local_experts
+    )
+
+    # Step 3: Gate projection
+    gate_out_3d = grouped_mxfp4_gemm_3d(
+        hidden_3d, gate_ptrs, gate_scale_ptrs, expert_counts,
+        N_intermediate, gate_weight_ref, gate_scale_ref
+    )
+
+    # Step 4: Up projection
+    up_out_3d = grouped_mxfp4_gemm_3d(
+        hidden_3d, up_ptrs, up_scale_ptrs, expert_counts,
+        N_intermediate, up_weight_ref, up_scale_ref
+    )
+
+    # Add biases if present
+    if gate_biases is not None:
+        gate_out_3d = gate_out_3d + gate_biases[:num_local_experts].unsqueeze(1)
+    if up_biases is not None:
+        up_out_3d = up_out_3d + up_biases[:num_local_experts].unsqueeze(1)
+
+    # Step 5: SwiGLU activation
+    gate_clamped = gate_out_3d.clamp(max=swiglu_limit)
+    up_clamped = up_out_3d.clamp(min=-swiglu_limit, max=swiglu_limit)
+    intermediate_3d = gate_clamped * torch.sigmoid(swiglu_alpha * gate_clamped) * (up_clamped + 1)
+
+    # Step 6: Down projection
+    output_3d = grouped_mxfp4_gemm_3d(
+        intermediate_3d, down_ptrs, down_scale_ptrs, expert_counts,
+        hidden_size, down_weight_ref, down_scale_ref
+    )
+
+    if down_biases is not None:
+        output_3d = output_3d + down_biases[:num_local_experts].unsqueeze(1)
+
+    # Step 7: Gather from 3D back to flat sorted layout
+    sorted_output = gather_from_3d_expert_layout(output_3d, expert_counts, total_dispatched)
+
+    # Step 8: CUDA reduce (replaces scatter_add_)
+    output = reduce_weighted_scatter_cuda(
+        sorted_output, topk_pos, topk_weights,
+        num_tokens, hidden_size, K,
+    )
 
     return output
 
