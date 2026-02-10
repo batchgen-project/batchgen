@@ -192,7 +192,7 @@ class GptOss_Parameter_Server:
         """
         # Create model to parse weight names
         self.hf_config._attn_implementation = "eager"
-        model = GptOss(self.hf_config).to('cpu')
+        model = GptOss(self.hf_config).to_empty(device='cpu')
         model.eval()
 
         self.weight_copy_task["attn"] = []

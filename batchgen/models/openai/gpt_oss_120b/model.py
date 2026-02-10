@@ -591,11 +591,13 @@ class GptOssExpert(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.swiglu_limit = config.swiglu_limit
 
-        # Fused gate+up projection (output is 2x intermediate_size for SwiGLU interleaving)
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
-        # Down projection
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
+        # Use meta device: these parameters are placeholders for named_parameters()
+        # enumeration only. Actual weights are MXFP4 packed tensors loaded separately.
+        # This avoids ~459 GB of useless CPU allocation + kaiming init for 4608 experts.
+        with torch.device('meta'):
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with OpenAI's SwiGLU activation."""
