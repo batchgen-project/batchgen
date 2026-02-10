@@ -927,8 +927,11 @@ def _load_mxfp4_module():
         return _module_mxfp4_moe
 
     try:
-        # Base CUDA flags
-        cuda_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v"]
+        # Base CUDA flags — detect arch from device capability
+        device = torch.cuda.current_device()
+        cc = torch.cuda.get_device_capability(device)
+        arch = f"-arch=sm_{cc[0]}{cc[1]}a"
+        cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v"]
 
         # Add kernel NaN debug flag if requested
         debug_kernel = os.environ.get("DEBUG_KERNEL_NAN", "0") == "1"

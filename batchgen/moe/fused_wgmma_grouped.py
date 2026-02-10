@@ -952,7 +952,10 @@ def _load_grouped_module():
         return _grouped_module
 
     try:
-        cuda_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v", "-lineinfo"]
+        device = torch.cuda.current_device()
+        cc = torch.cuda.get_device_capability(device)
+        arch = f"-arch=sm_{cc[0]}{cc[1]}a"
+        cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v", "-lineinfo"]
 
         _grouped_module = load_inline(
             name="batchgen_fused_mxfp4_grouped_wgmma_tma_v1",
