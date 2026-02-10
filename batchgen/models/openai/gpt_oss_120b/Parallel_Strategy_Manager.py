@@ -519,80 +519,149 @@ class GptOssParallelStrategyManager:
 
         log_gpu_memory(f"After clearing {cleared_count} expert weights")
 
-    def _swap_to_quantized_moe(self):
-        """Swap GptOssMoE to GptOssMoEQuantized for grouped GEMM execution.
+    def _setup_decode_moe(self, ep_enabled: bool, weight_format: str):
+        """Set up unified GptOssMoEDecode for all layers.
 
-        Collects MXFP4 weights from wrapped experts into GptOssMoEQuantized format,
-        then replaces layer.mlp with the quantized version.
+        Creates GptOssMoEDecode per layer, configures persistent/non-persistent
+        expert lists, and sets up grouped kernel pointer arrays.
 
-        This enables grouped GEMM which reduces kernel launches from 384 (3 × 128 experts)
-        to just 3 per layer, achieving ~5x speedup for MoE execution.
+        Args:
+            ep_enabled: Whether Expert Parallelism is active (world_size > 1)
+            weight_format: "mxfp4" or "bf16"
         """
-        from batchgen.models.openai.gpt_oss_120b.model import GptOssMoEQuantized
+        from .model import GptOssMoEDecode, _HAS_WGMMA_GROUPED
+        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
 
         device = self.engine_config.Basic_Config.device_torch
+
+        if ep_enabled:
+            expert_start = self.routed_expert_gpu_start_idx
+            num_persistent = self.num_local_expert_per_layer
+            num_total_per_rank = self.experts_per_rank
+            # Non-persistent = host-resident experts on this rank
+            persistent_indices = list(range(expert_start, expert_start + num_persistent))
+            non_persistent_indices = list(range(
+                expert_start + num_persistent,
+                expert_start + num_total_per_rank
+            ))
+        else:
+            expert_start = 0
+            num_persistent = self.model_config.num_local_experts
+            persistent_indices = list(range(num_persistent))
+            non_persistent_indices = []
 
         for layer_idx in range(self.model_config.num_hidden_layers):
             old_moe = self.model.model.layers[layer_idx].mlp
 
-            # Create quantized MoE
-            quantized_moe = GptOssMoEQuantized(self.model_config)
-            quantized_moe.router = old_moe.router  # Copy router weights
-            quantized_moe.to(device)
-
-            # Collect MXFP4 weights from wrapped experts
-            gate_weights, gate_scales = [], []
-            up_weights, up_scales = [], []
-            down_weights, down_scales = [], []
-            gate_biases, up_biases, down_biases = [], [], []
-
-            for expert_idx in range(self.model_config.num_local_experts):
-                wrapper = old_moe.experts[expert_idx]
-
-                # Get MXFP4 weights from wrapper (registered by _register_mxfp4_weights)
-                gate_weights.append(wrapper.mxfp4_gate_packed)
-                gate_scales.append(wrapper.mxfp4_gate_scales)
-                up_weights.append(wrapper.mxfp4_up_packed)
-                up_scales.append(wrapper.mxfp4_up_scales)
-                down_weights.append(wrapper.mxfp4_down_packed)
-                down_scales.append(wrapper.mxfp4_down_scales)
-
-                # Collect biases if present
-                if hasattr(wrapper, 'mxfp4_gate_bias') and wrapper.mxfp4_gate_bias is not None:
-                    gate_biases.append(wrapper.mxfp4_gate_bias)
-                if hasattr(wrapper, 'mxfp4_up_bias') and wrapper.mxfp4_up_bias is not None:
-                    up_biases.append(wrapper.mxfp4_up_bias)
-                if hasattr(wrapper, 'mxfp4_down_bias') and wrapper.mxfp4_down_bias is not None:
-                    down_biases.append(wrapper.mxfp4_down_bias)
-
-            # Store in quantized MoE (as lists, not stacked tensors)
-            quantized_moe.gate_weights = gate_weights
-            quantized_moe.gate_scales = gate_scales
-            quantized_moe.up_weights = up_weights
-            quantized_moe.up_scales = up_scales
-            quantized_moe.down_weights = down_weights
-            quantized_moe.down_scales = down_scales
-
-            # Stack biases if present (as [num_experts, N] tensors)
-            if gate_biases:
-                quantized_moe.gate_biases = torch.stack(gate_biases)
-                quantized_moe.up_biases = torch.stack(up_biases)
-                quantized_moe.down_biases = torch.stack(down_biases)
-
-            # Set up pointer arrays for grouped GEMM
-            quantized_moe.setup_pointer_arrays()
-
-            # All experts persistent (mode 3 + EP-offloading disabled)
-            quantized_moe.persistent_mask = torch.ones(
-                self.model_config.num_local_experts, dtype=torch.bool, device=device
+            decode_moe = GptOssMoEDecode(
+                self.loaded_model_config,
+                ep_enabled=ep_enabled,
+                comm=self.comm,
             )
+            decode_moe.router = old_moe.router
+            decode_moe.total_experts = 128 if ep_enabled else self.model_config.num_local_experts
+            decode_moe.expert_start = expert_start
+            decode_moe.num_local_experts = num_persistent + len(non_persistent_indices)
+            decode_moe.persistent_expert_indices = persistent_indices
+            decode_moe.non_persistent_expert_indices = non_persistent_indices
+            decode_moe.weight_format = weight_format
 
-            # Swap MoE layer
-            self.model.model.layers[layer_idx].mlp = quantized_moe
+            # Transfer expert wrappers (for non-persistent single-expert forward)
+            for idx in non_persistent_indices:
+                decode_moe.experts[idx] = old_moe.experts[idx]
+
+            # Set up grouped kernel pointer arrays for persistent experts
+            if num_persistent > 0 and weight_format == "mxfp4" and _HAS_WGMMA_GROUPED:
+                gate_weights, gate_scales = [], []
+                up_weights, up_scales = [], []
+                down_weights, down_scales = [], []
+                gate_biases, up_biases, down_biases = [], [], []
+                has_biases = False
+
+                for idx in persistent_indices:
+                    wrapper = old_moe.experts[idx]
+                    gate_weights.append(wrapper.mxfp4_gate_packed.contiguous())
+                    gate_scales.append(wrapper.mxfp4_gate_scales.contiguous())
+                    up_weights.append(wrapper.mxfp4_up_packed.contiguous())
+                    up_scales.append(wrapper.mxfp4_up_scales.contiguous())
+                    down_weights.append(wrapper.mxfp4_down_packed.contiguous())
+                    down_scales.append(wrapper.mxfp4_down_scales.contiguous())
+
+                    gb = getattr(wrapper, 'mxfp4_gate_bias', None)
+                    if gb is not None:
+                        has_biases = True
+                        gate_biases.append(gb.contiguous())
+                        up_biases.append(getattr(wrapper, 'mxfp4_up_bias').contiguous())
+                        down_biases.append(getattr(wrapper, 'mxfp4_down_bias').contiguous())
+
+                decode_moe.gate_ptrs, decode_moe.gate_scale_ptrs = setup_expert_weight_pointers(
+                    gate_weights, gate_scales)
+                decode_moe.up_ptrs, decode_moe.up_scale_ptrs = setup_expert_weight_pointers(
+                    up_weights, up_scales)
+                decode_moe.down_ptrs, decode_moe.down_scale_ptrs = setup_expert_weight_pointers(
+                    down_weights, down_scales)
+
+                decode_moe.gate_weight_ref = gate_weights[0]
+                decode_moe.gate_scale_ref = gate_scales[0]
+                decode_moe.down_weight_ref = down_weights[0]
+                decode_moe.down_scale_ref = down_scales[0]
+
+                # Keep references alive
+                decode_moe._persistent_gate_weights = gate_weights
+                decode_moe._persistent_gate_scales = gate_scales
+                decode_moe._persistent_up_weights = up_weights
+                decode_moe._persistent_up_scales = up_scales
+                decode_moe._persistent_down_weights = down_weights
+                decode_moe._persistent_down_scales = down_scales
+
+                if has_biases:
+                    decode_moe.gate_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in gate_biases], dtype=torch.int64, device=device)
+                    decode_moe.up_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in up_biases], dtype=torch.int64, device=device)
+                    decode_moe.down_bias_ptrs = torch.tensor(
+                        [b.data_ptr() for b in down_biases], dtype=torch.int64, device=device)
+                    decode_moe._persistent_gate_biases = gate_biases
+                    decode_moe._persistent_up_biases = up_biases
+                    decode_moe._persistent_down_biases = down_biases
+
+            # Store per-expert weight references for non-persistent single-expert path
+            if non_persistent_indices and weight_format == "mxfp4":
+                # Build sparse weight lists indexed by global expert idx
+                num_total = 128 if ep_enabled else self.model_config.num_local_experts
+                decode_moe.gate_weights = [None] * num_total
+                decode_moe.gate_scales = [None] * num_total
+                decode_moe.up_weights = [None] * num_total
+                decode_moe.up_scales = [None] * num_total
+                decode_moe.down_weights = [None] * num_total
+                decode_moe.down_scales = [None] * num_total
+                decode_moe.gate_biases = [None] * num_total
+                decode_moe.up_biases = [None] * num_total
+                decode_moe.down_biases = [None] * num_total
+
+                for idx in non_persistent_indices:
+                    wrapper = old_moe.experts[idx]
+                    decode_moe.gate_weights[idx] = wrapper.mxfp4_gate_packed
+                    decode_moe.gate_scales[idx] = wrapper.mxfp4_gate_scales
+                    decode_moe.up_weights[idx] = wrapper.mxfp4_up_packed
+                    decode_moe.up_scales[idx] = wrapper.mxfp4_up_scales
+                    decode_moe.down_weights[idx] = wrapper.mxfp4_down_packed
+                    decode_moe.down_scales[idx] = wrapper.mxfp4_down_scales
+                    decode_moe.gate_biases[idx] = getattr(wrapper, 'mxfp4_gate_bias', None)
+                    decode_moe.up_biases[idx] = getattr(wrapper, 'mxfp4_up_bias', None)
+                    decode_moe.down_biases[idx] = getattr(wrapper, 'mxfp4_down_bias', None)
+
+            decode_moe.to(device)
+
+            if ep_enabled:
+                decode_moe.init_num_tokens(self.padding_bsz)
+
+            self.model.model.layers[layer_idx].mlp = decode_moe
 
         logging.info(
-            f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoEQuantized "
-            f"(grouped GEMM: 3 kernel launches per layer instead of 384)"
+            f"Set up GptOssMoEDecode for {self.model_config.num_hidden_layers} layers "
+            f"(EP={ep_enabled}, format={weight_format}, "
+            f"persistent={len(persistent_indices)}, non-persistent={len(non_persistent_indices)})"
         )
 
     def _swap_to_prefill_moe(self):
@@ -669,120 +738,6 @@ class GptOssParallelStrategyManager:
         logging.info(
             f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoEPrefill "
             f"(per-expert CuTe dequant + torch.matmul)"
-        )
-
-    def _swap_to_ep_moe(self):
-        """Swap GptOssMoE to GptOssMoE_EP for Expert Parallelism.
-
-        Replaces each layer's MoE with EP-enabled version that:
-        - AllGathers tokens from all ranks
-        - Routes globally (all 128 experts)
-        - Processes only local experts
-        - AllReduces to combine results
-
-        Expert wrappers from old MoE are transferred to EP MoE.
-        When WGMMA grouped kernels are available, sets up pointer arrays
-        for grouped GEMM execution (4 launches vs per-expert loop).
-        """
-        from .model import GptOssMoE_EP, _HAS_WGMMA_GROUPED
-
-        device = self.engine_config.Basic_Config.device_torch
-
-        # Check if grouped WGMMA is available for all layers
-        use_grouped = _HAS_WGMMA_GROUPED and not self.enable_ep_offloading
-
-        for layer_idx in range(self.model_config.num_hidden_layers):
-            old_moe = self.model.model.layers[layer_idx].mlp
-
-            # Create EP MoE
-            ep_moe = GptOssMoE_EP(self.loaded_model_config, self.comm)
-            ep_moe.router = old_moe.router  # Copy router weights (replicated)
-            ep_moe.enable_ep_offloading = self.enable_ep_offloading
-
-            # Transfer local expert wrappers (GPU-resident experts only)
-            for local_e in range(self.num_local_expert_per_layer):
-                global_e = self.routed_expert_gpu_start_idx + local_e
-                ep_moe.experts[global_e] = old_moe.experts[global_e]
-
-            # Set up grouped WGMMA pointer arrays if available
-            if use_grouped:
-                from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
-
-                gate_weights, gate_scales = [], []
-                up_weights, up_scales = [], []
-                down_weights, down_scales = [], []
-
-                for local_e in range(self.num_local_expert_per_layer):
-                    global_e = self.routed_expert_gpu_start_idx + local_e
-                    wrapper = ep_moe.experts[global_e]
-                    gate_weights.append(wrapper.mxfp4_gate_packed.contiguous())
-                    gate_scales.append(wrapper.mxfp4_gate_scales.contiguous())
-                    up_weights.append(wrapper.mxfp4_up_packed.contiguous())
-                    up_scales.append(wrapper.mxfp4_up_scales.contiguous())
-                    down_weights.append(wrapper.mxfp4_down_packed.contiguous())
-                    down_scales.append(wrapper.mxfp4_down_scales.contiguous())
-
-                ep_moe.gate_ptrs, ep_moe.gate_scale_ptrs = setup_expert_weight_pointers(
-                    gate_weights, gate_scales)
-                ep_moe.up_ptrs, ep_moe.up_scale_ptrs = setup_expert_weight_pointers(
-                    up_weights, up_scales)
-                ep_moe.down_ptrs, ep_moe.down_scale_ptrs = setup_expert_weight_pointers(
-                    down_weights, down_scales)
-
-                # Collect bias tensors and create pointer arrays
-                gate_biases, up_biases, down_biases = [], [], []
-                has_biases = False
-                for local_e in range(self.num_local_expert_per_layer):
-                    global_e = self.routed_expert_gpu_start_idx + local_e
-                    wrapper = ep_moe.experts[global_e]
-                    gb = getattr(wrapper, 'mxfp4_gate_bias', None)
-                    ub = getattr(wrapper, 'mxfp4_up_bias', None)
-                    db = getattr(wrapper, 'mxfp4_down_bias', None)
-                    if gb is not None:
-                        has_biases = True
-                        gate_biases.append(gb.contiguous())
-                        up_biases.append(ub.contiguous())
-                        down_biases.append(db.contiguous())
-
-                if has_biases:
-                    ep_moe.gate_bias_ptrs = torch.tensor(
-                        [b.data_ptr() for b in gate_biases],
-                        dtype=torch.int64, device=device)
-                    ep_moe.up_bias_ptrs = torch.tensor(
-                        [b.data_ptr() for b in up_biases],
-                        dtype=torch.int64, device=device)
-                    ep_moe.down_bias_ptrs = torch.tensor(
-                        [b.data_ptr() for b in down_biases],
-                        dtype=torch.int64, device=device)
-                    # Keep references so tensors aren't garbage-collected
-                    ep_moe._local_gate_biases = gate_biases
-                    ep_moe._local_up_biases = up_biases
-                    ep_moe._local_down_biases = down_biases
-                else:
-                    ep_moe.gate_bias_ptrs = None
-                    ep_moe.up_bias_ptrs = None
-                    ep_moe.down_bias_ptrs = None
-
-                # Reference weights for stride computation
-                ep_moe.gate_weight_ref = gate_weights[0]
-                ep_moe.gate_scale_ref = gate_scales[0]
-                ep_moe.down_weight_ref = down_weights[0]
-                ep_moe.down_scale_ref = down_scales[0]
-                ep_moe._use_grouped_wgmma = True
-
-            ep_moe.to(device)
-
-            # Initialize num_tokens_per_rank for AllGather/AllReduce buffers
-            ep_moe.init_num_tokens(self.padding_bsz)
-
-            # Swap MoE layer
-            self.model.model.layers[layer_idx].mlp = ep_moe
-
-        grouped_str = " + WGMMA grouped (4 launches)" if use_grouped else ""
-        logging.info(
-            f"Swapped all {self.model_config.num_hidden_layers} layers to GptOssMoE_EP "
-            f"(AllGather → Route → Local experts → AllReduce{grouped_str}). "
-            f"Rank {self.rank}: experts [{self.routed_expert_gpu_start_idx}, {self.routed_expert_gpu_end_idx})"
         )
 
     def _compute_expert_ranges(self):
@@ -981,35 +936,24 @@ class GptOssParallelStrategyManager:
         self._config_expert_module()
         self._config_lm_head_hook()
 
-        # Step 7.5: Swap MoE based on parallelism mode
-        if ep_enabled:
-            # EP: Use GptOssMoE_EP with AllGather/AllReduce communication
-            self._swap_to_ep_moe()
-
-            # Pre-dequant for better HBM utilization when enough GPUs
-            # Pre-dequantization is controlled by model_config.pre_dequantize_weights
-            # For GPT-OSS-120B, this defaults to False (always use MXFP4 fused kernels)
-            # The fused WGMMA kernels handle in-register dequant with 2.2-4.0x speedup
-            pre_dequant = getattr(self.model_config, 'pre_dequantize_weights', False)
-
-            # Only dequantize if explicitly enabled AND world_size >= 4 (memory feasible)
-            if pre_dequant and self.world_size >= 4:
-                self._dequant_experts_to_bf16()
-                self.use_bf16_experts = True
-                logging.info("Using pre-dequantized BF16 expert weights (pre_dequantize_weights=True)")
-            else:
-                self.use_bf16_experts = False
-                if pre_dequant and self.world_size < 4:
-                    logging.warning(
-                        "pre_dequantize_weights=True but world_size < 4. "
-                        "Keeping MXFP4 weights to avoid OOM."
-                    )
-                else:
-                    logging.info("Using MXFP4 fused expert kernels (pre_dequantize_weights=False)")
+        # Step 7.5: Set up unified decode MoE
+        # Determine weight format
+        pre_dequant = getattr(self.model_config, 'pre_dequantize_weights', False)
+        if ep_enabled and pre_dequant and self.world_size >= 4:
+            weight_format = "bf16"
         else:
-            # Single GPU: Use grouped GEMM (3 kernel launches per layer)
-            self._swap_to_quantized_moe()
-            self.use_bf16_experts = False
+            weight_format = "mxfp4"
+            if ep_enabled and pre_dequant and self.world_size < 4:
+                logging.warning(
+                    "pre_dequantize_weights=True but world_size < 4. "
+                    "Keeping MXFP4 weights to avoid OOM."
+                )
+
+        self._setup_decode_moe(ep_enabled, weight_format)
+
+        if weight_format == "bf16":
+            self._dequant_experts_to_bf16()
+            logging.info("Using pre-dequantized BF16 expert weights")
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)

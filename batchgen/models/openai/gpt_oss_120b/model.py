@@ -695,406 +695,114 @@ class GptOssMoE(nn.Module):
 
 
 # ============================================================================
-# Quantized MoE Layer (MXFP4 with Grouped GEMM)
+# Unified Decode MoE Layer
 # ============================================================================
 
-class GptOssMoEQuantized(nn.Module):
-    """MoE layer with MXFP4 quantized experts and grouped GEMM execution.
+class GptOssMoEDecode(nn.Module):
+    """Unified decode MoE for GPT-OSS-120B.
 
-    This class provides hybrid execution:
-    - Persistent experts (weights in VRAM): Use grouped GEMM (3 kernel launches total)
-    - Non-persistent experts (loaded on-demand): Use optimized single-expert kernel
+    Handles both single-GPU and EP (Expert Parallelism) modes with a single
+    forward path:
+      1. [EP only] AllGather tokens from all ranks
+      2. Router → topk_indices, topk_weights
+      3. Grouped kernel for persistent experts (weights in VRAM)
+      4. Single-expert kernel for non-persistent experts one-by-one (if any)
+      5. [EP only] AllReduce results
 
-    The grouped GEMM approach reduces kernel launches from 128×3=384 to just 3,
-    achieving ~5x speedup for persistent experts.
+    Supports two weight formats:
+      - "mxfp4": MXFP4 quantized weights with fused WGMMA kernels
+      - "bf16": Pre-dequantized BF16 weights with grouped BF16 GEMM
 
-    Weight storage:
-    - gate_weights: [num_experts] list of [intermediate_size, hidden_size//2] uint8
-    - gate_scales: [num_experts] list of [intermediate_size, hidden_size//32] uint8
-    - up_weights, up_scales: Same shapes as gate
-    - down_weights: [num_experts] list of [hidden_size, intermediate_size//2] uint8
-    - down_scales: [num_experts] list of [hidden_size, intermediate_size//32] uint8
-    - gate_biases: [num_experts, intermediate_size] BF16 (optional)
-    - up_biases: [num_experts, intermediate_size] BF16 (optional)
-    - down_biases: [num_experts, hidden_size] BF16 (optional)
+    The model instance does not need to know about ep_with_offloading or
+    pre_dequantize_weights flags. The Parallel_Strategy_Manager configures
+    persistent/non-persistent expert lists and weight format at setup time.
     """
 
-    def __init__(self, config: GptOssConfig):
+    def __init__(self, config: GptOssConfig, ep_enabled: bool = False, comm=None):
         super().__init__()
         self.config = config
-        self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
 
-        # Router (same as original)
-        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=True)
-
-        # MXFP4 quantized weights - initialized as None, populated during weight loading
-        # Stored as lists of tensors (one per expert) for flexibility
-        self.gate_weights = None  # List[Tensor[N_inter, hidden//2]]
-        self.gate_scales = None   # List[Tensor[N_inter, hidden//32]]
-        self.up_weights = None
-        self.up_scales = None
-        self.down_weights = None  # List[Tensor[hidden, N_inter//2]]
-        self.down_scales = None
-
-        # Optional biases (stacked as [num_experts, N])
-        self.gate_biases = None
-        self.up_biases = None
-        self.down_biases = None
-
-        # Pointer arrays for grouped GEMM (set after weight loading)
-        self.gate_ptrs = None
-        self.gate_scale_ptrs = None
-        self.up_ptrs = None
-        self.up_scale_ptrs = None
-        self.down_ptrs = None
-        self.down_scale_ptrs = None
-
-        # Persistent expert mask (which experts are in VRAM)
-        # True = persistent (use grouped GEMM), False = non-persistent (use single kernel)
-        self.persistent_mask = None  # [num_experts] bool tensor
-
-        # SwiGLU parameters
-        self.swiglu_alpha = 1.702
-        self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
-
-    def setup_pointer_arrays(self):
-        """Create pointer arrays for grouped GEMM. Call after loading weights."""
-        from batchgen.moe.mxfp4_grouped_gemm import setup_expert_weight_pointers
-
-        if self.gate_weights is None:
-            raise RuntimeError("Weights not loaded. Call setup_pointer_arrays() after loading weights.")
-
-        # Ensure all weight/scale tensors are contiguous before capturing pointers.
-        # The grouped kernel reads via raw pointers with stride = shape[1], so
-        # non-contiguous tensors would cause incorrect data access.
-        self.gate_weights = [w.contiguous() for w in self.gate_weights]
-        self.gate_scales = [s.contiguous() for s in self.gate_scales]
-        self.up_weights = [w.contiguous() for w in self.up_weights]
-        self.up_scales = [s.contiguous() for s in self.up_scales]
-        self.down_weights = [w.contiguous() for w in self.down_weights]
-        self.down_scales = [s.contiguous() for s in self.down_scales]
-
-        # Create pointer arrays (now guaranteed contiguous)
-        self.gate_ptrs, self.gate_scale_ptrs = setup_expert_weight_pointers(
-            self.gate_weights, self.gate_scales
-        )
-        self.up_ptrs, self.up_scale_ptrs = setup_expert_weight_pointers(
-            self.up_weights, self.up_scales
-        )
-        self.down_ptrs, self.down_scale_ptrs = setup_expert_weight_pointers(
-            self.down_weights, self.down_scales
-        )
-
-        # Create bias pointer arrays if biases exist
-        if self.gate_biases is not None:
-            device = self.gate_weights[0].device
-            self.gate_bias_ptrs = torch.tensor(
-                [b.data_ptr() for b in self.gate_biases],
-                dtype=torch.int64, device=device)
-            self.up_bias_ptrs = torch.tensor(
-                [b.data_ptr() for b in self.up_biases],
-                dtype=torch.int64, device=device)
-            self.down_bias_ptrs = torch.tensor(
-                [b.data_ptr() for b in self.down_biases],
-                dtype=torch.int64, device=device)
-        else:
-            self.gate_bias_ptrs = None
-            self.up_bias_ptrs = None
-            self.down_bias_ptrs = None
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Hybrid forward: grouped GEMM for persistent, single for non-persistent."""
-        from batchgen.moe.mxfp4_grouped_gemm import (
-            grouped_mxfp4_moe_forward_3d,
-            mxfp4_expert_forward_single,
-        )
-        if _HAS_CUDA_ROUTING:
-            from batchgen.moe.mxfp4_grouped_gemm import grouped_mxfp4_moe_forward_cuda_routing
-
-        timing_enabled = DecodeLayerTiming.enabled
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_flat = hidden_states.view(-1, hidden_dim)
-
-        # ========== ROUTER TIMING ==========
-        if timing_enabled:
-            torch.cuda.synchronize()
-            router_start = time.perf_counter()
-
-        # Compute routing logits
-        router_logits = self.router(hidden_flat)
-
-        # Select Top-K experts with fused CUDA gate (topk + softmax in one kernel)
-        if _HAS_CUDA_ROUTING:
-            topk_indices, topk_weights = gate_topk_softmax_cuda(
-                router_logits, k=self.num_experts_per_tok
-            )
-        else:
-            topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
-            topk_weights = F.softmax(topk_weights, dim=-1)
-
-        if timing_enabled:
-            torch.cuda.synchronize()
-            DecodeLayerTiming.record_moe_component("router", (time.perf_counter() - router_start) * 1000)
-
-        # Initialize output
-        output = torch.zeros_like(hidden_flat)
-
-        # ========== GEMM TIMING ==========
-        if timing_enabled:
-            torch.cuda.synchronize()
-            gemm_start = time.perf_counter()
-
-        # Check if pointer arrays are set up
-        if self.gate_ptrs is None:
-            self.setup_pointer_arrays()
-
-        # Determine persistent vs non-persistent experts
-        if self.persistent_mask is not None:
-            has_non_persistent = not self.persistent_mask.all()
-        else:
-            # Default: all experts are persistent
-            has_non_persistent = False
-
-        # === Part A: Grouped GEMM for all experts (or persistent only) ===
-        if not has_non_persistent:
-            if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING:
-                # WGMMA grouped: fast path (4 kernel launches, highest priority)
-                global _WGMMA_GROUPED_LOGGED
-                if not _WGMMA_GROUPED_LOGGED:
-                    print("[WGMMA grouped] MoE forward using grouped path (4 launches)", flush=True)
-                    _WGMMA_GROUPED_LOGGED = True
-                output = fused_mxfp4_grouped_moe_forward_cuda_routing(
-                    hidden_flat, topk_indices, topk_weights,
-                    self.gate_ptrs, self.gate_scale_ptrs,
-                    self.up_ptrs, self.up_scale_ptrs,
-                    self.down_ptrs, self.down_scale_ptrs,
-                    self.gate_weights[0], self.gate_scales[0],
-                    self.down_weights[0], self.down_scales[0],
-                    num_experts=self.num_experts,
-                    num_local_experts=self.num_experts,
-                    gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
-                    up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
-                    down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
-                )
-            elif _HAS_WGMMA_SINGLE and _HAS_CUDA_ROUTING:
-                # WGMMA single-expert: per-expert WGMMA + CUDA routing (fallback)
-                global _WGMMA_SINGLE_LOGGED
-                if not _WGMMA_SINGLE_LOGGED:
-                    print("[WGMMA single] MoE forward using per-expert WGMMA path", flush=True)
-                    _WGMMA_SINGLE_LOGGED = True
-                output = wgmma_single_expert_moe_forward_cuda_routing(
-                    hidden_flat, topk_indices, topk_weights,
-                    self.gate_weights, self.gate_scales,
-                    self.up_weights, self.up_scales,
-                    self.down_weights, self.down_scales,
-                    gate_biases=self.gate_biases,
-                    up_biases=self.up_biases,
-                    down_biases=self.down_biases,
-                    num_experts=self.num_experts,
-                    num_local_experts=self.num_experts,
-                )
-            elif _HAS_CUDA_ROUTING:
-                output = grouped_mxfp4_moe_forward_cuda_routing(
-                    hidden_flat, topk_indices, topk_weights,
-                    self.gate_ptrs, self.gate_scale_ptrs,
-                    self.up_ptrs, self.up_scale_ptrs,
-                    self.down_ptrs, self.down_scale_ptrs,
-                    self.gate_weights[0], self.gate_scales[0],
-                    self.up_weights[0], self.up_scales[0],
-                    self.down_weights[0], self.down_scales[0],
-                    self.gate_biases, self.up_biases, self.down_biases,
-                    num_experts=self.num_experts,
-                    num_local_experts=self.num_experts,
-                    swiglu_alpha=self.swiglu_alpha,
-                    swiglu_limit=self.swiglu_limit,
-                )
-            else:
-                output = grouped_mxfp4_moe_forward_3d(
-                    hidden_flat, topk_indices, topk_weights,
-                    self.gate_ptrs, self.gate_scale_ptrs,
-                    self.up_ptrs, self.up_scale_ptrs,
-                    self.down_ptrs, self.down_scale_ptrs,
-                    self.gate_weights[0], self.gate_scales[0],
-                    self.up_weights[0], self.up_scales[0],
-                    self.down_weights[0], self.down_scales[0],
-                    self.gate_biases, self.up_biases, self.down_biases,
-                    num_experts=self.num_experts,
-                    swiglu_alpha=self.swiglu_alpha,
-                    swiglu_limit=self.swiglu_limit,
-                )
-        else:
-            # Hybrid execution: grouped WGMMA for persistent, single for non-persistent
-            persistent_experts = self.persistent_mask.nonzero(as_tuple=True)[0]
-            non_persistent_experts = (~self.persistent_mask).nonzero(as_tuple=True)[0]
-            num_persistent = persistent_experts.numel()
-
-            # Part A: Grouped GEMM for persistent experts
-            # Create mask for tokens routed to persistent experts only
-            persistent_routing_mask = torch.zeros_like(topk_indices, dtype=torch.bool)
-            for pe in persistent_experts:
-                persistent_routing_mask |= (topk_indices == pe)
-
-            if persistent_routing_mask.any():
-                if _HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING and self.gate_ptrs is not None:
-                    # WGMMA grouped for persistent experts (4 kernel launches)
-                    # dispatch_count_gather routes only to [0, num_persistent)
-                    persistent_output = fused_mxfp4_grouped_moe_forward_cuda_routing(
-                        hidden_flat, topk_indices, topk_weights,
-                        self.gate_ptrs, self.gate_scale_ptrs,
-                        self.up_ptrs, self.up_scale_ptrs,
-                        self.down_ptrs, self.down_scale_ptrs,
-                        self.gate_weights[0], self.gate_scales[0],
-                        self.down_weights[0], self.down_scales[0],
-                        num_experts=self.num_experts,
-                        num_local_experts=num_persistent,
-                        gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
-                        up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
-                        down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
-                    )
-                else:
-                    # Triton grouped fallback for persistent experts
-                    persistent_output = grouped_mxfp4_moe_forward_3d(
-                        hidden_flat, topk_indices, topk_weights,
-                        self.gate_ptrs, self.gate_scale_ptrs,
-                        self.up_ptrs, self.up_scale_ptrs,
-                        self.down_ptrs, self.down_scale_ptrs,
-                        self.gate_weights[0], self.gate_scales[0],
-                        self.up_weights[0], self.up_scales[0],
-                        self.down_weights[0], self.down_scales[0],
-                        self.gate_biases, self.up_biases, self.down_biases,
-                        num_experts=self.num_experts,
-                        swiglu_alpha=self.swiglu_alpha,
-                        swiglu_limit=self.swiglu_limit,
-                    )
-                output += persistent_output
-
-            # Part B: Single-expert kernel for non-persistent experts
-            for expert_idx in non_persistent_experts.tolist():
-                expert_mask = (topk_indices == expert_idx).any(dim=-1)
-                if expert_mask.any():
-                    expert_input = hidden_flat[expert_mask]
-
-                    # Use WGMMA single-expert if available, else Triton
-                    if _HAS_WGMMA_SINGLE:
-                        expert_output = fused_mxfp4_expert_forward(
-                            expert_input,
-                            self.gate_weights[expert_idx], self.gate_scales[expert_idx],
-                            self.up_weights[expert_idx], self.up_scales[expert_idx],
-                            self.down_weights[expert_idx], self.down_scales[expert_idx],
-                            gate_bias=self.gate_biases[expert_idx] if self.gate_biases is not None else None,
-                            up_bias=self.up_biases[expert_idx] if self.up_biases is not None else None,
-                            down_bias=self.down_biases[expert_idx] if self.down_biases is not None else None,
-                        )
-                    else:
-                        expert_output = mxfp4_expert_forward_single(
-                            expert_input,
-                            self.gate_weights[expert_idx], self.gate_scales[expert_idx],
-                            self.up_weights[expert_idx], self.up_scales[expert_idx],
-                            self.down_weights[expert_idx], self.down_scales[expert_idx],
-                            self.gate_biases[expert_idx] if self.gate_biases is not None else None,
-                            self.up_biases[expert_idx] if self.up_biases is not None else None,
-                            self.down_biases[expert_idx] if self.down_biases is not None else None,
-                            swiglu_alpha=self.swiglu_alpha,
-                            swiglu_limit=self.swiglu_limit,
-                        )
-
-                    # Get routing weight for this expert
-                    expert_weight = torch.where(
-                        topk_indices[expert_mask] == expert_idx,
-                        topk_weights[expert_mask],
-                        torch.zeros_like(topk_weights[expert_mask])
-                    ).sum(dim=-1)
-
-                    output[expert_mask] += expert_output * expert_weight.unsqueeze(-1)
-
-        if timing_enabled:
-            torch.cuda.synchronize()
-            DecodeLayerTiming.record_moe_component("gemm", (time.perf_counter() - gemm_start) * 1000)
-
-        return output.view(batch_size, seq_len, hidden_dim)
-
-
-# ============================================================================
-# EP-Enabled MoE Layer (Expert Parallelism with AllGather/AllReduce)
-# ============================================================================
-
-class GptOssMoE_EP(nn.Module):
-    """EP-enabled MoE for GPT-OSS-120B with MXFP4 quantization.
-
-    Distributes 128 experts across multiple ranks using Expert Parallelism:
-    - Each rank owns 128 // world_size experts
-    - Communication: AllGather tokens → Route globally → Process local experts → AllReduce
-
-    Based on DeepSeek's DeepseekV3MoE_Decoding_FP8 pattern (modeling_deepseek_v3.py:1757-2066).
-    """
-
-    def __init__(self, config: GptOssConfig, comm=None):
-        super().__init__()
-        self.config = config
-        self.num_experts_per_tok = config.num_experts_per_tok  # 4
-        self.hidden_size = config.hidden_size
+        # EP configuration
+        self.ep_enabled = ep_enabled
         self.comm = comm
 
-        # Import distributed after checking availability
-        import torch.distributed as dist
-
-        # Distributed metadata
-        if not dist.is_initialized():
-            self.rank, self.world_size = 0, 1
+        if ep_enabled:
+            import torch.distributed as dist
+            if not dist.is_initialized():
+                self.rank, self.world_size = 0, 1
+            else:
+                self.rank = dist.get_rank()
+                self.world_size = dist.get_world_size()
         else:
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
+            self.rank, self.world_size = 0, 1
 
-        self.experts_per_rank = 128 // self.world_size
-        self.total_experts = 128
-        self.routed_expert_start_idx = self.rank * self.experts_per_rank
-        self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
+        # Expert topology (set by Parallel_Strategy_Manager)
+        self.total_experts = config.num_local_experts  # 128
+        self.expert_start = 0  # first local expert global index
+        self.num_local_experts = config.num_local_experts  # experts on this rank
 
-        # Router (replicated across all ranks - routes to all 128 experts)
-        self.router = nn.Linear(config.hidden_size, 128, bias=True)
+        # Persistent / non-persistent expert indices (set by PSM)
+        self.persistent_expert_indices = []   # global indices, weights in VRAM
+        self.non_persistent_expert_indices = []  # global indices, loaded on-demand
 
-        # Experts placeholder - only local experts will be non-None
-        # Populated by Parallel_Strategy_Manager._swap_to_ep_moe()
-        self.experts = nn.ModuleList([None] * 128)
+        # Weight format: "mxfp4" or "bf16"
+        self.weight_format = "mxfp4"
 
-        # Communication setup
-        self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
-        self.num_tokens_per_rank = None
+        # Router
+        self.router = nn.Linear(config.hidden_size, self.total_experts, bias=True)
 
-        # EP offloading flag (set by Parallel_Strategy_Manager)
-        self.enable_ep_offloading = False
+        # Expert wrappers for non-persistent experts (single-expert forward)
+        self.experts = nn.ModuleList([None] * self.total_experts)
 
-        # SwiGLU parameters
-        self.swiglu_alpha = getattr(config, 'swiglu_alpha', 1.702)
-        self.swiglu_limit = getattr(config, 'swiglu_limit', 7.0)
-
-        # Grouped WGMMA pointer arrays (set by Parallel_Strategy_Manager)
+        # ---- MXFP4 grouped kernel pointer arrays (persistent experts) ----
         self.gate_ptrs = None
         self.gate_scale_ptrs = None
         self.up_ptrs = None
         self.up_scale_ptrs = None
         self.down_ptrs = None
         self.down_scale_ptrs = None
+        self.gate_bias_ptrs = None
+        self.up_bias_ptrs = None
+        self.down_bias_ptrs = None
+        # Reference tensors for stride computation
         self.gate_weight_ref = None
         self.gate_scale_ref = None
         self.down_weight_ref = None
         self.down_scale_ref = None
-        self._use_grouped_wgmma = False
+
+        # ---- MXFP4 per-expert weight lists (non-persistent experts) ----
+        self.gate_weights = None  # List[Tensor] indexed by global expert idx
+        self.gate_scales = None
+        self.up_weights = None
+        self.up_scales = None
+        self.down_weights = None
+        self.down_scales = None
+        self.gate_biases = None
+        self.up_biases = None
+        self.down_biases = None
+
+        # ---- BF16 grouped kernel pointer arrays (placeholder) ----
+        # TODO: Set up when grouped BF16 kernel is ported
+        self.bf16_gate_ptrs = None
+        self.bf16_up_ptrs = None
+        self.bf16_down_ptrs = None
+
+        # ---- EP buffers (allocated lazily via init_num_tokens) ----
+        self.num_tokens_per_rank = None
+        self.device = torch.device("cuda", self.rank % torch.cuda.device_count()) if ep_enabled else None
 
     def init_num_tokens(self, num_tokens_per_rank: int):
-        """Initialize communication buffers for given batch size.
+        """Initialize EP communication buffers. Only needed when ep_enabled=True."""
+        if not self.ep_enabled:
+            return
 
-        Pre-allocates all buffers to avoid per-forward allocation overhead.
-        """
         self.num_tokens_per_rank = num_tokens_per_rank
         global_num_tokens = num_tokens_per_rank * self.world_size
         K = self.num_experts_per_tok
-        hidden_size = self.config.hidden_size
+        hidden_size = self.hidden_size
 
-        # Pre-allocate index tensors (following DeepSeek pattern)
         self.token_idx_buffer = torch.arange(
             global_num_tokens, dtype=torch.int64, device=self.device
         ).repeat_interleave(K)
@@ -1102,7 +810,6 @@ class GptOssMoE_EP(nn.Module):
             K, dtype=torch.int64, device=self.device
         ).repeat(global_num_tokens)
 
-        # Pre-allocate communication buffers
         self.all_tokens_buffer = torch.zeros(
             (global_num_tokens, hidden_size), device=self.device, dtype=torch.bfloat16
         )
@@ -1113,169 +820,117 @@ class GptOssMoE_EP(nn.Module):
             (global_num_tokens, hidden_size), device=self.device, dtype=torch.bfloat16
         )
 
-        # Pre-allocate expert counts buffer
-        self.expert_counts_buffer = torch.zeros(128, dtype=torch.int32, device=self.device)
-
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
-        """Update num_tokens_per_rank for dynamic batch size.
-
-        Reallocates buffers only when size changes.
-        """
+        """Update num_tokens_per_rank for dynamic batch size."""
         if num_tokens_per_rank == self.num_tokens_per_rank:
-            return  # No reallocation needed
-
-        # Reallocate all buffers with new size
+            return
         self.init_num_tokens(num_tokens_per_rank)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass with EP communication."""
         orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        if len(orig_shape) == 3:
+            hidden_states = hidden_states.view(-1, orig_shape[-1])
 
-        # Use loop-based execution (simpler, works with MXFP4 wrappers)
-        out = self.moe_infer_loop_with_offloading(hidden_states)
+        if self.ep_enabled:
+            out = self._forward_ep(hidden_states)
+        else:
+            out = self._forward_local(hidden_states)
 
         return out.view(*orig_shape)
 
+    def _forward_local(self, hidden_flat: torch.Tensor) -> torch.Tensor:
+        """Single-GPU forward: route → grouped persistent → single non-persistent."""
+        # Route
+        router_logits = self.router(hidden_flat)
+        if _HAS_CUDA_ROUTING:
+            topk_indices, topk_weights = gate_topk_softmax_cuda(
+                router_logits, k=self.num_experts_per_tok
+            )
+        else:
+            topk_weights, topk_indices = torch.topk(router_logits, k=self.num_experts_per_tok, dim=-1)
+            topk_weights = F.softmax(topk_weights, dim=-1)
+
+        output = torch.zeros_like(hidden_flat)
+
+        # Phase 1: Grouped kernel for persistent experts
+        num_persistent = len(self.persistent_expert_indices)
+        if num_persistent > 0:
+            output = self._grouped_forward(
+                hidden_flat, topk_indices, topk_weights,
+                expert_start=self.expert_start,
+                num_local_experts=num_persistent,
+            )
+
+        # Phase 2: Single-expert kernel for non-persistent experts
+        if self.non_persistent_expert_indices:
+            self._single_expert_forward(
+                hidden_flat, topk_indices, topk_weights, output,
+            )
+
+        return output
+
     @torch.inference_mode()
-    def moe_infer_loop_with_offloading(self, x: torch.Tensor) -> torch.Tensor:
-        """Loop-based expert execution with AllGather/AllReduce.
-
-        Following DeepSeek's moe_infer_loop_with_offloading (lines 1933-2066):
-        1. AllGather tokens from all ranks
-        2. Route globally (router logits for all 128 experts)
-        3. Loop through local experts, process tokens
-        4. AllReduce to combine results
-        5. Extract local rank's results
-
-        Args:
-            x: Input tensor [num_tokens, hidden_size]
-
-        Returns:
-            Output tensor [num_tokens, hidden_size]
-        """
+    def _forward_ep(self, x: torch.Tensor) -> torch.Tensor:
+        """EP forward: AllGather → route → grouped persistent → single non-persistent → AllReduce."""
         import torch.distributed as dist
 
-        num_tokens, hidden_size = x.shape
-        device = x.device
+        num_tokens = x.shape[0]
 
-        # Safety check
         if self.num_tokens_per_rank is None:
             raise RuntimeError("num_tokens_per_rank not set. Call init_num_tokens() first.")
-
         if num_tokens > self.num_tokens_per_rank:
             raise RuntimeError(
                 f"MoE buffer overflow: num_tokens={num_tokens} > num_tokens_per_rank={self.num_tokens_per_rank}"
             )
 
-        # ---- 1) AllGather: Collect tokens from all ranks ----
-        # Reuse pre-allocated buffers (avoid per-forward allocation)
+        # 1) AllGather
         all_tokens = self.all_tokens_buffer
         all_tokens.zero_()
-
-        # Pad local tokens to num_tokens_per_rank
-        padded_hidden_states = self.padded_hidden_buffer
-        padded_hidden_states.zero_()
+        padded = self.padded_hidden_buffer
+        padded.zero_()
         if num_tokens > 0:
-            padded_hidden_states[:num_tokens] = x
+            padded[:num_tokens] = x
 
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
-                all_tokens,
-                padded_hidden_states,
+                all_tokens, padded,
                 stream=torch.cuda.default_stream(self.device)
             )
 
-        # ---- 2) Router: Compute routing for ALL global tokens ----
-        router_logits = self.router(all_tokens)  # [global_tokens, 128]
+        # 2) Route
+        router_logits = self.router(all_tokens)
         if _HAS_CUDA_ROUTING:
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
-
         else:
             topk_weights, topk_indices = torch.topk(
                 router_logits, k=self.num_experts_per_tok, dim=-1
             )
             topk_weights = F.softmax(topk_weights, dim=-1)
 
-        # ---- 3) Process local experts ----
-        num_global_tokens = all_tokens.shape[0]
-        K = self.num_experts_per_tok
-
-        # Use pre-allocated output buffer (BF16 to avoid dtype conversion in loop)
+        # 3) Process local experts
         global_results = self.global_results_buffer
         global_results.zero_()
+        num_global_tokens = all_tokens.shape[0]
 
-        if self._use_grouped_wgmma and _HAS_CUDA_ROUTING:
-            # Grouped WGMMA: 4 kernel launches for all local experts
-            global_results[:num_global_tokens] = fused_mxfp4_grouped_moe_forward_cuda_routing(
+        # Phase 1: Grouped kernel for persistent experts
+        num_persistent = len(self.persistent_expert_indices)
+        if num_persistent > 0:
+            global_results[:num_global_tokens] = self._grouped_forward(
                 all_tokens, topk_indices, topk_weights,
-                self.gate_ptrs, self.gate_scale_ptrs,
-                self.up_ptrs, self.up_scale_ptrs,
-                self.down_ptrs, self.down_scale_ptrs,
-                self.gate_weight_ref, self.gate_scale_ref,
-                self.down_weight_ref, self.down_scale_ref,
-                num_experts=self.total_experts,
-                expert_start=self.routed_expert_start_idx,
-                num_local_experts=self.experts_per_rank,
-                gate_bias_ptrs=getattr(self, 'gate_bias_ptrs', None),
-                up_bias_ptrs=getattr(self, 'up_bias_ptrs', None),
-                down_bias_ptrs=getattr(self, 'down_bias_ptrs', None),
+                expert_start=self.expert_start,
+                num_local_experts=num_persistent,
             )
-        else:
-            # Per-expert loop fallback
-            # Flat view of expert assignments
-            flat_expert_idx = topk_indices.view(-1)  # [global_tokens * K]
 
-            # Use pre-allocated index tensors
-            token_indices = self.token_idx_buffer
-            topk_positions = self.topk_pos_buffer
-
-            # Pre-compute expert token counts ONCE to avoid per-expert .any() sync
-            # This reduces GPU→CPU syncs from 32 per layer to 1 per layer
-            expert_counts = self.expert_counts_buffer
-            expert_counts.zero_()
-            expert_counts.scatter_add_(
-                0, flat_expert_idx.to(torch.int64),
-                torch.ones_like(flat_expert_idx, dtype=torch.int32)
+        # Phase 2: Single-expert kernel for non-persistent experts
+        if self.non_persistent_expert_indices:
+            self._single_expert_forward(
+                all_tokens, topk_indices, topk_weights,
+                global_results[:num_global_tokens],
             )
-            # Single CPU transfer for all counts
-            expert_counts_cpu = expert_counts.cpu()
 
-            # Loop through local experts only
-            for local_e in range(self.experts_per_rank):
-                global_e = self.routed_expert_start_idx + local_e
-
-                # Check token count without GPU sync (already on CPU)
-                if expert_counts_cpu[global_e].item() == 0:
-                    continue
-
-                # Find tokens routed to this expert
-                mask = flat_expert_idx == global_e
-
-                # Get token indices and topk positions for this expert
-                expert_token_idx = token_indices[mask]
-                expert_topk_pos = topk_positions[mask]
-
-                # Gather tokens for this expert
-                tokens_for_expert = all_tokens[expert_token_idx]
-
-                # Call expert forward (wrapper handles MXFP4 dequant)
-                expert = self.experts[global_e]
-                if expert is None:
-                    continue  # Expert not loaded on this rank (shouldn't happen)
-
-                expert_output = expert(tokens_for_expert)
-
-                # Get weights for these tokens at these topk positions
-                expert_weights = topk_weights[expert_token_idx, expert_topk_pos]
-
-                # Weighted accumulation into results
-                weighted_output = (expert_output * expert_weights.unsqueeze(-1)).to(global_results.dtype)
-                global_results.index_add_(0, expert_token_idx, weighted_output)
-
-        # ---- 4) AllReduce: Combine results from all ranks ----
+        # 4) AllReduce
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 global_results,
@@ -1283,11 +938,93 @@ class GptOssMoE_EP(nn.Module):
                 stream=torch.cuda.default_stream(self.device)
             )
 
-        # ---- 5) Extract results for local tokens ----
-        start_token_idx = self.rank * self.num_tokens_per_rank
-        end_token_idx = start_token_idx + num_tokens
+        # 5) Extract local rank slice
+        start = self.rank * self.num_tokens_per_rank
+        return global_results[start:start + num_tokens].to(x.dtype)
 
-        return global_results[start_token_idx:end_token_idx].to(x.dtype)
+    def _grouped_forward(
+        self,
+        hidden_flat: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        expert_start: int,
+        num_local_experts: int,
+    ) -> torch.Tensor:
+        """Grouped kernel for persistent experts."""
+        if self.weight_format == "mxfp4":
+            if not (_HAS_WGMMA_GROUPED and _HAS_CUDA_ROUTING):
+                raise RuntimeError(
+                    "Grouped WGMMA MXFP4 kernel not available. "
+                    "Requires SM90 (Hopper) and CUDA routing."
+                )
+            return fused_mxfp4_grouped_moe_forward_cuda_routing(
+                hidden_flat, topk_indices, topk_weights,
+                self.gate_ptrs, self.gate_scale_ptrs,
+                self.up_ptrs, self.up_scale_ptrs,
+                self.down_ptrs, self.down_scale_ptrs,
+                self.gate_weight_ref, self.gate_scale_ref,
+                self.down_weight_ref, self.down_scale_ref,
+                num_experts=self.total_experts,
+                expert_start=expert_start,
+                num_local_experts=num_local_experts,
+                gate_bias_ptrs=self.gate_bias_ptrs,
+                up_bias_ptrs=self.up_bias_ptrs,
+                down_bias_ptrs=self.down_bias_ptrs,
+            )
+        elif self.weight_format == "bf16":
+            # Placeholder: grouped BF16 kernel to be ported from
+            # batchgen_kernels/moe/gptoss/grouped_bf16_moe_wgmma.py
+            raise NotImplementedError(
+                "Grouped BF16 MoE kernel not yet ported. "
+                "See batchgen_kernels/moe/gptoss/grouped_bf16_moe_wgmma.py"
+            )
+        else:
+            raise ValueError(f"Unknown weight_format: {self.weight_format}")
+
+    def _single_expert_forward(
+        self,
+        hidden_flat: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Process non-persistent experts one by one, accumulating into output."""
+        for expert_idx in self.non_persistent_expert_indices:
+            expert_mask = (topk_indices == expert_idx).any(dim=-1)
+            if not expert_mask.any():
+                continue
+
+            expert_input = hidden_flat[expert_mask]
+
+            if self.weight_format == "mxfp4":
+                if _HAS_WGMMA_SINGLE:
+                    expert_output = fused_mxfp4_expert_forward(
+                        expert_input,
+                        self.gate_weights[expert_idx], self.gate_scales[expert_idx],
+                        self.up_weights[expert_idx], self.up_scales[expert_idx],
+                        self.down_weights[expert_idx], self.down_scales[expert_idx],
+                        gate_bias=self.gate_biases[expert_idx] if self.gate_biases is not None else None,
+                        up_bias=self.up_biases[expert_idx] if self.up_biases is not None else None,
+                        down_bias=self.down_biases[expert_idx] if self.down_biases is not None else None,
+                    )
+                else:
+                    expert = self.experts[expert_idx]
+                    expert_output = expert(expert_input)
+            elif self.weight_format == "bf16":
+                # BF16 single expert: use wrapper forward (torch.mm path)
+                expert = self.experts[expert_idx]
+                expert_output = expert(expert_input)
+            else:
+                raise ValueError(f"Unknown weight_format: {self.weight_format}")
+
+            # Weighted accumulation
+            expert_weight = torch.where(
+                topk_indices[expert_mask] == expert_idx,
+                topk_weights[expert_mask],
+                torch.zeros_like(topk_weights[expert_mask])
+            ).sum(dim=-1)
+
+            output[expert_mask] += expert_output * expert_weight.unsqueeze(-1)
 
 
 # ============================================================================
