@@ -15,7 +15,6 @@ import logging
 import os
 import re
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -408,15 +407,6 @@ if __name__ == "__main__":
         temperature=args.temperature,
         top_p=args.top_p,
     )
-
-    # Save raw batch results to JSONL for post-analysis
-    results_dir = Path("./gpt-oss-120b-bench")
-    results_dir.mkdir(parents=True, exist_ok=True)
-    results_file = results_dir / f"batch_results_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
-    with results_file.open("w", encoding="utf-8") as f:
-        for r in results:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    logger.info(f"Batch results saved to {results_file}")
 
     # Sort results by custom_id to match original order
     results.sort(key=lambda x: int(x.get("custom_id", "mmlu-0").split("-")[1]))

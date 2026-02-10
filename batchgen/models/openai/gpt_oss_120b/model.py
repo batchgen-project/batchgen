@@ -242,18 +242,9 @@ def swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.T
 # RMSNorm
 # ============================================================================
 
-try:
-    from mgn_kernel import fused_rmsnorm as _fused_rmsnorm
-    _HAS_FUSED_RMSNORM = True
-except ImportError:
-    _HAS_FUSED_RMSNORM = False
-
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization.
-
-    Uses mgn_kernel fused CUDA kernel when available, falls back to PyTorch.
-    """
+    """Root Mean Square Layer Normalization."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         super().__init__()
@@ -261,8 +252,6 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _HAS_FUSED_RMSNORM:
-            return _fused_rmsnorm(x, self.weight, self.eps)
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -1094,7 +1083,6 @@ class GptOssMoE_EP(nn.Module):
         self.down_weight_ref = None
         self.down_scale_ref = None
         self._use_grouped_wgmma = False
-        self._grouped_logged = False
 
     def init_num_tokens(self, num_tokens_per_rank: int):
         """Initialize communication buffers for given batch size.
@@ -1221,14 +1209,6 @@ class GptOssMoE_EP(nn.Module):
 
         if self._use_grouped_wgmma and _HAS_CUDA_ROUTING:
             # Grouped WGMMA: 4 kernel launches for all local experts
-            if not self._grouped_logged:
-                logging.info(
-                    f"[WGMMA grouped] EP rank {self.rank}: using grouped path "
-                    f"(experts [{self.routed_expert_start_idx}, "
-                    f"{self.routed_expert_start_idx + self.experts_per_rank}), 4 launches)"
-                )
-                self._grouped_logged = True
-
             global_results[:num_global_tokens] = fused_mxfp4_grouped_moe_forward_cuda_routing(
                 all_tokens, topk_indices, topk_weights,
                 self.gate_ptrs, self.gate_scale_ptrs,
