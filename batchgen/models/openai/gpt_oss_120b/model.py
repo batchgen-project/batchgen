@@ -243,8 +243,18 @@ def swiglu(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.T
 # RMSNorm
 # ============================================================================
 
+try:
+    from mgn_kernel import fused_rmsnorm as _fused_rmsnorm
+    _HAS_FUSED_RMSNORM = True
+except ImportError:
+    _HAS_FUSED_RMSNORM = False
+
+
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization.
+
+    Uses mgn_kernel fused CUDA kernel when available, falls back to PyTorch.
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         super().__init__()
@@ -252,6 +262,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_FUSED_RMSNORM:
+            return _fused_rmsnorm(x, self.weight, self.eps)
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
