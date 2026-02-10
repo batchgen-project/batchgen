@@ -591,13 +591,9 @@ class GptOssExpert(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.swiglu_limit = config.swiglu_limit
 
-        # Use meta device: these parameters are placeholders for named_parameters()
-        # enumeration only. Actual weights are MXFP4 packed tensors loaded separately.
-        # This avoids ~459 GB of useless CPU allocation + kaiming init for 4608 experts.
-        with torch.device('meta'):
-            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
-            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
-            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with OpenAI's SwiGLU activation."""
@@ -618,6 +614,16 @@ class GptOssExpert(nn.Module):
 # MoE Layer (Mixture of Experts)
 # ============================================================================
 
+class _ExpertPlaceholder:
+    """Lightweight placeholder for expert slots in GptOssMoE.experts.
+
+    Avoids creating 4608 nn.Module objects during model init. Supports arbitrary
+    attribute setting (used by _load_expert_module to attach mxfp4_* tensors).
+    Replaced by GptOssExpertWrapper during _config_expert_module().
+    """
+    pass
+
+
 class GptOssMoE(nn.Module):
     """Mixture of Experts layer with Top-4 routing.
 
@@ -633,8 +639,10 @@ class GptOssMoE(nn.Module):
         # Router (OpenAI's gate uses bias=True)
         self.router = nn.Linear(config.hidden_size, self.num_experts, bias=True)
 
-        # Experts
-        self.experts = nn.ModuleList([GptOssExpert(config) for _ in range(self.num_experts)])
+        # Experts — use plain list of lightweight placeholders instead of nn.ModuleList
+        # to avoid creating 4608 nn.Module objects (128 experts × 36 layers).
+        # These are replaced by GptOssExpertWrapper during _config_expert_module().
+        self.experts = [_ExpertPlaceholder() for _ in range(self.num_experts)]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass with Top-K expert routing."""

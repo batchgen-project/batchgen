@@ -132,24 +132,27 @@ class GptOssParallelStrategyManager:
                 }
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
 
-            # Routed experts (MXFP4 quantized)
+            # Routed experts (MXFP4 quantized) — use known param names directly
+            # instead of named_parameters() to avoid iterating nn.Module objects
+            _expert_param_names = [
+                "gate_proj.weight", "gate_proj.bias",
+                "up_proj.weight", "up_proj.bias",
+                "down_proj.weight", "down_proj.bias",
+            ]
             for expert_idx in range(self.model_config.num_local_experts):
-                for name, _ in (
-                    self.model.model.layers[layer_idx].mlp.experts[expert_idx].named_parameters()
-                ):
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+                for name in _expert_param_names:
                     tensor_full_name = (
                         f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
                     )
                     self.state_dict_name_map[tensor_full_name] = {
-                        "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
+                        "module_key": module_key,
                         "tensor_key": name,
                     }
                 # Only add to weight_copy_task if offloading is enabled
                 # When not offloading, experts are persistent (MXFP4 stored on GPU)
                 if experts_need_offloading:
-                    self.weight_copy_task["routed_expert"].append(
-                        f"routed_expert_{layer_idx}_{expert_idx}"
-                    )
+                    self.weight_copy_task["routed_expert"].append(module_key)
 
         timings["mapping_build"] = time.perf_counter() - step_start
 
@@ -921,16 +924,20 @@ class GptOssParallelStrategyManager:
                 }
             # Note: attn NOT added to weight_copy_task -> persistent=True
 
-            # Routed experts (MXFP4 quantized)
+            # Routed experts (MXFP4 quantized) — use known param names directly
+            _expert_param_names = [
+                "gate_proj.weight", "gate_proj.bias",
+                "up_proj.weight", "up_proj.bias",
+                "down_proj.weight", "down_proj.bias",
+            ]
             for expert_idx in range(self.model_config.num_local_experts):
-                for name, _ in (
-                    self.model.model.layers[layer_idx].mlp.experts[expert_idx].named_parameters()
-                ):
+                module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+                for name in _expert_param_names:
                     tensor_full_name = (
                         f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
                     )
                     self.state_dict_name_map[tensor_full_name] = {
-                        "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
+                        "module_key": module_key,
                         "tensor_key": name,
                     }
 
