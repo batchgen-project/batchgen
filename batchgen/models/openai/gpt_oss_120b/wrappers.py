@@ -1016,6 +1016,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         self.head_dim = model_config.head_dim  # 64
         self.num_groups = self.num_heads // self.num_kv_heads  # 8
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.q_size = self.num_heads * self.head_dim        # 4096
+        self.kv_size = self.num_kv_heads * self.head_dim    # 512
 
         # Determine if this layer uses sliding window
         # GPT-OSS uses alternating: even layers = sliding, odd = full
@@ -1137,9 +1139,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         batch, seq_len, _ = hidden_states.shape
 
         # Project Q, K, V using module's projections
-        query = self.module.q_proj(hidden_states)
-        key = self.module.k_proj(hidden_states)
-        value = self.module.v_proj(hidden_states)
+        qkv = self.module.qkv_proj(hidden_states)
+        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape for attention: [batch, seq, heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1249,9 +1250,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         if do_timing:
             t0 = time.perf_counter()
 
-        query = self.module.q_proj(hidden_states)
-        key = self.module.k_proj(hidden_states)
-        value = self.module.v_proj(hidden_states)
+        qkv = self.module.qkv_proj(hidden_states)
+        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape: [batch, 1, num_heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1473,9 +1473,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         assert seq_len == 1, "Decode expects single token"
 
         # Project Q, K, V
-        query = self.module.q_proj(hidden_states)
-        key = self.module.k_proj(hidden_states)
-        value = self.module.v_proj(hidden_states)
+        qkv = self.module.qkv_proj(hidden_states)
+        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1643,9 +1642,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Project Q, K, V in varlen format
         # hidden_states_2d: [total_tokens, hidden_size]
-        query = self.module.q_proj(hidden_states_2d)  # [total_tokens, num_heads * head_dim]
-        key = self.module.k_proj(hidden_states_2d)    # [total_tokens, num_kv_heads * head_dim]
-        value = self.module.v_proj(hidden_states_2d)  # [total_tokens, num_kv_heads * head_dim]
+        qkv = self.module.qkv_proj(hidden_states_2d)  # [total_tokens, q_size + 2 * kv_size]
+        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape to [total_tokens, num_heads, head_dim]
         query = query.view(total_tokens, self.num_heads, self.head_dim)

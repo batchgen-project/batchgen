@@ -275,23 +275,15 @@ class GptOssParallelStrategyManager:
             # Get weights from core_engine
             tensors = self.core_engine.get_tensor(module_key)
 
-            # Load projection weights
-            if "q_proj.weight" in tensors:
-                attn_module.q_proj.weight.data = tensors["q_proj.weight"].to(device)
-            if "k_proj.weight" in tensors:
-                attn_module.k_proj.weight.data = tensors["k_proj.weight"].to(device)
-            if "v_proj.weight" in tensors:
-                attn_module.v_proj.weight.data = tensors["v_proj.weight"].to(device)
+            # Load projection weights (packed QKV + O)
+            if "qkv_proj.weight" in tensors:
+                attn_module.qkv_proj.weight.data = tensors["qkv_proj.weight"].to(device)
             if "o_proj.weight" in tensors:
                 attn_module.o_proj.weight.data = tensors["o_proj.weight"].to(device)
 
             # Load biases if present
-            if "q_proj.bias" in tensors:
-                attn_module.q_proj.bias.data = tensors["q_proj.bias"].to(device)
-            if "k_proj.bias" in tensors:
-                attn_module.k_proj.bias.data = tensors["k_proj.bias"].to(device)
-            if "v_proj.bias" in tensors:
-                attn_module.v_proj.bias.data = tensors["v_proj.bias"].to(device)
+            if "qkv_proj.bias" in tensors:
+                attn_module.qkv_proj.bias.data = tensors["qkv_proj.bias"].to(device)
             if "o_proj.bias" in tensors:
                 attn_module.o_proj.bias.data = tensors["o_proj.bias"].to(device)
 

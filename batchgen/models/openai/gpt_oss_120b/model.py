@@ -406,20 +406,12 @@ class GptOssAttention(nn.Module):
         # NOTE: Must be zeros (not empty) - uninitialized values corrupt attention
         self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.bfloat16))
 
-        # Projections
-        self.q_proj = nn.Linear(
+        # Projections — packed QKV: single GEMM instead of 3
+        self.q_size = self.num_heads * self.head_dim        # 4096
+        self.kv_size = self.num_kv_heads * self.head_dim    # 512
+        self.qkv_proj = nn.Linear(
             self.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
+            self.q_size + 2 * self.kv_size,  # 5120
             bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
@@ -445,10 +437,11 @@ class GptOssAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project Q, K, V
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Project Q, K, V (packed QKV)
+        qkv = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
 
         # Reshape for attention
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
