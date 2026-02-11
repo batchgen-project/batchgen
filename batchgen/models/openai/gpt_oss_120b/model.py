@@ -1379,15 +1379,16 @@ class GptOssDecoderLayer(nn.Module):
                         sliding_window=self.self_attn.sliding_window,
                     )
 
-                    # --- 3. Post-attn graph: O_proj → residual add ---
-                    residual_for_post = hidden_states[:batch_size] if hidden_states.shape[0] > batch_size else hidden_states
+                    # --- 3. Post-attn graph: O_proj only ---
                     post_out = self.cuda_graph_manager.replay(
                         self._post_attn_segment_name,
                         batch_size,
                         attn_output=attn_output,
-                        residual=residual_for_post,
                     )
-                    hidden_states = post_out["hidden_states"]
+                    # Store O_proj output; residual add + post-layernorm handled
+                    # eagerly via cuda_add_rmsnorm (matching main branch exactly)
+                    attn_residual = hidden_states  # original layer input = residual
+                    hidden_states = post_out["o_proj_output"]
 
                     # Host KV append callback
                     kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
@@ -1427,7 +1428,7 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
         elif attn_residual is not None:
-            # Eager path: fuse residual add + post-attn layernorm (1 kernel)
+            # Both eager and graph paths: fuse residual add + post-attn layernorm (1 kernel)
             from batchgen.attention.fused_kernels import cuda_add_rmsnorm
             hidden_states, residual = cuda_add_rmsnorm(
                 attn_residual, hidden_states,
@@ -1435,7 +1436,7 @@ class GptOssDecoderLayer(nn.Module):
                 self.post_attention_layernorm.eps,
             )
         else:
-            # Graph path: residual already added by segment
+            # Fallback (shouldn't happen in normal flow)
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 

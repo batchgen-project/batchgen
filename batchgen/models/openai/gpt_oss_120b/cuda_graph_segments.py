@@ -120,7 +120,10 @@ class GptOssPreAttnSegment:
 
 
 class GptOssPostAttnSegment:
-    """Capturable segment: O_proj → residual add.
+    """Capturable segment: O_proj only.
+
+    The residual add + post-attention layernorm is handled eagerly via
+    cuda_add_rmsnorm to match the main branch's fused kernel exactly.
 
     Args:
         attn_wrapper: The GptOssAttnWrapper for this layer.
@@ -137,14 +140,11 @@ class GptOssPostAttnSegment:
             "attn_output": TensorSpec(
                 ("batch_size", 1, self.num_heads, self.head_dim), torch.bfloat16
             ),
-            "residual": TensorSpec(
-                ("batch_size", 1, self.hidden_size), torch.bfloat16
-            ),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
-            "hidden_states": TensorSpec(
+            "o_proj_output": TensorSpec(
                 ("batch_size", 1, self.hidden_size), torch.bfloat16
             ),
         }
@@ -152,19 +152,16 @@ class GptOssPostAttnSegment:
     def forward(
         self,
         attn_output: torch.Tensor,
-        residual: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """O_proj → residual add.
+        """O_proj only.
 
         Args:
             attn_output: [bucket_size, 1, num_heads, head_dim]
-            residual: [bucket_size, 1, hidden_size]
 
         Returns:
-            hidden_states: [bucket_size, 1, hidden_size]
+            o_proj_output: [bucket_size, 1, hidden_size]
         """
         batch = attn_output.shape[0]
         attn_output = attn_output.view(batch, 1, self.num_heads * self.head_dim)
-        attn_output = self.attn_module.o_proj(attn_output)
-        hidden_states = residual + attn_output
-        return {"hidden_states": hidden_states}
+        o_proj_output = self.attn_module.o_proj(attn_output)
+        return {"o_proj_output": o_proj_output}
