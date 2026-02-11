@@ -324,8 +324,24 @@ class CUDAGraphManager:
                     f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
                 )
 
-        # Replay the graph
+        # Synchronize streams: input copies ran on the current (default) stream,
+        # but graph.replay() runs on the capture stream. We must ensure:
+        # 1. Capture stream waits for input copies to finish
+        # 2. Current stream waits for graph replay to finish (so caller's
+        #    subsequent ops like KV write see the correct output)
+        current_stream = torch.cuda.current_stream(self.device)
+        capture_stream = captured.capture_stream
+
+        # Current stream → capture stream: wait for input copies
+        event_inputs_done = current_stream.record_event()
+        capture_stream.wait_event(event_inputs_done)
+
+        # Replay the graph (runs on capture stream)
         captured.graph.replay()
+
+        # Capture stream → current stream: wait for replay to finish
+        event_replay_done = capture_stream.record_event()
+        current_stream.wait_event(event_replay_done)
 
         # Return unpadded outputs
         result = {}
