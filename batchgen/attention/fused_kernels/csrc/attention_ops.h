@@ -23,3 +23,18 @@ std::vector<torch::Tensor> rope_forward(
     torch::Tensor cos,      // [B, S, head_dim]
     torch::Tensor sin,      // [B, S, head_dim]
     int half_dim);
+
+// QKV Split (allocating): returns new (q, k, v) tensors
+std::vector<torch::Tensor> qkv_split_forward(
+    torch::Tensor qkv,
+    int q_size,
+    int kv_size);
+
+// QKV Split (in-place): writes to pre-allocated output tensors
+void qkv_split_inplace(
+    torch::Tensor qkv,
+    torch::Tensor q_out,
+    torch::Tensor k_out,
+    torch::Tensor v_out,
+    int q_size,
+    int kv_size);

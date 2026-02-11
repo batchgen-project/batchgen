@@ -1140,10 +1140,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Project Q, K, V using module's projections
         qkv = self.module.qkv_proj(hidden_states)
-        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape for attention: [batch, seq, heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1254,10 +1252,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
             t0 = time.perf_counter()
 
         qkv = self.module.qkv_proj(hidden_states)
-        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape: [batch, 1, num_heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1480,10 +1476,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Project Q, K, V
         qkv = self.module.qkv_proj(hidden_states)
-        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1652,10 +1646,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # Project Q, K, V in varlen format
         # hidden_states_2d: [total_tokens, hidden_size]
         qkv = self.module.qkv_proj(hidden_states_2d)  # [total_tokens, q_size + 2 * kv_size]
-        query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape to [total_tokens, num_heads, head_dim]
         query = query.view(total_tokens, self.num_heads, self.head_dim)

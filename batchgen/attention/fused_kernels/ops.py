@@ -1,5 +1,5 @@
 """
-Fused CUDA attention kernels: RMSNorm, Add+RMSNorm, RoPE.
+Fused CUDA attention kernels: RMSNorm, Add+RMSNorm, RoPE, QKV Split.
 
 Compiled via torch.utils.cpp_extension.load() at import time.
 """
@@ -16,6 +16,7 @@ _ext = load(
         str(_csrc_dir / "attention_extension.cc"),
         str(_csrc_dir / "rmsnorm.cu"),
         str(_csrc_dir / "rope.cu"),
+        str(_csrc_dir / "qkv_split.cu"),
     ],
     extra_cuda_cflags=[
         "-O3",
@@ -65,3 +66,25 @@ def cuda_rope(
 
     results = _ext.rope_forward(query, key, cos, sin, half_dim)
     return results[0], results[1]
+
+
+def cuda_qkv_split(
+    qkv: torch.Tensor,
+    q_size: int,
+    kv_size: int,
+) -> tuple:
+    """QKV split (allocating). Returns (q, k, v)."""
+    results = _ext.qkv_split_forward(qkv, q_size, kv_size)
+    return results[0], results[1], results[2]
+
+
+def cuda_qkv_split_inplace(
+    qkv: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    q_size: int,
+    kv_size: int,
+):
+    """QKV split (zero-alloc). Writes to pre-allocated output tensors."""
+    _ext.qkv_split_inplace(qkv, q_out, k_out, v_out, q_size, kv_size)
