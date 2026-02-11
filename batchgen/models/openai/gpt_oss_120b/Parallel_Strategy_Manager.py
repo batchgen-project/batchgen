@@ -275,6 +275,11 @@ class GptOssParallelStrategyManager:
             # Get weights from core_engine
             tensors = self.core_engine.get_tensor(module_key)
 
+            if layer_idx == 0:
+                logging.info(f"[Layer 0] get_tensor keys: {list(tensors.keys())}")
+                for name, t in tensors.items():
+                    logging.info(f"  {name}: shape={list(t.shape)}, dtype={t.dtype}")
+
             # Load projection weights (packed QKV + O)
             if "qkv_proj.weight" in tensors:
                 attn_module.qkv_proj.weight.data = tensors["qkv_proj.weight"].to(device)
