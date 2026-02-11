@@ -1544,6 +1544,19 @@ class GptOssDecoderLayer(nn.Module):
                 debug_layer, timing_enabled,
             )
 
+        # --- DIAGNOSTIC: layer 0 attention output (after graph or eager attn) ---
+        if (self.layer_idx == 0
+                and not getattr(self, '_l0_attn_out_diag_done', False)
+                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                _attn_hs = hidden_states[0, 0, :20].float().tolist()
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L0] attn_output seq0[:20]: "
+                    f"[{', '.join(f'{v:.6f}' for v in _attn_hs)}]"
+                )
+            self._l0_attn_out_diag_done = True
+
         # ========== MoE BLOCK (always eager) ==========
         if debug_layer and self.layer_idx < 3:
             # Unfused path for debug visibility
