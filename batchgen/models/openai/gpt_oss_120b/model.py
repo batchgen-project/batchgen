@@ -1352,8 +1352,9 @@ class GptOssDecoderLayer(nn.Module):
                     key = pre_out["key"][:batch_size]
                     value = pre_out["value"][:batch_size]
 
-                    # --- DIAGNOSTIC: compare graph vs eager at all layers, first call ---
-                    if (not getattr(self, '_graph_diag_done', False)
+                    # --- DIAGNOSTIC: compare graph vs eager, first 2 decode iterations ---
+                    _diag_count = getattr(self, '_graph_diag_count', 0)
+                    if (_diag_count < 2
                             and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
                         with torch.no_grad():
                             from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
@@ -1369,14 +1370,15 @@ class GptOssDecoderLayer(nn.Module):
                             _sin = _re.sin_cached[_ctp].unsqueeze(1).to(_q.dtype)
                             _q, _k = cuda_rope(_q, _k, _cos, _sin)
                             torch.cuda.synchronize()
+                            _iter_tag = f"iter{_diag_count}"
                             for _nm, _gt, _et in [("query", query, _q), ("key", key, _k), ("value", value, _v)]:
                                 _d = (_gt.float() - _et.float()).abs()
                                 logging.warning(
-                                    f"[CUDA_GRAPH_DIAG L{self.layer_idx}] pre-attn {_nm}: "
+                                    f"[CUDA_GRAPH_DIAG L{self.layer_idx} {_iter_tag}] pre-attn {_nm}: "
                                     f"max_diff={_d.max().item():.6e}, mean_diff={_d.mean().item():.6e}, "
                                     f"graph_norm={_gt.float().norm().item():.4f}, eager_norm={_et.float().norm().item():.4f}"
                                 )
-                        self._graph_diag_done = True
+                        self._graph_diag_count = _diag_count + 1
 
                     # --- 2. Eager middle: KV write + FlashAttention ---
                     gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
