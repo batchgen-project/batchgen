@@ -351,6 +351,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         enable_ep_with_offloading=parsed.enable_ep_with_offloading,
         ep_offloading_ratio=parsed.ep_offloading_ratio,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
+        disable_cuda_graphs=parsed.disable_cuda_graphs,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

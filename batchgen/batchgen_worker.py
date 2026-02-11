@@ -4071,6 +4071,10 @@ class BatchGenWorker:
 				# Only initializes if not already done; subsequent iterations skip
 				self._init_gpu_kv_with_actual_size()
 
+				# ============ STEP B.1: CUDA Graph Warmup (one-time) ============
+				if self._cuda_graph_manager is None:
+					self._warmup_cuda_graphs()
+
 				# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
 				decode_uuids = self._prepare_decode_batch()
 				
@@ -5796,39 +5800,67 @@ class BatchGenWorker:
 		
 		return updated_uuids, updated_batch
 
+	def _warmup_cuda_graphs(self):
+		"""One-time CUDA graph warmup phase with model guard.
+
+		Called from generate() after model and GPU KV manager are ready.
+		Only captures graphs for supported models (currently GPT-OSS-120B).
+		"""
+		if not self.engine_config.Basic_Config.enable_cuda_graphs:
+			return
+
+		# Model guard: only capture for supported models
+		SUPPORTED_MODELS = {"gpt-oss-120b"}
+		model_name = getattr(self, 'model_name', '') or ''
+		if not any(s in model_name.lower() for s in SUPPORTED_MODELS):
+			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
+			return
+
+		gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+		if gpu_manager is None:
+			logging.warning(f"Rank {self.rank}: No GPU KV manager, skipping CUDA graph warmup")
+			return
+
+		logging.info(f"Rank {self.rank}: CUDA graph warmup starting...")
+		self._setup_cuda_graphs(gpu_manager)
+		logging.info(f"Rank {self.rank}: CUDA graph warmup complete")
+
 	def _setup_cuda_graphs(self, gpu_manager):
-		"""One-time CUDA graph capture for decode attention blocks.
+		"""Capture CUDA graphs for decode attention blocks.
 
-		Creates a CUDAGraphManager, registers each decoder layer's attention
-		as a GptOssAttentionSegment, warmup + captures all graphs, then
-		enables graph mode on each decoder layer.
-
-		Must be called after gpu_paged_kv_manager is set.
+		Two segments per layer (pre-attn and post-attn), with KV write +
+		FlashAttention running eagerly between them.
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
-		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import GptOssAttentionSegment
+		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
+			GptOssPreAttnSegment, GptOssPostAttnSegment,
+		)
 
 		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			attn_wrapper = decoder_layer.self_attn  # GptOssAttnWrapper
-			segment = GptOssAttentionSegment(
+			attn_wrapper = decoder_layer.self_attn
+			pre_seg = GptOssPreAttnSegment(
 				attn_wrapper=attn_wrapper,
 				input_layernorm=decoder_layer.input_layernorm,
 				layer_idx=layer_idx,
-				gpu_paged_kv_manager=gpu_manager,
 			)
-			seg_name = f"layer_{layer_idx}_attn"
-			manager.register_segment(seg_name, segment)
+			post_seg = GptOssPostAttnSegment(attn_wrapper=attn_wrapper)
+			manager.register_segment(f"layer_{layer_idx}_pre_attn", pre_seg)
+			manager.register_segment(f"layer_{layer_idx}_post_attn", post_seg)
 
 		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture...")
 		manager.warmup_and_capture_all()
 
 		# Enable graph mode on each decoder layer
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			decoder_layer.enable_cuda_graph(manager, f"layer_{layer_idx}_attn")
+			decoder_layer.enable_cuda_graph(
+				manager,
+				f"layer_{layer_idx}_pre_attn",
+				f"layer_{layer_idx}_post_attn",
+			)
 
 		self._cuda_graph_manager = manager
 		stats = manager.get_capture_stats()
@@ -5882,12 +5914,6 @@ class BatchGenWorker:
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 		AttnWrapperBase.host_paged_kv_worker_view = worker_view
 		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-
-		# One-time CUDA graph capture (after gpu_paged_kv_manager is set)
-		if (self._cuda_graph_manager is None
-				and self.engine_config.Basic_Config.enable_cuda_graphs
-				and gpu_manager is not None):
-			self._setup_cuda_graphs(gpu_manager)
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions

@@ -1273,9 +1273,12 @@ class GptOssDecoderLayer(nn.Module):
     """Single transformer decoder layer.
 
     Supports optional CUDA graph mode for decode phase. When
-    ``cuda_graph_manager`` is set, the attention block (layernorm → QKV →
-    RoPE → KV write → FlashAttn → sink → O_proj → residual) is replayed
-    from a captured graph. The MoE block always runs eagerly.
+    ``cuda_graph_manager`` is set, two segments are replayed from captured
+    graphs with KV write + FlashAttention running eagerly between them:
+      pre_attn graph:  RMSNorm → QKV proj → QKV split → RoPE
+      eager middle:    KV cache write → FlashAttention
+      post_attn graph: O_proj → residual add
+    The MoE block always runs eagerly.
     """
 
     def __init__(self, config: GptOssConfig, layer_idx: int):
@@ -1290,17 +1293,23 @@ class GptOssDecoderLayer(nn.Module):
 
         # CUDA graph support (set externally after model init)
         self.cuda_graph_manager = None
-        self._cuda_graph_segment_name = None
+        self._pre_attn_segment_name = None
+        self._post_attn_segment_name = None
 
-    def enable_cuda_graph(self, manager, segment_name: str):
+    def enable_cuda_graph(self, manager, pre_attn_name: str, post_attn_name: str):
         """Enable CUDA graph mode for the attention block of this layer.
 
+        Two segments per layer: pre-attn (RMSNorm→QKV→RoPE) and post-attn
+        (O_proj→residual). KV write + FlashAttention run eagerly between them.
+
         Args:
-            manager: CUDAGraphManager with the attention segment pre-captured.
-            segment_name: Name of the registered segment (e.g. "layer_0_attn").
+            manager: CUDAGraphManager with both segments pre-captured.
+            pre_attn_name: Name of the pre-attention segment.
+            post_attn_name: Name of the post-attention segment.
         """
         self.cuda_graph_manager = manager
-        self._cuda_graph_segment_name = segment_name
+        self._pre_attn_segment_name = pre_attn_name
+        self._post_attn_segment_name = post_attn_name
 
     def forward(
         self,
@@ -1318,12 +1327,12 @@ class GptOssDecoderLayer(nn.Module):
         DecodeLayerTiming.start_layer(self.layer_idx)
 
         # ========== ATTENTION BLOCK ==========
-        # attn_output: attention output (without residual add for eager path)
         # attn_residual: pre-attention hidden_states (for fused residual add + norm)
-        # For CUDA graph path: segment already does residual add, so attn_residual=None
+        # For CUDA graph path: post_attn segment does residual add, so attn_residual=None
         attn_residual = None
         use_graph = (self.cuda_graph_manager is not None
-                     and self._cuda_graph_segment_name is not None)
+                     and self._pre_attn_segment_name is not None
+                     and self._post_attn_segment_name is not None)
 
         if use_graph:
             batch_size = hidden_states.shape[0]
@@ -1332,24 +1341,59 @@ class GptOssDecoderLayer(nn.Module):
 
             if cache_seqlens is not None and batch_size > 0:
                 try:
-                    outputs = self.cuda_graph_manager.replay(
-                        self._cuda_graph_segment_name,
+                    # --- 1. Pre-attn graph: RMSNorm → QKV → RoPE ---
+                    pre_out = self.cuda_graph_manager.replay(
+                        self._pre_attn_segment_name,
                         batch_size,
                         hidden_states=hidden_states,
-                        residual=hidden_states,
                         cache_seqlens=cache_seqlens[:batch_size],
                     )
-                    # Graph segment includes residual add
-                    hidden_states = outputs["hidden_states"]
+                    query = pre_out["query"][:batch_size]
+                    key = pre_out["key"][:batch_size]
+                    value = pre_out["value"][:batch_size]
 
-                    # Host KV append callback (must happen outside graph)
+                    # --- 2. Eager middle: KV write + FlashAttention ---
+                    gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+                    current_token_position = cache_seqlens[:batch_size] - 1
+
+                    gpu_kv_manager.update_layer_decode_new_token(
+                        k_tensor=key,
+                        v_tensor=value,
+                        sequence_lengths=current_token_position,
+                        layer_idx=self.layer_idx,
+                    )
+
+                    k_cache, v_cache, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
+                        self.layer_idx
+                    )
+
+                    from batchgen.attention.gqa import gqa_decode_fa
+                    attn_output, _ = gqa_decode_fa(
+                        q=query,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        cache_seqlens=cache_seqlens[:batch_size],
+                        block_table=page_table,
+                        sinks=self.self_attn.sinks,
+                        softmax_scale=1.0 / math.sqrt(self.self_attn.head_dim),
+                        sliding_window=self.self_attn.sliding_window,
+                    )
+
+                    # --- 3. Post-attn graph: O_proj → residual add ---
+                    residual_for_post = hidden_states[:batch_size] if hidden_states.shape[0] > batch_size else hidden_states
+                    post_out = self.cuda_graph_manager.replay(
+                        self._post_attn_segment_name,
+                        batch_size,
+                        attn_output=attn_output,
+                        residual=residual_for_post,
+                    )
+                    hidden_states = post_out["hidden_states"]
+
+                    # Host KV append callback
                     kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
                     if kv_append_callback is not None:
-                        kv_append_callback(
-                            self.layer_idx,
-                            outputs["key"][:batch_size],
-                            outputs["value"][:batch_size],
-                        )
+                        kv_append_callback(self.layer_idx, key, value)
+
                 except (ValueError, RuntimeError) as e:
                     logging.warning(
                         f"Layer {self.layer_idx}: CUDA graph replay failed ({e}), "
