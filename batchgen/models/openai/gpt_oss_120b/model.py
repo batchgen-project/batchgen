@@ -1354,44 +1354,23 @@ class GptOssDecoderLayer(nn.Module):
 
             if cache_seqlens is not None and batch_size > 0:
                 try:
-                    # --- 1. Pre-attn graph: RMSNorm → QKV → RoPE ---
+                    # --- 1. Pre-attn graph: RMSNorm → QKV proj → QKV split ---
                     pre_out = self.cuda_graph_manager.replay(
                         self._pre_attn_segment_name,
                         batch_size,
                         hidden_states=hidden_states,
-                        cache_seqlens=cache_seqlens[:batch_size],
                     )
                     query = pre_out["query"][:batch_size]
                     key = pre_out["key"][:batch_size]
                     value = pre_out["value"][:batch_size]
 
-                    # --- DIAGNOSTIC: compare graph vs eager, first 2 decode iterations ---
-                    _diag_count = getattr(self, '_graph_diag_count', 0)
-                    if (_diag_count < 2
-                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-                        with torch.no_grad():
-                            from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
-                            _n = cuda_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
-                            _qkv = self.self_attn.module.qkv_proj(_n)
-                            _q, _k, _v = cuda_qkv_split(_qkv, self.self_attn.q_size, self.self_attn.kv_size)
-                            _q = _q.view(batch_size, 1, self.self_attn.num_heads, self.self_attn.head_dim)
-                            _k = _k.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
-                            _v = _v.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
-                            _ctp = cache_seqlens[:batch_size] - 1
-                            _re = self.self_attn.module.rotary_emb
-                            _cos = _re.cos_cached[_ctp].unsqueeze(1).to(_q.dtype)
-                            _sin = _re.sin_cached[_ctp].unsqueeze(1).to(_q.dtype)
-                            _q, _k = cuda_rope(_q, _k, _cos, _sin)
-                            torch.cuda.synchronize()
-                            _iter_tag = f"iter{_diag_count}"
-                            for _nm, _gt, _et in [("query", query, _q), ("key", key, _k), ("value", value, _v)]:
-                                _d = (_gt.float() - _et.float()).abs()
-                                logging.warning(
-                                    f"[CUDA_GRAPH_DIAG L{self.layer_idx} {_iter_tag}] pre-attn {_nm}: "
-                                    f"max_diff={_d.max().item():.6e}, mean_diff={_d.mean().item():.6e}, "
-                                    f"graph_norm={_gt.float().norm().item():.4f}, eager_norm={_et.float().norm().item():.4f}"
-                                )
-                        self._graph_diag_count = _diag_count + 1
+                    # --- 1b. RoPE (eager, not graph-safe due to dynamic position indexing) ---
+                    from batchgen.attention.fused_kernels import cuda_rope
+                    current_token_position = cache_seqlens[:batch_size] - 1
+                    rotary_emb = self.self_attn.module.rotary_emb
+                    cos_pos = rotary_emb.cos_cached[current_token_position].unsqueeze(1).to(query.dtype)
+                    sin_pos = rotary_emb.sin_cached[current_token_position].unsqueeze(1).to(query.dtype)
+                    query, key = cuda_rope(query, key, cos_pos, sin_pos)
 
                     # --- 2. Eager middle: KV write + FlashAttention ---
                     gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager

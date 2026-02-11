@@ -3,9 +3,9 @@
 Two segments per decoder layer, with KV write + FlashAttention running eagerly
 between them:
 
-  Pre-attn segment (graph):  input_layernorm → packed QKV proj → QKV split → RoPE
-  Eager middle:              KV cache write → FlashAttention
-  Post-attn segment (graph): O_proj → residual_add
+  Pre-attn segment (graph):  input_layernorm → packed QKV proj → QKV split
+  Eager middle:              RoPE → KV cache write → FlashAttention
+  Post-attn segment (graph): O_proj
 
 FlashAttention with paged KV cache is excluded from graphs because:
 - Dynamic workspace allocation based on max(cache_seqlens)
@@ -22,13 +22,16 @@ import torch
 import torch.nn as nn
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
-from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
+from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split
 
 logger = logging.getLogger(__name__)
 
 
 class GptOssPreAttnSegment:
-    """Capturable segment: RMSNorm → QKV proj → QKV split → RoPE.
+    """Capturable segment: RMSNorm → QKV proj → QKV split.
+
+    RoPE is excluded from the graph because it requires dynamic position
+    indexing into cos/sin caches which is not graph-safe.
 
     Args:
         attn_wrapper: The GptOssAttnWrapper for this layer.
@@ -53,18 +56,10 @@ class GptOssPreAttnSegment:
         self.q_size = attn_wrapper.q_size                # 4096
         self.kv_size = attn_wrapper.kv_size              # 512
 
-        # Pre-fetch RoPE cos/sin to avoid CPU-GPU sync inside graph
-        rotary_emb = self.attn_module.rotary_emb
-        self._rope_cos = rotary_emb.cos_cached  # [max_pos, head_dim]
-        self._rope_sin = rotary_emb.sin_cached  # [max_pos, head_dim]
-
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.hidden_size), torch.bfloat16
-            ),
-            "cache_seqlens": TensorSpec(
-                ("batch_size",), torch.int32, fill_value=1
             ),
         }
 
@@ -84,13 +79,11 @@ class GptOssPreAttnSegment:
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_seqlens: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """RMSNorm → QKV proj → QKV split → RoPE.
+        """RMSNorm → QKV proj → QKV split.
 
         Args:
             hidden_states: [bucket_size, 1, hidden_size]
-            cache_seqlens: [bucket_size] int32
 
         Returns:
             query: [bucket_size, 1, num_heads, head_dim]
@@ -109,12 +102,6 @@ class GptOssPreAttnSegment:
         query = query.view(batch, 1, self.num_heads, self.head_dim)
         key = key.view(batch, 1, self.num_kv_heads, self.head_dim)
         value = value.view(batch, 1, self.num_kv_heads, self.head_dim)
-
-        # 3. RoPE
-        current_token_position = cache_seqlens - 1
-        cos_pos = self._rope_cos[current_token_position].unsqueeze(1).to(query.dtype)
-        sin_pos = self._rope_sin[current_token_position].unsqueeze(1).to(query.dtype)
-        query, key = cuda_rope(query, key, cos_pos, sin_pos)
 
         return {"query": query, "key": key, "value": value}
 
