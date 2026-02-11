@@ -1352,6 +1352,33 @@ class GptOssDecoderLayer(nn.Module):
                     key = pre_out["key"][:batch_size]
                     value = pre_out["value"][:batch_size]
 
+                    # --- DIAGNOSTIC: compare graph vs eager at layer 0, first call ---
+                    if (self.layer_idx == 0
+                            and not getattr(self, '_graph_diag_done', False)
+                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+                        with torch.no_grad():
+                            from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
+                            _n = cuda_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
+                            _qkv = self.self_attn.module.qkv_proj(_n)
+                            _q, _k, _v = cuda_qkv_split(_qkv, self.self_attn.q_size, self.self_attn.kv_size)
+                            _q = _q.view(batch_size, 1, self.self_attn.num_heads, self.self_attn.head_dim)
+                            _k = _k.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
+                            _v = _v.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
+                            _ctp = cache_seqlens[:batch_size] - 1
+                            _re = self.self_attn.module.rotary_emb
+                            _cos = _re.cos_cached[_ctp].unsqueeze(1).to(_q.dtype)
+                            _sin = _re.sin_cached[_ctp].unsqueeze(1).to(_q.dtype)
+                            _q, _k = cuda_rope(_q, _k, _cos, _sin)
+                            torch.cuda.synchronize()
+                            for _nm, _gt, _et in [("query", query, _q), ("key", key, _k), ("value", value, _v)]:
+                                _d = (_gt.float() - _et.float()).abs()
+                                logging.warning(
+                                    f"[CUDA_GRAPH_DIAG L0] pre-attn {_nm}: "
+                                    f"max_diff={_d.max().item():.6e}, mean_diff={_d.mean().item():.6e}, "
+                                    f"graph_norm={_gt.float().norm().item():.4f}, eager_norm={_et.float().norm().item():.4f}"
+                                )
+                        self._graph_diag_done = True
+
                     # --- 2. Eager middle: KV write + FlashAttention ---
                     gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
                     current_token_position = cache_seqlens[:batch_size] - 1
