@@ -1504,6 +1504,19 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after MLP+residual (final): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
+        # --- DIAGNOSTIC: per-layer output norm (first decode step only) ---
+        if (use_graph and not getattr(self, '_layer_diag_done', False)
+                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                _norm = hidden_states.float().norm().item()
+                _std = hidden_states.float().std().item()
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG] Layer {self.layer_idx} output: "
+                    f"norm={_norm:.4f}, std={_std:.6f}"
+                )
+            self._layer_diag_done = True
+
         # End layer timing
         DecodeLayerTiming.end_layer()
 
