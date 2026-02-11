@@ -1290,7 +1290,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
             # This matches DeepSeek which uses position_ids = cache_seqlens - 1.
             current_token_position = micro_cache_seqlens - 1
 
-            max_seqlen = int(micro_cache_seqlens.max().item())  # No +1 needed since we use current position
+            # Use pre-computed max_seqlen from AttnWrapperBase (set once per decode step)
+            # to avoid per-layer CPU-GPU sync from .item()
+            max_seqlen = AttnWrapperBase.max_seqlen
             cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
 
             # Apply RoPE at each sequence's current position (cache_seqlens - 1)

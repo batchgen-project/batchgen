@@ -1158,13 +1158,9 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         expert_start, num_local_experts,
     )
 
-    # Trim to actual dispatched tokens
-    total_dispatched = expert_offsets[num_local_experts].item()
-    dispatched_x = dispatched_x[:total_dispatched]
-
-    if total_dispatched == 0:
-        return torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype,
-                           device=hidden_states.device)
+    # No CPU-GPU sync: pass dispatched_x at full allocated size.
+    # The WGMMA kernels bound per-expert work via expert_offsets and early-return
+    # for excess M-tiles (line 367: if (m_tile >= num_m_tiles) return).
 
     # Compute strides from reference weights
     # Stage 1 (gate/up): weight is [N, K//2], scale is [N, K//32]

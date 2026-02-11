@@ -989,10 +989,14 @@ class GptOssMoEDecode(nn.Module):
         output: torch.Tensor,
     ) -> None:
         """Process non-persistent experts one by one, accumulating into output."""
+        # Precompute which experts have tokens with a single CPU-GPU sync
+        # instead of one sync per expert from expert_mask.any()
+        active_experts_set = set(topk_indices.flatten().tolist())
+
         for expert_idx in self.non_persistent_expert_indices:
-            expert_mask = (topk_indices == expert_idx).any(dim=-1)
-            if not expert_mask.any():
+            if expert_idx not in active_experts_set:
                 continue
+            expert_mask = (topk_indices == expert_idx).any(dim=-1)
 
             expert_input = hidden_flat[expert_mask]
 

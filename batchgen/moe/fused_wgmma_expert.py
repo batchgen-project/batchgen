@@ -1186,8 +1186,9 @@ def wgmma_single_expert_moe_forward_cuda_routing(
         expert_start, num_local_experts,
     )
 
-    # Trim to actual dispatched tokens
-    total_dispatched = expert_offsets[num_local_experts].item()
+    # Single CPU-GPU sync: read all expert offsets at once instead of per-expert .item()
+    offsets_list = expert_offsets[:num_local_experts + 1].tolist()
+    total_dispatched = offsets_list[num_local_experts]
     dispatched_x = dispatched_x[:total_dispatched]
 
     # Step 2: Per-expert WGMMA forward
@@ -1198,8 +1199,8 @@ def wgmma_single_expert_moe_forward_cuda_routing(
     )
 
     for e_local in range(num_local_experts):
-        start = expert_offsets[e_local].item()
-        end = expert_offsets[e_local + 1].item()
+        start = offsets_list[e_local]
+        end = offsets_list[e_local + 1]
         if start == end:
             continue  # Skip empty experts
 
