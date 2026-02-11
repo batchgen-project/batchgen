@@ -1542,6 +1542,20 @@ class GptOssDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 
+        # --- DIAGNOSTIC: compare MoE input (post-attn norm output) graph vs eager ---
+        _moe_diag_count = getattr(self, '_moe_diag_count', 0)
+        if (use_graph and _moe_diag_count < 2
+                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L{self.layer_idx} iter{_moe_diag_count}] "
+                    f"MoE input: norm={hidden_states.float().norm().item():.4f}, "
+                    f"std={hidden_states.float().std().item():.6f}, "
+                    f"residual_norm={residual.float().norm().item():.4f}"
+                )
+            self._moe_diag_count = _moe_diag_count + 1
+
         if timing_enabled:
             torch.cuda.synchronize()
             moe_start = time.perf_counter()
@@ -1557,6 +1571,23 @@ class GptOssDecoderLayer(nn.Module):
                 print(f"[L{self.layer_idx}] after MLP (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
         hidden_states = residual + hidden_states
+
+        # --- DIAGNOSTIC: log layer 1 output values on first decode iteration ---
+        if (self.layer_idx == 1
+                and not getattr(self, '_output_diag_done', False)
+                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                _s = hidden_states[0, 0, :20].float().tolist()
+                _vals = ", ".join(f"{v:.6f}" for v in _s)
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L1 output] seq0 first 20: [{_vals}]"
+                )
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L1 output] norm={hidden_states.float().norm().item():.6f}, "
+                    f"std={hidden_states.float().std().item():.6f}"
+                )
+            self._output_diag_done = True
 
         if debug_layer and self.layer_idx < 3:
             with torch.no_grad():
