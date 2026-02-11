@@ -115,6 +115,8 @@ std::vector<torch::Tensor> rope_forward(
     auto q_out = torch::empty_like(q_flat);
     auto k_out = torch::empty_like(k_flat);
 
+    if (total == 0) return {q_out.reshape_as(query), k_out.reshape_as(key)};
+
     // One block per vector, half_dim threads per block
     // For head_dim=64, half_dim=32 → 32 threads per block
     const int threads = half_dim;

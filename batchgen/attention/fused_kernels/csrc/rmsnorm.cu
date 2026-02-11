@@ -152,6 +152,8 @@ torch::Tensor rmsnorm_forward(
 
     auto output = torch::empty_like(input);
 
+    if (num_rows == 0) return output;
+
     // 256 threads: each handles hidden_size/256 = 16 elements for H=4096
     const int threads = 256;
     const int blocks = num_rows;
@@ -200,6 +202,8 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
     int num_rows = residual.numel() / hidden_size;
 
     auto normed_out = torch::empty_like(residual);
+
+    if (num_rows == 0) return {normed_out, residual};
 
     const int threads = 256;
     const int blocks = num_rows;
