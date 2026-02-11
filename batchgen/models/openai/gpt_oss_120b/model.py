@@ -1334,6 +1334,19 @@ class GptOssDecoderLayer(nn.Module):
                      and self._pre_attn_segment_name is not None
                      and self._post_attn_segment_name is not None)
 
+        # --- DIAGNOSTIC: layer 0 input values ---
+        if (self.layer_idx == 0
+                and not getattr(self, '_l0_input_diag_done', False)
+                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                _inp = hidden_states[0, 0, :20].float().tolist()
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L0] layer_input seq0[:20]: "
+                    f"[{', '.join(f'{v:.6f}' for v in _inp)}]"
+                )
+            self._l0_input_diag_done = True
+
         if use_graph:
             batch_size = hidden_states.shape[0]
             from batchgen.models.wrappers import AttnWrapperBase
@@ -1475,11 +1488,22 @@ class GptOssDecoderLayer(nn.Module):
                     attn_residual = hidden_states  # original layer input = residual
                     hidden_states = post_out["o_proj_output"]
 
-                    # --- DIAGNOSTIC: compare post-attn O_proj graph vs eager ---
+                    # --- DIAGNOSTIC: L0 O_proj output values ---
                     if (self.layer_idx == 0
                             and not getattr(self, '_post_diag_done', False)
                             and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
                         with torch.no_grad():
+                            torch.cuda.synchronize()
+                            _oproj = hidden_states[0, 0, :20].float().tolist()
+                            logging.warning(
+                                f"[CUDA_GRAPH_DIAG L0] O_proj_output seq0[:20]: "
+                                f"[{', '.join(f'{v:.6f}' for v in _oproj)}]"
+                            )
+                            _attn_out = attn_output[0, 0, :10].float().tolist()
+                            logging.warning(
+                                f"[CUDA_GRAPH_DIAG L0] FA_output seq0[:10]: "
+                                f"[{', '.join(f'{v:.6f}' for v in _attn_out)}]"
+                            )
                             _eager_o = self.self_attn.module.o_proj(
                                 attn_output.view(batch_size, 1, self.self_attn.num_heads * self.self_attn.head_dim))
                             torch.cuda.synchronize()
@@ -1542,19 +1566,24 @@ class GptOssDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # --- DIAGNOSTIC: compare MoE input (post-attn norm output) graph vs eager ---
-        _moe_diag_count = getattr(self, '_moe_diag_count', 0)
-        if (use_graph and _moe_diag_count < 2
+        # --- DIAGNOSTIC: layer 0 intermediate values for graph vs eager comparison ---
+        if (self.layer_idx == 0
+                and not getattr(self, '_l0_inter_diag_done', False)
                 and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
             with torch.no_grad():
                 torch.cuda.synchronize()
+                # Log MoE input (post-attn normed hidden_states) and residual
+                _moe_vals = hidden_states[0, 0, :20].float().tolist()
+                _res_vals = residual[0, 0, :20].float().tolist()
                 logging.warning(
-                    f"[CUDA_GRAPH_DIAG L{self.layer_idx} iter{_moe_diag_count}] "
-                    f"MoE input: norm={hidden_states.float().norm().item():.4f}, "
-                    f"std={hidden_states.float().std().item():.6f}, "
-                    f"residual_norm={residual.float().norm().item():.4f}"
+                    f"[CUDA_GRAPH_DIAG L0] MoE_input seq0[:20]: "
+                    f"[{', '.join(f'{v:.6f}' for v in _moe_vals)}]"
                 )
-            self._moe_diag_count = _moe_diag_count + 1
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L0] residual seq0[:20]: "
+                    f"[{', '.join(f'{v:.6f}' for v in _res_vals)}]"
+                )
+            self._l0_inter_diag_done = True
 
         if timing_enabled:
             torch.cuda.synchronize()
@@ -1570,7 +1599,33 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after MLP (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
+        # --- DIAGNOSTIC: layer 0 MoE output + final output ---
+        if (self.layer_idx == 0
+                and not getattr(self, '_l0_moe_diag_done', False)
+                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                _moe_out = hidden_states[0, 0, :20].float().tolist()
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L0] MoE_output seq0[:20]: "
+                    f"[{', '.join(f'{v:.6f}' for v in _moe_out)}]"
+                )
+            self._l0_moe_diag_done = True
+
         hidden_states = residual + hidden_states
+
+        # --- DIAGNOSTIC: layer 0 final output (= layer 1 input) ---
+        if (self.layer_idx == 0
+                and not getattr(self, '_l0_final_diag_done', False)
+                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+            with torch.no_grad():
+                torch.cuda.synchronize()
+                _final = hidden_states[0, 0, :20].float().tolist()
+                logging.warning(
+                    f"[CUDA_GRAPH_DIAG L0] final_output seq0[:20]: "
+                    f"[{', '.join(f'{v:.6f}' for v in _final)}]"
+                )
+            self._l0_final_diag_done = True
 
         # --- DIAGNOSTIC: log layer 1 output values on first decode iteration ---
         if (self.layer_idx == 1
