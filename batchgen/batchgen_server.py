@@ -192,6 +192,7 @@ class BatchGenServer:
 			# EP with offloading settings
 			enable_ep_with_offloading=getattr(self.args, 'enable_ep_with_offloading', False),
 			ep_offloading_ratio=getattr(self.args, 'ep_offloading_ratio', 0.0),
+			pre_dequantize_weights=getattr(self.args, 'pre_dequantize_weights', False),
 
 			# Place holder
 			local_rank=-1,
@@ -596,6 +597,12 @@ def parse_args():
 		type=float,
 		default=0.0,
 		help="Ratio of experts per layer to offload (0.0-1.0). E.g., 0.2 means 20%% of experts loaded/freed at runtime"
+	)
+	parser.add_argument(
+		"--pre-dequantize-weights",
+		action="store_true",
+		default=False,
+		help="Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected."
 	)
 
 	return parser.parse_args()

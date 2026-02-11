@@ -85,6 +85,7 @@ class ServerArgs:
     # EP with offloading settings
     enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
+    pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -239,6 +240,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Ratio of experts per layer to offload (0.0-1.0). E.g., 0.2 means 20%% of experts loaded/freed at runtime",
     )
+    parser.add_argument(
+        "--pre-dequantize-weights",
+        action="store_true",
+        default=False,
+        help="Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected.",
+    )
     return parser
 
 
@@ -336,6 +343,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         decision_frequency_pages=parsed.decision_frequency_pages,
         enable_ep_with_offloading=parsed.enable_ep_with_offloading,
         ep_offloading_ratio=parsed.ep_offloading_ratio,
+        pre_dequantize_weights=parsed.pre_dequantize_weights,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

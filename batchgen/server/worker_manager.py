@@ -397,6 +397,7 @@ class WorkerManager:
             decision_frequency_pages=self.args.decision_frequency_pages,
             enable_ep_with_offloading=self.args.enable_ep_with_offloading,
             ep_offloading_ratio=self.args.ep_offloading_ratio,
+            pre_dequantize_weights=self.args.pre_dequantize_weights,
         )
         self.worker_process = mp.spawn(
             server_worker_main,
