@@ -1,0 +1,25 @@
+#pragma once
+#include <torch/extension.h>
+
+// RMSNorm: standalone
+torch::Tensor rmsnorm_forward(
+    torch::Tensor input,    // [*, hidden_size] BF16/FP16
+    torch::Tensor weight,   // [hidden_size]
+    float eps);
+
+// Fused Add + RMSNorm: residual += hidden, normed = rmsnorm(residual)
+// Returns (normed, residual_updated)
+std::vector<torch::Tensor> add_rmsnorm_forward(
+    torch::Tensor residual, // [*, hidden_size] modified in-place
+    torch::Tensor hidden,   // [*, hidden_size]
+    torch::Tensor weight,   // [hidden_size]
+    float eps);
+
+// Fused RoPE for Q and K (YaRN half-dim rotation)
+// Returns (q_rot, k_rot)
+std::vector<torch::Tensor> rope_forward(
+    torch::Tensor query,    // [B, S, num_heads, head_dim]
+    torch::Tensor key,      // [B, S, num_kv_heads, head_dim]
+    torch::Tensor cos,      // [B, S, head_dim]
+    torch::Tensor sin,      // [B, S, head_dim]
+    int half_dim);

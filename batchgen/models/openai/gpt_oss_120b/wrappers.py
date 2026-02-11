@@ -1535,39 +1535,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         Returns:
             Tuple of rotated (query, key)
         """
-        half_dim = self.head_dim // 2
-
-        # Expand cos/sin for broadcasting with query/key
-        if cos.dim() == 2:
-            # Prefill: [seq, head_dim] -> [1, seq, 1, head_dim]
-            cos = cos.unsqueeze(0).unsqueeze(2)
-            sin = sin.unsqueeze(0).unsqueeze(2)
-        elif cos.dim() == 3:
-            # Decode: [batch, 1, head_dim] -> [batch, 1, 1, head_dim]
-            cos = cos.unsqueeze(2)
-            sin = sin.unsqueeze(2)
-        else:
-            raise ValueError(f"Unexpected cos shape: {cos.shape}")
-
-        # Split heads
-        q1, q2 = query[..., :half_dim], query[..., half_dim:]
-        k1, k2 = key[..., :half_dim], key[..., half_dim:]
-
-        cos_half = cos[..., :half_dim]
-        sin_half = sin[..., :half_dim]
-
-        # Apply rotation
-        q_rot = torch.cat([
-            q1 * cos_half - q2 * sin_half,
-            q2 * cos_half + q1 * sin_half
-        ], dim=-1)
-
-        k_rot = torch.cat([
-            k1 * cos_half - k2 * sin_half,
-            k2 * cos_half + k1 * sin_half
-        ], dim=-1)
-
-        return q_rot, k_rot
+        from batchgen.attention.fused_kernels import cuda_rope
+        return cuda_rope(query, key, cos, sin)
 
     def _forward_prefill_prepacked(
         self,

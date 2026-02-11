@@ -252,11 +252,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(input_dtype)
+        from batchgen.attention.fused_kernels import cuda_rmsnorm
+        return cuda_rmsnorm(x, self.weight, self.eps)
 
 
 # ============================================================================
@@ -1339,19 +1336,23 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after attention (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
-        hidden_states = residual + hidden_states
-
         if debug_layer and self.layer_idx < 3:
+            # Unfused path for debug visibility
+            hidden_states = residual + hidden_states
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after attn+residual: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
-
-        # Pre-norm + MoE
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
-        if debug_layer and self.layer_idx < 3:
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+        else:
+            # Fused residual add + RMSNorm (1 kernel instead of ~5)
+            from batchgen.attention.fused_kernels import cuda_add_rmsnorm
+            hidden_states, residual = cuda_add_rmsnorm(
+                residual, hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
 
         # ========== MoE TIMING ==========
         if timing_enabled:
