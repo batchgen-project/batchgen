@@ -1395,34 +1395,60 @@ class GptOssDecoderLayer(nn.Module):
                         self.layer_idx
                     )
 
-                    # --- DIAGNOSTIC: verify KV cache readback matches written values ---
+                    # --- DIAGNOSTIC: compare KV cache content against eager-computed K/V ---
                     _kv_diag_count = getattr(self, '_kv_diag_count', 0)
                     if (_kv_diag_count < 2
                             and self.layer_idx == 0
                             and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
                         with torch.no_grad():
                             torch.cuda.synchronize()
+                            # Compute eager K/V from same hidden_states (original layer input)
+                            from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
+                            _orig_hs = attn_residual if attn_residual is not None else hidden_states
+                            _n = cuda_rmsnorm(_orig_hs, self.input_layernorm.weight, self.input_layernorm.eps)
+                            _qkv = self.self_attn.module.qkv_proj(_n)
+                            _, _ek, _ev = cuda_qkv_split(_qkv, self.self_attn.q_size, self.self_attn.kv_size)
+                            _ek = _ek.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
+                            _ev = _ev.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
+                            _ctp = cache_seqlens[:batch_size] - 1
+                            _re = self.self_attn.module.rotary_emb
+                            _cos = _re.cos_cached[_ctp].unsqueeze(1).to(_ek.dtype)
+                            _sin = _re.sin_cached[_ctp].unsqueeze(1).to(_ek.dtype)
+                            # cuda_rope expects (query, key) — use dummy query, we only need key
+                            _eq = torch.zeros(batch_size, 1, self.self_attn.num_heads, self.self_attn.head_dim,
+                                              dtype=_ek.dtype, device=_ek.device)
+                            _, _ek = cuda_rope(_eq, _ek, _cos, _sin)
+                            torch.cuda.synchronize()
+
+                            # Read back from cache and compare against eager K/V
                             _page_size = k_cache.shape[1]
                             _n_check = min(3, batch_size)
                             for _si in range(_n_check):
                                 _pos = int(current_token_position[_si].item())
                                 _page_idx = _pos // _page_size
                                 _offset = _pos % _page_size
-                                _slot = _si  # no micro-batching
+                                _slot = _si
                                 _gpu_page = int(page_table[_slot, _page_idx].item())
-                                # Read back K from cache
-                                _k_readback = k_cache[_gpu_page, _offset]  # [num_kv_heads, head_dim]
-                                _k_written = key[_si, 0]  # [num_kv_heads, head_dim]
-                                _k_diff = (_k_readback.float() - _k_written.float()).abs().max().item()
-                                # Read back V from cache
+                                # Compare K in cache vs eager K
+                                _k_cache_val = k_cache[_gpu_page, _offset]  # [num_kv_heads, head_dim]
+                                _k_eager = _ek[_si, 0]  # [num_kv_heads, head_dim]
+                                _k_diff = (_k_cache_val.float() - _k_eager.float()).abs().max().item()
+                                _k_cache_norm = _k_cache_val.float().norm().item()
+                                _k_eager_norm = _k_eager.float().norm().item()
+                                # Compare V in cache vs eager V
                                 _v_diff = 0.0
+                                _v_cache_norm = 0.0
+                                _v_eager_norm = 0.0
                                 if v_cache is not None:
-                                    _v_readback = v_cache[_gpu_page, _offset]
-                                    _v_written = value[_si, 0]
-                                    _v_diff = (_v_readback.float() - _v_written.float()).abs().max().item()
+                                    _v_cache_val = v_cache[_gpu_page, _offset]
+                                    _v_eager = _ev[_si, 0]
+                                    _v_diff = (_v_cache_val.float() - _v_eager.float()).abs().max().item()
+                                    _v_cache_norm = _v_cache_val.float().norm().item()
+                                    _v_eager_norm = _v_eager.float().norm().item()
                                 logging.warning(
-                                    f"[CUDA_GRAPH_DIAG L0 iter{_kv_diag_count}] KV readback seq{_si}: "
-                                    f"pos={_pos}, k_diff={_k_diff:.6e}, v_diff={_v_diff:.6e}"
+                                    f"[CUDA_GRAPH_DIAG L0 iter{_kv_diag_count}] KV cache vs eager seq{_si}: "
+                                    f"pos={_pos}, k_diff={_k_diff:.6e} (cache_norm={_k_cache_norm:.4f}, eager_norm={_k_eager_norm:.4f}), "
+                                    f"v_diff={_v_diff:.6e} (cache_norm={_v_cache_norm:.4f}, eager_norm={_v_eager_norm:.4f})"
                                 )
                         self._kv_diag_count = _kv_diag_count + 1
 
