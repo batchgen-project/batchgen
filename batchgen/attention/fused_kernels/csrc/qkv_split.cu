@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "attention_ops.h"
 
 // ============================================================================
@@ -76,18 +77,19 @@ void qkv_split_inplace(
 
     const int threads = 256;
     const int blocks = M;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_SWITCH(qkv.scalar_type(),
         "qkv_split_inplace",
         AT_DISPATCH_CASE(at::ScalarType::BFloat16,
-            [&] { qkv_split_kernel<at::BFloat16><<<blocks, threads>>>(
+            [&] { qkv_split_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
                 qkv.data_ptr<at::BFloat16>(),
                 q_out.data_ptr<at::BFloat16>(),
                 k_out.data_ptr<at::BFloat16>(),
                 v_out.data_ptr<at::BFloat16>(),
                 M, q_size, kv_size, total_dim); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
-            [&] { qkv_split_kernel<at::Half><<<blocks, threads>>>(
+            [&] { qkv_split_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 qkv.data_ptr<at::Half>(),
                 q_out.data_ptr<at::Half>(),
                 k_out.data_ptr<at::Half>(),

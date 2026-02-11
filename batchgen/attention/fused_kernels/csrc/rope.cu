@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "attention_ops.h"
 
 // ============================================================================
@@ -121,11 +122,12 @@ std::vector<torch::Tensor> rope_forward(
     // For head_dim=64, half_dim=32 → 32 threads per block
     const int threads = half_dim;
     const int blocks = total;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_SWITCH(query.scalar_type(),
         "rope_forward",
         AT_DISPATCH_CASE(at::ScalarType::BFloat16,
-            [&] { rope_kernel<at::BFloat16><<<blocks, threads>>>(
+            [&] { rope_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
                 q_flat.data_ptr<at::BFloat16>(),
                 k_flat.data_ptr<at::BFloat16>(),
                 cos_flat.data_ptr<at::BFloat16>(),
@@ -136,7 +138,7 @@ std::vector<torch::Tensor> rope_forward(
                 num_q_heads, num_kv_heads,
                 S, half_dim, head_dim); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
-            [&] { rope_kernel<at::Half><<<blocks, threads>>>(
+            [&] { rope_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 q_flat.data_ptr<at::Half>(),
                 k_flat.data_ptr<at::Half>(),
                 cos_flat.data_ptr<at::Half>(),

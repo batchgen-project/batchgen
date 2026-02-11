@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "attention_ops.h"
 
 // ============================================================================
@@ -157,23 +158,24 @@ torch::Tensor rmsnorm_forward(
     // 256 threads: each handles hidden_size/256 = 16 elements for H=4096
     const int threads = 256;
     const int blocks = num_rows;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_SWITCH(input.scalar_type(),
         "rmsnorm_forward",
         AT_DISPATCH_CASE(at::ScalarType::BFloat16,
-            [&] { rmsnorm_kernel<at::BFloat16><<<blocks, threads>>>(
+            [&] { rmsnorm_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
                 input.data_ptr<at::BFloat16>(),
                 weight.data_ptr<at::BFloat16>(),
                 output.data_ptr<at::BFloat16>(),
                 hidden_size, eps); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
-            [&] { rmsnorm_kernel<at::Half><<<blocks, threads>>>(
+            [&] { rmsnorm_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 input.data_ptr<at::Half>(),
                 weight.data_ptr<at::Half>(),
                 output.data_ptr<at::Half>(),
                 hidden_size, eps); })
         AT_DISPATCH_CASE(at::ScalarType::Float,
-            [&] { rmsnorm_kernel<float><<<blocks, threads>>>(
+            [&] { rmsnorm_kernel<float><<<blocks, threads, 0, stream>>>(
                 input.data_ptr<float>(),
                 weight.data_ptr<float>(),
                 output.data_ptr<float>(),
@@ -207,25 +209,26 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
 
     const int threads = 256;
     const int blocks = num_rows;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_SWITCH(residual.scalar_type(),
         "add_rmsnorm_forward",
         AT_DISPATCH_CASE(at::ScalarType::BFloat16,
-            [&] { add_rmsnorm_kernel<at::BFloat16><<<blocks, threads>>>(
+            [&] { add_rmsnorm_kernel<at::BFloat16><<<blocks, threads, 0, stream>>>(
                 residual.data_ptr<at::BFloat16>(),
                 hidden.data_ptr<at::BFloat16>(),
                 weight.data_ptr<at::BFloat16>(),
                 normed_out.data_ptr<at::BFloat16>(),
                 hidden_size, eps); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
-            [&] { add_rmsnorm_kernel<at::Half><<<blocks, threads>>>(
+            [&] { add_rmsnorm_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 residual.data_ptr<at::Half>(),
                 hidden.data_ptr<at::Half>(),
                 weight.data_ptr<at::Half>(),
                 normed_out.data_ptr<at::Half>(),
                 hidden_size, eps); })
         AT_DISPATCH_CASE(at::ScalarType::Float,
-            [&] { add_rmsnorm_kernel<float><<<blocks, threads>>>(
+            [&] { add_rmsnorm_kernel<float><<<blocks, threads, 0, stream>>>(
                 residual.data_ptr<float>(),
                 hidden.data_ptr<float>(),
                 weight.data_ptr<float>(),
