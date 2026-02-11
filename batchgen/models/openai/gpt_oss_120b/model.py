@@ -1395,6 +1395,37 @@ class GptOssDecoderLayer(nn.Module):
                         self.layer_idx
                     )
 
+                    # --- DIAGNOSTIC: verify KV cache readback matches written values ---
+                    _kv_diag_count = getattr(self, '_kv_diag_count', 0)
+                    if (_kv_diag_count < 2
+                            and self.layer_idx == 0
+                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+                        with torch.no_grad():
+                            torch.cuda.synchronize()
+                            _page_size = k_cache.shape[1]
+                            _n_check = min(3, batch_size)
+                            for _si in range(_n_check):
+                                _pos = int(current_token_position[_si].item())
+                                _page_idx = _pos // _page_size
+                                _offset = _pos % _page_size
+                                _slot = _si  # no micro-batching
+                                _gpu_page = int(page_table[_slot, _page_idx].item())
+                                # Read back K from cache
+                                _k_readback = k_cache[_gpu_page, _offset]  # [num_kv_heads, head_dim]
+                                _k_written = key[_si, 0]  # [num_kv_heads, head_dim]
+                                _k_diff = (_k_readback.float() - _k_written.float()).abs().max().item()
+                                # Read back V from cache
+                                _v_diff = 0.0
+                                if v_cache is not None:
+                                    _v_readback = v_cache[_gpu_page, _offset]
+                                    _v_written = value[_si, 0]
+                                    _v_diff = (_v_readback.float() - _v_written.float()).abs().max().item()
+                                logging.warning(
+                                    f"[CUDA_GRAPH_DIAG L0 iter{_kv_diag_count}] KV readback seq{_si}: "
+                                    f"pos={_pos}, k_diff={_k_diff:.6e}, v_diff={_v_diff:.6e}"
+                                )
+                        self._kv_diag_count = _kv_diag_count + 1
+
                     from batchgen.attention.gqa import gqa_decode_fa
                     attn_output, _ = gqa_decode_fa(
                         q=query,
