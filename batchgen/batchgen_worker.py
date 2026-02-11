@@ -239,6 +239,7 @@ class BatchGenWorkerArgs:
 	enable_ep_with_offloading: bool = False  # Enable Expert Parallelism with offloading
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
 
 
 class BatchGenWorker:
@@ -284,6 +285,9 @@ class BatchGenWorker:
 		self.kv_dtype = args.kv_dtype
 		self.device = args.device
 		self.torch_device = torch.device(f"cuda:{args.device}")
+
+		# CUDA graph state
+		self._cuda_graph_manager = None
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -1127,6 +1131,10 @@ class BatchGenWorker:
 
 		self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		self.engine_config.Basic_Config.num_queries = num_queries
+
+		# Set CUDA graph config from command-line args
+		if self.args.disable_cuda_graphs:
+			self.engine_config.Basic_Config.enable_cuda_graphs = False
 
 		# Set EP offloading config from command-line args
 		self.engine_config.EP_Config.enable_offloading = self.args.enable_ep_with_offloading
@@ -5788,6 +5796,48 @@ class BatchGenWorker:
 		
 		return updated_uuids, updated_batch
 
+	def _setup_cuda_graphs(self, gpu_manager):
+		"""One-time CUDA graph capture for decode attention blocks.
+
+		Creates a CUDAGraphManager, registers each decoder layer's attention
+		as a GptOssAttentionSegment, warmup + captures all graphs, then
+		enables graph mode on each decoder layer.
+
+		Must be called after gpu_paged_kv_manager is set.
+		"""
+		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
+		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import GptOssAttentionSegment
+
+		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
+		bucketing = BatchSizeBucketing(bucket_sizes)
+		manager = CUDAGraphManager(bucketing, device=self.torch_device)
+
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			attn_wrapper = decoder_layer.self_attn  # GptOssAttnWrapper
+			segment = GptOssAttentionSegment(
+				attn_wrapper=attn_wrapper,
+				input_layernorm=decoder_layer.input_layernorm,
+				layer_idx=layer_idx,
+				gpu_paged_kv_manager=gpu_manager,
+			)
+			seg_name = f"layer_{layer_idx}_attn"
+			manager.register_segment(seg_name, segment)
+
+		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture...")
+		manager.warmup_and_capture_all()
+
+		# Enable graph mode on each decoder layer
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			decoder_layer.enable_cuda_graph(manager, f"layer_{layer_idx}_attn")
+
+		self._cuda_graph_manager = manager
+		stats = manager.get_capture_stats()
+		logging.info(
+			f"Rank {self.rank}: CUDA graphs ready — "
+			f"{stats['num_segments']} segments × {len(stats['bucket_sizes'])} buckets "
+			f"in {stats['total_capture_time_ms']:.0f}ms"
+		)
+
 	def decoding_continuous(
 		self,
 		new_tokens: torch.Tensor,
@@ -5832,6 +5882,12 @@ class BatchGenWorker:
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 		AttnWrapperBase.host_paged_kv_worker_view = worker_view
 		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+
+		# One-time CUDA graph capture (after gpu_paged_kv_manager is set)
+		if (self._cuda_graph_manager is None
+				and self.engine_config.Basic_Config.enable_cuda_graphs
+				and gpu_manager is not None):
+			self._setup_cuda_graphs(gpu_manager)
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
 		# This fixes order mismatch that can occur during decode→prefill→decode transitions

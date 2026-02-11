@@ -86,6 +86,7 @@ class ServerArgs:
     enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+    disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -245,6 +246,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected.",
+    )
+    parser.add_argument(
+        "--disable-cuda-graphs",
+        action="store_true",
+        default=False,
+        help="Disable CUDA graph capture for decode attention (enabled by default for supported models)",
     )
     return parser
 
