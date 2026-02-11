@@ -640,7 +640,9 @@ def reshape_to_3d_expert_layout(
         hidden_3d: [num_experts, max_tokens_per_expert, hidden] - zero-padded
         max_tokens: Maximum tokens assigned to any single expert
     """
-    max_tokens = expert_counts.max().item()
+    # Single CPU-GPU sync: read all expert counts at once
+    counts_list = expert_counts.tolist()
+    max_tokens = max(counts_list) if counts_list else 0
     if max_tokens == 0:
         # No tokens routed to any expert (edge case)
         hidden_size = sorted_hidden.shape[-1]
@@ -657,7 +659,7 @@ def reshape_to_3d_expert_layout(
     # This can be optimized with a Triton scatter kernel later
     offset = 0
     for e in range(num_experts):
-        count = expert_counts[e].item()
+        count = counts_list[e]
         if count > 0:
             hidden_3d[e, :count] = sorted_hidden[offset:offset+count]
             offset += count
@@ -687,9 +689,11 @@ def gather_from_3d_expert_layout(
 
     sorted_output = torch.zeros(total_tokens, hidden_size, dtype=dtype, device=device)
 
+    # Single CPU-GPU sync: read all expert counts at once
+    counts_list = expert_counts.tolist()
     offset = 0
     for e in range(num_experts):
-        count = expert_counts[e].item()
+        count = counts_list[e]
         if count > 0:
             sorted_output[offset:offset+count] = output_3d[e, :count]
             offset += count
@@ -1033,8 +1037,8 @@ def grouped_mxfp4_moe_forward_cuda_routing(
         expert_start, num_local_experts,
     )
 
-    # Trim to actual dispatched tokens
-    total_dispatched = expert_offsets[num_local_experts].item()
+    # Trim to actual dispatched tokens (sync consolidated with reshape_to_3d below)
+    total_dispatched = int(expert_offsets[num_local_experts])
     dispatched_x = dispatched_x[:total_dispatched]
 
     # Step 2: Reshape to 3D layout for GEMM
@@ -1152,9 +1156,12 @@ def grouped_mxfp4_moe_forward(
     # Allocate output for all sorted tokens
     sorted_output = torch.zeros_like(sorted_hidden)
 
+    # Single CPU-GPU sync: read all offsets at once
+    offsets_list = expert_offsets[:num_experts + 1].tolist()
+
     for expert_idx in range(num_experts):
-        start = expert_offsets[expert_idx].item()
-        end = expert_offsets[expert_idx + 1].item()
+        start = offsets_list[expert_idx]
+        end = offsets_list[expert_idx + 1]
 
         if start == end:
             continue  # No tokens for this expert
