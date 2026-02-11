@@ -1141,6 +1141,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # Project Q, K, V using module's projections
         qkv = self.module.qkv_proj(hidden_states)
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
 
         # Reshape for attention: [batch, seq, heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1252,6 +1255,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         qkv = self.module.qkv_proj(hidden_states)
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
 
         # Reshape: [batch, 1, num_heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1475,6 +1481,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # Project Q, K, V
         qkv = self.module.qkv_proj(hidden_states)
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
 
         # Reshape
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1644,6 +1653,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # hidden_states_2d: [total_tokens, hidden_size]
         qkv = self.module.qkv_proj(hidden_states_2d)  # [total_tokens, q_size + 2 * kv_size]
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
 
         # Reshape to [total_tokens, num_heads, head_dim]
         query = query.view(total_tokens, self.num_heads, self.head_dim)

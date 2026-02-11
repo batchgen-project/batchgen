@@ -442,6 +442,9 @@ class GptOssAttention(nn.Module):
         query_states, key_states, value_states = qkv.split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
 
         # Reshape for attention
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
