@@ -1478,10 +1478,10 @@ class GptOssDecoderLayer(nn.Module):
                                 f"[CUDA_GRAPH_DIAG L0] O_proj_output seq0[:20]: "
                                 f"[{', '.join(f'{v:.6f}' for v in _oproj)}]"
                             )
-                            _attn_out = attn_output[0, 0, :10].float().tolist()
+                            _attn_flat = attn_output[0, 0].flatten()[:20].float().tolist()
                             logging.warning(
-                                f"[CUDA_GRAPH_DIAG L0] FA_output seq0[:10]: "
-                                f"[{', '.join(f'{v:.6f}' for v in _attn_out)}]"
+                                f"[CUDA_GRAPH_DIAG L0] FA_output seq0 flat[:20]: "
+                                f"[{', '.join(f'{v:.6f}' for v in _attn_flat)}]"
                             )
                             _eager_o = self.self_attn.module.o_proj(
                                 attn_output.view(batch_size, 1, self.self_attn.num_heads * self.self_attn.head_dim))
