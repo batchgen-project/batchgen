@@ -1295,21 +1295,22 @@ class GptOssDecoderLayer(nn.Module):
         self.cuda_graph_manager = None
         self._pre_attn_segment_name = None
         self._post_attn_segment_name = None
+        self._qkv_proj_segment_name = None
 
-    def enable_cuda_graph(self, manager, pre_attn_name: str, post_attn_name: str):
+    def enable_cuda_graph(self, manager, pre_attn_name: str, post_attn_name: str,
+                          qkv_proj_name: str = None):
         """Enable CUDA graph mode for the attention block of this layer.
 
-        Two segments per layer: pre-attn (RMSNorm→QKV→RoPE) and post-attn
-        (O_proj→residual). KV write + FlashAttention run eagerly between them.
-
         Args:
-            manager: CUDAGraphManager with both segments pre-captured.
-            pre_attn_name: Name of the pre-attention segment.
-            post_attn_name: Name of the post-attention segment.
+            manager: CUDAGraphManager with segments pre-captured.
+            pre_attn_name: Name of the pre-attention segment (unused in minimal mode).
+            post_attn_name: Name of the post-attention segment (unused in minimal mode).
+            qkv_proj_name: Name of the QKV proj-only segment (minimal graph mode).
         """
         self.cuda_graph_manager = manager
         self._pre_attn_segment_name = pre_attn_name
         self._post_attn_segment_name = post_attn_name
+        self._qkv_proj_segment_name = qkv_proj_name
 
     def forward(
         self,
@@ -1331,8 +1332,7 @@ class GptOssDecoderLayer(nn.Module):
         # For CUDA graph path: post_attn segment does residual add, so attn_residual=None
         attn_residual = None
         use_graph = (self.cuda_graph_manager is not None
-                     and self._pre_attn_segment_name is not None
-                     and self._post_attn_segment_name is not None)
+                     and self._qkv_proj_segment_name is not None)
 
         # --- DIAGNOSTIC: layer 0 input values ---
         if (self.layer_idx == 0
@@ -1354,28 +1354,37 @@ class GptOssDecoderLayer(nn.Module):
 
             if cache_seqlens is not None and batch_size > 0:
                 try:
-                    # --- 1. Pre-attn graph: RMSNorm → QKV proj → QKV split ---
-                    pre_out = self.cuda_graph_manager.replay(
-                        self._pre_attn_segment_name,
-                        batch_size,
-                        hidden_states=hidden_states,
-                    )
-                    query = pre_out["query"][:batch_size]
-                    key = pre_out["key"][:batch_size]
-                    value = pre_out["value"][:batch_size]
+                    # ============================================================
+                    # MINIMAL CUDA GRAPH: only QKV proj in graph, rest eager
+                    # ============================================================
 
-                    # --- 1b. RoPE (eager, not graph-safe due to dynamic position indexing) ---
-                    from batchgen.attention.fused_kernels import cuda_rope
+                    # --- 1. RMSNorm (eager) ---
+                    from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
+                    normed = cuda_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
+
+                    # --- 2. QKV proj (GRAPH) ---
+                    qkv_out = self.cuda_graph_manager.replay(
+                        self._qkv_proj_segment_name,
+                        batch_size,
+                        normed=normed,
+                    )
+                    qkv = qkv_out["qkv"]
+
+                    # --- 3. QKV split (eager) ---
+                    query, key, value = cuda_qkv_split(qkv, self.self_attn.q_size, self.self_attn.kv_size)
+                    query = query.view(batch_size, 1, self.self_attn.num_heads, self.self_attn.head_dim)
+                    key = key.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
+                    value = value.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
+
+                    # --- 4. RoPE (eager) ---
                     current_token_position = cache_seqlens[:batch_size] - 1
                     rotary_emb = self.self_attn.module.rotary_emb
                     cos_pos = rotary_emb.cos_cached[current_token_position].unsqueeze(1).to(query.dtype)
                     sin_pos = rotary_emb.sin_cached[current_token_position].unsqueeze(1).to(query.dtype)
                     query, key = cuda_rope(query, key, cos_pos, sin_pos)
 
-                    # --- 2. Eager middle: KV write + FlashAttention ---
+                    # --- 5. KV write (eager) ---
                     gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
-                    current_token_position = cache_seqlens[:batch_size] - 1
-
                     gpu_kv_manager.update_layer_decode_new_token(
                         k_tensor=key,
                         v_tensor=value,
@@ -1383,66 +1392,10 @@ class GptOssDecoderLayer(nn.Module):
                         layer_idx=self.layer_idx,
                     )
 
+                    # --- 6. FlashAttention (eager) ---
                     k_cache, v_cache, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
                         self.layer_idx
                     )
-
-                    # --- DIAGNOSTIC: compare KV cache content against eager-computed K/V ---
-                    _kv_diag_count = getattr(self, '_kv_diag_count', 0)
-                    if (_kv_diag_count < 2
-                            and self.layer_idx == 0
-                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-                        with torch.no_grad():
-                            torch.cuda.synchronize()
-                            # Compute eager K/V from same hidden_states (original layer input)
-                            from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
-                            _orig_hs = attn_residual if attn_residual is not None else hidden_states
-                            _n = cuda_rmsnorm(_orig_hs, self.input_layernorm.weight, self.input_layernorm.eps)
-                            _qkv = self.self_attn.module.qkv_proj(_n)
-                            _, _ek, _ev = cuda_qkv_split(_qkv, self.self_attn.q_size, self.self_attn.kv_size)
-                            _ek = _ek.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
-                            _ev = _ev.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
-                            _ctp = cache_seqlens[:batch_size] - 1
-                            _re = self.self_attn.module.rotary_emb
-                            _cos = _re.cos_cached[_ctp].unsqueeze(1).to(_ek.dtype)
-                            _sin = _re.sin_cached[_ctp].unsqueeze(1).to(_ek.dtype)
-                            # cuda_rope expects (query, key) — use dummy query, we only need key
-                            _eq = torch.zeros(batch_size, 1, self.self_attn.num_heads, self.self_attn.head_dim,
-                                              dtype=_ek.dtype, device=_ek.device)
-                            _, _ek = cuda_rope(_eq, _ek, _cos, _sin)
-                            torch.cuda.synchronize()
-
-                            # Read back from cache and compare against eager K/V
-                            _page_size = k_cache.shape[1]
-                            _n_check = min(3, batch_size)
-                            for _si in range(_n_check):
-                                _pos = int(current_token_position[_si].item())
-                                _page_idx = _pos // _page_size
-                                _offset = _pos % _page_size
-                                _slot = _si
-                                _gpu_page = int(page_table[_slot, _page_idx].item())
-                                # Compare K in cache vs eager K
-                                _k_cache_val = k_cache[_gpu_page, _offset]  # [num_kv_heads, head_dim]
-                                _k_eager = _ek[_si, 0]  # [num_kv_heads, head_dim]
-                                _k_diff = (_k_cache_val.float() - _k_eager.float()).abs().max().item()
-                                _k_cache_norm = _k_cache_val.float().norm().item()
-                                _k_eager_norm = _k_eager.float().norm().item()
-                                # Compare V in cache vs eager V
-                                _v_diff = 0.0
-                                _v_cache_norm = 0.0
-                                _v_eager_norm = 0.0
-                                if v_cache is not None:
-                                    _v_cache_val = v_cache[_gpu_page, _offset]
-                                    _v_eager = _ev[_si, 0]
-                                    _v_diff = (_v_cache_val.float() - _v_eager.float()).abs().max().item()
-                                    _v_cache_norm = _v_cache_val.float().norm().item()
-                                    _v_eager_norm = _v_eager.float().norm().item()
-                                logging.warning(
-                                    f"[CUDA_GRAPH_DIAG L0 iter{_kv_diag_count}] KV cache vs eager seq{_si}: "
-                                    f"pos={_pos}, k_diff={_k_diff:.6e} (cache_norm={_k_cache_norm:.4f}, eager_norm={_k_eager_norm:.4f}), "
-                                    f"v_diff={_v_diff:.6e} (cache_norm={_v_cache_norm:.4f}, eager_norm={_v_eager_norm:.4f})"
-                                )
-                        self._kv_diag_count = _kv_diag_count + 1
 
                     from batchgen.attention.gqa import gqa_decode_fa
                     attn_output, _ = gqa_decode_fa(
@@ -1456,44 +1409,12 @@ class GptOssDecoderLayer(nn.Module):
                         sliding_window=self.self_attn.sliding_window,
                     )
 
-                    # --- 3. Post-attn graph: O_proj only ---
-                    post_out = self.cuda_graph_manager.replay(
-                        self._post_attn_segment_name,
-                        batch_size,
-                        attn_output=attn_output,
-                    )
-                    # Store O_proj output; residual add + post-layernorm handled
-                    # eagerly via cuda_add_rmsnorm (matching main branch exactly)
-                    attn_residual = hidden_states  # original layer input = residual
-                    hidden_states = post_out["o_proj_output"]
+                    # --- 7. O_proj (eager) ---
+                    attn_output_flat = attn_output.view(batch_size, 1, self.self_attn.num_heads * self.self_attn.head_dim)
+                    hidden_states_out = self.self_attn.module.o_proj(attn_output_flat)
 
-                    # --- DIAGNOSTIC: L0 O_proj output values ---
-                    if (self.layer_idx == 0
-                            and not getattr(self, '_post_diag_done', False)
-                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-                        with torch.no_grad():
-                            torch.cuda.synchronize()
-                            _oproj = hidden_states[0, 0, :20].float().tolist()
-                            logging.warning(
-                                f"[CUDA_GRAPH_DIAG L0] O_proj_output seq0[:20]: "
-                                f"[{', '.join(f'{v:.6f}' for v in _oproj)}]"
-                            )
-                            _attn_flat = attn_output[0, 0].flatten()[:20].float().tolist()
-                            logging.warning(
-                                f"[CUDA_GRAPH_DIAG L0] FA_output seq0 flat[:20]: "
-                                f"[{', '.join(f'{v:.6f}' for v in _attn_flat)}]"
-                            )
-                            _eager_o = self.self_attn.module.o_proj(
-                                attn_output.view(batch_size, 1, self.self_attn.num_heads * self.self_attn.head_dim))
-                            torch.cuda.synchronize()
-                            _d = (hidden_states.float() - _eager_o.float()).abs()
-                            logging.warning(
-                                f"[CUDA_GRAPH_DIAG L0] post-attn o_proj: "
-                                f"max_diff={_d.max().item():.6e}, mean_diff={_d.mean().item():.6e}, "
-                                f"graph_norm={hidden_states.float().norm().item():.4f}, "
-                                f"eager_norm={_eager_o.float().norm().item():.4f}"
-                            )
-                        self._post_diag_done = True
+                    attn_residual = hidden_states  # original layer input = residual
+                    hidden_states = hidden_states_out
 
                     # Host KV append callback
                     kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)

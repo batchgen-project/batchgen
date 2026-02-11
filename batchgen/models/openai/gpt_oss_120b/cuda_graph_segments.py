@@ -1,18 +1,11 @@
 """CUDA Graph capturable segments for GPT-OSS-120B decode.
 
-Two segments per decoder layer, with KV write + FlashAttention running eagerly
-between them:
+MINIMAL graph: only the packed QKV projection (single nn.Linear / GEMM).
+Everything else runs eagerly for debugging.
 
-  Pre-attn segment (graph):  input_layernorm → packed QKV proj → QKV split
-  Eager middle:              RoPE → KV cache write → FlashAttention
-  Post-attn segment (graph): O_proj
-
-FlashAttention with paged KV cache is excluded from graphs because:
-- Dynamic workspace allocation based on max(cache_seqlens)
-- Variable page table access patterns in continuous batching
-
-The MoE block runs eagerly (outside both segments).
-Host KV append callback runs after the eager middle.
+  Graph segment:   packed QKV proj (nn.Linear)
+  Eager:           RMSNorm → [GRAPH: QKV proj] → QKV split → RoPE →
+                   KV write → FlashAttention → O_proj → residual+norm → MoE
 """
 
 import logging
@@ -22,133 +15,59 @@ import torch
 import torch.nn as nn
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
-from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split
 
 logger = logging.getLogger(__name__)
 
 
-class GptOssPreAttnSegment:
-    """Capturable segment: RMSNorm → QKV proj → QKV split.
+class GptOssQkvProjSegment:
+    """Capturable segment: packed QKV projection only (single GEMM).
 
-    RoPE is excluded from the graph because it requires dynamic position
-    indexing into cos/sin caches which is not graph-safe.
+    Input: normed hidden_states (after RMSNorm, done eagerly)
+    Output: packed QKV tensor (split done eagerly)
 
     Args:
         attn_wrapper: The GptOssAttnWrapper for this layer.
-        input_layernorm: The RMSNorm before attention.
         layer_idx: Decoder layer index (0-35).
     """
 
     def __init__(
         self,
         attn_wrapper,
-        input_layernorm: nn.Module,
         layer_idx: int,
     ):
         self.attn_module = attn_wrapper.module
-        self.input_layernorm = input_layernorm
         self.layer_idx = layer_idx
 
-        self.num_heads = attn_wrapper.num_heads          # 64
-        self.num_kv_heads = attn_wrapper.num_kv_heads    # 8
-        self.head_dim = attn_wrapper.head_dim             # 64
         self.hidden_size = 2880
         self.q_size = attn_wrapper.q_size                # 4096
         self.kv_size = attn_wrapper.kv_size              # 512
+        self.total_qkv_size = self.q_size + 2 * self.kv_size  # 5120
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
-            "hidden_states": TensorSpec(
+            "normed": TensorSpec(
                 ("batch_size", 1, self.hidden_size), torch.bfloat16
             ),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
-            "query": TensorSpec(
-                ("batch_size", 1, self.num_heads, self.head_dim), torch.bfloat16
-            ),
-            "key": TensorSpec(
-                ("batch_size", 1, self.num_kv_heads, self.head_dim), torch.bfloat16
-            ),
-            "value": TensorSpec(
-                ("batch_size", 1, self.num_kv_heads, self.head_dim), torch.bfloat16
+            "qkv": TensorSpec(
+                ("batch_size", 1, self.total_qkv_size), torch.bfloat16
             ),
         }
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        normed: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """RMSNorm → QKV proj → QKV split.
+        """Packed QKV projection only.
 
         Args:
-            hidden_states: [bucket_size, 1, hidden_size]
+            normed: [bucket_size, 1, hidden_size] (already RMSNorm'd)
 
         Returns:
-            query: [bucket_size, 1, num_heads, head_dim]
-            key: [bucket_size, 1, num_kv_heads, head_dim]
-            value: [bucket_size, 1, num_kv_heads, head_dim]
+            qkv: [bucket_size, 1, total_qkv_size]
         """
-        batch = hidden_states.shape[0]
-
-        # 1. Input LayerNorm
-        normed = cuda_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
-
-        # 2. Packed QKV Projection + Split
         qkv = self.attn_module.qkv_proj(normed)
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
-
-        query = query.view(batch, 1, self.num_heads, self.head_dim)
-        key = key.view(batch, 1, self.num_kv_heads, self.head_dim)
-        value = value.view(batch, 1, self.num_kv_heads, self.head_dim)
-
-        return {"query": query, "key": key, "value": value}
-
-
-class GptOssPostAttnSegment:
-    """Capturable segment: O_proj only.
-
-    The residual add + post-attention layernorm is handled eagerly via
-    cuda_add_rmsnorm to match the main branch's fused kernel exactly.
-
-    Args:
-        attn_wrapper: The GptOssAttnWrapper for this layer.
-    """
-
-    def __init__(self, attn_wrapper):
-        self.attn_module = attn_wrapper.module
-        self.num_heads = attn_wrapper.num_heads      # 64
-        self.head_dim = attn_wrapper.head_dim         # 64
-        self.hidden_size = 2880
-
-    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
-            "attn_output": TensorSpec(
-                ("batch_size", 1, self.num_heads, self.head_dim), torch.bfloat16
-            ),
-        }
-
-    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
-            "o_proj_output": TensorSpec(
-                ("batch_size", 1, self.hidden_size), torch.bfloat16
-            ),
-        }
-
-    def forward(
-        self,
-        attn_output: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """O_proj only.
-
-        Args:
-            attn_output: [bucket_size, 1, num_heads, head_dim]
-
-        Returns:
-            o_proj_output: [bucket_size, 1, hidden_size]
-        """
-        batch = attn_output.shape[0]
-        attn_output = attn_output.view(batch, 1, self.num_heads * self.head_dim)
-        o_proj_output = self.attn_module.o_proj(attn_output)
-        return {"o_proj_output": o_proj_output}
+        return {"qkv": qkv}

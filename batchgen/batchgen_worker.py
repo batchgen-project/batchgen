@@ -5828,12 +5828,12 @@ class BatchGenWorker:
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode attention blocks.
 
-		Two segments per layer (pre-attn and post-attn), with KV write +
-		FlashAttention running eagerly between them.
+		MINIMAL mode: only QKV proj (single GEMM) in graph.
+		Everything else runs eagerly for correctness debugging.
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
 		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
-			GptOssPreAttnSegment, GptOssPostAttnSegment,
+			GptOssQkvProjSegment,
 		)
 
 		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
@@ -5842,24 +5842,22 @@ class BatchGenWorker:
 
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			attn_wrapper = decoder_layer.self_attn
-			pre_seg = GptOssPreAttnSegment(
+			qkv_seg = GptOssQkvProjSegment(
 				attn_wrapper=attn_wrapper,
-				input_layernorm=decoder_layer.input_layernorm,
 				layer_idx=layer_idx,
 			)
-			post_seg = GptOssPostAttnSegment(attn_wrapper=attn_wrapper)
-			manager.register_segment(f"layer_{layer_idx}_pre_attn", pre_seg)
-			manager.register_segment(f"layer_{layer_idx}_post_attn", post_seg)
+			manager.register_segment(f"layer_{layer_idx}_qkv_proj", qkv_seg)
 
-		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture...")
+		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture (minimal: QKV proj only)...")
 		manager.warmup_and_capture_all()
 
 		# Enable graph mode on each decoder layer
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			decoder_layer.enable_cuda_graph(
 				manager,
-				f"layer_{layer_idx}_pre_attn",
-				f"layer_{layer_idx}_post_attn",
+				pre_attn_name=None,
+				post_attn_name=None,
+				qkv_proj_name=f"layer_{layer_idx}_qkv_proj",
 			)
 
 		self._cuda_graph_manager = manager
