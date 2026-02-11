@@ -1417,6 +1417,23 @@ class GptOssDecoderLayer(nn.Module):
                     attn_residual = hidden_states  # original layer input = residual
                     hidden_states = post_out["o_proj_output"]
 
+                    # --- DIAGNOSTIC: compare post-attn O_proj graph vs eager ---
+                    if (self.layer_idx == 0
+                            and not getattr(self, '_post_diag_done', False)
+                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+                        with torch.no_grad():
+                            _eager_o = self.self_attn.module.o_proj(
+                                attn_output.view(batch_size, 1, self.self_attn.num_heads * self.self_attn.head_dim))
+                            torch.cuda.synchronize()
+                            _d = (hidden_states.float() - _eager_o.float()).abs()
+                            logging.warning(
+                                f"[CUDA_GRAPH_DIAG L0] post-attn o_proj: "
+                                f"max_diff={_d.max().item():.6e}, mean_diff={_d.mean().item():.6e}, "
+                                f"graph_norm={hidden_states.float().norm().item():.4f}, "
+                                f"eager_norm={_eager_o.float().norm().item():.4f}"
+                            )
+                        self._post_diag_done = True
+
                     # Host KV append callback
                     kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
                     if kv_append_callback is not None:
