@@ -1370,6 +1370,32 @@ class GptOssDecoderLayer(nn.Module):
                     )
                     qkv = qkv_out["qkv"]
 
+                    # --- DIAGNOSTIC: graph QKV vs eager QKV ---
+                    if (self.layer_idx == 0
+                            and not getattr(self, '_qkv_diag_done', False)
+                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
+                        with torch.no_grad():
+                            torch.cuda.synchronize()
+                            _eager_qkv = self.self_attn.module.qkv_proj(normed)
+                            torch.cuda.synchronize()
+                            _d = (qkv.float() - _eager_qkv.float()).abs()
+                            logging.warning(
+                                f"[CUDA_GRAPH_DIAG L0] QKV proj graph_vs_eager: "
+                                f"max_diff={_d.max().item():.6e}, mean_diff={_d.mean().item():.6e}, "
+                                f"graph_norm={qkv.float().norm().item():.4f}, "
+                                f"eager_norm={_eager_qkv.float().norm().item():.4f}, "
+                                f"graph_shape={list(qkv.shape)}, eager_shape={list(_eager_qkv.shape)}"
+                            )
+                            _gv = qkv[0, 0, :10].float().tolist()
+                            _ev = _eager_qkv[0, 0, :10].float().tolist()
+                            logging.warning(
+                                f"[CUDA_GRAPH_DIAG L0] graph_qkv[0,0,:10]: [{', '.join(f'{v:.6f}' for v in _gv)}]"
+                            )
+                            logging.warning(
+                                f"[CUDA_GRAPH_DIAG L0] eager_qkv[0,0,:10]: [{', '.join(f'{v:.6f}' for v in _ev)}]"
+                            )
+                        self._qkv_diag_done = True
+
                     # --- 3. QKV split (eager) ---
                     query, key, value = cuda_qkv_split(qkv, self.self_attn.q_size, self.self_attn.kv_size)
                     query = query.view(batch_size, 1, self.self_attn.num_heads, self.self_attn.head_dim)
