@@ -164,9 +164,6 @@ class CUDAGraphManager:
         self.bucketing = bucketing
         self.device = device or torch.device("cuda")
 
-        # Shared memory pool across all graphs to reduce fragmentation
-        self._pool = torch.cuda.graph_pool_handle()
-
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
         self._segments: Dict[str, CapturableSegment] = {}
@@ -247,7 +244,7 @@ class CUDAGraphManager:
         # 3. Capture
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.stream(stream):
-            with torch.cuda.graph(graph, pool=self._pool, stream=stream):
+            with torch.cuda.graph(graph, stream=stream):
                 with torch.inference_mode():
                     static_outputs = segment.forward(**static_inputs)
 
