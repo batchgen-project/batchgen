@@ -309,8 +309,16 @@ class GptOss_Parameter_Server:
         """
         os.makedirs(self.converted_ckpt_dir, exist_ok=True)
 
-        # Check if already converted
-        converted_marker = os.path.join(self.converted_ckpt_dir, ".gpt_oss_converted")
+        # Check if already converted (v2 = packed QKV format)
+        converted_marker = os.path.join(self.converted_ckpt_dir, ".gpt_oss_converted_v2")
+        # Remove old marker if present (v1 had separate q/k/v, incompatible)
+        old_marker = os.path.join(self.converted_ckpt_dir, ".gpt_oss_converted")
+        if os.path.exists(old_marker) and not os.path.exists(converted_marker):
+            logging.warning("Found v1 converted checkpoint (separate q/k/v). "
+                          "Re-converting for packed QKV format...")
+            import shutil
+            shutil.rmtree(self.converted_ckpt_dir)
+            os.makedirs(self.converted_ckpt_dir, exist_ok=True)
         if os.path.exists(converted_marker):
             logging.info(f"Checkpoint already converted at {self.converted_ckpt_dir}")
             # Log what converted files exist
