@@ -252,11 +252,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(input_dtype)
+        from batchgen.attention.fused_kernels import cuda_rmsnorm
+        return cuda_rmsnorm(x, self.weight, self.eps)
 
 
 # ============================================================================
@@ -409,20 +406,12 @@ class GptOssAttention(nn.Module):
         # NOTE: Must be zeros (not empty) - uninitialized values corrupt attention
         self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.bfloat16))
 
-        # Projections
-        self.q_proj = nn.Linear(
+        # Projections — packed QKV: single GEMM instead of 3
+        self.q_size = self.num_heads * self.head_dim        # 4096
+        self.kv_size = self.num_kv_heads * self.head_dim    # 512
+        self.qkv_proj = nn.Linear(
             self.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
+            self.q_size + 2 * self.kv_size,  # 5120
             bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
@@ -448,10 +437,10 @@ class GptOssAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project Q, K, V
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Project Q, K, V (packed QKV)
+        qkv = self.qkv_proj(hidden_states)
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query_states, key_states, value_states = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape for attention
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -1339,19 +1328,23 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after attention (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
-        hidden_states = residual + hidden_states
-
         if debug_layer and self.layer_idx < 3:
+            # Unfused path for debug visibility
+            hidden_states = residual + hidden_states
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after attn+residual: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
-
-        # Pre-norm + MoE
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
-        if debug_layer and self.layer_idx < 3:
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+        else:
+            # Fused residual add + RMSNorm (1 kernel instead of ~5)
+            from batchgen.attention.fused_kernels import cuda_add_rmsnorm
+            hidden_states, residual = cuda_add_rmsnorm(
+                residual, hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
 
         # ========== MoE TIMING ==========
         if timing_enabled:

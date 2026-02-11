@@ -202,12 +202,8 @@ class GptOss_Parameter_Server:
             # Attention weights - these go to module_weights_storage_ for dynamic loading
             # Note: We add explicit list to match the converted checkpoint tensor names
             attn_tensor_names = [
-                "q_proj.weight",
-                "q_proj.bias",
-                "k_proj.weight",
-                "k_proj.bias",
-                "v_proj.weight",
-                "v_proj.bias",
+                "qkv_proj.weight",   # Packed QKV: [5120, 2880]
+                "qkv_proj.bias",     # Packed QKV bias: [5120]
                 "o_proj.weight",
                 "o_proj.bias",
                 "sinks",  # Attention sinks for GPT-OSS
@@ -403,38 +399,7 @@ class GptOss_Parameter_Server:
 
         logging.info(f"Found {len(tensor_to_file)} tensors in checkpoint")
 
-        # DEBUG: Print tensor names with print() to ensure visibility
-        print(f"\n[DEBUG] Found {len(tensor_to_file)} tensors in checkpoint")
-        sample_tensors = list(tensor_to_file.keys())[:30]
-        print(f"[DEBUG] Sample checkpoint tensor names (first 30):")
-        for t in sample_tensors:
-            print(f"  - {t}")
-
-        # Check for mlp1 related tensors
-        mlp1_tensors = [k for k in tensor_to_file.keys() if 'mlp1' in k.lower() or 'mlp.1' in k.lower()][:10]
-        print(f"[DEBUG] mlp1-related tensors: {mlp1_tensors}")
-
-        # Check specifically for block.0, block.1, block.2, block.3 tensors
-        print(f"\n[DEBUG] Checking for early layer tensors:")
-        for blk_idx in range(4):
-            blk_tensors = sorted([k for k in tensor_to_file.keys() if f'block.{blk_idx}.' in k])
-            print(f"  block.{blk_idx}: {len(blk_tensors)} tensors:")
-            for t in blk_tensors:
-                print(f"    - {t}")
-
-        # Also check block.4 for comparison (MoE layer)
-        blk4_tensors = sorted([k for k in tensor_to_file.keys() if 'block.4.' in k])
-        print(f"\n  block.4 (for comparison): {len(blk4_tensors)} tensors:")
-        for t in blk4_tensors:
-            print(f"    - {t}")
-
-        # Check if there's a different naming pattern (e.g., layers vs blocks)
-        layer_tensors = [k for k in tensor_to_file.keys() if 'layer' in k.lower()][:5]
-        if layer_tensors:
-            print(f"[DEBUG] 'layer'-related tensors: {layer_tensors}")
-
-        # Debug: Print first few tensor names from each category to verify naming convention
-        logging.info(f"Sample checkpoint tensor names (first 30): {sample_tensors}")
+        logging.debug(f"Sample checkpoint tensor names (first 30): {list(tensor_to_file.keys())[:30]}")
 
         # Print layer 0 tensor names for verification
         layer0_tensors = [k for k in tensor_to_file.keys() if "block.0." in k][:20]
@@ -482,18 +447,7 @@ class GptOss_Parameter_Server:
         """
         output_file = os.path.join(self.converted_ckpt_dir, f"layer_{layer_idx}.bin")
 
-        # DEBUG: Print BEFORE the early return check
-        if layer_idx == 0:
-            import sys
-            print(f"\n[DEBUG] _convert_layer called for layer {layer_idx}", flush=True)
-            print(f"[DEBUG] output_file: {output_file}", flush=True)
-            print(f"[DEBUG] output_file exists: {os.path.exists(output_file)}", flush=True)
-            print(f"[DEBUG] tensor_to_file has {len(tensor_to_file)} keys", flush=True)
-            sys.stdout.flush()
-
         if os.path.exists(output_file):
-            if layer_idx == 0:
-                print(f"[DEBUG] Layer {layer_idx} SKIPPED - file already exists!", flush=True)
             logging.debug(f"Layer {layer_idx} already converted, skipping")
             return
 
@@ -510,20 +464,10 @@ class GptOss_Parameter_Server:
             raise ValueError(f"Layer {layer_idx}: QKV weight tensor '{qkv_weight_name}' not found in checkpoint!")
 
         qkv_weight = self._load_tensor(qkv_weight_name, tensor_to_file)  # [5120, 2880]
-        # Split: Q=[4096, 2880], K=[512, 2880], V=[512, 2880]
-        q_weight = qkv_weight[:self.q_dim]  # [4096, 2880]
-        k_weight = qkv_weight[self.q_dim:self.q_dim + self.kv_dim]  # [512, 2880]
-        v_weight = qkv_weight[self.q_dim + self.kv_dim:]  # [512, 2880]
-
-        layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = q_weight
-        layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = k_weight
-        layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = v_weight
-        module_tensors.extend([
-            f"model.layers.{layer_idx}.self_attn.q_proj.weight",
-            f"model.layers.{layer_idx}.self_attn.k_proj.weight",
-            f"model.layers.{layer_idx}.self_attn.v_proj.weight",
-        ])
-        logging.debug(f"Layer {layer_idx} QKV weight split: Q={q_weight.shape}, K={k_weight.shape}, V={v_weight.shape}")
+        # Keep fused — packed QKV projection
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"] = qkv_weight
+        module_tensors.append(f"model.layers.{layer_idx}.self_attn.qkv_proj.weight")
+        logging.debug(f"Layer {layer_idx} QKV weight (packed): {qkv_weight.shape}")
 
         if qkv_bias_name in tensor_to_file:
             qkv_bias = self._load_tensor(qkv_bias_name, tensor_to_file)  # [5120]
@@ -532,18 +476,8 @@ class GptOss_Parameter_Server:
             logging.debug(f"Layer {layer_idx}: QKV bias not in checkpoint, initializing zeros")
             qkv_bias = torch.zeros(self.q_dim + 2 * self.kv_dim, dtype=torch.bfloat16)
 
-        q_bias = qkv_bias[:self.q_dim]
-        k_bias = qkv_bias[self.q_dim:self.q_dim + self.kv_dim]
-        v_bias = qkv_bias[self.q_dim + self.kv_dim:]
-
-        layer_tensors[f"model.layers.{layer_idx}.self_attn.q_proj.bias"] = q_bias
-        layer_tensors[f"model.layers.{layer_idx}.self_attn.k_proj.bias"] = k_bias
-        layer_tensors[f"model.layers.{layer_idx}.self_attn.v_proj.bias"] = v_bias
-        module_tensors.extend([
-            f"model.layers.{layer_idx}.self_attn.q_proj.bias",
-            f"model.layers.{layer_idx}.self_attn.k_proj.bias",
-            f"model.layers.{layer_idx}.self_attn.v_proj.bias",
-        ])
+        layer_tensors[f"model.layers.{layer_idx}.self_attn.qkv_proj.bias"] = qkv_bias
+        module_tensors.append(f"model.layers.{layer_idx}.self_attn.qkv_proj.bias")
 
         # Output projection
         out_weight_name = f"block.{layer_idx}.attn.out.weight"
@@ -613,14 +547,6 @@ class GptOss_Parameter_Server:
         mlp2_scales_name = f"block.{layer_idx}.mlp.mlp2_weight.scales"
         mlp2_bias_name = f"block.{layer_idx}.mlp.mlp2_bias"
 
-        # DEBUG: Unconditional print to trace code path
-        if layer_idx == 0:
-            print(f"\n[DEBUG] Layer {layer_idx}: Looking for '{mlp1_blocks_name}'")
-            print(f"[DEBUG] mlp1_blocks_name in tensor_to_file: {mlp1_blocks_name in tensor_to_file}")
-            if tensor_to_file:
-                sample_keys = [k for k in tensor_to_file.keys() if 'mlp1' in k][:5]
-                print(f"[DEBUG] Sample mlp1-related keys in tensor_to_file: {sample_keys}")
-
         if mlp1_blocks_name in tensor_to_file:
             # Load stacked tensors
             # RAW format from checkpoint: [128, rows, num_blocks, bytes_per_block]
@@ -633,29 +559,16 @@ class GptOss_Parameter_Server:
             mlp2_scales = self._load_tensor(mlp2_scales_name, tensor_to_file)  # [128, 2880, 90]
             mlp2_bias = self._load_tensor(mlp2_bias_name, tensor_to_file)      # [128, 2880]
 
-            # Log raw tensor shapes BEFORE reshape
-            if layer_idx == 0:
-                print(f"\n{'='*60}")
-                print(f"[GPT-OSS CHECKPOINT CONVERSION] Layer {layer_idx} RAW TENSORS (before reshape):")
-                print(f"  mlp1_blocks_raw: {mlp1_blocks_raw.shape}, dtype={mlp1_blocks_raw.dtype}")
-                print(f"  mlp1_scales: {mlp1_scales.shape}, dtype={mlp1_scales.dtype}")
-                print(f"  mlp2_blocks_raw: {mlp2_blocks_raw.shape}, dtype={mlp2_blocks_raw.dtype}")
-                print(f"  mlp2_scales: {mlp2_scales.shape}, dtype={mlp2_scales.dtype}")
-
             # Reshape blocks from [experts, rows, num_blocks, bytes_per_block] to [experts, rows, total_bytes]
             # This flattens the last two dimensions: [128, 5760, 90, 16] -> [128, 5760, 1440]
             if mlp1_blocks_raw.dim() == 4:
                 mlp1_blocks = mlp1_blocks_raw.reshape(
-                    mlp1_blocks_raw.shape[0],  # experts
-                    mlp1_blocks_raw.shape[1],  # rows
-                    -1  # flatten num_blocks * bytes_per_block
+                    mlp1_blocks_raw.shape[0],
+                    mlp1_blocks_raw.shape[1],
+                    -1
                 )
-                if layer_idx == 0:
-                    print(f"  mlp1_blocks RESHAPED: {mlp1_blocks.shape}")
             else:
                 mlp1_blocks = mlp1_blocks_raw
-                if layer_idx == 0:
-                    print(f"  mlp1_blocks (no reshape needed): {mlp1_blocks.shape}")
 
             if mlp2_blocks_raw.dim() == 4:
                 mlp2_blocks = mlp2_blocks_raw.reshape(
@@ -663,15 +576,8 @@ class GptOss_Parameter_Server:
                     mlp2_blocks_raw.shape[1],
                     -1
                 )
-                if layer_idx == 0:
-                    print(f"  mlp2_blocks RESHAPED: {mlp2_blocks.shape}")
             else:
                 mlp2_blocks = mlp2_blocks_raw
-                if layer_idx == 0:
-                    print(f"  mlp2_blocks (no reshape needed): {mlp2_blocks.shape}")
-
-            if layer_idx == 0:
-                print(f"{'='*60}\n")
 
             logging.debug(f"Layer {layer_idx} mlp1_blocks shape: {mlp1_blocks.shape}")
             logging.debug(f"Layer {layer_idx} mlp2_blocks shape: {mlp2_blocks.shape}")
@@ -695,17 +601,6 @@ class GptOss_Parameter_Server:
                 up_blocks = expert_mlp1_blocks[1::2].contiguous()     # odd rows [2880, K//2]
                 up_scales = expert_mlp1_scales[1::2].contiguous()     # odd rows [2880, K//32]
                 up_bias = expert_mlp1_bias[1::2].contiguous()         # odd indices [2880]
-
-                # Log sliced shapes for layer 0, expert 0 only - use print() for visibility
-                if layer_idx == 0 and expert_idx == 0:
-                    print(f"\n[GPT-OSS CHECKPOINT CONVERSION] Layer {layer_idx} Expert {expert_idx} SLICED TENSORS:")
-                    print(f"  gate_blocks: {gate_blocks.shape}, contiguous={gate_blocks.is_contiguous()}")
-                    print(f"  gate_scales: {gate_scales.shape}, contiguous={gate_scales.is_contiguous()}")
-                    print(f"  gate_bias: {gate_bias.shape}")
-                    print(f"  up_blocks: {up_blocks.shape}, contiguous={up_blocks.is_contiguous()}")
-                    print(f"  up_scales: {up_scales.shape}, contiguous={up_scales.is_contiguous()}")
-                    print(f"  up_bias: {up_bias.shape}")
-                    print(f"  INTERLEAVED SLICING: gate=[::2] (even rows), up=[1::2] (odd rows)\n")
 
                 # mlp2 -> down_proj
                 down_blocks = mlp2_blocks[expert_idx]  # [2880, K//2]

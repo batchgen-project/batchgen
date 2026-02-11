@@ -1016,6 +1016,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         self.head_dim = model_config.head_dim  # 64
         self.num_groups = self.num_heads // self.num_kv_heads  # 8
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.q_size = self.num_heads * self.head_dim        # 4096
+        self.kv_size = self.num_kv_heads * self.head_dim    # 512
 
         # Determine if this layer uses sliding window
         # GPT-OSS uses alternating: even layers = sliding, odd = full
@@ -1137,9 +1139,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         batch, seq_len, _ = hidden_states.shape
 
         # Project Q, K, V using module's projections
-        query = self.module.q_proj(hidden_states)
-        key = self.module.k_proj(hidden_states)
-        value = self.module.v_proj(hidden_states)
+        qkv = self.module.qkv_proj(hidden_states)
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape for attention: [batch, seq, heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1249,9 +1251,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         if do_timing:
             t0 = time.perf_counter()
 
-        query = self.module.q_proj(hidden_states)
-        key = self.module.k_proj(hidden_states)
-        value = self.module.v_proj(hidden_states)
+        qkv = self.module.qkv_proj(hidden_states)
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape: [batch, 1, num_heads, head_dim]
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1473,9 +1475,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         assert seq_len == 1, "Decode expects single token"
 
         # Project Q, K, V
-        query = self.module.q_proj(hidden_states)
-        key = self.module.k_proj(hidden_states)
-        value = self.module.v_proj(hidden_states)
+        qkv = self.module.qkv_proj(hidden_states)
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape
         query = query.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -1535,39 +1537,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         Returns:
             Tuple of rotated (query, key)
         """
-        half_dim = self.head_dim // 2
-
-        # Expand cos/sin for broadcasting with query/key
-        if cos.dim() == 2:
-            # Prefill: [seq, head_dim] -> [1, seq, 1, head_dim]
-            cos = cos.unsqueeze(0).unsqueeze(2)
-            sin = sin.unsqueeze(0).unsqueeze(2)
-        elif cos.dim() == 3:
-            # Decode: [batch, 1, head_dim] -> [batch, 1, 1, head_dim]
-            cos = cos.unsqueeze(2)
-            sin = sin.unsqueeze(2)
-        else:
-            raise ValueError(f"Unexpected cos shape: {cos.shape}")
-
-        # Split heads
-        q1, q2 = query[..., :half_dim], query[..., half_dim:]
-        k1, k2 = key[..., :half_dim], key[..., half_dim:]
-
-        cos_half = cos[..., :half_dim]
-        sin_half = sin[..., :half_dim]
-
-        # Apply rotation
-        q_rot = torch.cat([
-            q1 * cos_half - q2 * sin_half,
-            q2 * cos_half + q1 * sin_half
-        ], dim=-1)
-
-        k_rot = torch.cat([
-            k1 * cos_half - k2 * sin_half,
-            k2 * cos_half + k1 * sin_half
-        ], dim=-1)
-
-        return q_rot, k_rot
+        from batchgen.attention.fused_kernels import cuda_rope
+        return cuda_rope(query, key, cos, sin)
 
     def _forward_prefill_prepacked(
         self,
@@ -1674,9 +1645,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Project Q, K, V in varlen format
         # hidden_states_2d: [total_tokens, hidden_size]
-        query = self.module.q_proj(hidden_states_2d)  # [total_tokens, num_heads * head_dim]
-        key = self.module.k_proj(hidden_states_2d)    # [total_tokens, num_kv_heads * head_dim]
-        value = self.module.v_proj(hidden_states_2d)  # [total_tokens, num_kv_heads * head_dim]
+        qkv = self.module.qkv_proj(hidden_states_2d)  # [total_tokens, q_size + 2 * kv_size]
+        from batchgen.attention.fused_kernels import cuda_qkv_split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
         # Reshape to [total_tokens, num_heads, head_dim]
         query = query.view(total_tokens, self.num_heads, self.head_dim)
