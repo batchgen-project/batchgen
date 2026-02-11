@@ -164,6 +164,13 @@ class CUDAGraphManager:
         self.bucketing = bucketing
         self.device = device or torch.device("cuda")
 
+        # One pool per bucket size — segments sharing a pool are captured and
+        # replayed in the same order (layer 0 pre, layer 0 post, layer 1 pre, ...)
+        self._pools: Dict[int, Any] = {
+            bs: torch.cuda.graph_pool_handle()
+            for bs in bucketing.bucket_sizes
+        }
+
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
         self._segments: Dict[str, CapturableSegment] = {}
@@ -202,9 +209,12 @@ class CUDAGraphManager:
         total_start = time.perf_counter()
         num_graphs = 0
 
-        for seg_name, segment in self._segments.items():
-            for bucket_size in self.bucketing.bucket_sizes:
-                self._capture_one(seg_name, segment, bucket_size)
+        # Capture bucket-first so that within each bucket's shared pool,
+        # segments are captured in the same order they'll be replayed.
+        for bucket_size in self.bucketing.bucket_sizes:
+            pool = self._pools[bucket_size]
+            for seg_name, segment in self._segments.items():
+                self._capture_one(seg_name, segment, bucket_size, pool)
                 num_graphs += 1
 
         elapsed_ms = (time.perf_counter() - total_start) * 1000
@@ -218,7 +228,7 @@ class CUDAGraphManager:
         )
 
     def _capture_one(
-        self, name: str, segment: CapturableSegment, bucket_size: int
+        self, name: str, segment: CapturableSegment, bucket_size: int, pool=None
     ) -> None:
         """Warmup and capture a single graph for one segment at one bucket size."""
         start = time.perf_counter()
@@ -244,7 +254,7 @@ class CUDAGraphManager:
         # 3. Capture
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.stream(stream):
-            with torch.cuda.graph(graph, stream=stream):
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
                 with torch.inference_mode():
                     static_outputs = segment.forward(**static_inputs)
 
