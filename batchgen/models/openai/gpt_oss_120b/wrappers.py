@@ -1481,6 +1481,21 @@ class GptOssAttnWrapper(AttnWrapperBase):
         """
         batch = query.shape[0]
 
+        # === Bookkeeping (same as forward()) ===
+        # Load weights for non-persistent mode
+        if not self.persistent:
+            weights = self.load_weights(self.module_key)
+            dequant_weights = self.dequantize_weights(weights)
+            self.apply_weights(dequant_weights)
+
+        # Initialize sinks for persistent mode (lazy, same as forward() lines 1940-1942)
+        if self.sinks is None and self.persistent and hasattr(self.module, 'sinks'):
+            self.sinks = self.module.sinks.data
+
+        # Move sinks to correct device
+        if self.sinks is not None:
+            self.sinks = self.sinks.to(query.device)
+
         # Get class-level state
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
         cache_seqlens = AttnWrapperBase.cache_seqlens
@@ -1535,6 +1550,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
         kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
         if kv_append_callback is not None:
             kv_append_callback(self.layer_idx, key, value)
+
+        # === Cleanup for non-persistent mode (same as forward() lines 1982-1988) ===
+        if not self.persistent:
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
 
         return attn_output
 
