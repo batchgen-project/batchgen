@@ -1273,11 +1273,10 @@ class GptOssDecoderLayer(nn.Module):
     """Single transformer decoder layer.
 
     Supports optional CUDA graph mode for decode phase. When
-    ``cuda_graph_manager`` is set, two segments are replayed from captured
-    graphs with KV write + FlashAttention running eagerly between them:
-      pre_attn graph:  RMSNorm → QKV proj → QKV split → RoPE
-      eager middle:    KV cache write → FlashAttention
-      post_attn graph: O_proj → residual add
+    ``cuda_graph_manager`` is set, the full attention block is replayed
+    from a single captured graph:
+      RMSNorm → QKV proj → split → RoPE → KV write → FA → O_proj
+      → residual add + post-attn RMSNorm
     The MoE block always runs eagerly.
     """
 
@@ -1293,20 +1292,12 @@ class GptOssDecoderLayer(nn.Module):
 
         # CUDA graph support (set externally after model init)
         self.cuda_graph_manager = None
-        self._pre_attn_segment_name = None
-        self._post_attn_segment_name = None
+        self._full_attn_segment_name = None
 
-    def enable_cuda_graph(self, manager, pre_attn_name: str, post_attn_name: str):
-        """Enable CUDA graph mode for this layer.
-
-        Args:
-            manager: CUDAGraphManager with segments pre-captured.
-            pre_attn_name: Segment name for RMSNorm → QKV proj → split → reshape.
-            post_attn_name: Segment name for residual add + post-attn RMSNorm.
-        """
+    def enable_cuda_graph(self, manager, full_attn_name: str):
+        """Enable CUDA graph mode for this layer."""
         self.cuda_graph_manager = manager
-        self._pre_attn_segment_name = pre_attn_name
-        self._post_attn_segment_name = post_attn_name
+        self._full_attn_segment_name = full_attn_name
 
     def forward(
         self,
@@ -1328,38 +1319,21 @@ class GptOssDecoderLayer(nn.Module):
         # For CUDA graph path: post_attn segment does residual add, so attn_residual=None
         attn_residual = None
         use_graph = (self.cuda_graph_manager is not None
-                     and self._pre_attn_segment_name is not None)
+                     and self._full_attn_segment_name is not None)
 
         if use_graph:
             batch_size = hidden_states.shape[0]
 
             if batch_size > 0:
                 try:
-                    # --- Pre-attn graph: RMSNorm → QKV proj → split → reshape ---
-                    pre_out = self.cuda_graph_manager.replay(
-                        self._pre_attn_segment_name, batch_size,
+                    from batchgen.models.wrappers.attention import AttnWrapperBase
+                    out = self.cuda_graph_manager.replay(
+                        self._full_attn_segment_name, batch_size,
                         hidden_states=hidden_states,
+                        cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
                     )
-                    query = pre_out["query"]
-                    key = pre_out["key"]
-                    value = pre_out["value"]
-
-                    # --- Eager middle via wrapper: RoPE → KV write → FA → O_proj ---
-                    attn_output = self.self_attn._forward_decode_mid(
-                        query, key, value,
-                    )
-
-                    # --- Post-attn graph: residual add + post-attn RMSNorm ---
-                    post_out = self.cuda_graph_manager.replay(
-                        self._post_attn_segment_name, batch_size,
-                        attn_residual=hidden_states,
-                        attn_output=attn_output,
-                    )
-                    # Post-attn graph already fused residual add + norm.
-                    # hidden_states = normed MoE input, residual for MoE residual add.
-                    # Set attn_residual = "done" sentinel to skip the norm block below.
-                    hidden_states = post_out["normed"]
-                    residual = post_out["residual"]
+                    hidden_states = out["normed"]
+                    residual = out["residual"]
                     attn_residual = "graph_done"
 
                 except (ValueError, RuntimeError):

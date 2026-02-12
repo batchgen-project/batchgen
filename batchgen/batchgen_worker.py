@@ -5824,31 +5824,42 @@ class BatchGenWorker:
 		self._setup_cuda_graphs(gpu_manager)
 
 	def _setup_cuda_graphs(self, gpu_manager):
-		"""Capture CUDA graphs for decode: pre-attn and post-attn segments per layer.
+		"""Capture CUDA graphs for decode: full attention block per layer.
 
-		Pre-attn:  RMSNorm → QKV proj → QKV split → reshape  (pure compute)
-		Post-attn: residual add + post-attn RMSNorm           (pure compute)
+		Each graph captures the entire attention block in one shot:
+		  RMSNorm → QKV proj → split → reshape → RoPE → KV write → FA → O_proj
+		  → residual add + post-attn RMSNorm
 
-		The middle (RoPE → KV write → FA → O_proj) runs eagerly via the wrapper
-		because it depends on per-step runtime metadata (cache_seqlens, page_table).
+		Dynamic metadata (cache_seqlens) is passed as a static-address input buffer.
+		KV cache, page table, and cos/sin tables are at fixed GPU addresses.
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
-		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
-			PreAttnSegment,
-			PostAttnSegment,
-		)
+		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import FullAttnSegment
+		from batchgen.models.wrappers.attention import AttnWrapperBase
 
 		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-		# Register pre-attn and post-attn segments for each decoder layer
+		max_ctx = getattr(self.engine_config.Basic_Config, 'max_context_length', 8192)
+
+		# Pre-warm: initialize sinks and RoPE cache before capture
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			attn_wrapper = decoder_layer.self_attn  # GptOssAttnWrapper
-			pre_seg = PreAttnSegment(decoder_layer, attn_wrapper)
-			post_seg = PostAttnSegment(decoder_layer)
-			manager.register_segment(f"layer_{layer_idx}_pre_attn", pre_seg)
-			manager.register_segment(f"layer_{layer_idx}_post_attn", post_seg)
+			wrapper = decoder_layer.self_attn
+			# Initialize sinks for persistent mode
+			if wrapper.sinks is None and wrapper.persistent and hasattr(wrapper.module, 'sinks'):
+				wrapper.sinks = wrapper.module.sinks.data.to(self.torch_device)
+			elif wrapper.sinks is not None:
+				wrapper.sinks = wrapper.sinks.to(self.torch_device)
+			# Pre-warm RoPE cos/sin cache to max context length
+			dummy = torch.zeros(1, 1, wrapper.num_kv_heads, wrapper.head_dim, device=self.torch_device)
+			wrapper.module.rotary_emb(dummy, seq_len=max_ctx)
+
+		# Register full attention segments
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			attn_wrapper = decoder_layer.self_attn
+			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_ctx)
+			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
 
 		if self.rank == 0:
 			logging.info(
@@ -5862,8 +5873,7 @@ class BatchGenWorker:
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			decoder_layer.enable_cuda_graph(
 				manager,
-				pre_attn_name=f"layer_{layer_idx}_pre_attn",
-				post_attn_name=f"layer_{layer_idx}_post_attn",
+				full_attn_name=f"layer_{layer_idx}_full_attn",
 			)
 
 		self._cuda_graph_manager = manager
