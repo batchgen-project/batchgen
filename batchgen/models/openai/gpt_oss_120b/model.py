@@ -1362,11 +1362,7 @@ class GptOssDecoderLayer(nn.Module):
                     residual = post_out["residual"]
                     attn_residual = "graph_done"
 
-                except (ValueError, RuntimeError) as e:
-                    logging.warning(
-                        f"Layer {self.layer_idx}: CUDA graph replay failed ({e}), "
-                        "falling back to eager execution"
-                    )
+                except (ValueError, RuntimeError):
                     hidden_states, attn_residual = self._forward_attn_eager(
                         hidden_states, attention_mask, position_ids,
                         past_key_value, output_attentions, use_cache,
