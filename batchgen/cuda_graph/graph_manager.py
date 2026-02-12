@@ -229,6 +229,12 @@ class CUDAGraphManager:
             static_inputs[key] = t
             fill_values[key] = spec.fill_value
 
+        # 1b. Pre-allocate internal buffers if segment supports it
+        # (e.g. MoESegment needs TMA descriptors and intermediate buffers
+        #  created before graph capture since these are CPU-side operations)
+        if hasattr(segment, 'setup_static_buffers'):
+            segment.setup_static_buffers(bucket_size)
+
         # 2. Warmup on current stream
         for _ in range(self.WARMUP_ITERATIONS):
             with torch.inference_mode():

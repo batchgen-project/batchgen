@@ -918,11 +918,152 @@ torch::Tensor grouped_mxfp4_moe_stage2(
     return C;
 }
 
+// ============================================================================
+// TMA descriptor creation (callable from Python for pre-building descriptors)
+// ============================================================================
+torch::Tensor create_tma_desc_bf16(
+    torch::Tensor tensor,
+    int block_m,
+    int block_k
+) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tensor.dim() == 2, "Expected 2D tensor");
+
+    auto encode_func = get_cuTensorMapEncodeTiled();
+    CUtensorMap desc = make_2d_tma_desc_bf16(
+        reinterpret_cast<__nv_bfloat16*>(tensor.data_ptr()),
+        tensor.size(0), tensor.size(1), block_m, block_k, encode_func);
+
+    // Copy the 128-byte descriptor into a uint8 tensor
+    auto desc_tensor = torch::empty({128}, torch::dtype(torch::kUInt8).device(torch::kCPU));
+    std::memcpy(desc_tensor.data_ptr(), &desc, sizeof(CUtensorMap));
+    return desc_tensor;
+}
+
+// ============================================================================
+// C++ wrapper: Stage 1 inplace (pre-allocated output + pre-built TMA desc)
+// ============================================================================
+void grouped_mxfp4_moe_stage1_inplace(
+    torch::Tensor A,
+    torch::Tensor C,
+    torch::Tensor tma_desc_bytes,
+    torch::Tensor expert_offsets,
+    torch::Tensor gate_ptrs,
+    torch::Tensor gate_scale_ptrs,
+    torch::Tensor up_ptrs,
+    torch::Tensor up_scale_ptrs,
+    torch::Tensor gate_bias_ptrs,
+    torch::Tensor up_bias_ptrs,
+    int N,
+    int64_t stride_weight_n,
+    int64_t stride_scale_n,
+    int max_m_tiles
+) {
+    TORCH_CHECK(A.is_cuda() && A.dtype() == torch::kBFloat16);
+    TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tma_desc_bytes.numel() == 128, "TMA descriptor must be 128 bytes");
+
+    const int total_tokens = A.size(0);
+    const int K = A.size(1);
+    const int num_experts = expert_offsets.size(0) - 1;
+
+    // Copy pre-built TMA descriptor from CPU tensor
+    CUtensorMap desc_a;
+    std::memcpy(&desc_a, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
+
+    const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_experts, num_n_tiles, max_m_tiles);
+    dim3 block(TOTAL_THREADS);
+
+    constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
+                               4 * NUM_STAGES * sizeof(uint64_t) + LUT_BYTES;
+
+    cudaFuncSetAttribute(grouped_mxfp4_moe_stage1_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int has_gate_bias = gate_bias_ptrs.numel() > 0 ? 1 : 0;
+    int has_up_bias = up_bias_ptrs.numel() > 0 ? 1 : 0;
+
+    grouped_mxfp4_moe_stage1_kernel<<<grid, block, smem_bytes>>>(
+        desc_a,
+        gate_ptrs.data_ptr<int64_t>(),
+        gate_scale_ptrs.data_ptr<int64_t>(),
+        up_ptrs.data_ptr<int64_t>(),
+        up_scale_ptrs.data_ptr<int64_t>(),
+        has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        expert_offsets.data_ptr<int32_t>(),
+        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        C.stride(0),
+        total_tokens, N, K, num_experts,
+        stride_weight_n, stride_scale_n,
+        has_gate_bias, has_up_bias);
+}
+
+// ============================================================================
+// C++ wrapper: Stage 2 inplace (pre-allocated output + pre-built TMA desc)
+// ============================================================================
+void grouped_mxfp4_moe_stage2_inplace(
+    torch::Tensor input,
+    torch::Tensor C,
+    torch::Tensor tma_desc_bytes,
+    torch::Tensor expert_offsets,
+    torch::Tensor down_ptrs,
+    torch::Tensor down_scale_ptrs,
+    torch::Tensor down_bias_ptrs,
+    int K,
+    int64_t stride_weight_n,
+    int64_t stride_scale_n,
+    int max_m_tiles
+) {
+    TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kBFloat16);
+    TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tma_desc_bytes.numel() == 128, "TMA descriptor must be 128 bytes");
+
+    const int total_tokens = input.size(0);
+    const int N = input.size(1);
+    const int num_experts = expert_offsets.size(0) - 1;
+
+    // Copy pre-built TMA descriptor from CPU tensor
+    CUtensorMap desc_input;
+    std::memcpy(&desc_input, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
+
+    const int num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_experts, num_k_tiles, max_m_tiles);
+    dim3 block(TOTAL_THREADS);
+
+    constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
+                               2 * NUM_STAGES * sizeof(uint64_t) + LUT_BYTES;
+
+    cudaFuncSetAttribute(grouped_mxfp4_moe_stage2_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int has_down_bias = down_bias_ptrs.numel() > 0 ? 1 : 0;
+
+    grouped_mxfp4_moe_stage2_kernel<<<grid, block, smem_bytes>>>(
+        desc_input,
+        down_ptrs.data_ptr<int64_t>(),
+        down_scale_ptrs.data_ptr<int64_t>(),
+        has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        expert_offsets.data_ptr<int32_t>(),
+        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        C.stride(0),
+        total_tokens, N, K, num_experts,
+        stride_weight_n, stride_scale_n,
+        has_down_bias);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_mxfp4_moe_stage1", &grouped_mxfp4_moe_stage1,
           "Grouped MXFP4 Stage 1 (gate+up+SwiGLU) with TMA + bias");
     m.def("grouped_mxfp4_moe_stage2", &grouped_mxfp4_moe_stage2,
           "Grouped MXFP4 Stage 2 (down projection) with TMA + bias");
+    m.def("create_tma_desc_bf16", &create_tma_desc_bf16,
+          "Create TMA descriptor for a 2D BF16 tensor");
+    m.def("grouped_mxfp4_moe_stage1_inplace", &grouped_mxfp4_moe_stage1_inplace,
+          "Grouped MXFP4 Stage 1 inplace (pre-allocated output + TMA desc)");
+    m.def("grouped_mxfp4_moe_stage2_inplace", &grouped_mxfp4_moe_stage2_inplace,
+          "Grouped MXFP4 Stage 2 inplace (pre-allocated output + TMA desc)");
 }
 
 '''
@@ -1085,6 +1226,110 @@ def fused_mxfp4_grouped_stage2(
 
     return mod.grouped_mxfp4_moe_stage2(
         intermediate, expert_offsets,
+        down_ptrs, down_scale_ptrs,
+        db,
+        K, stride_weight_n, stride_scale_n,
+        max_m_tiles,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CUDA Graph Compatible: In-place Wrappers + TMA Descriptor Creation
+# ──────────────────────────────────────────────────────────────────────────────
+
+_BLOCK_M = 64
+_BLOCK_K = 64
+
+# Cached empty bias tensor per device (avoids allocation during graph capture)
+_empty_bias_cache = {}
+
+
+def _get_empty_bias(device: torch.device) -> torch.Tensor:
+    """Return a cached zero-size int64 tensor for use as empty bias placeholder."""
+    key = str(device)
+    if key not in _empty_bias_cache:
+        _empty_bias_cache[key] = torch.empty(0, dtype=torch.int64, device=device)
+    return _empty_bias_cache[key]
+
+
+def create_tma_descriptor(tensor: torch.Tensor, block_m: int = _BLOCK_M, block_k: int = _BLOCK_K) -> torch.Tensor:
+    """Create a TMA descriptor for a 2D BF16 tensor.
+
+    Returns a CPU uint8 tensor of 128 bytes encoding the CUtensorMap.
+    Must be called BEFORE CUDA graph capture — TMA descriptor creation
+    is a CPU-side driver API call and is not capturable.
+
+    Args:
+        tensor: 2D BF16 CUDA tensor (the global memory source for TMA loads)
+        block_m: Tile height (default 64)
+        block_k: Tile width (default 64)
+
+    Returns:
+        torch.Tensor of shape [128], dtype uint8, on CPU
+    """
+    mod = _load_grouped_module()
+    assert mod is not None, "WGMMA grouped module not available"
+    return mod.create_tma_desc_bf16(tensor, block_m, block_k)
+
+
+def fused_mxfp4_grouped_stage1_inplace(
+    sorted_hidden: torch.Tensor,
+    output: torch.Tensor,
+    tma_desc: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    gate_ptrs: torch.Tensor,
+    gate_scale_ptrs: torch.Tensor,
+    up_ptrs: torch.Tensor,
+    up_scale_ptrs: torch.Tensor,
+    N: int,
+    stride_weight_n: int,
+    stride_scale_n: int,
+    gate_bias_ptrs: torch.Tensor = None,
+    up_bias_ptrs: torch.Tensor = None,
+) -> None:
+    """In-place Stage 1 with pre-built TMA descriptor. CUDA graph compatible."""
+    mod = _load_grouped_module()
+    assert mod is not None, "WGMMA grouped module not available"
+
+    total_tokens = sorted_hidden.shape[0]
+    max_m_tiles = (total_tokens + 63) // 64 if total_tokens > 0 else 1
+
+    gb = gate_bias_ptrs if gate_bias_ptrs is not None else _get_empty_bias(sorted_hidden.device)
+    ub = up_bias_ptrs if up_bias_ptrs is not None else _get_empty_bias(sorted_hidden.device)
+
+    mod.grouped_mxfp4_moe_stage1_inplace(
+        sorted_hidden, output, tma_desc, expert_offsets,
+        gate_ptrs, gate_scale_ptrs,
+        up_ptrs, up_scale_ptrs,
+        gb, ub,
+        N, stride_weight_n, stride_scale_n,
+        max_m_tiles,
+    )
+
+
+def fused_mxfp4_grouped_stage2_inplace(
+    intermediate: torch.Tensor,
+    output: torch.Tensor,
+    tma_desc: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    down_ptrs: torch.Tensor,
+    down_scale_ptrs: torch.Tensor,
+    K: int,
+    stride_weight_n: int,
+    stride_scale_n: int,
+    down_bias_ptrs: torch.Tensor = None,
+) -> None:
+    """In-place Stage 2 with pre-built TMA descriptor. CUDA graph compatible."""
+    mod = _load_grouped_module()
+    assert mod is not None, "WGMMA grouped module not available"
+
+    total_tokens = intermediate.shape[0]
+    max_m_tiles = (total_tokens + 63) // 64 if total_tokens > 0 else 1
+
+    db = down_bias_ptrs if down_bias_ptrs is not None else _get_empty_bias(intermediate.device)
+
+    mod.grouped_mxfp4_moe_stage2_inplace(
+        intermediate, output, tma_desc, expert_offsets,
         down_ptrs, down_scale_ptrs,
         db,
         K, stride_weight_n, stride_scale_n,
