@@ -1293,11 +1293,13 @@ class GptOssDecoderLayer(nn.Module):
         # CUDA graph support (set externally after model init)
         self.cuda_graph_manager = None
         self._full_attn_segment_name = None
+        self._moe_segment_name = None
 
-    def enable_cuda_graph(self, manager, full_attn_name: str):
+    def enable_cuda_graph(self, manager, full_attn_name: str, moe_name: str = None):
         """Enable CUDA graph mode for this layer."""
         self.cuda_graph_manager = manager
         self._full_attn_segment_name = full_attn_name
+        self._moe_segment_name = moe_name
 
     def forward(
         self,
@@ -1362,7 +1364,7 @@ class GptOssDecoderLayer(nn.Module):
                 debug_layer, timing_enabled,
             )
 
-        # ========== MoE BLOCK (always eager) ==========
+        # ========== MoE BLOCK ==========
         # Post-attn norm: skip if post-attn graph already computed it
         if attn_residual == "graph_done":
             # hidden_states = normed, residual = residual — both set by post-attn graph
@@ -1392,7 +1394,21 @@ class GptOssDecoderLayer(nn.Module):
             torch.cuda.synchronize()
             moe_start = time.perf_counter()
 
-        hidden_states = self.mlp(hidden_states)
+        # MoE: graph path or eager
+        use_moe_graph = (use_graph and self._moe_segment_name is not None
+                         and batch_size > 0)
+        if use_moe_graph:
+            try:
+                moe_in = hidden_states.view(batch_size, -1)
+                moe_out = self.cuda_graph_manager.replay(
+                    self._moe_segment_name, batch_size,
+                    hidden_states=moe_in,
+                )
+                hidden_states = moe_out["moe_output"].view(batch_size, 1, -1)
+            except (ValueError, RuntimeError):
+                hidden_states = self.mlp(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
 
         if timing_enabled:
             torch.cuda.synchronize()

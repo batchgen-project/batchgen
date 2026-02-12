@@ -1,12 +1,13 @@
-"""CUDA Graph capturable segment for GPT-OSS-120B decode: full attention block.
+"""CUDA Graph capturable segments for GPT-OSS-120B decode.
 
-Captures the entire attention block in one graph:
-  RMSNorm → QKV proj → split → reshape → RoPE → KV write → FA → O_proj
-  → residual add + post-attn RMSNorm
+Segments:
+  FullAttnSegment: RMSNorm → QKV → RoPE → KV write → FA → O_proj → post-attn norm
+  MoESegment: AllGather → router → grouped WGMMA MoE → AllReduce
 
 Dynamic metadata (cache_seqlens, page_table) are static-address input buffers
 whose contents are updated before each replay. KV cache and cos/sin tables
-are at fixed GPU addresses.
+are at fixed GPU addresses. NCCL collectives use PyNccl (ctypes) for graph
+compatibility.
 """
 
 import logging
@@ -148,3 +149,116 @@ class FullAttnSegment:
             hidden_states, attn_out, self.post_ln_weight, self.post_ln_eps
         )
         return {"normed": normed, "residual": residual}
+
+
+class MoESegment:
+    """MoE block as a CUDA-graph-capturable segment (EP, persistent experts only).
+
+    Bypasses GptOssMoEDecode._forward_ep to use per-bucket-sized buffers and
+    call kernels directly. NCCL via PyNccl for graph compatibility.
+
+    Inputs:  hidden_states [B, H] bf16
+    Outputs: moe_output [B, H] bf16
+    """
+
+    def __init__(self, moe_decode, comm, world_size: int, rank: int, device):
+        import torch.distributed as dist
+        self.dist = dist
+
+        self.router = moe_decode.router
+        self.comm = comm
+        self.world_size = world_size
+        self.rank = rank
+        self.device = device
+        self.hidden_size = moe_decode.hidden_size
+        self.num_experts_per_tok = moe_decode.num_experts_per_tok
+        self.total_experts = moe_decode.total_experts
+        self.expert_start = moe_decode.expert_start
+        self.num_local_experts = len(moe_decode.persistent_expert_indices)
+
+        # Weight pointer arrays (at fixed GPU addresses)
+        self.gate_ptrs = moe_decode.gate_ptrs
+        self.gate_scale_ptrs = moe_decode.gate_scale_ptrs
+        self.up_ptrs = moe_decode.up_ptrs
+        self.up_scale_ptrs = moe_decode.up_scale_ptrs
+        self.down_ptrs = moe_decode.down_ptrs
+        self.down_scale_ptrs = moe_decode.down_scale_ptrs
+        self.gate_weight_ref = moe_decode.gate_weight_ref
+        self.gate_scale_ref = moe_decode.gate_scale_ref
+        self.down_weight_ref = moe_decode.down_weight_ref
+        self.down_scale_ref = moe_decode.down_scale_ref
+        self.gate_bias_ptrs = getattr(moe_decode, 'gate_bias_ptrs', None)
+        self.up_bias_ptrs = getattr(moe_decode, 'up_bias_ptrs', None)
+        self.down_bias_ptrs = getattr(moe_decode, 'down_bias_ptrs', None)
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "hidden_states": TensorSpec(
+                ("batch_size", self.hidden_size), torch.bfloat16
+            ),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "moe_output": TensorSpec(
+                ("batch_size", self.hidden_size), torch.bfloat16
+            ),
+        }
+
+    def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        from batchgen.moe.routing import gate_topk_softmax_cuda
+        from batchgen.moe.fused_wgmma_grouped import (
+            fused_mxfp4_grouped_moe_forward_cuda_routing,
+        )
+
+        B, H = hidden_states.shape
+        W = self.world_size
+
+        # Per-bucket buffers — graph captures allocations at fixed addresses
+        padded = torch.zeros(B, H, dtype=torch.bfloat16, device=self.device)
+        all_tokens = torch.zeros(W * B, H, dtype=torch.bfloat16, device=self.device)
+        global_results = torch.zeros(
+            W * B, H, dtype=torch.bfloat16, device=self.device
+        )
+
+        padded.copy_(hidden_states)
+
+        # AllGather (PyNccl, graph-compatible)
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                all_tokens, padded,
+                stream=torch.cuda.current_stream(self.device),
+            )
+
+        # Route
+        router_logits = self.router(all_tokens)
+        topk_indices, topk_weights = gate_topk_softmax_cuda(
+            router_logits, k=self.num_experts_per_tok,
+        )
+
+        # Grouped MoE (persistent experts only, 4 kernel launches)
+        global_results[:W * B] = fused_mxfp4_grouped_moe_forward_cuda_routing(
+            all_tokens, topk_indices, topk_weights,
+            self.gate_ptrs, self.gate_scale_ptrs,
+            self.up_ptrs, self.up_scale_ptrs,
+            self.down_ptrs, self.down_scale_ptrs,
+            self.gate_weight_ref, self.gate_scale_ref,
+            self.down_weight_ref, self.down_scale_ref,
+            num_experts=self.total_experts,
+            expert_start=self.expert_start,
+            num_local_experts=self.num_local_experts,
+            gate_bias_ptrs=self.gate_bias_ptrs,
+            up_bias_ptrs=self.up_bias_ptrs,
+            down_bias_ptrs=self.down_bias_ptrs,
+        )
+
+        # AllReduce (PyNccl, graph-compatible)
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                global_results, op=self.dist.ReduceOp.SUM,
+                stream=torch.cuda.current_stream(self.device),
+            )
+
+        # Extract local rank's slice
+        start = self.rank * B
+        return {"moe_output": global_results[start:start + B]}

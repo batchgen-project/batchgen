@@ -5834,7 +5834,7 @@ class BatchGenWorker:
 		KV cache, page table, and cos/sin tables are at fixed GPU addresses.
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
-		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import FullAttnSegment
+		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import FullAttnSegment, MoESegment
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
 		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
@@ -5864,12 +5864,27 @@ class BatchGenWorker:
 								  max_pages, page_size_tokens)
 			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
 
+		# Register MoE segments (persistent experts only, EP mode)
+		has_moe_graph = False
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			moe_decode = decoder_layer.mlp
+			if (hasattr(moe_decode, 'persistent_expert_indices')
+					and len(moe_decode.persistent_expert_indices) > 0
+					and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+				moe_seg = MoESegment(
+					moe_decode, moe_decode.comm,
+					self.world_size, self.rank, self.torch_device,
+				)
+				manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
+				has_moe_graph = True
+
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
 		if self.rank == 0:
+			num_segs = "attn+moe" if has_moe_graph else "attn"
 			logging.info(
-				f"CUDA graph capture: {len(self.model.model.layers)} layers × "
+				f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
 				f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
 			)
 
@@ -5877,9 +5892,11 @@ class BatchGenWorker:
 
 		# Enable graph mode on each decoder layer
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
 			decoder_layer.enable_cuda_graph(
 				manager,
 				full_attn_name=f"layer_{layer_idx}_full_attn",
+				moe_name=moe_name,
 			)
 
 		self._cuda_graph_manager = manager
