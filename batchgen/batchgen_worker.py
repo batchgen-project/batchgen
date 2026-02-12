@@ -5826,42 +5826,47 @@ class BatchGenWorker:
 		logging.info(f"Rank {self.rank}: CUDA graph warmup complete")
 
 	def _setup_cuda_graphs(self, gpu_manager):
-		"""Capture CUDA graphs for decode attention blocks.
+		"""Capture CUDA graphs for decode: pre-attn and post-attn segments per layer.
 
-		FAKE GRAPH MODE: captures a dummy torch.mm per layer whose output
-		is NEVER used downstream. QKV proj runs eagerly. This isolates
-		whether the graph replay mechanism itself corrupts state.
+		Pre-attn:  RMSNorm → QKV proj → QKV split → reshape  (pure compute)
+		Post-attn: residual add + post-attn RMSNorm           (pure compute)
+
+		The middle (RoPE → KV write → FA → O_proj) runs eagerly via the wrapper
+		because it depends on per-step runtime metadata (cache_seqlens, page_table).
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
 		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
-			FakeGemmSegment,
+			PreAttnSegment,
+			PostAttnSegment,
 		)
 
 		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-		# Register one fake GEMM segment per layer (output never used)
-		for layer_idx in range(len(self.model.model.layers)):
-			fake_seg = FakeGemmSegment(hidden_size=2880, out_size=256, device=self.torch_device)
-			manager.register_segment(f"layer_{layer_idx}_fake", fake_seg)
+		# Register pre-attn and post-attn segments for each decoder layer
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			attn_wrapper = decoder_layer.self_attn  # GptOssAttnWrapper
+			pre_seg = PreAttnSegment(decoder_layer, attn_wrapper)
+			post_seg = PostAttnSegment(decoder_layer)
+			manager.register_segment(f"layer_{layer_idx}_pre_attn", pre_seg)
+			manager.register_segment(f"layer_{layer_idx}_post_attn", post_seg)
 
-		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture (FAKE GEMM mode)...")
+		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture...")
 		manager.warmup_and_capture_all()
 
-		# Enable graph mode on each decoder layer — pass fake segment name
+		# Enable graph mode on each decoder layer
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			decoder_layer.enable_cuda_graph(
 				manager,
-				pre_attn_name=None,
-				post_attn_name=None,
-				qkv_proj_name=f"layer_{layer_idx}_fake",
+				pre_attn_name=f"layer_{layer_idx}_pre_attn",
+				post_attn_name=f"layer_{layer_idx}_post_attn",
 			)
 
 		self._cuda_graph_manager = manager
 		stats = manager.get_capture_stats()
 		logging.info(
-			f"Rank {self.rank}: CUDA graphs ready (FAKE) — "
+			f"Rank {self.rank}: CUDA graphs ready — "
 			f"{stats['num_segments']} segments × {len(stats['bucket_sizes'])} buckets "
 			f"in {stats['total_capture_time_ms']:.0f}ms"
 		)

@@ -1,14 +1,8 @@
 """CUDA Graph capturable segments for GPT-OSS-120B decode.
 
-MINIMAL graph: only the packed QKV projection (single nn.Linear / GEMM).
-Everything else runs eagerly for debugging.
-
-  Graph segment:   packed QKV proj (nn.Linear)
-  Eager:           RMSNorm → [GRAPH: QKV proj] → QKV split → RoPE →
-                   KV write → FlashAttention → O_proj → residual+norm → MoE
-
-FAKE graph mode: captures a dummy torch.mm whose output is never used.
-  Used to isolate whether the graph replay mechanism itself corrupts state.
+Pre-attn graph:   RMSNorm → QKV proj → QKV split → reshape → Q, K, V
+Eager middle:     RoPE → KV write → FlashAttention → O_proj  (via wrapper)
+Post-attn graph:  residual add + post-attn RMSNorm → normed, residual
 """
 
 import logging
@@ -22,91 +16,110 @@ from batchgen.cuda_graph.graph_manager import TensorSpec
 logger = logging.getLogger(__name__)
 
 
-class FakeGemmSegment:
-    """Captures a dummy torch.mm — output is never used downstream.
+class PreAttnSegment:
+    """Capturable segment: RMSNorm → QKV proj → QKV split → reshape.
 
-    Purpose: isolate whether CUDA graph capture/replay itself causes
-    corruption (stream state, memory aliasing, etc.), independent of
-    whether the graph's output is actually consumed.
+    Input:  hidden_states  [B, 1, hidden_size]
+    Output: query [B, 1, num_heads, head_dim],
+            key   [B, 1, num_kv_heads, head_dim],
+            value [B, 1, num_kv_heads, head_dim]
     """
 
-    def __init__(self, hidden_size: int = 2880, out_size: int = 256, device=None):
-        self.hidden_size = hidden_size
-        self.out_size = out_size
-        # Persistent random weight so the graph captures a real GEMM
-        self._weight = torch.randn(
-            hidden_size, out_size, dtype=torch.bfloat16,
-            device=device or torch.device("cuda"),
-        )
+    def __init__(self, decoder_layer, attn_wrapper):
+        # RMSNorm params (from decoder layer)
+        self.ln_weight = decoder_layer.input_layernorm.weight
+        self.ln_eps = decoder_layer.input_layernorm.eps
+
+        # QKV proj (from raw attention module via wrapper)
+        self.qkv_proj = attn_wrapper.module.qkv_proj
+
+        # Dimensions
+        self.hidden_size = decoder_layer.hidden_size        # 2880
+        self.q_size = attn_wrapper.q_size                   # 4096
+        self.kv_size = attn_wrapper.kv_size                 # 512
+        self.num_heads = attn_wrapper.num_heads             # 64
+        self.num_kv_heads = attn_wrapper.num_kv_heads       # 8
+        self.head_dim = attn_wrapper.head_dim               # 64
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
-            "x": TensorSpec(("batch_size", 1, self.hidden_size), torch.bfloat16),
-        }
-
-    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
-            "y": TensorSpec(("batch_size", 1, self.out_size), torch.bfloat16),
-        }
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        y = torch.matmul(x, self._weight)
-        return {"y": y}
-
-
-class GptOssQkvProjSegment:
-    """Capturable segment: packed QKV projection only (single GEMM).
-
-    Input: normed hidden_states (after RMSNorm, done eagerly)
-    Output: packed QKV tensor (split done eagerly)
-
-    Args:
-        attn_wrapper: The GptOssAttnWrapper for this layer.
-        layer_idx: Decoder layer index (0-35).
-    """
-
-    def __init__(
-        self,
-        attn_wrapper,
-        layer_idx: int,
-    ):
-        self.attn_module = attn_wrapper.module
-        self.layer_idx = layer_idx
-
-        self.hidden_size = 2880
-        self.q_size = attn_wrapper.q_size                # 4096
-        self.kv_size = attn_wrapper.kv_size              # 512
-        self.total_qkv_size = self.q_size + 2 * self.kv_size  # 5120
-
-    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
-            "normed": TensorSpec(
+            "hidden_states": TensorSpec(
                 ("batch_size", 1, self.hidden_size), torch.bfloat16
             ),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
-            "qkv": TensorSpec(
-                ("batch_size", 1, self.total_qkv_size), torch.bfloat16
+            "query": TensorSpec(
+                ("batch_size", 1, self.num_heads, self.head_dim), torch.bfloat16
+            ),
+            "key": TensorSpec(
+                ("batch_size", 1, self.num_kv_heads, self.head_dim), torch.bfloat16
+            ),
+            "value": TensorSpec(
+                ("batch_size", 1, self.num_kv_heads, self.head_dim), torch.bfloat16
             ),
         }
 
-    def get_weight_data_ptr(self) -> int:
-        """Return the GPU data pointer of qkv_proj weight for verification."""
-        return self.attn_module.qkv_proj.weight.data_ptr()
+    def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split
+
+        # RMSNorm
+        normed = cuda_rmsnorm(hidden_states, self.ln_weight, self.ln_eps)
+
+        # QKV projection
+        qkv = self.qkv_proj(normed)
+
+        # QKV split
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
+
+        # Reshape
+        B = hidden_states.shape[0]
+        query = query.view(B, 1, self.num_heads, self.head_dim)
+        key = key.view(B, 1, self.num_kv_heads, self.head_dim)
+        value = value.view(B, 1, self.num_kv_heads, self.head_dim)
+
+        return {"query": query, "key": key, "value": value}
+
+
+class PostAttnSegment:
+    """Capturable segment: fused residual add + post-attention RMSNorm.
+
+    Inputs:  attn_residual [B, 1, hidden_size], attn_output [B, 1, hidden_size]
+    Outputs: normed [B, 1, hidden_size] (MoE input), residual [B, 1, hidden_size]
+    """
+
+    def __init__(self, decoder_layer):
+        self.ln_weight = decoder_layer.post_attention_layernorm.weight
+        self.ln_eps = decoder_layer.post_attention_layernorm.eps
+        self.hidden_size = decoder_layer.hidden_size  # 2880
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "attn_residual": TensorSpec(
+                ("batch_size", 1, self.hidden_size), torch.bfloat16
+            ),
+            "attn_output": TensorSpec(
+                ("batch_size", 1, self.hidden_size), torch.bfloat16
+            ),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "normed": TensorSpec(
+                ("batch_size", 1, self.hidden_size), torch.bfloat16
+            ),
+            "residual": TensorSpec(
+                ("batch_size", 1, self.hidden_size), torch.bfloat16
+            ),
+        }
 
     def forward(
-        self,
-        normed: torch.Tensor,
+        self, attn_residual: torch.Tensor, attn_output: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        """Packed QKV projection only.
+        from batchgen.attention.fused_kernels import cuda_add_rmsnorm
 
-        Args:
-            normed: [bucket_size, 1, hidden_size] (already RMSNorm'd)
-
-        Returns:
-            qkv: [bucket_size, 1, total_qkv_size]
-        """
-        qkv = self.attn_module.qkv_proj(normed)
-        return {"qkv": qkv}
+        normed, residual = cuda_add_rmsnorm(
+            attn_residual, attn_output, self.ln_weight, self.ln_eps
+        )
+        return {"normed": normed, "residual": residual}

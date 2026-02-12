@@ -1295,22 +1295,18 @@ class GptOssDecoderLayer(nn.Module):
         self.cuda_graph_manager = None
         self._pre_attn_segment_name = None
         self._post_attn_segment_name = None
-        self._qkv_proj_segment_name = None
 
-    def enable_cuda_graph(self, manager, pre_attn_name: str, post_attn_name: str,
-                          qkv_proj_name: str = None):
-        """Enable CUDA graph mode for the attention block of this layer.
+    def enable_cuda_graph(self, manager, pre_attn_name: str, post_attn_name: str):
+        """Enable CUDA graph mode for this layer.
 
         Args:
             manager: CUDAGraphManager with segments pre-captured.
-            pre_attn_name: Name of the pre-attention segment (unused in minimal mode).
-            post_attn_name: Name of the post-attention segment (unused in minimal mode).
-            qkv_proj_name: Name of the QKV proj-only segment (minimal graph mode).
+            pre_attn_name: Segment name for RMSNorm → QKV proj → split → reshape.
+            post_attn_name: Segment name for residual add + post-attn RMSNorm.
         """
         self.cuda_graph_manager = manager
         self._pre_attn_segment_name = pre_attn_name
         self._post_attn_segment_name = post_attn_name
-        self._qkv_proj_segment_name = qkv_proj_name
 
     def forward(
         self,
@@ -1332,61 +1328,39 @@ class GptOssDecoderLayer(nn.Module):
         # For CUDA graph path: post_attn segment does residual add, so attn_residual=None
         attn_residual = None
         use_graph = (self.cuda_graph_manager is not None
-                     and self._qkv_proj_segment_name is not None)
-
-        # --- DIAGNOSTIC: layer 0 input values ---
-        if (self.layer_idx == 0
-                and not getattr(self, '_l0_input_diag_done', False)
-                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                _inp = hidden_states[0, 0, :20].float().tolist()
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L0] layer_input seq0[:20]: "
-                    f"[{', '.join(f'{v:.6f}' for v in _inp)}]"
-                )
-            self._l0_input_diag_done = True
+                     and self._pre_attn_segment_name is not None)
 
         if use_graph:
-            # CUDA graph path: replay graph segment, then delegate to the
-            # attention wrapper for the rest.  This ensures all metadata
-            # (sinks, cache_seqlens, page table, KV append callback, etc.)
-            # flows through the same code path as eager execution.
             batch_size = hidden_states.shape[0]
 
             if batch_size > 0:
                 try:
-                    # --- 1. RMSNorm (eager, outside wrapper) ---
-                    from batchgen.attention.fused_kernels import cuda_rmsnorm
-                    normed = cuda_rmsnorm(
-                        hidden_states,
-                        self.input_layernorm.weight,
-                        self.input_layernorm.eps,
+                    # --- Pre-attn graph: RMSNorm → QKV proj → split → reshape ---
+                    pre_out = self.cuda_graph_manager.replay(
+                        self._pre_attn_segment_name, batch_size,
+                        hidden_states=hidden_states,
+                    )
+                    query = pre_out["query"]
+                    key = pre_out["key"]
+                    value = pre_out["value"]
+
+                    # --- Eager middle via wrapper: RoPE → KV write → FA → O_proj ---
+                    attn_output = self.self_attn._forward_decode_mid(
+                        query, key, value,
                     )
 
-                    # --- 2. FAKE graph replay (output discarded) ---
-                    # Isolates whether CUDA graph infra itself has side-effects.
-                    _fake_out = self.cuda_graph_manager.replay(
-                        self._qkv_proj_segment_name,
-                        batch_size,
-                        x=normed,
+                    # --- Post-attn graph: residual add + post-attn RMSNorm ---
+                    post_out = self.cuda_graph_manager.replay(
+                        self._post_attn_segment_name, batch_size,
+                        attn_residual=hidden_states,
+                        attn_output=attn_output,
                     )
-                    del _fake_out  # intentionally unused
-
-                    # --- 3. Attention via wrapper (same path as eager) ---
-                    # The wrapper handles: QKV proj, QKV split, RoPE,
-                    # KV write, FlashAttention, O_proj, KV append callback.
-                    hidden_states_out, _, _ = self.self_attn(
-                        hidden_states=normed,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_value,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                    )
-
-                    attn_residual = hidden_states  # original input = residual
-                    hidden_states = hidden_states_out
+                    # Post-attn graph already fused residual add + norm.
+                    # hidden_states = normed MoE input, residual for MoE residual add.
+                    # Set attn_residual = "done" sentinel to skip the norm block below.
+                    hidden_states = post_out["normed"]
+                    residual = post_out["residual"]
+                    attn_residual = "graph_done"
 
                 except (ValueError, RuntimeError) as e:
                     logging.warning(
@@ -1425,7 +1399,11 @@ class GptOssDecoderLayer(nn.Module):
             self._l0_attn_out_diag_done = True
 
         # ========== MoE BLOCK (always eager) ==========
-        if debug_layer and self.layer_idx < 3:
+        # Post-attn norm: skip if post-attn graph already computed it
+        if attn_residual == "graph_done":
+            # hidden_states = normed, residual = residual — both set by post-attn graph
+            pass
+        elif debug_layer and self.layer_idx < 3:
             # Unfused path for debug visibility
             if attn_residual is not None:
                 hidden_states = attn_residual + hidden_states
@@ -1434,7 +1412,7 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
         elif attn_residual is not None:
-            # Both eager and graph paths: fuse residual add + post-attn layernorm (1 kernel)
+            # Eager path: fuse residual add + post-attn layernorm (1 kernel)
             from batchgen.attention.fused_kernels import cuda_add_rmsnorm
             hidden_states, residual = cuda_add_rmsnorm(
                 attn_residual, hidden_states,
