@@ -19,11 +19,10 @@ Usage:
     outputs = manager.replay("layer_0_attn", batch_size=5, hidden_states=x, ...)
 """
 
-import bisect
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
@@ -88,7 +87,7 @@ class BatchSizeBucketing:
     that fits a given batch size, and computes required padding.
     """
 
-    DEFAULT_BUCKET_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    DEFAULT_BUCKET_SIZES = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 256]
 
     def __init__(self, bucket_sizes: Optional[List[int]] = None):
         self.bucket_sizes: List[int] = sorted(bucket_sizes or self.DEFAULT_BUCKET_SIZES)
@@ -96,7 +95,7 @@ class BatchSizeBucketing:
             raise ValueError("At least one bucket size is required")
         self._max_bucket = self.bucket_sizes[-1]
         # Build O(1) lookup table: for any BS in [1, max_bucket], store the
-        # index of the smallest bucket that fits.
+        # smallest bucket that fits.
         self._lookup = [0] * (self._max_bucket + 1)
         bucket_idx = 0
         for bs in range(1, self._max_bucket + 1):
@@ -137,7 +136,6 @@ class CapturedGraph:
     graph: torch.cuda.CUDAGraph
     static_inputs: Dict[str, torch.Tensor]
     static_outputs: Dict[str, torch.Tensor]
-    capture_stream: torch.cuda.Stream
     input_fill_values: Dict[str, float] = field(default_factory=dict)
 
 
@@ -149,7 +147,7 @@ class CUDAGraphManager:
     """Model-agnostic CUDA graph capture and replay engine.
 
     Manages multiple named capturable segments, each captured at multiple
-    bucket sizes. All graphs share a single memory pool to reduce fragmentation.
+    bucket sizes. All graphs share a single memory pool to minimize HBM usage.
 
     Thread safety: NOT thread-safe. Designed for single-thread decode loops.
     """
@@ -164,8 +162,8 @@ class CUDAGraphManager:
         self.bucketing = bucketing
         self.device = device or torch.device("cuda")
 
-        # No shared pool — each graph gets its own isolated memory to prevent
-        # cross-graph aliasing of static output tensors.
+        # Shared memory pool across all graphs to minimize HBM usage.
+        self._pool = torch.cuda.graph_pool_handle()
 
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
@@ -236,22 +234,16 @@ class CUDAGraphManager:
             static_inputs[key] = t
             fill_values[key] = spec.fill_value
 
-        # 2. Warmup on a dedicated stream
-        stream = torch.cuda.Stream(device=self.device)
-        with torch.cuda.stream(stream):
-            for _ in range(self.WARMUP_ITERATIONS):
-                with torch.inference_mode():
-                    segment.forward(**static_inputs)
-        stream.synchronize()
+        # 2. Warmup on current stream
+        for _ in range(self.WARMUP_ITERATIONS):
+            with torch.inference_mode():
+                segment.forward(**static_inputs)
 
-        # 3. Capture
+        # 3. Capture on current stream with shared pool
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(stream):
-            with torch.cuda.graph(graph, stream=stream):
-                with torch.inference_mode():
-                    static_outputs = segment.forward(**static_inputs)
-
-        stream.synchronize()
+        with torch.cuda.graph(graph, pool=self._pool):
+            with torch.inference_mode():
+                static_outputs = segment.forward(**static_inputs)
 
         # Normalize outputs to dict
         if not isinstance(static_outputs, dict):
@@ -262,23 +254,11 @@ class CUDAGraphManager:
             graph=graph,
             static_inputs=static_inputs,
             static_outputs=static_outputs,
-            capture_stream=stream,
             input_fill_values=fill_values,
         )
 
         elapsed = (time.perf_counter() - start) * 1000
         logger.debug(f"Captured graph '{name}' @ BS={bucket_size} in {elapsed:.0f}ms")
-
-        # Log weight and buffer addresses for debugging aliasing issues
-        if hasattr(segment, 'get_weight_data_ptr') and bucket_size == self.bucketing.bucket_sizes[0]:
-            w_ptr = segment.get_weight_data_ptr()
-            in_ptrs = {k: hex(v.data_ptr()) for k, v in static_inputs.items()}
-            out_ptrs = {k: hex(v.data_ptr()) for k, v in static_outputs.items()}
-            logger.warning(
-                f"[CAPTURE_DIAG] '{name}' BS={bucket_size}: "
-                f"weight_ptr={hex(w_ptr)}, "
-                f"static_in={in_ptrs}, static_out={out_ptrs}"
-            )
 
     # -- Replay -------------------------------------------------------------
 
@@ -293,9 +273,7 @@ class CUDAGraphManager:
         Args:
             name: Segment name (must have been registered and captured).
             batch_size: Actual batch size (will be padded to nearest bucket).
-            **inputs: Tensor inputs. Shapes must match the batch dimension of
-                the captured graph (after padding). Non-batch dimensions must
-                match exactly.
+            **inputs: Tensor inputs matching the captured graph's input specs.
 
         Returns:
             Dict of output tensors, sliced to actual batch_size (unpadded).
@@ -308,7 +286,7 @@ class CUDAGraphManager:
                 f"Available: {list(self._graphs[name].keys())}"
             )
 
-        # Copy inputs to static buffers (graph-safe: same addresses, only contents change)
+        # Copy inputs to static buffers
         for key, tensor in inputs.items():
             static_tensor = captured.static_inputs.get(key)
             if static_tensor is None:
@@ -316,16 +294,13 @@ class CUDAGraphManager:
                     f"Input '{key}' not found in captured graph '{name}'. "
                     f"Available: {list(captured.static_inputs.keys())}"
                 )
-            # Handle padding: input may be smaller than static buffer in batch dim
             if tensor.shape[0] < static_tensor.shape[0]:
-                # Only fill the padding region (avoids writing real-data portion twice)
                 fill_val = captured.input_fill_values.get(key, 0.0)
                 padding_slice = static_tensor[tensor.shape[0]:]
                 if fill_val == 0.0:
                     padding_slice.zero_()
                 else:
                     padding_slice.fill_(fill_val)
-                # Copy actual data into the leading portion
                 static_tensor[:tensor.shape[0]].copy_(tensor, non_blocking=True)
             elif tensor.shape[0] == static_tensor.shape[0]:
                 static_tensor.copy_(tensor, non_blocking=True)
@@ -335,24 +310,8 @@ class CUDAGraphManager:
                     f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
                 )
 
-        # Synchronize streams: input copies ran on the current (default) stream,
-        # but graph.replay() runs on the capture stream. We must ensure:
-        # 1. Capture stream waits for input copies to finish
-        # 2. Current stream waits for graph replay to finish (so caller's
-        #    subsequent ops like KV write see the correct output)
-        current_stream = torch.cuda.current_stream(self.device)
-        capture_stream = captured.capture_stream
-
-        # Current stream → capture stream: wait for input copies
-        event_inputs_done = current_stream.record_event()
-        capture_stream.wait_event(event_inputs_done)
-
-        # Replay the graph (runs on capture stream)
+        # Replay on current stream — no cross-stream sync needed
         captured.graph.replay()
-
-        # Capture stream → current stream: wait for replay to finish
-        event_replay_done = capture_stream.record_event()
-        current_stream.wait_event(event_replay_done)
 
         # Return unpadded outputs
         result = {}
