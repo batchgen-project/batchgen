@@ -1385,19 +1385,6 @@ class GptOssDecoderLayer(nn.Module):
                 debug_layer, timing_enabled,
             )
 
-        # --- DIAGNOSTIC: layer 0 attention output (after graph or eager attn) ---
-        if (self.layer_idx == 0
-                and not getattr(self, '_l0_attn_out_diag_done', False)
-                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                _attn_hs = hidden_states[0, 0, :20].float().tolist()
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L0] attn_output seq0[:20]: "
-                    f"[{', '.join(f'{v:.6f}' for v in _attn_hs)}]"
-                )
-            self._l0_attn_out_diag_done = True
-
         # ========== MoE BLOCK (always eager) ==========
         # Post-attn norm: skip if post-attn graph already computed it
         if attn_residual == "graph_done":
@@ -1424,25 +1411,6 @@ class GptOssDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # --- DIAGNOSTIC: layer 0 intermediate values for graph vs eager comparison ---
-        if (self.layer_idx == 0
-                and not getattr(self, '_l0_inter_diag_done', False)
-                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                # Log MoE input (post-attn normed hidden_states) and residual
-                _moe_vals = hidden_states[0, 0, :20].float().tolist()
-                _res_vals = residual[0, 0, :20].float().tolist()
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L0] MoE_input seq0[:20]: "
-                    f"[{', '.join(f'{v:.6f}' for v in _moe_vals)}]"
-                )
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L0] residual seq0[:20]: "
-                    f"[{', '.join(f'{v:.6f}' for v in _res_vals)}]"
-                )
-            self._l0_inter_diag_done = True
-
         if timing_enabled:
             torch.cuda.synchronize()
             moe_start = time.perf_counter()
@@ -1457,67 +1425,11 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after MLP (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
-        # --- DIAGNOSTIC: layer 0 MoE output + final output ---
-        if (self.layer_idx == 0
-                and not getattr(self, '_l0_moe_diag_done', False)
-                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                _moe_out = hidden_states[0, 0, :20].float().tolist()
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L0] MoE_output seq0[:20]: "
-                    f"[{', '.join(f'{v:.6f}' for v in _moe_out)}]"
-                )
-            self._l0_moe_diag_done = True
-
         hidden_states = residual + hidden_states
-
-        # --- DIAGNOSTIC: layer 0 final output (= layer 1 input) ---
-        if (self.layer_idx == 0
-                and not getattr(self, '_l0_final_diag_done', False)
-                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                _final = hidden_states[0, 0, :20].float().tolist()
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L0] final_output seq0[:20]: "
-                    f"[{', '.join(f'{v:.6f}' for v in _final)}]"
-                )
-            self._l0_final_diag_done = True
-
-        # --- DIAGNOSTIC: log layer 1 output values on first decode iteration ---
-        if (self.layer_idx == 1
-                and not getattr(self, '_output_diag_done', False)
-                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                _s = hidden_states[0, 0, :20].float().tolist()
-                _vals = ", ".join(f"{v:.6f}" for v in _s)
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L1 output] seq0 first 20: [{_vals}]"
-                )
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG L1 output] norm={hidden_states.float().norm().item():.6f}, "
-                    f"std={hidden_states.float().std().item():.6f}"
-                )
-            self._output_diag_done = True
 
         if debug_layer and self.layer_idx < 3:
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after MLP+residual (final): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
-
-        # --- DIAGNOSTIC: per-layer output norm (first decode step only) ---
-        if (use_graph and not getattr(self, '_layer_diag_done', False)
-                and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                _norm = hidden_states.float().norm().item()
-                _std = hidden_states.float().std().item()
-                logging.warning(
-                    f"[CUDA_GRAPH_DIAG] Layer {self.layer_idx} output: "
-                    f"norm={_norm:.4f}, std={_std:.6f}"
-                )
-            self._layer_diag_done = True
 
         # End layer timing
         DecodeLayerTiming.end_layer()

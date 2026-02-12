@@ -5821,9 +5821,7 @@ class BatchGenWorker:
 			logging.warning(f"Rank {self.rank}: No GPU KV manager, skipping CUDA graph warmup")
 			return
 
-		logging.info(f"Rank {self.rank}: CUDA graph warmup starting...")
 		self._setup_cuda_graphs(gpu_manager)
-		logging.info(f"Rank {self.rank}: CUDA graph warmup complete")
 
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode: pre-attn and post-attn segments per layer.
@@ -5852,7 +5850,12 @@ class BatchGenWorker:
 			manager.register_segment(f"layer_{layer_idx}_pre_attn", pre_seg)
 			manager.register_segment(f"layer_{layer_idx}_post_attn", post_seg)
 
-		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture...")
+		if self.rank == 0:
+			logging.info(
+				f"CUDA graph capture: {len(self.model.model.layers)} layers × "
+				f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+			)
+
 		manager.warmup_and_capture_all()
 
 		# Enable graph mode on each decoder layer
@@ -5864,12 +5867,11 @@ class BatchGenWorker:
 			)
 
 		self._cuda_graph_manager = manager
-		stats = manager.get_capture_stats()
-		logging.info(
-			f"Rank {self.rank}: CUDA graphs ready — "
-			f"{stats['num_segments']} segments × {len(stats['bucket_sizes'])} buckets "
-			f"in {stats['total_capture_time_ms']:.0f}ms"
-		)
+		if self.rank == 0:
+			stats = manager.get_capture_stats()
+			logging.info(
+				f"CUDA graphs ready: {stats['total_capture_time_ms']:.0f}ms"
+			)
 
 	def decoding_continuous(
 		self,

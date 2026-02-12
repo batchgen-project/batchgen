@@ -186,7 +186,6 @@ class CUDAGraphManager:
             raise ValueError(f"Segment '{name}' already registered")
         self._segments[name] = segment
         self._graphs[name] = {}
-        logger.info(f"Registered capturable segment: '{name}'")
 
     # -- Capture ------------------------------------------------------------
 
@@ -197,33 +196,29 @@ class CUDAGraphManager:
         decode step. Blocks until all graphs are captured.
         """
         if not self._segments:
-            logger.warning("No segments registered. Skipping CUDA graph capture.")
             return
 
         total_start = time.perf_counter()
-        num_graphs = 0
+        num_buckets = len(self.bucketing.bucket_sizes)
 
-        for bucket_size in self.bucketing.bucket_sizes:
+        for i, bucket_size in enumerate(self.bucketing.bucket_sizes):
             for seg_name, segment in self._segments.items():
                 self._capture_one(seg_name, segment, bucket_size)
-                num_graphs += 1
+            done = i + 1
+            bar = "█" * done + "░" * (num_buckets - done)
+            logger.info(
+                f"CUDA graph capture [{bar}] {done}/{num_buckets} "
+                f"BS={bucket_size}"
+            )
 
         elapsed_ms = (time.perf_counter() - total_start) * 1000
         self._total_capture_time_ms = elapsed_ms
         self._is_captured = True
 
-        logger.info(
-            f"CUDA graph capture complete: {num_graphs} graphs "
-            f"({len(self._segments)} segments × {len(self.bucketing.bucket_sizes)} buckets) "
-            f"in {elapsed_ms:.0f}ms"
-        )
-
     def _capture_one(
         self, name: str, segment: CapturableSegment, bucket_size: int
     ) -> None:
         """Warmup and capture a single graph for one segment at one bucket size."""
-        start = time.perf_counter()
-
         # 1. Allocate static input buffers
         input_specs = segment.get_static_input_specs(bucket_size)
         static_inputs = {}
@@ -257,8 +252,6 @@ class CUDAGraphManager:
             input_fill_values=fill_values,
         )
 
-        elapsed = (time.perf_counter() - start) * 1000
-        logger.debug(f"Captured graph '{name}' @ BS={bucket_size} in {elapsed:.0f}ms")
 
     # -- Replay -------------------------------------------------------------
 
