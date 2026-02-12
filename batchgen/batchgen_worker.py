@@ -5888,6 +5888,12 @@ class BatchGenWorker:
 				f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
 			)
 
+		# Sync all ranks before warmup — MoE segments use NCCL collectives
+		# which require all ranks to participate simultaneously.
+		if has_moe_graph:
+			torch.cuda.synchronize(self.torch_device)
+			dist.barrier()
+
 		manager.warmup_and_capture_all()
 
 		# Enable graph mode on each decoder layer

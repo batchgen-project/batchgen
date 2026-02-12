@@ -1162,6 +1162,18 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     # The WGMMA kernels bound per-expert work via expert_offsets and early-return
     # for excess M-tiles (line 367: if (m_tile >= num_m_tiles) return).
 
+    # TMA descriptor requires gmem_rows >= BLOCK_M (64). When total dispatched
+    # tokens < 64 (e.g. BS=1 with 8 EP ranks → 32 dispatched), pad to BLOCK_M.
+    # Extra rows are zeros, never referenced by expert_offsets, so they don't
+    # affect correctness. reduce_weighted_scatter_cuda uses num_tokens (original).
+    _BLOCK_M = 64
+    if dispatched_x.shape[0] < _BLOCK_M:
+        padded_dx = torch.zeros(
+            _BLOCK_M, hidden_size, dtype=dispatched_x.dtype, device=dispatched_x.device
+        )
+        padded_dx[:dispatched_x.shape[0]] = dispatched_x
+        dispatched_x = padded_dx
+
     # Compute strides from reference weights
     # Stage 1 (gate/up): weight is [N, K//2], scale is [N, K//32]
     s1_stride_weight_n = gate_weight_ref.shape[1]   # K // 2
