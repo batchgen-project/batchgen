@@ -5861,6 +5861,9 @@ class BatchGenWorker:
 			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_ctx)
 			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
 
+		# Set gpu_paged_kv_manager so segments can access it during capture
+		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
+
 		if self.rank == 0:
 			logging.info(
 				f"CUDA graph capture: {len(self.model.model.layers)} layers × "
