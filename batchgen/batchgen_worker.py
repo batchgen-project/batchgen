@@ -7660,6 +7660,7 @@ class BatchGenWorker:
 		# Delete model directly without CPU transfer
 		del self.model
 		self.model = None
+		self._cuda_graph_manager = None
 
 		# Release memory
 		if torch.cuda.is_available():
@@ -7756,7 +7757,8 @@ class BatchGenWorker:
 			except Exception as e:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup model: {e}")
 		self.model = None
-		
+		self._cuda_graph_manager = None
+
 		# 9. Clear CUDA cache
 		torch.cuda.empty_cache()
 		torch.cuda.synchronize(self.torch_device)
