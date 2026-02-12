@@ -1327,10 +1327,15 @@ class GptOssDecoderLayer(nn.Module):
             if batch_size > 0:
                 try:
                     from batchgen.models.wrappers.attention import AttnWrapperBase
+                    gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+                    _, _, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
+                        self.layer_idx
+                    )
                     out = self.cuda_graph_manager.replay(
                         self._full_attn_segment_name, batch_size,
                         hidden_states=hidden_states,
                         cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+                        page_table=page_table[:batch_size],
                     )
                     hidden_states = out["normed"]
                     residual = out["residual"]

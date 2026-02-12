@@ -4,9 +4,9 @@ Captures the entire attention block in one graph:
   RMSNorm → QKV proj → split → reshape → RoPE → KV write → FA → O_proj
   → residual add + post-attn RMSNorm
 
-Dynamic metadata (cache_seqlens) is a static-address input buffer whose
-contents are updated before each replay. KV cache, page table, cos/sin
-tables are all at fixed GPU addresses.
+Dynamic metadata (cache_seqlens, page_table) are static-address input buffers
+whose contents are updated before each replay. KV cache and cos/sin tables
+are at fixed GPU addresses.
 """
 
 import logging
@@ -23,11 +23,13 @@ logger = logging.getLogger(__name__)
 class FullAttnSegment:
     """Full attention block as a single CUDA-graph-capturable segment.
 
-    Inputs:  hidden_states [B, 1, hidden_size], cache_seqlens [B] int32
+    Inputs:  hidden_states [B, 1, hidden_size], cache_seqlens [B] int32,
+             page_table [B, max_pages_per_seq] int32
     Outputs: normed [B, 1, hidden_size] (MoE input), residual [B, 1, hidden_size]
     """
 
-    def __init__(self, decoder_layer, attn_wrapper, layer_idx: int, max_seq_len: int):
+    def __init__(self, decoder_layer, attn_wrapper, layer_idx: int, max_seq_len: int,
+                 max_pages_per_seq: int):
         # Pre-attn: RMSNorm
         self.ln_weight = decoder_layer.input_layernorm.weight
         self.ln_eps = decoder_layer.input_layernorm.eps
@@ -58,6 +60,9 @@ class FullAttnSegment:
         self.post_ln_weight = decoder_layer.post_attention_layernorm.weight
         self.post_ln_eps = decoder_layer.post_attention_layernorm.eps
 
+        # Page table dimensions for static buffer
+        self.max_pages_per_seq = max_pages_per_seq
+
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
             "hidden_states": TensorSpec(
@@ -65,6 +70,9 @@ class FullAttnSegment:
             ),
             "cache_seqlens": TensorSpec(
                 ("batch_size",), torch.int32, fill_value=1
+            ),
+            "page_table": TensorSpec(
+                ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
         }
 
@@ -79,7 +87,8 @@ class FullAttnSegment:
         }
 
     def forward(
-        self, hidden_states: torch.Tensor, cache_seqlens: torch.Tensor
+        self, hidden_states: torch.Tensor, cache_seqlens: torch.Tensor,
+        page_table: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         from batchgen.attention.fused_kernels import (
             cuda_rmsnorm, cuda_qkv_split, cuda_rope, cuda_add_rmsnorm,
@@ -112,7 +121,7 @@ class FullAttnSegment:
         )
 
         # === FlashAttention ===
-        k_cache, v_cache, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
+        k_cache, v_cache, _ = gpu_kv_manager.get_layer_kv_with_page_table(
             self.layer_idx
         )
         attn_out, _ = gqa_decode_fa(
