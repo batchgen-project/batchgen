@@ -4071,12 +4071,14 @@ class BatchGenWorker:
 				# Only initializes if not already done; subsequent iterations skip
 				self._init_gpu_kv_with_actual_size()
 
-				# ============ STEP B.1: CUDA Graph Warmup (one-time) ============
-				if self._cuda_graph_manager is None:
-					self._warmup_cuda_graphs()
-
 				# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
 				decode_uuids = self._prepare_decode_batch()
+
+				# ============ STEP C.1: CUDA Graph Warmup (lazy, one-time) ============
+				# Must happen AFTER _prepare_decode_batch which allocates GPU pages.
+				# KV write inside the graph needs page table to be initialized.
+				if self._cuda_graph_manager is None:
+					self._warmup_cuda_graphs()
 				
 				# Include currently running sequences - PRESERVE ORDER
 				current_decoding = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
