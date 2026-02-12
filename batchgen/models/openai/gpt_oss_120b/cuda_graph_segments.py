@@ -24,12 +24,12 @@ class FullAttnSegment:
     """Full attention block as a single CUDA-graph-capturable segment.
 
     Inputs:  hidden_states [B, 1, hidden_size], cache_seqlens [B] int32,
-             page_table [B, max_pages_per_seq] int32
+             page_table [B, max_pages_per_seq] int32, slot_indices [B] int32
     Outputs: normed [B, 1, hidden_size] (MoE input), residual [B, 1, hidden_size]
     """
 
     def __init__(self, decoder_layer, attn_wrapper, layer_idx: int, max_seq_len: int,
-                 max_pages_per_seq: int):
+                 max_pages_per_seq: int, page_size_tokens: int):
         # Pre-attn: RMSNorm
         self.ln_weight = decoder_layer.input_layernorm.weight
         self.ln_eps = decoder_layer.input_layernorm.eps
@@ -62,6 +62,7 @@ class FullAttnSegment:
 
         # Page table dimensions for static buffer
         self.max_pages_per_seq = max_pages_per_seq
+        self.page_size_tokens = page_size_tokens
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -73,6 +74,9 @@ class FullAttnSegment:
             ),
             "page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
+            ),
+            "slot_indices": TensorSpec(
+                ("batch_size",), torch.int32, fill_value=0
             ),
         }
 
@@ -88,12 +92,13 @@ class FullAttnSegment:
 
     def forward(
         self, hidden_states: torch.Tensor, cache_seqlens: torch.Tensor,
-        page_table: torch.Tensor,
+        page_table: torch.Tensor, slot_indices: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         from batchgen.attention.fused_kernels import (
             cuda_rmsnorm, cuda_qkv_split, cuda_rope, cuda_add_rmsnorm,
         )
         from batchgen.attention.gqa.fa_decode import gqa_decode_fa
+        from batchgen.kv_cache.gpu_kv_kernels import run_paged_kv_token_update_fused
 
         B = hidden_states.shape[0]
 
@@ -112,17 +117,20 @@ class FullAttnSegment:
         sin = sin[current_pos].unsqueeze(1)
         query, key = cuda_rope(query, key, cos, sin)
 
-        # === KV write ===
+        # === KV write (direct kernel call with static buffers) ===
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
-        gpu_kv_manager.update_layer_decode_new_token(
-            k_tensor=key, v_tensor=value,
-            sequence_lengths=current_pos,
-            layer_idx=self.layer_idx,
-        )
-
-        # === FlashAttention ===
         k_cache, v_cache, _ = gpu_kv_manager.get_layer_kv_with_page_table(
             self.layer_idx
+        )
+        run_paged_kv_token_update_fused(
+            k_cache=k_cache,
+            k_tokens=key.view(B, -1),
+            page_table=page_table,
+            slot_indices=slot_indices,
+            token_indices=current_pos,
+            page_size_tokens=self.page_size_tokens,
+            v_cache=v_cache,
+            v_tokens=value.view(B, -1),
         )
         attn_out, _ = gqa_decode_fa(
             q=query, k_cache=k_cache, v_cache=v_cache,

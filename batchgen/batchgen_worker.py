@@ -5857,9 +5857,11 @@ class BatchGenWorker:
 
 		# Register full attention segments
 		max_pages = gpu_manager._gpu_page_table_manager.max_pages_per_sequence
+		page_size_tokens = gpu_manager.config.page_size_tokens
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			attn_wrapper = decoder_layer.self_attn
-			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_ctx, max_pages)
+			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_ctx,
+								  max_pages, page_size_tokens)
 			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
 
 		# Set gpu_paged_kv_manager so segments can access it during capture
