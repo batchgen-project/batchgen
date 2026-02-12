@@ -5840,13 +5840,30 @@ class BatchGenWorker:
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
+		# Verify each layer has unique weight pointers
+		weight_ptrs = {}
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			attn_wrapper = decoder_layer.self_attn
 			qkv_seg = GptOssQkvProjSegment(
 				attn_wrapper=attn_wrapper,
 				layer_idx=layer_idx,
 			)
+			w_ptr = qkv_seg.get_weight_data_ptr()
+			weight_ptrs[layer_idx] = w_ptr
 			manager.register_segment(f"layer_{layer_idx}_qkv_proj", qkv_seg)
+
+		# Log weight pointer uniqueness check
+		unique_ptrs = set(weight_ptrs.values())
+		logging.warning(
+			f"Rank {self.rank}: QKV weight pointers: {len(unique_ptrs)} unique out of "
+			f"{len(weight_ptrs)} layers. "
+			f"First 5: {[hex(weight_ptrs[i]) for i in range(min(5, len(weight_ptrs)))]}"
+		)
+		if len(unique_ptrs) < len(weight_ptrs):
+			logging.error(
+				f"Rank {self.rank}: DUPLICATE weight pointers detected! "
+				f"Multiple layers share the same qkv_proj weights!"
+			)
 
 		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture (minimal: QKV proj only)...")
 		manager.warmup_and_capture_all()

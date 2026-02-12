@@ -269,6 +269,17 @@ class CUDAGraphManager:
         elapsed = (time.perf_counter() - start) * 1000
         logger.debug(f"Captured graph '{name}' @ BS={bucket_size} in {elapsed:.0f}ms")
 
+        # Log weight and buffer addresses for debugging aliasing issues
+        if hasattr(segment, 'get_weight_data_ptr') and bucket_size == self.bucketing.bucket_sizes[0]:
+            w_ptr = segment.get_weight_data_ptr()
+            in_ptrs = {k: hex(v.data_ptr()) for k, v in static_inputs.items()}
+            out_ptrs = {k: hex(v.data_ptr()) for k, v in static_outputs.items()}
+            logger.warning(
+                f"[CAPTURE_DIAG] '{name}' BS={bucket_size}: "
+                f"weight_ptr={hex(w_ptr)}, "
+                f"static_in={in_ptrs}, static_out={out_ptrs}"
+            )
+
     # -- Replay -------------------------------------------------------------
 
     def replay(

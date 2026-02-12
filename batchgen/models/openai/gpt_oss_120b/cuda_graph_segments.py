@@ -57,6 +57,10 @@ class GptOssQkvProjSegment:
             ),
         }
 
+    def get_weight_data_ptr(self) -> int:
+        """Return the GPU data pointer of qkv_proj weight for verification."""
+        return self.attn_module.qkv_proj.weight.data_ptr()
+
     def forward(
         self,
         normed: torch.Tensor,
