@@ -1348,82 +1348,45 @@ class GptOssDecoderLayer(nn.Module):
             self._l0_input_diag_done = True
 
         if use_graph:
+            # CUDA graph path: replay graph segment, then delegate to the
+            # attention wrapper for the rest.  This ensures all metadata
+            # (sinks, cache_seqlens, page table, KV append callback, etc.)
+            # flows through the same code path as eager execution.
             batch_size = hidden_states.shape[0]
-            from batchgen.models.wrappers import AttnWrapperBase
-            cache_seqlens = AttnWrapperBase.cache_seqlens
 
-            if cache_seqlens is not None and batch_size > 0:
+            if batch_size > 0:
                 try:
-                    # ============================================================
-                    # FAKE GRAPH MODE: replay dummy graph (discard output),
-                    # then run ALL ops eagerly. Isolates graph infra side-effects.
-                    # ============================================================
-
-                    # --- 1. RMSNorm (eager) ---
-                    from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
-                    normed = cuda_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
+                    # --- 1. RMSNorm (eager, outside wrapper) ---
+                    from batchgen.attention.fused_kernels import cuda_rmsnorm
+                    normed = cuda_rmsnorm(
+                        hidden_states,
+                        self.input_layernorm.weight,
+                        self.input_layernorm.eps,
+                    )
 
                     # --- 2. FAKE graph replay (output discarded) ---
+                    # Isolates whether CUDA graph infra itself has side-effects.
                     _fake_out = self.cuda_graph_manager.replay(
                         self._qkv_proj_segment_name,
                         batch_size,
                         x=normed,
                     )
-                    # Intentionally discard _fake_out — never used
+                    del _fake_out  # intentionally unused
 
-                    # --- 3. QKV proj (EAGER) ---
-                    qkv = self.self_attn.module.qkv_proj(normed)
-
-                    # --- 3. QKV split (eager) ---
-                    query, key, value = cuda_qkv_split(qkv, self.self_attn.q_size, self.self_attn.kv_size)
-                    query = query.view(batch_size, 1, self.self_attn.num_heads, self.self_attn.head_dim)
-                    key = key.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
-                    value = value.view(batch_size, 1, self.self_attn.num_kv_heads, self.self_attn.head_dim)
-
-                    # --- 4. RoPE (eager) ---
-                    current_token_position = cache_seqlens[:batch_size] - 1
-                    rotary_emb = self.self_attn.module.rotary_emb
-                    cos_pos = rotary_emb.cos_cached[current_token_position].unsqueeze(1).to(query.dtype)
-                    sin_pos = rotary_emb.sin_cached[current_token_position].unsqueeze(1).to(query.dtype)
-                    query, key = cuda_rope(query, key, cos_pos, sin_pos)
-
-                    # --- 5. KV write (eager) ---
-                    gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
-                    gpu_kv_manager.update_layer_decode_new_token(
-                        k_tensor=key,
-                        v_tensor=value,
-                        sequence_lengths=current_token_position,
-                        layer_idx=self.layer_idx,
+                    # --- 3. Attention via wrapper (same path as eager) ---
+                    # The wrapper handles: QKV proj, QKV split, RoPE,
+                    # KV write, FlashAttention, O_proj, KV append callback.
+                    hidden_states_out, _, _ = self.self_attn(
+                        hidden_states=normed,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
                     )
 
-                    # --- 6. FlashAttention (eager) ---
-                    k_cache, v_cache, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
-                        self.layer_idx
-                    )
-
-                    from batchgen.attention.gqa import gqa_decode_fa
-                    attn_output, _ = gqa_decode_fa(
-                        q=query,
-                        k_cache=k_cache,
-                        v_cache=v_cache,
-                        cache_seqlens=cache_seqlens[:batch_size],
-                        block_table=page_table,
-                        sinks=self.self_attn.sinks,
-                        softmax_scale=1.0 / math.sqrt(self.self_attn.head_dim),
-                        sliding_window=self.self_attn.sliding_window,
-                    )
-
-                    # --- 7. O_proj (eager) ---
-                    attn_output_flat = attn_output.view(batch_size, 1, self.self_attn.num_heads * self.self_attn.head_dim)
-                    hidden_states_out = self.self_attn.module.o_proj(attn_output_flat)
-
-                    attn_residual = hidden_states  # original layer input = residual
+                    attn_residual = hidden_states  # original input = residual
                     hidden_states = hidden_states_out
-
-                    # Host KV append callback
-                    kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
-                    if kv_append_callback is not None:
-                        kv_append_callback(self.layer_idx, key, value)
 
                 except (ValueError, RuntimeError) as e:
                     logging.warning(
