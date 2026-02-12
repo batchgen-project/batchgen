@@ -6,6 +6,9 @@ Everything else runs eagerly for debugging.
   Graph segment:   packed QKV proj (nn.Linear)
   Eager:           RMSNorm → [GRAPH: QKV proj] → QKV split → RoPE →
                    KV write → FlashAttention → O_proj → residual+norm → MoE
+
+FAKE graph mode: captures a dummy torch.mm whose output is never used.
+  Used to isolate whether the graph replay mechanism itself corrupts state.
 """
 
 import logging
@@ -17,6 +20,38 @@ import torch.nn as nn
 from batchgen.cuda_graph.graph_manager import TensorSpec
 
 logger = logging.getLogger(__name__)
+
+
+class FakeGemmSegment:
+    """Captures a dummy torch.mm — output is never used downstream.
+
+    Purpose: isolate whether CUDA graph capture/replay itself causes
+    corruption (stream state, memory aliasing, etc.), independent of
+    whether the graph's output is actually consumed.
+    """
+
+    def __init__(self, hidden_size: int = 2880, out_size: int = 256, device=None):
+        self.hidden_size = hidden_size
+        self.out_size = out_size
+        # Persistent random weight so the graph captures a real GEMM
+        self._weight = torch.randn(
+            hidden_size, out_size, dtype=torch.bfloat16,
+            device=device or torch.device("cuda"),
+        )
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "x": TensorSpec(("batch_size", 1, self.hidden_size), torch.bfloat16),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "y": TensorSpec(("batch_size", 1, self.out_size), torch.bfloat16),
+        }
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        y = torch.matmul(x, self._weight)
+        return {"y": y}
 
 
 class GptOssQkvProjSegment:

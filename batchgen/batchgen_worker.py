@@ -5828,59 +5828,40 @@ class BatchGenWorker:
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode attention blocks.
 
-		MINIMAL mode: only QKV proj (single GEMM) in graph.
-		Everything else runs eagerly for correctness debugging.
+		FAKE GRAPH MODE: captures a dummy torch.mm per layer whose output
+		is NEVER used downstream. QKV proj runs eagerly. This isolates
+		whether the graph replay mechanism itself corrupts state.
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
 		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
-			GptOssQkvProjSegment,
+			FakeGemmSegment,
 		)
 
 		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-		# Verify each layer has unique weight pointers
-		weight_ptrs = {}
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			attn_wrapper = decoder_layer.self_attn
-			qkv_seg = GptOssQkvProjSegment(
-				attn_wrapper=attn_wrapper,
-				layer_idx=layer_idx,
-			)
-			w_ptr = qkv_seg.get_weight_data_ptr()
-			weight_ptrs[layer_idx] = w_ptr
-			manager.register_segment(f"layer_{layer_idx}_qkv_proj", qkv_seg)
+		# Register one fake GEMM segment per layer (output never used)
+		for layer_idx in range(len(self.model.model.layers)):
+			fake_seg = FakeGemmSegment(hidden_size=2880, out_size=256, device=self.torch_device)
+			manager.register_segment(f"layer_{layer_idx}_fake", fake_seg)
 
-		# Log weight pointer uniqueness check
-		unique_ptrs = set(weight_ptrs.values())
-		logging.warning(
-			f"Rank {self.rank}: QKV weight pointers: {len(unique_ptrs)} unique out of "
-			f"{len(weight_ptrs)} layers. "
-			f"First 5: {[hex(weight_ptrs[i]) for i in range(min(5, len(weight_ptrs)))]}"
-		)
-		if len(unique_ptrs) < len(weight_ptrs):
-			logging.error(
-				f"Rank {self.rank}: DUPLICATE weight pointers detected! "
-				f"Multiple layers share the same qkv_proj weights!"
-			)
-
-		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture (minimal: QKV proj only)...")
+		logging.info(f"Rank {self.rank}: Starting CUDA graph warmup and capture (FAKE GEMM mode)...")
 		manager.warmup_and_capture_all()
 
-		# Enable graph mode on each decoder layer
+		# Enable graph mode on each decoder layer — pass fake segment name
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			decoder_layer.enable_cuda_graph(
 				manager,
 				pre_attn_name=None,
 				post_attn_name=None,
-				qkv_proj_name=f"layer_{layer_idx}_qkv_proj",
+				qkv_proj_name=f"layer_{layer_idx}_fake",
 			)
 
 		self._cuda_graph_manager = manager
 		stats = manager.get_capture_stats()
 		logging.info(
-			f"Rank {self.rank}: CUDA graphs ready — "
+			f"Rank {self.rank}: CUDA graphs ready (FAKE) — "
 			f"{stats['num_segments']} segments × {len(stats['bucket_sizes'])} buckets "
 			f"in {stats['total_capture_time_ms']:.0f}ms"
 		)

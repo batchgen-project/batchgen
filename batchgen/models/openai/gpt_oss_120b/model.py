@@ -1355,53 +1355,24 @@ class GptOssDecoderLayer(nn.Module):
             if cache_seqlens is not None and batch_size > 0:
                 try:
                     # ============================================================
-                    # MINIMAL CUDA GRAPH: only QKV proj in graph, rest eager
+                    # FAKE GRAPH MODE: replay dummy graph (discard output),
+                    # then run ALL ops eagerly. Isolates graph infra side-effects.
                     # ============================================================
 
                     # --- 1. RMSNorm (eager) ---
                     from batchgen.attention.fused_kernels import cuda_rmsnorm, cuda_qkv_split, cuda_rope
                     normed = cuda_rmsnorm(hidden_states, self.input_layernorm.weight, self.input_layernorm.eps)
 
-                    # --- 2. QKV proj (GRAPH) ---
-                    qkv_out = self.cuda_graph_manager.replay(
+                    # --- 2. FAKE graph replay (output discarded) ---
+                    _fake_out = self.cuda_graph_manager.replay(
                         self._qkv_proj_segment_name,
                         batch_size,
-                        normed=normed,
+                        x=normed,
                     )
-                    qkv = qkv_out["qkv"]
+                    # Intentionally discard _fake_out — never used
 
-                    # --- DIAGNOSTIC: graph QKV vs eager QKV (multiple layers) ---
-                    _diag_layers = {0, 1, 17, 35}
-                    if (self.layer_idx in _diag_layers
-                            and not getattr(self, '_qkv_diag_done', False)
-                            and os.environ.get("BATCHGEN_CUDA_GRAPH_DIAG", "0") == "1"):
-                        with torch.no_grad():
-                            torch.cuda.synchronize()
-                            # Compare graph output vs eager with THIS layer's weights
-                            _eager_qkv = self.self_attn.module.qkv_proj(normed)
-                            torch.cuda.synchronize()
-                            _d = (qkv.float() - _eager_qkv.float()).abs()
-                            _li = self.layer_idx
-                            logging.warning(
-                                f"[CUDA_GRAPH_DIAG L{_li}] QKV graph_vs_eager: "
-                                f"max_diff={_d.max().item():.6e}, mean_diff={_d.mean().item():.6e}, "
-                                f"graph_norm={qkv.float().norm().item():.4f}, "
-                                f"eager_norm={_eager_qkv.float().norm().item():.4f}"
-                            )
-                            _gv = qkv[0, 0, :10].float().tolist()
-                            _ev = _eager_qkv[0, 0, :10].float().tolist()
-                            logging.warning(
-                                f"[CUDA_GRAPH_DIAG L{_li}] graph[0,0,:10]: [{', '.join(f'{v:.6f}' for v in _gv)}]"
-                            )
-                            logging.warning(
-                                f"[CUDA_GRAPH_DIAG L{_li}] eager[0,0,:10]: [{', '.join(f'{v:.6f}' for v in _ev)}]"
-                            )
-                            # Also log weight pointer this layer's qkv_proj uses
-                            logging.warning(
-                                f"[CUDA_GRAPH_DIAG L{_li}] qkv_proj weight ptr: "
-                                f"{hex(self.self_attn.module.qkv_proj.weight.data_ptr())}"
-                            )
-                        self._qkv_diag_done = True
+                    # --- 3. QKV proj (EAGER) ---
+                    qkv = self.self_attn.module.qkv_proj(normed)
 
                     # --- 3. QKV split (eager) ---
                     query, key, value = cuda_qkv_split(qkv, self.self_attn.q_size, self.self_attn.kv_size)
