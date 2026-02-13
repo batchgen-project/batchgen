@@ -5834,7 +5834,9 @@ class BatchGenWorker:
 		KV cache, page table, and cos/sin tables are at fixed GPU addresses.
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
-		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import FullAttnSegment, MoESegment
+		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
+			FullAttnSegment, MoESegment, SharedMoEBufferPool,
+		)
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
 		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
@@ -5864,15 +5866,28 @@ class BatchGenWorker:
 								  max_pages, page_size_tokens)
 			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
 
-		# Register MoE segments (persistent experts only, EP mode)
+		# Register MoE segments with shared buffer pool (EP mode)
 		has_moe_graph = False
+		moe_pool = None
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			moe_decode = decoder_layer.mlp
 			if (hasattr(moe_decode, 'persistent_expert_indices')
 					and len(moe_decode.persistent_expert_indices) > 0
 					and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+				# Create shared pool once from first MoE layer's params
+				if moe_pool is None:
+					moe_pool = SharedMoEBufferPool(
+						world_size=self.world_size,
+						hidden_size=moe_decode.hidden_size,
+						total_experts=moe_decode.total_experts,
+						num_experts_per_tok=moe_decode.num_experts_per_tok,
+						num_local_experts=len(moe_decode.persistent_expert_indices),
+						N_intermediate=moe_decode.gate_weight_ref.shape[0],
+						device=self.torch_device,
+					)
+					moe_pool.setup(bucketing.bucket_sizes)
 				moe_seg = MoESegment(
-					moe_decode, moe_decode.comm,
+					moe_decode, moe_pool, moe_decode.comm,
 					self.world_size, self.rank, self.torch_device,
 				)
 				manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)

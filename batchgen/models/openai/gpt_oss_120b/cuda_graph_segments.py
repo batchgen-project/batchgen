@@ -2,7 +2,11 @@
 
 Segments:
   FullAttnSegment: RMSNorm → QKV → RoPE → KV write → FA → O_proj → post-attn norm
-  MoESegment: AllGather → router → grouped WGMMA MoE → AllReduce
+  MoESegment: AllGather → router → grouped WGMMA MoE → ReduceScatter
+
+SharedMoEBufferPool allocates max-bucket-sized buffers ONCE and creates
+per-bucket views (slices sharing the same data_ptr). All 36 MoE layers
+share a single pool instance — they execute sequentially so no conflicts.
 
 Dynamic metadata (cache_seqlens, page_table) are static-address input buffers
 whose contents are updated before each replay. KV cache and cos/sin tables
@@ -11,7 +15,7 @@ compatibility.
 """
 
 import logging
-from typing import Dict
+from typing import Dict, List, Optional
 
 import torch
 
@@ -151,33 +155,141 @@ class FullAttnSegment:
         return {"normed": normed, "residual": residual}
 
 
+# ---------------------------------------------------------------------------
+# Shared MoE buffer pool
+# ---------------------------------------------------------------------------
+
+class SharedMoEBufferPool:
+    """Single buffer pool shared across all MoE layers for CUDA graph capture.
+
+    Allocates max-bucket-sized buffers once. For each bucket size, creates
+    correctly-sized views (same data_ptr, different shape) and TMA descriptors.
+
+    Memory usage: ~207MB for max_bucket=256, W=8, H=2880, E=128, K=4.
+    Previous per-layer approach: 36 layers × 16 buckets × ~20MB+ = OOM.
+    """
+
+    _BLOCK_M = 64
+
+    def __init__(
+        self,
+        world_size: int,
+        hidden_size: int,
+        total_experts: int,
+        num_experts_per_tok: int,
+        num_local_experts: int,
+        N_intermediate: int,
+        device: torch.device,
+    ):
+        self.W = world_size
+        self.H = hidden_size
+        self.E = total_experts
+        self.K = num_experts_per_tok
+        self.E_local = num_local_experts
+        self.N_inter = N_intermediate
+        self.device = device
+        self._base = {}
+        self._views = {}
+        self._tma_descs = {}
+
+    def setup(self, bucket_sizes: List[int]) -> None:
+        """Allocate base buffers for max bucket, create per-bucket views + TMA descs."""
+        max_B = max(bucket_sizes)
+        WB_max = self.W * max_B
+        NK_max = WB_max * self.K
+        disp_max = max(NK_max, self._BLOCK_M)
+
+        b = self._base
+        d = self.device
+        H = self.H
+
+        # Base allocations at max size
+        b["padded"]          = torch.zeros(max_B, H, dtype=torch.bfloat16, device=d)
+        b["all_tokens"]      = torch.zeros(WB_max, H, dtype=torch.bfloat16, device=d)
+        b["router_logits"]   = torch.empty(WB_max, self.E, dtype=torch.bfloat16, device=d)
+        b["router_f32"]      = torch.empty(WB_max, self.E, dtype=torch.float32, device=d)
+        b["topk_indices"]    = torch.empty(WB_max, self.K, dtype=torch.int32, device=d)
+        b["topk_weights"]    = torch.empty(WB_max, self.K, dtype=torch.float32, device=d)
+        b["expert_counts"]   = torch.zeros(self.E_local, dtype=torch.int32, device=d)
+        b["expert_offsets"]  = torch.empty(self.E_local + 1, dtype=torch.int32, device=d)
+        b["expert_counters"] = torch.zeros(self.E_local, dtype=torch.int32, device=d)
+        b["topk_pos"]        = torch.full((NK_max,), -1, dtype=torch.int32, device=d)
+        b["dispatched_x"]    = torch.zeros(disp_max, H, dtype=torch.bfloat16, device=d)
+        b["intermediate"]    = torch.zeros(disp_max, self.N_inter, dtype=torch.bfloat16, device=d)
+        b["sorted_output"]   = torch.zeros(disp_max, H, dtype=torch.bfloat16, device=d)
+        b["moe_output"]      = torch.zeros(WB_max, H, dtype=torch.bfloat16, device=d)
+        b["local_output"]    = torch.zeros(max_B, H, dtype=torch.bfloat16, device=d)
+
+        total_bytes = sum(t.nelement() * t.element_size() for t in b.values())
+        logger.info(
+            f"SharedMoEBufferPool: allocated {total_bytes / 1024**2:.1f}MB base buffers "
+            f"(max_bucket={max_B}, W={self.W}, H={H})"
+        )
+
+        for B in bucket_sizes:
+            self._create_views(B)
+
+    def _create_views(self, B: int) -> None:
+        from batchgen.moe.fused_wgmma_grouped import create_tma_descriptor
+
+        WB = self.W * B
+        NK = WB * self.K
+        disp = max(NK, self._BLOCK_M)
+        b = self._base
+
+        v = {}
+        v["padded"]          = b["padded"][:B]
+        v["all_tokens"]      = b["all_tokens"][:WB]
+        v["router_logits"]   = b["router_logits"][:WB]
+        v["router_f32"]      = b["router_f32"][:WB]
+        v["topk_indices"]    = b["topk_indices"][:WB]
+        v["topk_weights"]    = b["topk_weights"][:WB]
+        v["expert_counts"]   = b["expert_counts"]        # always E_local
+        v["expert_offsets"]  = b["expert_offsets"]        # always E_local+1
+        v["expert_counters"] = b["expert_counters"]       # always E_local
+        v["topk_pos"]        = b["topk_pos"][:NK]
+        v["dispatched_x"]    = b["dispatched_x"][:disp]
+        v["intermediate"]    = b["intermediate"][:disp]
+        v["sorted_output"]   = b["sorted_output"][:disp]
+        v["moe_output"]      = b["moe_output"][:WB]
+        v["local_output"]    = b["local_output"][:B]
+        self._views[B] = v
+
+        # TMA descriptors for WGMMA kernels — must be created before graph capture
+        self._tma_descs[B] = {
+            "dispatched": create_tma_descriptor(v["dispatched_x"]),
+            "intermediate": create_tma_descriptor(v["intermediate"]),
+        }
+
+    def get(self, bucket_size: int):
+        """Return (views_dict, tma_descs_dict) for this bucket."""
+        return self._views[bucket_size], self._tma_descs[bucket_size]
+
+
+# ---------------------------------------------------------------------------
+# MoE segment (lightweight — references shared pool)
+# ---------------------------------------------------------------------------
+
 class MoESegment:
     """MoE block as a CUDA-graph-capturable segment (EP, persistent experts only).
 
-    Bypasses GptOssMoEDecode._forward_ep to use per-bucket-sized buffers and
-    call kernels directly. NCCL via PyNccl for graph compatibility.
+    Lightweight wrapper: holds only per-layer model weights and references
+    the SharedMoEBufferPool for all intermediate buffers. No buffer ownership.
 
-    All intermediate buffers and TMA descriptors are pre-allocated per bucket
-    via setup_static_buffers() before CUDA graph capture. The forward() method
-    issues only kernel launches on static-address buffers — no allocations,
-    no CPU-side driver API calls.
+    Pipeline: AllGather → router (bf16 matmul + f32 cast) → gate_topk_softmax →
+    dispatch → WGMMA stage1 → WGMMA stage2 → reduce_weighted_scatter →
+    reduce_scatter
 
     Inputs:  hidden_states [B, H] bf16
     Outputs: moe_output [B, H] bf16
     """
 
-    _BLOCK_M = 64  # TMA tile height
-
-    def __init__(self, moe_decode, comm, world_size: int, rank: int, device):
+    def __init__(self, moe_decode, pool: SharedMoEBufferPool, comm,
+                 world_size: int, rank: int, device: torch.device):
         import torch.distributed as dist
         self.dist = dist
 
-        self.router = moe_decode.router
-        self.router_weight = moe_decode.router.weight  # [E, H] for linear
-        # Pre-compute float32 weight transpose for graph-compatible router matmul
-        self.router_weight_f32_t = moe_decode.router.weight.float().T.contiguous()  # [H, E]
-        _bias = getattr(moe_decode.router, 'bias', None)
-        self.router_bias_f32 = _bias.float() if _bias is not None else None
+        self.pool = pool
         self.comm = comm
         self.world_size = world_size
         self.rank = rank
@@ -187,6 +299,13 @@ class MoESegment:
         self.total_experts = moe_decode.total_experts
         self.expert_start = moe_decode.expert_start
         self.num_local_experts = len(moe_decode.persistent_expert_indices)
+
+        # Router weight: store bf16 transpose for graph-compatible matmul
+        # Router matmul: all_tokens [WB, H] bf16 @ router_weight_t [H, E] bf16 → router_logits [WB, E] bf16
+        # Then cast the small [WB, E] result to f32 for gate kernel
+        self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()  # [H, E] bf16
+        _bias = getattr(moe_decode.router, 'bias', None)
+        self.router_bias_f32 = _bias.float() if _bias is not None else None
 
         # Weight pointer arrays (at fixed GPU addresses)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -203,69 +322,15 @@ class MoESegment:
         self.up_bias_ptrs = getattr(moe_decode, 'up_bias_ptrs', None)
         self.down_bias_ptrs = getattr(moe_decode, 'down_bias_ptrs', None)
 
-        # Intermediate dimension from gate weight shape
         self.N_intermediate = self.gate_weight_ref.shape[0]
-
-        # Strides from reference weights
-        self.s1_stride_weight_n = self.gate_weight_ref.shape[1]   # K // 2
-        self.s1_stride_scale_n = self.gate_scale_ref.shape[1]     # K // 32
-        self.s2_stride_weight_n = self.down_weight_ref.shape[1]   # N // 2
-        self.s2_stride_scale_n = self.down_scale_ref.shape[1]     # N // 32
-
-        # Per-bucket static buffers: populated by setup_static_buffers()
-        self._static_bufs = {}
+        self.s1_stride_weight_n = self.gate_weight_ref.shape[1]
+        self.s1_stride_scale_n = self.gate_scale_ref.shape[1]
+        self.s2_stride_weight_n = self.down_weight_ref.shape[1]
+        self.s2_stride_scale_n = self.down_scale_ref.shape[1]
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """Pre-allocate all intermediate buffers for a given bucket size.
-
-        Must be called once per bucket BEFORE CUDA graph capture. Creates
-        static-address buffers and TMA descriptors that remain valid during
-        graph replay.
-        """
-        from batchgen.moe.fused_wgmma_grouped import create_tma_descriptor
-
-        B = bucket_size
-        W = self.world_size
-        H = self.hidden_size
-        K_topk = self.num_experts_per_tok
-        E_local = self.num_local_experts
-        WB = W * B
-        NK = WB * K_topk
-        # Dispatched tokens buffer must be >= BLOCK_M for TMA descriptor validity
-        disp_rows = max(NK, self._BLOCK_M)
-
-        bufs = {}
-
-        # Communication buffers
-        bufs["padded"] = torch.zeros(B, H, dtype=torch.bfloat16, device=self.device)
-        bufs["all_tokens"] = torch.zeros(WB, H, dtype=torch.bfloat16, device=self.device)
-        bufs["global_results"] = torch.zeros(WB, H, dtype=torch.bfloat16, device=self.device)
-
-        # Router output (avoid nn.Linear allocation)
-        bufs["all_tokens_f32"] = torch.zeros(WB, H, dtype=torch.float32, device=self.device)
-        bufs["router_logits"] = torch.empty(WB, self.total_experts, dtype=torch.float32, device=self.device)
-
-        # Gate/dispatch buffers
-        bufs["topk_indices"] = torch.empty(WB, K_topk, dtype=torch.int32, device=self.device)
-        bufs["topk_weights"] = torch.empty(WB, K_topk, dtype=torch.float32, device=self.device)
-        bufs["expert_counts"] = torch.zeros(E_local, dtype=torch.int32, device=self.device)
-        bufs["expert_offsets"] = torch.empty(E_local + 1, dtype=torch.int32, device=self.device)
-        bufs["expert_counters"] = torch.zeros(E_local, dtype=torch.int32, device=self.device)
-        bufs["topk_pos"] = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
-        bufs["dispatched_x"] = torch.zeros(disp_rows, H, dtype=torch.bfloat16, device=self.device)
-
-        # WGMMA intermediate and output
-        bufs["intermediate"] = torch.zeros(disp_rows, self.N_intermediate, dtype=torch.bfloat16, device=self.device)
-        bufs["sorted_output"] = torch.zeros(disp_rows, H, dtype=torch.bfloat16, device=self.device)
-        bufs["moe_output"] = torch.zeros(WB, H, dtype=torch.bfloat16, device=self.device)
-
-        # Pre-build TMA descriptors (CPU-side driver API, not capturable)
-        bufs["tma_desc_dispatched"] = create_tma_descriptor(bufs["dispatched_x"])
-        bufs["tma_desc_intermediate"] = create_tma_descriptor(bufs["intermediate"])
-
-        self._static_bufs[B] = bufs
-        logger.info(f"MoESegment: pre-allocated static buffers for bucket_size={B} "
-                     f"(disp_rows={disp_rows}, WB={WB})")
+        """No-op: buffers are managed by SharedMoEBufferPool."""
+        pass
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -293,10 +358,11 @@ class MoESegment:
             fused_mxfp4_grouped_stage2_inplace,
         )
 
-        B, H = hidden_states.shape
+        B = hidden_states.shape[0]
+        H = self.hidden_size
         W = self.world_size
         WB = W * B
-        bufs = self._static_bufs[B]
+        bufs, tma = self.pool.get(B)
 
         # 1. Copy input to padded buffer
         bufs["padded"].copy_(hidden_states)
@@ -308,28 +374,23 @@ class MoESegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 3. Router: manual matmul into pre-allocated buffer (avoid nn.Linear alloc)
-        # router_weight is [E, H], we compute all_tokens @ router_weight.T
-        # Use pre-allocated f32 buffer to avoid .float() allocation
-        bufs["all_tokens_f32"].copy_(bufs["all_tokens"])
-        torch.mm(bufs["all_tokens_f32"], self.router_weight_f32_t, out=bufs["router_logits"])
+        # 3. Router matmul in bf16, then cast small [WB, E] to f32
+        # bf16 matmul avoids the large [WB, H] f32 buffer from previous design
+        torch.mm(bufs["all_tokens"], self.router_weight_bf16_t, out=bufs["router_logits"])
+        bufs["router_f32"].copy_(bufs["router_logits"])
         if self.router_bias_f32 is not None:
-            bufs["router_logits"].add_(self.router_bias_f32)
+            bufs["router_f32"].add_(self.router_bias_f32)
 
-        # 4. Gate top-k softmax into pre-allocated buffers
+        # 4. Gate top-k softmax (f32 input, pre-allocated int32/f32 outputs)
         gate_topk_softmax_cuda(
-            bufs["router_logits"],
+            bufs["router_f32"],
             topk_indices=bufs["topk_indices"],
             topk_weights=bufs["topk_weights"],
             k=self.num_experts_per_tok,
         )
 
-        # 5. Dispatch (count + prefix_sum + gather) into pre-allocated buffers
-        # Note: dispatch_count_gather_cuda zeros expert_counts/counters internally.
-        # We zero dispatched_x to ensure padded rows beyond actual tokens are zero
-        # (important for TMA correctness when dispatched < BLOCK_M).
+        # 5. Dispatch: count + prefix_sum + gather into pre-allocated buffers
         bufs["dispatched_x"].zero_()
-
         dispatch_count_gather_cuda(
             bufs["all_tokens"], bufs["topk_indices"],
             self.expert_start, self.num_local_experts,
@@ -340,10 +401,10 @@ class MoESegment:
             topk_pos=bufs["topk_pos"],
         )
 
-        # 6. WGMMA Stage 1 (gate + up + SwiGLU) — inplace with pre-built TMA desc
+        # 6. WGMMA Stage 1 (gate + up + SwiGLU)
         fused_mxfp4_grouped_stage1_inplace(
             bufs["dispatched_x"], bufs["intermediate"],
-            bufs["tma_desc_dispatched"], bufs["expert_offsets"],
+            tma["dispatched"], bufs["expert_offsets"],
             self.gate_ptrs, self.gate_scale_ptrs,
             self.up_ptrs, self.up_scale_ptrs,
             self.N_intermediate,
@@ -352,33 +413,30 @@ class MoESegment:
             up_bias_ptrs=self.up_bias_ptrs,
         )
 
-        # 7. WGMMA Stage 2 (down projection) — inplace with pre-built TMA desc
+        # 7. WGMMA Stage 2 (down projection)
         fused_mxfp4_grouped_stage2_inplace(
             bufs["intermediate"], bufs["sorted_output"],
-            bufs["tma_desc_intermediate"], bufs["expert_offsets"],
+            tma["intermediate"], bufs["expert_offsets"],
             self.down_ptrs, self.down_scale_ptrs,
             H,
             self.s2_stride_weight_n, self.s2_stride_scale_n,
             down_bias_ptrs=self.down_bias_ptrs,
         )
 
-        # 8. Reduce (weighted scatter-add back to original order)
+        # 8. Reduce: weighted scatter-add back to original token order
         reduce_weighted_scatter_cuda(
             bufs["sorted_output"], bufs["topk_pos"], bufs["topk_weights"],
             WB, H, self.num_experts_per_tok,
             output=bufs["moe_output"],
         )
 
-        # 9. Copy MoE result into global_results for AllReduce
-        bufs["global_results"].copy_(bufs["moe_output"])
-
-        # 10. AllReduce (PyNccl, graph-compatible)
+        # 9. ReduceScatter: sum across ranks, each rank gets its B-sized slice
+        # Equivalent to all_reduce + slice but with W× less HBM write
         with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                bufs["global_results"], op=self.dist.ReduceOp.SUM,
+            self.comm.reduce_scatter(
+                bufs["local_output"], bufs["moe_output"],
+                op=self.dist.ReduceOp.SUM,
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 11. Extract local rank's slice
-        start = self.rank * B
-        return {"moe_output": bufs["global_results"][start:start + B]}
+        return {"moe_output": bufs["local_output"]}
