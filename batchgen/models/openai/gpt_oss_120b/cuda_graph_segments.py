@@ -15,6 +15,7 @@ compatibility.
 """
 
 import logging
+import os
 from typing import Dict, List, Optional
 
 import torch
@@ -322,6 +323,9 @@ class MoESegment:
         self.up_bias_ptrs = getattr(moe_decode, 'up_bias_ptrs', None)
         self.down_bias_ptrs = getattr(moe_decode, 'down_bias_ptrs', None)
 
+        self._diag = bool(os.environ.get("BATCHGEN_MOE_DIAG"))
+        self._diag_layer0 = False  # set by batchgen_worker for first MoE layer
+
         self.N_intermediate = self.gate_weight_ref.shape[0]
         self.s1_stride_weight_n = self.gate_weight_ref.shape[1]
         self.s1_stride_scale_n = self.gate_scale_ref.shape[1]
@@ -368,11 +372,15 @@ class MoESegment:
         bufs["padded"].copy_(hidden_states)
 
         # 2. AllGather (PyNccl, graph-compatible)
+        if self._diag and self._diag_layer0:
+            print(f"[MoE-diag] rank={self.rank} B={B} pre-allgather", flush=True)
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
                 bufs["all_tokens"], bufs["padded"],
                 stream=torch.cuda.current_stream(self.device),
             )
+        if self._diag and self._diag_layer0:
+            print(f"[MoE-diag] rank={self.rank} B={B} post-allgather", flush=True)
 
         # 3. Router matmul in bf16, then cast small [WB, E] to f32
         # bf16 matmul avoids the large [WB, H] f32 buffer from previous design
@@ -431,11 +439,15 @@ class MoESegment:
         )
 
         # 9. AllReduce in-place (proven graph-compatible)
+        if self._diag and self._diag_layer0:
+            print(f"[MoE-diag] rank={self.rank} B={B} pre-allreduce", flush=True)
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 bufs["moe_output"], op=self.dist.ReduceOp.SUM,
                 stream=torch.cuda.current_stream(self.device),
             )
+        if self._diag and self._diag_layer0:
+            print(f"[MoE-diag] rank={self.rank} B={B} post-allreduce", flush=True)
 
         # 10. Extract local rank's slice
         start = self.rank * B
