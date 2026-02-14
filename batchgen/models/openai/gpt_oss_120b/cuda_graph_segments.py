@@ -430,13 +430,13 @@ class MoESegment:
             output=bufs["moe_output"],
         )
 
-        # 9. ReduceScatter: sum across ranks, each rank gets its B-sized slice
-        # Equivalent to all_reduce + slice but with W× less HBM write
+        # 9. AllReduce in-place (proven graph-compatible)
         with self.comm.change_state(enable=True):
-            self.comm.reduce_scatter(
-                bufs["local_output"], bufs["moe_output"],
-                op=self.dist.ReduceOp.SUM,
+            self.comm.all_reduce(
+                bufs["moe_output"], op=self.dist.ReduceOp.SUM,
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        return {"moe_output": bufs["local_output"]}
+        # 10. Extract local rank's slice
+        start = self.rank * B
+        return {"moe_output": bufs["moe_output"][start:start + B]}
