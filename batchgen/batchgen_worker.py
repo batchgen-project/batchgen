@@ -6279,7 +6279,17 @@ class BatchGenWorker:
 				# NOTE: Do NOT skip forward pass even with empty batch!
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
-				
+
+				# Per-iteration MoE buffer sync: track actual batch size for tight NCCL buffers.
+				# Without this, num_tokens_per_rank stays stale from page boundary, causing
+				# oversized buckets and redundant GEMM compute on padded tokens.
+				_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
+				dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
+				_max_bs = max(_local_bs.item(), 1)
+				if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+					if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
+						self.parallel_manager.set_num_tokens_per_rank(_max_bs)
+
 				# KV append callback
 				# NOTE: v_tensor is optional for backward compatibility with MLA models (DeepSeek)
 				# GPT-OSS uses GQA with separate K and V, so it passes both tensors
