@@ -5891,6 +5891,8 @@ class BatchGenWorker:
 					self.world_size, self.rank, self.torch_device,
 				)
 				manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
+				decoder_layer._moe_segment = moe_seg
+				decoder_layer._moe_bucketing = bucketing
 				has_moe_graph = True
 
 		# Set gpu_paged_kv_manager so segments can access it during capture
