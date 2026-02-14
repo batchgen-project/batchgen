@@ -1397,16 +1397,28 @@ class GptOssDecoderLayer(nn.Module):
             moe_start = time.perf_counter()
 
         # MoE: graph path or eager
-        use_moe_graph = (use_graph and self._moe_segment_name is not None
-                         and batch_size > 0)
+        use_moe_graph = (use_graph and self._moe_segment_name is not None)
         if use_moe_graph:
             try:
-                moe_in = hidden_states.view(batch_size, -1)
+                # Use synced num_tokens_per_rank for consistent NCCL across all ranks
+                # (same fix as eager path — per-rank batch_size would cause different
+                # buckets → different captured graphs → NCCL buffer mismatch)
+                ntr = self.mlp.num_tokens_per_rank
+                bucket = self._moe_bucketing.get_padded_size(ntr)
+
+                # Prepare padded input using pool buffer (no allocation)
+                bufs, _ = self._moe_segment.pool.get(bucket)
+                bufs["padded"].zero_()
+                if batch_size > 0:
+                    bufs["padded"][:batch_size].copy_(hidden_states.view(batch_size, -1))
+
+                # replay() copies bufs["padded"] → static_inputs, then graph replays
                 moe_out = self.cuda_graph_manager.replay(
-                    self._moe_segment_name, batch_size,
-                    hidden_states=moe_in,
+                    self._moe_segment_name, bucket,
+                    hidden_states=bufs["padded"],
                 )
-                hidden_states = moe_out["moe_output"].view(batch_size, 1, -1)
+                if batch_size > 0:
+                    hidden_states = moe_out["moe_output"][:batch_size].view(batch_size, 1, -1)
             except (ValueError, RuntimeError):
                 hidden_states = self.mlp(hidden_states)
         elif use_graph and os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None:
