@@ -5890,10 +5890,13 @@ class BatchGenWorker:
 					moe_decode, moe_pool, moe_decode.comm,
 					self.world_size, self.rank, self.torch_device,
 				)
-				manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
 				decoder_layer._moe_segment = moe_seg
 				decoder_layer._moe_bucketing = bucketing
-				has_moe_graph = True
+				# Skip graph registration when testing eager MoE path
+				# (graph capture NCCL ops corrupt communicator for eager use)
+				if not os.environ.get("BATCHGEN_MOE_EAGER"):
+					manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
+					has_moe_graph = True
 
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager

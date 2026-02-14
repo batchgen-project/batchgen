@@ -1409,6 +1409,15 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states = moe_out["moe_output"].view(batch_size, 1, -1)
             except (ValueError, RuntimeError):
                 hidden_states = self.mlp(hidden_states)
+        elif os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None and batch_size > 0:
+            # Eager test: run new MoE pipeline without CUDA graph
+            moe_in = hidden_states.view(batch_size, -1)
+            bucket = self._moe_bucketing.get_padded_size(batch_size)
+            padded_in = torch.zeros(bucket, moe_in.shape[1],
+                                    dtype=moe_in.dtype, device=moe_in.device)
+            padded_in[:batch_size] = moe_in
+            moe_result = self._moe_segment.forward(padded_in)
+            hidden_states = moe_result["moe_output"][:batch_size].view(batch_size, 1, -1)
         else:
             hidden_states = self.mlp(hidden_states)
 
