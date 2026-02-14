@@ -1411,9 +1411,9 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states = self.mlp(hidden_states)
         elif use_graph and os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None:
             # Eager MoE: all ranks MUST use the same bucket size for NCCL.
-            # Different ranks can have different batch_size in EP, so we always
-            # use the max bucket to guarantee matching NCCL buffer sizes.
-            bucket = self._moe_bucketing.bucket_sizes[-1]  # max bucket, same on all ranks
+            # num_tokens_per_rank = max(local_batch_size) across all ranks,
+            # synced via dist.all_reduce(MAX) before each decode iteration.
+            bucket = self._moe_bucketing.get_padded_size(self.mlp.num_tokens_per_rank)
             bufs, _ = self._moe_segment.pool.get(bucket)
             bufs["padded"].zero_()
             if batch_size > 0:
