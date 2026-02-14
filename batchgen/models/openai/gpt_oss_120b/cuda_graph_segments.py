@@ -439,3 +439,146 @@ class MoESegment:
         # 10. Extract local rank's slice
         start = self.rank * B
         return {"moe_output": bufs["moe_output"][start:start + B]}
+
+
+# ---------------------------------------------------------------------------
+# MoE compute segment (no NCCL — graph-capturable)
+# ---------------------------------------------------------------------------
+
+class MoEComputeSegment:
+    """MoE compute without NCCL: router → gate → dispatch → WGMMA → scatter.
+
+    NCCL (all_gather, all_reduce) is handled by the caller as eager ops.
+    This segment contains only graph-capturable compute operations.
+
+    Input:  all_tokens [W*B, H] bf16 (post-all_gather)
+    Output: moe_output [W*B, H] bf16 (pre-all_reduce)
+    """
+
+    def __init__(self, moe_decode, pool: SharedMoEBufferPool,
+                 world_size: int, device: torch.device):
+        self.pool = pool
+        self.world_size = world_size
+        self.device = device
+        self.hidden_size = moe_decode.hidden_size
+        self.num_experts_per_tok = moe_decode.num_experts_per_tok
+        self.total_experts = moe_decode.total_experts
+        self.expert_start = moe_decode.expert_start
+        self.num_local_experts = len(moe_decode.persistent_expert_indices)
+
+        # Router weight: bf16 transpose for graph-compatible matmul
+        self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()
+        _bias = getattr(moe_decode.router, 'bias', None)
+        self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+
+        # Weight pointer arrays
+        self.gate_ptrs = moe_decode.gate_ptrs
+        self.gate_scale_ptrs = moe_decode.gate_scale_ptrs
+        self.up_ptrs = moe_decode.up_ptrs
+        self.up_scale_ptrs = moe_decode.up_scale_ptrs
+        self.down_ptrs = moe_decode.down_ptrs
+        self.down_scale_ptrs = moe_decode.down_scale_ptrs
+        self.gate_weight_ref = moe_decode.gate_weight_ref
+        self.gate_scale_ref = moe_decode.gate_scale_ref
+        self.down_weight_ref = moe_decode.down_weight_ref
+        self.down_scale_ref = moe_decode.down_scale_ref
+        self.gate_bias_ptrs = getattr(moe_decode, 'gate_bias_ptrs', None)
+        self.up_bias_ptrs = getattr(moe_decode, 'up_bias_ptrs', None)
+        self.down_bias_ptrs = getattr(moe_decode, 'down_bias_ptrs', None)
+
+        self.N_intermediate = self.gate_weight_ref.shape[0]
+        self.s1_stride_weight_n = self.gate_weight_ref.shape[1]
+        self.s1_stride_scale_n = self.gate_scale_ref.shape[1]
+        self.s2_stride_weight_n = self.down_weight_ref.shape[1]
+        self.s2_stride_scale_n = self.down_scale_ref.shape[1]
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        """No-op: buffers are managed by SharedMoEBufferPool."""
+        pass
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        WB = self.world_size * bucket_size
+        return {
+            "all_tokens": TensorSpec((WB, self.hidden_size), torch.bfloat16),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        WB = self.world_size * bucket_size
+        return {
+            "moe_output": TensorSpec((WB, self.hidden_size), torch.bfloat16),
+        }
+
+    def forward(self, all_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Graph-capturable MoE compute: no NCCL, no allocations."""
+        from batchgen.moe.routing import (
+            gate_topk_softmax_cuda,
+            dispatch_count_gather_cuda,
+            reduce_weighted_scatter_cuda,
+        )
+        from batchgen.moe.fused_wgmma_grouped import (
+            fused_mxfp4_grouped_stage1_inplace,
+            fused_mxfp4_grouped_stage2_inplace,
+        )
+
+        H = self.hidden_size
+        W = self.world_size
+        WB = all_tokens.shape[0]
+        B = WB // W
+        bufs, tma = self.pool.get(B)
+
+        # 1. Router matmul in bf16 + bias in bf16, then cast to f32
+        torch.mm(all_tokens, self.router_weight_bf16_t, out=bufs["router_logits"])
+        if self.router_bias_bf16 is not None:
+            bufs["router_logits"].add_(self.router_bias_bf16)
+        bufs["router_f32"].copy_(bufs["router_logits"])
+
+        # 2. Gate top-k softmax
+        gate_topk_softmax_cuda(
+            bufs["router_f32"],
+            topk_indices=bufs["topk_indices"],
+            topk_weights=bufs["topk_weights"],
+            k=self.num_experts_per_tok,
+        )
+
+        # 3. Dispatch: count + prefix_sum + gather
+        bufs["dispatched_x"].zero_()
+        dispatch_count_gather_cuda(
+            all_tokens, bufs["topk_indices"],
+            self.expert_start, self.num_local_experts,
+            expert_counts=bufs["expert_counts"],
+            expert_offsets=bufs["expert_offsets"],
+            expert_counters=bufs["expert_counters"],
+            dispatched_x=bufs["dispatched_x"],
+            topk_pos=bufs["topk_pos"],
+        )
+
+        # 4. WGMMA Stage 1 (gate + up + SwiGLU)
+        fused_mxfp4_grouped_stage1_inplace(
+            bufs["dispatched_x"], bufs["intermediate"],
+            tma["dispatched"], bufs["expert_offsets"],
+            self.gate_ptrs, self.gate_scale_ptrs,
+            self.up_ptrs, self.up_scale_ptrs,
+            self.N_intermediate,
+            self.s1_stride_weight_n, self.s1_stride_scale_n,
+            gate_bias_ptrs=self.gate_bias_ptrs,
+            up_bias_ptrs=self.up_bias_ptrs,
+        )
+
+        # 5. WGMMA Stage 2 (down projection)
+        fused_mxfp4_grouped_stage2_inplace(
+            bufs["intermediate"], bufs["sorted_output"],
+            tma["intermediate"], bufs["expert_offsets"],
+            self.down_ptrs, self.down_scale_ptrs,
+            H,
+            self.s2_stride_weight_n, self.s2_stride_scale_n,
+            down_bias_ptrs=self.down_bias_ptrs,
+        )
+
+        # 6. Reduce: weighted scatter-add back to original token order
+        reduce_weighted_scatter_cuda(
+            bufs["sorted_output"], bufs["topk_pos"], bufs["topk_weights"],
+            WB, H, self.num_experts_per_tok,
+            output=bufs["moe_output"],
+        )
+
+        return {"moe_output": bufs["moe_output"]}

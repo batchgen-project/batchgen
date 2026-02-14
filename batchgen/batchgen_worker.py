@@ -5835,7 +5835,7 @@ class BatchGenWorker:
 		"""
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
 		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
-			FullAttnSegment, MoESegment, SharedMoEBufferPool,
+			FullAttnSegment, MoESegment, MoEComputeSegment, SharedMoEBufferPool,
 		)
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
@@ -5892,10 +5892,14 @@ class BatchGenWorker:
 				)
 				decoder_layer._moe_segment = moe_seg
 				decoder_layer._moe_bucketing = bucketing
-				# Skip graph registration when testing eager MoE path
-				# (graph capture NCCL ops corrupt communicator for eager use)
+				# Register NCCL-free compute segment for graph capture.
+				# NCCL (all_gather/all_reduce) runs as eager ops in model.py.
 				if not os.environ.get("BATCHGEN_MOE_EAGER"):
-					manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
+					moe_compute_seg = MoEComputeSegment(
+						moe_decode, moe_pool,
+						self.world_size, self.torch_device,
+					)
+					manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
 					has_moe_graph = True
 
 		# Set gpu_paged_kv_manager so segments can access it during capture

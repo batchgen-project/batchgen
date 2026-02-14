@@ -1400,25 +1400,39 @@ class GptOssDecoderLayer(nn.Module):
         use_moe_graph = (use_graph and self._moe_segment_name is not None)
         if use_moe_graph:
             try:
+                import torch.distributed as dist
                 # Use synced num_tokens_per_rank for consistent NCCL across all ranks
-                # (same fix as eager path — per-rank batch_size would cause different
-                # buckets → different captured graphs → NCCL buffer mismatch)
                 ntr = self.mlp.num_tokens_per_rank
                 bucket = self._moe_bucketing.get_padded_size(ntr)
+                seg = self._moe_segment
 
-                # Prepare padded input using pool buffer (no allocation)
-                bufs, _ = self._moe_segment.pool.get(bucket)
+                # 1. Eager: pad + all_gather (NCCL not graph-capturable)
+                bufs, _ = seg.pool.get(bucket)
                 bufs["padded"].zero_()
                 if batch_size > 0:
                     bufs["padded"][:batch_size].copy_(hidden_states.view(batch_size, -1))
+                with seg.comm.change_state(enable=True):
+                    seg.comm.all_gather(
+                        bufs["all_tokens"], bufs["padded"],
+                        stream=torch.cuda.current_stream(seg.device),
+                    )
 
-                # replay() copies bufs["padded"] → static_inputs, then graph replays
+                # 2. Graph: compute (router → WGMMA → scatter)
                 moe_out = self.cuda_graph_manager.replay(
                     self._moe_segment_name, bucket,
-                    hidden_states=bufs["padded"],
+                    all_tokens=bufs["all_tokens"],
                 )
+
+                # 3. Eager: all_reduce + slice
+                moe_full = moe_out["moe_output"]
+                with seg.comm.change_state(enable=True):
+                    seg.comm.all_reduce(
+                        moe_full, op=dist.ReduceOp.SUM,
+                        stream=torch.cuda.current_stream(seg.device),
+                    )
+                start = seg.rank * bucket
                 if batch_size > 0:
-                    hidden_states = moe_out["moe_output"][:batch_size].view(batch_size, 1, -1)
+                    hidden_states = moe_full[start:start + batch_size].view(batch_size, 1, -1)
             except (ValueError, RuntimeError):
                 hidden_states = self.mlp(hidden_states)
         elif use_graph and os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None:
