@@ -1344,7 +1344,9 @@ class GptOssDecoderLayer(nn.Module):
                         slot_indices=slot_indices[:batch_size],
                     )
                     hidden_states = out["normed"]
-                    residual = out["residual"]
+                    # Clone residual: it lives in the CUDA graph memory pool
+                    # and would be clobbered by MoE graph replay (shared pool).
+                    residual = out["residual"].clone()
                     attn_residual = "graph_done"
 
                 except (ValueError, RuntimeError):
