@@ -5890,9 +5890,6 @@ class BatchGenWorker:
 					moe_decode, moe_pool, moe_decode.comm,
 					self.world_size, self.rank, self.torch_device,
 				)
-				if not hasattr(moe_pool, '_first_seg_set'):
-					moe_seg._diag_layer0 = True
-					moe_pool._first_seg_set = True
 				decoder_layer._moe_segment = moe_seg
 				decoder_layer._moe_bucketing = bucketing
 				# Skip graph registration when testing eager MoE path

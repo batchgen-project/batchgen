@@ -1266,20 +1266,6 @@ class GptOssMoEPrefill(nn.Module):
 
 
 # ============================================================================
-# MoE diagnostic logging (gated by BATCHGEN_MOE_DIAG=1)
-# ============================================================================
-_moe_diag_step = 0
-_moe_diag_prev_bs = -1
-
-def _diag_log_moe_branch(batch_size, branch, moe_seg):
-    global _moe_diag_step, _moe_diag_prev_bs
-    _moe_diag_step += 1
-    if _moe_diag_step % 100 == 1 or batch_size != _moe_diag_prev_bs:
-        rank = moe_seg.rank if moe_seg else -1
-        print(f"[MoE-diag] step={_moe_diag_step} bs={batch_size} branch={branch} rank={rank}", flush=True)
-        _moe_diag_prev_bs = batch_size
-
-# ============================================================================
 # Decoder Layer
 # ============================================================================
 
@@ -1413,9 +1399,6 @@ class GptOssDecoderLayer(nn.Module):
         # MoE: graph path or eager
         use_moe_graph = (use_graph and self._moe_segment_name is not None
                          and batch_size > 0)
-        if use_graph and self.layer_idx == 0 and os.environ.get("BATCHGEN_MOE_DIAG"):
-            _moe_branch = "graph" if use_moe_graph else "eager" if (os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None) else "fallback"
-            _diag_log_moe_branch(batch_size, _moe_branch, self._moe_segment)
         if use_moe_graph:
             try:
                 moe_in = hidden_states.view(batch_size, -1)

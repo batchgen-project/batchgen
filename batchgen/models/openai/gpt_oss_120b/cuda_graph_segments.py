@@ -15,7 +15,6 @@ compatibility.
 """
 
 import logging
-import os
 from typing import Dict, List, Optional
 
 import torch
@@ -306,7 +305,7 @@ class MoESegment:
         # Then cast the small [WB, E] result to f32 for gate kernel
         self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()  # [H, E] bf16
         _bias = getattr(moe_decode.router, 'bias', None)
-        self.router_bias_f32 = _bias.float() if _bias is not None else None
+        self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
 
         # Weight pointer arrays (at fixed GPU addresses)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -322,9 +321,6 @@ class MoESegment:
         self.gate_bias_ptrs = getattr(moe_decode, 'gate_bias_ptrs', None)
         self.up_bias_ptrs = getattr(moe_decode, 'up_bias_ptrs', None)
         self.down_bias_ptrs = getattr(moe_decode, 'down_bias_ptrs', None)
-
-        self._diag = bool(os.environ.get("BATCHGEN_MOE_DIAG"))
-        self._diag_layer0 = False  # set by batchgen_worker for first MoE layer
 
         self.N_intermediate = self.gate_weight_ref.shape[0]
         self.s1_stride_weight_n = self.gate_weight_ref.shape[1]
@@ -372,22 +368,17 @@ class MoESegment:
         bufs["padded"].copy_(hidden_states)
 
         # 2. AllGather (PyNccl, graph-compatible)
-        if self._diag and self._diag_layer0:
-            print(f"[MoE-diag] rank={self.rank} B={B} pre-allgather", flush=True)
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
                 bufs["all_tokens"], bufs["padded"],
                 stream=torch.cuda.current_stream(self.device),
             )
-        if self._diag and self._diag_layer0:
-            print(f"[MoE-diag] rank={self.rank} B={B} post-allgather", flush=True)
 
-        # 3. Router matmul in bf16, then cast small [WB, E] to f32
-        # bf16 matmul avoids the large [WB, H] f32 buffer from previous design
+        # 3. Router matmul in bf16 + bias in bf16 (matching nn.Linear), then cast to f32
         torch.mm(bufs["all_tokens"], self.router_weight_bf16_t, out=bufs["router_logits"])
+        if self.router_bias_bf16 is not None:
+            bufs["router_logits"].add_(self.router_bias_bf16)
         bufs["router_f32"].copy_(bufs["router_logits"])
-        if self.router_bias_f32 is not None:
-            bufs["router_f32"].add_(self.router_bias_f32)
 
         # 4. Gate top-k softmax (f32 input, pre-allocated int32/f32 outputs)
         gate_topk_softmax_cuda(
@@ -439,15 +430,11 @@ class MoESegment:
         )
 
         # 9. AllReduce in-place (proven graph-compatible)
-        if self._diag and self._diag_layer0:
-            print(f"[MoE-diag] rank={self.rank} B={B} pre-allreduce", flush=True)
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 bufs["moe_output"], op=self.dist.ReduceOp.SUM,
                 stream=torch.cuda.current_stream(self.device),
             )
-        if self._diag and self._diag_layer0:
-            print(f"[MoE-diag] rank={self.rank} B={B} post-allreduce", flush=True)
 
         # 10. Extract local rank's slice
         start = self.rank * B
