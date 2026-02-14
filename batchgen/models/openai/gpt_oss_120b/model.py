@@ -1413,8 +1413,8 @@ class GptOssDecoderLayer(nn.Module):
         # MoE: graph path or eager
         use_moe_graph = (use_graph and self._moe_segment_name is not None
                          and batch_size > 0)
-        _moe_branch = "graph" if use_moe_graph else "eager" if (os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None) else "fallback"
-        if self.layer_idx == 0 and os.environ.get("BATCHGEN_MOE_DIAG"):
+        if use_graph and self.layer_idx == 0 and os.environ.get("BATCHGEN_MOE_DIAG"):
+            _moe_branch = "graph" if use_moe_graph else "eager" if (os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None) else "fallback"
             _diag_log_moe_branch(batch_size, _moe_branch, self._moe_segment)
         if use_moe_graph:
             try:
@@ -1426,7 +1426,7 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states = moe_out["moe_output"].view(batch_size, 1, -1)
             except (ValueError, RuntimeError):
                 hidden_states = self.mlp(hidden_states)
-        elif os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None:
+        elif use_graph and os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None:
             # Eager MoE: always go through MoESegment to keep NCCL consistent
             # across all ranks (even batch_size=0 must participate in collectives)
             if batch_size > 0:
