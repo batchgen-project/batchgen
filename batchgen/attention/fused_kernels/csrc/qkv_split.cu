@@ -19,10 +19,13 @@ __global__ void qkv_split_kernel(
     int M,
     int q_size,
     int kv_size,
-    int total_dim)
+    int total_dim,
+    const int* __restrict__ num_valid_ptr)
 {
     int row = blockIdx.x;
     if (row >= M) return;
+    // Skip padding rows when num_valid_ptr is provided (CUDA graph path)
+    if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
 
     const T* qkv_row = qkv + row * total_dim;
     T* q_row = q_out + row * q_size;
@@ -68,12 +71,18 @@ void qkv_split_inplace(
     torch::Tensor k_out,   // [M, kv_size] pre-allocated
     torch::Tensor v_out,   // [M, kv_size] pre-allocated
     int q_size,
-    int kv_size)
+    int kv_size,
+    c10::optional<torch::Tensor> num_valid_tokens)
 {
     int total_dim = qkv.size(-1);
     int M = qkv.numel() / total_dim;
 
     if (M == 0) return;
+
+    const int* num_valid_ptr = nullptr;
+    if (num_valid_tokens.has_value() && num_valid_tokens->defined()) {
+        num_valid_ptr = num_valid_tokens->data_ptr<int>();
+    }
 
     const int threads = 256;
     const int blocks = M;
@@ -87,14 +96,14 @@ void qkv_split_inplace(
                 q_out.data_ptr<at::BFloat16>(),
                 k_out.data_ptr<at::BFloat16>(),
                 v_out.data_ptr<at::BFloat16>(),
-                M, q_size, kv_size, total_dim); })
+                M, q_size, kv_size, total_dim, num_valid_ptr); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
             [&] { qkv_split_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 qkv.data_ptr<at::Half>(),
                 q_out.data_ptr<at::Half>(),
                 k_out.data_ptr<at::Half>(),
                 v_out.data_ptr<at::Half>(),
-                M, q_size, kv_size, total_dim); })
+                M, q_size, kv_size, total_dim, num_valid_ptr); })
     );
 }
 
@@ -105,7 +114,8 @@ void qkv_split_inplace(
 std::vector<torch::Tensor> qkv_split_forward(
     torch::Tensor qkv,
     int q_size,
-    int kv_size)
+    int kv_size,
+    c10::optional<torch::Tensor> num_valid_tokens)
 {
     TORCH_CHECK(qkv.is_cuda(), "qkv must be CUDA");
 
@@ -134,7 +144,7 @@ std::vector<torch::Tensor> qkv_split_forward(
     auto k_out = torch::empty({M, kv_size}, qkv.options());
     auto v_out = torch::empty({M, kv_size}, qkv.options());
 
-    qkv_split_inplace(qkv_flat, q_out, k_out, v_out, q_size, kv_size);
+    qkv_split_inplace(qkv_flat, q_out, k_out, v_out, q_size, kv_size, num_valid_tokens);
 
     auto q_shape = orig_shape;
     auto kv_shape = orig_shape;

@@ -84,6 +84,9 @@ class FullAttnSegment:
             "slot_indices": TensorSpec(
                 ("batch_size",), torch.int32, fill_value=-1  # sentinel: kernel skips tokens with slot < 0
             ),
+            "num_valid_tokens": TensorSpec(
+                (1,), torch.int32, fill_value=0  # 1-element scalar; kernels skip rows >= this value
+            ),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -105,6 +108,7 @@ class FullAttnSegment:
     def forward(
         self, hidden_states: torch.Tensor, cache_seqlens: torch.Tensor,
         page_table: torch.Tensor, slot_indices: torch.Tensor,
+        num_valid_tokens: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         from batchgen.attention.fused_kernels import (
             cuda_rmsnorm, cuda_qkv_split, cuda_rope, cuda_add_rmsnorm,
@@ -113,11 +117,12 @@ class FullAttnSegment:
         from batchgen.kv_cache.gpu_kv_kernels import run_paged_kv_token_update_fused
 
         B = hidden_states.shape[0]
+        nvt = num_valid_tokens  # 1-element int32 device tensor
 
         # === Pre-attn: RMSNorm → QKV proj → split → reshape ===
-        normed = cuda_rmsnorm(hidden_states, self.ln_weight, self.ln_eps)
+        normed = cuda_rmsnorm(hidden_states, self.ln_weight, self.ln_eps, num_valid_tokens=nvt)
         qkv = self.qkv_proj(normed)
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
+        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size, num_valid_tokens=nvt)
         query = query.view(B, 1, self.num_heads, self.head_dim)
         key = key.view(B, 1, self.num_kv_heads, self.head_dim)
         value = value.view(B, 1, self.num_kv_heads, self.head_dim)
@@ -127,7 +132,7 @@ class FullAttnSegment:
         cos, sin = self.rotary_emb(value.transpose(1, 2), seq_len=self.max_seq_len)
         cos = cos[current_pos].unsqueeze(1)
         sin = sin[current_pos].unsqueeze(1)
-        query, key = cuda_rope(query, key, cos, sin)
+        query, key = cuda_rope(query, key, cos, sin, num_valid_tokens=nvt)
 
         # === KV write (direct kernel call with static buffers) ===
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
@@ -157,7 +162,8 @@ class FullAttnSegment:
 
         # === Post-attn: residual add + RMSNorm ===
         normed, residual = cuda_add_rmsnorm(
-            hidden_states, attn_out, self.post_ln_weight, self.post_ln_eps
+            hidden_states, attn_out, self.post_ln_weight, self.post_ln_eps,
+            num_valid_tokens=nvt,
         )
         return {"normed": normed, "residual": residual, "key": key, "value": value}
 

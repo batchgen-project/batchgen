@@ -1338,12 +1338,17 @@ class GptOssDecoderLayer(nn.Module):
                         self.layer_idx
                     )
                     slot_indices = gpu_kv_manager._gpu_page_table_manager._slot_index_tensor
+                    # num_valid_tokens: 1-element int32 tensor so custom kernels skip padding
+                    if not hasattr(self, '_nvt_tensor'):
+                        self._nvt_tensor = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
+                    self._nvt_tensor.fill_(batch_size)
                     out = self.cuda_graph_manager.replay(
                         self._full_attn_segment_name, batch_size,
                         hidden_states=hidden_states,
                         cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
                         page_table=page_table[:batch_size],
                         slot_indices=slot_indices[:batch_size],
+                        num_valid_tokens=self._nvt_tensor,
                     )
                     hidden_states = out["normed"]
                     # Clone residual: it lives in the CUDA graph memory pool

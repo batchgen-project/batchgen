@@ -23,7 +23,8 @@ __global__ void rope_kernel(
     int num_kv_heads,
     int seq_len,
     int half_dim,
-    int head_dim)
+    int head_dim,
+    const int* __restrict__ num_valid_ptr)
 {
     int vec_idx = blockIdx.x;
     bool is_q = vec_idx < total_q;
@@ -45,8 +46,10 @@ __global__ void rope_kernel(
         num_heads = num_kv_heads;
     }
 
-    // batch_idx from local_idx: local_idx = batch * seq * heads + seq_pos * heads + head
-    int batch_seq_idx = local_idx / num_heads;  // = batch * seq + seq_pos
+    // Skip padding tokens when num_valid_ptr is provided (CUDA graph path)
+    // batch_seq_idx = token index (for S=1 decode, this equals batch index)
+    int batch_seq_idx = local_idx / num_heads;
+    if (num_valid_ptr != nullptr && batch_seq_idx >= *num_valid_ptr) return;
 
     // Load cos/sin for this batch+seq position (only half_dim elements)
     int cos_base = batch_seq_idx * head_dim;
@@ -87,7 +90,8 @@ std::vector<torch::Tensor> rope_forward(
     torch::Tensor key,      // [B, S, num_kv_heads, head_dim]
     torch::Tensor cos,      // [B, S, head_dim]
     torch::Tensor sin,      // [B, S, head_dim]
-    int half_dim)
+    int half_dim,
+    c10::optional<torch::Tensor> num_valid_tokens)
 {
     TORCH_CHECK(query.is_cuda(), "query must be CUDA");
     TORCH_CHECK(key.is_cuda(), "key must be CUDA");
@@ -118,6 +122,11 @@ std::vector<torch::Tensor> rope_forward(
 
     if (total == 0) return {q_out.reshape_as(query), k_out.reshape_as(key)};
 
+    const int* num_valid_ptr = nullptr;
+    if (num_valid_tokens.has_value() && num_valid_tokens->defined()) {
+        num_valid_ptr = num_valid_tokens->data_ptr<int>();
+    }
+
     // One block per vector, half_dim threads per block
     // For head_dim=64, half_dim=32 → 32 threads per block
     const int threads = half_dim;
@@ -136,7 +145,7 @@ std::vector<torch::Tensor> rope_forward(
                 k_out.data_ptr<at::BFloat16>(),
                 total_q, total_k,
                 num_q_heads, num_kv_heads,
-                S, half_dim, head_dim); })
+                S, half_dim, head_dim, num_valid_ptr); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
             [&] { rope_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 q_flat.data_ptr<at::Half>(),
@@ -147,7 +156,7 @@ std::vector<torch::Tensor> rope_forward(
                 k_out.data_ptr<at::Half>(),
                 total_q, total_k,
                 num_q_heads, num_kv_heads,
-                S, half_dim, head_dim); })
+                S, half_dim, head_dim, num_valid_ptr); })
     );
 
     return {

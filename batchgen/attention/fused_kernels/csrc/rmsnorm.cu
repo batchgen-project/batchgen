@@ -53,9 +53,13 @@ __global__ void rmsnorm_kernel(
     const T* __restrict__ weight,
     T* __restrict__ output,
     int hidden_size,
-    float eps)
+    float eps,
+    const int* __restrict__ num_valid_ptr)
 {
     int row = blockIdx.x;
+    // Skip padding rows when num_valid_ptr is provided (CUDA graph path)
+    if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
+
     const T* x_row = input + row * hidden_size;
     T* o_row = output + row * hidden_size;
 
@@ -96,9 +100,13 @@ __global__ void add_rmsnorm_kernel(
     const T* __restrict__ weight,
     T* __restrict__ normed_out,
     int hidden_size,
-    float eps)
+    float eps,
+    const int* __restrict__ num_valid_ptr)
 {
     int row = blockIdx.x;
+    // Skip padding rows when num_valid_ptr is provided (CUDA graph path)
+    if (num_valid_ptr != nullptr && row >= *num_valid_ptr) return;
+
     T* r_row = residual + row * hidden_size;
     const T* h_row = hidden + row * hidden_size;
     T* o_row = normed_out + row * hidden_size;
@@ -139,7 +147,8 @@ __global__ void add_rmsnorm_kernel(
 torch::Tensor rmsnorm_forward(
     torch::Tensor input,
     torch::Tensor weight,
-    float eps)
+    float eps,
+    c10::optional<torch::Tensor> num_valid_tokens)
 {
     TORCH_CHECK(input.is_cuda(), "input must be CUDA");
     TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
@@ -155,7 +164,11 @@ torch::Tensor rmsnorm_forward(
 
     if (num_rows == 0) return output;
 
-    // 256 threads: each handles hidden_size/256 = 16 elements for H=4096
+    const int* num_valid_ptr = nullptr;
+    if (num_valid_tokens.has_value() && num_valid_tokens->defined()) {
+        num_valid_ptr = num_valid_tokens->data_ptr<int>();
+    }
+
     const int threads = 256;
     const int blocks = num_rows;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -167,19 +180,19 @@ torch::Tensor rmsnorm_forward(
                 input.data_ptr<at::BFloat16>(),
                 weight.data_ptr<at::BFloat16>(),
                 output.data_ptr<at::BFloat16>(),
-                hidden_size, eps); })
+                hidden_size, eps, num_valid_ptr); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
             [&] { rmsnorm_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 input.data_ptr<at::Half>(),
                 weight.data_ptr<at::Half>(),
                 output.data_ptr<at::Half>(),
-                hidden_size, eps); })
+                hidden_size, eps, num_valid_ptr); })
         AT_DISPATCH_CASE(at::ScalarType::Float,
             [&] { rmsnorm_kernel<float><<<blocks, threads, 0, stream>>>(
                 input.data_ptr<float>(),
                 weight.data_ptr<float>(),
                 output.data_ptr<float>(),
-                hidden_size, eps); })
+                hidden_size, eps, num_valid_ptr); })
     );
 
     return output;
@@ -189,7 +202,8 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
     torch::Tensor residual,
     torch::Tensor hidden,
     torch::Tensor weight,
-    float eps)
+    float eps,
+    c10::optional<torch::Tensor> num_valid_tokens)
 {
     TORCH_CHECK(residual.is_cuda(), "residual must be CUDA");
     TORCH_CHECK(hidden.is_cuda(), "hidden must be CUDA");
@@ -207,6 +221,11 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
 
     if (num_rows == 0) return {normed_out, residual};
 
+    const int* num_valid_ptr = nullptr;
+    if (num_valid_tokens.has_value() && num_valid_tokens->defined()) {
+        num_valid_ptr = num_valid_tokens->data_ptr<int>();
+    }
+
     const int threads = 256;
     const int blocks = num_rows;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -219,21 +238,21 @@ std::vector<torch::Tensor> add_rmsnorm_forward(
                 hidden.data_ptr<at::BFloat16>(),
                 weight.data_ptr<at::BFloat16>(),
                 normed_out.data_ptr<at::BFloat16>(),
-                hidden_size, eps); })
+                hidden_size, eps, num_valid_ptr); })
         AT_DISPATCH_CASE(at::ScalarType::Half,
             [&] { add_rmsnorm_kernel<at::Half><<<blocks, threads, 0, stream>>>(
                 residual.data_ptr<at::Half>(),
                 hidden.data_ptr<at::Half>(),
                 weight.data_ptr<at::Half>(),
                 normed_out.data_ptr<at::Half>(),
-                hidden_size, eps); })
+                hidden_size, eps, num_valid_ptr); })
         AT_DISPATCH_CASE(at::ScalarType::Float,
             [&] { add_rmsnorm_kernel<float><<<blocks, threads, 0, stream>>>(
                 residual.data_ptr<float>(),
                 hidden.data_ptr<float>(),
                 weight.data_ptr<float>(),
                 normed_out.data_ptr<float>(),
-                hidden_size, eps); })
+                hidden_size, eps, num_valid_ptr); })
     );
 
     return {normed_out, residual};
