@@ -11,6 +11,7 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
 #include <float.h>
 
 #define WARP_SIZE 32
@@ -160,28 +161,29 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
         topk_weights = torch::empty({N, k}, torch::dtype(torch::kFloat32).device(router_logits.device()));
     }
 
-    // Launch kernel
+    // Launch kernel on current CUDA stream (required for CUDA graph capture)
     dim3 grid(N);
     dim3 block(BLOCK_THREADS);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Dispatch K at compile time for best unrolling
     switch (k) {
         case 2:
-            gate_topk_softmax_kernel<2><<<grid, block>>>(
+            gate_topk_softmax_kernel<2><<<grid, block, 0, stream>>>(
                 router_logits.data_ptr<float>(),
                 topk_indices.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),
                 N, E);
             break;
         case 4:
-            gate_topk_softmax_kernel<4><<<grid, block>>>(
+            gate_topk_softmax_kernel<4><<<grid, block, 0, stream>>>(
                 router_logits.data_ptr<float>(),
                 topk_indices.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),
                 N, E);
             break;
         case 8:
-            gate_topk_softmax_kernel<8><<<grid, block>>>(
+            gate_topk_softmax_kernel<8><<<grid, block, 0, stream>>>(
                 router_logits.data_ptr<float>(),
                 topk_indices.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),

@@ -45,6 +45,7 @@ CUDA_SOURCE_GROUPED_MXFP4_MOE = r'''
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cstdint>
 #include <utility>
 
@@ -845,7 +846,8 @@ torch::Tensor grouped_mxfp4_moe_stage1(
     int has_gate_bias = gate_bias_ptrs.numel() > 0 ? 1 : 0;
     int has_up_bias = up_bias_ptrs.numel() > 0 ? 1 : 0;
 
-    grouped_mxfp4_moe_stage1_kernel<<<grid, block, smem_bytes>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    grouped_mxfp4_moe_stage1_kernel<<<grid, block, smem_bytes, stream>>>(
         desc_a,
         gate_ptrs.data_ptr<int64_t>(),
         gate_scale_ptrs.data_ptr<int64_t>(),
@@ -903,7 +905,8 @@ torch::Tensor grouped_mxfp4_moe_stage2(
 
     int has_down_bias = down_bias_ptrs.numel() > 0 ? 1 : 0;
 
-    grouped_mxfp4_moe_stage2_kernel<<<grid, block, smem_bytes>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    grouped_mxfp4_moe_stage2_kernel<<<grid, block, smem_bytes, stream>>>(
         desc_input,
         down_ptrs.data_ptr<int64_t>(),
         down_scale_ptrs.data_ptr<int64_t>(),
@@ -984,7 +987,8 @@ void grouped_mxfp4_moe_stage1_inplace(
     int has_gate_bias = gate_bias_ptrs.numel() > 0 ? 1 : 0;
     int has_up_bias = up_bias_ptrs.numel() > 0 ? 1 : 0;
 
-    grouped_mxfp4_moe_stage1_kernel<<<grid, block, smem_bytes>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    grouped_mxfp4_moe_stage1_kernel<<<grid, block, smem_bytes, stream>>>(
         desc_a,
         gate_ptrs.data_ptr<int64_t>(),
         gate_scale_ptrs.data_ptr<int64_t>(),
@@ -1040,7 +1044,8 @@ void grouped_mxfp4_moe_stage2_inplace(
 
     int has_down_bias = down_bias_ptrs.numel() > 0 ? 1 : 0;
 
-    grouped_mxfp4_moe_stage2_kernel<<<grid, block, smem_bytes>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    grouped_mxfp4_moe_stage2_kernel<<<grid, block, smem_bytes, stream>>>(
         desc_input,
         down_ptrs.data_ptr<int64_t>(),
         down_scale_ptrs.data_ptr<int64_t>(),

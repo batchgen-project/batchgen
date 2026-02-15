@@ -446,13 +446,15 @@ class MoESegment:
 # ---------------------------------------------------------------------------
 
 class MoEComputeSegment:
-    """MoE compute without NCCL: router → gate → dispatch → WGMMA → scatter.
+    """MoE router-only graph + eager compute.
+
+    Graph captures ONLY the router (gating MLP): matmul + bias + f32 cast + gate_topk_softmax.
+    Dispatch, WGMMA, and scatter run eagerly via eager_compute().
 
     NCCL (all_gather, all_reduce) is handled by the caller as eager ops.
-    This segment contains only graph-capturable compute operations.
 
-    Input:  all_tokens [W*B, H] bf16 (post-all_gather)
-    Output: moe_output [W*B, H] bf16 (pre-all_reduce)
+    Graph input:  all_tokens [W*B, H] bf16 (post-all_gather)
+    Graph output: topk_indices [W*B, K] int32, topk_weights [W*B, K] f32
     """
 
     def __init__(self, moe_decode, pool: SharedMoEBufferPool,
@@ -471,7 +473,7 @@ class MoEComputeSegment:
         _bias = getattr(moe_decode.router, 'bias', None)
         self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
 
-        # Weight pointer arrays
+        # Weight pointer arrays (for eager_compute)
         self.gate_ptrs = moe_decode.gate_ptrs
         self.gate_scale_ptrs = moe_decode.gate_scale_ptrs
         self.up_ptrs = moe_decode.up_ptrs
@@ -504,12 +506,14 @@ class MoEComputeSegment:
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         WB = self.world_size * bucket_size
+        K = self.num_experts_per_tok
         return {
-            "moe_output": TensorSpec((WB, self.hidden_size), torch.bfloat16),
+            "topk_indices": TensorSpec((WB, K), torch.int32),
+            "topk_weights": TensorSpec((WB, K), torch.float32),
         }
 
     def forward(self, all_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Graph-capturable MoE compute: no NCCL, no allocations."""
+        """Full MoE compute: router → gate → dispatch → WGMMA → scatter."""
         from batchgen.moe.routing import (
             gate_topk_softmax_cuda,
             dispatch_count_gather_cuda,
@@ -520,13 +524,13 @@ class MoEComputeSegment:
             fused_mxfp4_grouped_stage2_inplace,
         )
 
-        H = self.hidden_size
         W = self.world_size
         WB = all_tokens.shape[0]
         B = WB // W
+        H = self.hidden_size
         bufs, tma = self.pool.get(B)
 
-        # 1. Router matmul in bf16 + bias in bf16, then cast to f32
+        # 1. Router matmul in bf16 + bias, then cast to f32
         torch.mm(all_tokens, self.router_weight_bf16_t, out=bufs["router_logits"])
         if self.router_bias_bf16 is not None:
             bufs["router_logits"].add_(self.router_bias_bf16)
@@ -575,6 +579,7 @@ class MoEComputeSegment:
         )
 
         # 6. Reduce: weighted scatter-add back to original token order
+        bufs["moe_output"].zero_()
         reduce_weighted_scatter_cuda(
             bufs["sorted_output"], bufs["topk_pos"], bufs["topk_weights"],
             WB, H, self.num_experts_per_tok,

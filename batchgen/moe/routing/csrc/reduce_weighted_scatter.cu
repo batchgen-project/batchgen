@@ -14,6 +14,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <c10/cuda/CUDAStream.h>
 
 #define BLOCK_H 256
 
@@ -87,14 +88,15 @@ torch::Tensor reduce_weighted_scatter_cuda(
         output = torch::empty({N, H}, torch::dtype(torch::kBFloat16).device(device));
     }
 
-    // Launch kernel
+    // Launch kernel on current CUDA stream (required for CUDA graph capture)
     dim3 grid(N, (H + BLOCK_H - 1) / BLOCK_H);
     dim3 block(BLOCK_H);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Dispatch K at compile time
     switch (K) {
         case 2:
-            reduce_weighted_scatter_kernel<2><<<grid, block>>>(
+            reduce_weighted_scatter_kernel<2><<<grid, block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
                 topk_pos.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),
@@ -102,7 +104,7 @@ torch::Tensor reduce_weighted_scatter_cuda(
                 N, H);
             break;
         case 4:
-            reduce_weighted_scatter_kernel<4><<<grid, block>>>(
+            reduce_weighted_scatter_kernel<4><<<grid, block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
                 topk_pos.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),
@@ -110,7 +112,7 @@ torch::Tensor reduce_weighted_scatter_cuda(
                 N, H);
             break;
         case 8:
-            reduce_weighted_scatter_kernel<8><<<grid, block>>>(
+            reduce_weighted_scatter_kernel<8><<<grid, block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(expert_output.data_ptr()),
                 topk_pos.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),

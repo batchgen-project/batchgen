@@ -5899,6 +5899,7 @@ class BatchGenWorker:
 						moe_decode, moe_pool,
 						self.world_size, self.torch_device,
 					)
+					decoder_layer._moe_compute_segment = moe_compute_seg
 					manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
 					has_moe_graph = True
 

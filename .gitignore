@@ -239,3 +239,4 @@ cython_debug/
 
 # Local archive for deprecated code (never pushed to remote)
 local_archive/
+.DS_Store
