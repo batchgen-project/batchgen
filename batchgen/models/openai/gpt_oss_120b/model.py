@@ -1409,6 +1409,7 @@ class GptOssDecoderLayer(nn.Module):
         use_moe_graph = (use_graph and self._moe_segment_name is not None)
         if use_moe_graph:
             try:
+                import torch.distributed as dist
                 ntr = self.mlp.num_tokens_per_rank
                 bucket = self._moe_bucketing.get_padded_size(ntr)
                 seg = self._moe_segment
@@ -1419,13 +1420,22 @@ class GptOssDecoderLayer(nn.Module):
                 if batch_size > 0:
                     bufs["padded"][:batch_size].copy_(hidden_states.view(batch_size, -1))
 
-                # 2. Graph: all_gather → router → dispatch → WGMMA → scatter → all_reduce → slice
+                # 2. Graph: all_gather → router → dispatch → WGMMA → scatter
                 moe_out = self.cuda_graph_manager.replay(
                     self._moe_segment_name, bucket,
                     padded=bufs["padded"],
                 )
+
+                # 3. Eager: all_reduce + local slice (not in graph)
+                moe_output = moe_out["moe_output"]
+                with self.mlp.comm.change_state(enable=True):
+                    self.mlp.comm.all_reduce(
+                        moe_output, op=dist.ReduceOp.SUM,
+                        stream=torch.cuda.current_stream(self.mlp.device),
+                    )
                 if batch_size > 0:
-                    hidden_states = moe_out["local_output"][:batch_size].view(batch_size, 1, -1)
+                    start = self.mlp.rank * bucket
+                    hidden_states = moe_output[start:start + batch_size].view(batch_size, 1, -1)
             except (ValueError, RuntimeError):
                 hidden_states = self.mlp(hidden_states)
         elif use_graph and os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None:

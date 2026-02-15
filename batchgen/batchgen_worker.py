@@ -4123,8 +4123,10 @@ class BatchGenWorker:
 				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
 				config_decode_time += time.perf_counter() - config_start
 
-				# CUDA Graph Warmup (lazy, one-time) — after page allocation
-				if self._cuda_graph_manager is None:
+				# CUDA Graph Warmup (lazy, one-time) — only capture for final batch
+				# (all sequences prefilled, no more queueing). Earlier iterations
+				# have dynamic batch sizes from prefill/decode interleaving.
+				if self._cuda_graph_manager is None and not self.global_batch.has_queueing():
 					self._warmup_cuda_graphs()
 
 				# C. Execute Continuous Decode
