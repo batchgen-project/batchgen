@@ -5848,7 +5848,9 @@ class BatchGenWorker:
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-		max_ctx = getattr(self.engine_config.Basic_Config, 'max_context_length', 8192)
+		# Use model's max_position_embeddings (not max_context_length) so the
+		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
+		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
 
 		# Pre-warm: initialize sinks and RoPE cache before capture
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
@@ -5858,16 +5860,16 @@ class BatchGenWorker:
 				wrapper.sinks = wrapper.module.sinks.data.to(self.torch_device)
 			elif wrapper.sinks is not None:
 				wrapper.sinks = wrapper.sinks.to(self.torch_device)
-			# Pre-warm RoPE cos/sin cache to max context length
+			# Pre-warm RoPE cos/sin cache to max position embeddings
 			dummy = torch.zeros(1, 1, wrapper.num_kv_heads, wrapper.head_dim, device=self.torch_device)
-			wrapper.module.rotary_emb(dummy, seq_len=max_ctx)
+			wrapper.module.rotary_emb(dummy, seq_len=max_rope_len)
 
 		# Register full attention segments
 		max_pages = gpu_manager._gpu_page_table_manager.max_pages_per_sequence
 		page_size_tokens = gpu_manager.config.page_size_tokens
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			attn_wrapper = decoder_layer.self_attn
-			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_ctx,
+			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_rope_len,
 								  max_pages, page_size_tokens)
 			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
 
