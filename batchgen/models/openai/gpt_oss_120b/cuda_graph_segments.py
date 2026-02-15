@@ -446,12 +446,10 @@ class MoESegment:
 # ---------------------------------------------------------------------------
 
 class MoEComputeSegment:
-    """Graph-capturable MoE: all_gather → router → dispatch → WGMMA → scatter.
-
-    All_reduce is handled by the caller as an eager op.
+    """Graph-capturable MoE: all_gather → router → dispatch → WGMMA → scatter → all_reduce.
 
     Graph input:  padded [B, H] bf16 (local rank's tokens, zero-padded to bucket)
-    Graph output: moe_output [W*B, H] bf16 (pre-all_reduce)
+    Graph output: local_output [B, H] bf16 (local rank's slice, post-all_reduce)
     """
 
     def __init__(self, moe_decode, pool: SharedMoEBufferPool,
@@ -507,13 +505,12 @@ class MoEComputeSegment:
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        WB = self.world_size * bucket_size
         return {
-            "moe_output": TensorSpec((WB, self.hidden_size), torch.bfloat16),
+            "local_output": TensorSpec(("batch_size", self.hidden_size), torch.bfloat16),
         }
 
     def forward(self, padded: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """all_gather → router → gate → dispatch → WGMMA → scatter."""
+        """all_gather → router → gate → dispatch → WGMMA → scatter → all_reduce → slice."""
         from batchgen.moe.routing import (
             gate_topk_softmax_cuda,
             dispatch_count_gather_cuda,
@@ -593,4 +590,15 @@ class MoEComputeSegment:
             output=bufs["moe_output"],
         )
 
-        return {"moe_output": bufs["moe_output"]}
+        # 7. AllReduce in-place
+        import torch.distributed as dist
+        self.comm.all_reduce(
+            bufs["moe_output"], op=dist.ReduceOp.SUM,
+            stream=torch.cuda.current_stream(self.device),
+        )
+
+        # 8. Extract local rank's slice
+        start = self.rank * B
+        bufs["local_output"].copy_(bufs["moe_output"][start:start + B])
+
+        return {"local_output": bufs["local_output"]}
