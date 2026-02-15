@@ -1295,7 +1295,6 @@ class GptOssDecoderLayer(nn.Module):
         self._full_attn_segment_name = None
         self._moe_segment_name = None
         self._moe_segment = None
-        self._moe_compute_segment = None
         self._moe_bucketing = None
 
     def enable_cuda_graph(self, manager, full_attn_name: str, moe_name: str = None):
@@ -1404,29 +1403,20 @@ class GptOssDecoderLayer(nn.Module):
         if use_moe_graph:
             try:
                 import torch.distributed as dist
-                # Use synced num_tokens_per_rank for consistent NCCL across all ranks
                 ntr = self.mlp.num_tokens_per_rank
                 bucket = self._moe_bucketing.get_padded_size(ntr)
                 seg = self._moe_segment
-                # moe_compute_seg is the MoEComputeSegment registered with graph manager
-                # (stored on decoder_layer by batchgen_worker.py)
-                moe_compute = self._moe_compute_segment
-
-                # 1. Eager: pad + all_gather (NCCL not graph-capturable)
                 bufs, _ = seg.pool.get(bucket)
+
+                # 1. Prepare padded input (copy local tokens into static buffer)
                 bufs["padded"].zero_()
                 if batch_size > 0:
                     bufs["padded"][:batch_size].copy_(hidden_states.view(batch_size, -1))
-                with seg.comm.change_state(enable=True):
-                    seg.comm.all_gather(
-                        bufs["all_tokens"], bufs["padded"],
-                        stream=torch.cuda.current_stream(seg.device),
-                    )
 
-                # 2. Graph: full MoE compute (router → dispatch → WGMMA → scatter)
+                # 2. Graph: all_gather → router → dispatch → WGMMA → scatter
                 moe_out = self.cuda_graph_manager.replay(
                     self._moe_segment_name, bucket,
-                    all_tokens=bufs["all_tokens"],
+                    padded=bufs["padded"],
                 )
                 moe_full = moe_out["moe_output"]
 

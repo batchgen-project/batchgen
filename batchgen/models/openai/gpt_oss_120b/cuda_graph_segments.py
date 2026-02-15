@@ -446,21 +446,20 @@ class MoESegment:
 # ---------------------------------------------------------------------------
 
 class MoEComputeSegment:
-    """MoE router-only graph + eager compute.
+    """Graph-capturable MoE: all_gather → router → dispatch → WGMMA → scatter.
 
-    Graph captures ONLY the router (gating MLP): matmul + bias + f32 cast + gate_topk_softmax.
-    Dispatch, WGMMA, and scatter run eagerly via eager_compute().
+    All_reduce is handled by the caller as an eager op.
 
-    NCCL (all_gather, all_reduce) is handled by the caller as eager ops.
-
-    Graph input:  all_tokens [W*B, H] bf16 (post-all_gather)
-    Graph output: topk_indices [W*B, K] int32, topk_weights [W*B, K] f32
+    Graph input:  padded [B, H] bf16 (local rank's tokens, zero-padded to bucket)
+    Graph output: moe_output [W*B, H] bf16 (pre-all_reduce)
     """
 
     def __init__(self, moe_decode, pool: SharedMoEBufferPool,
-                 world_size: int, device: torch.device):
+                 comm, world_size: int, rank: int, device: torch.device):
         self.pool = pool
+        self.comm = comm
         self.world_size = world_size
+        self.rank = rank
         self.device = device
         self.hidden_size = moe_decode.hidden_size
         self.num_experts_per_tok = moe_decode.num_experts_per_tok
@@ -495,25 +494,26 @@ class MoEComputeSegment:
         self.s2_stride_scale_n = self.down_scale_ref.shape[1]
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """No-op: buffers are managed by SharedMoEBufferPool."""
-        pass
+        """Enable NCCL communicator for graph capture.
+
+        The comm is disabled by default. Enable it before warmup/capture
+        so all_gather is recorded into the graph.
+        """
+        self.comm.disabled = False
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        WB = self.world_size * bucket_size
         return {
-            "all_tokens": TensorSpec((WB, self.hidden_size), torch.bfloat16),
+            "padded": TensorSpec(("batch_size", self.hidden_size), torch.bfloat16),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         WB = self.world_size * bucket_size
-        K = self.num_experts_per_tok
         return {
-            "topk_indices": TensorSpec((WB, K), torch.int32),
-            "topk_weights": TensorSpec((WB, K), torch.float32),
+            "moe_output": TensorSpec((WB, self.hidden_size), torch.bfloat16),
         }
 
-    def forward(self, all_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Full MoE compute: router → gate → dispatch → WGMMA → scatter."""
+    def forward(self, padded: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """all_gather → router → gate → dispatch → WGMMA → scatter."""
         from batchgen.moe.routing import (
             gate_topk_softmax_cuda,
             dispatch_count_gather_cuda,
@@ -524,11 +524,18 @@ class MoEComputeSegment:
             fused_mxfp4_grouped_stage2_inplace,
         )
 
+        B = padded.shape[0]
         W = self.world_size
-        WB = all_tokens.shape[0]
-        B = WB // W
+        WB = W * B
         H = self.hidden_size
         bufs, tma = self.pool.get(B)
+
+        # 0. AllGather (PyNccl ctypes — enqueues on current stream)
+        self.comm.all_gather(
+            bufs["all_tokens"], padded,
+            stream=torch.cuda.current_stream(self.device),
+        )
+        all_tokens = bufs["all_tokens"]
 
         # 1. Router matmul in bf16 + bias, then cast to f32
         torch.mm(all_tokens, self.router_weight_bf16_t, out=bufs["router_logits"])

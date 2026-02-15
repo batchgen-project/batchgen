@@ -5892,14 +5892,13 @@ class BatchGenWorker:
 				)
 				decoder_layer._moe_segment = moe_seg
 				decoder_layer._moe_bucketing = bucketing
-				# Register NCCL-free compute segment for graph capture.
-				# NCCL (all_gather/all_reduce) runs as eager ops in model.py.
+				# Register compute segment for graph capture.
+				# All_gather is graph-captured; all_reduce remains eager.
 				if not os.environ.get("BATCHGEN_MOE_EAGER"):
 					moe_compute_seg = MoEComputeSegment(
-						moe_decode, moe_pool,
-						self.world_size, self.torch_device,
+						moe_decode, moe_pool, moe_decode.comm,
+						self.world_size, self.rank, self.torch_device,
 					)
-					decoder_layer._moe_compute_segment = moe_compute_seg
 					manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
 					has_moe_graph = True
 
