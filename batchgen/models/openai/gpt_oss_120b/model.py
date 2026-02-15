@@ -1351,10 +1351,12 @@ class GptOssDecoderLayer(nn.Module):
                     residual = out["residual"].clone()
                     attn_residual = "graph_done"
 
-                    # KV host offload: graph bypasses the wrapper, so fire callback here
+                    # KV host offload: graph bypasses the wrapper, so fire callback here.
+                    # Must clone key/value: they are views into graph static output buffers
+                    # which get overwritten on next layer's graph replay (shared memory pool).
                     kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
                     if kv_cb is not None:
-                        kv_cb(self.layer_idx, out["key"][:batch_size], out["value"][:batch_size])
+                        kv_cb(self.layer_idx, out["key"][:batch_size].clone(), out["value"][:batch_size].clone())
 
                 except (ValueError, RuntimeError):
                     hidden_states, attn_residual = self._forward_attn_eager(
