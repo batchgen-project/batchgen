@@ -288,6 +288,7 @@ class BatchGenWorker:
 
 		# CUDA graph state
 		self._cuda_graph_manager = None
+		self._whole_model_graph = False
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -1017,12 +1018,13 @@ class BatchGenWorker:
 				f"Rank {self.rank}: NaN detected in k_tensor BEFORE host append (layer={layer_idx}) - affected_seqs={nan_seq_info}"
 			)
 		
-		# CRITICAL: Sync default stream before launching async D2H copy.
-		# The k_tensor was computed on the default stream, but the async D2H copy
-		# uses a separate copy stream. Without this sync, the copy stream might
-		# start reading k_tensor before the default stream has finished writing it.
-		# This is the root cause of KV corruption after decode interruption/resume.
-		torch.cuda.current_stream(self.torch_device).synchronize()
+		# Ensure compute stream finishes writing k_tensor before D2H copy reads it.
+		# Record event on compute stream, then event.synchronize() waits only for
+		# work up to this point (not all GPU work). Lighter than full device sync.
+		if not hasattr(self, '_kv_offload_event'):
+			self._kv_offload_event = torch.cuda.Event()
+		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
+		self._kv_offload_event.synchronize()
 		
 		# Launch async append
 		task = worker_view.async_append_decode_kv_to_host(
@@ -5836,6 +5838,7 @@ class BatchGenWorker:
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
 		from batchgen.models.openai.gpt_oss_120b.cuda_graph_segments import (
 			FullAttnSegment, MoESegment, MoEComputeSegment, SharedMoEBufferPool,
+			WholeModelSegment,
 		)
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
@@ -5905,36 +5908,98 @@ class BatchGenWorker:
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
-		if self.rank == 0:
-			num_segs = "attn+moe" if has_moe_graph else "attn"
-			logging.info(
-				f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
-				f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
-			)
+		# Check for whole-model graph mode
+		use_whole_model = os.environ.get("BATCHGEN_WHOLE_MODEL_GRAPH", "0") == "1"
 
-		# Sync all ranks before warmup — MoE segments use NCCL collectives
-		# which require all ranks to participate simultaneously.
-		if has_moe_graph:
+		if use_whole_model:
+			# Whole-model mode: single graph for entire decode pass.
+			# Discard per-layer segments, register one WholeModelSegment instead.
+			manager = CUDAGraphManager(bucketing, device=self.torch_device)
+
+			# Build MoE segments dict (layer_idx → MoEComputeSegment) for WholeModelSegment
+			moe_segments = {}
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				moe_decode = decoder_layer.mlp
+				if (hasattr(moe_decode, 'persistent_expert_indices')
+						and len(moe_decode.persistent_expert_indices) > 0
+						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+					moe_segments[layer_idx] = MoEComputeSegment(
+						moe_decode, moe_pool, moe_decode.comm,
+						self.world_size, self.rank, self.torch_device,
+					)
+
+			vocab_size = self.model.vocab_size
+			hidden_size = self.model.config.hidden_size
+
+			whole_seg = WholeModelSegment(
+				model=self.model,
+				moe_pool=moe_pool,
+				moe_segments=moe_segments,
+				device=self.torch_device,
+				max_pages_per_seq=max_pages,
+				vocab_size=vocab_size,
+				hidden_size=hidden_size,
+			)
+			manager.register_segment("whole_model", whole_seg)
+
+			if self.rank == 0:
+				logging.info(
+					f"CUDA graph capture: whole-model × "
+					f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+				)
+
+			# Sync all ranks — NCCL collectives require simultaneous participation
 			torch.cuda.synchronize(self.torch_device)
 			dist.barrier()
 
-		manager.warmup_and_capture_all()
+			manager.warmup_and_capture_all()
 
-		# Enable graph mode on each decoder layer
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
-			decoder_layer.enable_cuda_graph(
-				manager,
-				full_attn_name=f"layer_{layer_idx}_full_attn",
-				moe_name=moe_name,
-			)
+			# Reset capture mode flags
+			for layer in self.model.model.layers:
+				layer._graph_capture_mode = False
 
-		self._cuda_graph_manager = manager
-		if self.rank == 0:
-			stats = manager.get_capture_stats()
-			logging.info(
-				f"CUDA graphs ready: {stats['total_capture_time_ms']:.0f}ms"
-			)
+			self._cuda_graph_manager = manager
+			self._whole_model_graph = True
+			self._whole_model_bucketing = bucketing
+			if self.rank == 0:
+				stats = manager.get_capture_stats()
+				logging.info(
+					f"CUDA graphs ready (whole-model): {stats['total_capture_time_ms']:.0f}ms"
+				)
+		else:
+			# Per-layer mode (existing behavior)
+			self._whole_model_graph = False
+
+			if self.rank == 0:
+				num_segs = "attn+moe" if has_moe_graph else "attn"
+				logging.info(
+					f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
+					f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+				)
+
+			# Sync all ranks before warmup — MoE segments use NCCL collectives
+			# which require all ranks to participate simultaneously.
+			if has_moe_graph:
+				torch.cuda.synchronize(self.torch_device)
+				dist.barrier()
+
+			manager.warmup_and_capture_all()
+
+			# Enable graph mode on each decoder layer
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
+				decoder_layer.enable_cuda_graph(
+					manager,
+					full_attn_name=f"layer_{layer_idx}_full_attn",
+					moe_name=moe_name,
+				)
+
+			self._cuda_graph_manager = manager
+			if self.rank == 0:
+				stats = manager.get_capture_stats()
+				logging.info(
+					f"CUDA graphs ready: {stats['total_capture_time_ms']:.0f}ms"
+				)
 
 	def decoding_continuous(
 		self,
@@ -6305,16 +6370,33 @@ class BatchGenWorker:
 				AttnWrapperBase.kv_append_callback = kv_append_callback
 
 				# Forward
-				# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
-				# Without this, the model generates position_ids = [[0]] for all decode steps,
-				# causing RoPE to be applied at position 0 instead of the actual token position.
-				outputs = self.model(
-					new_tokens,
-					attention_mask=Attn_Wrapper.attention_mask,
-					position_ids=Attn_Wrapper.position_ids,
-					use_cache=False
-				)
-				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
+				if getattr(self, '_whole_model_graph', False) and self._cuda_graph_manager is not None:
+					# Whole-model CUDA graph replay
+					batch_size = len(batch)
+					bucket = self._whole_model_bucketing.get_padded_size(max(batch_size, 1))
+					page_table_tensor = gpu_manager._gpu_page_table_manager._page_table_tensor
+					slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
+					graph_out = self._cuda_graph_manager.replay(
+						"whole_model", bucket,
+						input_ids=new_tokens,
+						cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+						page_table=page_table_tensor[:batch_size],
+						slot_indices=slot_indices_tensor[:batch_size],
+					)
+					logits = graph_out["logits"][:batch_size]
+					new_tokens_out = self._select_tokens(logits)
+				else:
+					# Per-layer graph or eager forward
+					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
+					# Without this, the model generates position_ids = [[0]] for all decode steps,
+					# causing RoPE to be applied at position 0 instead of the actual token position.
+					outputs = self.model(
+						new_tokens,
+						attention_mask=Attn_Wrapper.attention_mask,
+						position_ids=Attn_Wrapper.position_ids,
+						use_cache=False
+					)
+					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
 
@@ -6524,12 +6606,13 @@ class BatchGenWorker:
 				f"affected_seqs={nan_seq_info}"
 			)
 		
-		# CRITICAL: Sync default stream before launching async D2H copy.
-		# The k_tensor was computed on the default stream, but the async D2H copy
-		# uses a separate copy stream. Without this sync, the copy stream might
-		# start reading k_tensor before the default stream has finished writing it.
-		# This is the root cause of KV corruption after decode interruption/resume.
-		torch.cuda.current_stream(self.torch_device).synchronize()
+		# Ensure compute stream finishes writing k_tensor before D2H copy reads it.
+		# Record event on compute stream, then event.synchronize() waits only for
+		# work up to this point (not all GPU work). Lighter than full device sync.
+		if not hasattr(self, '_kv_offload_event'):
+			self._kv_offload_event = torch.cuda.Event()
+		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
+		self._kv_offload_event.synchronize()
 		
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
@@ -7734,6 +7817,7 @@ class BatchGenWorker:
 		del self.model
 		self.model = None
 		self._cuda_graph_manager = None
+		self._whole_model_graph = False
 
 		# Release memory
 		if torch.cuda.is_available():
@@ -7831,6 +7915,7 @@ class BatchGenWorker:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup model: {e}")
 		self.model = None
 		self._cuda_graph_manager = None
+		self._whole_model_graph = False
 
 		# 9. Clear CUDA cache
 		torch.cuda.empty_cache()

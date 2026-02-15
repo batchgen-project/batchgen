@@ -3,6 +3,7 @@
 Segments:
   FullAttnSegment: RMSNorm → QKV → RoPE → KV write → FA → O_proj → post-attn norm
   MoESegment: AllGather → router → grouped WGMMA MoE → ReduceScatter
+  WholeModelSegment: embedding → 36 decoder layers → final norm → lm_head (single graph)
 
 SharedMoEBufferPool allocates max-bucket-sized buffers ONCE and creates
 per-bucket views (slices sharing the same data_ptr). All 36 MoE layers
@@ -93,6 +94,12 @@ class FullAttnSegment:
             "residual": TensorSpec(
                 ("batch_size", 1, self.hidden_size), torch.bfloat16
             ),
+            "key": TensorSpec(
+                ("batch_size", 1, self.num_kv_heads, self.head_dim), torch.bfloat16
+            ),
+            "value": TensorSpec(
+                ("batch_size", 1, self.num_kv_heads, self.head_dim), torch.bfloat16
+            ),
         }
 
     def forward(
@@ -152,7 +159,7 @@ class FullAttnSegment:
         normed, residual = cuda_add_rmsnorm(
             hidden_states, attn_out, self.post_ln_weight, self.post_ln_eps
         )
-        return {"normed": normed, "residual": residual}
+        return {"normed": normed, "residual": residual, "key": key, "value": value}
 
 
 # ---------------------------------------------------------------------------
@@ -602,3 +609,164 @@ class MoEComputeSegment:
         bufs["local_output"].copy_(bufs["moe_output"][start:start + B])
 
         return {"local_output": bufs["local_output"]}
+
+
+# ---------------------------------------------------------------------------
+# Whole-model segment (single CUDA graph for entire decode pass)
+# ---------------------------------------------------------------------------
+
+class WholeModelSegment:
+    """Captures the entire decode forward pass in a single CUDA graph.
+
+    Embedding → 36 decoder layers (attention + MoE) → final RMSNorm → lm_head.
+
+    All layers run eagerly within the graph (no per-layer graph replay).
+    NCCL collectives (all_gather + all_reduce per MoE layer) are captured.
+    KV cache writes happen at fixed GPU addresses.
+
+    Inputs:  input_ids [B, 1] int64, cache_seqlens [B] int32,
+             page_table [B, max_pages] int32, slot_indices [B] int32
+    Outputs: logits [B, vocab_size] bfloat16
+    """
+
+    def __init__(
+        self,
+        model,  # GptOss instance
+        moe_pool: Optional[SharedMoEBufferPool],
+        moe_segments: Optional[Dict[int, 'MoEComputeSegment']],  # layer_idx → segment
+        device: torch.device,
+        max_pages_per_seq: int,
+        vocab_size: int,
+        hidden_size: int,
+    ):
+        self.model = model
+        self.moe_pool = moe_pool
+        self.moe_segments = moe_segments or {}
+        self.device = device
+        self.max_pages_per_seq = max_pages_per_seq
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        """Enable graph capture mode on all layers and enable NCCL."""
+        # Set capture mode flag so layers run eagerly (no per-layer graph replay)
+        for layer in self.model.model.layers:
+            layer._graph_capture_mode = True
+
+        # Enable NCCL for all MoE segments
+        for seg in self.moe_segments.values():
+            seg.comm.disabled = False
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "input_ids": TensorSpec(("batch_size", 1), torch.int64, fill_value=0),
+            "cache_seqlens": TensorSpec(("batch_size",), torch.int32, fill_value=1),
+            "page_table": TensorSpec(
+                ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
+            ),
+            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "logits": TensorSpec(("batch_size", self.vocab_size), torch.bfloat16),
+        }
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        page_table: torch.Tensor,
+        slot_indices: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Full decode forward: embed → layers → norm → lm_head."""
+        from batchgen.attention.fused_kernels import (
+            cuda_rmsnorm, cuda_qkv_split, cuda_rope, cuda_add_rmsnorm,
+        )
+        from batchgen.attention.gqa.fa_decode import gqa_decode_fa
+        from batchgen.kv_cache.gpu_kv_kernels import run_paged_kv_token_update_fused
+
+        B = input_ids.shape[0]
+        model = self.model.model  # GptOssModel
+
+        # === Embedding ===
+        hidden_states = model.embed_tokens(input_ids)  # [B, 1, H]
+
+        # === Decoder layers ===
+        for layer_idx, decoder_layer in enumerate(model.layers):
+            # -- Attention (eager, captured into graph) --
+            attn_wrapper = decoder_layer.self_attn
+
+            # Pre-attn RMSNorm
+            normed = cuda_rmsnorm(
+                hidden_states,
+                decoder_layer.input_layernorm.weight,
+                decoder_layer.input_layernorm.eps,
+            )
+
+            # QKV proj + split + reshape
+            qkv = attn_wrapper.module.qkv_proj(normed)
+            query, key, value = cuda_qkv_split(qkv, attn_wrapper.q_size, attn_wrapper.kv_size)
+            query = query.view(B, 1, attn_wrapper.num_heads, attn_wrapper.head_dim)
+            key = key.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+            value = value.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+
+            # RoPE
+            current_pos = cache_seqlens - 1
+            cos, sin = attn_wrapper.module.rotary_emb(
+                value.transpose(1, 2), seq_len=attn_wrapper.module.rotary_emb.max_seq_len_cached
+            )
+            cos = cos[current_pos].unsqueeze(1)
+            sin = sin[current_pos].unsqueeze(1)
+            query, key = cuda_rope(query, key, cos, sin)
+
+            # KV write
+            gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+            k_cache, v_cache, _ = gpu_kv_manager.get_layer_kv_with_page_table(layer_idx)
+            run_paged_kv_token_update_fused(
+                k_cache=k_cache,
+                k_tokens=key.view(B, -1),
+                page_table=page_table,
+                slot_indices=slot_indices,
+                token_indices=current_pos,
+                page_size_tokens=gpu_kv_manager.config.page_size_tokens,
+                v_cache=v_cache,
+                v_tokens=value.view(B, -1),
+            )
+
+            # Flash attention decode
+            attn_out, _ = gqa_decode_fa(
+                q=query, k_cache=k_cache, v_cache=v_cache,
+                cache_seqlens=cache_seqlens, block_table=page_table,
+                sinks=attn_wrapper.sinks, softmax_scale=attn_wrapper.scale,
+                sliding_window=attn_wrapper.sliding_window,
+            )
+
+            # O_proj
+            attn_out = attn_out.view(B, 1, attn_wrapper.num_heads * attn_wrapper.head_dim)
+            attn_out = attn_wrapper.module.o_proj(attn_out)
+
+            # Post-attn: residual add + RMSNorm
+            normed, residual = cuda_add_rmsnorm(
+                hidden_states, attn_out,
+                decoder_layer.post_attention_layernorm.weight,
+                decoder_layer.post_attention_layernorm.eps,
+            )
+
+            # -- MoE --
+            moe_seg = self.moe_segments.get(layer_idx)
+            if moe_seg is not None:
+                bucket = normed.shape[0]  # already padded to bucket size
+                bufs, tma = moe_seg.pool.get(bucket)
+                bufs["padded"].copy_(normed.view(B, -1))
+                moe_out = moe_seg.forward(bufs["padded"])
+                hidden_states = residual + moe_out["local_output"].view(B, 1, -1)
+            else:
+                hidden_states = residual + decoder_layer.mlp(normed)
+
+        # === Final norm + lm_head ===
+        hidden_states = model.norm(hidden_states)
+        logits = self.model.lm_head(hidden_states)  # [B, 1, vocab]
+        logits = logits.squeeze(1)  # [B, vocab]
+
+        return {"logits": logits}

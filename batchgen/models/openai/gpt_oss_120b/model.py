@@ -1296,6 +1296,8 @@ class GptOssDecoderLayer(nn.Module):
         self._moe_segment_name = None
         self._moe_segment = None
         self._moe_bucketing = None
+        # When True, forward() is a no-op (layer is driven by WholeModelSegment)
+        self._graph_capture_mode = False
 
     def enable_cuda_graph(self, manager, full_attn_name: str, moe_name: str = None):
         """Enable CUDA graph mode for this layer."""
@@ -1348,6 +1350,11 @@ class GptOssDecoderLayer(nn.Module):
                     # and would be clobbered by MoE graph replay (shared pool).
                     residual = out["residual"].clone()
                     attn_residual = "graph_done"
+
+                    # KV host offload: graph bypasses the wrapper, so fire callback here
+                    kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+                    if kv_cb is not None:
+                        kv_cb(self.layer_idx, out["key"][:batch_size], out["value"][:batch_size])
 
                 except (ValueError, RuntimeError):
                     hidden_states, attn_residual = self._forward_attn_eager(

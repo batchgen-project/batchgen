@@ -152,7 +152,7 @@ class CUDAGraphManager:
     Thread safety: NOT thread-safe. Designed for single-thread decode loops.
     """
 
-    WARMUP_ITERATIONS = 10
+    WARMUP_ITERATIONS = 2
 
     def __init__(
         self,
