@@ -177,6 +177,8 @@ def _paged_cache_update_with_page_table_kernel(
         return
 
     slot = tl.load(slot_indices_ptr + token_id)
+    if slot < 0:  # sentinel: skip padding tokens (CUDA graph bucketing)
+        return
     token_index = tl.load(token_indices_ptr + token_id)
 
     page_slot = token_index // page_size_tokens
