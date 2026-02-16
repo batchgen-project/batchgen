@@ -1427,10 +1427,16 @@ class GptOssDecoderLayer(nn.Module):
                 if batch_size > 0:
                     bufs["padded"][:batch_size].copy_(hidden_states.view(batch_size, -1))
 
+                # num_valid_per_rank: gate kernel skips padding tokens (rank_local_idx >= ntr)
+                if not hasattr(self, '_moe_nvpr_tensor'):
+                    self._moe_nvpr_tensor = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
+                self._moe_nvpr_tensor.fill_(ntr)
+
                 # 2. Graph: all_gather → router → dispatch → WGMMA → scatter
                 moe_out = self.cuda_graph_manager.replay(
                     self._moe_segment_name, bucket,
                     padded=bufs["padded"],
+                    num_valid_per_rank=self._moe_nvpr_tensor,
                 )
 
                 # 3. Eager: all_reduce + local slice (not in graph)

@@ -43,7 +43,8 @@ _cuda_ext = load(
 # Python wrappers (matching Triton kernel signatures)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, k=4):
+def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, k=4,
+                           num_valid_per_rank=None, bucket_size=0):
     """
     CUDA gate kernel: fused top-k selection + softmax.
 
@@ -52,6 +53,9 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
         topk_indices: [N, K] int32 pre-allocated output (optional)
         topk_weights: [N, K] FP32 pre-allocated output (optional)
         k: top-k (default 4)
+        num_valid_per_rank: 1-element int32 device tensor — valid tokens per rank block.
+            Tokens at rank_local_idx >= this value get sentinel indices (-1) and zero weights.
+        bucket_size: tokens per rank (N / num_ranks). Used with num_valid_per_rank.
 
     Returns:
         topk_indices: [N, K] int32
@@ -70,7 +74,8 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
     if topk_weights is None:
         topk_weights = torch.empty(N, k, dtype=torch.float32, device=device)
 
-    result = ext.gate_topk_softmax(router_logits, k, topk_indices, topk_weights)
+    result = ext.gate_topk_softmax(router_logits, k, topk_indices, topk_weights,
+                                   num_valid_per_rank, bucket_size)
     return result[0], result[1]
 
 

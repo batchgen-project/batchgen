@@ -14,7 +14,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("router_logits"),
           py::arg("k"),
           py::arg("topk_indices"),
-          py::arg("topk_weights"));
+          py::arg("topk_weights"),
+          py::arg("num_valid_per_rank") = c10::nullopt,
+          py::arg("bucket_size") = 0);
 
     m.def("dispatch_count_gather", &dispatch_count_gather_cuda,
           "Dispatch: count + prefix_sum + gather (CUDA)",

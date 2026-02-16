@@ -18,7 +18,9 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
     torch::Tensor router_logits,
     int k,
     torch::Tensor topk_indices,   // optional pre-allocated
-    torch::Tensor topk_weights    // optional pre-allocated
+    torch::Tensor topk_weights,   // optional pre-allocated
+    c10::optional<torch::Tensor> num_valid_per_rank = c10::nullopt,  // 1-element int32 device tensor
+    int bucket_size = 0           // tokens per rank (N / num_ranks), used with num_valid_per_rank
 );
 
 // Dispatch: count + prefix_sum + gather
