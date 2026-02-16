@@ -6388,11 +6388,22 @@ class BatchGenWorker:
 					bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
 					page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
 					slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
+					# Page table may have fewer columns than the static buffer
+					# (gpu_table gets rebuilt with varying max_pages_per_sequence).
+					# Pad to match the captured spec width.
+					wm_max_pages = self._whole_model_segment.max_pages_per_seq
+					pt_slice = page_table_tensor[:batch_size]
+					if pt_slice.shape[1] < wm_max_pages:
+						pt_slice = torch.nn.functional.pad(
+							pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
+						)
+					elif pt_slice.shape[1] > wm_max_pages:
+						pt_slice = pt_slice[:, :wm_max_pages]
 					graph_out = self._cuda_graph_manager.replay(
 						"whole_model", bucket,
 						input_ids=new_tokens,
 						cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
-						page_table=page_table_tensor[:batch_size],
+						page_table=pt_slice,
 						slot_indices=slot_indices_tensor[:batch_size],
 					)
 					logits = graph_out["logits"][:batch_size]
