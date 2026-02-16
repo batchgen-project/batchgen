@@ -87,7 +87,7 @@ class BatchSizeBucketing:
     that fits a given batch size, and computes required padding.
     """
 
-    DEFAULT_BUCKET_SIZES = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 256]
+    DEFAULT_BUCKET_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 
     def __init__(self, bucket_sizes: Optional[List[int]] = None):
         self.bucket_sizes: List[int] = sorted(bucket_sizes or self.DEFAULT_BUCKET_SIZES)
