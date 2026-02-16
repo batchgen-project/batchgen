@@ -6381,7 +6381,7 @@ class BatchGenWorker:
 					# Whole-model CUDA graph replay
 					batch_size = len(batch)
 					bucket = self._whole_model_bucketing.get_padded_size(max(batch_size, 1))
-					page_table_tensor = gpu_manager._gpu_page_table_manager._page_table_tensor
+					page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
 					slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
 					graph_out = self._cuda_graph_manager.replay(
 						"whole_model", bucket,
