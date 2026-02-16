@@ -772,8 +772,8 @@ class WholeModelSegment:
 
             # Copy KV to static offload buffers (baked into graph for host offloading)
             if self._kv_buffers is not None:
-                self._kv_buffers[layer_idx]["key"].copy_(key)
-                self._kv_buffers[layer_idx]["value"].copy_(value)
+                self._kv_buffers[layer_idx]["key"][:B].copy_(key)
+                self._kv_buffers[layer_idx]["value"][:B].copy_(value)
 
             # KV write to GPU paged cache
             gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
