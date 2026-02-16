@@ -518,9 +518,6 @@ class MoEComputeSegment:
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
             "padded": TensorSpec(("batch_size", self.hidden_size), torch.bfloat16),
-            "num_valid_per_rank": TensorSpec(
-                (1,), torch.int32, fill_value=0  # gate kernel skips tokens at rank_local_idx >= this
-            ),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -533,7 +530,7 @@ class MoEComputeSegment:
             "moe_output": TensorSpec((WB, self.hidden_size), torch.bfloat16),
         }
 
-    def forward(self, padded: torch.Tensor, num_valid_per_rank: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+    def forward(self, padded: torch.Tensor) -> Dict[str, torch.Tensor]:
         """all_gather → router → gate → dispatch → WGMMA → scatter.
 
         all_reduce and local slice are done eagerly after graph replay.
@@ -567,14 +564,12 @@ class MoEComputeSegment:
             bufs["router_logits"].add_(self.router_bias_bf16)
         bufs["router_f32"].copy_(bufs["router_logits"])
 
-        # 2. Gate top-k softmax (padding tokens get sentinel indices=-1, weights=0)
+        # 2. Gate top-k softmax
         gate_topk_softmax_cuda(
             bufs["router_f32"],
             topk_indices=bufs["topk_indices"],
             topk_weights=bufs["topk_weights"],
             k=self.num_experts_per_tok,
-            num_valid_per_rank=num_valid_per_rank,
-            bucket_size=B,
         )
 
         # 3. Dispatch: count + prefix_sum + gather

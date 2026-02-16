@@ -45,30 +45,10 @@ __global__ void gate_topk_softmax_kernel(
     const float* __restrict__ router_logits,  // [N, E]
     int32_t* __restrict__ topk_indices,       // [N, K]
     float* __restrict__ topk_weights,         // [N, K]
-    int N, int E,
-    const int* __restrict__ num_valid_per_rank_ptr,  // optional: 1-element int32 device tensor
-    int bucket_size                                   // tokens per rank (N / num_ranks)
+    int N, int E
 ) {
     const int token_id = blockIdx.x;
     if (token_id >= N) return;
-
-    // Skip padding tokens: within each rank's block, tokens at index >= num_valid_per_rank are padding
-    if (num_valid_per_rank_ptr != nullptr && bucket_size > 0) {
-        int rank_local_idx = token_id % bucket_size;
-        if (rank_local_idx >= *num_valid_per_rank_ptr) {
-            // Write sentinel indices and zero weights so downstream dispatch skips this token
-            if (threadIdx.x == 0) {
-                int32_t* out_idx = topk_indices + token_id * K;
-                float* out_w = topk_weights + token_id * K;
-                #pragma unroll
-                for (int k = 0; k < K; k++) {
-                    out_idx[k] = -1;
-                    out_w[k] = 0.0f;
-                }
-            }
-            return;
-        }
-    }
 
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
@@ -165,9 +145,7 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
     torch::Tensor router_logits,
     int k,
     torch::Tensor topk_indices,
-    torch::Tensor topk_weights,
-    c10::optional<torch::Tensor> num_valid_per_rank,
-    int bucket_size
+    torch::Tensor topk_weights
 ) {
     TORCH_CHECK(router_logits.is_cuda(), "router_logits must be CUDA tensor");
     TORCH_CHECK(router_logits.dtype() == torch::kFloat32, "router_logits must be FP32");
@@ -183,11 +161,6 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
         topk_weights = torch::empty({N, k}, torch::dtype(torch::kFloat32).device(router_logits.device()));
     }
 
-    const int* nvpr_ptr = nullptr;
-    if (num_valid_per_rank.has_value() && num_valid_per_rank->defined()) {
-        nvpr_ptr = num_valid_per_rank->data_ptr<int>();
-    }
-
     // Launch kernel on current CUDA stream (required for CUDA graph capture)
     dim3 grid(N);
     dim3 block(BLOCK_THREADS);
@@ -200,21 +173,21 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
                 router_logits.data_ptr<float>(),
                 topk_indices.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),
-                N, E, nvpr_ptr, bucket_size);
+                N, E);
             break;
         case 4:
             gate_topk_softmax_kernel<4><<<grid, block, 0, stream>>>(
                 router_logits.data_ptr<float>(),
                 topk_indices.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),
-                N, E, nvpr_ptr, bucket_size);
+                N, E);
             break;
         case 8:
             gate_topk_softmax_kernel<8><<<grid, block, 0, stream>>>(
                 router_logits.data_ptr<float>(),
                 topk_indices.data_ptr<int32_t>(),
                 topk_weights.data_ptr<float>(),
-                N, E, nvpr_ptr, bucket_size);
+                N, E);
             break;
         default:
             TORCH_CHECK(false, "Unsupported k=", k, ". Supported: 2, 4, 8");
