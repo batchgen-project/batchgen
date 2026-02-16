@@ -6378,9 +6378,13 @@ class BatchGenWorker:
 
 				# Forward
 				if getattr(self, '_whole_model_graph', False) and self._cuda_graph_manager is not None:
-					# Whole-model CUDA graph replay
+					# Whole-model CUDA graph replay.
+					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
+					# computation, NOT local len(batch). The graph has NCCL all_reduce
+					# baked inside — all ranks MUST replay the same bucket's graph,
+					# otherwise mismatched NCCL ops cause deadlock.
 					batch_size = len(batch)
-					bucket = self._whole_model_bucketing.get_padded_size(max(batch_size, 1))
+					bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
 					page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
 					slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
 					graph_out = self._cuda_graph_manager.replay(
