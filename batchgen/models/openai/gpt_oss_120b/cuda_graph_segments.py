@@ -652,8 +652,10 @@ class WholeModelSegment:
         max_pages_per_seq: int,
         vocab_size: int,
         hidden_size: int,
+        max_bucket_size: int = 256,
     ):
         self.model = model
+        self.max_bucket_size = max_bucket_size
         self.moe_pool = moe_pool
         self.moe_segments = moe_segments or {}
         self.device = device
@@ -672,22 +674,30 @@ class WholeModelSegment:
         self._kv_buffers = None
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """Allocate KV offload buffers, enable graph capture mode, enable NCCL."""
-        # Per-layer KV buffers at fixed GPU addresses for host offloading.
-        # During graph capture, copy_ into these gets baked into the graph.
-        # After replay, caller reads and clones these for async D2H.
-        self._kv_buffers = []
-        for _ in range(self.num_layers):
-            self._kv_buffers.append({
-                "key": torch.zeros(
-                    bucket_size, 1, self.num_kv_heads, self.head_dim,
-                    dtype=torch.bfloat16, device=self.device,
-                ),
-                "value": torch.zeros(
-                    bucket_size, 1, self.num_kv_heads, self.head_dim,
-                    dtype=torch.bfloat16, device=self.device,
-                ),
-            })
+        """Allocate KV offload buffers, enable graph capture mode, enable NCCL.
+
+        Called once per bucket size during graph capture. KV buffers are
+        allocated ONCE at the largest bucket size and reused — they must
+        stay at fixed GPU addresses since copy_() into them gets baked
+        into every captured graph.
+        """
+        # Allocate KV buffers only once at max_bucket_size. All captured
+        # graphs (for any bucket) bake copy_() to these same GPU addresses.
+        # Smaller buckets write only their first `bucket_size` rows.
+        if self._kv_buffers is None:
+            alloc_size = self.max_bucket_size
+            self._kv_buffers = []
+            for _ in range(self.num_layers):
+                self._kv_buffers.append({
+                    "key": torch.zeros(
+                        alloc_size, 1, self.num_kv_heads, self.head_dim,
+                        dtype=torch.bfloat16, device=self.device,
+                    ),
+                    "value": torch.zeros(
+                        alloc_size, 1, self.num_kv_heads, self.head_dim,
+                        dtype=torch.bfloat16, device=self.device,
+                    ),
+                })
 
         # Set capture mode flag so layers run eagerly (no per-layer graph replay)
         for layer in self.model.model.layers:

@@ -5945,6 +5945,7 @@ class BatchGenWorker:
 				max_pages_per_seq=max_pages,
 				vocab_size=vocab_size,
 				hidden_size=hidden_size,
+				max_bucket_size=bucketing._max_bucket,
 			)
 			manager.register_segment("whole_model", whole_seg)
 
