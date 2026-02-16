@@ -6378,7 +6378,12 @@ class BatchGenWorker:
 				AttnWrapperBase.kv_append_callback = kv_append_callback
 
 				# Forward
-				if getattr(self, '_whole_model_graph', False) and self._cuda_graph_manager is not None:
+				_use_graph = (
+					getattr(self, '_whole_model_graph', False)
+					and self._cuda_graph_manager is not None
+					and _max_bs <= self._whole_model_bucketing._max_bucket
+				)
+				if _use_graph:
 					# Whole-model CUDA graph replay.
 					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
 					# computation, NOT local len(batch). The graph has NCCL all_reduce
