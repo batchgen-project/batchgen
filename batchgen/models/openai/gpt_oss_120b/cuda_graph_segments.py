@@ -635,6 +635,8 @@ class WholeModelSegment:
     All layers run eagerly within the graph (no per-layer graph replay).
     NCCL collectives (all_gather + all_reduce per MoE layer) are captured.
     KV cache writes happen at fixed GPU addresses.
+    Per-layer KV tensors are copied to static buffers for host offloading
+    after graph replay.
 
     Inputs:  input_ids [B, 1] int64, cache_seqlens [B] int32,
              page_table [B, max_pages] int32, slot_indices [B] int32
@@ -645,7 +647,7 @@ class WholeModelSegment:
         self,
         model,  # GptOss instance
         moe_pool: Optional[SharedMoEBufferPool],
-        moe_segments: Optional[Dict[int, 'MoEComputeSegment']],  # layer_idx → segment
+        moe_segments: Optional[Dict[int, 'MoESegment']],  # layer_idx → MoESegment
         device: torch.device,
         max_pages_per_seq: int,
         vocab_size: int,
@@ -659,8 +661,34 @@ class WholeModelSegment:
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
 
+        # KV dimensions for offload buffers
+        layers = model.model.layers
+        self.num_layers = len(layers)
+        attn0 = layers[0].self_attn
+        self.num_kv_heads = attn0.num_kv_heads
+        self.head_dim = attn0.head_dim
+
+        # Per-layer KV buffers allocated in setup_static_buffers
+        self._kv_buffers = None
+
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """Enable graph capture mode on all layers and enable NCCL."""
+        """Allocate KV offload buffers, enable graph capture mode, enable NCCL."""
+        # Per-layer KV buffers at fixed GPU addresses for host offloading.
+        # During graph capture, copy_ into these gets baked into the graph.
+        # After replay, caller reads and clones these for async D2H.
+        self._kv_buffers = []
+        for _ in range(self.num_layers):
+            self._kv_buffers.append({
+                "key": torch.zeros(
+                    bucket_size, 1, self.num_kv_heads, self.head_dim,
+                    dtype=torch.bfloat16, device=self.device,
+                ),
+                "value": torch.zeros(
+                    bucket_size, 1, self.num_kv_heads, self.head_dim,
+                    dtype=torch.bfloat16, device=self.device,
+                ),
+            })
+
         # Set capture mode flag so layers run eagerly (no per-layer graph replay)
         for layer in self.model.model.layers:
             layer._graph_capture_mode = True
@@ -676,7 +704,7 @@ class WholeModelSegment:
             "page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
-            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -732,7 +760,12 @@ class WholeModelSegment:
             sin = sin[current_pos].unsqueeze(1)
             query, key = cuda_rope(query, key, cos, sin)
 
-            # KV write
+            # Copy KV to static offload buffers (baked into graph for host offloading)
+            if self._kv_buffers is not None:
+                self._kv_buffers[layer_idx]["key"].copy_(key)
+                self._kv_buffers[layer_idx]["value"].copy_(value)
+
+            # KV write to GPU paged cache
             gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
             k_cache, v_cache, _ = gpu_kv_manager.get_layer_kv_with_page_table(layer_idx)
             run_paged_kv_token_update_fused(
@@ -765,14 +798,14 @@ class WholeModelSegment:
                 decoder_layer.post_attention_layernorm.eps,
             )
 
-            # -- MoE --
+            # -- MoE (all_gather + router + dispatch + WGMMA + scatter + all_reduce) --
             moe_seg = self.moe_segments.get(layer_idx)
             if moe_seg is not None:
                 bucket = normed.shape[0]  # already padded to bucket size
                 bufs, tma = moe_seg.pool.get(bucket)
                 bufs["padded"].copy_(normed.view(B, -1))
                 moe_out = moe_seg.forward(bufs["padded"])
-                hidden_states = residual + moe_out["local_output"].view(B, 1, -1)
+                hidden_states = residual + moe_out["moe_output"].view(B, 1, -1)
             else:
                 hidden_states = residual + decoder_layer.mlp(normed)
 

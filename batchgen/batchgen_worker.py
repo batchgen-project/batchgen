@@ -5920,14 +5920,16 @@ class BatchGenWorker:
 			# Discard per-layer segments, register one WholeModelSegment instead.
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-			# Build MoE segments dict (layer_idx → MoEComputeSegment) for WholeModelSegment
+			# Build MoE segments dict (layer_idx → MoESegment) for WholeModelSegment.
+			# Use MoESegment (not MoEComputeSegment) because it includes all_reduce
+			# inside the graph — required for single-graph whole-model capture.
 			moe_segments = {}
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				moe_decode = decoder_layer.mlp
 				if (hasattr(moe_decode, 'persistent_expert_indices')
 						and len(moe_decode.persistent_expert_indices) > 0
 						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
-					moe_segments[layer_idx] = MoEComputeSegment(
+					moe_segments[layer_idx] = MoESegment(
 						moe_decode, moe_pool, moe_decode.comm,
 						self.world_size, self.rank, self.torch_device,
 					)
@@ -5965,6 +5967,7 @@ class BatchGenWorker:
 			self._cuda_graph_manager = manager
 			self._whole_model_graph = True
 			self._whole_model_bucketing = bucketing
+			self._whole_model_segment = whole_seg
 			if self.rank == 0:
 				stats = manager.get_capture_stats()
 				logging.info(
@@ -6389,6 +6392,20 @@ class BatchGenWorker:
 					)
 					logits = graph_out["logits"][:batch_size]
 					new_tokens_out = self._select_tokens(logits)
+
+					# Fire KV host offload callbacks for all layers.
+					# KV buffers are static-address tensors written inside the graph;
+					# clone before passing to async D2H to protect tensor lifespan.
+					kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+					wm_seg = getattr(self, '_whole_model_segment', None)
+					if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
+						for layer_idx in range(wm_seg.num_layers):
+							kv_buf = wm_seg._kv_buffers[layer_idx]
+							kv_cb(
+								layer_idx,
+								kv_buf["key"][:batch_size].clone(),
+								kv_buf["value"][:batch_size].clone(),
+							)
 				else:
 					# Per-layer graph or eager forward
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
