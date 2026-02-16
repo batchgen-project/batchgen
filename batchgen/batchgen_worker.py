@@ -6388,6 +6388,12 @@ class BatchGenWorker:
 					bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
 					page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
 					slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
+					if slot_indices_tensor is None:
+						# Rebuild may have cleared it; reconstruct as simple arange
+						slot_indices_tensor = torch.arange(
+							page_table_tensor.shape[0], dtype=torch.int32,
+							device=self.torch_device,
+						)
 					# Page table may have fewer columns than the static buffer
 					# (gpu_table gets rebuilt with varying max_pages_per_sequence).
 					# Pad to match the captured spec width.
