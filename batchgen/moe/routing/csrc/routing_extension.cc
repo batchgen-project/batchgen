@@ -28,6 +28,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("dispatched_x"),
           py::arg("topk_pos"));
 
+    m.def("router_bias_cast", &router_bias_cast_cuda,
+          "Router epilogue: fused BF16 bias add + BF16->FP32 cast (CUDA)",
+          py::arg("logits"),
+          py::arg("bias"),
+          py::arg("output"));
+
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter_cuda,
           "Reduce: weighted scatter-add (CUDA)",
           py::arg("expert_output"),

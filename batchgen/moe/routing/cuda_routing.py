@@ -29,6 +29,7 @@ _cuda_ext = load(
         str(_csrc_dir / "gate_topk_softmax.cu"),
         str(_csrc_dir / "dispatch_count_gather.cu"),
         str(_csrc_dir / "reduce_weighted_scatter.cu"),
+        str(_csrc_dir / "router_epilogue.cu"),
     ],
     extra_cuda_cflags=[
         "-O3",
@@ -72,6 +73,17 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
 
     result = ext.gate_topk_softmax(router_logits, k, topk_indices, topk_weights)
     return result[0], result[1]
+
+
+def router_bias_cast_cuda(logits, bias, output):
+    """Fused router epilogue: BF16 bias add + BF16→FP32 cast.
+
+    Args:
+        logits: [N, E] BF16 (router matmul output)
+        bias: [E] BF16 (router bias, or empty tensor if no bias)
+        output: [N, E] FP32 (pre-allocated output for gate kernel)
+    """
+    _cuda_ext.router_bias_cast(logits, bias, output)
 
 
 def dispatch_count_gather_cuda(

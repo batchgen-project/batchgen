@@ -319,6 +319,11 @@ class MoESegment:
         self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()  # [H, E] bf16
         _bias = getattr(moe_decode.router, 'bias', None)
         self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+        # For fused router_bias_cast kernel: empty tensor when no bias
+        self._router_bias_or_empty = (
+            self.router_bias_bf16 if self.router_bias_bf16 is not None
+            else torch.empty(0, dtype=torch.bfloat16, device=device)
+        )
 
         # Weight pointer arrays (at fixed GPU addresses)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -363,6 +368,7 @@ class MoESegment:
         """CUDA-graph-compatible forward: no allocations, no CPU driver calls."""
         from batchgen.moe.routing import (
             gate_topk_softmax_cuda,
+            router_bias_cast_cuda,
             dispatch_count_gather_cuda,
             reduce_weighted_scatter_cuda,
         )
@@ -387,11 +393,9 @@ class MoESegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 3. Router matmul in bf16 + bias in bf16 (matching nn.Linear), then cast to f32
+        # 3. Router matmul in bf16 + fused bias add + f32 cast (1 cuBLAS + 1 fused kernel)
         torch.mm(bufs["all_tokens"], self.router_weight_bf16_t, out=bufs["router_logits"])
-        if self.router_bias_bf16 is not None:
-            bufs["router_logits"].add_(self.router_bias_bf16)
-        bufs["router_f32"].copy_(bufs["router_logits"])
+        router_bias_cast_cuda(bufs["router_logits"], self._router_bias_or_empty, bufs["router_f32"])
 
         # 4. Gate top-k softmax (f32 input, pre-allocated int32/f32 outputs)
         gate_topk_softmax_cuda(
@@ -402,7 +406,7 @@ class MoESegment:
         )
 
         # 5. Dispatch: count + prefix_sum + gather into pre-allocated buffers
-        bufs["dispatched_x"].zero_()
+        # No zero_() needed: WGMMA reads only within expert_offsets; reduce writes all N rows
         dispatch_count_gather_cuda(
             bufs["all_tokens"], bufs["topk_indices"],
             self.expert_start, self.num_local_experts,
@@ -485,6 +489,10 @@ class MoEComputeSegment:
         self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()
         _bias = getattr(moe_decode.router, 'bias', None)
         self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+        self._router_bias_or_empty = (
+            self.router_bias_bf16 if self.router_bias_bf16 is not None
+            else torch.empty(0, dtype=torch.bfloat16, device=device)
+        )
 
         # Weight pointer arrays (for eager_compute)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -537,6 +545,7 @@ class MoEComputeSegment:
         """
         from batchgen.moe.routing import (
             gate_topk_softmax_cuda,
+            router_bias_cast_cuda,
             dispatch_count_gather_cuda,
             reduce_weighted_scatter_cuda,
         )
@@ -558,11 +567,9 @@ class MoEComputeSegment:
         )
         all_tokens = bufs["all_tokens"]
 
-        # 1. Router matmul in bf16 + bias, then cast to f32
+        # 1. Router matmul in bf16 + fused bias add + f32 cast
         torch.mm(all_tokens, self.router_weight_bf16_t, out=bufs["router_logits"])
-        if self.router_bias_bf16 is not None:
-            bufs["router_logits"].add_(self.router_bias_bf16)
-        bufs["router_f32"].copy_(bufs["router_logits"])
+        router_bias_cast_cuda(bufs["router_logits"], self._router_bias_or_empty, bufs["router_f32"])
 
         # 2. Gate top-k softmax
         gate_topk_softmax_cuda(
@@ -573,7 +580,6 @@ class MoEComputeSegment:
         )
 
         # 3. Dispatch: count + prefix_sum + gather
-        bufs["dispatched_x"].zero_()
         dispatch_count_gather_cuda(
             all_tokens, bufs["topk_indices"],
             self.expert_start, self.num_local_experts,
@@ -607,7 +613,7 @@ class MoEComputeSegment:
         )
 
         # 6. Reduce: weighted scatter-add back to original token order
-        bufs["moe_output"].zero_()
+        # No zero_() needed: reduce kernel writes all N×H elements (acc starts at 0.0f)
         reduce_weighted_scatter_cuda(
             bufs["sorted_output"], bufs["topk_pos"], bufs["topk_weights"],
             WB, H, self.num_experts_per_tok,
