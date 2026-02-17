@@ -127,8 +127,8 @@ class FullAttnSegment:
         key = key.view(B, 1, self.num_kv_heads, self.head_dim)
         value = value.view(B, 1, self.num_kv_heads, self.head_dim)
 
-        # === RoPE ===
-        current_pos = cache_seqlens - 1
+        # === RoPE === (clamp to 0 so padding rows with cache_seqlens=0 don't negative-index)
+        current_pos = (cache_seqlens - 1).clamp(min=0)
         cos, sin = self.rotary_emb(value.transpose(1, 2), seq_len=self.max_seq_len)
         cos = cos[current_pos].unsqueeze(1)
         sin = sin[current_pos].unsqueeze(1)
@@ -761,8 +761,8 @@ class WholeModelSegment:
             key = key.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
             value = value.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
 
-            # RoPE
-            current_pos = cache_seqlens - 1
+            # RoPE (clamp to 0 so padding rows with cache_seqlens=0 don't negative-index)
+            current_pos = (cache_seqlens - 1).clamp(min=0)
             cos, sin = attn_wrapper.module.rotary_emb(
                 value.transpose(1, 2), seq_len=attn_wrapper.module.rotary_emb.max_seq_len_cached
             )
