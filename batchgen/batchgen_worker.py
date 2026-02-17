@@ -5865,8 +5865,13 @@ class BatchGenWorker:
 			wrapper.module.rotary_emb(dummy, seq_len=max_rope_len)
 
 		# Register full attention segments
-		max_pages = gpu_manager._gpu_page_table_manager.max_pages_per_sequence
+		# Use max possible pages based on max sequence length, not current state.
+		# The page_table static buffer column width is baked into the graph —
+		# if sequences grow beyond this during decode, FlashAttention reads
+		# past the buffer causing illegal memory access.
 		page_size_tokens = gpu_manager.config.page_size_tokens
+		max_seq_len = self.model.config.max_position_embeddings
+		max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			attn_wrapper = decoder_layer.self_attn
 			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_rope_len,
