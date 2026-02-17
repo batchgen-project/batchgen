@@ -5917,8 +5917,8 @@ class BatchGenWorker:
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
-		# Check for whole-model graph mode
-		use_whole_model = os.environ.get("BATCHGEN_WHOLE_MODEL_GRAPH", "0") == "1"
+		# Whole-model graph is the default. Set BATCHGEN_SEGMENTED_GRAPH=1 to use per-layer graphs instead.
+		use_whole_model = os.environ.get("BATCHGEN_SEGMENTED_GRAPH", "0") != "1"
 
 		if use_whole_model:
 			# Whole-model mode: single graph for entire decode pass.
