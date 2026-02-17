@@ -16,6 +16,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <c10/cuda/CUDAStream.h>
 
 #define WARP_SIZE 32
 
@@ -200,12 +201,15 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
     // Flat view of topk_indices
     auto flat_indices = topk_indices.reshape({-1}).contiguous();
 
+    // All kernels launch on current CUDA stream (required for CUDA graph capture)
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
     // ── Sub-kernel A: Count ──
     {
         int threads = 256;
         int blocks = 1;  // For decode NK <= 256, single block suffices
         int smem_bytes = E_local * sizeof(int32_t);
-        count_tokens_kernel<<<blocks, threads, smem_bytes>>>(
+        count_tokens_kernel<<<blocks, threads, smem_bytes, stream>>>(
             flat_indices.data_ptr<int32_t>(),
             expert_counts.data_ptr<int32_t>(),
             topk_pos.data_ptr<int32_t>(),
@@ -215,7 +219,7 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
 
     // ── Sub-kernel B: Prefix sum ──
     {
-        prefix_sum_kernel<<<1, 1>>>(
+        prefix_sum_kernel<<<1, 1, 0, stream>>>(
             expert_counts.data_ptr<int32_t>(),
             expert_offsets.data_ptr<int32_t>(),
             E_local
@@ -229,7 +233,7 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
         int threads_per_block = 256;
         int blocks = (total_threads + threads_per_block - 1) / threads_per_block;
 
-        gather_tokens_kernel<<<blocks, threads_per_block>>>(
+        gather_tokens_kernel<<<blocks, threads_per_block, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
             flat_indices.data_ptr<int32_t>(),
             expert_offsets.data_ptr<int32_t>(),

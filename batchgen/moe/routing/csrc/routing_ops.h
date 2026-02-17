@@ -37,6 +37,15 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
     torch::Tensor topk_pos
 );
 
+// Router epilogue: fused BF16 bias add + BF16→FP32 cast
+// Input:  logits [N, E] BF16, bias [E] BF16 (or empty)
+// Output: output [N, E] FP32
+void router_bias_cast_cuda(
+    torch::Tensor logits,
+    torch::Tensor bias,
+    torch::Tensor output
+);
+
 // Reduce: weighted scatter-add
 // Input:  expert_output [max_disp, H] BF16, topk_pos [N*K] int32,
 //         topk_weights [N, K] FP32

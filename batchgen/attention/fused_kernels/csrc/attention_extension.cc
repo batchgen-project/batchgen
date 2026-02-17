@@ -6,14 +6,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "RMSNorm forward (CUDA)",
           py::arg("input"),
           py::arg("weight"),
-          py::arg("eps"));
+          py::arg("eps"),
+          py::arg("num_valid_tokens") = c10::nullopt);
 
     m.def("add_rmsnorm_forward", &add_rmsnorm_forward,
           "Fused Add + RMSNorm forward (CUDA)",
           py::arg("residual"),
           py::arg("hidden"),
           py::arg("weight"),
-          py::arg("eps"));
+          py::arg("eps"),
+          py::arg("num_valid_tokens") = c10::nullopt);
 
     m.def("rope_forward", &rope_forward,
           "Fused RoPE for Q+K forward (CUDA)",
@@ -21,13 +23,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("key"),
           py::arg("cos"),
           py::arg("sin"),
-          py::arg("half_dim"));
+          py::arg("half_dim"),
+          py::arg("num_valid_tokens") = c10::nullopt);
 
     m.def("qkv_split_forward", &qkv_split_forward,
           "QKV Split: packed QKV to separate Q/K/V (CUDA, allocating)",
           py::arg("qkv"),
           py::arg("q_size"),
-          py::arg("kv_size"));
+          py::arg("kv_size"),
+          py::arg("num_valid_tokens") = c10::nullopt);
 
     m.def("qkv_split_inplace", &qkv_split_inplace,
           "QKV Split: write to pre-allocated Q/K/V (CUDA, zero-alloc)",
@@ -36,5 +40,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("k_out"),
           py::arg("v_out"),
           py::arg("q_size"),
-          py::arg("kv_size"));
+          py::arg("kv_size"),
+          py::arg("num_valid_tokens") = c10::nullopt);
 }

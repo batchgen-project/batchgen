@@ -45,6 +45,8 @@ class BasicConfig:
     rank: Optional[int] = None
     world_size: Optional[int] = None
     gpu_arch: Optional[str] = None
+    enable_cuda_graphs: bool = True
+    cuda_graph_bucket_sizes: Optional[List[int]] = None
 
     @staticmethod
     def _str_to_torch_dtype(dtype_str: str) -> Any:

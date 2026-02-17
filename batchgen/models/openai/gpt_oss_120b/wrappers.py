@@ -1457,6 +1457,110 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # Return None for kv_cache since it's managed by gpu_paged_kv_manager
         return attn_output, None, None
 
+    def _forward_decode_mid(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Middle decode stages for CUDA graph mode.
+
+        Called by the decoder layer when pre-attn graph has already produced
+        Q, K, V. Handles: RoPE → KV write → FlashAttention → O_proj → KV append.
+
+        All metadata (cache_seqlens, gpu_paged_kv_manager, page_table, sinks,
+        etc.) comes from class-level state set by batchgen_worker each step.
+
+        Args:
+            query: [batch, 1, num_heads, head_dim]
+            key:   [batch, 1, num_kv_heads, head_dim]
+            value: [batch, 1, num_kv_heads, head_dim]
+
+        Returns:
+            attn_output: [batch, 1, hidden_size]
+        """
+        batch = query.shape[0]
+
+        # === Bookkeeping (same as forward()) ===
+        # Load weights for non-persistent mode
+        if not self.persistent:
+            weights = self.load_weights(self.module_key)
+            dequant_weights = self.dequantize_weights(weights)
+            self.apply_weights(dequant_weights)
+
+        # Initialize sinks for persistent mode (lazy, same as forward() lines 1940-1942)
+        if self.sinks is None and self.persistent and hasattr(self.module, 'sinks'):
+            self.sinks = self.module.sinks.data
+
+        # Move sinks to correct device
+        if self.sinks is not None:
+            self.sinks = self.sinks.to(query.device)
+
+        # Get class-level state
+        gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+        cache_seqlens = AttnWrapperBase.cache_seqlens
+
+        # === RoPE ===
+        if cache_seqlens is not None:
+            micro_cache_seqlens = cache_seqlens
+            current_token_position = micro_cache_seqlens - 1
+
+            max_seqlen = AttnWrapperBase.max_seqlen
+            cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
+            cos = cos[current_token_position].unsqueeze(1)
+            sin = sin[current_token_position].unsqueeze(1)
+        else:
+            cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
+            cos = cos[:1]
+            sin = sin[:1]
+
+        query, key = self._apply_rotary(query, key, cos, sin)
+
+        # === KV write ===
+        gpu_kv_manager.update_layer_decode_new_token(
+            k_tensor=key,
+            v_tensor=value,
+            sequence_lengths=current_token_position if cache_seqlens is not None else torch.zeros(batch, dtype=torch.int32, device=query.device),
+            layer_idx=self.layer_idx,
+        )
+
+        # === FlashAttention ===
+        k_cache_layer, v_cache_layer, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
+            self.layer_idx
+        )
+
+        cache_seqlens_for_attn = micro_cache_seqlens if cache_seqlens is not None else torch.ones(batch, dtype=torch.int32, device=query.device)
+
+        attn_output, _ = gqa_decode_fa(
+            q=query,
+            k_cache=k_cache_layer,
+            v_cache=v_cache_layer,
+            cache_seqlens=cache_seqlens_for_attn,
+            block_table=page_table,
+            sinks=self.sinks,
+            softmax_scale=self.scale,
+            sliding_window=self.sliding_window,
+        )
+
+        # === O_proj ===
+        attn_output = attn_output.view(batch, 1, self.num_heads * self.head_dim)
+        attn_output = self.module.o_proj(attn_output)
+
+        # === KV append callback ===
+        kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
+        if kv_append_callback is not None:
+            kv_append_callback(self.layer_idx, key, value)
+
+        # === Cleanup for non-persistent mode (same as forward() lines 1982-1988) ===
+        if not self.persistent:
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
+
+        return attn_output
+
     def _forward_decode_legacy(
         self,
         hidden_states: torch.Tensor,

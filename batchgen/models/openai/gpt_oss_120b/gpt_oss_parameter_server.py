@@ -157,10 +157,7 @@ class GptOss_Parameter_Server:
         try:
             skeleton_dict = self.parameter_server.get_skeleton_state_dict()
             logging.info(f"C++ Parameter_Server.get_skeleton_state_dict() returned {len(skeleton_dict)} keys")
-            if skeleton_dict:
-                sample_keys = list(skeleton_dict.keys())[:20]
-                logging.info(f"  Sample skeleton keys: {sample_keys}")
-            else:
+            if not skeleton_dict:
                 logging.warning("  WARNING: skeleton_state_dict is EMPTY!")
                 # Check if the converted_ckpt_dir is correct
                 logging.info(f"  converted_ckpt_dir: {self.converted_ckpt_dir}")

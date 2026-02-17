@@ -1270,7 +1270,15 @@ class GptOssMoEPrefill(nn.Module):
 # ============================================================================
 
 class GptOssDecoderLayer(nn.Module):
-    """Single transformer decoder layer."""
+    """Single transformer decoder layer.
+
+    Supports optional CUDA graph mode for decode phase. When
+    ``cuda_graph_manager`` is set, the full attention block is replayed
+    from a single captured graph:
+      RMSNorm → QKV proj → split → RoPE → KV write → FA → O_proj
+      → residual add + post-attn RMSNorm
+    The MoE block always runs eagerly.
+    """
 
     def __init__(self, config: GptOssConfig, layer_idx: int):
         super().__init__()
@@ -1281,6 +1289,21 @@ class GptOssDecoderLayer(nn.Module):
         self.self_attn = GptOssAttention(config, layer_idx)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = GptOssMoE(config)
+
+        # CUDA graph support (set externally after model init)
+        self.cuda_graph_manager = None
+        self._full_attn_segment_name = None
+        self._moe_segment_name = None
+        self._moe_segment = None
+        self._moe_bucketing = None
+        # When True, forward() is a no-op (layer is driven by WholeModelSegment)
+        self._graph_capture_mode = False
+
+    def enable_cuda_graph(self, manager, full_attn_name: str, moe_name: str = None):
+        """Enable CUDA graph mode for this layer."""
+        self.cuda_graph_manager = manager
+        self._full_attn_segment_name = full_attn_name
+        self._moe_segment_name = moe_name
 
     def forward(
         self,
@@ -1297,16 +1320,189 @@ class GptOssDecoderLayer(nn.Module):
         # Start layer timing
         DecodeLayerTiming.start_layer(self.layer_idx)
 
-        residual = hidden_states
+        # ========== ATTENTION BLOCK ==========
+        # attn_residual: pre-attention hidden_states (for fused residual add + norm)
+        # For CUDA graph path: post_attn segment does residual add, so attn_residual=None
+        attn_residual = None
+        use_graph = (self.cuda_graph_manager is not None
+                     and self._full_attn_segment_name is not None)
 
-        # Pre-norm + attention
+        if use_graph:
+            batch_size = hidden_states.shape[0]
+
+            if batch_size > 0:
+                try:
+                    from batchgen.models.wrappers.attention import AttnWrapperBase
+                    gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+                    _, _, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
+                        self.layer_idx
+                    )
+                    slot_indices = gpu_kv_manager._gpu_page_table_manager._slot_index_tensor
+                    # num_valid_tokens: 1-element int32 tensor so custom kernels skip padding
+                    if not hasattr(self, '_nvt_tensor'):
+                        self._nvt_tensor = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
+                    self._nvt_tensor.fill_(batch_size)
+                    out = self.cuda_graph_manager.replay(
+                        self._full_attn_segment_name, batch_size,
+                        hidden_states=hidden_states,
+                        cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+                        page_table=page_table[:batch_size],
+                        slot_indices=slot_indices[:batch_size],
+                        num_valid_tokens=self._nvt_tensor,
+                    )
+                    hidden_states = out["normed"]
+                    # Clone residual: it lives in the CUDA graph memory pool
+                    # and would be clobbered by MoE graph replay (shared pool).
+                    residual = out["residual"].clone()
+                    attn_residual = "graph_done"
+
+                    # KV host offload: graph bypasses the wrapper, so fire callback here.
+                    # Must clone key/value: they are views into graph static output buffers
+                    # which get overwritten on next layer's graph replay (shared memory pool).
+                    kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+                    if kv_cb is not None:
+                        kv_cb(self.layer_idx, out["key"][:batch_size].clone(), out["value"][:batch_size].clone())
+
+                except (ValueError, RuntimeError):
+                    hidden_states, attn_residual = self._forward_attn_eager(
+                        hidden_states, attention_mask, position_ids,
+                        past_key_value, output_attentions, use_cache,
+                        debug_layer, timing_enabled,
+                    )
+            else:
+                hidden_states, attn_residual = self._forward_attn_eager(
+                    hidden_states, attention_mask, position_ids,
+                    past_key_value, output_attentions, use_cache,
+                    debug_layer, timing_enabled,
+                )
+        else:
+            hidden_states, attn_residual = self._forward_attn_eager(
+                hidden_states, attention_mask, position_ids,
+                past_key_value, output_attentions, use_cache,
+                debug_layer, timing_enabled,
+            )
+
+        # ========== MoE BLOCK ==========
+        # Post-attn norm: skip if post-attn graph already computed it
+        if attn_residual == "graph_done":
+            # hidden_states = normed, residual = residual — both set by post-attn graph
+            pass
+        elif debug_layer and self.layer_idx < 3:
+            # Unfused path for debug visibility
+            if attn_residual is not None:
+                hidden_states = attn_residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+        elif attn_residual is not None:
+            # Eager path: fuse residual add + post-attn layernorm (1 kernel)
+            from batchgen.attention.fused_kernels import cuda_add_rmsnorm
+            hidden_states, residual = cuda_add_rmsnorm(
+                attn_residual, hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+        else:
+            # Fallback (shouldn't happen in normal flow)
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if timing_enabled:
+            torch.cuda.synchronize()
+            moe_start = time.perf_counter()
+
+        # MoE: graph path or eager
+        use_moe_graph = (use_graph and self._moe_segment_name is not None)
+        if use_moe_graph:
+            try:
+                import torch.distributed as dist
+                ntr = self.mlp.num_tokens_per_rank
+                bucket = self._moe_bucketing.get_padded_size(ntr)
+                seg = self._moe_segment
+                bufs, _ = seg.pool.get(bucket)
+
+                # 1. Prepare padded input (copy local tokens into static buffer)
+                bufs["padded"].zero_()
+                if batch_size > 0:
+                    bufs["padded"][:batch_size].copy_(hidden_states.view(batch_size, -1))
+
+                # 2. Graph: all_gather → router → dispatch → WGMMA → scatter
+                moe_out = self.cuda_graph_manager.replay(
+                    self._moe_segment_name, bucket,
+                    padded=bufs["padded"],
+                )
+
+                # 3. Eager: all_reduce + local slice (not in graph)
+                moe_output = moe_out["moe_output"]
+                with self.mlp.comm.change_state(enable=True):
+                    self.mlp.comm.all_reduce(
+                        moe_output, op=dist.ReduceOp.SUM,
+                        stream=torch.cuda.current_stream(self.mlp.device),
+                    )
+                if batch_size > 0:
+                    start = self.mlp.rank * bucket
+                    hidden_states = moe_output[start:start + batch_size].view(batch_size, 1, -1)
+            except (ValueError, RuntimeError):
+                hidden_states = self.mlp(hidden_states)
+        elif use_graph and os.environ.get("BATCHGEN_MOE_EAGER") and self._moe_segment is not None:
+            # Eager MoE: all ranks MUST use the same bucket size for NCCL.
+            # num_tokens_per_rank = max(local_batch_size) across all ranks,
+            # synced via dist.all_reduce(MAX) before each decode iteration.
+            bucket = self._moe_bucketing.get_padded_size(self.mlp.num_tokens_per_rank)
+            bufs, _ = self._moe_segment.pool.get(bucket)
+            bufs["padded"].zero_()
+            if batch_size > 0:
+                bufs["padded"][:batch_size].copy_(hidden_states.view(batch_size, -1))
+            moe_result = self._moe_segment.forward(bufs["padded"])
+            if batch_size > 0:
+                hidden_states = moe_result["moe_output"][:batch_size].view(batch_size, 1, -1)
+        else:
+            hidden_states = self.mlp(hidden_states)
+
+        if timing_enabled:
+            torch.cuda.synchronize()
+            DecodeLayerTiming.record_moe((time.perf_counter() - moe_start) * 1000)
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after MLP (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+
+        hidden_states = residual + hidden_states
+
+        if debug_layer and self.layer_idx < 3:
+            with torch.no_grad():
+                print(f"[L{self.layer_idx}] after MLP+residual (final): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
+
+        # End layer timing
+        DecodeLayerTiming.end_layer()
+
+        return hidden_states, None, None
+
+    def _forward_attn_eager(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor]],
+        output_attentions: bool,
+        use_cache: bool,
+        debug_layer: bool = False,
+        timing_enabled: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Eager attention forward (original path).
+
+        Returns:
+            (attn_output, residual) — caller uses cuda_add_rmsnorm to fuse
+            the residual add + post-attention layernorm.
+        """
+        residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         if debug_layer and self.layer_idx < 3:
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after input_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
-        # ========== ATTENTION TIMING ==========
         if timing_enabled:
             torch.cuda.synchronize()
             attn_start = time.perf_counter()
@@ -1328,49 +1524,7 @@ class GptOssDecoderLayer(nn.Module):
             with torch.no_grad():
                 print(f"[L{self.layer_idx}] after attention (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
 
-        if debug_layer and self.layer_idx < 3:
-            # Unfused path for debug visibility
-            hidden_states = residual + hidden_states
-            with torch.no_grad():
-                print(f"[L{self.layer_idx}] after attn+residual: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            with torch.no_grad():
-                print(f"[L{self.layer_idx}] after post_attn_layernorm: std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
-        else:
-            # Fused residual add + RMSNorm (1 kernel instead of ~5)
-            from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-            hidden_states, residual = cuda_add_rmsnorm(
-                residual, hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.eps,
-            )
-
-        # ========== MoE TIMING ==========
-        if timing_enabled:
-            torch.cuda.synchronize()
-            moe_start = time.perf_counter()
-
-        hidden_states = self.mlp(hidden_states)
-
-        if timing_enabled:
-            torch.cuda.synchronize()
-            DecodeLayerTiming.record_moe((time.perf_counter() - moe_start) * 1000)
-
-        if debug_layer and self.layer_idx < 3:
-            with torch.no_grad():
-                print(f"[L{self.layer_idx}] after MLP (before residual): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
-
-        hidden_states = residual + hidden_states
-
-        if debug_layer and self.layer_idx < 3:
-            with torch.no_grad():
-                print(f"[L{self.layer_idx}] after MLP+residual (final): std={hidden_states.float().std().item():.4f}, max={hidden_states.abs().max().item():.4f}")
-
-        # End layer timing
-        DecodeLayerTiming.end_layer()
-
-        return hidden_states, attn_weights, present_key_value
+        return hidden_states, residual
 
 
 # ============================================================================
