@@ -240,7 +240,7 @@ class BatchGenWorkerArgs:
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
-	cuda_graph_max_bucket_size: int = 256  # Max batch size per rank for CUDA graph capture
+	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
 
 

@@ -193,6 +193,22 @@ python -m batchgen.launch_http_server \
 - Offloading ratio must be between 0.0 and 1.0
 - Not needed if GPU memory is sufficient (e.g., two-node H20 deployment)
 
+### CUDA Graph Acceleration
+
+CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CPU overhead. Enabled by default for supported models during the decode phase.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--disable-cuda-graphs` | `false` | Disable CUDA graph capture for decode. Use if encountering compatibility issues. |
+| `--cuda-graph-max-bucket-size` | `128` | Maximum batch size per rank for CUDA graph capture. Batches exceeding this fall back to eager execution. |
+| `--cuda-graph-num-buckets` | `16` | Number of CUDA graph bucket sizes. More buckets = longer startup capture time but less padding waste. |
+
+**How it works:**
+- At startup, CUDA graphs are captured at multiple discrete batch sizes (buckets) from 1 to `--cuda-graph-max-bucket-size`
+- During decode, the actual batch size is rounded up to the nearest bucket and the pre-captured graph is replayed
+- If the batch size exceeds the max bucket on any rank, all ranks fall back to eager execution for that step
+- Use `BATCHGEN_SEGMENTED_GRAPH=1` to switch from whole-model graph to per-segment graph mode
+
 ---
 
 ## Storage Configuration
