@@ -5848,14 +5848,20 @@ class BatchGenWorker:
 
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
-		# Generate power-of-2 bucket sizes up to max_bucket, capped at num_buckets
-		bucket_sizes = []
-		size = 1
-		while len(bucket_sizes) < num_buckets and size <= max_bucket:
-			bucket_sizes.append(size)
-			size *= 2
-		if bucket_sizes[-1] != max_bucket:
-			bucket_sizes.append(max_bucket)
+		# Generate num_buckets geometrically spaced sizes from 1 to max_bucket.
+		# e.g. max=256, num=9 → [1,2,4,8,16,32,64,128,256]
+		# e.g. max=256, num=16 → [1,2,3,4,6,8,12,16,24,32,48,64,96,128,192,256]
+		import numpy as np
+		if num_buckets <= 1:
+			bucket_sizes = [max_bucket]
+		else:
+			raw = np.geomspace(1, max_bucket, num_buckets)
+			bucket_sizes = sorted(set(max(1, int(round(x))) for x in raw))
+			# Ensure 1 and max_bucket are included
+			if bucket_sizes[0] != 1:
+				bucket_sizes = [1] + bucket_sizes
+			if bucket_sizes[-1] != max_bucket:
+				bucket_sizes.append(max_bucket)
 		logging.info(f"CUDA graph bucket sizes: {bucket_sizes} (max={max_bucket}, num_buckets={num_buckets})")
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
