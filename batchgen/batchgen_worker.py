@@ -240,6 +240,8 @@ class BatchGenWorkerArgs:
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
 	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
+	cuda_graph_max_bucket_size: int = 256  # Max batch size per rank for CUDA graph capture
+	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
 
 
 class BatchGenWorker:
@@ -5844,7 +5846,17 @@ class BatchGenWorker:
 		)
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
-		bucket_sizes = self.engine_config.Basic_Config.cuda_graph_bucket_sizes
+		max_bucket = self.args.cuda_graph_max_bucket_size
+		num_buckets = self.args.cuda_graph_num_buckets
+		# Generate power-of-2 bucket sizes up to max_bucket, capped at num_buckets
+		bucket_sizes = []
+		size = 1
+		while len(bucket_sizes) < num_buckets and size <= max_bucket:
+			bucket_sizes.append(size)
+			size *= 2
+		if bucket_sizes[-1] != max_bucket:
+			bucket_sizes.append(max_bucket)
+		logging.info(f"CUDA graph bucket sizes: {bucket_sizes} (max={max_bucket}, num_buckets={num_buckets})")
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 

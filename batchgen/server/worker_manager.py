@@ -399,6 +399,8 @@ class WorkerManager:
             ep_offloading_ratio=self.args.ep_offloading_ratio,
             pre_dequantize_weights=self.args.pre_dequantize_weights,
             disable_cuda_graphs=self.args.disable_cuda_graphs,
+            cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
+            cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
         )
         self.worker_process = mp.spawn(
             server_worker_main,

@@ -652,7 +652,7 @@ class WholeModelSegment:
         max_pages_per_seq: int,
         vocab_size: int,
         hidden_size: int,
-        max_bucket_size: int = 128,
+        max_bucket_size: int = 256,
     ):
         self.model = model
         self.max_bucket_size = max_bucket_size

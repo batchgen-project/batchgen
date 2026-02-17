@@ -87,6 +87,8 @@ class ServerArgs:
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
     disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
+    cuda_graph_max_bucket_size: int = 256  # Max batch size per rank for CUDA graph capture
+    cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -253,6 +255,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Disable CUDA graph capture for decode attention (enabled by default for supported models)",
     )
+    parser.add_argument(
+        "--cuda-graph-max-bucket-size",
+        type=int,
+        default=256,
+        help="Maximum batch size per rank for CUDA graph capture (default: 256). Batches exceeding this fall back to eager execution.",
+    )
+    parser.add_argument(
+        "--cuda-graph-num-buckets",
+        type=int,
+        default=16,
+        help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
+    )
     return parser
 
 
@@ -352,6 +366,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         ep_offloading_ratio=parsed.ep_offloading_ratio,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
+        cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
+        cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)
