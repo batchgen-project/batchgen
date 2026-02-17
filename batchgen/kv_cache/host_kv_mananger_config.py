@@ -260,7 +260,7 @@ HOST_KV_AUX_SHM_NAME = "batchgen_host_kv_cache_aux"
 
 
 def is_dsa_model(model_name: str) -> bool:
-	"""Returns True if the model uses Dynamic Sparse Attention (has indexer cache)."""
+	"""Returns True if the model uses DeepSeek Sparse Attention (has indexer cache)."""
 	return _resolve_indexer_profile(model_name) is not None
 
 

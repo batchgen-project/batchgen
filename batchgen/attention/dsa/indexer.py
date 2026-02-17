@@ -1,4 +1,4 @@
-"""Lightning Indexer for Dynamic Sparse Attention (DSA).
+"""Lightning Indexer for DeepSeek Sparse Attention (DSA).
 
 The indexer is a lightweight per-layer module that scores all cached tokens
 and selects the top-K most relevant positions for full MLA attention.

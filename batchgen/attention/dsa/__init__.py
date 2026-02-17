@@ -1,4 +1,4 @@
-"""Dynamic Sparse Attention (DSA) module for BatchGen.
+"""DeepSeek Sparse Attention (DSA) module for BatchGen.
 
 DSA uses a lightweight Lightning Indexer to score cached tokens and select
 the top-K most relevant ones, then runs full MLA attention only on the

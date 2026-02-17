@@ -1,4 +1,4 @@
-"""Unit tests for Dynamic Sparse Attention (DSA) components.
+"""Unit tests for DeepSeek Sparse Attention (DSA) components.
 
 Tests cover:
 1. DualKVCacheCoordinator — lifecycle sync between two managers

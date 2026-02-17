@@ -84,7 +84,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     max_seqlen: ClassVar[Optional[int]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
-    # DSA auxiliary caches (indexer KV for Dynamic Sparse Attention)
+    # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)
     gpu_paged_kv_manager_aux: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view_aux: ClassVar[Optional[object]] = None
 
