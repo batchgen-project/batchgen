@@ -216,16 +216,6 @@ class GptOssParallelStrategyManager:
         # Debug: Print skeleton_state_dict keys for verification
         skeleton_keys = list(self.skeleton_state_dict.keys()) if self.skeleton_state_dict else []
         logging.info(f"Skeleton state_dict has {len(skeleton_keys)} keys")
-        if skeleton_keys:
-            # Print first 20 keys at INFO level to see actual naming
-            logging.info(f"Sample skeleton keys (first 20): {skeleton_keys[:20]}")
-            # Also print keys that should match embed/norm/lm_head
-            embed_keys = [k for k in skeleton_keys if 'embed' in k.lower()][:5]
-            norm_keys = [k for k in skeleton_keys if 'norm' in k.lower() and 'layer' not in k.lower()][:5]
-            lm_head_keys = [k for k in skeleton_keys if 'lm_head' in k.lower() or 'head' in k.lower()][:5]
-            logging.info(f"Embed-related keys: {embed_keys}")
-            logging.info(f"Final norm-related keys: {norm_keys}")
-            logging.info(f"LM head-related keys: {lm_head_keys}")
 
         loaded_count = 0
         missing_count = 0
@@ -275,10 +265,7 @@ class GptOssParallelStrategyManager:
             # Get weights from core_engine
             tensors = self.core_engine.get_tensor(module_key)
 
-            if layer_idx == 0:
-                logging.info(f"[Layer 0] get_tensor keys: {list(tensors.keys())}")
-                for name, t in tensors.items():
-                    logging.info(f"  {name}: shape={list(t.shape)}, dtype={t.dtype}")
+
 
             # Load projection weights (packed QKV + O)
             if "qkv_proj.weight" in tensors:

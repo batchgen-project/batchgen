@@ -312,33 +312,6 @@ class CUDAGraphManager:
         # Replay on current stream — no cross-stream sync needed
         captured.graph.replay()
 
-        # Diagnostic: compare graph replay vs eager forward
-        import os
-        if os.environ.get("BATCHGEN_DEBUG_GRAPH_REPLAY") == "1":
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            if rank == 0 and "_moe" in name:
-                torch.cuda.synchronize()
-                # Check graph output
-                for key, static_out in captured.static_outputs.items():
-                    std_val = static_out.float().std().item()
-                    max_val = static_out.abs().max().item()
-                    logger.info(f"[GRAPH-DBG] {name} bs={batch_size} graph output '{key}': std={std_val:.6f} max={max_val:.6f}")
-
-                # Run eager forward with same input for comparison
-                segment = self._segments[name]
-                eager_out = segment.forward(**{k: captured.static_inputs[k] for k in inputs})
-                for key, val in eager_out.items():
-                    std_val = val.float().std().item()
-                    max_val = val.abs().max().item()
-                    logger.info(f"[GRAPH-DBG] {name} bs={batch_size} eager output '{key}': std={std_val:.6f} max={max_val:.6f}")
-
-                # Check static input
-                for key, si in captured.static_inputs.items():
-                    std_val = si.float().std().item()
-                    max_val = si.abs().max().item()
-                    logger.info(f"[GRAPH-DBG] {name} bs={batch_size} static_input '{key}': std={std_val:.6f} max={max_val:.6f}")
-
         # Return unpadded outputs
         result = {}
         for key, static_out in captured.static_outputs.items():

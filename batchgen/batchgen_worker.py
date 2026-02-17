@@ -6415,27 +6415,6 @@ class BatchGenWorker:
 						)
 					elif pt_slice.shape[1] > wm_max_pages:
 						pt_slice = pt_slice[:, :wm_max_pages]
-					# Diagnostic logging for debugging illegal memory access
-					if os.environ.get("BATCHGEN_DEBUG_GRAPH") == "1":
-						num_pages = gpu_manager._k_cache.shape[1]
-						logging.info(
-							f"[GRAPH-DIAG] rank={self.rank} iter={local_iteration} "
-							f"local_bs={batch_size} max_bs={_max_bs} bucket={bucket} "
-							f"pt_shape={list(pt_slice.shape)} "
-							f"pt_min={pt_slice.min().item() if pt_slice.numel() > 0 else 'N/A'} "
-							f"pt_max={pt_slice.max().item() if pt_slice.numel() > 0 else 'N/A'} "
-							f"num_pages={num_pages} "
-							f"seqlens_min={AttnWrapperBase.cache_seqlens[:batch_size].min().item() if batch_size > 0 else 'N/A'} "
-							f"seqlens_max={AttnWrapperBase.cache_seqlens[:batch_size].max().item() if batch_size > 0 else 'N/A'} "
-							f"slot_min={slot_indices_tensor[:batch_size].min().item() if batch_size > 0 else 'N/A'} "
-							f"slot_max={slot_indices_tensor[:batch_size].max().item() if batch_size > 0 else 'N/A'}"
-						)
-						if pt_slice.numel() > 0 and batch_size > 0:
-							real_pt = pt_slice[:batch_size]
-							oob = (real_pt >= num_pages) | (real_pt < -1)
-							if oob.any():
-								logging.error(f"[GRAPH-DIAG] OUT OF BOUNDS page IDs! count={oob.sum().item()}")
-
 					graph_out = self._cuda_graph_manager.replay(
 						"whole_model", bucket,
 						input_ids=new_tokens,
@@ -6444,9 +6423,6 @@ class BatchGenWorker:
 						slot_indices=slot_indices_tensor[:batch_size],
 					)
 
-					if os.environ.get("BATCHGEN_DEBUG_GRAPH") == "1":
-						torch.cuda.synchronize()
-						logging.info(f"[GRAPH-DIAG] rank={self.rank} iter={local_iteration} replay OK")
 					logits = graph_out["logits"][:batch_size]
 					new_tokens_out = self._select_tokens(logits)
 
