@@ -5829,6 +5829,61 @@ class BatchGenWorker:
 
 		self._setup_cuda_graphs(gpu_manager)
 
+	@staticmethod
+	def _generate_bucket_sizes(max_bucket: int, num_buckets: int) -> list:
+		"""Generate exactly num_buckets bucket sizes from 1 to max_bucket.
+
+		Uses geometric spacing for initial placement with magnitude-aware
+		rounding (small values exact, large values rounded to clean multiples).
+		Fills any gaps from rounding collisions by splitting the largest gaps.
+		Caps at max_bucket if num_buckets > max_bucket.
+
+		Examples:
+		  max=256, num=9  → [1,2,4,8,16,32,64,128,256]
+		  max=256, num=16 → [1,2,3,4,6,10,14,20,28,40,56,80,128,160,192,256]
+		  max=16,  num=16 → [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
+		"""
+		import math
+		num_buckets = min(num_buckets, max_bucket)
+		if num_buckets <= 1:
+			return [max_bucket]
+
+		def _round_nice(x):
+			"""Round to nearest clean multiple that scales with magnitude."""
+			if x <= 8:
+				return int(round(x))
+			log2 = int(math.log2(x))
+			step = max(1 << (log2 - 2), 1)
+			return max(1, round(x / step) * step)
+
+		# Geometric spacing with nice rounding
+		ratio = max_bucket ** (1.0 / (num_buckets - 1))
+		sizes = set()
+		for i in range(num_buckets):
+			sizes.add(max(1, _round_nice(ratio ** i)))
+		sizes.add(1)
+		sizes.add(max_bucket)
+		sizes = sorted(sizes)
+
+		# Fill gaps from rounding collisions
+		while len(sizes) < num_buckets:
+			best_gap, best_idx = 0, -1
+			for i in range(len(sizes) - 1):
+				gap = sizes[i + 1] - sizes[i]
+				if gap > best_gap:
+					best_gap = gap
+					best_idx = i
+			if best_gap < 2:
+				break
+			mid = _round_nice((sizes[best_idx] + sizes[best_idx + 1]) / 2)
+			if mid <= sizes[best_idx] or mid >= sizes[best_idx + 1]:
+				mid = (sizes[best_idx] + sizes[best_idx + 1]) // 2
+			if mid in sizes or mid <= sizes[best_idx] or mid >= sizes[best_idx + 1]:
+				break
+			sizes.insert(best_idx + 1, mid)
+
+		return sizes
+
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode: full attention block per layer.
 
@@ -5848,20 +5903,11 @@ class BatchGenWorker:
 
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
-		# Generate num_buckets geometrically spaced sizes from 1 to max_bucket.
-		# e.g. max=256, num=9 → [1,2,4,8,16,32,64,128,256]
-		# e.g. max=256, num=16 → [1,2,3,4,6,8,12,16,24,32,48,64,96,128,192,256]
-		import numpy as np
-		if num_buckets <= 1:
-			bucket_sizes = [max_bucket]
-		else:
-			raw = np.geomspace(1, max_bucket, num_buckets)
-			bucket_sizes = sorted(set(max(1, int(round(x))) for x in raw))
-			# Ensure 1 and max_bucket are included
-			if bucket_sizes[0] != 1:
-				bucket_sizes = [1] + bucket_sizes
-			if bucket_sizes[-1] != max_bucket:
-				bucket_sizes.append(max_bucket)
+		# Generate exactly num_buckets geometrically-spaced bucket sizes.
+		# e.g. max=256, num=9  → [1,2,4,8,16,32,64,128,256]
+		# e.g. max=256, num=16 → [1,2,3,4,6,10,14,20,28,40,56,80,128,160,192,256]
+		# e.g. max=16,  num=16 → [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
+		bucket_sizes = self._generate_bucket_sizes(max_bucket, num_buckets)
 		logging.info(f"CUDA graph bucket sizes: {bucket_sizes} (max={max_bucket}, num_buckets={num_buckets})")
 		bucketing = BatchSizeBucketing(bucket_sizes)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
