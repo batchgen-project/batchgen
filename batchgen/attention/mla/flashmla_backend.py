@@ -394,7 +394,7 @@ def mla_decoding_flashmla_(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	"""
@@ -570,7 +570,7 @@ def mla_decoding_flashmla_attn_mode_3_(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	try:
@@ -710,7 +710,6 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	)
 
 	assert qk_head_dim == 576, f"qk_head_dim should be 576, but got {qk_head_dim}"
-	assert self.num_heads == 128, f"num_heads should be 128, but got {self.num_heads}"
 	
 	block_size = 64	
 	block_table = torch.arange(
@@ -722,7 +721,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 	try:
 		attn_out, _ = flash_mla_with_kvcache(
@@ -971,7 +970,7 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	try:
@@ -1114,7 +1113,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	try:
@@ -1329,7 +1328,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	query_states[:, :, :, self.kv_lora_rank :] = q_pe
 	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
 
-	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, self.num_heads, 1)
 
 	try:
 		attn_out, _ = flash_mla_with_kvcache(
@@ -1474,7 +1473,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 # 	)
 
 # 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-# 		cache_seqlens, 128, 1
+# 		cache_seqlens, self.num_heads, 1
 # 	)
 
 # 	try:
@@ -1655,7 +1654,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_triton_gemm(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	try:
@@ -1819,7 +1818,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_without_fused_rmsnorm_rope(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	try:
@@ -1978,7 +1977,7 @@ def mla_decoding_flashmla_attn_mode_3_dequant_fusion(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	try:
@@ -2120,7 +2119,7 @@ def mla_decoding_flashmla(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	"""
@@ -2442,7 +2441,7 @@ def mla_decoding_flashmla_v2(
 	)
 
 	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens, 128, 1
+		cache_seqlens, self.num_heads, 1
 	)
 
 	"""
