@@ -49,11 +49,8 @@ from batchgen.models.engine_loader import core_engine
 
 from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
-	build_gpu_kv_config_aux,
 	build_host_kv_config,
-	is_dsa_model,
 )
-from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
 from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits, get_prepack_stats, PrepackMetadata
 
@@ -1242,29 +1239,14 @@ class BatchGenWorker:
 		"""Reuse cached token budgets so host/GPU allocations stay consistent."""
 		return [self._get_sequence_token_budget(sequence_id) for sequence_id in sequence_ids]
 
-	def _bind_gpu_paged_kv_manager(self, manager) -> None:
-		"""Bind GPU KV manager to both worker and core_engine.
-
-		If manager is a DualKVCacheCoordinator, the primary manager is bound
-		to existing gpu_paged_kv_manager slots and the auxiliary (indexer) is
-		bound to gpu_paged_kv_manager_aux slots.
-		"""
+	def _bind_gpu_paged_kv_manager(self, manager: GPUPagedKVCacheManager) -> None:
+		"""Bind GPU KV manager to both worker and core_engine."""
 		self.gpu_paged_kv_cache_manager = manager
-		if isinstance(manager, DualKVCacheCoordinator):
-			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-				self.core_engine.gpu_paged_kv_manager = manager.primary
-			if hasattr(self.core_engine, "gpu_paged_kv_manager_aux"):
-				self.core_engine.gpu_paged_kv_manager_aux = manager.auxiliary
-		else:
-			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-				self.core_engine.gpu_paged_kv_manager = manager
+		if hasattr(self.core_engine, "gpu_paged_kv_manager"):
+			self.core_engine.gpu_paged_kv_manager = manager
 
 	def _ensure_gpu_paged_kv_manager(self, sequence_tokens: Sequence[int]) -> GPUPagedKVCacheManager:
-		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`.
-
-		For DSA models, returns a DualKVCacheCoordinator wrapping both primary
-		(MLA) and auxiliary (indexer) managers.
-		"""
+		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`."""
 		gpu_config = build_gpu_kv_config(
 			model_name=self.huggingface_ckpt_name,
 			sequence_tokens=sequence_tokens,
@@ -1285,48 +1267,24 @@ class BatchGenWorker:
 
 		if manager is not None:
 			manager.destroy()
-
+		
 		logging.info(
 			"Rank %s creating GPUPagedKVCacheManager on %s: "
 			"current pages=%d, required pages=%d",
 			self.rank, self.local_rank, current_pages, required_pages
 		)
 
-		primary = GPUPagedKVCacheManager(
+		manager = GPUPagedKVCacheManager(
 			config=gpu_config,
 			device=self.local_rank,
 		)
+		manager.initialize()
+		self._bind_gpu_paged_kv_manager(manager)
 
-		# For DSA models, create auxiliary (indexer) manager and wrap in coordinator
-		aux_config = build_gpu_kv_config_aux(
-			model_name=self.huggingface_ckpt_name,
-			sequence_tokens=sequence_tokens,
+		logging.info(
+			"Rank %s initialized GPUPagedKVCacheManager on %s with %d pages",
+			self.rank, manager.device, gpu_config.num_pages,
 		)
-		if aux_config is not None:
-			auxiliary = GPUPagedKVCacheManager(
-				config=aux_config,
-				device=self.local_rank,
-			)
-			manager = DualKVCacheCoordinator(primary, auxiliary)
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-
-			logging.info(
-				"Rank %s initialized DualKVCacheCoordinator on %s: "
-				"primary=%d pages (dim=%d), auxiliary=%d pages (dim=%d)",
-				self.rank, self.local_rank,
-				gpu_config.num_pages, gpu_config.k_head_dim,
-				aux_config.num_pages, aux_config.k_head_dim,
-			)
-		else:
-			manager = primary
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-
-			logging.info(
-				"Rank %s initialized GPUPagedKVCacheManager on %s with %d pages",
-				self.rank, self.local_rank, gpu_config.num_pages,
-			)
 		return manager
 
 	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
@@ -6161,12 +6119,7 @@ class BatchGenWorker:
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 
 		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
-		if isinstance(gpu_manager, DualKVCacheCoordinator):
-			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager.primary
-			AttnWrapperBase.gpu_paged_kv_manager_aux = gpu_manager.auxiliary
-		else:
-			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
-			AttnWrapperBase.gpu_paged_kv_manager_aux = None
+		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 		AttnWrapperBase.host_paged_kv_worker_view = worker_view
 		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
@@ -6633,9 +6586,7 @@ class BatchGenWorker:
 
 		# Also cleanup AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 		AttnWrapperBase.gpu_paged_kv_manager = None
-		AttnWrapperBase.gpu_paged_kv_manager_aux = None
 		AttnWrapperBase.host_paged_kv_worker_view = None
-		AttnWrapperBase.host_paged_kv_worker_view_aux = None
 		AttnWrapperBase.cache_seqlens = None
 		AttnWrapperBase.attention_mask = None
 		AttnWrapperBase.position_ids = None
