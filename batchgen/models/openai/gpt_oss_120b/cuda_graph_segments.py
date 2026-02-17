@@ -76,7 +76,7 @@ class FullAttnSegment:
                 ("batch_size", 1, self.hidden_size), torch.bfloat16
             ),
             "cache_seqlens": TensorSpec(
-                ("batch_size",), torch.int32, fill_value=1
+                ("batch_size",), torch.int32, fill_value=0
             ),
             "page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
@@ -710,7 +710,7 @@ class WholeModelSegment:
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
             "input_ids": TensorSpec(("batch_size", 1), torch.int64, fill_value=0),
-            "cache_seqlens": TensorSpec(("batch_size",), torch.int32, fill_value=1),
+            "cache_seqlens": TensorSpec(("batch_size",), torch.int32, fill_value=0),
             "page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
