@@ -86,19 +86,8 @@ _GPT_OSS_GQA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
-# DeepSeek-V3.2 DSA: same MLA cache as V3, plus a separate indexer cache
-_DEEPSEEK_V3_2_INDEXER_PROFILE = _HostKVModelProfile(
-	num_layers=61,
-	num_k_heads=1,
-	k_head_dim=128,
-	num_v_heads=0,
-	v_head_dim=0,
-	kv_dtype="bfloat16",
-)
-
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
-	"deepseek_v3_2_indexer": _DEEPSEEK_V3_2_INDEXER_PROFILE,
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
 }
 
@@ -111,9 +100,6 @@ for canonical, aliases in {
 		"deepseek/deepseek-v3",
 		"deepseek-r1",
 		"deepseek-v3",
-		"deepseek-ai/deepseek-v3.2",
-		"deepseek/deepseek-v3.2",
-		"deepseek-v3.2",
 	),
 	"gpt_oss_gqa": (
 		"openai/gpt-oss-120b",
@@ -122,27 +108,6 @@ for canonical, aliases in {
 }.items():
 	for alias in aliases:
 		_PROFILE_ALIASES[alias.lower()] = canonical
-
-# DSA indexer profile aliases (used by build_*_aux functions)
-_INDEXER_PROFILE_ALIASES: Dict[str, str] = {}
-for canonical, aliases in {
-	"deepseek_v3_2_indexer": (
-		"deepseek-ai/deepseek-v3.2",
-		"deepseek/deepseek-v3.2",
-		"deepseek-v3.2",
-	),
-}.items():
-	for alias in aliases:
-		_INDEXER_PROFILE_ALIASES[alias.lower()] = canonical
-
-
-def _resolve_indexer_profile(model_name: str) -> _HostKVModelProfile | None:
-	"""Maps a model name to its DSA indexer profile, or None if not a DSA model."""
-	alias = model_name.strip().lower()
-	canonical = _INDEXER_PROFILE_ALIASES.get(alias)
-	if canonical is None:
-		return None
-	return _PROFILE_REGISTRY[canonical]
 
 
 def _resolve_profile(model_name: str) -> _HostKVModelProfile:
@@ -255,70 +220,7 @@ def build_gpu_kv_config(
 		kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
 	)
 
-
-HOST_KV_AUX_SHM_NAME = "batchgen_host_kv_cache_aux"
-
-
-def is_dsa_model(model_name: str) -> bool:
-	"""Returns True if the model uses Dynamic Sparse Attention (has indexer cache)."""
-	return _resolve_indexer_profile(model_name) is not None
-
-
-def build_gpu_kv_config_aux(
-	model_name: str, sequence_tokens: Sequence[int]
-) -> GPUPagedKVConfig | None:
-	"""Builds a GPUPagedKVConfig for the DSA indexer cache, or None if not a DSA model."""
-
-	profile = _resolve_indexer_profile(model_name)
-	if profile is None:
-		return None
-	num_pages = _compute_gpu_page_capacity(sequence_tokens, profile.page_size)
-	return GPUPagedKVConfig(
-		num_layers=profile.num_layers,
-		num_pages=num_pages,
-		page_size_tokens=profile.page_size,
-		num_k_heads=profile.num_k_heads,
-		k_head_dim=profile.k_head_dim,
-		num_v_heads=profile.num_v_heads,
-		v_head_dim=profile.v_head_dim,
-		kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
-	)
-
-
-def build_host_kv_config_aux(model_name: str, host_kv_cache_size: int) -> Any | None:
-	"""Builds a HostPagedKVConfig for the DSA indexer host cache, or None."""
-
-	profile = _resolve_indexer_profile(model_name)
-	if profile is None:
-		return None
-
-	host_budget = int(host_kv_cache_size)
-	if host_budget <= 0:
-		raise ValueError("host_kv_cache_size must be a positive integer")
-
-	bytes_per_page = profile.bytes_per_page()
-	denom = profile.num_layers * bytes_per_page
-	num_pages_per_layer = host_budget // denom
-
-	config = bg_lib.HostPagedKVConfig()
-	config.shm_name = HOST_KV_AUX_SHM_NAME
-	config.num_layers = profile.num_layers
-	config.num_pages = num_pages_per_layer
-	config.page_size_tokens = profile.page_size
-	config.num_k_heads = profile.num_k_heads
-	config.k_head_dim = profile.k_head_dim
-	config.num_v_heads = profile.num_v_heads
-	config.v_head_dim = profile.v_head_dim
-	config.k_element_size_bytes = _dtype_size_bytes(profile.kv_dtype)
-	config.v_element_size_bytes = 0
-	config.sequence_table_capacity = (
-		profile.sequence_table_capacity or config.num_pages
-	)
-	config.alignment_bytes = profile.alignment_bytes
-	return config
-
-
-# Legacy function below
+# In batchgen/kv_cache/host_kv_mananger_config.py (add this function)
 
 def build_gpu_kv_config_fixed_size(
 	model_name: str,
