@@ -1363,6 +1363,171 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	attn_output = attn_output.view(bsz, 1, -1)
 	return attn_output, k_tensor
 
+
+def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
+	self,
+	hidden_states: torch.Tensor,
+	q_position_ids: torch.Tensor,
+	cache_seqlens: torch.Tensor,
+	max_seqlen: int,
+	weight_scale: Optional[dict] = None,
+	gpu_paged_kv_manager: Optional['GPUPagedKVCacheManager'] = None,
+	layer_idx: int = 0,
+	batch_slice: Optional[tuple] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+	"""Pure BF16 MLA decoding for models like Kimi K2.5 (no FP8 quantization).
+
+	This function is identical to mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv
+	but uses pure BF16 linear operations instead of FP8 quantized GEMMs.
+
+	Args:
+		hidden_states: Input tensor [bsz, 1, hidden_dim]
+		q_position_ids: Position IDs [bsz, 1]
+		cache_seqlens: Sequence lengths [bsz]
+		max_seqlen: Maximum sequence length
+		weight_scale: Ignored (for compatibility)
+		gpu_paged_kv_manager: Paged KV cache manager
+		layer_idx: Current layer index
+		batch_slice: Optional (start_idx, end_idx) for micro-batching
+
+	Returns:
+		attn_output: Attention output [bsz, 1, hidden_dim]
+		k_tensor: KV tensor for callback [bsz, 1, 1, kv_dim]
+	"""
+	if gpu_paged_kv_manager is None:
+		raise ValueError(
+			"gpu_paged_kv_manager must be provided for page-KV decoding backend"
+		)
+
+	# ============ INPUT VALIDATION ============
+	assert hidden_states is not None, "hidden_states is None"
+	assert hidden_states.dim() == 3, f"hidden_states must be 3D, got {hidden_states.dim()}D"
+
+	bsz, q_len, hidden_dim = hidden_states.size()
+
+	# Early return for empty batch
+	if bsz == 0:
+		logging.debug(f"[Layer {layer_idx}] Empty batch (bsz=0), returning empty tensor")
+		return hidden_states, torch.empty(
+			0, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim,
+			dtype=hidden_states.dtype, device=hidden_states.device
+		)
+
+	if q_len != 1:
+		raise ValueError("mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv only supports q_len=1")
+
+	assert q_position_ids is not None, "q_position_ids is None"
+
+	if q_position_ids.shape[0] != bsz:
+		raise ValueError(
+			f"q_position_ids batch ({q_position_ids.shape[0]}) "
+			f"doesn't match hidden_states batch ({bsz})"
+		)
+
+	hidden_states = hidden_states.squeeze(1)  # [bsz, hidden_dim]
+
+	# ============ PURE BF16 PROJECTIONS (no quantization) ============
+	q = F.linear(hidden_states, self.q_a_proj.weight)
+	new_compressed_kv = F.linear(hidden_states, self.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
+
+	q = self.q_a_layernorm(q)
+	q = F.linear(q, self.q_b_proj.weight)
+
+	# ============ ROPE & QUERY PROCESSING ============
+	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+	q_pe = q_pe.contiguous()
+	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
+
+	# Validate RoPE cache size
+	max_pos_id = q_position_ids.max().item()
+	cos_seq_len = cos.size(0)
+	if max_pos_id >= cos_seq_len:
+		raise ValueError(
+			f"q_position_ids (max={max_pos_id}) exceed RoPE cache size ({cos_seq_len})"
+		)
+
+	# ============ KV CACHE UPDATE ============
+	offload_kv = fused_rmsnorm_rope_with_q(
+		new_compressed_kv,
+		q_pe,
+		cos,
+		sin,
+		q_position_ids,
+		self.kv_a_layernorm.weight,
+		self.kv_lora_rank,
+		self.qk_rope_head_dim,
+	)
+
+	manager_device = gpu_paged_kv_manager.device
+	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
+	sequence_lengths = q_position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
+
+	gpu_paged_kv_manager.update_layer_decode_new_token(
+		k_tensor=k_tensor,
+		v_tensor=None,
+		sequence_lengths=sequence_lengths,
+		layer_idx=layer_idx,
+		batch_slice=batch_slice,
+	)
+
+	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
+		layer_idx=layer_idx
+	)
+
+	# Apply batch slice for micro-batching
+	if batch_slice is not None:
+		start_idx, end_idx = batch_slice
+		block_table = block_table[start_idx:end_idx]
+
+	assert block_table.shape[0] == bsz, (
+		f"[Layer {layer_idx}] block_table batch mismatch: "
+		f"block_table.shape[0]={block_table.shape[0]} != bsz={bsz}"
+	)
+
+	# ============ KV_B_PROJ (Pure BF16, no dequantization) ============
+	kv_b_proj = self.kv_b_proj.weight.data.view(self.num_heads, -1, self.kv_lora_rank)
+	q_absorb = kv_b_proj[:, :self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
+
+	# ============ QUERY STATES CONSTRUCTION ============
+	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+	query_states = torch.empty(
+		bsz, self.num_heads, 1, qk_head_dim,
+		dtype=blocked_k.dtype, device=blocked_k.device,
+	)
+	q_nope = q_nope.squeeze(2)
+	query_states[:, :, :, :self.kv_lora_rank] = torch.einsum(
+		"bhd,hdc->bhc", q_nope, q_absorb
+	).view(bsz, self.num_heads, 1, self.kv_lora_rank)
+	query_states[:, :, :, self.kv_lora_rank:] = q_pe
+	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
+
+	# ============ FLASH MLA ATTENTION ============
+	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+
+	attn_out, _ = flash_mla_with_kvcache(
+		query_states,
+		blocked_k,
+		block_table,
+		cache_seqlens,
+		512,
+		tile_scheduler_metadata,
+		num_splits,
+		self.softmax_scale,
+		True,
+	)
+
+	# ============ OUTPUT PROJECTION (Pure BF16) ============
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	attn_output = attn_output.transpose(1, 2).contiguous()
+	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
+	attn_output = F.linear(attn_output, self.o_proj.weight)
+	attn_output = attn_output.view(bsz, 1, -1)
+
+	return attn_output, k_tensor
+
+
 # @torch.inference_mode()
 # def mla_decoding_flashmla_attn_mode_3_bf16_without_inplace_cache_update(
 # 	self,
