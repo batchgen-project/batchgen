@@ -528,6 +528,8 @@ class KimiK25Model(nn.Module):
             original_max_position_embeddings=rope_scaling.get("original_max_position_embeddings", 4096),
             beta_fast=rope_scaling.get("beta_fast", 32.0),
             beta_slow=rope_scaling.get("beta_slow", 1.0),
+            mscale=rope_scaling.get("mscale"),
+            mscale_all_dim=rope_scaling.get("mscale_all_dim"),
         )
 
         self.layers = nn.ModuleList([

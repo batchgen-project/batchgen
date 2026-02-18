@@ -24,6 +24,13 @@ import torch
 import torch.nn as nn
 
 
+def _yarn_get_mscale(scale=1, mscale=1):
+    """Compute YaRN mscale factor for softmax/RoPE scaling."""
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
 class YarnRotaryEmbedding(nn.Module):
     """YaRN Rotary Position Embedding with NTK-by-parts interpolation.
 
@@ -47,6 +54,8 @@ class YarnRotaryEmbedding(nn.Module):
         original_max_position_embeddings: int = 4096,
         beta_fast: float = 32.0,
         beta_slow: float = 1.0,
+        mscale: float = None,
+        mscale_all_dim: float = None,
         device: torch.device = None,
     ):
         super().__init__()
@@ -57,6 +66,8 @@ class YarnRotaryEmbedding(nn.Module):
         self.original_max_position_embeddings = original_max_position_embeddings
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        self.mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
 
         self._compute_inv_freq(device)
         self._set_cos_sin_cache(max_position_embeddings, device, torch.get_default_dtype())
@@ -68,7 +79,16 @@ class YarnRotaryEmbedding(nn.Module):
         )
 
         if self.scaling_factor > 1.0:
-            concentration = 0.1 * math.log(self.scaling_factor) + 1.0
+            if self.mscale is not None and self.mscale_all_dim is not None:
+                # DeepSeek/K2.5 style: mscale / mscale_all_dim ratio
+                # When mscale == mscale_all_dim (e.g., both 1.0), concentration = 1.0
+                concentration = float(
+                    _yarn_get_mscale(self.scaling_factor, self.mscale)
+                    / _yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+                )
+            else:
+                # GPT-OSS style: direct concentration
+                concentration = 0.1 * math.log(self.scaling_factor) + 1.0
 
             d_half = self.dim / 2
             low = (
