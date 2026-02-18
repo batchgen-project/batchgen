@@ -40,7 +40,14 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Optional, Tuple
 
+from dataclasses import dataclass
 from batchgen.layers.rotary_embedding import YarnRotaryEmbedding
+
+
+@dataclass
+class _CausalLMOutput:
+    """Minimal output container with .logits attribute for worker compatibility."""
+    logits: torch.Tensor
 
 
 # ============================================================================
@@ -374,11 +381,57 @@ class KimiK25MoE(nn.Module):
             self.moe_intermediate_size * n_shared,
         )
 
+    @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(
-            "KimiK25MoE.forward() is structural. "
-            "Use KimiK25ExpertWrapper for actual MoE computation."
-        )
+        """MoE forward with loop-based expert dispatch.
+
+        Routes tokens to top-k experts via the gate, dispatches to each expert
+        individually (compatible with INT4 wrappers), and adds shared expert output.
+        """
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        num_tokens, hidden_size = hidden_states.shape
+        device = hidden_states.device
+
+        # Gate routing
+        topk_idx, topk_weight = self.gate(identity)
+        # topk_idx: [num_tokens, top_k], topk_weight: [num_tokens, top_k]
+
+        K = self.top_k
+        flat_expert_idx = topk_idx.view(-1)  # [num_tokens * K]
+        flat_weights = topk_weight.view(-1)  # [num_tokens * K]
+        token_indices = torch.arange(num_tokens, device=device).repeat_interleave(K)
+        topk_positions = torch.arange(K, device=device).repeat(num_tokens)
+
+        # Accumulate weighted expert outputs
+        results = torch.zeros(num_tokens, hidden_size, device=device, dtype=torch.float32)
+
+        for expert_idx, expert in enumerate(self.experts):
+            if expert is None:
+                continue
+
+            # Find tokens routed to this expert
+            mask = flat_expert_idx == expert_idx
+            if not mask.any():
+                continue
+
+            expert_token_idx = token_indices[mask]
+            expert_topk_pos = topk_positions[mask]
+            tokens_for_expert = hidden_states[expert_token_idx]
+
+            expert_output = expert(tokens_for_expert)
+
+            expert_weights = topk_weight[expert_token_idx, expert_topk_pos]
+            weighted_output = expert_output.float() * expert_weights.unsqueeze(-1)
+            results.index_add_(0, expert_token_idx, weighted_output)
+
+        results = results.to(hidden_states.dtype)
+
+        # Add shared expert output
+        results = results + self.shared_experts(identity.view(-1, hidden_size))
+
+        return results.view(*orig_shape)
 
 
 # ============================================================================
@@ -475,17 +528,15 @@ class KimiK25Model(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
-        """Forward pass returning hidden states (no lm_head).
-
-        Args:
-            input_ids: Token IDs [batch, seq].
-            inputs_embeds: Pre-computed embeddings [batch, seq, hidden_size].
-
-        Returns:
-            hidden_states: [batch, seq, hidden_size]
-        """
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("Must provide either input_ids or inputs_embeds")
@@ -494,7 +545,12 @@ class KimiK25Model(nn.Module):
         hidden_states = inputs_embeds
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
+            layer_output = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
+            hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -521,11 +577,25 @@ class KimiK25ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> torch.Tensor:
-        hidden_states = self.model(input_ids=input_ids, inputs_embeds=inputs_embeds)
-        return self.lm_head(hidden_states)
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        **kwargs,
+    ):
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+        )
+        logits = self.lm_head(hidden_states)
+        return _CausalLMOutput(logits=logits)
 
     def eval(self):
-        """Set model to evaluation mode."""
         return super().eval()
