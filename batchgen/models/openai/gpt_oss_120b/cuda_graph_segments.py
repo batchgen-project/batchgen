@@ -313,17 +313,17 @@ class MoESegment:
         self.expert_start = moe_decode.expert_start
         self.num_local_experts = len(moe_decode.persistent_expert_indices)
 
-        # Router weight: store bf16 transpose for graph-compatible matmul
-        # Router matmul: all_tokens [WB, H] bf16 @ router_weight_t [H, E] bf16 → router_logits [WB, E] bf16
-        # Then cast the small [WB, E] result to f32 for gate kernel
-        self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()  # [H, E] bf16
+        # Fused gate context: caches weight transpose + TMA descriptor at init
+        # Replaces: cuBLAS mm + router_bias_cast + gate_topk_softmax (3 kernels → 2)
+        from batchgen.moe.routing import FusedGateContext
         _bias = getattr(moe_decode.router, 'bias', None)
-        self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
-        # For fused router_bias_cast kernel: empty tensor when no bias
-        self._router_bias_or_empty = (
-            self.router_bias_bf16 if self.router_bias_bf16 is not None
-            else torch.empty(0, dtype=torch.bfloat16, device=device)
+        _bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+        self.fused_gate_ctx = FusedGateContext(
+            moe_decode.router.weight,  # [E, K_dim] BF16 (nn.Linear weight)
+            _bias_bf16,
+            topk=self.num_experts_per_tok,
         )
+        self._fused_gate_warmed = False
 
         # Weight pointer arrays (at fixed GPU addresses)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -347,8 +347,10 @@ class MoESegment:
         self.s2_stride_scale_n = self.down_scale_ref.shape[1]
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """No-op: buffers are managed by SharedMoEBufferPool."""
-        pass
+        """Warmup fused gate TMA descriptor (once, against full base buffer)."""
+        if not self._fused_gate_warmed:
+            self.fused_gate_ctx.warmup(self.pool._base["all_tokens"])
+            self._fused_gate_warmed = True
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -367,8 +369,6 @@ class MoESegment:
     def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """CUDA-graph-compatible forward: no allocations, no CPU driver calls."""
         from batchgen.moe.routing import (
-            gate_topk_softmax_cuda,
-            router_bias_cast_cuda,
             dispatch_count_gather_cuda,
             reduce_weighted_scatter_cuda,
         )
@@ -393,20 +393,15 @@ class MoESegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 3. Router matmul in bf16 + fused bias add + f32 cast (1 cuBLAS + 1 fused kernel)
-        torch.mm(bufs["all_tokens"], self.router_weight_bf16_t, out=bufs["router_logits"])
-        router_bias_cast_cuda(bufs["router_logits"], self._router_bias_or_empty, bufs["router_f32"])
-
-        # 4. Gate top-k softmax (f32 input, pre-allocated int32/f32 outputs)
-        gate_topk_softmax_cuda(
-            bufs["router_f32"],
+        # 3+4. Fused gate: WGMMA GEMM + bias + TopK + Softmax (2 kernels)
+        self.fused_gate_ctx.forward(
+            bufs["all_tokens"],
+            logits=bufs["router_f32"],
             topk_indices=bufs["topk_indices"],
             topk_weights=bufs["topk_weights"],
-            k=self.num_experts_per_tok,
         )
 
-        # 5. Dispatch: count + prefix_sum + gather into pre-allocated buffers
-        # No zero_() needed: WGMMA reads only within expert_offsets; reduce writes all N rows
+        # 5. Dispatch: count+prefix_sum + gather (2 fused kernels)
         dispatch_count_gather_cuda(
             bufs["all_tokens"], bufs["topk_indices"],
             self.expert_start, self.num_local_experts,
@@ -485,14 +480,16 @@ class MoEComputeSegment:
         self.expert_start = moe_decode.expert_start
         self.num_local_experts = len(moe_decode.persistent_expert_indices)
 
-        # Router weight: bf16 transpose for graph-compatible matmul
-        self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()
+        # Fused gate context: caches weight transpose + TMA descriptor at init
+        from batchgen.moe.routing import FusedGateContext
         _bias = getattr(moe_decode.router, 'bias', None)
-        self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
-        self._router_bias_or_empty = (
-            self.router_bias_bf16 if self.router_bias_bf16 is not None
-            else torch.empty(0, dtype=torch.bfloat16, device=device)
+        _bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+        self.fused_gate_ctx = FusedGateContext(
+            moe_decode.router.weight,
+            _bias_bf16,
+            topk=self.num_experts_per_tok,
         )
+        self._fused_gate_warmed = False
 
         # Weight pointer arrays (for eager_compute)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -516,12 +513,11 @@ class MoEComputeSegment:
         self.s2_stride_scale_n = self.down_scale_ref.shape[1]
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """Enable NCCL communicator for graph capture.
-
-        The comm is disabled by default. Enable it before warmup/capture
-        so all_gather is recorded into the graph.
-        """
+        """Enable NCCL communicator and warmup fused gate TMA for graph capture."""
         self.comm.disabled = False
+        if not self._fused_gate_warmed:
+            self.fused_gate_ctx.warmup(self.pool._base["all_tokens"])
+            self._fused_gate_warmed = True
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -544,8 +540,6 @@ class MoEComputeSegment:
         all_reduce and local slice are done eagerly after graph replay.
         """
         from batchgen.moe.routing import (
-            gate_topk_softmax_cuda,
-            router_bias_cast_cuda,
             dispatch_count_gather_cuda,
             reduce_weighted_scatter_cuda,
         )
@@ -567,19 +561,15 @@ class MoEComputeSegment:
         )
         all_tokens = bufs["all_tokens"]
 
-        # 1. Router matmul in bf16 + fused bias add + f32 cast
-        torch.mm(all_tokens, self.router_weight_bf16_t, out=bufs["router_logits"])
-        router_bias_cast_cuda(bufs["router_logits"], self._router_bias_or_empty, bufs["router_f32"])
-
-        # 2. Gate top-k softmax
-        gate_topk_softmax_cuda(
-            bufs["router_f32"],
+        # 1+2. Fused gate: WGMMA GEMM + bias + TopK + Softmax (2 kernels)
+        self.fused_gate_ctx.forward(
+            all_tokens,
+            logits=bufs["router_f32"],
             topk_indices=bufs["topk_indices"],
             topk_weights=bufs["topk_weights"],
-            k=self.num_experts_per_tok,
         )
 
-        # 3. Dispatch: count + prefix_sum + gather
+        # 3. Dispatch: count+prefix_sum + gather (2 fused kernels)
         dispatch_count_gather_cuda(
             all_tokens, bufs["topk_indices"],
             self.expert_start, self.num_local_experts,
@@ -703,9 +693,12 @@ class WholeModelSegment:
         for layer in self.model.model.layers:
             layer._graph_capture_mode = True
 
-        # Enable NCCL for all MoE segments
+        # Enable NCCL and warmup fused gate for all MoE segments
         for seg in self.moe_segments.values():
             seg.comm.disabled = False
+            if not seg._fused_gate_warmed:
+                seg.fused_gate_ctx.warmup(seg.pool._base["all_tokens"])
+                seg._fused_gate_warmed = True
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
