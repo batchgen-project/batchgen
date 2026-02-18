@@ -417,7 +417,7 @@ class KimiK25DecoderLayer(nn.Module):
         # Pre-norm attention + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
+        hidden_states = self.self_attn(hidden_states=hidden_states)
         hidden_states = residual + hidden_states
 
         # Pre-norm MoE/FFN + residual
