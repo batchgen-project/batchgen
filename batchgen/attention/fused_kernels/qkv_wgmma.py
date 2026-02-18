@@ -649,6 +649,7 @@ def _get_module():
             name="batchgen_qkv_wgmma",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
+            functions=["qkv_wgmma_forward"],
             extra_cuda_cflags=cuda_flags,
             verbose=False,
         )
