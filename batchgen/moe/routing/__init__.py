@@ -5,6 +5,7 @@ from .cuda_routing import (
     router_bias_cast_cuda,
     dispatch_count_gather_cuda,
     reduce_weighted_scatter_cuda,
+    FusedGateContext,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "router_bias_cast_cuda",
     "dispatch_count_gather_cuda",
     "reduce_weighted_scatter_cuda",
+    "FusedGateContext",
 ]
