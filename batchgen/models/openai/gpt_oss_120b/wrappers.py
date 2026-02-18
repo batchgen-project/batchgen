@@ -1024,6 +1024,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
         self.is_sliding = (layer_idx % 2 == 0)
         self.sliding_window = model_config.sliding_window if self.is_sliding else None
 
+        # Use WGMMA fused kernel when available (SM90+)
+        from batchgen.attention.fused_kernels import is_qkv_wgmma_available
+        self._use_wgmma = is_qkv_wgmma_available()
+
         # Sink token parameter will be loaded with weights
         self.sinks = None
 
@@ -1138,33 +1142,44 @@ class GptOssAttnWrapper(AttnWrapperBase):
         """
         batch, seq_len, _ = hidden_states.shape
 
-        # Project Q, K, V using module's projections
-        qkv = self.module.qkv_proj(hidden_states)
-        from batchgen.attention.fused_kernels import cuda_qkv_split
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
-
-        # Reshape for attention: [batch, seq, heads, head_dim]
-        query = query.view(batch, seq_len, self.num_heads, self.head_dim)
-        key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
-        value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
-
-        # Get RoPE embeddings
+        # Project Q, K, V + RoPE
         kv_seq_len = seq_len
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[1]
 
-        cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=kv_seq_len)
-
-        # Get cos/sin for positions
-        if position_ids is not None:
-            cos = cos[position_ids]
-            sin = sin[position_ids]
+        if self._use_wgmma:
+            from batchgen.attention.fused_kernels import cuda_qkv_wgmma
+            cos_table = self.module.rotary_emb.cos_cached[:kv_seq_len].to(hidden_states.dtype)
+            sin_table = self.module.rotary_emb.sin_cached[:kv_seq_len].to(hidden_states.dtype)
+            if position_ids is not None:
+                rope_cos = cos_table[position_ids].reshape(-1, self.head_dim)
+                rope_sin = sin_table[position_ids].reshape(-1, self.head_dim)
+            else:
+                rope_cos = cos_table[:seq_len]
+                rope_sin = sin_table[:seq_len]
+            hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+            query, key, value = cuda_qkv_wgmma(
+                hidden_2d, self.module.qkv_proj.weight, self.module.qkv_proj.bias,
+                self.q_size, self.kv_size, None, rope_cos, rope_sin, self.head_dim,
+            )
+            query = query.view(batch, seq_len, self.num_heads, self.head_dim)
+            key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
         else:
-            cos = cos[:seq_len]
-            sin = sin[:seq_len]
-
-        # Apply RoPE
-        query, key = self._apply_rotary(query, key, cos, sin)
+            qkv = self.module.qkv_proj(hidden_states)
+            from batchgen.attention.fused_kernels import cuda_qkv_split
+            query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
+            query = query.view(batch, seq_len, self.num_heads, self.head_dim)
+            key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=kv_seq_len)
+            if position_ids is not None:
+                cos = cos[position_ids]
+                sin = sin[position_ids]
+            else:
+                cos = cos[:seq_len]
+                sin = sin[:seq_len]
+            query, key = self._apply_rotary(query, key, cos, sin)
 
         # Handle KV cache
         if past_key_value is not None:
@@ -1247,39 +1262,16 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 past_key_value, output_attentions, use_cache, **kwargs
             )
 
-        # === Stage 1: Project Q, K, V for the new token ===
-        if do_timing:
-            t0 = time.perf_counter()
-
-        qkv = self.module.qkv_proj(hidden_states)
-        from batchgen.attention.fused_kernels import cuda_qkv_split
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
-
-        # Reshape: [batch, 1, num_heads, head_dim]
-        query = query.view(batch, seq_len, self.num_heads, self.head_dim)
-        key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
-        value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
-
-        if do_timing:
-            torch.cuda.synchronize()
-            DecodeTimingStats.attn_projection_ms += (time.perf_counter() - t0) * 1000
-
-        # === Stage 2: Get and apply RoPE ===
-        if do_timing:
-            t0 = time.perf_counter()
-
-        # cache_seqlens represents the total context length (including the current token to be processed).
-        # The current token's KV should be written at position cache_seqlens - 1 (0-indexed).
-        # This matches DeepSeek which uses position_ids = cache_seqlens - 1.
+        # === Precompute position info (needed by both WGMMA and cuBLAS paths) ===
+        micro_cache_seqlens = None
+        current_token_position = None
         if cache_seqlens is not None:
-            # Apply batch_slice if provided
             if batch_slice is not None:
                 start_idx, end_idx = batch_slice
                 micro_cache_seqlens = cache_seqlens[start_idx:end_idx]
             else:
                 micro_cache_seqlens = cache_seqlens
 
-            # Handle empty batch slice (happens when batch < world_size in EP mode)
             if micro_cache_seqlens.numel() == 0:
                 return (
                     torch.empty((0, 1, hidden_states.shape[-1]), device=hidden_states.device, dtype=hidden_states.dtype),
@@ -1287,35 +1279,57 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     None
                 )
 
-            # CRITICAL: cache_seqlens is the token COUNT (e.g., 11).
-            # The current token's position is cache_seqlens - 1 (e.g., 10).
-            # This matches DeepSeek which uses position_ids = cache_seqlens - 1.
             current_token_position = micro_cache_seqlens - 1
 
-            # Use pre-computed max_seqlen from AttnWrapperBase (set once per decode step)
-            # to avoid per-layer CPU-GPU sync from .item()
+        # === Stage 1+2: Project Q, K, V + RoPE ===
+        if do_timing:
+            t0 = time.perf_counter()
+
+        if self._use_wgmma and cache_seqlens is not None:
+            from batchgen.attention.fused_kernels import cuda_qkv_wgmma
+            if False:  # was: diagnostic print to verify eager path uses WGMMA
+                print("[WGMMA-QKV] eager decode: using cuda_qkv_wgmma (layer 0)")
             max_seqlen = AttnWrapperBase.max_seqlen
-            cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
+            cos_table = self.module.rotary_emb.cos_cached[:max_seqlen].to(hidden_states.dtype)
+            sin_table = self.module.rotary_emb.sin_cached[:max_seqlen].to(hidden_states.dtype)
+            rope_cos = cos_table[current_token_position]  # [batch, head_dim]
+            rope_sin = sin_table[current_token_position]  # [batch, head_dim]
 
-            # Apply RoPE at each sequence's current position (cache_seqlens - 1)
-            # CRITICAL: Always use current_token_position from cache_seqlens, ignore model's position_ids.
-            # The model may generate wrong position_ids (e.g., [[0]]) if not properly configured.
-            # Using cache_seqlens ensures correctness regardless of what the model passes.
-            # Indexing by [batch] tensor gives [batch, head_dim]
-            # Need to add seq dimension: [batch, head_dim] -> [batch, 1, head_dim]
-            cos = cos[current_token_position].unsqueeze(1)
-            sin = sin[current_token_position].unsqueeze(1)
+            hidden_2d = hidden_states.view(batch, -1)
+            query, key, value = cuda_qkv_wgmma(
+                hidden_2d, self.module.qkv_proj.weight, self.module.qkv_proj.bias,
+                self.q_size, self.kv_size, None,
+                rope_cos, rope_sin, self.head_dim,
+            )
+            query = query.view(batch, seq_len, self.num_heads, self.head_dim)
+            key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
         else:
-            # Fallback if cache_seqlens not set
-            cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
-            cos = cos[:1]
-            sin = sin[:1]
+            qkv = self.module.qkv_proj(hidden_states)
+            from batchgen.attention.fused_kernels import cuda_qkv_split
+            query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
-        query, key = self._apply_rotary(query, key, cos, sin)
+            query = query.view(batch, seq_len, self.num_heads, self.head_dim)
+            key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+
+            if cache_seqlens is not None:
+                max_seqlen = AttnWrapperBase.max_seqlen
+                cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
+                cos = cos[current_token_position].unsqueeze(1)
+                sin = sin[current_token_position].unsqueeze(1)
+            else:
+                cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
+                cos = cos[:1]
+                sin = sin[:1]
+
+            query, key = self._apply_rotary(query, key, cos, sin)
 
         if do_timing:
             torch.cuda.synchronize()
-            DecodeTimingStats.attn_rope_ms += (time.perf_counter() - t0) * 1000
+            elapsed = (time.perf_counter() - t0) * 1000
+            DecodeTimingStats.attn_projection_ms += elapsed
+            # RoPE is fused into projection for WGMMA path; attribute both to projection
 
         # === Stage 3: Write new K, V to paged GPU cache ===
         if do_timing:
@@ -1747,72 +1761,51 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     else:
                         print(f"[PREFILL L0] OK: seq0 and seq1 DIFFER at end (different questions)")
 
-        # Project Q, K, V in varlen format
+        # Project Q, K, V + RoPE in varlen format
         # hidden_states_2d: [total_tokens, hidden_size]
-        qkv = self.module.qkv_proj(hidden_states_2d)  # [total_tokens, q_size + 2 * kv_size]
-        from batchgen.attention.fused_kernels import cuda_qkv_split
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
+        if self._use_wgmma and position_ids is not None:
+            from batchgen.attention.fused_kernels import cuda_qkv_wgmma
+            cos_table = self.module.rotary_emb.cos_cached[:max_seqlen].to(hidden_states_2d.dtype)
+            sin_table = self.module.rotary_emb.sin_cached[:max_seqlen].to(hidden_states_2d.dtype)
+            rope_cos = cos_table[position_ids]  # [total_tokens, head_dim]
+            rope_sin = sin_table[position_ids]
+            query, key, value = cuda_qkv_wgmma(
+                hidden_states_2d, self.module.qkv_proj.weight, self.module.qkv_proj.bias,
+                self.q_size, self.kv_size, None, rope_cos, rope_sin, self.head_dim,
+            )
+            query = query.view(total_tokens, self.num_heads, self.head_dim)
+            key = key.view(total_tokens, self.num_kv_heads, self.head_dim)
+            value = value.view(total_tokens, self.num_kv_heads, self.head_dim)
+        else:
+            qkv = self.module.qkv_proj(hidden_states_2d)  # [total_tokens, q_size + 2 * kv_size]
+            from batchgen.attention.fused_kernels import cuda_qkv_split
+            query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
+            query = query.view(total_tokens, self.num_heads, self.head_dim)
+            key = key.view(total_tokens, self.num_kv_heads, self.head_dim)
+            value = value.view(total_tokens, self.num_kv_heads, self.head_dim)
 
-        # Reshape to [total_tokens, num_heads, head_dim]
-        query = query.view(total_tokens, self.num_heads, self.head_dim)
-        key = key.view(total_tokens, self.num_kv_heads, self.head_dim)
-        value = value.view(total_tokens, self.num_kv_heads, self.head_dim)
+            # Apply RoPE per sequence using position_ids
+            if position_ids is not None:
+                cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+                cos = cos[position_ids]  # [total_tokens, head_dim]
+                sin = sin[position_ids]  # [total_tokens, head_dim]
 
-        # DEBUG: Check K after projection, before RoPE
-        if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
-            print(f"\n[PREFILL L0] === AFTER K_PROJ (before RoPE) ===")
-            if cu_seqlens is not None and num_sequences >= 2:
-                k0_pre = key[cu_seqlens[0].item(), 0, :4].cpu().tolist()
-                k1_pre = key[cu_seqlens[1].item(), 0, :4].cpu().tolist()
-                print(f"[PREFILL L0] K_pre_rope seq0[0,:4] = {k0_pre}")
-                print(f"[PREFILL L0] K_pre_rope seq1[0,:4] = {k1_pre}")
-                if k0_pre == k1_pre:
-                    print(f"[PREFILL L0] *** K already IDENTICAL before RoPE! ***")
-                else:
-                    print(f"[PREFILL L0] OK: K differs before RoPE")
+                half_dim = self.head_dim // 2
+                q1, q2 = query[..., :half_dim], query[..., half_dim:]
+                k1, k2 = key[..., :half_dim], key[..., half_dim:]
 
-        # Apply RoPE per sequence using position_ids
-        if position_ids is not None:
-            cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
-            # Get cos/sin for each position
-            cos = cos[position_ids]  # [total_tokens, head_dim]
-            sin = sin[position_ids]  # [total_tokens, head_dim]
+                cos_half = cos[..., :half_dim].unsqueeze(1)  # [total_tokens, 1, half_dim]
+                sin_half = sin[..., :half_dim].unsqueeze(1)
 
-            # Apply RoPE - split heads for rotation
-            half_dim = self.head_dim // 2
-            q1, q2 = query[..., :half_dim], query[..., half_dim:]
-            k1, k2 = key[..., :half_dim], key[..., half_dim:]
+                query = torch.cat([
+                    q1 * cos_half - q2 * sin_half,
+                    q2 * cos_half + q1 * sin_half
+                ], dim=-1)
 
-            cos_half = cos[..., :half_dim].unsqueeze(1)  # [total_tokens, 1, half_dim]
-            sin_half = sin[..., :half_dim].unsqueeze(1)
-
-            query = torch.cat([
-                q1 * cos_half - q2 * sin_half,
-                q2 * cos_half + q1 * sin_half
-            ], dim=-1)
-
-            key = torch.cat([
-                k1 * cos_half - k2 * sin_half,
-                k2 * cos_half + k1 * sin_half
-            ], dim=-1)
-
-            # DEBUG: Check K after RoPE
-            if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
-                print(f"\n[PREFILL L0] === AFTER RoPE ===")
-                print(f"[PREFILL L0] position_ids[:10] = {position_ids[:10].cpu().tolist()}")
-                print(f"[PREFILL L0] position_ids at seq boundaries:")
-                for i in range(min(3, num_sequences)):
-                    s_idx = cu_seqlens[i].item()
-                    print(f"[PREFILL L0]   position_ids[{s_idx}] = {position_ids[s_idx].item()}")
-                if num_sequences >= 2:
-                    k0_post = key[cu_seqlens[0].item(), 0, :4].cpu().tolist()
-                    k1_post = key[cu_seqlens[1].item(), 0, :4].cpu().tolist()
-                    print(f"[PREFILL L0] K_post_rope seq0[0,:4] = {k0_post}")
-                    print(f"[PREFILL L0] K_post_rope seq1[0,:4] = {k1_post}")
-                    if k0_post == k1_post:
-                        print(f"[PREFILL L0] *** K became IDENTICAL after RoPE! ***")
-                    else:
-                        print(f"[PREFILL L0] OK: K differs after RoPE")
+                key = torch.cat([
+                    k1 * cos_half - k2 * sin_half,
+                    k2 * cos_half + k1 * sin_half
+                ], dim=-1)
 
         # Use gqa_prefill_fa for varlen attention with sink correction
         # q, k, v: [total_tokens, num_heads, head_dim]
