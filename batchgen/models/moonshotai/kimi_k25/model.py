@@ -404,7 +404,16 @@ class KimiK25DecoderLayer(nn.Module):
         else:
             self.mlp = KimiK25MoE(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ):
         # Pre-norm attention + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -417,7 +426,7 @@ class KimiK25DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        return (hidden_states, None, None)
 
 
 # ============================================================================
