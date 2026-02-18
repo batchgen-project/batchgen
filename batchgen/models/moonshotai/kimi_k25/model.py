@@ -259,8 +259,19 @@ class MoEGate(nn.Module):
             topk_idx: [total_tokens, top_k] — selected expert indices
             topk_weight: [total_tokens, top_k] — normalized + scaled weights
         """
-        bsz, seq_len, h = hidden_states.shape
+        if hidden_states.dim() == 2:
+            num_tokens, h = hidden_states.shape
+        else:
+            bsz, seq_len, h = hidden_states.shape
+            num_tokens = bsz * seq_len
         hidden_states = hidden_states.view(-1, h)
+
+        # Early return for zero tokens (can happen on some ranks during decode)
+        if num_tokens == 0:
+            return (
+                torch.empty(0, self.top_k, dtype=torch.long, device=hidden_states.device),
+                torch.empty(0, self.top_k, dtype=hidden_states.dtype, device=hidden_states.device),
+            )
 
         logits = F.linear(hidden_states.float(), self.weight.float(), None)
         scores = logits.sigmoid()
@@ -270,7 +281,7 @@ class MoEGate(nn.Module):
 
         # Group-based selection (n_group=1 makes this a simple topk)
         group_scores = (
-            scores_for_choice.view(bsz * seq_len, self.n_group, -1)
+            scores_for_choice.view(num_tokens, self.n_group, -1)
             .topk(2, dim=-1)[0]
             .sum(dim=-1)
         )
@@ -281,8 +292,8 @@ class MoEGate(nn.Module):
         group_mask.scatter_(1, group_idx, 1)
         score_mask = (
             group_mask.unsqueeze(-1)
-            .expand(bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(bsz * seq_len, -1)
+            .expand(num_tokens, self.n_group, self.n_routed_experts // self.n_group)
+            .reshape(num_tokens, -1)
         )
         tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
@@ -300,7 +311,11 @@ class MoEGate(nn.Module):
     @torch.compile(mode="max-autotune", backend="inductor")
     def decoding_forward(self, hidden_states):
         """Decode-optimized routing (torch.compiled)."""
-        bsz, seq_len, h = hidden_states.shape
+        if hidden_states.dim() == 2:
+            num_tokens, h = hidden_states.shape
+        else:
+            bsz, seq_len, h = hidden_states.shape
+            num_tokens = bsz * seq_len
         hidden_states = hidden_states.view(-1, h)
 
         logits = F.linear(hidden_states.float(), self.weight.float(), None)
@@ -308,7 +323,7 @@ class MoEGate(nn.Module):
 
         scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
         group_scores = (
-            scores_for_choice.view(bsz * seq_len, self.n_group, -1)
+            scores_for_choice.view(num_tokens, self.n_group, -1)
             .topk(2, dim=-1)[0]
             .sum(dim=-1)
         )
@@ -319,8 +334,8 @@ class MoEGate(nn.Module):
         group_mask.scatter_(1, group_idx, 1)
         score_mask = (
             group_mask.unsqueeze(-1)
-            .expand(bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(bsz * seq_len, -1)
+            .expand(num_tokens, self.n_group, self.n_routed_experts // self.n_group)
+            .reshape(num_tokens, -1)
         )
         tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
