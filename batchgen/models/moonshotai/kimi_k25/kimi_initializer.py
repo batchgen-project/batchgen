@@ -36,7 +36,7 @@ import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
-from .assets.configuration_deepseek_v3 import KimiK25ModelConfig
+from .config import KimiK25Config
 from .planner import KimiK25Planner
 
 try:
@@ -59,9 +59,8 @@ class KimiK25Initializer:
         # Load BatchGen config (single source of truth for K2.5 params)
         self.batchgen_config = load_config(input_arguments.huggingface_ckpt_name)
 
-        # Create HF config for model instantiation.
-        # KimiK25ModelConfig defaults are already K2.5 values.
-        self.loaded_model_config = KimiK25ModelConfig()
+        # Create BatchGen config for model instantiation.
+        self.loaded_model_config = KimiK25Config()
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size

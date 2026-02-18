@@ -28,7 +28,7 @@ Key differences from DeepSeek-V3 PSM:
 - Loads INT4 packed/scale tensors for persistent experts
 """
 
-from .assets.modeling_deepseek import KimiK25ForCausalLM
+from .model import KimiK25ForCausalLM
 from .wrappers import KimiK25ExpertWrapper, KimiK25AttnWrapper
 import logging
 import types

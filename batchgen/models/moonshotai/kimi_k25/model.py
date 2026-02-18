@@ -16,28 +16,31 @@
 #  limitations under the License.                                               #
 # ---------------------------------------------------------------------------- #
 
-"""Kimi K2.5 model definition following BatchGen flat design pattern.
-
-This module defines the core model structure for Kimi K2.5 (DeepSeek-V3 architecture
-with K2.5-specific hyperparameters). Weight loading, quantization, and inference
-optimization are handled by separate wrappers and parameter server.
+"""Kimi K2.5 model definition following BatchGen design pattern.
 
 Architecture:
-    - 61 transformer layers (3 dense + 58 MoE)
+    - 61 transformer layers (1 dense + 60 MoE)
     - MLA attention with 64 heads, kv_lora_rank=512
     - 384 routed experts + 1 shared expert per MoE layer
     - INT4 W4A16 quantization (routed experts only)
-    - RoPE theta=50000, YaRN scaling
+    - Shared YaRN RoPE (single instance across all layers)
     - RMSNorm (eps=1e-6)
 
-Reference: DeepSeek-V3 architecture with K2.5 modifications.
+Design:
+    - KimiK25ForCausalLM (outer): .model + .lm_head (worker-compatible)
+    - KimiK25Model (inner): .embed_tokens, .layers, .norm
+    - Wrappers handle optimized forward (INT4 dequant, FlashAttention, KV cache)
 """
+
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
 from typing import Optional, Tuple
 
-from .config import KimiK25Config
+from batchgen.layers.rotary_embedding import YarnRotaryEmbedding
 
 
 # ============================================================================
@@ -67,19 +70,16 @@ class RMSNorm(nn.Module):
 class KimiK25Attention(nn.Module):
     """MLA attention for K2.5.
 
-    Multi-head Latent Attention with compressed KV cache:
-        - Q projection: q_a (1536) → q_b (64*192=12,288)
-        - KV projection: kv_a (576) → kv_b (64*256=16,384)
-        - Compressed KV cache: 576-dim instead of separate K/V
-        - RoPE on qk_rope_dim=64, non-rope on qk_nope_dim=128
-        - 64 attention heads, v_head_dim=128
+    Structural definition — actual forward (FlashAttention, RoPE, KV cache)
+    is handled by KimiK25AttnWrapper.
 
-    This is a structural stub — actual forward pass (FlashAttention, RoPE,
-    KV cache) is handled by KimiK25AttnWrapper for prefill/decode dispatch.
+    The rotary_emb attribute is assigned externally by KimiK25Model to share
+    a single YarnRotaryEmbedding instance across all layers.
     """
 
-    def __init__(self, config: KimiK25Config, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads  # 64
@@ -89,23 +89,25 @@ class KimiK25Attention(nn.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim  # 64
         self.v_head_dim = config.v_head_dim  # 128
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 192
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+        self.attention_dropout = config.attention_dropout
 
         # Q projection with low-rank compression
         self.q_a_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = nn.Linear(
             self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
         )
 
         # KV projection with MQA-style compression
-        # Output: kv_lora_rank (512) for compressed KV + qk_rope_head_dim (64) for K RoPE
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=1e-6)
-        # Output: num_heads * (qk_nope_head_dim + v_head_dim) = 64 * (128 + 128) = 16,384
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -117,65 +119,211 @@ class KimiK25Attention(nn.Module):
             self.num_heads * self.v_head_dim, self.hidden_size, bias=False
         )
 
+        # RoPE — assigned by KimiK25Model (shared across layers)
+        self.rotary_emb = None
+
+        # Softmax scales for MLA (materialized and unmaterialized KV)
+        self.qkv_materialized_softmax_scale = self.q_head_dim ** -0.5
+        self.qkv_unmaterialized_softmax_scale = (self.kv_lora_rank + self.qk_rope_head_dim) ** -0.5
+        if config.rope_scaling is not None:
+            mscale_all_dim = config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = _yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.qkv_materialized_softmax_scale *= mscale * mscale
+                self.qkv_unmaterialized_softmax_scale *= mscale * mscale
+        self.softmax_scale = self.qkv_materialized_softmax_scale
+
+    def initialize(self):
+        """Pre-compute absorbed projections for decode phase."""
+        if getattr(self.config, 'phase', None) == "decode":
+            kv_b_proj = self.kv_b_proj.weight.view(
+                self.num_heads, -1, self.kv_lora_rank
+            )
+            self.q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+            self.out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MLA forward pass (stub).
-
-        The actual implementation (FlashAttention-2, RoPE, KV cache) is handled
-        by KimiK25AttnWrapper which intercepts this call.
-
-        This stub defines the projection structure only.
-
-        Args:
-            hidden_states: [batch, seq, hidden_size]
-
-        Returns:
-            attn_output: [batch, seq, hidden_size]
-        """
-        # This forward is a placeholder — wrappers intercept for optimized attention
-        # The projections (q_a/q_b/kv_a/kv_b/o) are used by wrappers
         raise NotImplementedError(
-            "KimiK25Attention.forward() is a stub. "
+            "KimiK25Attention.forward() is structural. "
             "Use KimiK25AttnWrapper for actual attention computation."
         )
 
 
+def _yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
 # ============================================================================
-# Dense MLP (First 3 Layers)
+# Expert MLP
+# ============================================================================
+
+class KimiK25Expert(nn.Module):
+    """Single expert FFN with SiLU gating.
+
+    Used for both routed experts (INT4 W4A16, weights managed by wrappers)
+    and shared experts (BF16, weights loaded directly).
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = nn.SiLU()
+
+    @torch.inference_mode()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+# ============================================================================
+# Dense MLP (Layer 0)
 # ============================================================================
 
 class DenseMLP(nn.Module):
-    """Dense FFN for first 3 K2.5 layers (non-MoE).
+    """Dense FFN for K2.5 layer 0 (non-MoE).
 
-    Standard SwiGLU-style MLP:
-        gate_out = SiLU(gate_proj(x))
-        up_out = up_proj(x)
-        output = down_proj(gate_out * up_out)
-
-    No expert routing — always active for all tokens.
+    Uses larger intermediate_size (18432) than MoE experts (2048).
     """
 
-    def __init__(self, config: KimiK25Config):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size  # 18432
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Dense MLP forward.
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+
+
+# ============================================================================
+# MoE Gate (Router)
+# ============================================================================
+
+class MoEGate(nn.Module):
+    """MoE router with sigmoid scoring and top-k selection.
+
+    K2.5 specifics:
+        - Sigmoid scoring (not softmax)
+        - n_group=1, topk_group=1 (no group-based selection)
+        - routed_scaling_factor=2.5
+        - e_score_correction_bias for noaux_tc routing
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok  # 8
+        self.n_routed_experts = config.n_routed_experts  # 384
+        self.routed_scaling_factor = config.routed_scaling_factor  # 2.5
+        self.scoring_func = config.scoring_func  # "sigmoid"
+        self.topk_method = config.topk_method  # "noaux_tc"
+        self.n_group = config.n_group  # 1
+        self.topk_group = config.topk_group  # 1
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.weight = nn.Parameter(
+            torch.empty(self.n_routed_experts, config.hidden_size)
+        )
+        if self.topk_method == "noaux_tc":
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty(self.n_routed_experts)
+            )
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    @torch.inference_mode()
+    def warmup(self):
+        pass
+
+    def forward(self, hidden_states: torch.Tensor):
+        """Standard routing forward.
 
         Args:
             hidden_states: [batch, seq, hidden_size]
 
         Returns:
-            output: [batch, seq, hidden_size]
+            topk_idx: [total_tokens, top_k] — selected expert indices
+            topk_weight: [total_tokens, top_k] — normalized + scaled weights
         """
-        gate_out = self.act_fn(self.gate_proj(hidden_states))
-        up_out = self.up_proj(hidden_states)
-        return self.down_proj(gate_out * up_out)
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+
+        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        scores = logits.sigmoid()
+
+        # Top-k with noaux_tc correction bias
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+
+        # Group-based selection (n_group=1 makes this a simple topk)
+        group_scores = (
+            scores_for_choice.view(bsz * seq_len, self.n_group, -1)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )
+        group_idx = torch.topk(
+            group_scores, k=self.topk_group, dim=-1, sorted=False
+        )[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group)
+            .reshape(bsz * seq_len, -1)
+        )
+        tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
+        topk_weight = scores.gather(1, topk_idx)
+
+        # Normalize and scale
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+        topk_weight = topk_weight * self.routed_scaling_factor
+
+        return topk_idx, topk_weight
+
+    @torch.inference_mode()
+    @torch.compile(mode="max-autotune", backend="inductor")
+    def decoding_forward(self, hidden_states):
+        """Decode-optimized routing (torch.compiled)."""
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+
+        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        scores = logits.sigmoid()
+
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        group_scores = (
+            scores_for_choice.view(bsz * seq_len, self.n_group, -1)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )
+        group_idx = torch.topk(
+            group_scores, k=self.topk_group, dim=-1, sorted=False
+        )[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group)
+            .reshape(bsz * seq_len, -1)
+        )
+        tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
+        topk_weight = scores.gather(1, topk_idx)
+
+        denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+        topk_weight = topk_weight / denominator
+        topk_weight = topk_weight * self.routed_scaling_factor
+
+        return topk_idx, topk_weight.to(hidden_states.dtype)
 
 
 # ============================================================================
@@ -185,64 +333,51 @@ class DenseMLP(nn.Module):
 class KimiK25MoE(nn.Module):
     """MoE layer with 384 routed + 1 shared expert.
 
-    Routing: Simple top-8 (n_group=1, no group-based selection)
-    Experts: INT4 W4A16 quantization (routed), BF16 (shared)
-    Kernels: Fused gate+up projection via grouped GEMM
-
-    This is a structural stub — actual expert forward (INT4 dequant + grouped GEMM)
-    is handled by KimiK25ExpertWrapper for prefill/decode dispatch.
+    In EP mode (decode), only local experts are instantiated; rest are None.
+    Wrappers handle the actual forward pass (INT4 dequant, routing execution).
     """
 
-    def __init__(self, config: KimiK25Config):
+    def __init__(self, config):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.num_experts = config.n_routed_experts  # 384
         self.top_k = config.num_experts_per_tok  # 8
         self.moe_intermediate_size = config.moe_intermediate_size  # 2048
+        self.num_experts_per_tok = config.num_experts_per_tok
 
-        # Router (BF16)
-        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        # Router
+        self.gate = MoEGate(config)
 
-        # Routed experts (stubs — wrappers handle INT4 dequant + GEMM)
-        # Each expert: gate_proj (7168 → 2048), up_proj (7168 → 2048), down_proj (2048 → 7168)
-        # Actual forward handled by KimiK25ExpertWrapper
-        # We define structure only (nn.ModuleList for weight storage)
-        self.experts = nn.ModuleList([
-            nn.ModuleDict({
-                'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-                'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-                'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False),
-            })
-            for _ in range(self.num_experts)
-        ])
+        # Routed experts — EP mode creates None placeholders for non-local experts
+        ep_size = getattr(config, 'ep_size', 1)
+        if ep_size > 1 and dist.is_initialized():
+            rank = dist.get_rank()
+            experts_per_rank = self.num_experts // ep_size
+            start = rank * experts_per_rank
+            end = start + experts_per_rank
+            self.experts = nn.ModuleList([
+                KimiK25Expert(self.hidden_size, self.moe_intermediate_size)
+                if start <= i < end else None
+                for i in range(self.num_experts)
+            ])
+        else:
+            self.experts = nn.ModuleList([
+                KimiK25Expert(self.hidden_size, self.moe_intermediate_size)
+                for _ in range(self.num_experts)
+            ])
 
         # Shared expert (BF16, always active)
-        self.shared_experts = nn.ModuleDict({
-            'gate_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-            'up_proj': nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False),
-            'down_proj': nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False),
-        })
-        self.act_fn = nn.SiLU()
+        n_shared = getattr(config, 'n_shared_experts', 1)
+        self.shared_experts = KimiK25Expert(
+            self.hidden_size,
+            self.moe_intermediate_size * n_shared,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MoE forward pass (stub).
-
-        The actual implementation (top-k routing, INT4 dequant, grouped GEMM) is
-        handled by KimiK25ExpertWrapper which intercepts this call.
-
-        This stub defines the router and expert structure only.
-
-        Args:
-            hidden_states: [batch, seq, hidden_size]
-
-        Returns:
-            output: [batch, seq, hidden_size]
-        """
-        # This forward is a placeholder — wrappers intercept for optimized MoE
-        # The gate and expert weights are used by wrappers
         raise NotImplementedError(
-            "KimiK25MoE.forward() is a stub. "
-            "Use KimiK25ExpertWrapper for actual expert computation."
+            "KimiK25MoE.forward() is structural. "
+            "Use KimiK25ExpertWrapper for actual MoE computation."
         )
 
 
@@ -251,41 +386,25 @@ class KimiK25MoE(nn.Module):
 # ============================================================================
 
 class KimiK25DecoderLayer(nn.Module):
-    """Single K2.5 transformer layer with MLA attention + MoE/dense FFN.
+    """Single K2.5 transformer layer with pre-norm architecture.
 
-    Pre-norm architecture:
-        1. LayerNorm → Attention → Residual
-        2. LayerNorm → MLP/MoE → Residual
-
-    First 3 layers use DenseMLP, remaining 58 layers use KimiK25MoE.
+    Layer 0: dense MLP. Layers 1-60: MoE with 384 routed + 1 shared expert.
     """
 
-    def __init__(self, config: KimiK25Config, layer_idx: int):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
 
-        # Pre-norm for attention
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = KimiK25Attention(config, layer_idx)
-
-        # Pre-norm for MLP/MoE
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # First 3 layers: dense MLP, remaining: MoE
         if layer_idx < config.first_k_dense_replace:
             self.mlp = DenseMLP(config)
         else:
             self.mlp = KimiK25MoE(config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Layer forward with pre-norm + residual connections.
-
-        Args:
-            hidden_states: [batch, seq, hidden_size]
-
-        Returns:
-            hidden_states: [batch, seq, hidden_size]
-        """
         # Pre-norm attention + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -302,68 +421,62 @@ class KimiK25DecoderLayer(nn.Module):
 
 
 # ============================================================================
-# Main Model
+# Inner Model
 # ============================================================================
 
 class KimiK25Model(nn.Module):
-    """Kimi K2.5 main model (flat design).
+    """Kimi K2.5 transformer model (inner, no lm_head).
 
-    Architecture:
-        - 61 transformer layers
-        - MLA attention (kv_lora_rank=512, q_lora_rank=1536, 64 heads)
-        - First 3 layers: dense MLP (18432 intermediate)
-        - Remaining 58 layers: 384 routed experts + 1 shared expert
-        - RMSNorm (eps=1e-6), SiLU activation
-        - INT4 W4A16 quantization (handled by wrappers)
-
-    This model follows the BatchGen flat design pattern:
-        - Single class with embed_tokens, layers, norm, unembedding
-        - No outer wrapper (unlike HuggingFace's ForCausalLM nesting)
-        - Wrappers handle optimization (quantization, KV cache, kernels)
-        - model.py defines structure only
+    Contains embed_tokens, layers, norm. A single shared YarnRotaryEmbedding
+    instance is created and assigned to all attention layers to avoid
+    duplicated cos/sin caches on GPU (~2.4 GiB savings).
     """
 
-    def __init__(self, config: KimiK25Config):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
 
-        # Token embedding
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
-        # Transformer layers (61 total: 3 dense + 58 MoE)
+        # Shared RoPE — single instance for all 61 attention layers
+        rope_scaling = config.rope_scaling or {}
+        self._shared_rotary_emb = YarnRotaryEmbedding(
+            dim=config.qk_rope_head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            original_max_position_embeddings=rope_scaling.get("original_max_position_embeddings", 4096),
+            beta_fast=rope_scaling.get("beta_fast", 32.0),
+            beta_slow=rope_scaling.get("beta_slow", 1.0),
+        )
+
         self.layers = nn.ModuleList([
             KimiK25DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
 
-        # Final layer norm
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Assign shared RoPE to all attention layers
+        for layer in self.layers:
+            layer.self_attn.rotary_emb = self._shared_rotary_emb
 
-        # Unembedding (lm_head)
-        self.unembedding = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass returning hidden states (no lm_head).
 
         Args:
-            input_ids: Token IDs [batch, seq] (text-only mode)
-            inputs_embeds: Pre-computed embeddings [batch, seq, hidden_size]
-                (multimodal mode with vision tokens already replaced)
+            input_ids: Token IDs [batch, seq].
+            inputs_embeds: Pre-computed embeddings [batch, seq, hidden_size].
 
         Returns:
-            logits: [batch, seq, vocab_size]
-
-        Note:
-            When inputs_embeds is provided (multimodal mode), input_ids is ignored.
-            This enables vision-language models to inject vision embeddings directly.
+            hidden_states: [batch, seq, hidden_size]
         """
-        # Embedding lookup (skip if inputs_embeds provided)
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("Must provide either input_ids or inputs_embeds")
@@ -371,12 +484,39 @@ class KimiK25Model(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Transformer layers
         for layer in self.layers:
             hidden_states = layer(hidden_states)
 
-        # Final norm + unembedding
         hidden_states = self.norm(hidden_states)
-        logits = self.unembedding(hidden_states)
+        return hidden_states
 
-        return logits
+
+# ============================================================================
+# Outer Wrapper (worker-compatible)
+# ============================================================================
+
+class KimiK25ForCausalLM(nn.Module):
+    """Kimi K2.5 model with language modeling head.
+
+    Provides .model and .lm_head attributes expected by batchgen_worker.py:
+        - self.model.layers[i]  (via KimiK25Model)
+        - self.lm_head          (output projection)
+    """
+
+    def __init__(self, config, comm=None):
+        super().__init__()
+        self.config = config
+        self.model = KimiK25Model(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids=input_ids, inputs_embeds=inputs_embeds)
+        return self.lm_head(hidden_states)
+
+    def eval(self):
+        """Set model to evaluation mode."""
+        return super().eval()
