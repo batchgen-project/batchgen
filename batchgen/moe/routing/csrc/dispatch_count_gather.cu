@@ -1,19 +1,15 @@
 /*
- * GPT-OSS-120B Dispatch Kernel: Count+PrefixSum + Gather (CUDA).
+ * GPT-OSS-120B Dispatch Kernel: Count + Prefix Sum + Gather (CUDA).
  *
- * 2 sub-kernels (fused from original 3):
- *   A. count_and_prefix_sum_kernel: shared-memory atomics for counting + prefix sum
- *   B. gather_tokens_kernel:        warp-cooperative vectorized copy with atomic position claim
- *
- * Supports num_valid_tokens for CUDA graph compatibility:
- *   When graph is captured at max bucket size, only the first num_valid_tokens
- *   tokens are processed; padding tokens get topk_pos = -1.
+ * 3 sub-kernels following hpc-ops count_and_gather architecture:
+ *   A. count_tokens_kernel:    shared-memory atomics for counting + init topk_pos=-1
+ *   B. prefix_sum_kernel:      sequential scan (E_local <= 128, negligible)
+ *   C. gather_tokens_kernel:   warp-cooperative vectorized copy
  *
  * Key advantages over Triton version:
  *   - Shared memory atomics (vs Triton global atomics)
  *   - Warp-cooperative float4 copy (32 threads copy one token row)
  *   - __shfl_sync for position broadcast
- *   - 2 kernels instead of 3 (count+prefix_sum fused)
  */
 
 #include <torch/extension.h>
@@ -26,18 +22,18 @@
 
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Sub-kernel A: Count tokens per local expert + prefix sum (fused, single block)
+// Sub-kernel A: Count tokens per local expert + init topk_pos = -1
 // ──────────────────────────────────────────────────────────────────────────────
 
-__global__ void count_and_prefix_sum_kernel(
+__global__ void count_tokens_kernel(
     const int32_t* __restrict__ topk_indices,  // [NK] flat
     int32_t* __restrict__ expert_counts,       // [E_local] output
-    int32_t* __restrict__ expert_offsets,      // [E_local + 1] output
-    int32_t* __restrict__ topk_pos,            // [NK] output (init to -1)
+    int32_t* __restrict__ topk_pos,            // [NK] output
     int NK,
     int expert_start,
     int E_local
 ) {
+    // Shared memory for counts (much faster than global atomics)
     extern __shared__ int32_t s_counts[];
 
     const int tid = threadIdx.x;
@@ -49,9 +45,9 @@ __global__ void count_and_prefix_sum_kernel(
     }
     __syncthreads();
 
-    // Count + init topk_pos = -1
+    // Count + init topk_pos
     for (int i = tid; i < NK; i += stride) {
-        topk_pos[i] = -1;  // sentinel for non-local or padding
+        topk_pos[i] = -1;  // sentinel for non-local
 
         int eid = topk_indices[i];
         int local_id = eid - expert_start;
@@ -61,25 +57,35 @@ __global__ void count_and_prefix_sum_kernel(
     }
     __syncthreads();
 
-    // Write counts to global memory
+    // Write back to global memory
     for (int i = tid; i < E_local; i += stride) {
         expert_counts[i] = s_counts[i];
-    }
-
-    // Single-thread prefix sum (E_local <= 128, negligible cost)
-    if (tid == 0) {
-        int32_t cumsum = 0;
-        expert_offsets[0] = 0;
-        for (int e = 0; e < E_local; e++) {
-            cumsum += s_counts[e];
-            expert_offsets[e + 1] = cumsum;
-        }
     }
 }
 
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Sub-kernel B: Gather tokens to expert-sorted flat layout
+// Sub-kernel B: Exclusive prefix sum (sequential, E_local is small)
+// ──────────────────────────────────────────────────────────────────────────────
+
+__global__ void prefix_sum_kernel(
+    const int32_t* __restrict__ expert_counts,
+    int32_t* __restrict__ expert_offsets,
+    int E_local
+) {
+    if (threadIdx.x > 0) return;
+
+    int32_t cumsum = 0;
+    expert_offsets[0] = 0;
+    for (int e = 0; e < E_local; e++) {
+        cumsum += expert_counts[e];
+        expert_offsets[e + 1] = cumsum;
+    }
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Sub-kernel C: Gather tokens to expert-sorted flat layout
 // ──────────────────────────────────────────────────────────────────────────────
 
 __global__ void gather_tokens_kernel(
@@ -143,7 +149,7 @@ __global__ void gather_tokens_kernel(
 
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Python wrapper: launches 2 sub-kernels
+// Python wrapper: launches all 3 sub-kernels
 // ──────────────────────────────────────────────────────────────────────────────
 
 std::vector<torch::Tensor> dispatch_count_gather_cuda(
@@ -155,8 +161,7 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
     torch::Tensor expert_offsets,
     torch::Tensor expert_counters,
     torch::Tensor dispatched_x,
-    torch::Tensor topk_pos,
-    int64_t num_valid_tokens
+    torch::Tensor topk_pos
 ) {
     TORCH_CHECK(x.is_cuda(), "x must be CUDA tensor");
     TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be BF16");
@@ -164,14 +169,9 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
     const int N = topk_indices.size(0);
     const int K = topk_indices.size(1);
     const int H = x.size(1);
+    const int NK = N * K;
     const int E_local = num_local_experts;
     auto device = x.device();
-
-    // Effective token count: use num_valid_tokens if provided, else all N
-    const int N_eff = (num_valid_tokens > 0 && num_valid_tokens < N)
-                      ? static_cast<int>(num_valid_tokens) : N;
-    const int NK = N_eff * K;
-    const int NK_full = N * K;  // full buffer size for topk_pos init
 
     // Allocate outputs if not pre-allocated
     if (!expert_counts.defined() || expert_counts.numel() == 0) {
@@ -191,47 +191,44 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
     }
 
     if (!topk_pos.defined() || topk_pos.numel() == 0) {
-        topk_pos = torch::full({NK_full}, -1, torch::dtype(torch::kInt32).device(device));
+        topk_pos = torch::full({NK}, -1, torch::dtype(torch::kInt32).device(device));
     }
 
     if (!dispatched_x.defined() || dispatched_x.numel() == 0) {
-        dispatched_x = torch::empty({NK_full, H}, torch::dtype(torch::kBFloat16).device(device));
+        dispatched_x = torch::empty({NK, H}, torch::dtype(torch::kBFloat16).device(device));
     }
 
-    // Flat view of topk_indices (only valid tokens)
+    // Flat view of topk_indices
     auto flat_indices = topk_indices.reshape({-1}).contiguous();
 
     // All kernels launch on current CUDA stream (required for CUDA graph capture)
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // ── Sub-kernel A: Count + Prefix Sum (fused, single block) ──
+    // ── Sub-kernel A: Count ──
     {
         int threads = 256;
+        int blocks = 1;  // For decode NK <= 256, single block suffices
         int smem_bytes = E_local * sizeof(int32_t);
-        // Pass NK_full so all topk_pos entries (including padding) get set to -1,
-        // but only count tokens within NK (valid tokens)
-        count_and_prefix_sum_kernel<<<1, threads, smem_bytes, stream>>>(
+        count_tokens_kernel<<<blocks, threads, smem_bytes, stream>>>(
             flat_indices.data_ptr<int32_t>(),
             expert_counts.data_ptr<int32_t>(),
-            expert_offsets.data_ptr<int32_t>(),
             topk_pos.data_ptr<int32_t>(),
-            NK,  // only process valid tokens for counting
-            expert_start, E_local
+            NK, expert_start, E_local
         );
     }
 
-    // If we have padding tokens beyond NK, their topk_pos is already -1
-    // from the pre-allocated full({NK_full}, -1) or from previous iteration.
-    // For CUDA graph re-runs with pre-allocated buffers, we need to ensure
-    // padding positions are reset. The count kernel handles [0, NK) range.
-    // We explicitly fill padding range if NK < NK_full.
-    // Note: In CUDA graph mode, topk_pos is pre-allocated and reused.
-    // The gate kernel already sets padding indices to values that won't match
-    // local experts, so gather naturally skips them. But we still fill -1
-    // for safety via a small memset on the padding tail.
+    // ── Sub-kernel B: Prefix sum ──
+    {
+        prefix_sum_kernel<<<1, 1, 0, stream>>>(
+            expert_counts.data_ptr<int32_t>(),
+            expert_offsets.data_ptr<int32_t>(),
+            E_local
+        );
+    }
 
-    // ── Sub-kernel B: Gather ──
-    if (NK > 0) {
+    // ── Sub-kernel C: Gather ──
+    {
+        // One warp per topk assignment
         int total_threads = NK * WARP_SIZE;
         int threads_per_block = 256;
         int blocks = (total_threads + threads_per_block - 1) / threads_per_block;

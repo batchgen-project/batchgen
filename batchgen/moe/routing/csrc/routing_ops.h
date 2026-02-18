@@ -18,11 +18,10 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
     torch::Tensor router_logits,
     int k,
     torch::Tensor topk_indices,   // optional pre-allocated
-    torch::Tensor topk_weights,   // optional pre-allocated
-    int64_t num_valid_tokens = -1 // -1 = process all N
+    torch::Tensor topk_weights    // optional pre-allocated
 );
 
-// Dispatch: count+prefix_sum + gather (2 fused kernels)
+// Dispatch: count + prefix_sum + gather
 // Input:  x [N, H] BF16, topk_indices [N, K] int32
 // Output: dispatched_x, expert_counts, expert_offsets, topk_pos
 std::vector<torch::Tensor> dispatch_count_gather_cuda(
@@ -35,8 +34,7 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
     torch::Tensor expert_offsets,
     torch::Tensor expert_counters,
     torch::Tensor dispatched_x,
-    torch::Tensor topk_pos,
-    int64_t num_valid_tokens = -1  // -1 = process all N
+    torch::Tensor topk_pos
 );
 
 // Router epilogue: fused BF16 bias add + BF16→FP32 cast
@@ -46,25 +44,6 @@ void router_bias_cast_cuda(
     torch::Tensor logits,
     torch::Tensor bias,
     torch::Tensor output
-);
-
-// Fused Gate: WGMMA GEMM + bias + TopK + Softmax (SM90a, 2 kernels)
-// Requires FusedGateContext for cached weight transpose + TMA descriptors.
-int64_t create_fused_gate_context(
-    torch::Tensor router_weight,    // [K_dim, E] BF16
-    torch::Tensor router_bias,      // [E] BF16 (or empty)
-    int topk
-);
-
-void destroy_fused_gate_context(int64_t ctx_ptr);
-
-std::vector<torch::Tensor> fused_gate_forward(
-    int64_t ctx_ptr,
-    torch::Tensor hidden_states,     // [N, K_dim] BF16
-    torch::Tensor logits,            // [N, E] FP32 pre-allocated (optional)
-    torch::Tensor topk_indices,      // [N, topk] int32 pre-allocated (optional)
-    torch::Tensor topk_weights,      // [N, topk] FP32 pre-allocated (optional)
-    int64_t num_valid_tokens = -1
 );
 
 // Reduce: weighted scatter-add
@@ -78,6 +57,5 @@ torch::Tensor reduce_weighted_scatter_cuda(
     int64_t N,
     int64_t H,
     int64_t K,
-    torch::Tensor output,  // optional pre-allocated
-    int64_t num_valid_tokens = -1  // -1 = process all N
+    torch::Tensor output  // optional pre-allocated
 );

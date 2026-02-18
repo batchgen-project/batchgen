@@ -145,18 +145,13 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
     torch::Tensor router_logits,
     int k,
     torch::Tensor topk_indices,
-    torch::Tensor topk_weights,
-    int64_t num_valid_tokens
+    torch::Tensor topk_weights
 ) {
     TORCH_CHECK(router_logits.is_cuda(), "router_logits must be CUDA tensor");
     TORCH_CHECK(router_logits.dtype() == torch::kFloat32, "router_logits must be FP32");
 
     const int N = router_logits.size(0);
     const int E = router_logits.size(1);
-
-    // Effective token count for CUDA graph compatibility
-    const int N_eff = (num_valid_tokens > 0 && num_valid_tokens < N)
-                      ? static_cast<int>(num_valid_tokens) : N;
 
     // Allocate outputs if not pre-allocated
     if (!topk_indices.defined() || topk_indices.numel() == 0) {
@@ -167,7 +162,7 @@ std::vector<torch::Tensor> gate_topk_softmax_cuda(
     }
 
     // Launch kernel on current CUDA stream (required for CUDA graph capture)
-    dim3 grid(N_eff);  // only process valid tokens
+    dim3 grid(N);
     dim3 block(BLOCK_THREADS);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
