@@ -696,6 +696,10 @@ class WholeModelSegment:
         # Per-layer KV buffers allocated in setup_static_buffers
         self._kv_buffers = None
 
+        # Use WGMMA fused kernel when available (SM90+)
+        from batchgen.attention.fused_kernels import is_qkv_wgmma_available
+        self.use_wgmma = is_qkv_wgmma_available()
+
     def setup_static_buffers(self, bucket_size: int) -> None:
         """Allocate KV offload buffers, enable graph capture mode, enable NCCL.
 
@@ -777,21 +781,39 @@ class WholeModelSegment:
                 decoder_layer.input_layernorm.eps,
             )
 
-            # QKV proj + split + reshape
-            qkv = attn_wrapper.module.qkv_proj(normed)
-            query, key, value = cuda_qkv_split(qkv, attn_wrapper.q_size, attn_wrapper.kv_size)
-            query = query.view(B, 1, attn_wrapper.num_heads, attn_wrapper.head_dim)
-            key = key.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
-            value = value.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
-
-            # RoPE (clamp to 0 so padding rows with cache_seqlens=0 don't negative-index)
+            # QKV proj + split + reshape + RoPE
             current_pos = (cache_seqlens - 1).clamp(min=0)
-            cos, sin = attn_wrapper.module.rotary_emb(
-                value.transpose(1, 2), seq_len=attn_wrapper.module.rotary_emb.max_seq_len_cached
-            )
-            cos = cos[current_pos].unsqueeze(1)
-            sin = sin[current_pos].unsqueeze(1)
-            query, key = cuda_rope(query, key, cos, sin)
+
+            if self.use_wgmma:
+                from batchgen.attention.fused_kernels import cuda_qkv_wgmma
+                rotary_emb = attn_wrapper.module.rotary_emb
+                cos_table = rotary_emb.cos_cached[:rotary_emb.max_seq_len_cached].to(normed.dtype)
+                sin_table = rotary_emb.sin_cached[:rotary_emb.max_seq_len_cached].to(normed.dtype)
+                rope_cos = cos_table[current_pos]  # [B, head_dim]
+                rope_sin = sin_table[current_pos]  # [B, head_dim]
+                normed_2d = normed.view(B, -1)
+                qkv_weight = attn_wrapper.module.qkv_proj.weight
+                qkv_bias = attn_wrapper.module.qkv_proj.bias
+                query, key, value = cuda_qkv_wgmma(
+                    normed_2d, qkv_weight, qkv_bias,
+                    attn_wrapper.q_size, attn_wrapper.kv_size, None,
+                    rope_cos, rope_sin, attn_wrapper.head_dim,
+                )
+                query = query.view(B, 1, attn_wrapper.num_heads, attn_wrapper.head_dim)
+                key = key.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+                value = value.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+            else:
+                qkv = attn_wrapper.module.qkv_proj(normed)
+                query, key, value = cuda_qkv_split(qkv, attn_wrapper.q_size, attn_wrapper.kv_size)
+                query = query.view(B, 1, attn_wrapper.num_heads, attn_wrapper.head_dim)
+                key = key.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+                value = value.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+                cos, sin = attn_wrapper.module.rotary_emb(
+                    value.transpose(1, 2), seq_len=attn_wrapper.module.rotary_emb.max_seq_len_cached
+                )
+                cos = cos[current_pos].unsqueeze(1)
+                sin = sin[current_pos].unsqueeze(1)
+                query, key = cuda_rope(query, key, cos, sin)
 
             # Copy KV to static offload buffers (baked into graph for host offloading)
             if self._kv_buffers is not None:
