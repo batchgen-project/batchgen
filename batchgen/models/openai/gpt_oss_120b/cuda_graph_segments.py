@@ -42,6 +42,12 @@ class FullAttnSegment:
 
         # Pre-attn: QKV proj
         self.qkv_proj = attn_wrapper.module.qkv_proj
+        self.qkv_weight = self.qkv_proj.weight  # [N, K] BF16
+        self.qkv_bias = self.qkv_proj.bias       # [N] BF16 or None
+
+        # Use WGMMA fused kernel when available (SM90+)
+        from batchgen.attention.fused_kernels import is_qkv_wgmma_available
+        self.use_wgmma = is_qkv_wgmma_available()
 
         # Dimensions
         self.hidden_size = decoder_layer.hidden_size
@@ -119,20 +125,37 @@ class FullAttnSegment:
         B = hidden_states.shape[0]
         nvt = num_valid_tokens  # 1-element int32 device tensor
 
-        # === Pre-attn: RMSNorm → QKV proj → split → reshape ===
+        # === Pre-attn: RMSNorm → QKV proj → split → reshape + RoPE ===
         normed = cuda_rmsnorm(hidden_states, self.ln_weight, self.ln_eps, num_valid_tokens=nvt)
-        qkv = self.qkv_proj(normed)
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size, num_valid_tokens=nvt)
-        query = query.view(B, 1, self.num_heads, self.head_dim)
-        key = key.view(B, 1, self.num_kv_heads, self.head_dim)
-        value = value.view(B, 1, self.num_kv_heads, self.head_dim)
-
-        # === RoPE === (clamp to 0 so padding rows with cache_seqlens=0 don't negative-index)
         current_pos = (cache_seqlens - 1).clamp(min=0)
-        cos, sin = self.rotary_emb(value.transpose(1, 2), seq_len=self.max_seq_len)
-        cos = cos[current_pos].unsqueeze(1)
-        sin = sin[current_pos].unsqueeze(1)
-        query, key = cuda_rope(query, key, cos, sin, num_valid_tokens=nvt)
+
+        if self.use_wgmma:
+            from batchgen.attention.fused_kernels import cuda_qkv_wgmma
+            # cos/sin table: [max_seq_len, head_dim] BF16
+            cos_table = self.rotary_emb.cos_cached[:self.max_seq_len].to(normed.dtype)
+            sin_table = self.rotary_emb.sin_cached[:self.max_seq_len].to(normed.dtype)
+            rope_cos = cos_table[current_pos]  # [B, head_dim]
+            rope_sin = sin_table[current_pos]  # [B, head_dim]
+            # Single WGMMA call: GEMM + split + RoPE
+            normed_2d = normed.view(B, self.hidden_size)
+            query, key, value = cuda_qkv_wgmma(
+                normed_2d, self.qkv_weight, self.qkv_bias,
+                self.q_size, self.kv_size, nvt,
+                rope_cos, rope_sin, self.head_dim,
+            )
+            query = query.view(B, 1, self.num_heads, self.head_dim)
+            key = key.view(B, 1, self.num_kv_heads, self.head_dim)
+            value = value.view(B, 1, self.num_kv_heads, self.head_dim)
+        else:
+            qkv = self.qkv_proj(normed)
+            query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size, num_valid_tokens=nvt)
+            query = query.view(B, 1, self.num_heads, self.head_dim)
+            key = key.view(B, 1, self.num_kv_heads, self.head_dim)
+            value = value.view(B, 1, self.num_kv_heads, self.head_dim)
+            cos, sin = self.rotary_emb(value.transpose(1, 2), seq_len=self.max_seq_len)
+            cos = cos[current_pos].unsqueeze(1)
+            sin = sin[current_pos].unsqueeze(1)
+            query, key = cuda_rope(query, key, cos, sin, num_valid_tokens=nvt)
 
         # === KV write (direct kernel call with static buffers) ===
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager

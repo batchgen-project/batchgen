@@ -1024,6 +1024,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
         self.is_sliding = (layer_idx % 2 == 0)
         self.sliding_window = model_config.sliding_window if self.is_sliding else None
 
+        # Use WGMMA fused kernel when available (SM90+)
+        from batchgen.attention.fused_kernels import is_qkv_wgmma_available
+        self._use_wgmma = is_qkv_wgmma_available()
+
         # Sink token parameter will be loaded with weights
         self.sinks = None
 
@@ -1247,39 +1251,16 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 past_key_value, output_attentions, use_cache, **kwargs
             )
 
-        # === Stage 1: Project Q, K, V for the new token ===
-        if do_timing:
-            t0 = time.perf_counter()
-
-        qkv = self.module.qkv_proj(hidden_states)
-        from batchgen.attention.fused_kernels import cuda_qkv_split
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
-
-        # Reshape: [batch, 1, num_heads, head_dim]
-        query = query.view(batch, seq_len, self.num_heads, self.head_dim)
-        key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
-        value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
-
-        if do_timing:
-            torch.cuda.synchronize()
-            DecodeTimingStats.attn_projection_ms += (time.perf_counter() - t0) * 1000
-
-        # === Stage 2: Get and apply RoPE ===
-        if do_timing:
-            t0 = time.perf_counter()
-
-        # cache_seqlens represents the total context length (including the current token to be processed).
-        # The current token's KV should be written at position cache_seqlens - 1 (0-indexed).
-        # This matches DeepSeek which uses position_ids = cache_seqlens - 1.
+        # === Precompute position info (needed by both WGMMA and cuBLAS paths) ===
+        micro_cache_seqlens = None
+        current_token_position = None
         if cache_seqlens is not None:
-            # Apply batch_slice if provided
             if batch_slice is not None:
                 start_idx, end_idx = batch_slice
                 micro_cache_seqlens = cache_seqlens[start_idx:end_idx]
             else:
                 micro_cache_seqlens = cache_seqlens
 
-            # Handle empty batch slice (happens when batch < world_size in EP mode)
             if micro_cache_seqlens.numel() == 0:
                 return (
                     torch.empty((0, 1, hidden_states.shape[-1]), device=hidden_states.device, dtype=hidden_states.dtype),
@@ -1287,35 +1268,55 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     None
                 )
 
-            # CRITICAL: cache_seqlens is the token COUNT (e.g., 11).
-            # The current token's position is cache_seqlens - 1 (e.g., 10).
-            # This matches DeepSeek which uses position_ids = cache_seqlens - 1.
             current_token_position = micro_cache_seqlens - 1
 
-            # Use pre-computed max_seqlen from AttnWrapperBase (set once per decode step)
-            # to avoid per-layer CPU-GPU sync from .item()
+        # === Stage 1+2: Project Q, K, V + RoPE ===
+        if do_timing:
+            t0 = time.perf_counter()
+
+        if self._use_wgmma and cache_seqlens is not None:
+            from batchgen.attention.fused_kernels import cuda_qkv_wgmma
             max_seqlen = AttnWrapperBase.max_seqlen
-            cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
+            cos_table = self.module.rotary_emb.cos_cached[:max_seqlen].to(hidden_states.dtype)
+            sin_table = self.module.rotary_emb.sin_cached[:max_seqlen].to(hidden_states.dtype)
+            rope_cos = cos_table[current_token_position]  # [batch, head_dim]
+            rope_sin = sin_table[current_token_position]  # [batch, head_dim]
 
-            # Apply RoPE at each sequence's current position (cache_seqlens - 1)
-            # CRITICAL: Always use current_token_position from cache_seqlens, ignore model's position_ids.
-            # The model may generate wrong position_ids (e.g., [[0]]) if not properly configured.
-            # Using cache_seqlens ensures correctness regardless of what the model passes.
-            # Indexing by [batch] tensor gives [batch, head_dim]
-            # Need to add seq dimension: [batch, head_dim] -> [batch, 1, head_dim]
-            cos = cos[current_token_position].unsqueeze(1)
-            sin = sin[current_token_position].unsqueeze(1)
+            hidden_2d = hidden_states.view(batch, -1)
+            query, key, value = cuda_qkv_wgmma(
+                hidden_2d, self.module.qkv_proj.weight, self.module.qkv_proj.bias,
+                self.q_size, self.kv_size, None,
+                rope_cos, rope_sin, self.head_dim,
+            )
+            query = query.view(batch, seq_len, self.num_heads, self.head_dim)
+            key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
         else:
-            # Fallback if cache_seqlens not set
-            cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
-            cos = cos[:1]
-            sin = sin[:1]
+            qkv = self.module.qkv_proj(hidden_states)
+            from batchgen.attention.fused_kernels import cuda_qkv_split
+            query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size)
 
-        query, key = self._apply_rotary(query, key, cos, sin)
+            query = query.view(batch, seq_len, self.num_heads, self.head_dim)
+            key = key.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            value = value.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+
+            if cache_seqlens is not None:
+                max_seqlen = AttnWrapperBase.max_seqlen
+                cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
+                cos = cos[current_token_position].unsqueeze(1)
+                sin = sin[current_token_position].unsqueeze(1)
+            else:
+                cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=1)
+                cos = cos[:1]
+                sin = sin[:1]
+
+            query, key = self._apply_rotary(query, key, cos, sin)
 
         if do_timing:
             torch.cuda.synchronize()
-            DecodeTimingStats.attn_rope_ms += (time.perf_counter() - t0) * 1000
+            elapsed = (time.perf_counter() - t0) * 1000
+            DecodeTimingStats.attn_projection_ms += elapsed
+            # RoPE is fused into projection for WGMMA path; attribute both to projection
 
         # === Stage 3: Write new K, V to paged GPU cache ===
         if do_timing:
