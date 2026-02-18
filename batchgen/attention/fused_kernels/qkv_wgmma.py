@@ -503,7 +503,43 @@ static CUtensorMap make_2d_tma_desc_bf16(
 }
 
 // ============================================================================
-// C++ wrapper
+// Shared kernel launch helper (used by both eager and inplace wrappers)
+// ============================================================================
+static bool _smem_configured = false;
+
+static void launch_qkv_wgmma(
+    CUtensorMap& desc_a, CUtensorMap& desc_b,
+    const __nv_bfloat16* bias_ptr, int has_bias,
+    __nv_bfloat16* Q_ptr, __nv_bfloat16* K_ptr, __nv_bfloat16* V_ptr,
+    int64_t stride_q, int64_t stride_k, int64_t stride_v,
+    const __nv_bfloat16* rope_cos_ptr, const __nv_bfloat16* rope_sin_ptr,
+    int head_dim, const int* num_valid_ptr,
+    int M, int N, int K, int q_size, int kv_size
+) {
+    const int num_m_tiles = (M + BLOCK_M - 1) / BLOCK_M;
+    const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_m_tiles, num_n_tiles);
+    dim3 block(TOTAL_THREADS);
+
+    constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES + 2 * NUM_STAGES * sizeof(uint64_t);
+
+    if (!_smem_configured) {
+        cudaFuncSetAttribute(qkv_wgmma_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        _smem_configured = true;
+    }
+
+    qkv_wgmma_kernel<<<grid, block, smem_bytes>>>(
+        desc_a, desc_b,
+        bias_ptr, Q_ptr, K_ptr, V_ptr,
+        stride_q, stride_k, stride_v,
+        rope_cos_ptr, rope_sin_ptr, head_dim,
+        num_valid_ptr, M, N, K, q_size, kv_size, has_bias);
+}
+
+// ============================================================================
+// C++ wrapper: eager mode (creates TMA descs + allocates output)
+// NOT safe during CUDA graph capture — use qkv_wgmma_forward_inplace instead.
 // ============================================================================
 std::vector<torch::Tensor> qkv_wgmma_forward(
     torch::Tensor input,        // [M, K] BF16
@@ -554,7 +590,6 @@ std::vector<torch::Tensor> qkv_wgmma_forward(
         num_valid_ptr = num_valid_tokens->data_ptr<int>();
     }
 
-    // Allocate output tensors
     auto Q_out = torch::empty({M, q_size}, input.options());
     auto K_out = torch::empty({M, kv_size}, input.options());
     auto V_out = torch::empty({M, kv_size}, input.options());
@@ -571,46 +606,112 @@ std::vector<torch::Tensor> qkv_wgmma_forward(
         reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
         N, K, BLOCK_N, BLOCK_K, encode_func);
 
-    const int num_m_tiles = (M + BLOCK_M - 1) / BLOCK_M;
-    const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    dim3 grid(num_m_tiles, num_n_tiles);
-    dim3 block(TOTAL_THREADS);
-
-    constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES + 2 * NUM_STAGES * sizeof(uint64_t);
-
-    cudaFuncSetAttribute(qkv_wgmma_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-
-    qkv_wgmma_kernel<<<grid, block, smem_bytes>>>(
+    launch_qkv_wgmma(
         desc_a, desc_b,
-        has_bias ? reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()) : nullptr,
+        has_bias ? reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()) : nullptr, has_bias,
         reinterpret_cast<__nv_bfloat16*>(Q_out.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(K_out.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(V_out.data_ptr()),
         Q_out.stride(0), K_out.stride(0), V_out.stride(0),
-        rope_cos_ptr,
-        rope_sin_ptr,
-        head_dim,
-        num_valid_ptr,
-        M, N, K,
-        q_size, kv_size, has_bias);
+        rope_cos_ptr, rope_sin_ptr, head_dim, num_valid_ptr,
+        M, N, K, q_size, kv_size);
 
     return {Q_out, K_out, V_out};
 }
-'''
 
-_CPP_SOURCE = r'''
-std::vector<torch::Tensor> qkv_wgmma_forward(
-    torch::Tensor input,
-    torch::Tensor weight,
-    torch::Tensor bias,
-    int q_size,
-    int kv_size,
+// ============================================================================
+// Create TMA descriptor (callable from Python, BEFORE graph capture)
+// Returns CPU uint8[128] encoding the CUtensorMap struct.
+// ============================================================================
+torch::Tensor create_qkv_tma_desc(
+    torch::Tensor tensor,       // [rows, cols] BF16, CUDA, contiguous
+    int block_rows,             // BLOCK_M or BLOCK_N
+    int block_cols              // BLOCK_K
+) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tensor.dim() == 2, "Expected 2D tensor");
+    TORCH_CHECK(tensor.is_contiguous());
+
+    auto encode_func = get_cuTensorMapEncodeTiled();
+    CUtensorMap desc = make_2d_tma_desc_bf16(
+        reinterpret_cast<__nv_bfloat16*>(tensor.data_ptr()),
+        tensor.size(0), tensor.size(1),
+        block_rows, block_cols, encode_func);
+
+    auto desc_tensor = torch::empty({128}, torch::dtype(torch::kUInt8).device(torch::kCPU));
+    std::memcpy(desc_tensor.data_ptr(), &desc, sizeof(CUtensorMap));
+    return desc_tensor;
+}
+
+// ============================================================================
+// C++ wrapper: inplace mode (pre-allocated output + pre-built TMA descs)
+// Safe during CUDA graph capture — no cuTensorMapEncodeTiled, no torch::empty.
+// ============================================================================
+void qkv_wgmma_forward_inplace(
+    torch::Tensor Q_out,              // [max_M, q_size] BF16, pre-allocated
+    torch::Tensor K_out,              // [max_M, kv_size] BF16, pre-allocated
+    torch::Tensor V_out,              // [max_M, kv_size] BF16, pre-allocated
+    torch::Tensor tma_desc_a_bytes,   // CPU uint8[128], pre-built for input
+    torch::Tensor tma_desc_b_bytes,   // CPU uint8[128], pre-built for weight
+    torch::Tensor bias,               // [N] BF16 or empty tensor (size 0)
+    torch::Tensor rope_cos,           // [M, head_dim] BF16 or empty tensor (size 0)
+    torch::Tensor rope_sin,           // [M, head_dim] BF16 or empty tensor (size 0)
+    int head_dim,
     c10::optional<torch::Tensor> num_valid_tokens,
-    torch::Tensor rope_cos,
-    torch::Tensor rope_sin,
-    int head_dim
-);
+    int M, int N, int K, int q_size, int kv_size
+) {
+    TORCH_CHECK(tma_desc_a_bytes.numel() == 128, "TMA desc A must be 128 bytes");
+    TORCH_CHECK(tma_desc_b_bytes.numel() == 128, "TMA desc B must be 128 bytes");
+    TORCH_CHECK(Q_out.is_cuda() && Q_out.dtype() == torch::kBFloat16);
+    TORCH_CHECK(K_out.is_cuda() && K_out.dtype() == torch::kBFloat16);
+    TORCH_CHECK(V_out.is_cuda() && V_out.dtype() == torch::kBFloat16);
+
+    if (M == 0) return;
+
+    // Reconstruct TMA descriptors from pre-built bytes (host memcpy, no driver call)
+    CUtensorMap desc_a, desc_b;
+    std::memcpy(&desc_a, tma_desc_a_bytes.data_ptr(), sizeof(CUtensorMap));
+    std::memcpy(&desc_b, tma_desc_b_bytes.data_ptr(), sizeof(CUtensorMap));
+
+    int has_bias = 0;
+    if (bias.numel() > 0) {
+        has_bias = 1;
+    }
+
+    const __nv_bfloat16* rope_cos_ptr = nullptr;
+    const __nv_bfloat16* rope_sin_ptr = nullptr;
+    if (rope_cos.numel() > 0) {
+        rope_cos_ptr = reinterpret_cast<const __nv_bfloat16*>(rope_cos.data_ptr());
+        rope_sin_ptr = reinterpret_cast<const __nv_bfloat16*>(rope_sin.data_ptr());
+    }
+
+    const int* num_valid_ptr = nullptr;
+    if (num_valid_tokens.has_value() && num_valid_tokens->defined()) {
+        num_valid_ptr = num_valid_tokens->data_ptr<int>();
+    }
+
+    launch_qkv_wgmma(
+        desc_a, desc_b,
+        has_bias ? reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()) : nullptr, has_bias,
+        reinterpret_cast<__nv_bfloat16*>(Q_out.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(K_out.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(V_out.data_ptr()),
+        Q_out.stride(0), K_out.stride(0), V_out.stride(0),
+        rope_cos_ptr, rope_sin_ptr, head_dim, num_valid_ptr,
+        M, N, K, q_size, kv_size);
+}
+
+// ============================================================================
+// Module registration (manual PYBIND11, matches MoE WGMMA pattern)
+// ============================================================================
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("qkv_wgmma_forward", &qkv_wgmma_forward,
+          "QKV WGMMA fused projection (eager mode)");
+    m.def("qkv_wgmma_forward_inplace", &qkv_wgmma_forward_inplace,
+          "QKV WGMMA fused projection (graph-safe inplace mode)");
+    m.def("create_qkv_tma_desc", &create_qkv_tma_desc,
+          "Create TMA descriptor for QKV WGMMA (call before graph capture)");
+}
 '''
 
 
@@ -647,9 +748,8 @@ def _get_module():
 
         _module = load_inline(
             name="batchgen_qkv_wgmma",
-            cpp_sources=[_CPP_SOURCE],
+            cpp_sources=[""],
             cuda_sources=[_CUDA_SOURCE],
-            functions=["qkv_wgmma_forward"],
             extra_cuda_cflags=cuda_flags,
             verbose=False,
         )
@@ -727,3 +827,79 @@ def cuda_qkv_wgmma(
         rope_cos, rope_sin, head_dim,
     )
     return results[0], results[1], results[2]
+
+
+def create_qkv_tma_desc(tensor: torch.Tensor, block_rows: int = 64, block_cols: int = 64) -> torch.Tensor:
+    """Create TMA descriptor for a 2D BF16 tensor.
+
+    Returns a CPU uint8 tensor of 128 bytes encoding the CUtensorMap.
+    Must be called BEFORE CUDA graph capture — TMA descriptor creation
+    is a CPU-side driver API call and is not capturable.
+
+    Args:
+        tensor: [rows, cols] BF16 CUDA tensor (must be contiguous, at fixed GPU address)
+        block_rows: tile rows (BLOCK_M=64 for input, BLOCK_N=64 for weight)
+        block_cols: tile cols (BLOCK_K=64)
+
+    Returns:
+        torch.Tensor of shape [128], dtype uint8, on CPU
+    """
+    mod = _get_module()
+    assert mod is not None, "QKV WGMMA module not available"
+    return mod.create_qkv_tma_desc(tensor, block_rows, block_cols)
+
+
+def cuda_qkv_wgmma_inplace(
+    Q_out: torch.Tensor,
+    K_out: torch.Tensor,
+    V_out: torch.Tensor,
+    tma_desc_a: torch.Tensor,
+    tma_desc_b: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    rope_cos: Optional[torch.Tensor] = None,
+    rope_sin: Optional[torch.Tensor] = None,
+    head_dim: int = 64,
+    num_valid_tokens: Optional[torch.Tensor] = None,
+    M: int = 0,
+    N: int = 0,
+    K: int = 0,
+    q_size: int = 0,
+    kv_size: int = 0,
+) -> None:
+    """Inplace WGMMA for CUDA graph path.
+
+    Uses pre-allocated output buffers and pre-built TMA descriptors.
+    Safe to call during CUDA graph capture — no cuTensorMapEncodeTiled,
+    no torch::empty inside C++.
+
+    Args:
+        Q_out: [max_M, q_size] BF16, pre-allocated output buffer
+        K_out: [max_M, kv_size] BF16, pre-allocated output buffer
+        V_out: [max_M, kv_size] BF16, pre-allocated output buffer
+        tma_desc_a: CPU uint8[128], TMA descriptor for input buffer
+        tma_desc_b: CPU uint8[128], TMA descriptor for weight
+        bias: [N] BF16 or None
+        rope_cos: [M, head_dim] BF16 or None
+        rope_sin: [M, head_dim] BF16 or None
+        head_dim: attention head dimension (64)
+        num_valid_tokens: 1-element int32 device tensor, or None
+        M, N, K: matrix dimensions
+        q_size, kv_size: split sizes
+    """
+    mod = _get_module()
+    assert mod is not None, "QKV WGMMA module not available"
+
+    empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=Q_out.device)
+    if bias is None:
+        bias = empty_bf16
+    if rope_cos is None:
+        rope_cos = empty_bf16
+    if rope_sin is None:
+        rope_sin = empty_bf16
+
+    mod.qkv_wgmma_forward_inplace(
+        Q_out, K_out, V_out,
+        tma_desc_a, tma_desc_b,
+        bias, rope_cos, rope_sin, head_dim,
+        num_valid_tokens, M, N, K, q_size, kv_size,
+    )
