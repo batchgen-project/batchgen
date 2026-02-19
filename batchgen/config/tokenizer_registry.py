@@ -63,6 +63,7 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x22B": "mixtral",
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
+    "Kimi-K2.5": "kimi_k25",
 }
 
 
@@ -151,6 +152,11 @@ def _import_tokenizers():
 
     try:
         from batchgen.models.mixtral import tokenizer as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.moonshotai.kimi_k25 import tokenizer as _  # noqa: F401
     except ImportError:
         pass
 

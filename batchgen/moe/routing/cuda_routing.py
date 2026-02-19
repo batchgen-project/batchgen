@@ -30,11 +30,13 @@ _cuda_ext = load(
         str(_csrc_dir / "dispatch_count_gather.cu"),
         str(_csrc_dir / "reduce_weighted_scatter.cu"),
         str(_csrc_dir / "router_epilogue.cu"),
+        str(_csrc_dir / "fused_gate.cu"),
     ],
     extra_cuda_cflags=[
         "-O3",
         "--use_fast_math",
         "-std=c++17",
+        "-gencode", "arch=compute_90a,code=sm_90a",   # H100 (WGMMA required)
     ],
     verbose=False,
 )
@@ -44,7 +46,8 @@ _cuda_ext = load(
 # Python wrappers (matching Triton kernel signatures)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, k=4):
+def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, k=4,
+                           num_valid_tokens=-1):
     """
     CUDA gate kernel: fused top-k selection + softmax.
 
@@ -53,6 +56,7 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
         topk_indices: [N, K] int32 pre-allocated output (optional)
         topk_weights: [N, K] FP32 pre-allocated output (optional)
         k: top-k (default 4)
+        num_valid_tokens: only process first num_valid_tokens tokens (-1 = all)
 
     Returns:
         topk_indices: [N, K] int32
@@ -71,7 +75,8 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
     if topk_weights is None:
         topk_weights = torch.empty(N, k, dtype=torch.float32, device=device)
 
-    result = ext.gate_topk_softmax(router_logits, k, topk_indices, topk_weights)
+    result = ext.gate_topk_softmax(router_logits, k, topk_indices, topk_weights,
+                                   num_valid_tokens)
     return result[0], result[1]
 
 
@@ -91,9 +96,10 @@ def dispatch_count_gather_cuda(
     expert_start, num_local_experts,
     expert_counts=None, expert_offsets=None,
     expert_counters=None, dispatched_x=None, topk_pos=None,
+    num_valid_tokens=-1,
 ):
     """
-    CUDA dispatch kernel: count + prefix_sum + gather.
+    CUDA dispatch kernel: count+prefix_sum + gather (2 fused kernels).
 
     Args:
         x: [N, H] BF16 token activations
@@ -101,6 +107,7 @@ def dispatch_count_gather_cuda(
         expert_start: first local expert index
         num_local_experts: number of local experts
         expert_counts/offsets/counters/dispatched_x/topk_pos: pre-allocated (optional)
+        num_valid_tokens: only process first num_valid_tokens tokens (-1 = all)
 
     Returns:
         dispatched_x: [max_dispatched, H] BF16
@@ -145,13 +152,93 @@ def dispatch_count_gather_cuda(
         expert_start, num_local_experts,
         expert_counts, expert_offsets,
         expert_counters, dispatched_x, topk_pos,
+        num_valid_tokens,
     )
     return result[0], result[1], result[2], result[3]
 
 
+class FusedGateContext:
+    """Cached context for fused WGMMA GEMM + bias + TopK + Softmax (SM90a).
+
+    Caches weight transpose, TMA descriptor for B, encode_func, and
+    cudaFuncSetAttribute at init time. Per-call only creates TMA desc
+    for A (input changes) and launches 2 kernels.
+
+    Must be created at model init (once per MoE layer) and kept alive
+    for the lifetime of the model. The weight tensor must not be
+    reallocated after context creation (TMA descriptor points to it).
+
+    Usage:
+        ctx = FusedGateContext(router_weight, router_bias, topk=4)
+        topk_idx, topk_wt = ctx.forward(hidden_states)
+        # or with pre-allocated outputs and num_valid_tokens:
+        topk_idx, topk_wt = ctx.forward(
+            hidden_states, logits=buf_logits,
+            topk_indices=buf_idx, topk_weights=buf_wt,
+            num_valid_tokens=actual_B)
+    """
+
+    def __init__(self, router_weight, router_bias, topk=4):
+        """Create fused gate context.
+
+        Args:
+            router_weight: [E, K_dim] BF16 (nn.Linear weight, kept as-is)
+            router_bias: [E] BF16 (or empty tensor if no bias)
+            topk: number of top experts (2, 4, or 8)
+        """
+        ext = _cuda_ext
+        bias = router_bias if router_bias is not None else torch.empty(
+            0, dtype=torch.bfloat16, device=router_weight.device)
+        self._ctx = ext.create_fused_gate_context(router_weight, bias, topk)
+        self._ext = ext
+
+    def warmup(self, base_buffer):
+        """Create TMA descriptor for input against the full base buffer.
+
+        Call once with the base buffer (not per-bucket views) before CUDA
+        graph capture. All per-bucket views share the same data_ptr, so
+        one TMA desc covers all bucket sizes. The kernel grid controls
+        which rows are actually processed per bucket.
+
+        Args:
+            base_buffer: [WB_max, H] BF16 — the full allocated buffer
+        """
+        self._ext.fused_gate_warmup(self._ctx, base_buffer)
+
+    def forward(self, hidden_states, logits=None, topk_indices=None,
+                topk_weights=None, num_valid_tokens=-1):
+        """Run fused gate: WGMMA GEMM + bias + TopK + Softmax.
+
+        Args:
+            hidden_states: [N, K_dim] BF16
+            logits: [N, E] FP32 pre-allocated (optional)
+            topk_indices: [N, K] int32 pre-allocated (optional)
+            topk_weights: [N, K] FP32 pre-allocated (optional)
+            num_valid_tokens: only process first N tokens (-1 = all)
+
+        Returns:
+            topk_indices: [N, K] int32
+            topk_weights: [N, K] FP32
+        """
+        _empty = torch.empty(0)
+        result = self._ext.fused_gate_forward(
+            self._ctx,
+            hidden_states,
+            logits if logits is not None else _empty,
+            topk_indices if topk_indices is not None else _empty,
+            topk_weights if topk_weights is not None else _empty,
+            num_valid_tokens,
+        )
+        return result[0], result[1]
+
+    def __del__(self):
+        if hasattr(self, '_ctx') and hasattr(self, '_ext'):
+            self._ext.destroy_fused_gate_context(self._ctx)
+
+
 def reduce_weighted_scatter_cuda(
     expert_output, topk_pos, topk_weights, N, H=None, K=4,
-    output=None,
+    output=None, num_valid_tokens=-1,
 ):
     """
     CUDA reduce kernel: weighted scatter-add.
@@ -164,6 +251,7 @@ def reduce_weighted_scatter_cuda(
         H: hidden size (auto-detected if None)
         K: top-k (default 4)
         output: [N, H] BF16 pre-allocated output (optional)
+        num_valid_tokens: only process first num_valid_tokens tokens (-1 = all)
 
     Returns:
         output: [N, H] BF16
@@ -183,5 +271,5 @@ def reduce_weighted_scatter_cuda(
 
     return ext.reduce_weighted_scatter(
         expert_output, topk_pos, topk_weights,
-        N, H, K, output,
+        N, H, K, output, num_valid_tokens,
     )
