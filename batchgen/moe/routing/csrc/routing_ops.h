@@ -46,6 +46,18 @@ void router_bias_cast_cuda(
     torch::Tensor output
 );
 
+// Gate: fused sigmoid + top-k + normalize + scale (K2.5)
+// Input:  router_logits [N, E] FP32, e_score_correction [E] FP32
+// Output: topk_indices [N, K] int32, topk_weights [N, K] FP32
+std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
+    torch::Tensor router_logits,
+    torch::Tensor e_score_correction,
+    int k,
+    float routed_scaling_factor,
+    torch::Tensor topk_indices,   // optional pre-allocated
+    torch::Tensor topk_weights    // optional pre-allocated
+);
+
 // Reduce: weighted scatter-add
 // Input:  expert_output [max_disp, H] BF16, topk_pos [N*K] int32,
 //         topk_weights [N, K] FP32

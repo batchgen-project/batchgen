@@ -896,38 +896,17 @@ class MoEGate(nn.Module):
 		logits = F.linear(
 			hidden_states.type(torch.float32), self.weight.type(torch.float32), None
 		)
-		scores = logits.sigmoid()
 
-		### select top-k experts
-		scores_for_choice = scores.view(bsz * seq_len, -1) + self.e_score_correction_bias.unsqueeze(0)
-		group_scores = (
-			scores_for_choice.view(bsz * seq_len, self.n_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
-		)  # [n, n_group]
-		group_idx = torch.topk(
-			group_scores, k=self.topk_group, dim=-1, sorted=False
-		)[
-			1
-		]  # [n, top_k_group]
-		group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-		group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-		score_mask = (
-			group_mask.unsqueeze(-1)
-			.expand(
-				bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group
-			)
-			.reshape(bsz * seq_len, -1)
-		)  # [n, e]
-		tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
-		_, topk_idx = torch.topk(
-			tmp_scores, k=self.top_k, dim=-1, sorted=False
+		# K2.5 (n_group=1): fused CUDA kernel for sigmoid + topk + normalize + scale
+		from batchgen.moe.routing import gate_sigmoid_topk_cuda
+		topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+			logits,
+			self.e_score_correction_bias.float(),
+			k=self.top_k,
+			routed_scaling_factor=self.routed_scaling_factor,
 		)
-		topk_weight = scores.gather(1, topk_idx)
 
-		denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-		topk_weight = topk_weight / denominator
-		topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
-
-		return topk_idx, topk_weight.to(hidden_states.dtype)
+		return topk_idx, topk_weight
 	
 	@torch.inference_mode()
 	def decoding_forward(self, hidden_states):
