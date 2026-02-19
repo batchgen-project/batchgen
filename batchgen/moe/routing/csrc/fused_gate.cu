@@ -271,17 +271,22 @@ std::vector<torch::Tensor> fused_gate_forward(
         topk_weights = torch::empty({N, topk}, torch::dtype(torch::kFloat32).device(device));
     }
 
-    // TMA descriptor for A (input): cached when input buffer address is stable
-    // (CUDA graph mode uses fixed GPU addresses from SharedMoEBufferPool).
-    // TMA with CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA auto-fills
-    // OOB reads with zero, so partial M-tiles at the boundary are handled.
-    // TMA desc A is created once via fused_gate_warmup() against the full base buffer.
-    // All per-bucket views share the same data_ptr, so the cached desc works for all N.
-    // The kernel grid (num_m_tiles based on N_eff) controls which rows are processed.
-    TORCH_CHECK(ctx->has_cached_tma_a,
-                "fused_gate_warmup() must be called before fused_gate_forward()");
-    TORCH_CHECK(ctx->cached_input_ptr == hidden_states.data_ptr(),
-                "Input buffer address changed — call fused_gate_warmup() again");
+    // TMA descriptor for A (input):
+    // - Decode (CUDA graph): pre-cached via fused_gate_warmup() against fixed base buffer
+    // - Prefill (eager): auto-created when input pointer or size changes
+    // TMA OOB fill zeros handle partial M-tiles at boundary.
+    void* input_ptr = hidden_states.data_ptr();
+    int input_rows = hidden_states.size(0);
+    if (!ctx->has_cached_tma_a ||
+        ctx->cached_input_ptr != input_ptr ||
+        input_rows > ctx->cached_input_rows) {
+        ctx->tma_desc_a = make_2d_tma_desc_bf16(
+            reinterpret_cast<__nv_bfloat16*>(input_ptr),
+            input_rows, ctx->K_dim, BLOCK_M, BLOCK_K, ctx->encode_func);
+        ctx->has_cached_tma_a = true;
+        ctx->cached_input_ptr = input_ptr;
+        ctx->cached_input_rows = input_rows;
+    }
     CUtensorMap tma_a = ctx->tma_desc_a;
 
     const __nv_bfloat16* bias_ptr = ctx->has_bias

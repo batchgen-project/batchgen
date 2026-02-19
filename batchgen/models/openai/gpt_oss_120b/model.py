@@ -1100,6 +1100,9 @@ class GptOssMoEPrefill(nn.Module):
         self.down_weight_ref = None
         self.down_scale_ref = None
 
+        # Fused gate context (lazy init on first forward)
+        self._fused_gate_ctx = None
+
     def _get_bf16_buffer(self, shape: Tuple[int, int], device: torch.device) -> torch.Tensor:
         """Get or allocate BF16 buffer for dequantized weights."""
         if self._bf16_buffer is None or self._buffer_shape != shape or self._bf16_buffer.device != device:
@@ -1118,15 +1121,24 @@ class GptOssMoEPrefill(nn.Module):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)  # [total_tokens, hidden_size]
 
-        # Compute routing logits
-        router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
+        # Compute routing: fused gate (WGMMA GEMM + bias + TopK + Softmax) or fallback
+        if self._fused_gate_ctx is None and _HAS_CUDA_ROUTING:
+            w = self.router.weight  # [E, K_dim] BF16
+            if w.dtype == torch.bfloat16:
+                from batchgen.moe.routing import FusedGateContext
+                _bias = self.router.bias
+                _bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+                self._fused_gate_ctx = FusedGateContext(w, _bias_bf16, topk=self.num_experts_per_tok)
 
-        # Select Top-K experts per token
-        if _HAS_CUDA_ROUTING:
+        if self._fused_gate_ctx is not None:
+            topk_indices, topk_weights = self._fused_gate_ctx.forward(hidden_flat)
+        elif _HAS_CUDA_ROUTING:
+            router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
         else:
+            router_logits = self.router(hidden_flat)
             topk_weights, topk_indices = torch.topk(
                 router_logits, k=self.num_experts_per_tok, dim=-1
             )
