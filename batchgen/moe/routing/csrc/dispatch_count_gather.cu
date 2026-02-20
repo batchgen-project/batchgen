@@ -1,15 +1,14 @@
 /*
- * GPT-OSS-120B Dispatch Kernel: Count + Prefix Sum + Gather (CUDA).
+ * K2.5 MoE Dispatch Kernel: Count + Prefix Sum + Gather (CUDA).
  *
- * 3 sub-kernels following hpc-ops count_and_gather architecture:
- *   A. count_tokens_kernel:    shared-memory atomics for counting + init topk_pos=-1
- *   B. prefix_sum_kernel:      sequential scan (E_local <= 128, negligible)
+ * Ported from validated batchgen_kernels/moe_gemm/k25_gating/dispatch_count_gather.py.
+ *
+ * 3 sub-kernels:
+ *   A. count_tokens_kernel:    multi-block shared-mem atomics + atomicAdd flush
+ *   B. prefix_sum_kernel:      sequential scan (E_local small)
  *   C. gather_tokens_kernel:   warp-cooperative vectorized copy
  *
- * Key advantages over Triton version:
- *   - Shared memory atomics (vs Triton global atomics)
- *   - Warp-cooperative float4 copy (32 threads copy one token row)
- *   - __shfl_sync for position broadcast
+ * K2.5: E=384, top_k=8, H=7168. Multi-block count handles NK up to 32K+.
  */
 
 #include <torch/extension.h>
@@ -19,25 +18,27 @@
 #include <c10/cuda/CUDAStream.h>
 
 #define WARP_SIZE 32
+#define COUNT_THREADS 256
 
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Sub-kernel A: Count tokens per local expert + init topk_pos = -1
+// Multi-block: each block uses shared-mem atomics, then atomicAdd to global.
 // ──────────────────────────────────────────────────────────────────────────────
 
 __global__ void count_tokens_kernel(
     const int32_t* __restrict__ topk_indices,  // [NK] flat
-    int32_t* __restrict__ expert_counts,       // [E_local] output
+    int32_t* __restrict__ expert_counts,       // [E_local] output (zero-initialized)
     int32_t* __restrict__ topk_pos,            // [NK] output
     int NK,
     int expert_start,
     int E_local
 ) {
-    // Shared memory for counts (much faster than global atomics)
     extern __shared__ int32_t s_counts[];
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
+    const int global_offset = blockIdx.x * blockDim.x;
 
     // Zero shared counts
     for (int i = tid; i < E_local; i += stride) {
@@ -45,9 +46,9 @@ __global__ void count_tokens_kernel(
     }
     __syncthreads();
 
-    // Count + init topk_pos
-    for (int i = tid; i < NK; i += stride) {
-        topk_pos[i] = -1;  // sentinel for non-local
+    // Count + init topk_pos (each block handles a strided chunk)
+    for (int i = global_offset + tid; i < NK; i += gridDim.x * blockDim.x) {
+        topk_pos[i] = -1;
 
         int eid = topk_indices[i];
         int local_id = eid - expert_start;
@@ -57,9 +58,11 @@ __global__ void count_tokens_kernel(
     }
     __syncthreads();
 
-    // Write back to global memory
+    // Flush shared counts to global (atomicAdd for multi-block safety)
     for (int i = tid; i < E_local; i += stride) {
-        expert_counts[i] = s_counts[i];
+        if (s_counts[i] > 0) {
+            atomicAdd(&expert_counts[i], s_counts[i]);
+        }
     }
 }
 
@@ -92,13 +95,12 @@ __global__ void gather_tokens_kernel(
     const __nv_bfloat16* __restrict__ x,           // [N, H]
     const int32_t* __restrict__ topk_indices,       // [NK] flat
     const int32_t* __restrict__ expert_offsets,     // [E_local + 1]
-    int32_t* __restrict__ expert_counters,          // [E_local] scratch (zero-initialized)
+    int32_t* __restrict__ expert_counters,          // [E_local] scratch (zero-init)
     __nv_bfloat16* __restrict__ dispatched_x,       // [max_disp, H]
     int32_t* __restrict__ topk_pos,                 // [NK]
     int NK, int H, int K,
     int expert_start, int E_local
 ) {
-    // One warp per topk assignment
     const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int warp_id = global_tid / WARP_SIZE;
     const int lane_id = global_tid % WARP_SIZE;
@@ -110,34 +112,29 @@ __global__ void gather_tokens_kernel(
     const int eid = topk_indices[itopk];
     const int local_expert = eid - expert_start;
 
-    // Skip non-local experts (all lanes return together)
     if (local_expert < 0 || local_expert >= E_local) return;
 
-    // Lane 0: atomically claim a position within expert's segment
+    // Lane 0: atomically claim a position
     int write_pos;
     if (lane_id == 0) {
         int relative_pos = atomicAdd(&expert_counters[local_expert], 1);
         write_pos = expert_offsets[local_expert] + relative_pos;
         topk_pos[itopk] = write_pos;
     }
-    // Broadcast write_pos to all lanes in the warp
     write_pos = __shfl_sync(0xffffffff, write_pos, 0);
 
-    // Warp-cooperative vectorized copy: x[token_id, :] -> dispatched_x[write_pos, :]
-    // Use float4 (128-bit) loads: 8 BF16 values per float4
-    const int vec_size = 8;  // BF16 values per float4
+    // Warp-cooperative vectorized copy
+    const int vec_size = 8;
     const int vec_count = H / vec_size;
     const int remainder = H % vec_size;
 
     const float4* src = reinterpret_cast<const float4*>(x + (int64_t)token_id * H);
     float4* dst = reinterpret_cast<float4*>(dispatched_x + (int64_t)write_pos * H);
 
-    // Each of 32 lanes copies different float4 chunks
     for (int v = lane_id; v < vec_count; v += WARP_SIZE) {
         dst[v] = src[v];
     }
 
-    // Handle remainder (H=2880: 2880/8=360, no remainder)
     if (remainder > 0 && lane_id == 0) {
         const __nv_bfloat16* src_r = x + (int64_t)token_id * H + vec_count * vec_size;
         __nv_bfloat16* dst_r = dispatched_x + (int64_t)write_pos * H + vec_count * vec_size;
@@ -198,16 +195,14 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
         dispatched_x = torch::empty({NK, H}, torch::dtype(torch::kBFloat16).device(device));
     }
 
-    // Flat view of topk_indices
     auto flat_indices = topk_indices.reshape({-1}).contiguous();
-
-    // All kernels launch on current CUDA stream (required for CUDA graph capture)
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // ── Sub-kernel A: Count ──
+    // Sub-kernel A: Count (multi-block for large NK)
     {
-        int threads = 256;
-        int blocks = 1;  // For decode NK <= 256, single block suffices
+        int threads = COUNT_THREADS;
+        int blocks = (NK + threads - 1) / threads;
+        if (blocks > 128) blocks = 128;  // cap blocks, each does grid-stride loop
         int smem_bytes = E_local * sizeof(int32_t);
         count_tokens_kernel<<<blocks, threads, smem_bytes, stream>>>(
             flat_indices.data_ptr<int32_t>(),
@@ -217,7 +212,7 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
         );
     }
 
-    // ── Sub-kernel B: Prefix sum ──
+    // Sub-kernel B: Prefix sum
     {
         prefix_sum_kernel<<<1, 1, 0, stream>>>(
             expert_counts.data_ptr<int32_t>(),
@@ -226,13 +221,11 @@ std::vector<torch::Tensor> dispatch_count_gather_cuda(
         );
     }
 
-    // ── Sub-kernel C: Gather ──
+    // Sub-kernel C: Gather
     {
-        // One warp per topk assignment
         int total_threads = NK * WARP_SIZE;
         int threads_per_block = 256;
         int blocks = (total_threads + threads_per_block - 1) / threads_per_block;
-
         gather_tokens_kernel<<<blocks, threads_per_block, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
             flat_indices.data_ptr<int32_t>(),

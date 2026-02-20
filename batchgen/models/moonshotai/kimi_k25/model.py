@@ -32,6 +32,7 @@ Design:
     - Wrappers handle optimized forward (INT4 dequant, FlashAttention, KV cache)
 """
 
+import logging
 import math
 
 import torch
@@ -274,43 +275,16 @@ class MoEGate(nn.Module):
             )
 
         logits = F.linear(hidden_states.float(), self.weight.float(), None)
-        scores = logits.sigmoid()
-
-        # Top-k with noaux_tc correction bias
-        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
-
-        # Group-based selection (n_group=1 makes this a simple topk)
-        group_scores = (
-            scores_for_choice.view(num_tokens, self.n_group, -1)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
+        from batchgen.moe.routing import gate_sigmoid_topk_cuda
+        topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+            logits, self.e_score_correction_bias.float(),
+            k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
         )
-        group_idx = torch.topk(
-            group_scores, k=self.topk_group, dim=-1, sorted=False
-        )[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(num_tokens, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(num_tokens, -1)
-        )
-        tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
-        _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
-        topk_weight = scores.gather(1, topk_idx)
-
-        # Normalize and scale
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weight = topk_weight / denominator
-        topk_weight = topk_weight * self.routed_scaling_factor
-
         return topk_idx, topk_weight
 
     @torch.inference_mode()
-    @torch.compile(mode="max-autotune", backend="inductor")
     def decoding_forward(self, hidden_states):
-        """Decode-optimized routing (torch.compiled)."""
+        """Decode-optimized routing (CUDA kernel)."""
         if hidden_states.dim() == 2:
             num_tokens, h = hidden_states.shape
         else:
@@ -319,33 +293,12 @@ class MoEGate(nn.Module):
         hidden_states = hidden_states.view(-1, h)
 
         logits = F.linear(hidden_states.float(), self.weight.float(), None)
-        scores = logits.sigmoid()
-
-        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
-        group_scores = (
-            scores_for_choice.view(num_tokens, self.n_group, -1)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
+        from batchgen.moe.routing import gate_sigmoid_topk_cuda
+        topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+            logits, self.e_score_correction_bias.float(),
+            k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
         )
-        group_idx = torch.topk(
-            group_scores, k=self.topk_group, dim=-1, sorted=False
-        )[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(num_tokens, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(num_tokens, -1)
-        )
-        tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
-        _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
-        topk_weight = scores.gather(1, topk_idx)
-
-        denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-        topk_weight = topk_weight / denominator
-        topk_weight = topk_weight * self.routed_scaling_factor
-
-        return topk_idx, topk_weight.to(hidden_states.dtype)
+        return topk_idx, topk_weight
 
 
 # ============================================================================
@@ -355,8 +308,9 @@ class MoEGate(nn.Module):
 class KimiK25MoE(nn.Module):
     """MoE layer with 384 routed + 1 shared expert.
 
-    In EP mode (decode), only local experts are instantiated; rest are None.
-    Wrappers handle the actual forward pass (INT4 dequant, routing execution).
+    Supports two execution modes:
+    - EP mode (decode): AllGather → gate on global tokens → local expert loop → AllReduce
+    - Local mode (prefill or single-GPU): gate on local tokens → all-expert loop
     """
 
     def __init__(self, config):
@@ -368,19 +322,38 @@ class KimiK25MoE(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size  # 2048
         self.num_experts_per_tok = config.num_experts_per_tok
 
+        # EP metadata
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+        self.experts_per_rank = self.num_experts // self.world_size
+        self.routed_expert_start_idx = self.rank * self.experts_per_rank
+        self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
+
+        # Set by PSM after model creation
+        self.comm = None
+        self.device = None
+        self.num_tokens_per_rank = None
+
+        # Persistent vs non-persistent expert tracking (set by PSM)
+        # Default: all local experts are persistent (no offloading)
+        all_local = list(range(self.routed_expert_start_idx, self.routed_expert_end_idx))
+        self.persistent_expert_ids = all_local  # global IDs, GPU-resident
+        self.nonpersistent_expert_ids = []      # global IDs, host-offloaded
+        self.num_persistent_local_experts = self.experts_per_rank
+
         # Router
         self.gate = MoEGate(config)
 
         # Routed experts — EP mode creates None placeholders for non-local experts
         ep_size = getattr(config, 'ep_size', 1)
         if ep_size > 1 and dist.is_initialized():
-            rank = dist.get_rank()
-            experts_per_rank = self.num_experts // ep_size
-            start = rank * experts_per_rank
-            end = start + experts_per_rank
             self.experts = nn.ModuleList([
                 KimiK25Expert(self.hidden_size, self.moe_intermediate_size)
-                if start <= i < end else None
+                if self.routed_expert_start_idx <= i < self.routed_expert_end_idx else None
                 for i in range(self.num_experts)
             ])
         else:
@@ -396,56 +369,191 @@ class KimiK25MoE(nn.Module):
             self.moe_intermediate_size * n_shared,
         )
 
+    def init_num_tokens(self, num_tokens_per_rank):
+        """Initialize num_tokens_per_rank (called by PSM during decode setup)."""
+        self.num_tokens_per_rank = num_tokens_per_rank
+
+    def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
+        """Update num_tokens_per_rank dynamically."""
+        self.num_tokens_per_rank = num_tokens_per_rank
+
     @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MoE forward with loop-based expert dispatch.
+        """MoE forward — routes to decode or prefill path."""
+        if self.config.phase == "decode":
+            return self._forward_decode(hidden_states)
+        else:
+            return self._forward_prefill(hidden_states)
 
-        Routes tokens to top-k experts via the gate, dispatches to each expert
-        individually (compatible with INT4 wrappers), and adds shared expert output.
+    def init_grouped_wgmma(self):
+        """Setup weight pointer arrays for grouped WGMMA kernels.
+
+        Called by PSM after expert wrapping + INT4 weights moved to GPU.
+        Only sets up pointers for persistent (GPU-resident) experts.
         """
+        if self.num_persistent_local_experts == 0:
+            self._use_grouped_wgmma = False
+            return
+
+        try:
+            from batchgen.moe.grouped_int4_wgmma import setup_expert_weight_pointers
+            self._wgmma_weight_ptrs = setup_expert_weight_pointers(
+                self.experts, self.num_persistent_local_experts,
+                self.routed_expert_start_idx, self.device,
+            )
+            self._use_grouped_wgmma = True
+        except Exception as e:
+            logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
+            self._use_grouped_wgmma = False
+
+    @torch.inference_mode()
+    def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """EP decode: AllGather → CUDA gate → CUDA dispatch → grouped WGMMA → CUDA reduce → AllReduce."""
+        from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_states
+        num_tokens, hidden_size = hidden_states.shape
+        device = self.device or hidden_states.device
+        K = self.top_k
+
+        # 1) AllGather: collect tokens from all ranks
+        all_tokens = torch.zeros(
+            self.world_size * self.num_tokens_per_rank, hidden_size,
+            device=device, dtype=torch.bfloat16,
+        )
+        padded = torch.zeros(
+            self.num_tokens_per_rank, hidden_size,
+            device=device, dtype=hidden_states.dtype,
+        )
+        if num_tokens > 0:
+            padded[:num_tokens] = hidden_states
+
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                all_tokens, padded,
+                stream=torch.cuda.default_stream(device),
+            )
+
+        # 2) CUDA gate on global tokens
+        global_x = all_tokens
+        num_global = global_x.shape[0]
+        topk_idx, topk_weight = self.gate(global_x.view(num_global, 1, hidden_size))
+
+        # 3) CUDA dispatch
+        dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+            global_x, topk_idx.to(torch.int32),
+            self.routed_expert_start_idx, self.experts_per_rank,
+        )
+
+        # 4) Expert execution
+        n_persistent = self.num_persistent_local_experts
+        all_persistent = (n_persistent == self.experts_per_rank)
+
+        if all_persistent and getattr(self, '_use_grouped_wgmma', False):
+            # All-persistent fast path: zero host-device sync
+            # Pass full dispatched_x — WGMMA tiles by expert_offsets, handles BLOCK_M padding.
+            # Reduce uses topk_pos to index into expert_output, skips pos=-1.
+            from batchgen.moe.grouped_int4_wgmma import grouped_int4_moe_forward
+            expert_output = grouped_int4_moe_forward(
+                dispatched_x, expert_offsets,
+                self._wgmma_weight_ptrs,
+                self.moe_intermediate_size, hidden_size,
+            )
+        else:
+            # Mixed path: grouped WGMMA for persistent + loop for non-persistent
+            offsets_cpu = expert_offsets.tolist()
+            actual = offsets_cpu[-1]
+            if actual == 0:
+                global_results = torch.zeros(num_global, hidden_size, device=device, dtype=torch.bfloat16)
+                # Skip to AllReduce
+                with self.comm.change_state(enable=True):
+                    self.comm.all_reduce(
+                        global_results, op=dist.ReduceOp.SUM,
+                        stream=torch.cuda.default_stream(device),
+                    )
+                start = self.rank * self.num_tokens_per_rank
+                out = global_results[start:start + num_tokens]
+                out = out + self.shared_experts(identity)
+                return out.view(*orig_shape)
+
+            expert_output = dispatched_x.new_empty(actual, hidden_size)
+
+            if getattr(self, '_use_grouped_wgmma', False) and n_persistent > 0:
+                from batchgen.moe.grouped_int4_wgmma import grouped_int4_moe_forward
+                persistent_end = offsets_cpu[n_persistent]
+                if persistent_end > 0:
+                    wgmma_offsets = expert_offsets[:n_persistent + 1]
+                    wgmma_out = grouped_int4_moe_forward(
+                        dispatched_x[:persistent_end], wgmma_offsets,
+                        self._wgmma_weight_ptrs,
+                        self.moe_intermediate_size, hidden_size,
+                    )
+                    expert_output[:persistent_end] = wgmma_out[:persistent_end]
+
+            for local_e in range(n_persistent, self.experts_per_rank):
+                start_off = offsets_cpu[local_e]
+                end_off = offsets_cpu[local_e + 1]
+                if start_off == end_off:
+                    continue
+                global_e = self.routed_expert_start_idx + local_e
+                expert_output[start_off:end_off] = self.experts[global_e](dispatched_x[start_off:end_off])
+
+        # 5) CUDA reduce
+        global_results = reduce_weighted_scatter_cuda(
+            expert_output, topk_pos, topk_weight,
+            num_global, hidden_size, K,
+        )
+
+        # 6) AllReduce: sum results from all ranks
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                global_results, op=dist.ReduceOp.SUM,
+                stream=torch.cuda.default_stream(device),
+            )
+
+        # 7) Extract local results + add shared expert
+        start = self.rank * self.num_tokens_per_rank
+        end = start + num_tokens
+        out = global_results[start:end]
+        out = out + self.shared_experts(identity)
+        return out.view(*orig_shape)
+
+    @torch.inference_mode()
+    def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Prefill: CUDA gate → per-expert wrapper loop (all experts local, no EP)."""
         identity = hidden_states
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         num_tokens, hidden_size = hidden_states.shape
         device = hidden_states.device
-
-        # Gate routing
-        topk_idx, topk_weight = self.gate(identity)
-        # topk_idx: [num_tokens, top_k], topk_weight: [num_tokens, top_k]
-
         K = self.top_k
-        flat_expert_idx = topk_idx.view(-1)  # [num_tokens * K]
-        flat_weights = topk_weight.view(-1)  # [num_tokens * K]
+
+        topk_idx, topk_weight = self.gate(identity)
+
+        flat_expert_idx = topk_idx.view(-1)
         token_indices = torch.arange(num_tokens, device=device).repeat_interleave(K)
         topk_positions = torch.arange(K, device=device).repeat(num_tokens)
 
-        # Accumulate weighted expert outputs
         results = torch.zeros(num_tokens, hidden_size, device=device, dtype=torch.float32)
 
         for expert_idx, expert in enumerate(self.experts):
             if expert is None:
                 continue
-
-            # Find tokens routed to this expert
             mask = flat_expert_idx == expert_idx
             if not mask.any():
                 continue
-
             expert_token_idx = token_indices[mask]
             expert_topk_pos = topk_positions[mask]
             tokens_for_expert = hidden_states[expert_token_idx]
-
             expert_output = expert(tokens_for_expert)
-
             expert_weights = topk_weight[expert_token_idx, expert_topk_pos]
             weighted_output = expert_output.float() * expert_weights.unsqueeze(-1)
             results.index_add_(0, expert_token_idx, weighted_output)
 
         results = results.to(hidden_states.dtype)
-
-        # Add shared expert output
         results = results + self.shared_experts(identity.view(-1, hidden_size))
-
         return results.view(*orig_shape)
 
 

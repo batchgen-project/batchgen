@@ -761,13 +761,22 @@ class MoEGate(nn.Module):
 		init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
 	def forward(self, hidden_states):
-		# log self.weight and self.e_score_correction_bias shape and dtype
 		bsz, seq_len, h = hidden_states.shape
-		### compute gating score
 		hidden_states = hidden_states.view(-1, h)
 		logits = F.linear(
 			hidden_states.type(torch.float32), self.weight.type(torch.float32), None
 		)
+
+		# K2.5 (n_group=1): fused CUDA kernel for sigmoid + topk + normalize + scale
+		if self.n_group == 1 and self.topk_group == 1:
+			from batchgen.moe.routing import gate_sigmoid_topk_cuda
+			topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+				logits, self.e_score_correction_bias.float(),
+				k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
+			)
+			return topk_idx, topk_weight
+
+		# n_group > 1 path (DeepSeek-V3 style group routing)
 		if self.scoring_func == "sigmoid":
 			scores = logits.sigmoid()
 		else:
@@ -775,7 +784,6 @@ class MoEGate(nn.Module):
 				f"insupportable scoring function for MoE gating: {self.scoring_func}"
 			)
 
-		### select top-k experts
 		if self.topk_method == "noaux_tc":
 			assert not self.training
 			scores_for_choice = scores.view(bsz * seq_len, -1) + self.e_score_correction_bias.unsqueeze(0)
@@ -810,7 +818,7 @@ class MoEGate(nn.Module):
 		if self.top_k > 1 and self.norm_topk_prob:
 			denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
 			topk_weight = topk_weight / denominator
-		topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
+		topk_weight = topk_weight * self.routed_scaling_factor
 
 		return topk_idx, topk_weight
 	
@@ -896,38 +904,17 @@ class MoEGate(nn.Module):
 		logits = F.linear(
 			hidden_states.type(torch.float32), self.weight.type(torch.float32), None
 		)
-		scores = logits.sigmoid()
 
-		### select top-k experts
-		scores_for_choice = scores.view(bsz * seq_len, -1) + self.e_score_correction_bias.unsqueeze(0)
-		group_scores = (
-			scores_for_choice.view(bsz * seq_len, self.n_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
-		)  # [n, n_group]
-		group_idx = torch.topk(
-			group_scores, k=self.topk_group, dim=-1, sorted=False
-		)[
-			1
-		]  # [n, top_k_group]
-		group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-		group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-		score_mask = (
-			group_mask.unsqueeze(-1)
-			.expand(
-				bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group
-			)
-			.reshape(bsz * seq_len, -1)
-		)  # [n, e]
-		tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
-		_, topk_idx = torch.topk(
-			tmp_scores, k=self.top_k, dim=-1, sorted=False
+		# K2.5 (n_group=1): fused CUDA kernel for sigmoid + topk + normalize + scale
+		from batchgen.moe.routing import gate_sigmoid_topk_cuda
+		topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+			logits,
+			self.e_score_correction_bias.float(),
+			k=self.top_k,
+			routed_scaling_factor=self.routed_scaling_factor,
 		)
-		topk_weight = scores.gather(1, topk_idx)
 
-		denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-		topk_weight = topk_weight / denominator
-		topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
-
-		return topk_idx, topk_weight.to(hidden_states.dtype)
+		return topk_idx, topk_weight
 	
 	@torch.inference_mode()
 	def decoding_forward(self, hidden_states):
@@ -1106,103 +1093,37 @@ class DeepseekV3MoE_Prefill(nn.Module):
 
 	@torch.no_grad()
 	def moe_infer(self, x, topk_ids, topk_weight):
-		cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
-		cnts.scatter_(1, topk_ids, 1)
-		tokens_per_expert = cnts.sum(dim=0)
-		idxs = topk_ids.view(-1).argsort()
-		sorted_tokens = x[idxs // topk_ids.shape[1]]
-		sorted_tokens_shape = sorted_tokens.shape
-		if self.ep_size > 1:
-			tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-			tokens_per_expert_group = tokens_per_expert.new_empty(
-				tokens_per_expert.shape[0]
-			)
-			dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
-			output_splits = (
-				tokens_per_expert_group.view(self.ep_size, -1)
-				.sum(1)
-				.cpu()
-				.numpy()
-				.tolist()
-			)
-			gathered_tokens = sorted_tokens.new_empty(
-				tokens_per_expert_group.sum(dim=0).cpu().item(), sorted_tokens.shape[1]
-			)
-			input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
-			dist.all_to_all(
-				list(gathered_tokens.split(output_splits)),
-				list(sorted_tokens.split(input_split_sizes)),
-			)
-			tokens_per_expert_post_gather = tokens_per_expert_group.view(
-				self.ep_size, self.experts_per_rank
-			).sum(dim=0)
-			gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
-			s = 0
-			for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-				gatherd_idxs[s : s + k] = i % self.experts_per_rank
-				s += k
-			gatherd_idxs = gatherd_idxs.argsort()
-			sorted_tokens = gathered_tokens[gatherd_idxs]
-			tokens_per_expert = tokens_per_expert_post_gather
-		tokens_per_expert = tokens_per_expert.cpu().numpy()
+		from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
 
-		# Pre-allocate output buffer to avoid torch.cat() memory overhead
-		total_tokens = int(tokens_per_expert.sum())
-		if total_tokens > 0:
-			# Get hidden_dim from sorted_tokens shape
-			hidden_dim = sorted_tokens.shape[-1]
-			outs = sorted_tokens.new_empty(total_tokens, hidden_dim)
+		N, H = x.shape
+		K = topk_ids.shape[1]
+		topk_ids_i32 = topk_ids.to(torch.int32)
+		expert_start = self.ep_rank * self.experts_per_rank
+		num_local = self.experts_per_rank
 
-			read_idx = 0
-			write_idx = 0
-			for i, num_tokens in enumerate(tokens_per_expert):
-				if num_tokens == 0:
-					continue
-				expert = self.experts[i + self.ep_rank * self.experts_per_rank]
-				tokens_for_this_expert = sorted_tokens[read_idx:read_idx + num_tokens]
-				expert_out = expert(tokens_for_this_expert)
-				# Write directly to pre-allocated buffer
-				outs[write_idx:write_idx + num_tokens] = expert_out
-				read_idx += num_tokens
-				write_idx += num_tokens
-		else:
-			outs = sorted_tokens.new_empty(0)
-		if self.ep_size > 1:
-			new_x = torch.empty_like(outs)
-			new_x[gatherd_idxs] = outs
-			gathered_tokens = new_x.new_empty(*sorted_tokens_shape)
-			dist.all_to_all(
-				list(gathered_tokens.split(input_split_sizes)),
-				list(new_x.split(output_splits)),
-			)
-			outs = gathered_tokens
-
-		# new_x = torch.empty_like(outs)
-		# new_x[idxs] = outs
-		# topk_weight = topk_weight.to(torch.bfloat16)
-		# final_out = (
-		# 	new_x.view(*topk_ids.shape, -1)
-		# 	.mul_(topk_weight.unsqueeze(dim=-1))
-		# 	.sum(dim=1)
-		# 	.type(new_x.dtype)
-		# )
-
-		# new_x = torch.empty_like(outs)
-		# new_x[idxs] = outs
-		# assert topk_weight.dtype == torch.float32
-		# topk_weight = topk_weight.to(new_x.dtype)
-		# final_out = (
-		# 	new_x.view(*topk_ids.shape, -1)
-		# 	.type(topk_weight.dtype)
-		# 	.mul_(topk_weight.unsqueeze(dim=-1))
-		# 	.sum(dim=1)
-		# 	.type(new_x.dtype)
-		# )
-
-		final_out = moe_fp32_accum_triton_v2(
-			outs, idxs, topk_weight
+		# CUDA dispatch: sort tokens by expert
+		dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+			x, topk_ids_i32, expert_start, num_local,
 		)
-		return final_out
+
+		# Expert loop using expert_offsets
+		total_dispatched = expert_offsets[-1].item()
+		if total_dispatched > 0:
+			outs = dispatched_x.new_empty(total_dispatched, H)
+			offset = 0
+			for i in range(num_local):
+				count = expert_counts[i].item()
+				if count == 0:
+					continue
+				expert = self.experts[i + expert_start]
+				outs[offset:offset + count] = expert(dispatched_x[offset:offset + count])
+				offset += count
+		else:
+			outs = dispatched_x.new_empty(0, H)
+
+		# CUDA reduce: weighted scatter back to original token order
+		output = reduce_weighted_scatter_cuda(outs, topk_pos, topk_weight, N, H, K)
+		return output
 
 from batchgen.moe.fused_grouped_dequant_gemm import (
 	fused_dequant_grouped_gemm_bf16_fp8_triton,
@@ -2785,58 +2706,24 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
 		assert topk_weight.dtype == torch.float32, f"topk_weight must be float32, got {topk_weight.dtype}"
-		global_x = global_x.squeeze(1) 
+		global_x = global_x.squeeze(1)
 		# ---- 3) Process tokens assigned to local experts ------------------
-		topk_idx = topk_idx.to(torch.int32)		
-		# input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
-		# 	global_x, topk_idx, self.token_idx, self.topk_pos,
-		# 	self.routed_expert_start_idx, self.routed_expert_end_idx,
-		# )
-		input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
-					global_x, topk_idx, self.token_idx, self.topk_pos,
-					self.routed_expert_start_idx, self.routed_expert_end_idx,
-				)
-		# # Filter out sentinels here because the token dispatch kernel reserved oversized space.
-		# valid_mask = input_eids >= 0  # Expert IDs are never negative
-
-		# # Apply filter to all tensors
-		# input_x = input_x[valid_mask]
-		# input_eids = input_eids[valid_mask]
-		# global_indices = global_indices[valid_mask]
-		# token_topk_pos = token_topk_pos[valid_mask]
-
-		# ---- 3) Process tokens assigned to local experts ------------------
-		# res = self.grouped_dequant_moe_fp8_(input_x, input_eids)
-		
-		
-		res = self.grouped_dequant_moe_fp8(
-					input_x,          # Oversized
-					input_eids,         # Oversized
-					expert_counts,    # [num_local_experts] (on GPU)
-					expert_offsets    # [num_local_experts + 1] (on GPU)
-				)	
-
-
-
-
-		# res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
-		# global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
-		#  									 device=self.device, dtype=torch.bfloat16)
-		# global_results[global_indices, token_topk_pos, :] = res
-
-		# """ FP32 Weighting """
-		# assert topk_weight.dtype == torch.float32
-		# weighted_output = global_results.to(torch.float32) * topk_weight.unsqueeze(-1)
-		# global_results = weighted_output.sum(dim=1)
-		global_results = scatter_weight_reduce_optimized(
-			res, global_indices, token_topk_pos, topk_weight,
-			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+		topk_idx = topk_idx.to(torch.int32)
+		from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+		dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+			global_x, topk_idx, self.routed_expert_start_idx, self.experts_per_rank,
 		)
-		
-		""" BF16 Weighting """
-		# topk_weight = topk_weight.to(x.dtype)
-		# global_results = moe_weighted_sum_triton_v2(global_results, topk_weight)
-		
+
+		res = self.grouped_dequant_moe_fp8(
+			dispatched_x, None, expert_counts, expert_offsets
+		)
+
+		num_global = self.num_tokens_per_rank * self.world_size
+		global_results = reduce_weighted_scatter_cuda(
+			res, topk_pos, topk_weight, num_global, hidden_size, self.num_experts_per_tok
+		)
+		global_results = global_results.float()
+
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
@@ -2867,65 +2754,28 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		torch.distributed.all_gather_into_tensor(all_tokens, padded_hidden_states, async_op=False)
 		# ---- 2) Gate computation on global tokens --------------------------
 		global_x = all_tokens
-		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
-		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
 		assert topk_weight.dtype == torch.float32, f"topk_weight must be float32, got {topk_weight.dtype}"
-		global_x = global_x.squeeze(1) 
+		global_x = global_x.squeeze(1)
 		# ---- 3) Process tokens assigned to local experts ------------------
-		topk_idx = topk_idx.to(torch.int32)		
-		# input_x, input_eids, global_indices, token_topk_pos, _ = fused_moe_token_dispatch(
-		# 	global_x, topk_idx, self.token_idx, self.topk_pos,
-		# 	self.routed_expert_start_idx, self.routed_expert_end_idx,
-		# )
-		input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
-					global_x, topk_idx, self.token_idx, self.topk_pos,
-					self.routed_expert_start_idx, self.routed_expert_end_idx,
-				)
-		# # Filter out sentinels here because the token dispatch kernel reserved oversized space.
-		# valid_mask = input_eids >= 0  # Expert IDs are never negative
-
-		# # Apply filter to all tensors
-		# input_x = input_x[valid_mask]
-		# input_eids = input_eids[valid_mask]
-		# global_indices = global_indices[valid_mask]
-		# token_topk_pos = token_topk_pos[valid_mask]
-
-		# ---- 3) Process tokens assigned to local experts ------------------
-		# res = self.grouped_dequant_moe_fp8_(input_x, input_eids)
-		
-		
-		res = self.grouped_dequant_moe_fp8(
-					input_x,          # Oversized
-					input_eids,         # Oversized
-					expert_counts,    # [num_local_experts] (on GPU)
-					expert_offsets    # [num_local_experts + 1] (on GPU)
-				)	
-
-
-
-
-		# res = self.grouped_weight_dequant_moe_a16w8(input_x, input_eids)
-		# global_results = torch.zeros((self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok, self.config.hidden_size),
-		#  									 device=self.device, dtype=torch.bfloat16)
-		# global_results[global_indices, token_topk_pos, :] = res
-
-		# """ FP32 Weighting """
-		# assert topk_weight.dtype == torch.float32
-		# weighted_output = global_results.to(torch.float32) * topk_weight.unsqueeze(-1)
-		# global_results = weighted_output.sum(dim=1)
-		global_results = scatter_weight_reduce_optimized(
-			res, global_indices, token_topk_pos, topk_weight,
-			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+		topk_idx = topk_idx.to(torch.int32)
+		from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+		dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+			global_x, topk_idx, self.routed_expert_start_idx, self.experts_per_rank,
 		)
-		
-		""" BF16 Weighting """
-		# topk_weight = topk_weight.to(x.dtype)
-		# global_results = moe_weighted_sum_triton_v2(global_results, topk_weight)
-		
+
+		res = self.grouped_dequant_moe_fp8(
+			dispatched_x, None, expert_counts, expert_offsets
+		)
+
+		num_global = self.num_tokens_per_rank * self.world_size
+		global_results = reduce_weighted_scatter_cuda(
+			res, topk_pos, topk_weight, num_global, hidden_size, self.num_experts_per_tok
+		)
+		global_results = global_results.float()
+
 		# ---- 3.3) All-reduce to combine results from all workers ------------
-		# with self.comm.change_state(enable=True):
-		# 	self.comm.all_reduce(global_results, op=dist.ReduceOp.SUM, stream=torch.cuda.default_stream(self.device))
 		torch.distributed.all_reduce(global_results, op=dist.ReduceOp.SUM, async_op=False)
 		# ---- 3.4) Extract results for local tokens and aggregate ------------
 		# CRITICAL: Use num_tokens_per_rank for stride since all_gather used padded size
@@ -2953,46 +2803,27 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			self.comm.all_gather(all_tokens, padded_hidden_states, stream=torch.cuda.default_stream(self.device))
 		# ---- 2) Gate computation on global tokens --------------------------
 		global_x = all_tokens
-		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])  # Add dummy dimension for compatibility
-		# topk_idx, topk_weight = self.gate.decoding_forward(global_x)
+		global_x = global_x.view(global_x.shape[0], 1, global_x.shape[1])
 		topk_idx, topk_weight = self.gate.moe_gate_forward_hybrid(global_x)
 		assert topk_weight.dtype == torch.float32, f"topk_weight must be float32, got {topk_weight.dtype}"
-		global_x = global_x.squeeze(1) 
+		global_x = global_x.squeeze(1)
 		# ---- 3) Process tokens assigned to local experts ------------------
-		topk_idx = topk_idx.to(torch.int32)		
-		input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
-					global_x, topk_idx, self.token_idx, self.topk_pos,
-					self.routed_expert_start_idx, self.routed_expert_end_idx,
-				)
-
-		# ---- 3) Process tokens assigned to local experts ------------------
-		# res = self.grouped_dequant_moe_fp8_(input_x, input_eids)
-		# logger.info(f"Rank {self.rank}: input_x shape: {input_x.shape}, input_eids shape: {input_eids.shape}, expert_counts shape: {expert_counts.shape}, expert_offsets shape: {expert_offsets.shape}, expert_counts: {expert_counts}, expert_offsets: {expert_offsets}")
-		res = self.grouped_dequant_moe_fp8(
-					input_x,          # Oversized
-					input_eids,         # Oversized
-					expert_counts,    # [num_local_experts] (on GPU)
-					expert_offsets    # [num_local_experts + 1] (on GPU)
-				)	
-
-		# """ FP32 Weighting """
-		# assert topk_weight.dtype == torch.float32
-		# weighted_output = global_results.to(torch.float32) * topk_weight.unsqueeze(-1)
-		# global_results = weighted_output.sum(dim=1)
-		# global_results = scatter_weight_reduce_optimized(
-		# 	res, global_indices, token_topk_pos, topk_weight,
-		# 	self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
-		# )
-		
-		""" BF16 Weighting """
-		# topk_weight = topk_weight.to(x.dtype)
-		# global_results = moe_weighted_sum_triton_v2(global_results, topk_weight)
-		assert topk_weight.dtype == torch.float32
-		global_results = scatter_weight_reduce_optimized(
-			res, global_indices, token_topk_pos, topk_weight,
-			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+		topk_idx = topk_idx.to(torch.int32)
+		from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+		dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+			global_x, topk_idx, self.routed_expert_start_idx, self.experts_per_rank,
 		)
-		global_results = global_results.to(torch.bfloat16)
+
+		res = self.grouped_dequant_moe_fp8(
+			dispatched_x, None, expert_counts, expert_offsets
+		)
+
+		assert topk_weight.dtype == torch.float32
+		num_global = self.num_tokens_per_rank * self.world_size
+		global_results = reduce_weighted_scatter_cuda(
+			res, topk_pos, topk_weight, num_global, hidden_size, self.num_experts_per_tok
+		)
+		global_results = global_results.float()
 		
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
@@ -3050,24 +2881,24 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 			global_x = global_x.squeeze(1)
 			
 			topk_idx = topk_idx.to(torch.int32)
-			input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
-				global_x, topk_idx, self.token_idx, self.topk_pos,
-				self.routed_expert_start_idx, self.routed_expert_end_idx,
+			from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+			dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+				global_x, topk_idx, self.routed_expert_start_idx, self.experts_per_rank,
 			)
-			
+
 			# Process tokens (may still have tokens from other ranks routed to this rank's experts)
 			res = self.grouped_dequant_moe_fp8(
-				input_x,
-				input_eids,
+				dispatched_x,
+				None,
 				expert_counts,
 				expert_offsets
 			)
-			
-			global_results = scatter_weight_reduce_optimized(
-				res, global_indices, token_topk_pos, topk_weight,
-				self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+
+			num_global = self.num_tokens_per_rank * self.world_size
+			global_results = reduce_weighted_scatter_cuda(
+				res, topk_pos, topk_weight, num_global, hidden_size, self.num_experts_per_tok
 			)
-			global_results = global_results.to(torch.bfloat16)
+			global_results = global_results.float()
 			
 			# Participate in all-reduce
 			with self.comm.change_state(enable=True):
@@ -3113,25 +2944,25 @@ class DeepseekV3MoE_Decoding_FP8(nn.Module):
 		
 		# ---- 3) Process tokens assigned to local experts ------------------
 		topk_idx = topk_idx.to(torch.int32)
-		input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = fused_moe_token_dispatch(
-			global_x, topk_idx, self.token_idx, self.topk_pos,
-			self.routed_expert_start_idx, self.routed_expert_end_idx,
+		from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
+		dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+			global_x, topk_idx, self.routed_expert_start_idx, self.experts_per_rank,
 		)
-		
+
 		res = self.grouped_dequant_moe_fp8(
-			input_x,
-			input_eids,
+			dispatched_x,
+			None,
 			expert_counts,
 			expert_offsets
 		)
-		
+
 		assert topk_weight.dtype == torch.float32
-		global_results = scatter_weight_reduce_optimized(
-			res, global_indices, token_topk_pos, topk_weight,
-			self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok
+		num_global = self.num_tokens_per_rank * self.world_size
+		global_results = reduce_weighted_scatter_cuda(
+			res, topk_pos, topk_weight, num_global, hidden_size, self.num_experts_per_tok
 		)
-		global_results = global_results.to(torch.bfloat16)
-		
+		global_results = global_results.float()
+
 		# ---- 3.3) All-reduce to combine results from all workers ------------
 		with self.comm.change_state(enable=True):
 			self.comm.all_reduce(

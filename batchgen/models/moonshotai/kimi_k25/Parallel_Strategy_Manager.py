@@ -265,6 +265,16 @@ class KimiK25ParallelStrategyManager:
         with torch.device('cpu'):
             self.model = KimiK25ForCausalLM(self.loaded_model_config, comm)
 
+        # Inject comm and device into MoE layers for EP AllGather/AllReduce
+        device = self.engine_config.Basic_Config.device_torch
+        for layer_idx in range(
+            self.loaded_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            moe = self.model.model.layers[layer_idx].mlp
+            moe.comm = comm
+            moe.device = device
+
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.weight_copy_task["attn"] = []
@@ -414,23 +424,23 @@ class KimiK25ParallelStrategyManager:
         self._config_lm_head_hook()
         _log_hbm("_config_lm_head_hook")
 
-        # K2.5: Always use loop-based execution (not grouped GEMM)
-        # Loop-based execution works with INT4 wrappers (calls wrapper.forward())
-        # Grouped GEMM expects FP8 attributes which K2.5 doesn't have
-
-        # Set PSM flag to skip grouped GEMM init in _init_mode_decoding
-        self.enable_ep_offloading = True
-
-        # Set per-layer flags to use loop-based execution in forward()
+        # Set per-layer persistent/non-persistent expert ID lists
+        routed_expert_gpu_start = self.global_rank * (NUM_TOTAL_EXPERTS // self.world_size)
+        routed_expert_gpu_end = routed_expert_gpu_start + self.num_local_expert_per_layer
+        routed_expert_host_end = (self.global_rank + 1) * (NUM_TOTAL_EXPERTS // self.world_size)
         for layer_idx in range(
             self.loaded_model_config.first_k_dense_replace,
             self.model_config.num_hidden_layers,
         ):
             layer = self.model.model.layers[layer_idx]
-            layer.mlp.enable_ep_offloading = True
+            layer.mlp.persistent_expert_ids = list(range(routed_expert_gpu_start, routed_expert_gpu_end))
+            layer.mlp.nonpersistent_expert_ids = list(range(routed_expert_gpu_end, routed_expert_host_end))
+            layer.mlp.num_persistent_local_experts = self.num_local_expert_per_layer
 
         logging.info(
-            f"Rank {self.rank}: K2.5 using loop-based MoE execution (INT4 wrapper-compatible) "
+            f"Rank {self.rank}: K2.5 MoE expert split — "
+            f"persistent: {self.num_local_expert_per_layer}, "
+            f"non-persistent: {routed_expert_host_end - routed_expert_gpu_end}, "
             f"for layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1}"
         )
 
@@ -448,6 +458,16 @@ class KimiK25ParallelStrategyManager:
         # This avoids ~20 GiB CUDA allocator fragmentation from small scale tensors.
         self._move_int4_to_gpu_contiguous()
         _log_hbm("_move_int4_to_gpu_contiguous")
+
+        # Initialize grouped WGMMA for persistent experts (after INT4 weights on GPU)
+        for layer_idx in range(
+            self.loaded_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            moe = self.model.model.layers[layer_idx].mlp
+            if hasattr(moe, 'init_grouped_wgmma'):
+                moe.init_grouped_wgmma()
+        _log_hbm("init_grouped_wgmma")
 
         # Initialize MoE layers for decoding
         self._init_mode_decoding()
