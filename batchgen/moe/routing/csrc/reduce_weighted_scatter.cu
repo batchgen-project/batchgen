@@ -75,7 +75,8 @@ torch::Tensor reduce_weighted_scatter_cuda(
     int64_t N,
     int64_t H,
     int64_t K,
-    torch::Tensor output
+    torch::Tensor output,
+    int64_t num_valid_tokens
 ) {
     TORCH_CHECK(expert_output.is_cuda(), "expert_output must be CUDA tensor");
     TORCH_CHECK(expert_output.dtype() == torch::kBFloat16, "expert_output must be BF16");
@@ -83,13 +84,17 @@ torch::Tensor reduce_weighted_scatter_cuda(
 
     if (H == 0) H = expert_output.size(1);
 
+    // Effective token count for CUDA graph compatibility
+    const int64_t N_eff = (num_valid_tokens > 0 && num_valid_tokens < N)
+                          ? num_valid_tokens : N;
+
     // Allocate output if not pre-allocated
     if (!output.defined() || output.numel() == 0) {
         output = torch::empty({N, H}, torch::dtype(torch::kBFloat16).device(device));
     }
 
     // Launch kernel on current CUDA stream (required for CUDA graph capture)
-    dim3 grid(N, (H + BLOCK_H - 1) / BLOCK_H);
+    dim3 grid(N_eff, (H + BLOCK_H - 1) / BLOCK_H);
     dim3 block(BLOCK_H);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

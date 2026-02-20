@@ -16,6 +16,7 @@ compatibility.
 """
 
 import logging
+import os
 from typing import Dict, List, Optional
 
 import torch
@@ -42,6 +43,12 @@ class FullAttnSegment:
 
         # Pre-attn: QKV proj
         self.qkv_proj = attn_wrapper.module.qkv_proj
+        self.qkv_weight = self.qkv_proj.weight  # [N, K] BF16
+        self.qkv_bias = self.qkv_proj.bias       # [N] BF16 or None
+
+        # Use WGMMA fused kernel when available (SM90+)
+        from batchgen.attention.fused_kernels import is_qkv_wgmma_available
+        self.use_wgmma = is_qkv_wgmma_available()
 
         # Dimensions
         self.hidden_size = decoder_layer.hidden_size
@@ -70,7 +77,29 @@ class FullAttnSegment:
         self.max_pages_per_seq = max_pages_per_seq
         self.page_size_tokens = page_size_tokens
 
+    def _setup_wgmma_buffers(self, bucket_size: int) -> None:
+        """Pre-allocate WGMMA scratch buffers + TMA descs. Must be called before graph capture."""
+        if not self.use_wgmma or hasattr(self, '_normed_scratch'):
+            return
+        from batchgen.attention.fused_kernels import create_qkv_tma_desc
+        device = self.qkv_weight.device
+        B = bucket_size
+
+        self._normed_scratch = torch.empty(B, self.hidden_size, dtype=torch.bfloat16, device=device)
+        self._q_scratch = torch.empty(B, self.q_size, dtype=torch.bfloat16, device=device)
+        self._k_scratch = torch.empty(B, self.kv_size, dtype=torch.bfloat16, device=device)
+        self._v_scratch = torch.empty(B, self.kv_size, dtype=torch.bfloat16, device=device)
+
+        self._tma_desc_a = create_qkv_tma_desc(self._normed_scratch)
+        self._tma_desc_b = create_qkv_tma_desc(self.qkv_weight)
+
+        # Pre-convert cos/sin to BF16
+        self._cos_bf16 = self.rotary_emb.cos_cached.to(torch.bfloat16).contiguous()
+        self._sin_bf16 = self.rotary_emb.sin_cached.to(torch.bfloat16).contiguous()
+
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        # Set up WGMMA buffers before graph capture (this is called before capture)
+        self._setup_wgmma_buffers(bucket_size)
         return {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.hidden_size), torch.bfloat16
@@ -119,20 +148,39 @@ class FullAttnSegment:
         B = hidden_states.shape[0]
         nvt = num_valid_tokens  # 1-element int32 device tensor
 
-        # === Pre-attn: RMSNorm → QKV proj → split → reshape ===
+        # === Pre-attn: RMSNorm → QKV proj → split → reshape + RoPE ===
         normed = cuda_rmsnorm(hidden_states, self.ln_weight, self.ln_eps, num_valid_tokens=nvt)
-        qkv = self.qkv_proj(normed)
-        query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size, num_valid_tokens=nvt)
-        query = query.view(B, 1, self.num_heads, self.head_dim)
-        key = key.view(B, 1, self.num_kv_heads, self.head_dim)
-        value = value.view(B, 1, self.num_kv_heads, self.head_dim)
-
-        # === RoPE === (clamp to 0 so padding rows with cache_seqlens=0 don't negative-index)
         current_pos = (cache_seqlens - 1).clamp(min=0)
-        cos, sin = self.rotary_emb(value.transpose(1, 2), seq_len=self.max_seq_len)
-        cos = cos[current_pos].unsqueeze(1)
-        sin = sin[current_pos].unsqueeze(1)
-        query, key = cuda_rope(query, key, cos, sin, num_valid_tokens=nvt)
+
+        if self.use_wgmma:
+            from batchgen.attention.fused_kernels import cuda_qkv_wgmma_inplace
+            # Pre-built BF16 cos/sin gathered by position
+            rope_cos = self._cos_bf16[current_pos]  # [B, head_dim]
+            rope_sin = self._sin_bf16[current_pos]  # [B, head_dim]
+            # Copy normed input to static scratch buffer (TMA desc points to this address)
+            self._normed_scratch[:B].copy_(normed.view(B, self.hidden_size))
+            empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=normed.device)
+            cuda_qkv_wgmma_inplace(
+                self._q_scratch, self._k_scratch, self._v_scratch,
+                self._tma_desc_a, self._tma_desc_b,
+                self.qkv_bias if self.qkv_bias is not None else empty_bf16,
+                rope_cos, rope_sin, self.head_dim, nvt,
+                B, self.q_size + 2 * self.kv_size, self.hidden_size,
+                self.q_size, self.kv_size,
+            )
+            query = self._q_scratch[:B].view(B, 1, self.num_heads, self.head_dim)
+            key = self._k_scratch[:B].view(B, 1, self.num_kv_heads, self.head_dim)
+            value = self._v_scratch[:B].view(B, 1, self.num_kv_heads, self.head_dim)
+        else:
+            qkv = self.qkv_proj(normed)
+            query, key, value = cuda_qkv_split(qkv, self.q_size, self.kv_size, num_valid_tokens=nvt)
+            query = query.view(B, 1, self.num_heads, self.head_dim)
+            key = key.view(B, 1, self.num_kv_heads, self.head_dim)
+            value = value.view(B, 1, self.num_kv_heads, self.head_dim)
+            cos, sin = self.rotary_emb(value.transpose(1, 2), seq_len=self.max_seq_len)
+            cos = cos[current_pos].unsqueeze(1)
+            sin = sin[current_pos].unsqueeze(1)
+            query, key = cuda_rope(query, key, cos, sin, num_valid_tokens=nvt)
 
         # === KV write (direct kernel call with static buffers) ===
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
@@ -313,17 +361,17 @@ class MoESegment:
         self.expert_start = moe_decode.expert_start
         self.num_local_experts = len(moe_decode.persistent_expert_indices)
 
-        # Router weight: store bf16 transpose for graph-compatible matmul
-        # Router matmul: all_tokens [WB, H] bf16 @ router_weight_t [H, E] bf16 → router_logits [WB, E] bf16
-        # Then cast the small [WB, E] result to f32 for gate kernel
-        self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()  # [H, E] bf16
+        # Fused gate context: caches weight transpose + TMA descriptor at init
+        # Replaces: cuBLAS mm + router_bias_cast + gate_topk_softmax (3 kernels → 2)
+        from batchgen.moe.routing import FusedGateContext
         _bias = getattr(moe_decode.router, 'bias', None)
-        self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
-        # For fused router_bias_cast kernel: empty tensor when no bias
-        self._router_bias_or_empty = (
-            self.router_bias_bf16 if self.router_bias_bf16 is not None
-            else torch.empty(0, dtype=torch.bfloat16, device=device)
+        _bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+        self.fused_gate_ctx = FusedGateContext(
+            moe_decode.router.weight,  # [E, K_dim] BF16 (nn.Linear weight)
+            _bias_bf16,
+            topk=self.num_experts_per_tok,
         )
+        self._fused_gate_warmed = False
 
         # Weight pointer arrays (at fixed GPU addresses)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -347,8 +395,10 @@ class MoESegment:
         self.s2_stride_scale_n = self.down_scale_ref.shape[1]
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """No-op: buffers are managed by SharedMoEBufferPool."""
-        pass
+        """Warmup fused gate TMA descriptor (once, against full base buffer)."""
+        if not self._fused_gate_warmed:
+            self.fused_gate_ctx.warmup(self.pool._base["all_tokens"])
+            self._fused_gate_warmed = True
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -367,8 +417,6 @@ class MoESegment:
     def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """CUDA-graph-compatible forward: no allocations, no CPU driver calls."""
         from batchgen.moe.routing import (
-            gate_topk_softmax_cuda,
-            router_bias_cast_cuda,
             dispatch_count_gather_cuda,
             reduce_weighted_scatter_cuda,
         )
@@ -393,20 +441,15 @@ class MoESegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 3. Router matmul in bf16 + fused bias add + f32 cast (1 cuBLAS + 1 fused kernel)
-        torch.mm(bufs["all_tokens"], self.router_weight_bf16_t, out=bufs["router_logits"])
-        router_bias_cast_cuda(bufs["router_logits"], self._router_bias_or_empty, bufs["router_f32"])
-
-        # 4. Gate top-k softmax (f32 input, pre-allocated int32/f32 outputs)
-        gate_topk_softmax_cuda(
-            bufs["router_f32"],
+        # 3+4. Fused gate: WGMMA GEMM + bias + TopK + Softmax (2 kernels)
+        self.fused_gate_ctx.forward(
+            bufs["all_tokens"],
+            logits=bufs["router_f32"],
             topk_indices=bufs["topk_indices"],
             topk_weights=bufs["topk_weights"],
-            k=self.num_experts_per_tok,
         )
 
-        # 5. Dispatch: count + prefix_sum + gather into pre-allocated buffers
-        # No zero_() needed: WGMMA reads only within expert_offsets; reduce writes all N rows
+        # 5. Dispatch: count+prefix_sum + gather (2 fused kernels)
         dispatch_count_gather_cuda(
             bufs["all_tokens"], bufs["topk_indices"],
             self.expert_start, self.num_local_experts,
@@ -485,14 +528,16 @@ class MoEComputeSegment:
         self.expert_start = moe_decode.expert_start
         self.num_local_experts = len(moe_decode.persistent_expert_indices)
 
-        # Router weight: bf16 transpose for graph-compatible matmul
-        self.router_weight_bf16_t = moe_decode.router.weight.T.contiguous()
+        # Fused gate context: caches weight transpose + TMA descriptor at init
+        from batchgen.moe.routing import FusedGateContext
         _bias = getattr(moe_decode.router, 'bias', None)
-        self.router_bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
-        self._router_bias_or_empty = (
-            self.router_bias_bf16 if self.router_bias_bf16 is not None
-            else torch.empty(0, dtype=torch.bfloat16, device=device)
+        _bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
+        self.fused_gate_ctx = FusedGateContext(
+            moe_decode.router.weight,
+            _bias_bf16,
+            topk=self.num_experts_per_tok,
         )
+        self._fused_gate_warmed = False
 
         # Weight pointer arrays (for eager_compute)
         self.gate_ptrs = moe_decode.gate_ptrs
@@ -516,12 +561,11 @@ class MoEComputeSegment:
         self.s2_stride_scale_n = self.down_scale_ref.shape[1]
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """Enable NCCL communicator for graph capture.
-
-        The comm is disabled by default. Enable it before warmup/capture
-        so all_gather is recorded into the graph.
-        """
+        """Enable NCCL communicator and warmup fused gate TMA for graph capture."""
         self.comm.disabled = False
+        if not self._fused_gate_warmed:
+            self.fused_gate_ctx.warmup(self.pool._base["all_tokens"])
+            self._fused_gate_warmed = True
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -544,8 +588,6 @@ class MoEComputeSegment:
         all_reduce and local slice are done eagerly after graph replay.
         """
         from batchgen.moe.routing import (
-            gate_topk_softmax_cuda,
-            router_bias_cast_cuda,
             dispatch_count_gather_cuda,
             reduce_weighted_scatter_cuda,
         )
@@ -567,19 +609,15 @@ class MoEComputeSegment:
         )
         all_tokens = bufs["all_tokens"]
 
-        # 1. Router matmul in bf16 + fused bias add + f32 cast
-        torch.mm(all_tokens, self.router_weight_bf16_t, out=bufs["router_logits"])
-        router_bias_cast_cuda(bufs["router_logits"], self._router_bias_or_empty, bufs["router_f32"])
-
-        # 2. Gate top-k softmax
-        gate_topk_softmax_cuda(
-            bufs["router_f32"],
+        # 1+2. Fused gate: WGMMA GEMM + bias + TopK + Softmax (2 kernels)
+        self.fused_gate_ctx.forward(
+            all_tokens,
+            logits=bufs["router_f32"],
             topk_indices=bufs["topk_indices"],
             topk_weights=bufs["topk_weights"],
-            k=self.num_experts_per_tok,
         )
 
-        # 3. Dispatch: count + prefix_sum + gather
+        # 3. Dispatch: count+prefix_sum + gather (2 fused kernels)
         dispatch_count_gather_cuda(
             all_tokens, bufs["topk_indices"],
             self.expert_start, self.num_local_experts,
@@ -673,6 +711,10 @@ class WholeModelSegment:
         # Per-layer KV buffers allocated in setup_static_buffers
         self._kv_buffers = None
 
+        # Use WGMMA fused kernel when available (SM90+)
+        from batchgen.attention.fused_kernels import is_qkv_wgmma_available
+        self.use_wgmma = is_qkv_wgmma_available()
+
     def setup_static_buffers(self, bucket_size: int) -> None:
         """Allocate KV offload buffers, enable graph capture mode, enable NCCL.
 
@@ -699,13 +741,51 @@ class WholeModelSegment:
                     ),
                 })
 
+        # Pre-allocate WGMMA scratch buffers + TMA descriptors (must happen before capture)
+        if self.use_wgmma and not hasattr(self, '_normed_scratch'):
+            from batchgen.attention.fused_kernels import create_qkv_tma_desc
+
+            layers = self.model.model.layers
+            attn0 = layers[0].self_attn
+            q_size = attn0.q_size
+            kv_size = attn0.kv_size
+            H = self.hidden_size
+            B = self.max_bucket_size
+
+            # Static scratch buffers (fixed GPU addresses, reused across layers)
+            self._normed_scratch = torch.empty(B, H, dtype=torch.bfloat16, device=self.device)
+            self._q_scratch = torch.empty(B, q_size, dtype=torch.bfloat16, device=self.device)
+            self._k_scratch = torch.empty(B, kv_size, dtype=torch.bfloat16, device=self.device)
+            self._v_scratch = torch.empty(B, kv_size, dtype=torch.bfloat16, device=self.device)
+
+            # TMA descriptors: input buffer (shared across layers) + per-layer weight
+            self._tma_desc_a = create_qkv_tma_desc(self._normed_scratch)
+            self._tma_desc_b = {}
+            for idx, layer in enumerate(layers):
+                weight = layer.self_attn.module.qkv_proj.weight
+                self._tma_desc_b[idx] = create_qkv_tma_desc(weight)
+
+            # Pre-convert cos/sin from FP32 to BF16 (rotary_emb is shared across layers)
+            rotary_emb = self.model.model._shared_rotary_emb
+            self._cos_bf16 = rotary_emb.cos_cached.to(torch.bfloat16).contiguous()
+            self._sin_bf16 = rotary_emb.sin_cached.to(torch.bfloat16).contiguous()
+
+            self._wgmma_q_size = q_size
+            self._wgmma_kv_size = kv_size
+            self._wgmma_N = q_size + 2 * kv_size
+            self._wgmma_K = H
+            self._empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=self.device)
+
         # Set capture mode flag so layers run eagerly (no per-layer graph replay)
         for layer in self.model.model.layers:
             layer._graph_capture_mode = True
 
-        # Enable NCCL for all MoE segments
+        # Enable NCCL and warmup fused gate for all MoE segments
         for seg in self.moe_segments.values():
             seg.comm.disabled = False
+            if not seg._fused_gate_warmed:
+                seg.fused_gate_ctx.warmup(seg.pool._base["all_tokens"])
+                seg._fused_gate_warmed = True
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -742,6 +822,13 @@ class WholeModelSegment:
         # === Embedding ===
         hidden_states = model.embed_tokens(input_ids)  # [B, 1, H]
 
+        # === Pre-compute RoPE cos/sin (shared across all 36 layers) ===
+        current_pos = (cache_seqlens - 1).clamp(min=0)
+        if self.use_wgmma:
+            from batchgen.attention.fused_kernels import cuda_qkv_wgmma_inplace
+            rope_cos = self._cos_bf16[current_pos]  # [B, head_dim]
+            rope_sin = self._sin_bf16[current_pos]  # [B, head_dim]
+
         # === Decoder layers ===
         for layer_idx, decoder_layer in enumerate(model.layers):
             # -- Attention (eager, captured into graph) --
@@ -754,21 +841,36 @@ class WholeModelSegment:
                 decoder_layer.input_layernorm.eps,
             )
 
-            # QKV proj + split + reshape
-            qkv = attn_wrapper.module.qkv_proj(normed)
-            query, key, value = cuda_qkv_split(qkv, attn_wrapper.q_size, attn_wrapper.kv_size)
-            query = query.view(B, 1, attn_wrapper.num_heads, attn_wrapper.head_dim)
-            key = key.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
-            value = value.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+            # QKV proj + split + reshape + RoPE
+            if self.use_wgmma:
+                # Copy normed into scratch buffer (fixed GPU address for TMA)
+                self._normed_scratch[:B].copy_(normed.view(B, -1))
 
-            # RoPE (clamp to 0 so padding rows with cache_seqlens=0 don't negative-index)
-            current_pos = (cache_seqlens - 1).clamp(min=0)
-            cos, sin = attn_wrapper.module.rotary_emb(
-                value.transpose(1, 2), seq_len=attn_wrapper.module.rotary_emb.max_seq_len_cached
-            )
-            cos = cos[current_pos].unsqueeze(1)
-            sin = sin[current_pos].unsqueeze(1)
-            query, key = cuda_rope(query, key, cos, sin)
+                cuda_qkv_wgmma_inplace(
+                    self._q_scratch, self._k_scratch, self._v_scratch,
+                    self._tma_desc_a, self._tma_desc_b[layer_idx],
+                    attn_wrapper.module.qkv_proj.bias,
+                    rope_cos, rope_sin,
+                    attn_wrapper.head_dim,
+                    None,  # num_valid_tokens
+                    B, self._wgmma_N, self._wgmma_K,
+                    self._wgmma_q_size, self._wgmma_kv_size,
+                )
+                query = self._q_scratch[:B].view(B, 1, attn_wrapper.num_heads, attn_wrapper.head_dim)
+                key = self._k_scratch[:B].view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+                value = self._v_scratch[:B].view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+            else:
+                qkv = attn_wrapper.module.qkv_proj(normed)
+                query, key, value = cuda_qkv_split(qkv, attn_wrapper.q_size, attn_wrapper.kv_size)
+                query = query.view(B, 1, attn_wrapper.num_heads, attn_wrapper.head_dim)
+                key = key.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+                value = value.view(B, 1, attn_wrapper.num_kv_heads, attn_wrapper.head_dim)
+                cos, sin = attn_wrapper.module.rotary_emb(
+                    value.transpose(1, 2), seq_len=attn_wrapper.module.rotary_emb.max_seq_len_cached
+                )
+                cos = cos[current_pos].unsqueeze(1)
+                sin = sin[current_pos].unsqueeze(1)
+                query, key = cuda_rope(query, key, cos, sin)
 
             # Copy KV to static offload buffers (baked into graph for host offloading)
             if self._kv_buffers is not None:
