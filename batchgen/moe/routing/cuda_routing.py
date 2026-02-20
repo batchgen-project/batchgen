@@ -30,6 +30,7 @@ _cuda_ext = load(
         str(_csrc_dir / "dispatch_count_gather.cu"),
         str(_csrc_dir / "reduce_weighted_scatter.cu"),
         str(_csrc_dir / "router_epilogue.cu"),
+        str(_csrc_dir / "gate_sigmoid_topk.cu"),
         str(_csrc_dir / "fused_gate.cu"),
     ],
     extra_cuda_cflags=[
@@ -77,6 +78,54 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
 
     result = ext.gate_topk_softmax(router_logits, k, topk_indices, topk_weights,
                                    num_valid_tokens)
+    return result[0], result[1]
+
+
+def gate_sigmoid_topk_cuda(
+    router_logits, e_score_correction,
+    k=8, routed_scaling_factor=2.5,
+    topk_indices=None, topk_weights=None,
+):
+    """
+    CUDA gate kernel: fused sigmoid + top-k + normalize + scale (K2.5).
+
+    Algorithm:
+        1. sigmoid(logits) → scores
+        2. scores + e_score_correction → biased (for selection only)
+        3. topk(biased, k) → indices
+        4. gather raw sigmoid scores at indices → weights
+        5. normalize weights, multiply by routed_scaling_factor
+
+    Args:
+        router_logits: [N, E] FP32
+        e_score_correction: [E] FP32
+        k: top-k (default 8)
+        routed_scaling_factor: scaling factor (default 2.5)
+        topk_indices: [N, K] int32 pre-allocated output (optional)
+        topk_weights: [N, K] FP32 pre-allocated output (optional)
+
+    Returns:
+        topk_indices: [N, K] int32
+        topk_weights: [N, K] FP32
+    """
+    ext = _cuda_ext
+    N = router_logits.shape[0]
+    device = router_logits.device
+
+    if router_logits.dtype != torch.float32:
+        router_logits = router_logits.float()
+    if e_score_correction.dtype != torch.float32:
+        e_score_correction = e_score_correction.float()
+
+    if topk_indices is None:
+        topk_indices = torch.empty(N, k, dtype=torch.int32, device=device)
+    if topk_weights is None:
+        topk_weights = torch.empty(N, k, dtype=torch.float32, device=device)
+
+    result = ext.gate_sigmoid_topk(
+        router_logits, e_score_correction, k, routed_scaling_factor,
+        topk_indices, topk_weights,
+    )
     return result[0], result[1]
 
 

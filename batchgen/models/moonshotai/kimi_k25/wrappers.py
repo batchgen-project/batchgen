@@ -219,11 +219,14 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             # Routed experts: Dequant INT4 → BF16 and do GEMM
             result = self._forward_int4(hidden_states, weights)
 
-        # Cleanup for non-persistent experts
-        torch.cuda.current_stream(
-            self.engine_config.Basic_Config.device_torch
-        ).synchronize()
+        # Non-persistent experts use a shared GPU buffer that gets recycled.
+        # Must sync before free_weights() to prevent the next expert's load_weights()
+        # from overwriting the buffer while this expert's matmuls are still running.
+        # Persistent experts use static module attributes — no buffer recycling, no sync needed.
         if not self.persistent:
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
             self.free_weights(self.module_key)
 
         logging.debug(
@@ -234,23 +237,24 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         return result
 
     def _forward_int4(self, hidden_states: torch.Tensor, weights: dict) -> torch.Tensor:
-        """INT4 dequant + BF16 GEMM forward.
-
-        Dequantizes INT4 weights to BF16, then does standard matmul.
-        Uses SiLU gating: silu(gate) * up
-
-        Args:
-            hidden_states: Input [num_tokens, hidden_size] in BF16
-            weights: Dict with gate/up/down_proj.weight_packed and .weight_scale
-
-        Returns:
-            Output [num_tokens, hidden_size] in BF16
-        """
+        """INT4 forward using fused WGMMA kernel (preferred) or dequant+mm fallback."""
         x = hidden_states
         if x.dim() == 3:
             x = x.view(-1, x.shape[-1])
 
-        # Dequantize INT4 → BF16
+        # Try fused WGMMA kernel (stage1: gate+up+SiLU, stage2: down)
+        try:
+            from batchgen.moe.int4_single_expert_wgmma import single_expert_int4_forward
+            return single_expert_int4_forward(
+                x,
+                weights["gate_proj.weight_packed"], weights["gate_proj.weight_scale"],
+                weights["up_proj.weight_packed"], weights["up_proj.weight_scale"],
+                weights["down_proj.weight_packed"], weights["down_proj.weight_scale"],
+            )
+        except Exception:
+            pass
+
+        # Fallback: dequant → BF16 matmul
         gate_weight = self.dequant_fn(
             weights["gate_proj.weight_packed"],
             weights["gate_proj.weight_scale"],
@@ -267,16 +271,10 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             torch.bfloat16,
         )
 
-        # Gate and Up projections
         gate_out = torch.mm(x, gate_weight.T)
         up_out = torch.mm(x, up_weight.T)
-
-        # SiLU gating (standard DeepSeek-V3 / K2.5)
         intermediate = F.silu(gate_out) * up_out
-
-        # Down projection
         output = torch.mm(intermediate, down_weight.T)
-
         return output
 
 

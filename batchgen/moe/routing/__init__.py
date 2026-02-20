@@ -2,6 +2,7 @@
 
 from .cuda_routing import (
     gate_topk_softmax_cuda,
+    gate_sigmoid_topk_cuda,
     router_bias_cast_cuda,
     dispatch_count_gather_cuda,
     reduce_weighted_scatter_cuda,
@@ -10,6 +11,7 @@ from .cuda_routing import (
 
 __all__ = [
     "gate_topk_softmax_cuda",
+    "gate_sigmoid_topk_cuda",
     "router_bias_cast_cuda",
     "dispatch_count_gather_cuda",
     "reduce_weighted_scatter_cuda",
