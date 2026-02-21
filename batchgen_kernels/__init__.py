@@ -19,6 +19,22 @@ def get_src_dir() -> Path:
     return Path(__file__).parent / "src"
 
 
+def load_extension(module_name: str):
+    """Import a pre-compiled CUDA extension with proper symbol visibility.
+
+    Extensions using PYBIND11_MODULE need libtorch_python symbols to be
+    globally visible. Python's default import uses RTLD_LOCAL, so we
+    temporarily switch to RTLD_GLOBAL for the import.
+    """
+    import sys, os, importlib
+    old_flags = sys.getdlopenflags()
+    sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_LAZY)
+    try:
+        return importlib.import_module(module_name)
+    finally:
+        sys.setdlopenflags(old_flags)
+
+
 def get_device_arch() -> str:
     """Detect GPU architecture for kernel selection."""
     if not torch.cuda.is_available():

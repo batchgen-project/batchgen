@@ -63,7 +63,8 @@ def _load_grouped_module():
         return _grouped_module
 
     try:
-        import batchgen_kernels.moe._C_grouped_mxfp4_wgmma as _grouped_module
+        import batchgen_kernels
+        _grouped_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_grouped_mxfp4_wgmma")
         logging.info("Loaded pre-compiled WGMMA fused grouped MXFP4 MoE kernels")
         return _grouped_module
     except Exception as e:

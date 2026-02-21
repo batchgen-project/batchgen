@@ -7,21 +7,16 @@ Usage:
     pip install -e batchgen_kernels/
 """
 
-import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-import torch
 
 _sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v", "-lineinfo"]
-_torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
 
 def _make_ext(name, sources):
     return CUDAExtension(
         name=name,
         sources=sources,
         extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
-        libraries=["torch_python"],
-        library_dirs=[_torch_lib_dir],
     )
 
 setup(

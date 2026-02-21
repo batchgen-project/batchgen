@@ -69,7 +69,8 @@ def _load_mxfp4_module():
         return _module_mxfp4_moe
 
     try:
-        import batchgen_kernels.moe._C_expert_mxfp4_wgmma as _module_mxfp4_moe
+        import batchgen_kernels
+        _module_mxfp4_moe = batchgen_kernels.load_extension("batchgen_kernels.moe._C_expert_mxfp4_wgmma")
         logging.info("Loaded pre-compiled WGMMA fused MXFP4 MoE kernels")
         return _module_mxfp4_moe
     except Exception as e:
