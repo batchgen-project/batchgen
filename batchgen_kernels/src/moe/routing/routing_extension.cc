@@ -5,7 +5,7 @@
  * Built via torch.utils.cpp_extension.load() JIT compilation.
  */
 
-#include <torch/extension.h>
+#include <torch/python.h>
 #include "routing_ops.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

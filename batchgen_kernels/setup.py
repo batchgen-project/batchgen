@@ -9,6 +9,10 @@ Usage:
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import torch
+
+# Force CXX11 ABI to match PyTorch (same approach as flash-attention)
+torch._C._GLIBCXX_USE_CXX11_ABI = True
 
 _sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v", "-lineinfo"]
 

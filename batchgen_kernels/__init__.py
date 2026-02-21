@@ -20,21 +20,13 @@ def get_src_dir() -> Path:
 
 
 def load_extension(module_name: str):
-    """Import a pre-compiled CUDA extension with proper symbol visibility.
+    """Import a pre-compiled CUDA extension by module name.
 
-    PYBIND11_MODULE extensions need libtorch_python symbols globally
-    visible. We temporarily set RTLD_GLOBAL before import (same approach
-    as PyTorch's cpp_extension.load). Safe because callers use lazy
-    loading — this only runs in GPU worker processes, not in the
-    Parameter_Server subprocess.
+    Extensions are compiled at pip install time via CUDAExtension with
+    torch/python.h + CXX11 ABI, so standard import works directly.
     """
-    import sys, os, importlib
-    old_flags = sys.getdlopenflags()
-    sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_NOW)
-    try:
-        return importlib.import_module(module_name)
-    finally:
-        sys.setdlopenflags(old_flags)
+    import importlib
+    return importlib.import_module(module_name)
 
 
 def get_device_arch() -> str:

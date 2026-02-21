@@ -1,4 +1,4 @@
-#include <torch/extension.h>
+#include <torch/python.h>
 #include "attention_ops.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
