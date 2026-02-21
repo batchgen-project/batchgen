@@ -144,5 +144,7 @@ setup(
     ],
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.10",
-    install_requires=["torch>=2.9.0"],
+    # torch must be pre-installed (with correct CUDA variant, e.g. cu128).
+    # Do NOT list it here — pip would pull the CPU-only version from PyPI.
+    install_requires=[],
 )

@@ -2,7 +2,7 @@
 
 Supports head_dim=64 (gpt-oss-120b), head_dim=80, and head_dim=128.
 Features: LSE output, sliding window attention, split-K.
-Ported from hpc-ops Hunyuan decode kernel.
+Ported from BatchGen WGMMA decode kernel.
 
 Usage:
     from batchgen_kernels.attention import attention_decode_bf16
@@ -12,7 +12,7 @@ Usage:
 
 import torch
 
-# Import triggers registration of torch.ops.hpc_decode
+# Import triggers registration of torch.ops.batchgen_decode
 import batchgen_kernels.attention._C_gqa_mha_decode_bf16  # noqa: F401
 
 
@@ -43,9 +43,9 @@ def attention_decode_bf16(
     Returns:
         (output, lse) where:
             output: [num_batch, num_head_q, head_dim] BF16
-            lse: [num_batch, num_head_q] FP32 — log-sum-exp (log2 base)
+            lse: [num_batch, num_head_q] FP32 — log-sum-exp (natural log)
     """
-    return torch.ops.hpc_decode.attention_decode_bf16(
+    return torch.ops.batchgen_decode.attention_decode_bf16(
         q, kcache, vcache, block_ids, num_seq_kvcache,
         new_kv_included, use_splitk, output, sliding_window,
     )
