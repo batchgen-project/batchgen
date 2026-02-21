@@ -7,27 +7,9 @@ Compiled via torch.utils.cpp_extension.load() at import time.
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
-
 import batchgen_kernels
-_csrc_dir = batchgen_kernels.get_src_dir() / "attention" / "csrc"
 
-_ext = load(
-    name="attention_fused_cuda",
-    sources=[
-        str(_csrc_dir / "attention_extension.cc"),
-        str(_csrc_dir / "rmsnorm.cu"),
-        str(_csrc_dir / "rope.cu"),
-        str(_csrc_dir / "qkv_split.cu"),
-    ],
-    extra_cuda_cflags=[
-        "-O3",
-        "-std=c++17",
-        "--expt-relaxed-constexpr",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    ],
-    verbose=False,
-)
+_ext = batchgen_kernels.load_extension("batchgen_kernels.attention._C_fused_ops")
 
 
 def cuda_rmsnorm(

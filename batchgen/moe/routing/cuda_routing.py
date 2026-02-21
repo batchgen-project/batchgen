@@ -13,34 +13,13 @@ Usage:
 """
 
 import torch
-from torch.utils.cpp_extension import load
-
 import batchgen_kernels
-_csrc_dir = batchgen_kernels.get_src_dir() / "moe" / "routing"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Compile at import time
+# Pre-compiled at pip install time
 # ──────────────────────────────────────────────────────────────────────────────
 
-_cuda_ext = load(
-    name="routing_cuda",
-    sources=[
-        str(_csrc_dir / "routing_extension.cc"),
-        str(_csrc_dir / "gate_topk_softmax.cu"),
-        str(_csrc_dir / "dispatch_count_gather.cu"),
-        str(_csrc_dir / "reduce_weighted_scatter.cu"),
-        str(_csrc_dir / "router_epilogue.cu"),
-        str(_csrc_dir / "gate_sigmoid_topk.cu"),
-        str(_csrc_dir / "fused_gate.cu"),
-    ],
-    extra_cuda_cflags=[
-        "-O3",
-        "--use_fast_math",
-        "-std=c++17",
-        "-gencode", "arch=compute_90a,code=sm_90a",   # H100 (WGMMA required)
-    ],
-    verbose=False,
-)
+_cuda_ext = batchgen_kernels.load_extension("batchgen_kernels.moe._C_routing")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

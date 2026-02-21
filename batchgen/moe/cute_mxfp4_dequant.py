@@ -16,19 +16,10 @@ Usage:
 """
 
 import torch
-from torch.utils.cpp_extension import load
 import batchgen_kernels
-import os
 
-# Compile CuTe CUDA extension on module import (not lazy)
-# This ensures compilation happens during warmup/initialization
-_src_dir = batchgen_kernels.get_src_dir()
-_cute_module = load(
-    name='cute_mxfp4_dequant',
-    sources=[str(_src_dir / "moe" / "mxfp4_dequant_cute.cu")],
-    extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo'],
-    verbose=os.environ.get('CUDA_DEBUG', '0') == '1',
-)
+# Pre-compiled at pip install time
+_cute_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_mxfp4_dequant_cute")
 
 
 def _get_cute_module():
