@@ -43,7 +43,7 @@ def attention_decode_bf16(
     Returns:
         (output, lse) where:
             output: [num_batch, num_head_q, head_dim] BF16
-            lse: [num_batch, num_head_q] FP32 — log-sum-exp (log2 base)
+            lse: [num_batch, num_head_q] FP32 — log-sum-exp (natural log)
     """
     return torch.ops.hpc_decode.attention_decode_bf16(
         q, kcache, vcache, block_ids, num_seq_kvcache,
