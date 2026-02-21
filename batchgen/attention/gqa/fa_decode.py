@@ -154,7 +154,7 @@ def gqa_decode_fa(
 
     # FlashAttention path
     if not hasattr(gqa_decode_fa, '_logged'):
-        print(f"[batchgen_decode] gqa_decode_fa CALLED DIRECTLY (not through batchgen_gqa_decode_bf16)")
+        print(f"[batchgen_decode] gqa_decode_fa CALLED DIRECTLY (not through batchgen_gqa_decode_bf16)", flush=True)
         gqa_decode_fa._logged = True
     if _flash_with_kvcache is None:
         raise ImportError("Neither flash_attn_interface (FA3) nor flash_attn (FA2) is available")

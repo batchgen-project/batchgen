@@ -23,24 +23,24 @@ def _check_custom_kernel():
     _custom_kernel_checked = True
 
     if not torch.cuda.is_available():
-        print("[batchgen_decode] CUDA not available, using FA3 fallback")
+        print("[batchgen_decode] CUDA not available, using FA3 fallback", flush=True)
         return False
 
     cc = torch.cuda.get_device_capability()
-    print(f"[batchgen_decode] GPU compute capability: SM{cc[0]}{cc[1]}")
+    print(f"[batchgen_decode] GPU compute capability: SM{cc[0]}{cc[1]}", flush=True)
 
     if cc[0] < 9:
-        print(f"[batchgen_decode] SM{cc[0]}{cc[1]} < SM90, using FA3 fallback")
+        print(f"[batchgen_decode] SM{cc[0]}{cc[1]} < SM90, using FA3 fallback", flush=True)
         return False
 
     try:
         from batchgen_kernels.attention.decode import attention_decode_bf16
         _custom_kernel = attention_decode_bf16
-        print("[batchgen_decode] Custom WGMMA decode kernel loaded successfully")
+        print("[batchgen_decode] Custom WGMMA decode kernel loaded successfully", flush=True)
         return True
     except Exception as e:
-        print(f"[batchgen_decode] Failed to load custom kernel: {e}")
-        print("[batchgen_decode] Falling back to FA3")
+        print(f"[batchgen_decode] Failed to load custom kernel: {e}", flush=True)
+        print("[batchgen_decode] Falling back to FA3", flush=True)
         return False
 
 
@@ -82,7 +82,7 @@ def batchgen_gqa_decode_bf16(
         if not _backend_logged:
             print(f"[batchgen_decode] Using custom WGMMA kernel "
                   f"(q={list(q.shape)}, headdim={q.shape[-1]}, "
-                  f"sliding_window={sliding_window})")
+                  f"sliding_window={sliding_window})", flush=True)
             _backend_logged = True
 
         # Shape adaptation: FA format -> custom kernel format
@@ -114,7 +114,7 @@ def batchgen_gqa_decode_bf16(
     # Fallback to FA3/FA2
     if not _backend_logged:
         print(f"[batchgen_decode] Using FA3 fallback "
-              f"(q={list(q.shape)}, headdim={q.shape[-1]})")
+              f"(q={list(q.shape)}, headdim={q.shape[-1]})", flush=True)
         _backend_logged = True
 
     from .fa_decode import gqa_decode_fa

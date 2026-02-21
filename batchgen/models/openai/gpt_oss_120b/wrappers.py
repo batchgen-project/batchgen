@@ -1425,7 +1425,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 print(f"[DECODE ATTN L0] seq{i}: Q[:4]={q_sample}")
 
         if not hasattr(self, '_decode_logged'):
-            print(f"[batchgen_decode] CALLED from wrappers._forward_decode layer={self.layer_idx}")
+            print(f"[batchgen_decode] CALLED from wrappers._forward_decode layer={self.layer_idx}", flush=True)
             self._decode_logged = True
         attn_output, _ = batchgen_gqa_decode_bf16(
             q=query,  # [batch, 1, num_heads, head_dim]
@@ -1550,7 +1550,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
         cache_seqlens_for_attn = micro_cache_seqlens if cache_seqlens is not None else torch.ones(batch, dtype=torch.int32, device=query.device)
 
         if not hasattr(self, '_decode_mid_logged'):
-            print(f"[batchgen_decode] CALLED from wrappers._forward_decode_mid layer={self.layer_idx}")
+            print(f"[batchgen_decode] CALLED from wrappers._forward_decode_mid layer={self.layer_idx}", flush=True)
             self._decode_mid_logged = True
         attn_output, _ = batchgen_gqa_decode_bf16(
             q=query,

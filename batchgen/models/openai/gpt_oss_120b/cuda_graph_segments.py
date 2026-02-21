@@ -198,7 +198,7 @@ class FullAttnSegment:
             v_tokens=value.view(B, -1),
         )
         if not hasattr(self, '_decode_logged'):
-            print(f"[batchgen_decode] CALLED from cuda_graph_segments.PerLayerSegment")
+            print(f"[batchgen_decode] CALLED from cuda_graph_segments.PerLayerSegment", flush=True)
             self._decode_logged = True
         attn_out, _ = batchgen_gqa_decode_bf16(
             q=query, k_cache=k_cache, v_cache=v_cache,
@@ -896,7 +896,7 @@ class WholeModelSegment:
 
             # Flash attention decode
             if not hasattr(self, '_decode_logged'):
-                print(f"[batchgen_decode] CALLED from cuda_graph_segments.FullModelSegment layer={layer_idx}")
+                print(f"[batchgen_decode] CALLED from cuda_graph_segments.FullModelSegment layer={layer_idx}", flush=True)
                 self._decode_logged = True
             attn_out, _ = batchgen_gqa_decode_bf16(
                 q=query, k_cache=k_cache, v_cache=v_cache,

@@ -185,7 +185,7 @@ def gqa_decoding_mode_3_bf16(
 
     # 6. Flash attention with paged KV
     if not hasattr(gqa_decoding_mode_3_bf16, '_logged'):
-        print(f"[batchgen_decode] gqa_decoding_mode_3_bf16 CALLED (gqa_mode3.py)")
+        print(f"[batchgen_decode] gqa_decoding_mode_3_bf16 CALLED (gqa_mode3.py)", flush=True)
         gqa_decoding_mode_3_bf16._logged = True
     if timing and timing.enabled:
         with timing.time("attn.flash_attn"):
