@@ -12,7 +12,7 @@ Usage:
 
 import torch
 
-# Import triggers registration of torch.ops.batchgen_decode
+# Import triggers registration of torch.ops.hpc_decode
 import batchgen_kernels.attention._C_gqa_mha_decode_bf16  # noqa: F401
 
 
@@ -43,9 +43,9 @@ def attention_decode_bf16(
     Returns:
         (output, lse) where:
             output: [num_batch, num_head_q, head_dim] BF16
-            lse: [num_batch, num_head_q] FP32 — log-sum-exp (natural log)
+            lse: [num_batch, num_head_q] FP32 — log-sum-exp (log2 base)
     """
-    return torch.ops.batchgen_decode.attention_decode_bf16(
+    return torch.ops.hpc_decode.attention_decode_bf16(
         q, kcache, vcache, block_ids, num_seq_kvcache,
         new_kv_included, use_splitk, output, sliding_window,
     )

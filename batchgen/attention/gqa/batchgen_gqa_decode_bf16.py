@@ -85,7 +85,11 @@ def batchgen_gqa_decode_bf16(
         # Output: [batch, nheads, headdim] -> [batch, 1, nheads, headdim]
         output = output_3d.unsqueeze(1)
 
+        # LSE base conversion: kernel returns log2, sink correction expects natural log
         # LSE shape: kernel returns [batch, nheads], sink correction expects [batch, nheads, seqlen=1]
+        if lse is not None:
+            import math
+            lse = lse * math.log(2)  # log2 -> ln
         if lse is not None and sinks is not None:
             lse = lse.unsqueeze(-1)  # [batch, nheads] -> [batch, nheads, 1]
             from .sink_correction import apply_sink_correction
