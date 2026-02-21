@@ -86,6 +86,7 @@ __pycache__/
 
 # C extensions
 *.so
+!batchgen_kernels/attention/_C_gqa_mha_decode*.so
 
 # Distribution / packaging
 .Python

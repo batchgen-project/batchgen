@@ -23,32 +23,20 @@ Architecture:
 
 import logging
 import torch
-from torch.utils.cpp_extension import load
-import batchgen_kernels
 from typing import Tuple, List, Optional
 
-# Lazy-loaded CUDA module
 _wgmma_module = None
 
+
 def _get_wgmma_module():
-    """Build and cache the grouped INT4 WGMMA CUDA module."""
+    """Load the pre-compiled grouped INT4 WGMMA CUDA module."""
     global _wgmma_module
     if _wgmma_module is not None:
         return _wgmma_module
 
-    device = torch.cuda.current_device()
-    cc = torch.cuda.get_device_capability(device)
-    arch = f"-arch=sm_{cc[0]}{cc[1]}a"
-    cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v", "-lineinfo"]
-
-    _src_dir = batchgen_kernels.get_src_dir()
-    _wgmma_module = load(
-        name="grouped_int4_moe_wgmma_v1",
-        sources=[str(_src_dir / "moe" / "grouped_int4_wgmma_ext.cu")],
-        extra_cuda_cflags=cuda_flags,
-        verbose=False,
-    )
-    logging.info("[WGMMA] Built grouped INT4 WGMMA module")
+    import batchgen_kernels
+    _wgmma_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_grouped_int4_wgmma")
+    logging.info("[WGMMA] Loaded pre-compiled grouped INT4 WGMMA module")
     return _wgmma_module
 
 

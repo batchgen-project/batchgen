@@ -3,8 +3,12 @@
 The attention decode kernel ships as a pre-compiled .so (SM90a).
 All other kernels are compiled from source at install time.
 
+IMPORTANT: Must use --no-build-isolation to compile against the
+installed PyTorch (build isolation installs a different torch version
+whose headers may not match the runtime library).
+
 Usage:
-    pip install -e batchgen_kernels/
+    pip install -e batchgen_kernels/ --no-build-isolation
 """
 
 import os
@@ -37,7 +41,7 @@ setup(
     },
     packages=["batchgen_kernels", "batchgen_kernels.attention",
               "batchgen_kernels.moe", "batchgen_kernels.common"],
-    package_data={"batchgen_kernels.attention": ["_C_gqa_mha_decode*.so"]},
+    package_data={"batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"]},
     ext_modules=[
         # MoE WGMMA kernels (SM90a)
         CUDAExtension(
@@ -94,6 +98,48 @@ setup(
                 "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
                          "--threads", _nvcc_threads],
             },
+        ),
+        # QKV WGMMA fused projection (SM90a)
+        CUDAExtension(
+            name="batchgen_kernels.attention._C_qkv_wgmma",
+            sources=["src/attention/qkv_wgmma.cu"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+        ),
+        # MXFP4 dequant with shared memory LUT
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_mxfp4_dequant",
+            sources=["src/moe/mxfp4_dequant.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # RMSNorm (multi-dtype: BF16/FP16/FP32)
+        CUDAExtension(
+            name="batchgen_kernels.common._C_rmsnorm",
+            sources=["src/common/rmsnorm.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                         "-U__CUDA_NO_HALF_OPERATORS__",
+                         "-U__CUDA_NO_HALF_CONVERSIONS__",
+                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--expt-relaxed-constexpr",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # Grouped INT4 WGMMA for K2.5 decode (SM90a)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_grouped_int4_wgmma",
+            sources=["src/moe/grouped_int4_wgmma_ext.cu"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+        ),
+        # Single-expert INT4 WGMMA (SM90a)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_single_expert_int4_wgmma",
+            sources=["src/moe/single_expert_int4_wgmma.cu"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

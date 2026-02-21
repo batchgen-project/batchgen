@@ -25,88 +25,30 @@ import torch
 import torch.nn as nn
 import warnings
 from typing import Optional
-from torch.utils.cpp_extension import load
-import batchgen_kernels
 
-# Global variable to cache the compiled extension
 _cuda_extension = None
 _compilation_attempted = False
 
+
 def _compile_simple_extension():
-    """Compile the simplified CUDA extension quickly"""
+    """Load the pre-compiled RMSNorm CUDA extension."""
     global _cuda_extension, _compilation_attempted
-    
+
     if _compilation_attempted:
         return _cuda_extension
-    
-    _compilation_attempted = True
-    
-    if not torch.cuda.is_available():
-        print("❌ CUDA not available")
-        return None
-    
-    try:
-        import os
 
-        # Get current GPU architecture only
-        capability = torch.cuda.get_device_capability()
-        current_arch = f"{capability[0]}{capability[1]}"
-        
-        print(f"🔧 Compiling for current GPU (compute {capability[0]}.{capability[1]})...")
-        
-        # Minimal compilation flags for speed - added BF16 support
-        cuda_flags = [
-            '-O2',  # Reduced optimization for faster compilation
-            '--use_fast_math',
-            f'--gpu-architecture=sm_{current_arch}',  # Only current GPU
-            '-U__CUDA_NO_HALF_OPERATORS__',
-            '-U__CUDA_NO_HALF_CONVERSIONS__', 
-            '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
-            '--expt-relaxed-constexpr',
-        ]
-        
-        _src_dir = batchgen_kernels.get_src_dir()
-        _cuda_extension = load(
-            name="simple_rmsnorm_cuda",
-            sources=[str(_src_dir / "common" / "rmsnorm.cu")],
-            extra_cflags=['-O2'],
-            extra_cuda_cflags=cuda_flags,
-            verbose=False,
-        )
-        
-        print("✅ Compilation successful!")
-        
-        # # Test the extension with different dtypes
-        # try:
-        #     device = torch.device('cuda')
-            
-        #     # Test BF16
-        #     test_input_bf16 = torch.randn(1, 4, device=device, dtype=torch.bfloat16)
-        #     test_weight_bf16 = torch.ones(4, device=device, dtype=torch.bfloat16)
-        #     output_bf16 = _cuda_extension.forward(test_input_bf16, test_weight_bf16, 1e-6)
-        #     print("✅ BF16 kernel test passed!")
-            
-        #     # Test FP16
-        #     test_input_fp16 = torch.randn(1, 4, device=device, dtype=torch.float16)
-        #     test_weight_fp16 = torch.ones(4, device=device, dtype=torch.float16)
-        #     output_fp16 = _cuda_extension.forward(test_input_fp16, test_weight_fp16, 1e-6)
-        #     print("✅ FP16 kernel test passed!")
-            
-        #     # Test FP32
-        #     test_input_fp32 = torch.randn(1, 4, device=device, dtype=torch.float32)
-        #     test_weight_fp32 = torch.ones(4, device=device, dtype=torch.float32)
-        #     output_fp32 = _cuda_extension.forward(test_input_fp32, test_weight_fp32, 1e-6)
-        #     print("✅ FP32 kernel test passed!")
-            
-        # except Exception as test_error:
-        #     print(f"❌ Kernel test failed: {test_error}")
-        #     print("   Falling back to PyTorch implementation")
-        #     _cuda_extension = None
-        
+    _compilation_attempted = True
+
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        import batchgen_kernels
+        _cuda_extension = batchgen_kernels.load_extension("batchgen_kernels.common._C_rmsnorm")
         return _cuda_extension
-        
     except Exception as e:
-        print(f"❌ Compilation failed: {e}")
+        import logging
+        logging.warning(f"Failed to load RMSNorm CUDA extension: {e}")
         return None
 
 def _pytorch_rmsnorm(input, weight, eps=1e-6):

@@ -11,9 +11,6 @@ import logging
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
-
-import batchgen_kernels
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +41,9 @@ def _get_module():
         return _module
 
     try:
-        device = torch.cuda.current_device()
-        cc = torch.cuda.get_device_capability(device)
-        arch = f"-arch=sm_{cc[0]}{cc[1]}a"
-        cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v", "-lineinfo"]
-
-        _src_dir = batchgen_kernels.get_src_dir()
-        _module = load(
-            name="batchgen_qkv_wgmma",
-            sources=[str(_src_dir / "attention" / "qkv_wgmma.cu")],
-            extra_cuda_cflags=cuda_flags,
-            verbose=False,
-        )
-        logger.info("Loaded QKV WGMMA fused kernel")
+        import batchgen_kernels
+        _module = batchgen_kernels.load_extension("batchgen_kernels.attention._C_qkv_wgmma")
+        logger.info("Loaded pre-compiled QKV WGMMA kernel")
         return _module
     except Exception as e:
         logger.warning(f"Failed to load QKV WGMMA kernel: {e}")

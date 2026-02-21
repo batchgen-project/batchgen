@@ -12,40 +12,16 @@ Usage:
 """
 
 import torch
-from torch.utils.cpp_extension import load
-import os
-import time
-import batchgen_kernels
 
-# Compile and cache the CUDA extension
 _cuda_module = None
 
-def clear_cuda_cache():
-    """Clear the cached CUDA extension to force recompilation."""
-    import shutil
-    import glob
-    cache_dir = os.path.expanduser("~/.cache/torch_extensions")
-    for path in glob.glob(os.path.join(cache_dir, "*", "cuda_mxfp4_dequant")):
-        try:
-            shutil.rmtree(path)
-            print(f"Cleared cache: {path}")
-        except Exception as e:
-            print(f"Failed to clear {path}: {e}")
 
 def _get_cuda_module():
-    """Lazy-load and compile the CUDA module."""
+    """Lazy-load the pre-compiled MXFP4 dequant CUDA module."""
     global _cuda_module
     if _cuda_module is None:
-        # First try to clear any stale cache
-        clear_cuda_cache()
-
-        _src_dir = batchgen_kernels.get_src_dir()
-        _cuda_module = load(
-            name='cuda_mxfp4_dequant',
-            sources=[str(_src_dir / "moe" / "mxfp4_dequant.cu")],
-            extra_cuda_cflags=['-O3', '--use_fast_math', '-lineinfo'],
-            verbose=os.environ.get('CUDA_DEBUG', '0') == '1',
-        )
+        import batchgen_kernels
+        _cuda_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_mxfp4_dequant")
     return _cuda_module
 
 
