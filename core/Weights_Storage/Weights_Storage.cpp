@@ -213,6 +213,21 @@ py::dict Weights_Storage::get_tensor(std::string module_key) {
         } else if (tb.dtype == "float16") {
             torch_dtype = torch::kFloat16;
             resolved_dtype_name = "float16";
+        } else if (tb.dtype == "int32") {
+            torch_dtype = torch::kInt32;
+            resolved_dtype_name = "int32";
+        } else if (tb.dtype == "int64") {
+            torch_dtype = torch::kInt64;
+            resolved_dtype_name = "int64";
+        } else if (tb.dtype == "int16") {
+            torch_dtype = torch::kInt16;
+            resolved_dtype_name = "int16";
+        } else if (tb.dtype == "int8") {
+            torch_dtype = torch::kInt8;
+            resolved_dtype_name = "int8";
+        } else if (tb.dtype == "float64") {
+            torch_dtype = torch::kFloat64;
+            resolved_dtype_name = "float64";
         } else {
             // Fallback to fp8 for backward compatibility
             this->logger->warn("Unknown dtype '{}' for tensor '{}', defaulting to fp8",

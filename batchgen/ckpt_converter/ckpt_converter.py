@@ -99,7 +99,8 @@ class ckpt_converter:
 					"offset": offset,
 					"byte_size": tensor_byte_size
 				}
-				# Write tensor to file
+
+		# Write tensor to file
 				data_ptr = tensor.data_ptr()
 				buf = (ctypes.c_char * tensor_byte_size).from_address(data_ptr)
 				# Write tensor data to file

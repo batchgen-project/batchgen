@@ -30,6 +30,7 @@ _CUDA_SOURCE = r'''
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cstdint>
 #include <utility>
 
@@ -529,7 +530,10 @@ static void launch_qkv_wgmma(
         _smem_configured = true;
     }
 
-    qkv_wgmma_kernel<<<grid, block, smem_bytes>>>(
+    // Must use PyTorch's current stream — default stream (<<<grid, block, smem>>>)
+    // is NOT captured during CUDA graph recording.
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    qkv_wgmma_kernel<<<grid, block, smem_bytes, stream>>>(
         desc_a, desc_b,
         bias_ptr, Q_ptr, K_ptr, V_ptr,
         stride_q, stride_k, stride_v,
