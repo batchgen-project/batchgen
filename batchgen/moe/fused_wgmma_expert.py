@@ -34,8 +34,6 @@ import logging
 from typing import Optional, Dict
 
 import torch
-from torch.utils.cpp_extension import load
-import batchgen_kernels
 
 # Module-level state
 _wgmma_available = None
@@ -64,36 +62,15 @@ def _check_wgmma_support() -> bool:
 
 
 def _load_mxfp4_module():
-    """Load the MXFP4 fused MoE CUDA module."""
+    """Load the MXFP4 fused MoE CUDA module (pre-compiled via pip install)."""
     global _module_mxfp4_moe
 
     if _module_mxfp4_moe is not None:
         return _module_mxfp4_moe
 
     try:
-        # Base CUDA flags — detect arch from device capability
-        device = torch.cuda.current_device()
-        cc = torch.cuda.get_device_capability(device)
-        arch = f"-arch=sm_{cc[0]}{cc[1]}a"
-        cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v"]
-
-        # Add kernel NaN debug flag if requested
-        debug_kernel = os.environ.get("DEBUG_KERNEL_NAN", "0") == "1"
-        if debug_kernel:
-            cuda_flags.append("-DDEBUG_KERNEL_NAN")
-            logging.info("Enabled kernel NaN debug (DEBUG_KERNEL_NAN=1)")
-
-        # Use different module name for debug build to avoid cache conflicts
-        module_name = "batchgen_fused_mxfp4_moe_wgmma_debug" if debug_kernel else "batchgen_fused_mxfp4_moe_wgmma"
-
-        _src_dir = batchgen_kernels.get_src_dir()
-        _module_mxfp4_moe = load(
-            name=module_name,
-            sources=[str(_src_dir / "moe" / "expert_mxfp4_wgmma.cu")],
-            extra_cuda_cflags=cuda_flags,
-            verbose=False,
-        )
-        logging.info("Loaded WGMMA fused MXFP4 MoE kernels")
+        import batchgen_kernels.moe._C_expert_mxfp4_wgmma as _module_mxfp4_moe
+        logging.info("Loaded pre-compiled WGMMA fused MXFP4 MoE kernels")
         return _module_mxfp4_moe
     except Exception as e:
         logging.warning(f"Failed to load WGMMA fused MoE kernels: {e}")

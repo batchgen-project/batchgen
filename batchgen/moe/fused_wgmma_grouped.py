@@ -25,8 +25,6 @@ import os
 import logging
 
 import torch
-from torch.utils.cpp_extension import load
-import batchgen_kernels
 
 
 # Module-level state
@@ -58,26 +56,15 @@ def _check_wgmma_support() -> bool:
 
 
 def _load_grouped_module():
-    """Load the grouped WGMMA CUDA module (Stage 1 + Stage 2)."""
+    """Load the grouped WGMMA CUDA module (pre-compiled via pip install)."""
     global _grouped_module
 
     if _grouped_module is not None:
         return _grouped_module
 
     try:
-        device = torch.cuda.current_device()
-        cc = torch.cuda.get_device_capability(device)
-        arch = f"-arch=sm_{cc[0]}{cc[1]}a"
-        cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v", "-lineinfo"]
-
-        _src_dir = batchgen_kernels.get_src_dir()
-        _grouped_module = load(
-            name="batchgen_fused_mxfp4_grouped_wgmma_tma_v1",
-            sources=[str(_src_dir / "moe" / "grouped_mxfp4_wgmma.cu")],
-            extra_cuda_cflags=cuda_flags,
-            verbose=False,
-        )
-        logging.info("Loaded WGMMA fused grouped MXFP4 MoE kernels")
+        import batchgen_kernels.moe._C_grouped_mxfp4_wgmma as _grouped_module
+        logging.info("Loaded pre-compiled WGMMA fused grouped MXFP4 MoE kernels")
         return _grouped_module
     except Exception as e:
         logging.warning(f"Failed to load WGMMA grouped MoE kernels: {e}")
