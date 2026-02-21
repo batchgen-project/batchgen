@@ -142,7 +142,7 @@ class FullAttnSegment:
         from batchgen.attention.fused_kernels import (
             cuda_rmsnorm, cuda_qkv_split, cuda_rope, cuda_add_rmsnorm,
         )
-        from batchgen.attention.gqa.fa_decode import gqa_decode_fa
+        from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
         from batchgen.kv_cache.gpu_kv_kernels import run_paged_kv_token_update_fused
 
         B = hidden_states.shape[0]
@@ -197,7 +197,7 @@ class FullAttnSegment:
             v_cache=v_cache,
             v_tokens=value.view(B, -1),
         )
-        attn_out, _ = gqa_decode_fa(
+        attn_out, _ = batchgen_gqa_decode_bf16(
             q=query, k_cache=k_cache, v_cache=v_cache,
             cache_seqlens=cache_seqlens, block_table=page_table,
             sinks=self.sinks, softmax_scale=self.scale,
@@ -813,7 +813,7 @@ class WholeModelSegment:
         from batchgen.attention.fused_kernels import (
             cuda_rmsnorm, cuda_qkv_split, cuda_rope, cuda_add_rmsnorm,
         )
-        from batchgen.attention.gqa.fa_decode import gqa_decode_fa
+        from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
         from batchgen.kv_cache.gpu_kv_kernels import run_paged_kv_token_update_fused
 
         B = input_ids.shape[0]
@@ -892,7 +892,7 @@ class WholeModelSegment:
             )
 
             # Flash attention decode
-            attn_out, _ = gqa_decode_fa(
+            attn_out, _ = batchgen_gqa_decode_bf16(
                 q=query, k_cache=k_cache, v_cache=v_cache,
                 cache_seqlens=cache_seqlens, block_table=page_table,
                 sinks=attn_wrapper.sinks, softmax_scale=attn_wrapper.scale,

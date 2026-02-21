@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _custom_kernel = None
 _custom_kernel_checked = False
+_backend_logged = False
 
 
 def _check_custom_kernel():
@@ -20,17 +21,26 @@ def _check_custom_kernel():
     if _custom_kernel_checked:
         return _custom_kernel is not None
     _custom_kernel_checked = True
+
+    if not torch.cuda.is_available():
+        print("[batchgen_decode] CUDA not available, using FA3 fallback")
+        return False
+
+    cc = torch.cuda.get_device_capability()
+    print(f"[batchgen_decode] GPU compute capability: SM{cc[0]}{cc[1]}")
+
+    if cc[0] < 9:
+        print(f"[batchgen_decode] SM{cc[0]}{cc[1]} < SM90, using FA3 fallback")
+        return False
+
     try:
-        cc = torch.cuda.get_device_capability()
-        if cc[0] < 9:
-            logger.info("Custom decode kernel requires SM90+, using FA3")
-            return False
         from batchgen_kernels.attention.decode import attention_decode_bf16
         _custom_kernel = attention_decode_bf16
-        logger.info("Custom WGMMA decode kernel loaded")
+        print("[batchgen_decode] Custom WGMMA decode kernel loaded successfully")
         return True
     except Exception as e:
-        logger.warning(f"Custom decode kernel unavailable: {e}, using FA3")
+        print(f"[batchgen_decode] Failed to load custom kernel: {e}")
+        print("[batchgen_decode] Falling back to FA3")
         return False
 
 
@@ -66,7 +76,15 @@ def batchgen_gqa_decode_bf16(
             output: (batch, seqlen_q=1, nheads, headdim) BF16
             lse: Log-sum-exp values or None
     """
+    global _backend_logged
+
     if _check_custom_kernel():
+        if not _backend_logged:
+            print(f"[batchgen_decode] Using custom WGMMA kernel "
+                  f"(q={list(q.shape)}, headdim={q.shape[-1]}, "
+                  f"sliding_window={sliding_window})")
+            _backend_logged = True
+
         # Shape adaptation: FA format -> custom kernel format
         # Q: [batch, 1, nheads, headdim] -> [batch, nheads, headdim]
         q_3d = q.squeeze(1)
@@ -94,6 +112,11 @@ def batchgen_gqa_decode_bf16(
         return output, lse
 
     # Fallback to FA3/FA2
+    if not _backend_logged:
+        print(f"[batchgen_decode] Using FA3 fallback "
+              f"(q={list(q.shape)}, headdim={q.shape[-1]})")
+        _backend_logged = True
+
     from .fa_decode import gqa_decode_fa
     return gqa_decode_fa(
         q, k_cache, v_cache, cache_seqlens, block_table,
