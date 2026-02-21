@@ -27,6 +27,9 @@ install.sh
 *.dylib
 *.dll
 
+# Pre-compiled decode kernel (closed-source)
+!batchgen_kernels/_C*.so
+
 # Fortran module files
 *.mod
 *.smod
