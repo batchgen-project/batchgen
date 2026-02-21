@@ -22,17 +22,19 @@ def get_src_dir() -> Path:
 def load_extension(module_name: str):
     """Import a pre-compiled CUDA extension with proper symbol visibility.
 
-    Uses ctypes.CDLL with RTLD_GLOBAL on the specific .so file only,
-    matching PyTorch's load() behavior. This avoids polluting the global
-    dlopen flags which can cause symbol conflicts with other .so files
-    (e.g., core_engine).
+    PYBIND11_MODULE extensions need libtorch_python symbols globally
+    visible. We temporarily set RTLD_GLOBAL before import (same approach
+    as PyTorch's cpp_extension.load). Safe because callers use lazy
+    loading — this only runs in GPU worker processes, not in the
+    Parameter_Server subprocess.
     """
-    import importlib, ctypes
-    mod = importlib.import_module(module_name)
-    so_path = getattr(mod, "__file__", None)
-    if so_path and so_path.endswith(".so"):
-        ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
-    return mod
+    import sys, os, importlib
+    old_flags = sys.getdlopenflags()
+    sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_NOW)
+    try:
+        return importlib.import_module(module_name)
+    finally:
+        sys.setdlopenflags(old_flags)
 
 
 def get_device_arch() -> str:
