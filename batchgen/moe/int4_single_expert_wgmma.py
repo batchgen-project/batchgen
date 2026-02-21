@@ -16,9 +16,9 @@ Stage 2: down projection (2D grid: K_tiles × M_tiles)
 """
 
 import logging
-import os
 import torch
-from torch.utils.cpp_extension import load_inline
+import batchgen_kernels
+from torch.utils.cpp_extension import load
 
 _single_expert_module = None
 
@@ -29,21 +29,15 @@ def _get_single_expert_module():
     if _single_expert_module is not None:
         return _single_expert_module
 
-    cu_path = os.path.join(os.path.dirname(__file__), "int4_single_expert_wgmma.cu")
-    if not os.path.isfile(cu_path):
-        raise FileNotFoundError(f"CUDA source not found at {cu_path}")
-    with open(cu_path, "r") as f:
-        cuda_source = f.read()
-
     device = torch.cuda.current_device()
     cc = torch.cuda.get_device_capability(device)
     arch = f"-arch=sm_{cc[0]}{cc[1]}a"
     cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v", "-lineinfo"]
 
-    _single_expert_module = load_inline(
+    _src_dir = batchgen_kernels.get_src_dir()
+    _single_expert_module = load(
         name="int4_single_expert_wgmma_v1",
-        cpp_sources=[""],
-        cuda_sources=[cuda_source],
+        sources=[str(_src_dir / "moe" / "single_expert_int4_wgmma.cu")],
         extra_cuda_cflags=cuda_flags,
         verbose=False,
     )

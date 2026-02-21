@@ -27,8 +27,8 @@ install.sh
 *.dylib
 *.dll
 
-# Pre-compiled decode kernel (closed-source)
-!batchgen_kernels/_C*.so
+# Pre-compiled decode kernel (closed-source, supports GQA and MHA)
+!batchgen_kernels/attention/_C_gqa_mha_decode*.so
 
 # Fortran module files
 *.mod

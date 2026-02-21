@@ -7,10 +7,10 @@ Compiled via torch.utils.cpp_extension.load() at import time.
 from typing import Optional
 
 import torch
-from pathlib import Path
 from torch.utils.cpp_extension import load
 
-_csrc_dir = Path(__file__).parent / "csrc"
+import batchgen_kernels
+_csrc_dir = batchgen_kernels.get_src_dir() / "attention" / "csrc"
 
 _ext = load(
     name="attention_fused_cuda",

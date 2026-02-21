@@ -12,7 +12,7 @@ Usage:
 import torch
 
 # Import triggers compilation on first use
-import batchgen_kernels._C  # noqa: F401
+import batchgen_kernels.attention._C_gqa_mha_decode  # noqa: F401
 
 
 def attention_decode_bf16(

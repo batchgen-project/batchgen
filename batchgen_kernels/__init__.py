@@ -11,6 +11,12 @@ Usage:
 __version__ = "0.1.0"
 
 import torch
+from pathlib import Path
+
+
+def get_src_dir() -> Path:
+    """Return the path to batchgen_kernels/src/ for JIT compilation."""
+    return Path(__file__).parent / "src"
 
 
 def get_device_arch() -> str:

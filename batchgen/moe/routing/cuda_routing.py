@@ -13,14 +13,14 @@ Usage:
 """
 
 import torch
-from pathlib import Path
 from torch.utils.cpp_extension import load
+
+import batchgen_kernels
+_csrc_dir = batchgen_kernels.get_src_dir() / "moe" / "routing"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Compile at import time
 # ──────────────────────────────────────────────────────────────────────────────
-
-_csrc_dir = Path(__file__).parent / "csrc"
 
 _cuda_ext = load(
     name="routing_cuda",

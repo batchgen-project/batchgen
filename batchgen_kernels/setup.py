@@ -21,7 +21,7 @@ setup(
     },
     packages=["batchgen_kernels", "batchgen_kernels.attention",
               "batchgen_kernels.moe", "batchgen_kernels.common"],
-    package_data={"batchgen_kernels": ["_C*.so"]},
+    package_data={"batchgen_kernels.attention": ["_C_gqa_mha_decode*.so"]},
     python_requires=">=3.10",
     install_requires=["torch>=2.9.0"],
 )
