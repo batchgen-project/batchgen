@@ -7,6 +7,7 @@ Usage:
     pip install -e batchgen_kernels/
 """
 
+import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 import torch
@@ -14,7 +15,15 @@ import torch
 # Force CXX11 ABI to match PyTorch (same approach as flash-attention)
 torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-_sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v", "-lineinfo"]
+# Parallel compilation: MAX_JOBS controls number of files compiled in parallel
+if not os.environ.get("MAX_JOBS"):
+    os.environ["MAX_JOBS"] = str(max(1, os.cpu_count() // 2))
+
+# nvcc --threads controls parallelism within a single .cu file
+_nvcc_threads = os.getenv("NVCC_THREADS", "4")
+
+_sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v",
+                "-lineinfo", "--threads", _nvcc_threads]
 
 setup(
     name="batchgen_kernels",
@@ -56,7 +65,8 @@ setup(
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
-                         "-gencode", "arch=compute_90a,code=sm_90a"],
+                         "-gencode", "arch=compute_90a,code=sm_90a",
+                         "--threads", _nvcc_threads],
             },
         ),
         # Attention fused ops (RMSNorm, RoPE, QKV split)
@@ -71,7 +81,8 @@ setup(
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
-                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__"],
+                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--threads", _nvcc_threads],
             },
         ),
         # CuTe MXFP4 dequantization
@@ -80,7 +91,8 @@ setup(
             sources=["src/moe/mxfp4_dequant_cute.cu"],
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-O3", "--use_fast_math", "-lineinfo"],
+                "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
+                         "--threads", _nvcc_threads],
             },
         ),
     ],
