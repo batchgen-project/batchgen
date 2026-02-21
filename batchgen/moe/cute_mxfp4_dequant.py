@@ -16,14 +16,17 @@ Usage:
 """
 
 import torch
-import batchgen_kernels
 
-# Pre-compiled at pip install time
-_cute_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_mxfp4_dequant_cute")
+# Pre-compiled at pip install time, loaded lazily on first use
+_cute_module = None
 
 
 def _get_cute_module():
-    """Return the pre-compiled CuTe-style CUDA module."""
+    """Return the pre-compiled CuTe-style CUDA module (lazy load)."""
+    global _cute_module
+    if _cute_module is None:
+        import batchgen_kernels
+        _cute_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_mxfp4_dequant_cute")
     return _cute_module
 
 
