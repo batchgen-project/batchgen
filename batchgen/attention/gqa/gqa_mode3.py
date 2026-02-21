@@ -184,6 +184,9 @@ def gqa_decoding_mode_3_bf16(
         cache_seqlens_slice = cache_seqlens
 
     # 6. Flash attention with paged KV
+    if not hasattr(gqa_decoding_mode_3_bf16, '_logged'):
+        print(f"[batchgen_decode] gqa_decoding_mode_3_bf16 CALLED (gqa_mode3.py)")
+        gqa_decoding_mode_3_bf16._logged = True
     if timing and timing.enabled:
         with timing.time("attn.flash_attn"):
             attn_output, lse = gqa_decode_fa(
