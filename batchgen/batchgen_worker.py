@@ -24,7 +24,6 @@ Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
 
 from .config.config import EngineConfig
-from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 from .scheduler.host_mem import get_physical_memory_info
 
 from batchgen.parameter_server_client import ParameterServerClient
