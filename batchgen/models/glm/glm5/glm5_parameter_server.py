@@ -14,7 +14,7 @@ Key differences from DeepSeek:
 - Indexer tensors (wk, wq_b, k_norm, weights_proj) — kept in skeleton (BF16/FP8 mixed)
 - e_score_correction_bias in MoE gate
 - MTP layer at index 78 (eh_proj, enorm, hnorm, shared_head.norm)
-- FP8 byte_size ~760 GB
+- byte_size ~1400 GB (BF16 routed experts + FP8 attention)
 """
 
 import gc
@@ -67,8 +67,8 @@ class GLM5_Parameter_Server:
 
         self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
 
-        # GLM-5-FP8: ~756 GB checkpoint
-        byte_size = 760 * 1024 * 1024 * 1024
+        # GLM-5: BF16 experts (1350 GB) + FP8 attn (12.3 GB) + BF16 rest (~18 GB) ≈ 1380 GB
+        byte_size = 1400 * 1024 * 1024 * 1024
 
         total, used, free = shutil.disk_usage("/dev/shm")
         logging.info(f"Freespace in /dev/shm: {free / 1024**3:.1f} GB")
