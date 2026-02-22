@@ -568,6 +568,17 @@ class WorkerManager:
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
             )
+        elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
+            from batchgen.models.glm.glm5.glm5_parameter_server import (
+                GLM5_Parameter_Server,
+            )
+
+            parameter_server = GLM5_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
+                self.args.enable_hugetlbfs,
+            )
         else:
             raise NotImplementedError(
                 f"Model type for {self.args.model} not supported"
