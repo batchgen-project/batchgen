@@ -44,12 +44,9 @@ def glm5_fp8_dequantization(
 
 
 class GLM5ExpertWrapper(ExpertWrapperBase):
-    """Expert wrapper with FP8 dequantization for GLM-5.
+    """Expert wrapper for GLM-5 (BF16 routed experts).
 
-    Handles:
-    - FP8 block-wise dequantization with scale factors
-    - FP8 weight caching for local experts
-    - deepgemm kernel for forward computation
+    GLM-5 routed experts are BF16, not FP8. Uses standard nn.Linear forward.
     """
 
     def __init__(
@@ -68,36 +65,28 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             persistent
         )
         self.weight_dequant_scale = weight_dequant_scale or {}
-        self.fp8_gate = None
-        self.fp8_up = None
-        self.fp8_down = None
+        self.cached_gate = None
+        self.cached_up = None
+        self.cached_down = None
 
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        result = {}
-        for name, weight in weights_dict.items():
-            scale_key = f"{name}_scale_inv"
-            if scale_key in self.weight_dequant_scale:
-                result[name] = glm5_fp8_dequantization(
-                    weight, self.weight_dequant_scale[scale_key]
-                )
-            else:
-                result[name] = weight
-        return result
+        """BF16 experts need no dequantization — pass through."""
+        return weights_dict
 
     def _register_fp8_weights(self):
-        self.fp8_gate = self.module.gate_proj.weight.data
-        self.fp8_up = self.module.up_proj.weight.data
-        self.fp8_down = self.module.down_proj.weight.data
+        self.cached_gate = self.module.gate_proj.weight.data
+        self.cached_up = self.module.up_proj.weight.data
+        self.cached_down = self.module.down_proj.weight.data
 
     def _unregister_fp8_weights(self):
-        self.fp8_gate = None
-        self.fp8_up = None
-        self.fp8_down = None
+        self.cached_gate = None
+        self.cached_up = None
+        self.cached_down = None
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.module.deepgemm_forward(hidden_states, self.weight_dequant_scale)
+        return self.module(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.persistent:
@@ -105,9 +94,9 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             for name, param in self.module.named_parameters():
                 param.data = weights[name]
         else:
-            self.module.gate_proj.weight.data = self.fp8_gate
-            self.module.up_proj.weight.data = self.fp8_up
-            self.module.down_proj.weight.data = self.fp8_down
+            self.module.gate_proj.weight.data = self.cached_gate
+            self.module.up_proj.weight.data = self.cached_up
+            self.module.down_proj.weight.data = self.cached_down
 
         result = self.micro_batch_forward(hidden_states, "expert")
 

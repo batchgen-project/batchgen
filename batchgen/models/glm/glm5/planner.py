@@ -28,7 +28,7 @@ class GLM5Planner(BasePlanner):
     # GLM-5 specific constants
     NUM_LAYERS = 78
     COMPRESSED_KV_DIM = 576  # kv_lora_rank(512) + qk_rope_head_dim(64)
-    EXPERT_SIZE_GB = 2.7  # Per-expert across all 75 MoE layers (75 * 36MB)
+    EXPERT_SIZE_GB = 5.4  # Per-expert across all 75 MoE layers (75 * 72MB BF16)
 
     def __version__(self):
         return "0.1.0"
