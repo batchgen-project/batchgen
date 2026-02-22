@@ -529,6 +529,74 @@ class Glm5MoE(nn.Module):
 
 
 # ============================================================================
+# Scatter + Weighted Reduce (Triton kernel, copied from DeepSeek V3)
+# ============================================================================
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _scatter_weight_reduce_kernel(
+    res_ptr, nnz_indices_ptr, topk_weight_ptr, output_ptr,
+    num_tokens, num_experts_per_tok, hidden_size, nnz,
+    BLOCK_SIZE_H: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    if token_idx >= num_tokens:
+        return
+    h_offset = tl.program_id(1) * BLOCK_SIZE_H
+    h_indices = h_offset + tl.arange(0, BLOCK_SIZE_H)
+    h_mask = h_indices < hidden_size
+    accumulator = tl.zeros([BLOCK_SIZE_H], dtype=tl.float32)
+    for k in range(num_experts_per_tok):
+        mapping_offset = token_idx * num_experts_per_tok + k
+        nnz_idx = tl.load(nnz_indices_ptr + mapping_offset)
+        is_valid = (nnz_idx >= 0) & (nnz_idx < nnz)
+        weight = tl.load(topk_weight_ptr + mapping_offset)
+        safe_nnz_idx = tl.where(is_valid, nnz_idx, 0)
+        res_offset = safe_nnz_idx * hidden_size + h_indices
+        load_mask = h_mask & is_valid
+        res_vals = tl.load(res_ptr + res_offset, mask=load_mask, other=0.0)
+        res_vals_fp32 = res_vals.to(tl.float32)
+        weighted = tl.where(is_valid, res_vals_fp32 * weight, 0.0)
+        accumulator += weighted
+    output_offset = token_idx * hidden_size + h_indices
+    tl.store(output_ptr + output_offset, accumulator, mask=h_mask)
+
+
+def _build_inverse_mapping(global_indices, token_topk_pos, num_tokens, num_experts_per_tok):
+    mapping = torch.full((num_tokens, num_experts_per_tok), -1,
+                         dtype=torch.int64, device=global_indices.device)
+    if global_indices.numel() == 0:
+        return mapping
+    mapping[global_indices, token_topk_pos] = torch.arange(
+        len(global_indices), dtype=torch.int64, device=global_indices.device)
+    return mapping
+
+
+def scatter_weight_reduce_optimized(res, global_indices, token_topk_pos,
+                                    topk_weight, num_tokens, num_experts_per_tok):
+    assert topk_weight.dtype == torch.float32
+    nnz, hidden_size = res.shape
+    if nnz == 0:
+        return torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+    nnz_indices = _build_inverse_mapping(
+        global_indices[:nnz], token_topk_pos[:nnz], num_tokens, num_experts_per_tok)
+    output = torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+    if num_tokens == 0:
+        return output
+    BLOCK_SIZE_H = min(triton.next_power_of_2(hidden_size), 256)
+    grid = (num_tokens, triton.cdiv(hidden_size, BLOCK_SIZE_H))
+    _scatter_weight_reduce_kernel[grid](
+        res, nnz_indices, topk_weight, output,
+        num_tokens, num_experts_per_tok, hidden_size, nnz,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+    )
+    return output
+
+
+# ============================================================================
 # MoE Layer (Decode with EP)
 # ============================================================================
 
@@ -716,7 +784,7 @@ class Glm5MoEDecode(nn.Module):
         import torch.distributed as dist
         from mgn_kernel import fused_moe_token_dispatch
         # scatter_weight_reduce_optimized is imported from DeepSeek's modeling file
-        from batchgen.models.deepseek.deepseekv3.modeling_deepseek_v3 import scatter_weight_reduce_optimized
+
 
         num_tokens, hidden_size = x.shape
         device = x.device
@@ -794,7 +862,7 @@ class Glm5MoEDecode(nn.Module):
         """
         import torch.distributed as dist
         from mgn_kernel import fused_moe_token_dispatch
-        from batchgen.models.deepseek.deepseekv3.modeling_deepseek_v3 import scatter_weight_reduce_optimized
+
 
         num_tokens, hidden_size = x.shape
         device = x.device
