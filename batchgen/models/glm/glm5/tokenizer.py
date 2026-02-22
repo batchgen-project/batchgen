@@ -16,6 +16,7 @@ GLM-5 tokenizer specifications:
 import json
 import logging
 from pathlib import Path
+from typing import Dict, List, Optional, Union
 
 from tokenizers import Tokenizer
 from batchgen.config.fast_tokenizer import FastTokenizer
@@ -58,7 +59,13 @@ class GLM5Tokenizer(FastTokenizer):
         self.tokenizer_path = TOKENIZER_DIR
         self._config = self._load_config()
         self._setup_special_tokens(self._config)
-        self.chat_template = self._config.get("chat_template")
+
+        # Load chat template from separate jinja file (not inline in tokenizer_config.json)
+        chat_template_file = TOKENIZER_DIR / "chat_template.jinja"
+        if chat_template_file.exists():
+            self.chat_template = chat_template_file.read_text()
+        else:
+            self.chat_template = self._config.get("chat_template")
 
         self.bos_token_id = None
         self.eos_token_id = GLM5_EOS_TOKEN_ID
@@ -84,3 +91,34 @@ class GLM5Tokenizer(FastTokenizer):
             f"GLM-5 tokenizer initialized: vocab_size={self.vocab_size}, "
             f"eos={self.eos_token_id}, stop_tokens={self.stop_token_ids}"
         )
+
+    def apply_chat_template(
+        self,
+        messages: List[Dict[str, str]],
+        tokenize: bool = True,
+        add_generation_prompt: bool = False,
+        **kwargs,
+    ) -> Union[str, List[int]]:
+        """Apply GLM-5 chat template.
+
+        Overrides parent to use permissive Jinja2 undefined (not StrictUndefined),
+        since the GLM-5 template checks optional variables like 'tools',
+        'enable_thinking', 'clear_thinking' with {% if %} guards.
+        """
+        if not self.chat_template:
+            raise ValueError("No chat template available for GLM-5 tokenizer.")
+
+        from jinja2 import Template
+
+        template = Template(self.chat_template)
+        rendered = template.render(
+            messages=messages,
+            bos_token="",
+            eos_token=self.eos_token or "",
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+        if tokenize:
+            return self.encode(rendered, add_special_tokens=False)
+        return rendered
