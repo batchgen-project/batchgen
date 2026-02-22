@@ -26,7 +26,7 @@ import types
 import torch
 import torch.distributed as dist
 
-from .model import Glm5ForCausalLM
+from .model import Glm5ForCausalLM, Glm5MoEDecode
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
@@ -264,12 +264,8 @@ class GLM5ParallelStrategyManager:
         self._load_shared_expert_module()
         self._config_attn_module()
         self._config_expert_module()
+        self._setup_decode_moe(comm)
         self._config_lm_head_hook()
-
-        if self.enable_ep_offloading:
-            for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
-                layer = self.model.model.layers[layer_idx]
-                layer.mlp.enable_ep_offloading = True
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
@@ -305,9 +301,10 @@ class GLM5ParallelStrategyManager:
                 layer.init_num_tokens(max_rank_bsz)
 
     def _init_mode_decoding(self):
-        if self.enable_ep_offloading:
+        has_persistent = self.num_local_expert_per_layer > 0
+        if not has_persistent:
             if self.rank == 0:
-                logging.info("EP offloading: skipping grouped GEMM init")
+                logging.info("EP offloading: no persistent experts, skipping grouped GEMM init")
             return
         for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
             layer = self.model.model.layers[layer_idx].mlp
@@ -545,6 +542,48 @@ class GLM5ParallelStrategyManager:
 
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Expert module config time: {elapsed:.2f}s")
+
+    def _setup_decode_moe(self, comm):
+        """Replace Glm5MoE with Glm5MoEDecode for EP decode path.
+
+        Creates Glm5MoEDecode per MoE layer, transfers gate, shared_experts,
+        and all expert wrappers from the old Glm5MoE. Pointer arrays for
+        grouped FP8 GEMM are built later in _init_mode_decoding() via init().
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        NUM_EXPERT_PER_RANK = self.NUM_TOTAL_EXPERTS // self.world_size
+
+        for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
+            old_moe = self.model.model.layers[layer_idx].mlp
+
+            decode_moe = Glm5MoEDecode(self.loaded_model_config, comm=comm)
+
+            # Transfer gate and shared experts
+            decode_moe.gate = old_moe.gate
+            decode_moe.shared_experts = old_moe.shared_experts
+
+            # Set EP range
+            decode_moe.routed_expert_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
+            decode_moe.routed_expert_end_idx = (self.global_rank + 1) * NUM_EXPERT_PER_RANK
+            decode_moe.experts_per_rank = NUM_EXPERT_PER_RANK
+            decode_moe.num_persistent_local_experts = self.num_local_expert_per_layer
+
+            # Transfer all expert wrappers (persistent + non-persistent)
+            for expert_idx in range(self.NUM_TOTAL_EXPERTS):
+                decode_moe.experts[expert_idx] = old_moe.experts[expert_idx]
+
+            # Propagate offloading flag
+            decode_moe.enable_ep_offloading = self.enable_ep_offloading
+
+            decode_moe.to(device)
+            self.model.model.layers[layer_idx].mlp = decode_moe
+
+        if self.rank == 0:
+            logging.info(
+                f"[DECODE] Set up Glm5MoEDecode for {self.model_config.num_hidden_layers - self.FIRST_K_DENSE} "
+                f"MoE layers (experts_per_rank={NUM_EXPERT_PER_RANK}, "
+                f"offloading={self.enable_ep_offloading})"
+            )
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, gates, indexer, lm_head)."""
