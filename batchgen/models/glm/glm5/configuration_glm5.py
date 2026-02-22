@@ -121,4 +121,10 @@ class Glm5Config(PretrainedConfig):
         self.num_local_experts = n_routed_experts
         self.compressed_kv_dim = kv_lora_rank + qk_rope_head_dim  # 576
 
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
