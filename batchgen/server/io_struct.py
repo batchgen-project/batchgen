@@ -43,6 +43,13 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Reasoning effort level for GPT-OSS models (low, medium, high)",
     )
+    # Thinking/reasoning mode for GLM-5 and similar models
+    enable_thinking: Optional[bool] = Field(
+        default=None,
+        description="Enable thinking/reasoning mode for supported models (GLM-5). "
+                    "When true, model generates <think>...</think> reasoning before the answer. "
+                    "Overrides server-level --enable-thinking flag if set.",
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:

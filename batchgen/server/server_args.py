@@ -267,6 +267,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help="Enable thinking/reasoning mode by default for supported models (GLM-5, etc.). "
+             "Can be overridden per-request via the enable_thinking field in the API body.",
+    )
     return parser
 
 

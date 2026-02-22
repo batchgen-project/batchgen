@@ -251,7 +251,13 @@ class BatchScheduler:
                     body.model,
                     body.reasoning_effort,
                 )
-                prompt = self._format_chat_messages(messages, body.model)
+                # Resolve enable_thinking: per-request overrides server default
+                enable_thinking = body.enable_thinking
+                if enable_thinking is None:
+                    enable_thinking = getattr(self.server_args, "enable_thinking", False)
+                prompt = self._format_chat_messages(
+                    messages, body.model, enable_thinking=enable_thinking
+                )
                 current_max_tokens = body.max_tokens or 128
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
@@ -308,14 +314,19 @@ class BatchScheduler:
 
         return modified
 
-    def _format_chat_messages(self, messages: List[dict], model: str) -> str:
+    def _format_chat_messages(
+        self, messages: List[dict], model: str, enable_thinking: bool = False,
+    ) -> str:
         tokenizer = self._get_tokenizer(model)
         if not hasattr(tokenizer, "apply_chat_template"):
             raise RuntimeError(
                 f"Tokenizer for {model} does not support apply_chat_template"
             )
+        kwargs = {}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
 
     def _build_output_items(
