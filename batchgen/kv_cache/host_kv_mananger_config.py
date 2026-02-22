@@ -377,30 +377,12 @@ def build_gpu_kv_config_fixed_size(
 	"""
 	from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 	
-	# Get model-specific KV dimensions
-	if "deepseek" in model_name.lower() or "kimi" in model_name.lower():
-		# DeepSeek-V3 / Kimi K2.5 MLA: compressed KV
-		# compressed_kv_dim = kv_lora_rank + qk_rope_head_dim = 512 + 64 = 576
-		kv_dim = 576  # compressed_kv_dim (was 512 - bug fix)
-		num_layers = 61
-		dtype_bytes = 2  # bfloat16
-	elif "gpt-oss-120b" in model_name.lower():
-		# GPT-OSS-120B GQA: 8 KV heads * 64 head_dim = 512 for K, same for V
-		kv_dim = 8 * 64 * 2  # K + V
-		num_layers = 36
-		dtype_bytes = 2  # bfloat16
-	else:
-		raise NotImplementedError(f"Model {model_name} not supported")
-	
-	# Calculate bytes per page per layer
-	bytes_per_token = kv_dim * dtype_bytes
-	bytes_per_page = bytes_per_token * page_size_tokens
-	bytes_per_page_all_layers = bytes_per_page * num_layers
-	
-	# Calculate total pages from memory budget
+	profile = _resolve_profile(model_name)
+
+	# Calculate total pages from memory budget using profile
+	bytes_per_page_all_layers = profile.bytes_per_page() * profile.num_layers
 	total_bytes = int(gpu_kv_cache_size_gb * (1024 ** 3))
 	num_pages = total_bytes // bytes_per_page_all_layers
-	profile = _resolve_profile(model_name)
 	return GPUPagedKVConfig(
 		num_layers=profile.num_layers,
 		num_pages=num_pages,
