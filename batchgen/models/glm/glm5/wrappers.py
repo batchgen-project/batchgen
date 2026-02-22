@@ -44,9 +44,12 @@ def glm5_fp8_dequantization(
 
 
 class GLM5ExpertWrapper(ExpertWrapperBase):
-    """Expert wrapper for GLM-5 (BF16 routed experts).
+    """Expert wrapper for GLM-5 models.
 
-    GLM-5 routed experts are BF16, not FP8. Uses standard nn.Linear forward.
+    Supports both variants:
+    - GLM-5 (BF16): standard nn.Linear forward
+    - GLM-5-FP8: FP8 deepgemm forward with w8a16_gemm
+    Controlled by `is_fp8` flag set during PSM configuration.
     """
 
     def __init__(
@@ -59,12 +62,14 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         model_config,
         persistent: bool = False,
         weight_dequant_scale: Optional[Dict[str, torch.Tensor]] = None,
+        is_fp8: bool = False,
     ):
         super().__init__(
             module, layer_idx, expert_idx, core_engine, engine_config, model_config,
             persistent
         )
         self.weight_dequant_scale = weight_dequant_scale or {}
+        self.is_fp8 = is_fp8
         self.cached_gate = None
         self.cached_up = None
         self.cached_down = None
@@ -72,8 +77,18 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """BF16 experts need no dequantization — pass through."""
-        return weights_dict
+        if not self.is_fp8:
+            return weights_dict
+        result = {}
+        for name, weight in weights_dict.items():
+            scale_key = f"{name}_scale_inv"
+            if scale_key in self.weight_dequant_scale:
+                result[name] = glm5_fp8_dequantization(
+                    weight, self.weight_dequant_scale[scale_key]
+                )
+            else:
+                result[name] = weight
+        return result
 
     def _register_fp8_weights(self):
         self.cached_gate = self.module.gate_proj.weight.data
@@ -86,6 +101,8 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         self.cached_down = None
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.is_fp8:
+            return self.module.deepgemm_forward(hidden_states, self.weight_dequant_scale)
         return self.module(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -75,6 +75,10 @@ class GLM5ParallelStrategyManager:
         self.global_rank = global_rank
         self.world_size = world_size
         self.rank = global_rank
+        # Detect FP8 variant by checking for expert scale tensors in skeleton
+        self.is_fp8_experts = any(
+            "experts.0.gate_proj.weight_scale_inv" in k for k in skeleton_state_dict
+        )
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
@@ -513,7 +517,7 @@ class GLM5ParallelStrategyManager:
             layer.mlp.shared_experts = GLM5ExpertWrapper(
                 layer.mlp.shared_experts, layer_idx, -1,
                 self.core_engine, self.engine_config, self.model_config,
-                shared_persistent, shared_scales,
+                shared_persistent, shared_scales, is_fp8=self.is_fp8_experts,
             )
             if shared_persistent:
                 layer.mlp.shared_experts._register_fp8_weights()
@@ -534,7 +538,7 @@ class GLM5ParallelStrategyManager:
                 layer.mlp.experts[expert_idx] = GLM5ExpertWrapper(
                     layer.mlp.experts[expert_idx], layer_idx, expert_idx,
                     self.core_engine, self.engine_config, self.model_config,
-                    persistent, expert_scales,
+                    persistent, expert_scales, is_fp8=self.is_fp8_experts,
                 )
                 if persistent:
                     layer.mlp.experts[expert_idx]._register_fp8_weights()
