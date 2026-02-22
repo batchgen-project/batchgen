@@ -51,11 +51,26 @@ class GLM5Tokenizer(FastTokenizer):
         tokenizer_file = TOKENIZER_DIR / "tokenizer.json"
         with open(tokenizer_file) as f:
             tok_data = json.load(f)
-        if tok_data.get("model", {}).get("ignore_merges") is not None:
-            tok_data["model"]["ignore_merges"] = None
+        if "ignore_merges" in tok_data.get("model", {}):
+            del tok_data["model"]["ignore_merges"]
 
         # Load from patched JSON string, then run parent setup (skip file load)
-        self.tokenizer = Tokenizer.from_str(json.dumps(tok_data))
+        model_keys = list(tok_data.get("model", {}).keys())
+        logger.info(f"GLM-5 tokenizer.json model keys after patch: {model_keys}")
+        json_str = json.dumps(tok_data)
+        logger.info(f"GLM-5 tokenizer JSON string length: {len(json_str)}")
+
+        try:
+            self.tokenizer = Tokenizer.from_str(json_str)
+        except Exception as e:
+            import re
+            m = re.search(r"column (\d+)", str(e))
+            if m:
+                col = int(m.group(1))
+                start = max(0, col - 200)
+                end = min(len(json_str), col + 200)
+                logger.error(f"Tokenizer parse failed near column {col}: ...{json_str[start:end]}...")
+            raise
         self.tokenizer_path = TOKENIZER_DIR
         self._config = self._load_config()
         self._setup_special_tokens(self._config)
