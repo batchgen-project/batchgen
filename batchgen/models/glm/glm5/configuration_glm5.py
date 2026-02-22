@@ -71,6 +71,9 @@ class Glm5Config(PretrainedConfig):
         tie_word_embeddings=False,
         num_nextn_predict_layers=1,
         ep_size=1,
+        pad_token_id=154820,
+        bos_token_id=None,
+        eos_token_id=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
