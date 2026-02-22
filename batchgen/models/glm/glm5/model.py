@@ -970,7 +970,7 @@ class Glm5Model(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
         # Shared RoPE instance
         self._shared_rotary_emb = Glm5RotaryEmbedding(
