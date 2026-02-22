@@ -13,9 +13,11 @@ GLM-5 tokenizer specifications:
 - Uses HuggingFace tokenizer.json format (bundled in this directory)
 """
 
+import json
 import logging
 from pathlib import Path
 
+from tokenizers import Tokenizer
 from batchgen.config.fast_tokenizer import FastTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
 
@@ -43,7 +45,20 @@ class GLM5Tokenizer(FastTokenizer):
     """
 
     def __init__(self):
-        super().__init__(str(TOKENIZER_DIR))
+        # Patch tokenizer.json: 'ignore_merges' field not supported by
+        # older versions of the tokenizers Rust library
+        tokenizer_file = TOKENIZER_DIR / "tokenizer.json"
+        with open(tokenizer_file) as f:
+            tok_data = json.load(f)
+        if tok_data.get("model", {}).get("ignore_merges") is not None:
+            tok_data["model"]["ignore_merges"] = None
+
+        # Load from patched JSON string, then run parent setup (skip file load)
+        self.tokenizer = Tokenizer.from_str(json.dumps(tok_data))
+        self.tokenizer_path = TOKENIZER_DIR
+        self._config = self._load_config()
+        self._setup_special_tokens(self._config)
+        self.chat_template = self._config.get("chat_template")
 
         self.bos_token_id = None
         self.eos_token_id = GLM5_EOS_TOKEN_ID
