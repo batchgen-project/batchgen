@@ -46,20 +46,22 @@ class GLM5Tokenizer(FastTokenizer):
     """
 
     def __init__(self):
-        # Patch tokenizer.json: 'ignore_merges' field not supported by
-        # older versions of the tokenizers Rust library
+        # Patch tokenizer.json for older tokenizers Rust library compatibility.
+        # GLM-5 uses ignore_merges=True (tiktoken-style: direct vocab lookup, no BPE merges).
+        # Old library doesn't support this field. Remove it AND clear merges so the old
+        # library does direct vocab lookup too (BPE with no merges = same behavior).
         tokenizer_file = TOKENIZER_DIR / "tokenizer.json"
         with open(tokenizer_file) as f:
             tok_data = json.load(f)
-        if "ignore_merges" in tok_data.get("model", {}):
-            del tok_data["model"]["ignore_merges"]
+
+        model = tok_data.get("model", {})
+        if model.pop("ignore_merges", None):
+            logger.info("Patching GLM-5 tokenizer: removing ignore_merges=True and clearing merges list")
+            model["merges"] = []
+        model.pop("byte_fallback", None)
 
         # Load from patched JSON string, then run parent setup (skip file load)
-        model_keys = list(tok_data.get("model", {}).keys())
-        logger.info(f"GLM-5 tokenizer.json model keys after patch: {model_keys}")
         json_str = json.dumps(tok_data)
-        logger.info(f"GLM-5 tokenizer JSON string length: {len(json_str)}")
-
         try:
             self.tokenizer = Tokenizer.from_str(json_str)
         except Exception as e:
