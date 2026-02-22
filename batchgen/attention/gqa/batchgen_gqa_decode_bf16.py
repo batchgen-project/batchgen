@@ -98,6 +98,7 @@ def batchgen_gqa_decode_bf16(
             vcache=v_cache,
             block_ids=block_table,
             num_seq_kvcache=cache_seqlens,
+            new_kv_included=True,  # cache_seqlens includes current token
             sliding_window=sw,
         )
 
