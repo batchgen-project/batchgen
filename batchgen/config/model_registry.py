@@ -60,6 +60,7 @@ ARCH_PATTERNS: Dict[str, str] = {
     "Mixtral": "mixtral",
     "GptOss": "gpt_oss",
     "Qwen2Moe": "qwen2_moe",
+    "GlmMoeDsa": "glm_moe_dsa",
 }
 
 # Model name/identifier patterns for detection from HuggingFace model IDs
@@ -73,6 +74,8 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x22B": "mixtral",
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
+    "GLM-5-FP8": "glm_moe_dsa",
+    "GLM-5": "glm_moe_dsa",
 }
 
 
@@ -229,6 +232,11 @@ def _import_model_configs():
 
     try:
         from batchgen.models.moonshotai.kimi_k25 import config as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.glm.glm5 import config as _  # noqa: F401
     except ImportError:
         pass
 

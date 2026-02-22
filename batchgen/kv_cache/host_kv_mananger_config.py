@@ -96,10 +96,32 @@ _DEEPSEEK_V3_2_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# GLM-5: MLA cache (78 layers, compressed_kv_dim=576, same as DeepSeek)
+_GLM5_MLA_PROFILE = _HostKVModelProfile(
+	num_layers=78,
+	num_k_heads=1,
+	k_head_dim=576,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+)
+
+# GLM-5 DSA: indexer cache (78 layers, index_dim=32*128=4096)
+_GLM5_INDEXER_PROFILE = _HostKVModelProfile(
+	num_layers=78,
+	num_k_heads=1,
+	k_head_dim=4096,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+)
+
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
 	"deepseek_v3_2_indexer": _DEEPSEEK_V3_2_INDEXER_PROFILE,
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
+	"glm5_mla": _GLM5_MLA_PROFILE,
+	"glm5_indexer": _GLM5_INDEXER_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -124,6 +146,12 @@ for canonical, aliases in {
 		"openai/gpt-oss-120b",
 		"gpt-oss-120b",
 	),
+	"glm5_mla": (
+		"zai-org/glm-5-fp8",
+		"zai-org/glm-5",
+		"glm-5-fp8",
+		"glm-5",
+	),
 }.items():
 	for alias in aliases:
 		_PROFILE_ALIASES[alias.lower()] = canonical
@@ -135,6 +163,12 @@ for canonical, aliases in {
 		"deepseek-ai/deepseek-v3.2",
 		"deepseek/deepseek-v3.2",
 		"deepseek-v3.2",
+	),
+	"glm5_indexer": (
+		"zai-org/glm-5-fp8",
+		"zai-org/glm-5",
+		"glm-5-fp8",
+		"glm-5",
 	),
 }.items():
 	for alias in aliases:
