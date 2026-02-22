@@ -13,10 +13,12 @@ GLM-5 tokenizer specifications:
 - Uses HuggingFace tokenizer.json format (bundled in this directory)
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from tokenizers import Tokenizer
 from batchgen.config.fast_tokenizer import FastTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
 
@@ -35,7 +37,6 @@ class GLM5Tokenizer(FastTokenizer):
     """GLM-5 tokenizer.
 
     Loads tokenizer.json from package directory (not user cache).
-    Requires tokenizers>=0.21 which natively supports ignore_merges.
 
     Attributes:
         eos_token_id: 154820 (primary EOS)
@@ -45,7 +46,36 @@ class GLM5Tokenizer(FastTokenizer):
     """
 
     def __init__(self):
-        super().__init__(str(TOKENIZER_DIR))
+        # Patch tokenizer.json for older tokenizers Rust library compatibility.
+        # GLM-5 uses ignore_merges=True (tiktoken-style: direct vocab lookup, no BPE merges).
+        # Old library doesn't support this field. Remove it AND clear merges so the old
+        # library does direct vocab lookup too (BPE with no merges = same behavior).
+        tokenizer_file = TOKENIZER_DIR / "tokenizer.json"
+        with open(tokenizer_file) as f:
+            tok_data = json.load(f)
+
+        model = tok_data.get("model", {})
+        if model.pop("ignore_merges", None):
+            logger.info("Patching GLM-5 tokenizer: removing ignore_merges=True and clearing merges list")
+            model["merges"] = []
+        model.pop("byte_fallback", None)
+
+        # Load from patched JSON string, then run parent setup (skip file load)
+        json_str = json.dumps(tok_data)
+        try:
+            self.tokenizer = Tokenizer.from_str(json_str)
+        except Exception as e:
+            import re
+            m = re.search(r"column (\d+)", str(e))
+            if m:
+                col = int(m.group(1))
+                start = max(0, col - 200)
+                end = min(len(json_str), col + 200)
+                logger.error(f"Tokenizer parse failed near column {col}: ...{json_str[start:end]}...")
+            raise
+        self.tokenizer_path = TOKENIZER_DIR
+        self._config = self._load_config()
+        self._setup_special_tokens(self._config)
 
         # Load chat template from separate jinja file (not inline in tokenizer_config.json)
         chat_template_file = TOKENIZER_DIR / "chat_template.jinja"
