@@ -323,7 +323,8 @@ class Glm5Indexer(nn.Module):
     ) -> torch.Tensor:
         """Score cached tokens from paged cache and select top-K.
 
-        Gathers indexer K from paged cache into contiguous tensor,
+        Gathers indexer K from paged cache into contiguous tensor using
+        cached gather indices (reused across layers within a decode step),
         then delegates to score_and_select.
 
         Args:
@@ -338,15 +339,30 @@ class Glm5Indexer(nn.Module):
         Returns:
             top_k_indices: [batch, index_topk] — absolute token positions
         """
-        from batchgen.attention.dsa.indexer import _gather_all_from_paged_cache
-
+        batch_size = block_table.shape[0]
         max_seqlen = int(cache_seqlens.max().item())
-        # gathered: [batch, max_seqlen, 1, head_dim]
-        gathered_k = _gather_all_from_paged_cache(
-            indexer_blocked_k, block_table, cache_seqlens, page_size, max_seqlen
-        )
-        # Squeeze num_k_heads dim: [batch, max_seqlen, head_dim]
-        gathered_k = gathered_k.squeeze(2)
+        num_k_heads = indexer_blocked_k.shape[2]
+        k_head_dim = indexer_blocked_k.shape[3]
+
+        # Cache gather indices — same block_table and seqlens across all 78 layers
+        cache_key = (block_table.data_ptr(), max_seqlen, page_size)
+        if not hasattr(self, '_gather_cache') or self._gather_cache_key != cache_key:
+            device = block_table.device
+            token_positions = torch.arange(max_seqlen, device=device)
+            page_indices = (token_positions // page_size).unsqueeze(0).expand(batch_size, -1)
+            page_offsets = token_positions % page_size
+            max_pages = block_table.shape[1]
+            page_indices_clamped = page_indices.clamp(max=max_pages - 1)
+            physical_pages = torch.gather(block_table, 1, page_indices_clamped)
+            self._gather_cache = (physical_pages * page_size + page_offsets.unsqueeze(0)).reshape(-1).long()
+            self._gather_cache_key = cache_key
+            self._gather_cache_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
+
+        flat_idx = self._gather_cache
+        blocked_flat = indexer_blocked_k.reshape(-1, num_k_heads * k_head_dim)
+        gathered = blocked_flat[flat_idx].view(self._gather_cache_shape)
+
+        gathered_k = gathered.squeeze(2)
         return self.score_and_select(
             q_a, hidden_states, gathered_k, cache_seqlens, positions=positions,
         )

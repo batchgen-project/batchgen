@@ -186,6 +186,8 @@ def _paged_cache_update_with_page_table_kernel(
 
     # page_table is 2-D flattened row-major: [num_slots, page_table_cols]
     page = tl.load(page_table_ptr + slot * page_table_cols + page_slot)
+    if page < 0:  # sentinel -1: unallocated page slot
+        return
 
     dest_base = cache_ptr + page * page_stride + offset * token_stride
     src_base = src_ptr + token_id * elements_per_token

@@ -422,18 +422,26 @@ class GLM5AttnWrapper(AttnWrapperBase):
             AttnWrapperBase.kv_append_callback_aux(self.layer_idx, indexer_k_tensor, None)
 
         # --- Step 3: Score all cached tokens (including new), select top-K ---
-        # q_a_normed is shared between main Q and indexer Q
-        q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
-        indexer_blocked_k, _, idx_block_table = \
-            gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(self.layer_idx)
         updated_seqlens = cache_seqlens + 1
-        aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-        top_k_indices = indexer.score_and_select_paged(
-            q_a_for_indexer, hidden_states,
-            indexer_blocked_k, idx_block_table,
-            updated_seqlens, aux_page_size,
-            positions=cache_seqlens,  # current decode position for Q RoPE
-        )
+
+        if torch.all(updated_seqlens <= indexer.index_topk):
+            # Short-circuit: all sequences fit within topk — use full range
+            max_len = int(updated_seqlens.max())
+            top_k_indices = torch.arange(
+                max_len, device=hidden_states.device, dtype=torch.long,
+            ).unsqueeze(0).expand(bsz, -1)
+        else:
+            # Full indexer scoring path
+            q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
+            indexer_blocked_k, _, idx_block_table = \
+                gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(self.layer_idx)
+            aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
+            top_k_indices = indexer.score_and_select_paged(
+                q_a_for_indexer, hidden_states,
+                indexer_blocked_k, idx_block_table,
+                updated_seqlens, aux_page_size,
+                positions=cache_seqlens,
+            )
 
         if not hasattr(GLM5AttnWrapper, '_dsa_topk_logged'):
             GLM5AttnWrapper._dsa_topk_logged = True

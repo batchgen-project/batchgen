@@ -436,9 +436,12 @@ class _GPUPageTableManager:
 		fill_region = table[:num_slots, :new_max]
 
 		# Fill table rows from sequence state pages.
+		# Always clear unused columns to prevent stale page IDs from
+		# polluting page 0 (the first allocated page).
 		for slot, seq_id in enumerate(wanted_order):
 			state = sequences.get(seq_id)
 			if state is None or state.pages.numel() == 0:
+				fill_region[slot, :] = -1
 				continue
 			pages = state.pages.to(self.device, dtype=torch.int32)
 			count = int(pages.numel())
@@ -454,6 +457,8 @@ class _GPUPageTableManager:
 				count = new_max
 				pages = pages[:count]
 			fill_region[slot, :count] = pages[:count]
+			if count < new_max:
+				fill_region[slot, count:] = -1
 
 		if not reuse_existing:
 			self.gpu_table = table
