@@ -41,7 +41,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from dataclasses import dataclass
 from .config import MiniMaxM25Config
+
+
+@dataclass
+class _CausalLMOutput:
+    """Minimal output container with .logits attribute for worker compatibility."""
+    logits: torch.Tensor
 
 # CUDA routing kernels
 try:
@@ -794,7 +801,7 @@ class MiniMaxM25MoE(nn.Module):
                 read_idx += num_tokens
                 write_idx += num_tokens
         else:
-            outs = sorted_tokens.new_empty(0)
+            outs = sorted_tokens.new_empty(0, sorted_tokens.shape[-1])
 
         # Weighted accumulation via Triton kernel (FP32 precision)
         final_out = moe_fp32_accum_triton_v2(outs, idxs, topk_weight)
@@ -919,8 +926,15 @@ class MiniMaxM25Model(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = False,
+        **kwargs,
+    ) -> _CausalLMOutput:
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("Cannot specify both input_ids and inputs_embeds")
         elif input_ids is not None:
@@ -938,4 +952,4 @@ class MiniMaxM25Model(nn.Module):
         DecodeLayerTiming.print_summary()
 
         logits = self.unembedding(hidden_states)
-        return logits
+        return _CausalLMOutput(logits=logits)
