@@ -300,15 +300,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 and hasattr(self.module, 'indexer')
             )
 
-            if self.layer_idx == 0:
-                import logging as _log
-                _log.info(
-                    f"[DECODE PATH] layer_idx={self.layer_idx}, "
-                    f"paged_kv={gpu_paged_kv_manager is not None}, "
-                    f"dsa_active={dsa_active}, "
-                    f"cache_seqlens={cache_seqlens.tolist()}"
-                )
-
             if dsa_active:
                 attn_output = self._forward_decode_dsa(
                     hidden_states, position_ids, cache_seqlens, max_seqlen,
@@ -332,13 +323,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             return (attn_output, None, None)
         else:
             # FP8 KV cache with tensor references
-            if self.layer_idx == 0:
-                import logging as _log
-                _log.info(
-                    f"[DECODE PATH] layer_idx={self.layer_idx}, "
-                    f"paged_kv=None, using FP8 path, "
-                    f"past_key_states={'set' if past_key_states else 'None'}"
-                )
             attention_mask = AttnWrapperBase.attention_mask
             scale = AttnWrapperBase.scale
             layer_past_key = past_key_states[self.layer_idx] if past_key_states else None
@@ -446,6 +430,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
             if AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(li, k_tensor, None)
 
+        # DSA diagnostic logging (first 2 calls, layer 0 only)
+        if li == 0 and getattr(GLM5AttnWrapper, '_dsa_diag_count', 0) < 2:
+            logging.info(
+                f"[DSA DIAG] cache_seqlens={cache_seqlens.tolist()}, "
+                f"page_size={gpu_paged_kv_manager.config.page_size_tokens}, "
+                f"aux_page_size={gpu_paged_kv_manager_aux.config.page_size_tokens}"
+            )
+
         # --- Step 2: Write indexer K to auxiliary cache ---
         with (dt.timed("indexer_k", li) if dt else _nullctx()):
             # position_ids = cache_seqlens - 1 = 0-based position of the new token
@@ -506,6 +498,17 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
             )
             # sparse_mla_kv: [batch, topk, 1, 576]
+
+        if li == 0 and getattr(GLM5AttnWrapper, '_dsa_diag_count', 0) < 2:
+            logging.info(
+                f"[DSA DIAG] short_circuit={torch.all(updated_seqlens <= indexer.index_topk).item()}, "
+                f"top_k_indices.shape={top_k_indices.shape}, "
+                f"mla_blocked_k={mla_blocked_k.shape}, "
+                f"block_table={mla_block_table.shape}, "
+                f"block_table[0]={mla_block_table[0].tolist()}, "
+                f"sparse_mla_kv={sparse_mla_kv.shape}"
+            )
+            GLM5AttnWrapper._dsa_diag_count = getattr(GLM5AttnWrapper, '_dsa_diag_count', 0) + 1
 
         # --- Step 5: Absorbed Q → sparse FlashMLA ---
         with (dt.timed("q_absorb", li) if dt else _nullctx()):

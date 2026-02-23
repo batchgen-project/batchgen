@@ -3973,13 +3973,14 @@ class BatchGenWorker:
 		manager.rebuild_page_table(global_ids)
 
 		# Log KV load details
-		if self.rank == 0:
+		try:
 			bt = manager._gpu_page_table_manager.gpu_table
 			logging.info(
-				f"[KV LOAD] seqs={global_ids}, tokens={tokens}, "
-				f"block_table shape={bt.shape}, "
-				f"block_table[:2]={bt[:min(2,bt.shape[0])].tolist()}"
+				f"[KV LOAD] rank={self.rank}, seqs={global_ids}, tokens={tokens}, "
+				f"block_table shape={bt.shape}"
 			)
+		except Exception as e:
+			logging.info(f"[KV LOAD] rank={self.rank}, seqs={global_ids}, log_error={e}")
 
 		# 3. Load Host -> GPU (BLOCKING)
 		self._load_host_kv_to_gpu(manager, global_ids)
