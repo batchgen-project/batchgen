@@ -410,7 +410,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # --- Step 2: Write indexer K to auxiliary cache ---
         # cache_seqlens = position of the new token (0-indexed)
         indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=cache_seqlens)
-        indexer_k_tensor = indexer_kv.squeeze(1)  # [batch, 1, index_dim]
+        indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
         gpu_paged_kv_manager_aux.update_layer_decode_new_token(
             k_tensor=indexer_k_tensor,
             v_tensor=None,
