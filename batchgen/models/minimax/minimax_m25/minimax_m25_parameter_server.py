@@ -43,12 +43,16 @@ except ImportError:
     Parameter_Server = core_engine.Parameter_Server
 
 
-# GQA attention parameter names (BF16)
+# GQA attention parameter names (FP8 weights + BF16 scales/norms)
 _GQA_ATTN_TENSOR_NAMES = [
     "q_proj.weight",
+    "q_proj.weight_scale_inv",
     "k_proj.weight",
+    "k_proj.weight_scale_inv",
     "v_proj.weight",
+    "v_proj.weight_scale_inv",
     "o_proj.weight",
+    "o_proj.weight_scale_inv",
     "q_norm.weight",
     "k_norm.weight",
 ]

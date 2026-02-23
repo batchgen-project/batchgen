@@ -9,11 +9,16 @@ Provides wrappers for MiniMax-M2.5 with FP8 quantization:
 - MiniMaxM25ExpertWrapper: Expert wrapper with FP8 block-wise dequantization
 - MiniMaxM25AttnWrapper: Attention wrapper with GQA + QK norm + partial RoPE
 
+All weights (attention + experts) are FP8 e4m3fn with BF16 block-wise scales.
+
 Core engine tensor keys (from parameter_server.py):
   Expert: w1.weight, w1.weight_scale_inv  (gate_proj)
           w2.weight, w2.weight_scale_inv  (down_proj)
           w3.weight, w3.weight_scale_inv  (up_proj)
-  Attn:   q_proj.weight, k_proj.weight, v_proj.weight, o_proj.weight,
+  Attn:   q_proj.weight, q_proj.weight_scale_inv,
+          k_proj.weight, k_proj.weight_scale_inv,
+          v_proj.weight, v_proj.weight_scale_inv,
+          o_proj.weight, o_proj.weight_scale_inv,
           q_norm.weight, k_norm.weight
 """
 
@@ -36,6 +41,11 @@ try:
     _HAS_W8A16 = True
 except ImportError:
     _HAS_W8A16 = False
+
+
+def _fp8_linear(weight_fp8, scale_bf16, x):
+    """FP8 weight × BF16 activation via w8a16_gemm. Scales cast to float32 for DeepGEMM."""
+    return w8a16_gemm(weight_fp8, scale_bf16.float(), x)
 
 
 class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
@@ -73,6 +83,10 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
                 result[name] = weight
         return result
 
+    def clear_weights(self):
+        """No-op: _ExpertPlaceholder has no nn.Module parameters to clear."""
+        pass
+
     def _register_fp8_weights(self, tensors):
         """Cache FP8 weights and scales from core_engine tensors.
 
@@ -87,10 +101,6 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
             "w2.weight_scale_inv": tensors["w2.weight_scale_inv"],
             "w3.weight_scale_inv": tensors["w3.weight_scale_inv"],
         }
-
-    def clear_weights(self):
-        """No-op: _ExpertPlaceholder has no nn.Module parameters to clear."""
-        pass
 
     def _unregister_fp8_weights(self):
         self.fp8_gate = None
@@ -144,7 +154,8 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
 class MiniMaxM25AttnWrapper(AttnWrapperBase):
     """Attention wrapper for MiniMax-M2.5 GQA with QK norm + partial RoPE.
 
-    M2.5 attention is BF16 (not quantized). Only expert FFN weights are FP8.
+    M2.5 attention projections are FP8 (same as experts). QK norms are BF16.
+    Uses w8a16_gemm for Q/K/V/O projections (act_quant → DeepGEMM).
     """
 
     def __init__(self, module, layer_idx, core_engine, engine_config,
@@ -153,19 +164,63 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             module, layer_idx, core_engine, engine_config, model_config,
             persistent, weight_dequant_scale
         )
+        # FP8 attention weights + scales (set by _register_fp8_weights)
+        self.fp8_q = None
+        self.fp8_k = None
+        self.fp8_v = None
+        self.fp8_o = None
+        self.q_scale = None
+        self.k_scale = None
+        self.v_scale = None
+        self.o_scale = None
+
+    def _register_fp8_weights(self, tensors):
+        """Cache FP8 attention weights and scales."""
+        device = self.engine_config.Basic_Config.device_torch
+        self.fp8_q = tensors["q_proj.weight"].to(device)
+        self.fp8_k = tensors["k_proj.weight"].to(device)
+        self.fp8_v = tensors["v_proj.weight"].to(device)
+        self.fp8_o = tensors["o_proj.weight"].to(device)
+        self.q_scale = tensors["q_proj.weight_scale_inv"].to(device)
+        self.k_scale = tensors["k_proj.weight_scale_inv"].to(device)
+        self.v_scale = tensors["v_proj.weight_scale_inv"].to(device)
+        self.o_scale = tensors["o_proj.weight_scale_inv"].to(device)
+        # QK norms (BF16) — keep on module
+        self.module.q_norm.weight.data = tensors["q_norm.weight"].to(device)
+        self.module.k_norm.weight.data = tensors["k_norm.weight"].to(device)
+
+    def _unregister_fp8_weights(self):
+        self.fp8_q = None
+        self.fp8_k = None
+        self.fp8_v = None
+        self.fp8_o = None
+        self.q_scale = None
+        self.k_scale = None
+        self.v_scale = None
+        self.o_scale = None
+
+    def _get_attn_weights(self):
+        """Get FP8 weights + scales. Persistent: cached. Non-persistent: load from core_engine."""
+        if self.persistent:
+            return (self.fp8_q, self.q_scale, self.fp8_k, self.k_scale,
+                    self.fp8_v, self.v_scale, self.fp8_o, self.o_scale)
+        else:
+            tensors = self.load_weights(self.module_key)
+            return (tensors["q_proj.weight"], tensors["q_proj.weight_scale_inv"],
+                    tensors["k_proj.weight"], tensors["k_proj.weight_scale_inv"],
+                    tensors["v_proj.weight"], tensors["v_proj.weight_scale_inv"],
+                    tensors["o_proj.weight"], tensors["o_proj.weight_scale_inv"])
 
     def dequantize_weights(self, weights_dict):
-        """M2.5 attention is BF16 — no dequantization needed."""
+        """Not used — we use w8a16_gemm directly."""
         return weights_dict
 
     def _forward_prefill(self, hidden_states, **kwargs):
-        """Prefill forward: Q/K/V projection + QK norm + partial RoPE + FA varlen.
-
-        Follows GPT-OSS pattern: all attention logic inline in wrapper,
-        calling gqa_prefill_fa directly (no setattr injection).
-        """
+        """Prefill forward: FP8 Q/K/V projection + QK norm + partial RoPE + FA varlen."""
         from batchgen.attention.gqa import gqa_prefill_fa
         from batchgen.attention.fused_kernels import cuda_rmsnorm
+
+        fp8_q, q_scale, fp8_k, k_scale, fp8_v, v_scale, fp8_o, o_scale = self._get_attn_weights()
 
         # Always prepack mode in production prefill
         if hidden_states.dim() == 3:
@@ -179,10 +234,10 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         max_seqlen = self.prepack_max_seqlen
         position_ids = self.position_ids.to(hidden_states_2d.device)
 
-        # Q/K/V projection
-        query = self.module.q_proj(hidden_states_2d)   # [total_tokens, num_heads * head_dim]
-        key = self.module.k_proj(hidden_states_2d)     # [total_tokens, num_kv_heads * head_dim]
-        value = self.module.v_proj(hidden_states_2d)   # [total_tokens, num_kv_heads * head_dim]
+        # Q/K/V projection via FP8 GEMM
+        query = _fp8_linear(fp8_q, q_scale, hidden_states_2d)
+        key = _fp8_linear(fp8_k, k_scale, hidden_states_2d)
+        value = _fp8_linear(fp8_v, v_scale, hidden_states_2d)
 
         # QK Norm (on flat projected dims, before reshape)
         query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
@@ -232,9 +287,14 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             max_seqlen_k=max_seqlen,
         )
 
-        # Output projection: [total_tokens, num_heads * head_dim] -> [total_tokens, hidden_size]
+        # Output projection via FP8 GEMM
         attn_output = attn_output.view(total_tokens, num_heads * head_dim)
-        attn_output = self.module.o_proj(attn_output)
+        attn_output = _fp8_linear(fp8_o, o_scale, attn_output)
+
+        # Non-persistent: free weights
+        if not self.persistent:
+            torch.cuda.current_stream().synchronize()
+            self.free_weights(self.module_key)
 
         # Offload KV cache to host
         torch.cuda.current_stream().synchronize()
@@ -268,12 +328,11 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             )
 
     def _forward_decode(self, hidden_states, **kwargs):
-        """Decode forward: Q/K/V + QK norm + partial RoPE + paged KV FA.
-
-        Follows GPT-OSS pattern: all attention logic inline in wrapper.
-        """
+        """Decode forward: FP8 Q/K/V + QK norm + partial RoPE + paged KV FA."""
         from batchgen.attention.gqa import gqa_decode_fa
         from batchgen.attention.fused_kernels import cuda_rmsnorm
+
+        fp8_q, q_scale, fp8_k, k_scale, fp8_v, v_scale, fp8_o, o_scale = self._get_attn_weights()
 
         batch_slice = kwargs.get("batch_slice", None)
         batch, seq_len, _ = hidden_states.shape
@@ -298,10 +357,10 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         head_dim = self.module.head_dim
         rotary_dim = self.module.rotary_dim
 
-        # Q/K/V projection
-        query = self.module.q_proj(hidden_states)
-        key = self.module.k_proj(hidden_states)
-        value = self.module.v_proj(hidden_states)
+        # Q/K/V projection via FP8 GEMM
+        query = _fp8_linear(fp8_q, q_scale, hidden_states)
+        key = _fp8_linear(fp8_k, k_scale, hidden_states)
+        value = _fp8_linear(fp8_v, v_scale, hidden_states)
 
         # QK Norm
         query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
@@ -360,9 +419,9 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             block_table=page_table,
         )
 
-        # Output projection
+        # Output projection via FP8 GEMM
         attn_output = attn_output.view(batch, 1, num_heads * head_dim)
-        attn_output = self.module.o_proj(attn_output)
+        attn_output = _fp8_linear(fp8_o, o_scale, attn_output)
 
         # Append KV to host
         kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)

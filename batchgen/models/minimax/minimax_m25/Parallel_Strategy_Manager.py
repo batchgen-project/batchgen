@@ -137,10 +137,10 @@ class MiniMaxM25ParallelStrategyManager:
 
         # 1. Load skeleton (norms, embeddings, gate, correction_bias)
         self._load_model_skeleton()
-        # 2. Load attention weights (persistent for decode)
-        self._load_attn_module()
-        # 3. Wrap attention modules
+        # 2. Wrap attention modules
         self._config_attn_module()
+        # 3. Load FP8 attention weights into wrappers (persistent for decode)
+        self._load_attn_module()
         # 4. Wrap expert modules (placeholders → wrappers)
         self._config_expert_module()
         # 5. Load FP8 weights into persistent expert wrappers
@@ -187,17 +187,14 @@ class MiniMaxM25ParallelStrategyManager:
             )
 
     def _load_attn_module(self):
-        """Load BF16 GQA attention weights from core engine."""
+        """Load FP8 attention weights + scales from core engine into attn wrappers.
+
+        Must be called AFTER _config_attn_module() so self_attn is a wrapper.
+        """
         for layer_idx in range(len(self.model.model.layers)):
-            attn = self.model.model.layers[layer_idx].self_attn
+            wrapper = self.model.model.layers[layer_idx].self_attn
             tensors = self.core_engine.get_tensor(f"attn_{layer_idx}")
-            device = self.engine_config.Basic_Config.device_torch
-            attn.q_proj.weight.data = tensors["q_proj.weight"].to(device)
-            attn.k_proj.weight.data = tensors["k_proj.weight"].to(device)
-            attn.v_proj.weight.data = tensors["v_proj.weight"].to(device)
-            attn.o_proj.weight.data = tensors["o_proj.weight"].to(device)
-            attn.q_norm.weight.data = tensors["q_norm.weight"].to(device)
-            attn.k_norm.weight.data = tensors["k_norm.weight"].to(device)
+            wrapper._register_fp8_weights(tensors)
 
     def _load_local_routed_experts(self):
         """Load FP8 weights + scales for persistent routed expert wrappers.
