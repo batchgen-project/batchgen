@@ -199,6 +199,22 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         self.v_scale = None
         self.o_scale = None
 
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        """Forward with FP8-specific weight lifecycle.
+
+        Overrides AttnWrapperBase.forward() to avoid double load/free.
+        The base class loads weights via apply_weights (for BF16 nn.Module params),
+        but FP8 attention loads weights directly in _forward_prefill/_forward_decode
+        via _get_attn_weights(). Using both paths causes double load_weights +
+        double free_weights on the same module_key, crashing the C++ buffer system.
+        """
+        hidden_states = kwargs.pop("hidden_states", None)
+        if self.phase == "prefill":
+            result = self._forward_prefill(hidden_states, **kwargs)
+        else:
+            result = self._forward_decode(hidden_states, **kwargs)
+        return result
+
     def _get_attn_weights(self):
         """Get FP8 weights + scales. Persistent: cached. Non-persistent: load from core_engine."""
         if self.persistent:
