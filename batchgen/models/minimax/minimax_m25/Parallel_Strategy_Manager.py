@@ -71,7 +71,7 @@ class MiniMaxM25ParallelStrategyManager:
         self._config_unembedding_hook()
 
         self.model.eval()
-        self.model.to(dtype=torch.bfloat16, device=self.engine_config.Basic_Config.device_torch)
+        self.model.to(self.engine_config.Basic_Config.device_torch)
 
         total_time = time.perf_counter() - start_time
         if self.rank == 0:
@@ -160,7 +160,7 @@ class MiniMaxM25ParallelStrategyManager:
             layer.mlp.enable_ep_offloading = self.enable_ep_offloading
 
         self.model.eval()
-        self.model.to(dtype=torch.bfloat16, device=device)
+        self.model.to(device)
 
         self._init_mode_decoding()
         effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
@@ -229,6 +229,7 @@ class MiniMaxM25ParallelStrategyManager:
         Model named_parameters() uses `mlp`. Map between them.
         """
         loaded = 0
+        not_found = []
         for key, param in self.model.named_parameters():
             ckpt_key = self._model_key_to_ckpt_key(key)
             if ckpt_key in self.skeleton_state_dict:
@@ -237,6 +238,8 @@ class MiniMaxM25ParallelStrategyManager:
             elif key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
                 loaded += 1
+            else:
+                not_found.append(key)
 
         # Also load buffers (e_score_correction_bias)
         for key, buf in self.model.named_buffers():
@@ -247,10 +250,29 @@ class MiniMaxM25ParallelStrategyManager:
             elif key in self.skeleton_state_dict:
                 buf.data = self.skeleton_state_dict[key]
                 loaded += 1
+            else:
+                not_found.append(key)
 
         if self.rank == 0:
             size_gb = sum(p.numel() * p.element_size() for p in self.model.parameters()) / (1024**3)
             logging.info(f"Model skeleton: {loaded} tensors loaded, {size_gb:.2f} GB")
+
+            # Log skeleton keys for debugging
+            logging.info(f"Skeleton state_dict has {len(self.skeleton_state_dict)} keys")
+            for k, v in sorted(self.skeleton_state_dict.items()):
+                if any(x in k for x in ["gate.weight", "embed_tokens", "norm.weight",
+                                          "e_score_correction", "lm_head"]):
+                    logging.info(f"  skeleton[{k}]: dtype={v.dtype}, shape={list(v.shape)}")
+
+            if not_found:
+                logging.warning(f"Skeleton: {len(not_found)} model params not found in skeleton")
+                for k in not_found[:10]:
+                    logging.warning(f"  NOT FOUND: {k}")
+
+            # Log loaded dtypes for key parameters
+            for key, param in self.model.named_parameters():
+                if "gate.weight" in key or "embed_tokens" in key or "lm_head" in key:
+                    logging.info(f"  model[{key}]: dtype={param.dtype}, shape={list(param.shape)}")
 
     def _config_attn_module(self):
         """Configure GQA attention wrappers."""
