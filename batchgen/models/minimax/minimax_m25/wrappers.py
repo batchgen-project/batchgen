@@ -222,6 +222,9 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
                     self.fp8_v, self.v_scale, self.fp8_o, self.o_scale)
         else:
             tensors = self.load_weights(self.module_key)
+            # Also load QK norms into self.module (not returned as FP8 weights)
+            self.module.q_norm.weight.data = tensors["q_norm.weight"]
+            self.module.k_norm.weight.data = tensors["k_norm.weight"]
             return (tensors["q_proj.weight"], tensors["q_proj.weight_scale_inv"],
                     tensors["k_proj.weight"], tensors["k_proj.weight_scale_inv"],
                     tensors["v_proj.weight"], tensors["v_proj.weight_scale_inv"],
