@@ -463,6 +463,13 @@ class BatchGenServer:
 			ps = Mixtral_Parameter_Server(
 				self.args.model, self.args.cache_dir, converted_ckpt_dir
 			)
+		elif "minimax" in self.args.model.lower():
+			from batchgen.models.minimax.minimax_m25.minimax_m25_parameter_server import (
+				MiniMaxM25_Parameter_Server,
+			)
+			ps = MiniMaxM25_Parameter_Server(
+				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
+			)
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")
 
