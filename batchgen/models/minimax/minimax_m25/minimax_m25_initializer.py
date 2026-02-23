@@ -57,6 +57,10 @@ class MiniMaxM25Initializer:
         self._default_engine_config()
         self.planner = MiniMaxM25Planner()
         self.engine_config = self.planner.generate_config(self.engine_config)
+
+        # Post-planner fixups (depend on values set by planner)
+        self._post_planner_config()
+
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")
 
@@ -72,7 +76,7 @@ class MiniMaxM25Initializer:
         - module_types: attn + routed_expert only (no shared_expert)
         """
         engine_config.Basic_Config.device = args.device
-        engine_config.Basic_Config.device_torch = torch.device(f"cuda:{args.device}")
+        engine_config.Basic_Config.device_torch = torch.device(args.device)
 
         # FP8 expert weights
         engine_config.Basic_Config.weight_dtype = "float8_e4m3fn"
@@ -114,6 +118,36 @@ class MiniMaxM25Initializer:
 
         return engine_config
 
+    def _post_planner_config(self):
+        """Set configs that depend on planner-computed values."""
+        ec = self.engine_config
+
+        # kv_buffer_num_tokens depends on attn_decoding_micro_batch_size (set by planner)
+        ec.GPU_Buffer_Config.kv_buffer_num_tokens = (
+            ec.Module_Batching_Config.attn_decoding_micro_batch_size
+            * (ec.Basic_Config.max_decoding_length + ec.Basic_Config.padding_length)
+        )
+
+        # attn_mode: 3 for multi-node EP decode, 1 for single-node
+        if ec.Basic_Config.world_size > 8:
+            ec.Basic_Config.attn_mode = 3
+        elif ec.EP_Config.enable_offloading:
+            ec.Basic_Config.attn_mode = 3
+        else:
+            ec.Basic_Config.attn_mode = 1
+
+        # For attn_mode=3 (EP decode), zero out module buffers (all weights persistent on GPU)
+        if ec.Basic_Config.attn_mode == 3 and not ec.EP_Config.enable_offloading:
+            ec.GPU_Buffer_Config.num_decoding_module_buffer = {
+                "attn": 0, "routed_expert": 0,
+            }
+            ec.GPU_Buffer_Config.num_k_buffer = 0
+            ec.GPU_Buffer_Config.kv_buffer_num_tokens = 0
+        elif ec.EP_Config.enable_offloading:
+            ec.GPU_Buffer_Config.num_decoding_module_buffer["attn"] = 0
+        else:
+            ec.GPU_Buffer_Config.num_k_buffer = 6
+
     def _default_engine_config(self):
         """Configure default engine settings for M2.5.
 
@@ -153,13 +187,7 @@ class MiniMaxM25Initializer:
             f"Number of host kv slots: {self.engine_config.KV_Storage_Config.num_host_slots}"
         )
 
-        self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens = (
-            self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
-            * (
-                self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
-            )
-        )
+        # Note: kv_buffer_num_tokens is set after planner runs (depends on attn_decoding_micro_batch_size)
 
         # Module shapes
         hidden_size = cfg.hidden_size       # 3072
@@ -219,6 +247,8 @@ class MiniMaxM25Initializer:
         model_config.num_attention_heads = cfg.num_attention_heads
         model_config.num_key_value_heads = cfg.num_key_value_heads
         model_config.head_dim = cfg.head_dim
+        model_config.hidden_size = cfg.hidden_size
+        model_config.intermediate_size = cfg.moe_intermediate_size
         return model_config
 
     def Init(self, weights_storage) -> Tuple:
