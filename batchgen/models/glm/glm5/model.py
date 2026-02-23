@@ -306,7 +306,10 @@ class Glm5Indexer(nn.Module):
 
         # Aggregate across heads and select top-K
         aggregated = scores.sum(dim=1)  # [batch, max_seqlen]
-        effective_topk = min(self.index_topk, max_seqlen)
+        # Clamp topk to min sequence length to avoid selecting -inf positions
+        # (which causes non-deterministic tie-breaking and garbage gather)
+        min_valid = int(cache_seqlens.min().item())
+        effective_topk = min(self.index_topk, max_seqlen, min_valid)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
 
         return top_k_indices

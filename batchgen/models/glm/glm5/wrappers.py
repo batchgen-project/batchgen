@@ -408,13 +408,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
             AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
 
         # --- Step 2: Write indexer K to auxiliary cache ---
-        # cache_seqlens = position of the new token (0-indexed)
-        indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=cache_seqlens)
+        # position_ids = cache_seqlens - 1 = 0-based position of the new token
+        # Must match primary cache write position (line 400 uses position_ids)
+        new_token_pos = position_ids.squeeze(-1)  # [batch]
+        indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=new_token_pos)
         indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
+        seq_lengths_i32_aux = new_token_pos.to(dtype=torch.int32, device=gpu_paged_kv_manager_aux.device)
         gpu_paged_kv_manager_aux.update_layer_decode_new_token(
             k_tensor=indexer_k_tensor,
             v_tensor=None,
-            sequence_lengths=cache_seqlens,
+            sequence_lengths=seq_lengths_i32_aux,
             layer_idx=self.layer_idx,
         )
         # Offload indexer K to auxiliary host cache
@@ -422,7 +425,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
             AttnWrapperBase.kv_append_callback_aux(self.layer_idx, indexer_k_tensor, None)
 
         # --- Step 3: Score all cached tokens (including new), select top-K ---
-        updated_seqlens = cache_seqlens + 1
+        # cache_seqlens already includes the new token (pre-incremented in worker)
+        updated_seqlens = cache_seqlens
 
         if torch.all(updated_seqlens <= indexer.index_topk):
             # Short-circuit: all sequences fit within topk — use full range
@@ -440,7 +444,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 q_a_for_indexer, hidden_states,
                 indexer_blocked_k, idx_block_table,
                 updated_seqlens, aux_page_size,
-                positions=cache_seqlens,
+                positions=new_token_pos,
             )
 
         if not hasattr(GLM5AttnWrapper, '_dsa_topk_logged'):
