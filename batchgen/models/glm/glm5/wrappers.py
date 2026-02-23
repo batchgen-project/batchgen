@@ -356,7 +356,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 f"[DSA] _forward_decode_dsa invoked: layer={self.layer_idx}, "
                 f"bsz={bsz}, cache_seqlens={cache_seqlens.tolist()[:4]}, "
                 f"index_topk={indexer.index_topk}, "
-                f"index_dim={indexer.index_dim}"
+                f"index_dim={indexer.index_head_dim}"
             )
 
         # --- Shared FP8 activation quantization ---
