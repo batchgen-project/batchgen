@@ -923,6 +923,13 @@ class MiniMaxM25Model(nn.Module):
         self.norm = MiniMaxM25RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.unembedding = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Worker expects HF-style ForCausalLM nesting:
+        #   self.model.model.embed_tokens, self.model.model.layers, self.model.model.norm
+        #   self.model.lm_head
+        # Since we use a flat model, alias self.model = self and lm_head = unembedding.
+        self.model = self
+        self.lm_head = self.unembedding
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
