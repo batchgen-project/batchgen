@@ -718,6 +718,20 @@ class WorkerManager:
     def allocate_host_kv_cache(
         host_kv_cache_size_gb: int, model_name: str
     ) -> Any:
+        from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+
+        # DSA models: split budget into primary + auxiliary
+        dual = DualHostKVCoordinator.create_managers(
+            model_name=model_name,
+            host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+        )
+        if dual is not None:
+            primary_mgr, aux_mgr = dual
+            logger.info(
+                "Allocated dual host KV cache: primary + auxiliary (DSA indexer)"
+            )
+            return primary_mgr
+
         config = build_host_kv_config(
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
