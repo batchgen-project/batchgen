@@ -541,7 +541,7 @@ class MiniMaxM25MoE(nn.Module):
             topk_idx: [N, num_experts_per_tok] int32
             topk_weight: [N, num_experts_per_tok] float32
         """
-        router_logits = self.gate(hidden_states_2d)
+        router_logits = self.gate(hidden_states_2d.to(self.gate.weight.dtype)).to(hidden_states_2d.dtype)
 
         if _HAS_CUDA_ROUTING:
             topk_idx, topk_weight = gate_topk_sigmoid_cuda(
