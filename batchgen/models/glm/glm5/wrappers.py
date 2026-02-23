@@ -300,6 +300,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 and hasattr(self.module, 'indexer')
             )
 
+            if self.layer_idx == 0:
+                import logging as _log
+                _log.info(
+                    f"[DECODE PATH] layer_idx={self.layer_idx}, "
+                    f"paged_kv={gpu_paged_kv_manager is not None}, "
+                    f"dsa_active={dsa_active}, "
+                    f"cache_seqlens={cache_seqlens.tolist()}"
+                )
+
             if dsa_active:
                 attn_output = self._forward_decode_dsa(
                     hidden_states, position_ids, cache_seqlens, max_seqlen,
@@ -323,6 +332,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
             return (attn_output, None, None)
         else:
             # FP8 KV cache with tensor references
+            if self.layer_idx == 0:
+                import logging as _log
+                _log.info(
+                    f"[DECODE PATH] layer_idx={self.layer_idx}, "
+                    f"paged_kv=None, using FP8 path, "
+                    f"past_key_states={'set' if past_key_states else 'None'}"
+                )
             attention_mask = AttnWrapperBase.attention_mask
             scale = AttnWrapperBase.scale
             layer_past_key = past_key_states[self.layer_idx] if past_key_states else None
