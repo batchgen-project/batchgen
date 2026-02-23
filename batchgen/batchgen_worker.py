@@ -863,10 +863,6 @@ class BatchGenWorker:
 		manager.rebuild_page_table(global_ids)
 
 		if load_from_host:
-			logging.info(
-				f"[KV HOST→GPU] rank={self.rank}, global_ids={global_ids}, "
-				f"pages_per_seq={pages_per_seq}, total_pages={total_pages}"
-			)
 			self._load_host_kv_to_gpu(manager, global_ids)
 		
 		# Track in set
@@ -1111,15 +1107,11 @@ class BatchGenWorker:
 				f"Rank {self.rank}: NaN detected in k_tensor BEFORE host append (layer={layer_idx}) - affected_seqs={nan_seq_info}"
 			)
 		
-		# Ensure compute stream finishes writing k_tensor before D2H copy reads it.
-		# Record event on compute stream, then event.synchronize() waits only for
-		# work up to this point (not all GPU work). Lighter than full device sync.
-		if not hasattr(self, '_kv_offload_event'):
-			self._kv_offload_event = torch.cuda.Event()
-		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
-		self._kv_offload_event.synchronize()
-		
-		# Launch async append
+		# Launch async D2H append — no CPU-side sync needed here.
+		# The C++ side runs on a background thread with its own D2H stream.
+		# Tensor references are kept alive in _pending_kv_append_tensors to
+		# prevent GC/memory reuse. All tasks are waited at decision boundary
+		# via _wait_pending_kv_append_tasks().
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
@@ -1128,14 +1120,12 @@ class BatchGenWorker:
 			sequence_lengths=sequence_lengths,
 		)
 
-		# CRITICAL FIX: Store tensor references alongside task to prevent GC
-		# Must store BOTH k and v tensors to prevent memory reuse during async D2H copy
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 		self._pending_kv_append_tensors.append(k_tensor)
 		if v_tensor is not None:
 			self._pending_kv_append_tensors.append(v_tensor)
-		
+
 		# Add to pending list - will be waited at page boundary
 		if task is not None:
 			self._pending_kv_append_tasks.append(task)
@@ -1176,12 +1166,7 @@ class BatchGenWorker:
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
 
-		# Ensure compute stream finishes before D2H copy
-		if not hasattr(self, '_kv_offload_event_aux'):
-			self._kv_offload_event_aux = torch.cuda.Event()
-		self._kv_offload_event_aux.record(torch.cuda.current_stream(self.torch_device))
-		self._kv_offload_event_aux.synchronize()
-
+		# Launch async D2H — no CPU-side sync needed (same as primary path).
 		task = aux_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
@@ -3109,15 +3094,6 @@ class BatchGenWorker:
 				f"(local: {local_tokenize_time:.2f}s, gather: {gather_time:.2f}s)"
 			)
 
-		# Log per-sequence token counts and boundary tokens for debugging
-		if self.rank == 0:
-			for i in range(num_sequences):
-				ids = tokenized_by_idx[i]['input_ids']
-				n = tokenized_by_idx[i]['length']
-				first5 = ids[:5].tolist() if hasattr(ids, 'tolist') else list(ids[:5])
-				last5 = ids[max(0,n-5):n].tolist() if hasattr(ids, 'tolist') else list(ids[max(0,n-5):n])
-				logging.info(f"[TOKENIZE] Seq {i}: {n} tokens, first5={first5}, last5={last5}")
-
 		# Phase 2: Find the longest prompt length to use as max_prompt_length
 		# Use lightweight length field instead of creating tensors
 		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
@@ -3933,7 +3909,6 @@ class BatchGenWorker:
 		"""
 		Allocates GPU pages using TWO-PAGE BUFFER strategy and triggers blocking load from Host.
 		"""
-		logging.info(f"[KV ALLOC] rank={self.rank}, entering _allocate_and_load_gpu_kv_for_new_sequences, local_ids={local_sequence_ids}")
 		if not local_sequence_ids:
 			return
 		
@@ -3980,16 +3955,6 @@ class BatchGenWorker:
 
 		# 2. Rebuild Page Table
 		manager.rebuild_page_table(global_ids)
-
-		# Log KV load details
-		try:
-			bt = manager._gpu_page_table_manager.gpu_table
-			logging.info(
-				f"[KV LOAD] rank={self.rank}, seqs={global_ids}, tokens={tokens}, "
-				f"block_table shape={bt.shape}"
-			)
-		except Exception as e:
-			logging.info(f"[KV LOAD] rank={self.rank}, seqs={global_ids}, log_error={e}")
 
 		# 3. Load Host -> GPU (BLOCKING)
 		self._load_host_kv_to_gpu(manager, global_ids)
@@ -5276,16 +5241,6 @@ class BatchGenWorker:
 				AttnWrapperBase.position_ids = batch_position_ids_flat
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
-				# Log prefill input shapes
-				if self.rank == 0:
-					logging.info(
-						f"[PREFILL SHAPE] Micro-batch {batch_idx}: "
-						f"input_ids={batch_input_ids_flat.shape}, "
-						f"cu_seqlens={batch_cu_seqlens.tolist()}, "
-						f"max_seqlen={batch_max_seqlen}, "
-						f"seq_lengths={list(batch_seq_lengths)}"
-					)
-
 				# Embed tokens
 				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
@@ -5309,12 +5264,6 @@ class BatchGenWorker:
 
 				# Extract last token hidden states for each sequence
 				last_token_indices = batch_cu_seqlens[1:] - 1
-				if self.rank == 0:
-					logging.info(
-						f"[PREFILL SHAPE] Micro-batch {batch_idx}: "
-						f"hidden_states_out={hidden_states.shape}, "
-						f"last_token_indices={last_token_indices.tolist()}"
-					)
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
 				# DEBUG: Verify per-sequence hidden states after prefill
@@ -6645,13 +6594,6 @@ class BatchGenWorker:
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
 
-					# Always log first 2 decode iterations for debugging
-					if self.rank == 0 and local_iteration <= 2:
-						logging.info(
-							f"[DECODE STEP] iter={local_iteration}, batch_size={len(batch)}, "
-							f"cache_seqlens={Attn_Wrapper.cache_seqlens.tolist()}"
-						)
-
 					# DEBUG: Print cache_seqlens and input tokens
 					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
 						print(f"\n[DECODE DEBUG] Iteration {local_iteration}")
@@ -7014,14 +6956,9 @@ class BatchGenWorker:
 				f"affected_seqs={nan_seq_info}"
 			)
 		
-		# Ensure compute stream finishes writing k_tensor before D2H copy reads it.
-		# Record event on compute stream, then event.synchronize() waits only for
-		# work up to this point (not all GPU work). Lighter than full device sync.
-		if not hasattr(self, '_kv_offload_event'):
-			self._kv_offload_event = torch.cuda.Event()
-		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
-		self._kv_offload_event.synchronize()
-		
+		# Launch async D2H append — no CPU-side sync needed.
+		# Tensor references kept alive in _pending_kv_append_tensors.
+		# All tasks waited at decision boundary via _wait_pending_kv_append_tasks().
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
@@ -7030,10 +6967,7 @@ class BatchGenWorker:
 			sequence_lengths=sequence_lengths,
 		)
 
-		# CRITICAL FIX: Store tensor references alongside task to prevent GC
-		# PyTorch's CUDA caching allocator can reuse memory if tensor is dereferenced
-		# while async operation is still reading from it!
-		# Must store BOTH k and v tensors for GQA models
+		# Store tensor references alongside task to prevent GC/memory reuse
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 		self._pending_kv_append_tensors.append(k_tensor)

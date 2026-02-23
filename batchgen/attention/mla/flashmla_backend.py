@@ -1329,15 +1329,6 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
 
 	page_size = gpu_paged_kv_manager.config.page_size_tokens
-	if layer_idx == 0:
-		import logging as _logging
-		_logging.info(
-			f"[FLASHMLA DECODE] blocked_k={blocked_k.shape}, "
-			f"block_table={block_table.shape}, "
-			f"block_table[:3]={block_table[:min(3,bsz)].tolist()}, "
-			f"cache_seqlens={cache_seqlens.tolist()}, "
-			f"page_size={page_size}"
-		)
 	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, self.num_heads, 1)
 
 	try:

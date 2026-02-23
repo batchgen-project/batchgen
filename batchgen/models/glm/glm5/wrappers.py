@@ -369,15 +369,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
         dt = get_decode_timer()
         li = self.layer_idx
 
-        if not hasattr(GLM5AttnWrapper, '_dsa_logged'):
-            GLM5AttnWrapper._dsa_logged = True
-            logging.info(
-                f"[DSA] _forward_decode_dsa invoked: layer={li}, "
-                f"bsz={bsz}, cache_seqlens={cache_seqlens.tolist()[:4]}, "
-                f"index_topk={indexer.index_topk}, "
-                f"index_dim={indexer.index_head_dim}"
-            )
-
         # --- Shared FP8 activation quantization ---
         with (dt.timed("act_quant", li) if dt else _nullctx()):
             hidden_flat = hidden_states.squeeze(1)  # [batch, hidden_size]
@@ -416,14 +407,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 attn.kv_lora_rank, attn.qk_rope_head_dim,
             )
 
-        if li == 0 and getattr(GLM5AttnWrapper, '_dsa_rope_logged', 0) < 2:
-            logging.info(
-                f"[DSA DIAG] position_ids={position_ids.squeeze(-1).tolist()}, "
-                f"max_seqlen={max_seqlen}, "
-                f"q_pe_norm={q_pe.float().norm().item():.4f}, "
-                f"offload_kv_norm={offload_kv.float().norm().item():.4f}"
-            )
-
         # --- Step 1: Write new MLA KV to primary cache ---
         with (dt.timed("kv_write", li) if dt else _nullctx()):
             manager_device = gpu_paged_kv_manager.device
@@ -437,14 +420,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             if AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(li, k_tensor, None)
-
-        # DSA diagnostic logging (first 2 calls, layer 0 only)
-        if li == 0 and getattr(GLM5AttnWrapper, '_dsa_diag_count', 0) < 2:
-            logging.info(
-                f"[DSA DIAG] cache_seqlens={cache_seqlens.tolist()}, "
-                f"page_size={gpu_paged_kv_manager.config.page_size_tokens}, "
-                f"aux_page_size={gpu_paged_kv_manager_aux.config.page_size_tokens}"
-            )
 
         # --- Step 2: Write indexer K to auxiliary cache ---
         with (dt.timed("indexer_k", li) if dt else _nullctx()):
@@ -488,15 +463,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     positions=new_token_pos,
                 )
 
-        if not hasattr(GLM5AttnWrapper, '_dsa_topk_logged'):
-            GLM5AttnWrapper._dsa_topk_logged = True
-            logging.info(
-                f"[DSA] Indexer top-K: layer={li}, "
-                f"top_k_indices.shape={top_k_indices.shape}, "
-                f"updated_seqlens={updated_seqlens.tolist()[:4]}, "
-                f"sample indices[0]={top_k_indices[0, :10].tolist()}"
-            )
-
         # --- Step 4: Sparse gather MLA KV at top-K positions ---
         with (dt.timed("sparse_gather", li) if dt else _nullctx()):
             mla_blocked_k, _, mla_block_table = \
@@ -506,26 +472,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
             )
             # sparse_mla_kv: [batch, topk, 1, 576]
-
-        if li == 0 and getattr(GLM5AttnWrapper, '_dsa_diag_count', 0) < 2:
-            logging.info(
-                f"[DSA DIAG] short_circuit={torch.all(updated_seqlens <= indexer.index_topk).item()}, "
-                f"top_k_indices.shape={top_k_indices.shape}, "
-                f"mla_blocked_k={mla_blocked_k.shape}, "
-                f"block_table={mla_block_table.shape}, "
-                f"block_table[0]={mla_block_table[0].tolist()}, "
-                f"sparse_mla_kv={sparse_mla_kv.shape}"
-            )
-            for si in range(min(bsz, 4)):
-                valid = int(updated_seqlens[si].item())
-                kv_valid = sparse_mla_kv[si, :valid]
-                kv_invalid = sparse_mla_kv[si, valid:] if valid < sparse_mla_kv.shape[1] else None
-                msg = (f"[DSA DIAG] seq={si}, valid_tokens={valid}, "
-                       f"kv_valid_norm={kv_valid.float().norm().item():.4f}")
-                if kv_invalid is not None and kv_invalid.numel() > 0:
-                    msg += f", kv_invalid_norm={kv_invalid.float().norm().item():.4f}"
-                logging.info(msg)
-            GLM5AttnWrapper._dsa_diag_count = getattr(GLM5AttnWrapper, '_dsa_diag_count', 0) + 1
 
         # --- Step 5: Absorbed Q → sparse FlashMLA ---
         with (dt.timed("q_absorb", li) if dt else _nullctx()):
@@ -559,14 +505,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 head_dim_v=attn.kv_lora_rank,
                 page_size=mla_page_size,
             )
-
-        if li == 0 and getattr(GLM5AttnWrapper, '_dsa_rope_logged', 0) < 2:
-            logging.info(
-                f"[DSA DIAG] sparse_seqlens={sparse_seqlens.tolist()}, "
-                f"attn_out_norm={attn_out.float().norm().item():.4f}, "
-                f"attn_out[0]={attn_out[0,0,0,:8].tolist()}"
-            )
-            GLM5AttnWrapper._dsa_rope_logged = getattr(GLM5AttnWrapper, '_dsa_rope_logged', 0) + 1
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
