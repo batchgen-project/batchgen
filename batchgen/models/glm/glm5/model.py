@@ -190,24 +190,36 @@ class Glm5Indexer(nn.Module):
         self.rotary_emb: Optional[nn.Module] = None
 
     def _apply_rope_to_k(self, k: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Apply RoPE to first rope_head_dim dims of K [batch, seq, head_dim]."""
+        """Apply RoPE to first rope_head_dim dims of K [batch, seq, head_dim].
+
+        positions: [batch] or [batch, seq] integer position IDs.
+        """
         k_rope = k[..., :self.rope_head_dim]
         k_nope = k[..., self.rope_head_dim:]
-        cos, sin = self.rotary_emb(k_rope, positions)  # type: ignore[misc]
-        # K is [batch, seq, rope_dim] — treat as single-head for RoPE
-        # apply_rotary_pos_emb_interleaved expects [batch, seq, num_heads, head_dim]
-        # but we can apply it on the last dim directly
+        seq_len = int(positions.max()) + 1
+        cos, sin = self.rotary_emb(k_rope, seq_len)
+        # Index cos/sin by position: positions may be [batch] (decode) or [batch, seq] (prefill)
+        cos = cos[positions]  # [batch, ...rope_dim*2]
+        sin = sin[positions]
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(1)  # [batch, 1, rope_dim*2]
+            sin = sin.unsqueeze(1)
         k_rope = k_rope.unsqueeze(2)  # [batch, seq, 1, rope_dim]
-        # Use same zero-size dummy for the second arg
         k_rope, _ = apply_rotary_pos_emb_interleaved(k_rope, k_rope, cos, sin)
         k_rope = k_rope.squeeze(2)
         return torch.cat([k_rope, k_nope], dim=-1)
 
     def _apply_rope_to_q(self, q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Apply RoPE to first rope_head_dim dims of Q [batch, n_heads, head_dim]."""
+        """Apply RoPE to first rope_head_dim dims of Q [batch, n_heads, head_dim].
+
+        positions: [batch] integer position IDs (decode only).
+        """
         q_rope = q[..., :self.rope_head_dim]
         q_nope = q[..., self.rope_head_dim:]
-        cos, sin = self.rotary_emb(q_rope.view(-1, 1, self.rope_head_dim), positions)  # type: ignore[misc]
+        seq_len = int(positions.max()) + 1
+        cos, sin = self.rotary_emb(q_rope.view(-1, 1, self.rope_head_dim), seq_len)
+        cos = cos[positions].unsqueeze(1)  # [batch, 1, rope_dim*2]
+        sin = sin[positions].unsqueeze(1)
         q_rope = q_rope.unsqueeze(2)  # [batch, n_heads, 1, rope_dim]
         q_rope, _ = apply_rotary_pos_emb_interleaved(q_rope, q_rope, cos, sin)
         q_rope = q_rope.squeeze(2)
