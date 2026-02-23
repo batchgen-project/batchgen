@@ -51,6 +51,9 @@ def sparse_gather_from_paged_kv(
 		block_table, 1, logical_page_idx.long()
 	)  # [batch, topk]
 
+	# Clamp -1 (unused) page entries to 0 to prevent negative indexing
+	physical_page_idx = physical_page_idx.clamp(min=0)
+
 	# Compute flat index into blocked_k reshaped as [num_pages * page_size, ...]
 	flat_idx = physical_page_idx * page_size + page_offset  # [batch, topk]
 

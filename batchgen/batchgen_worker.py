@@ -3925,6 +3925,7 @@ class BatchGenWorker:
 		"""
 		Allocates GPU pages using TWO-PAGE BUFFER strategy and triggers blocking load from Host.
 		"""
+		logging.info(f"[KV ALLOC] rank={self.rank}, entering _allocate_and_load_gpu_kv_for_new_sequences, local_ids={local_sequence_ids}")
 		if not local_sequence_ids:
 			return
 		
