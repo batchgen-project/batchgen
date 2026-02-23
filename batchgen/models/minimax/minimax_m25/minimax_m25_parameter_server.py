@@ -116,7 +116,16 @@ class MiniMaxM25_Parameter_Server:
             self.converted_ckpt_dir,
             self.state_dict_name_map,
         )
+
+        # Expose weights_storage for core engine
+        self._weights_storage = self.parameter_server
+
         return self.shm_name, self.tensor_meta_shm_name
+
+    @property
+    def weights_storage(self):
+        """Return the C++ parameter server as weights storage for core engine."""
+        return self._weights_storage
 
     def _parse_state_dict(self):
         """Build name mapping from checkpoint tensor names to BatchGen format.
