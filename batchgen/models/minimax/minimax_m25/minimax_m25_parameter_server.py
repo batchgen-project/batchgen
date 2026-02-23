@@ -90,8 +90,8 @@ class MiniMaxM25_Parameter_Server:
 
         self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
 
-        # M2.5: ~230GB FP8 experts + ~5GB BF16 (attn/embed) ~ 250GB with buffer
-        byte_size = 300 * 1024 * 1024 * 1024
+        # M2.5: ~225GB FP8 experts + ~8GB BF16 (attn/embed/router) ≈ 233GB, 250GB with buffer
+        byte_size = 250 * 1024 * 1024 * 1024
 
         total, used, free = shutil.disk_usage("/dev/shm")
         logging.info(f"Freespace in /dev/shm: {free/1024/1024/1024:.2f} GB")

@@ -87,6 +87,12 @@ class MiniMaxM25Tokenizer(FastTokenizer):
                 pad_token=self.pad_token,
             )
 
+        # Load chat template from separate .jinja file (not in tokenizer_config.json)
+        chat_template_path = TOKENIZER_DIR / "chat_template.jinja"
+        if chat_template_path.exists():
+            self.chat_template = chat_template_path.read_text()
+            logger.info("Loaded chat template from chat_template.jinja")
+
         logger.info(
             f"MiniMax-M2.5 tokenizer initialized: vocab_size={self.vocab_size}, "
             f"bos={self.bos_token_id}, eos={self.eos_token_id}"
