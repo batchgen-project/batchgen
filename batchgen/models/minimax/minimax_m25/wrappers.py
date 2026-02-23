@@ -9,7 +9,7 @@ Provides wrappers for MiniMax-M2.5 with FP8 quantization:
 - MiniMaxM25ExpertWrapper: Expert wrapper with FP8 block-wise dequantization
 - MiniMaxM25AttnWrapper: Attention wrapper with GQA + QK norm + partial RoPE
 
-All weights (attention + experts) are FP8 e4m3fn with BF16 block-wise scales.
+All weights (attention + experts) are FP8 e4m3fn with F32 block-wise scales.
 
 Core engine tensor keys (from parameter_server.py):
   Expert: w1.weight, w1.weight_scale_inv  (gate_proj)
@@ -43,9 +43,9 @@ except ImportError:
     _HAS_W8A16 = False
 
 
-def _fp8_linear(weight_fp8, scale_bf16, x):
-    """FP8 weight × BF16 activation via w8a16_gemm. Scales cast to float32 for DeepGEMM."""
-    return w8a16_gemm(weight_fp8, scale_bf16.float(), x)
+def _fp8_linear(weight_fp8, scale, x):
+    """FP8 weight × BF16 activation via w8a16_gemm. Scale factors are F32 (from checkpoint)."""
+    return w8a16_gemm(weight_fp8, scale, x)
 
 
 class MiniMaxM25ExpertWrapper(ExpertWrapperBase):

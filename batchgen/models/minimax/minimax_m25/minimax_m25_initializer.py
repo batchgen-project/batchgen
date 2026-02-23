@@ -195,7 +195,7 @@ class MiniMaxM25Initializer:
         head_dim = cfg.head_dim              # 128
 
         self.engine_config.GPU_Buffer_Config.module_shapes = {
-            # GQA attention (FP8 weights + BF16 scales/norms)
+            # GQA attention (FP8 weights + F32 scales + BF16 norms)
             "attn": {
                 "q_proj.weight": [num_heads * head_dim, hidden_size],
                 "q_proj.weight_scale_inv": [num_heads * head_dim // 128, hidden_size // 128],
@@ -225,20 +225,22 @@ class MiniMaxM25Initializer:
             "routed_expert": torch.float8_e4m3fn,
         }
 
-        # Per-tensor dtype overrides (scales and norms are BF16)
+        # Per-tensor dtype overrides
+        # Scale factors are F32 in checkpoint (verified via extract_tensor_metadata.py).
+        # Norms are BF16.
         self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
             "attn": {
-                "q_proj.weight_scale_inv": torch.bfloat16,
-                "k_proj.weight_scale_inv": torch.bfloat16,
-                "v_proj.weight_scale_inv": torch.bfloat16,
-                "o_proj.weight_scale_inv": torch.bfloat16,
+                "q_proj.weight_scale_inv": torch.float32,
+                "k_proj.weight_scale_inv": torch.float32,
+                "v_proj.weight_scale_inv": torch.float32,
+                "o_proj.weight_scale_inv": torch.float32,
                 "q_norm.weight": torch.bfloat16,
                 "k_norm.weight": torch.bfloat16,
             },
             "routed_expert": {
-                "w1.weight_scale_inv": torch.bfloat16,
-                "w2.weight_scale_inv": torch.bfloat16,
-                "w3.weight_scale_inv": torch.bfloat16,
+                "w1.weight_scale_inv": torch.float32,
+                "w2.weight_scale_inv": torch.float32,
+                "w3.weight_scale_inv": torch.float32,
             },
         }
 

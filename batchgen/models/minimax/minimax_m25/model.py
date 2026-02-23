@@ -40,6 +40,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import triton
+import triton.language as tl
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -61,6 +63,181 @@ try:
     _HAS_FP8_GROUPED = True
 except ImportError:
     _HAS_FP8_GROUPED = False
+
+
+# ============================================================================
+# MoE Triton Kernels (self-contained — no cross-model imports)
+# ============================================================================
+
+@triton.jit
+def _moe_fp32_accum_kernel_v2(
+    outs_ptr,
+    inv_idxs_ptr,
+    topk_weights_ptr,
+    output_ptr,
+    total_tokens: tl.constexpr,
+    topk: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """FP32 accumulation kernel for MoE prefill scatter-reduce."""
+    token_block_id = tl.program_id(0)
+    h_block_id = tl.program_id(1)
+
+    TOKENS_PER_BLOCK: tl.constexpr = 4
+    token_start = token_block_id * TOKENS_PER_BLOCK
+
+    h_start = h_block_id * BLOCK_SIZE
+    h_offsets = h_start + tl.arange(0, BLOCK_SIZE)
+    h_mask = h_offsets < hidden_dim
+
+    for t_idx in range(TOKENS_PER_BLOCK):
+        token_id = token_start + t_idx
+        if token_id < total_tokens:
+            accum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+            for k in range(topk):
+                new_x_idx = token_id * topk + k
+                outs_idx = tl.load(inv_idxs_ptr + new_x_idx)
+                weight_offset = token_id * topk + k
+                weight = tl.load(topk_weights_ptr + weight_offset).to(tl.float32)
+                outs_offsets = outs_idx * hidden_dim + h_offsets
+                expert_out = tl.load(outs_ptr + outs_offsets, mask=h_mask, other=0.0)
+                accum += expert_out.to(tl.float32) * weight
+            output_offsets = token_id * hidden_dim + h_offsets
+            tl.store(output_ptr + output_offsets, accum.to(output_ptr.dtype.element_ty), mask=h_mask)
+
+
+def moe_fp32_accum_triton_v2(
+    outs: torch.Tensor,
+    idxs: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """FP32 accumulation for MoE prefill: weighted scatter-reduce of expert outputs."""
+    total_tokens, topk = topk_weights.shape
+    hidden_dim = outs.shape[1]
+
+    inv_idxs = torch.empty_like(idxs)
+    inv_idxs[idxs] = torch.arange(len(idxs), device=idxs.device, dtype=idxs.dtype)
+
+    output = torch.empty((total_tokens, hidden_dim), device=outs.device, dtype=outs.dtype)
+
+    BLOCK_SIZE = 128
+    TOKENS_PER_BLOCK = 4
+
+    grid = lambda META: (
+        triton.cdiv(total_tokens, TOKENS_PER_BLOCK),
+        triton.cdiv(hidden_dim, META['BLOCK_SIZE'])
+    )
+
+    _moe_fp32_accum_kernel_v2[grid](
+        outs, inv_idxs, topk_weights, output,
+        total_tokens=total_tokens,
+        topk=topk,
+        hidden_dim=hidden_dim,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return output
+
+
+@triton.jit
+def _scatter_weight_reduce_kernel(
+    res_ptr,
+    nnz_indices_ptr,
+    topk_weight_ptr,
+    output_ptr,
+    num_tokens,
+    num_experts_per_tok,
+    hidden_size,
+    nnz,
+    BLOCK_SIZE_H: tl.constexpr,
+):
+    """Optimized scatter-reduce using pre-computed inverse mapping."""
+    token_idx = tl.program_id(0)
+    if token_idx >= num_tokens:
+        return
+
+    h_offset = tl.program_id(1) * BLOCK_SIZE_H
+    h_indices = h_offset + tl.arange(0, BLOCK_SIZE_H)
+    h_mask = h_indices < hidden_size
+
+    accumulator = tl.zeros([BLOCK_SIZE_H], dtype=tl.float32)
+
+    for k in range(num_experts_per_tok):
+        mapping_offset = token_idx * num_experts_per_tok + k
+        nnz_idx = tl.load(nnz_indices_ptr + mapping_offset)
+        is_valid = (nnz_idx >= 0) & (nnz_idx < nnz)
+        weight = tl.load(topk_weight_ptr + mapping_offset)
+        safe_nnz_idx = tl.where(is_valid, nnz_idx, 0)
+        res_offset = safe_nnz_idx * hidden_size + h_indices
+        load_mask = h_mask & is_valid
+        res_vals = tl.load(res_ptr + res_offset, mask=load_mask, other=0.0)
+        res_vals_fp32 = res_vals.to(tl.float32)
+        weighted = tl.where(is_valid, res_vals_fp32 * weight, 0.0)
+        accumulator += weighted
+
+    output_offset = token_idx * hidden_size + h_indices
+    tl.store(output_ptr + output_offset, accumulator, mask=h_mask)
+
+
+def _build_inverse_mapping(
+    global_indices: torch.Tensor,
+    token_topk_pos: torch.Tensor,
+    num_tokens: int,
+    num_experts_per_tok: int,
+) -> torch.Tensor:
+    """Build inverse mapping: [num_tokens, num_experts_per_tok] -> nnz_idx."""
+    mapping = torch.full((num_tokens, num_experts_per_tok), -1,
+                         dtype=torch.int64, device=global_indices.device)
+    if global_indices.numel() == 0:
+        return mapping
+    mapping[global_indices, token_topk_pos] = torch.arange(
+        len(global_indices), dtype=torch.int64, device=global_indices.device
+    )
+    return mapping
+
+
+def scatter_weight_reduce_optimized(
+    res: torch.Tensor,
+    global_indices: torch.Tensor,
+    token_topk_pos: torch.Tensor,
+    topk_weight: torch.Tensor,
+    num_tokens: int,
+    num_experts_per_tok: int,
+) -> torch.Tensor:
+    """Optimized scatter-reduce for EP decode MoE combine step."""
+    assert topk_weight.dtype == torch.float32, "topk_weight must be float32"
+    assert topk_weight.shape == (num_tokens, num_experts_per_tok), \
+        f"topk_weight shape mismatch, expected ({num_tokens}, {num_experts_per_tok}), got {topk_weight.shape}"
+
+    nnz, hidden_size = res.shape
+
+    if nnz == 0:
+        return torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+
+    global_indices_sliced = global_indices[:nnz]
+    token_topk_pos_sliced = token_topk_pos[:nnz]
+
+    nnz_indices = _build_inverse_mapping(
+        global_indices_sliced, token_topk_pos_sliced, num_tokens, num_experts_per_tok
+    )
+
+    output = torch.zeros((num_tokens, hidden_size), device=res.device, dtype=torch.float32)
+
+    if num_tokens == 0:
+        return output
+
+    BLOCK_SIZE_H = min(triton.next_power_of_2(hidden_size), 256)
+    grid = (num_tokens, triton.cdiv(hidden_size, BLOCK_SIZE_H))
+
+    _scatter_weight_reduce_kernel[grid](
+        res, nnz_indices, topk_weight,
+        output,
+        num_tokens, num_experts_per_tok, hidden_size, nnz,
+        BLOCK_SIZE_H=BLOCK_SIZE_H,
+    )
+
+    return output
 
 
 # ============================================================================
@@ -625,9 +802,7 @@ class MiniMaxM25MoE(nn.Module):
 
         All-persistent path. No shared experts (unlike DeepSeek-V3).
         """
-        from batchgen.models.deepseek.deepseekv3.modeling_deepseek_v3 import (
-            scatter_weight_reduce_optimized,
-        )
+        # scatter_weight_reduce_optimized is defined at module level (self-contained)
 
         num_tokens, hidden_size = x.shape
         device = x.device
@@ -790,7 +965,7 @@ class MiniMaxM25MoE(nn.Module):
         3. Sequential expert calls (each uses deepgemm w8a16)
         4. Triton kernel for weighted scatter-reduce (FP32 accumulation)
         """
-        from batchgen.models.deepseek.deepseekv3.modeling_deepseek_v3 import moe_fp32_accum_triton_v2
+        # moe_fp32_accum_triton_v2 is defined at module level (self-contained)
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)

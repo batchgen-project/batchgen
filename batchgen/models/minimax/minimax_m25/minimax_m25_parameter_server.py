@@ -7,21 +7,24 @@
 
 Handles weight loading for MiniMax-M2.5 (230B MoE) with:
 - FP8 e4m3fn quantized expert weights (block_size [128,128])
-- BF16 attention weights (GQA, not quantized)
+- FP8 e4m3fn quantized attention weights (Q/K/V/O projections) with F32 scales
+- BF16 QK norm, embeddings, layer norms
+- F32 router gate weight, e_score_correction_bias
 - 256 routed experts per MoE layer, no shared experts
 - All 62 layers are MoE
 
 Checkpoint format (HuggingFace FP8):
-    model.layers.{L}.self_attn.{q,k,v,o}_proj.weight        -> BF16
-    model.layers.{L}.self_attn.{q,k}_norm.weight             -> BF16 (QK norm)
-    model.layers.{L}.block_sparse_moe.gate.weight             -> BF16 (router)
-    model.layers.{L}.block_sparse_moe.e_score_correction_bias -> BF16 (routing bias)
-    model.layers.{L}.block_sparse_moe.experts.{E}.{w1,w2,w3}.weight        -> FP8
-    model.layers.{L}.block_sparse_moe.experts.{E}.{w1,w2,w3}.weight_scale_inv -> BF16
+    model.layers.{L}.self_attn.{q,k,v,o}_proj.weight            -> FP8 e4m3fn
+    model.layers.{L}.self_attn.{q,k,v,o}_proj.weight_scale_inv  -> F32
+    model.layers.{L}.self_attn.{q,k}_norm.weight                -> BF16 (QK norm)
+    model.layers.{L}.block_sparse_moe.gate.weight                -> F32 (router)
+    model.layers.{L}.block_sparse_moe.e_score_correction_bias   -> F32 (routing bias)
+    model.layers.{L}.block_sparse_moe.experts.{E}.{w1,w2,w3}.weight           -> FP8 e4m3fn
+    model.layers.{L}.block_sparse_moe.experts.{E}.{w1,w2,w3}.weight_scale_inv -> F32
 
 BatchGen format:
-    attn_{L}              / {tensor_key}  -> attention weights
-    routed_expert_{L}_{E} / {tensor_key}  -> expert FP8 weights + scales
+    attn_{L}              / {tensor_key}  -> attention FP8 weights + F32 scales + BF16 norms
+    routed_expert_{L}_{E} / {tensor_key}  -> expert FP8 weights + F32 scales
 """
 
 import gc
@@ -43,7 +46,7 @@ except ImportError:
     Parameter_Server = core_engine.Parameter_Server
 
 
-# GQA attention parameter names (FP8 weights + BF16 scales/norms)
+# GQA attention parameter names (FP8 weights + F32 scales + BF16 norms)
 _GQA_ATTN_TENSOR_NAMES = [
     "q_proj.weight",
     "q_proj.weight_scale_inv",
