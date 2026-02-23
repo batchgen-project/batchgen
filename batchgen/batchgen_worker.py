@@ -3972,6 +3972,15 @@ class BatchGenWorker:
 		# 2. Rebuild Page Table
 		manager.rebuild_page_table(global_ids)
 
+		# Log KV load details
+		if self.rank == 0:
+			bt = manager._gpu_page_table_manager.gpu_table
+			logging.info(
+				f"[KV LOAD] seqs={global_ids}, tokens={tokens}, "
+				f"block_table shape={bt.shape}, "
+				f"block_table[:2]={bt[:min(2,bt.shape[0])].tolist()}"
+			)
+
 		# 3. Load Host -> GPU (BLOCKING)
 		self._load_host_kv_to_gpu(manager, global_ids)
 		
@@ -6623,6 +6632,13 @@ class BatchGenWorker:
 					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
+
+					# Always log first 2 decode iterations for debugging
+					if self.rank == 0 and local_iteration <= 2:
+						logging.info(
+							f"[DECODE STEP] iter={local_iteration}, batch_size={len(batch)}, "
+							f"cache_seqlens={Attn_Wrapper.cache_seqlens.tolist()}"
+						)
 
 					# DEBUG: Print cache_seqlens and input tokens
 					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
