@@ -272,6 +272,7 @@ if __name__ == "__main__":
             + "Now answer the following question:\n"
             + "Q: " + entry["question"] + "\n"
             + form_options(entry["options"])
+            + "A: Let's think step by step."
         )
         queries.append(prompt)
 
@@ -333,6 +334,7 @@ if __name__ == "__main__":
             hugging_face_checkpoint,
             cache_dir=args.hf_cache_dir,
             trust_remote_code=True,
+            local_files_only=True,
         )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer: {e}. Token IDs will not be shown.")
