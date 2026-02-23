@@ -71,7 +71,7 @@ class MiniMaxM25ParallelStrategyManager:
         self._config_unembedding_hook()
 
         self.model.eval()
-        self.model.to(self.engine_config.Basic_Config.device_torch)
+        self.model.to(dtype=torch.bfloat16, device=self.engine_config.Basic_Config.device_torch)
 
         total_time = time.perf_counter() - start_time
         if self.rank == 0:
@@ -160,7 +160,7 @@ class MiniMaxM25ParallelStrategyManager:
             layer.mlp.enable_ep_offloading = self.enable_ep_offloading
 
         self.model.eval()
-        self.model.to(device)
+        self.model.to(dtype=torch.bfloat16, device=device)
 
         self._init_mode_decoding()
         effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
