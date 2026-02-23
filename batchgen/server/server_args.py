@@ -90,6 +90,7 @@ class ServerArgs:
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
     detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
+    enable_thinking: bool = False  # Enable thinking/reasoning mode by default for supported models
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -382,6 +383,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
+        detokenization_include_special_tokens=parsed.detokenization_include_special_tokens,
+        enable_thinking=parsed.enable_thinking,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

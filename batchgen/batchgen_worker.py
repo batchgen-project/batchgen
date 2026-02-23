@@ -861,8 +861,12 @@ class BatchGenWorker:
 		
 		manager.allocate_pages_for_sequences(global_ids, pages_per_seq)
 		manager.rebuild_page_table(global_ids)
-		
+
 		if load_from_host:
+			logging.info(
+				f"[KV HOST→GPU] rank={self.rank}, global_ids={global_ids}, "
+				f"pages_per_seq={pages_per_seq}, total_pages={total_pages}"
+			)
 			self._load_host_kv_to_gpu(manager, global_ids)
 		
 		# Track in set
@@ -3105,10 +3109,14 @@ class BatchGenWorker:
 				f"(local: {local_tokenize_time:.2f}s, gather: {gather_time:.2f}s)"
 			)
 
-		# Log per-sequence token counts for debugging
+		# Log per-sequence token counts and boundary tokens for debugging
 		if self.rank == 0:
 			for i in range(num_sequences):
-				logging.info(f"[TOKENIZE] Seq {i}: {tokenized_by_idx[i]['length']} tokens")
+				ids = tokenized_by_idx[i]['input_ids']
+				n = tokenized_by_idx[i]['length']
+				first5 = ids[:5].tolist() if hasattr(ids, 'tolist') else list(ids[:5])
+				last5 = ids[max(0,n-5):n].tolist() if hasattr(ids, 'tolist') else list(ids[max(0,n-5):n])
+				logging.info(f"[TOKENIZE] Seq {i}: {n} tokens, first5={first5}, last5={last5}")
 
 		# Phase 2: Find the longest prompt length to use as max_prompt_length
 		# Use lightweight length field instead of creating tensors
