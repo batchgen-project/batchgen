@@ -417,6 +417,7 @@ class WorkerManager:
             disable_cuda_graphs=self.args.disable_cuda_graphs,
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
+            detokenization_ignore_special_token=self.args.detokenization_ignore_special_token,
         )
         self.worker_process = mp.spawn(
             server_worker_main,

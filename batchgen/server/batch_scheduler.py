@@ -532,9 +532,10 @@ class BatchScheduler:
         if tokenizer is None:
             return " ".join(str(token) for token in token_ids)
         trimmed = self._trim_tokens(token_ids, tokenizer)
+        ignore_special = getattr(self.server_args, "detokenization_ignore_special_token", True)
         return tokenizer.decode(
             trimmed,
-            skip_special_tokens=True,
+            skip_special_tokens=(not ignore_special),
             clean_up_tokenization_spaces=False,
         )
 

@@ -322,6 +322,7 @@ class BatchGenWorker:
 		self.enable_prepack = args.enable_prepack
 		self.host_kv_watermark = args.host_kv_watermark
 		self.enable_decode_preemption = args.enable_decode_preemption
+		self.detokenization_ignore_special_token = getattr(args, 'detokenization_ignore_special_token', True)
 
 		# 4. Initialize Weights Storage (cudaHostRegister for weights)
 		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
@@ -3103,6 +3104,11 @@ class BatchGenWorker:
 				f"(local: {local_tokenize_time:.2f}s, gather: {gather_time:.2f}s)"
 			)
 
+		# Log per-sequence token counts for debugging
+		if self.rank == 0:
+			for i in range(num_sequences):
+				logging.info(f"[TOKENIZE] Seq {i}: {tokenized_by_idx[i]['length']} tokens")
+
 		# Phase 2: Find the longest prompt length to use as max_prompt_length
 		# Use lightweight length field instead of creating tensors
 		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
@@ -4472,7 +4478,7 @@ class BatchGenWorker:
 			end_pos = non_zero[-1] + 1 if non_zero else len(tokens_list)
 
 		# Decode tokens up to end position
-		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
+		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=(not self.detokenization_ignore_special_token))
 
 	# ============ Phase Configuration ============
 
@@ -5248,6 +5254,16 @@ class BatchGenWorker:
 				AttnWrapperBase.position_ids = batch_position_ids_flat
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
+				# Log prefill input shapes
+				if self.rank == 0:
+					logging.info(
+						f"[PREFILL SHAPE] Micro-batch {batch_idx}: "
+						f"input_ids={batch_input_ids_flat.shape}, "
+						f"cu_seqlens={batch_cu_seqlens.tolist()}, "
+						f"max_seqlen={batch_max_seqlen}, "
+						f"seq_lengths={list(batch_seq_lengths)}"
+					)
+
 				# Embed tokens
 				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
@@ -5271,6 +5287,12 @@ class BatchGenWorker:
 
 				# Extract last token hidden states for each sequence
 				last_token_indices = batch_cu_seqlens[1:] - 1
+				if self.rank == 0:
+					logging.info(
+						f"[PREFILL SHAPE] Micro-batch {batch_idx}: "
+						f"hidden_states_out={hidden_states.shape}, "
+						f"last_token_indices={last_token_indices.tolist()}"
+					)
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
 				# DEBUG: Verify per-sequence hidden states after prefill
