@@ -393,8 +393,8 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         # Partial RoPE
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
-        cos = cos[current_token_position].unsqueeze(1)  # [batch, 1, rotary_dim]
-        sin = sin[current_token_position].unsqueeze(1)
+        cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, rotary_dim]
+        sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
 
         q_rot = query[..., :rotary_dim]
         q_pass = query[..., rotary_dim:]
