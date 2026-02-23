@@ -39,10 +39,9 @@ logger = logging.getLogger(__name__)
 # Tokenizer files are in the same directory as this module
 TOKENIZER_DIR = Path(__file__).parent
 
-# MiniMax-M2.5 special token IDs (from tokenizer_config.json)
-# TODO: Verify these from the actual tokenizer_config.json after download
-MINIMAX_M25_BOS_TOKEN_ID = 0
-MINIMAX_M25_EOS_TOKEN_ID = 1
+# MiniMax-M2.5 special token IDs (from tokenizer_config.json added_tokens_decoder)
+MINIMAX_M25_BOS_TOKEN_ID = 200034
+MINIMAX_M25_EOS_TOKEN_ID = 200020
 MINIMAX_M25_VOCAB_SIZE = 200064
 
 
