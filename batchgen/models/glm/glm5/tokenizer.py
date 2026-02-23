@@ -67,13 +67,6 @@ class GLM5Tokenizer(FastTokenizer):
         self.eos_token = id_to_token.get(self.eos_token_id)
         self.pad_token = self.eos_token
 
-        if self.pad_token is not None:
-            self.tokenizer.enable_padding(
-                direction="left",  # GLM-5 uses left padding
-                pad_id=self.pad_token_id,
-                pad_token=self.pad_token,
-            )
-
         logger.info(
             f"GLM-5 tokenizer initialized: vocab_size={self.vocab_size}, "
             f"eos={self.eos_token_id}, stop_tokens={self.stop_token_ids}"
