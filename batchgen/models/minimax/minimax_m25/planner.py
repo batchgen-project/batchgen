@@ -32,6 +32,17 @@ class MiniMaxM25Planner:
         engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 128
         engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size = 128
 
+        # Module buffer counts (must be dicts, not ints — C++ core_engine expects unordered_map)
+        # MiniMax-M2.5: no shared experts
+        engine_config.GPU_Buffer_Config.num_prefill_module_buffer = {
+            "attn": 1,
+            "routed_expert": 32,
+        }
+        engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
+            "attn": 1,
+            "routed_expert": 64,
+        }
+
         # EP config: 256 experts / world_size
         num_experts = 256
         if world_size > 0:
