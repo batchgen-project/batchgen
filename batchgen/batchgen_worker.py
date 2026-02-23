@@ -244,7 +244,7 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
-	detokenization_ignore_special_token: bool = True  # Include special tokens in detokenized output
+	detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
 
 
 class BatchGenWorker:
@@ -323,7 +323,7 @@ class BatchGenWorker:
 		self.enable_prepack = args.enable_prepack
 		self.host_kv_watermark = args.host_kv_watermark
 		self.enable_decode_preemption = args.enable_decode_preemption
-		self.detokenization_ignore_special_token = getattr(args, 'detokenization_ignore_special_token', True)
+		self.detokenization_include_special_tokens = getattr(args, 'detokenization_include_special_tokens', False)
 
 		# 4. Initialize Weights Storage (cudaHostRegister for weights)
 		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
@@ -4479,7 +4479,7 @@ class BatchGenWorker:
 			end_pos = non_zero[-1] + 1 if non_zero else len(tokens_list)
 
 		# Decode tokens up to end position
-		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=(not self.detokenization_ignore_special_token))
+		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=(not self.detokenization_include_special_tokens))
 
 	# ============ Phase Configuration ============
 

@@ -89,7 +89,7 @@ class ServerArgs:
     disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
-    detokenization_ignore_special_token: bool = True  # Include special tokens in detokenized output
+    detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -269,11 +269,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
     )
     parser.add_argument(
-        "--detokenization-ignore-special-token",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Include special tokens in detokenized output (default: True). "
-             "Use --no-detokenization-ignore-special-token to strip special tokens.",
+        "--detokenization-include-special-tokens",
+        action="store_true",
+        default=False,
+        help="Include special tokens in detokenized output (default: off, special tokens stripped).",
     )
     parser.add_argument(
         "--enable-thinking",
