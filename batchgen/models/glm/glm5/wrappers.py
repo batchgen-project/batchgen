@@ -230,7 +230,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             seq_len = end_idx - start_idx
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
             seq_global_id = [global_sequence_ids[seq_idx]]
-            self.core_engine.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
+            AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=seq_global_id,
                 k_tensor=seq_kv,

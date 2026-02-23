@@ -1153,7 +1153,7 @@ class BatchGenWorker:
 		Mirrors _append_decode_kv_to_host_async but uses the auxiliary host
 		worker view. Shares the same pending task list for unified flushing.
 		"""
-		aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 		if aux_view is None or not batch:
 			return
 
@@ -1272,7 +1272,7 @@ class BatchGenWorker:
 
 		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view.primary
-			self.core_engine.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view.auxiliary
+			self.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view.auxiliary
 		else:
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		self.engine_config.Basic_Config.num_queries = num_queries
@@ -1555,7 +1555,7 @@ class BatchGenWorker:
 		torch.cuda.synchronize(self.torch_device)
 
 		# DSA: also load auxiliary (indexer) host KV to GPU
-		aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 		if aux_view is not None and isinstance(self.gpu_paged_kv_cache_manager, DualKVCacheCoordinator):
 			aux_mgr = self.gpu_paged_kv_cache_manager.auxiliary
 			k_ptrs_aux, v_ptrs_aux = aux_mgr.get_padded_3d_page_pointers()
@@ -2308,7 +2308,7 @@ class BatchGenWorker:
 			manager.free_pages_for_sequences([global_idx])
 			# Free host KV pages
 			worker_view.release_sequence_pages([global_idx])
-			aux_view_mig = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+			aux_view_mig = getattr(self, "host_paged_kv_worker_view_aux", None)
 			if aux_view_mig is not None:
 				aux_view_mig.release_sequence_pages([global_idx])
 			# Also send query_book data (input_ids, attention_mask, decoded_tokens)
@@ -4575,7 +4575,7 @@ class BatchGenWorker:
 				list(zip(global_sequence_ids, sequence_tokens))
 			)
 			# DSA: mirror registration on auxiliary host KV
-			aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 			if aux_view is not None:
 				aux_view.register_sequences(global_sequence_ids)
 				aux_view.allocate_pages_for_sequences(
@@ -4955,7 +4955,7 @@ class BatchGenWorker:
 			# so we don't need to call unregister_sequences separately
 			worker_view.release_sequence_pages(global_sequence_ids)
 			# DSA: release auxiliary host KV pages too
-			aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 			if aux_view is not None:
 				aux_view.release_sequence_pages(global_sequence_ids)
 
@@ -6335,6 +6335,7 @@ class BatchGenWorker:
 			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 			AttnWrapperBase.gpu_paged_kv_manager_aux = None
 		AttnWrapperBase.host_paged_kv_worker_view = worker_view
+		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
@@ -6661,7 +6662,7 @@ class BatchGenWorker:
 				AttnWrapperBase.kv_append_callback = kv_append_callback
 
 				# DSA: auxiliary KV append callback for indexer host cache
-				aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 				if aux_view is not None:
 					def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
 						self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
@@ -8218,7 +8219,7 @@ class BatchGenWorker:
 						)
 						# Try to release each sequence individually to handle already-released ones
 						released_count = 0
-						aux_view_shutdown = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+						aux_view_shutdown = getattr(self, "host_paged_kv_worker_view_aux", None)
 						for seq_id in global_ids_to_release:
 							try:
 								worker_view.release_sequence_pages([seq_id])
