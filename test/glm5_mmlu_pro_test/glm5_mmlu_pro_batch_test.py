@@ -217,6 +217,10 @@ if __name__ == "__main__":
         help="Explicitly disable thinking mode (send enable_thinking=false)",
     )
     parser.add_argument(
+        "--no_few_shot", action="store_true",
+        help="Disable few-shot examples (zero-shot evaluation)",
+    )
+    parser.add_argument(
         "--verbose", action="store_true",
         help="Print detailed output for every sample",
     )
@@ -240,31 +244,35 @@ if __name__ == "__main__":
         logger.info(f"Using top {args.max_prompts} sequences from dataset")
 
     # Load validation set for few-shot examples
-    validation_set = pd.read_parquet(r1_test_dir / "mmlu_pro_validation.parquet")
     categories = [
         "computer science", "math", "chemistry", "engineering", "law",
         "biology", "health", "physics", "business", "philosophy",
         "economics", "other", "psychology", "history",
     ]
     prompts = {c: "" for c in categories}
-    example_counts = {c: 0 for c in categories}
-    MAX_EXAMPLES = 5
 
-    for _, row in validation_set.iterrows():
-        cat = row["category"]
-        if example_counts[cat] < MAX_EXAMPLES:
-            answer_letter = row["answer"]
-            cot = row["cot_content"].strip()
-            # cot_content may already start with "A:" — avoid duplication
-            if cot.startswith("A:"):
-                cot = cot[2:].strip()
-            prompts[cat] += (
-                f"Q: {row['question']}\n"
-                + form_options(row["options"])
-                + f"A: {cot}\n"
-                + f"The answer is ({answer_letter}).\n\n"
-            )
-            example_counts[cat] += 1
+    if not args.no_few_shot:
+        validation_set = pd.read_parquet(r1_test_dir / "mmlu_pro_validation.parquet")
+        example_counts = {c: 0 for c in categories}
+        MAX_EXAMPLES = 5
+
+        for _, row in validation_set.iterrows():
+            cat = row["category"]
+            if example_counts[cat] < MAX_EXAMPLES:
+                answer_letter = row["answer"]
+                cot = row["cot_content"].strip()
+                # cot_content may already start with "A:" — avoid duplication
+                if cot.startswith("A:"):
+                    cot = cot[2:].strip()
+                prompts[cat] += (
+                    f"Q: {row['question']}\n"
+                    + form_options(row["options"])
+                    + f"A: {cot}\n"
+                    + f"The answer is ({answer_letter}).\n\n"
+                )
+                example_counts[cat] += 1
+    else:
+        logger.info("Few-shot disabled (--no_few_shot)")
 
     # Build queries
     queries: List[str] = []
