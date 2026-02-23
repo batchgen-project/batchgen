@@ -506,13 +506,13 @@ class MiniMaxM25MoE(nn.Module):
             self.up_list.append(self.experts[e].fp8_up)
             self.down_list.append(self.experts[e].fp8_down)
             self.gate_scale_list.append(
-                self.experts[e].weight_dequant_scale['gate_proj.weight_scale_inv']
+                self.experts[e].weight_dequant_scale['w1.weight_scale_inv']
             )
             self.up_scale_list.append(
-                self.experts[e].weight_dequant_scale['up_proj.weight_scale_inv']
+                self.experts[e].weight_dequant_scale['w3.weight_scale_inv']
             )
             self.down_scale_list.append(
-                self.experts[e].weight_dequant_scale['down_proj.weight_scale_inv']
+                self.experts[e].weight_dequant_scale['w2.weight_scale_inv']
             )
 
         self.gate_ptrs_ptr = torch.tensor(

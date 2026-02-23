@@ -8,6 +8,13 @@
 Provides wrappers for MiniMax-M2.5 with FP8 quantization:
 - MiniMaxM25ExpertWrapper: Expert wrapper with FP8 block-wise dequantization
 - MiniMaxM25AttnWrapper: Attention wrapper with GQA + QK norm + partial RoPE
+
+Core engine tensor keys (from parameter_server.py):
+  Expert: w1.weight, w1.weight_scale_inv  (gate_proj)
+          w2.weight, w2.weight_scale_inv  (down_proj)
+          w3.weight, w3.weight_scale_inv  (up_proj)
+  Attn:   q_proj.weight, k_proj.weight, v_proj.weight, o_proj.weight,
+          q_norm.weight, k_norm.weight
 """
 
 import logging
@@ -24,13 +31,21 @@ from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 from .model import rotate_half
 
+try:
+    from batchgen.attention.mla.fa3_backend import w8a16_gemm
+    _HAS_W8A16 = True
+except ImportError:
+    _HAS_W8A16 = False
+
 
 class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
     """Expert wrapper with FP8 dequantization for MiniMax-M2.5.
 
-    Reuses DeepSeek-V3's FP8 block-wise [128,128] dequantization.
-    Expert FFN: gate_proj [1536, 3072], up_proj [1536, 3072], down_proj [3072, 1536]
-    Activation: standard SwiGLU (silu(gate) * up)
+    Wraps _ExpertPlaceholder (not a real nn.Module). All computation is done
+    directly in this wrapper using w8a16_gemm (FP8 weight × BF16 activation).
+
+    Core engine tensor keys: w1 (gate_proj), w2 (down_proj), w3 (up_proj).
+    Activation: standard SwiGLU — silu(w1(x)) * w3(x) → w2(intermediate).
     """
 
     def __init__(self, module, layer_idx, expert_idx, core_engine, engine_config,
@@ -40,9 +55,10 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
             persistent
         )
         self.weight_dequant_scale = weight_dequant_scale or {}
-        self.fp8_gate = None
-        self.fp8_up = None
-        self.fp8_down = None
+        # Cached FP8 weight data (set by _register_fp8_weights for persistent experts)
+        self.fp8_gate = None   # w1.weight
+        self.fp8_up = None     # w3.weight
+        self.fp8_down = None   # w2.weight
 
     def dequantize_weights(self, weights_dict):
         """Dequantize FP8 weights using block-wise scale factors."""
@@ -57,32 +73,54 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
                 result[name] = weight
         return result
 
-    def _register_fp8_weights(self):
-        self.fp8_gate = self.module.gate_proj.weight.data
-        self.fp8_up = self.module.up_proj.weight.data
-        self.fp8_down = self.module.down_proj.weight.data
+    def _register_fp8_weights(self, tensors):
+        """Cache FP8 weights and scales from core_engine tensors.
+
+        Called by PSM._load_local_routed_experts() after wrapping.
+        tensors keys: w1.weight, w1.weight_scale_inv, w2.weight, etc.
+        """
+        self.fp8_gate = tensors["w1.weight"]
+        self.fp8_up = tensors["w3.weight"]
+        self.fp8_down = tensors["w2.weight"]
+        self.weight_dequant_scale = {
+            "w1.weight_scale_inv": tensors["w1.weight_scale_inv"],
+            "w2.weight_scale_inv": tensors["w2.weight_scale_inv"],
+            "w3.weight_scale_inv": tensors["w3.weight_scale_inv"],
+        }
 
     def _unregister_fp8_weights(self):
         self.fp8_gate = None
         self.fp8_up = None
         self.fp8_down = None
 
-    def _forward_impl(self, hidden_states):
-        """Forward using deepgemm kernel (FP8 weight × BF16 activation)."""
-        return self.module.deepgemm_forward(hidden_states, self.weight_dequant_scale)
-
     def forward(self, hidden_states):
-        rank = self.get_rank_safe()
-        if not self.persistent:
-            weights = self.load_weights(self.module_key)
-            for name, param in self.module.named_parameters():
-                param.data = weights[name]
-        else:
-            self.module.gate_proj.weight.data = self.fp8_gate
-            self.module.up_proj.weight.data = self.fp8_up
-            self.module.down_proj.weight.data = self.fp8_down
+        """Forward: FP8 weight × BF16 activation via w8a16_gemm.
 
-        result = self._forward_impl(hidden_states)
+        Non-persistent: load weights from core_engine on demand.
+        Persistent: use cached FP8 weights.
+        SwiGLU: silu(gate(x)) * up(x) → down(intermediate)
+        """
+        if not self.persistent:
+            tensors = self.load_weights(self.module_key)
+            fp8_gate = tensors["w1.weight"]
+            fp8_up = tensors["w3.weight"]
+            fp8_down = tensors["w2.weight"]
+            gate_scale = tensors["w1.weight_scale_inv"]
+            up_scale = tensors["w3.weight_scale_inv"]
+            down_scale = tensors["w2.weight_scale_inv"]
+        else:
+            fp8_gate = self.fp8_gate
+            fp8_up = self.fp8_up
+            fp8_down = self.fp8_down
+            gate_scale = self.weight_dequant_scale["w1.weight_scale_inv"]
+            up_scale = self.weight_dequant_scale["w3.weight_scale_inv"]
+            down_scale = self.weight_dequant_scale["w2.weight_scale_inv"]
+
+        # w8a16: FP8 weight × BF16 activation
+        gate = w8a16_gemm(fp8_gate, gate_scale, hidden_states)
+        up = w8a16_gemm(fp8_up, up_scale, hidden_states)
+        intermediate = F.silu(gate) * up
+        result = w8a16_gemm(fp8_down, down_scale, intermediate)
 
         if not self.persistent:
             torch.cuda.current_stream(

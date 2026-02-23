@@ -7,12 +7,15 @@
 
 Handles model initialization, weight loading, and EP configuration for MiniMax-M2.5.
 
-Key differences from Kimi K2.5 PSM:
-- GQA attention (not MLA) — loads q_proj, k_proj, v_proj, o_proj, q_norm, k_norm
-- FP8 expert weights (not INT4) — uses deepseek_v3_dequantization
-- 256 routed experts (not 384), no shared experts
-- All 62 layers are MoE (no first_k_dense_replace)
-- BF16 attention (same as K2.5)
+Core engine tensor keys (from parameter_server.py):
+  attn_{L}:              q_proj.weight, k_proj.weight, v_proj.weight, o_proj.weight,
+                         q_norm.weight, k_norm.weight
+  routed_expert_{L}_{E}: w1.weight, w1.weight_scale_inv  (gate_proj)
+                         w2.weight, w2.weight_scale_inv  (down_proj)
+                         w3.weight, w3.weight_scale_inv  (up_proj)
+
+Skeleton state dict uses HF checkpoint keys (block_sparse_moe), while model
+uses `mlp` as the nn.Module attribute name. _model_key_to_ckpt_key() maps between them.
 """
 
 from .model import MiniMaxM25
@@ -43,7 +46,11 @@ class MiniMaxM25ParallelStrategyManager:
         self.enable_ep_offloading = False
 
     def configure_prefill(self):
-        """Configure model for prefill (pure DP)."""
+        """Configure model for prefill (pure DP).
+
+        All attn and expert modules are non-persistent (loaded from core_engine
+        buffers on demand). Weight copy tasks include all modules.
+        """
         start_time = time.perf_counter()
         self.loaded_model_config.phase = "prefill"
 
@@ -128,11 +135,17 @@ class MiniMaxM25ParallelStrategyManager:
 
         self.weight_copy_task["routed_expert"] = self.host_routed_experts
 
+        # 1. Load skeleton (norms, embeddings, gate, correction_bias)
         self._load_model_skeleton()
-        self._load_local_routed_experts()
+        # 2. Load attention weights (persistent for decode)
         self._load_attn_module()
+        # 3. Wrap attention modules
         self._config_attn_module()
+        # 4. Wrap expert modules (placeholders → wrappers)
         self._config_expert_module()
+        # 5. Load FP8 weights into persistent expert wrappers
+        self._load_local_routed_experts()
+        # 6. Configure unembedding hook
         self._config_unembedding_hook()
 
         # Set persistent/non-persistent expert lists and offloading flag per layer
@@ -187,40 +200,60 @@ class MiniMaxM25ParallelStrategyManager:
             attn.k_norm.weight.data = tensors["k_norm.weight"].to(device)
 
     def _load_local_routed_experts(self):
-        """Load FP8 weights for persistent routed experts."""
-        for routed_expert_idx in self.local_routed_experts:
-            tensors = self.core_engine.get_tensor(routed_expert_idx)
-            layer_idx = int(routed_expert_idx.split("_")[2])
-            global_expert_idx = int(routed_expert_idx.split("_")[3])
-            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
-            if expert is None:
-                continue
-            for name, param in expert.named_parameters():
-                if name in tensors:
-                    param.data = tensors[name]
+        """Load FP8 weights + scales for persistent routed expert wrappers.
+
+        Must be called AFTER _config_expert_module() so experts[idx] is a wrapper.
+        Core engine tensors: w1.weight, w1.weight_scale_inv, w2.weight, etc.
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        for routed_expert_key in self.local_routed_experts:
+            tensors = self.core_engine.get_tensor(routed_expert_key)
+            layer_idx = int(routed_expert_key.split("_")[2])
+            global_expert_idx = int(routed_expert_key.split("_")[3])
+            wrapper = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
+            # Move tensors to device and register on wrapper
+            device_tensors = {k: v.to(device) for k, v in tensors.items()}
+            wrapper._register_fp8_weights(device_tensors)
+
+    def _model_key_to_ckpt_key(self, key):
+        """Map model parameter name to HF checkpoint key.
+
+        Model uses `mlp` (nn.Module attribute), checkpoint uses `block_sparse_moe`.
+        """
+        return key.replace(".mlp.", ".block_sparse_moe.")
 
     def _load_model_skeleton(self):
-        """Load skeleton weights (norms, embeddings, router, correction bias)."""
+        """Load skeleton weights (norms, embeddings, router, correction bias).
+
+        Skeleton state dict uses HF checkpoint keys (block_sparse_moe).
+        Model named_parameters() uses `mlp`. Map between them.
+        """
+        loaded = 0
         for key, param in self.model.named_parameters():
-            if key in self.skeleton_state_dict:
+            ckpt_key = self._model_key_to_ckpt_key(key)
+            if ckpt_key in self.skeleton_state_dict:
+                param.data = self.skeleton_state_dict[ckpt_key]
+                loaded += 1
+            elif key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
+                loaded += 1
 
         # Also load buffers (e_score_correction_bias)
         for key, buf in self.model.named_buffers():
-            if key in self.skeleton_state_dict:
+            ckpt_key = self._model_key_to_ckpt_key(key)
+            if ckpt_key in self.skeleton_state_dict:
+                buf.data = self.skeleton_state_dict[ckpt_key]
+                loaded += 1
+            elif key in self.skeleton_state_dict:
                 buf.data = self.skeleton_state_dict[key]
+                loaded += 1
 
         if self.rank == 0:
             size_gb = sum(p.numel() * p.element_size() for p in self.model.parameters()) / (1024**3)
-            logging.info(f"Model skeleton size: {size_gb:.2f} GB")
+            logging.info(f"Model skeleton: {loaded} tensors loaded, {size_gb:.2f} GB")
 
     def _config_attn_module(self):
-        """Configure GQA attention wrappers.
-
-        Prefill attention (Q/K/V projection, QK norm, partial RoPE, FA varlen)
-        is handled inline in MiniMaxM25AttnWrapper._forward_prefill.
-        No method injection needed — wrapper calls gqa_prefill_fa directly.
-        """
+        """Configure GQA attention wrappers."""
         for layer_idx in range(len(self.model.model.layers)):
             attn_module = self.model.model.layers[layer_idx].self_attn
 
@@ -232,7 +265,12 @@ class MiniMaxM25ParallelStrategyManager:
             self.model.model.layers[layer_idx].self_attn = wrapper
 
     def _config_expert_module(self):
-        """Replace expert modules with FP8 wrappers."""
+        """Replace expert placeholders with FP8 wrappers.
+
+        Wrappers are created around placeholders. For persistent experts,
+        FP8 weights are loaded later by _load_local_routed_experts().
+        For non-persistent experts, weights are loaded from core_engine on demand.
+        """
         for layer_idx in range(len(self.model.model.layers)):
             layer = self.model.model.layers[layer_idx]
             for expert_idx in range(len(layer.mlp.experts)):
@@ -242,36 +280,11 @@ class MiniMaxM25ParallelStrategyManager:
                 module_key = f"routed_expert_{layer_idx}_{expert_idx}"
                 persistent = module_key not in self.weight_copy_task.get("routed_expert", [])
 
-                weight_dequant_scale = self._extract_dequant_scales(layer_idx, expert_idx)
-
                 wrapper = MiniMaxM25ExpertWrapper(
                     expert, layer_idx, expert_idx, self.core_engine,
                     self.engine_config, self.model_config, persistent,
-                    weight_dequant_scale=weight_dequant_scale,
                 )
-                if persistent:
-                    wrapper._register_fp8_weights()
-                    for key, value in wrapper.weight_dequant_scale.items():
-                        wrapper.weight_dequant_scale[key] = value.to(
-                            self.engine_config.Basic_Config.device_torch
-                        )
                 layer.mlp.experts[expert_idx] = wrapper
-
-    def _extract_dequant_scales(self, layer_idx, expert_idx):
-        """Extract FP8 dequant scale factors for an expert.
-
-        HF checkpoint naming: w1=gate_proj, w2=down_proj, w3=up_proj.
-        Wrapper expects: gate_proj.weight_scale_inv, up_proj.weight_scale_inv, down_proj.weight_scale_inv.
-        """
-        scales = {}
-        prefix = f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}"
-        # w1 -> gate_proj, w2 -> down_proj, w3 -> up_proj
-        hf_to_bg = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-        for hf_name, bg_name in hf_to_bg.items():
-            full_key = f"{prefix}.{hf_name}.weight_scale_inv"
-            if full_key in self.skeleton_state_dict:
-                scales[f"{bg_name}.weight_scale_inv"] = self.skeleton_state_dict[full_key]
-        return scales
 
     def _unembedding_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)
