@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
+from .model import rotate_half
 
 
 class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
@@ -111,27 +112,90 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         return weights_dict
 
     def _forward_prefill(self, hidden_states, **kwargs):
-        """Prefill forward using GQA FlashAttention."""
-        attention_mask = kwargs.get("attention_mask", None)
-        position_ids = kwargs.get("position_ids", None)
+        """Prefill forward: Q/K/V projection + QK norm + partial RoPE + FA varlen.
 
-        if self.prepack_mode:
+        Follows GPT-OSS pattern: all attention logic inline in wrapper,
+        calling gqa_prefill_fa directly (no setattr injection).
+        """
+        from batchgen.attention.gqa import gqa_prefill_fa
+        from batchgen.attention.fused_kernels import cuda_rmsnorm
+
+        # Always prepack mode in production prefill
+        if hidden_states.dim() == 3:
+            assert hidden_states.shape[0] == 1, "Prepack mode expects batch_size=1"
             hidden_states_2d = hidden_states.squeeze(0)
-            attn_output, k_for_cache, v_for_cache = self.module.prefill_attn_gqa_prepacked(
-                hidden_states_2d,
-                self.position_ids.to(hidden_states_2d.device),
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
-            )
-            self._offload_prepacked_kv_gqa(k_for_cache, v_for_cache)
-            attn_output = attn_output.unsqueeze(0)
-            return (attn_output, None, None)
         else:
-            attn_output, k_for_cache, v_for_cache = self.module.prefill_attn_gqa(
-                hidden_states, attention_mask, position_ids,
-            )
-            return (attn_output, None, (k_for_cache, v_for_cache))
+            hidden_states_2d = hidden_states
+
+        total_tokens = hidden_states_2d.shape[0]
+        cu_seqlens = self.prepack_cu_seqlens.to(hidden_states_2d.device)
+        max_seqlen = self.prepack_max_seqlen
+        position_ids = self.position_ids.to(hidden_states_2d.device)
+
+        # Q/K/V projection
+        query = self.module.q_proj(hidden_states_2d)   # [total_tokens, num_heads * head_dim]
+        key = self.module.k_proj(hidden_states_2d)     # [total_tokens, num_kv_heads * head_dim]
+        value = self.module.v_proj(hidden_states_2d)   # [total_tokens, num_kv_heads * head_dim]
+
+        # QK Norm (on flat projected dims, before reshape)
+        query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
+        key = cuda_rmsnorm(key, self.module.k_norm.weight, self.module.k_norm.eps)
+
+        # Reshape to [total_tokens, num_heads, head_dim]
+        num_heads = self.module.num_heads
+        num_kv_heads = self.module.num_kv_heads
+        head_dim = self.module.head_dim
+        rotary_dim = self.module.rotary_dim
+
+        query = query.view(total_tokens, num_heads, head_dim)
+        key = key.view(total_tokens, num_kv_heads, head_dim)
+        value = value.view(total_tokens, num_kv_heads, head_dim)
+
+        # Partial RoPE (rotate first rotary_dim=64 dims, passthrough rest)
+        cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+        cos = cos[position_ids]  # [total_tokens, rotary_dim]
+        sin = sin[position_ids]
+
+        # Apply RoPE to rotary part only
+        q_rot = query[..., :rotary_dim]
+        q_pass = query[..., rotary_dim:]
+        k_rot = key[..., :rotary_dim]
+        k_pass = key[..., rotary_dim:]
+
+        cos = cos.unsqueeze(1)  # [total_tokens, 1, rotary_dim]
+        sin = sin.unsqueeze(1)
+
+        query = torch.cat([
+            q_rot * cos + rotate_half(q_rot) * sin,
+            q_pass,
+        ], dim=-1)
+        key = torch.cat([
+            k_rot * cos + rotate_half(k_rot) * sin,
+            k_pass,
+        ], dim=-1)
+
+        # FlashAttention varlen GQA
+        attn_output, lse = gqa_prefill_fa(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+        )
+
+        # Output projection: [total_tokens, num_heads * head_dim] -> [total_tokens, hidden_size]
+        attn_output = attn_output.view(total_tokens, num_heads * head_dim)
+        attn_output = self.module.o_proj(attn_output)
+
+        # Offload KV cache to host
+        torch.cuda.current_stream().synchronize()
+        self._offload_prepacked_kv_gqa(key.view(total_tokens, num_kv_heads, head_dim),
+                                        value)
+
+        attn_output = attn_output.unsqueeze(0)
+        return (attn_output, None, None)
 
     def _offload_prepacked_kv_gqa(self, k_cache, v_cache):
         """Offload GQA KV cache per-sequence to host memory."""
@@ -157,33 +221,105 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             )
 
     def _forward_decode(self, hidden_states, **kwargs):
-        """Decode forward using GQA FlashAttention with paged KV cache."""
-        position_ids = AttnWrapperBase.position_ids
+        """Decode forward: Q/K/V + QK norm + partial RoPE + paged KV FA.
+
+        Follows GPT-OSS pattern: all attention logic inline in wrapper.
+        """
+        from batchgen.attention.gqa import gqa_decode_fa
+        from batchgen.attention.fused_kernels import cuda_rmsnorm
+
+        batch_slice = kwargs.get("batch_slice", None)
+        batch, seq_len, _ = hidden_states.shape
+        assert seq_len == 1, "Decode expects single token"
+
+        if batch == 0 or hidden_states.numel() == 0:
+            return (hidden_states, None, None)
+
+        gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
         cache_seqlens = AttnWrapperBase.cache_seqlens
+
+        # Micro-batch slicing
+        micro_cache_seqlens = cache_seqlens
+        if cache_seqlens is not None and batch_slice is not None:
+            start_idx, end_idx = batch_slice
+            micro_cache_seqlens = cache_seqlens[start_idx:end_idx]
+
+        current_token_position = micro_cache_seqlens - 1 if micro_cache_seqlens is not None else None
+
+        num_heads = self.module.num_heads
+        num_kv_heads = self.module.num_kv_heads
+        head_dim = self.module.head_dim
+        rotary_dim = self.module.rotary_dim
+
+        # Q/K/V projection
+        query = self.module.q_proj(hidden_states)
+        key = self.module.k_proj(hidden_states)
+        value = self.module.v_proj(hidden_states)
+
+        # QK Norm
+        query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
+        key = cuda_rmsnorm(key, self.module.k_norm.weight, self.module.k_norm.eps)
+
+        # Reshape: [batch, 1, num_heads, head_dim]
+        query = query.view(batch, seq_len, num_heads, head_dim)
+        key = key.view(batch, seq_len, num_kv_heads, head_dim)
+        value = value.view(batch, seq_len, num_kv_heads, head_dim)
+
+        # Partial RoPE
         max_seqlen = AttnWrapperBase.max_seqlen
-        gpu_paged_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+        cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+        cos = cos[current_token_position].unsqueeze(1)  # [batch, 1, rotary_dim]
+        sin = sin[current_token_position].unsqueeze(1)
 
-        if gpu_paged_kv_manager is not None:
-            attn_output, k_tensor, v_tensor = self.module.decoding_attn_gqa_paged(
-                hidden_states, position_ids, cache_seqlens, max_seqlen,
-                gpu_paged_kv_manager, self.layer_idx,
-            )
-            if AttnWrapperBase.kv_append_callback is not None:
-                AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, v_tensor)
-            return (attn_output, None, None)
-        else:
-            # Fallback
-            past_key_states = AttnWrapperBase.past_key_states
-            past_value_states = AttnWrapperBase.past_value_states
-            attention_mask = AttnWrapperBase.attention_mask
+        q_rot = query[..., :rotary_dim]
+        q_pass = query[..., rotary_dim:]
+        k_rot = key[..., :rotary_dim]
+        k_pass = key[..., rotary_dim:]
 
-            attn_output, attn_weights, present = self.module(
-                hidden_states, attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=(
-                    past_key_states[self.layer_idx] if past_key_states else None,
-                    past_value_states[self.layer_idx] if past_value_states else None,
-                ),
-                use_cache=True,
-            )
-            return (attn_output, present[0] if present else None, present[1] if present else None)
+        query = torch.cat([
+            q_rot * cos + rotate_half(q_rot) * sin,
+            q_pass,
+        ], dim=-1)
+        key = torch.cat([
+            k_rot * cos + rotate_half(k_rot) * sin,
+            k_pass,
+        ], dim=-1)
+
+        # Write new K,V to paged GPU cache
+        gpu_kv_manager.update_layer_decode_new_token(
+            k_tensor=key,
+            v_tensor=value,
+            sequence_lengths=current_token_position,
+            layer_idx=self.layer_idx,
+            batch_slice=batch_slice,
+        )
+
+        # Retrieve paged KV cache
+        k_cache_layer, v_cache_layer, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
+            self.layer_idx
+        )
+        if batch_slice is not None:
+            start_idx, end_idx = batch_slice
+            page_table = page_table[start_idx:end_idx]
+
+        cache_seqlens_for_attn = micro_cache_seqlens
+
+        # FlashAttention decode with paged KV
+        attn_output, _ = gqa_decode_fa(
+            q=query,
+            k_cache=k_cache_layer,
+            v_cache=v_cache_layer,
+            cache_seqlens=cache_seqlens_for_attn,
+            block_table=page_table,
+        )
+
+        # Output projection
+        attn_output = attn_output.view(batch, 1, num_heads * head_dim)
+        attn_output = self.module.o_proj(attn_output)
+
+        # Append KV to host
+        kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)
+        if kv_append_callback is not None:
+            kv_append_callback(self.layer_idx, key, value)
+
+        return (attn_output, None, None)

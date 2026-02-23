@@ -18,7 +18,6 @@ Key differences from Kimi K2.5 PSM:
 from .model import MiniMaxM25Model
 from .wrappers import MiniMaxM25ExpertWrapper, MiniMaxM25AttnWrapper
 import logging
-import types
 import time
 import torch
 import gc
@@ -216,27 +215,14 @@ class MiniMaxM25ParallelStrategyManager:
             logging.info(f"Model skeleton size: {size_gb:.2f} GB")
 
     def _config_attn_module(self):
-        """Configure GQA attention wrappers with FA3/FA2."""
+        """Configure GQA attention wrappers.
+
+        Prefill attention (Q/K/V projection, QK norm, partial RoPE, FA varlen)
+        is handled inline in MiniMaxM25AttnWrapper._forward_prefill.
+        No method injection needed — wrapper calls gqa_prefill_fa directly.
+        """
         for layer_idx in range(len(self.model.layers)):
             attn_module = self.model.layers[layer_idx].self_attn
-
-            # Inject GQA prefill/decode methods
-            if self.engine_config.Basic_Config.gpu_arch == "hopper":
-                from batchgen.attention.gqa.fa_prefill import gqa_prefill_fa3, gqa_prefill_fa3_prepacked
-                from batchgen.attention.gqa.fa_decode import gqa_decode_fa3_paged
-                setattr(attn_module, "prefill_attn_gqa",
-                        types.MethodType(gqa_prefill_fa3, attn_module))
-                setattr(attn_module, "prefill_attn_gqa_prepacked",
-                        types.MethodType(gqa_prefill_fa3_prepacked, attn_module))
-                setattr(attn_module, "decoding_attn_gqa_paged",
-                        types.MethodType(gqa_decode_fa3_paged, attn_module))
-            elif self.engine_config.Basic_Config.gpu_arch == "ampere":
-                from batchgen.attention.gqa.fa_prefill import gqa_prefill_fa2
-                from batchgen.attention.gqa.fa_decode import gqa_decode_fa2_paged
-                setattr(attn_module, "prefill_attn_gqa",
-                        types.MethodType(gqa_prefill_fa2, attn_module))
-                setattr(attn_module, "decoding_attn_gqa_paged",
-                        types.MethodType(gqa_decode_fa2_paged, attn_module))
 
             persistent = f"attn_{layer_idx}" not in self.weight_copy_task.get("attn", [])
             wrapper = MiniMaxM25AttnWrapper(
