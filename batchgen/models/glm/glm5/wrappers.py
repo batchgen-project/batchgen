@@ -426,7 +426,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # position_ids = cache_seqlens - 1 = 0-based position of the new token
             # Must match primary cache write position (Step 1 uses position_ids)
             new_token_pos = position_ids.squeeze(-1)  # [batch]
-            indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=new_token_pos)
+            indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=new_token_pos, max_seqlen=max_seqlen)
             indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
             seq_lengths_i32_aux = new_token_pos.to(dtype=torch.int32, device=gpu_paged_kv_manager_aux.device)
             gpu_paged_kv_manager_aux.update_layer_decode_new_token(

@@ -21,7 +21,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -125,26 +125,31 @@ def apply_rotary_pos_emb_split(
 # DSA Indexer
 # ============================================================================
 
+_hadamard_matrix_cache: Dict[Tuple, torch.Tensor] = {}
+
+
+def _get_hadamard_matrix(dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return cached Hadamard matrix H/sqrt(dim) via Sylvester construction."""
+    key = (dim, device, dtype)
+    if key not in _hadamard_matrix_cache:
+        H = torch.tensor([[1.0]], device=device, dtype=dtype)
+        while H.shape[0] < dim:
+            H = torch.cat([torch.cat([H, H], dim=1),
+                           torch.cat([H, -H], dim=1)], dim=0)
+        _hadamard_matrix_cache[key] = H * (dim ** -0.5)
+    return _hadamard_matrix_cache[key]
+
+
 def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     """Hadamard transform with 1/sqrt(dim) scaling. x last dim must be power of 2."""
     try:
         from fast_hadamard_transform import hadamard_transform
+        return hadamard_transform(x.contiguous(), scale=x.shape[-1] ** -0.5)
     except ImportError:
-        # Fallback: naive O(n*n) Hadamard via recursion — only for small dims
         dim = x.shape[-1]
         assert dim & (dim - 1) == 0, f"Hadamard requires power-of-2 dim, got {dim}"
-        # Use Walsh-Hadamard via recursive butterfly
-        y = x.clone()
-        h = 1
-        while h < dim:
-            for i in range(0, dim, h * 2):
-                a = y[..., i:i+h].clone()
-                b = y[..., i+h:i+2*h].clone()
-                y[..., i:i+h] = a + b
-                y[..., i+h:i+2*h] = a - b
-            h *= 2
-        return y * (dim ** -0.5)
-    return hadamard_transform(x.contiguous(), scale=x.shape[-1] ** -0.5)
+        H = _get_hadamard_matrix(dim, x.device, x.dtype)
+        return x @ H
 
 
 class Glm5Indexer(nn.Module):
@@ -189,14 +194,15 @@ class Glm5Indexer(nn.Module):
         # RoPE — assigned externally after construction (shares main attention's rotary_emb)
         self.rotary_emb: Optional[nn.Module] = None
 
-    def _apply_rope_to_k(self, k: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def _apply_rope_to_k(self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None) -> torch.Tensor:
         """Apply RoPE to first rope_head_dim dims of K [batch, seq, head_dim].
 
         positions: [batch] or [batch, seq] integer position IDs.
+        max_seqlen: if provided, avoids CPU-GPU sync from int(positions.max()).
         """
         k_rope = k[..., :self.rope_head_dim]
         k_nope = k[..., self.rope_head_dim:]
-        seq_len = int(positions.max()) + 1
+        seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
         cos, sin = self.rotary_emb(k_rope, seq_len)
         # Index cos/sin by position: positions may be [batch] (decode) or [batch, seq] (prefill)
         cos = cos[positions]  # [batch, ...rope_dim*2]
@@ -227,6 +233,7 @@ class Glm5Indexer(nn.Module):
 
     def compute_indexer_kv(
         self, hidden_states: torch.Tensor, positions: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """Compute indexer K for cache storage.
 
@@ -236,6 +243,7 @@ class Glm5Indexer(nn.Module):
             hidden_states: [batch, seq_len, hidden_size]
             positions: [batch, seq_len] or [seq_len] — token positions for RoPE.
                        If None, RoPE and Hadamard are skipped (backwards compat).
+            max_seqlen: max sequence length (int) to avoid CPU-GPU sync in RoPE.
 
         Returns:
             indexer_k: [batch, seq_len, 1, head_dim] shaped for paged KV manager
@@ -245,7 +253,7 @@ class Glm5Indexer(nn.Module):
         k = self.k_norm(k)
 
         if positions is not None and self.rotary_emb is not None:
-            k = self._apply_rope_to_k(k, positions)
+            k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
             # Hadamard transform on full head_dim
             orig_shape = k.shape
             k = _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
