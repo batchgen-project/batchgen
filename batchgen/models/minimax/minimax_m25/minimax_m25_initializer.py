@@ -128,10 +128,8 @@ class MiniMaxM25Initializer:
             * (ec.Basic_Config.max_decoding_length + ec.Basic_Config.padding_length)
         )
 
-        # attn_mode: 3 for multi-node EP decode, 1 for single-node
-        if ec.Basic_Config.world_size > 8:
-            ec.Basic_Config.attn_mode = 3
-        elif ec.EP_Config.enable_offloading:
+        # attn_mode: 3 for EP decode (MiniMax always uses EP with 256 experts)
+        if ec.Basic_Config.world_size > 1:
             ec.Basic_Config.attn_mode = 3
         else:
             ec.Basic_Config.attn_mode = 1
