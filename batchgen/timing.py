@@ -95,6 +95,13 @@ class TimingStats:
     def log_summary(self):
         if not self.enabled:
             return
+        # Only log on rank 0 to avoid interleaved output from multiple ranks
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return
+        except Exception:
+            pass
         total_all = sum(self._totals.values())
         if total_all <= 0:
             return
