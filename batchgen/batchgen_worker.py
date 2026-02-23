@@ -4476,11 +4476,13 @@ class BatchGenWorker:
 
 		tokens_list = tokens.tolist()
 
-		# Find first EOS token position (after min_tokens)
-		eos_positions = [i for i, t in enumerate(tokens_list) if t == self.eos_token_id and i >= min_tokens]
+		# Find first stop token position (after min_tokens)
+		eos_positions = [i for i, t in enumerate(tokens_list) if t in self._stop_token_ids and i >= min_tokens]
 
 		if eos_positions:
 			end_pos = eos_positions[0]
+			if self.detokenization_include_special_tokens:
+				end_pos += 1  # Include the stop token itself
 		else:
 			# No EOS found, use all non-zero tokens
 			# Find last non-zero token
