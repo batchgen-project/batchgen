@@ -88,6 +88,10 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
             "w3.weight_scale_inv": tensors["w3.weight_scale_inv"],
         }
 
+    def clear_weights(self):
+        """No-op: _ExpertPlaceholder has no nn.Module parameters to clear."""
+        pass
+
     def _unregister_fp8_weights(self):
         self.fp8_gate = None
         self.fp8_up = None
