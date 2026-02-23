@@ -125,50 +125,120 @@ def apply_rotary_pos_emb_split(
 # DSA Indexer
 # ============================================================================
 
+def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Hadamard transform with 1/sqrt(dim) scaling. x last dim must be power of 2."""
+    try:
+        from fast_hadamard_transform import hadamard_transform
+    except ImportError:
+        # Fallback: naive O(n*n) Hadamard via recursion — only for small dims
+        dim = x.shape[-1]
+        assert dim & (dim - 1) == 0, f"Hadamard requires power-of-2 dim, got {dim}"
+        # Use Walsh-Hadamard via recursive butterfly
+        y = x.clone()
+        h = 1
+        while h < dim:
+            for i in range(0, dim, h * 2):
+                a = y[..., i:i+h].clone()
+                b = y[..., i+h:i+2*h].clone()
+                y[..., i:i+h] = a + b
+                y[..., i+h:i+2*h] = a - b
+            h *= 2
+        return y * (dim ** -0.5)
+    return hadamard_transform(x.contiguous(), scale=x.shape[-1] ** -0.5)
+
+
 class Glm5Indexer(nn.Module):
-    """Lightning Indexer for DSA (DeepSeek Sparse Attention).
+    """NSA (Nested Sparse Attention) Indexer for GLM-5.
 
-    GLM-5 indexer components:
-    - wk: K projection from hidden_states [index_dim, hidden_size] (FP8)
-    - wq_b: Q B-projection from q_a intermediate [index_dim, q_lora_rank] (FP8)
-    - k_norm: RMSNorm on K output (with bias) [index_dim]
-    - weights_proj: Per-head importance scoring [index_n_heads, hidden_size] (BF16)
+    Uses MQA (Multi-Query Attention) pattern for scoring:
+    - K is single-head: hidden_states -> wk [hidden_size -> head_dim=128] -> k_norm
+      -> RoPE(first 64 dims) -> Hadamard transform -> cache
+    - Q is multi-head: q_a -> wq_b [q_lora_rank -> n_heads*head_dim=4096] -> reshape
+      -> RoPE(first 64 dims) -> Hadamard transform
+    - Scoring: Q[n_heads, head_dim] @ K[1, head_dim]^T (K broadcast across heads)
+    - Head gates: weights_proj[hidden_size -> n_heads] modulate per-head scores
+    - Aggregate across heads -> top-K selection
 
-    The Q path shares q_a from the main MLA attention, then applies wq_b.
-    The K path: hidden_states -> wk -> k_norm -> indexer K.
-    Scoring: importance scores from weights_proj modulate Q@K scoring.
+    The K cached per token is only head_dim=128 (not n_heads*head_dim=4096).
+    Reference: sglang nsa_indexer.py
     """
 
     def __init__(self, config: Glm5Config, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
-        self.index_n_heads = config.index_n_heads
-        self.index_head_dim = config.index_head_dim
-        self.index_topk = config.index_topk
-        self.index_dim = config.index_n_heads * config.index_head_dim  # 4096
+        self.index_n_heads = config.index_n_heads   # 32
+        self.index_head_dim = config.index_head_dim  # 128
+        self.index_topk = config.index_topk          # 2048
+        self.rope_head_dim = config.qk_rope_head_dim  # 64 — first 64 dims get RoPE
+        self.softmax_scale = config.index_head_dim ** -0.5
 
-        # K path: hidden -> wk -> k_norm
-        self.wk = nn.Linear(config.hidden_size, self.index_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.index_dim)  # Has weight + bias
+        # K path: hidden -> wk -> k_norm -> RoPE -> Hadamard (MQA: single head, dim=128)
+        self.wk = nn.Linear(config.hidden_size, config.index_head_dim, bias=False)
+        self.k_norm = nn.LayerNorm(config.index_head_dim)  # Has weight + bias
 
-        # Q path: q_a (from main attention) -> wq_b
-        self.wq_b = nn.Linear(config.q_lora_rank, self.index_dim, bias=False)
+        # Q path: q_a (from main attention) -> wq_b (multi-head, dim=4096) -> RoPE -> Hadamard
+        self.wq_b = nn.Linear(
+            config.q_lora_rank,
+            config.index_n_heads * config.index_head_dim,
+            bias=False,
+        )
 
-        # Importance scoring
-        self.weights_proj = nn.Linear(config.hidden_size, self.index_n_heads, bias=False)
+        # Per-head importance scoring
+        self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
 
-    def compute_indexer_kv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # RoPE — assigned externally after construction (shares main attention's rotary_emb)
+        self.rotary_emb: Optional[nn.Module] = None
+
+    def _apply_rope_to_k(self, k: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Apply RoPE to first rope_head_dim dims of K [batch, seq, head_dim]."""
+        k_rope = k[..., :self.rope_head_dim]
+        k_nope = k[..., self.rope_head_dim:]
+        cos, sin = self.rotary_emb(k_rope, positions)  # type: ignore[misc]
+        # K is [batch, seq, rope_dim] — treat as single-head for RoPE
+        # apply_rotary_pos_emb_interleaved expects [batch, seq, num_heads, head_dim]
+        # but we can apply it on the last dim directly
+        k_rope = k_rope.unsqueeze(2)  # [batch, seq, 1, rope_dim]
+        # Use same zero-size dummy for the second arg
+        k_rope, _ = apply_rotary_pos_emb_interleaved(k_rope, k_rope, cos, sin)
+        k_rope = k_rope.squeeze(2)
+        return torch.cat([k_rope, k_nope], dim=-1)
+
+    def _apply_rope_to_q(self, q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Apply RoPE to first rope_head_dim dims of Q [batch, n_heads, head_dim]."""
+        q_rope = q[..., :self.rope_head_dim]
+        q_nope = q[..., self.rope_head_dim:]
+        cos, sin = self.rotary_emb(q_rope.view(-1, 1, self.rope_head_dim), positions)  # type: ignore[misc]
+        q_rope = q_rope.unsqueeze(2)  # [batch, n_heads, 1, rope_dim]
+        q_rope, _ = apply_rotary_pos_emb_interleaved(q_rope, q_rope, cos, sin)
+        q_rope = q_rope.squeeze(2)
+        return torch.cat([q_rope, q_nope], dim=-1)
+
+    def compute_indexer_kv(
+        self, hidden_states: torch.Tensor, positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute indexer K for cache storage.
+
+        Pipeline: wk -> k_norm -> RoPE(first 64 dims) -> Hadamard -> cache
 
         Args:
             hidden_states: [batch, seq_len, hidden_size]
+            positions: [batch, seq_len] or [seq_len] — token positions for RoPE.
+                       If None, RoPE and Hadamard are skipped (backwards compat).
 
         Returns:
-            indexer_k: [batch, seq_len, 1, index_dim] shaped for paged KV manager
+            indexer_k: [batch, seq_len, 1, head_dim] shaped for paged KV manager
+                       head_dim=128 (single MQA head)
         """
-        k = self.wk(hidden_states)
+        k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
         k = self.k_norm(k)
-        return k.unsqueeze(2)  # [batch, seq_len, 1, index_dim]
+
+        if positions is not None and self.rotary_emb is not None:
+            k = self._apply_rope_to_k(k, positions)
+            # Hadamard transform on full head_dim
+            orig_shape = k.shape
+            k = _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
+
+        return k.unsqueeze(2)  # [batch, seq_len, 1, head_dim]
 
     def score_and_select(
         self,
@@ -176,14 +246,19 @@ class Glm5Indexer(nn.Module):
         hidden_states: torch.Tensor,
         cached_k: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Score cached tokens and select top-K.
+        """Score cached tokens via MQA Q@K and select top-K.
+
+        K is already RoPE'd + Hadamard'd in cache.
+        Q gets: wq_b -> reshape -> RoPE -> Hadamard -> score against cached K.
 
         Args:
             q_a: [batch, 1, q_lora_rank] — q_a intermediate from main attention
-            hidden_states: [batch, 1, hidden_size] — for importance scoring
-            cached_k: [batch, max_seqlen, index_dim] — gathered indexer K cache
+            hidden_states: [batch, 1, hidden_size] — for head gate scoring
+            cached_k: [batch, max_seqlen, head_dim] — gathered indexer K (128-dim, with RoPE+Hadamard)
             cache_seqlens: [batch] — valid lengths
+            positions: [batch] or [batch, 1] — current token positions for Q RoPE
 
         Returns:
             top_k_indices: [batch, index_topk]
@@ -191,22 +266,26 @@ class Glm5Indexer(nn.Module):
         batch_size = q_a.shape[0]
         max_seqlen = cached_k.shape[1]
 
-        # Q from shared q_a intermediate
-        q = self.wq_b(q_a)  # [batch, 1, index_dim]
+        # Q from shared q_a intermediate: [batch, 1, q_lora_rank] -> [batch, n_heads, head_dim]
+        q = self.wq_b(q_a)  # [batch, 1, n_heads * head_dim]
         q = q.view(batch_size, self.index_n_heads, self.index_head_dim)
 
-        # Reshape cached K
-        cached_k = cached_k.view(batch_size, max_seqlen, self.index_n_heads, self.index_head_dim)
-        cached_k = cached_k.permute(0, 2, 1, 3)  # [batch, n_heads, max_seqlen, head_dim]
+        # Apply RoPE + Hadamard to Q (must match cached K processing)
+        if positions is not None and self.rotary_emb is not None:
+            q = self._apply_rope_to_q(q, positions)
+            q = _hadamard_transform(q.to(torch.bfloat16)).to(q.dtype)
 
-        # Q @ K^T
+        # MQA: K is [batch, max_seqlen, head_dim] — no per-head dim
+        # Q @ K^T: [batch, n_heads, 1, head_dim] @ [batch, 1, head_dim, max_seqlen]
         q = q.unsqueeze(2)  # [batch, n_heads, 1, head_dim]
-        scores = torch.matmul(q, cached_k.transpose(-2, -1))  # [batch, n_heads, 1, max_seqlen]
+        cached_k_t = cached_k.transpose(1, 2).unsqueeze(1)  # [batch, 1, head_dim, max_seqlen]
+        scores = torch.matmul(q, cached_k_t)  # [batch, n_heads, 1, max_seqlen]
         scores = scores.squeeze(2)  # [batch, n_heads, max_seqlen]
 
-        # Importance weighting
-        importance = self.weights_proj(hidden_states.squeeze(1))  # [batch, n_heads]
-        scores = scores * importance.unsqueeze(-1)  # [batch, n_heads, max_seqlen]
+        # Head gate weighting (reference: weights * n_heads^-0.5 * softmax_scale)
+        head_gates = self.weights_proj(hidden_states.squeeze(1))  # [batch, n_heads]
+        head_gates = head_gates.float() * (self.index_n_heads ** -0.5) * self.softmax_scale
+        scores = scores * head_gates.unsqueeze(-1)  # [batch, n_heads, max_seqlen]
 
         # Mask invalid positions
         position_indices = torch.arange(max_seqlen, device=scores.device).unsqueeze(0)
@@ -228,6 +307,7 @@ class Glm5Indexer(nn.Module):
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         page_size: int = 64,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Score cached tokens from paged cache and select top-K.
 
@@ -236,11 +316,12 @@ class Glm5Indexer(nn.Module):
 
         Args:
             q_a: [batch, 1, q_lora_rank] — q_a intermediate from main attention
-            hidden_states: [batch, 1, hidden_size] — for importance scoring
-            indexer_blocked_k: [num_pages, page_size, 1, index_dim] — paged indexer cache
+            hidden_states: [batch, 1, hidden_size] — for head gate scoring
+            indexer_blocked_k: [num_pages, page_size, 1, head_dim] — paged indexer cache
             block_table: [batch, max_num_pages_per_seq] — page mapping
             cache_seqlens: [batch] — valid lengths
             page_size: tokens per page
+            positions: [batch] — current token positions for Q RoPE
 
         Returns:
             top_k_indices: [batch, index_topk] — absolute token positions
@@ -248,13 +329,15 @@ class Glm5Indexer(nn.Module):
         from batchgen.attention.dsa.indexer import _gather_all_from_paged_cache
 
         max_seqlen = int(cache_seqlens.max().item())
-        # gathered: [batch, max_seqlen, 1, index_dim]
+        # gathered: [batch, max_seqlen, 1, head_dim]
         gathered_k = _gather_all_from_paged_cache(
             indexer_blocked_k, block_table, cache_seqlens, page_size, max_seqlen
         )
-        # Squeeze num_k_heads dim: [batch, max_seqlen, index_dim]
+        # Squeeze num_k_heads dim: [batch, max_seqlen, head_dim]
         gathered_k = gathered_k.squeeze(2)
-        return self.score_and_select(q_a, hidden_states, gathered_k, cache_seqlens)
+        return self.score_and_select(
+            q_a, hidden_states, gathered_k, cache_seqlens, positions=positions,
+        )
 
 
 # ============================================================================
@@ -1050,9 +1133,11 @@ class Glm5Model(nn.Module):
         self.layers = nn.ModuleList(
             [Glm5DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        # Assign shared RoPE
+        # Assign shared RoPE to attention and indexer
         for layer in self.layers:
             layer.self_attn.rotary_emb = self._shared_rotary_emb
+            if hasattr(layer.self_attn, 'indexer'):
+                layer.self_attn.indexer.rotary_emb = self._shared_rotary_emb
 
         self.norm = Glm5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

@@ -106,11 +106,11 @@ _GLM5_MLA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
-# GLM-5 DSA: indexer cache (78 layers, index_dim=32*128=4096)
+# GLM-5 DSA: indexer cache (78 layers, MQA single-head K, head_dim=128)
 _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	num_layers=78,
 	num_k_heads=1,
-	k_head_dim=4096,
+	k_head_dim=128,
 	num_v_heads=0,
 	v_head_dim=0,
 	kv_dtype="bfloat16",

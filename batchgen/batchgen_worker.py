@@ -52,6 +52,7 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 	is_dsa_model,
 )
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
+from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
 from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits, get_prepack_stats, PrepackMetadata
 
@@ -343,22 +344,35 @@ class BatchGenWorker:
 		self.host_kv_cache_size = args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 		
-		worker_kv_config = build_host_kv_config(
+		# DSA models: create DualHostKVCoordinator with proportional budget split
+		host_budget_bytes = int(args.global_host_kv_cache_size_gb * (1024**3))
+		dual_host = DualHostKVCoordinator.from_budget(
 			model_name=args.model_name,
-			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
+			host_kv_cache_size=host_budget_bytes,
+			core_engine_module=core_engine,
 		)
-
-		# Select worker view based on model's KV cache configuration
-		# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
-		if worker_kv_config.num_v_heads == 0:
-			self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+		if dual_host is not None:
+			self.host_paged_kv_worker_view = dual_host
+			logging.info(f"Rank {self.rank}: Initializing DualHostKVCoordinator with parallel cudaHostRegister (local_rank={self.local_rank})")
+			dual_host.initialize(device_index=self.local_rank, create_region=False)
+			logging.info(f"Rank {self.rank}: DualHostKVCoordinator cudaHostRegister completed (local_rank={self.local_rank})")
 		else:
-			self.host_paged_kv_worker_view = core_engine.DefaultHostPagedKVWorkerView(worker_kv_config)
+			worker_kv_config = build_host_kv_config(
+				model_name=args.model_name,
+				host_kv_cache_size=host_budget_bytes,
+			)
 
-		# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
-		logging.info(f"Rank {self.rank}: Initializing Host KV view with parallel cudaHostRegister (local_rank={self.local_rank})")
-		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
-		logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
+			# Select worker view based on model's KV cache configuration
+			# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
+			if worker_kv_config.num_v_heads == 0:
+				self.host_paged_kv_worker_view = core_engine.MLAHostPagedKVWorkerView(worker_kv_config)
+			else:
+				self.host_paged_kv_worker_view = core_engine.DefaultHostPagedKVWorkerView(worker_kv_config)
+
+			# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
+			logging.info(f"Rank {self.rank}: Initializing Host KV view with parallel cudaHostRegister (local_rank={self.local_rank})")
+			self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
+			logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
@@ -520,31 +534,93 @@ class BatchGenWorker:
 		"""
 		Initialize GPU KV manager with pre-determined fixed size.
 		Called once at the start of decoding.
+
+		For DSA models, splits the memory budget between primary (MLA) and
+		auxiliary (indexer) caches, wrapping both in a DualKVCacheCoordinator.
 		"""
-		from batchgen.kv_cache.host_kv_mananger_config import build_gpu_kv_config_fixed_size
+		from batchgen.kv_cache.host_kv_mananger_config import (
+			build_gpu_kv_config_fixed_size,
+			is_dsa_model,
+			_resolve_indexer_profile,
+			_torch_dtype_from_string,
+		)
+		from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 
 		# Calculate GPU KV cache size if not already done
 		if self.gpu_kv_cache_size_gb is None:
 			self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
 
-		config = build_gpu_kv_config_fixed_size(
-			model_name=self.huggingface_ckpt_name,
-			gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
-		)
+		if is_dsa_model(self.huggingface_ckpt_name):
+			# Split memory budget between primary MLA cache and auxiliary indexer cache.
+			# Compute the ratio of bytes-per-page for primary vs auxiliary so both
+			# get the same number of pages (they share the same page table).
+			from batchgen.kv_cache.host_kv_mananger_config import _resolve_profile
+			primary_profile = _resolve_profile(self.huggingface_ckpt_name)
+			aux_profile = _resolve_indexer_profile(self.huggingface_ckpt_name)
 
-		manager = GPUPagedKVCacheManager(
-			config=config,
-			device=self.local_rank,
-		)
-		manager.initialize()
-		self._bind_gpu_paged_kv_manager(manager)
+			primary_bytes_per_page = primary_profile.bytes_per_page() * primary_profile.num_layers
+			aux_bytes_per_page = aux_profile.bytes_per_page() * aux_profile.num_layers
+			combined_bytes_per_page = primary_bytes_per_page + aux_bytes_per_page
 
-		if self.rank == 0:
-			logging.info(
-				f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {config.num_pages} pages"
+			total_bytes = int(self.gpu_kv_cache_size_gb * (1024 ** 3))
+			num_pages = total_bytes // combined_bytes_per_page
+
+			primary_config = GPUPagedKVConfig(
+				num_layers=primary_profile.num_layers,
+				num_pages=num_pages,
+				page_size_tokens=primary_profile.page_size,
+				num_k_heads=primary_profile.num_k_heads,
+				k_head_dim=primary_profile.k_head_dim,
+				num_v_heads=primary_profile.num_v_heads,
+				v_head_dim=primary_profile.v_head_dim,
+				kv_dtype=_torch_dtype_from_string(primary_profile.kv_dtype),
+			)
+			aux_config = GPUPagedKVConfig(
+				num_layers=aux_profile.num_layers,
+				num_pages=num_pages,
+				page_size_tokens=aux_profile.page_size,
+				num_k_heads=aux_profile.num_k_heads,
+				k_head_dim=aux_profile.k_head_dim,
+				num_v_heads=aux_profile.num_v_heads,
+				v_head_dim=aux_profile.v_head_dim,
+				kv_dtype=_torch_dtype_from_string(aux_profile.kv_dtype),
 			)
 
-		return manager
+			primary = GPUPagedKVCacheManager(config=primary_config, device=self.local_rank)
+			primary.initialize()
+			auxiliary = GPUPagedKVCacheManager(config=aux_config, device=self.local_rank)
+			auxiliary.initialize()
+			manager = DualKVCacheCoordinator(primary, auxiliary)
+			self._bind_gpu_paged_kv_manager(manager)
+
+			if self.rank == 0:
+				primary_gb = (primary_bytes_per_page * num_pages) / (1024 ** 3)
+				aux_gb = (aux_bytes_per_page * num_pages) / (1024 ** 3)
+				logging.info(
+					f"[GPU-KV] DualKVCacheCoordinator initialized: "
+					f"{num_pages} pages, primary={primary_gb:.2f} GB (dim={primary_profile.k_head_dim}), "
+					f"auxiliary={aux_gb:.2f} GB (dim={aux_profile.k_head_dim})"
+				)
+			return manager
+		else:
+			config = build_gpu_kv_config_fixed_size(
+				model_name=self.huggingface_ckpt_name,
+				gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
+			)
+
+			manager = GPUPagedKVCacheManager(
+				config=config,
+				device=self.local_rank,
+			)
+			manager.initialize()
+			self._bind_gpu_paged_kv_manager(manager)
+
+			if self.rank == 0:
+				logging.info(
+					f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {config.num_pages} pages"
+				)
+
+			return manager
 		
 	def set_ignore_eos(self, ignore_eos: bool) -> None:
 		"""
@@ -1065,6 +1141,59 @@ class BatchGenWorker:
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
 			self._wait_pending_kv_append_tasks()
 
+	def _append_decode_kv_to_host_aux_async(
+		self,
+		layer_idx: int,
+		batch: List[int],
+		k_tensor: torch.Tensor,
+		v_tensor: torch.Tensor = None,
+	) -> None:
+		"""Fire-and-forget auxiliary (indexer) KV append to host.
+
+		Mirrors _append_decode_kv_to_host_async but uses the auxiliary host
+		worker view. Shares the same pending task list for unified flushing.
+		"""
+		aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+		if aux_view is None or not batch:
+			return
+
+		sequence_ids = []
+		sequence_lengths = []
+		for local_idx in batch:
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			sequence_ids.append(seq.global_idx)
+			write_pos = seq.current_context_length - 1
+			sequence_lengths.append(write_pos)
+
+		if k_tensor.dim() == 3:
+			k_tensor = k_tensor.unsqueeze(2)
+
+		# Ensure compute stream finishes before D2H copy
+		if not hasattr(self, '_kv_offload_event_aux'):
+			self._kv_offload_event_aux = torch.cuda.Event()
+		self._kv_offload_event_aux.record(torch.cuda.current_stream(self.torch_device))
+		self._kv_offload_event_aux.synchronize()
+
+		task = aux_view.async_append_decode_kv_to_host(
+			layer_idx=layer_idx,
+			sequence_ids=sequence_ids,
+			k_tensor=k_tensor,
+			v_tensor=None,
+			sequence_lengths=sequence_lengths,
+		)
+
+		if not hasattr(self, '_pending_kv_append_tensors'):
+			self._pending_kv_append_tensors = []
+		self._pending_kv_append_tensors.append(k_tensor)
+
+		if task is not None:
+			self._pending_kv_append_tasks.append(task)
+
+		MAX_PENDING_KV_TASKS = 256
+		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
+			self._wait_pending_kv_append_tasks()
+
 	def _initialize_core_components(self, num_queries: int) -> None:
 		"""
 		One-time initialization of heavy components.
@@ -1141,7 +1270,11 @@ class BatchGenWorker:
 			self.initializer.Init(self.weights_storage)
 		)
 
-		self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
+		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view.primary
+			self.core_engine.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view.auxiliary
+		else:
+			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		self.engine_config.Basic_Config.num_queries = num_queries
 
 		# Set CUDA graph config from command-line args
@@ -1420,6 +1553,21 @@ class BatchGenWorker:
 		load_task.wait()
 		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
 		torch.cuda.synchronize(self.torch_device)
+
+		# DSA: also load auxiliary (indexer) host KV to GPU
+		aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+		if aux_view is not None and isinstance(self.gpu_paged_kv_cache_manager, DualKVCacheCoordinator):
+			aux_mgr = self.gpu_paged_kv_cache_manager.auxiliary
+			k_ptrs_aux, v_ptrs_aux = aux_mgr.get_padded_3d_page_pointers()
+			page_counts_aux = aux_mgr.export_active_sequence_page_counts()
+			load_task_aux = aux_view.async_load_layer_paged_kv_to_device(
+				sequence_ids=sequence_tensor,
+				active_page_counts=page_counts_aux,
+				k_device_ptrs=k_ptrs_aux,
+				v_device_ptrs=v_ptrs_aux,
+			)
+			load_task_aux.wait()
+			torch.cuda.synchronize(self.torch_device)
 
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
@@ -2160,6 +2308,9 @@ class BatchGenWorker:
 			manager.free_pages_for_sequences([global_idx])
 			# Free host KV pages
 			worker_view.release_sequence_pages([global_idx])
+			aux_view_mig = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+			if aux_view_mig is not None:
+				aux_view_mig.release_sequence_pages([global_idx])
 			# Also send query_book data (input_ids, attention_mask, decoded_tokens)
 			local_idx = self._uuid_to_local_map.get(uuid)
 			if local_idx is not None and local_idx in self.query_book:
@@ -4423,6 +4574,13 @@ class BatchGenWorker:
 			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
 				list(zip(global_sequence_ids, sequence_tokens))
 			)
+			# DSA: mirror registration on auxiliary host KV
+			aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+			if aux_view is not None:
+				aux_view.register_sequences(global_sequence_ids)
+				aux_view.allocate_pages_for_sequences(
+					list(zip(global_sequence_ids, sequence_tokens))
+				)
 
 			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
 			if self.rank == 0:
@@ -4796,7 +4954,11 @@ class BatchGenWorker:
 			# NOTE: release_sequence_pages already calls unregister_sequences internally,
 			# so we don't need to call unregister_sequences separately
 			worker_view.release_sequence_pages(global_sequence_ids)
-			
+			# DSA: release auxiliary host KV pages too
+			aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+			if aux_view is not None:
+				aux_view.release_sequence_pages(global_sequence_ids)
+
 			# Rebuild GPU page table with remaining active sequences
 			manager = self.gpu_paged_kv_cache_manager
 			if manager is not None and manager.is_initialized:
@@ -6498,6 +6660,15 @@ class BatchGenWorker:
 				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 				AttnWrapperBase.kv_append_callback = kv_append_callback
 
+				# DSA: auxiliary KV append callback for indexer host cache
+				aux_view = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
+				if aux_view is not None:
+					def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+						self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
+					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
+				else:
+					AttnWrapperBase.kv_append_callback_aux = None
+
 				# Forward
 				_use_graph = (
 					getattr(self, '_whole_model_graph', False)
@@ -6647,7 +6818,8 @@ class BatchGenWorker:
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
 		AttnWrapperBase.kv_append_callback = None
-		
+		AttnWrapperBase.kv_append_callback_aux = None
+
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
 		if self.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
@@ -8046,9 +8218,12 @@ class BatchGenWorker:
 						)
 						# Try to release each sequence individually to handle already-released ones
 						released_count = 0
+						aux_view_shutdown = getattr(self.core_engine, "host_paged_kv_worker_view_aux", None)
 						for seq_id in global_ids_to_release:
 							try:
 								worker_view.release_sequence_pages([seq_id])
+								if aux_view_shutdown is not None:
+									aux_view_shutdown.release_sequence_pages([seq_id])
 								released_count += 1
 							except Exception:
 								# Sequence was already released during decode - this is normal

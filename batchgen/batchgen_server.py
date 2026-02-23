@@ -143,7 +143,25 @@ class BatchGenServer:
 		logging.info("Model Loaded. SHM: %s", self.model_info['shm_name'])
 
 	def allocate_host_kv_cache(self, host_kv_cache_size_gb: int):
-		"""Allocates shared host kv cache."""
+		"""Allocates shared host kv cache.
+
+		For DSA models, also allocates an auxiliary host KV cache for the
+		indexer, splitting the budget proportionally between primary and aux.
+		"""
+		from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+
+		# DSA models: split budget into primary + auxiliary
+		dual = DualHostKVCoordinator.create_managers(
+			model_name=self.args.model,
+			host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+		)
+		if dual is not None:
+			primary_mgr, aux_mgr = dual
+			logging.info(
+				"Allocated dual host KV cache: primary + auxiliary (DSA indexer)"
+			)
+			return primary_mgr
+
 		config = build_host_kv_config(
 			host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
 			model_name=self.args.model

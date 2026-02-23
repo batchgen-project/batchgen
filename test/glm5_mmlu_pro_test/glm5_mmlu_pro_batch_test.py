@@ -255,6 +255,9 @@ if __name__ == "__main__":
         if example_counts[cat] < MAX_EXAMPLES:
             answer_letter = row["answer"]
             cot = row["cot_content"].strip()
+            # cot_content may already start with "A:" — avoid duplication
+            if cot.startswith("A:"):
+                cot = cot[2:].strip()
             prompts[cat] += (
                 f"Q: {row['question']}\n"
                 + form_options(row["options"])

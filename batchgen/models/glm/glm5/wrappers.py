@@ -200,7 +200,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
             gpu_paged_kv_manager_aux = AttnWrapperBase.gpu_paged_kv_manager_aux
             if gpu_paged_kv_manager_aux is not None and hasattr(self.module, 'indexer'):
                 indexer_kv = self.module.indexer.compute_indexer_kv(
-                    hidden_states_2d.unsqueeze(0)
+                    hidden_states_2d.unsqueeze(0),
+                    positions=self.position_ids.to(hidden_states_2d.device),
                 )
                 # indexer_kv: [1, total_tokens, 1, index_dim]
                 self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
@@ -407,13 +408,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
             AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
 
         # --- Step 2: Write indexer K to auxiliary cache ---
-        indexer_kv = indexer.compute_indexer_kv(hidden_states)
+        # cache_seqlens = position of the new token (0-indexed)
+        indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=cache_seqlens)
+        indexer_k_tensor = indexer_kv.squeeze(1)  # [batch, 1, index_dim]
         gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-            k_tensor=indexer_kv.squeeze(1),  # [batch, 1, index_dim]
+            k_tensor=indexer_k_tensor,
             v_tensor=None,
             sequence_lengths=cache_seqlens,
             layer_idx=self.layer_idx,
         )
+        # Offload indexer K to auxiliary host cache
+        if AttnWrapperBase.kv_append_callback_aux is not None:
+            AttnWrapperBase.kv_append_callback_aux(self.layer_idx, indexer_k_tensor, None)
 
         # --- Step 3: Score all cached tokens (including new), select top-K ---
         # q_a_normed is shared between main Q and indexer Q
@@ -426,6 +432,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             q_a_for_indexer, hidden_states,
             indexer_blocked_k, idx_block_table,
             updated_seqlens, aux_page_size,
+            positions=cache_seqlens,  # current decode position for Q RoPE
         )
 
         if not hasattr(GLM5AttnWrapper, '_dsa_topk_logged'):

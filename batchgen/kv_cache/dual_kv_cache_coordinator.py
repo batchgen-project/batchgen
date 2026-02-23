@@ -61,8 +61,9 @@ class DualKVCacheCoordinator:
 		self.primary.destroy(empty_cuda_cache=empty_cuda_cache)
 		self.auxiliary.destroy(empty_cuda_cache=empty_cuda_cache)
 
+	@property
 	def is_initialized(self) -> bool:
-		return self.primary.is_initialized() and self.auxiliary.is_initialized()
+		return self.primary.is_initialized and self.auxiliary.is_initialized
 
 	# -- Page allocation --
 
@@ -133,6 +134,14 @@ class DualKVCacheCoordinator:
 	@property
 	def config(self) -> GPUPagedKVConfig:
 		return self.primary.config
+
+	@property
+	def device(self):
+		return self.primary.device
+
+	@property
+	def _gpu_page_table_manager(self):
+		return self.primary._gpu_page_table_manager
 
 	def copy_kv_to_tensor(self, sequence_id: int) -> torch.Tensor:
 		return self.primary.copy_kv_to_tensor(sequence_id)

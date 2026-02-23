@@ -66,6 +66,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     position_ids: ClassVar[Optional[torch.Tensor]] = None
     kv_quantization_factor: ClassVar[Optional[List]] = None
     kv_append_callback: ClassVar[Optional[callable]] = None
+    kv_append_callback_aux: ClassVar[Optional[callable]] = None
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
 
