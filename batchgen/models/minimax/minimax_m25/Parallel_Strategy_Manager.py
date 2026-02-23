@@ -15,7 +15,7 @@ Key differences from Kimi K2.5 PSM:
 - BF16 attention (same as K2.5)
 """
 
-from .model import MiniMaxM25Model
+from .model import MiniMaxM25
 from .wrappers import MiniMaxM25ExpertWrapper, MiniMaxM25AttnWrapper
 import logging
 import time
@@ -47,7 +47,7 @@ class MiniMaxM25ParallelStrategyManager:
         start_time = time.perf_counter()
         self.loaded_model_config.phase = "prefill"
 
-        self.model = MiniMaxM25Model(self.loaded_model_config)
+        self.model = MiniMaxM25(self.loaded_model_config)
 
         self.weight_copy_task = {"attn": [], "routed_expert": []}
 
@@ -87,11 +87,11 @@ class MiniMaxM25ParallelStrategyManager:
         torch.cuda.empty_cache()
 
         with torch.device('cpu'):
-            self.model = MiniMaxM25Model(self.loaded_model_config, comm)
+            self.model = MiniMaxM25(self.loaded_model_config)
 
         # Inject comm into MoE layers
         for layer_idx in range(self.model_config.num_hidden_layers):
-            moe = self.model.layers[layer_idx].mlp
+            moe = self.model.model.layers[layer_idx].mlp
             moe.comm = comm
             moe.device = device
 
@@ -137,7 +137,7 @@ class MiniMaxM25ParallelStrategyManager:
 
         # Set persistent/non-persistent expert lists and offloading flag per layer
         for layer_idx in range(self.model_config.num_hidden_layers):
-            layer = self.model.layers[layer_idx]
+            layer = self.model.model.layers[layer_idx]
             layer.mlp.persistent_expert_ids = list(
                 range(routed_expert_gpu_start_idx, routed_expert_gpu_end_idx)
             )
@@ -159,24 +159,24 @@ class MiniMaxM25ParallelStrategyManager:
         env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
         max_rank_bsz = int(env_max_bsz) if env_max_bsz else padding_bsz
         for layer_idx in range(self.model_config.num_hidden_layers):
-            self.model.layers[layer_idx].mlp.init_num_tokens(max_rank_bsz)
+            self.model.model.layers[layer_idx].mlp.init_num_tokens(max_rank_bsz)
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
         for layer_idx in range(self.model_config.num_hidden_layers):
-            self.model.layers[layer_idx].mlp.set_num_tokens_per_rank(num_tokens_per_rank)
+            self.model.model.layers[layer_idx].mlp.set_num_tokens_per_rank(num_tokens_per_rank)
 
     def _init_mode_decoding(self):
         if self.enable_ep_offloading:
             return
         for layer_idx in range(self.model_config.num_hidden_layers):
-            self.model.layers[layer_idx].mlp.init(
+            self.model.model.layers[layer_idx].mlp.init(
                 self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
             )
 
     def _load_attn_module(self):
         """Load BF16 GQA attention weights from core engine."""
-        for layer_idx in range(len(self.model.layers)):
-            attn = self.model.layers[layer_idx].self_attn
+        for layer_idx in range(len(self.model.model.layers)):
+            attn = self.model.model.layers[layer_idx].self_attn
             tensors = self.core_engine.get_tensor(f"attn_{layer_idx}")
             device = self.engine_config.Basic_Config.device_torch
             attn.q_proj.weight.data = tensors["q_proj.weight"].to(device)
@@ -192,7 +192,7 @@ class MiniMaxM25ParallelStrategyManager:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
             layer_idx = int(routed_expert_idx.split("_")[2])
             global_expert_idx = int(routed_expert_idx.split("_")[3])
-            expert = self.model.layers[layer_idx].mlp.experts[global_expert_idx]
+            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
             if expert is None:
                 continue
             for name, param in expert.named_parameters():
@@ -221,20 +221,20 @@ class MiniMaxM25ParallelStrategyManager:
         is handled inline in MiniMaxM25AttnWrapper._forward_prefill.
         No method injection needed — wrapper calls gqa_prefill_fa directly.
         """
-        for layer_idx in range(len(self.model.layers)):
-            attn_module = self.model.layers[layer_idx].self_attn
+        for layer_idx in range(len(self.model.model.layers)):
+            attn_module = self.model.model.layers[layer_idx].self_attn
 
             persistent = f"attn_{layer_idx}" not in self.weight_copy_task.get("attn", [])
             wrapper = MiniMaxM25AttnWrapper(
                 attn_module, layer_idx, self.core_engine, self.engine_config,
                 self.model_config, persistent,
             )
-            self.model.layers[layer_idx].self_attn = wrapper
+            self.model.model.layers[layer_idx].self_attn = wrapper
 
     def _config_expert_module(self):
         """Replace expert modules with FP8 wrappers."""
-        for layer_idx in range(len(self.model.layers)):
-            layer = self.model.layers[layer_idx]
+        for layer_idx in range(len(self.model.model.layers)):
+            layer = self.model.model.layers[layer_idx]
             for expert_idx in range(len(layer.mlp.experts)):
                 expert = layer.mlp.experts[expert_idx]
                 if expert is None:
@@ -277,4 +277,4 @@ class MiniMaxM25ParallelStrategyManager:
         return input[0][:, -1, :].unsqueeze(1)
 
     def _config_unembedding_hook(self):
-        self.model.unembedding.register_forward_pre_hook(self._unembedding_forward_pre_hook)
+        self.model.lm_head.register_forward_pre_hook(self._unembedding_forward_pre_hook)

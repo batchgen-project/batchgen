@@ -41,14 +41,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from dataclasses import dataclass
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
 from .config import MiniMaxM25Config
-
-
-@dataclass
-class _CausalLMOutput:
-    """Minimal output container with .logits attribute for worker compatibility."""
-    logits: torch.Tensor
 
 # CUDA routing kernels
 try:
@@ -279,7 +274,15 @@ class MiniMaxM25Attention(nn.Module):
 
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
         # Project Q, K, V
@@ -297,9 +300,17 @@ class MiniMaxM25Attention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim)
 
         # Get RoPE embeddings
-        cos, sin = self.rotary_emb(value_states, seq_len=q_len)
-        cos = cos[:q_len]
-        sin = sin[:q_len]
+        kv_seq_len = key_states.shape[1]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        if position_ids is not None:
+            cos = cos[position_ids]
+            sin = sin[position_ids]
+        else:
+            cos = cos[:q_len]
+            sin = sin[:q_len]
 
         # Apply partial RoPE (rotate first 64 dims, passthrough last 64)
         query_states, key_states = apply_partial_rotary_pos_emb(
@@ -311,15 +322,23 @@ class MiniMaxM25Attention(nn.Module):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
+        # Handle KV cache
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
+
         # Repeat KV for GQA
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
 
         # Scaled dot-product attention with causal mask
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
+        kv_len = key_states.shape[-2]
         causal_mask = torch.triu(
-            torch.ones((q_len, q_len), dtype=torch.bool, device=attn_weights.device),
-            diagonal=1,
+            torch.ones((q_len, kv_len), dtype=torch.bool, device=attn_weights.device),
+            diagonal=kv_len - q_len + 1,
         )
         attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
         attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -329,7 +348,7 @@ class MiniMaxM25Attention(nn.Module):
         attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output
+        return attn_output, None, past_key_value
 
 
 # ============================================================================
@@ -853,14 +872,28 @@ class MiniMaxM25DecoderLayer(nn.Module):
         self.cuda_graph_manager = manager
         self._full_attn_segment_name = full_attn_name
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         DecodeLayerTiming.start_layer(self.layer_idx)
 
         # ========== ATTENTION ==========
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        attn_out = self.self_attn(hidden_states=hidden_states)
-        hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+        hidden_states, attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
 
         # Fused residual add + post-attention layernorm
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
@@ -885,7 +918,7 @@ class MiniMaxM25DecoderLayer(nn.Module):
 
         DecodeLayerTiming.end_layer()
 
-        return hidden_states
+        return hidden_states, None, None
 
 
 # ============================================================================
@@ -893,13 +926,13 @@ class MiniMaxM25DecoderLayer(nn.Module):
 # ============================================================================
 
 class MiniMaxM25Model(nn.Module):
-    """MiniMax-M2.5 transformer model.
+    """MiniMax-M2.5 inner transformer model.
 
-    Flat model with embed_tokens, layers, and unembedding.
-    Forward returns logits directly.
+    Contains embed_tokens, layers, and norm. No lm_head.
+    Forward returns tuple: (hidden_states, next_cache, all_hidden_states, all_self_attns).
     """
 
-    def __init__(self, config: MiniMaxM25Config, comm=None):
+    def __init__(self, config: MiniMaxM25Config):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -921,27 +954,18 @@ class MiniMaxM25Model(nn.Module):
             layer.self_attn.rotary_emb = self._shared_rotary_emb
 
         self.norm = MiniMaxM25RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.unembedding = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Worker expects HF-style ForCausalLM nesting:
-        #   self.model.model.embed_tokens, self.model.model.layers, self.model.model.norm
-        #   self.model.lm_head
-        # Since we use a flat model, alias self.model = self and lm_head = unembedding.
-        self.model = self
-        self.lm_head = self.unembedding
 
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        output_hidden_states: Optional[bool] = False,
-        **kwargs,
-    ) -> _CausalLMOutput:
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, ...]:
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("Cannot specify both input_ids and inputs_embeds")
         elif input_ids is not None:
@@ -951,12 +975,78 @@ class MiniMaxM25Model(nn.Module):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states)
+        next_cache = () if use_cache else None
+
+        for idx, decoder_layer in enumerate(self.layers):
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_cache += (layer_outputs[2],)
 
         hidden_states = self.norm(hidden_states)
 
         DecodeLayerTiming.print_summary()
 
-        logits = self.unembedding(hidden_states)
-        return _CausalLMOutput(logits=logits)
+        return (hidden_states, next_cache, None, None)
+
+
+class MiniMaxM25(nn.Module):
+    """MiniMax-M2.5 model with language modeling head.
+
+    Outer wrapper following GPT-OSS pattern:
+    - self.model = MiniMaxM25Model (inner transformer)
+    - self.lm_head = nn.Linear (unembedding)
+    - Forward returns CausalLMOutputWithPast
+    """
+
+    def __init__(self, config: MiniMaxM25Config):
+        super().__init__()
+        self.config = config
+        self.model = MiniMaxM25Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        **kwargs,
+    ) -> CausalLMOutputWithPast:
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states)
+
+        return CausalLMOutputWithPast(
+            loss=None,
+            logits=logits,
+            past_key_values=outputs[1],
+            hidden_states=outputs[2],
+            attentions=outputs[3],
+        )
