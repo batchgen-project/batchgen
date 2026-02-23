@@ -116,6 +116,11 @@ class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
             up_scale = self.weight_dequant_scale["w3.weight_scale_inv"]
             down_scale = self.weight_dequant_scale["w2.weight_scale_inv"]
 
+        # DeepGEMM requires float32 scale factors
+        gate_scale = gate_scale.float()
+        up_scale = up_scale.float()
+        down_scale = down_scale.float()
+
         # w8a16: FP8 weight × BF16 activation
         gate = w8a16_gemm(fp8_gate, gate_scale, hidden_states)
         up = w8a16_gemm(fp8_up, up_scale, hidden_states)
