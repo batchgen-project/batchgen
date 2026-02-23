@@ -1328,6 +1328,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 	query_states[:, :, :, self.kv_lora_rank :] = q_pe
 	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
 
+	page_size = gpu_paged_kv_manager.config.page_size_tokens
 	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, self.num_heads, 1)
 
 	try:
@@ -1336,7 +1337,7 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 			blocked_k,
 			block_table,
 			cache_seqlens,
-			512,
+			page_size,
 			tile_scheduler_metadata,
 			num_splits,
 			self.softmax_scale,

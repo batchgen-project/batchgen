@@ -17,12 +17,28 @@ Key differences from DeepSeek:
 """
 
 import logging
+from contextlib import nullcontext as _nullctx
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
+from batchgen.timing import init_decode_timer
+
+# Initialize GLM-5 decode timer (activated by BATCHGEN_DECODE_TIMING=1)
+_GLM5_ATTN_CATEGORIES = [
+    "act_quant", "q_proj", "kv_proj", "kv_write",
+    "indexer_k", "indexer_score", "sparse_gather",
+    "q_absorb", "sparse_attn", "o_proj",
+]
+_GLM5_MOE_CATEGORIES = [
+    "allgather", "routing", "dispatch", "grouped_gemm",
+    "expert_loop", "scatter_reduce", "allreduce",
+]
+_glm5_decode_timer = init_decode_timer(
+    "GLM-5", _GLM5_ATTN_CATEGORIES + _GLM5_MOE_CATEGORIES
+)
 
 
 def glm5_fp8_dequantization(
@@ -344,166 +360,180 @@ class GLM5AttnWrapper(AttnWrapperBase):
         from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
         from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+        from batchgen.timing import get_decode_timer
 
         weight_scale = self.weight_dequant_scale
         attn = self.module
         indexer = attn.indexer
         bsz = hidden_states.shape[0]
+        dt = get_decode_timer()
+        li = self.layer_idx
 
         if not hasattr(GLM5AttnWrapper, '_dsa_logged'):
             GLM5AttnWrapper._dsa_logged = True
             logging.info(
-                f"[DSA] _forward_decode_dsa invoked: layer={self.layer_idx}, "
+                f"[DSA] _forward_decode_dsa invoked: layer={li}, "
                 f"bsz={bsz}, cache_seqlens={cache_seqlens.tolist()[:4]}, "
                 f"index_topk={indexer.index_topk}, "
                 f"index_dim={indexer.index_head_dim}"
             )
 
         # --- Shared FP8 activation quantization ---
-        hidden_flat = hidden_states.squeeze(1)  # [batch, hidden_size]
-        hidden_fp8, hidden_scale = act_quant(hidden_flat)
+        with (dt.timed("act_quant", li) if dt else _nullctx()):
+            hidden_flat = hidden_states.squeeze(1)  # [batch, hidden_size]
+            hidden_fp8, hidden_scale = act_quant(hidden_flat)
 
         # --- Q path: q_a_proj → layernorm → q_b_proj → split → RoPE ---
-        q_a = w8a8_deepgemm(
-            hidden_fp8, hidden_scale,
-            attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
-        )
-        q_a_normed = attn.q_a_layernorm(q_a)
-        q_a_fp8, q_a_scale = act_quant(q_a_normed)
-        q = w8a8_deepgemm(
-            q_a_fp8, q_a_scale,
-            attn.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"],
-        )
-        q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-        q_nope, q_pe = torch.split(
-            q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
-        )
-        q_pe = q_pe.contiguous()
+        with (dt.timed("q_proj", li) if dt else _nullctx()):
+            q_a = w8a8_deepgemm(
+                hidden_fp8, hidden_scale,
+                attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
+            )
+            q_a_normed = attn.q_a_layernorm(q_a)
+            q_a_fp8, q_a_scale = act_quant(q_a_normed)
+            q = w8a8_deepgemm(
+                q_a_fp8, q_a_scale,
+                attn.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"],
+            )
+            q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
+            q_nope, q_pe = torch.split(
+                q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
+            )
+            q_pe = q_pe.contiguous()
 
         # --- KV path: kv_a_proj → fused_rmsnorm_rope → compressed KV ---
-        new_compressed_kv = w8a8_deepgemm(
-            hidden_fp8, hidden_scale,
-            attn.kv_a_proj_with_mqa.weight,
-            weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-        ).view(bsz, 1, -1)
+        with (dt.timed("kv_proj", li) if dt else _nullctx()):
+            new_compressed_kv = w8a8_deepgemm(
+                hidden_fp8, hidden_scale,
+                attn.kv_a_proj_with_mqa.weight,
+                weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+            ).view(bsz, 1, -1)
 
-        cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
-        offload_kv = fused_rmsnorm_rope_with_q(
-            new_compressed_kv, q_pe, cos, sin, position_ids,
-            attn.kv_a_layernorm.weight,
-            attn.kv_lora_rank, attn.qk_rope_head_dim,
-        )
+            cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
+            offload_kv = fused_rmsnorm_rope_with_q(
+                new_compressed_kv, q_pe, cos, sin, position_ids,
+                attn.kv_a_layernorm.weight,
+                attn.kv_lora_rank, attn.qk_rope_head_dim,
+            )
 
         # --- Step 1: Write new MLA KV to primary cache ---
-        manager_device = gpu_paged_kv_manager.device
-        k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
-        seq_lengths_i32 = position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
-        gpu_paged_kv_manager.update_layer_decode_new_token(
-            k_tensor=k_tensor,
-            v_tensor=None,
-            sequence_lengths=seq_lengths_i32,
-            layer_idx=self.layer_idx,
-        )
-        if AttnWrapperBase.kv_append_callback is not None:
-            AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
+        with (dt.timed("kv_write", li) if dt else _nullctx()):
+            manager_device = gpu_paged_kv_manager.device
+            k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
+            seq_lengths_i32 = position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
+            gpu_paged_kv_manager.update_layer_decode_new_token(
+                k_tensor=k_tensor,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32,
+                layer_idx=li,
+            )
+            if AttnWrapperBase.kv_append_callback is not None:
+                AttnWrapperBase.kv_append_callback(li, k_tensor, None)
 
         # --- Step 2: Write indexer K to auxiliary cache ---
-        # position_ids = cache_seqlens - 1 = 0-based position of the new token
-        # Must match primary cache write position (line 400 uses position_ids)
-        new_token_pos = position_ids.squeeze(-1)  # [batch]
-        indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=new_token_pos)
-        indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
-        seq_lengths_i32_aux = new_token_pos.to(dtype=torch.int32, device=gpu_paged_kv_manager_aux.device)
-        gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-            k_tensor=indexer_k_tensor,
-            v_tensor=None,
-            sequence_lengths=seq_lengths_i32_aux,
-            layer_idx=self.layer_idx,
-        )
-        # Offload indexer K to auxiliary host cache
-        if AttnWrapperBase.kv_append_callback_aux is not None:
-            AttnWrapperBase.kv_append_callback_aux(self.layer_idx, indexer_k_tensor, None)
+        with (dt.timed("indexer_k", li) if dt else _nullctx()):
+            # position_ids = cache_seqlens - 1 = 0-based position of the new token
+            # Must match primary cache write position (Step 1 uses position_ids)
+            new_token_pos = position_ids.squeeze(-1)  # [batch]
+            indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=new_token_pos)
+            indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
+            seq_lengths_i32_aux = new_token_pos.to(dtype=torch.int32, device=gpu_paged_kv_manager_aux.device)
+            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
+                k_tensor=indexer_k_tensor,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32_aux,
+                layer_idx=li,
+            )
+            # Offload indexer K to auxiliary host cache
+            if AttnWrapperBase.kv_append_callback_aux is not None:
+                AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
 
         # --- Step 3: Score all cached tokens (including new), select top-K ---
-        # cache_seqlens already includes the new token (pre-incremented in worker)
-        updated_seqlens = cache_seqlens
+        with (dt.timed("indexer_score", li) if dt else _nullctx()):
+            # cache_seqlens already includes the new token (pre-incremented in worker)
+            updated_seqlens = cache_seqlens
 
-        if torch.all(updated_seqlens <= indexer.index_topk):
-            # Short-circuit: all sequences fit within topk — use full range
-            max_len = int(updated_seqlens.max())
-            top_k_indices = torch.arange(
-                max_len, device=hidden_states.device, dtype=torch.long,
-            ).unsqueeze(0).expand(bsz, -1)
-        else:
-            # Full indexer scoring path
-            q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
-            indexer_blocked_k, _, idx_block_table = \
-                gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(self.layer_idx)
-            aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-            top_k_indices = indexer.score_and_select_paged(
-                q_a_for_indexer, hidden_states,
-                indexer_blocked_k, idx_block_table,
-                updated_seqlens, aux_page_size,
-                positions=new_token_pos,
-            )
+            if torch.all(updated_seqlens <= indexer.index_topk):
+                # Short-circuit: all sequences fit within topk — use full range
+                max_len = int(updated_seqlens.max())
+                top_k_indices = torch.arange(
+                    max_len, device=hidden_states.device, dtype=torch.long,
+                ).unsqueeze(0).expand(bsz, -1)
+            else:
+                # Full indexer scoring path
+                q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
+                indexer_blocked_k, _, idx_block_table = \
+                    gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+                aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
+                top_k_indices = indexer.score_and_select_paged(
+                    q_a_for_indexer, hidden_states,
+                    indexer_blocked_k, idx_block_table,
+                    updated_seqlens, aux_page_size,
+                    positions=new_token_pos,
+                )
 
         if not hasattr(GLM5AttnWrapper, '_dsa_topk_logged'):
             GLM5AttnWrapper._dsa_topk_logged = True
             logging.info(
-                f"[DSA] Indexer top-K: layer={self.layer_idx}, "
+                f"[DSA] Indexer top-K: layer={li}, "
                 f"top_k_indices.shape={top_k_indices.shape}, "
                 f"updated_seqlens={updated_seqlens.tolist()[:4]}, "
                 f"sample indices[0]={top_k_indices[0, :10].tolist()}"
             )
 
         # --- Step 4: Sparse gather MLA KV at top-K positions ---
-        mla_blocked_k, _, mla_block_table = \
-            gpu_paged_kv_manager.get_layer_kv_with_page_table(self.layer_idx)
-        mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
-        sparse_mla_kv = sparse_gather_from_paged_kv(
-            mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
-        )
-        # sparse_mla_kv: [batch, topk, 1, 576]
+        with (dt.timed("sparse_gather", li) if dt else _nullctx()):
+            mla_blocked_k, _, mla_block_table = \
+                gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+            mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
+            sparse_mla_kv = sparse_gather_from_paged_kv(
+                mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
+            )
+            # sparse_mla_kv: [batch, topk, 1, 576]
 
         # --- Step 5: Absorbed Q → sparse FlashMLA ---
-        kv_b_proj = deepseek_v3_dequantization(
-            attn.kv_b_proj.weight.data,
-            weight_scale["kv_b_proj.weight_scale_inv"],
-        ).view(attn.num_heads, -1, attn.kv_lora_rank)
-        q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
-        out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
+        with (dt.timed("q_absorb", li) if dt else _nullctx()):
+            kv_b_proj = deepseek_v3_dequantization(
+                attn.kv_b_proj.weight.data,
+                weight_scale["kv_b_proj.weight_scale_inv"],
+            ).view(attn.num_heads, -1, attn.kv_lora_rank)
+            q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
+            out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
 
-        qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-        query_states = torch.empty(
-            bsz, attn.num_heads, 1, qk_head_dim,
-            dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
-        )
-        q_nope_squeezed = q_nope.squeeze(2)
-        query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
-            "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
-        ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
-        query_states[:, :, :, attn.kv_lora_rank:] = q_pe
-        query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
+            qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+            query_states = torch.empty(
+                bsz, attn.num_heads, 1, qk_head_dim,
+                dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
+            )
+            q_nope_squeezed = q_nope.squeeze(2)
+            query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
+                "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
+            ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+            query_states[:, :, :, attn.kv_lora_rank:] = q_pe
+            query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
-        # Sparse seqlens: min(topk, actual cache length)
-        topk = top_k_indices.shape[1]
-        sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
+        with (dt.timed("sparse_attn", li) if dt else _nullctx()):
+            # Sparse seqlens: min(topk, actual cache length)
+            topk = top_k_indices.shape[1]
+            sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
 
-        attn_out = sparse_flash_mla_decode(
-            query_states, sparse_mla_kv, sparse_seqlens,
-            attn.num_heads, attn.softmax_scale,
-            head_dim_v=attn.kv_lora_rank,
-            page_size=mla_page_size,
-        )
+            attn_out = sparse_flash_mla_decode(
+                query_states, sparse_mla_kv, sparse_seqlens,
+                attn.num_heads, attn.softmax_scale,
+                head_dim_v=attn.kv_lora_rank,
+                page_size=mla_page_size,
+            )
 
         # --- Step 6: out_absorb → o_proj ---
-        attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
-        attn_output_fp8, attn_output_scale = act_quant(attn_output)
-        attn_output = w8a8_deepgemm(
-            attn_output_fp8, attn_output_scale,
-            attn.o_proj.weight, weight_scale["o_proj.weight_scale_inv"],
-        )
-        attn_output = attn_output.view(bsz, 1, -1)
+        with (dt.timed("o_proj", li) if dt else _nullctx()):
+            attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
+            attn_output_fp8, attn_output_scale = act_quant(attn_output)
+            attn_output = w8a8_deepgemm(
+                attn_output_fp8, attn_output_scale,
+                attn.o_proj.weight, weight_scale["o_proj.weight_scale_inv"],
+            )
+            attn_output = attn_output.view(bsz, 1, -1)
+
         return attn_output

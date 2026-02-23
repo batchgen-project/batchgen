@@ -896,9 +896,11 @@ class Glm5MoEDecode(nn.Module):
     def moe_infer_allgather_allreduce_bf16_acc(self, x: torch.Tensor) -> torch.Tensor:
         """Grouped FP8 GEMM path: AllGather → Gate → Dispatch → GroupedGEMM → Scatter → AllReduce."""
         import torch.distributed as dist
+        from contextlib import nullcontext as _nullctx
         from mgn_kernel import fused_moe_token_dispatch
-        # scatter_weight_reduce_optimized is imported from DeepSeek's modeling file
+        from batchgen.timing import get_decode_timer
 
+        dt = get_decode_timer()
 
         num_tokens, hidden_size = x.shape
         device = x.device
@@ -910,58 +912,62 @@ class Glm5MoEDecode(nn.Module):
             )
 
         # 1) AllGather
-        all_tokens = torch.zeros(
-            (self.world_size * self.num_tokens_per_rank, self.hidden_size),
-            device=self.device, dtype=torch.bfloat16,
-        )
-        if x.shape[0] < self.num_tokens_per_rank:
-            padded_hidden_states = torch.zeros(
-                (self.num_tokens_per_rank, hidden_size),
-                device=self.device, dtype=x.dtype,
+        with (dt.timed("allgather", 0) if dt else _nullctx()):
+            all_tokens = torch.zeros(
+                (self.world_size * self.num_tokens_per_rank, self.hidden_size),
+                device=self.device, dtype=torch.bfloat16,
             )
-            padded_hidden_states[:x.shape[0]] = x
-        else:
-            padded_hidden_states = x
+            if x.shape[0] < self.num_tokens_per_rank:
+                padded_hidden_states = torch.zeros(
+                    (self.num_tokens_per_rank, hidden_size),
+                    device=self.device, dtype=x.dtype,
+                )
+                padded_hidden_states[:x.shape[0]] = x
+            else:
+                padded_hidden_states = x
 
-        with self.comm.change_state(enable=True):
-            self.comm.all_gather(
-                all_tokens, padded_hidden_states,
-                stream=torch.cuda.default_stream(self.device),
-            )
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    all_tokens, padded_hidden_states,
+                    stream=torch.cuda.default_stream(self.device),
+                )
 
         # 2) Gate (GLM-5: sigmoid scoring)
-        global_x = all_tokens
-        topk_weight, topk_idx = self.gate(global_x)
-        # gate returns (weights, indices); fused_moe_token_dispatch expects int32 indices
-        topk_idx = topk_idx.to(torch.int32)
-        # topk_weight must be float32 for scatter_weight_reduce_optimized
-        topk_weight = topk_weight.to(torch.float32)
+        with (dt.timed("routing", 0) if dt else _nullctx()):
+            global_x = all_tokens
+            topk_weight, topk_idx = self.gate(global_x)
+            topk_idx = topk_idx.to(torch.int32)
+            topk_weight = topk_weight.to(torch.float32)
 
         # 3) Dispatch tokens to local experts
-        input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
-            fused_moe_token_dispatch(
-                global_x, topk_idx, self.token_idx, self.topk_pos,
-                self.routed_expert_start_idx, self.routed_expert_end_idx,
-            )
+        with (dt.timed("dispatch", 0) if dt else _nullctx()):
+            input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
+                fused_moe_token_dispatch(
+                    global_x, topk_idx, self.token_idx, self.topk_pos,
+                    self.routed_expert_start_idx, self.routed_expert_end_idx,
+                )
 
         # 4) Grouped FP8 GEMM
-        res = self.grouped_dequant_moe_fp8(
-            input_x, input_eids, expert_counts, expert_offsets,
-        )
+        with (dt.timed("grouped_gemm", 0) if dt else _nullctx()):
+            res = self.grouped_dequant_moe_fp8(
+                input_x, input_eids, expert_counts, expert_offsets,
+            )
 
         # 5) Scatter + weighted reduce
-        global_results = scatter_weight_reduce_optimized(
-            res, global_indices, token_topk_pos, topk_weight,
-            self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
-        )
-        global_results = global_results.to(torch.bfloat16)
+        with (dt.timed("scatter_reduce", 0) if dt else _nullctx()):
+            global_results = scatter_weight_reduce_optimized(
+                res, global_indices, token_topk_pos, topk_weight,
+                self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
+            )
+            global_results = global_results.to(torch.bfloat16)
 
         # 6) AllReduce
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                global_results, op=dist.ReduceOp.SUM,
-                stream=torch.cuda.default_stream(self.device),
-            )
+        with (dt.timed("allreduce", 0) if dt else _nullctx()):
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    global_results, op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.default_stream(self.device),
+                )
 
         # 7) Extract local slice
         start_token_ids = self.rank * self.num_tokens_per_rank
@@ -975,8 +981,11 @@ class Glm5MoEDecode(nn.Module):
         so expert_offsets cleanly splits persistent vs non-persistent slices.
         """
         import torch.distributed as dist
+        from contextlib import nullcontext as _nullctx
         from mgn_kernel import fused_moe_token_dispatch
+        from batchgen.timing import get_decode_timer
 
+        dt = get_decode_timer()
 
         num_tokens, hidden_size = x.shape
         device = x.device
@@ -989,35 +998,38 @@ class Glm5MoEDecode(nn.Module):
             )
 
         # 1) AllGather
-        all_tokens = torch.zeros(
-            (self.world_size * self.num_tokens_per_rank, self.hidden_size),
-            device=self.device, dtype=torch.bfloat16,
-        )
-        padded = torch.zeros(
-            (self.num_tokens_per_rank, hidden_size),
-            device=self.device, dtype=x.dtype,
-        )
-        if num_tokens > 0:
-            padded[:num_tokens] = x
-
-        with self.comm.change_state(enable=True):
-            self.comm.all_gather(
-                all_tokens, padded,
-                stream=torch.cuda.default_stream(self.device),
+        with (dt.timed("allgather", 0) if dt else _nullctx()):
+            all_tokens = torch.zeros(
+                (self.world_size * self.num_tokens_per_rank, self.hidden_size),
+                device=self.device, dtype=torch.bfloat16,
             )
+            padded = torch.zeros(
+                (self.num_tokens_per_rank, hidden_size),
+                device=self.device, dtype=x.dtype,
+            )
+            if num_tokens > 0:
+                padded[:num_tokens] = x
+
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    all_tokens, padded,
+                    stream=torch.cuda.default_stream(self.device),
+                )
 
         # 2) Gate
-        global_x = all_tokens
-        topk_weight, topk_idx = self.gate(global_x)
-        topk_idx = topk_idx.to(torch.int32)
-        topk_weight = topk_weight.to(torch.float32)
+        with (dt.timed("routing", 0) if dt else _nullctx()):
+            global_x = all_tokens
+            topk_weight, topk_idx = self.gate(global_x)
+            topk_idx = topk_idx.to(torch.int32)
+            topk_weight = topk_weight.to(torch.float32)
 
         # 3) Dispatch tokens to ALL local experts (persistent + non-persistent)
-        input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
-            fused_moe_token_dispatch(
-                global_x, topk_idx, self.token_idx, self.topk_pos,
-                self.routed_expert_start_idx, self.routed_expert_end_idx,
-            )
+        with (dt.timed("dispatch", 0) if dt else _nullctx()):
+            input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
+                fused_moe_token_dispatch(
+                    global_x, topk_idx, self.token_idx, self.topk_pos,
+                    self.routed_expert_start_idx, self.routed_expert_end_idx,
+                )
 
         offsets_cpu = expert_offsets.tolist()
         actual_total = offsets_cpu[-1]
@@ -1032,38 +1044,42 @@ class Glm5MoEDecode(nn.Module):
             res = input_x.new_empty(actual_total, hidden_size, dtype=torch.bfloat16)
 
             # Phase 1: Grouped FP8 GEMM for persistent experts
-            persistent_end = offsets_cpu[n_persistent]
-            if n_persistent > 0 and persistent_end > 0:
-                persistent_counts = expert_counts[:n_persistent]
-                persistent_offsets = expert_offsets[:n_persistent + 1]
-                persistent_res = self.grouped_dequant_moe_fp8(
-                    input_x[:persistent_end], input_eids[:persistent_end],
-                    persistent_counts, persistent_offsets,
-                )
-                res[:persistent_end] = persistent_res[:persistent_end]
+            with (dt.timed("grouped_gemm", 0) if dt else _nullctx()):
+                persistent_end = offsets_cpu[n_persistent]
+                if n_persistent > 0 and persistent_end > 0:
+                    persistent_counts = expert_counts[:n_persistent]
+                    persistent_offsets = expert_offsets[:n_persistent + 1]
+                    persistent_res = self.grouped_dequant_moe_fp8(
+                        input_x[:persistent_end], input_eids[:persistent_end],
+                        persistent_counts, persistent_offsets,
+                    )
+                    res[:persistent_end] = persistent_res[:persistent_end]
 
             # Phase 2: Loop for non-persistent experts
-            for local_e in range(n_persistent, self.experts_per_rank):
-                start_off = offsets_cpu[local_e]
-                end_off = offsets_cpu[local_e + 1]
-                if start_off == end_off:
-                    continue
-                global_e = self.routed_expert_start_idx + local_e
-                res[start_off:end_off] = self.experts[global_e](input_x[start_off:end_off])
+            with (dt.timed("expert_loop", 0) if dt else _nullctx()):
+                for local_e in range(n_persistent, self.experts_per_rank):
+                    start_off = offsets_cpu[local_e]
+                    end_off = offsets_cpu[local_e + 1]
+                    if start_off == end_off:
+                        continue
+                    global_e = self.routed_expert_start_idx + local_e
+                    res[start_off:end_off] = self.experts[global_e](input_x[start_off:end_off])
 
             # 4) Scatter + weighted reduce
-            global_results = scatter_weight_reduce_optimized(
-                res, global_indices, token_topk_pos, topk_weight,
-                self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
-            )
-            global_results = global_results.to(torch.bfloat16)
+            with (dt.timed("scatter_reduce", 0) if dt else _nullctx()):
+                global_results = scatter_weight_reduce_optimized(
+                    res, global_indices, token_topk_pos, topk_weight,
+                    self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
+                )
+                global_results = global_results.to(torch.bfloat16)
 
         # 5) AllReduce
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                global_results, op=dist.ReduceOp.SUM,
-                stream=torch.cuda.default_stream(self.device),
-            )
+        with (dt.timed("allreduce", 0) if dt else _nullctx()):
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    global_results, op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.default_stream(self.device),
+                )
 
         # 6) Extract local slice
         start = self.rank * self.num_tokens_per_rank

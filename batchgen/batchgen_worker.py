@@ -397,6 +397,7 @@ class BatchGenWorker:
 		
 		# 8. Runtime State
 		self.eos_token_id: Optional[int] = None
+		self._stop_token_ids: set = set()
 		self.max_input_length = 0
 		self.max_decoding_length = 0
 		self.model_context_length = 131072  # Default 128K, updated from model config
@@ -738,7 +739,7 @@ class BatchGenWorker:
 		"""
 		if self._ignore_eos:
 			return False
-		return token_id == self.eos_token_id
+		return token_id in self._stop_token_ids
 
 	def _is_sequence_completed(self, seq) -> bool:
 		"""
@@ -1217,7 +1218,11 @@ class BatchGenWorker:
 
 		# Set EOS token ID from tokenizer
 		self.eos_token_id = self.tokenizer.eos_token_id
-		logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}")
+		if hasattr(self.tokenizer, 'stop_token_ids') and self.tokenizer.stop_token_ids:
+			self._stop_token_ids = set(self.tokenizer.stop_token_ids)
+		else:
+			self._stop_token_ids = {self.eos_token_id}
+		logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}, stop tokens: {self._stop_token_ids}")
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
 		# Note: EngineConfig is created by the model-specific initializer which uses a Planner
@@ -6793,6 +6798,13 @@ class BatchGenWorker:
 					seq.eos_reached = True
 			
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
+
+			# Decode timing ablation (BATCHGEN_DECODE_TIMING=1)
+			from batchgen.timing import get_decode_timer
+			_dt = get_decode_timer()
+			if _dt and _dt.enabled:
+				_dt.log_summary()
+				_dt.reset()
 
 		# Cleanup
 		self._wait_pending_kv_append_tasks()
