@@ -100,7 +100,7 @@ def create_batch_input_file(
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are a knowledge expert. Answer the multi-choice question and provide your final answer in the format 'The answer is (X)' where X is A, B, C, D, E, F, G, H, I, or J.",
+                        "content": "You are an expert at answering multiple-choice questions. Follow the examples provided, reason step by step, then give your final answer in the format: The answer is (X).",
                     },
                     {"role": "user", "content": query},
                 ],
@@ -254,10 +254,11 @@ if __name__ == "__main__":
         cat = row["category"]
         if example_counts[cat] < MAX_EXAMPLES:
             answer_letter = row["answer"]
+            cot = row["cot_content"].strip()
             prompts[cat] += (
-                "Q: " + row["question"] + "\n"
+                f"Q: {row['question']}\n"
                 + form_options(row["options"])
-                + row["cot_content"] + "\n"
+                + f"A: {cot}\n"
                 + f"The answer is ({answer_letter}).\n\n"
             )
             example_counts[cat] += 1
@@ -267,12 +268,10 @@ if __name__ == "__main__":
     for _, entry in dataset.iterrows():
         prefix = prompts[entry["category"]]
         prompt = (
-            "The following are example questions with step-by-step solutions:\n\n"
-            + prefix
-            + "Now answer the following question:\n"
-            + "Q: " + entry["question"] + "\n"
+            prefix
+            + f"Q: {entry['question']}\n"
             + form_options(entry["options"])
-            + "A: Let's think step by step."
+            + "A:"
         )
         queries.append(prompt)
 
@@ -346,7 +345,7 @@ if __name__ == "__main__":
         for idx in range(len(answer_set)):
             print("=" * 70)
             print(f"[Sample {idx}]")
-            print(f"Query: {queries[idx][:500]}...")
+            print(f"Query:\n{queries[idx]}")
             print(f"\n--- De-tokenized Output (full) ---")
             print(answer_set[idx])
             if tokenizer and answer_set[idx]:
@@ -374,7 +373,7 @@ if __name__ == "__main__":
     else:
         for idx in range(min(5, len(answer_set))):
             print("=" * 70)
-            print(f"Query {idx}: {queries[idx][:500]}...")
+            print(f"Query {idx}:\n{queries[idx]}")
             print(f"\n--- De-tokenized Output (full) ---")
             print(answer_set[idx])
             if tokenizer and answer_set[idx]:

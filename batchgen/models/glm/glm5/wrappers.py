@@ -349,6 +349,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
         indexer = attn.indexer
         bsz = hidden_states.shape[0]
 
+        if not hasattr(GLM5AttnWrapper, '_dsa_logged'):
+            GLM5AttnWrapper._dsa_logged = True
+            logging.info(
+                f"[DSA] _forward_decode_dsa invoked: layer={self.layer_idx}, "
+                f"bsz={bsz}, cache_seqlens={cache_seqlens.tolist()[:4]}, "
+                f"index_topk={indexer.index_topk}, "
+                f"index_dim={indexer.index_dim}"
+            )
+
         # --- Shared FP8 activation quantization ---
         hidden_flat = hidden_states.squeeze(1)  # [batch, hidden_size]
         hidden_fp8, hidden_scale = act_quant(hidden_flat)
@@ -418,6 +427,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
             indexer_blocked_k, idx_block_table,
             updated_seqlens, aux_page_size,
         )
+
+        if not hasattr(GLM5AttnWrapper, '_dsa_topk_logged'):
+            GLM5AttnWrapper._dsa_topk_logged = True
+            logging.info(
+                f"[DSA] Indexer top-K: layer={self.layer_idx}, "
+                f"top_k_indices.shape={top_k_indices.shape}, "
+                f"updated_seqlens={updated_seqlens.tolist()[:4]}, "
+                f"sample indices[0]={top_k_indices[0, :10].tolist()}"
+            )
 
         # --- Step 4: Sparse gather MLA KV at top-K positions ---
         mla_blocked_k, _, mla_block_table = \
