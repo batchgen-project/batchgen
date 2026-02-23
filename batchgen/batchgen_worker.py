@@ -244,6 +244,7 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+	detokenization_ignore_special_token: bool = True  # Include special tokens in detokenized output
 
 
 class BatchGenWorker:
