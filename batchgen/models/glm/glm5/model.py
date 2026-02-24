@@ -236,6 +236,27 @@ class Glm5Indexer(nn.Module):
         q_rope = q_rope.squeeze(2)
         return torch.cat([q_rope, q_nope], dim=-1)
 
+    def _fused_rope_hadamard_or_fallback(
+        self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Fused interleaved RoPE + Hadamard, falling back to separate ops."""
+        seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
+        cos, sin = self.rotary_emb(k, seq_len)
+        # cos/sin are [seq_len, 64] in model dtype; fused kernel needs float32
+        cos_f32 = cos.float()
+        sin_f32 = sin.float()
+        try:
+            from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard
+            return fused_rope_hadamard(
+                k.to(torch.bfloat16), cos_f32, sin_f32, positions.reshape(-1),
+                scale=k.shape[-1] ** -0.5,
+            )
+        except (ImportError, Exception):
+            pass
+        # Fallback: separate RoPE + Hadamard
+        k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
+        return _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
+
     def compute_indexer_kv(
         self, hidden_states: torch.Tensor, positions: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
@@ -258,10 +279,7 @@ class Glm5Indexer(nn.Module):
         k = self.k_norm(k)
 
         if positions is not None and self.rotary_emb is not None:
-            k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
-            # Hadamard transform on full head_dim
-            orig_shape = k.shape
-            k = _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
+            k = self._fused_rope_hadamard_or_fallback(k, positions, max_seqlen=max_seqlen)
 
         return k.unsqueeze(2)  # [batch, seq_len, 1, head_dim]
 
