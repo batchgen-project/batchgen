@@ -128,10 +128,12 @@ def apply_rotary_pos_emb_split(
 # Resolve hadamard kernels once at import time (triggers JIT compilation)
 try:
     from batchgen.other_kernels.hadamard_transform import hadamard_transform as _hadamard_cuda_fn
-    from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard as _fused_rope_hadamard_fn
 except (ImportError, Exception):
     _hadamard_cuda_fn = None
-    _fused_rope_hadamard_fn = None
+
+# Fused RoPE+Hadamard kernel — disabled until unit-tested.
+# Set to the imported function to enable: _fused_rope_hadamard_fn = fused_rope_hadamard
+_fused_rope_hadamard_fn = None
 
 _hadamard_matrix_cache: Dict[Tuple, torch.Tensor] = {}
 

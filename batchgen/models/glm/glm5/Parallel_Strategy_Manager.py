@@ -26,7 +26,7 @@ import types
 import torch
 import torch.distributed as dist
 
-from .model import Glm5ForCausalLM, Glm5MoEDecode
+from .model import Glm5ForCausalLM, Glm5MoEDecode, Glm5Expert, _Glm5ExpertPlaceholder
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
@@ -53,6 +53,7 @@ class GLM5ParallelStrategyManager:
     NUM_LAYERS = 78
     FIRST_K_DENSE = 3
     HIDDEN_SIZE = 6144
+    EXPERT_INTERMEDIATE_SIZE = 2048
 
     def __init__(
         self,
@@ -511,10 +512,15 @@ class GLM5ParallelStrategyManager:
             if shared_persistent:
                 layer.mlp.shared_experts._register_fp8_weights()
 
-            # Routed experts
+            # Routed experts — replace placeholders with real Glm5Expert modules
             for expert_idx in range(len(layer.mlp.experts)):
                 routed_key = f"routed_expert_{layer_idx}_{expert_idx}"
                 persistent = routed_key not in self.weight_copy_task.get("routed_expert", [])
+
+                # Replace placeholder with real module (cheap: config_torch_module_initializer shrinks params)
+                expert_module = layer.mlp.experts[expert_idx]
+                if isinstance(expert_module, _Glm5ExpertPlaceholder):
+                    expert_module = Glm5Expert(self.HIDDEN_SIZE, self.EXPERT_INTERMEDIATE_SIZE)
 
                 prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
                 expert_scales = {}
@@ -525,7 +531,7 @@ class GLM5ParallelStrategyManager:
                             self.engine_config.Basic_Config.device_torch
                         )
                 layer.mlp.experts[expert_idx] = GLM5ExpertWrapper(
-                    layer.mlp.experts[expert_idx], layer_idx, expert_idx,
+                    expert_module, layer_idx, expert_idx,
                     self.core_engine, self.engine_config, self.model_config,
                     persistent, expert_scales, is_fp8=self.is_fp8_experts,
                 )
