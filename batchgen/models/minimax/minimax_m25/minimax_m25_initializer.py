@@ -128,11 +128,8 @@ class MiniMaxM25Initializer:
             * (ec.Basic_Config.max_decoding_length + ec.Basic_Config.padding_length)
         )
 
-        # attn_mode: 3 for EP decode (MiniMax always uses EP with 256 experts)
-        if ec.Basic_Config.world_size > 1:
-            ec.Basic_Config.attn_mode = 3
-        else:
-            ec.Basic_Config.attn_mode = 1
+        # attn_mode: always 3 for MiniMax-M2.5 (uses decoding_continuous path)
+        ec.Basic_Config.attn_mode = 3
 
         # For attn_mode=3 (EP decode), zero out module buffers (all weights persistent on GPU)
         if ec.Basic_Config.attn_mode == 3 and not ec.EP_Config.enable_offloading:
