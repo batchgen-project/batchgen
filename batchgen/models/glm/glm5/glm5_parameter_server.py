@@ -140,10 +140,9 @@ class GLM5_Parameter_Server:
 
             # MoE layers (layer_idx >= first_k_dense)
             if layer_idx >= first_k_dense:
-                # Shared experts
-                for name, _ in model.model.layers[
-                    layer_idx
-                ].mlp.shared_experts.named_parameters():
+                # Shared experts — use static param names (experts are placeholders)
+                _shared_expert_param_names = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
+                for name in _shared_expert_param_names:
                     tensor_full_name = f"model.layers.{layer_idx}.mlp.shared_experts.{name}"
                     self.state_dict_name_map[tensor_full_name] = {
                         "module_key": f"shared_expert_{layer_idx}",
@@ -153,24 +152,20 @@ class GLM5_Parameter_Server:
                     f"shared_expert_{layer_idx}"
                 )
 
-                # Routed experts
+                # Routed experts — use static param names (experts are placeholders)
+                _expert_param_names = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
                 num_experts = self.model_config.num_local_experts  # 256
                 for expert_idx in range(num_experts):
-                    for name, _ in (
-                        model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
-                        .named_parameters()
-                    ):
+                    module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+                    for name in _expert_param_names:
                         tensor_full_name = (
                             f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
                         )
                         self.state_dict_name_map[tensor_full_name] = {
-                            "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
+                            "module_key": module_key,
                             "tensor_key": name,
                         }
-                    self.weight_copy_task["routed_expert"].append(
-                        f"routed_expert_{layer_idx}_{expert_idx}"
-                    )
+                    self.weight_copy_task["routed_expert"].append(module_key)
 
         del model
         gc.collect()
