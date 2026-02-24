@@ -22,6 +22,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
@@ -107,9 +108,22 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         return result
 
     def _register_fp8_weights(self):
-        self.cached_gate = self.module.gate_proj.weight.data
-        self.cached_up = self.module.up_proj.weight.data
-        self.cached_down = self.module.down_proj.weight.data
+        """Cache weight pointers for persistent experts.
+
+        Supports both:
+        - Placeholders with flat attrs (routed experts, set by _load_local_routed_experts)
+        - Real Glm5Expert modules (shared experts, weights in gate_proj.weight.data)
+        """
+        if hasattr(self.module, 'fp8_gate'):
+            # Placeholder with flat attrs
+            self.cached_gate = self.module.fp8_gate
+            self.cached_up = self.module.fp8_up
+            self.cached_down = self.module.fp8_down
+        else:
+            # Real nn.Module (shared experts)
+            self.cached_gate = self.module.gate_proj.weight.data
+            self.cached_up = self.module.up_proj.weight.data
+            self.cached_down = self.module.down_proj.weight.data
 
     def _unregister_fp8_weights(self):
         self.cached_gate = None
@@ -117,19 +131,25 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         self.cached_down = None
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.is_fp8:
-            return self.module.deepgemm_forward(hidden_states, self.weight_dequant_scale)
-        return self.module(hidden_states)
+        """FP8 forward using cached weight tensors directly (no nn.Module delegation)."""
+        from batchgen.attention.mla.fa3_backend import w8a16_gemm
+        gate = w8a16_gemm(
+            self.cached_gate, self.weight_dequant_scale.get('gate_proj.weight_scale_inv'), hidden_states
+        )
+        up = w8a16_gemm(
+            self.cached_up, self.weight_dequant_scale.get('up_proj.weight_scale_inv'), hidden_states
+        )
+        intermediate = F.silu(gate) * up
+        return w8a16_gemm(
+            self.cached_down, self.weight_dequant_scale.get('down_proj.weight_scale_inv'), intermediate
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.persistent:
             weights = self.load_weights(self.module_key)
-            for name, param in self.module.named_parameters():
-                param.data = weights[name]
-        else:
-            self.module.gate_proj.weight.data = self.cached_gate
-            self.module.up_proj.weight.data = self.cached_up
-            self.module.down_proj.weight.data = self.cached_down
+            self.cached_gate = weights["gate_proj.weight"]
+            self.cached_up = weights["up_proj.weight"]
+            self.cached_down = weights["down_proj.weight"]
 
         result = self.micro_batch_forward(hidden_states, "expert")
 
@@ -138,7 +158,7 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
                 self.engine_config.Basic_Config.device_torch
             ).synchronize()
             self.free_weights(self.module_key)
-            self.clear_weights()
+            self.cached_gate = self.cached_up = self.cached_down = None
 
         return result
 

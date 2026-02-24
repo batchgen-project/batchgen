@@ -26,7 +26,7 @@ import types
 import torch
 import torch.distributed as dist
 
-from .model import Glm5ForCausalLM, Glm5MoEDecode, Glm5Expert, _Glm5ExpertPlaceholder
+from .model import Glm5ForCausalLM, Glm5MoEDecode
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
@@ -53,7 +53,6 @@ class GLM5ParallelStrategyManager:
     NUM_LAYERS = 78
     FIRST_K_DENSE = 3
     HIDDEN_SIZE = 6144
-    EXPERT_INTERMEDIATE_SIZE = 2048
 
     def __init__(
         self,
@@ -399,7 +398,11 @@ class GLM5ParallelStrategyManager:
             shared.down_proj.weight.data = tensors["down_proj.weight"].to(device)
 
     def _load_local_routed_experts(self):
-        """Load persistent routed expert FP8 weights for decode."""
+        """Load persistent routed expert FP8 weights for decode.
+
+        Stores weights as flat attributes on placeholder (following GPT-OSS pattern).
+        GLM5ExpertWrapper._register_fp8_weights() reads these during _config_expert_module.
+        """
         device = self.engine_config.Basic_Config.device_torch
         for routed_expert_idx in self.local_routed_experts:
             tensors = self.core_engine.get_tensor(routed_expert_idx)
@@ -407,9 +410,10 @@ class GLM5ParallelStrategyManager:
             layer_idx = int(parts[2])
             expert_idx = int(parts[3])
             expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
-            expert.gate_proj.weight.data = tensors["gate_proj.weight"].to(device)
-            expert.up_proj.weight.data = tensors["up_proj.weight"].to(device)
-            expert.down_proj.weight.data = tensors["down_proj.weight"].to(device)
+            # Store as flat attrs on placeholder (no nn.Module needed)
+            expert.fp8_gate = tensors["gate_proj.weight"].to(device)
+            expert.fp8_up = tensors["up_proj.weight"].to(device)
+            expert.fp8_down = tensors["down_proj.weight"].to(device)
         logging.debug("Local routed experts loaded")
 
     def _config_attn_module(self):
@@ -512,15 +516,10 @@ class GLM5ParallelStrategyManager:
             if shared_persistent:
                 layer.mlp.shared_experts._register_fp8_weights()
 
-            # Routed experts — replace placeholders with real Glm5Expert modules
+            # Routed experts — wrap placeholders directly (no nn.Module needed)
             for expert_idx in range(len(layer.mlp.experts)):
                 routed_key = f"routed_expert_{layer_idx}_{expert_idx}"
                 persistent = routed_key not in self.weight_copy_task.get("routed_expert", [])
-
-                # Replace placeholder with real module (cheap: config_torch_module_initializer shrinks params)
-                expert_module = layer.mlp.experts[expert_idx]
-                if isinstance(expert_module, _Glm5ExpertPlaceholder):
-                    expert_module = Glm5Expert(self.HIDDEN_SIZE, self.EXPERT_INTERMEDIATE_SIZE)
 
                 prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
                 expert_scales = {}
@@ -531,7 +530,7 @@ class GLM5ParallelStrategyManager:
                             self.engine_config.Basic_Config.device_torch
                         )
                 layer.mlp.experts[expert_idx] = GLM5ExpertWrapper(
-                    expert_module, layer_idx, expert_idx,
+                    layer.mlp.experts[expert_idx], layer_idx, expert_idx,
                     self.core_engine, self.engine_config, self.model_config,
                     persistent, expert_scales, is_fp8=self.is_fp8_experts,
                 )
