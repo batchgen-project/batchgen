@@ -254,22 +254,14 @@ class MiniMaxM25ParallelStrategyManager:
             size_gb = sum(p.numel() * p.element_size() for p in self.model.parameters()) / (1024**3)
             logging.info(f"Model skeleton: {loaded} tensors loaded, {size_gb:.2f} GB")
 
-            # Log skeleton keys for debugging
             logging.info(f"Skeleton state_dict has {len(self.skeleton_state_dict)} keys")
-            for k, v in sorted(self.skeleton_state_dict.items()):
-                if any(x in k for x in ["gate.weight", "embed_tokens", "norm.weight",
-                                          "e_score_correction", "lm_head"]):
-                    logging.info(f"  skeleton[{k}]: dtype={v.dtype}, shape={list(v.shape)}")
 
             if not_found:
                 logging.warning(f"Skeleton: {len(not_found)} model params not found in skeleton")
-                for k in not_found[:10]:
+                for k in not_found[:3]:
                     logging.warning(f"  NOT FOUND: {k}")
-
-            # Log loaded dtypes for key parameters
-            for key, param in self.model.named_parameters():
-                if "gate.weight" in key or "embed_tokens" in key or "lm_head" in key:
-                    logging.info(f"  model[{key}]: dtype={param.dtype}, shape={list(param.shape)}")
+                if len(not_found) > 3:
+                    logging.warning(f"  ... and {len(not_found) - 3} more")
 
     def _config_attn_module(self):
         """Configure GQA attention wrappers."""
