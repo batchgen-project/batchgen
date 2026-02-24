@@ -592,6 +592,9 @@ class GLM5ParallelStrategyManager:
         must be dequantized here since nn.Linear requires matching dtypes.
         """
         for key, param in self.model.named_parameters():
+            # Skip weights loaded by wrappers (attention, experts)
+            if key in self.state_dict_name_map:
+                continue
             if key in self.skeleton_state_dict:
                 weight = self.skeleton_state_dict[key]
                 dequant_key = key + "_scale_inv"
