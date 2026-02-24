@@ -112,10 +112,9 @@ class GLM5ParallelStrategyManager:
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
 
             if layer_idx >= self.FIRST_K_DENSE:
-                # Shared experts
-                for name, _ in self.model.model.layers[
-                    layer_idx
-                ].mlp.shared_experts.named_parameters():
+                # Shared experts — use static param names (no nn.Module traversal)
+                _shared_expert_param_names = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
+                for name in _shared_expert_param_names:
                     tensor_full_name = f"model.layers.{layer_idx}.mlp.shared_experts.{name}"
                     self.state_dict_name_map[tensor_full_name] = {
                         "module_key": f"shared_expert_{layer_idx}",
@@ -123,23 +122,19 @@ class GLM5ParallelStrategyManager:
                     }
                 self.weight_copy_task["shared_expert"].append(f"shared_expert_{layer_idx}")
 
-                # Routed experts
+                # Routed experts — use static param names (experts are placeholders)
+                _expert_param_names = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
                 for expert_idx in range(self.NUM_TOTAL_EXPERTS):
-                    for name, _ in (
-                        self.model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
-                        .named_parameters()
-                    ):
+                    module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+                    for name in _expert_param_names:
                         tensor_full_name = (
                             f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
                         )
                         self.state_dict_name_map[tensor_full_name] = {
-                            "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
+                            "module_key": module_key,
                             "tensor_key": name,
                         }
-                    self.weight_copy_task["routed_expert"].append(
-                        f"routed_expert_{layer_idx}_{expert_idx}"
-                    )
+                    self.weight_copy_task["routed_expert"].append(module_key)
         timings['weight_mappings'] = time.perf_counter() - step_start
 
         step_start = time.perf_counter()
@@ -233,26 +228,23 @@ class GLM5ParallelStrategyManager:
                 }
 
             if layer_idx >= self.FIRST_K_DENSE:
-                for name, _ in self.model.model.layers[
-                    layer_idx
-                ].mlp.shared_experts.named_parameters():
+                _shared_expert_param_names = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
+                for name in _shared_expert_param_names:
                     tensor_full_name = f"model.layers.{layer_idx}.mlp.shared_experts.{name}"
                     self.state_dict_name_map[tensor_full_name] = {
                         "module_key": f"shared_expert_{layer_idx}",
                         "tensor_key": name,
                     }
 
+                _expert_param_names = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
                 for expert_idx in range(self.model_config.num_local_experts):
-                    for name, _ in (
-                        self.model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
-                        .named_parameters()
-                    ):
+                    module_key = f"routed_expert_{layer_idx}_{expert_idx}"
+                    for name in _expert_param_names:
                         tensor_full_name = (
                             f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}"
                         )
                         self.state_dict_name_map[tensor_full_name] = {
-                            "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
+                            "module_key": module_key,
                             "tensor_key": name,
                         }
 

@@ -554,6 +554,15 @@ class Glm5Expert(nn.Module):
         return w8a16_gemm(self.down_proj.weight.data, scale['down_proj.weight_scale_inv'], intermediate)
 
 
+class _Glm5ExpertPlaceholder:
+    """Lightweight placeholder for expert slots in Glm5MoE.
+
+    Avoids creating 19200 nn.Module objects during model init. Replaced by
+    GLM5ExpertWrapper during _config_expert_module().
+    """
+    pass
+
+
 # ============================================================================
 # MoE Gate
 # ============================================================================
@@ -619,10 +628,7 @@ class Glm5MoE(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.gate = Glm5MoEGate(config)
-        self.experts = nn.ModuleList([
-            Glm5Expert(config.hidden_size, config.moe_intermediate_size)
-            for _ in range(self.num_experts)
-        ])
+        self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.num_experts)]
 
         # Shared expert
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
@@ -755,7 +761,7 @@ class Glm5MoEDecode(nn.Module):
         self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
 
         self.gate = Glm5MoEGate(config)
-        self.experts = nn.ModuleList([None] * self.total_experts)
+        self.experts = [None] * self.total_experts
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
 
         self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
