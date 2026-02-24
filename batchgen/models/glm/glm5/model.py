@@ -146,6 +146,11 @@ def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
         from fast_hadamard_transform import hadamard_transform
         return hadamard_transform(x.contiguous(), scale=x.shape[-1] ** -0.5)
     except ImportError:
+        pass
+    try:
+        from batchgen.other_kernels.hadamard_transform import hadamard_transform
+        return hadamard_transform(x.contiguous(), scale=x.shape[-1] ** -0.5)
+    except (ImportError, Exception):
         dim = x.shape[-1]
         assert dim & (dim - 1) == 0, f"Hadamard requires power-of-2 dim, got {dim}"
         H = _get_hadamard_matrix(dim, x.device, x.dtype)
