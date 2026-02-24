@@ -587,12 +587,20 @@ class GLM5ParallelStrategyManager:
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, gates, indexer, lm_head).
 
-        No dequantization here — FP8 weights are stored as-is.
-        Dequantization happens on-the-fly during forward via w8a16_gemm.
+        Attention and expert FP8 weights are dequantized on-the-fly by wrappers.
+        Skeleton weights used directly by nn.Linear (dense MLP, indexer, lm_head)
+        must be dequantized here since nn.Linear requires matching dtypes.
         """
         for key, param in self.model.named_parameters():
             if key in self.skeleton_state_dict:
-                param.data = self.skeleton_state_dict[key]
+                weight = self.skeleton_state_dict[key]
+                dequant_key = key + "_scale_inv"
+                if dequant_key in self.dequant_scale and weight.dtype == torch.float8_e4m3fn:
+                    param.data = glm5_fp8_dequantization(
+                        weight, self.dequant_scale[dequant_key],
+                    )
+                else:
+                    param.data = weight
 
         skeleton_size = sum(
             p.numel() * p.element_size() for p in self.model.parameters()
