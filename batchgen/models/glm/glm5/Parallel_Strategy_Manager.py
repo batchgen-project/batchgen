@@ -517,6 +517,7 @@ class GLM5ParallelStrategyManager:
                 layer.mlp.shared_experts._register_fp8_weights()
 
             # Routed experts — wrap placeholders directly (no nn.Module needed)
+            local_set = set(self.local_routed_experts) if hasattr(self, 'local_routed_experts') else set()
             for expert_idx in range(len(layer.mlp.experts)):
                 routed_key = f"routed_expert_{layer_idx}_{expert_idx}"
                 persistent = routed_key not in self.weight_copy_task.get("routed_expert", [])
@@ -534,7 +535,8 @@ class GLM5ParallelStrategyManager:
                     self.core_engine, self.engine_config, self.model_config,
                     persistent, expert_scales, is_fp8=self.is_fp8_experts,
                 )
-                if persistent:
+                # Only register weights for experts that had weights loaded
+                if persistent and routed_key in local_set:
                     layer.mlp.experts[expert_idx]._register_fp8_weights()
 
         elapsed = time.perf_counter() - start_time
