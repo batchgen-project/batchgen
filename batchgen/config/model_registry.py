@@ -60,12 +60,15 @@ ARCH_PATTERNS: Dict[str, str] = {
     "Mixtral": "mixtral",
     "GptOss": "gpt_oss",
     "Qwen2Moe": "qwen2_moe",
+    "MiniMaxM2": "minimax_m25",
     "GlmMoeDsa": "glm_moe_dsa",
 }
 
 # Model name/identifier patterns for detection from HuggingFace model IDs
 # Maps patterns found in model names to model_type
 MODEL_NAME_PATTERNS: Dict[str, str] = {
+    "MiniMax-M2.5": "minimax_m25",
+    "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
     "moonshotai/Kimi-K2.5": "kimi_k25",
     "DeepSeek-R1": "deepseek_v3",
     "DeepSeek-V3": "deepseek_v3",
@@ -232,6 +235,11 @@ def _import_model_configs():
 
     try:
         from batchgen.models.moonshotai.kimi_k25 import config as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.minimax.minimax_m25 import config as _  # noqa: F401
     except ImportError:
         pass
 

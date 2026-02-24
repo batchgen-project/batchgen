@@ -8131,8 +8131,9 @@ class BatchGenWorker:
 			if hasattr(attn_module, '_unregister_fp8_weights'):
 				attn_module._unregister_fp8_weights()
 			if layer_idx >= self.loaded_model_config.first_k_dense_replace:
-				if hasattr(self.model.model.layers[layer_idx].mlp.shared_experts, '_unregister_fp8_weights'):
-					self.model.model.layers[layer_idx].mlp.shared_experts._unregister_fp8_weights()
+				shared_experts = getattr(self.model.model.layers[layer_idx].mlp, 'shared_experts', None)
+				if shared_experts is not None and hasattr(shared_experts, '_unregister_fp8_weights'):
+					shared_experts._unregister_fp8_weights()
 				for routed_expert_idx in range(self.model_config.num_local_experts):
 					if hasattr(self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx], '_unregister_fp8_weights'):
 						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()

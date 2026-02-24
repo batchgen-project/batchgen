@@ -96,6 +96,16 @@ _DEEPSEEK_V3_2_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# MiniMax-M2.5: GQA with 8 KV heads, head_dim=128, 62 layers
+_MINIMAX_M25_GQA_PROFILE = _HostKVModelProfile(
+	num_layers=62,
+	num_k_heads=8,
+	k_head_dim=128,
+	num_v_heads=8,
+	v_head_dim=128,
+	kv_dtype="bfloat16",
+)
+
 # GLM-5: MLA cache (78 layers, compressed_kv_dim=576, same as DeepSeek)
 _GLM5_MLA_PROFILE = _HostKVModelProfile(
 	num_layers=78,
@@ -120,6 +130,7 @@ _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
 	"deepseek_v3_2_indexer": _DEEPSEEK_V3_2_INDEXER_PROFILE,
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
+	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
 	"glm5_mla": _GLM5_MLA_PROFILE,
 	"glm5_indexer": _GLM5_INDEXER_PROFILE,
 }
@@ -145,6 +156,11 @@ for canonical, aliases in {
 	"gpt_oss_gqa": (
 		"openai/gpt-oss-120b",
 		"gpt-oss-120b",
+	),
+	"minimax_m25_gqa": (
+		"minimaxai/minimax-m2.5",
+		"minimax-m2.5",
+		"minimax",
 	),
 	"glm5_mla": (
 		"zai-org/glm-5-fp8",
