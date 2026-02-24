@@ -125,6 +125,14 @@ def apply_rotary_pos_emb_split(
 # DSA Indexer
 # ============================================================================
 
+# Resolve hadamard kernels once at import time (triggers JIT compilation)
+try:
+    from batchgen.other_kernels.hadamard_transform import hadamard_transform as _hadamard_cuda_fn
+    from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard as _fused_rope_hadamard_fn
+except (ImportError, Exception):
+    _hadamard_cuda_fn = None
+    _fused_rope_hadamard_fn = None
+
 _hadamard_matrix_cache: Dict[Tuple, torch.Tensor] = {}
 
 
@@ -142,19 +150,12 @@ def _get_hadamard_matrix(dim: int, device: torch.device, dtype: torch.dtype) -> 
 
 def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     """Hadamard transform with 1/sqrt(dim) scaling. x last dim must be power of 2."""
-    try:
-        from fast_hadamard_transform import hadamard_transform
-        return hadamard_transform(x.contiguous(), scale=x.shape[-1] ** -0.5)
-    except ImportError:
-        pass
-    try:
-        from batchgen.other_kernels.hadamard_transform import hadamard_transform
-        return hadamard_transform(x.contiguous(), scale=x.shape[-1] ** -0.5)
-    except (ImportError, Exception):
-        dim = x.shape[-1]
-        assert dim & (dim - 1) == 0, f"Hadamard requires power-of-2 dim, got {dim}"
-        H = _get_hadamard_matrix(dim, x.device, x.dtype)
-        return x @ H
+    if _hadamard_cuda_fn is not None:
+        return _hadamard_cuda_fn(x.contiguous(), scale=x.shape[-1] ** -0.5)
+    dim = x.shape[-1]
+    assert dim & (dim - 1) == 0, f"Hadamard requires power-of-2 dim, got {dim}"
+    H = _get_hadamard_matrix(dim, x.device, x.dtype)
+    return x @ H
 
 
 class Glm5Indexer(nn.Module):
@@ -240,19 +241,13 @@ class Glm5Indexer(nn.Module):
         self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """Fused interleaved RoPE + Hadamard, falling back to separate ops."""
-        seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
-        cos, sin = self.rotary_emb(k, seq_len)
-        # cos/sin are [seq_len, 64] in model dtype; fused kernel needs float32
-        cos_f32 = cos.float()
-        sin_f32 = sin.float()
-        try:
-            from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard
-            return fused_rope_hadamard(
-                k.to(torch.bfloat16), cos_f32, sin_f32, positions.reshape(-1),
-                scale=k.shape[-1] ** -0.5,
+        if _fused_rope_hadamard_fn is not None:
+            seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
+            cos, sin = self.rotary_emb(k, seq_len)
+            return _fused_rope_hadamard_fn(
+                k.to(torch.bfloat16), cos.float(), sin.float(),
+                positions.reshape(-1), scale=k.shape[-1] ** -0.5,
             )
-        except (ImportError, Exception):
-            pass
         # Fallback: separate RoPE + Hadamard
         k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
         return _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
