@@ -585,17 +585,14 @@ class GLM5ParallelStrategyManager:
             )
 
     def _load_model_skeleton(self):
-        """Load skeleton weights (norms, embeddings, gates, indexer, lm_head)."""
+        """Load skeleton weights (norms, embeddings, gates, indexer, lm_head).
+
+        No dequantization here — FP8 weights are stored as-is.
+        Dequantization happens on-the-fly during forward via w8a16_gemm.
+        """
         for key, param in self.model.named_parameters():
             if key in self.skeleton_state_dict:
-                dequant_key = key + "_scale_inv"
-                if dequant_key in self.dequant_scale:
-                    param.data = glm5_fp8_dequantization(
-                        self.skeleton_state_dict[key],
-                        self.dequant_scale[dequant_key],
-                    )
-                else:
-                    param.data = self.skeleton_state_dict[key]
+                param.data = self.skeleton_state_dict[key]
 
         skeleton_size = sum(
             p.numel() * p.element_size() for p in self.model.parameters()
