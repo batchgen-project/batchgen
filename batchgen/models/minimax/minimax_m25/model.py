@@ -344,24 +344,28 @@ class MiniMaxM25RotaryEmbedding(nn.Module):
         self.rotary_dim = rotary_dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        self.max_seq_len_cached = 0
+        self.cos_cached = None
+        self.sin_cached = None
 
         inv_freq = 1.0 / (base ** (
             torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim
         ))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings, device, torch.get_default_dtype())
+        # cos/sin cache is deferred to first forward() call — avoids heavy
+        # CPU trig computation during model init (runs on GPU instead).
 
     def _set_cos_sin_cache(self, seq_len: int, device, dtype):
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
         # [seq_len, rotary_dim] — cos/sin for the rotated dimensions only
         emb = torch.cat((freqs, freqs), dim=-1)  # [seq_len, rotary_dim]
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        self.cos_cached = emb.cos().to(dtype)
+        self.sin_cached = emb.sin().to(dtype)
 
     def forward(self, x: torch.Tensor, seq_len: int = None):
-        if seq_len > self.max_seq_len_cached:
+        if self.cos_cached is None or seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len, x.device, x.dtype)
         return (
             self.cos_cached[:seq_len].to(x.dtype),
