@@ -274,7 +274,11 @@ class Glm5Indexer(nn.Module):
             indexer_k: [batch, seq_len, 1, head_dim] shaped for paged KV manager
                        head_dim=128 (single MQA head)
         """
-        k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
+        if hasattr(self, 'wk_scale'):
+            from batchgen.attention.mla.fa3_backend import w8a16_gemm
+            k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
+        else:
+            k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
         k = self.k_norm(k)
 
         if positions is not None and self.rotary_emb is not None:
@@ -309,7 +313,11 @@ class Glm5Indexer(nn.Module):
         max_seqlen = cached_k.shape[1]
 
         # Q from shared q_a intermediate: [batch, 1, q_lora_rank] -> [batch, n_heads, head_dim]
-        q = self.wq_b(q_a)  # [batch, 1, n_heads * head_dim]
+        if hasattr(self, 'wq_b_scale'):
+            from batchgen.attention.mla.fa3_backend import w8a16_gemm
+            q = w8a16_gemm(self.wq_b.weight.data, self.wq_b_scale, q_a)
+        else:
+            q = self.wq_b(q_a)  # [batch, 1, n_heads * head_dim]
         q = q.view(batch_size, self.index_n_heads, self.index_head_dim)
 
         # Apply RoPE + Hadamard to Q (must match cached K processing)
@@ -1136,6 +1144,11 @@ class Glm5MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, 'gate_scale'):
+            from batchgen.attention.mla.fa3_backend import w8a16_gemm
+            gate = w8a16_gemm(self.gate_proj.weight.data, self.gate_scale, x)
+            up = w8a16_gemm(self.up_proj.weight.data, self.up_scale, x)
+            return w8a16_gemm(self.down_proj.weight.data, self.down_scale, F.silu(gate) * up)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 

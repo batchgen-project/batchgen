@@ -30,22 +30,6 @@ from .model import Glm5ForCausalLM, Glm5MoEDecode
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
-def glm5_fp8_dequantization(
-    weight_data_fp8: torch.Tensor,
-    weight_scale_inv_fp32: torch.Tensor,
-    block_size=(128, 128),
-) -> torch.Tensor:
-    """Blockwise FP8 dequantization (standalone copy)."""
-    rows, cols = weight_data_fp8.shape
-    block_rows, block_cols = block_size
-    n_block_rows = rows // block_rows
-    n_block_cols = cols // block_cols
-    weight_4d = weight_data_fp8.reshape(
-        n_block_rows, block_rows, n_block_cols, block_cols
-    ).to(torch.float32)
-    scale_4d = weight_scale_inv_fp32.unsqueeze(1).unsqueeze(-1)
-    dequantized_4d = weight_4d * scale_4d
-    return dequantized_4d.reshape(rows, cols).to(torch.bfloat16)
 
 
 class GLM5ParallelStrategyManager:
@@ -158,6 +142,7 @@ class GLM5ParallelStrategyManager:
 
         step_start = time.perf_counter()
         self.model.to(self.engine_config.Basic_Config.device_torch)
+        self._setup_fp8_scales()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time
@@ -261,6 +246,7 @@ class GLM5ParallelStrategyManager:
 
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
+        self._setup_fp8_scales()
 
         if self.rank == 0:
             used = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
@@ -585,31 +571,35 @@ class GLM5ParallelStrategyManager:
             )
 
     def _load_model_skeleton(self):
-        """Load skeleton weights (norms, embeddings, gates, indexer, lm_head).
-
-        Attention and expert FP8 weights are dequantized on-the-fly by wrappers.
-        Skeleton weights used directly by nn.Linear (dense MLP, indexer, lm_head)
-        must be dequantized here since nn.Linear requires matching dtypes.
-        """
+        """Load skeleton weights as-is (no CPU dequant). FP8 dequant happens on-the-fly."""
         for key, param in self.model.named_parameters():
-            # Skip weights loaded by wrappers (attention, experts)
             if key in self.state_dict_name_map:
                 continue
             if key in self.skeleton_state_dict:
-                weight = self.skeleton_state_dict[key]
-                dequant_key = key + "_scale_inv"
-                if dequant_key in self.dequant_scale and weight.dtype == torch.float8_e4m3fn:
-                    param.data = glm5_fp8_dequantization(
-                        weight, self.dequant_scale[dequant_key],
-                    )
-                else:
-                    param.data = weight
+                param.data = self.skeleton_state_dict[key]
 
         skeleton_size = sum(
             p.numel() * p.element_size() for p in self.model.parameters()
         ) / (1024**3)
         if self.rank == 0:
             logging.info(f"Model skeleton size: {skeleton_size:.2f} GB")
+
+    def _setup_fp8_scales(self):
+        """Attach FP8 scale tensors to indexer and dense MLP for on-the-fly dequant."""
+        device = self.engine_config.Basic_Config.device_torch
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            indexer = self.model.model.layers[layer_idx].self_attn.indexer
+            for proj, attr in [("wk", "wk_scale"), ("wq_b", "wq_b_scale")]:
+                key = f"model.layers.{layer_idx}.self_attn.indexer.{proj}.weight_scale_inv"
+                if key in self.dequant_scale:
+                    setattr(indexer, attr, self.dequant_scale[key].to(device))
+        for layer_idx in range(self.FIRST_K_DENSE):
+            mlp = self.model.model.layers[layer_idx].mlp
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                key = f"model.layers.{layer_idx}.mlp.{proj}.weight_scale_inv"
+                if key in self.dequant_scale:
+                    setattr(mlp, f"{proj.split('_')[0]}_scale",
+                            self.dequant_scale[key].to(device))
 
     def _lm_head_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)
