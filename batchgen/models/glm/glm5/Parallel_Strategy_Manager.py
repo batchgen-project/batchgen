@@ -588,7 +588,10 @@ class GLM5ParallelStrategyManager:
         """Attach FP8 scale tensors to indexer and dense MLP for on-the-fly dequant."""
         device = self.engine_config.Basic_Config.device_torch
         for layer_idx in range(self.model_config.num_hidden_layers):
-            indexer = self.model.model.layers[layer_idx].self_attn.indexer
+            attn = self.model.model.layers[layer_idx].self_attn
+            # After wrapping, self_attn is GLM5AttnWrapper; original Glm5MLA is at .module
+            inner = attn.module if hasattr(attn, 'module') else attn
+            indexer = inner.indexer
             for proj, attr in [("wk", "wk_scale"), ("wq_b", "wq_b_scale")]:
                 key = f"model.layers.{layer_idx}.self_attn.indexer.{proj}.weight_scale_inv"
                 if key in self.dequant_scale:
