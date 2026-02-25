@@ -191,3 +191,11 @@ class DualHostKVCoordinator:
 
 	def get_stats(self):
 		return self.primary.get_stats()
+
+	# -- Migration (primary only, aux rebuilt during prefill) --
+
+	def async_load_layer_paged_kv_to_device(self, **kwargs):
+		return self.primary.async_load_layer_paged_kv_to_device(**kwargs)
+
+	def async_offload_layer_kv_to_host(self, **kwargs):
+		return self.primary.async_offload_layer_kv_to_host(**kwargs)
