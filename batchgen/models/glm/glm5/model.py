@@ -57,23 +57,25 @@ class Glm5RotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        self.max_seq_len_cached = 0
+        self.cos_cached = None
+        self.sin_cached = None
         inv_freq = 1.0 / (
             self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings, torch.get_default_dtype())
 
-    def _set_cos_sin_cache(self, seq_len: int, dtype: torch.dtype):
+    def _set_cos_sin_cache(self, seq_len: int, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        self.cos_cached = emb.cos().to(dtype)
+        self.sin_cached = emb.sin().to(dtype)
 
     def forward(self, x: torch.Tensor, seq_len: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len, x.dtype)
+        if self.cos_cached is None or seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
         return (
             self.cos_cached[:seq_len].to(x.dtype),
             self.sin_cached[:seq_len].to(x.dtype),
