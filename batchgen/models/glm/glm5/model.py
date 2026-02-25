@@ -295,6 +295,7 @@ class Glm5Indexer(nn.Module):
         cached_k: torch.Tensor,
         cache_seqlens: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """Score cached tokens via MQA Q@K and select top-K.
 
@@ -307,12 +308,14 @@ class Glm5Indexer(nn.Module):
             cached_k: [batch, max_seqlen, head_dim] — gathered indexer K (128-dim, with RoPE+Hadamard)
             cache_seqlens: [batch] — valid lengths
             positions: [batch] or [batch, 1] — current token positions for Q RoPE
+            max_seqlen: max sequence length (int) to avoid CPU-GPU sync
 
         Returns:
             top_k_indices: [batch, index_topk]
         """
         batch_size = q_a.shape[0]
-        max_seqlen = cached_k.shape[1]
+        if max_seqlen is None:
+            max_seqlen = cached_k.shape[1]
 
         # Q from shared q_a intermediate: [batch, 1, q_lora_rank] -> [batch, n_heads, head_dim]
         if hasattr(self, 'wq_b_scale'):
@@ -325,8 +328,7 @@ class Glm5Indexer(nn.Module):
         # Apply RoPE + Hadamard to Q (must match cached K processing)
         if positions is not None and self.rotary_emb is not None:
             if _fused_rope_hadamard_fn is not None:
-                seq_len = int(positions.max()) + 1
-                cos, sin = self.rotary_emb(q.view(-1, 1, self.rope_head_dim), seq_len)
+                cos, sin = self.rotary_emb(q.view(-1, 1, self.rope_head_dim), max_seqlen)
                 # Reshape [B, n_heads, 128] → [B*n_heads, 128], expand positions
                 B = q.shape[0]
                 q_flat = q.reshape(-1, self.index_head_dim)
@@ -358,10 +360,9 @@ class Glm5Indexer(nn.Module):
 
         # Aggregate across heads and select top-K
         aggregated = scores.sum(dim=1)  # [batch, max_seqlen]
-        # Clamp topk to min sequence length to avoid selecting -inf positions
-        # (which causes non-deterministic tie-breaking and garbage gather)
-        min_valid = int(cache_seqlens.min().item())
-        effective_topk = min(self.index_topk, max_seqlen, min_valid)
+        # Clamp topk: index_topk is fixed hyperparameter, max_seqlen is Python int.
+        # Per-sequence masking (-inf) handles varying lengths within the batch.
+        effective_topk = min(self.index_topk, max_seqlen)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
 
         return top_k_indices
@@ -375,6 +376,7 @@ class Glm5Indexer(nn.Module):
         cache_seqlens: torch.Tensor,
         page_size: int = 64,
         positions: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """Score cached tokens from paged cache and select top-K.
 
@@ -390,12 +392,14 @@ class Glm5Indexer(nn.Module):
             cache_seqlens: [batch] — valid lengths
             page_size: tokens per page
             positions: [batch] — current token positions for Q RoPE
+            max_seqlen: max sequence length (int) to avoid CPU-GPU sync
 
         Returns:
             top_k_indices: [batch, index_topk] — absolute token positions
         """
         batch_size = block_table.shape[0]
-        max_seqlen = int(cache_seqlens.max().item())
+        if max_seqlen is None:
+            max_seqlen = int(cache_seqlens.max().item())
         num_k_heads = indexer_blocked_k.shape[2]
         k_head_dim = indexer_blocked_k.shape[3]
 
@@ -419,7 +423,8 @@ class Glm5Indexer(nn.Module):
 
         gathered_k = gathered.squeeze(2)
         return self.score_and_select(
-            q_a, hidden_states, gathered_k, cache_seqlens, positions=positions,
+            q_a, hidden_states, gathered_k, cache_seqlens,
+            positions=positions, max_seqlen=max_seqlen,
         )
 
 

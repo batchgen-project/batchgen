@@ -470,7 +470,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
             if torch.all(updated_seqlens <= indexer.index_topk):
                 # Short-circuit: all sequences fit within topk — use full range
-                max_len = int(updated_seqlens.max())
+                max_len = max_seqlen
                 top_k_indices = torch.arange(
                     max_len, device=hidden_states.device, dtype=torch.long,
                 ).unsqueeze(0).expand(bsz, -1)
@@ -485,6 +485,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     indexer_blocked_k, idx_block_table,
                     updated_seqlens, aux_page_size,
                     positions=new_token_pos,
+                    max_seqlen=max_seqlen,
                 )
 
         # --- Step 4: Sparse gather MLA KV at top-K positions ---
