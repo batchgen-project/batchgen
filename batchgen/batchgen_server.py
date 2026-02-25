@@ -646,7 +646,7 @@ def parse_args():
 	parser.add_argument("--hf-cache-dir", type=str, default=None)
 	parser.add_argument("--cache-dir", type=str, default=None)
 	parser.add_argument("--pt-ckpt-dir", type=str, default=None)
-	parser.add_argument("--enable-hugetlbfs", action='store_false')
+	parser.add_argument("--enable-hugetlbfs", action='store_true')
 	parser.add_argument("--dist-init-addr", type=str)
 	parser.add_argument("--kv-dtype", type=str, default="bfloat16")
 	parser.add_argument("--host-kv-cache-size", type=int, default=None)
@@ -672,6 +672,8 @@ def parse_args():
 		default=0.0,
 		help="Ratio of experts per layer to offload (0.0-1.0). E.g., 0.2 means 20%% of experts loaded/freed at runtime"
 	)
+	parser.add_argument("--converted-ckpt-dir", type=str, default=None,
+		help="Directory for converted checkpoint (default: <cache-dir>/converted_ckpt)")
 	parser.add_argument(
 		"--pre-dequantize-weights",
 		action="store_true",
