@@ -389,6 +389,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
         dt = get_decode_timer()
         li = self.layer_idx
 
+        # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
+        if bsz == 0:
+            return hidden_states.new_empty(0, 1, attn.hidden_size)
+
         # --- Shared FP8 activation quantization ---
         with (dt.timed("act_quant", li) if dt else _nullctx()):
             hidden_flat = hidden_states.squeeze(1)  # [batch, hidden_size]
