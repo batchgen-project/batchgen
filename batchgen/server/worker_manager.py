@@ -27,7 +27,6 @@ from batchgen.server.process_utils import (
     get_model_byte_size,
 )
 from batchgen.server.server_args import ServerArgs
-from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
 
 logger = logging.getLogger(__name__)
@@ -419,6 +418,7 @@ class WorkerManager:
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
             detokenization_include_special_tokens=self.args.detokenization_include_special_tokens,
         )
+        from batchgen.server_worker_main_loop import server_worker_main
         self.worker_process = mp.spawn(
             server_worker_main,
             args=(
