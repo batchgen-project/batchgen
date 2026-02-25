@@ -2302,11 +2302,8 @@ class BatchGenWorker:
 				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo send: {(t_send-t_cpu)*1000:.1f}ms")
 			# Free GPU pages
 			manager.free_pages_for_sequences([global_idx])
-			# Free host KV pages
+			# Free host KV pages (DualHostKVCoordinator handles both primary + aux)
 			worker_view.release_sequence_pages([global_idx])
-			aux_view_mig = getattr(self, "host_paged_kv_worker_view_aux", None)
-			if aux_view_mig is not None:
-				aux_view_mig.release_sequence_pages([global_idx])
 			# Also send query_book data (input_ids, attention_mask, decoded_tokens)
 			local_idx = self._uuid_to_local_map.get(uuid)
 			if local_idx is not None and local_idx in self.query_book:
