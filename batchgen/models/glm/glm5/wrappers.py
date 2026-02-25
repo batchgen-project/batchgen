@@ -468,7 +468,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # cache_seqlens already includes the new token (pre-incremented in worker)
             updated_seqlens = cache_seqlens
 
-            if torch.all(updated_seqlens <= indexer.index_topk):
+            if max_seqlen <= indexer.index_topk:
                 # Short-circuit: all sequences fit within topk — use full range
                 max_len = max_seqlen
                 top_k_indices = torch.arange(

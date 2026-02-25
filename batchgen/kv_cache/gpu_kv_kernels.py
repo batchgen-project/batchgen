@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -7,6 +8,120 @@ import triton
 import triton.language as tl
 
 _BLOCK_SIZE = 256
+
+# ---------------------------------------------------------------------------
+# CUDA kernel for paged KV cache update (lower launch overhead than Triton)
+# ---------------------------------------------------------------------------
+_cuda_kv_module = None
+_cuda_kv_available = None  # None = not checked yet
+
+
+def _get_cuda_kv_module():
+    global _cuda_kv_module, _cuda_kv_available
+    if _cuda_kv_available is not None:
+        return _cuda_kv_module
+    try:
+        from torch.utils.cpp_extension import load_inline
+        _CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void paged_kv_token_update_kernel(
+    scalar_t* __restrict__ cache,
+    const scalar_t* __restrict__ src,
+    const int32_t* __restrict__ page_table,
+    const int32_t* __restrict__ slot_indices,
+    const int32_t* __restrict__ token_indices,
+    const int64_t page_stride,
+    const int64_t token_stride,
+    const int32_t page_table_cols,
+    const int32_t page_size_tokens,
+    const int32_t elements_per_token,
+    const int32_t num_tokens
+) {
+    const int token_id = blockIdx.x;
+    if (token_id >= num_tokens) return;
+
+    const int32_t slot = __ldg(&slot_indices[token_id]);
+    if (slot < 0) return;
+
+    const int32_t token_index = __ldg(&token_indices[token_id]);
+    const int32_t page_slot = token_index / page_size_tokens;
+    const int32_t offset = token_index - page_slot * page_size_tokens;
+
+    const int32_t page = __ldg(&page_table[slot * page_table_cols + page_slot]);
+    if (page < 0) return;
+
+    scalar_t* dst = cache + page * page_stride + offset * token_stride;
+    const scalar_t* src_row = src + (int64_t)token_id * elements_per_token;
+
+    for (int e = threadIdx.x; e < elements_per_token; e += blockDim.x) {
+        dst[e] = src_row[e];
+    }
+}
+
+void paged_kv_token_update_cuda(
+    torch::Tensor cache,
+    torch::Tensor src_tokens,
+    torch::Tensor page_table,
+    torch::Tensor slot_indices,
+    torch::Tensor token_indices,
+    int64_t page_size_tokens
+) {
+    const int num_tokens = src_tokens.size(0);
+    if (num_tokens == 0) return;
+
+    const int elements_per_token = src_tokens.size(1);
+    const int64_t page_stride = cache.stride(0);
+    const int64_t token_stride = cache.stride(1);
+    const int page_table_cols = page_table.size(1);
+
+    const int threads = 128;
+    const int blocks = num_tokens;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_ALL_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        cache.scalar_type(), "paged_kv_token_update", [&] {
+            paged_kv_token_update_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                cache.data_ptr<scalar_t>(),
+                src_tokens.data_ptr<scalar_t>(),
+                page_table.data_ptr<int32_t>(),
+                slot_indices.data_ptr<int32_t>(),
+                token_indices.data_ptr<int32_t>(),
+                page_stride,
+                token_stride,
+                page_table_cols,
+                static_cast<int32_t>(page_size_tokens),
+                elements_per_token,
+                num_tokens
+            );
+        }
+    );
+}
+"""
+        _CPP_SRC = r"""
+void paged_kv_token_update_cuda(
+    torch::Tensor cache, torch::Tensor src_tokens,
+    torch::Tensor page_table, torch::Tensor slot_indices,
+    torch::Tensor token_indices, int64_t page_size_tokens);
+"""
+        _cuda_kv_module = load_inline(
+            name="paged_kv_write_cuda",
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            functions=["paged_kv_token_update_cuda"],
+            verbose=False,
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+        )
+        _cuda_kv_available = True
+        logging.info("CUDA paged KV write kernel compiled successfully")
+    except Exception as e:
+        _cuda_kv_available = False
+        logging.warning(f"CUDA paged KV write kernel unavailable, using Triton: {e}")
+    return _cuda_kv_module
 
 
 @triton.jit
@@ -210,6 +325,16 @@ def _launch_single_cache_update_with_page_table(
     if num_tokens == 0:
         return
 
+    # Use CUDA kernel if available (lower launch overhead)
+    mod = _get_cuda_kv_module()
+    if mod is not None:
+        mod.paged_kv_token_update_cuda(
+            cache_tensor, src_tokens, page_table,
+            slot_indices, token_indices, page_size_tokens,
+        )
+        return
+
+    # Fallback to Triton
     if src_tokens.shape[1] <= 0:
         raise ValueError("Token vectors must contain at least one element")
 
