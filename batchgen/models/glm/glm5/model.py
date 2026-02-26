@@ -785,6 +785,11 @@ class Glm5MoEDecode(nn.Module):
     - moe_infer_loop_with_offloading: loop-based for mixed persistent/non-persistent
     """
 
+    # Shared across all instances (all 75 MoE layers)
+    _wgmma_modules = None       # (wgmma_mod, fast_mod, dr_mod)
+    _wgmma_shared_bufs = None   # WGMMAMoEBuffers instance
+    _wgmma_next_layer_id = 0    # Counter for layer registration
+
     def __init__(self, config: Glm5Config, comm=None):
         super().__init__()
         self.config = config
@@ -876,11 +881,14 @@ class Glm5MoEDecode(nn.Module):
         self.down_scale_ptrs_ptr = torch.tensor(
             [s.data_ptr() for s in self.down_scale_list], dtype=torch.int64, device=self.device)
 
-        # Build WGMMA CUDA modules if enabled (buffers created lazily on first forward)
-        if self.use_wgmma_fp8 and not hasattr(self, '_wgmma_modules'):
-            from batchgen.moe.fp8_wgmma_pipeline import build_all_modules
-            self._wgmma_modules = build_all_modules()
-            self._wgmma_bufs = None
+        # WGMMA: register this layer's weights (buffers shared via class variable)
+        if self.use_wgmma_fp8:
+            if Glm5MoEDecode._wgmma_modules is None:
+                from batchgen.moe.fp8_wgmma_pipeline import build_all_modules
+                Glm5MoEDecode._wgmma_modules = build_all_modules()
+            # Assign layer id for weight registration (incremental)
+            self._wgmma_layer_id = Glm5MoEDecode._wgmma_next_layer_id
+            Glm5MoEDecode._wgmma_next_layer_id += 1
 
     def cleanup(self):
         for attr in ('gate_list', 'up_list', 'down_list',
@@ -1010,12 +1018,13 @@ class Glm5MoEDecode(nn.Module):
             topk_weight = topk_weight.to(torch.float32)
 
         if self.use_wgmma_fp8:
-            # Lazy-init buffers on first forward (needs num_tokens_per_rank)
-            if self._wgmma_bufs is None:
+            # Lazy-init shared buffers on first forward (needs num_tokens_per_rank)
+            bufs = Glm5MoEDecode._wgmma_shared_bufs
+            if bufs is None:
                 from batchgen.moe.fp8_wgmma_pipeline import WGMMAMoEBuffers, DEFAULT_MTP
-                wgmma_mod, fast_mod, dr_mod = self._wgmma_modules
+                wgmma_mod, fast_mod, dr_mod = Glm5MoEDecode._wgmma_modules
                 num_global_tokens = self.num_tokens_per_rank * self.world_size
-                self._wgmma_bufs = WGMMAMoEBuffers(
+                bufs = WGMMAMoEBuffers(
                     wgmma_mod, fast_mod, dr_mod,
                     len(self.gate_list), DEFAULT_MTP,
                     self.hidden_size, self.config.moe_intermediate_size,
@@ -1026,10 +1035,18 @@ class Glm5MoEDecode(nn.Module):
                     self.num_experts_per_tok,
                     num_global_tokens,
                     device=self.device)
+                Glm5MoEDecode._wgmma_shared_bufs = bufs
+            # Register this layer's weights if not yet registered
+            if self._wgmma_layer_id not in bufs._layer_weights:
+                bufs.register_layer_weights(
+                    self._wgmma_layer_id,
+                    self.gate_list, self.gate_scale_list,
+                    self.up_list, self.up_scale_list,
+                    self.down_list, self.down_scale_list)
             # ── WGMMA path: dispatch_scatter_3d → WGMMA pipeline → reduce ──
             with (dt.timed("wgmma_pipeline", 0) if dt else _nullctx()):
-                global_results = self._wgmma_bufs.forward(
-                    0, global_x, topk_idx, topk_weight)
+                global_results = bufs.forward(
+                    self._wgmma_layer_id, global_x, topk_idx, topk_weight)
         else:
             # ── Triton path (original) ──
             # 3) Dispatch tokens to local experts
