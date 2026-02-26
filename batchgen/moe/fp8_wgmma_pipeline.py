@@ -1618,10 +1618,12 @@ class WGMMAMoEBuffers:
                       down_weights, down_scales),
         }
 
-    def _create_tma_descriptors(self):
-        """Create TMA descriptors for v8c (stage 1) and v8b (stage 2)."""
-        # Use layer 0's weights for TMA B descriptors (weight layout is same across layers)
-        lw = self._layer_weights[0]
+    def _create_tma_descriptors(self, layer_id=0):
+        """Create TMA descriptors for v8c (stage 1) and v8b (stage 2).
+
+        Must be called each time the layer changes (weight pointers differ).
+        """
+        lw = self._layer_weights[layer_id]
 
         # v8c: 4E descriptors (A + B_gate + B_up + xscale)
         self.tma_v8c = self.wgmma_mod.create_tma_descriptors_v8c(
@@ -1632,6 +1634,8 @@ class WGMMAMoEBuffers:
         self.tma_v8b = self.wgmma_mod.create_tma_descriptors_v8b(
             self.inter_fp8, lw["down_weight_ptrs"],
             self.inter_scale_t, self.H, self.mtp_padded)
+
+        self._current_tma_layer_id = layer_id
 
     def _maybe_resize(self, max_tokens_needed):
         """Resize buffers if max tokens per expert exceeds current mtp."""
@@ -1688,6 +1692,10 @@ class WGMMAMoEBuffers:
         mtp = self.mtp_padded
 
         lw = self._layer_weights[layer_id]
+
+        # Recreate TMA descriptors if layer changed (weight pointers differ)
+        if getattr(self, '_current_tma_layer_id', None) != layer_id:
+            self._create_tma_descriptors(layer_id)
 
         # Ensure topk_pos is large enough
         self._resize_topk_pos_if_needed(G)
