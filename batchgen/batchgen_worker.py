@@ -6404,9 +6404,9 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# P0: Cache the all_reduce batch-size sync result.
-		# Batch size only changes at page boundaries, so we sync there and reuse.
-		_cached_max_bs = max(max_batch_size, 1)
+		# P0: Pre-allocate tensor for per-token all_reduce batch-size sync
+		# (avoids torch.tensor allocation every token)
+		_local_bs_buf = torch.tensor([max_batch_size], dtype=torch.int64, device=self.torch_device)
 
 		# P1: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
@@ -6446,14 +6446,6 @@ class BatchGenWorker:
 
 				# Batch may have changed - need to verify page table
 				_page_table_verified_this_batch = False
-
-				# P0: Re-sync batch size at page boundary (batch may have changed)
-				_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-				dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
-				_cached_max_bs = max(_local_bs.item(), 1)
-				if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-					if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-						self.parallel_manager.set_num_tokens_per_rank(_cached_max_bs)
 
 				# P2: Reinitialize attention metadata after batch change
 				_attn_meta_initialized = False
@@ -6672,8 +6664,13 @@ class BatchGenWorker:
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
 
-				# P0: Use cached batch size from page boundary (no per-token all_reduce)
-				_max_bs = _cached_max_bs
+				# P0: Per-token all_reduce with pre-allocated buffer (no torch.tensor alloc)
+				_local_bs_buf.fill_(len(batch))
+				dist.all_reduce(_local_bs_buf, op=dist.ReduceOp.MAX)
+				_max_bs = max(_local_bs_buf.item(), 1)
+				if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+					if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
+						self.parallel_manager.set_num_tokens_per_rank(_max_bs)
 
 				# KV append callback
 				# NOTE: v_tensor is optional for backward compatibility with MLA models (DeepSeek)
