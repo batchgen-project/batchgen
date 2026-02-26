@@ -1029,7 +1029,7 @@ class Glm5MoEDecode(nn.Module):
             # ── WGMMA path: dispatch_scatter_3d → WGMMA pipeline → reduce ──
             with (dt.timed("wgmma_pipeline", 0) if dt else _nullctx()):
                 global_results = self._wgmma_bufs.forward(
-                    global_x, topk_idx, topk_weight)
+                    0, global_x, topk_idx, topk_weight)
         else:
             # ── Triton path (original) ──
             # 3) Dispatch tokens to local experts
