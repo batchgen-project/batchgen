@@ -1131,9 +1131,11 @@ __global__ void fused_silu_quant_3d_kernel(
 // ============================================================================
 // C++ wrappers
 // ============================================================================
-std::tuple<torch::Tensor, torch::Tensor> act_quant_3d(
+void act_quant_3d(
     torch::Tensor x,
-    torch::Tensor tokens_per_expert
+    torch::Tensor tokens_per_expert,
+    torch::Tensor out_fp8,
+    torch::Tensor out_scale_t
 ) {
     TORCH_CHECK(x.dim() == 3, "x must be 3D [E, mtp, K]");
     TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be BF16");
@@ -1144,26 +1146,21 @@ std::tuple<torch::Tensor, torch::Tensor> act_quant_3d(
     int K = x.size(2);
     int num_k_blocks = (K + BLOCK_SIZE_QUANT - 1) / BLOCK_SIZE_QUANT;
 
-    auto y = torch::empty({E, mtp, K}, torch::dtype(torch::kUInt8).device(x.device()));
-    // Transposed scale: [num_k_blocks, E * mtp]
-    auto scale_t = torch::empty({num_k_blocks, E * mtp},
-                                 torch::dtype(torch::kFloat32).device(x.device()));
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     act_quant_3d_kernel<<<E, 128, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-        y.data_ptr<uint8_t>(),
-        scale_t.data_ptr<float>(),
+        out_fp8.data_ptr<uint8_t>(),
+        out_scale_t.data_ptr<float>(),
         tokens_per_expert.data_ptr<int32_t>(),
         E, mtp, K, num_k_blocks);
-
-    return std::make_tuple(y, scale_t);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> fused_silu_quant_3d(
+void fused_silu_quant_3d(
     torch::Tensor gate,
     torch::Tensor up,
-    torch::Tensor tokens_per_expert
+    torch::Tensor tokens_per_expert,
+    torch::Tensor out_fp8,
+    torch::Tensor out_scale_t
 ) {
     TORCH_CHECK(gate.dim() == 3 && up.dim() == 3, "Inputs must be 3D");
     TORCH_CHECK(gate.sizes() == up.sizes(), "Shape mismatch");
@@ -1173,32 +1170,27 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_quant_3d(
     int N = gate.size(2);
     int num_n_blocks = (N + BLOCK_SIZE_QUANT - 1) / BLOCK_SIZE_QUANT;
 
-    auto y = torch::empty({E, mtp, N}, torch::dtype(torch::kUInt8).device(gate.device()));
-    // Transposed scale: [num_n_blocks, E * mtp]
-    auto scale_t = torch::empty({num_n_blocks, E * mtp},
-                                 torch::dtype(torch::kFloat32).device(gate.device()));
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     fused_silu_quant_3d_kernel<<<E, 128, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(up.data_ptr()),
-        y.data_ptr<uint8_t>(),
-        scale_t.data_ptr<float>(),
+        out_fp8.data_ptr<uint8_t>(),
+        out_scale_t.data_ptr<float>(),
         tokens_per_expert.data_ptr<int32_t>(),
         E, mtp, N, num_n_blocks);
-
-    return std::make_tuple(y, scale_t);
 }
 ''';
 
 FAST_CPP_SOURCE = r'''
 #include <torch/extension.h>
 
-std::tuple<torch::Tensor, torch::Tensor> act_quant_3d(
-    torch::Tensor x, torch::Tensor tokens_per_expert);
+void act_quant_3d(
+    torch::Tensor x, torch::Tensor tokens_per_expert,
+    torch::Tensor out_fp8, torch::Tensor out_scale_t);
 
-std::tuple<torch::Tensor, torch::Tensor> fused_silu_quant_3d(
-    torch::Tensor gate, torch::Tensor up, torch::Tensor tokens_per_expert);
+void fused_silu_quant_3d(
+    torch::Tensor gate, torch::Tensor up, torch::Tensor tokens_per_expert,
+    torch::Tensor out_fp8, torch::Tensor out_scale_t);
 ''';
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1577,6 +1569,9 @@ class WGMMAMoEBuffers:
         self.expert_counts = torch.zeros(E_local, dtype=torch.int32, device=device)
         self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
         self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
+        self.tpe = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.global_results = torch.zeros(
+            num_global_tokens, H, dtype=torch.bfloat16, device=device)
         self.num_global_tokens = num_global_tokens
 
         # ── Weight pointers (per layer — stored as list of per-layer dicts) ──
@@ -1631,6 +1626,8 @@ class WGMMAMoEBuffers:
         self.expert_counts = None
         self.expert_counters = None
         self.topk_pos = None
+        self.tpe = None
+        self.global_results = None
         self._layer_weights.clear()
         self._current_tma_layer_id = None
 
@@ -1682,11 +1679,14 @@ class WGMMAMoEBuffers:
         self._create_tma_descriptors()
 
     def _resize_topk_pos_if_needed(self, num_global_tokens):
-        """Resize topk_pos if global token count changed."""
+        """Resize topk_pos and global_results if global token count changed."""
         NK = num_global_tokens * self.top_k
         if self.topk_pos.numel() < NK:
             self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
             self.num_global_tokens = num_global_tokens
+        if self.global_results.shape[0] < num_global_tokens:
+            self.global_results = torch.zeros(
+                num_global_tokens, self.H, dtype=torch.bfloat16, device=self.device)
 
     def forward(self, layer_id, global_x, topk_idx, topk_weight):
         """Full WGMMA MoE pipeline forward.
@@ -1725,55 +1725,51 @@ class WGMMAMoEBuffers:
             self.expert_start, E, mtp,
             self.expert_counts, self.expert_counters, self.topk_pos)
 
-        tpe = expert_counts.clone()
+        self.tpe.copy_(expert_counts)
         max_tpe = expert_counts.max().item()
 
         if max_tpe == 0:
-            return torch.zeros(G, H, dtype=torch.bfloat16, device=self.device)
+            self.global_results[:G].zero_()
+            return self.global_results[:G]
 
         # Check if resize needed
         self._maybe_resize(max_tpe)
 
-        # ── Step 2: act_quant_3d (transposed scale output) ──
-        act_fp8, act_scale_t = self.fast_mod.act_quant_3d(
-            self.act_buf_bf16, tpe)
-
-        # Copy into pre-allocated buffers (for TMA)
-        self.act_buf_fp8.copy_(act_fp8)
-        self.act_scale_t.copy_(act_scale_t)
+        # ── Step 2: act_quant_3d (write directly into pre-allocated buffers) ──
+        self.fast_mod.act_quant_3d(
+            self.act_buf_bf16, self.tpe,
+            self.act_buf_fp8, self.act_scale_t)
 
         # ── Step 3: v8c fused gate+up WGMMA ──
         num_k_h = H // QUANT_BLOCK
         self.wgmma_mod.grouped_fp8_moe_gemm_v8c(
-            self.tma_v8c, tpe,
+            self.tma_v8c, self.tpe,
             lw["gate_scale_ptrs"], lw["up_scale_ptrs"],
             num_k_h,  # w_scale_stride_n
             self.gate_out, self.up_out,
             mtp, N, N, H, E)
 
-        # ── Step 4: fused_silu_quant_3d (transposed scale output) ──
+        # ── Step 4: fused_silu_quant_3d (write directly into pre-allocated buffers) ──
         gate_3d = self.gate_out.view(E, mtp, N)
         up_3d = self.up_out.view(E, mtp, N)
-        inter_fp8, inter_scale_t = self.fast_mod.fused_silu_quant_3d(
-            gate_3d, up_3d, tpe)
-
-        self.inter_fp8.copy_(inter_fp8)
-        self.inter_scale_t.copy_(inter_scale_t)
+        self.fast_mod.fused_silu_quant_3d(
+            gate_3d, up_3d, self.tpe,
+            self.inter_fp8, self.inter_scale_t)
 
         # ── Step 5: v8b down WGMMA ──
         num_k_n = N // QUANT_BLOCK
         self.wgmma_mod.grouped_fp8_moe_gemm_v8b(
-            self.tma_v8b, tpe,
+            self.tma_v8b, self.tpe,
             lw["down_scale_ptrs"],
             num_k_n,  # w_scale_stride_n
             self.down_out,
             mtp, H, N, E)
 
         # ── Step 6: Reduce weighted scatter ──
-        global_results = torch.zeros(G, H, dtype=torch.bfloat16, device=self.device)
+        self.global_results[:G].zero_()
         topk_weights_flat = topk_weight.reshape(-1)
         self.dr_mod.reduce_weighted_scatter(
             self.down_out, topk_pos, topk_weights_flat,
-            G, H, K_topk, global_results)
+            G, H, K_topk, self.global_results[:G])
 
-        return global_results
+        return self.global_results[:G]
