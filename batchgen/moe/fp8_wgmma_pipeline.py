@@ -1618,6 +1618,22 @@ class WGMMAMoEBuffers:
                       down_weights, down_scales),
         }
 
+    def free_buffers(self):
+        """Release all GPU buffers. Called during phase transitions to reclaim memory."""
+        self.act_buf_bf16 = None
+        self.act_buf_fp8 = None
+        self.act_scale_t = None
+        self.gate_out = None
+        self.up_out = None
+        self.inter_fp8 = None
+        self.inter_scale_t = None
+        self.down_out = None
+        self.expert_counts = None
+        self.expert_counters = None
+        self.topk_pos = None
+        self._layer_weights.clear()
+        self._current_tma_layer_id = None
+
     def _create_tma_descriptors(self, layer_id=0):
         """Create TMA descriptors for v8c (stage 1) and v8b (stage 2).
 

@@ -8153,6 +8153,16 @@ class BatchGenWorker:
 		if torch.cuda.is_available():
 			torch.cuda.synchronize(self.torch_device)
 
+		# Free WGMMA shared buffers if they exist (class-level, survives model deletion)
+		try:
+			from batchgen.models.glm.glm5.model import Glm5MoEDecode
+			if getattr(Glm5MoEDecode, '_wgmma_shared_bufs', None) is not None:
+				Glm5MoEDecode._wgmma_shared_bufs.free_buffers()
+				Glm5MoEDecode._wgmma_shared_bufs = None
+				Glm5MoEDecode._wgmma_next_layer_id = 0
+		except ImportError:
+			pass
+
 		# Delete model directly without CPU transfer
 		del self.model
 		self.model = None
