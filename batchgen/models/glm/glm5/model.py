@@ -1013,9 +1013,20 @@ class Glm5MoEDecode(nn.Module):
         # 2) Gate (GLM-5: sigmoid scoring)
         with (dt.timed("routing", 0) if dt else _nullctx()):
             global_x = all_tokens
-            topk_weight, topk_idx = self.gate(global_x)
-            topk_idx = topk_idx.to(torch.int32)
-            topk_weight = topk_weight.to(torch.float32)
+            if self.use_wgmma_fp8:
+                # Fused CUDA kernel: sigmoid + bias + topk + normalize + scale
+                from batchgen.moe.routing import gate_sigmoid_topk_cuda
+                router_logits = F.linear(global_x, self.gate.weight).float()
+                topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+                    router_logits,
+                    self.gate.e_score_correction_bias.float(),
+                    k=self.num_experts_per_tok,
+                    routed_scaling_factor=self.gate.routed_scaling_factor,
+                )
+            else:
+                topk_weight, topk_idx = self.gate(global_x)
+                topk_idx = topk_idx.to(torch.int32)
+                topk_weight = topk_weight.to(torch.float32)
 
         if self.use_wgmma_fp8:
             # Lazy-init shared buffers on first forward (needs num_tokens_per_rank)

@@ -1726,14 +1726,8 @@ class WGMMAMoEBuffers:
             self.expert_counts, self.expert_counters, self.topk_pos)
 
         self.tpe.copy_(expert_counts)
-        max_tpe = expert_counts.max().item()
-
-        if max_tpe == 0:
-            self.global_results[:G].zero_()
-            return self.global_results[:G]
-
-        # Check if resize needed
-        self._maybe_resize(max_tpe)
+        # Note: no .item() sync here — buffers are pre-sized to mtp=4096
+        # which is always sufficient for decode (typically <100 tokens/expert).
 
         # ── Step 2: act_quant_3d (write directly into pre-allocated buffers) ──
         self.fast_mod.act_quant_3d(
