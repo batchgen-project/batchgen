@@ -6403,7 +6403,23 @@ class BatchGenWorker:
 		# OPTIMIZATION: Track if page table was verified since last batch change
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
-		
+
+		# P0: Cache the all_reduce batch-size sync result.
+		# Batch size only changes at page boundaries, so we sync there and reuse.
+		_cached_max_bs = max(max_batch_size, 1)
+
+		# P1: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
+		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
+
+		# P2: Pre-allocate attention metadata tensors on GPU (avoid per-token allocations)
+		# These are initialized at first iteration and updated in-place thereafter.
+		_seqlens_i32 = None  # [B] int32 on GPU — incremented in-place each step
+		_seqlens_i64 = None  # [B] int64 on GPU — for attention_mask computation
+		_position_ids = None  # [B, 1] int64 on GPU
+		_attn_mask = None    # [B, max_ctx_capacity] int64 on GPU (lazily grown)
+		_attn_meta_initialized = False
+		_max_ctx = 0         # Tracks max context length across iterations
+
 		# Main decode loop
 		while decode_uuids:
 			local_iteration += 1
@@ -6430,6 +6446,17 @@ class BatchGenWorker:
 
 				# Batch may have changed - need to verify page table
 				_page_table_verified_this_batch = False
+
+				# P0: Re-sync batch size at page boundary (batch may have changed)
+				_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
+				dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
+				_cached_max_bs = max(_local_bs.item(), 1)
+				if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+					if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
+						self.parallel_manager.set_num_tokens_per_rank(_cached_max_bs)
+
+				# P2: Reinitialize attention metadata after batch change
+				_attn_meta_initialized = False
 
 				# Post-boundary: verify page table matches batch and fix if needed
 				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
@@ -6560,36 +6587,45 @@ class BatchGenWorker:
 
 			with torch.inference_mode():
 				if batch:
-					# Collect context lengths, handling rare edge case of ctx_len == 0
-					cache_seqlens = []
-					for seq in batch_sequences:
-						ctx_len = seq.current_context_length
-						if ctx_len == 0:  # Rare edge case - trust prompt_length + decoded_length
-							ctx_len = seq.prompt_length + seq.decoded_length
-							if ctx_len > 0:
-								seq.current_context_length = ctx_len
-						cache_seqlens.append(ctx_len)
+					# P2: Initialize or incrementally update attention metadata on GPU
+					# Key optimization: avoid per-token CPU→GPU transfer of cache_seqlens
+					if not _attn_meta_initialized:
+						# First iteration or after batch change: full initialization from Python state
+						cache_seqlens = []
+						for seq in batch_sequences:
+							ctx_len = seq.current_context_length
+							if ctx_len == 0:
+								ctx_len = seq.prompt_length + seq.decoded_length
+								if ctx_len > 0:
+									seq.current_context_length = ctx_len
+							cache_seqlens.append(ctx_len)
 
-					max_ctx = max(cache_seqlens)
-					# Build attention metadata directly on GPU (avoids CPU→GPU copy of list)
-					positions = torch.arange(max_ctx, device=self.torch_device)
-					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
-					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)
+						_seqlens_i32 = torch.tensor(cache_seqlens, dtype=torch.int32, device=self.torch_device)
+						_position_ids = (_seqlens_i32.to(torch.int64) - 1).unsqueeze(-1)
+						_max_ctx = max(cache_seqlens)
+						_seqlens_i64 = _seqlens_i32.to(torch.int64)
+						positions = torch.arange(_max_ctx, device=self.torch_device)
+						_attn_mask = (positions.unsqueeze(0) < _seqlens_i64.unsqueeze(1)).to(torch.int64)
+						_attn_meta_initialized = True
+					else:
+						# Incremental update: all active sequences advance by 1 token
+						# Completed sequences stay frozen (their output is discarded)
+						_seqlens_i32 += 1
+						_position_ids += 1
+						_max_ctx += 1
+						_seqlens_i64 = _seqlens_i32.to(torch.int64)
+						positions = torch.arange(_max_ctx, device=self.torch_device)
+						_attn_mask = (positions.unsqueeze(0) < _seqlens_i64.unsqueeze(1)).to(torch.int64)
 
-					Attn_Wrapper.attention_mask = attention_mask
-					# Optimization: Compute position_ids from cache_seqlens directly (O(batch))
-					# instead of attention_mask.sum(-1) which is O(batch × max_ctx)
-					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
-					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
-					Attn_Wrapper.max_seqlen = max_ctx
+					Attn_Wrapper.attention_mask = _attn_mask
+					Attn_Wrapper.cache_seqlens = _seqlens_i32
+					Attn_Wrapper.position_ids = _position_ids
+					Attn_Wrapper.max_seqlen = _max_ctx
 
-					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-					# Without this, GPT-OSS attention uses stale cache_seqlens (always None),
-					# causing same KV positions to be read/written every decode step.
-					AttnWrapperBase.attention_mask = attention_mask
-					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-					AttnWrapperBase.max_seqlen = max_ctx
+					AttnWrapperBase.attention_mask = _attn_mask
+					AttnWrapperBase.cache_seqlens = _seqlens_i32
+					AttnWrapperBase.position_ids = _position_ids
+					AttnWrapperBase.max_seqlen = _max_ctx
 
 					# DEBUG: Print cache_seqlens and input tokens
 					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
@@ -6636,15 +6672,8 @@ class BatchGenWorker:
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
 
-				# Per-iteration MoE buffer sync: track actual batch size for tight NCCL buffers.
-				# Without this, num_tokens_per_rank stays stale from page boundary, causing
-				# oversized buckets and redundant GEMM compute on padded tokens.
-				_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-				dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
-				_max_bs = max(_local_bs.item(), 1)
-				if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-					if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-						self.parallel_manager.set_num_tokens_per_rank(_max_bs)
+				# P0: Use cached batch size from page boundary (no per-token all_reduce)
+				_max_bs = _cached_max_bs
 
 				# KV append callback
 				# NOTE: v_tensor is optional for backward compatibility with MLA models (DeepSeek)
@@ -6760,9 +6789,13 @@ class BatchGenWorker:
 						top_vals, top_ids = torch.topk(logits[i], k=5)
 						print(f"[DECODE DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
 
-			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
-			# This avoids N GPU synchronizations which cause heavy CPU overhead
-			new_tokens_cpu = new_tokens.cpu()
+			# P1: Non-blocking GPU→CPU transfer via pinned memory
+			bs = new_tokens.shape[0]
+			if bs > _new_tokens_pinned.shape[0]:
+				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
+			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
+			torch.cuda.current_stream(self.torch_device).synchronize()
+			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
 			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):

@@ -1524,6 +1524,8 @@ class WGMMAMoEBuffers:
                  up_weights_list, up_scales_list,
                  down_weights_list, down_scales_list,
                  expert_start, top_k, num_global_tokens,
+                 num_tokens_per_rank=None,
+                 n_routed_experts=256,
                  device="cuda"):
         self.wgmma_mod = wgmma_mod
         self.fast_mod = fast_mod
@@ -1573,6 +1575,19 @@ class WGMMAMoEBuffers:
         self.global_results = torch.zeros(
             num_global_tokens, H, dtype=torch.bfloat16, device=device)
         self.num_global_tokens = num_global_tokens
+
+        # ── AllGather/Gate pre-allocated buffers ──
+        if num_tokens_per_rank is None:
+            num_tokens_per_rank = num_global_tokens  # fallback: single-rank
+        self.num_tokens_per_rank = num_tokens_per_rank
+        self.all_tokens = torch.zeros(
+            num_global_tokens, H, dtype=torch.bfloat16, device=device)
+        self.padded_hidden_states = torch.zeros(
+            num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
+        self.router_logits_bf16 = torch.zeros(
+            num_global_tokens, n_routed_experts, dtype=torch.bfloat16, device=device)
+        self.router_logits = torch.zeros(
+            num_global_tokens, n_routed_experts, dtype=torch.float32, device=device)
 
         # ── Weight pointers (per layer — stored as list of per-layer dicts) ──
         # For now, store the first layer's weights. Multi-layer support via
@@ -1628,6 +1643,10 @@ class WGMMAMoEBuffers:
         self.topk_pos = None
         self.tpe = None
         self.global_results = None
+        self.all_tokens = None
+        self.padded_hidden_states = None
+        self.router_logits_bf16 = None
+        self.router_logits = None
         self._layer_weights.clear()
         self._current_tma_layer_id = None
 

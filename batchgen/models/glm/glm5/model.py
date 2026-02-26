@@ -991,18 +991,45 @@ class Glm5MoEDecode(nn.Module):
 
         # 1) AllGather
         with (dt.timed("allgather", 0) if dt else _nullctx()):
-            all_tokens = torch.zeros(
-                (self.world_size * self.num_tokens_per_rank, self.hidden_size),
-                device=self.device, dtype=torch.bfloat16,
-            )
-            if x.shape[0] < self.num_tokens_per_rank:
-                padded_hidden_states = torch.zeros(
-                    (self.num_tokens_per_rank, hidden_size),
-                    device=self.device, dtype=x.dtype,
-                )
-                padded_hidden_states[:x.shape[0]] = x
+            if self.use_wgmma_fp8:
+                bufs = Glm5MoEDecode._wgmma_shared_bufs
+                if bufs is not None:
+                    G = self.world_size * self.num_tokens_per_rank
+                    all_tokens = bufs.all_tokens[:G]
+                    all_tokens.zero_()
+                    if x.shape[0] < self.num_tokens_per_rank:
+                        padded_hidden_states = bufs.padded_hidden_states
+                        padded_hidden_states.zero_()
+                        padded_hidden_states[:x.shape[0]] = x
+                    else:
+                        padded_hidden_states = x
+                else:
+                    # Fallback before bufs init (first call)
+                    all_tokens = torch.zeros(
+                        (self.world_size * self.num_tokens_per_rank, self.hidden_size),
+                        device=self.device, dtype=torch.bfloat16,
+                    )
+                    if x.shape[0] < self.num_tokens_per_rank:
+                        padded_hidden_states = torch.zeros(
+                            (self.num_tokens_per_rank, hidden_size),
+                            device=self.device, dtype=x.dtype,
+                        )
+                        padded_hidden_states[:x.shape[0]] = x
+                    else:
+                        padded_hidden_states = x
             else:
-                padded_hidden_states = x
+                all_tokens = torch.zeros(
+                    (self.world_size * self.num_tokens_per_rank, self.hidden_size),
+                    device=self.device, dtype=torch.bfloat16,
+                )
+                if x.shape[0] < self.num_tokens_per_rank:
+                    padded_hidden_states = torch.zeros(
+                        (self.num_tokens_per_rank, hidden_size),
+                        device=self.device, dtype=x.dtype,
+                    )
+                    padded_hidden_states[:x.shape[0]] = x
+                else:
+                    padded_hidden_states = x
 
             with self.comm.change_state(enable=True):
                 self.comm.all_gather(
@@ -1016,13 +1043,27 @@ class Glm5MoEDecode(nn.Module):
             if self.use_wgmma_fp8:
                 # Fused CUDA kernel: sigmoid + bias + topk + normalize + scale
                 from batchgen.moe.routing import gate_sigmoid_topk_cuda
-                router_logits = F.linear(global_x, self.gate.weight).float()
-                topk_idx, topk_weight = gate_sigmoid_topk_cuda(
-                    router_logits,
-                    self.gate.e_score_correction_bias.float(),
-                    k=self.num_experts_per_tok,
-                    routed_scaling_factor=self.gate.routed_scaling_factor,
-                )
+                bufs_r = Glm5MoEDecode._wgmma_shared_bufs
+                if bufs_r is not None:
+                    G = global_x.shape[0]
+                    rl_bf16 = bufs_r.router_logits_bf16[:G]
+                    rl_fp32 = bufs_r.router_logits[:G]
+                    torch.mm(global_x, self.gate.weight.t(), out=rl_bf16)
+                    rl_fp32.copy_(rl_bf16)
+                    topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+                        rl_fp32,
+                        self.gate.e_score_correction_bias.float(),
+                        k=self.num_experts_per_tok,
+                        routed_scaling_factor=self.gate.routed_scaling_factor,
+                    )
+                else:
+                    router_logits = F.linear(global_x, self.gate.weight).float()
+                    topk_idx, topk_weight = gate_sigmoid_topk_cuda(
+                        router_logits,
+                        self.gate.e_score_correction_bias.float(),
+                        k=self.num_experts_per_tok,
+                        routed_scaling_factor=self.gate.routed_scaling_factor,
+                    )
             else:
                 topk_weight, topk_idx = self.gate(global_x)
                 topk_idx = topk_idx.to(torch.int32)
@@ -1045,6 +1086,7 @@ class Glm5MoEDecode(nn.Module):
                     self.routed_expert_start_idx,
                     self.num_experts_per_tok,
                     num_global_tokens,
+                    num_tokens_per_rank=self.num_tokens_per_rank,
                     device=self.device)
                 Glm5MoEDecode._wgmma_shared_bufs = bufs
             # Register this layer's weights if not yet registered
