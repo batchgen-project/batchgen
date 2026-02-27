@@ -994,11 +994,13 @@ class Glm5MoEDecode(nn.Module):
             if self.use_wgmma_fp8:
                 bufs = Glm5MoEDecode._wgmma_shared_bufs
                 if bufs is not None:
-                    G = self.world_size * self.num_tokens_per_rank
+                    ntp = self.num_tokens_per_rank
+                    G = self.world_size * ntp
                     all_tokens = bufs.all_tokens[:G]
                     all_tokens.zero_()
-                    if x.shape[0] < self.num_tokens_per_rank:
-                        padded_hidden_states = bufs.padded_hidden_states
+                    if x.shape[0] < ntp:
+                        # Slice pre-allocated buffer to current num_tokens_per_rank
+                        padded_hidden_states = bufs.padded_hidden_states[:ntp]
                         padded_hidden_states.zero_()
                         padded_hidden_states[:x.shape[0]] = x
                     else:
