@@ -25,6 +25,7 @@ The Kimi K2.5 tokenizer uses TikToken format with 163,840 tokens.
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -214,3 +215,15 @@ class KimiK25Tokenizer(BaseTokenizer):
                 result["attention_mask"] = attention_mask
 
         return result
+
+    # ---- Output parsing ----
+
+    _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+    def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        m = self._THINK_RE.search(text)
+        if not m:
+            return None, text
+        reasoning = m.group(1).strip()
+        visible = self._THINK_RE.sub("", text, count=1).strip()
+        return reasoning, visible

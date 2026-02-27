@@ -197,9 +197,22 @@ class Usage(BaseModel):
     total_tokens: int
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
 class ChatCompletionChoiceMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
-    content: str
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class ChatCompletionChoice(BaseModel):
