@@ -6411,14 +6411,6 @@ class BatchGenWorker:
 		# P1: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
 
-		# P2: Pre-allocate attention metadata tensors on GPU (avoid per-token allocations)
-		# These are initialized at first iteration and updated in-place thereafter.
-		_seqlens_i32 = None  # [B] int32 on GPU — incremented in-place each step
-		_seqlens_i64 = None  # [B] int64 on GPU — for attention_mask computation
-		_position_ids = None  # [B, 1] int64 on GPU
-		_attn_mask = None    # [B, max_ctx_capacity] int64 on GPU (lazily grown)
-		_attn_meta_initialized = False
-		_max_ctx = 0         # Tracks max context length across iterations
 
 		# Main decode loop
 		while decode_uuids:
@@ -6446,9 +6438,6 @@ class BatchGenWorker:
 
 				# Batch may have changed - need to verify page table
 				_page_table_verified_this_batch = False
-
-				# P2: Reinitialize attention metadata after batch change
-				_attn_meta_initialized = False
 
 				# Post-boundary: verify page table matches batch and fix if needed
 				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
@@ -6579,45 +6568,30 @@ class BatchGenWorker:
 
 			with torch.inference_mode():
 				if batch:
-					# P2: Initialize or incrementally update attention metadata on GPU
-					# Key optimization: avoid per-token CPU→GPU transfer of cache_seqlens
-					if not _attn_meta_initialized:
-						# First iteration or after batch change: full initialization from Python state
-						cache_seqlens = []
-						for seq in batch_sequences:
-							ctx_len = seq.current_context_length
-							if ctx_len == 0:
-								ctx_len = seq.prompt_length + seq.decoded_length
-								if ctx_len > 0:
-									seq.current_context_length = ctx_len
-							cache_seqlens.append(ctx_len)
+					# Collect context lengths, handling rare edge case of ctx_len == 0
+					cache_seqlens = []
+					for seq in batch_sequences:
+						ctx_len = seq.current_context_length
+						if ctx_len == 0:  # Rare edge case - trust prompt_length + decoded_length
+							ctx_len = seq.prompt_length + seq.decoded_length
+							if ctx_len > 0:
+								seq.current_context_length = ctx_len
+						cache_seqlens.append(ctx_len)
 
-						_seqlens_i32 = torch.tensor(cache_seqlens, dtype=torch.int32, device=self.torch_device)
-						_position_ids = (_seqlens_i32.to(torch.int64) - 1).unsqueeze(-1)
-						_max_ctx = max(cache_seqlens)
-						_seqlens_i64 = _seqlens_i32.to(torch.int64)
-						positions = torch.arange(_max_ctx, device=self.torch_device)
-						_attn_mask = (positions.unsqueeze(0) < _seqlens_i64.unsqueeze(1)).to(torch.int64)
-						_attn_meta_initialized = True
-					else:
-						# Incremental update: all active sequences advance by 1 token
-						# Completed sequences stay frozen (their output is discarded)
-						_seqlens_i32 += 1
-						_position_ids += 1
-						_max_ctx += 1
-						_seqlens_i64 = _seqlens_i32.to(torch.int64)
-						positions = torch.arange(_max_ctx, device=self.torch_device)
-						_attn_mask = (positions.unsqueeze(0) < _seqlens_i64.unsqueeze(1)).to(torch.int64)
+					max_ctx = max(cache_seqlens)
+					positions = torch.arange(max_ctx, device=self.torch_device)
+					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
+					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)
 
-					Attn_Wrapper.attention_mask = _attn_mask
-					Attn_Wrapper.cache_seqlens = _seqlens_i32
-					Attn_Wrapper.position_ids = _position_ids
-					Attn_Wrapper.max_seqlen = _max_ctx
+					Attn_Wrapper.attention_mask = attention_mask
+					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
+					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
+					Attn_Wrapper.max_seqlen = max_ctx
 
-					AttnWrapperBase.attention_mask = _attn_mask
-					AttnWrapperBase.cache_seqlens = _seqlens_i32
-					AttnWrapperBase.position_ids = _position_ids
-					AttnWrapperBase.max_seqlen = _max_ctx
+					AttnWrapperBase.attention_mask = attention_mask
+					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+					AttnWrapperBase.max_seqlen = max_ctx
 
 					# DEBUG: Print cache_seqlens and input tokens
 					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
