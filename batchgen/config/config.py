@@ -176,6 +176,15 @@ class HostPagedKVConfig:
     num_v_heads: int = 0 # Zero for MLA.
     v_head_dim: int = 0
     kv_dtype: str = "bfloat16" # "bfloat16 or float8_e4m3fn"
+    enable_prefix_reuse: bool = False
+    prefix_min_reuse_pages: int = 1
+    prefix_min_store_pages: int = 2
+    sequence_page_node_capacity: int = 0
+    radix_node_capacity: int = 0
+    radix_edge_capacity: int = 0
+    prefix_entry_capacity: int = 0
+    prefix_page_ref_capacity: int = 0
+    prefix_page_budget: int = 0
 
 @dataclass
 class DevicePagedKVConfig:

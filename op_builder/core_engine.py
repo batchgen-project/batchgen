@@ -30,10 +30,14 @@ class CoreEngineBuilder(CUDAOpBuilder):
             f"{BATCHGEN_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_manager.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_backend.cpp",
+            f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_prefix_cache.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_worker_view.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_kv_page_table.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/uva_copy_kernel.cu",
-            f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
+            (
+                f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/"
+                "grouped_query_attention_cpu_avx2_omp.cpp"
+            ),
             f"{BATCHGEN_CORE_ROOT}/allocator.cpp",
         ]
 
@@ -42,9 +46,9 @@ class CoreEngineBuilder(CUDAOpBuilder):
 
     def cxx_args(self):
         """C++ compiler flags - DON'T call super() to avoid conflicts"""
-        CPU_ARCH = self.cpu_arch()
-        SIMD_WIDTH = self.simd_width()
-        
+        cpu_arch = self.cpu_arch()
+        simd_width = self.simd_width()
+
         args = [
             "-O2",
             "-std=c++17",  # Must be C++17 for PyTorch
@@ -56,8 +60,8 @@ class CoreEngineBuilder(CUDAOpBuilder):
             "-fprefetch-loop-arrays",
             "-fopenmp",
             "-Wno-reorder",
-            CPU_ARCH,
-            SIMD_WIDTH,
+            cpu_arch,
+            simd_width,
             "-D_GLIBCXX_USE_CXX11_ABI=1",
         ]
         return args

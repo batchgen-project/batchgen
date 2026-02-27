@@ -125,6 +125,15 @@ struct HostPagedKVConfig {
     std::size_t num_v_heads = 0;
     std::size_t v_head_dim = 0;
     std::string kv_dtype = "bfloat16";
+    bool enable_prefix_reuse = false;
+    std::size_t prefix_min_reuse_pages = 1;
+    std::size_t prefix_min_store_pages = 2;
+    std::size_t sequence_page_node_capacity = 0;
+    std::size_t radix_node_capacity = 0;
+    std::size_t radix_edge_capacity = 0;
+    std::size_t prefix_entry_capacity = 0;
+    std::size_t prefix_page_ref_capacity = 0;
+    std::size_t prefix_page_budget = 0;
 };
 
 struct DevicePagedKVConfig {

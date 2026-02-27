@@ -221,6 +221,15 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	config.enable_prefix_reuse = False
+	config.prefix_min_reuse_pages = 1
+	config.prefix_min_store_pages = 2
+	config.sequence_page_node_capacity = 0
+	config.radix_node_capacity = 0
+	config.radix_edge_capacity = 0
+	config.prefix_entry_capacity = 0
+	config.prefix_page_ref_capacity = 0
+	config.prefix_page_budget = 0
 	return config
 
 
@@ -336,6 +345,15 @@ def build_host_kv_config_aux(model_name: str, host_kv_cache_size: int) -> Any | 
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	config.enable_prefix_reuse = False
+	config.prefix_min_reuse_pages = 1
+	config.prefix_min_store_pages = 2
+	config.sequence_page_node_capacity = 0
+	config.radix_node_capacity = 0
+	config.radix_edge_capacity = 0
+	config.prefix_entry_capacity = 0
+	config.prefix_page_ref_capacity = 0
+	config.prefix_page_budget = 0
 	return config
 
 

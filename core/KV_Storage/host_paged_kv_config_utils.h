@@ -87,6 +87,15 @@ inline HostPagedKVConfig BuildHostPagedKVConfig(
     config.sequence_table_capacity = detail::DetermineSequenceTableCapacity(
         engine_config.kv_storage_config, config.num_pages);
     config.alignment_bytes = 64;
+    config.enable_prefix_reuse = external.enable_prefix_reuse;
+    config.prefix_min_reuse_pages = external.prefix_min_reuse_pages;
+    config.prefix_min_store_pages = external.prefix_min_store_pages;
+    config.sequence_page_node_capacity = external.sequence_page_node_capacity;
+    config.radix_node_capacity = external.radix_node_capacity;
+    config.radix_edge_capacity = external.radix_edge_capacity;
+    config.prefix_entry_capacity = external.prefix_entry_capacity;
+    config.prefix_page_ref_capacity = external.prefix_page_ref_capacity;
+    config.prefix_page_budget = external.prefix_page_budget;
     return config;
 }
 

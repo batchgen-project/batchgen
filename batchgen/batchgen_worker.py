@@ -4411,20 +4411,37 @@ class BatchGenWorker:
 		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
+			flat_prompt_tokens = []
+			prompt_offsets = [0]
 
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				global_sequence_ids.append(seq.global_idx)
 				sequence_tokens.append(seq.kv_token_budget)
+				prompt_ids = seq.input_ids[0, :seq.prompt_length].tolist()
+				flat_prompt_tokens.extend(int(t) for t in prompt_ids)
+				prompt_offsets.append(len(flat_prompt_tokens))
 
 			logging.debug(
 				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV"
 			)
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
-			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
-				list(zip(global_sequence_ids, sequence_tokens))
+			host_cfg = getattr(self.engine_config, "Host_Paged_KV_Config", None)
+			enable_prefix_reuse = (
+				host_cfg is not None
+				and getattr(host_cfg, "enable_prefix_reuse", False)
 			)
+			if enable_prefix_reuse:
+				self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences_with_prefix(
+					list(zip(global_sequence_ids, sequence_tokens)),
+					flat_prompt_tokens,
+					prompt_offsets,
+				)
+			else:
+				self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
+					list(zip(global_sequence_ids, sequence_tokens))
+				)
 
 			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
 			if self.rank == 0:
@@ -8103,4 +8120,3 @@ class BatchGenWorker:
 		dist.barrier()
 		
 		logging.info(f"Rank {self.rank}: State reset completed")
-

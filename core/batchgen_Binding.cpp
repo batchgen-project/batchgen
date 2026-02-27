@@ -18,26 +18,258 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
-#include "KV_Storage/host_paged_kv_manager.h"
-#include "KV_Storage/host_paged_kv_worker_view.h"
-#include "batchgen.h"
-#include "Weights_Storage/Weights_Storage.h" 
-#include "allocator.h"
-#include "data_structures.h"
-#include <ATen/cuda/CachingHostAllocator.h>
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <ATen/cuda/CachingHostAllocator.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
+
+#include "KV_Storage/host_paged_kv_manager.h"
+#include "KV_Storage/host_paged_kv_prefix_cache.h"
+#include "KV_Storage/host_paged_kv_worker_view.h"
+#include "Weights_Storage/Weights_Storage.h"
+#include "allocator.h"
+#include "batchgen.h"
+#include "data_structures.h"
 
 namespace py = pybind11;
 namespace kv = batchgen::kv;
 
 namespace {
+
+struct HostKVPrefixCacheHarnessStats {
+    std::uint32_t prefix_entry_count = 0;
+    std::uint32_t prefix_used_pages = 0;
+    std::uint64_t prefix_access_epoch = 0;
+    std::uint64_t prefix_hit_count = 0;
+    std::uint64_t prefix_miss_count = 0;
+    std::uint64_t prefix_evict_count = 0;
+    std::int32_t lru_head = kv::kHostKVInvalidIndex;
+    std::int32_t lru_tail = kv::kHostKVInvalidIndex;
+};
+
+class HostKVPrefixCacheHarness {
+   public:
+    HostKVPrefixCacheHarness(std::size_t num_pages,
+                             std::size_t radix_node_capacity,
+                             std::size_t radix_edge_capacity,
+                             std::size_t prefix_entry_capacity,
+                             std::size_t prefix_page_ref_capacity,
+                             bool enable_prefix_reuse = true,
+                             std::size_t prefix_min_reuse_pages = 1,
+                             std::size_t prefix_min_store_pages = 1,
+                             std::size_t prefix_page_budget = 0)
+        : num_pages_(num_pages),
+          radix_node_capacity_(radix_node_capacity),
+          radix_edge_capacity_(radix_edge_capacity),
+          prefix_entry_capacity_(prefix_entry_capacity),
+          prefix_page_ref_capacity_(prefix_page_ref_capacity),
+          radix_nodes_(radix_node_capacity),
+          radix_edges_(radix_edge_capacity),
+          prefix_entries_(prefix_entry_capacity),
+          prefix_page_refs_(prefix_page_ref_capacity),
+          radix_node_free_stack_(radix_node_capacity),
+          radix_edge_free_stack_(radix_edge_capacity),
+          prefix_entry_free_stack_(prefix_entry_capacity),
+          prefix_page_ref_free_stack_(prefix_page_ref_capacity),
+          page_refcounts_(num_pages, 0) {
+        if (num_pages_ == 0) {
+            throw std::invalid_argument("num_pages must be > 0");
+        }
+        if (radix_node_capacity_ == 0) {
+            throw std::invalid_argument("radix_node_capacity must be > 0");
+        }
+        if (radix_edge_capacity_ == 0) {
+            throw std::invalid_argument("radix_edge_capacity must be > 0");
+        }
+        if (prefix_entry_capacity_ == 0) {
+            throw std::invalid_argument("prefix_entry_capacity must be > 0");
+        }
+        if (prefix_page_ref_capacity_ == 0) {
+            throw std::invalid_argument("prefix_page_ref_capacity must be > 0");
+        }
+
+        params_.enable_prefix_reuse = enable_prefix_reuse;
+        params_.prefix_min_reuse_pages =
+            std::max<std::size_t>(1, prefix_min_reuse_pages);
+        params_.prefix_min_store_pages =
+            std::max<std::size_t>(1, prefix_min_store_pages);
+        params_.prefix_page_budget =
+            prefix_page_budget == 0 ? num_pages_ : prefix_page_budget;
+
+        kv::HostKVPrefixCache::SharedFields shared_fields;
+        shared_fields.radix_node_free_top = &radix_node_free_top_;
+        shared_fields.radix_edge_free_top = &radix_edge_free_top_;
+        shared_fields.prefix_entry_free_top = &prefix_entry_free_top_;
+        shared_fields.prefix_page_ref_free_top = &prefix_page_ref_free_top_;
+        shared_fields.prefix_entry_count = &prefix_entry_count_;
+        shared_fields.prefix_used_pages = &prefix_used_pages_;
+        shared_fields.prefix_access_epoch = &prefix_access_epoch_;
+        shared_fields.prefix_hit_count = &prefix_hit_count_;
+        shared_fields.prefix_miss_count = &prefix_miss_count_;
+        shared_fields.prefix_evict_count = &prefix_evict_count_;
+        shared_fields.lru_head = &lru_head_;
+        shared_fields.lru_tail = &lru_tail_;
+
+        cache_.Bind(
+            params_, radix_nodes_.data(), radix_edges_.data(),
+            prefix_entries_.data(), prefix_page_refs_.data(),
+            radix_node_free_stack_.data(), radix_edge_free_stack_.data(),
+            prefix_entry_free_stack_.data(), prefix_page_ref_free_stack_.data(),
+            shared_fields,
+            [this](std::int32_t page_idx) {
+                ValidatePageIdx(page_idx);
+                ++page_refcounts_[page_idx];
+            },
+            [this](std::int32_t page_idx) {
+                ValidatePageIdx(page_idx);
+                if (page_refcounts_[page_idx] == 0) {
+                    throw std::runtime_error(
+                        "page_refcount underflow on page " +
+                        std::to_string(page_idx));
+                }
+                --page_refcounts_[page_idx];
+            });
+
+        Reset();
+    }
+
+    std::pair<std::vector<std::int32_t>, std::size_t> Lookup(
+        const std::vector<std::int32_t>& tokens, std::size_t max_pages) {
+        const auto result =
+            cache_.LookupPrefixPagesLocked(tokens.data(), tokens.size(), max_pages);
+        return {result.pages, result.reused_pages};
+    }
+
+    bool Commit(const std::vector<std::int32_t>& tokens,
+                const std::vector<std::int32_t>& pages) {
+        ValidatePageIndices(pages);
+        return cache_.CommitPrefixLocked(tokens.data(), tokens.size(), pages);
+    }
+
+    HostKVPrefixCacheHarnessStats GetStats() const {
+        HostKVPrefixCacheHarnessStats stats;
+        stats.prefix_entry_count =
+            prefix_entry_count_.load(std::memory_order_relaxed);
+        stats.prefix_used_pages =
+            prefix_used_pages_.load(std::memory_order_relaxed);
+        stats.prefix_access_epoch =
+            prefix_access_epoch_.load(std::memory_order_relaxed);
+        stats.prefix_hit_count = prefix_hit_count_.load(std::memory_order_relaxed);
+        stats.prefix_miss_count =
+            prefix_miss_count_.load(std::memory_order_relaxed);
+        stats.prefix_evict_count =
+            prefix_evict_count_.load(std::memory_order_relaxed);
+        stats.lru_head = lru_head_;
+        stats.lru_tail = lru_tail_;
+        return stats;
+    }
+
+    std::int32_t PageRefcount(std::int32_t page_idx) const {
+        ValidatePageIdx(page_idx);
+        return static_cast<std::int32_t>(page_refcounts_[page_idx]);
+    }
+
+    std::vector<std::int32_t> PageRefcounts() const {
+        std::vector<std::int32_t> result;
+        result.reserve(page_refcounts_.size());
+        for (std::uint32_t count : page_refcounts_) {
+            result.push_back(static_cast<std::int32_t>(count));
+        }
+        return result;
+    }
+
+    void Reset() {
+        std::fill(page_refcounts_.begin(), page_refcounts_.end(), 0);
+
+        radix_node_free_top_.store(
+            static_cast<std::uint32_t>(radix_node_capacity_ - 1),
+            std::memory_order_relaxed);
+        radix_edge_free_top_.store(
+            static_cast<std::uint32_t>(radix_edge_capacity_),
+            std::memory_order_relaxed);
+        prefix_entry_free_top_.store(
+            static_cast<std::uint32_t>(prefix_entry_capacity_),
+            std::memory_order_relaxed);
+        prefix_page_ref_free_top_.store(
+            static_cast<std::uint32_t>(prefix_page_ref_capacity_),
+            std::memory_order_relaxed);
+
+        prefix_entry_count_.store(0, std::memory_order_relaxed);
+        prefix_used_pages_.store(0, std::memory_order_relaxed);
+        prefix_access_epoch_.store(0, std::memory_order_relaxed);
+        prefix_hit_count_.store(0, std::memory_order_relaxed);
+        prefix_miss_count_.store(0, std::memory_order_relaxed);
+        prefix_evict_count_.store(0, std::memory_order_relaxed);
+        lru_head_ = kv::kHostKVInvalidIndex;
+        lru_tail_ = kv::kHostKVInvalidIndex;
+
+        cache_.InitializePools(radix_node_capacity_, radix_edge_capacity_,
+                               prefix_entry_capacity_,
+                               prefix_page_ref_capacity_);
+    }
+
+   private:
+    void ValidatePageIdx(std::int32_t page_idx) const {
+        if (page_idx < 0 || static_cast<std::size_t>(page_idx) >= num_pages_) {
+            throw std::out_of_range("page index out of range: " +
+                                    std::to_string(page_idx));
+        }
+    }
+
+    void ValidatePageIndices(const std::vector<std::int32_t>& pages) const {
+        for (std::int32_t page_idx : pages) {
+            ValidatePageIdx(page_idx);
+        }
+    }
+
+    std::size_t num_pages_ = 0;
+    std::size_t radix_node_capacity_ = 0;
+    std::size_t radix_edge_capacity_ = 0;
+    std::size_t prefix_entry_capacity_ = 0;
+    std::size_t prefix_page_ref_capacity_ = 0;
+
+    kv::HostKVPrefixCache cache_;
+    kv::HostKVPrefixCacheParams params_{};
+
+    std::vector<kv::HostKVRadixNode> radix_nodes_;
+    std::vector<kv::HostKVRadixEdge> radix_edges_;
+    std::vector<kv::HostKVPrefixEntry> prefix_entries_;
+    std::vector<kv::HostKVPrefixPageRef> prefix_page_refs_;
+
+    std::vector<std::int32_t> radix_node_free_stack_;
+    std::vector<std::int32_t> radix_edge_free_stack_;
+    std::vector<std::int32_t> prefix_entry_free_stack_;
+    std::vector<std::int32_t> prefix_page_ref_free_stack_;
+
+    std::vector<std::uint32_t> page_refcounts_;
+
+    std::atomic<std::uint32_t> radix_node_free_top_{0};
+    std::atomic<std::uint32_t> radix_edge_free_top_{0};
+    std::atomic<std::uint32_t> prefix_entry_free_top_{0};
+    std::atomic<std::uint32_t> prefix_page_ref_free_top_{0};
+
+    std::atomic<std::uint32_t> prefix_entry_count_{0};
+    std::atomic<std::uint32_t> prefix_used_pages_{0};
+
+    std::atomic<std::uint64_t> prefix_access_epoch_{0};
+    std::atomic<std::uint64_t> prefix_hit_count_{0};
+    std::atomic<std::uint64_t> prefix_miss_count_{0};
+    std::atomic<std::uint64_t> prefix_evict_count_{0};
+
+    std::int32_t lru_head_ = kv::kHostKVInvalidIndex;
+    std::int32_t lru_tail_ = kv::kHostKVInvalidIndex;
+};
 
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
@@ -188,6 +420,29 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                 return self.AllocatePagesForSequences(sequence_ids,
                                                       num_tokens);
             })
+        .def(
+            "allocate_pages_for_sequences_with_prefix",
+            [](WorkerView& self,
+               const std::vector<std::pair<std::int64_t, std::size_t>>&
+                   requests,
+               const std::vector<std::int32_t>& flat_prompt_tokens,
+               const std::vector<std::size_t>& prompt_offsets) {
+                std::vector<std::int64_t> sequence_ids;
+                std::vector<std::size_t> num_tokens;
+                sequence_ids.reserve(requests.size());
+                num_tokens.reserve(requests.size());
+                for (const auto& request : requests) {
+                    sequence_ids.push_back(request.first);
+                    num_tokens.push_back(request.second);
+                }
+                auto result = self.AllocatePagesForSequencesWithPrefix(
+                    sequence_ids, num_tokens, flat_prompt_tokens,
+                    prompt_offsets);
+                return py::make_tuple(std::move(result.first),
+                                      std::move(result.second));
+            },
+            py::arg("requests"), py::arg("flat_prompt_tokens"),
+            py::arg("prompt_offsets"))
         .def("grow_sequence_pages",
              [](WorkerView& self, std::int64_t sequence_id,
                 std::size_t num_pages) {
@@ -237,7 +492,7 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                  return py::make_tuple(std::move(k_ptrs), v_ptrs);
              },
              py::arg("sequence_id"), py::arg("layer_idx"),
-             py::arg("max_tokens") = py::none());;
+             py::arg("max_tokens") = py::none());
 }
 
 }  // namespace
@@ -285,32 +540,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &BatchGen::get_kv_scale,
              "Get the quantization scale for KV storage.")
         .def("get_past_key_states",
-                &BatchGen::get_past_key_states,
-                "Get the past key states for the given query global indices and max sequence length.")
-           .def("init_weight_storage", &BatchGen::init_weight_storage)
-           .def_property(
-              "host_paged_kv_worker_view",
-              &BatchGen::host_paged_kv_worker_view,
-              &BatchGen::set_host_paged_kv_worker_view,
-              "Reference to the bound HostPagedKVWorkerView instance.")
-          .def_property(
-              "gpu_paged_kv_manager",
-              &BatchGen::gpu_paged_kv_manager,
-              &BatchGen::set_gpu_paged_kv_manager,
-              "Python GPU paged KV manager bound to this engine.");
-    
+             &BatchGen::get_past_key_states,
+             "Get the past key states for the given query global indices and "
+             "max sequence length.")
+        .def("init_weight_storage", &BatchGen::init_weight_storage)
+        .def_property(
+            "host_paged_kv_worker_view", &BatchGen::host_paged_kv_worker_view,
+            &BatchGen::set_host_paged_kv_worker_view,
+            "Reference to the bound HostPagedKVWorkerView instance.")
+        .def_property("gpu_paged_kv_manager", &BatchGen::gpu_paged_kv_manager,
+                      &BatchGen::set_gpu_paged_kv_manager,
+                      "Python GPU paged KV manager bound to this engine.");
+
     py::class_<Weights_Storage>(m, "Weights_Storage")
         // Updated Constructor Binding
-        .def(py::init<int>(), py::arg("device_id")) 
-        
+        .def(py::init<int>(), py::arg("device_id"))
         .def("Init", &Weights_Storage::Init,
-            py::arg("shm_name"),
-            py::arg("byte_size"),
-            py::arg("module_weights_shm"),
-            py::arg("enable_hugetlbfs") = false)
+             py::arg("shm_name"), py::arg("byte_size"),
+             py::arg("module_weights_shm"),
+             py::arg("enable_hugetlbfs") = false)
         .def("get_tensor", &Weights_Storage::get_tensor,
-            py::arg("module_key"));
-    
+             py::arg("module_key"));
+
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
         .def(py::init<>())
         .def_readwrite("shm_name", &kv::HostPagedKVConfig::shm_name)
@@ -330,6 +581,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPagedKVConfig::sequence_table_capacity)
         .def_readwrite("alignment_bytes",
                        &kv::HostPagedKVConfig::alignment_bytes)
+        .def_readwrite("enable_prefix_reuse",
+                       &kv::HostPagedKVConfig::enable_prefix_reuse)
+        .def_readwrite("prefix_min_reuse_pages",
+                       &kv::HostPagedKVConfig::prefix_min_reuse_pages)
+        .def_readwrite("prefix_min_store_pages",
+                       &kv::HostPagedKVConfig::prefix_min_store_pages)
+        .def_readwrite("sequence_page_node_capacity",
+                       &kv::HostPagedKVConfig::sequence_page_node_capacity)
+        .def_readwrite("radix_node_capacity",
+                       &kv::HostPagedKVConfig::radix_node_capacity)
+        .def_readwrite("radix_edge_capacity",
+                       &kv::HostPagedKVConfig::radix_edge_capacity)
+        .def_readwrite("prefix_entry_capacity",
+                       &kv::HostPagedKVConfig::prefix_entry_capacity)
+        .def_readwrite("prefix_page_ref_capacity",
+                       &kv::HostPagedKVConfig::prefix_page_ref_capacity)
+        .def_readwrite("prefix_page_budget",
+                       &kv::HostPagedKVConfig::prefix_page_budget)
         .def("__repr__",
              [](const kv::HostPagedKVConfig& self) {
                  return kv::ToString(self);
@@ -345,10 +614,66 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("sequence_table_capacity",
                        &kv::HostPagedKVStats::sequence_table_capacity)
         .def_readwrite("total_bytes", &kv::HostPagedKVStats::total_bytes)
+        .def_readwrite("num_prefix_entries",
+                       &kv::HostPagedKVStats::num_prefix_entries)
+        .def_readwrite("num_prefix_hits",
+                       &kv::HostPagedKVStats::num_prefix_hits)
+        .def_readwrite("num_prefix_misses",
+                       &kv::HostPagedKVStats::num_prefix_misses)
+        .def_readwrite("num_prefix_evictions",
+                       &kv::HostPagedKVStats::num_prefix_evictions)
+        .def_readwrite("num_prefix_pinned_pages",
+                       &kv::HostPagedKVStats::num_prefix_pinned_pages)
+        .def_readwrite("num_shared_pages",
+                       &kv::HostPagedKVStats::num_shared_pages)
         .def("__repr__",
              [](const kv::HostPagedKVStats& self) {
                  return kv::ToString(self);
              });
+
+    py::class_<HostKVPrefixCacheHarnessStats>(m, "HostKVPrefixCacheHarnessStats")
+        .def(py::init<>())
+        .def_readwrite("prefix_entry_count",
+                       &HostKVPrefixCacheHarnessStats::prefix_entry_count)
+        .def_readwrite("prefix_used_pages",
+                       &HostKVPrefixCacheHarnessStats::prefix_used_pages)
+        .def_readwrite("prefix_access_epoch",
+                       &HostKVPrefixCacheHarnessStats::prefix_access_epoch)
+        .def_readwrite("prefix_hit_count",
+                       &HostKVPrefixCacheHarnessStats::prefix_hit_count)
+        .def_readwrite("prefix_miss_count",
+                       &HostKVPrefixCacheHarnessStats::prefix_miss_count)
+        .def_readwrite("prefix_evict_count",
+                       &HostKVPrefixCacheHarnessStats::prefix_evict_count)
+        .def_readwrite("lru_head", &HostKVPrefixCacheHarnessStats::lru_head)
+        .def_readwrite("lru_tail", &HostKVPrefixCacheHarnessStats::lru_tail);
+
+    py::class_<HostKVPrefixCacheHarness>(m, "HostKVPrefixCacheHarness")
+        .def(py::init<std::size_t, std::size_t, std::size_t, std::size_t,
+                      std::size_t, bool, std::size_t, std::size_t,
+                      std::size_t>(),
+             py::arg("num_pages"), py::arg("radix_node_capacity"),
+             py::arg("radix_edge_capacity"), py::arg("prefix_entry_capacity"),
+             py::arg("prefix_page_ref_capacity"),
+             py::arg("enable_prefix_reuse") = true,
+             py::arg("prefix_min_reuse_pages") = 1,
+             py::arg("prefix_min_store_pages") = 1,
+             py::arg("prefix_page_budget") = 0)
+        .def("lookup",
+             [](HostKVPrefixCacheHarness& self,
+                const std::vector<std::int32_t>& tokens,
+                std::size_t max_pages) {
+                 auto result = self.Lookup(tokens, max_pages);
+                 return py::make_tuple(std::move(result.first), result.second);
+             },
+             py::arg("tokens"), py::arg("max_pages"))
+        .def("commit", &HostKVPrefixCacheHarness::Commit, py::arg("tokens"),
+             py::arg("pages"))
+        .def("get_stats", &HostKVPrefixCacheHarness::GetStats)
+        .def("page_refcount", &HostKVPrefixCacheHarness::PageRefcount,
+             py::arg("page_idx"))
+        .def("page_refcounts", &HostKVPrefixCacheHarness::PageRefcounts)
+        .def("reset", &HostKVPrefixCacheHarness::Reset);
 
     py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
         .def_property_readonly("id", &kv::KVAsyncTask::id)
