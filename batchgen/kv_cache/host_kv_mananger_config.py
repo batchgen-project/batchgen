@@ -96,10 +96,21 @@ _DEEPSEEK_V3_2_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# MiniMax-M2.5: GQA with 8 KV heads, head_dim=128, 62 layers
+_MINIMAX_M25_GQA_PROFILE = _HostKVModelProfile(
+	num_layers=62,
+	num_k_heads=8,
+	k_head_dim=128,
+	num_v_heads=8,
+	v_head_dim=128,
+	kv_dtype="bfloat16",
+)
+
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
 	"deepseek_v3_2_indexer": _DEEPSEEK_V3_2_INDEXER_PROFILE,
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
+	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -123,6 +134,11 @@ for canonical, aliases in {
 	"gpt_oss_gqa": (
 		"openai/gpt-oss-120b",
 		"gpt-oss-120b",
+	),
+	"minimax_m25_gqa": (
+		"minimaxai/minimax-m2.5",
+		"minimax-m2.5",
+		"minimax",
 	),
 }.items():
 	for alias in aliases:
@@ -354,6 +370,11 @@ def build_gpu_kv_config_fixed_size(
 		# GPT-OSS-120B GQA: 8 KV heads * 64 head_dim = 512 for K, same for V
 		kv_dim = 8 * 64 * 2  # K + V
 		num_layers = 36
+		dtype_bytes = 2  # bfloat16
+	elif "minimax" in model_name.lower():
+		# MiniMax-M2.5 GQA: 8 KV heads * 128 head_dim = 1024 for K, same for V
+		kv_dim = 8 * 128 * 2  # K + V
+		num_layers = 62
 		dtype_bytes = 2  # bfloat16
 	else:
 		raise NotImplementedError(f"Model {model_name} not supported")
