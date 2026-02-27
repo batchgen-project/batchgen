@@ -16,19 +16,16 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-"""DeepSeek-V3/R1 tokenizer for BatchGen.
+"""MiniMax-M2.5 tokenizer for BatchGen.
 
-This module provides the tokenizer implementation for DeepSeek-V3 and DeepSeek-R1
-models, which use the same tokenizer architecture.
-
-DeepSeek tokenizer specifications:
-- Vocabulary size: 129,280 tokens
-- BOS token: <｜begin▁of▁sentence｜> (ID: 0)
-- EOS token: <｜end▁of▁sentence｜> (ID: 1)
+MiniMax-M2.5 tokenizer specifications:
+- Vocabulary size: 200,064 tokens
 - Uses HuggingFace tokenizer.json format
+- tokenizer.json must be bundled in this directory
 
-The tokenizer.json file is bundled with BatchGen in this directory.
-It is NOT loaded from user's cache directory.
+To bundle the tokenizer files:
+    huggingface-cli download MiniMaxAI/MiniMax-M2.5 tokenizer.json tokenizer_config.json \
+        --local-dir batchgen/models/minimax/minimax_m25/
 """
 
 import json
@@ -46,40 +43,33 @@ logger = logging.getLogger(__name__)
 # Tokenizer files are in the same directory as this module
 TOKENIZER_DIR = Path(__file__).parent
 
+# MiniMax-M2.5 special token IDs (from tokenizer_config.json added_tokens_decoder)
+MINIMAX_M25_BOS_TOKEN_ID = 200034
+MINIMAX_M25_EOS_TOKEN_ID = 200020
+MINIMAX_M25_VOCAB_SIZE = 200064
 
-# DeepSeek-V3/R1 special token IDs
-DEEPSEEK_V3_BOS_TOKEN_ID = 0  # <｜begin▁of▁sentence｜>
-DEEPSEEK_V3_EOS_TOKEN_ID = 1  # <｜end▁of▁sentence｜>
-DEEPSEEK_V3_VOCAB_SIZE = 129280
 
-
-@register_tokenizer("deepseek_v3")
-class DeepSeekV3Tokenizer(FastTokenizer):
-    """DeepSeek-V3/R1 tokenizer.
+@register_tokenizer("minimax_m25")
+class MiniMaxM25Tokenizer(FastTokenizer):
+    """MiniMax-M2.5 tokenizer.
 
     Loads tokenizer.json from package directory (not user cache).
 
     Attributes:
-        bos_token_id: 0 (<｜begin▁of▁sentence｜>)
-        eos_token_id: 1 (<｜end▁of▁sentence｜>)
-        pad_token_id: 1 (uses EOS as pad token)
-        vocab_size: 129,280
+        bos_token_id: BOS token ID
+        eos_token_id: EOS token ID
+        pad_token_id: PAD token ID (uses EOS)
+        vocab_size: 200,064
     """
 
     def __init__(self):
-        """Initialize the DeepSeek-V3 tokenizer.
-
-        Loads tokenizer.json from the package directory (TOKENIZER_DIR).
-        """
-        # Load from package directory, not user path
+        """Initialize the MiniMax-M2.5 tokenizer."""
         super().__init__(str(TOKENIZER_DIR))
 
-        # Override with DeepSeek-specific special token IDs
-        # These are the correct values for DeepSeek-V3/R1 models
-        self.bos_token_id = DEEPSEEK_V3_BOS_TOKEN_ID
-        self.eos_token_id = DEEPSEEK_V3_EOS_TOKEN_ID
-        self.pad_token_id = DEEPSEEK_V3_EOS_TOKEN_ID  # Use EOS as pad token
-        self.vocab_size = DEEPSEEK_V3_VOCAB_SIZE
+        self.bos_token_id = MINIMAX_M25_BOS_TOKEN_ID
+        self.eos_token_id = MINIMAX_M25_EOS_TOKEN_ID
+        self.pad_token_id = MINIMAX_M25_EOS_TOKEN_ID  # Use EOS as pad
+        self.vocab_size = MINIMAX_M25_VOCAB_SIZE
 
         # Get the actual token strings from vocabulary for padding setup
         vocab = self.tokenizer.get_vocab()
@@ -87,15 +77,13 @@ class DeepSeekV3Tokenizer(FastTokenizer):
         self.eos_token = None
         self.pad_token = None
 
-        # Find tokens by ID
         id_to_token = {v: k for k, v in vocab.items()}
         if self.bos_token_id in id_to_token:
             self.bos_token = id_to_token[self.bos_token_id]
         if self.eos_token_id in id_to_token:
             self.eos_token = id_to_token[self.eos_token_id]
-            self.pad_token = self.eos_token  # Use EOS as pad
+            self.pad_token = self.eos_token
 
-        # Re-enable padding with correct pad token
         if self.pad_token is not None:
             self.tokenizer.enable_padding(
                 direction="right",
@@ -103,8 +91,14 @@ class DeepSeekV3Tokenizer(FastTokenizer):
                 pad_token=self.pad_token,
             )
 
+        # Load chat template from separate .jinja file (not in tokenizer_config.json)
+        chat_template_path = TOKENIZER_DIR / "chat_template.jinja"
+        if chat_template_path.exists():
+            self.chat_template = chat_template_path.read_text()
+            logger.info("Loaded chat template from chat_template.jinja")
+
         logger.info(
-            f"DeepSeek-V3 tokenizer initialized: vocab_size={self.vocab_size}, "
+            f"MiniMax-M2.5 tokenizer initialized: vocab_size={self.vocab_size}, "
             f"bos={self.bos_token_id}, eos={self.eos_token_id}"
         )
 
@@ -112,7 +106,13 @@ class DeepSeekV3Tokenizer(FastTokenizer):
 
     _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
     _TOOL_CALL_RE = re.compile(
-        r"<｜tool▁call▁begin｜>(.*?)<｜tool▁call▁end｜>", re.DOTALL
+        r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
+    )
+    _INVOKE_RE = re.compile(
+        r'<invoke\s+name="([^"]+)">(.*?)</invoke>', re.DOTALL
+    )
+    _PARAM_RE = re.compile(
+        r'<parameter\s+name="([^"]+)">(.*?)</parameter>', re.DOTALL
     )
 
     def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
@@ -129,13 +129,24 @@ class DeepSeekV3Tokenizer(FastTokenizer):
             return None, text
         tool_calls = []
         for raw in matches:
-            lines = raw.strip().split("\n", 1)
-            name = lines[0].strip()
-            arguments = lines[1].strip() if len(lines) > 1 else "{}"
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {"name": name, "arguments": arguments},
-            })
+            for inv in self._INVOKE_RE.finditer(raw):
+                name = inv.group(1)
+                body = inv.group(2)
+                arguments = {}
+                for pm in self._PARAM_RE.finditer(body):
+                    key = pm.group(1).strip()
+                    val = pm.group(2).strip()
+                    try:
+                        arguments[key] = json.loads(val)
+                    except (ValueError, json.JSONDecodeError):
+                        arguments[key] = val
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments),
+                    },
+                })
         visible = self._TOOL_CALL_RE.sub("", text).strip()
-        return tool_calls, visible
+        return tool_calls or None, visible

@@ -211,6 +211,15 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 
 ---
 
+## Output Parsing
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--parse-thinking` | `false` | Extract thinking/reasoning blocks into `reasoning_content` field |
+| `--parse-tool-call` | `false` | Extract tool call blocks into `tool_calls` array |
+
+---
+
 ## Storage Configuration
 
 | Flag | Default | Description |

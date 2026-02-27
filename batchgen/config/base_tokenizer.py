@@ -121,6 +121,29 @@ class BaseTokenizer(ABC):
         """
         pass
 
+    def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        """Extract reasoning content from model output.
+
+        Returns:
+            (reasoning_content, visible_content)
+            reasoning_content is None if no thinking block found.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement parse_thinking()"
+        )
+
+    def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        """Extract tool calls from model output.
+
+        Returns:
+            (tool_calls_list, remaining_content)
+            tool_calls_list is None if no tool calls found.
+            Each dict: {id, type, function: {name, arguments}}.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement parse_tool_calls()"
+        )
+
     def batch_decode(
         self,
         sequences: List[List[int]],

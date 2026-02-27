@@ -234,6 +234,8 @@ with open("results.jsonl", "r") as f:
         print(f"[{custom_id}] {content}")
 ```
 
+See [Output Format](output-format.md) for the full response schema, including structured fields for thinking and tool calls.
+
 ---
 
 ## Test Script CLI Arguments
