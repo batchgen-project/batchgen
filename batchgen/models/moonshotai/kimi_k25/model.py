@@ -466,6 +466,13 @@ class KimiK25MoE(nn.Module):
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         """Update num_tokens_per_rank dynamically."""
         self.num_tokens_per_rank = num_tokens_per_rank
+        buf = self.__class__._buf
+        if buf is not None and buf.padded.shape[0] != num_tokens_per_rank:
+            buf.padded = torch.zeros(
+                num_tokens_per_rank, buf.H,
+                dtype=torch.bfloat16, device=buf.device,
+            )
+            buf.num_tokens_per_rank = num_tokens_per_rank
 
     @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
