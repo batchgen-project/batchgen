@@ -342,10 +342,10 @@ grouped_int4_moe_stage1_kernel(
     const int64_t* __restrict__ up_scale_ptrs,
     const int64_t* __restrict__ gate_bias_ptrs,
     const int64_t* __restrict__ up_bias_ptrs,
-    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ tokens_per_expert,
     __nv_bfloat16* __restrict__ C,
     int64_t stride_c_m,
-    int total_tokens, int N, int K, int num_experts,
+    int max_tokens_padded, int N, int K, int num_experts,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
     int has_gate_bias, int has_up_bias
@@ -361,14 +361,13 @@ grouped_int4_moe_stage1_kernel(
 
     if (n_start >= N) return;
 
-    const int expert_start = expert_offsets[expert_idx];
-    const int expert_end = expert_offsets[expert_idx + 1];
-    const int expert_tokens = expert_end - expert_start;
+    const int expert_tokens = tokens_per_expert[expert_idx];
 
     const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
     if (m_tile >= num_m_tiles) return;
 
-    const int m_start = expert_start + m_tile * BLOCK_M;
+    const int m_start = expert_idx * max_tokens_padded + m_tile * BLOCK_M;
+    const int expert_end = expert_idx * max_tokens_padded + expert_tokens;
     const int m_size = min(BLOCK_M, expert_end - m_start);
 
     const uint8_t* gate_weight = reinterpret_cast<const uint8_t*>(gate_ptrs[expert_idx]);
@@ -584,10 +583,10 @@ grouped_int4_moe_stage2_kernel(
     const int64_t* __restrict__ down_ptrs,
     const int64_t* __restrict__ down_scale_ptrs,
     const int64_t* __restrict__ down_bias_ptrs,
-    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ tokens_per_expert,
     __nv_bfloat16* __restrict__ C,
     int64_t stride_c_m,
-    int total_tokens, int N, int K, int num_experts,
+    int max_tokens_padded, int N, int K, int num_experts,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
     int has_down_bias
@@ -603,14 +602,13 @@ grouped_int4_moe_stage2_kernel(
 
     if (k_start >= K) return;
 
-    const int expert_start = expert_offsets[expert_idx];
-    const int expert_end = expert_offsets[expert_idx + 1];
-    const int expert_tokens = expert_end - expert_start;
+    const int expert_tokens = tokens_per_expert[expert_idx];
 
     const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
     if (m_tile >= num_m_tiles) return;
 
-    const int m_start = expert_start + m_tile * BLOCK_M;
+    const int m_start = expert_idx * max_tokens_padded + m_tile * BLOCK_M;
+    const int expert_end = expert_idx * max_tokens_padded + expert_tokens;
     const int m_size = min(BLOCK_M, expert_end - m_start);
 
     const uint8_t* down_weight = reinterpret_cast<const uint8_t*>(down_ptrs[expert_idx]);
@@ -786,7 +784,7 @@ static CUtensorMap make_2d_tma_desc_bf16(
 // ============================================================================
 torch::Tensor grouped_int4_moe_stage1(
     torch::Tensor A,
-    torch::Tensor expert_offsets,
+    torch::Tensor tokens_per_expert,
     torch::Tensor gate_ptrs,
     torch::Tensor gate_scale_ptrs,
     torch::Tensor up_ptrs,
@@ -796,14 +794,15 @@ torch::Tensor grouped_int4_moe_stage1(
     int N,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
-    int max_m_tiles
+    int max_m_tiles,
+    int max_tokens_padded
 ) {
     TORCH_CHECK(A.is_cuda() && A.dtype() == torch::kBFloat16);
-    TORCH_CHECK(expert_offsets.is_cuda() && expert_offsets.dtype() == torch::kInt32);
+    TORCH_CHECK(tokens_per_expert.is_cuda() && tokens_per_expert.dtype() == torch::kInt32);
 
     const int total_tokens = A.size(0);
     const int K = A.size(1);
-    const int num_experts = expert_offsets.size(0) - 1;
+    const int num_experts = tokens_per_expert.size(0);
 
     auto C = torch::empty({total_tokens, N}, A.options());
 
@@ -816,7 +815,6 @@ torch::Tensor grouped_int4_moe_stage1(
     dim3 grid(num_experts, num_n_tiles, max_m_tiles);
     dim3 block(TOTAL_THREADS);
 
-    // No LUT needed for INT4 — save 1024 bytes vs MXFP4
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
                                4 * NUM_STAGES * sizeof(uint64_t);
 
@@ -835,10 +833,10 @@ torch::Tensor grouped_int4_moe_stage1(
         up_scale_ptrs.data_ptr<int64_t>(),
         has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
         has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
-        expert_offsets.data_ptr<int32_t>(),
+        tokens_per_expert.data_ptr<int32_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
-        total_tokens, N, K, num_experts,
+        max_tokens_padded, N, K, num_experts,
         stride_weight_n, stride_scale_n,
         has_gate_bias, has_up_bias);
 
@@ -850,21 +848,22 @@ torch::Tensor grouped_int4_moe_stage1(
 // ============================================================================
 torch::Tensor grouped_int4_moe_stage2(
     torch::Tensor input,
-    torch::Tensor expert_offsets,
+    torch::Tensor tokens_per_expert,
     torch::Tensor down_ptrs,
     torch::Tensor down_scale_ptrs,
     torch::Tensor down_bias_ptrs,
     int K,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
-    int max_m_tiles
+    int max_m_tiles,
+    int max_tokens_padded
 ) {
     TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kBFloat16);
-    TORCH_CHECK(expert_offsets.is_cuda() && expert_offsets.dtype() == torch::kInt32);
+    TORCH_CHECK(tokens_per_expert.is_cuda() && tokens_per_expert.dtype() == torch::kInt32);
 
     const int total_tokens = input.size(0);
     const int N = input.size(1);
-    const int num_experts = expert_offsets.size(0) - 1;
+    const int num_experts = tokens_per_expert.size(0);
 
     auto C = torch::empty({total_tokens, K}, input.options());
 
@@ -891,10 +890,10 @@ torch::Tensor grouped_int4_moe_stage2(
         down_ptrs.data_ptr<int64_t>(),
         down_scale_ptrs.data_ptr<int64_t>(),
         has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
-        expert_offsets.data_ptr<int32_t>(),
+        tokens_per_expert.data_ptr<int32_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
-        total_tokens, N, K, num_experts,
+        max_tokens_padded, N, K, num_experts,
         stride_weight_n, stride_scale_n,
         has_down_bias);
 
@@ -929,7 +928,7 @@ void grouped_int4_moe_stage1_inplace(
     torch::Tensor A,
     torch::Tensor C,
     torch::Tensor tma_desc_bytes,
-    torch::Tensor expert_offsets,
+    torch::Tensor tokens_per_expert,
     torch::Tensor gate_ptrs,
     torch::Tensor gate_scale_ptrs,
     torch::Tensor up_ptrs,
@@ -939,7 +938,8 @@ void grouped_int4_moe_stage1_inplace(
     int N,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
-    int max_m_tiles
+    int max_m_tiles,
+    int max_tokens_padded
 ) {
     TORCH_CHECK(A.is_cuda() && A.dtype() == torch::kBFloat16);
     TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
@@ -947,7 +947,7 @@ void grouped_int4_moe_stage1_inplace(
 
     const int total_tokens = A.size(0);
     const int K = A.size(1);
-    const int num_experts = expert_offsets.size(0) - 1;
+    const int num_experts = tokens_per_expert.size(0);
 
     CUtensorMap desc_a;
     std::memcpy(&desc_a, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
@@ -974,10 +974,10 @@ void grouped_int4_moe_stage1_inplace(
         up_scale_ptrs.data_ptr<int64_t>(),
         has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
         has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
-        expert_offsets.data_ptr<int32_t>(),
+        tokens_per_expert.data_ptr<int32_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
-        total_tokens, N, K, num_experts,
+        max_tokens_padded, N, K, num_experts,
         stride_weight_n, stride_scale_n,
         has_gate_bias, has_up_bias);
 }
@@ -989,14 +989,15 @@ void grouped_int4_moe_stage2_inplace(
     torch::Tensor input,
     torch::Tensor C,
     torch::Tensor tma_desc_bytes,
-    torch::Tensor expert_offsets,
+    torch::Tensor tokens_per_expert,
     torch::Tensor down_ptrs,
     torch::Tensor down_scale_ptrs,
     torch::Tensor down_bias_ptrs,
     int K,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
-    int max_m_tiles
+    int max_m_tiles,
+    int max_tokens_padded
 ) {
     TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kBFloat16);
     TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
@@ -1004,7 +1005,7 @@ void grouped_int4_moe_stage2_inplace(
 
     const int total_tokens = input.size(0);
     const int N = input.size(1);
-    const int num_experts = expert_offsets.size(0) - 1;
+    const int num_experts = tokens_per_expert.size(0);
 
     CUtensorMap desc_input;
     std::memcpy(&desc_input, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
@@ -1027,25 +1028,25 @@ void grouped_int4_moe_stage2_inplace(
         down_ptrs.data_ptr<int64_t>(),
         down_scale_ptrs.data_ptr<int64_t>(),
         has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
-        expert_offsets.data_ptr<int32_t>(),
+        tokens_per_expert.data_ptr<int32_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
-        total_tokens, N, K, num_experts,
+        max_tokens_padded, N, K, num_experts,
         stride_weight_n, stride_scale_n,
         has_down_bias);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_int4_moe_stage1", &grouped_int4_moe_stage1,
-          "Grouped INT4 Stage 1 (gate+up+SiLU) with TMA + bias");
+          "Grouped INT4 Stage 1 (gate+up+SiLU) with 3D strided layout");
     m.def("grouped_int4_moe_stage2", &grouped_int4_moe_stage2,
-          "Grouped INT4 Stage 2 (down projection) with TMA + bias");
+          "Grouped INT4 Stage 2 (down projection) with 3D strided layout");
     m.def("create_tma_desc_bf16", &create_tma_desc_bf16,
           "Create TMA descriptor for a 2D BF16 tensor");
     m.def("grouped_int4_moe_stage1_inplace", &grouped_int4_moe_stage1_inplace,
-          "Grouped INT4 Stage 1 inplace (pre-allocated output + TMA desc)");
+          "Grouped INT4 Stage 1 inplace with 3D strided layout");
     m.def("grouped_int4_moe_stage2_inplace", &grouped_int4_moe_stage2_inplace,
-          "Grouped INT4 Stage 2 inplace (pre-allocated output + TMA desc)");
+          "Grouped INT4 Stage 2 inplace with 3D strided layout");
 }
 
 '''
@@ -1120,8 +1121,8 @@ def is_int4_grouped_wgmma_available() -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def fused_int4_grouped_stage1(
-    sorted_hidden: torch.Tensor,       # [total_tokens, K] BF16
-    expert_offsets: torch.Tensor,       # [num_experts + 1] int32
+    sorted_hidden: torch.Tensor,       # [E*mtp, K] BF16 (3D strided layout)
+    tokens_per_expert: torch.Tensor,   # [num_experts] int32
     gate_ptrs: torch.Tensor,           # [num_experts] int64
     gate_scale_ptrs: torch.Tensor,     # [num_experts] int64
     up_ptrs: torch.Tensor,             # [num_experts] int64
@@ -1129,65 +1130,49 @@ def fused_int4_grouped_stage1(
     N: int,                            # intermediate_size
     stride_weight_n: int,              # K // 2 (bytes per row in packed weight)
     stride_scale_n: int,               # K // 32 (BF16 elements per row in scale)
+    max_tokens_padded: int,            # stride per expert in the 3D buffer
     gate_bias_ptrs: torch.Tensor = None,
     up_bias_ptrs: torch.Tensor = None,
 ) -> torch.Tensor:
     """Grouped INT4 Stage 1: gate + up + SiLU via WGMMA with TMA.
 
-    Args:
-        sorted_hidden: Dispatched tokens [total_tokens, K] BF16
-        expert_offsets: Cumulative offsets [num_experts + 1] int32
-        gate_ptrs/gate_scale_ptrs: Pointer arrays [num_experts] int64
-        up_ptrs/up_scale_ptrs: Pointer arrays [num_experts] int64
-        N: Intermediate dimension (gate/up output width)
-        stride_weight_n: Weight stride along N in bytes (= K_dim // 2)
-        stride_scale_n: Scale stride along N in BF16 elements (= K_dim // 32)
-
-    Returns:
-        Intermediate activations [total_tokens, N] BF16 after SiLU gating
+    Uses 3D strided buffer layout [E, max_tokens_padded, K].
+    Each expert's tokens start at expert_idx * max_tokens_padded.
     """
     mod = _load_int4_grouped_module()
     assert mod is not None, "INT4 WGMMA grouped module not available"
 
-    total_tokens = sorted_hidden.shape[0]
-    max_m_tiles = (total_tokens + 63) // 64 if total_tokens > 0 else 1
+    max_m_tiles = (max_tokens_padded + 63) // 64 if max_tokens_padded > 0 else 1
 
     empty_bias = torch.empty(0, dtype=torch.int64, device=sorted_hidden.device)
     gb = gate_bias_ptrs if gate_bias_ptrs is not None else empty_bias
     ub = up_bias_ptrs if up_bias_ptrs is not None else empty_bias
 
     return mod.grouped_int4_moe_stage1(
-        sorted_hidden, expert_offsets,
+        sorted_hidden, tokens_per_expert,
         gate_ptrs, gate_scale_ptrs,
         up_ptrs, up_scale_ptrs,
         gb, ub,
         N, stride_weight_n, stride_scale_n,
-        max_m_tiles,
+        max_m_tiles, max_tokens_padded,
     )
 
 
 def fused_int4_grouped_stage2(
-    intermediate: torch.Tensor,        # [total_tokens, N] BF16
-    expert_offsets: torch.Tensor,       # [num_experts + 1] int32
+    intermediate: torch.Tensor,        # [E*mtp, N] BF16 (3D strided layout)
+    tokens_per_expert: torch.Tensor,   # [num_experts] int32
     down_ptrs: torch.Tensor,           # [num_experts] int64
     down_scale_ptrs: torch.Tensor,     # [num_experts] int64
     K: int,                            # hidden_size (output width)
     stride_weight_n: int,              # N // 2 (bytes per row in packed weight)
     stride_scale_n: int,               # N // 32 (BF16 elements per row in scale)
+    max_tokens_padded: int,            # stride per expert in the 3D buffer
     down_bias_ptrs: torch.Tensor = None,
 ) -> torch.Tensor:
     """Grouped INT4 Stage 2: down projection via WGMMA with TMA.
 
-    Args:
-        intermediate: Stage 1 output [total_tokens, N] BF16
-        expert_offsets: Cumulative offsets [num_experts + 1] int32
-        down_ptrs/down_scale_ptrs: Pointer arrays [num_experts] int64
-        K: Hidden size (output width)
-        stride_weight_n: Weight stride along N in bytes (= N_inter // 2)
-        stride_scale_n: Scale stride along N in BF16 elements (= N_inter // 32)
-
-    Returns:
-        Output activations [total_tokens, K] BF16
+    Uses 3D strided buffer layout [E, max_tokens_padded, N].
+    Each expert's tokens start at expert_idx * max_tokens_padded.
     """
     mod = _load_int4_grouped_module()
     assert mod is not None, "INT4 WGMMA grouped module not available"
@@ -1195,15 +1180,14 @@ def fused_int4_grouped_stage2(
     empty_bias = torch.empty(0, dtype=torch.int64, device=intermediate.device)
     db = down_bias_ptrs if down_bias_ptrs is not None else empty_bias
 
-    total_tokens = intermediate.shape[0]
-    max_m_tiles = (total_tokens + 63) // 64 if total_tokens > 0 else 1
+    max_m_tiles = (max_tokens_padded + 63) // 64 if max_tokens_padded > 0 else 1
 
     return mod.grouped_int4_moe_stage2(
-        intermediate, expert_offsets,
+        intermediate, tokens_per_expert,
         down_ptrs, down_scale_ptrs,
         db,
         K, stride_weight_n, stride_scale_n,
-        max_m_tiles,
+        max_m_tiles, max_tokens_padded,
     )
 
 
@@ -1239,7 +1223,7 @@ def fused_int4_grouped_stage1_inplace(
     sorted_hidden: torch.Tensor,
     output: torch.Tensor,
     tma_desc: torch.Tensor,
-    expert_offsets: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
     gate_ptrs: torch.Tensor,
     gate_scale_ptrs: torch.Tensor,
     up_ptrs: torch.Tensor,
@@ -1247,26 +1231,26 @@ def fused_int4_grouped_stage1_inplace(
     N: int,
     stride_weight_n: int,
     stride_scale_n: int,
+    max_tokens_padded: int,
     gate_bias_ptrs: torch.Tensor = None,
     up_bias_ptrs: torch.Tensor = None,
 ) -> None:
-    """In-place Stage 1 with pre-built TMA descriptor. CUDA graph compatible."""
+    """In-place Stage 1 with pre-built TMA descriptor and 3D strided layout."""
     mod = _load_int4_grouped_module()
     assert mod is not None, "INT4 WGMMA grouped module not available"
 
-    total_tokens = sorted_hidden.shape[0]
-    max_m_tiles = (total_tokens + 63) // 64 if total_tokens > 0 else 1
+    max_m_tiles = (max_tokens_padded + 63) // 64 if max_tokens_padded > 0 else 1
 
     gb = gate_bias_ptrs if gate_bias_ptrs is not None else _get_empty_bias(sorted_hidden.device)
     ub = up_bias_ptrs if up_bias_ptrs is not None else _get_empty_bias(sorted_hidden.device)
 
     mod.grouped_int4_moe_stage1_inplace(
-        sorted_hidden, output, tma_desc, expert_offsets,
+        sorted_hidden, output, tma_desc, tokens_per_expert,
         gate_ptrs, gate_scale_ptrs,
         up_ptrs, up_scale_ptrs,
         gb, ub,
         N, stride_weight_n, stride_scale_n,
-        max_m_tiles,
+        max_m_tiles, max_tokens_padded,
     )
 
 
@@ -1274,29 +1258,29 @@ def fused_int4_grouped_stage2_inplace(
     intermediate: torch.Tensor,
     output: torch.Tensor,
     tma_desc: torch.Tensor,
-    expert_offsets: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
     down_ptrs: torch.Tensor,
     down_scale_ptrs: torch.Tensor,
     K: int,
     stride_weight_n: int,
     stride_scale_n: int,
+    max_tokens_padded: int,
     down_bias_ptrs: torch.Tensor = None,
 ) -> None:
-    """In-place Stage 2 with pre-built TMA descriptor. CUDA graph compatible."""
+    """In-place Stage 2 with pre-built TMA descriptor and 3D strided layout."""
     mod = _load_int4_grouped_module()
     assert mod is not None, "INT4 WGMMA grouped module not available"
 
-    total_tokens = intermediate.shape[0]
-    max_m_tiles = (total_tokens + 63) // 64 if total_tokens > 0 else 1
+    max_m_tiles = (max_tokens_padded + 63) // 64 if max_tokens_padded > 0 else 1
 
     db = down_bias_ptrs if down_bias_ptrs is not None else _get_empty_bias(intermediate.device)
 
     mod.grouped_int4_moe_stage2_inplace(
-        intermediate, output, tma_desc, expert_offsets,
+        intermediate, output, tma_desc, tokens_per_expert,
         down_ptrs, down_scale_ptrs,
         db,
         K, stride_weight_n, stride_scale_n,
-        max_m_tiles,
+        max_m_tiles, max_tokens_padded,
     )
 
 
