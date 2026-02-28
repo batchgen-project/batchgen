@@ -88,6 +88,14 @@ class KimiK25Tokenizer(BaseTokenizer):
             added_tokens_decoder=added_tokens_decoder
         )
 
+        # Load chat template from jinja file if available
+        jinja_file = TOKENIZER_DIR / "chat_template.jinja"
+        if not jinja_file.exists():
+            # Try checkpoint directory (may differ from assets)
+            pass
+        if jinja_file.exists():
+            self._tokenizer.chat_template = jinja_file.read_text()
+
         # Set special token IDs
         self.bos_token_id = KIMI_K25_BOS_TOKEN_ID
         self.eos_token_id = KIMI_K25_EOS_TOKEN_ID
