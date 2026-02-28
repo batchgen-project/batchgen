@@ -541,11 +541,29 @@ class KimiK25MoE(nn.Module):
                     global_e = self.routed_expert_start_idx + local_e
                     wrapper = self.experts[global_e]
                     module = wrapper.module if hasattr(wrapper, 'module') else wrapper
-                    w_ptrs[local_e] = getattr(module, f'int4_{prefix}_packed').data_ptr()
-                    s_ptrs[local_e] = getattr(module, f'int4_{prefix}_scale').data_ptr()
+                    w_packed = getattr(module, f'int4_{prefix}_packed')
+                    w_scale = getattr(module, f'int4_{prefix}_scale')
+
+                    # Log dtype/shape for first expert of each prefix (layer 0 only)
+                    if local_e == 0 and not hasattr(self.__class__, '_dtype_logged'):
+                        logging.info(
+                            f"[MoE WGMMA] int4_{prefix}_packed: "
+                            f"dtype={w_packed.dtype}, shape={list(w_packed.shape)}, "
+                            f"stride={w_packed.stride()}, contiguous={w_packed.is_contiguous()}"
+                        )
+                        logging.info(
+                            f"[MoE WGMMA] int4_{prefix}_scale: "
+                            f"dtype={w_scale.dtype}, shape={list(w_scale.shape)}, "
+                            f"stride={w_scale.stride()}, contiguous={w_scale.is_contiguous()}"
+                        )
+
+                    w_ptrs[local_e] = w_packed.data_ptr()
+                    s_ptrs[local_e] = w_scale.data_ptr()
 
                 weights[f'_ptr_{prefix}'] = w_ptrs
                 weights[f'_ptr_{prefix}_scale'] = s_ptrs
+
+            self.__class__._dtype_logged = True
 
             self._moe_weights = weights
             self._wgmma_mod = _load_int4_grouped_module()
@@ -566,6 +584,30 @@ class KimiK25MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_states
         num_tokens, H = hidden_states.shape
+
+        # One-time runtime dtype verification
+        if not hasattr(self.__class__, '_runtime_logged'):
+            self.__class__._runtime_logged = True
+            logging.info(
+                f"[MoE decode] hidden_states: dtype={hidden_states.dtype}, shape={list(hidden_states.shape)}"
+            )
+            logging.info(
+                f"[MoE decode] gate.weight: dtype={self.gate.weight.dtype}, shape={list(self.gate.weight.shape)}"
+            )
+            if buf is not None:
+                logging.info(
+                    f"[MoE decode] buf.dispatched_x: dtype={buf.dispatched_x.dtype}, "
+                    f"buf.intermediate: dtype={buf.intermediate.dtype}, "
+                    f"buf.expert_out: dtype={buf.expert_out.dtype}"
+                )
+                logging.info(
+                    f"[MoE decode] buf.tma_dispatched: {'set' if buf.tma_dispatched is not None else 'None'}, "
+                    f"buf.tma_intermediate: {'set' if buf.tma_intermediate is not None else 'None'}"
+                )
+            logging.info(
+                f"[MoE decode] use_grouped_wgmma={getattr(self, '_use_grouped_wgmma', False)}, "
+                f"N={self.moe_intermediate_size}, K={H}"
+            )
         device = self.device or hidden_states.device
         topk = self.top_k
         N = self.moe_intermediate_size  # 2048
