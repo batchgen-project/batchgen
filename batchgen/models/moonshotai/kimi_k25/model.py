@@ -557,14 +557,17 @@ class KimiK25MoE(nn.Module):
         K = self.top_k
 
         # 1) AllGather: collect tokens from all ranks
-        all_tokens = torch.zeros(
-            self.world_size * self.num_tokens_per_rank, hidden_size,
-            device=device, dtype=torch.bfloat16,
-        )
-        padded = torch.zeros(
-            self.num_tokens_per_rank, hidden_size,
-            device=device, dtype=hidden_states.dtype,
-        )
+        buf = self.__class__._buf
+        num_global = self.world_size * self.num_tokens_per_rank
+        if buf is not None:
+            buf.resize_if_needed(num_global)
+            all_tokens = buf.all_tokens[:num_global]
+            all_tokens.zero_()
+            padded = buf.padded
+            padded.zero_()
+        else:
+            all_tokens = torch.zeros(num_global, hidden_size, device=device, dtype=torch.bfloat16)
+            padded = torch.zeros(self.num_tokens_per_rank, hidden_size, device=device, dtype=hidden_states.dtype)
         if num_tokens > 0:
             padded[:num_tokens] = hidden_states
 
