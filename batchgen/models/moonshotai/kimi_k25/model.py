@@ -648,11 +648,10 @@ class KimiK25MoE(nn.Module):
             mod = self._wgmma_mod
             w = self._moe_weights
             mtp = buf.max_tokens_padded
-            # Use actual max tokens per expert for grid size (avoid launching empty m-tiles)
-            max_tokens_any_expert = expert_counts.max().item()
-            max_m_tiles = (max_tokens_any_expert + _BLOCK_M - 1) // _BLOCK_M
-            if max_m_tiles == 0:
-                max_m_tiles = 1  # kernel handles zero-count experts
+            # Heuristic grid: assume worst-case ~2x uniform distribution
+            avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
+            max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
+            max_m_tiles = max(max_m_tiles, 1)
 
             # Stage 1 inplace: dispatched_x → intermediate
             mod.grouped_int4_moe_stage1_inplace(
