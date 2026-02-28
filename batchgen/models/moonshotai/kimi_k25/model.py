@@ -129,7 +129,7 @@ class KimiK25MoEBufferManager:
         # Cached TMA descriptors (single shared TMA on full [E*mtp, dim] buffer)
         self.tma_dispatched = None
         self.tma_intermediate = None
-        self._init_tma_descriptors()
+        # self._init_tma_descriptors()  # Disabled for debugging Step 3.1
 
         logging.info(
             f"[MoEBufferManager] 3D strided layout: E_local={E_local}, mtp={max_tokens_padded}, "
