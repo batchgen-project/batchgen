@@ -400,7 +400,7 @@ class MoEGate(nn.Module):
                 torch.empty(0, self.top_k, dtype=hidden_states.dtype, device=hidden_states.device),
             )
 
-        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
             logits, self.e_score_correction_bias.float(),
             k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
@@ -417,7 +417,7 @@ class MoEGate(nn.Module):
             num_tokens = bsz * seq_len
         hidden_states = hidden_states.view(-1, h)
 
-        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
             logits, self.e_score_correction_bias.float(),
             k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
