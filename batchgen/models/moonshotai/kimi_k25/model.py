@@ -504,7 +504,6 @@ class KimiK25MoE(nn.Module):
         Uses pre-allocated buffers from KimiK25MoEBufferManager (class variable _buf)
         to eliminate per-forward memory allocations in the hot path.
         """
-        buf = self._buf
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_states
@@ -513,46 +512,30 @@ class KimiK25MoE(nn.Module):
         K = self.top_k
         num_global = self.world_size * self.num_tokens_per_rank
 
-        # 1) AllGather: collect tokens from all ranks (pre-allocated buffers)
-        buf.padded.zero_()
+        # 1) AllGather: collect tokens from all ranks
+        all_tokens = torch.zeros(
+            num_global, hidden_size, device=device, dtype=torch.bfloat16,
+        )
+        padded = torch.zeros(
+            self.num_tokens_per_rank, hidden_size,
+            device=device, dtype=hidden_states.dtype,
+        )
         if num_tokens > 0:
-            buf.padded[:num_tokens] = hidden_states
+            padded[:num_tokens] = hidden_states
 
-        all_tokens = buf.all_tokens[:num_global]
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
-                all_tokens, buf.padded,
+                all_tokens, padded,
                 stream=torch.cuda.default_stream(device),
             )
 
-        # 2) CUDA gate on global tokens (pre-allocated output buffers)
-        gate_logits = buf.gate_logits[:num_global]
-        topk_idx = buf.topk_indices[:num_global]
-        topk_weight = buf.topk_weights[:num_global]
+        # 2) CUDA gate on global tokens
+        topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, hidden_size))
 
-        # Router matmul + sigmoid topk
-        torch.mm(all_tokens.float(), self.gate.weight.float().t(), out=gate_logits)
-        gate_sigmoid_topk_cuda(
-            gate_logits, self.gate.e_score_correction_bias.float(),
-            k=self.top_k, routed_scaling_factor=self.gate.routed_scaling_factor,
-            topk_indices=topk_idx, topk_weights=topk_weight,
-        )
-
-        # 3) CUDA dispatch (pre-allocated buffers)
-        buf.expert_counts.zero_()
-        buf.expert_counters.zero_()
-        NK = num_global * K
-        topk_pos = buf.topk_pos[:NK]
-        topk_pos.fill_(-1)
-
+        # 3) CUDA dispatch
         dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
-            all_tokens, topk_idx,
+            all_tokens, topk_idx.to(torch.int32),
             self.routed_expert_start_idx, self.experts_per_rank,
-            expert_counts=buf.expert_counts,
-            expert_offsets=buf.expert_offsets,
-            expert_counters=buf.expert_counters,
-            dispatched_x=buf.dispatched_x,
-            topk_pos=topk_pos,
         )
 
         # 4) Expert execution
@@ -617,24 +600,23 @@ class KimiK25MoE(nn.Module):
                     # Fallback: standard forward (BF16 matmul)
                     expert_output[start_off:end_off] = wrapper(dispatched_x[start_off:end_off])
 
-        # 5) CUDA reduce (pre-allocated result buffer)
-        reduce_weighted_scatter_cuda(
+        # 5) CUDA reduce
+        global_results = reduce_weighted_scatter_cuda(
             expert_output, topk_pos, topk_weight,
             num_global, hidden_size, K,
-            output=buf.result_buffer[:num_global],
         )
 
         # 6) AllReduce: sum results from all ranks
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
-                buf.result_buffer[:num_global], op=dist.ReduceOp.SUM,
+                global_results, op=dist.ReduceOp.SUM,
                 stream=torch.cuda.default_stream(device),
             )
 
         # 7) Extract local results + add shared expert
         start = self.rank * self.num_tokens_per_rank
         end = start + num_tokens
-        out = buf.result_buffer[start:end]
+        out = global_results[start:end]
         out = out + self.shared_experts(identity)
         return out.view(*orig_shape)
 
