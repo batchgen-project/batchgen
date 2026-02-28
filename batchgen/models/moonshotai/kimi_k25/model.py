@@ -48,7 +48,10 @@ from batchgen.moe.routing import (
     reduce_weighted_scatter_cuda,
     gate_sigmoid_topk_cuda,
 )
-from batchgen.moe.grouped_int4_wgmma import _get_wgmma_module
+from batchgen.moe.fused_int4_wgmma_grouped import (
+    _load_int4_grouped_module,
+    create_tma_descriptor,
+)
 from batchgen.moe.int4_single_expert_wgmma import single_expert_int4_forward
 
 
@@ -66,17 +69,14 @@ _BLOCK_M = 64  # TMA constraint: global tensor M >= BLOCK_M
 
 
 class KimiK25MoEBufferManager:
-    """Pre-allocated buffers for K2.5 MoE decode pipeline.
+    """Pre-allocated buffers for K2.5 MoE decode pipeline (v5 design).
 
     One instance per model, shared across all 60 MoE layers via class variable.
-    Eliminates per-forward torch.zeros/empty allocations in the hot path.
-
-    Buffers:
-        Communication: all_tokens (AllGather output), padded (local pad)
-        Routing: topk_indices, topk_weights, expert_counts, expert_offsets,
-                 expert_counters, topk_pos
-        GEMM: dispatched_x (dispatch output / WGMMA input)
-        Result: result_buffer (reduce output)
+    Follows layer_opt_pipeline MoEBufferState design:
+    - Reserved GEMM buffers: dispatched_x, intermediate, expert_out
+    - Routing metadata: topk_indices, topk_weights, expert_counts/offsets, topk_pos
+    - Communication: all_tokens, padded, result_buffer
+    - TMA descriptors: cached for dispatched_x and intermediate (WGMMA inplace)
     """
 
     def __init__(
@@ -95,6 +95,7 @@ class KimiK25MoEBufferManager:
         self.topk = topk
         self.max_global_bsz = max_global_bsz
         self.num_tokens_per_rank = num_tokens_per_rank
+        self.device = device
 
         NK = max_global_bsz * topk
         disp_max = max(NK, _BLOCK_M)
@@ -112,26 +113,65 @@ class KimiK25MoEBufferManager:
         self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
         self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
 
-        # GEMM buffer
-        self.dispatched_x = torch.empty(disp_max, H, dtype=torch.bfloat16, device=device)
+        # Reserved GEMM buffers (flat, expert-contiguous via offsets)
+        self.dispatched_x = torch.zeros(disp_max, H, dtype=torch.bfloat16, device=device)
+        self.intermediate = torch.zeros(disp_max, N_inter, dtype=torch.bfloat16, device=device)
+        self.expert_out = torch.zeros(disp_max, H, dtype=torch.bfloat16, device=device)
 
         # Result buffer
         self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
 
-        # Gate logits buffer (FP32 for numerical stability)
-        self.gate_logits = torch.empty(max_global_bsz, 384, dtype=torch.float32, device=device)
+        # Empty bias (reusable)
+        self.empty_bias = torch.empty(0, dtype=torch.int64, device=device)
+
+        # Cached TMA descriptors (for WGMMA inplace kernels)
+        self.tma_dispatched = None
+        self.tma_intermediate = None
+        self._init_tma_descriptors()
 
         logging.info(
             f"[MoEBufferManager] Allocated: E_local={E_local}, max_global_bsz={max_global_bsz}, "
-            f"H={H}, disp_max={disp_max}, "
+            f"H={H}, N_inter={N_inter}, disp_max={disp_max}, "
             f"total={self._total_bytes() / (1024**3):.2f} GiB"
         )
+
+    def _init_tma_descriptors(self):
+        """Create TMA descriptors for dispatched_x and intermediate buffers."""
+        try:
+            self.tma_dispatched = create_tma_descriptor(self.dispatched_x, _BLOCK_M, 64)
+            self.tma_intermediate = create_tma_descriptor(self.intermediate, _BLOCK_M, 64)
+        except Exception as e:
+            logging.warning(f"[MoEBufferManager] TMA descriptor creation failed: {e}")
+            self.tma_dispatched = None
+            self.tma_intermediate = None
+
+    def resize_if_needed(self, global_bsz: int):
+        """Resize buffers if global_bsz exceeds current capacity. Re-cache TMA descriptors."""
+        if global_bsz <= self.max_global_bsz:
+            return
+        logging.info(f"[MoEBufferManager] Resizing: {self.max_global_bsz} → {global_bsz}")
+        self.max_global_bsz = global_bsz
+        NK = global_bsz * self.topk
+        disp_max = max(NK, _BLOCK_M)
+        self.disp_max = disp_max
+        device = self.device
+
+        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=device)
+        self.topk_indices = torch.empty(global_bsz, self.topk, dtype=torch.int32, device=device)
+        self.topk_weights = torch.empty(global_bsz, self.topk, dtype=torch.float32, device=device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
+        self.dispatched_x = torch.zeros(disp_max, self.H, dtype=torch.bfloat16, device=device)
+        self.intermediate = torch.zeros(disp_max, self.N_inter, dtype=torch.bfloat16, device=device)
+        self.expert_out = torch.zeros(disp_max, self.H, dtype=torch.bfloat16, device=device)
+        self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=device)
+        self._init_tma_descriptors()
 
     def _total_bytes(self):
         total = 0
         for attr in ['all_tokens', 'padded', 'topk_indices', 'topk_weights',
                       'expert_counts', 'expert_offsets', 'expert_counters',
-                      'topk_pos', 'dispatched_x', 'result_buffer', 'gate_logits']:
+                      'topk_pos', 'dispatched_x', 'intermediate', 'expert_out',
+                      'result_buffer']:
             t = getattr(self, attr)
             total += t.nelement() * t.element_size()
         return total
@@ -475,14 +515,14 @@ class KimiK25MoE(nn.Module):
             return self._forward_prefill(hidden_states)
 
     def init_grouped_wgmma(self):
-        """Setup weight pointer arrays for grouped WGMMA kernels.
+        """Setup WGMMA module and weight pointer arrays.
 
-        Follows layer_opt_pipeline design: build pointer arrays from per-expert
-        INT4 weight tensors, then call WGMMA module directly with
-        N, K//2, K//32 (stage1) and K, N//2, N//32 (stage2).
+        Follows layer_opt_pipeline v5 design:
+        - Build pointer arrays from per-expert INT4 weight tensors
+        - Cache WGMMA module for inplace kernel calls
+        - Kernel args: N, K//2, K//32 (stage1) and K, N//2, N//32 (stage2)
 
         Called by PSM after expert wrapping + INT4 weights moved to GPU.
-        Only sets up pointers for persistent (GPU-resident) experts.
         """
         if self.num_persistent_local_experts == 0:
             self._use_grouped_wgmma = False
@@ -508,7 +548,7 @@ class KimiK25MoE(nn.Module):
                 weights[f'_ptr_{prefix}_scale'] = s_ptrs
 
             self._moe_weights = weights
-            self._wgmma_mod = _get_wgmma_module()
+            self._wgmma_mod = _load_int4_grouped_module()
             self._use_grouped_wgmma = True
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
@@ -516,11 +556,12 @@ class KimiK25MoE(nn.Module):
 
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """EP decode forward following layer_opt_pipeline design.
+        """EP decode forward — v5 reserved buffer + inplace WGMMA design.
 
-        AllGather → CUDA gate → CUDA dispatch → grouped WGMMA → CUDA reduce → AllReduce.
-        Calls WGMMA module directly with (N, K//2, K//32) / (K, N//2, N//32).
+        AllGather → CUDA gate → CUDA dispatch (reserved buf) →
+        WGMMA inplace (stage1 + stage2) → CUDA reduce (reserved buf) → AllReduce.
         """
+        buf = self.__class__._buf
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_states
@@ -531,14 +572,20 @@ class KimiK25MoE(nn.Module):
         K = H                           # 7168
         num_global = self.world_size * self.num_tokens_per_rank
 
-        # 1) AllGather
-        all_tokens = torch.zeros(
-            num_global, H, device=device, dtype=torch.bfloat16,
-        )
-        padded = torch.zeros(
-            self.num_tokens_per_rank, H,
-            device=device, dtype=hidden_states.dtype,
-        )
+        # Resize buffers if needed (rare: only on batch size increase)
+        if buf is not None:
+            buf.resize_if_needed(num_global)
+
+        # 1) AllGather into reserved buffer
+        if buf is not None:
+            all_tokens = buf.all_tokens[:num_global]
+            all_tokens.zero_()
+            padded = buf.padded
+            padded.zero_()
+        else:
+            all_tokens = torch.zeros(num_global, H, device=device, dtype=torch.bfloat16)
+            padded = torch.zeros(self.num_tokens_per_rank, H, device=device, dtype=hidden_states.dtype)
+
         if num_tokens > 0:
             padded[:num_tokens] = hidden_states
 
@@ -551,53 +598,84 @@ class KimiK25MoE(nn.Module):
         # 2) CUDA gate: sigmoid + top-k + normalize + scale
         topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
 
-        # 3) CUDA dispatch: count + prefix_sum + gather
-        dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
-            all_tokens, topk_idx.to(torch.int32),
-            self.routed_expert_start_idx, self.experts_per_rank,
-        )
+        # 3) CUDA dispatch into reserved buffers
+        if buf is not None:
+            dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+                all_tokens, topk_idx.to(torch.int32),
+                self.routed_expert_start_idx, self.experts_per_rank,
+                expert_counts=buf.expert_counts,
+                expert_offsets=buf.expert_offsets,
+                expert_counters=buf.expert_counters,
+                dispatched_x=buf.dispatched_x,
+                topk_pos=buf.topk_pos[:num_global * topk],
+            )
+        else:
+            dispatched_x, expert_counts, expert_offsets, topk_pos = dispatch_count_gather_cuda(
+                all_tokens, topk_idx.to(torch.int32),
+                self.routed_expert_start_idx, self.experts_per_rank,
+            )
 
-        # 4) Expert compute: grouped INT4 WGMMA (layer_opt calling convention)
-        total_dispatched = dispatched_x.shape[0]
+        # 4) Expert compute: grouped INT4 WGMMA inplace on reserved buffers
+        total_dispatched = expert_offsets[-1].item() if expert_offsets.numel() > 0 else 0
+
         if total_dispatched == 0:
             expert_output = torch.empty(0, H, dtype=torch.bfloat16, device=device)
+        elif getattr(self, '_use_grouped_wgmma', False) and buf is not None and buf.tma_dispatched is not None:
+            # v5 path: inplace WGMMA with TMA descriptors on reserved buffers
+            mod = self._wgmma_mod
+            w = self._moe_weights
+            max_m_tiles = (buf.dispatched_x.shape[0] + _BLOCK_M - 1) // _BLOCK_M
+
+            # Stage 1 inplace: dispatched_x → intermediate
+            mod.grouped_int4_moe_stage1_inplace(
+                buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
+                expert_offsets,
+                w["_ptr_gate"], w["_ptr_gate_scale"],
+                w["_ptr_up"], w["_ptr_up_scale"],
+                buf.empty_bias, buf.empty_bias,
+                N, K // 2, K // 32, max_m_tiles,
+            )
+
+            # Stage 2 inplace: intermediate → expert_out
+            mod.grouped_int4_moe_stage2_inplace(
+                buf.intermediate, buf.expert_out, buf.tma_intermediate,
+                expert_offsets,
+                w["_ptr_down"], w["_ptr_down_scale"],
+                buf.empty_bias,
+                K, N // 2, N // 32, max_m_tiles,
+            )
+            expert_output = buf.expert_out[:total_dispatched]
+
         elif getattr(self, '_use_grouped_wgmma', False):
+            # Allocating fallback: WGMMA without TMA descriptors
             mod = self._wgmma_mod
             w = self._moe_weights
 
-            # TMA requires gmem_rows >= BLOCK_M; pad if needed
-            BLOCK_M = 64
-            need_pad = total_dispatched < BLOCK_M
+            need_pad = total_dispatched < _BLOCK_M
+            wgmma_input = dispatched_x
             if need_pad:
-                pad_rows = BLOCK_M - total_dispatched
-                dispatched_x = torch.nn.functional.pad(dispatched_x, (0, 0, 0, pad_rows))
+                wgmma_input = torch.nn.functional.pad(dispatched_x[:total_dispatched], (0, 0, 0, _BLOCK_M - total_dispatched))
 
-            max_m_tiles = (dispatched_x.shape[0] + BLOCK_M - 1) // BLOCK_M
+            max_m_tiles = (wgmma_input.shape[0] + _BLOCK_M - 1) // _BLOCK_M
             empty_bias = torch.empty(0, dtype=torch.int64, device=device)
 
-            # Stage 1: gate + up + SiLU → [dispatched, N]
             intermediate = mod.grouped_int4_moe_stage1(
-                dispatched_x, expert_offsets,
+                wgmma_input, expert_offsets,
                 w["_ptr_gate"], w["_ptr_gate_scale"],
                 w["_ptr_up"], w["_ptr_up_scale"],
                 empty_bias, empty_bias,
-                N, K // 2, K // 32,
-                max_m_tiles,
+                N, K // 2, K // 32, max_m_tiles,
             )
-
-            # Stage 2: down → [dispatched, K]
             expert_output = mod.grouped_int4_moe_stage2(
                 intermediate, expert_offsets,
                 w["_ptr_down"], w["_ptr_down_scale"],
                 empty_bias,
-                K, N // 2, N // 32,
-                max_m_tiles,
+                K, N // 2, N // 32, max_m_tiles,
             )
-
             if need_pad:
                 expert_output = expert_output[:total_dispatched]
         else:
-            # Fallback: per-expert loop
+            # Per-expert loop fallback
             expert_output = dispatched_x.new_empty(total_dispatched, H)
             offsets_cpu = expert_offsets.tolist()
             for local_e in range(self.experts_per_rank):
@@ -618,11 +696,18 @@ class KimiK25MoE(nn.Module):
                 else:
                     expert_output[start_off:end_off] = wrapper(dispatched_x[start_off:end_off])
 
-        # 5) CUDA reduce: weighted scatter-add
-        global_results = reduce_weighted_scatter_cuda(
-            expert_output, topk_pos, topk_weight,
-            num_global, H, topk,
-        )
+        # 5) CUDA reduce: weighted scatter-add into reserved buffer
+        if buf is not None:
+            global_results = reduce_weighted_scatter_cuda(
+                expert_output, topk_pos, topk_weight,
+                num_global, H, topk,
+                output=buf.result_buffer[:num_global],
+            )
+        else:
+            global_results = reduce_weighted_scatter_cuda(
+                expert_output, topk_pos, topk_weight,
+                num_global, H, topk,
+            )
 
         # 6) AllReduce
         with self.comm.change_state(enable=True):
