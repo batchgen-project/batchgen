@@ -600,7 +600,6 @@ class KimiK25MoE(nn.Module):
         # 1) AllGather into reserved buffer
         if buf is not None:
             all_tokens = buf.all_tokens[:num_global]
-            all_tokens.zero_()
             padded = buf.padded
             padded.zero_()
         else:
@@ -644,14 +643,16 @@ class KimiK25MoE(nn.Module):
             )
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
-        total_dispatched = expert_counts.sum().item()
-
-        if total_dispatched > 0 and getattr(self, '_use_grouped_wgmma', False) \
+        if getattr(self, '_use_grouped_wgmma', False) \
                 and buf is not None and buf.tma_dispatched is not None:
             mod = self._wgmma_mod
             w = self._moe_weights
             mtp = buf.max_tokens_padded
-            max_m_tiles = (mtp + _BLOCK_M - 1) // _BLOCK_M
+            # Use actual max tokens per expert for grid size (avoid launching empty m-tiles)
+            max_tokens_any_expert = expert_counts.max().item()
+            max_m_tiles = (max_tokens_any_expert + _BLOCK_M - 1) // _BLOCK_M
+            if max_m_tiles == 0:
+                max_m_tiles = 1  # kernel handles zero-count experts
 
             # Stage 1 inplace: dispatched_x → intermediate
             mod.grouped_int4_moe_stage1_inplace(
@@ -675,7 +676,6 @@ class KimiK25MoE(nn.Module):
         # 5) Reduce: weighted scatter from 3D strided buffer to flat [G, H]
         if buf is not None:
             result_buf = buf.result_buffer[:num_global]
-            result_buf.zero_()
             global_results = reduce_weighted_scatter(
                 buf.expert_out, topk_pos, topk_weight,
                 num_global, H, topk, output=result_buf,
