@@ -524,58 +524,21 @@ class KimiK25MoE(nn.Module):
             return self._forward_prefill(hidden_states)
 
     def init_grouped_wgmma(self):
-        """Setup WGMMA module and weight pointer arrays.
-
-        Follows layer_opt_pipeline v5 design:
-        - Build pointer arrays from per-expert INT4 weight tensors
-        - Cache WGMMA module for inplace kernel calls
-        - Kernel args: N, K//2, K//32 (stage1) and K, N//2, N//32 (stage2)
+        """Setup weight pointer arrays for grouped WGMMA kernels.
 
         Called by PSM after expert wrapping + INT4 weights moved to GPU.
+        Only sets up pointers for persistent (GPU-resident) experts.
         """
         if self.num_persistent_local_experts == 0:
             self._use_grouped_wgmma = False
             return
 
         try:
-            E = self.num_persistent_local_experts
-            device = self.device
-            weights = {}
-
-            for prefix in ('gate', 'up', 'down'):
-                w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-
-                for local_e in range(E):
-                    global_e = self.routed_expert_start_idx + local_e
-                    wrapper = self.experts[global_e]
-                    module = wrapper.module if hasattr(wrapper, 'module') else wrapper
-                    w_packed = getattr(module, f'int4_{prefix}_packed')
-                    w_scale = getattr(module, f'int4_{prefix}_scale')
-
-                    # Log dtype/shape for first expert of each prefix (layer 0 only)
-                    if local_e == 0 and not hasattr(self.__class__, '_dtype_logged'):
-                        logging.info(
-                            f"[MoE WGMMA] int4_{prefix}_packed: "
-                            f"dtype={w_packed.dtype}, shape={list(w_packed.shape)}, "
-                            f"stride={w_packed.stride()}, contiguous={w_packed.is_contiguous()}"
-                        )
-                        logging.info(
-                            f"[MoE WGMMA] int4_{prefix}_scale: "
-                            f"dtype={w_scale.dtype}, shape={list(w_scale.shape)}, "
-                            f"stride={w_scale.stride()}, contiguous={w_scale.is_contiguous()}"
-                        )
-
-                    w_ptrs[local_e] = w_packed.data_ptr()
-                    s_ptrs[local_e] = w_scale.data_ptr()
-
-                weights[f'_ptr_{prefix}'] = w_ptrs
-                weights[f'_ptr_{prefix}_scale'] = s_ptrs
-
-            self.__class__._dtype_logged = True
-
-            self._moe_weights = weights
-            self._wgmma_mod = _load_int4_grouped_module()
+            from batchgen.moe.grouped_int4_wgmma import setup_expert_weight_pointers
+            self._wgmma_weight_ptrs = setup_expert_weight_pointers(
+                self.experts, self.num_persistent_local_experts,
+                self.routed_expert_start_idx, self.device,
+            )
             self._use_grouped_wgmma = True
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
