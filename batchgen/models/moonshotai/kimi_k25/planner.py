@@ -61,8 +61,10 @@ class KimiK25Planner(BasePlanner):
         # Override base planner logic that sets attn_mode=1 when enable_offloading=False
         self.config.Basic_Config.attn_mode = 3
 
-        # EP offloading is disabled for K2.5 (all experts resident on GPU)
-        self.config.EP_Config.enable_offloading = False
+        # Default: EP offloading disabled (all experts GPU-resident).
+        # Only override if user didn't explicitly request offloading via server flag.
+        if not self.config.EP_Config.enable_offloading:
+            self.config.EP_Config.enable_offloading = False
 
     def get_module_shapes(self) -> dict:
         """Return Kimi K2.5 specific tensor shapes."""
