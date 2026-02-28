@@ -103,38 +103,13 @@ class KimiK25MoEBufferManager:
         self.device = device
         self.max_tokens_padded = max_tokens_padded
 
-        NK = max_global_bsz * topk
-        buf_rows = E_local * max_tokens_padded  # 3D strided: E * mtp
-
-        # Communication buffers
+        # Communication buffers only (debug: no 3D GEMM buffers)
         self.all_tokens = torch.zeros(max_global_bsz, H, dtype=torch.bfloat16, device=device)
         self.padded = torch.zeros(num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
 
-        # Routing metadata
-        self.expert_counts = torch.zeros(E_local, dtype=torch.int32, device=device)
-        self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
-        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
-
-        # Reserved GEMM buffers (3D strided: [E_local * mtp, dim])
-        self.dispatched_x = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
-        self.intermediate = torch.zeros(buf_rows, N_inter, dtype=torch.bfloat16, device=device)
-        self.expert_out = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
-
-        # Result buffer
-        self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
-
-        # Empty bias (reusable)
-        self.empty_bias = torch.empty(0, dtype=torch.int64, device=device)
-
-        # Cached TMA descriptors (single shared TMA on full [E*mtp, dim] buffer)
-        self.tma_dispatched = None
-        self.tma_intermediate = None
-        # self._init_tma_descriptors()  # Disabled for debugging Step 3.1
-
         logging.info(
-            f"[MoEBufferManager] 3D strided layout: E_local={E_local}, mtp={max_tokens_padded}, "
-            f"buf_rows={buf_rows}, H={H}, N_inter={N_inter}, "
-            f"total={self._total_bytes() / (1024**3):.2f} GiB"
+            f"[MoEBufferManager] Comm-only mode: max_global_bsz={max_global_bsz}, "
+            f"num_tokens_per_rank={num_tokens_per_rank}, H={H}"
         )
 
     def _init_tma_descriptors(self):
@@ -148,39 +123,16 @@ class KimiK25MoEBufferManager:
             self.tma_intermediate = None
 
     def resize_if_needed(self, global_bsz: int):
-        """Resize communication/routing buffers if global_bsz exceeds capacity.
-
-        The 3D GEMM buffers only resize if global_bsz exceeds max_tokens_padded
-        (i.e., more tokens per expert than the stride allows).
-        """
+        """Resize comm buffers if global_bsz exceeds capacity."""
         if global_bsz <= self.max_global_bsz:
             return
-
-        logging.info(f"[MoEBufferManager] Resizing comm buffers: {self.max_global_bsz} → {global_bsz}")
+        logging.info(f"[MoEBufferManager] Resizing: {self.max_global_bsz} → {global_bsz}")
         self.max_global_bsz = global_bsz
-        NK = global_bsz * self.topk
-        device = self.device
-
-        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=device)
-        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
-        self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=device)
-
-        # Resize 3D buffers only if needed (when tokens per expert could exceed mtp)
-        if global_bsz > self.max_tokens_padded:
-            new_mtp = ((global_bsz + _BLOCK_M - 1) // _BLOCK_M) * _BLOCK_M
-            logging.info(f"[MoEBufferManager] Resizing 3D buffers: mtp {self.max_tokens_padded} → {new_mtp}")
-            self.max_tokens_padded = new_mtp
-            buf_rows = self.E_local * new_mtp
-            self.dispatched_x = torch.zeros(buf_rows, self.H, dtype=torch.bfloat16, device=device)
-            self.intermediate = torch.zeros(buf_rows, self.N_inter, dtype=torch.bfloat16, device=device)
-            self.expert_out = torch.zeros(buf_rows, self.H, dtype=torch.bfloat16, device=device)
-            self._init_tma_descriptors()
+        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
 
     def _total_bytes(self):
         total = 0
-        for attr in ['all_tokens', 'padded', 'expert_counts', 'expert_counters',
-                      'topk_pos', 'dispatched_x', 'intermediate', 'expert_out',
-                      'result_buffer']:
+        for attr in ['all_tokens', 'padded']:
             t = getattr(self, attr)
             total += t.nelement() * t.element_size()
         return total
