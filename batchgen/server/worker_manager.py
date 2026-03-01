@@ -417,6 +417,14 @@ class WorkerManager:
             disable_cuda_graphs=self.args.disable_cuda_graphs,
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
+            host_kv_chunk_size=self.args.host_kv_chunk_size,
+            enable_host_kv_eviction=self.args.enable_host_kv_eviction,
+            host_kv_eviction_watermark=self.args.host_kv_eviction_watermark,
+            adaptive_chunk=self.args.adaptive_chunk,
+            adaptive_chunk_min=self.args.adaptive_chunk_min,
+            adaptive_chunk_max=self.args.adaptive_chunk_max,
+            adaptive_chunk_ema_alpha=self.args.adaptive_chunk_ema_alpha,
+            adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
         )
         self.worker_process = mp.spawn(
             server_worker_main,
