@@ -798,7 +798,6 @@ class KimiK25DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor = None,
         attention_mask=None,
         position_ids=None,
         past_key_value=None,
@@ -808,21 +807,9 @@ class KimiK25DecoderLayer(nn.Module):
     ):
         fused_add_norm = self._get_fused_add_rmsnorm_fn()
 
-        # Fused: residual += hidden_states (from prev layer MLP), then input_layernorm
-        if residual is not None and fused_add_norm is not None:
-            hidden_states, residual = fused_add_norm(
-                residual, hidden_states,
-                self.input_layernorm.weight,
-                self.input_layernorm.variance_epsilon,
-            )
-        else:
-            # First layer (residual=None) or no fused kernel
-            if residual is not None:
-                hidden_states = residual + hidden_states
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-
-        # Attention
+        # Pre-norm attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(hidden_states=hidden_states)
         hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
 
@@ -841,8 +828,10 @@ class KimiK25DecoderLayer(nn.Module):
         # MoE/FFN
         hidden_states = self.mlp(hidden_states)
 
-        # Return mlp_out and residual separately — next layer fuses the add
-        return (hidden_states, residual)
+        # residual += mlp_out
+        hidden_states = residual + hidden_states
+
+        return (hidden_states, None, None)
 
 
 # ============================================================================
@@ -908,27 +897,16 @@ class KimiK25Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-        residual = None
 
         for layer in self.layers:
-            hidden_states, residual = layer(
+            layer_output = layer(
                 hidden_states,
-                residual=residual,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
             )
+            hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
-        # Final: fuse residual + hidden_states with model.norm
-        fused_add_norm = KimiK25DecoderLayer._get_fused_add_rmsnorm_fn()
-        if residual is not None and fused_add_norm is not None:
-            hidden_states, _ = fused_add_norm(
-                residual, hidden_states,
-                self.norm.weight, self.norm.variance_epsilon,
-            )
-        else:
-            if residual is not None:
-                hidden_states = residual + hidden_states
-            hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
