@@ -187,14 +187,31 @@ class KimiK25MoEBufferManager:
 # ============================================================================
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization (fused CUDA kernel)."""
+
+    _fused_fn = None  # cached kernel function
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    @staticmethod
+    def _get_fused_fn():
+        if RMSNorm._fused_fn is not None:
+            return RMSNorm._fused_fn
+        try:
+            from mgn_kernel import fused_rmsnorm
+            RMSNorm._fused_fn = fused_rmsnorm
+            return fused_rmsnorm
+        except ImportError:
+            return None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        fn = self._get_fused_fn()
+        if fn is not None:
+            return fn(hidden_states, self.weight, self.variance_epsilon)
+        # Fallback: pure PyTorch
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
