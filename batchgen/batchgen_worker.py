@@ -4462,7 +4462,78 @@ class BatchGenWorker:
 
 		# NOTE: _destroy_gpu_paged_kv_cache() moved before configure_prefill() (Bug Fix 7.2)
 
-		# STEP 3: Allocate host KV pages for new sequences (only THIS RANK's sequences)
+		# STEP 3: Prepare evicted sequences for re-entry (before host KV allocation)
+		# Evicted sequences need their metadata updated to reflect the new "prompt"
+		# (original prompt + previously decoded tokens) and pre-filled decoded_tokens.
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq.status != SequenceStatus.EVICTED:
+				continue
+			if seq.evicted_token_ids is None:
+				logging.error(f"Rank {self.rank}: EVICTED seq {uuid[:8]} has no evicted_token_ids!")
+				continue
+
+			evicted_ids = seq.evicted_token_ids  # 1D tensor
+			new_prompt_len = len(evicted_ids)
+			prev_decoded = seq.total_decoded_before_eviction
+
+			# Rebuild input_ids and attention_mask with new prompt
+			# kv_token_budget stays unchanged (Q5 answer)
+			seq_extended_size = seq.kv_token_budget
+			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
+			attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
+			input_ids_extended[0, :new_prompt_len] = evicted_ids
+			attention_mask_extended[0, :new_prompt_len] = 1
+
+			seq.input_ids = input_ids_extended
+			seq.attention_mask = attention_mask_extended
+			seq.prompt_length = new_prompt_len
+			seq.current_context_length = new_prompt_len
+			# original_prompt_length stays unchanged (set at init)
+
+			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
+			# So the final decoded_tokens contains the COMPLETE response
+			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
+			if prev_decoded > 0:
+				# Extract old decoded tokens from evicted_token_ids
+				old_decoded = evicted_ids[seq.original_prompt_length:]
+				n_old = min(len(old_decoded), self.max_decoding_length)
+				seq.decoded_tokens[0, :n_old] = old_decoded[:n_old]
+				seq.decoded_length = n_old
+			else:
+				seq.decoded_length = 0
+
+			# Remaining decode budget
+			remaining_decode = max(0, seq.original_max_decode_length - prev_decoded)
+			seq.max_decode_length = remaining_decode
+
+			# Clear eviction state
+			seq.evicted_token_ids = None
+
+			# Recreate query_book entry for this rank's evicted sequences (Q4)
+			# The old entry has stale input_ids/decoded_tokens references
+			if seq.assigned_rank == self.rank and uuid in self._uuid_to_local_map:
+				local_idx = self._uuid_to_local_map[uuid]
+				self.query_book[local_idx] = query(
+					text=seq.text,
+					encoded={
+						"input_ids": seq.input_ids,
+						"attention_mask": seq.attention_mask,
+					},
+					decoded_tokens=seq.decoded_tokens,
+					kv_token_budget=seq.kv_token_budget,
+				)
+
+			# Transition: EVICTED → IN_PREFILL
+			self.global_batch.update_status(uuid, SequenceStatus.IN_PREFILL)
+
+			logging.info(
+				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
+				f"new_prompt={new_prompt_len}, prev_decoded={prev_decoded}, "
+				f"remaining_decode={remaining_decode}, kv_budget={seq.kv_token_budget}"
+			)
+
+		# STEP 4: Allocate host KV pages for sequences (only THIS RANK's sequences)
 		# Check by assigned_rank, NOT by _uuid_to_local_map (which may not have new sequences yet)
 		my_prefill_uuids = []
 		for uuid in prefill_uuids:
@@ -4984,19 +5055,24 @@ class BatchGenWorker:
 				output_tokens.append(new_tokens)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
-		self.update_new_token(new_tokens, batch, 0)
-		
+
 		# Update sequence state after prefill
+		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
+		# For fresh sequences: decoded_length is 0, so offset is 0 (same as before)
+		new_tokens_cpu = new_tokens.cpu()
 		for i, local_idx in enumerate(batch):
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			seq.decoded_length = 1
+			# Write token at correct offset (handles both fresh and re-entered sequences)
+			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
+			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
+			seq.decoded_length = token_pos + 1
 			seq.current_context_length = seq.prompt_length + 1
-			
+
 			# MODIFIED: Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens[i].item()):
+			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 				seq.eos_reached = True
-		
+
 		return new_tokens
 
 	def prefill_prepacked(self, batch: list[int]):
@@ -5247,17 +5323,20 @@ class BatchGenWorker:
 		self._log_prefill_timing()
 
 		new_tokens = torch.cat(output_tokens, dim=0)
-		self.update_new_token(new_tokens, batch, 0)
 
 		# Update sequence state after prefill
+		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
+		new_tokens_cpu = new_tokens.cpu()
 		for i, local_idx in enumerate(batch):
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			seq.decoded_length = 1
+			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
+			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
+			seq.decoded_length = token_pos + 1
 			seq.current_context_length = seq.prompt_length + 1
 
 			# Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens[i].item()):
+			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 				seq.eos_reached = True
 
 		return new_tokens
@@ -5539,21 +5618,52 @@ class BatchGenWorker:
 		# ========== HOST KV GROWTH ==========
 		# Grow host KV pages for sequences approaching their current capacity.
 		# Each rank grows its own sequences; decisions are from all_gather'd state.
-		host_grow_requests = []  # (global_idx, num_pages)
+		#
+		# SAFETY: All ranks on a node share one host page pool (shm). We must
+		# pre-check that the TOTAL growth across ALL ranks fits within free pages
+		# before any rank attempts allocation. Without this, concurrent
+		# grow_pages_for_sequences() calls race on the atomic free_stack and
+		# the last ranks can throw "Insufficient free pages".
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+
+		# Step 1: Compute total growth needed across ALL ranks (deterministic)
+		total_growth_needed = 0
 		for uuid in decode_uuids:
 			state = global_seq_state.get(uuid)
-			if state and state.get('needs_host_growth') and uuid in self._uuid_to_local_map:
-				growth_pages = state['host_growth_pages']
+			if state and state.get('needs_host_growth'):
+				growth_pages = state.get('host_growth_pages', 0)
 				if growth_pages > 0:
-					seq = self.global_batch.get_sequence(uuid)
-					host_grow_requests.append((seq.global_idx, growth_pages))
-					seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
-					seq.host_pages_allocated += growth_pages
+					total_growth_needed += growth_pages
 
-		if host_grow_requests:
-			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-			if worker_view is not None:
-				worker_view.grow_pages_for_sequences(host_grow_requests)
+		# Step 2: Check if growth is globally feasible
+		growth_feasible = False
+		if total_growth_needed > 0 and worker_view is not None:
+			host_stats = worker_view.get_stats()
+			# Keep 5% safety margin to avoid exhausting the pool
+			safety_margin = int(host_stats.num_total_pages * 0.05)
+			growth_feasible = total_growth_needed <= (host_stats.num_free_pages - safety_margin)
+			if not growth_feasible and self.rank == 0:
+				logging.warning(
+					f"[HOST_KV_GROWTH] Skipped: need {total_growth_needed} pages "
+					f"but only {host_stats.num_free_pages} free "
+					f"({safety_margin} reserved). Will rely on eviction."
+				)
+
+		# Step 3: Execute growth only if globally feasible
+		host_grow_requests = []  # (global_idx, num_pages)
+		if growth_feasible:
+			for uuid in decode_uuids:
+				state = global_seq_state.get(uuid)
+				if state and state.get('needs_host_growth') and uuid in self._uuid_to_local_map:
+					growth_pages = state['host_growth_pages']
+					if growth_pages > 0:
+						seq = self.global_batch.get_sequence(uuid)
+						host_grow_requests.append((seq.global_idx, growth_pages))
+						seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
+						seq.host_pages_allocated += growth_pages
+
+		if host_grow_requests and worker_view is not None:
+			worker_view.grow_pages_for_sequences(host_grow_requests)
 			if self.rank == 0:
 				logging.debug(
 					f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
@@ -5603,14 +5713,17 @@ class BatchGenWorker:
 								# Save token IDs before releasing host KV
 								for uuid in my_evicted:
 									seq = self.global_batch.get_sequence(uuid)
-									# Concatenate prompt + decoded tokens
+									# Save original prompt length (only on first eviction)
+									if seq.original_prompt_length == seq.prompt_length:
+										pass  # Already correct from init
+									# Concatenate prompt + decoded tokens (1D)
+									# input_ids is [1, N], decoded_tokens is [1, M] — extract 1D slices
+									prompt_tokens = seq.input_ids[0, :seq.prompt_length]
 									if seq.decoded_tokens is not None and seq.decoded_length > 0:
-										seq.evicted_token_ids = torch.cat([
-											seq.input_ids[:seq.prompt_length],
-											seq.decoded_tokens[:seq.decoded_length],
-										])
+										decoded = seq.decoded_tokens[0, :seq.decoded_length]
+										seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
 									else:
-										seq.evicted_token_ids = seq.input_ids[:seq.prompt_length].clone()
+										seq.evicted_token_ids = prompt_tokens.clone()
 									seq.total_decoded_before_eviction = seq.decoded_length
 								# Release host KV pages
 								evicted_global_ids = [

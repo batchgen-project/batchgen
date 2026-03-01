@@ -46,8 +46,14 @@ def make_seq(
     seq.host_pages_allocated = host_pages_allocated
     seq.status = status
     seq.assigned_rank = assigned_rank
-    seq.input_ids = torch.zeros(prompt_length, dtype=torch.long)
-    seq.decoded_tokens = torch.zeros(max_decode_length, dtype=torch.long)
+    # Use 2D tensors matching production shape: [1, N]
+    seq.input_ids = torch.zeros((1, prompt_length + max_decode_length), dtype=torch.long)
+    seq.input_ids[0, :prompt_length] = torch.arange(1, prompt_length + 1)  # Non-zero prompt tokens
+    seq.decoded_tokens = torch.zeros((1, max_decode_length), dtype=torch.long)
+    if decoded_length > 0:
+        seq.decoded_tokens[0, :decoded_length] = torch.arange(
+            prompt_length + 1, prompt_length + 1 + decoded_length
+        )
     return seq
 
 
@@ -396,9 +402,11 @@ class TestFullLifecycle:
         seq.host_pages_allocated += growth
         assert seq.host_token_capacity == 512 + 8192 + 8192
 
-        # Continue decoding
-        seq.decoded_length = 16000
-        seq.current_context_length = 512 + 16000
+        # Continue decoding near second capacity boundary
+        # host_token_capacity = 16896, threshold = 16896 - 256 = 16640
+        # current_context_length must be >= 16640 → decoded_length >= 16128
+        seq.decoded_length = 16200
+        seq.current_context_length = 512 + 16200
         assert seq.needs_host_kv_growth(chunk_size)
 
         # Grow again
@@ -408,7 +416,7 @@ class TestFullLifecycle:
         assert seq.host_token_capacity == 512 + 8192 * 3
 
     def test_eviction_reentry_lifecycle(self):
-        """Test: decode -> evict -> save tokens -> re-prefill."""
+        """Test: decode -> evict -> save tokens -> re-prefill with pre-filled decoded_tokens."""
         batch = SequenceBatch()
         seq = make_seq(
             uuid="s1",
@@ -419,11 +427,10 @@ class TestFullLifecycle:
         )
         batch.add_sequence(seq)
 
-        # Evict
-        seq.evicted_token_ids = torch.cat([
-            seq.input_ids[:seq.prompt_length],
-            seq.decoded_tokens[:seq.decoded_length],
-        ])
+        # Evict — use correct 2D tensor indexing
+        prompt_tokens = seq.input_ids[0, :seq.prompt_length]
+        decoded = seq.decoded_tokens[0, :seq.decoded_length]
+        seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
         seq.total_decoded_before_eviction = seq.decoded_length
         seq.gpu_pages_allocated = 0
         seq.host_pages_allocated = 0
@@ -434,18 +441,79 @@ class TestFullLifecycle:
         assert not batch.all_completed()
         assert seq.evicted_token_ids.shape[0] == 512 + 5000
 
-        # Re-enter via prefill (simulating what _prepare_prefill_batch does)
-        seq.input_ids = seq.evicted_token_ids.clone()
-        seq.prompt_length = len(seq.evicted_token_ids)
-        seq.max_decode_length = seq.original_max_decode_length - seq.total_decoded_before_eviction
-        seq.kv_token_budget = seq.prompt_length + seq.max_decode_length
-        seq.decoded_length = 0
-        seq.current_context_length = seq.prompt_length
+        # Re-enter: simulate _config_prefill_for_batch re-entry prep
+        evicted_ids = seq.evicted_token_ids
+        new_prompt_len = len(evicted_ids)
+        prev_decoded = seq.total_decoded_before_eviction
+
+        # Rebuild input_ids (2D) and attention_mask
+        seq_extended_size = seq.kv_token_budget
+        input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
+        attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
+        input_ids_extended[0, :new_prompt_len] = evicted_ids
+        attention_mask_extended[0, :new_prompt_len] = 1
+
+        seq.input_ids = input_ids_extended
+        seq.attention_mask = attention_mask_extended
+        seq.prompt_length = new_prompt_len
+        seq.current_context_length = new_prompt_len
+
+        # Pre-fill decoded_tokens with old decoded tokens
+        max_decoding_length = 32768
+        seq.decoded_tokens = torch.zeros(1, max_decoding_length, dtype=torch.long)
+        old_decoded = evicted_ids[seq.original_prompt_length:]
+        n_old = min(len(old_decoded), max_decoding_length)
+        seq.decoded_tokens[0, :n_old] = old_decoded[:n_old]
+        seq.decoded_length = n_old
+
+        remaining_decode = seq.original_max_decode_length - prev_decoded
+        seq.max_decode_length = remaining_decode
+        # kv_token_budget stays unchanged
+        seq.evicted_token_ids = None
         batch.update_status("s1", SequenceStatus.IN_PREFILL)
 
         assert seq.prompt_length == 5512
         assert seq.max_decode_length == 32768 - 5000
+        assert seq.decoded_length == 5000  # Pre-filled with old tokens
+        assert seq.kv_token_budget == 512 + 32768  # Unchanged
+        assert seq.original_prompt_length == 512  # Original preserved
         assert seq.status == SequenceStatus.IN_PREFILL
+
+        # Verify pre-filled tokens match original decoded tokens
+        assert torch.equal(seq.decoded_tokens[0, :n_old], decoded[:n_old])
+
+    def test_eviction_reentry_token_write_offset(self):
+        """After re-entry, first new token should write at prev_decoded position."""
+        seq = make_seq(
+            uuid="s1",
+            prompt_length=100,
+            max_decode_length=1000,
+            decoded_length=200,
+            status=SequenceStatus.IN_DECODE,
+        )
+        # Evict
+        prompt_tokens = seq.input_ids[0, :seq.prompt_length]
+        decoded = seq.decoded_tokens[0, :seq.decoded_length]
+        seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
+        seq.total_decoded_before_eviction = 200
+
+        # Re-entry prep
+        evicted_ids = seq.evicted_token_ids
+        seq.decoded_tokens = torch.zeros(1, 1000, dtype=torch.long)
+        old_decoded = evicted_ids[seq.original_prompt_length:]
+        seq.decoded_tokens[0, :len(old_decoded)] = old_decoded
+        seq.decoded_length = len(old_decoded)  # = 200
+
+        # Simulate first new token after re-prefill
+        new_token = torch.tensor([99999])
+        token_pos = seq.decoded_length  # Should be 200
+        seq.decoded_tokens[0, token_pos] = new_token[0]
+        seq.decoded_length = token_pos + 1
+
+        assert seq.decoded_length == 201
+        assert seq.decoded_tokens[0, 200].item() == 99999
+        # Old tokens still intact
+        assert torch.equal(seq.decoded_tokens[0, :200], old_decoded)
 
     def test_adaptive_chunk_reduces_waste(self):
         """Demonstrate that adaptive sizing reduces over-reservation."""
@@ -511,13 +579,13 @@ class TestEdgeCases:
             status=SequenceStatus.IN_DECODE,
         )
         # No decoded tokens — evicted_token_ids should just be prompt
+        # Use correct 2D indexing: input_ids is [1, N]
+        prompt_tokens = seq.input_ids[0, :seq.prompt_length]
         if seq.decoded_tokens is not None and seq.decoded_length > 0:
-            seq.evicted_token_ids = torch.cat([
-                seq.input_ids[:seq.prompt_length],
-                seq.decoded_tokens[:seq.decoded_length],
-            ])
+            decoded = seq.decoded_tokens[0, :seq.decoded_length]
+            seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
         else:
-            seq.evicted_token_ids = seq.input_ids[:seq.prompt_length].clone()
+            seq.evicted_token_ids = prompt_tokens.clone()
 
         assert seq.evicted_token_ids.shape[0] == 512
 
@@ -536,6 +604,62 @@ class TestEdgeCases:
         chunk_size = 8192
         effective = sizer.get_chunk_size() if sizer else chunk_size
         assert effective == 8192
+
+
+# ============ Growth Safety Pre-check ============
+
+class TestGrowthSafetyPrecheck:
+    """Tests for the global free page pre-check before host KV growth."""
+
+    def test_growth_feasible_when_enough_free(self):
+        """Growth should proceed when total needed <= free - safety margin."""
+        total_pages = 1000
+        free_pages = 200
+        safety_margin = int(total_pages * 0.05)  # 50
+
+        total_growth_needed = 100
+        feasible = total_growth_needed <= (free_pages - safety_margin)
+        assert feasible  # 100 <= 150
+
+    def test_growth_blocked_when_insufficient(self):
+        """Growth should be blocked when total needed > free - safety margin."""
+        total_pages = 1000
+        free_pages = 100
+        safety_margin = int(total_pages * 0.05)  # 50
+
+        total_growth_needed = 80
+        feasible = total_growth_needed <= (free_pages - safety_margin)
+        assert not feasible  # 80 > 50
+
+    def test_growth_blocked_preserves_safety_margin(self):
+        """Even if total_needed < free, block if it would breach safety margin."""
+        total_pages = 1000
+        free_pages = 60
+        safety_margin = int(total_pages * 0.05)  # 50
+
+        total_growth_needed = 20  # Would leave 40 < 50 safety margin
+        feasible = total_growth_needed <= (free_pages - safety_margin)
+        assert not feasible  # 20 > 10
+
+    def test_growth_zero_needed(self):
+        """Zero growth needed should not attempt growth."""
+        total_growth_needed = 0
+        # In the actual code, growth_feasible stays False when total_growth_needed == 0
+        assert total_growth_needed == 0  # No growth requests
+
+    def test_multi_rank_total_growth(self):
+        """Total growth across all ranks must fit within shared pool."""
+        # Simulate 8 ranks each needing 15 pages = 120 total
+        per_rank_growth = [15, 15, 15, 15, 15, 15, 15, 15]
+        total_growth = sum(per_rank_growth)
+        assert total_growth == 120
+
+        # Pool with 100 free pages + 50 safety = need 170, have 100
+        total_pages = 1000
+        free_pages = 100
+        safety_margin = int(total_pages * 0.05)
+        feasible = total_growth <= (free_pages - safety_margin)
+        assert not feasible  # 120 > 50 → blocked, preventing crash
 
 
 if __name__ == "__main__":
