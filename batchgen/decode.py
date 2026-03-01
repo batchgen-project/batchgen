@@ -705,19 +705,24 @@ class DecodeBatchState:
 
 def check_eos_batch(
     new_tokens: torch.Tensor,
-    eos_token_id: int,
+    eos_token_id,
     sequence_uuids: List[str],
 ) -> Tuple[List[str], List[str]]:
     """Check for EOS tokens in a batch of new tokens.
 
     Args:
         new_tokens: [batch_size, 1] tensor of new token IDs
-        eos_token_id: The EOS token ID to check for
+        eos_token_id: EOS token ID (int) or set/list of EOS token IDs
         sequence_uuids: List of sequence UUIDs corresponding to tokens
 
     Returns:
         (continuing_uuids, completed_uuids)
     """
+    # Normalize to set for O(1) lookup
+    if isinstance(eos_token_id, int):
+        eos_token_id = {eos_token_id}
+    eos_set = set(eos_token_id)
+
     # Flatten tokens for comparison
     tokens_flat = new_tokens.view(-1).cpu().tolist()
 
@@ -725,7 +730,7 @@ def check_eos_batch(
     completed = []
 
     for uuid, token in zip(sequence_uuids, tokens_flat):
-        if token == eos_token_id:
+        if token in eos_set:
             completed.append(uuid)
         else:
             continuing.append(uuid)

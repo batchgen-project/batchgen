@@ -40,7 +40,8 @@ TOKENIZER_DIR = Path(__file__).parent / "assets"
 
 # Kimi K2.5 special token IDs (from tokenizer_config.json)
 KIMI_K25_BOS_TOKEN_ID = 163584  # "[BOS]"
-KIMI_K25_EOS_TOKEN_ID = 163585  # "[EOS]"
+KIMI_K25_EOS_TOKEN_ID = 163586  # "<|im_end|>" (chat end-of-turn)
+KIMI_K25_EOS_TOKEN_IDS = {163585, 163586}  # Both "[EOS]" and "<|im_end|>"
 KIMI_K25_PAD_TOKEN_ID = 163839  # "[PAD]"
 KIMI_K25_VOCAB_SIZE = 163840
 
@@ -97,6 +98,7 @@ class KimiK25Tokenizer(BaseTokenizer):
         # Set special token IDs
         self.bos_token_id = KIMI_K25_BOS_TOKEN_ID
         self.eos_token_id = KIMI_K25_EOS_TOKEN_ID
+        self.eos_token_ids = KIMI_K25_EOS_TOKEN_IDS
         self.pad_token_id = KIMI_K25_PAD_TOKEN_ID
         self.vocab_size = KIMI_K25_VOCAB_SIZE
         self.padding_side = "right"
