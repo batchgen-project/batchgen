@@ -769,6 +769,8 @@ class KimiK25DecoderLayer(nn.Module):
     Layer 0: dense MLP. Layers 1-60: MoE with 384 routed + 1 shared expert.
     """
 
+    _fused_add_rmsnorm_fn = None  # cached fused add+rmsnorm kernel
+
     def __init__(self, config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -782,6 +784,17 @@ class KimiK25DecoderLayer(nn.Module):
         else:
             self.mlp = KimiK25MoE(config)
 
+    @staticmethod
+    def _get_fused_add_rmsnorm_fn():
+        if KimiK25DecoderLayer._fused_add_rmsnorm_fn is not None:
+            return KimiK25DecoderLayer._fused_add_rmsnorm_fn
+        try:
+            from batchgen.other_kernels.triton_add_rmsnorm import fused_add_rmsnorm
+            KimiK25DecoderLayer._fused_add_rmsnorm_fn = fused_add_rmsnorm
+            return fused_add_rmsnorm
+        except ImportError:
+            return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -792,17 +805,30 @@ class KimiK25DecoderLayer(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ):
-        # Pre-norm attention + residual
+        fused_add_norm = self._get_fused_add_rmsnorm_fn()
+
+        # Pre-norm attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(hidden_states=hidden_states)
         hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
-        hidden_states = residual + hidden_states
 
-        # Pre-norm MoE/FFN + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fused: residual += attn_out, then post_attention_layernorm
+        if fused_add_norm is not None:
+            hidden_states, residual = fused_add_norm(
+                residual, hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # MoE/FFN
         hidden_states = self.mlp(hidden_states)
+
+        # residual += mlp_out (unfused — next layer's input_layernorm handles it)
         hidden_states = residual + hidden_states
 
         return (hidden_states, None, None)
