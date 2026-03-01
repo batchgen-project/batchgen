@@ -624,8 +624,7 @@ class KimiK25MoE(nn.Module):
         if buf is not None:
             all_tokens = buf.all_tokens[:num_global]
             padded = buf.padded
-            if num_tokens < padded.shape[0]:
-                padded[num_tokens:].zero_()
+            padded.zero_()
         else:
             all_tokens = torch.zeros(num_global, H, device=device, dtype=torch.bfloat16)
             padded = torch.zeros(self.num_tokens_per_rank, H, device=device, dtype=hidden_states.dtype)
