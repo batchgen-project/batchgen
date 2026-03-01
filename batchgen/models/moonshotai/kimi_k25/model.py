@@ -201,10 +201,10 @@ class RMSNorm(nn.Module):
         if RMSNorm._fused_fn is not None:
             return RMSNorm._fused_fn
         try:
-            from batchgen.other_kernels.triton_rmsnorm import fused_rmsnorm
-            RMSNorm._fused_fn = fused_rmsnorm
-            return fused_rmsnorm
-        except ImportError:
+            from batchgen.other_kernels.cuda_rmsnorm import cuda_rmsnorm
+            RMSNorm._fused_fn = cuda_rmsnorm
+            return cuda_rmsnorm
+        except Exception:
             pass
         try:
             from mgn_kernel import fused_rmsnorm
@@ -769,7 +769,7 @@ class KimiK25DecoderLayer(nn.Module):
     Layer 0: dense MLP. Layers 1-60: MoE with 384 routed + 1 shared expert.
     """
 
-    _fused_add_rmsnorm_fn = None  # cached fused add+rmsnorm kernel
+    _fused_add_rmsnorm_fn = None  # cached CUDA fused add+rmsnorm kernel
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -789,10 +789,10 @@ class KimiK25DecoderLayer(nn.Module):
         if KimiK25DecoderLayer._fused_add_rmsnorm_fn is not None:
             return KimiK25DecoderLayer._fused_add_rmsnorm_fn
         try:
-            from batchgen.other_kernels.triton_add_rmsnorm import fused_add_rmsnorm
-            KimiK25DecoderLayer._fused_add_rmsnorm_fn = fused_add_rmsnorm
-            return fused_add_rmsnorm
-        except ImportError:
+            from batchgen.other_kernels.cuda_rmsnorm import cuda_add_rmsnorm
+            KimiK25DecoderLayer._fused_add_rmsnorm_fn = cuda_add_rmsnorm
+            return cuda_add_rmsnorm
+        except Exception:
             return None
 
     def forward(
