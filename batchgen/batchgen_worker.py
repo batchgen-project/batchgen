@@ -5100,7 +5100,13 @@ class BatchGenWorker:
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.prompt_length + 1
+			seq.current_context_length = seq.prompt_length + seq.decoded_length
+
+			# Update attention mask for the first decoded token produced by prefill
+			attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
+			mask_pos = seq.current_context_length - 1  # position of the new token
+			if mask_pos < attn_mask.shape[0]:
+				attn_mask[mask_pos] = 1
 
 			# MODIFIED: Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -5366,7 +5372,13 @@ class BatchGenWorker:
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.prompt_length + 1
+			seq.current_context_length = seq.prompt_length + seq.decoded_length
+
+			# Update attention mask for the first decoded token produced by prefill
+			attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
+			mask_pos = seq.current_context_length - 1  # position of the new token
+			if mask_pos < attn_mask.shape[0]:
+				attn_mask[mask_pos] = 1
 
 			# Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
