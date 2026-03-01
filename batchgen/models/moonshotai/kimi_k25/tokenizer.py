@@ -225,7 +225,9 @@ class KimiK25Tokenizer(BaseTokenizer):
 
     # ---- Output parsing ----
 
+    # Match both <think>...</think> and bare ...{reasoning}</think> (when <think> was in the prompt)
     _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    _THINK_CLOSE_RE = re.compile(r"^(.*?)</think>", re.DOTALL)
     _TOOL_CALLS_RE = re.compile(
         r"<\|tool_calls_section_begin\|>(.*?)<\|tool_calls_section_end\|>",
         re.DOTALL,
@@ -238,12 +240,19 @@ class KimiK25Tokenizer(BaseTokenizer):
     )
 
     def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        # Case 1: Full <think>...</think> tags present
         m = self._THINK_RE.search(text)
-        if not m:
-            return None, text
-        reasoning = m.group(1).strip()
-        visible = self._THINK_RE.sub("", text, count=1).strip()
-        return reasoning, visible
+        if m:
+            reasoning = m.group(1).strip()
+            visible = self._THINK_RE.sub("", text, count=1).strip()
+            return reasoning, visible
+        # Case 2: Only closing </think> — opening <think> was in the prompt
+        m = self._THINK_CLOSE_RE.search(text)
+        if m:
+            reasoning = m.group(1).strip()
+            visible = text[m.end():].strip()
+            return reasoning if reasoning else None, visible
+        return None, text
 
     def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
         section_match = self._TOOL_CALLS_RE.search(text)
