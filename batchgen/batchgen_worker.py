@@ -59,7 +59,12 @@ from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits
 
 # Import modularized components
 # FastBoundaryTimingStats: Timing dataclass for page boundary operations
-from batchgen.continuous_batching import FastBoundaryTimingStats
+from batchgen.continuous_batching import (
+	AdaptiveChunkSizer,
+	FastBoundaryTimingStats,
+	select_sequences_for_eviction as select_host_kv_eviction,
+	EvictionStrategy,
+)
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
 # Migration data structures for KV cache migration between nodes
@@ -245,6 +250,15 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+	# Dynamic host KV reservation
+	host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens
+	host_kv_eviction_watermark: int = 10  # Trigger eviction when free < this %
+	enable_host_kv_eviction: bool = False  # Enable host KV eviction + recompute
+	adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
+	adaptive_chunk_min: int = 1024
+	adaptive_chunk_max: int = 65536
+	adaptive_chunk_ema_alpha: float = 0.1
+	adaptive_chunk_multiplier: float = 1.5
 
 
 class BatchGenWorker:
@@ -267,6 +281,29 @@ class BatchGenWorker:
 		)
 		# Update class attribute after configuration
 		BatchGenWorker.DECISION_INTERVAL = args.decision_frequency_pages * 64
+
+		# Dynamic host KV reservation
+		self.host_kv_chunk_size = args.host_kv_chunk_size
+		self.host_kv_eviction_watermark = args.host_kv_eviction_watermark
+		self.enable_host_kv_eviction = args.enable_host_kv_eviction
+		if args.adaptive_chunk:
+			self.adaptive_chunk_sizer = AdaptiveChunkSizer(
+				initial_chunk=args.host_kv_chunk_size,
+				min_chunk=args.adaptive_chunk_min,
+				max_chunk=args.adaptive_chunk_max,
+				ema_alpha=args.adaptive_chunk_ema_alpha,
+				multiplier=args.adaptive_chunk_multiplier,
+			)
+		else:
+			self.adaptive_chunk_sizer = None
+
+		if args.global_rank == 0:
+			logging.info(
+				f"Dynamic Host KV Config: chunk_size={args.host_kv_chunk_size}, "
+				f"eviction_watermark={args.host_kv_eviction_watermark}%, "
+				f"eviction_enabled={args.enable_host_kv_eviction}, "
+				f"adaptive_chunk={args.adaptive_chunk}"
+			)
 
 		# Watchdog for stuck detection (can be set via set_watchdog())
 		self._watchdog = None
@@ -1633,11 +1670,15 @@ class BatchGenWorker:
 			valid_sequences.extend(seqs)
 
 		# Calculate pages used by valid sequences
+		# Use actual host_pages_allocated for dynamic reservation (if set),
+		# otherwise fall back to full kv_token_budget for backwards compatibility
 		used_pages = 0
 		for uuid in valid_sequences:
 			seq = self.global_batch.get_sequence(uuid)
-			pages_needed = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
-			used_pages += pages_needed
+			if seq.host_pages_allocated > 0:
+				used_pages += seq.host_pages_allocated
+			else:
+				used_pages += math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
 
 		# Free pages = total - used by valid sequences
 		free_pages = stats.num_total_pages - used_pages
@@ -1689,10 +1730,11 @@ class BatchGenWorker:
 		max_free_percent = max(s['free_percent'] for s in node_stats)
 		above_watermark = max_free_percent > self.host_kv_watermark
 
-		# Check if queued sequences available
+		# Check if queued or evicted sequences available
 		has_queued = self.global_batch.has_queueing()
+		has_evicted = self.enable_host_kv_eviction and self.global_batch.has_evicted()
 
-		should_trigger = above_watermark and has_queued
+		should_trigger = above_watermark and (has_queued or has_evicted)
 
 		# Log global host KV cache stats (rank 0 only, aggregated across all nodes)
 		if self.rank == 0:
@@ -3126,66 +3168,95 @@ class BatchGenWorker:
 		gpus_per_node = torch.cuda.device_count()
 		return self.world_size // gpus_per_node
 
+	def _get_effective_chunk_size(self) -> int:
+		"""Return the current host KV chunk size, considering adaptive sizing."""
+		if self.adaptive_chunk_sizer is not None:
+			return self.adaptive_chunk_sizer.get_chunk_size()
+		return self.host_kv_chunk_size
+
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
 		Select sequences for prefill based on HOST KV cache capacity.
-		
+
 		Key constraint: Host KV cache is PER NODE.
 		- Each node has its own host KV capacity
 		- Sequences assigned to ranks on node N use node N's host KV
 		- Must check per-node capacity, not global
+
+		With dynamic host KV reservation, sequences only need prompt + chunk_size
+		pages initially (not the full kv_token_budget). This allows more sequences
+		to be prefilled concurrently.
+
+		EVICTED sequences get weighted priority (more decoded = higher priority)
+		and re-enter through the prefill path.
 		"""
+		# Collect candidates: evicted sequences first (weighted priority), then new
+		evicted_uuids = []
+		if self.enable_host_kv_eviction:
+			evicted_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)
+			# Weighted priority: more decoded tokens = higher priority (less wasted work)
+			evicted_uuids.sort(key=lambda u: (
+				-self.global_batch.get_sequence(u).total_decoded_before_eviction,
+				self.global_batch.get_sequence(u).global_idx
+			))
+
 		queueing_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING)
 		queueing_uuids.sort(key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx)
-		
-		if not queueing_uuids:
+
+		all_candidates = evicted_uuids + queueing_uuids
+		if not all_candidates:
 			return []
-		
+
 		gpus_per_node = torch.cuda.device_count()
 		num_nodes = self._get_num_nodes()
 		my_node = self._get_node_for_rank(self.rank)
-		
+		chunk_size = self._get_effective_chunk_size()
+
 		# Step 1: Get this node's host KV free pages
 		local_host_free = self._get_host_kv_free_pages()
-		
+
 		# Step 2: Gather host KV free pages from first rank on each node
 		# Only rank 0, 8, 16, ... (first on each node) reports actual value
 		if self.rank % gpus_per_node == 0:
 			report_free = local_host_free
 		else:
 			report_free = 0  # Non-first ranks report 0
-		
+
 		free_tensor = torch.tensor([report_free], dtype=torch.int64, device=self.torch_device)
 		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered, free_tensor)
-		
+
 		# Extract per-node host KV free pages
 		per_node_host_free = []
 		for node in range(num_nodes):
 			first_rank = node * gpus_per_node
 			per_node_host_free.append(int(gathered[first_rank].item()))
-		
+
 		if self.rank == 0:
-			logging.info(f"Per-node host KV free pages: {per_node_host_free}")
-		
+			logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
+
 		# Step 3: Select sequences considering per-node host KV capacity
+		# Use chunk-based pages instead of full kv_token_budget
 		node_pages_used = [0] * num_nodes
 		prefill_batch = []
-		
-		for uuid in queueing_uuids:
+
+		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
 			seq_node = self._get_node_for_rank(assigned_rank)
-			
-			req_pages = seq.get_pages_required()
-			
+
+			# Dynamic reservation: only reserve initial chunk, not full budget
+			req_pages = seq.get_host_pages_for_initial_chunk(chunk_size)
+
 			if node_pages_used[seq_node] + req_pages <= per_node_host_free[seq_node]:
 				prefill_batch.append(uuid)
 				node_pages_used[seq_node] += req_pages
-		
+
 		if self.rank == 0:
+			n_evicted = sum(1 for u in prefill_batch if self.global_batch.get_sequence(u).status == SequenceStatus.EVICTED)
 			logging.info(
-				f"[PREFILL] Selected {len(prefill_batch)} sequences, "
+				f"[PREFILL] Selected {len(prefill_batch)} sequences "
+				f"({n_evicted} recompute from eviction), "
 				f"per-node pages: {node_pages_used}"
 			)
 
@@ -4037,7 +4108,7 @@ class BatchGenWorker:
 			# =================================================================
 			# 1. PREFILL PHASE: Fill Host KV Cache
 			# =================================================================
-			if self.global_batch.has_queueing():
+			if self.global_batch.has_queueing() or (self.enable_host_kv_eviction and self.global_batch.has_evicted()):
 				dist.barrier()
 
 				# CRITICAL FIX: Sync sequence metadata BEFORE rebalancing
@@ -4200,11 +4271,15 @@ class BatchGenWorker:
 				# CRITICAL FIX: After decode returns (possibly due to watermark trigger),
 				# check if there are queued sequences waiting for prefill.
 				# If so, break out of inner decode loop to allow outer loop to enter prefill.
-				if self.global_batch.has_queueing():
+				needs_prefill = self.global_batch.has_queueing() or (
+					self.enable_host_kv_eviction and self.global_batch.has_evicted()
+				)
+				if needs_prefill:
 					if self.rank == 0:
 						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
-						logging.info(f"[DECODE] Breaking for prefill - {num_queued} sequences queued")
-					break  # Exit inner decode while loop, outer loop will check has_queueing()
+						num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
+						logging.info(f"[DECODE] Breaking for prefill - {num_queued} queued, {num_evicted} evicted")
+					break  # Exit inner decode while loop, outer loop will check has_queueing()/has_evicted()
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
@@ -4412,14 +4487,20 @@ class BatchGenWorker:
 		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
+			chunk_size = self._get_effective_chunk_size()
 
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				global_sequence_ids.append(seq.global_idx)
-				sequence_tokens.append(seq.kv_token_budget)
+				# Dynamic reservation: allocate prompt + chunk_size, not full budget
+				initial_capacity = min(seq.prompt_length + chunk_size, seq.kv_token_budget)
+				sequence_tokens.append(initial_capacity)
+				seq.host_token_capacity = initial_capacity
+				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
 
 			logging.debug(
-				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV"
+				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
+				f"(chunk_size={chunk_size})"
 			)
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
@@ -5311,6 +5392,7 @@ class BatchGenWorker:
 			)
 		
 		# Build local state for sequences owned by this rank
+		chunk_size = self._get_effective_chunk_size()
 		local_seq_state = {}
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
@@ -5323,6 +5405,11 @@ class BatchGenWorker:
 					'completed': self._is_sequence_completed(seq),
 					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
+					# Host KV growth fields
+					'needs_host_growth': seq.needs_host_kv_growth(chunk_size),
+					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
+					'host_pages_allocated': seq.host_pages_allocated,
+					'host_token_capacity': seq.host_token_capacity,
 				}
 		
 		# Get candidates for loading - report PREFILLED/ON_HOLD sequences that could be loaded
@@ -5439,9 +5526,118 @@ class BatchGenWorker:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
 				self._release_gpu_kv_pages(my_completed_local)
 				self._release_host_kv_pages_for_batch(my_completed)
-		
+			# Report completions to adaptive chunk sizer
+			if self.adaptive_chunk_sizer is not None:
+				for uuid in completed_uuids:
+					state = global_seq_state.get(uuid)
+					if state:
+						self.adaptive_chunk_sizer.report_completion(state['decoded_length'])
+
 		decode_uuids = active_uuids
 		batch = self._get_local_indices_for_uuids(decode_uuids)
+
+		# ========== HOST KV GROWTH ==========
+		# Grow host KV pages for sequences approaching their current capacity.
+		# Each rank grows its own sequences; decisions are from all_gather'd state.
+		host_grow_requests = []  # (global_idx, num_pages)
+		for uuid in decode_uuids:
+			state = global_seq_state.get(uuid)
+			if state and state.get('needs_host_growth') and uuid in self._uuid_to_local_map:
+				growth_pages = state['host_growth_pages']
+				if growth_pages > 0:
+					seq = self.global_batch.get_sequence(uuid)
+					host_grow_requests.append((seq.global_idx, growth_pages))
+					seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
+					seq.host_pages_allocated += growth_pages
+
+		if host_grow_requests:
+			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+			if worker_view is not None:
+				worker_view.grow_pages_for_sequences(host_grow_requests)
+			if self.rank == 0:
+				logging.debug(
+					f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
+					f"chunk_size={chunk_size}"
+				)
+
+		# ========== HOST KV EVICTION (Phase 2, gated) ==========
+		host_evicted_uuids = []
+		if self.enable_host_kv_eviction and decode_uuids:
+			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+			if worker_view is not None:
+				host_stats = worker_view.get_stats()
+				total_pages = host_stats.num_total_pages
+				free_pages = host_stats.num_free_pages
+				free_pct = (free_pages / total_pages * 100) if total_pages > 0 else 100
+
+				if free_pct < self.host_kv_eviction_watermark:
+					# Build candidate list from all_gather'd state (deterministic)
+					eviction_candidates = []
+					for uuid in decode_uuids:
+						state = global_seq_state.get(uuid)
+						if state and uuid not in set(completed_uuids):
+							eviction_candidates.append((uuid, {
+								'decoded_length': state['decoded_length'],
+								'host_pages_allocated': state.get('host_pages_allocated', 0),
+								'global_idx': self.global_batch.get_sequence(uuid).global_idx,
+							}))
+
+					# Target: free enough to get back above watermark
+					target_free = int(total_pages * self.host_kv_eviction_watermark / 100)
+					pages_to_free = max(0, target_free - free_pages)
+
+					if pages_to_free > 0 and eviction_candidates:
+						host_evicted_uuids, freed = select_host_kv_eviction(
+							eviction_candidates, pages_to_free,
+							strategy=EvictionStrategy.SHORTEST_FIRST,
+							page_key='host_pages_allocated',
+						)
+
+						if host_evicted_uuids:
+							# Save token IDs and release resources for evicted sequences
+							my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
+							if my_evicted:
+								# Release GPU KV first
+								my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
+								self._release_gpu_kv_pages(my_evicted_local)
+								# Save token IDs before releasing host KV
+								for uuid in my_evicted:
+									seq = self.global_batch.get_sequence(uuid)
+									# Concatenate prompt + decoded tokens
+									if seq.decoded_tokens is not None and seq.decoded_length > 0:
+										seq.evicted_token_ids = torch.cat([
+											seq.input_ids[:seq.prompt_length],
+											seq.decoded_tokens[:seq.decoded_length],
+										])
+									else:
+										seq.evicted_token_ids = seq.input_ids[:seq.prompt_length].clone()
+									seq.total_decoded_before_eviction = seq.decoded_length
+								# Release host KV pages
+								evicted_global_ids = [
+									self.global_batch.get_sequence(u).global_idx for u in my_evicted
+								]
+								worker_view.release_sequence_pages(evicted_global_ids)
+								worker_view.unregister_sequences(evicted_global_ids)
+
+							# Update status (all ranks)
+							for uuid in host_evicted_uuids:
+								seq = self.global_batch.get_sequence(uuid)
+								seq.gpu_pages_allocated = 0
+								seq.host_pages_allocated = 0
+								seq.host_token_capacity = 0
+								self._sequences_with_gpu_kv.discard(uuid)
+								self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
+
+							# Remove evicted from active decode
+							evicted_set = set(host_evicted_uuids)
+							decode_uuids = [u for u in decode_uuids if u not in evicted_set]
+							batch = self._get_local_indices_for_uuids(decode_uuids)
+
+							if self.rank == 0:
+								logging.info(
+									f"[HOST_KV_EVICT] Evicted {len(host_evicted_uuids)} sequences "
+									f"(freed ~{freed} host pages, free_pct was {free_pct:.1f}%)"
+								)
 
 		timing.process_ms = (time.perf_counter() - t0) * 1000
 

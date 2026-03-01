@@ -198,6 +198,16 @@ class BatchGenServer:
 			global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
 			skeleton_state_dict_file=self.skeleton_state_dict_file,
 
+			# Dynamic host KV reservation
+			host_kv_chunk_size=getattr(self.args, 'host_kv_chunk_size', 8192),
+			host_kv_eviction_watermark=getattr(self.args, 'host_kv_eviction_watermark', 10),
+			enable_host_kv_eviction=getattr(self.args, 'enable_host_kv_eviction', False),
+			adaptive_chunk=getattr(self.args, 'adaptive_chunk', True),
+			adaptive_chunk_min=getattr(self.args, 'adaptive_chunk_min', 1024),
+			adaptive_chunk_max=getattr(self.args, 'adaptive_chunk_max', 65536),
+			adaptive_chunk_ema_alpha=getattr(self.args, 'adaptive_chunk_ema_alpha', 0.1),
+			adaptive_chunk_multiplier=getattr(self.args, 'adaptive_chunk_multiplier', 1.5),
+
 			# Place holder
 			local_rank=-1,
 			global_rank=-1,

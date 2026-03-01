@@ -7,6 +7,7 @@ help organize the scheduling process.
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -89,12 +90,61 @@ class EvictionStrategy(Enum):
     FIFO = "fifo"  # First-in-first-out
 
 
+class AdaptiveChunkSizer:
+    """Adapts host KV chunk size based on observed decode lengths (EMA).
+
+    Tracks a running exponential moving average of completed sequence decode
+    lengths and adjusts the chunk size to reduce waste (over-reservation) and
+    eviction frequency (under-reservation).
+    """
+
+    def __init__(
+        self,
+        initial_chunk: int = 8192,
+        min_chunk: int = 1024,
+        max_chunk: int = 65536,
+        ema_alpha: float = 0.1,
+        multiplier: float = 1.5,
+    ):
+        self.current_chunk = initial_chunk
+        self.min_chunk = min_chunk
+        self.max_chunk = max_chunk
+        self.ema_alpha = ema_alpha
+        self.multiplier = multiplier
+        self.ema_decode_length: Optional[float] = None
+        self.completed_count = 0
+
+    def report_completion(self, decoded_length: int) -> None:
+        """Called when a sequence completes. Updates EMA and chunk size."""
+        if self.ema_decode_length is None:
+            self.ema_decode_length = float(decoded_length)
+        else:
+            self.ema_decode_length = (
+                self.ema_alpha * decoded_length
+                + (1 - self.ema_alpha) * self.ema_decode_length
+            )
+        self.completed_count += 1
+        # Only adapt after enough samples to have a reasonable estimate
+        if self.completed_count >= 10:
+            target = self.ema_decode_length * self.multiplier
+            self.current_chunk = int(
+                max(self.min_chunk, min(self.max_chunk, target))
+            )
+            # Round up to page boundary (64 tokens per page)
+            self.current_chunk = math.ceil(self.current_chunk / 64) * 64
+
+    def get_chunk_size(self) -> int:
+        """Return current chunk size in tokens."""
+        return self.current_chunk
+
+
 def select_sequences_for_eviction(
     sequences: List[Tuple[str, Dict[str, Any]]],
     pages_to_free: int,
     strategy: EvictionStrategy = EvictionStrategy.SHORTEST_FIRST,
+    page_key: str = "gpu_pages_allocated",
 ) -> Tuple[List[str], int]:
-    """Select sequences to evict to host memory to free GPU pages.
+    """Select sequences to evict to free pages (GPU or host).
 
     Uses deterministic sorting to ensure all ranks select the same sequences.
 
@@ -102,6 +152,8 @@ def select_sequences_for_eviction(
         sequences: List of (uuid, state_dict) tuples for sequences on a rank
         pages_to_free: Minimum number of pages to free
         strategy: Eviction strategy to use
+        page_key: Key in state_dict for page count (default: gpu_pages_allocated,
+                  use 'host_pages_allocated' for host KV eviction)
 
     Returns:
         (list of uuids to evict, total pages freed)
@@ -133,7 +185,7 @@ def select_sequences_for_eviction(
         if freed >= pages_to_free:
             break
         evict_uuids.append(uuid)
-        freed += state.get("gpu_pages_allocated", 0)
+        freed += state.get(page_key, 0)
 
     return evict_uuids, freed
 
