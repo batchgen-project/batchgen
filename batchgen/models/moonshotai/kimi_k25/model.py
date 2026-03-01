@@ -632,25 +632,23 @@ class KimiK25MoE(nn.Module):
         if num_tokens > 0:
             padded[:num_tokens] = hidden_states
 
-        # 1b) Launch AllGather on NCCL stream, shared expert on compute stream (overlapped)
+        # 1b) Launch shared expert on dedicated stream (overlaps with AllGather + entire MoE pipeline)
         compute_stream = torch.cuda.current_stream(device)
-        if not hasattr(self.__class__, '_nccl_stream') or self.__class__._nccl_stream is None:
-            self.__class__._nccl_stream = torch.cuda.Stream(device)
-        nccl_stream = self.__class__._nccl_stream
+        if not hasattr(self.__class__, '_shared_expert_stream') or self.__class__._shared_expert_stream is None:
+            self.__class__._shared_expert_stream = torch.cuda.Stream(device)
+        shared_stream = self.__class__._shared_expert_stream
 
-        # AllGather on NCCL stream
-        nccl_stream.wait_stream(compute_stream)  # wait for padded copy
+        # Shared expert on its own stream (depends on identity which is ready on compute_stream)
+        shared_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(shared_stream):
+            shared_out = self.shared_experts(identity)
+
+        # AllGather on compute stream (normal path)
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
                 all_tokens, padded,
-                stream=nccl_stream,
+                stream=torch.cuda.default_stream(device),
             )
-
-        # Shared expert on compute stream (concurrent with AllGather)
-        shared_out = self.shared_experts(identity)
-
-        # Sync: need all_tokens before gate
-        compute_stream.wait_stream(nccl_stream)
 
         # 2) CUDA gate: sigmoid + top-k + normalize + scale
         topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
@@ -729,7 +727,8 @@ class KimiK25MoE(nn.Module):
                 stream=torch.cuda.default_stream(device),
             )
 
-        # 7) Extract local + add pre-computed shared expert output
+        # 7) Sync shared expert stream and combine
+        compute_stream.wait_stream(shared_stream)
         start = self.rank * self.num_tokens_per_rank
         end = start + num_tokens
         out = global_results[start:end] + shared_out

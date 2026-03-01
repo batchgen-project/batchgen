@@ -79,7 +79,7 @@ class KimiK25ParallelStrategyManager:
 
         # Step 1: Set phase (pure DP - no EP in prefill)
         self.loaded_model_config.phase = "prefill"
-        # Don't set ep_size - prefill uses pure DP (all experts on each rank)
+        self.loaded_model_config.ep_size = 1  # Pure DP: all 384 experts on each rank
 
         # Step 2: Initialize model
         # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides
