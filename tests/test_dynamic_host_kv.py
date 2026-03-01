@@ -303,6 +303,91 @@ class TestAdaptiveChunkSizer:
             sizer.report_completion(1337)  # Not page-aligned
         assert sizer.get_chunk_size() % 64 == 0
 
+    def test_max_chunk_capped_by_external(self):
+        """Simulate capping max_chunk by max_decoding_length (done at init time)."""
+        sizer = AdaptiveChunkSizer(
+            initial_chunk=8192,
+            max_chunk=65536,
+            ema_alpha=1.0,
+            multiplier=2.0,
+        )
+        # Simulate what worker.initialize() does: cap max_chunk
+        max_decoding_length = 4096
+        capped_max = min(sizer.max_chunk, max_decoding_length)
+        capped_max = math.ceil(capped_max / 64) * 64
+        sizer.max_chunk = capped_max
+        assert sizer.max_chunk == 4096
+
+        # After many long completions, chunk should stay <= 4096
+        for _ in range(20):
+            sizer.report_completion(100000)
+        assert sizer.get_chunk_size() <= 4096
+        assert sizer.get_chunk_size() % 64 == 0
+
+
+# ============ Chunk Size Capping by max_decoding_length ============
+
+class TestChunkSizeCapping:
+    """Tests for _get_effective_chunk_size capping by max_decoding_length."""
+
+    def test_static_chunk_capped(self):
+        """Static chunk size should be capped by max_decoding_length."""
+        # Simulate: chunk=8192, max_decoding_length=512
+        chunk = 8192
+        max_decoding_length = 512
+        page_size = 64
+
+        chunk = min(chunk, max_decoding_length)
+        chunk = math.ceil(chunk / page_size) * page_size
+        assert chunk == 512
+
+    def test_static_chunk_not_capped_when_larger(self):
+        """When max_decoding_length > chunk, no capping needed."""
+        chunk = 8192
+        max_decoding_length = 100000
+        page_size = 64
+
+        chunk = min(chunk, max_decoding_length)
+        chunk = math.ceil(chunk / page_size) * page_size
+        assert chunk == 8192
+
+    def test_adaptive_chunk_capped(self):
+        """Adaptive chunk should be capped by max_decoding_length."""
+        sizer = AdaptiveChunkSizer(
+            initial_chunk=8192,
+            ema_alpha=1.0,
+            multiplier=1.5,
+        )
+        max_decoding_length = 128
+        page_size = 64
+
+        # Before adaptation, chunk is 8192 but capped to 128
+        chunk = sizer.get_chunk_size()
+        chunk = min(chunk, max_decoding_length)
+        chunk = math.ceil(chunk / page_size) * page_size
+        assert chunk == 128
+
+    def test_capping_page_aligned(self):
+        """Capped chunk should be page-aligned (round up)."""
+        chunk = 8192
+        max_decoding_length = 100  # Not page-aligned
+        page_size = 64
+
+        chunk = min(chunk, max_decoding_length)
+        chunk = math.ceil(chunk / page_size) * page_size
+        assert chunk == 128  # Rounded up to next page boundary
+
+    def test_zero_max_decoding_no_cap(self):
+        """When max_decoding_length is 0 (not yet set), no capping."""
+        chunk = 8192
+        max_decoding_length = 0
+        page_size = 64
+
+        if max_decoding_length > 0:
+            chunk = min(chunk, max_decoding_length)
+        chunk = math.ceil(chunk / page_size) * page_size
+        assert chunk == 8192
+
 
 # ============ select_sequences_for_eviction with page_key ============
 

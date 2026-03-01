@@ -126,12 +126,18 @@ class AdaptiveChunkSizer:
         self.completed_count += 1
         # Only adapt after enough samples to have a reasonable estimate
         if self.completed_count >= 10:
+            old_chunk = self.current_chunk
             target = self.ema_decode_length * self.multiplier
             self.current_chunk = int(
                 max(self.min_chunk, min(self.max_chunk, target))
             )
             # Round up to page boundary (64 tokens per page)
             self.current_chunk = math.ceil(self.current_chunk / 64) * 64
+            if self.current_chunk != old_chunk and BATCHGEN_CB_DEBUG:
+                logger.debug(
+                    f"[ADAPTIVE_CHUNK] {old_chunk} -> {self.current_chunk} "
+                    f"ema={self.ema_decode_length:.0f} completed={self.completed_count}"
+                )
 
     def get_chunk_size(self) -> int:
         """Return current chunk size in tokens."""

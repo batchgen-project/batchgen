@@ -305,6 +305,9 @@ class BatchGenWorker:
 				f"adaptive_chunk={args.adaptive_chunk}"
 			)
 
+		# Page boundary counter for periodic diagnostic logging
+		self._boundary_count = 0
+
 		# Watchdog for stuck detection (can be set via set_watchdog())
 		self._watchdog = None
 
@@ -482,7 +485,13 @@ class BatchGenWorker:
 		else:
 			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
-		
+
+		# Cap adaptive chunk sizer's max_chunk by max_decoding_length
+		if self.adaptive_chunk_sizer is not None and max_decoding_length > 0:
+			capped_max = min(self.adaptive_chunk_sizer.max_chunk, max_decoding_length)
+			capped_max = math.ceil(capped_max / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
+			self.adaptive_chunk_sizer.max_chunk = capped_max
+
 		logging.info(f"Initializing batchgen with global rank {self.args.global_rank} and world size {self.args.world_size} with PID: {os.getpid()}")
 		
 		# One-time initialization (only on first call)
@@ -3169,10 +3178,22 @@ class BatchGenWorker:
 		return self.world_size // gpus_per_node
 
 	def _get_effective_chunk_size(self) -> int:
-		"""Return the current host KV chunk size, considering adaptive sizing."""
+		"""Return the current host KV chunk size, considering adaptive sizing.
+
+		The chunk size is capped by max_decoding_length since allocating more
+		than the maximum possible decode tokens is wasteful. The result is
+		always rounded up to a page boundary (multiple of PAGE_SIZE=64).
+		"""
 		if self.adaptive_chunk_sizer is not None:
-			return self.adaptive_chunk_sizer.get_chunk_size()
-		return self.host_kv_chunk_size
+			chunk = self.adaptive_chunk_sizer.get_chunk_size()
+		else:
+			chunk = self.host_kv_chunk_size
+		# Cap by max_decoding_length — no point reserving more than max decode
+		if self.max_decoding_length > 0:
+			chunk = min(chunk, self.max_decoding_length)
+		# Round up to page boundary
+		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
+		return chunk
 
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
@@ -5400,6 +5421,20 @@ class BatchGenWorker:
 						f"Rank {r} has {len(diff_in_r)} extra: {list(diff_in_r)[:5]}, "
 						f"Rank {self.rank} has {len(diff_in_local)} extra: {list(diff_in_local)[:5]}"
 					)
+			# Dump state of mismatched sequences for diagnostics
+			if BATCHGEN_CB_DEBUG:
+				all_diff = set()
+				for s in all_decode_sets:
+					if s:
+						all_diff.symmetric_difference_update(s)
+				for uuid in list(all_diff)[:10]:
+					seq = self.global_batch.get_sequence(uuid)
+					if seq:
+						logging.error(
+							f"[DESYNC_DETAIL] seq={uuid[:8]} status={seq.status.name} "
+							f"decoded={seq.decoded_length} host_cap={seq.host_token_capacity} "
+							f"host_pages={seq.host_pages_allocated} ctx_len={seq.current_context_length}"
+						)
 			# Use UNION to ensure all sequences get their state gathered
 			global_decode_set = set()
 			for s in all_decode_sets:
@@ -5611,6 +5646,19 @@ class BatchGenWorker:
 					state = global_seq_state.get(uuid)
 					if state:
 						self.adaptive_chunk_sizer.report_completion(state['decoded_length'])
+			# Log completion details for diagnostics
+			if self.rank == 0 and BATCHGEN_CB_DEBUG:
+				for uuid in completed_uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					state = global_seq_state.get(uuid, {})
+					was_evicted = getattr(seq, 'total_decoded_before_eviction', 0) > 0
+					logging.debug(
+						f"[COMPLETION] seq={uuid[:8]} "
+						f"decoded={state.get('decoded_length', 0)} "
+						f"prompt={getattr(seq, 'original_prompt_length', seq.prompt_length)} "
+						f"was_evicted={was_evicted} "
+						f"host_pages={state.get('host_pages_allocated', 0)}"
+					)
 
 		decode_uuids = active_uuids
 		batch = self._get_local_indices_for_uuids(decode_uuids)
@@ -5669,6 +5717,20 @@ class BatchGenWorker:
 					f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
 					f"chunk_size={chunk_size}"
 				)
+			# Per-sequence growth detail
+			if self.rank == 0 and BATCHGEN_CB_DEBUG:
+				for uuid in decode_uuids:
+					state = global_seq_state.get(uuid)
+					if state and state.get('needs_host_growth') and uuid in self._uuid_to_local_map:
+						seq = self.global_batch.get_sequence(uuid)
+						growth_pages = state['host_growth_pages']
+						old_cap = seq.host_token_capacity - growth_pages * seq.PAGE_SIZE
+						runway = seq.host_token_capacity - seq.current_context_length
+						logging.debug(
+							f"[HOST_KV_GROWTH_DETAIL] seq={uuid[:8]} "
+							f"old_cap={old_cap} new_cap={seq.host_token_capacity} "
+							f"runway={runway} pages={growth_pages}"
+						)
 
 		# ========== HOST KV EVICTION (Phase 2, gated) ==========
 		host_evicted_uuids = []
@@ -5725,6 +5787,13 @@ class BatchGenWorker:
 									else:
 										seq.evicted_token_ids = prompt_tokens.clone()
 									seq.total_decoded_before_eviction = seq.decoded_length
+									if BATCHGEN_CB_DEBUG:
+										logging.debug(
+											f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
+											f"decoded={seq.decoded_length} "
+											f"host_pages={seq.host_pages_allocated} "
+											f"tokens_saved={len(seq.evicted_token_ids)}"
+										)
 								# Release host KV pages
 								evicted_global_ids = [
 									self.global_batch.get_sequence(u).global_idx for u in my_evicted
@@ -6097,6 +6166,38 @@ class BatchGenWorker:
 					)
 		
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
+
+		# Periodic host KV diagnostic summary
+		self._boundary_count += 1
+		if self.rank == 0 and BATCHGEN_CB_DEBUG and self._boundary_count % 10 == 0:
+			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+			if worker_view is not None:
+				hs = worker_view.get_stats()
+				used = hs.num_total_pages - hs.num_free_pages
+				pct = (used / hs.num_total_pages * 100) if hs.num_total_pages > 0 else 0
+				# Gather status counts
+				status_counts = {}
+				for s in SequenceStatus:
+					cnt = len(self.global_batch.get_sequences_by_status(s))
+					if cnt > 0:
+						status_counts[s.name] = cnt
+				# Per-sequence host page stats
+				host_pages_list = []
+				for uuid in decode_uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is not None:
+						host_pages_list.append(seq.host_pages_allocated)
+				chunk_val = self._get_effective_chunk_size()
+				hp_min = min(host_pages_list) if host_pages_list else 0
+				hp_max = max(host_pages_list) if host_pages_list else 0
+				hp_avg = sum(host_pages_list) / len(host_pages_list) if host_pages_list else 0
+				logging.info(
+					f"[HOST_KV_SUMMARY][Iter {self._boundary_count}] "
+					f"host_pages: total={hs.num_total_pages} free={hs.num_free_pages} "
+					f"used={used} ({pct:.1f}%) "
+					f"chunk_size={chunk_val} | {status_counts} | "
+					f"per_seq_host_pages: min={hp_min} max={hp_max} avg={hp_avg:.0f}"
+				)
 
 		# Check watermark trigger for dynamic prefill switching
 		watermark_triggered = self._check_host_kv_watermark_trigger()
