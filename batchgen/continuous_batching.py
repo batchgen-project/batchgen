@@ -74,6 +74,25 @@ class FastBoundaryTimingStats:
         )
 
 
+@dataclass
+class BoundaryDecisions:
+    """Rank-0 computed decisions, broadcast to all ranks.
+
+    Centralizes all batching decisions to rank 0 to prevent desync.
+    All ranks receive identical decisions via broadcast_object_list.
+    """
+    completed_uuids: List[str]           # Sequences to mark COMPLETED
+    active_uuids: List[str]              # Remaining decode sequences after completions (ordered)
+    host_growth_uuids: List[str]         # Sequences needing host KV growth
+    host_growth_pages: List[int]         # Pages to grow per sequence (parallel to host_growth_uuids)
+    growth_feasible: bool                # Whether host growth is feasible
+    host_evicted_uuids: List[str]        # Sequences to evict from host KV
+    onhold_uuids: List[str]              # Sequences to put ON_HOLD (GPU eviction)
+    seqs_needing_extension: List[str]    # Sequences needing GPU page extension
+    new_load_uuids: List[str]            # Sequences to async-load into GPU
+    decode_uuids_final: List[str]        # Final decode_uuids after all decisions
+
+
 class LoadingStrategy(Enum):
     """Strategy for selecting which sequences to load from host."""
 

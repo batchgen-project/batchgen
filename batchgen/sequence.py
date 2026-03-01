@@ -408,7 +408,7 @@ class SequenceBatch:
         seq.assigned_rank = rank
 
     def get_sequences_by_status(self, status: SequenceStatus) -> List[str]:
-        return list(self._status_index[status])
+        return sorted(self._status_index[status])
 
     def get_sequences_for_rank(self, rank: int) -> List[str]:
         return list(self._rank_index.get(rank, set()))

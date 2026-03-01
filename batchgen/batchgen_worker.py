@@ -61,6 +61,7 @@ from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits
 # FastBoundaryTimingStats: Timing dataclass for page boundary operations
 from batchgen.continuous_batching import (
 	AdaptiveChunkSizer,
+	BoundaryDecisions,
 	FastBoundaryTimingStats,
 	select_sequences_for_eviction as select_host_kv_eviction,
 	EvictionStrategy,
@@ -2843,8 +2844,10 @@ class BatchGenWorker:
 					if seq.status != SequenceStatus.COMPLETED:
 						try:
 							self.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
-						except ValueError:
-							pass
+						except ValueError as e:
+							logging.debug(
+								f"Rank {self.rank}: Could not update {uuid[:8]} to COMPLETED: {e}"
+							)
 			else:
 				active_uuids.append(uuid)
 
@@ -5368,6 +5371,192 @@ class BatchGenWorker:
 
 		return new_tokens
 
+	# ============ RANK-0 BOUNDARY DECISION COMPUTATION ============
+
+	def _compute_boundary_decisions(
+		self,
+		decode_uuids: List[str],
+		global_seq_state: Dict[str, Dict],
+		global_candidate_info: Dict[str, Dict],
+		per_rank_free: List[int],
+		chunk_size: int,
+		worker_view: Optional[object],
+	) -> 'BoundaryDecisions':
+		"""Compute ALL batching decisions on rank 0 only.
+
+		This method is called ONLY by rank 0. The returned BoundaryDecisions
+		struct is broadcast to all ranks, which then execute their local portion.
+
+		This centralizes all decision-making to prevent desync between ranks.
+		"""
+		# Identify completed sequences
+		completed_uuids = []
+		active_uuids = []
+		for uuid in decode_uuids:
+			state = global_seq_state.get(uuid)
+			if state and state['completed']:
+				completed_uuids.append(uuid)
+			else:
+				active_uuids.append(uuid)
+
+		# Host KV growth decisions
+		host_growth_uuids = []
+		host_growth_pages_list = []
+		total_growth_needed = 0
+		for uuid in active_uuids:
+			state = global_seq_state.get(uuid)
+			if state and state.get('needs_host_growth'):
+				growth_pages = state.get('host_growth_pages', 0)
+				if growth_pages > 0:
+					host_growth_uuids.append(uuid)
+					host_growth_pages_list.append(growth_pages)
+					total_growth_needed += growth_pages
+
+		growth_feasible = False
+		if total_growth_needed > 0 and worker_view is not None:
+			host_stats = worker_view.get_stats()
+			safety_margin = int(host_stats.num_total_pages * 0.05)
+			growth_feasible = total_growth_needed <= (host_stats.num_free_pages - safety_margin)
+			if not growth_feasible:
+				logging.warning(
+					f"[HOST_KV_GROWTH] Skipped: need {total_growth_needed} pages "
+					f"but only {host_stats.num_free_pages} free "
+					f"({safety_margin} reserved). Will rely on eviction."
+				)
+
+		# Host KV eviction decisions
+		host_evicted_uuids = []
+		decode_after_eviction = list(active_uuids)
+		if self.enable_host_kv_eviction and active_uuids and worker_view is not None:
+			host_stats = worker_view.get_stats()
+			total_pages = host_stats.num_total_pages
+			free_pages = host_stats.num_free_pages
+			free_pct = (free_pages / total_pages * 100) if total_pages > 0 else 100
+
+			if free_pct < self.host_kv_eviction_watermark:
+				eviction_candidates = []
+				completed_set = set(completed_uuids)
+				for uuid in active_uuids:
+					state = global_seq_state.get(uuid)
+					if state and uuid not in completed_set:
+						eviction_candidates.append((uuid, {
+							'decoded_length': state['decoded_length'],
+							'host_pages_allocated': state.get('host_pages_allocated', 0),
+							'global_idx': self.global_batch.get_sequence(uuid).global_idx,
+						}))
+
+				target_free = int(total_pages * self.host_kv_eviction_watermark / 100)
+				pages_to_free = max(0, target_free - free_pages)
+
+				if pages_to_free > 0 and eviction_candidates:
+					host_evicted_uuids, _ = select_host_kv_eviction(
+						eviction_candidates, pages_to_free,
+						strategy=EvictionStrategy.SHORTEST_FIRST,
+						page_key='host_pages_allocated',
+					)
+					if host_evicted_uuids:
+						evicted_set = set(host_evicted_uuids)
+						decode_after_eviction = [u for u in active_uuids if u not in evicted_set]
+
+		# GPU page extension / on-hold decisions
+		seqs_needing_extension = []
+		total_additional_by_rank = [0] * self.world_size
+
+		for uuid in decode_after_eviction:
+			state = global_seq_state.get(uuid)
+			if state and state['additional_pages_needed'] > 0:
+				assigned_rank = state['assigned_rank']
+				total_additional_by_rank[assigned_rank] += state['additional_pages_needed']
+				seqs_needing_extension.append(uuid)
+
+		all_can_extend = all(
+			total_additional_by_rank[r] <= per_rank_free[r]
+			for r in range(self.world_size)
+		)
+
+		onhold_uuids = []
+		actual_extension_by_rank = [0] * self.world_size
+
+		if all_can_extend:
+			actual_extension_by_rank = list(total_additional_by_rank)
+		elif not all_can_extend:
+			for r in range(self.world_size):
+				if total_additional_by_rank[r] > per_rank_free[r]:
+					rank_seqs = [
+						(uuid, global_seq_state[uuid])
+						for uuid in decode_after_eviction
+						if uuid in global_seq_state and global_seq_state[uuid]['assigned_rank'] == r
+					]
+					rank_seqs.sort(
+						key=lambda x: (x[1]['decoded_length'],
+									self.global_batch.get_sequence(x[0]).global_idx)
+					)
+					pages_to_free = total_additional_by_rank[r] - per_rank_free[r]
+					freed = 0
+					for uuid, state in rank_seqs:
+						if freed >= pages_to_free:
+							break
+						onhold_uuids.append(uuid)
+						freed += state['gpu_pages_allocated']
+
+			# Compute actual extension for remaining sequences
+			onhold_set = set(onhold_uuids)
+			for uuid in seqs_needing_extension:
+				if uuid not in onhold_set:
+					state = global_seq_state.get(uuid, {})
+					r = state.get('assigned_rank')
+					if r is not None:
+						actual_extension_by_rank[r] += state.get('additional_pages_needed', 0)
+
+		# Load candidate selection
+		onhold_set = set(onhold_uuids)
+		completed_set = set(completed_uuids)
+		evicted_set = set(host_evicted_uuids)
+		decode_uuids_final = [u for u in decode_after_eviction if u not in onhold_set]
+
+		new_load_uuids = []
+		if global_candidate_info and decode_uuids_final:
+			load_candidates_synced = sorted(
+				[u for u in global_candidate_info.keys()
+				 if u not in completed_set and u not in onhold_set and u not in evicted_set],
+				key=lambda u: (
+					-global_candidate_info[u].get('decoded_length', 0),
+					self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+				)
+			)
+
+			# Compute adjusted free pages after extensions (arithmetic, no collective needed)
+			adjusted_per_rank_free = [
+				per_rank_free[r] - actual_extension_by_rank[r]
+				for r in range(self.world_size)
+			]
+
+			rank_pages_used = [0] * self.world_size
+			for uuid in load_candidates_synced:
+				info = global_candidate_info.get(uuid)
+				if info is None:
+					continue
+				req_pages = info['pages_needed']
+				assigned_rank = info['assigned_rank']
+				if req_pages == 0:
+					continue
+				if rank_pages_used[assigned_rank] + req_pages <= adjusted_per_rank_free[assigned_rank]:
+					new_load_uuids.append(uuid)
+					rank_pages_used[assigned_rank] += req_pages
+
+		return BoundaryDecisions(
+			completed_uuids=completed_uuids,
+			active_uuids=active_uuids,
+			host_growth_uuids=host_growth_uuids,
+			host_growth_pages=host_growth_pages_list,
+			growth_feasible=growth_feasible,
+			host_evicted_uuids=host_evicted_uuids,
+			onhold_uuids=onhold_uuids,
+			seqs_needing_extension=seqs_needing_extension,
+			new_load_uuids=new_load_uuids,
+			decode_uuids_final=decode_uuids_final,
+		)
+
 	# ============ OPTIMIZED PAGE BOUNDARY (Consolidated Collectives) ============
 
 	def _page_boundary_fast(
@@ -5441,17 +5630,14 @@ class BatchGenWorker:
 							f"decoded={seq.decoded_length} host_cap={seq.host_token_capacity} "
 							f"host_pages={seq.host_pages_allocated} ctx_len={seq.current_context_length}"
 						)
-			# Use UNION to ensure all sequences get their state gathered
-			global_decode_set = set()
-			for s in all_decode_sets:
-				if s:
-					global_decode_set.update(s)
+			# Use RANK 0 as authoritative source (not UNION which propagates errors)
+			rank0_set = all_decode_sets[0] if all_decode_sets[0] is not None else set()
 			decode_uuids = sorted(
-				global_decode_set,
+				rank0_set,
 				key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
 			)
 			batch = self._get_local_indices_for_uuids(decode_uuids)
-			logging.warning(f"Rank {self.rank}: Using union to sync at boundary start, decode_uuids now {len(decode_uuids)}")
+			logging.warning(f"Rank {self.rank}: Using rank-0 authoritative set at boundary start, decode_uuids now {len(decode_uuids)}")
 		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
 		
 		# Integrate previous async load if any
@@ -5570,13 +5756,12 @@ class BatchGenWorker:
 		
 		timing.gather_ms = (time.perf_counter() - t0) * 1000
 		
-		# ========== PHASE 2: PROCESS GATHERED DATA (LOCAL COMPUTATION) ==========
-		# CRITICAL: All computations below must be DETERMINISTIC across all ranks
+		# ========== PHASE 2: MERGE GATHERED DATA + RANK-0 DECISIONS ==========
 		t0 = time.perf_counter()
-		
+
 		# Extract per-rank free pages
 		per_rank_free = [p['free_pages'] for p in all_payloads]
-		
+
 		# Merge sequence state - each uuid appears exactly once (owned by one rank)
 		global_seq_state = {}
 		for rank_idx, payload in enumerate(all_payloads):
@@ -5584,24 +5769,22 @@ class BatchGenWorker:
 				for uuid, state in payload['seq_state'].items():
 					global_seq_state[uuid] = state
 					global_seq_state[uuid]['owning_rank'] = rank_idx
-		
+
 		# Merge candidate state
 		global_candidate_info = {}
 		for payload in all_payloads:
 			if payload and payload['candidate_state']:
 				global_candidate_info.update(payload['candidate_state'])
-		
+
 		# VALIDATION: Check that all decode_uuids have state reported
 		missing_uuids = [u for u in decode_uuids if u not in global_seq_state]
 		if missing_uuids:
-			# Enhanced diagnostics for debugging
 			for missing_uuid in missing_uuids[:10]:
 				seq = self.global_batch.get_sequence(missing_uuid)
 				expected_rank = seq.assigned_rank if seq else "N/A"
 				in_local_map = missing_uuid in self._uuid_to_local_map
 				seq_status = seq.status.name if seq else "NOT_FOUND"
-				# Check what state each rank reported for this uuid
-				rank_reported = [r for r, p in enumerate(all_payloads) 
+				rank_reported = [r for r, p in enumerate(all_payloads)
 								if p and p.get('seq_state', {}).get(missing_uuid)]
 				logging.error(
 					f"Rank {self.rank}: Missing UUID={missing_uuid}, assigned_rank={expected_rank}, "
@@ -5612,9 +5795,8 @@ class BatchGenWorker:
 				f"decode_uuids_len={len(decode_uuids)}, global_seq_state_len={len(global_seq_state)}, "
 				f"Missing first 5: {missing_uuids[:5]}"
 			)
-			# Safe fallback: remove missing sequences from decode_uuids
 			decode_uuids = [u for u in decode_uuids if u in global_seq_state]
-		
+
 		# Update local SequenceEntry with gathered info (for sequences on other ranks)
 		for uuid, state in global_seq_state.items():
 			if uuid not in self._uuid_to_local_map:
@@ -5624,21 +5806,33 @@ class BatchGenWorker:
 					seq.current_context_length = state['current_context_length']
 					seq.gpu_pages_allocated = state['gpu_pages_allocated']
 					seq.eos_reached = state['eos_reached']
-		
-		# ========== IDENTIFY COMPLETED SEQUENCES (DETERMINISTIC) ==========
-		completed_uuids = []
-		active_uuids = []
-		for uuid in decode_uuids:
-			state = global_seq_state.get(uuid)
-			# CRITICAL: Use gathered 'completed' flag, not local computation
-			if state and state['completed']:
-				completed_uuids.append(uuid)
-			else:
-				active_uuids.append(uuid)
-		
-		timing.num_completed = len(completed_uuids)
-		
-		# ========== RELEASE COMPLETED SEQUENCES ==========
+
+		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
+		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
+		# This eliminates desync from independent decision-making.
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+
+		if self.rank == 0:
+			decisions = self._compute_boundary_decisions(
+				decode_uuids, global_seq_state, global_candidate_info,
+				per_rank_free, chunk_size, worker_view,
+			)
+		else:
+			decisions = None
+
+		# ========== PHASE 3: BROADCAST DECISIONS ==========
+		decisions_list = [decisions]
+		dist.broadcast_object_list(decisions_list, src=0)
+		decisions = decisions_list[0]
+
+		timing.num_completed = len(decisions.completed_uuids)
+		timing.num_onhold = len(decisions.onhold_uuids)
+
+		# ========== PHASE 4: EXECUTE DECISIONS LOCALLY ==========
+		# All ranks execute the same decisions, but only operate on locally-owned sequences
+
+		# A. Release completed sequences
+		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
@@ -5666,166 +5860,87 @@ class BatchGenWorker:
 						f"host_pages={state.get('host_pages_allocated', 0)}"
 					)
 
-		decode_uuids = active_uuids
+		decode_uuids = decisions.active_uuids
 		batch = self._get_local_indices_for_uuids(decode_uuids)
 
-		# ========== HOST KV GROWTH ==========
-		# Grow host KV pages for sequences approaching their current capacity.
-		# Each rank grows its own sequences; decisions are from all_gather'd state.
-		#
-		# SAFETY: All ranks on a node share one host page pool (shm). We must
-		# pre-check that the TOTAL growth across ALL ranks fits within free pages
-		# before any rank attempts allocation. Without this, concurrent
-		# grow_pages_for_sequences() calls race on the atomic free_stack and
-		# the last ranks can throw "Insufficient free pages".
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		# B. Host KV growth
+		if decisions.growth_feasible and decisions.host_growth_uuids:
+			host_grow_requests = []
+			for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
+				if uuid in self._uuid_to_local_map:
+					seq = self.global_batch.get_sequence(uuid)
+					host_grow_requests.append((seq.global_idx, growth_pages))
+					seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
+					seq.host_pages_allocated += growth_pages
 
-		# Step 1: Compute total growth needed across ALL ranks (deterministic)
-		total_growth_needed = 0
-		for uuid in decode_uuids:
-			state = global_seq_state.get(uuid)
-			if state and state.get('needs_host_growth'):
-				growth_pages = state.get('host_growth_pages', 0)
-				if growth_pages > 0:
-					total_growth_needed += growth_pages
+			if host_grow_requests and worker_view is not None:
+				worker_view.grow_pages_for_sequences(host_grow_requests)
+				if self.rank == 0:
+					logging.debug(
+						f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
+						f"chunk_size={chunk_size}"
+					)
+				if self.rank == 0 and BATCHGEN_CB_DEBUG:
+					for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
+						if uuid in self._uuid_to_local_map:
+							seq = self.global_batch.get_sequence(uuid)
+							old_cap = seq.host_token_capacity - growth_pages * seq.PAGE_SIZE
+							runway = seq.host_token_capacity - seq.current_context_length
+							logging.debug(
+								f"[HOST_KV_GROWTH_DETAIL] seq={uuid[:8]} "
+								f"old_cap={old_cap} new_cap={seq.host_token_capacity} "
+								f"runway={runway} pages={growth_pages}"
+							)
 
-		# Step 2: Check if growth is globally feasible
-		growth_feasible = False
-		if total_growth_needed > 0 and worker_view is not None:
-			host_stats = worker_view.get_stats()
-			# Keep 5% safety margin to avoid exhausting the pool
-			safety_margin = int(host_stats.num_total_pages * 0.05)
-			growth_feasible = total_growth_needed <= (host_stats.num_free_pages - safety_margin)
-			if not growth_feasible and self.rank == 0:
-				logging.warning(
-					f"[HOST_KV_GROWTH] Skipped: need {total_growth_needed} pages "
-					f"but only {host_stats.num_free_pages} free "
-					f"({safety_margin} reserved). Will rely on eviction."
-				)
-
-		# Step 3: Execute growth only if globally feasible
-		host_grow_requests = []  # (global_idx, num_pages)
-		if growth_feasible:
-			for uuid in decode_uuids:
-				state = global_seq_state.get(uuid)
-				if state and state.get('needs_host_growth') and uuid in self._uuid_to_local_map:
-					growth_pages = state['host_growth_pages']
-					if growth_pages > 0:
-						seq = self.global_batch.get_sequence(uuid)
-						host_grow_requests.append((seq.global_idx, growth_pages))
-						seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
-						seq.host_pages_allocated += growth_pages
-
-		if host_grow_requests and worker_view is not None:
-			worker_view.grow_pages_for_sequences(host_grow_requests)
-			if self.rank == 0:
-				logging.debug(
-					f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
-					f"chunk_size={chunk_size}"
-				)
-			# Per-sequence growth detail
-			if self.rank == 0 and BATCHGEN_CB_DEBUG:
-				for uuid in decode_uuids:
-					state = global_seq_state.get(uuid)
-					if state and state.get('needs_host_growth') and uuid in self._uuid_to_local_map:
-						seq = self.global_batch.get_sequence(uuid)
-						growth_pages = state['host_growth_pages']
-						old_cap = seq.host_token_capacity - growth_pages * seq.PAGE_SIZE
-						runway = seq.host_token_capacity - seq.current_context_length
+		# C. Host KV eviction
+		host_evicted_uuids = decisions.host_evicted_uuids
+		if host_evicted_uuids:
+			my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
+			if my_evicted:
+				my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
+				self._release_gpu_kv_pages(my_evicted_local)
+				for uuid in my_evicted:
+					seq = self.global_batch.get_sequence(uuid)
+					if seq.original_prompt_length == seq.prompt_length:
+						pass  # Already correct from init
+					prompt_tokens = seq.input_ids[0, :seq.prompt_length]
+					if seq.decoded_tokens is not None and seq.decoded_length > 0:
+						decoded = seq.decoded_tokens[0, :seq.decoded_length]
+						seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
+					else:
+						seq.evicted_token_ids = prompt_tokens.clone()
+					seq.total_decoded_before_eviction = seq.decoded_length
+					if BATCHGEN_CB_DEBUG:
 						logging.debug(
-							f"[HOST_KV_GROWTH_DETAIL] seq={uuid[:8]} "
-							f"old_cap={old_cap} new_cap={seq.host_token_capacity} "
-							f"runway={runway} pages={growth_pages}"
+							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
+							f"decoded={seq.decoded_length} "
+							f"host_pages={seq.host_pages_allocated} "
+							f"tokens_saved={len(seq.evicted_token_ids)}"
 						)
+				evicted_global_ids = [
+					self.global_batch.get_sequence(u).global_idx for u in my_evicted
+				]
+				if worker_view is not None:
+					worker_view.release_sequence_pages(evicted_global_ids)
+					worker_view.unregister_sequences(evicted_global_ids)
 
-		# ========== HOST KV EVICTION (Phase 2, gated) ==========
-		host_evicted_uuids = []
-		if self.enable_host_kv_eviction and decode_uuids:
-			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-			if worker_view is not None:
-				host_stats = worker_view.get_stats()
-				total_pages = host_stats.num_total_pages
-				free_pages = host_stats.num_free_pages
-				free_pct = (free_pages / total_pages * 100) if total_pages > 0 else 100
+			# Update status (all ranks)
+			for uuid in host_evicted_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = 0
+				seq.host_pages_allocated = 0
+				seq.host_token_capacity = 0
+				self._sequences_with_gpu_kv.discard(uuid)
+				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
 
-				if free_pct < self.host_kv_eviction_watermark:
-					# Build candidate list from all_gather'd state (deterministic)
-					eviction_candidates = []
-					for uuid in decode_uuids:
-						state = global_seq_state.get(uuid)
-						if state and uuid not in set(completed_uuids):
-							eviction_candidates.append((uuid, {
-								'decoded_length': state['decoded_length'],
-								'host_pages_allocated': state.get('host_pages_allocated', 0),
-								'global_idx': self.global_batch.get_sequence(uuid).global_idx,
-							}))
+			evicted_set = set(host_evicted_uuids)
+			decode_uuids = [u for u in decode_uuids if u not in evicted_set]
+			batch = self._get_local_indices_for_uuids(decode_uuids)
 
-					# Target: free enough to get back above watermark
-					target_free = int(total_pages * self.host_kv_eviction_watermark / 100)
-					pages_to_free = max(0, target_free - free_pages)
-
-					if pages_to_free > 0 and eviction_candidates:
-						host_evicted_uuids, freed = select_host_kv_eviction(
-							eviction_candidates, pages_to_free,
-							strategy=EvictionStrategy.SHORTEST_FIRST,
-							page_key='host_pages_allocated',
-						)
-
-						if host_evicted_uuids:
-							# Save token IDs and release resources for evicted sequences
-							my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
-							if my_evicted:
-								# Release GPU KV first
-								my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
-								self._release_gpu_kv_pages(my_evicted_local)
-								# Save token IDs before releasing host KV
-								for uuid in my_evicted:
-									seq = self.global_batch.get_sequence(uuid)
-									# Save original prompt length (only on first eviction)
-									if seq.original_prompt_length == seq.prompt_length:
-										pass  # Already correct from init
-									# Concatenate prompt + decoded tokens (1D)
-									# input_ids is [1, N], decoded_tokens is [1, M] — extract 1D slices
-									prompt_tokens = seq.input_ids[0, :seq.prompt_length]
-									if seq.decoded_tokens is not None and seq.decoded_length > 0:
-										decoded = seq.decoded_tokens[0, :seq.decoded_length]
-										seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
-									else:
-										seq.evicted_token_ids = prompt_tokens.clone()
-									seq.total_decoded_before_eviction = seq.decoded_length
-									if BATCHGEN_CB_DEBUG:
-										logging.debug(
-											f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
-											f"decoded={seq.decoded_length} "
-											f"host_pages={seq.host_pages_allocated} "
-											f"tokens_saved={len(seq.evicted_token_ids)}"
-										)
-								# Release host KV pages
-								evicted_global_ids = [
-									self.global_batch.get_sequence(u).global_idx for u in my_evicted
-								]
-								worker_view.release_sequence_pages(evicted_global_ids)
-								worker_view.unregister_sequences(evicted_global_ids)
-
-							# Update status (all ranks)
-							for uuid in host_evicted_uuids:
-								seq = self.global_batch.get_sequence(uuid)
-								seq.gpu_pages_allocated = 0
-								seq.host_pages_allocated = 0
-								seq.host_token_capacity = 0
-								self._sequences_with_gpu_kv.discard(uuid)
-								self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
-
-							# Remove evicted from active decode
-							evicted_set = set(host_evicted_uuids)
-							decode_uuids = [u for u in decode_uuids if u not in evicted_set]
-							batch = self._get_local_indices_for_uuids(decode_uuids)
-
-							if self.rank == 0:
-								logging.info(
-									f"[HOST_KV_EVICT] Evicted {len(host_evicted_uuids)} sequences "
-									f"(freed ~{freed} host pages, free_pct was {free_pct:.1f}%)"
-								)
+			if self.rank == 0:
+				logging.info(
+					f"[HOST_KV_EVICT] Evicted {len(host_evicted_uuids)} sequences"
+				)
 
 		timing.process_ms = (time.perf_counter() - t0) * 1000
 
@@ -5836,67 +5951,12 @@ class BatchGenWorker:
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing, False
 
-		# ========== CHECK/EXTEND PAGE BUFFERS (DETERMINISTIC) ==========
+		# D. GPU page extension / on-hold (using rank-0 decisions)
 		t0 = time.perf_counter()
-		# CRITICAL: Use gathered 'assigned_rank' to ensure all ranks agree
-		seqs_needing_extension = []
-		total_additional_by_rank = [0] * self.world_size
-		
-		for uuid in decode_uuids:
-			state = global_seq_state.get(uuid)
-			if state and state['additional_pages_needed'] > 0:
-				# CRITICAL: Use assigned_rank from gathered state, not local
-				assigned_rank = state['assigned_rank']
-				total_additional_by_rank[assigned_rank] += state['additional_pages_needed']
-				if uuid in self._uuid_to_local_map:
-					seqs_needing_extension.append(uuid)
-		
-		# Check if all ranks can extend (DETERMINISTIC computation)
-		all_can_extend = all(
-			total_additional_by_rank[r] <= per_rank_free[r] 
-			for r in range(self.world_size)
-		)
-		
-		onhold_uuids = []
-		onhold_set = set()  # Initialize early for later use
-		# Track actual pages used for extension (needed for load selection)
-		actual_extension_by_rank = [0] * self.world_size
-		
-		if all_can_extend and seqs_needing_extension:
-			# Simple extension - no eviction needed
-			self._extend_gpu_kv_allocation(seqs_needing_extension)
-			# All extension pages are used
-			actual_extension_by_rank = list(total_additional_by_rank)
-		elif not all_can_extend:
-			# Need eviction - put SHORTEST-decoded sequences on hold first
-			# Rationale: Keep longer-decoded sequences in GPU because:
-			#   1. They are closer to completion (may finish soon)
-			#   2. We want to prioritize finishing sequences over starting new ones
-			# CRITICAL: Sort DETERMINISTICALLY by (decoded_length ASC, global_idx ASC)
-			for r in range(self.world_size):
-				if total_additional_by_rank[r] > per_rank_free[r]:
-					# Use gathered state for filtering AND sorting
-					rank_seqs = [
-						(uuid, global_seq_state[uuid])
-						for uuid in decode_uuids
-						if uuid in global_seq_state and global_seq_state[uuid]['assigned_rank'] == r
-					]
-					# CRITICAL: Stable sort with tie-breaker for determinism
-					# Shortest decoded_length first (ascending), then by global_idx
-					rank_seqs.sort(
-						key=lambda x: (x[1]['decoded_length'],
-									self.global_batch.get_sequence(x[0]).global_idx)
-					)
-					
-					pages_to_free = total_additional_by_rank[r] - per_rank_free[r]
-					freed = 0
-					for uuid, state in rank_seqs:
-						if freed >= pages_to_free:
-							break
-						onhold_uuids.append(uuid)
-						freed += state['gpu_pages_allocated']
-			
-			# Evict locally owned sequences
+		onhold_uuids = decisions.onhold_uuids
+		onhold_set = set(onhold_uuids)
+
+		if onhold_uuids:
 			my_onhold = [u for u in onhold_uuids if u in self._uuid_to_local_map]
 			if my_onhold:
 				local_indices = self._get_local_indices_for_uuids(my_onhold)
@@ -5907,199 +5967,102 @@ class BatchGenWorker:
 					seq = self.global_batch.get_sequence(uuid)
 					seq.gpu_pages_allocated = 0
 					self._sequences_with_gpu_kv.discard(uuid)
-			
+
 			for uuid in onhold_uuids:
 				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
-			
-			# Update active lists
-			onhold_set = set(onhold_uuids)
+
 			decode_uuids = [u for u in decode_uuids if u not in onhold_set]
 			batch = self._get_local_indices_for_uuids(decode_uuids)
-			
-			# DEBUG: Log batch size after on-hold
+
 			if BATCHGEN_CB_DEBUG:
 				logging.info(
 					f"Rank {self.rank}: After on-hold: batch_size={len(batch)}, "
 					f"num_onhold={len(onhold_uuids)}, my_onhold={len(my_onhold)}"
 				)
-			
-			# Extend remaining sequences and track actual extension pages used
-			remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
-			if remaining_needing_ext:
-				self._extend_gpu_kv_allocation(remaining_needing_ext)
-				# Calculate actual extension pages used per rank
-				for uuid in remaining_needing_ext:
-					state = global_seq_state.get(uuid, {})
-					r = state.get('assigned_rank')
-					if r is not None:
-						actual_extension_by_rank[r] += state.get('additional_pages_needed', 0)
-		
-		timing.num_onhold = len(onhold_uuids)
+
+		# Extend GPU pages for sequences that need it (not on-hold)
+		seqs_needing_extension = decisions.seqs_needing_extension
+		remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
+		my_remaining_ext = [u for u in remaining_needing_ext if u in self._uuid_to_local_map]
+		if my_remaining_ext:
+			self._extend_gpu_kv_allocation(my_remaining_ext)
+
 		timing.extension_ms = (time.perf_counter() - t0) * 1000
-		
-		# ========== PHASE 3: SELECT AND LAUNCH ASYNC LOAD (DETERMINISTIC) ==========
+
+		# E. Async load (using rank-0 decisions)
 		t0 = time.perf_counter()
 		new_async_task = None
-		new_load_uuids = []
+		new_load_uuids = decisions.new_load_uuids
 		new_load_local = []
 		new_load_global = []
-		
-		# CRITICAL: Use global_candidate_info keys as the authoritative load_candidates list
-		# This ensures all ranks have the same view of candidates, since global_candidate_info
-		# is built from gathered state from all ranks.
-		# Local status queries (PREFILLED/ON_HOLD) can be desynchronized across ranks.
-		# ALSO: Filter out sequences that were marked COMPLETED in this boundary
-		# (their host KV pages have been released, so we can't load them)
-		# ALSO: Filter out sequences put ON_HOLD in THIS boundary (to avoid loading just-evicted sequences)
-		completed_set = set(completed_uuids)
-		# LOADING STRATEGY: Prioritize LONGEST decoded sequences first
-		# Rationale: Longer-decoded sequences are closer to completion, so loading them
-		# helps finish sequences faster and reduces long-tail latency.
-		# Sort by decoded_length DESCENDING, global_idx as tie-breaker for determinism.
-		load_candidates_synced = sorted(
-			[u for u in global_candidate_info.keys() if u not in completed_set and u not in onhold_set],
-			key=lambda u: (
-				-global_candidate_info[u].get('decoded_length', 0),  # Descending (longest first)
-				self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
-			)
-		)
-		
-		if load_candidates_synced and decode_uuids:
-			
-			# CRITICAL: Gather ACTUAL free pages from all ranks AFTER extension/eviction
-			# This ensures accurate selection instead of relying on estimates
-			local_free_after = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
-			all_free_after = [0] * self.world_size
-			dist.all_gather_object(all_free_after, local_free_after)
-			
-			# Use gathered actual free pages for selection
-			adjusted_per_rank_free = all_free_after
-			
-			timing.load_select_ms = (time.perf_counter() - t0) * 1000
-			
-			# Select candidates that fit in ADJUSTED available GPU pages
-			rank_pages_used = [0] * self.world_size
-			for uuid in load_candidates_synced:
-				info = global_candidate_info.get(uuid)
-				if info is None:
-					continue
-				
-				req_pages = info['pages_needed']
-				assigned_rank = info['assigned_rank']
-				
-				if req_pages == 0:
-					continue
-				
-				if rank_pages_used[assigned_rank] + req_pages <= adjusted_per_rank_free[assigned_rank]:
-					new_load_uuids.append(uuid)
-					rank_pages_used[assigned_rank] += req_pages
-			
-			t_alloc = time.perf_counter()
-			if new_load_uuids:
-				# Get this rank's sequences to load
-				my_new_uuids = [u for u in new_load_uuids 
-							if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
-				new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
-				
-				# Track which UUIDs this rank actually loaded (for sync)
-				my_actually_loaded = set()
-				
-				if new_load_local:
-					# SAFETY CHECK: Verify actual pages needed doesn't exceed actual free pages
-					# The estimate may be off due to state drift, so we filter here
-					actual_free = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
-					
-					# Filter sequences that fit in actual free pages
-					filtered_local = []
-					filtered_global = []
-					filtered_tokens = []
-					pages_used = 0
-					
-					for local_idx in new_load_local:
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
-						pages_needed = seq.get_gpu_pages_for_two_page_buffer()
-						
-						if pages_used + pages_needed <= actual_free:
-							filtered_local.append(local_idx)
-							filtered_global.append(seq.global_idx)
-							filtered_tokens.append(pages_needed * self.PAGE_SIZE)
-							pages_used += pages_needed
-							my_actually_loaded.add(uuid)
-						else:
-							# Log that we're dropping this sequence due to insufficient pages
-							gathered_pages = global_candidate_info.get(uuid, {}).get('pages_needed', 'N/A')
-							logging.warning(
-								f"Rank {self.rank}: Dropping {uuid} from load - "
-								f"need={pages_needed}, gathered={gathered_pages}, "
-								f"pages_used={pages_used}, actual_free={actual_free}"
-							)
-					
-					if filtered_local:
-						new_load_local = filtered_local
-						new_load_global = filtered_global
-						tokens = filtered_tokens
-						
-						# Allocate pages
-						gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
-						timing.load_alloc_ms = (time.perf_counter() - t_alloc) * 1000
-						
-						# Get pointers and launch async load
-						t_launch = time.perf_counter()
-						worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-						if worker_view is not None:
-							existing_global_ids = self._local_indices_to_global_seq_ids(batch)
-							gpu_manager.rebuild_page_table(new_load_global)
-							k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
-							active_page_counts = gpu_manager.export_active_sequence_page_counts()
-							sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
 
-							new_async_task = worker_view.async_load_layer_paged_kv_to_device(
-								sequence_ids=sequence_tensor,
-								active_page_counts=active_page_counts,
-								k_device_ptrs=k_ptrs,
-								v_device_ptrs=v_ptrs,
-							)
+		if new_load_uuids and decode_uuids:
+			my_new_uuids = [u for u in new_load_uuids
+						if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
+			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
 
-							# Restore page table to current batch
-							if existing_global_ids:
-								gpu_manager.rebuild_page_table(existing_global_ids)
-							
-							# Store tensor refs
-							self._async_load_tensors = {
-								'k_ptrs': k_ptrs, 'v_ptrs': v_ptrs,
-								'sequence_tensor': sequence_tensor,
-								'active_page_counts': active_page_counts,
-							}
-						timing.load_launch_ms = (time.perf_counter() - t_launch) * 1000
+			if new_load_local:
+				actual_free = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
+
+				filtered_local = []
+				filtered_global = []
+				filtered_tokens = []
+				pages_used = 0
+
+				for local_idx in new_load_local:
+					uuid = self._local_to_uuid_map[local_idx]
+					seq = self.global_batch.get_sequence(uuid)
+					pages_needed = seq.get_gpu_pages_for_two_page_buffer()
+
+					if pages_used + pages_needed <= actual_free:
+						filtered_local.append(local_idx)
+						filtered_global.append(seq.global_idx)
+						filtered_tokens.append(pages_needed * self.PAGE_SIZE)
+						pages_used += pages_needed
 					else:
-						# All sequences were dropped due to insufficient pages
-						new_load_local = []
-						new_load_global = []
 						logging.warning(
-							f"Rank {self.rank}: All load candidates dropped due to insufficient pages, "
-							f"actual_free={actual_free}"
+							f"Rank {self.rank}: Dropping {uuid[:8]} from load - "
+							f"need={pages_needed}, pages_used={pages_used}, actual_free={actual_free}"
 						)
-				
-				# CRITICAL: Sync which sequences were actually loaded across ALL ranks
-				# This must be called by ALL ranks (even those with no sequences to load)
-				# If any rank dropped sequences, all ranks must update new_load_uuids
-				all_actually_loaded = [None] * self.world_size
-				dist.all_gather_object(all_actually_loaded, my_actually_loaded)
-				
-				# new_load_uuids should only include sequences that their owning rank actually loaded
-				actually_loaded_global = set()
-				for loaded_set in all_actually_loaded:
-					if loaded_set:
-						actually_loaded_global.update(loaded_set)
-				
-				# Update new_load_uuids to match what was actually loaded
-				original_count = len(new_load_uuids)
-				new_load_uuids = [u for u in new_load_uuids if u in actually_loaded_global]
-				if len(new_load_uuids) != original_count:
+
+				if filtered_local:
+					new_load_local = filtered_local
+					new_load_global = filtered_global
+					tokens = filtered_tokens
+
+					gpu_manager.allocate_pages_for_sequences(new_load_global, tokens)
+					timing.load_alloc_ms = (time.perf_counter() - t0) * 1000
+
+					t_launch = time.perf_counter()
+					if worker_view is not None:
+						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
+						gpu_manager.rebuild_page_table(new_load_global)
+						k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+						active_page_counts = gpu_manager.export_active_sequence_page_counts()
+						sequence_tensor = torch.tensor(new_load_global, dtype=torch.int64, device="cpu")
+
+						new_async_task = worker_view.async_load_layer_paged_kv_to_device(
+							sequence_ids=sequence_tensor,
+							active_page_counts=active_page_counts,
+							k_device_ptrs=k_ptrs,
+							v_device_ptrs=v_ptrs,
+						)
+
+						if existing_global_ids:
+							gpu_manager.rebuild_page_table(existing_global_ids)
+
+						self._async_load_tensors = {
+							'k_ptrs': k_ptrs, 'v_ptrs': v_ptrs,
+							'sequence_tensor': sequence_tensor,
+							'active_page_counts': active_page_counts,
+						}
+					timing.load_launch_ms = (time.perf_counter() - t_launch) * 1000
+				else:
+					new_load_local = []
+					new_load_global = []
 					logging.warning(
-						f"Rank {self.rank}: new_load_uuids reduced from {original_count} to {len(new_load_uuids)} "
-						f"due to safety filter"
+						f"Rank {self.rank}: All load candidates dropped due to insufficient pages, "
+						f"actual_free={actual_free}"
 					)
 		
 		timing.num_loaded = len(new_load_uuids)
