@@ -201,6 +201,12 @@ class RMSNorm(nn.Module):
         if RMSNorm._fused_fn is not None:
             return RMSNorm._fused_fn
         try:
+            from batchgen.other_kernels.triton_rmsnorm import fused_rmsnorm
+            RMSNorm._fused_fn = fused_rmsnorm
+            return fused_rmsnorm
+        except ImportError:
+            pass
+        try:
             from mgn_kernel import fused_rmsnorm
             RMSNorm._fused_fn = fused_rmsnorm
             return fused_rmsnorm
