@@ -664,7 +664,7 @@ class BatchGenWorker:
 		"""
 		if self._ignore_eos:
 			return False
-		return token_id == self.eos_token_id
+		return token_id in self.eos_token_ids
 
 	def _is_sequence_completed(self, seq) -> bool:
 		"""
@@ -1088,9 +1088,10 @@ class BatchGenWorker:
 		# Pass model identifier for pattern matching; tokenizer loads from package dir
 		self.tokenizer = load_tokenizer(self.huggingface_ckpt_name)
 
-		# Set EOS token ID from tokenizer
+		# Set EOS token IDs from tokenizer (support multiple stop tokens)
 		self.eos_token_id = self.tokenizer.eos_token_id
-		logging.info(f"Rank {self.rank}: EOS token ID set to {self.eos_token_id}")
+		self.eos_token_ids = getattr(self.tokenizer, 'eos_token_ids', {self.eos_token_id})
+		logging.info(f"Rank {self.rank}: EOS token IDs set to {self.eos_token_ids}")
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
 		# Note: EngineConfig is created by the model-specific initializer which uses a Planner
@@ -4307,7 +4308,7 @@ class BatchGenWorker:
 		tokens_list = tokens.tolist()
 
 		# Find first EOS token position (after min_tokens)
-		eos_positions = [i for i, t in enumerate(tokens_list) if t == self.eos_token_id and i >= min_tokens]
+		eos_positions = [i for i, t in enumerate(tokens_list) if t in self.eos_token_ids and i >= min_tokens]
 
 		if eos_positions:
 			end_pos = eos_positions[0]

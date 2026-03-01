@@ -55,7 +55,8 @@ class DecodeTask:
         self.page_size = page_size
         # Assuming tokenizer info is accessible, e.g., via runtime
         self.pad_token_id = getattr(self.runtime.tokenizer, 'pad_token_id', 0)
-        self.eos_token_id = getattr(self.runtime.tokenizer, 'eos_token_id', -1) # Handle missing EOS
+        self.eos_token_id = getattr(self.runtime.tokenizer, 'eos_token_id', -1)
+        self.eos_token_ids = getattr(self.runtime.tokenizer, 'eos_token_ids', {self.eos_token_id})
 
         # --- State ---
         self.active_batch: Optional[ActiveBatch] = None # Current batch being decoded
@@ -616,7 +617,7 @@ class DecodeTask:
                 continue # Skip EOS check if max length hit
 
             # Check EOS token (only if output_tokens is not empty)
-            if seq.output_tokens and seq.output_tokens[-1] == self.eos_token_id:
+            if seq.output_tokens and seq.output_tokens[-1] in self.eos_token_ids:
                 self.logger.debug(f"Sequence {seq.uuid} hit EOS token.")
                 completed.append(seq.uuid)
 
