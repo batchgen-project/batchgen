@@ -183,17 +183,17 @@ class SequenceEntry:
     def get_gpu_pages_for_two_page_buffer(self) -> int:
         """
         Get GPU pages needed for page buffer design.
-        
+
         For INITIAL load (had_initial_gpu_reservation=False):
             Allocates enough pages for: current_context_length + INITIAL_GPU_PAGE_BUFFER*PAGE_SIZE tokens.
             This gives sequences a large runway to reduce load/on-hold traffic.
-        
+
         For EXTENSION (had_initial_gpu_reservation=True):
             Allocates enough pages for: current_context_length + EXTENSION_GPU_PAGE_BUFFER*PAGE_SIZE tokens.
             This ensures we have a small buffer before needing extension.
-        
+
         Returns:
-            Number of pages to allocate on GPU
+            Number of pages to allocate on GPU (capped at host_pages_allocated)
         """
         if not self.had_initial_gpu_reservation:
             # Initial load - use larger buffer
@@ -201,11 +201,15 @@ class SequenceEntry:
         else:
             # Extension - use smaller buffer
             buffer_pages = EXTENSION_GPU_PAGE_BUFFER
-        
+
         buffer_tokens = self.current_context_length + buffer_pages * self.PAGE_SIZE
         # Cap at full budget (don't over-allocate)
         buffer_tokens = min(buffer_tokens, self.kv_token_budget)
-        return math.ceil(buffer_tokens / self.PAGE_SIZE)
+        pages = math.ceil(buffer_tokens / self.PAGE_SIZE)
+        # Cap at host pages: GPU can't load more pages than host has allocated
+        if self.host_pages_allocated > 0:
+            pages = min(pages, self.host_pages_allocated)
+        return pages
 
     def get_additional_gpu_pages_needed(self) -> int:
         """
