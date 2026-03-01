@@ -226,6 +226,16 @@ class KimiK25Tokenizer(BaseTokenizer):
     # ---- Output parsing ----
 
     _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    _TOOL_CALLS_RE = re.compile(
+        r"<\|tool_calls_section_begin\|>(.*?)<\|tool_calls_section_end\|>",
+        re.DOTALL,
+    )
+    # K2.5 tool call format: <|tool_call_begin|>functions.func_name:idx<|tool_call_argument_begin|>{json}<|tool_call_end|>
+    _TOOL_CALL_RE = re.compile(
+        r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*"
+        r"<\|tool_call_argument_begin\|>\s*(?P<arguments>.*?)\s*<\|tool_call_end\|>",
+        re.DOTALL,
+    )
 
     def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
         m = self._THINK_RE.search(text)
@@ -234,3 +244,25 @@ class KimiK25Tokenizer(BaseTokenizer):
         reasoning = m.group(1).strip()
         visible = self._THINK_RE.sub("", text, count=1).strip()
         return reasoning, visible
+
+    def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        section_match = self._TOOL_CALLS_RE.search(text)
+        if not section_match:
+            return None, text
+        section = section_match.group(1)
+        calls = []
+        for m in self._TOOL_CALL_RE.finditer(section):
+            tool_call_id = m.group("tool_call_id")
+            args_str = m.group("arguments").strip()
+            # Extract function name from "functions.func_name:idx" format
+            func_name = tool_call_id.split(".")[1].split(":")[0] if "." in tool_call_id else tool_call_id
+            calls.append({
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": args_str,
+                },
+            })
+        visible = self._TOOL_CALLS_RE.sub("", text, count=1).strip()
+        return calls if calls else None, visible
