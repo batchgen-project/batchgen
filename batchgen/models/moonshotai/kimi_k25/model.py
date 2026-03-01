@@ -708,28 +708,18 @@ class KimiK25MoE(nn.Module):
                 num_global, H, topk,
             )
 
-        # 6) AllReduce on NCCL stream + shared expert on compute stream (overlapped)
-        compute_stream = torch.cuda.current_stream(device)
-        if not hasattr(self.__class__, '_nccl_stream') or self.__class__._nccl_stream is None:
-            self.__class__._nccl_stream = torch.cuda.Stream(device)
-        nccl_stream = self.__class__._nccl_stream
-
-        # Launch AllReduce on separate NCCL stream
-        nccl_stream.wait_stream(compute_stream)
+        # 6) AllReduce
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 global_results, op=dist.ReduceOp.SUM,
-                stream=nccl_stream,
+                stream=torch.cuda.default_stream(device),
             )
 
-        # Shared expert runs on compute stream concurrently with AllReduce
-        shared_out = self.shared_experts(identity)
-
-        # 7) Sync and combine
-        compute_stream.wait_stream(nccl_stream)
+        # 7) Extract local + shared expert
         start = self.rank * self.num_tokens_per_rank
         end = start + num_tokens
-        out = global_results[start:end] + shared_out
+        out = global_results[start:end]
+        out = out + self.shared_experts(identity)
         return out.view(*orig_shape)
 
     @torch.inference_mode()

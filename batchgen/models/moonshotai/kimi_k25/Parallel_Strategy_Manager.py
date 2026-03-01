@@ -131,12 +131,12 @@ class KimiK25ParallelStrategyManager:
 
                 # Routed experts — module keys only (INT4 tensors handled by wrappers)
                 # Prefill uses pure DP: all 384 experts on each rank
+                # In EP mode, non-local experts are None — skip them
                 for expert_idx in range(NUM_TOTAL_EXPERTS):
-                    for name, _ in (
-                        self.model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
-                        .named_parameters()
-                    ):
+                    expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+                    if expert is None:
+                        continue
+                    for name, _ in expert.named_parameters():
                         tensor_full_name = (
                             "model.layers."
                             + str(layer_idx)
