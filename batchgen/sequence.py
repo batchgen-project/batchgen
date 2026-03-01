@@ -301,11 +301,13 @@ class SequenceEntry:
         """Get pages for initial host KV allocation.
 
         Must match the actual allocation in _config_prefill_host_kv():
-        max(prompt + chunk_size, prompt_pages + INITIAL_GPU_PAGE_BUFFER pages)
-        to ensure the GPU initial load has enough host pages.
+        max(prompt + chunk_size, ceil((prompt+1)/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER pages)
+        The +1 accounts for the first decoded token produced during prefill
+        (current_context_length = prompt_length + 1 after prefill).
         """
         chunk_tokens = self.prompt_length + chunk_size
-        gpu_initial_pages = math.ceil(self.prompt_length / self.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
+        post_prefill_length = self.prompt_length + 1  # prefill produces 1 decode token
+        gpu_initial_pages = math.ceil(post_prefill_length / self.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
         gpu_initial_tokens = gpu_initial_pages * self.PAGE_SIZE
         initial_tokens = max(chunk_tokens, gpu_initial_tokens)
         initial_tokens = min(initial_tokens, self.kv_token_budget)

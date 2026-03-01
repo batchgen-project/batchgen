@@ -4589,9 +4589,12 @@ class BatchGenWorker:
 				global_sequence_ids.append(seq.global_idx)
 				# Dynamic reservation: allocate prompt + chunk_size, not full budget.
 				# Must also cover the GPU initial load which needs
-				# ceil(prompt/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER pages.
+				# ceil((prompt+1)/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER pages.
+				# The +1 accounts for the first decoded token produced during prefill
+				# (current_context_length = prompt_length + 1 after prefill).
 				from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
-				gpu_initial_pages = math.ceil(seq.prompt_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
+				post_prefill_length = seq.prompt_length + 1  # prefill produces 1 decode token
+				gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
 				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
 				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
 				initial_capacity = min(initial_capacity, seq.kv_token_budget)
