@@ -298,11 +298,17 @@ class SequenceEntry:
         return math.ceil(growth_tokens / self.PAGE_SIZE)
 
     def get_host_pages_for_initial_chunk(self, chunk_size: int) -> int:
-        """Get pages for initial host KV allocation (prompt + chunk_size).
+        """Get pages for initial host KV allocation.
 
-        Used instead of get_pages_required() for dynamic reservation.
+        Must match the actual allocation in _config_prefill_host_kv():
+        max(prompt + chunk_size, prompt_pages + INITIAL_GPU_PAGE_BUFFER pages)
+        to ensure the GPU initial load has enough host pages.
         """
-        initial_tokens = min(self.prompt_length + chunk_size, self.kv_token_budget)
+        chunk_tokens = self.prompt_length + chunk_size
+        gpu_initial_pages = math.ceil(self.prompt_length / self.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
+        gpu_initial_tokens = gpu_initial_pages * self.PAGE_SIZE
+        initial_tokens = max(chunk_tokens, gpu_initial_tokens)
+        initial_tokens = min(initial_tokens, self.kv_token_budget)
         return math.ceil(initial_tokens / self.PAGE_SIZE)
 
     # ============ Completion and Status Methods ============
