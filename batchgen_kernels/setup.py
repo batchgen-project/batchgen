@@ -31,16 +31,17 @@ _nvcc_threads = os.getenv("NVCC_THREADS", "4")
 _sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v",
                 "-lineinfo", "--threads", _nvcc_threads]
 
-_sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads,
-               "-gencode", "arch=compute_80,code=sm_80",
-               "-gencode", "arch=compute_90,code=sm_90"]
+_sm80_gencode = ["-gencode", "arch=compute_80,code=sm_80",
+                 "-gencode", "arch=compute_90,code=sm_90"]
 
 # Add SM100 gencode if CUDA toolkit >= 12.8
 _cuda_version = getattr(torch.version, "cuda", None)
 if _cuda_version:
     _cuda_major, _cuda_minor = (int(x) for x in _cuda_version.split(".")[:2])
     if (_cuda_major, _cuda_minor) >= (12, 8):
-        _sm80_flags += ["-gencode", "arch=compute_100,code=sm_100"]
+        _sm80_gencode += ["-gencode", "arch=compute_100,code=sm_100"]
+
+_sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
 
 setup(
     name="batchgen_kernels",
@@ -141,7 +142,7 @@ setup(
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
                          "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                         "--threads", _nvcc_threads] + _sm80_flags[3:],
+                         "--threads", _nvcc_threads] + _sm80_gencode,
             },
         ),
         # CuTe MXFP4 dequantization
@@ -209,7 +210,7 @@ setup(
                          "-U__CUDA_NO_HALF_OPERATORS__",
                          "-U__CUDA_NO_HALF_CONVERSIONS__",
                          "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                         "--threads", _nvcc_threads] + _sm80_flags[3:],
+                         "--threads", _nvcc_threads] + _sm80_gencode,
             },
         ),
     ],
