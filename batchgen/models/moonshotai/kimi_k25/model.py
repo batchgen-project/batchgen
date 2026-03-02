@@ -207,7 +207,7 @@ class RMSNorm(nn.Module):
         except Exception:
             pass
         try:
-            from mgn_kernel import fused_rmsnorm
+            from batchgen_kernels.common.mgn import fused_rmsnorm
             RMSNorm._fused_fn = fused_rmsnorm
             return fused_rmsnorm
         except ImportError:

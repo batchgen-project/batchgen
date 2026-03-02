@@ -26,8 +26,21 @@ if not os.environ.get("MAX_JOBS"):
 # nvcc --threads controls parallelism within a single .cu file
 _nvcc_threads = os.getenv("NVCC_THREADS", "4")
 
+# ── Multi-architecture flag sets ──
+
 _sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v",
                 "-lineinfo", "--threads", _nvcc_threads]
+
+_sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads,
+               "-gencode", "arch=compute_80,code=sm_80",
+               "-gencode", "arch=compute_90,code=sm_90"]
+
+# Add SM100 gencode if CUDA toolkit >= 12.8
+_cuda_version = getattr(torch.version, "cuda", None)
+if _cuda_version:
+    _cuda_major, _cuda_minor = (int(x) for x in _cuda_version.split(".")[:2])
+    if (_cuda_major, _cuda_minor) >= (12, 8):
+        _sm80_flags += ["-gencode", "arch=compute_100,code=sm_100"]
 
 setup(
     name="batchgen_kernels",
@@ -38,12 +51,16 @@ setup(
         "batchgen_kernels.attention": "attention",
         "batchgen_kernels.moe": "moe",
         "batchgen_kernels.common": "common",
+        "batchgen_kernels.triton": "triton",
     },
     packages=["batchgen_kernels", "batchgen_kernels.attention",
-              "batchgen_kernels.moe", "batchgen_kernels.common"],
+              "batchgen_kernels.moe", "batchgen_kernels.common",
+              "batchgen_kernels.triton"],
     package_data={"batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"]},
     ext_modules=[
-        # MoE WGMMA kernels (SM90a)
+        # ── SM90a WGMMA kernels ──
+
+        # MoE WGMMA kernels (MXFP4)
         CUDAExtension(
             name="batchgen_kernels.moe._C_expert_mxfp4_wgmma",
             sources=["src/moe/expert_mxfp4_wgmma.cu"],
@@ -54,7 +71,31 @@ setup(
             sources=["src/moe/grouped_mxfp4_wgmma.cu"],
             extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
         ),
-        # Routing kernels (SM90a — uses WGMMA for fused gate)
+        # Grouped INT4 WGMMA for K2.5 decode
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_grouped_int4_wgmma",
+            sources=["src/moe/grouped_int4_wgmma_ext.cu"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+        ),
+        # Single-expert INT4 WGMMA
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_single_expert_int4_wgmma",
+            sources=["src/moe/single_expert_int4_wgmma.cu"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+        ),
+        # Fused INT4 WGMMA grouped (K2.5 TMA-based, gate+up+SiLU + down)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_fused_int4_wgmma_grouped",
+            sources=["src/moe/fused_int4_wgmma_grouped.cu"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+        ),
+        # QKV WGMMA fused projection
+        CUDAExtension(
+            name="batchgen_kernels.attention._C_qkv_wgmma",
+            sources=["src/attention/qkv_wgmma.cu"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+        ),
+        # Routing kernels (fused_gate uses WGMMA)
         CUDAExtension(
             name="batchgen_kernels.moe._C_routing",
             sources=[
@@ -73,6 +114,20 @@ setup(
                          "--threads", _nvcc_threads],
             },
         ),
+        # 3D dispatch scatter + reduce (strided MoE buffer)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_dispatch_scatter_3d",
+            sources=["src/moe/dispatch_scatter_3d.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17",
+                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+
+        # ── SM80+ universal kernels ──
+
         # Attention fused ops (RMSNorm, RoPE, QKV split)
         CUDAExtension(
             name="batchgen_kernels.attention._C_fused_ops",
@@ -86,7 +141,7 @@ setup(
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
                          "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                         "--threads", _nvcc_threads],
+                         "--threads", _nvcc_threads] + _sm80_flags[3:],
             },
         ),
         # CuTe MXFP4 dequantization
@@ -99,12 +154,6 @@ setup(
                          "--threads", _nvcc_threads],
             },
         ),
-        # QKV WGMMA fused projection (SM90a)
-        CUDAExtension(
-            name="batchgen_kernels.attention._C_qkv_wgmma",
-            sources=["src/attention/qkv_wgmma.cu"],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
-        ),
         # MXFP4 dequant with shared memory LUT
         CUDAExtension(
             name="batchgen_kernels.moe._C_mxfp4_dequant",
@@ -115,7 +164,7 @@ setup(
                          "--threads", _nvcc_threads],
             },
         ),
-        # RMSNorm (multi-dtype: BF16/FP16/FP32)
+        # RMSNorm (multi-dtype: BF16/FP16/FP32) — common
         CUDAExtension(
             name="batchgen_kernels.common._C_rmsnorm",
             sources=["src/common/rmsnorm.cu"],
@@ -129,17 +178,39 @@ setup(
                          "--threads", _nvcc_threads],
             },
         ),
-        # Grouped INT4 WGMMA for K2.5 decode (SM90a)
+        # CUDA RMSNorm + Add+RMSNorm (from cuda_rmsnorm.py)
         CUDAExtension(
-            name="batchgen_kernels.moe._C_grouped_int4_wgmma",
-            sources=["src/moe/grouped_int4_wgmma_ext.cu"],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+            name="batchgen_kernels.common._C_cuda_rmsnorm",
+            sources=["src/common/cuda_rmsnorm.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17",
+                         "-U__CUDA_NO_HALF_OPERATORS__",
+                         "-U__CUDA_NO_HALF_CONVERSIONS__",
+                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--expt-relaxed-constexpr",
+                         "--threads", _nvcc_threads],
+            },
         ),
-        # Single-expert INT4 WGMMA (SM90a)
+        # MGN (MoE General Native) ops — token dispatch, fused gate, bincount, rmsnorm
         CUDAExtension(
-            name="batchgen_kernels.moe._C_single_expert_int4_wgmma",
-            sources=["src/moe/single_expert_int4_wgmma.cu"],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
+            name="batchgen_kernels.common._C_mgn_ops",
+            sources=[
+                "src/moe/mgn/mgn_extension.cc",
+                "src/moe/mgn/fused_moe_token_dispatch.cu",
+                "src/moe/mgn/moe_fused_gate.cu",
+                "src/moe/mgn/expert_bin_count.cu",
+                "src/moe/mgn/rmsnorm.cu",
+            ],
+            include_dirs=["src/moe/mgn"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17",
+                         "-U__CUDA_NO_HALF_OPERATORS__",
+                         "-U__CUDA_NO_HALF_CONVERSIONS__",
+                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--threads", _nvcc_threads] + _sm80_flags[3:],
+            },
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

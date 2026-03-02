@@ -1,4 +1,3 @@
-
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -180,11 +179,11 @@ __device__ __forceinline__ void mbarrier_wait_parity(
     asm volatile(
         "{\n"
         ".reg .pred P;\n"
-        "INT4_SINGLE_MBAR_WAIT_%=:\n"
+        "GROUPED_INT4_MBAR_WAIT_%=:\n"
         "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
-        "@P bra INT4_SINGLE_MBAR_DONE_%=;\n"
-        "bra INT4_SINGLE_MBAR_WAIT_%=;\n"
-        "INT4_SINGLE_MBAR_DONE_%=:\n"
+        "@P bra GROUPED_INT4_MBAR_DONE_%=;\n"
+        "bra GROUPED_INT4_MBAR_WAIT_%=;\n"
+        "GROUPED_INT4_MBAR_DONE_%=:\n"
         "}\n"
         :: "r"(smem_addr), "r"(phase_parity));
 }
@@ -207,6 +206,9 @@ __device__ __forceinline__ void tma_load_2d(
         : "memory");
 }
 
+// ============================================================================
+// Named barrier sync (producer WG internal)
+// ============================================================================
 __device__ __forceinline__ void bar_sync(uint32_t bar_id, uint32_t num_threads) {
     asm volatile("bar.sync %0, %1;" :: "r"(bar_id), "r"(num_threads));
 }
@@ -216,28 +218,33 @@ __device__ __forceinline__ void bar_sync(uint32_t bar_id, uint32_t num_threads) 
 // ============================================================================
 __device__ __forceinline__ void load_decode_rhs_int4_swizzled(
     __nv_bfloat16* smem_rhs,
-    const uint8_t* weight_base,
-    const __nv_bfloat16* scale_base,
+    const uint8_t* weight_base,        // raw bytes (works for both uint8 and int32 packing)
+    const __nv_bfloat16* scale_base,   // BF16 scales (not uint8 exponents)
     int n_start, int k_start,
     int N, int K,
-    int64_t stride_weight_n,
-    int64_t stride_scale_n,
+    int64_t stride_weight_n,           // in bytes: K_dim / 2
+    int64_t stride_scale_n,            // in BF16 elements: K_dim / 32
     int tid
 ) {
+    // Thread mapping: 64 threads cover 64 N-rows × 64 K-elements
+    // Each thread handles 1 N-row × 32 K-elements (one scale group)
     const int n_local = tid / 2;
     const int k_local_start = (tid & 1) * 32;
     const int n_global = n_start + n_local;
 
     if (n_global >= N) return;
 
+    // Load 16 packed bytes = 32 INT4 values via uint4 (128-bit load)
     const int k_packed_start = k_start / 2 + k_local_start / 2;
     uint4 packed_vec = *reinterpret_cast<const uint4*>(
         weight_base + n_global * stride_weight_n + k_packed_start);
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed_vec);
 
+    // Load BF16 scale directly (one per 32 elements)
     __nv_bfloat16 scale_val = scale_base[n_global * stride_scale_n + (k_start + k_local_start) / 32];
     __nv_bfloat162 scale2 = __bfloat162bfloat162(scale_val);
 
+    // Decode: extract nibbles, offset decode (nibble - 8), cast to BF16, apply scale
     __nv_bfloat162 raw[16];
     #pragma unroll
     for (int i = 0; i < 16; i++) {
@@ -248,11 +255,13 @@ __device__ __forceinline__ void load_decode_rhs_int4_swizzled(
         raw[i] = __halves2bfloat162(lo, hi);
     }
 
+    // Apply scale
     #pragma unroll
     for (int i = 0; i < 16; i++) {
         raw[i] = __hmul2(raw[i], scale2);
     }
 
+    // Store to shared memory with 128B swizzle for WGMMA consumption
     const int n_mod8 = n_local & 7;
     const int n_base = n_local << 6;
 
@@ -272,20 +281,22 @@ __device__ __forceinline__ void load_decode_rhs_int4_swizzled(
 }
 
 // ============================================================================
-// Stage 1 Kernel: Gate + Up + SiLU (single expert, 2D grid)
-// Grid: (num_n_tiles, num_m_tiles)
+// Stage 1 Kernel: Gate + Up + SiLU (TMA-based, 3D grid, with bias)
+//   Grid: (num_experts, num_n_tiles, max_m_tiles)
 // ============================================================================
 __global__ void __launch_bounds__(TOTAL_THREADS, 1)
-int4_single_expert_stage1_kernel(
+grouped_int4_moe_stage1_kernel(
     const __grid_constant__ CUtensorMap desc_a,
-    const uint8_t* __restrict__ B_gate_packed,
-    const __nv_bfloat16* __restrict__ B_gate_scales,
-    const uint8_t* __restrict__ B_up_packed,
-    const __nv_bfloat16* __restrict__ B_up_scales,
-    const __nv_bfloat16* __restrict__ gate_bias,
-    const __nv_bfloat16* __restrict__ up_bias,
+    const int64_t* __restrict__ gate_ptrs,
+    const int64_t* __restrict__ gate_scale_ptrs,
+    const int64_t* __restrict__ up_ptrs,
+    const int64_t* __restrict__ up_scale_ptrs,
+    const int64_t* __restrict__ gate_bias_ptrs,
+    const int64_t* __restrict__ up_bias_ptrs,
+    const int32_t* __restrict__ tokens_per_expert,
     __nv_bfloat16* __restrict__ C,
-    int M, int N, int K,
+    int64_t stride_c_m,
+    int max_tokens_padded, int N, int K, int num_experts,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
     int has_gate_bias, int has_up_bias
@@ -294,8 +305,31 @@ int4_single_expert_stage1_kernel(
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    const int n_start = blockIdx.x * BLOCK_N;
-    const int m_start = blockIdx.y * BLOCK_M;
+    const int expert_idx = blockIdx.x;
+    const int n_tile = blockIdx.y;
+    const int m_tile = blockIdx.z;
+    const int n_start = n_tile * BLOCK_N;
+
+    if (n_start >= N) return;
+
+    const int expert_tokens = tokens_per_expert[expert_idx];
+
+    const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
+    if (m_tile >= num_m_tiles) return;
+
+    const int m_start = expert_idx * max_tokens_padded + m_tile * BLOCK_M;
+    const int expert_end = expert_idx * max_tokens_padded + expert_tokens;
+    const int m_size = min(BLOCK_M, expert_end - m_start);
+
+    const uint8_t* gate_weight = reinterpret_cast<const uint8_t*>(gate_ptrs[expert_idx]);
+    const __nv_bfloat16* gate_scale = reinterpret_cast<const __nv_bfloat16*>(gate_scale_ptrs[expert_idx]);
+    const uint8_t* up_weight = reinterpret_cast<const uint8_t*>(up_ptrs[expert_idx]);
+    const __nv_bfloat16* up_scale = reinterpret_cast<const __nv_bfloat16*>(up_scale_ptrs[expert_idx]);
+
+    const __nv_bfloat16* gate_bias = has_gate_bias ?
+        reinterpret_cast<const __nv_bfloat16*>(gate_bias_ptrs[expert_idx]) : nullptr;
+    const __nv_bfloat16* up_bias = has_up_bias ?
+        reinterpret_cast<const __nv_bfloat16*>(up_bias_ptrs[expert_idx]) : nullptr;
 
     extern __shared__ __align__(128) char smem_buf[];
     __nv_bfloat16* smem_a[NUM_STAGES];
@@ -305,80 +339,86 @@ int4_single_expert_stage1_kernel(
         smem_b[s] = reinterpret_cast<__nv_bfloat16*>(smem_buf + (2*s + 1) * TILE_BYTES);
     }
     const int bar_offset = 2 * NUM_STAGES * TILE_BYTES;
-    uint64_t* full_barriers  = reinterpret_cast<uint64_t*>(smem_buf + bar_offset);
-    uint64_t* empty_barriers = full_barriers + NUM_STAGES;
+    uint64_t* gate_full_barriers  = reinterpret_cast<uint64_t*>(smem_buf + bar_offset);
+    uint64_t* gate_empty_barriers = gate_full_barriers + NUM_STAGES;
+    uint64_t* up_full_barriers    = gate_empty_barriers + NUM_STAGES;
+    uint64_t* up_empty_barriers   = up_full_barriers + NUM_STAGES;
 
+    const int num_k_blocks = (K + BLOCK_K - 1) / BLOCK_K;
+
+    // Init barriers with arrival count = 2 (TMA + decode)
     if (tid == 0) {
         for (int s = 0; s < NUM_STAGES; s++) {
-            mbarrier_init(&full_barriers[s], 2);
-            mbarrier_init(&empty_barriers[s], 1);
+            mbarrier_init(&gate_full_barriers[s], 2);
+            mbarrier_init(&gate_empty_barriers[s], 1);
+            mbarrier_init(&up_full_barriers[s], 2);
+            mbarrier_init(&up_empty_barriers[s], 1);
         }
     }
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
 
-    const int num_k_blocks = (K + BLOCK_K - 1) / BLOCK_K;
-
     if (wg_id == 0) {
-        // PRODUCER WG: Gate K-loop
+        // PRODUCER WG: TMA A + decode B (no LUT needed for INT4)
+
         if (wg_tid == 0) {
             asm volatile("prefetch.tensormap [%0];" :: "l"(&desc_a) : "memory");
         }
 
+        // GATE K-LOOP
         for (int kb = 0; kb < num_k_blocks; kb++) {
             const int s = kb % NUM_STAGES;
             const int empty_phase = ((kb / NUM_STAGES) + 1) & 1;
-            mbarrier_wait_parity(&empty_barriers[s], empty_phase);
+
+            mbarrier_wait_parity(&gate_empty_barriers[s], empty_phase);
+
             if (wg_tid == 0) {
-                mbarrier_arrive_expect_tx(&full_barriers[s], TILE_BYTES);
-                tma_load_2d(&desc_a, &full_barriers[s], smem_a[s],
+                mbarrier_arrive_expect_tx(&gate_full_barriers[s], TILE_BYTES);
+                tma_load_2d(&desc_a, &gate_full_barriers[s], smem_a[s],
                             kb * BLOCK_K, m_start);
             }
+
             load_decode_rhs_int4_swizzled(
-                smem_b[s], B_gate_packed, B_gate_scales,
+                smem_b[s], gate_weight, gate_scale,
                 n_start, kb * BLOCK_K, N, K,
                 stride_weight_n, stride_scale_n, wg_tid);
+
             bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             if (wg_tid == 0) {
-                mbarrier_arrive(&full_barriers[s]);
+                mbarrier_arrive(&gate_full_barriers[s]);
             }
         }
 
-        // Re-init barriers for Up K-loop
-        __syncthreads();
-        if (wg_tid == 0) {
-            for (int s = 0; s < NUM_STAGES; s++) {
-                mbarrier_init(&full_barriers[s], 2);
-                mbarrier_init(&empty_barriers[s], 1);
-            }
-        }
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
 
-        // PRODUCER WG: Up K-loop
+        // UP K-LOOP
         for (int kb = 0; kb < num_k_blocks; kb++) {
             const int s = kb % NUM_STAGES;
             const int empty_phase = ((kb / NUM_STAGES) + 1) & 1;
-            mbarrier_wait_parity(&empty_barriers[s], empty_phase);
+
+            mbarrier_wait_parity(&up_empty_barriers[s], empty_phase);
+
             if (wg_tid == 0) {
-                mbarrier_arrive_expect_tx(&full_barriers[s], TILE_BYTES);
-                tma_load_2d(&desc_a, &full_barriers[s], smem_a[s],
+                mbarrier_arrive_expect_tx(&up_full_barriers[s], TILE_BYTES);
+                tma_load_2d(&desc_a, &up_full_barriers[s], smem_a[s],
                             kb * BLOCK_K, m_start);
             }
+
             load_decode_rhs_int4_swizzled(
-                smem_b[s], B_up_packed, B_up_scales,
+                smem_b[s], up_weight, up_scale,
                 n_start, kb * BLOCK_K, N, K,
                 stride_weight_n, stride_scale_n, wg_tid);
+
             bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             if (wg_tid == 0) {
-                mbarrier_arrive(&full_barriers[s]);
+                mbarrier_arrive(&up_full_barriers[s]);
             }
         }
 
     } else {
-        // MATH WG: Gate K-loop
+        // MATH WG: gate GEMM -> up GEMM -> SiLU
         float gate_acc[WGMMA_NUM_ACCUM];
         float up_acc[WGMMA_NUM_ACCUM];
         for (int i = 0; i < WGMMA_NUM_ACCUM; i++) gate_acc[i] = 0.0f;
@@ -387,107 +427,145 @@ int4_single_expert_stage1_kernel(
         const int warp_in_wg = wg_tid / WARP_SIZE;
         const int lane_id = wg_tid % WARP_SIZE;
 
+        // GATE K-LOOP
         for (int kb = 0; kb < num_k_blocks; kb++) {
             const int s = kb % NUM_STAGES;
             const int full_phase = (kb / NUM_STAGES) & 1;
-            mbarrier_wait_parity(&full_barriers[s], full_phase);
+
+            mbarrier_wait_parity(&gate_full_barriers[s], full_phase);
+
             #pragma unroll
             for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
                 warpgroup_fence_operand(gate_acc[i]);
+
             warpgroup_arrive();
+
             #pragma unroll
             for (int t = 0; t < TILES_K; t++) {
                 GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
                 GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
                 wgmma_bf16_ss(da.desc_, db.desc_, gate_acc, 1);
             }
+
             warpgroup_commit_batch();
+
             #pragma unroll
             for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
                 warpgroup_fence_operand(gate_acc[i]);
+
             warpgroup_wait<0>();
+
             if (wg_tid == 0) {
-                mbarrier_arrive(&empty_barriers[s]);
+                mbarrier_arrive(&gate_empty_barriers[s]);
             }
         }
 
-        // Sync for barrier re-init
-        __syncthreads();
         __syncthreads();
 
-        // MATH WG: Up K-loop
+        // UP K-LOOP
         for (int kb = 0; kb < num_k_blocks; kb++) {
             const int s = kb % NUM_STAGES;
             const int full_phase = (kb / NUM_STAGES) & 1;
-            mbarrier_wait_parity(&full_barriers[s], full_phase);
+
+            mbarrier_wait_parity(&up_full_barriers[s], full_phase);
+
             #pragma unroll
             for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
                 warpgroup_fence_operand(up_acc[i]);
+
             warpgroup_arrive();
+
             #pragma unroll
             for (int t = 0; t < TILES_K; t++) {
                 GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
                 GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
                 wgmma_bf16_ss(da.desc_, db.desc_, up_acc, 1);
             }
+
             warpgroup_commit_batch();
+
             #pragma unroll
             for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
                 warpgroup_fence_operand(up_acc[i]);
+
             warpgroup_wait<0>();
+
             if (wg_tid == 0) {
-                mbarrier_arrive(&empty_barriers[s]);
+                mbarrier_arrive(&up_empty_barriers[s]);
             }
         }
 
-        // SiLU EPILOGUE: silu(gate) * up
+        // SiLU EPILOGUE with bias: silu(gate) * up
         #pragma unroll 1
         for (int i = 0; i < WGMMA_NUM_ACCUM; i++) {
             int m, n;
             reg_to_mn(i, warp_in_wg, lane_id, m, n);
+            const int m_global = m_start + m;
+            const int n_global = n_start + n;
 
-            if ((m_start + m) >= M || (n_start + n) >= N) continue;
+            if (m_global >= expert_end || n_global >= N) continue;
 
             float g = gate_acc[i];
             float u = up_acc[i];
 
-            if (has_gate_bias) {
-                g += __bfloat162float(gate_bias[n_start + n]);
+            if (has_gate_bias && gate_bias != nullptr) {
+                g += __bfloat162float(gate_bias[n_global]);
             }
-            if (has_up_bias) {
-                u += __bfloat162float(up_bias[n_start + n]);
+            if (has_up_bias && up_bias != nullptr) {
+                u += __bfloat162float(up_bias[n_global]);
             }
 
+            // Standard SiLU: gate * sigmoid(gate)
             float sig = __frcp_rn(1.0f + expf(-g));
             float result = g * sig * u;
 
-            C[(m_start + m) * N + (n_start + n)] = __float2bfloat16(result);
+            C[m_global * stride_c_m + n_global] = __float2bfloat16(result);
         }
     }
 }
 
 // ============================================================================
-// Stage 2 Kernel: Down projection (single expert, 2D grid)
-// Grid: (num_k_tiles, num_m_tiles)
+// Stage 2 Kernel: Down projection (TMA-based, 3D grid, with bias)
+//   Grid: (num_experts, num_k_tiles, max_m_tiles)
 // ============================================================================
 __global__ void __launch_bounds__(TOTAL_THREADS, 1)
-int4_single_expert_stage2_kernel(
+grouped_int4_moe_stage2_kernel(
     const __grid_constant__ CUtensorMap desc_input,
-    const uint8_t* __restrict__ B_down_packed,
-    const __nv_bfloat16* __restrict__ B_down_scales,
-    const __nv_bfloat16* __restrict__ bias,
+    const int64_t* __restrict__ down_ptrs,
+    const int64_t* __restrict__ down_scale_ptrs,
+    const int64_t* __restrict__ down_bias_ptrs,
+    const int32_t* __restrict__ tokens_per_expert,
     __nv_bfloat16* __restrict__ C,
-    int M, int N, int K,
+    int64_t stride_c_m,
+    int max_tokens_padded, int N, int K, int num_experts,
     int64_t stride_weight_n,
     int64_t stride_scale_n,
-    int has_bias
+    int has_down_bias
 ) {
     const int tid = threadIdx.x;
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    const int k_start = blockIdx.x * BLOCK_N;
-    const int m_start = blockIdx.y * BLOCK_M;
+    const int expert_idx = blockIdx.x;
+    const int k_tile = blockIdx.y;
+    const int m_tile = blockIdx.z;
+    const int k_start = k_tile * BLOCK_N;
+
+    if (k_start >= K) return;
+
+    const int expert_tokens = tokens_per_expert[expert_idx];
+
+    const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
+    if (m_tile >= num_m_tiles) return;
+
+    const int m_start = expert_idx * max_tokens_padded + m_tile * BLOCK_M;
+    const int expert_end = expert_idx * max_tokens_padded + expert_tokens;
+    const int m_size = min(BLOCK_M, expert_end - m_start);
+
+    const uint8_t* down_weight = reinterpret_cast<const uint8_t*>(down_ptrs[expert_idx]);
+    const __nv_bfloat16* down_scale = reinterpret_cast<const __nv_bfloat16*>(down_scale_ptrs[expert_idx]);
+    const __nv_bfloat16* down_bias = has_down_bias ?
+        reinterpret_cast<const __nv_bfloat16*>(down_bias_ptrs[expert_idx]) : nullptr;
 
     extern __shared__ __align__(128) char smem_buf[];
     __nv_bfloat16* smem_a[NUM_STAGES];
@@ -500,6 +578,9 @@ int4_single_expert_stage2_kernel(
     uint64_t* full_barriers  = reinterpret_cast<uint64_t*>(smem_buf + bar_offset);
     uint64_t* empty_barriers = full_barriers + NUM_STAGES;
 
+    const int num_n_blocks = (N + BLOCK_K - 1) / BLOCK_K;
+
+    // Init barriers with arrival count = 2 (TMA + decode)
     if (tid == 0) {
         for (int s = 0; s < NUM_STAGES; s++) {
             mbarrier_init(&full_barriers[s], 2);
@@ -509,10 +590,9 @@ int4_single_expert_stage2_kernel(
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
 
-    const int num_n_blocks = (N + BLOCK_K - 1) / BLOCK_K;
-
     if (wg_id == 0) {
         // PRODUCER WG
+
         if (wg_tid == 0) {
             asm volatile("prefetch.tensormap [%0];" :: "l"(&desc_input) : "memory");
         }
@@ -520,16 +600,20 @@ int4_single_expert_stage2_kernel(
         for (int nb = 0; nb < num_n_blocks; nb++) {
             const int s = nb % NUM_STAGES;
             const int empty_phase = ((nb / NUM_STAGES) + 1) & 1;
+
             mbarrier_wait_parity(&empty_barriers[s], empty_phase);
+
             if (wg_tid == 0) {
                 mbarrier_arrive_expect_tx(&full_barriers[s], TILE_BYTES);
                 tma_load_2d(&desc_input, &full_barriers[s], smem_a[s],
                             nb * BLOCK_K, m_start);
             }
+
             load_decode_rhs_int4_swizzled(
-                smem_b[s], B_down_packed, B_down_scales,
+                smem_b[s], down_weight, down_scale,
                 k_start, nb * BLOCK_K, K, N,
                 stride_weight_n, stride_scale_n, wg_tid);
+
             bar_sync(PRODUCER_BAR_ID, PRODUCER_THREADS);
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             if (wg_tid == 0) {
@@ -548,22 +632,30 @@ int4_single_expert_stage2_kernel(
         for (int nb = 0; nb < num_n_blocks; nb++) {
             const int s = nb % NUM_STAGES;
             const int full_phase = (nb / NUM_STAGES) & 1;
+
             mbarrier_wait_parity(&full_barriers[s], full_phase);
+
             #pragma unroll
             for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
                 warpgroup_fence_operand(acc[i]);
+
             warpgroup_arrive();
+
             #pragma unroll
             for (int t = 0; t < TILES_K; t++) {
                 GmmaDescriptor da = make_smem_desc(smem_a[s] + t * WGMMA_K);
                 GmmaDescriptor db = make_smem_desc(smem_b[s] + t * WGMMA_K);
                 wgmma_bf16_ss(da.desc_, db.desc_, acc, 1);
             }
+
             warpgroup_commit_batch();
+
             #pragma unroll
             for (int i = 0; i < WGMMA_NUM_ACCUM; i++)
                 warpgroup_fence_operand(acc[i]);
+
             warpgroup_wait<0>();
+
             if (wg_tid == 0) {
                 mbarrier_arrive(&empty_barriers[s]);
             }
@@ -572,16 +664,20 @@ int4_single_expert_stage2_kernel(
         // EPILOGUE: store with optional bias
         #pragma unroll 1
         for (int i = 0; i < WGMMA_NUM_ACCUM; i++) {
-            int m, k;
-            reg_to_mn(i, warp_in_wg, lane_id, m, k);
+            int m, n;
+            reg_to_mn(i, warp_in_wg, lane_id, m, n);
+            const int m_global = m_start + m;
+            const int k_global = k_start + n;
 
-            if ((m_start + m) >= M || (k_start + k) >= K) continue;
+            if (m_global >= expert_end || k_global >= K) continue;
 
             float result = acc[i];
-            if (has_bias) {
-                result += __bfloat162float(bias[k_start + k]);
+
+            if (has_down_bias && down_bias != nullptr) {
+                result += __bfloat162float(down_bias[k_global]);
             }
-            C[(m_start + m) * K + (k_start + k)] = __float2bfloat16(result);
+
+            C[m_global * stride_c_m + k_global] = __float2bfloat16(result);
         }
     }
 }
@@ -635,116 +731,271 @@ static CUtensorMap make_2d_tma_desc_bf16(
 }
 
 // ============================================================================
-// C++ wrappers
+// C++ wrapper: Stage 1 (gate + up + SiLU) with TMA + bias
 // ============================================================================
-torch::Tensor int4_single_expert_stage1(
+torch::Tensor grouped_int4_moe_stage1(
     torch::Tensor A,
-    torch::Tensor B_gate_packed,
-    torch::Tensor B_gate_scales,
-    torch::Tensor B_up_packed,
-    torch::Tensor B_up_scales,
-    torch::Tensor gate_bias,
-    torch::Tensor up_bias
+    torch::Tensor tokens_per_expert,
+    torch::Tensor gate_ptrs,
+    torch::Tensor gate_scale_ptrs,
+    torch::Tensor up_ptrs,
+    torch::Tensor up_scale_ptrs,
+    torch::Tensor gate_bias_ptrs,
+    torch::Tensor up_bias_ptrs,
+    int N,
+    int64_t stride_weight_n,
+    int64_t stride_scale_n,
+    int max_m_tiles,
+    int max_tokens_padded
 ) {
     TORCH_CHECK(A.is_cuda() && A.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tokens_per_expert.is_cuda() && tokens_per_expert.dtype() == torch::kInt32);
 
-    const int M = A.size(0);
+    const int total_tokens = A.size(0);
     const int K = A.size(1);
-    const int N = B_gate_packed.size(0);
+    const int num_experts = tokens_per_expert.size(0);
 
-    auto C = torch::empty({M, N}, A.options());
+    auto C = torch::empty({total_tokens, N}, A.options());
 
     auto encode_func = get_cuTensorMapEncodeTiled();
     CUtensorMap desc_a = make_2d_tma_desc_bf16(
-        reinterpret_cast<__nv_bfloat16*>(A.data_ptr()), M, K, BLOCK_M, BLOCK_K, encode_func);
-
-    const int64_t stride_weight_n = K / 2;
-    const int64_t stride_scale_n = K / 32;
+        reinterpret_cast<__nv_bfloat16*>(A.data_ptr()),
+        total_tokens, K, BLOCK_M, BLOCK_K, encode_func);
 
     const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    const int num_m_tiles = (M + BLOCK_M - 1) / BLOCK_M;
-    dim3 grid(num_n_tiles, num_m_tiles);
+    dim3 grid(num_experts, num_n_tiles, max_m_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
-                               2 * NUM_STAGES * sizeof(uint64_t);
-    cudaFuncSetAttribute(int4_single_expert_stage1_kernel,
+                               4 * NUM_STAGES * sizeof(uint64_t);
+
+    cudaFuncSetAttribute(grouped_int4_moe_stage1_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
-    int has_gate_bias = gate_bias.numel() > 0 ? 1 : 0;
-    int has_up_bias = up_bias.numel() > 0 ? 1 : 0;
-    __nv_bfloat16* gate_bias_ptr = has_gate_bias ?
-        reinterpret_cast<__nv_bfloat16*>(gate_bias.data_ptr()) : nullptr;
-    __nv_bfloat16* up_bias_ptr = has_up_bias ?
-        reinterpret_cast<__nv_bfloat16*>(up_bias.data_ptr()) : nullptr;
+    int has_gate_bias = gate_bias_ptrs.numel() > 0 ? 1 : 0;
+    int has_up_bias = up_bias_ptrs.numel() > 0 ? 1 : 0;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    int4_single_expert_stage1_kernel<<<grid, block, smem_bytes, stream>>>(
+    grouped_int4_moe_stage1_kernel<<<grid, block, smem_bytes, stream>>>(
         desc_a,
-        reinterpret_cast<const uint8_t*>(B_gate_packed.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(B_gate_scales.data_ptr()),
-        reinterpret_cast<const uint8_t*>(B_up_packed.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(B_up_scales.data_ptr()),
-        gate_bias_ptr, up_bias_ptr,
+        gate_ptrs.data_ptr<int64_t>(),
+        gate_scale_ptrs.data_ptr<int64_t>(),
+        up_ptrs.data_ptr<int64_t>(),
+        up_scale_ptrs.data_ptr<int64_t>(),
+        has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        tokens_per_expert.data_ptr<int32_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        M, N, K,
-        stride_weight_n, stride_scale_n, has_gate_bias, has_up_bias);
+        C.stride(0),
+        max_tokens_padded, N, K, num_experts,
+        stride_weight_n, stride_scale_n,
+        has_gate_bias, has_up_bias);
 
     return C;
 }
 
-torch::Tensor int4_single_expert_stage2(
+// ============================================================================
+// C++ wrapper: Stage 2 (down projection) with TMA + bias
+// ============================================================================
+torch::Tensor grouped_int4_moe_stage2(
     torch::Tensor input,
-    torch::Tensor B_down_packed,
-    torch::Tensor B_down_scales,
-    torch::Tensor bias
+    torch::Tensor tokens_per_expert,
+    torch::Tensor down_ptrs,
+    torch::Tensor down_scale_ptrs,
+    torch::Tensor down_bias_ptrs,
+    int K,
+    int64_t stride_weight_n,
+    int64_t stride_scale_n,
+    int max_m_tiles,
+    int max_tokens_padded
 ) {
     TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tokens_per_expert.is_cuda() && tokens_per_expert.dtype() == torch::kInt32);
 
-    const int M = input.size(0);
+    const int total_tokens = input.size(0);
     const int N = input.size(1);
-    const int K = B_down_packed.size(0);
+    const int num_experts = tokens_per_expert.size(0);
 
-    auto C = torch::empty({M, K}, input.options());
+    auto C = torch::empty({total_tokens, K}, input.options());
 
     auto encode_func = get_cuTensorMapEncodeTiled();
     CUtensorMap desc_input = make_2d_tma_desc_bf16(
-        reinterpret_cast<__nv_bfloat16*>(input.data_ptr()), M, N, BLOCK_M, BLOCK_K, encode_func);
-
-    const int64_t stride_weight_n = N / 2;
-    const int64_t stride_scale_n = N / 32;
+        reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
+        total_tokens, N, BLOCK_M, BLOCK_K, encode_func);
 
     const int num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;
-    const int num_m_tiles = (M + BLOCK_M - 1) / BLOCK_M;
-    dim3 grid(num_k_tiles, num_m_tiles);
+    dim3 grid(num_experts, num_k_tiles, max_m_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
                                2 * NUM_STAGES * sizeof(uint64_t);
-    cudaFuncSetAttribute(int4_single_expert_stage2_kernel,
+
+    cudaFuncSetAttribute(grouped_int4_moe_stage2_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
-    int has_bias = bias.numel() > 0 ? 1 : 0;
-    __nv_bfloat16* bias_ptr = has_bias ?
-        reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()) : nullptr;
+    int has_down_bias = down_bias_ptrs.numel() > 0 ? 1 : 0;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    int4_single_expert_stage2_kernel<<<grid, block, smem_bytes, stream>>>(
+    grouped_int4_moe_stage2_kernel<<<grid, block, smem_bytes, stream>>>(
         desc_input,
-        reinterpret_cast<const uint8_t*>(B_down_packed.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(B_down_scales.data_ptr()),
-        bias_ptr,
+        down_ptrs.data_ptr<int64_t>(),
+        down_scale_ptrs.data_ptr<int64_t>(),
+        has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        tokens_per_expert.data_ptr<int32_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        M, N, K,
-        stride_weight_n, stride_scale_n, has_bias);
+        C.stride(0),
+        max_tokens_padded, N, K, num_experts,
+        stride_weight_n, stride_scale_n,
+        has_down_bias);
 
     return C;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("int4_single_expert_stage1", &int4_single_expert_stage1,
-          "INT4 Single Expert Stage 1 (gate+up+SiLU)");
-    m.def("int4_single_expert_stage2", &int4_single_expert_stage2,
-          "INT4 Single Expert Stage 2 (down projection)");
+// ============================================================================
+// TMA descriptor creation (callable from Python for pre-building descriptors)
+// ============================================================================
+torch::Tensor create_tma_desc_bf16(
+    torch::Tensor tensor,
+    int block_m,
+    int block_k
+) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tensor.dim() == 2, "Expected 2D tensor");
+
+    auto encode_func = get_cuTensorMapEncodeTiled();
+    CUtensorMap desc = make_2d_tma_desc_bf16(
+        reinterpret_cast<__nv_bfloat16*>(tensor.data_ptr()),
+        tensor.size(0), tensor.size(1), block_m, block_k, encode_func);
+
+    auto desc_tensor = torch::empty({128}, torch::dtype(torch::kUInt8).device(torch::kCPU));
+    std::memcpy(desc_tensor.data_ptr(), &desc, sizeof(CUtensorMap));
+    return desc_tensor;
 }
 
+// ============================================================================
+// C++ wrapper: Stage 1 inplace (pre-allocated output + pre-built TMA desc)
+// ============================================================================
+void grouped_int4_moe_stage1_inplace(
+    torch::Tensor A,
+    torch::Tensor C,
+    torch::Tensor tma_desc_bytes,
+    torch::Tensor tokens_per_expert,
+    torch::Tensor gate_ptrs,
+    torch::Tensor gate_scale_ptrs,
+    torch::Tensor up_ptrs,
+    torch::Tensor up_scale_ptrs,
+    torch::Tensor gate_bias_ptrs,
+    torch::Tensor up_bias_ptrs,
+    int N,
+    int64_t stride_weight_n,
+    int64_t stride_scale_n,
+    int max_m_tiles,
+    int max_tokens_padded
+) {
+    TORCH_CHECK(A.is_cuda() && A.dtype() == torch::kBFloat16);
+    TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tma_desc_bytes.numel() == 128, "TMA descriptor must be 128 bytes");
+
+    const int total_tokens = A.size(0);
+    const int K = A.size(1);
+    const int num_experts = tokens_per_expert.size(0);
+
+    CUtensorMap desc_a;
+    std::memcpy(&desc_a, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
+
+    const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_experts, num_n_tiles, max_m_tiles);
+    dim3 block(TOTAL_THREADS);
+
+    constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
+                               4 * NUM_STAGES * sizeof(uint64_t);
+
+    cudaFuncSetAttribute(grouped_int4_moe_stage1_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int has_gate_bias = gate_bias_ptrs.numel() > 0 ? 1 : 0;
+    int has_up_bias = up_bias_ptrs.numel() > 0 ? 1 : 0;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    grouped_int4_moe_stage1_kernel<<<grid, block, smem_bytes, stream>>>(
+        desc_a,
+        gate_ptrs.data_ptr<int64_t>(),
+        gate_scale_ptrs.data_ptr<int64_t>(),
+        up_ptrs.data_ptr<int64_t>(),
+        up_scale_ptrs.data_ptr<int64_t>(),
+        has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        tokens_per_expert.data_ptr<int32_t>(),
+        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        C.stride(0),
+        max_tokens_padded, N, K, num_experts,
+        stride_weight_n, stride_scale_n,
+        has_gate_bias, has_up_bias);
+}
+
+// ============================================================================
+// C++ wrapper: Stage 2 inplace (pre-allocated output + pre-built TMA desc)
+// ============================================================================
+void grouped_int4_moe_stage2_inplace(
+    torch::Tensor input,
+    torch::Tensor C,
+    torch::Tensor tma_desc_bytes,
+    torch::Tensor tokens_per_expert,
+    torch::Tensor down_ptrs,
+    torch::Tensor down_scale_ptrs,
+    torch::Tensor down_bias_ptrs,
+    int K,
+    int64_t stride_weight_n,
+    int64_t stride_scale_n,
+    int max_m_tiles,
+    int max_tokens_padded
+) {
+    TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kBFloat16);
+    TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
+    TORCH_CHECK(tma_desc_bytes.numel() == 128, "TMA descriptor must be 128 bytes");
+
+    const int total_tokens = input.size(0);
+    const int N = input.size(1);
+    const int num_experts = tokens_per_expert.size(0);
+
+    CUtensorMap desc_input;
+    std::memcpy(&desc_input, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
+
+    const int num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_experts, num_k_tiles, max_m_tiles);
+    dim3 block(TOTAL_THREADS);
+
+    constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
+                               2 * NUM_STAGES * sizeof(uint64_t);
+
+    cudaFuncSetAttribute(grouped_int4_moe_stage2_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int has_down_bias = down_bias_ptrs.numel() > 0 ? 1 : 0;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    grouped_int4_moe_stage2_kernel<<<grid, block, smem_bytes, stream>>>(
+        desc_input,
+        down_ptrs.data_ptr<int64_t>(),
+        down_scale_ptrs.data_ptr<int64_t>(),
+        has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
+        tokens_per_expert.data_ptr<int32_t>(),
+        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        C.stride(0),
+        max_tokens_padded, N, K, num_experts,
+        stride_weight_n, stride_scale_n,
+        has_down_bias);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("grouped_int4_moe_stage1", &grouped_int4_moe_stage1,
+          "Grouped INT4 Stage 1 (gate+up+SiLU) with 3D strided layout");
+    m.def("grouped_int4_moe_stage2", &grouped_int4_moe_stage2,
+          "Grouped INT4 Stage 2 (down projection) with 3D strided layout");
+    m.def("create_tma_desc_bf16", &create_tma_desc_bf16,
+          "Create TMA descriptor for a 2D BF16 tensor");
+    m.def("grouped_int4_moe_stage1_inplace", &grouped_int4_moe_stage1_inplace,
+          "Grouped INT4 Stage 1 inplace with 3D strided layout");
+    m.def("grouped_int4_moe_stage2_inplace", &grouped_int4_moe_stage2_inplace,
+          "Grouped INT4 Stage 2 inplace with 3D strided layout");
+}
