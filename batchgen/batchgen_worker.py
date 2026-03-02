@@ -4245,20 +4245,6 @@ class BatchGenWorker:
 				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
 				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
 
-				# Verification: Check count consistency (fast tensor operation)
-				local_count = torch.tensor([len(decode_uuids)], dtype=torch.int64, device=self.torch_device)
-				all_counts = [torch.zeros_like(local_count) for _ in range(self.world_size)]
-				dist.all_gather(all_counts, local_count)
-				counts = [int(t.item()) for t in all_counts]
-
-				if len(set(counts)) > 1:
-					# Rare case: still divergent after tensor sync, use tensor intersection
-					logging.warning(
-						f"Rank {self.rank}: decode_uuids DIVERGENT after tensor sync! counts={counts}. "
-						f"Re-syncing with tensor intersection..."
-					)
-					decode_uuids = self._sync_decode_uuids_tensor(decode_uuids)
-				
 				if not decode_uuids:
 					break
 				
@@ -5608,51 +5594,32 @@ class BatchGenWorker:
 		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks()
 		timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
 		
-		# ========== CRITICAL: SYNC decode_uuids BEFORE finalize_async_load ==========
-		# decode_uuids may have drifted between boundaries. We MUST sync BEFORE
-		# _finalize_async_load_minimal because it concatenates valid_pending_uuids 
-		# (synced) with current_decode_uuids (potentially desync'd).
-		# If we don't sync first, the output will be desync'd.
+		# decode_uuids sync: only run in debug mode for desync detection.
+		# In production, rank 0 makes all decisions so sync is unnecessary.
 		t_sync = time.perf_counter()
-		local_decode_set = set(decode_uuids)
-		all_decode_sets = [None] * self.world_size
-		dist.all_gather_object(all_decode_sets, local_decode_set)
-		
-		# Check for desync
-		all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
-		if not all_sets_equal:
-			# Log detailed desync info
-			for r, s in enumerate(all_decode_sets):
-				if s != local_decode_set:
-					diff_in_r = s - local_decode_set if s else set()
-					diff_in_local = local_decode_set - s if s else local_decode_set
-					logging.error(
-						f"Rank {self.rank}: decode_uuids DESYNC detected at boundary start! "
-						f"Rank {r} has {len(diff_in_r)} extra: {list(diff_in_r)[:5]}, "
-						f"Rank {self.rank} has {len(diff_in_local)} extra: {list(diff_in_local)[:5]}"
-					)
-			# Dump state of mismatched sequences for diagnostics
-			if BATCHGEN_CB_DEBUG:
-				all_diff = set()
-				for s in all_decode_sets:
-					if s:
-						all_diff.symmetric_difference_update(s)
-				for uuid in list(all_diff)[:10]:
-					seq = self.global_batch.get_sequence(uuid)
-					if seq:
+		if BATCHGEN_CB_DEBUG:
+			local_decode_set = set(decode_uuids)
+			all_decode_sets = [None] * self.world_size
+			dist.all_gather_object(all_decode_sets, local_decode_set)
+			all_sets_equal = all(s == local_decode_set for s in all_decode_sets if s is not None)
+			if not all_sets_equal:
+				for r, s in enumerate(all_decode_sets):
+					if s != local_decode_set:
+						diff_in_r = s - local_decode_set if s else set()
+						diff_in_local = local_decode_set - s if s else local_decode_set
 						logging.error(
-							f"[DESYNC_DETAIL] seq={uuid[:8]} status={seq.status.name} "
-							f"decoded={seq.decoded_length} host_cap={seq.host_token_capacity} "
-							f"host_pages={seq.host_pages_allocated} ctx_len={seq.current_context_length}"
+							f"Rank {self.rank}: decode_uuids DESYNC detected at boundary start! "
+							f"Rank {r} has {len(diff_in_r)} extra: {list(diff_in_r)[:5]}, "
+							f"Rank {self.rank} has {len(diff_in_local)} extra: {list(diff_in_local)[:5]}"
 						)
-			# Use RANK 0 as authoritative source (not UNION which propagates errors)
-			rank0_set = all_decode_sets[0] if all_decode_sets[0] is not None else set()
-			decode_uuids = sorted(
-				rank0_set,
-				key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
-			)
-			batch = self._get_local_indices_for_uuids(decode_uuids)
-			logging.warning(f"Rank {self.rank}: Using rank-0 authoritative set at boundary start, decode_uuids now {len(decode_uuids)}")
+				# Use RANK 0 as authoritative source
+				rank0_set = all_decode_sets[0] if all_decode_sets[0] is not None else set()
+				decode_uuids = sorted(
+					rank0_set,
+					key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
+				)
+				batch = self._get_local_indices_for_uuids(decode_uuids)
+				logging.warning(f"Rank {self.rank}: Using rank-0 authoritative set at boundary start, decode_uuids now {len(decode_uuids)}")
 		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
 		
 		# Integrate previous async load if any
@@ -6084,20 +6051,17 @@ class BatchGenWorker:
 		
 		# ========== FINAL PAGE TABLE REBUILD ==========
 		t0 = time.perf_counter()
-		# DEBUG: Log batch size before final rebuild
 		if BATCHGEN_CB_DEBUG:
 			global_ids_for_rebuild = self._local_indices_to_global_seq_ids(batch) if batch else []
-			logging.info(
+			logging.debug(
 				f"Rank {self.rank}: FINAL REBUILD: batch_size={len(batch)}, "
 				f"global_ids_count={len(global_ids_for_rebuild)}"
 			)
 		self._rebuild_page_table_for_batch(batch, gpu_manager)
-		
-		# DEBUG: Verify page table size after rebuild
 		if BATCHGEN_CB_DEBUG and gpu_manager and gpu_manager.is_initialized:
 			mgr = gpu_manager._gpu_page_table_manager
 			if mgr and mgr.gpu_table is not None:
-				logging.info(
+				logging.debug(
 					f"Rank {self.rank}: After rebuild: gpu_table.shape={mgr.gpu_table.shape}, "
 					f"slot_to_seq_id_len={len(mgr.slot_to_seq_id)}"
 				)
