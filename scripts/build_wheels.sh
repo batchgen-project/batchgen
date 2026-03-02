@@ -130,7 +130,7 @@ if [[ $ONLY_KERNELS -eq 0 && $SKIP_FLASHMLA -eq 0 ]]; then
         "https://github.com/deepseek-ai/FlashMLA.git" \
         "$FLASHMLA_COMMIT"
     cd "$DEPS_DIR/FlashMLA"
-    pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
+    FLASH_MLA_DISABLE_SM100=1 pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
     ok "FlashMLA wheel built"
 else
     warn "Skipping FlashMLA"

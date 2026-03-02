@@ -174,7 +174,7 @@ install_flashmla() {
     fi
 
     print_step "Installing FlashMLA from git (this may take 5-10 minutes)..."
-    pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
+    FLASH_MLA_DISABLE_SM100=1 pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
 
     print_success "FlashMLA installed"
 }

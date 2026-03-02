@@ -118,7 +118,7 @@ if [[ $BUILD_WHEELS -eq 1 ]]; then
         git clone --recursive https://github.com/deepseek-ai/FlashMLA.git
     fi
     cd FlashMLA && git checkout "$FLASHMLA_COMMIT" && git submodule update --init --recursive
-    pip wheel . --no-build-isolation -w "$WHEEL_DIR"
+    FLASH_MLA_DISABLE_SM100=1 pip wheel . --no-build-isolation -w "$WHEEL_DIR"
     ok "FlashMLA wheel built"
 
     # DeepGEMM
@@ -245,7 +245,7 @@ else
 
     # FlashMLA
     step "Building FlashMLA..."
-    pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
+    FLASH_MLA_DISABLE_SM100=1 pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
     ok "FlashMLA installed"
 
     # DeepGEMM
