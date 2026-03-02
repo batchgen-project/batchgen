@@ -203,7 +203,7 @@ setup(
                 "src/moe/mgn/expert_bin_count.cu",
                 "src/moe/mgn/rmsnorm.cu",
             ],
-            include_dirs=["src/moe/mgn"],
+            include_dirs=["src/moe/mgn", "3rd/cutlass/include"],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-std=c++17",
