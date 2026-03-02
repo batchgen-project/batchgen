@@ -179,6 +179,43 @@ std::int32_t HostKVPrefixCache::FindEdgeByFirstTokenLocked(
     return kHostKVInvalidIndex;
 }
 
+std::int32_t HostKVPrefixCache::FindExactPathNodeLocked(
+    const std::int32_t* tokens, std::size_t token_count) const {
+    if (tokens == nullptr) {
+        return kHostKVInvalidIndex;
+    }
+
+    std::int32_t node_idx = 0;
+    std::size_t pos = 0;
+    while (pos < token_count) {
+        const std::int32_t edge_idx =
+            FindEdgeByFirstTokenLocked(node_idx, tokens[pos]);
+        if (edge_idx == kHostKVInvalidIndex) {
+            return kHostKVInvalidIndex;
+        }
+
+        const HostKVRadixEdge& edge = radix_edges_[edge_idx];
+        const std::size_t remaining = token_count - pos;
+        if (remaining < edge.label_len) {
+            return kHostKVInvalidIndex;
+        }
+
+        std::size_t common = 0;
+        while (common < edge.label_len &&
+               edge.label_tokens[common] == tokens[pos + common]) {
+            ++common;
+        }
+        if (common != edge.label_len) {
+            return kHostKVInvalidIndex;
+        }
+
+        pos += common;
+        node_idx = edge.child_node;
+    }
+
+    return node_idx;
+}
+
 std::int32_t HostKVPrefixCache::AppendTokenPathLocked(std::int32_t start_node,
                                                        const std::int32_t* tokens,
                                                        std::size_t token_count) {
@@ -525,6 +562,17 @@ bool HostKVPrefixCache::CommitPrefixLocked(const std::int32_t* tokens,
     if (!params_.enable_prefix_reuse || tokens == nullptr || token_count == 0 ||
         pages.size() < params_.prefix_min_store_pages) {
         return false;
+    }
+
+    const std::int32_t existing_terminal_node =
+        FindExactPathNodeLocked(tokens, token_count);
+    if (existing_terminal_node != kHostKVInvalidIndex) {
+        const std::int32_t existing_entry_idx =
+            radix_nodes_[existing_terminal_node].terminal_entry;
+        if (existing_entry_idx != kHostKVInvalidIndex) {
+            TouchPrefixEntryLocked(existing_entry_idx);
+            return true;
+        }
     }
 
     const std::size_t max_needed_nodes =

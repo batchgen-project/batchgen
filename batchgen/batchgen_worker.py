@@ -976,6 +976,8 @@ class BatchGenWorker:
 		# Build sequence info
 		sequence_ids = []
 		sequence_lengths = []
+		decode_token_ids = []
+		has_decode_tokens = True
 		
 		# DIAGNOSTIC: Track host KV append positions for debugging
 		append_diag = []
@@ -987,6 +989,14 @@ class BatchGenWorker:
 			# Write position is current position (0-indexed)
 			write_pos = seq.current_context_length - 1
 			sequence_lengths.append(write_pos)
+			if (
+				seq.input_ids is None
+				or write_pos < 0
+				or write_pos >= seq.input_ids.shape[1]
+			):
+				has_decode_tokens = False
+			else:
+				decode_token_ids.append(int(seq.input_ids[0, write_pos].item()))
 			
 			# Track for debugging (only first few sequences)
 			if len(append_diag) < 3 and seq.decoded_length > 1:
@@ -1039,12 +1049,14 @@ class BatchGenWorker:
 		self._kv_offload_event.synchronize()
 		
 		# Launch async append
+		decode_token_ids_arg = decode_token_ids if has_decode_tokens else None
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
 			k_tensor=k_tensor,
 			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
 			sequence_lengths=sequence_lengths,
+			decode_token_ids=decode_token_ids_arg,
 		)
 
 		# CRITICAL FIX: Store tensor references alongside task to prevent GC
@@ -6761,12 +6773,23 @@ class BatchGenWorker:
 		
 		sequence_ids = []
 		sequence_lengths = []
+		decode_token_ids = []
+		has_decode_tokens = True
 		
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			sequence_ids.append(seq.global_idx)
-			sequence_lengths.append(seq.current_context_length - 1)
+			write_pos = seq.current_context_length - 1
+			sequence_lengths.append(write_pos)
+			if (
+				seq.input_ids is None
+				or write_pos < 0
+				or write_pos >= seq.input_ids.shape[1]
+			):
+				has_decode_tokens = False
+			else:
+				decode_token_ids.append(int(seq.input_ids[0, write_pos].item()))
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
@@ -6805,12 +6828,14 @@ class BatchGenWorker:
 		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
 		self._kv_offload_event.synchronize()
 		
+		decode_token_ids_arg = decode_token_ids if has_decode_tokens else None
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
 			k_tensor=k_tensor,
 			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
 			sequence_lengths=sequence_lengths,
+			decode_token_ids=decode_token_ids_arg,
 		)
 
 		# CRITICAL FIX: Store tensor references alongside task to prevent GC

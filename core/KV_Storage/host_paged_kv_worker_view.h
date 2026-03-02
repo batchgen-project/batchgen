@@ -303,7 +303,6 @@ class HostPagedKVWorkerView {
                               std::vector<std::int32_t>(
                                   flat_prompt_tokens.begin() + begin,
                                   flat_prompt_tokens.begin() + end),
-                              end - begin,
                               alloc_result.reused_prefix_tokens[i]);
         }
 
@@ -1050,7 +1049,9 @@ class HostPagedKVWorkerView {
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths sequence_lengths) {
+        SequenceLengths sequence_lengths,
+        std::optional<std::vector<std::int32_t>> decode_token_ids =
+            std::nullopt) {
         geometry_.EnsureLayerBounds(layer_idx, "AsyncAppendDecodeKVToHost");
         EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
@@ -1061,6 +1062,12 @@ class HostPagedKVWorkerView {
             ValidateKTensorShape(k_tensor, batch);
         ValidateSequenceLengthsInput(sequence_lengths, batch,
                                      "AsyncAppendDecodeKVToHost");
+        if (decode_token_ids.has_value() &&
+            decode_token_ids->size() != batch) {
+            throw std::invalid_argument(
+                "AsyncAppendDecodeKVToHost: decode_token_ids size must match "
+                "sequence_ids size");
+        }
         torch::Tensor prepared_k = k_tensor;
         std::optional<torch::Tensor> prepared_v;
         if (v_tensor.has_value()) {
@@ -1082,7 +1089,9 @@ class HostPagedKVWorkerView {
         return LaunchAsyncTask([this, layer_idx,
                                 sequence_ids = std::move(sequence_ids),
                                 sequence_lengths = std::move(sequence_lengths),
-                                prepared_k, prepared_v]() mutable {
+                                prepared_k, prepared_v,
+                                decode_token_ids = std::move(decode_token_ids)]()
+                                   mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
 
@@ -1142,6 +1151,11 @@ class HostPagedKVWorkerView {
             }
 
             this->SynchronizeWithEvent(cuda_stream);
+            if (decode_token_ids.has_value() &&
+                layer_idx + 1 == config_.num_layers) {
+                this->AppendDecodeTokens(sequence_ids, *decode_token_ids);
+            }
+            this->MaybeCommitPrefix(layer_idx, sequence_ids);
         });
     }
 
@@ -1297,25 +1311,42 @@ class HostPagedKVWorkerView {
     }
 
     struct PrefixSequenceState {
-        std::vector<std::int32_t> prompt_tokens;
-        std::size_t prompt_token_count = 0;
+        std::vector<std::int32_t> tokens;
         std::size_t reused_prefix_tokens = 0;
-        bool committed = false;
+        std::size_t committed_token_count = 0;
     };
 
     void UpdatePrefixState(std::int64_t sequence_id,
                            std::vector<std::int32_t> prompt_tokens,
-                           std::size_t prompt_token_count,
                            std::size_t reused_prefix_tokens) {
         if (!config_.enable_prefix_reuse) {
             return;
         }
         std::lock_guard<std::mutex> guard(prefix_state_mutex_);
         auto& state = prefix_states_[sequence_id];
-        state.prompt_tokens = std::move(prompt_tokens);
-        state.prompt_token_count = prompt_token_count;
+        state.tokens = std::move(prompt_tokens);
         state.reused_prefix_tokens = reused_prefix_tokens;
-        state.committed = false;
+        state.committed_token_count = 0;
+    }
+
+    void AppendDecodeTokens(const std::vector<std::int64_t>& sequence_ids,
+                            const std::vector<std::int32_t>& decode_token_ids) {
+        if (!config_.enable_prefix_reuse) {
+            return;
+        }
+        if (sequence_ids.size() != decode_token_ids.size()) {
+            throw std::invalid_argument(
+                "AppendDecodeTokens: decode_token_ids size must match "
+                "sequence_ids size");
+        }
+        std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            auto it = prefix_states_.find(sequence_ids[i]);
+            if (it == prefix_states_.end()) {
+                continue;
+            }
+            it->second.tokens.push_back(decode_token_ids[i]);
+        }
     }
 
     std::size_t PrefixTokensToSkip(std::int64_t sequence_id) const {
@@ -1336,13 +1367,13 @@ class HostPagedKVWorkerView {
             return;
         }
 
-        struct PrefixCommitItem {
+        struct CacheCommitItem {
             std::int64_t sequence_id = 0;
-            std::vector<std::int32_t> prompt_tokens;
-            std::size_t prompt_token_count = 0;
+            std::vector<std::int32_t> tokens;
+            std::size_t token_count = 0;
         };
 
-        std::vector<PrefixCommitItem> commit_items;
+        std::vector<CacheCommitItem> commit_items;
         {
             std::lock_guard<std::mutex> guard(prefix_state_mutex_);
             for (std::int64_t sequence_id : sequence_ids) {
@@ -1350,19 +1381,26 @@ class HostPagedKVWorkerView {
                 if (it == prefix_states_.end()) {
                     continue;
                 }
-                if (it->second.committed) {
+                const std::size_t token_count = it->second.tokens.size();
+                const std::size_t full_prompt_pages =
+                    token_count / config_.page_size_tokens;
+                if (full_prompt_pages < config_.prefix_min_store_pages) {
+                    continue;
+                }
+                const std::size_t full_page_token_count =
+                    full_prompt_pages * config_.page_size_tokens;
+                if (full_page_token_count <= it->second.committed_token_count) {
                     continue;
                 }
                 commit_items.push_back(
-                    {sequence_id, it->second.prompt_tokens,
-                     it->second.prompt_token_count});
-                it->second.committed = true;
+                    {sequence_id, it->second.tokens, full_page_token_count});
+                it->second.committed_token_count = full_page_token_count;
             }
         }
 
         for (const auto& item : commit_items) {
-            backend_.CommitSequencePrefix(item.sequence_id, item.prompt_tokens,
-                                          item.prompt_token_count);
+            backend_.CommitSequencePrefix(item.sequence_id, item.tokens,
+                                          item.token_count);
         }
     }
 

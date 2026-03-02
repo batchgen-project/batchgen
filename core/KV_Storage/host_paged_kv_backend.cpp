@@ -285,7 +285,8 @@ struct HostPagedKVBackend::SharedState {
     std::size_t HashSequenceId(std::int64_t sequence_id) const;
     SequenceEntry* FindSequenceEntryLocked(std::int64_t sequence_id) const;
     SequenceEntry* FindOrInsertSequenceEntryLocked(std::int64_t sequence_id,
-                                                   bool* is_new);
+                                                   bool* is_new,
+                                                   std::int64_t* previous_marker);
 
     std::int32_t PopStackIndexLocked(std::int32_t* stack,
                                      std::atomic<std::uint32_t>* top,
@@ -633,7 +634,7 @@ SequenceEntry* HostPagedKVBackend::SharedState::FindSequenceEntryLocked(
 }
 
 SequenceEntry* HostPagedKVBackend::SharedState::FindOrInsertSequenceEntryLocked(
-    std::int64_t sequence_id, bool* is_new) {
+    std::int64_t sequence_id, bool* is_new, std::int64_t* previous_marker) {
     std::size_t index = HashSequenceId(sequence_id);
     SequenceEntry* first_tombstone = nullptr;
     for (std::size_t probe = 0; probe < sequence_capacity; ++probe) {
@@ -642,11 +643,17 @@ SequenceEntry* HostPagedKVBackend::SharedState::FindOrInsertSequenceEntryLocked(
             if (is_new != nullptr) {
                 *is_new = false;
             }
+            if (previous_marker != nullptr) {
+                *previous_marker = sequence_id;
+            }
             return entry;
         }
         if (entry->sequence_id == kEmptySequenceId) {
             SequenceEntry* target =
                 first_tombstone != nullptr ? first_tombstone : entry;
+            if (previous_marker != nullptr) {
+                *previous_marker = target->sequence_id;
+            }
             *target = SequenceEntry();
             target->sequence_id = sequence_id;
             if (is_new != nullptr) {
@@ -905,7 +912,8 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
     }
 
     bool is_new = false;
-    SequenceEntry* entry = FindOrInsertSequenceEntryLocked(sequence_id, &is_new);
+    SequenceEntry* entry =
+        FindOrInsertSequenceEntryLocked(sequence_id, &is_new, nullptr);
     if (is_new) {
         header->active_sequences.fetch_add(1, std::memory_order_relaxed);
     }
@@ -943,74 +951,148 @@ HostPagedKVBackend::SharedState::AcquirePagesForSequencesWithPrefix(
     result.allocated_pages.resize(sequence_ids.size());
     result.reused_prefix_tokens.resize(sequence_ids.size(), 0);
 
-    for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
-        const std::size_t begin = prompt_offsets[i];
-        const std::size_t end = prompt_offsets[i + 1];
-        if (begin > end || end > flat_prompt_tokens.size()) {
-            throw std::invalid_argument("prompt_offsets contain invalid slice");
+    struct SequenceRollbackRecord {
+        SequenceEntry* entry = nullptr;
+        std::int64_t previous_marker = kEmptySequenceId;
+        std::uint32_t previous_num_pages = 0;
+        std::int32_t previous_head_node = kInvalidIndex;
+        std::int32_t previous_tail_node = kInvalidIndex;
+        bool was_new = false;
+    };
+
+    ScopedMutexLock lock(&header->metadata_mutex);
+    std::vector<SequenceRollbackRecord> rollback_records;
+    rollback_records.reserve(sequence_ids.size());
+
+    try {
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            const std::size_t begin = prompt_offsets[i];
+            const std::size_t end = prompt_offsets[i + 1];
+            if (begin > end || end > flat_prompt_tokens.size()) {
+                throw std::invalid_argument("prompt_offsets contain invalid slice");
+            }
+            if (num_tokens[i] == 0) {
+                throw std::invalid_argument("num_tokens entries must be > 0");
+            }
+
+            const std::size_t required_pages =
+                (num_tokens[i] + config.page_size_tokens - 1) /
+                config.page_size_tokens;
+            const std::size_t prompt_tokens = end - begin;
+            const std::size_t prompt_full_pages =
+                std::min(required_pages, prompt_tokens / config.page_size_tokens);
+
+            std::size_t reused_pages = 0;
+            std::vector<std::int32_t> reused_page_candidates;
+            if (config.enable_prefix_reuse && prompt_full_pages > 0) {
+                auto lookup = prefix_cache_.LookupPrefixPagesLocked(
+                    flat_prompt_tokens.data() + begin,
+                    prompt_full_pages * config.page_size_tokens,
+                    prompt_full_pages);
+                reused_pages =
+                    std::min<std::size_t>(lookup.reused_pages, prompt_full_pages);
+                reused_page_candidates = std::move(lookup.pages);
+                if (reused_page_candidates.size() < reused_pages) {
+                    throw std::runtime_error(
+                        "Prefix lookup returned fewer pages than expected");
+                }
+            }
+
+            const std::size_t new_pages = required_pages - reused_pages;
+            if (header->free_stack_top.load(std::memory_order_relaxed) <
+                new_pages) {
+                throw std::runtime_error(
+                    "Insufficient free pages for prefix-aware allocation of "
+                    "sequence " +
+                    std::to_string(sequence_ids[i]));
+            }
+            if (header->seq_page_node_free_top.load(std::memory_order_relaxed) <
+                required_pages) {
+                throw std::runtime_error(
+                    "Insufficient sequence page nodes for prefix-aware allocation");
+            }
+
+            bool is_new = false;
+            std::int64_t previous_marker = kEmptySequenceId;
+            SequenceEntry* entry = FindOrInsertSequenceEntryLocked(
+                sequence_ids[i], &is_new, &previous_marker);
+
+            SequenceRollbackRecord rollback_record;
+            rollback_record.entry = entry;
+            rollback_record.previous_marker = previous_marker;
+            rollback_record.previous_num_pages = entry->num_pages;
+            rollback_record.previous_head_node = entry->head_node;
+            rollback_record.previous_tail_node = entry->tail_node;
+            rollback_record.was_new = is_new;
+            rollback_records.push_back(rollback_record);
+
+            if (is_new) {
+                header->active_sequences.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            std::vector<std::int32_t> pages;
+            pages.reserve(required_pages);
+
+            for (std::size_t j = 0; j < reused_pages; ++j) {
+                const std::int32_t page_idx = reused_page_candidates[j];
+                IncrementPageRefLocked(page_idx);
+                AppendPageToSequenceLocked(entry, page_idx);
+                pages.push_back(page_idx);
+            }
+
+            for (std::size_t j = 0; j < new_pages; ++j) {
+                const std::int32_t page_idx = PopFreePageLocked();
+                IncrementPageRefLocked(page_idx);
+                AppendPageToSequenceLocked(entry, page_idx);
+                pages.push_back(page_idx);
+            }
+
+            result.allocated_pages[i] = std::move(pages);
+            result.reused_prefix_tokens[i] = reused_pages * config.page_size_tokens;
         }
-        if (num_tokens[i] == 0) {
-            throw std::invalid_argument("num_tokens entries must be > 0");
+    } catch (...) {
+        for (auto it = rollback_records.rbegin(); it != rollback_records.rend();
+             ++it) {
+            SequenceRollbackRecord& record = *it;
+            SequenceEntry* entry = record.entry;
+            if (entry == nullptr) {
+                continue;
+            }
+
+            std::int32_t first_added_node = kInvalidIndex;
+            if (entry->num_pages > record.previous_num_pages) {
+                if (record.previous_num_pages == 0) {
+                    first_added_node = entry->head_node;
+                } else {
+                    first_added_node =
+                        seq_page_nodes[record.previous_tail_node].next_node;
+                }
+            }
+
+            std::int32_t node_idx = first_added_node;
+            while (node_idx != kInvalidIndex) {
+                const std::int32_t next_node = seq_page_nodes[node_idx].next_node;
+                const std::int32_t page_idx = seq_page_nodes[node_idx].page_idx;
+                DecrementPageRefLocked(page_idx);
+                FreeSeqPageNodeLocked(node_idx);
+                node_idx = next_node;
+            }
+
+            if (record.previous_tail_node != kInvalidIndex) {
+                seq_page_nodes[record.previous_tail_node].next_node =
+                    kInvalidIndex;
+            }
+
+            entry->num_pages = record.previous_num_pages;
+            entry->head_node = record.previous_head_node;
+            entry->tail_node = record.previous_tail_node;
+            entry->sequence_id = record.previous_marker;
+
+            if (record.was_new) {
+                header->active_sequences.fetch_sub(1, std::memory_order_relaxed);
+            }
         }
-
-        const std::size_t required_pages =
-            (num_tokens[i] + config.page_size_tokens - 1) / config.page_size_tokens;
-        const std::size_t prompt_tokens = end - begin;
-        const std::size_t prompt_full_pages =
-            std::min(required_pages, prompt_tokens / config.page_size_tokens);
-
-        if (!config.enable_prefix_reuse || prompt_full_pages == 0) {
-            result.allocated_pages[i] = AcquirePages(sequence_ids[i], required_pages);
-            continue;
-        }
-
-        std::vector<std::int32_t> pages;
-        pages.reserve(required_pages);
-
-        ScopedMutexLock lock(&header->metadata_mutex);
-
-        const auto lookup = prefix_cache_.LookupPrefixPagesLocked(
-            flat_prompt_tokens.data() + begin,
-            prompt_full_pages * config.page_size_tokens, prompt_full_pages);
-
-        const std::size_t reused_pages = std::min<std::size_t>(
-            lookup.reused_pages, prompt_full_pages);
-        const std::size_t new_pages = required_pages - reused_pages;
-
-        if (header->free_stack_top.load(std::memory_order_relaxed) < new_pages) {
-            throw std::runtime_error(
-                "Insufficient free pages for prefix-aware allocation of sequence " +
-                std::to_string(sequence_ids[i]));
-        }
-        if (header->seq_page_node_free_top.load(std::memory_order_relaxed) <
-            required_pages) {
-            throw std::runtime_error(
-                "Insufficient sequence page nodes for prefix-aware allocation");
-        }
-
-        bool is_new = false;
-        SequenceEntry* entry =
-            FindOrInsertSequenceEntryLocked(sequence_ids[i], &is_new);
-        if (is_new) {
-            header->active_sequences.fetch_add(1, std::memory_order_relaxed);
-        }
-
-        for (std::size_t j = 0; j < reused_pages; ++j) {
-            const std::int32_t page_idx = lookup.pages[j];
-            IncrementPageRefLocked(page_idx);
-            AppendPageToSequenceLocked(entry, page_idx);
-            pages.push_back(page_idx);
-        }
-
-        for (std::size_t j = 0; j < new_pages; ++j) {
-            const std::int32_t page_idx = PopFreePageLocked();
-            IncrementPageRefLocked(page_idx);
-            AppendPageToSequenceLocked(entry, page_idx);
-            pages.push_back(page_idx);
-        }
-
-        result.allocated_pages[i] = std::move(pages);
-        result.reused_prefix_tokens[i] = reused_pages * config.page_size_tokens;
+        throw;
     }
 
     return result;
@@ -1101,7 +1183,7 @@ HostPagedKVStats HostPagedKVBackend::SharedState::CollectStats() const {
         header->prefix_miss_count.load(std::memory_order_relaxed);
     stats.num_prefix_evictions =
         header->prefix_evict_count.load(std::memory_order_relaxed);
-    stats.num_prefix_pinned_pages =
+    stats.num_cache_entry_pages =
         header->prefix_used_pages.load(std::memory_order_relaxed);
 
     std::size_t shared_pages = 0;

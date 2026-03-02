@@ -24,7 +24,7 @@ struct HostPagedKVStats {
     std::size_t num_prefix_hits = 0;
     std::size_t num_prefix_misses = 0;
     std::size_t num_prefix_evictions = 0;
-    std::size_t num_prefix_pinned_pages = 0;
+    std::size_t num_cache_entry_pages = 0;
     std::size_t num_shared_pages = 0;
 };
 
@@ -130,7 +130,8 @@ inline HostPagedKVConfig SanitizeConfig(HostPagedKVConfig config) {
             std::max<std::size_t>(1024, config.num_pages / 64);
     }
     if (config.prefix_page_budget == 0) {
-        config.prefix_page_budget = std::max<std::size_t>(64, config.num_pages / 4);
+        config.prefix_page_budget =
+            std::max<std::size_t>(128, config.num_pages / 2);
     }
     if (config.prefix_page_ref_capacity == 0) {
         config.prefix_page_ref_capacity = std::max<std::size_t>(
@@ -197,7 +198,7 @@ inline std::string ToString(const HostPagedKVStats& stats) {
         << ", prefix_hits=" << stats.num_prefix_hits
         << ", prefix_misses=" << stats.num_prefix_misses
         << ", prefix_evictions=" << stats.num_prefix_evictions
-        << ", prefix_pinned_pages=" << stats.num_prefix_pinned_pages
+        << ", cache_entry_pages=" << stats.num_cache_entry_pages
         << ", shared_pages=" << stats.num_shared_pages << ")";
     return oss.str();
 }

@@ -374,7 +374,8 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            &WorkerView::AsyncAppendDecodeKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
-           py::arg("sequence_lengths"))
+           py::arg("sequence_lengths"),
+           py::arg("decode_token_ids") = py::none())
         .def(
             "async_load_layer_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,
@@ -622,8 +623,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPagedKVStats::num_prefix_misses)
         .def_readwrite("num_prefix_evictions",
                        &kv::HostPagedKVStats::num_prefix_evictions)
-        .def_readwrite("num_prefix_pinned_pages",
-                       &kv::HostPagedKVStats::num_prefix_pinned_pages)
+        .def_readwrite("num_cache_entry_pages",
+                       &kv::HostPagedKVStats::num_cache_entry_pages)
         .def_readwrite("num_shared_pages",
                        &kv::HostPagedKVStats::num_shared_pages)
         .def("__repr__",

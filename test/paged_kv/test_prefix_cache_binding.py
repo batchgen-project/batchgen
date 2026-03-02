@@ -98,3 +98,40 @@ def test_prefix_cache_harness_lru_evict_releases_page_refs() -> None:
     pages, reused = cache.lookup(tokens_b, 2)
     assert pages == [2, 3]
     assert reused == 2
+
+
+def test_prefix_cache_harness_supports_decode_extension_commit() -> None:
+    cache = _make_prefix_cache(prefix_min_store_pages=1, prefix_page_budget=16)
+    prompt_tokens = [3000 + i for i in range(64)]
+    decode_tokens = [4000 + i for i in range(64)]
+
+    assert cache.commit(prompt_tokens, [9]) is True
+    assert cache.commit(prompt_tokens + decode_tokens, [9, 10]) is True
+
+    pages, reused = cache.lookup(prompt_tokens, 1)
+    assert pages == [9]
+    assert reused == 1
+
+    pages, reused = cache.lookup(prompt_tokens + decode_tokens, 2)
+    assert pages == [9, 10]
+    assert reused == 2
+
+
+def test_prefix_cache_harness_duplicate_commit_avoids_spurious_evict() -> None:
+    cache = _make_prefix_cache(num_pages=8, prefix_page_budget=2)
+    tokens = [5000 + i for i in range(128)]
+
+    assert cache.commit(tokens, [0, 1]) is True
+    stats_before = cache.get_stats()
+    assert stats_before.prefix_entry_count == 1
+    assert stats_before.prefix_evict_count == 0
+    assert cache.page_refcount(0) == 1
+    assert cache.page_refcount(1) == 1
+
+    # Re-committing the exact same prefix should only touch recency metadata.
+    assert cache.commit(tokens, [0, 1]) is True
+    stats_after = cache.get_stats()
+    assert stats_after.prefix_entry_count == 1
+    assert stats_after.prefix_evict_count == 0
+    assert cache.page_refcount(0) == 1
+    assert cache.page_refcount(1) == 1

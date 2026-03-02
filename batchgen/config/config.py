@@ -179,12 +179,42 @@ class HostPagedKVConfig:
     enable_prefix_reuse: bool = False
     prefix_min_reuse_pages: int = 1
     prefix_min_store_pages: int = 2
+    # Capacity knobs for prefix cache internals.
+    # 0 means "auto": values are derived from num_pages_per_layer at runtime.
     sequence_page_node_capacity: int = 0
     radix_node_capacity: int = 0
     radix_edge_capacity: int = 0
     prefix_entry_capacity: int = 0
     prefix_page_ref_capacity: int = 0
     prefix_page_budget: int = 0
+
+    def __post_init__(self) -> None:
+        self.apply_runtime_defaults()
+
+    def apply_runtime_defaults(self) -> None:
+        """Fill auto (0) capacity fields using num_pages_per_layer."""
+        num_pages = max(int(self.num_pages_per_layer), 0)
+        if num_pages == 0:
+            return
+
+        if self.sequence_page_node_capacity <= 0:
+            self.sequence_page_node_capacity = max(num_pages, num_pages * 4)
+        if self.radix_node_capacity <= 0:
+            self.radix_node_capacity = max(4096, num_pages // 2)
+        if self.radix_edge_capacity <= 0:
+            self.radix_edge_capacity = max(
+                self.radix_node_capacity * 2,
+                self.radix_node_capacity + 1,
+            )
+        if self.prefix_entry_capacity <= 0:
+            self.prefix_entry_capacity = max(1024, num_pages // 64)
+        if self.prefix_page_budget <= 0:
+            self.prefix_page_budget = max(128, num_pages // 2)
+        if self.prefix_page_ref_capacity <= 0:
+            self.prefix_page_ref_capacity = max(
+                num_pages,
+                self.prefix_entry_capacity * 8,
+            )
 
 @dataclass
 class DevicePagedKVConfig:

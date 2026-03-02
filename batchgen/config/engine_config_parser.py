@@ -209,6 +209,7 @@ def _parse_host_paged_kv_config(
         if key not in valid_fields:
             raise ValueError(f"Unknown key in Host_Paged_KV_Config: {key}")
         setattr(host_config, key, value)
+    host_config.apply_runtime_defaults()
 
 
 def _parse_device_paged_kv_config(

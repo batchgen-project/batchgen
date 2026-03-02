@@ -27,13 +27,13 @@ def _shm_unlink(name: str) -> None:
 
 
 def _make_mla_config(
-    shm_name: str, enable_prefix_reuse: bool
+    shm_name: str, enable_prefix_reuse: bool, page_size_tokens: int = 64
 ) -> bg.HostPagedKVConfig:  # type: ignore
     cfg = bg.HostPagedKVConfig()
     cfg.shm_name = shm_name
     cfg.num_layers = 1
     cfg.num_pages = 512
-    cfg.page_size_tokens = 64
+    cfg.page_size_tokens = page_size_tokens
     cfg.num_k_heads = 1
     cfg.k_head_dim = 576
     cfg.num_v_heads = 0
@@ -138,6 +138,115 @@ def test_prefix_reuse_hits_after_commit() -> None:
         assert stats.num_shared_pages >= 1
 
         worker.release_sequence_pages([202])
+    finally:
+        worker.shutdown()
+        del worker
+        _shm_unlink(shm_name)
+
+
+def test_prefix_reuse_includes_decode_tokens() -> None:
+    if not torch.cuda.is_available():
+        raise SkipTest("CUDA is not available")
+
+    shm_name = _random_shm_name()
+    cfg = _make_mla_config(
+        shm_name, enable_prefix_reuse=True, page_size_tokens=8
+    )
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+
+    try:
+        worker.initialize(device_index=0, create_region=True)
+
+        prompt_tokens = [100 + i for i in range(cfg.page_size_tokens)]
+        decode_tokens = [200 + i for i in range(cfg.page_size_tokens)]
+        full_tokens = prompt_tokens + decode_tokens
+
+        worker.register_sequences([301])
+        pages_1, reused_1 = worker.allocate_pages_for_sequences_with_prefix(
+            [(301, len(full_tokens))], prompt_tokens, [0, len(prompt_tokens)]
+        )
+        assert reused_1 == [0]
+        assert len(pages_1[0]) == 2
+
+        prefill_k = torch.full(
+            (1, len(prompt_tokens), cfg.num_k_heads, cfg.k_head_dim),
+            fill_value=1.0,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        worker.async_offload_layer_kv_to_host(
+            layer_idx=0,
+            sequence_ids=[301],
+            k_tensor=prefill_k,
+            v_tensor=None,
+            sequence_lengths=[len(prompt_tokens)],
+        ).wait()
+
+        for step, token_id in enumerate(decode_tokens):
+            decode_k = torch.full(
+                (1, 1, cfg.num_k_heads, cfg.k_head_dim),
+                fill_value=2.0 + step,
+                dtype=torch.bfloat16,
+                device="cuda:0",
+            )
+            worker.async_append_decode_kv_to_host(
+                layer_idx=0,
+                sequence_ids=[301],
+                k_tensor=decode_k,
+                v_tensor=None,
+                sequence_lengths=[len(prompt_tokens) + step],
+                decode_token_ids=[token_id],
+            ).wait()
+
+        worker.release_sequence_pages([301])
+
+        worker.register_sequences([302])
+        pages_2, reused_2 = worker.allocate_pages_for_sequences_with_prefix(
+            [(302, len(full_tokens))], full_tokens, [0, len(full_tokens)]
+        )
+        assert len(pages_2[0]) == 2
+        assert reused_2 == [len(full_tokens)]
+
+        stats = worker.get_stats()
+        assert stats.num_prefix_hits >= 1
+        assert stats.num_shared_pages >= 1
+
+        worker.release_sequence_pages([302])
+    finally:
+        worker.shutdown()
+        del worker
+        _shm_unlink(shm_name)
+
+
+def test_prefix_batch_allocation_failure_rolls_back() -> None:
+    if not torch.cuda.is_available():
+        raise SkipTest("CUDA is not available")
+
+    shm_name = _random_shm_name()
+    cfg = _make_mla_config(shm_name, enable_prefix_reuse=True)
+    cfg.num_pages = 2
+    cfg.sequence_page_node_capacity = 16
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+
+    try:
+        worker.initialize(device_index=0, create_region=True)
+        worker.register_sequences([401, 402])
+
+        flat_prompt_tokens = list(range(128))
+        raised = False
+        try:
+            worker.allocate_pages_for_sequences_with_prefix(
+                [(401, 64), (402, 128)],
+                flat_prompt_tokens,
+                [0, 64, 128],
+            )
+        except RuntimeError:
+            raised = True
+        assert raised
+
+        stats = worker.get_stats()
+        assert stats.num_used_pages == 0
+        assert stats.num_active_sequences == 0
     finally:
         worker.shutdown()
         del worker

@@ -127,6 +127,8 @@ class HostKVPrefixCache {
 
     std::int32_t FindEdgeByFirstTokenLocked(std::int32_t node_idx,
                                             std::int32_t first_token) const;
+    std::int32_t FindExactPathNodeLocked(const std::int32_t* tokens,
+                                         std::size_t token_count) const;
     std::int32_t AppendTokenPathLocked(std::int32_t start_node,
                                        const std::int32_t* tokens,
                                        std::size_t token_count);

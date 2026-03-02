@@ -177,6 +177,32 @@ def _resolve_profile(model_name: str) -> _HostKVModelProfile:
 	return _PROFILE_REGISTRY[_PROFILE_ALIASES[alias]]
 
 
+def _apply_capacity_defaults(config: Any) -> None:
+	"""Populate HostPagedKVConfig capacity fields when they are zero."""
+	num_pages = int(config.num_pages)
+	if num_pages <= 0:
+		return
+
+	if int(config.sequence_page_node_capacity) <= 0:
+		config.sequence_page_node_capacity = max(num_pages, num_pages * 4)
+	if int(config.radix_node_capacity) <= 0:
+		config.radix_node_capacity = max(4096, num_pages // 2)
+	if int(config.radix_edge_capacity) <= 0:
+		config.radix_edge_capacity = max(
+			int(config.radix_node_capacity) * 2,
+			int(config.radix_node_capacity) + 1,
+		)
+	if int(config.prefix_entry_capacity) <= 0:
+		config.prefix_entry_capacity = max(1024, num_pages // 64)
+	if int(config.prefix_page_budget) <= 0:
+		config.prefix_page_budget = max(128, num_pages // 2)
+	if int(config.prefix_page_ref_capacity) <= 0:
+		config.prefix_page_ref_capacity = max(
+			num_pages,
+			int(config.prefix_entry_capacity) * 8,
+		)
+
+
 def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 	"""Builds a core HostPagedKVConfig for the given model and host budget."""
 
@@ -224,12 +250,7 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 	config.enable_prefix_reuse = False
 	config.prefix_min_reuse_pages = 1
 	config.prefix_min_store_pages = 2
-	config.sequence_page_node_capacity = 0
-	config.radix_node_capacity = 0
-	config.radix_edge_capacity = 0
-	config.prefix_entry_capacity = 0
-	config.prefix_page_ref_capacity = 0
-	config.prefix_page_budget = 0
+	_apply_capacity_defaults(config)
 	return config
 
 
@@ -348,12 +369,7 @@ def build_host_kv_config_aux(model_name: str, host_kv_cache_size: int) -> Any | 
 	config.enable_prefix_reuse = False
 	config.prefix_min_reuse_pages = 1
 	config.prefix_min_store_pages = 2
-	config.sequence_page_node_capacity = 0
-	config.radix_node_capacity = 0
-	config.radix_edge_capacity = 0
-	config.prefix_entry_capacity = 0
-	config.prefix_page_ref_capacity = 0
-	config.prefix_page_budget = 0
+	_apply_capacity_defaults(config)
 	return config
 
 
