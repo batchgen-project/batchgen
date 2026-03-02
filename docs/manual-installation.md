@@ -26,7 +26,7 @@ conda activate batchgen
 ## Step 1: Install PyTorch with CUDA Support
 
 ```bash
-pip install torch==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ---
@@ -78,7 +78,17 @@ See https://github.com/deepseek-ai/DeepGEMM for more details.
 
 ---
 
-## Step 5: Install BatchGen
+## Step 5: Reinstall PyTorch (Important)
+
+Building flash-attention, FlashMLA, or DeepGEMM from source may downgrade PyTorch or install conflicting versions of triton. Reinstall to ensure the correct versions:
+
+```bash
+pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+```
+
+---
+
+## Step 6: Install BatchGen
 
 ```bash
 git clone git@github.com:EfficientMoE/BatchGen.git
