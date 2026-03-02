@@ -14,6 +14,8 @@ Usage:
 import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+_this_dir = os.path.dirname(os.path.abspath(__file__))
 import torch
 
 # Force CXX11 ABI to match PyTorch (same approach as flash-attention)
@@ -203,7 +205,8 @@ setup(
                 "src/moe/mgn/expert_bin_count.cu",
                 "src/moe/mgn/rmsnorm.cu",
             ],
-            include_dirs=["src/moe/mgn", "3rd/cutlass/include"],
+            include_dirs=[os.path.join(_this_dir, "src/moe/mgn"),
+                         os.path.join(_this_dir, "3rd/cutlass/include")],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-std=c++17",
