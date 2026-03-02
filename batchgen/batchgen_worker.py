@@ -3173,12 +3173,14 @@ class BatchGenWorker:
 	def _get_node_for_rank(self, rank: int) -> int:
 		"""Get node ID for a rank. Assumes uniform GPUs per node."""
 		gpus_per_node = torch.cuda.device_count()
+		if self.world_size <= gpus_per_node:
+			return 0
 		return rank // gpus_per_node
 
 	def _get_num_nodes(self) -> int:
 		"""Get total number of nodes."""
 		gpus_per_node = torch.cuda.device_count()
-		return self.world_size // gpus_per_node
+		return max(1, self.world_size // gpus_per_node)
 
 	def _get_effective_chunk_size(self) -> int:
 		"""Return the current host KV chunk size, considering adaptive sizing.
