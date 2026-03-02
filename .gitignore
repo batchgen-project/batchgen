@@ -241,6 +241,12 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Server runtime storage (batch metadata, uploaded files, outputs)
+batchgen/storage/batches/
+batchgen/storage/files/
+batchgen/storage/files_meta/
+batchgen/storage/outputs/
+
 # Local archive for deprecated code (never pushed to remote)
 local_archive/
 .DS_Store

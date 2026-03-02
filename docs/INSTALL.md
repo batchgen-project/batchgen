@@ -6,6 +6,9 @@
 - **Python**: 3.11+
 - **OS**: Ubuntu 22.04 (tested)
 
+All three options below have been validated end-to-end on a fresh 2-node (16×H20) cluster
+with Kimi-K2.5. Pick whichever fits your workflow.
+
 ## Option A: Docker (Recommended for Production)
 
 ```bash
@@ -51,33 +54,18 @@ conda create -n batchgen python=3.11 -y
 conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
-# 2. Download and install all wheels from the latest release
+# 2. Install all wheels from the latest release
 RELEASE_URL="https://github.com/EfficientMoE/BatchGen/releases/download/v0.1.0"
 pip install \
-  "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp311-cp311-linux_x86_64.whl" \
+  "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
   "${RELEASE_URL}/flash_mla-1.0.0-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/deep_gemm-2.1.1-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/batchgen_kernels-0.1.0-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen-0.1-cp311-cp311-linux_x86_64.whl"
+  "${RELEASE_URL}/batchgen-0.1-py3-none-any.whl"
 ```
 
-Or with `install_deps.sh` using a local wheel directory:
-
-```bash
-# Download wheels to a local directory first
-mkdir -p wheels && cd wheels
-RELEASE_URL="https://github.com/EfficientMoE/BatchGen/releases/download/v0.1.0"
-for whl in flash_attn_3 flash_mla deep_gemm batchgen_kernels batchgen; do
-    wget "${RELEASE_URL}/${whl}"-*.whl
-done
-cd ..
-
-# Install using the script
-git clone https://github.com/EfficientMoE/BatchGen.git && cd BatchGen
-./scripts/install_deps.sh --all --wheel-dir /path/to/wheels
-```
-
-No source compilation needed — total install time ~2 min.
+No source compilation needed — pip auto-installs all remaining Python dependencies
+(transformers, fastapi, etc.) from PyPI when installing the batchgen wheel.
 
 ### Building wheels yourself
 
@@ -179,6 +167,16 @@ source directly. If building manually:
 cd flash-attention/hopper
 FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
 ```
+
+### FlashMLA build fails with SM100 errors
+FlashMLA's SM100 (Blackwell) codepath requires NVCC 12.9+. If your CUDA toolkit is
+12.8, disable SM100 support:
+
+```bash
+FLASH_MLA_DISABLE_SM100=1 pip install . --no-build-isolation
+```
+
+The install scripts set this automatically.
 
 ### nvcc: "A single input file is required"
 Ensure `TORCH_CUDA_ARCH_LIST` is set correctly (e.g., `9.0a` for H20).

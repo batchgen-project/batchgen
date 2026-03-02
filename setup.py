@@ -165,6 +165,14 @@ setup(
             "**/*.so",
         ],
     },
+    exclude_package_data={
+        "batchgen": [
+            "storage/batches/*",
+            "storage/files/*",
+            "storage/files_meta/*",
+            "storage/outputs/*",
+        ],
+    },
     include_package_data=True,
     install_requires=install_requires,
     author="EfficientMoE Team",
