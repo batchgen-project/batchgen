@@ -91,6 +91,15 @@ class ServerArgs:
     disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+    # Dynamic host KV reservation settings
+    host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
+    host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
+    enable_host_kv_eviction: bool = False  # Enable host KV eviction + prefill recompute
+    adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
+    adaptive_chunk_min: int = 1024  # Minimum adaptive chunk size in tokens
+    adaptive_chunk_max: int = 65536  # Maximum adaptive chunk size in tokens
+    adaptive_chunk_ema_alpha: float = 0.1  # EMA smoothing factor
+    adaptive_chunk_multiplier: float = 1.5  # Headroom multiplier on EMA
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -281,6 +290,61 @@ def _build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
     )
+    # Dynamic host KV reservation
+    parser.add_argument(
+        "--host-kv-chunk-size",
+        type=int,
+        default=8192,
+        help="Host KV chunk size in tokens for dynamic reservation (default: 8192). Each sequence initially reserves prompt_length + chunk_size tokens instead of full max_decode_length.",
+    )
+    parser.add_argument(
+        "--host-kv-eviction-watermark",
+        type=int,
+        default=10,
+        help="Trigger host KV eviction when free pages drop below this percentage (default: 10)",
+    )
+    parser.add_argument(
+        "--enable-host-kv-eviction",
+        action="store_true",
+        default=False,
+        help="Enable host KV eviction with prefill recompute for evicted sequences (default: disabled)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk",
+        action="store_true",
+        default=True,
+        help="Enable EMA-based adaptive chunk sizing (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-adaptive-chunk",
+        action="store_true",
+        default=False,
+        help="Disable EMA-based adaptive chunk sizing (use static --host-kv-chunk-size)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-min",
+        type=int,
+        default=1024,
+        help="Minimum adaptive chunk size in tokens (default: 1024)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-max",
+        type=int,
+        default=65536,
+        help="Maximum adaptive chunk size in tokens (default: 65536)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-ema-alpha",
+        type=float,
+        default=0.1,
+        help="EMA smoothing factor for adaptive chunk sizing (default: 0.1)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-multiplier",
+        type=float,
+        default=1.5,
+        help="Headroom multiplier on EMA for adaptive chunk sizing (default: 1.5)",
+    )
     return parser
 
 
@@ -338,6 +402,18 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError(
             "ep_offloading_ratio > 0 requires --enable-ep-with-offloading"
         )
+    if args.host_kv_chunk_size <= 0:
+        raise ValueError("host_kv_chunk_size must be positive")
+    if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
+        raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
+    if args.adaptive_chunk_min <= 0:
+        raise ValueError("adaptive_chunk_min must be positive")
+    if args.adaptive_chunk_max < args.adaptive_chunk_min:
+        raise ValueError("adaptive_chunk_max must be >= adaptive_chunk_min")
+    if args.adaptive_chunk_ema_alpha <= 0 or args.adaptive_chunk_ema_alpha > 1.0:
+        raise ValueError("adaptive_chunk_ema_alpha must be in (0, 1]")
+    if args.adaptive_chunk_multiplier <= 0:
+        raise ValueError("adaptive_chunk_multiplier must be positive")
     args.storage_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -384,6 +460,14 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
+        host_kv_chunk_size=parsed.host_kv_chunk_size,
+        host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
+        enable_host_kv_eviction=parsed.enable_host_kv_eviction,
+        adaptive_chunk=not getattr(parsed, 'no_adaptive_chunk', False),
+        adaptive_chunk_min=parsed.adaptive_chunk_min,
+        adaptive_chunk_max=parsed.adaptive_chunk_max,
+        adaptive_chunk_ema_alpha=parsed.adaptive_chunk_ema_alpha,
+        adaptive_chunk_multiplier=parsed.adaptive_chunk_multiplier,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

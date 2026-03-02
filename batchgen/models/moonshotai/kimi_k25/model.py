@@ -131,7 +131,7 @@ class KimiK25MoEBufferManager:
         self.tma_intermediate = None
         self._init_tma_descriptors()
 
-        logging.info(
+        logging.debug(
             f"[MoEBufferManager] 3D strided layout: E_local={E_local}, mtp={max_tokens_padded}, "
             f"buf_rows={buf_rows}, H={H}, N_inter={N_inter}, "
             f"total={self._total_bytes() / (1024**3):.2f} GiB"
@@ -574,18 +574,6 @@ class KimiK25MoE(nn.Module):
                     module = wrapper.module if hasattr(wrapper, 'module') else wrapper
                     w_packed = getattr(module, f'int4_{prefix}_packed')
                     w_scale = getattr(module, f'int4_{prefix}_scale')
-
-                    if local_e == 0 and not hasattr(self.__class__, '_dtype_logged'):
-                        logging.info(
-                            f"[MoE WGMMA] int4_{prefix}_packed: "
-                            f"dtype={w_packed.dtype}, shape={list(w_packed.shape)}, "
-                            f"stride={w_packed.stride()}, contiguous={w_packed.is_contiguous()}"
-                        )
-                        logging.info(
-                            f"[MoE WGMMA] int4_{prefix}_scale: "
-                            f"dtype={w_scale.dtype}, shape={list(w_scale.shape)}, "
-                            f"stride={w_scale.stride()}, contiguous={w_scale.is_contiguous()}"
-                        )
 
                     w_ptrs[local_e] = w_packed.data_ptr()
                     s_ptrs[local_e] = w_scale.data_ptr()

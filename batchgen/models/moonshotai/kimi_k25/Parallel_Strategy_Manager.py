@@ -398,7 +398,7 @@ class KimiK25ParallelStrategyManager:
         def _log_hbm(step_name):
             a = torch.cuda.memory_allocated(device) / (1024**3)
             r = torch.cuda.memory_reserved(device) / (1024**3)
-            logging.info(f"Rank {self.rank}: HBM after {step_name}: allocated={a:.2f} GiB, reserved={r:.2f} GiB")
+            logging.debug(f"Rank {self.rank}: HBM after {step_name}: allocated={a:.2f} GiB, reserved={r:.2f} GiB")
 
         torch.cuda.empty_cache()
         _log_hbm("empty_cache")

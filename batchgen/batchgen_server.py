@@ -211,6 +211,16 @@ class BatchGenServer:
 			ep_offloading_ratio=getattr(self.args, 'ep_offloading_ratio', 0.0),
 			pre_dequantize_weights=getattr(self.args, 'pre_dequantize_weights', False),
 
+			# Dynamic host KV reservation
+			host_kv_chunk_size=getattr(self.args, 'host_kv_chunk_size', 8192),
+			host_kv_eviction_watermark=getattr(self.args, 'host_kv_eviction_watermark', 10),
+			enable_host_kv_eviction=getattr(self.args, 'enable_host_kv_eviction', False),
+			adaptive_chunk=getattr(self.args, 'adaptive_chunk', True),
+			adaptive_chunk_min=getattr(self.args, 'adaptive_chunk_min', 1024),
+			adaptive_chunk_max=getattr(self.args, 'adaptive_chunk_max', 65536),
+			adaptive_chunk_ema_alpha=getattr(self.args, 'adaptive_chunk_ema_alpha', 0.1),
+			adaptive_chunk_multiplier=getattr(self.args, 'adaptive_chunk_multiplier', 1.5),
+
 			# Place holder
 			local_rank=-1,
 			global_rank=-1,

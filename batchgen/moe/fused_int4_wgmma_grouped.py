@@ -1088,7 +1088,7 @@ def _load_int4_grouped_module():
             extra_cuda_cflags=cuda_flags,
             verbose=False,
         )
-        logging.info("Loaded WGMMA fused grouped INT4 MoE kernels")
+        logging.debug("Loaded WGMMA fused grouped INT4 MoE kernels")
         return _int4_grouped_module
     except Exception as e:
         logging.warning(f"Failed to load WGMMA grouped INT4 MoE kernels: {e}")
