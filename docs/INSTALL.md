@@ -94,11 +94,31 @@ gh release create v0.1.0 --title "BatchGen v0.1.0"
 gh release upload v0.1.0 /path/to/wheels/*.whl
 ```
 
+## Important: Do Not Run from the Source Directory
+
+After installing with `pip install .` (non-editable), you **must not** launch the
+server from the BatchGen source directory. Python will find the source `batchgen/`
+and `batchgen_kernels/` directories before the installed site-packages, causing
+import errors (e.g., missing compiled CUDA extensions).
+
+```bash
+# WRONG — source dir shadows installed packages
+cd /path/to/BatchGen
+python -m batchgen.launch_http_server ...
+
+# CORRECT — run from any other directory
+cd /root   # or /tmp, or ~, etc.
+python -m batchgen.launch_http_server ...
+```
+
+This does not apply to Docker (Option A), where the source is the install target.
+
 ## Key Notes
 
 | Item | Detail |
 |------|--------|
 | **Install mode** | `pip install .` (non-editable) — required for ray/production |
+| **Do not run from source dir** | Source tree shadows installed packages (see above) |
 | **batchgen_kernels** | Must use `--no-build-isolation` (needs installed PyTorch headers) |
 | **H20 GPUs** | Set `TORCH_CUDA_ARCH_LIST=9.0a` before building kernels |
 | **Core engine** | JIT-compiled at first server launch via ninja (automatic, ~5s) |
