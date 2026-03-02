@@ -108,7 +108,7 @@ if [[ $BUILD_WHEELS -eq 1 ]]; then
         git clone --recursive https://github.com/Dao-AILab/flash-attention.git
     fi
     cd flash-attention && git checkout "$FLASH_ATTN_VERSION"
-    cd hopper && pip wheel . --no-build-isolation -w "$WHEEL_DIR"
+    cd hopper && FLASH_ATTENTION_FORCE_BUILD=TRUE pip wheel . --no-build-isolation -w "$WHEEL_DIR"
     ok "flash-attention 3 wheel built"
 
     # FlashMLA
@@ -240,7 +240,7 @@ else
         git clone --recursive https://github.com/Dao-AILab/flash-attention.git
     fi
     cd flash-attention && git checkout "$FLASH_ATTN_VERSION"
-    cd hopper && pip install . --no-build-isolation
+    cd hopper && FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
     ok "flash-attention 3 installed"
 
     # FlashMLA

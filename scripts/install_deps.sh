@@ -159,7 +159,7 @@ install_flash_attention() {
 
     print_step "Building flash-attention 3 (this may take 10-20 minutes)..."
     cd hopper
-    pip install . --no-build-isolation
+    FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
 
     print_success "flash-attention 3 installed"
 }

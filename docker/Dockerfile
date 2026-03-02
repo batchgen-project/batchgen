@@ -40,7 +40,7 @@ RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && cd flash-attention \
     && git checkout v2.8.3 \
     && cd hopper \
-    && uv pip install . --no-build-isolation \
+    && FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install . --no-build-isolation \
     && uv cache clean
 
 # Install FlashMLA
