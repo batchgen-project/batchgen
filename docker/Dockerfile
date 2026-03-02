@@ -38,7 +38,7 @@ RUN uv pip install torch==2.9.0+cu128 --extra-index-url https://download.pytorch
 # Install Flash Attention
 RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && cd flash-attention \
-    && git checkout v2.8.3 \
+    && git checkout v2.8.2 \
     && cd hopper \
     && FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install . --no-build-isolation \
     && uv cache clean
