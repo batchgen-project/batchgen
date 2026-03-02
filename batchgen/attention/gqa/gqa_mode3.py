@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from .fa_decode import gqa_decode_fa
+from .batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
 from .sink_correction import apply_sink_correction
 
 # Import timing from model module (lazy to avoid circular import)
@@ -186,7 +186,7 @@ def gqa_decoding_mode_3_bf16(
     # 6. Flash attention with paged KV
     if timing and timing.enabled:
         with timing.time("attn.flash_attn"):
-            attn_output, lse = gqa_decode_fa(
+            attn_output, lse = batchgen_gqa_decode_bf16(
                 q,  # [batch, 1, num_q_heads, head_dim]
                 blocked_k,  # [num_blocks, page_size, num_kv_heads, head_dim]
                 blocked_v,
@@ -197,7 +197,7 @@ def gqa_decoding_mode_3_bf16(
                 sliding_window=sliding_window if sliding_window > 0 else None,
             )
     else:
-        attn_output, lse = gqa_decode_fa(
+        attn_output, lse = batchgen_gqa_decode_bf16(
             q,
             blocked_k,
             blocked_v,

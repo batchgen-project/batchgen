@@ -59,7 +59,7 @@ try:
     from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_tma
     from batchgen.moe.fused_grouped_dequant_gemm import fused_dequant_grouped_gemm_fp8_tma
     from batchgen.attention.mla.fa3_backend import act_quant, w8a16_gemm
-    from mgn_kernel import compact_expert_data, fused_moe_token_dispatch
+    from batchgen_kernels.common.mgn import compact_expert_data, fused_moe_token_dispatch
     _HAS_FP8_GROUPED = True
 except ImportError:
     _HAS_FP8_GROUPED = False

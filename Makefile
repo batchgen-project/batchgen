@@ -3,13 +3,14 @@
 #  Copyright (c) EfficientMoE team 2025                                        #
 # ---------------------------------------------------------------------------- #
 
-.PHONY: help install install-all install-deps install-hopper-deps clean
+.PHONY: help install install-all install-deps install-hopper-deps install-kernels clean
 
 # Default target
 help:
 	@echo "BatchGen Installation Targets"
 	@echo ""
-	@echo "  make install              Install BatchGen only (assumes deps are installed)"
+	@echo "  make install              Install batchgen_kernels + BatchGen (assumes deps are installed)"
+	@echo "  make install-kernels      Install batchgen_kernels CUDA extensions only"
 	@echo "  make install-all          Install BatchGen with all Hopper dependencies"
 	@echo "  make install-deps         Install Hopper dependencies only (flash-attn, FlashMLA, DeepGEMM)"
 	@echo ""
@@ -22,9 +23,13 @@ help:
 	@echo "  make clean                Clean build artifacts"
 	@echo "  make help                 Show this help message"
 
-# Install BatchGen only
-install:
-	pip install -e .
+# Install BatchGen and its CUDA kernel extensions
+install: install-kernels
+	pip install .
+
+# Install CUDA kernel extensions only
+install-kernels:
+	cd batchgen_kernels && pip install . --no-build-isolation
 
 # Install all dependencies + BatchGen
 install-all:

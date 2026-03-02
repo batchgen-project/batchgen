@@ -1,33 +1,22 @@
 """
 Fused CUDA attention kernels: RMSNorm, Add+RMSNorm, RoPE, QKV Split.
 
-Compiled via torch.utils.cpp_extension.load() at import time.
+Pre-compiled via pip install -e batchgen_kernels/. Loaded lazily on first use.
 """
 
 from typing import Optional
 
 import torch
-from pathlib import Path
-from torch.utils.cpp_extension import load
 
-_csrc_dir = Path(__file__).parent / "csrc"
+_ext = None
 
-_ext = load(
-    name="attention_fused_cuda",
-    sources=[
-        str(_csrc_dir / "attention_extension.cc"),
-        str(_csrc_dir / "rmsnorm.cu"),
-        str(_csrc_dir / "rope.cu"),
-        str(_csrc_dir / "qkv_split.cu"),
-    ],
-    extra_cuda_cflags=[
-        "-O3",
-        "-std=c++17",
-        "--expt-relaxed-constexpr",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    ],
-    verbose=False,
-)
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        import batchgen_kernels
+        _ext = batchgen_kernels.load_extension("batchgen_kernels.attention._C_fused_ops")
+    return _ext
 
 
 def cuda_rmsnorm(
@@ -38,7 +27,7 @@ def cuda_rmsnorm(
 ) -> torch.Tensor:
     """Standalone RMSNorm. Single CUDA kernel launch.
     num_valid_tokens: optional 1-element int32 device tensor to skip padding rows."""
-    return _ext.rmsnorm_forward(x, weight, eps, num_valid_tokens)
+    return _get_ext().rmsnorm_forward(x, weight, eps, num_valid_tokens)
 
 
 def cuda_add_rmsnorm(
@@ -51,7 +40,7 @@ def cuda_add_rmsnorm(
     """Fused residual add + RMSNorm. Residual modified in-place.
     Returns (normed, residual).
     num_valid_tokens: optional 1-element int32 device tensor to skip padding rows."""
-    results = _ext.add_rmsnorm_forward(residual, hidden, weight, eps, num_valid_tokens)
+    results = _get_ext().add_rmsnorm_forward(residual, hidden, weight, eps, num_valid_tokens)
     return results[0], results[1]
 
 
@@ -76,7 +65,7 @@ def cuda_rope(
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
 
-    results = _ext.rope_forward(query, key, cos, sin, half_dim, num_valid_tokens)
+    results = _get_ext().rope_forward(query, key, cos, sin, half_dim, num_valid_tokens)
     return results[0], results[1]
 
 
@@ -88,7 +77,7 @@ def cuda_qkv_split(
 ) -> tuple:
     """QKV split (allocating). Returns (q, k, v).
     num_valid_tokens: optional 1-element int32 device tensor to skip padding rows."""
-    results = _ext.qkv_split_forward(qkv, q_size, kv_size, num_valid_tokens)
+    results = _get_ext().qkv_split_forward(qkv, q_size, kv_size, num_valid_tokens)
     return results[0], results[1], results[2]
 
 
@@ -103,4 +92,4 @@ def cuda_qkv_split_inplace(
 ):
     """QKV split (zero-alloc). Writes to pre-allocated output tensors.
     num_valid_tokens: optional 1-element int32 device tensor to skip padding rows."""
-    _ext.qkv_split_inplace(qkv, q_out, k_out, v_out, q_size, kv_size, num_valid_tokens)
+    _get_ext().qkv_split_inplace(qkv, q_out, k_out, v_out, q_size, kv_size, num_valid_tokens)

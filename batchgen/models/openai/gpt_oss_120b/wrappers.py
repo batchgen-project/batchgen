@@ -114,7 +114,8 @@ def log_gpu_memory(msg: str = ""):
         )
 
 
-from batchgen.attention.gqa import gqa_attention_with_sinks, gqa_decode_fa
+from batchgen.attention.gqa import gqa_attention_with_sinks
+from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
 from batchgen.attention.sink import softmax_with_sinks
 
 
@@ -1373,7 +1374,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
         if do_timing:
             t0 = time.perf_counter()
 
-        # gqa_decode_fa expects:
+        # batchgen_gqa_decode_bf16 expects:
         #   q: [batch, seqlen_q, nheads, headdim]
         #   k_cache: [num_blocks, page_size, nheads_kv, headdim]
         #   v_cache: [num_blocks, page_size, nheads_kv, headdim]
@@ -1423,7 +1424,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 q_sample = query[i, 0, 0, :4].cpu().tolist()  # batch i, seq 0, head 0, first 4 dims
                 print(f"[DECODE ATTN L0] seq{i}: Q[:4]={q_sample}")
 
-        attn_output, _ = gqa_decode_fa(
+        attn_output, _ = batchgen_gqa_decode_bf16(
             q=query,  # [batch, 1, num_heads, head_dim]
             k_cache=k_cache_layer,  # [num_pages, page_size, num_kv_heads, head_dim]
             v_cache=v_cache_layer,  # [num_pages, page_size, num_kv_heads, head_dim]
@@ -1545,7 +1546,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         cache_seqlens_for_attn = micro_cache_seqlens if cache_seqlens is not None else torch.ones(batch, dtype=torch.int32, device=query.device)
 
-        attn_output, _ = gqa_decode_fa(
+        attn_output, _ = batchgen_gqa_decode_bf16(
             q=query,
             k_cache=k_cache_layer,
             v_cache=v_cache_layer,
