@@ -211,6 +211,21 @@ install_deepgemm() {
     print_success "DeepGEMM installed"
 }
 
+install_batchgen_kernels() {
+    print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
+
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BATCHGEN_DIR="$(dirname "$SCRIPT_DIR")"
+
+    if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
+        cd "$BATCHGEN_DIR/batchgen_kernels"
+        pip install . --no-build-isolation
+        print_success "batchgen_kernels installed"
+    else
+        print_warning "batchgen_kernels/setup.py not found, skipping kernel compilation"
+    fi
+}
+
 install_batchgen() {
     print_step "Installing BatchGen..."
 
@@ -220,8 +235,8 @@ install_batchgen() {
 
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install -e .
-        print_success "BatchGen installed in editable mode"
+        pip install .
+        print_success "BatchGen installed"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
         print_error "Please run this script from the BatchGen/scripts directory"
@@ -355,6 +370,7 @@ main() {
             print_warning "Skipping Hopper-specific dependencies (non-Hopper GPU detected)"
             print_warning "Use --skip-gpu-check to force installation"
         fi
+        install_batchgen_kernels
         install_batchgen
     else
         if [[ $INSTALL_FLASH_ATTN -eq 1 ]]; then
@@ -367,6 +383,7 @@ main() {
             install_deepgemm
         fi
         if [[ $INSTALL_BATCHGEN -eq 1 ]]; then
+            install_batchgen_kernels
             install_batchgen
         fi
     fi
