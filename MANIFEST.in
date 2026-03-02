@@ -1,6 +1,6 @@
 recursive-include batchgen/core *.cpp *.h *.cc *.cu *.hpp
 recursive-include batchgen/external *.cpp *.h *.cc *.hpp *.rst
 recursive-include batchgen/op_builder *.py
-recursive-include batchgen *.json *.parquet
+recursive-include batchgen *.json *.parquet *.jinja *.model
 graft batchgen/core
 graft batchgen/external

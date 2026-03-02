@@ -159,6 +159,8 @@ setup(
             # Data files (tokenizers, configs, etc.)
             "**/*.json",
             "**/*.parquet",
+            "**/*.jinja",
+            "**/*.model",
             # Compiled binaries
             "**/*.so",
         ],
