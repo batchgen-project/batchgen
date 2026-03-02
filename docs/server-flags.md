@@ -150,6 +150,43 @@ At page boundaries during decode, `extension_gpu_page_buffer` pages are added. T
 
 **Constraint:** `extension_gpu_page_buffer >= decision_frequency_pages` (to prevent overflow)
 
+### Host KV Scheduling
+
+Controls how host KV cache pages are allocated and reclaimed during inference. By default, each sequence reserves its full KV token budget at prefill time. With dynamic reservation, sequences start with a small chunk and grow incrementally, enabling host KV oversubscription.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host-kv-chunk-size` | `8192` | Initial chunk size in tokens. Each sequence reserves `max(prompt_length, chunk_size)` tokens at prefill instead of the full decode budget. Smaller values increase oversubscription but may trigger more evictions. |
+| `--enable-host-kv-eviction` | `false` | Enable eviction of host KV pages when free pages are exhausted. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
+| `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
+| `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
+| `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
+| `--adaptive-chunk-min` | `1024` | Minimum adaptive chunk size in tokens. |
+| `--adaptive-chunk-max` | `65536` | Maximum adaptive chunk size in tokens. |
+| `--adaptive-chunk-ema-alpha` | `0.1` | EMA smoothing factor (0-1]. Lower values make adaptation slower but more stable. |
+| `--adaptive-chunk-multiplier` | `1.5` | Safety multiplier applied to the EMA estimate. Values > 1.0 reduce eviction frequency at the cost of higher memory usage. |
+
+**How chunk-based reservation works:**
+
+1. At prefill, each sequence allocates `max(prompt_length, chunk_size)` tokens of host KV pages
+2. During decode, sequences that approach their allocated capacity trigger chunk growth (capped at their KV token budget)
+3. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA)
+4. If host pages are exhausted and eviction is enabled, shortest-decoded sequences are evicted first to free pages
+
+**Example: High oversubscription with eviction**
+
+```bash
+python -m batchgen.launch_http_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 256 \
+    --host-kv-chunk-size 512 \
+    --enable-host-kv-eviction \
+    --host-kv-eviction-watermark 10 \
+    --adaptive-chunk
+```
+
+This allows serving more concurrent sequences than the host KV cache can hold at full decode length. Sequences that exhaust their chunk grow incrementally, and if memory runs out, the least-progressed sequences are evicted and recomputed later.
+
 ### Prefill Optimization
 
 | Flag | Default | Description |
