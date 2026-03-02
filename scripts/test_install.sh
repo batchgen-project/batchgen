@@ -84,8 +84,8 @@ step "BatchGen root: $BATCHGEN_DIR"
 
 # ── Pinned versions (must match install_deps.sh) ──
 FLASH_ATTN_VERSION="v2.8.2"
-FLASHMLA_COMMIT="9edee0c022cd0938148a18e334203b0aab43aa19"
-DEEPGEMM_COMMIT="d374456"
+FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
+DEEPGEMM_VERSION="v2.1.1.post3"
 
 # ============================================================================ #
 # Build-wheels mode: build wheels from source repos, then exit
@@ -127,7 +127,7 @@ if [[ $BUILD_WHEELS -eq 1 ]]; then
     if [[ ! -d "DeepGEMM" ]]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
     fi
-    cd DeepGEMM && git checkout "$DEEPGEMM_COMMIT" && git submodule update --init --recursive
+    cd DeepGEMM && git checkout "$DEEPGEMM_VERSION" && git submodule update --init --recursive
     pip wheel . --no-build-isolation -w "$WHEEL_DIR"
     ok "DeepGEMM wheel built"
 
@@ -254,7 +254,7 @@ else
     if [[ ! -d "DeepGEMM" ]]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
     fi
-    cd DeepGEMM && git checkout "$DEEPGEMM_COMMIT" && git submodule update --init --recursive
+    cd DeepGEMM && git checkout "$DEEPGEMM_VERSION" && git submodule update --init --recursive
     pip install . --no-build-isolation
     ok "DeepGEMM installed"
 

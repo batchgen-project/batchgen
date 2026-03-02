@@ -20,8 +20,8 @@ NC='\033[0m' # No Color
 
 # Configuration - pinned versions for reproducibility
 FLASH_ATTN_VERSION="v2.8.2"
-FLASHMLA_COMMIT="9edee0c022cd0938148a18e334203b0aab43aa19"
-DEEPGEMM_COMMIT="d374456"
+FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
+DEEPGEMM_VERSION="v2.1.1.post3"
 
 # Installation directory (defaults to temp, can be overridden)
 INSTALL_DIR="${BATCHGEN_INSTALL_DIR:-/tmp/batchgen_deps}"
@@ -195,13 +195,13 @@ install_deepgemm() {
         print_step "Updating existing DeepGEMM repository..."
         cd DeepGEMM
         git fetch origin
-        git checkout "$DEEPGEMM_COMMIT"
+        git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     else
         print_step "Cloning DeepGEMM repository..."
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
         cd DeepGEMM
-        git checkout "$DEEPGEMM_COMMIT"
+        git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     fi
 
