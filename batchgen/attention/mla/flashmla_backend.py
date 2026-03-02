@@ -1439,14 +1439,6 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
 
-	# Validate RoPE cache size
-	max_pos_id = q_position_ids.max().item()
-	cos_seq_len = cos.size(0)
-	if max_pos_id >= cos_seq_len:
-		raise ValueError(
-			f"q_position_ids (max={max_pos_id}) exceed RoPE cache size ({cos_seq_len})"
-		)
-
 	# ============ KV CACHE UPDATE ============
 	offload_kv = fused_rmsnorm_rope_with_q(
 		new_compressed_kv,

@@ -27,6 +27,8 @@ from batchgen.server.io_struct import (
     FileObject,
     FilePurpose,
     FileStatus,
+    ToolCall,
+    ToolCallFunction,
     Usage,
 )
 from batchgen.server.server_args import ServerArgs
@@ -251,7 +253,15 @@ class BatchScheduler:
                     body.model,
                     body.reasoning_effort,
                 )
-                prompt = self._format_chat_messages(messages, body.model)
+                # Forward extra kwargs (thinking, tools) to chat template
+                template_kwargs = {}
+                if body.thinking is not None:
+                    template_kwargs["thinking"] = body.thinking
+                if body.tools is not None:
+                    template_kwargs["tools"] = body.tools
+                prompt = self._format_chat_messages(
+                    messages, body.model, **template_kwargs
+                )
                 current_max_tokens = body.max_tokens or 128
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
@@ -308,14 +318,14 @@ class BatchScheduler:
 
         return modified
 
-    def _format_chat_messages(self, messages: List[dict], model: str) -> str:
+    def _format_chat_messages(self, messages: List[dict], model: str, **kwargs) -> str:
         tokenizer = self._get_tokenizer(model)
         if not hasattr(tokenizer, "apply_chat_template"):
             raise RuntimeError(
                 f"Tokenizer for {model} does not support apply_chat_template"
             )
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
 
     def _build_output_items(
@@ -390,6 +400,50 @@ class BatchScheduler:
             body=body,
         )
 
+    def _parse_output(
+        self,
+        model: str,
+        decoded_text: str,
+    ) -> tuple[str, Optional[str], Optional[List[ToolCall]]]:
+        """Apply thinking/tool-call parsing if flags are enabled.
+
+        Returns:
+            (content, reasoning_content, tool_calls)
+        """
+        content = decoded_text
+        reasoning_content = None
+        tool_calls = None
+
+        tokenizer = self._get_tokenizer(model)
+        if tokenizer is None:
+            return content, reasoning_content, tool_calls
+
+        if self.server_args.parse_thinking:
+            try:
+                reasoning_content, content = tokenizer.parse_thinking(content)
+            except NotImplementedError:
+                pass
+
+        if self.server_args.parse_tool_call:
+            try:
+                raw_calls, content = tokenizer.parse_tool_calls(content)
+                if raw_calls:
+                    tool_calls = [
+                        ToolCall(
+                            id=c["id"],
+                            type=c["type"],
+                            function=ToolCallFunction(
+                                name=c["function"]["name"],
+                                arguments=c["function"]["arguments"],
+                            ),
+                        )
+                        for c in raw_calls
+                    ]
+            except NotImplementedError:
+                pass
+
+        return content, reasoning_content, tool_calls
+
     def _build_response_body(
         self,
         request: BatchRequestItem,
@@ -400,6 +454,9 @@ class BatchScheduler:
         created_at = int(time.time())
         decoded_text = self._decode_tokens(model, token_ids)
         usage = self._build_usage(model, prompt_text, token_ids)
+        content, reasoning_content, tool_calls = self._parse_output(
+            model, decoded_text
+        )
 
         if request.url == BatchEndpoint.CHAT_COMPLETIONS:
             body: BatchResponseBody = ChatCompletionResponse(
@@ -410,7 +467,9 @@ class BatchScheduler:
                     ChatCompletionChoice(
                         index=0,
                         message=ChatCompletionChoiceMessage(
-                            content=decoded_text
+                            content=content,
+                            reasoning_content=reasoning_content,
+                            tool_calls=tool_calls,
                         ),
                         logprobs=None,
                         finish_reason=None,
@@ -445,6 +504,9 @@ class BatchScheduler:
         model = request.body.model
         created_at = int(time.time())
         usage = self._build_usage_from_text(model, prompt_text, decoded_text)
+        content, reasoning_content, tool_calls = self._parse_output(
+            model, decoded_text
+        )
 
         if request.url == BatchEndpoint.CHAT_COMPLETIONS:
             body: BatchResponseBody = ChatCompletionResponse(
@@ -455,7 +517,9 @@ class BatchScheduler:
                     ChatCompletionChoice(
                         index=0,
                         message=ChatCompletionChoiceMessage(
-                            content=decoded_text
+                            content=content,
+                            reasoning_content=reasoning_content,
+                            tool_calls=tool_calls,
                         ),
                         logprobs=None,
                         finish_reason=None,

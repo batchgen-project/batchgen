@@ -60,6 +60,7 @@ class SequenceStatus(IntEnum):
     IN_DECODE = 3     # Currently decoding with KV in GPU
     ON_HOLD = 4       # Was decoding, paused due to GPU memory pressure, KV in host
     COMPLETED = 5     # Finished generation
+    EVICTED = 6       # Host KV fully released, only token IDs retained; awaits prefill recompute
 
 
 class SequenceEntry:
@@ -72,15 +73,24 @@ class SequenceEntry:
         'gpu_pages_allocated',
         # Track whether this sequence has had its initial GPU reservation
         'had_initial_gpu_reservation',
+        # Dynamic host KV reservation tracking
+        'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
+        'host_pages_allocated',  # Current host page count
+        # Eviction support
+        'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
+        'original_prompt_length',  # Original prompt length before eviction (for tracking)
+        'original_max_decode_length',  # Original max_decode_length before eviction
+        'total_decoded_before_eviction',  # Tokens decoded before this eviction cycle
     )
 
     VALID_TRANSITIONS = {
         SequenceStatus.QUEUEING: {SequenceStatus.IN_PREFILL},
         SequenceStatus.IN_PREFILL: {SequenceStatus.PREFILLED},
         SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE},
-        SequenceStatus.IN_DECODE: {SequenceStatus.ON_HOLD, SequenceStatus.COMPLETED},
-        SequenceStatus.ON_HOLD: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED},
+        SequenceStatus.IN_DECODE: {SequenceStatus.ON_HOLD, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
+        SequenceStatus.ON_HOLD: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.COMPLETED: set(),
+        SequenceStatus.EVICTED: {SequenceStatus.IN_PREFILL},  # Re-enters via prefill recompute
     }
 
     # Page size for KV cache (tokens per page)
@@ -112,10 +122,20 @@ class SequenceEntry:
         # Two-page buffer: tracks current GPU page allocation
         # This is separate from host pages (which always hold full kv_token_budget)
         self.gpu_pages_allocated: int = 0
-        
+
         # Track whether this sequence has had its initial large GPU reservation
         # Reset to False when sequence goes ON_HOLD (GPU pages released)
         self.had_initial_gpu_reservation: bool = False
+
+        # Dynamic host KV reservation: starts at 0, set by worker at prefill time
+        self.host_token_capacity: int = 0
+        self.host_pages_allocated: int = 0
+
+        # Eviction support
+        self.evicted_token_ids: Optional[torch.Tensor] = None
+        self.original_prompt_length: int = prompt_length
+        self.original_max_decode_length: int = max_decode_length
+        self.total_decoded_before_eviction: int = 0
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:
@@ -163,17 +183,17 @@ class SequenceEntry:
     def get_gpu_pages_for_two_page_buffer(self) -> int:
         """
         Get GPU pages needed for page buffer design.
-        
+
         For INITIAL load (had_initial_gpu_reservation=False):
             Allocates enough pages for: current_context_length + INITIAL_GPU_PAGE_BUFFER*PAGE_SIZE tokens.
             This gives sequences a large runway to reduce load/on-hold traffic.
-        
+
         For EXTENSION (had_initial_gpu_reservation=True):
             Allocates enough pages for: current_context_length + EXTENSION_GPU_PAGE_BUFFER*PAGE_SIZE tokens.
             This ensures we have a small buffer before needing extension.
-        
+
         Returns:
-            Number of pages to allocate on GPU
+            Number of pages to allocate on GPU (capped at host_pages_allocated)
         """
         if not self.had_initial_gpu_reservation:
             # Initial load - use larger buffer
@@ -181,11 +201,15 @@ class SequenceEntry:
         else:
             # Extension - use smaller buffer
             buffer_pages = EXTENSION_GPU_PAGE_BUFFER
-        
+
         buffer_tokens = self.current_context_length + buffer_pages * self.PAGE_SIZE
         # Cap at full budget (don't over-allocate)
         buffer_tokens = min(buffer_tokens, self.kv_token_budget)
-        return math.ceil(buffer_tokens / self.PAGE_SIZE)
+        pages = math.ceil(buffer_tokens / self.PAGE_SIZE)
+        # Cap at host pages: GPU can't load more pages than host has allocated
+        if self.host_pages_allocated > 0:
+            pages = min(pages, self.host_pages_allocated)
+        return pages
 
     def get_additional_gpu_pages_needed(self) -> int:
         """
@@ -250,6 +274,49 @@ class SequenceEntry:
         self.gpu_pages_allocated = 0
         self.had_initial_gpu_reservation = False
 
+    # ============ Dynamic Host KV Reservation Methods ============
+
+    def needs_host_kv_growth(self, chunk_size: int) -> bool:
+        """Check if sequence needs more host KV pages to continue decoding.
+
+        Returns True when the sequence is approaching its current host token
+        capacity, leaving enough runway for one extension buffer.
+        """
+        if self.host_token_capacity <= 0:
+            return False
+        # Trigger growth when within one extension buffer of capacity
+        runway = self.host_token_capacity - self.current_context_length
+        threshold = EXTENSION_GPU_PAGE_BUFFER * self.PAGE_SIZE
+        return runway <= threshold
+
+    def get_host_growth_pages(self, chunk_size: int) -> int:
+        """Get number of pages to grow host KV by.
+
+        Returns chunk_size / PAGE_SIZE pages, capped so that total host
+        capacity does not exceed kv_token_budget.
+        """
+        remaining_budget = self.kv_token_budget - self.host_token_capacity
+        if remaining_budget <= 0:
+            return 0
+        growth_tokens = min(chunk_size, remaining_budget)
+        return math.ceil(growth_tokens / self.PAGE_SIZE)
+
+    def get_host_pages_for_initial_chunk(self, chunk_size: int) -> int:
+        """Get pages for initial host KV allocation.
+
+        Must match the actual allocation in _config_prefill_host_kv():
+        max(prompt + chunk_size, ceil((prompt+1)/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER pages)
+        The +1 accounts for the first decoded token produced during prefill
+        (current_context_length = prompt_length + 1 after prefill).
+        """
+        chunk_tokens = self.prompt_length + chunk_size
+        post_prefill_length = self.prompt_length + 1  # prefill produces 1 decode token
+        gpu_initial_pages = math.ceil(post_prefill_length / self.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
+        gpu_initial_tokens = gpu_initial_pages * self.PAGE_SIZE
+        initial_tokens = max(chunk_tokens, gpu_initial_tokens)
+        initial_tokens = min(initial_tokens, self.kv_token_budget)
+        return math.ceil(initial_tokens / self.PAGE_SIZE)
+
     # ============ Completion and Status Methods ============
 
     def is_finished(self) -> bool:
@@ -292,7 +359,8 @@ class SequenceEntry:
         return (
             f"SequenceEntry(uuid={self.uuid}, global_idx={self.global_idx}, "
             f"status={self.status.name}, decoded={self.decoded_length}/{self.max_decode_length}, "
-            f"ctx_len={self.current_context_length}, gpu_pages={self.gpu_pages_allocated})"
+            f"ctx_len={self.current_context_length}, gpu_pages={self.gpu_pages_allocated}, "
+            f"host_cap={self.host_token_capacity}, host_pages={self.host_pages_allocated})"
         )
 
 
@@ -346,7 +414,7 @@ class SequenceBatch:
         seq.assigned_rank = rank
 
     def get_sequences_by_status(self, status: SequenceStatus) -> List[str]:
-        return list(self._status_index[status])
+        return sorted(self._status_index[status])
 
     def get_sequences_for_rank(self, rank: int) -> List[str]:
         return list(self._rank_index.get(rank, set()))
@@ -417,6 +485,10 @@ class SequenceBatch:
     def has_resumable(self) -> bool:
         """Check if there are sequences that can be loaded/resumed into GPU."""
         return self.has_prefilled() or self.has_on_hold()
+
+    def has_evicted(self) -> bool:
+        """Check if there are sequences evicted from host KV awaiting recompute."""
+        return len(self._status_index[SequenceStatus.EVICTED]) > 0
 
     def all_completed(self) -> bool:
         return len(self._status_index[SequenceStatus.COMPLETED]) == len(self.sequences)

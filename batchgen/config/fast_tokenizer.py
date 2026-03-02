@@ -311,15 +311,16 @@ class FastTokenizer(BaseTokenizer):
             )
 
         try:
-            from jinja2 import Template, StrictUndefined
+            from jinja2 import Template, Undefined
         except ImportError:
             raise ImportError(
                 "jinja2 is required for apply_chat_template. "
                 "Install it with: pip install jinja2"
             )
 
-        # Create Jinja2 template
-        template = Template(self.chat_template, undefined=StrictUndefined)
+        # Create Jinja2 template (use permissive Undefined like HuggingFace transformers,
+        # since chat templates may access optional attributes like current_date)
+        template = Template(self.chat_template, undefined=Undefined)
 
         # Render the template with messages and special tokens
         rendered = template.render(
