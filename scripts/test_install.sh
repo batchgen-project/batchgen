@@ -19,6 +19,8 @@
 #    --cache-dir DIR    Model cache directory                                   #
 #    --world-size N     Number of GPUs (default: 1)                             #
 #    --port PORT        Server port (default: 10900)                            #
+#    --wheel-dir DIR    Pre-built wheels for flash-attn/FlashMLA/DeepGEMM      #
+#    --build-wheels     Build wheels into --wheel-dir (use existing env)        #
 # ---------------------------------------------------------------------------- #
 
 set -e
@@ -40,9 +42,11 @@ divider() { echo -e "${BLUE}$(printf '=%.0s' {1..60})${NC}"; }
 SKIP_DEPS=0
 SKIP_SERVER=0
 KEEP_ENV=0
+BUILD_WHEELS=0
 ENV_NAME="batchgen_install_test"
 MODEL="openai/gpt-oss-120b"
 CACHE_DIR=""
+WHEEL_DIR=""
 WORLD_SIZE=1
 PORT=10900
 
@@ -52,9 +56,11 @@ while [[ $# -gt 0 ]]; do
         --skip-deps)     SKIP_DEPS=1;    shift ;;
         --skip-server)   SKIP_SERVER=1;  shift ;;
         --keep-env)      KEEP_ENV=1;     shift ;;
+        --build-wheels)  BUILD_WHEELS=1; shift ;;
         --env-name)      ENV_NAME="$2";  shift 2 ;;
         --model)         MODEL="$2";     shift 2 ;;
         --cache-dir)     CACHE_DIR="$2"; shift 2 ;;
+        --wheel-dir)     WHEEL_DIR="$2"; shift 2 ;;
         --world-size)    WORLD_SIZE="$2"; shift 2 ;;
         --port)          PORT="$2";      shift 2 ;;
         --help)
@@ -75,6 +81,60 @@ if [[ ! -f "$BATCHGEN_DIR/setup.py" ]]; then
 fi
 
 step "BatchGen root: $BATCHGEN_DIR"
+
+# ── Pinned versions (must match install_deps.sh) ──
+FLASH_ATTN_VERSION="v2.8.2"
+FLASHMLA_COMMIT="9edee0c022cd0938148a18e334203b0aab43aa19"
+DEEPGEMM_COMMIT="d374456"
+
+# ============================================================================ #
+# Build-wheels mode: build wheels from source repos, then exit
+# ============================================================================ #
+if [[ $BUILD_WHEELS -eq 1 ]]; then
+    if [[ -z "$WHEEL_DIR" ]]; then
+        fail "--build-wheels requires --wheel-dir"
+        exit 1
+    fi
+    mkdir -p "$WHEEL_DIR"
+    step "Building dependency wheels into $WHEEL_DIR"
+
+    DEPS_DIR="${BATCHGEN_INSTALL_DIR:-/tmp/batchgen_build_deps}"
+    mkdir -p "$DEPS_DIR"
+
+    # Flash-Attention 3
+    step "Building flash-attention 3 wheel..."
+    cd "$DEPS_DIR"
+    if [[ ! -d "flash-attention" ]]; then
+        git clone --recursive https://github.com/Dao-AILab/flash-attention.git
+    fi
+    cd flash-attention && git checkout "$FLASH_ATTN_VERSION"
+    cd hopper && pip wheel . --no-build-isolation -w "$WHEEL_DIR"
+    ok "flash-attention 3 wheel built"
+
+    # FlashMLA
+    step "Building FlashMLA wheel..."
+    cd "$DEPS_DIR"
+    if [[ ! -d "FlashMLA" ]]; then
+        git clone --recursive https://github.com/deepseek-ai/FlashMLA.git
+    fi
+    cd FlashMLA && git checkout "$FLASHMLA_COMMIT" && git submodule update --init --recursive
+    pip wheel . --no-build-isolation -w "$WHEEL_DIR"
+    ok "FlashMLA wheel built"
+
+    # DeepGEMM
+    step "Building DeepGEMM wheel..."
+    cd "$DEPS_DIR"
+    if [[ ! -d "DeepGEMM" ]]; then
+        git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
+    fi
+    cd DeepGEMM && git checkout "$DEEPGEMM_COMMIT" && git submodule update --init --recursive
+    pip wheel . --no-build-isolation -w "$WHEEL_DIR"
+    ok "DeepGEMM wheel built"
+
+    ok "All wheels built in $WHEEL_DIR:"
+    ls -lh "$WHEEL_DIR"/*.whl
+    exit 0
+fi
 
 # ── Track elapsed time ──
 PIPELINE_START=$SECONDS
@@ -146,9 +206,24 @@ divider
 if [[ $SKIP_DEPS -eq 1 ]]; then
     warn "Phase 3: Skipping flash-attn/FlashMLA/DeepGEMM (--skip-deps)"
 
-    # Install from existing env's site-packages if available
-    # These are header-only at runtime so we just need the Python packages
-    step "Installing deps from requirements.txt (excluding build-from-source deps)..."
+    step "Installing deps from requirements.txt..."
+    cd "$BATCHGEN_DIR"
+    pip install -r requirements.txt 2>&1 | tail -5
+    ok "Requirements installed"
+elif [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
+    step "Phase 3: Installing Hopper dependencies from pre-built wheels"
+    step "Wheel dir: $WHEEL_DIR"
+
+    # Install from cached wheels (no network, no compilation)
+    pip install --find-links "$WHEEL_DIR" --no-index \
+        flash-attn-hopper flash-mla deep-gemm 2>&1 || {
+        # Wheel names may vary — try installing all .whl files
+        warn "Named install failed, installing all wheels from $WHEEL_DIR"
+        pip install "$WHEEL_DIR"/*.whl
+    }
+    ok "Hopper dependencies installed from wheels"
+
+    # Install remaining requirements
     cd "$BATCHGEN_DIR"
     pip install -r requirements.txt 2>&1 | tail -5
     ok "Requirements installed"
@@ -164,13 +239,13 @@ else
     if [[ ! -d "flash-attention" ]]; then
         git clone --recursive https://github.com/Dao-AILab/flash-attention.git
     fi
-    cd flash-attention && git checkout v2.8.2
+    cd flash-attention && git checkout "$FLASH_ATTN_VERSION"
     cd hopper && pip install . --no-build-isolation
     ok "flash-attention 3 installed"
 
     # FlashMLA
     step "Building FlashMLA..."
-    pip install "git+https://github.com/deepseek-ai/FlashMLA.git@9edee0c022cd0938148a18e334203b0aab43aa19" --no-build-isolation
+    pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
     ok "FlashMLA installed"
 
     # DeepGEMM
@@ -179,7 +254,7 @@ else
     if [[ ! -d "DeepGEMM" ]]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
     fi
-    cd DeepGEMM && git checkout d374456 && git submodule update --init --recursive
+    cd DeepGEMM && git checkout "$DEEPGEMM_COMMIT" && git submodule update --init --recursive
     pip install . --no-build-isolation
     ok "DeepGEMM installed"
 

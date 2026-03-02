@@ -265,6 +265,7 @@ show_help() {
     echo "  --flashmla        Install FlashMLA only"
     echo "  --deepgemm        Install DeepGEMM only"
     echo "  --batchgen        Install BatchGen only"
+    echo "  --wheel-dir DIR   Use pre-built wheels for flash-attn/FlashMLA/DeepGEMM"
     echo "  --skip-gpu-check  Skip GPU architecture detection"
     echo "  --keep-build      Keep build directory after installation"
     echo "  --help            Show this help message"
@@ -274,9 +275,10 @@ show_help() {
     echo "  KEEP_BUILD_DIR        Set to 1 to keep build directory"
     echo ""
     echo "Examples:"
-    echo "  $0                    # Install everything (auto-detect GPU)"
-    echo "  $0 --flash-attn       # Install only flash-attention 3"
-    echo "  $0 --skip-gpu-check   # Install all deps without GPU check"
+    echo "  $0                                  # Install everything (auto-detect GPU)"
+    echo "  $0 --flash-attn                     # Install only flash-attention 3"
+    echo "  $0 --wheel-dir /path/to/wheels      # Install deps from pre-built wheels"
+    echo "  $0 --skip-gpu-check                 # Install all deps without GPU check"
 }
 
 main() {
@@ -292,6 +294,7 @@ main() {
     INSTALL_DEEPGEMM=0
     INSTALL_BATCHGEN=0
     SKIP_GPU_CHECK=0
+    WHEEL_DIR=""
 
     if [[ $# -eq 0 ]]; then
         INSTALL_ALL=1
@@ -322,6 +325,10 @@ main() {
             --skip-gpu-check)
                 SKIP_GPU_CHECK=1
                 shift
+                ;;
+            --wheel-dir)
+                WHEEL_DIR="$2"
+                shift 2
                 ;;
             --keep-build)
                 export KEEP_BUILD_DIR=1
@@ -359,13 +366,21 @@ main() {
     # Install dependencies based on options
     if [[ $INSTALL_ALL -eq 1 ]]; then
         if [[ $IS_HOPPER -eq 1 ]]; then
-            install_flash_attention
-            install_flashmla
-            install_deepgemm
-            # Reinstall PyTorch — building deps from source may downgrade torch or triton
-            print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
-            pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
-            print_success "PyTorch reinstalled"
+            if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
+                print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
+                pip install --find-links "$WHEEL_DIR" --no-index \
+                    flash-attn-hopper flash-mla deep-gemm 2>/dev/null || \
+                    pip install "$WHEEL_DIR"/*.whl
+                print_success "Hopper dependencies installed from wheels"
+            else
+                install_flash_attention
+                install_flashmla
+                install_deepgemm
+                # Reinstall PyTorch — building deps from source may downgrade torch or triton
+                print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
+                pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+                print_success "PyTorch reinstalled"
+            fi
         else
             print_warning "Skipping Hopper-specific dependencies (non-Hopper GPU detected)"
             print_warning "Use --skip-gpu-check to force installation"
