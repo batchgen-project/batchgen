@@ -128,7 +128,7 @@ install_torch() {
         fi
     else
         print_step "Installing PyTorch with CUDA 12.8 support..."
-        pip install torch==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+        pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
         print_success "PyTorch installed"
     fi
 }
@@ -347,6 +347,10 @@ main() {
             install_flash_attention
             install_flashmla
             install_deepgemm
+            # Reinstall PyTorch — building deps from source may downgrade torch or triton
+            print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
+            pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+            print_success "PyTorch reinstalled"
         else
             print_warning "Skipping Hopper-specific dependencies (non-Hopper GPU detected)"
             print_warning "Use --skip-gpu-check to force installation"
