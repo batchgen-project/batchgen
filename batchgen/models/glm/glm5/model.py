@@ -17,6 +17,7 @@ Architecture:
 - rope_interleave=True, rope_theta=1M, no scaling
 """
 
+import logging
 import math
 import os
 import time
@@ -774,15 +775,22 @@ def scatter_weight_reduce_optimized(res, global_indices, token_topk_pos,
 
 
 # ============================================================================
-# MoE Layer (Decode with EP)
+# MoE Layer (Decode with EP) — inherits from MoEBase
 # ============================================================================
 
-class Glm5MoEDecode(nn.Module):
-    """MoE layer for decode with EP and grouped FP8 GEMM.
+from batchgen.moe.moe_base import MoEBase
 
-    Modeled on DeepseekV3MoE_Decoding_FP8. Two execution paths:
-    - moe_infer_allgather_allreduce_bf16_acc: grouped FP8 GEMM for all-persistent
-    - moe_infer_loop_with_offloading: loop-based for mixed persistent/non-persistent
+class Glm5FP8MoE(MoEBase):
+    """GLM-5 FP8 MoE decode layer.
+
+    Inherits the universal decode template from MoEBase:
+        AllGather → Gate → Expert Compute → AllReduce → Extract + Shared
+
+    Implements:
+        gate()                       — sigmoid + bias + topk (CUDA kernel with fallback)
+        expert_compute_persistent()  — WGMMA FP8 pipeline (zero CPU-GPU sync)
+        expert_compute_mixed()       — WGMMA persistent + loop non-persistent (one .tolist())
+        shared_expert_forward()      — BF16 SwiGLU shared expert
     """
 
     # Shared across all instances (all 75 MoE layers)
@@ -791,36 +799,17 @@ class Glm5MoEDecode(nn.Module):
     _wgmma_next_layer_id = 0    # Counter for layer registration
 
     def __init__(self, config: Glm5Config, comm=None):
-        super().__init__()
-        self.config = config
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.hidden_size = config.hidden_size
-        self.comm = comm
+        super().__init__(config, comm)
         self.use_wgmma_fp8 = os.environ.get("BATCHGEN_USE_WGMMA_FP8", "0") == "1"
 
-        import torch.distributed as dist
-        if not dist.is_initialized():
-            self.rank, self.world_size = 0, 1
-        else:
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
-
-        self.experts_per_rank = config.n_routed_experts // self.world_size
-        self.total_experts = self.world_size * self.experts_per_rank
-        self.routed_expert_start_idx = self.rank * self.experts_per_rank
-        self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
-
-        self.gate = Glm5MoEGate(config)
+        self.gate_module = Glm5MoEGate(config)
         self.experts = [None] * self.total_experts
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
 
-        self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
-        self.num_tokens_per_rank = None
-        self.enable_ep_offloading = False
-        self.num_persistent_local_experts = self.experts_per_rank  # default: all persistent
+    # ── Token count management (called by PSM) ──
 
     def init_num_tokens(self, num_tokens_per_rank: int):
-        self.num_tokens_per_rank = num_tokens_per_rank
+        super().init_num_tokens(num_tokens_per_rank)
         self.max_num_tokens_per_rank = num_tokens_per_rank
         global_num_tokens = num_tokens_per_rank * self.world_size
         K = self.num_experts_per_tok
@@ -834,9 +823,9 @@ class Glm5MoEDecode(nn.Module):
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         if num_tokens_per_rank == self.num_tokens_per_rank:
             return
+        super().set_num_tokens_per_rank(num_tokens_per_rank)
         if hasattr(self, 'max_num_tokens_per_rank') and num_tokens_per_rank > self.max_num_tokens_per_rank:
             self.max_num_tokens_per_rank = num_tokens_per_rank
-        self.num_tokens_per_rank = num_tokens_per_rank
         global_num_tokens = num_tokens_per_rank * self.world_size
         K = self.num_experts_per_tok
         self.token_idx = torch.arange(
@@ -846,12 +835,10 @@ class Glm5MoEDecode(nn.Module):
             K, dtype=torch.int32, device=self.device
         ).repeat(global_num_tokens)
 
-    def init(self, micro_batch_size):
-        """Collect FP8 weight tensors and build pointer arrays for grouped GEMM.
+    # ── Weight pointer setup (called by PSM) ──
 
-        Only collects from persistent experts (first num_persistent_local_experts
-        in the local range). Non-persistent experts use the loop path.
-        """
+    def init(self, micro_batch_size):
+        """Collect FP8 weight tensors and build pointer arrays for grouped GEMM."""
         self.gate_list, self.up_list, self.down_list = [], [], []
         self.gate_scale_list, self.up_scale_list, self.down_scale_list = [], [], []
         n_persistent = getattr(self, 'num_persistent_local_experts', self.experts_per_rank)
@@ -881,14 +868,13 @@ class Glm5MoEDecode(nn.Module):
         self.down_scale_ptrs_ptr = torch.tensor(
             [s.data_ptr() for s in self.down_scale_list], dtype=torch.int64, device=self.device)
 
-        # WGMMA: register this layer's weights (buffers shared via class variable)
+        # WGMMA: build shared modules (once across all layers)
         if self.use_wgmma_fp8:
-            if Glm5MoEDecode._wgmma_modules is None:
+            if Glm5FP8MoE._wgmma_modules is None:
                 from batchgen.moe.fp8_wgmma_pipeline import build_all_modules
-                Glm5MoEDecode._wgmma_modules = build_all_modules()
-            # Assign layer id for weight registration (incremental)
-            self._wgmma_layer_id = Glm5MoEDecode._wgmma_next_layer_id
-            Glm5MoEDecode._wgmma_next_layer_id += 1
+                Glm5FP8MoE._wgmma_modules = build_all_modules()
+            self._wgmma_layer_id = Glm5FP8MoE._wgmma_next_layer_id
+            Glm5FP8MoE._wgmma_next_layer_id += 1
 
     def cleanup(self):
         for attr in ('gate_list', 'up_list', 'down_list',
@@ -897,15 +883,193 @@ class Glm5MoEDecode(nn.Module):
                       'gate_scale_ptrs_ptr', 'up_scale_ptrs_ptr', 'down_scale_ptrs_ptr'):
             setattr(self, attr, None)
 
-    def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets,
-                                num_local_experts=None):
-        """Grouped FP8 GEMM: gate+up+SiLU → down, same as DeepSeek.
+    # ── MoEBase abstract method implementations ──
 
-        Args:
-            num_local_experts: Number of experts in the pointer arrays. Defaults to
-                num_persistent_local_experts (set by init()). Must match the length
-                of gate_list/up_list/down_list.
+    def gate(self, x: torch.Tensor):
+        """Sigmoid gating with e_score_correction. CUDA kernel with Python fallback."""
+        if self.use_wgmma_fp8:
+            try:
+                from batchgen.moe.routing import gate_sigmoid_topk_cuda
+                bufs = Glm5FP8MoE._wgmma_shared_bufs
+                if bufs is not None:
+                    G = x.shape[0]
+                    rl_bf16 = bufs.router_logits_bf16[:G]
+                    rl_fp32 = bufs.router_logits[:G]
+                    torch.mm(x, self.gate_module.weight.t(), out=rl_bf16)
+                    rl_fp32.copy_(rl_bf16)
+                    return gate_sigmoid_topk_cuda(
+                        rl_fp32,
+                        self.gate_module.e_score_correction_bias.float(),
+                        k=self.num_experts_per_tok,
+                        routed_scaling_factor=self.gate_module.routed_scaling_factor,
+                    )
+                else:
+                    router_logits = F.linear(x, self.gate_module.weight).float()
+                    return gate_sigmoid_topk_cuda(
+                        router_logits,
+                        self.gate_module.e_score_correction_bias.float(),
+                        k=self.num_experts_per_tok,
+                        routed_scaling_factor=self.gate_module.routed_scaling_factor,
+                    )
+            except ImportError:
+                logging.warning("gate_sigmoid_topk_cuda unavailable, using Python fallback")
+
+        # Python fallback
+        topk_weight, topk_idx = self.gate_module(x)
+        return topk_idx.to(torch.int32), topk_weight.to(torch.float32)
+
+    def expert_compute_persistent(self, global_x, topk_idx, topk_weight):
+        """All-persistent expert compute. Zero CPU-GPU sync on WGMMA path."""
+        if self.use_wgmma_fp8:
+            # WGMMA path: dispatch_scatter_3d → WGMMA pipeline → reduce (zero sync)
+            bufs = Glm5FP8MoE._wgmma_shared_bufs
+            if bufs is None:
+                bufs = self._lazy_init_wgmma_bufs()
+
+            if self._wgmma_layer_id not in bufs._layer_weights:
+                bufs.register_layer_weights(
+                    self._wgmma_layer_id,
+                    self.gate_list, self.gate_scale_list,
+                    self.up_list, self.up_scale_list,
+                    self.down_list, self.down_scale_list)
+
+            return bufs.forward(self._wgmma_layer_id, global_x, topk_idx, topk_weight)
+        else:
+            # Triton fallback path: dispatch → grouped FP8 GEMM → scatter
+            return self._triton_compute(global_x, topk_idx, topk_weight)
+
+    def _triton_compute(self, global_x, topk_idx, topk_weight):
+        """Triton dispatch + grouped FP8 GEMM + scatter reduce."""
+        from mgn_kernel import fused_moe_token_dispatch
+
+        input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
+            fused_moe_token_dispatch(
+                global_x, topk_idx, self.token_idx, self.topk_pos,
+                self.routed_expert_start_idx, self.routed_expert_end_idx,
+            )
+
+        res = self._grouped_dequant_moe_fp8(
+            input_x, input_eids, expert_counts, expert_offsets,
+        )
+
+        global_results = scatter_weight_reduce_optimized(
+            res, global_indices, token_topk_pos, topk_weight,
+            self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
+        )
+        return global_results.to(torch.bfloat16)
+
+    def expert_compute_mixed(self, global_x, topk_idx, topk_weight):
+        """Mixed path: WGMMA for persistent + loop for non-persistent.
+
+        One .tolist() sync for expert_offsets (acceptable on opt-in path).
         """
+        from mgn_kernel import fused_moe_token_dispatch
+
+        n_persistent = self.num_persistent_local_experts
+        num_tokens = global_x.shape[0]
+        hidden_size = global_x.shape[1]
+
+        # Dispatch
+        input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
+            fused_moe_token_dispatch(
+                global_x, topk_idx, self.token_idx, self.topk_pos,
+                self.routed_expert_start_idx, self.routed_expert_end_idx,
+            )
+
+        offsets_cpu = expert_offsets.tolist()
+        actual_total = offsets_cpu[-1]
+
+        if actual_total == 0:
+            return torch.zeros(
+                num_tokens, hidden_size,
+                device=self.device, dtype=torch.bfloat16,
+            )
+
+        res = input_x.new_empty(actual_total, hidden_size, dtype=torch.bfloat16)
+
+        # Phase 1: Grouped FP8 GEMM for persistent experts
+        persistent_end = offsets_cpu[n_persistent]
+        if n_persistent > 0 and persistent_end > 0:
+            persistent_counts = expert_counts[:n_persistent]
+            persistent_offsets = expert_offsets[:n_persistent + 1]
+            persistent_res = self._grouped_dequant_moe_fp8(
+                input_x[:persistent_end], input_eids[:persistent_end],
+                persistent_counts, persistent_offsets,
+            )
+            res[:persistent_end] = persistent_res[:persistent_end]
+
+        # Phase 2: Loop for non-persistent experts
+        for local_e in range(n_persistent, self.experts_per_rank):
+            start_off = offsets_cpu[local_e]
+            end_off = offsets_cpu[local_e + 1]
+            if start_off == end_off:
+                continue
+            global_e = self.routed_expert_start_idx + local_e
+            res[start_off:end_off] = self.experts[global_e](input_x[start_off:end_off])
+
+        # Scatter + weighted reduce
+        global_results = scatter_weight_reduce_optimized(
+            res, global_indices, token_topk_pos, topk_weight,
+            self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
+        )
+        return global_results.to(torch.bfloat16)
+
+    def shared_expert_forward(self, identity: torch.Tensor) -> torch.Tensor:
+        return self.shared_experts(identity)
+
+    def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Prefill: per-expert loop (no EP)."""
+        orig_shape = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_flat
+
+        topk_weights, topk_indices = self.gate_module(hidden_flat)
+
+        output = torch.zeros_like(hidden_flat, dtype=torch.float32)
+        for i, expert in enumerate(self.experts):
+            if expert is None:
+                continue
+            expert_mask = (topk_indices == i).any(dim=-1)
+            if not expert_mask.any():
+                continue
+            expert_input = hidden_flat[expert_mask]
+            expert_output = expert(expert_input)
+            expert_weight = torch.where(
+                topk_indices[expert_mask] == i,
+                topk_weights[expert_mask],
+                torch.zeros_like(topk_weights[expert_mask])
+            ).sum(dim=-1)
+            output[expert_mask] += expert_output.float() * expert_weight.unsqueeze(-1)
+
+        output = output.to(hidden_flat.dtype)
+        output = output + self.shared_experts(identity)
+        return output.view(*orig_shape)
+
+    # ── Internal helpers ──
+
+    def _lazy_init_wgmma_bufs(self):
+        """Lazy-init WGMMAMoEBuffers on first forward."""
+        from batchgen.moe.fp8_wgmma_pipeline import WGMMAMoEBuffers, DEFAULT_MTP
+        wgmma_mod, fast_mod, dr_mod = Glm5FP8MoE._wgmma_modules
+        num_global_tokens = self.num_tokens_per_rank * self.world_size
+        bufs = WGMMAMoEBuffers(
+            wgmma_mod, fast_mod, dr_mod,
+            len(self.gate_list), DEFAULT_MTP,
+            self.hidden_size, self.config.moe_intermediate_size,
+            self.gate_list, self.gate_scale_list,
+            self.up_list, self.up_scale_list,
+            self.down_list, self.down_scale_list,
+            self.routed_expert_start_idx,
+            self.num_experts_per_tok,
+            num_global_tokens,
+            num_tokens_per_rank=self.num_tokens_per_rank,
+            device=self.device)
+        Glm5FP8MoE._wgmma_shared_bufs = bufs
+        return bufs
+
+    def _grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets,
+                                  num_local_experts=None):
+        """Grouped FP8 GEMM: gate+up+SiLU → down (Triton fallback path)."""
         from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_tma
         from batchgen.moe.fused_grouped_dequant_gemm import fused_dequant_grouped_gemm_fp8_tma
@@ -955,300 +1119,6 @@ class Glm5MoEDecode(nn.Module):
             group_size, activated_group_idx, group_start_indices,
             num_active_experts,
         )
-
-    @torch.inference_mode()
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        identity = hidden_states
-
-        if getattr(self, 'enable_ep_offloading', False):
-            out = self.moe_infer_loop_with_offloading(hidden_states)
-        else:
-            out = self.moe_infer_allgather_allreduce_bf16_acc(hidden_states)
-
-        out = out + self.shared_experts(identity)
-        return out.view(*orig_shape)
-
-    @torch.inference_mode()
-    def moe_infer_allgather_allreduce_bf16_acc(self, x: torch.Tensor) -> torch.Tensor:
-        """Grouped FP8 GEMM path: AllGather → Gate → Dispatch → GroupedGEMM → Scatter → AllReduce."""
-        import torch.distributed as dist
-        from contextlib import nullcontext as _nullctx
-        from mgn_kernel import fused_moe_token_dispatch
-        from batchgen.timing import get_decode_timer
-
-        dt = get_decode_timer()
-
-        num_tokens, hidden_size = x.shape
-        device = x.device
-
-        if num_tokens > self.num_tokens_per_rank:
-            raise RuntimeError(
-                f"MoE buffer overflow: num_tokens={num_tokens} > "
-                f"num_tokens_per_rank={self.num_tokens_per_rank}"
-            )
-
-        # 1) AllGather
-        with (dt.timed("allgather", 0) if dt else _nullctx()):
-            if self.use_wgmma_fp8:
-                bufs = Glm5MoEDecode._wgmma_shared_bufs
-                if bufs is not None:
-                    ntp = self.num_tokens_per_rank
-                    G = self.world_size * ntp
-                    all_tokens = bufs.all_tokens[:G]
-                    all_tokens.zero_()
-                    if x.shape[0] < ntp:
-                        # Slice pre-allocated buffer to current num_tokens_per_rank
-                        padded_hidden_states = bufs.padded_hidden_states[:ntp]
-                        padded_hidden_states.zero_()
-                        padded_hidden_states[:x.shape[0]] = x
-                    else:
-                        padded_hidden_states = x
-                else:
-                    # Fallback before bufs init (first call)
-                    all_tokens = torch.zeros(
-                        (self.world_size * self.num_tokens_per_rank, self.hidden_size),
-                        device=self.device, dtype=torch.bfloat16,
-                    )
-                    if x.shape[0] < self.num_tokens_per_rank:
-                        padded_hidden_states = torch.zeros(
-                            (self.num_tokens_per_rank, hidden_size),
-                            device=self.device, dtype=x.dtype,
-                        )
-                        padded_hidden_states[:x.shape[0]] = x
-                    else:
-                        padded_hidden_states = x
-            else:
-                all_tokens = torch.zeros(
-                    (self.world_size * self.num_tokens_per_rank, self.hidden_size),
-                    device=self.device, dtype=torch.bfloat16,
-                )
-                if x.shape[0] < self.num_tokens_per_rank:
-                    padded_hidden_states = torch.zeros(
-                        (self.num_tokens_per_rank, hidden_size),
-                        device=self.device, dtype=x.dtype,
-                    )
-                    padded_hidden_states[:x.shape[0]] = x
-                else:
-                    padded_hidden_states = x
-
-            with self.comm.change_state(enable=True):
-                self.comm.all_gather(
-                    all_tokens, padded_hidden_states,
-                    stream=torch.cuda.default_stream(self.device),
-                )
-
-        # 2) Gate (GLM-5: sigmoid scoring)
-        with (dt.timed("routing", 0) if dt else _nullctx()):
-            global_x = all_tokens
-            if self.use_wgmma_fp8:
-                # Fused CUDA kernel: sigmoid + bias + topk + normalize + scale
-                from batchgen.moe.routing import gate_sigmoid_topk_cuda
-                bufs_r = Glm5MoEDecode._wgmma_shared_bufs
-                if bufs_r is not None:
-                    G = global_x.shape[0]
-                    rl_bf16 = bufs_r.router_logits_bf16[:G]
-                    rl_fp32 = bufs_r.router_logits[:G]
-                    torch.mm(global_x, self.gate.weight.t(), out=rl_bf16)
-                    rl_fp32.copy_(rl_bf16)
-                    topk_idx, topk_weight = gate_sigmoid_topk_cuda(
-                        rl_fp32,
-                        self.gate.e_score_correction_bias.float(),
-                        k=self.num_experts_per_tok,
-                        routed_scaling_factor=self.gate.routed_scaling_factor,
-                    )
-                else:
-                    router_logits = F.linear(global_x, self.gate.weight).float()
-                    topk_idx, topk_weight = gate_sigmoid_topk_cuda(
-                        router_logits,
-                        self.gate.e_score_correction_bias.float(),
-                        k=self.num_experts_per_tok,
-                        routed_scaling_factor=self.gate.routed_scaling_factor,
-                    )
-            else:
-                topk_weight, topk_idx = self.gate(global_x)
-                topk_idx = topk_idx.to(torch.int32)
-                topk_weight = topk_weight.to(torch.float32)
-
-        if self.use_wgmma_fp8:
-            # Lazy-init shared buffers on first forward (needs num_tokens_per_rank)
-            bufs = Glm5MoEDecode._wgmma_shared_bufs
-            if bufs is None:
-                from batchgen.moe.fp8_wgmma_pipeline import WGMMAMoEBuffers, DEFAULT_MTP
-                wgmma_mod, fast_mod, dr_mod = Glm5MoEDecode._wgmma_modules
-                num_global_tokens = self.num_tokens_per_rank * self.world_size
-                bufs = WGMMAMoEBuffers(
-                    wgmma_mod, fast_mod, dr_mod,
-                    len(self.gate_list), DEFAULT_MTP,
-                    self.hidden_size, self.config.moe_intermediate_size,
-                    self.gate_list, self.gate_scale_list,
-                    self.up_list, self.up_scale_list,
-                    self.down_list, self.down_scale_list,
-                    self.routed_expert_start_idx,
-                    self.num_experts_per_tok,
-                    num_global_tokens,
-                    num_tokens_per_rank=self.num_tokens_per_rank,
-                    device=self.device)
-                Glm5MoEDecode._wgmma_shared_bufs = bufs
-            # Register this layer's weights if not yet registered
-            if self._wgmma_layer_id not in bufs._layer_weights:
-                bufs.register_layer_weights(
-                    self._wgmma_layer_id,
-                    self.gate_list, self.gate_scale_list,
-                    self.up_list, self.up_scale_list,
-                    self.down_list, self.down_scale_list)
-            # ── WGMMA path: dispatch_scatter_3d → WGMMA pipeline → reduce ──
-            with (dt.timed("wgmma_pipeline", 0) if dt else _nullctx()):
-                global_results = bufs.forward(
-                    self._wgmma_layer_id, global_x, topk_idx, topk_weight)
-        else:
-            # ── Triton path (original) ──
-            # 3) Dispatch tokens to local experts
-            with (dt.timed("dispatch", 0) if dt else _nullctx()):
-                input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
-                    fused_moe_token_dispatch(
-                        global_x, topk_idx, self.token_idx, self.topk_pos,
-                        self.routed_expert_start_idx, self.routed_expert_end_idx,
-                    )
-
-            # 4) Grouped FP8 GEMM
-            with (dt.timed("grouped_gemm", 0) if dt else _nullctx()):
-                res = self.grouped_dequant_moe_fp8(
-                    input_x, input_eids, expert_counts, expert_offsets,
-                )
-
-            # 5) Scatter + weighted reduce
-            with (dt.timed("scatter_reduce", 0) if dt else _nullctx()):
-                global_results = scatter_weight_reduce_optimized(
-                    res, global_indices, token_topk_pos, topk_weight,
-                    self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
-                )
-                global_results = global_results.to(torch.bfloat16)
-
-        # 6) AllReduce
-        with (dt.timed("allreduce", 0) if dt else _nullctx()):
-            with self.comm.change_state(enable=True):
-                self.comm.all_reduce(
-                    global_results, op=dist.ReduceOp.SUM,
-                    stream=torch.cuda.default_stream(self.device),
-                )
-
-        # 7) Extract local slice
-        start_token_ids = self.rank * self.num_tokens_per_rank
-        return global_results[start_token_ids:start_token_ids + num_tokens].to(x.dtype)
-
-    @torch.inference_mode()
-    def moe_infer_loop_with_offloading(self, x: torch.Tensor) -> torch.Tensor:
-        """Hybrid EP path: grouped FP8 GEMM for persistent + loop for non-persistent.
-
-        Like K2.5 pattern: fused_moe_token_dispatch sorts tokens by local expert index,
-        so expert_offsets cleanly splits persistent vs non-persistent slices.
-        """
-        import torch.distributed as dist
-        from contextlib import nullcontext as _nullctx
-        from mgn_kernel import fused_moe_token_dispatch
-        from batchgen.timing import get_decode_timer
-
-        dt = get_decode_timer()
-
-        num_tokens, hidden_size = x.shape
-        device = x.device
-        n_persistent = self.num_persistent_local_experts
-
-        if num_tokens > self.num_tokens_per_rank:
-            raise RuntimeError(
-                f"MoE buffer overflow: num_tokens={num_tokens} > "
-                f"num_tokens_per_rank={self.num_tokens_per_rank}"
-            )
-
-        # 1) AllGather
-        with (dt.timed("allgather", 0) if dt else _nullctx()):
-            all_tokens = torch.zeros(
-                (self.world_size * self.num_tokens_per_rank, self.hidden_size),
-                device=self.device, dtype=torch.bfloat16,
-            )
-            padded = torch.zeros(
-                (self.num_tokens_per_rank, hidden_size),
-                device=self.device, dtype=x.dtype,
-            )
-            if num_tokens > 0:
-                padded[:num_tokens] = x
-
-            with self.comm.change_state(enable=True):
-                self.comm.all_gather(
-                    all_tokens, padded,
-                    stream=torch.cuda.default_stream(self.device),
-                )
-
-        # 2) Gate
-        with (dt.timed("routing", 0) if dt else _nullctx()):
-            global_x = all_tokens
-            topk_weight, topk_idx = self.gate(global_x)
-            topk_idx = topk_idx.to(torch.int32)
-            topk_weight = topk_weight.to(torch.float32)
-
-        # 3) Dispatch tokens to ALL local experts (persistent + non-persistent)
-        with (dt.timed("dispatch", 0) if dt else _nullctx()):
-            input_x, input_eids, global_indices, token_topk_pos, expert_counts, expert_offsets = \
-                fused_moe_token_dispatch(
-                    global_x, topk_idx, self.token_idx, self.topk_pos,
-                    self.routed_expert_start_idx, self.routed_expert_end_idx,
-                )
-
-        offsets_cpu = expert_offsets.tolist()
-        actual_total = offsets_cpu[-1]
-
-        if actual_total == 0:
-            # No tokens dispatched to this rank
-            global_results = torch.zeros(
-                self.num_tokens_per_rank * self.world_size, hidden_size,
-                device=self.device, dtype=torch.bfloat16,
-            )
-        else:
-            res = input_x.new_empty(actual_total, hidden_size, dtype=torch.bfloat16)
-
-            # Phase 1: Grouped FP8 GEMM for persistent experts
-            with (dt.timed("grouped_gemm", 0) if dt else _nullctx()):
-                persistent_end = offsets_cpu[n_persistent]
-                if n_persistent > 0 and persistent_end > 0:
-                    persistent_counts = expert_counts[:n_persistent]
-                    persistent_offsets = expert_offsets[:n_persistent + 1]
-                    persistent_res = self.grouped_dequant_moe_fp8(
-                        input_x[:persistent_end], input_eids[:persistent_end],
-                        persistent_counts, persistent_offsets,
-                    )
-                    res[:persistent_end] = persistent_res[:persistent_end]
-
-            # Phase 2: Loop for non-persistent experts
-            with (dt.timed("expert_loop", 0) if dt else _nullctx()):
-                for local_e in range(n_persistent, self.experts_per_rank):
-                    start_off = offsets_cpu[local_e]
-                    end_off = offsets_cpu[local_e + 1]
-                    if start_off == end_off:
-                        continue
-                    global_e = self.routed_expert_start_idx + local_e
-                    res[start_off:end_off] = self.experts[global_e](input_x[start_off:end_off])
-
-            # 4) Scatter + weighted reduce
-            with (dt.timed("scatter_reduce", 0) if dt else _nullctx()):
-                global_results = scatter_weight_reduce_optimized(
-                    res, global_indices, token_topk_pos, topk_weight,
-                    self.num_tokens_per_rank * self.world_size, self.num_experts_per_tok,
-                )
-                global_results = global_results.to(torch.bfloat16)
-
-        # 5) AllReduce
-        with (dt.timed("allreduce", 0) if dt else _nullctx()):
-            with self.comm.change_state(enable=True):
-                self.comm.all_reduce(
-                    global_results, op=dist.ReduceOp.SUM,
-                    stream=torch.cuda.default_stream(self.device),
-                )
-
-        # 6) Extract local slice
-        start = self.rank * self.num_tokens_per_rank
-        return global_results[start:start + num_tokens].to(x.dtype)
 
 
 # ============================================================================
@@ -1315,11 +1185,16 @@ class Glm5DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             use_cache=use_cache,
         )
-        hidden_states = residual + hidden_states
 
-        # Pre-norm MoE/FFN
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
+        from batchgen.attention.fused_kernels import cuda_add_rmsnorm
+        hidden_states, residual = cuda_add_rmsnorm(
+            residual, hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+
+        # MoE/FFN
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 

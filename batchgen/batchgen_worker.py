@@ -8159,11 +8159,11 @@ class BatchGenWorker:
 
 		# Free WGMMA shared buffers if they exist (class-level, survives model deletion)
 		try:
-			from batchgen.models.glm.glm5.model import Glm5MoEDecode
-			if getattr(Glm5MoEDecode, '_wgmma_shared_bufs', None) is not None:
-				Glm5MoEDecode._wgmma_shared_bufs.free_buffers()
-				Glm5MoEDecode._wgmma_shared_bufs = None
-				Glm5MoEDecode._wgmma_next_layer_id = 0
+			from batchgen.models.glm.glm5.model import Glm5FP8MoE
+			if getattr(Glm5FP8MoE, '_wgmma_shared_bufs', None) is not None:
+				Glm5FP8MoE._wgmma_shared_bufs.free_buffers()
+				Glm5FP8MoE._wgmma_shared_bufs = None
+				Glm5FP8MoE._wgmma_next_layer_id = 0
 		except ImportError:
 			pass
 
