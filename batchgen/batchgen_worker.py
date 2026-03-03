@@ -3842,15 +3842,13 @@ class BatchGenWorker:
 		all_completed_tokens = [None] * self.world_size
 		dist.all_gather_object(all_completed_tokens, my_completed_tokens)
 
-		# Rank 0 submits to writer (deduplicate by global_idx)
+		# Rank 0 submits to writer
+		# Each global_idx is owned by exactly one rank, so no duplicates possible
 		if writer is not None:
-			seen = set()
 			for rank_tokens in all_completed_tokens:
 				if rank_tokens:
 					for global_idx, tokens in rank_tokens:
-						if global_idx not in seen:
-							seen.add(global_idx)
-							writer.submit(global_idx, tokens)
+						writer.submit(global_idx, tokens)
 
 	def _try_load_new_sequences(
 		self, 
