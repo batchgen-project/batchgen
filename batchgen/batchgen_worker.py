@@ -312,8 +312,10 @@ class BatchGenWorker:
 		# Watchdog for stuck detection (can be set via set_watchdog())
 		self._watchdog = None
 
-		# Incremental writer for crash-resilient result saving (set by server_worker_main_loop)
+		# Incremental writer for crash-resilient result saving
+		# Config is staged by server_worker_main_loop; writer created after tokenizer init
 		self._incremental_writer = None
+		self._incremental_writer_config = None
 
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
@@ -2598,6 +2600,29 @@ class BatchGenWorker:
 
 	# ============ Main Entry Point ============
 
+	def _init_incremental_writer(self) -> None:
+		"""Create IncrementalWriter from staged config (rank 0 only).
+
+		Called after _tokenize_global_batch() so tokenizer and eos_token_ids
+		are available. Config is staged by server_worker_main_loop.
+		"""
+		cfg = getattr(self, '_incremental_writer_config', None)
+		if cfg is None or self.rank != 0:
+			return
+		from batchgen.server.incremental_writer import IncrementalWriter
+		self._incremental_writer = IncrementalWriter(
+			output_dir=cfg["output_dir"],
+			batch_id=cfg["batch_id"],
+			model_name=cfg["model_name"],
+			custom_id_map=cfg["custom_id_map"],
+			request_urls=cfg["request_urls"],
+			prompt_texts=cfg["prompt_texts"],
+			tokenizer=self.tokenizer,
+			eos_token_ids=self.eos_token_ids,
+			parse_thinking=cfg.get("parse_thinking", False),
+			parse_tool_call=cfg.get("parse_tool_call", False),
+		)
+
 	def process_new_batch(self, global_prompts: List[str]) -> List[torch.Tensor]:
 		"""
 		Process a global batch of prompts.
@@ -2638,6 +2663,9 @@ class BatchGenWorker:
 			# Step 2: Tokenize all sequences (all ranks do this identically)
 			# This determines the actual max_input_length dynamically
 			self._tokenize_global_batch()
+
+			# Step 2.1: Create incremental writer now that tokenizer/eos_token_ids are available
+			self._init_incremental_writer()
 
 			# Step 2.5: Update engine config with actual max_input_length after tokenization
 			self._update_config_after_tokenization()
