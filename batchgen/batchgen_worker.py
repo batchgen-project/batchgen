@@ -3807,46 +3807,25 @@ class BatchGenWorker:
 		self,
 		completed_uuids: List[str],
 	) -> None:
-		"""Gather completed sequence tokens and submit to incremental writer.
+		"""Submit completed sequence tokens to incremental writer (rank 0 only).
 
-		All ranks participate in the all_gather_object. Only rank 0
-		actually submits to the writer. No-op if writer is not active.
+		With tensor parallelism, all ranks have all sequences, so rank 0
+		can directly access tokens without cross-rank communication.
+		No collective operations — zero overhead on non-rank-0.
 		"""
-		if not completed_uuids:
-			return
 		writer = getattr(self, '_incremental_writer', None)
-		# All ranks must participate in the collective even if writer is None on non-rank-0
-		# But we only do the gather if rank 0 has a writer (otherwise skip entirely)
-		# Since the writer is only set on rank 0, we broadcast whether to gather
-		has_writer = torch.tensor(
-			[1 if writer is not None else 0],
-			dtype=torch.int32, device=self.torch_device
-		)
-		dist.all_reduce(has_writer, op=dist.ReduceOp.MAX)
-		if has_writer.item() == 0:
+		if writer is None or not completed_uuids:
 			return
 
-		# Each rank collects tokens for its locally-owned completed sequences
-		my_completed_tokens = []
 		for uuid in completed_uuids:
 			if uuid in self._uuid_to_local_map:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
-					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu())
+					writer.submit(
+						seq.global_idx,
+						self.query_book[local_idx].decoded_tokens.cpu(),
 					)
-
-		# Gather to all ranks (all_gather_object is a collective — all must call)
-		all_completed_tokens = [None] * self.world_size
-		dist.all_gather_object(all_completed_tokens, my_completed_tokens)
-
-		# Rank 0 submits to writer
-		if writer is not None:
-			for rank_tokens in all_completed_tokens:
-				if rank_tokens:
-					for global_idx, tokens in rank_tokens:
-						writer.submit(global_idx, tokens)
 
 	def _try_load_new_sequences(
 		self, 
