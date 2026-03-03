@@ -15,7 +15,7 @@ from typing import Optional
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from batchgen.server.batch_scheduler import BatchScheduler, parse_batch_file
@@ -34,6 +34,7 @@ from batchgen.server.io_struct import (
     RawInferenceRequest,
     normalize_inference_results,
 )
+from batchgen.server.health import ServerHealthState
 from batchgen.server.server_args import ServerArgs
 from batchgen.server.storage import StorageManager
 from batchgen.server.worker_manager import WorkerExitState, WorkerManager
@@ -83,8 +84,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 def create_app(
     server_args: ServerArgs,
     worker_exit_state: Optional[WorkerExitState] = None,
+    health_state: Optional[ServerHealthState] = None,
 ) -> FastAPI:
     worker_exit_state = worker_exit_state or WorkerExitState()
+    health_state = health_state or ServerHealthState()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -99,6 +102,7 @@ def create_app(
 
         worker.start()
         await scheduler.start()
+        health_state.mark_startup_complete()
 
         try:
             yield
@@ -108,6 +112,7 @@ def create_app(
 
     app = FastAPI(title="BatchGen OpenAI-Compatible API", lifespan=lifespan)
     app.state.worker_exit_state = worker_exit_state
+    app.state.health = health_state
 
     # Add custom access logging middleware (replaces uvicorn's default)
     app.add_middleware(QuietAccessLogMiddleware)
@@ -413,7 +418,26 @@ def create_app(
         return response_data
 
     @app.get("/health")
-    async def health_check():
+    async def health_check(request: Request):
+        health: ServerHealthState = request.app.state.health
+        worker_exit: WorkerExitState = request.app.state.worker_exit_state
+
+        if worker_exit.is_failed():
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "reason": worker_exit.reason or "Worker process exited.",
+                },
+            )
+
+        healthy, reason = health.is_healthy()
+        if not healthy:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "unhealthy", "reason": reason},
+            )
+
         return {"status": "healthy"}
 
     return app
@@ -421,12 +445,36 @@ def create_app(
 
 def launch_server(server_args: ServerArgs) -> None:
     """Launch the HTTP server."""
+    import os
     import signal
+    import threading
+
     from batchgen.server.process_utils import cleanup_resources
 
     worker_exit_state = WorkerExitState()
-    app = create_app(server_args, worker_exit_state)
+    health_state = ServerHealthState()
+    app = create_app(server_args, worker_exit_state, health_state)
     shutdown_requested = False
+
+    # Startup timeout: if the server doesn't become ready in time, log error
+    # and force-exit the process with exit code 1. The caller (shell, systemd,
+    # K8s) sees the non-zero exit code and error logs.
+    if server_args.startup_timeout is not None:
+        def _startup_watchdog():
+            deadline = time.monotonic() + server_args.startup_timeout
+            while time.monotonic() < deadline:
+                if health_state.is_startup_complete():
+                    return
+                time.sleep(1.0)
+            if not health_state.is_startup_complete():
+                logger.error(
+                    "Server failed to start within %ss. Exiting with code 1.",
+                    server_args.startup_timeout,
+                )
+                os._exit(1)
+
+        t = threading.Thread(target=_startup_watchdog, daemon=True)
+        t.start()
 
     def shutdown_handler(signum, frame):
         nonlocal shutdown_requested

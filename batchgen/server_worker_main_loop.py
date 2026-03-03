@@ -209,6 +209,17 @@ def _server_worker_main_impl(
 	# Pass watchdog to worker for fine-grained feeding during inference
 	worker.set_watchdog(watchdog)
 
+	# 2.6. Initialize decode watchdog for per-decode-step timeout
+	decode_step_timeout = getattr(args, 'decode_step_timeout', None)
+	decode_watchdog = Watchdog.create(
+		debug_name=f"decode-{args.global_rank}",
+		watchdog_timeout=decode_step_timeout,
+		soft=False,  # Hard mode: kill parent process on timeout
+	)
+	if decode_step_timeout:
+		logging.info(f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s")
+	worker.set_decode_watchdog(decode_watchdog)
+
 	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
 	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.
 	# Without this barrier, faster ranks will start the main loop and attempt collective
