@@ -989,7 +989,24 @@ class BatchGenWorker:
 			# Write position is current position (0-indexed)
 			write_pos = seq.current_context_length - 1
 			sequence_lengths.append(write_pos)
-			if (
+			decode_pos = write_pos - seq.prompt_length
+			if decode_pos >= 0:
+				query_entry = self.query_book.get(local_idx)
+				decoded_tokens = (
+					None if query_entry is None else query_entry.decoded_tokens
+				)
+				if (
+					decode_pos >= seq.decoded_length
+					or decoded_tokens is None
+					or decoded_tokens.dim() < 2
+					or decode_pos >= decoded_tokens.shape[1]
+				):
+					has_decode_tokens = False
+				else:
+					decode_token_ids.append(
+						int(decoded_tokens[0, decode_pos].item())
+					)
+			elif (
 				seq.input_ids is None
 				or write_pos < 0
 				or write_pos >= seq.input_ids.shape[1]
@@ -6801,7 +6818,24 @@ class BatchGenWorker:
 			sequence_ids.append(seq.global_idx)
 			write_pos = seq.current_context_length - 1
 			sequence_lengths.append(write_pos)
-			if (
+			decode_pos = write_pos - seq.prompt_length
+			if decode_pos >= 0:
+				query_entry = self.query_book.get(local_idx)
+				decoded_tokens = (
+					None if query_entry is None else query_entry.decoded_tokens
+				)
+				if (
+					decode_pos >= seq.decoded_length
+					or decoded_tokens is None
+					or decoded_tokens.dim() < 2
+					or decode_pos >= decoded_tokens.shape[1]
+				):
+					has_decode_tokens = False
+				else:
+					decode_token_ids.append(
+						int(decoded_tokens[0, decode_pos].item())
+					)
+			elif (
 				seq.input_ids is None
 				or write_pos < 0
 				or write_pos >= seq.input_ids.shape[1]
