@@ -312,6 +312,9 @@ class BatchGenWorker:
 		# Watchdog for stuck detection (can be set via set_watchdog())
 		self._watchdog = None
 
+		# Incremental writer for crash-resilient result saving (set by server_worker_main_loop)
+		self._incremental_writer = None
+
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
 			logging.info(
@@ -3772,6 +3775,51 @@ class BatchGenWorker:
 		
 		return active_uuids, active_local_indices, completed_uuids
 
+	def _submit_completed_to_incremental_writer(
+		self,
+		completed_uuids: List[str],
+	) -> None:
+		"""Gather completed sequence tokens and submit to incremental writer.
+
+		All ranks participate in the all_gather_object. Only rank 0
+		actually submits to the writer. No-op if writer is not active.
+		"""
+		if not completed_uuids:
+			return
+		writer = getattr(self, '_incremental_writer', None)
+		# All ranks must participate in the collective even if writer is None on non-rank-0
+		# But we only do the gather if rank 0 has a writer (otherwise skip entirely)
+		# Since the writer is only set on rank 0, we broadcast whether to gather
+		has_writer = torch.tensor(
+			[1 if writer is not None else 0],
+			dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(has_writer, op=dist.ReduceOp.MAX)
+		if has_writer.item() == 0:
+			return
+
+		# Each rank collects tokens for its locally-owned completed sequences
+		my_completed_tokens = []
+		for uuid in completed_uuids:
+			if uuid in self._uuid_to_local_map:
+				local_idx = self._uuid_to_local_map[uuid]
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None and local_idx in self.query_book:
+					my_completed_tokens.append(
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu())
+					)
+
+		# Gather to all ranks (all_gather_object is a collective — all must call)
+		all_completed_tokens = [None] * self.world_size
+		dist.all_gather_object(all_completed_tokens, my_completed_tokens)
+
+		# Rank 0 submits to writer
+		if writer is not None:
+			for rank_tokens in all_completed_tokens:
+				if rank_tokens:
+					for global_idx, tokens in rank_tokens:
+						writer.submit(global_idx, tokens)
+
 	def _try_load_new_sequences(
 		self, 
 		current_decode_uuids: List[str],
@@ -5819,6 +5867,8 @@ class BatchGenWorker:
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+			# Incremental write: gather completed tokens to rank 0
+			self._submit_completed_to_incremental_writer(completed_uuids)
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
@@ -7765,6 +7815,8 @@ class BatchGenWorker:
 				
 				if completed_uuids:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+					# Incremental write: gather completed tokens to rank 0
+					self._submit_completed_to_incremental_writer(completed_uuids)
 					# FIX: Must release GPU KV pages BEFORE releasing host KV pages
 					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 					if my_completed:

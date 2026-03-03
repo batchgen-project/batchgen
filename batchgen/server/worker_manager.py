@@ -269,6 +269,15 @@ class WorkerManager:
         ignore_eos: bool = False,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        # Incremental writer metadata
+        custom_id_map: Optional[Dict[int, str]] = None,
+        request_url_map: Optional[Dict[int, str]] = None,
+        prompt_text_map: Optional[Dict[int, str]] = None,
+        batch_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        incremental_output_dir: Optional[str] = None,
+        parse_thinking: bool = False,
+        parse_tool_call: bool = False,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -280,6 +289,16 @@ class WorkerManager:
             "temperature": temperature,
             "top_p": top_p,
         }
+        # Incremental writer metadata (only included when active)
+        if incremental_output_dir and custom_id_map:
+            payload["incremental_output_dir"] = incremental_output_dir
+            payload["custom_id_map"] = custom_id_map
+            payload["request_url_map"] = request_url_map or {}
+            payload["prompt_text_map"] = prompt_text_map or {}
+            payload["batch_id"] = batch_id
+            payload["model_name"] = model_name
+            payload["parse_thinking"] = parse_thinking
+            payload["parse_tool_call"] = parse_tool_call
         with self._lock:
             self.request_queue.put(payload)
             result = self.response_queue.get()

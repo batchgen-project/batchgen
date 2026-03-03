@@ -297,6 +297,7 @@ def _server_worker_main_impl(
 		# --- STEP 4: Inference with full global batch ---
 		local_results = []
 		inference_error = None
+		incremental_writer = None
 		try:
 			# Unpack payload - all ranks now have the full global batch
 			global_prompts = task_data.get("prompts", [])
@@ -310,6 +311,25 @@ def _server_worker_main_impl(
 			top_p = task_data.get("top_p", None)
 			if global_rank == 0:
 				logging.info(f"[PAYLOAD] Extracted from task_data: temperature={temperature}, top_p={top_p}")
+
+			# Create incremental writer on rank 0 (if metadata present)
+			incr_output_dir = task_data.get("incremental_output_dir")
+			incr_custom_ids = task_data.get("custom_id_map")
+			if global_rank == 0 and incr_output_dir and incr_custom_ids:
+				from batchgen.server.incremental_writer import IncrementalWriter
+				incremental_writer = IncrementalWriter(
+					output_dir=incr_output_dir,
+					batch_id=task_data.get("batch_id", "unknown"),
+					model_name=task_data.get("model_name", "unknown"),
+					custom_id_map=incr_custom_ids,
+					request_urls=task_data.get("request_url_map", {}),
+					prompt_texts=task_data.get("prompt_text_map", {}),
+					tokenizer=worker.tokenizer,
+					eos_token_ids=worker.eos_token_ids,
+					parse_thinking=task_data.get("parse_thinking", False),
+					parse_tool_call=task_data.get("parse_tool_call", False),
+				)
+				worker._incremental_writer = incremental_writer
 
 			# Clear previous state if supported
 			if hasattr(worker, 'reset_runtime_state'):
@@ -335,6 +355,11 @@ def _server_worker_main_impl(
 			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
 			inference_error = str(e)
 			local_results = []
+		finally:
+			# Close incremental writer regardless of success/failure
+			if incremental_writer is not None:
+				incremental_writer.close()
+				worker._incremental_writer = None
 
 		# --- STEP 5: Synchronize and check for errors ---
 		# Sync CUDA to catch any async errors
