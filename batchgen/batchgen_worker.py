@@ -3807,25 +3807,50 @@ class BatchGenWorker:
 		self,
 		completed_uuids: List[str],
 	) -> None:
-		"""Submit completed sequence tokens to incremental writer (rank 0 only).
+		"""Gather completed sequence tokens from all ranks and submit to writer.
 
-		With tensor parallelism, all ranks have all sequences, so rank 0
-		can directly access tokens without cross-rank communication.
-		No collective operations — zero overhead on non-rank-0.
+		Sequences are distributed across ranks (each rank owns a subset).
+		Uses all_gather_object to collect decoded tokens from the owning
+		rank to rank 0 where the writer lives. All ranks must participate
+		in the collective.
 		"""
-		writer = getattr(self, '_incremental_writer', None)
-		if writer is None or not completed_uuids:
+		if not completed_uuids:
 			return
 
+		# Quick check: does rank 0 have a writer? Broadcast to all ranks.
+		writer = getattr(self, '_incremental_writer', None)
+		has_writer = torch.tensor(
+			[1 if writer is not None else 0],
+			dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(has_writer, op=dist.ReduceOp.MAX)
+		if has_writer.item() == 0:
+			return
+
+		# Each rank collects tokens for its locally-owned completed sequences
+		my_completed_tokens = []
 		for uuid in completed_uuids:
 			if uuid in self._uuid_to_local_map:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
-					writer.submit(
-						seq.global_idx,
-						self.query_book[local_idx].decoded_tokens.cpu(),
+					my_completed_tokens.append(
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu())
 					)
+
+		# All ranks participate in gather (NCCL collective requirement)
+		all_completed_tokens = [None] * self.world_size
+		dist.all_gather_object(all_completed_tokens, my_completed_tokens)
+
+		# Rank 0 submits to writer (deduplicate by global_idx)
+		if writer is not None:
+			seen = set()
+			for rank_tokens in all_completed_tokens:
+				if rank_tokens:
+					for global_idx, tokens in rank_tokens:
+						if global_idx not in seen:
+							seen.add(global_idx)
+							writer.submit(global_idx, tokens)
 
 	def _try_load_new_sequences(
 		self, 

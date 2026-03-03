@@ -73,6 +73,9 @@ class IncrementalWriter:
         self._closed = False
         self._count = 0
 
+        # Create file eagerly so it exists before any writes
+        self._output_path.touch(exist_ok=True)
+
         self._thread = threading.Thread(
             target=self._background_loop,
             name="incremental-writer",
