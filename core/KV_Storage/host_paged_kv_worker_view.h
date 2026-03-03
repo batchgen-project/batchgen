@@ -295,6 +295,8 @@ class HostPagedKVWorkerView {
         auto alloc_result = backend_.AcquirePagesForSequencesWithPrefix(
             sequence_ids, num_tokens, flat_prompt_tokens, prompt_offsets);
 
+        std::size_t reused_sequence_count = 0;
+        std::size_t reused_token_total = 0;
         for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
             AppendAllocatedPages(sequence_ids[i], alloc_result.allocated_pages[i]);
             const std::size_t begin = prompt_offsets[i];
@@ -304,6 +306,23 @@ class HostPagedKVWorkerView {
                                   flat_prompt_tokens.begin() + begin,
                                   flat_prompt_tokens.begin() + end),
                               alloc_result.reused_prefix_tokens[i]);
+            reused_token_total += alloc_result.reused_prefix_tokens[i];
+            if (alloc_result.reused_prefix_tokens[i] > 0) {
+                ++reused_sequence_count;
+            }
+        }
+        if (config_.enable_prefix_reuse) {
+            if (reused_sequence_count > 0) {
+                logger_->info(
+                    "PrefixCache allocation completed (sequences={}, reused_sequences={}, reused_tokens={}, reused_pages={})",
+                    sequence_ids.size(), reused_sequence_count,
+                    reused_token_total,
+                    reused_token_total / config_.page_size_tokens);
+            } else {
+                logger_->debug(
+                    "PrefixCache allocation completed (sequences={}, reused_sequences=0, reused_tokens=0, reused_pages=0)",
+                    sequence_ids.size());
+            }
         }
 
         return {std::move(alloc_result.allocated_pages),
@@ -944,8 +963,20 @@ class HostPagedKVWorkerView {
         }
 
         std::vector<std::size_t> prefix_skip_tokens(sequence_ids.size(), 0);
+        std::size_t skipped_sequence_count = 0;
+        std::size_t skipped_token_total = 0;
         for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
             prefix_skip_tokens[i] = PrefixTokensToSkip(sequence_ids[i]);
+            skipped_token_total += prefix_skip_tokens[i];
+            if (prefix_skip_tokens[i] > 0) {
+                ++skipped_sequence_count;
+            }
+        }
+        if (config_.enable_prefix_reuse && skipped_sequence_count > 0) {
+            logger_->debug(
+                "PrefixCache prefill skip planned (layer={}, sequences={}, skipped_sequences={}, skipped_tokens={})",
+                layer_idx, sequence_ids.size(), skipped_sequence_count,
+                skipped_token_total);
         }
 
         return LaunchAsyncTask([this, layer_idx,
@@ -1327,6 +1358,9 @@ class HostPagedKVWorkerView {
         state.tokens = std::move(prompt_tokens);
         state.reused_prefix_tokens = reused_prefix_tokens;
         state.committed_token_count = 0;
+        logger_->debug(
+            "PrefixCache state initialized (sequence_id={}, token_count={}, reused_tokens={})",
+            sequence_id, state.tokens.size(), reused_prefix_tokens);
     }
 
     void AppendDecodeTokens(const std::vector<std::int64_t>& sequence_ids,
@@ -1374,6 +1408,7 @@ class HostPagedKVWorkerView {
         };
 
         std::vector<CacheCommitItem> commit_items;
+        std::size_t committed_token_total = 0;
         {
             std::lock_guard<std::mutex> guard(prefix_state_mutex_);
             for (std::int64_t sequence_id : sequence_ids) {
@@ -1395,7 +1430,14 @@ class HostPagedKVWorkerView {
                 commit_items.push_back(
                     {sequence_id, it->second.tokens, full_page_token_count});
                 it->second.committed_token_count = full_page_token_count;
+                committed_token_total += full_page_token_count;
             }
+        }
+        if (!commit_items.empty()) {
+            logger_->info(
+                "PrefixCache commit scheduled (layer={}, commit_count={}, committed_tokens={}, committed_pages={})",
+                layer_idx, commit_items.size(), committed_token_total,
+                committed_token_total / config_.page_size_tokens);
         }
 
         for (const auto& item : commit_items) {

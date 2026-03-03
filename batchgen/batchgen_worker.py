@@ -1006,6 +1006,11 @@ class BatchGenWorker:
 					'decoded_len': seq.decoded_length,
 					'write_pos': write_pos,
 				})
+		if not has_decode_tokens:
+			logging.debug(
+				f"Rank {self.rank}: PrefixCache decode token capture unavailable "
+				f"(layer={layer_idx}, batch_size={len(batch)}), skip decode token cache update"
+			)
 		
 		# Log append positions for resumed sequences (layer 0 only to reduce spam)
 		if layer_idx == 0 and append_diag and BATCHGEN_CB_DEBUG:
@@ -4445,11 +4450,25 @@ class BatchGenWorker:
 				and getattr(host_cfg, "enable_prefix_reuse", False)
 			)
 			if enable_prefix_reuse:
-				self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences_with_prefix(
+				_, reused_prefix_tokens = self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences_with_prefix(
 					list(zip(global_sequence_ids, sequence_tokens)),
 					flat_prompt_tokens,
 					prompt_offsets,
 				)
+				reused_sequences = sum(1 for tokens in reused_prefix_tokens if tokens > 0)
+				reused_tokens_total = sum(int(tokens) for tokens in reused_prefix_tokens)
+				page_size = max(1, int(getattr(host_cfg, "page_size_tokens", 1)))
+				if reused_sequences > 0:
+					logging.info(
+						f"Rank {self.rank}: PrefixCache allocation summary "
+						f"(batch={len(global_sequence_ids)}, reused_sequences={reused_sequences}, "
+						f"reused_tokens={reused_tokens_total}, reused_pages={reused_tokens_total // page_size})"
+					)
+				else:
+					logging.debug(
+						f"Rank {self.rank}: PrefixCache allocation summary "
+						f"(batch={len(global_sequence_ids)}, reused_sequences=0, reused_tokens=0, reused_pages=0)"
+					)
 			else:
 				self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
 					list(zip(global_sequence_ids, sequence_tokens))
@@ -6790,6 +6809,11 @@ class BatchGenWorker:
 				has_decode_tokens = False
 			else:
 				decode_token_ids.append(int(seq.input_ids[0, write_pos].item()))
+		if not has_decode_tokens:
+			logging.debug(
+				f"Rank {self.rank}: PrefixCache decode token capture unavailable "
+				f"(layer={layer_idx}, batch_size={len(batch)}), skip decode token cache update"
+			)
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
