@@ -100,10 +100,16 @@ class ServerArgs:
     adaptive_chunk_max: int = 65536  # Maximum adaptive chunk size in tokens
     adaptive_chunk_ema_alpha: float = 0.1  # EMA smoothing factor
     adaptive_chunk_multiplier: float = 1.5  # Headroom multiplier on EMA
+    # Incremental result saving (crash-resilient output)
+    incremental_output_dir: Optional[str] = None  # Directory for incremental JSONL; None = auto
+    no_incremental_save: bool = False  # Opt-out flag to disable incremental saving
 
     def __post_init__(self):
         if self.storage_path is None:
             self.storage_path = _default_storage_path()
+        # Default incremental output dir: {storage_path}/incremental/
+        if self.incremental_output_dir is None and not self.no_incremental_save:
+            self.incremental_output_dir = str(self.storage_path / "incremental")
 
     def resolve_paths(self) -> None:
         """Normalize any path-like args."""
@@ -345,6 +351,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.5,
         help="Headroom multiplier on EMA for adaptive chunk sizing (default: 1.5)",
     )
+    # Incremental result saving (crash-resilient)
+    parser.add_argument(
+        "--incremental-output-dir",
+        type=str,
+        default=None,
+        help="Directory for incremental JSONL results (crash-resilient). "
+             "Default: {storage_path}/incremental/",
+    )
+    parser.add_argument(
+        "--no-incremental-save",
+        action="store_true",
+        default=False,
+        help="Disable incremental saving of completed sequences to disk",
+    )
     return parser
 
 
@@ -468,6 +488,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         adaptive_chunk_max=parsed.adaptive_chunk_max,
         adaptive_chunk_ema_alpha=parsed.adaptive_chunk_ema_alpha,
         adaptive_chunk_multiplier=parsed.adaptive_chunk_multiplier,
+        incremental_output_dir=parsed.incremental_output_dir,
+        no_incremental_save=parsed.no_incremental_save,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

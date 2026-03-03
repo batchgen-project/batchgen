@@ -195,6 +195,26 @@ class BatchScheduler:
         prompts, per_request_max_tokens = self._convert_requests_to_worker_inputs(requests)
         # Use batch-level max_decoding_length if specified, otherwise use per-request value
         max_tokens = batch.max_decoding_length or per_request_max_tokens
+
+        # Build incremental writer metadata
+        incremental_output_dir = (
+            self.server_args.incremental_output_dir
+            if not self.server_args.no_incremental_save
+            else None
+        )
+        incremental_kwargs = {}
+        if incremental_output_dir:
+            incremental_kwargs = dict(
+                custom_id_map={idx: req.custom_id for idx, req in enumerate(requests)},
+                request_url_map={idx: req.url.value for idx, req in enumerate(requests)},
+                prompt_text_map={idx: prompts[idx] for idx in range(len(prompts))},
+                batch_id=batch_id,
+                model_name=requests[0].body.model if requests else "unknown",
+                incremental_output_dir=incremental_output_dir,
+                parse_thinking=self.server_args.parse_thinking,
+                parse_tool_call=self.server_args.parse_tool_call,
+            )
+
         try:
             results = await asyncio.to_thread(
                 self.worker.infer,
@@ -204,6 +224,7 @@ class BatchScheduler:
                 False,  # ignore_eos
                 batch.temperature,  # None = greedy decoding
                 batch.top_p,  # None = disabled
+                **incremental_kwargs,
             )
         except Exception as exc:
             self.storage.update_batch_status(
@@ -213,10 +234,30 @@ class BatchScheduler:
             return
 
         output_file_id = f"file-{uuid.uuid4().hex}"
-        output_items = self._build_output_items(requests, results, prompts)
-        output_path = self.storage.write_output_file(
-            output_file_id, output_items
-        )
+
+        # If incremental save was active, use the incremental JSONL as the output
+        incremental_path = None
+        if incremental_output_dir:
+            from pathlib import Path
+            import shutil
+            incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
+
+        if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
+            # Copy incremental file to storage for API access
+            api_path = self.storage.files_dir / output_file_id
+            shutil.copy2(incremental_path, api_path)
+            output_path = self.storage.output_dir / f"{output_file_id}.jsonl"
+            shutil.copy2(incremental_path, output_path)
+            logger.info(
+                f"Batch {batch_id}: using incremental output "
+                f"({incremental_path} -> {output_path})"
+            )
+        else:
+            # Fallback: build output the original way
+            output_items = self._build_output_items(requests, results, prompts)
+            output_path = self.storage.write_output_file(
+                output_file_id, output_items
+            )
 
         output_meta = FileObject(
             id=output_file_id,

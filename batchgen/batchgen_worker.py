@@ -312,6 +312,11 @@ class BatchGenWorker:
 		# Watchdog for stuck detection (can be set via set_watchdog())
 		self._watchdog = None
 
+		# Incremental writer for crash-resilient result saving
+		# Config is staged by server_worker_main_loop; writer created after tokenizer init
+		self._incremental_writer = None
+		self._incremental_writer_config = None
+
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
 			logging.info(
@@ -2595,6 +2600,29 @@ class BatchGenWorker:
 
 	# ============ Main Entry Point ============
 
+	def _init_incremental_writer(self) -> None:
+		"""Create IncrementalWriter from staged config (rank 0 only).
+
+		Called after _tokenize_global_batch() so tokenizer and eos_token_ids
+		are available. Config is staged by server_worker_main_loop.
+		"""
+		cfg = getattr(self, '_incremental_writer_config', None)
+		if cfg is None or self.rank != 0:
+			return
+		from batchgen.server.incremental_writer import IncrementalWriter
+		self._incremental_writer = IncrementalWriter(
+			output_dir=cfg["output_dir"],
+			batch_id=cfg["batch_id"],
+			model_name=cfg["model_name"],
+			custom_id_map=cfg["custom_id_map"],
+			request_urls=cfg["request_urls"],
+			prompt_texts=cfg["prompt_texts"],
+			tokenizer=self.tokenizer,
+			eos_token_ids=self.eos_token_ids,
+			parse_thinking=cfg.get("parse_thinking", False),
+			parse_tool_call=cfg.get("parse_tool_call", False),
+		)
+
 	def process_new_batch(self, global_prompts: List[str]) -> List[torch.Tensor]:
 		"""
 		Process a global batch of prompts.
@@ -2635,6 +2663,9 @@ class BatchGenWorker:
 			# Step 2: Tokenize all sequences (all ranks do this identically)
 			# This determines the actual max_input_length dynamically
 			self._tokenize_global_batch()
+
+			# Step 2.1: Create incremental writer now that tokenizer/eos_token_ids are available
+			self._init_incremental_writer()
 
 			# Step 2.5: Update engine config with actual max_input_length after tokenization
 			self._update_config_after_tokenization()
@@ -3772,6 +3803,53 @@ class BatchGenWorker:
 		
 		return active_uuids, active_local_indices, completed_uuids
 
+	def _submit_completed_to_incremental_writer(
+		self,
+		completed_uuids: List[str],
+	) -> None:
+		"""Gather completed sequence tokens from all ranks and submit to writer.
+
+		Sequences are distributed across ranks (each rank owns a subset).
+		Uses all_gather_object to collect decoded tokens from the owning
+		rank to rank 0 where the writer lives. All ranks must participate
+		in the collective.
+		"""
+		if not completed_uuids:
+			return
+
+		# Quick check: does rank 0 have a writer? Broadcast to all ranks.
+		writer = getattr(self, '_incremental_writer', None)
+		has_writer = torch.tensor(
+			[1 if writer is not None else 0],
+			dtype=torch.int32, device=self.torch_device
+		)
+		dist.all_reduce(has_writer, op=dist.ReduceOp.MAX)
+		if has_writer.item() == 0:
+			return
+
+		# Each rank collects tokens for its locally-owned completed sequences
+		my_completed_tokens = []
+		for uuid in completed_uuids:
+			if uuid in self._uuid_to_local_map:
+				local_idx = self._uuid_to_local_map[uuid]
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None and local_idx in self.query_book:
+					my_completed_tokens.append(
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu())
+					)
+
+		# All ranks participate in gather (NCCL collective requirement)
+		all_completed_tokens = [None] * self.world_size
+		dist.all_gather_object(all_completed_tokens, my_completed_tokens)
+
+		# Rank 0 submits to writer
+		# Each global_idx is owned by exactly one rank, so no duplicates possible
+		if writer is not None:
+			for rank_tokens in all_completed_tokens:
+				if rank_tokens:
+					for global_idx, tokens in rank_tokens:
+						writer.submit(global_idx, tokens)
+
 	def _try_load_new_sequences(
 		self, 
 		current_decode_uuids: List[str],
@@ -4246,6 +4324,10 @@ class BatchGenWorker:
 				# Step 2: Sync completion status using tensor-based all_reduce
 				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
 				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
+
+				# Incremental write: submit sequences completed between decode rounds
+				if global_completed:
+					self._submit_completed_to_incremental_writer(list(global_completed))
 
 				if not decode_uuids:
 					break
@@ -5819,6 +5901,8 @@ class BatchGenWorker:
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+			# Incremental write: gather completed tokens to rank 0
+			self._submit_completed_to_incremental_writer(completed_uuids)
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
@@ -7765,6 +7849,8 @@ class BatchGenWorker:
 				
 				if completed_uuids:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+					# Incremental write: gather completed tokens to rank 0
+					self._submit_completed_to_incremental_writer(completed_uuids)
 					# FIX: Must release GPU KV pages BEFORE releasing host KV pages
 					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 					if my_completed:
