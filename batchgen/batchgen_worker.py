@@ -4302,6 +4302,10 @@ class BatchGenWorker:
 				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
 				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
 
+				# Incremental write: submit sequences completed between decode rounds
+				if global_completed:
+					self._submit_completed_to_incremental_writer(list(global_completed))
+
 				if not decode_uuids:
 					break
 				
