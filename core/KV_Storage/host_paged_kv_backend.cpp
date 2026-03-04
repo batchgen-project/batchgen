@@ -576,6 +576,7 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
             shm_fd = fd;
             using_memfd = true;
             mapping = static_cast<std::byte*>(mapped);
+            MapPointers();
             WaitForInitialization();
             ValidateSharedState();
         }

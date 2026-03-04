@@ -400,7 +400,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             }
             allocated_size = aligned_size;
             madvise(ptr, allocated_size, MADV_HUGEPAGE);
-            touch_pages(ptr, size, huge_page_size, true);
+            // Skip touch_pages — weight loading writes every byte of the region,
+            // which faults pages in naturally with THP via madvise above.
+            logger->info("--fast-init: Skipping page touching for weights memfd (pages fault in during weight copy)");
             if (out_memfd_fd) {
                 *out_memfd_fd = fd;
             }
