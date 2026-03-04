@@ -160,7 +160,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--fast-init",
         action="store_true",
         help="Use memfd_create + THP for fast memory registration. "
-             "Requires: echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled",
+             "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
+             "(2) root access (for pre-allocation memory compaction). "
+             "Automatically runs drop_caches + compact_memory before allocation "
+             "to defragment physical memory for stable 2MB THP pages.",
     )
     parser.add_argument(
         "--dist-init-addr",

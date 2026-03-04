@@ -183,6 +183,7 @@ class WorkerManager:
 
         if self.args.fast_init:
             _validate_shmem_enabled()
+            self._compact_memory()
 
         if self.args.enable_hugetlbfs:
             byte_size = get_model_byte_size(self.args.model)
@@ -351,6 +352,16 @@ class WorkerManager:
         return result
 
     # ---------------------- Startup helpers ----------------------
+    def _compact_memory(self) -> None:
+        """Drop page cache and compact memory for stable THP allocation."""
+        import subprocess
+        try:
+            subprocess.run(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True)
+            subprocess.run(["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"], check=True)
+            logger.info("[fast-init] Memory compaction completed (drop_caches + compact_memory)")
+        except (subprocess.CalledProcessError, PermissionError) as e:
+            logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
+
     def _config_hugepages(self, byte_size: int = None) -> None:
         """Configure hugepages for shared memory.
 
