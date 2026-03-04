@@ -355,10 +355,13 @@ class WorkerManager:
     def _compact_memory(self) -> None:
         """Drop page cache and compact memory for stable THP allocation."""
         import subprocess
+        import time as _time
+        t0 = _time.monotonic()
         try:
             subprocess.run(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True)
             subprocess.run(["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"], check=True)
-            logger.info("[fast-init] Memory compaction completed (drop_caches + compact_memory)")
+            logger.info("[fast-init] Memory compaction completed in %.2fs (drop_caches + compact_memory)",
+                        _time.monotonic() - t0)
         except (subprocess.CalledProcessError, PermissionError) as e:
             logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
 
