@@ -230,6 +230,7 @@ class BatchGenWorkerArgs:
 	watchdog_timeout: Optional[float] = 600.0  # Seconds before declaring process stuck (10 min for long inference)
 	watchdog_test_stuck_time: float = 0.0  # Deliberate delay for testing
 	watchdog_heartbeat_interval: Optional[float] = None  # Heartbeat interval
+	decode_step_timeout: Optional[float] = None  # Max seconds per decode step
 
 	# Prepack optimization (default: enabled, recommended always on)
 	enable_prepack: bool = True
@@ -311,6 +312,8 @@ class BatchGenWorker:
 
 		# Watchdog for stuck detection (can be set via set_watchdog())
 		self._watchdog = None
+		# Decode watchdog: per-decode-step timeout (separate from general watchdog)
+		self._decode_watchdog = None
 
 		# Incremental writer for crash-resilient result saving
 		# Config is staged by server_worker_main_loop; writer created after tokenizer init
@@ -690,10 +693,33 @@ class BatchGenWorker:
 		"""
 		self._watchdog = watchdog
 
+	def set_decode_watchdog(self, watchdog) -> None:
+		"""Set a per-decode-step watchdog. Starts disabled; enabled only during decode."""
+		self._decode_watchdog = watchdog
+		# Start disabled — only enable around actual decode iterations
+		if hasattr(watchdog, '_active'):
+			watchdog._active = False
+
 	def feed_watchdog(self) -> None:
 		"""Feed the watchdog to prevent timeout during long operations."""
 		if self._watchdog is not None:
 			self._watchdog.feed()
+
+	def feed_decode_watchdog(self) -> None:
+		"""Feed the decode watchdog at the start of each decode step."""
+		if self._decode_watchdog is not None:
+			self._decode_watchdog.feed()
+
+	def enable_decode_watchdog(self) -> None:
+		"""Enable decode watchdog monitoring (call before decode loop)."""
+		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
+			self._decode_watchdog._active = True
+			self._decode_watchdog.feed()  # Reset timer
+
+	def disable_decode_watchdog(self) -> None:
+		"""Disable decode watchdog monitoring (call after decode loop)."""
+		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
+			self._decode_watchdog._active = False
 
 	@contextmanager
 	def disable_watchdog(self):
@@ -6693,13 +6719,15 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 		
-		# Main decode loop
+		# Main decode loop — enable decode watchdog for monitoring
+		self.enable_decode_watchdog()
 		while decode_uuids:
 			local_iteration += 1
 			self._cumulative_decode_iterations += 1
 
-			# Feed watchdog to prevent timeout during long decoding
+			# Feed watchdogs to prevent timeout during long decoding
 			self.feed_watchdog()
+			self.feed_decode_watchdog()
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
@@ -7111,6 +7139,7 @@ class BatchGenWorker:
 				f"{'='*50}"
 			)
 
+		self.disable_decode_watchdog()
 		return decode_uuids, batch
 
 	def _wait_pending_kv_append_tasks(self) -> int:

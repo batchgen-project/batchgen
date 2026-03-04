@@ -103,6 +103,10 @@ class ServerArgs:
     # Incremental result saving (crash-resilient output)
     incremental_output_dir: Optional[str] = None  # Directory for incremental JSONL; None = auto
     no_incremental_save: bool = False  # Opt-out flag to disable incremental saving
+    # Decode step watchdog
+    decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
+    # Startup timeout
+    startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -205,6 +209,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Idle heartbeat interval in seconds when watchdog is enabled",
+    )
+    parser.add_argument(
+        "--decode-step-timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds for a single decode step. If exceeded, server is marked unhealthy and killed. Default: disabled. Recommended: 300.",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds from process launch to server ready (/health returns 200). If exceeded, server exits. Default: disabled. Recommended: 1800.",
     )
     parser.add_argument(
         "--enable-prepack",
@@ -401,6 +417,10 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("watchdog_test_stuck_time must be non-negative")
     if args.watchdog_test_stuck_time > 0 and args.watchdog_timeout is None:
         raise ValueError("watchdog_test_stuck_time requires watchdog_timeout")
+    if args.decode_step_timeout is not None and args.decode_step_timeout <= 0:
+        raise ValueError("decode_step_timeout must be positive")
+    if args.startup_timeout is not None and args.startup_timeout <= 0:
+        raise ValueError("startup_timeout must be positive")
     if args.host_kv_watermark < 0 or args.host_kv_watermark > 100:
         raise ValueError("host_kv_watermark must be between 0 and 100")
     if args.gpu_memory_frac <= 0 or args.gpu_memory_frac > 1.0:
@@ -490,6 +510,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         adaptive_chunk_multiplier=parsed.adaptive_chunk_multiplier,
         incremental_output_dir=parsed.incremental_output_dir,
         no_incremental_save=parsed.no_incremental_save,
+        decode_step_timeout=parsed.decode_step_timeout,
+        startup_timeout=parsed.startup_timeout,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

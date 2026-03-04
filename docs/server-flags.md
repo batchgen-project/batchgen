@@ -304,16 +304,18 @@ Each line in the JSONL file is a complete `BatchResultItem` with `custom_id`, `r
 
 ## Watchdog Configuration
 
-The watchdog monitors worker processes and restarts them if they become unresponsive. It is fed after each prefill micro-batch and each decode step.
+The watchdog monitors worker processes and reports health via the `/health` endpoint. See [Watchdog & Health Monitoring](watchdog.md) for full documentation.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--watchdog-timeout` | Disabled | Timeout in seconds per micro-batch/decode step. Recommended: 300 for production. |
+| `--watchdog-timeout` | Disabled | General per-step/micro-batch timeout in seconds. Recommended: 600 for production. |
+| `--decode-step-timeout` | Disabled | Max seconds for a single decode iteration. Recommended: 300 for production. |
+| `--startup-timeout` | Disabled | Max seconds from process launch to server ready. Recommended: 1800 for large models. |
 | `--no-watchdog` | - | Disable watchdog (default behavior, kept for compatibility) |
 
 **When to enable watchdog:**
-- For production deployments: use `--watchdog-timeout 300` (5 minutes)
-- Increase timeout for very long sequences or slow hardware
+- For production deployments: use `--watchdog-timeout 600 --decode-step-timeout 300 --startup-timeout 1800`
+- Increase timeouts for very long sequences or slow hardware
 
 ---
 

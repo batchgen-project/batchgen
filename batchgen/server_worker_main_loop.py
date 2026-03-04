@@ -222,6 +222,18 @@ def _server_worker_main_impl(
 		ready_event.set()
 		logging.info(f"Rank {args.global_rank}: Signaled ready event to WorkerManager")
 
+	# 2.6. Initialize decode watchdog AFTER barrier — only monitors decode steps,
+	# not worker init, CUDA graph capture, or NCCL warmup.
+	decode_step_timeout = getattr(args, 'decode_step_timeout', None)
+	decode_watchdog = Watchdog.create(
+		debug_name=f"decode-{args.global_rank}",
+		watchdog_timeout=decode_step_timeout,
+		soft=False,  # Hard mode: kill parent process on timeout
+	)
+	if decode_step_timeout:
+		logging.info(f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s")
+	worker.set_decode_watchdog(decode_watchdog)
+
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
 	world_size = args.world_size
