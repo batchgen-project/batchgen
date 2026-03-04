@@ -461,27 +461,17 @@ def launch_server(server_args: ServerArgs) -> None:
     # K8s) sees the non-zero exit code and error logs.
     if server_args.startup_timeout is not None:
         def _startup_watchdog():
-            import sys
-            print(
-                f"[Startup Watchdog] Started, timeout={server_args.startup_timeout}s, "
-                f"pid={os.getpid()}",
-                file=sys.stderr, flush=True,
+            logger.info(
+                "Startup watchdog started (timeout=%ss, pid=%s).",
+                server_args.startup_timeout, os.getpid(),
             )
             deadline = time.monotonic() + server_args.startup_timeout
             while time.monotonic() < deadline:
                 if health_state.is_startup_complete():
-                    print(
-                        "[Startup Watchdog] Startup completed successfully.",
-                        file=sys.stderr, flush=True,
-                    )
+                    logger.info("Startup completed successfully.")
                     return
                 time.sleep(1.0)
             if not health_state.is_startup_complete():
-                print(
-                    f"[Startup Watchdog] TIMEOUT after {server_args.startup_timeout}s! "
-                    f"Calling os._exit(1)",
-                    file=sys.stderr, flush=True,
-                )
                 logger.error(
                     "Server failed to start within %ss. Exiting with code 1.",
                     server_args.startup_timeout,
