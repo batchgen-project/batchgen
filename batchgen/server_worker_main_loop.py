@@ -135,6 +135,9 @@ def _server_worker_main_impl(
 	# 2. Initialize Process Group
 	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
 
+	# Set CUDA device before init_process_group so NCCL uses the correct device context
+	torch.cuda.set_device(args.local_rank)
+
 	try:
 		dist.init_process_group(
 			backend="nccl",
@@ -147,8 +150,6 @@ def _server_worker_main_impl(
 	except Exception as e:
 		logging.error(f"Failed to initialize process group: {e}")
 		sys.exit(1)
-
-	torch.cuda.set_device(args.local_rank)
 	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
 
 	# CRITICAL: Warmup NCCL connections before entering server loop
