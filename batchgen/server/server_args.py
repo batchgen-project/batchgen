@@ -487,6 +487,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         cache_dir=parsed.cache_dir,
         converted_ckpt_dir=parsed.converted_ckpt_dir,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
+        fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
         kv_dtype=parsed.kv_dtype,
         host_kv_cache_size=parsed.host_kv_cache_size,
