@@ -104,10 +104,11 @@ def create_app(
         worker.start()
         await scheduler.start()
         health_state.mark_startup_complete()
+        e2e_elapsed = time.monotonic() - e2e_start
         logger.info(
-            "[startup] End-to-end server ready in %.2fs",
-            time.monotonic() - e2e_start,
+            "[startup] End-to-end server ready in %.2fs", e2e_elapsed,
         )
+        print(f"[startup] End-to-end server ready in {e2e_elapsed:.2f}s", flush=True)
 
         try:
             yield
