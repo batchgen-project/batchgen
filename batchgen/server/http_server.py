@@ -91,6 +91,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        e2e_start = time.monotonic()
         storage = StorageManager(server_args.storage_path)
         worker = WorkerManager(server_args, worker_exit_state=worker_exit_state)
         scheduler = BatchScheduler(storage, worker, server_args)
@@ -103,6 +104,10 @@ def create_app(
         worker.start()
         await scheduler.start()
         health_state.mark_startup_complete()
+        logger.info(
+            "[startup] End-to-end server ready in %.2fs",
+            time.monotonic() - e2e_start,
+        )
 
         try:
             yield
