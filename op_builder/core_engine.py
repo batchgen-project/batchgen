@@ -1,3 +1,5 @@
+import os
+
 from .builder import CUDAOpBuilder
 
 BATCHGEN_CORE_ROOT = "core/"
@@ -73,7 +75,26 @@ class CoreEngineBuilder(CUDAOpBuilder):
         return args
 
     def extra_ldflags(self):
-        return [
+        import torch
+
+        flags = []
+
+        # CUDA_HOME lib paths (system installs, e.g. /usr/local/cuda/lib64)
+        cuda_home = torch.utils.cpp_extension.CUDA_HOME
+        if cuda_home:
+            for subdir in ("lib64", "lib"):
+                lib_dir = os.path.join(cuda_home, subdir)
+                if os.path.isdir(lib_dir):
+                    flags.append(f"-L{lib_dir}")
+
+        # Conda stubs dir (libcuda.so stub for linking in conda envs)
+        conda_prefix = os.environ.get("CONDA_PREFIX")
+        if conda_prefix:
+            stubs_dir = os.path.join(conda_prefix, "lib", "stubs")
+            if os.path.isdir(stubs_dir):
+                flags.append(f"-L{stubs_dir}")
+
+        flags += [
             '-lnuma',
             '-lcuda',
             '-lcudart',
@@ -82,6 +103,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
             # '-ltcmalloc',
             '-lcufile',
         ]
+        return flags
 
     def is_compatible(self, verbose=True):
         return super().is_compatible(verbose)
