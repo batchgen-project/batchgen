@@ -120,8 +120,11 @@ class DeepSeek_Parameter_Server:
         logging.info(f"GPU 0 free memory before cpp pm Init: {gpu0_memory} GB / {total_memory} GB")
 
         # Convert checkpoint files to BatchGen format (or validate existing conversion)
-        converter = ckpt_converter()
-        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        if self.converted_ckpt_dir is None:
+            converter = ckpt_converter()
+            self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        else:
+            logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 
         self.parameter_server.Init(
             self.shm_name,

@@ -145,6 +145,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to pre-downloaded model weights",
     )
     parser.add_argument(
+        "--converted-ckpt-dir",
+        type=Path,
+        default=None,
+        help="Path to pre-converted checkpoint directory (skips conversion step)",
+    )
+    parser.add_argument(
         "--enable-hugetlbfs",
         action="store_true",
         help="Enable hugeTLBFS for shared memory (requires system support)",
@@ -472,6 +478,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         listen_ip=parsed.listen_ip,
         listen_port=parsed.listen_port,
         cache_dir=parsed.cache_dir,
+        converted_ckpt_dir=parsed.converted_ckpt_dir,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
         dist_init_addr=parsed.dist_init_addr,
         kv_dtype=parsed.kv_dtype,
