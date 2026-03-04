@@ -113,8 +113,11 @@ class MiniMaxM25_Parameter_Server:
         logging.info(f"Model parameters shared memory name: {self.shm_name}")
         logging.info(f"Tensor meta shared memory name: {self.tensor_meta_shm_name}")
 
-        converter = ckpt_converter()
-        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        if self.converted_ckpt_dir is None:
+            converter = ckpt_converter()
+            self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        else:
+            logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 
         self.parameter_server.Init(
             self.shm_name,

@@ -161,8 +161,11 @@ class KimiK25_Parameter_Server:
 
         # Convert checkpoint files to BatchGen format using standard ckpt_converter
         # K2.5 uses HuggingFace safetensors format — no custom conversion needed
-        converter = ckpt_converter()
-        self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        if self.converted_ckpt_dir is None:
+            converter = ckpt_converter()
+            self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+        else:
+            logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 
         self.parameter_server.Init(
             self.shm_name,
