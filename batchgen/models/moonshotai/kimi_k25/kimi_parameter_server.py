@@ -172,7 +172,7 @@ class KimiK25_Parameter_Server:
             self.shm_name,
             self.tensor_meta_shm_name,
             byte_size,
-            self.converted_ckpt_dir,
+            str(self.converted_ckpt_dir),
             self.state_dict_name_map,
         )
         return self.shm_name, self.tensor_meta_shm_name
