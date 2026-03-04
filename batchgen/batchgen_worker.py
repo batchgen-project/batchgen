@@ -6725,13 +6725,15 @@ class BatchGenWorker:
 			local_iteration += 1
 			self._cumulative_decode_iterations += 1
 
-			# Feed watchdogs to prevent timeout during long decoding
+			# Feed general watchdog every iteration
 			self.feed_watchdog()
-			self.feed_decode_watchdog()
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
 				last_boundary = local_iteration
+
+				# Feed decode watchdog at decision interval (not every token) to avoid hot-path overhead
+				self.feed_decode_watchdog()
 
 				(decode_uuids, batch,
 				 pending_async_task, pending_load_uuids,

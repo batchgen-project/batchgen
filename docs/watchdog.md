@@ -21,9 +21,9 @@ BatchGen includes three watchdog mechanisms and a health endpoint for detecting 
 
 ### `--decode-step-timeout <seconds>`
 
-Maximum wall-clock time allowed for a **single decode iteration** in the continuous decoding loop. The decode watchdog is a per-worker daemon thread that monitors the decode hot path only — it is **disabled** during worker initialization, weight loading, CUDA graph capture, NCCL warmup, and idle waiting between requests. It is enabled when the worker enters `decoding_continuous()` and disabled when it exits.
+Maximum wall-clock time allowed for a **decision interval** in the continuous decoding loop. The decode watchdog is a per-worker daemon thread that monitors the decode hot path only — it is **disabled** during worker initialization, weight loading, CUDA graph capture, NCCL warmup, and idle waiting between requests. It is enabled when the worker enters `decoding_continuous()` and disabled when it exits.
 
-Each decode iteration includes one forward pass plus scheduling overhead (page boundary checks, KV management). On healthy hardware, a single decode step typically completes in milliseconds to low seconds depending on batch size and model. A timeout here indicates a stuck NCCL collective, GPU hang, or deadlock.
+The watchdog is fed at each decision interval boundary (every `decision_frequency_pages × 64` tokens, default 128 tokens), not every single token — this avoids adding overhead to the per-token hot path. Each decision interval includes multiple forward passes plus page boundary scheduling (KV management, load/unload decisions, collective operations). A timeout here indicates a stuck NCCL collective, GPU hang, or deadlock.
 
 On timeout, the watchdog dumps a py-spy stack trace for diagnostics, then sends `SIGQUIT` to the parent process.
 
