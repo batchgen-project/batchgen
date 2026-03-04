@@ -103,13 +103,14 @@ class KimiK25_Parameter_Server:
     - Using ckpt_converter for standard safetensors → BatchGen binary conversion
     """
 
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_memfd=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
+        self.enable_memfd = enable_memfd
 
         # Use BatchGen's unified config system
         self.model_config = load_config(huggingface_ckpt_name)
@@ -138,7 +139,7 @@ class KimiK25_Parameter_Server:
         total_memory = total_memory / 1024 / 1024 / 1024
         logging.info(f"GPU 0 free mem before cpp pm instantiate: {gpu0_memory:.2f} GB / {total_memory:.2f} GB")
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
 
         # Kimi K2.5: ~580GB INT4 experts + ~20GB BF16 (attn/shared/embed) ≈ 600GB
         # 650GB with buffer

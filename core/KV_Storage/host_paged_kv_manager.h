@@ -238,6 +238,7 @@ class HostPagedKVManager {
 
     const HostPagedKVConfig& config() const { return config_; }
     const Layout& layout() const { return layout_; }
+    int memfd_fd() const { return backend_.memfd_fd(); }
 
    private:
     void LogPageBytes(const char* tag, std::size_t layer_idx,

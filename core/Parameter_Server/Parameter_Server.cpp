@@ -427,7 +427,14 @@ void Parameter_Server::Init(
     // Allocate shared memory for weights (server does NOT register with CUDA - no GPU access needed)
     // Only worker processes will call cudaHostRegister for DMA
     void* weight_ptr = nullptr;
-    weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true, this->enable_hugetlbfs, false);
+    int memfd_fd_out = -1;
+    weight_ptr = allocate_shared_pinned_memory(weight_shm_name, byte_size, true,
+                                               this->enable_hugetlbfs, false,
+                                               this->enable_memfd_, -1, -1,
+                                               &memfd_fd_out);
+    if (this->enable_memfd_ && memfd_fd_out >= 0) {
+        this->weights_memfd_fd_ = memfd_fd_out;
+    }
     this->byte_size_ = byte_size;
     this->weight_ptr_ = weight_ptr;
 
@@ -444,9 +451,10 @@ void Parameter_Server::Init(
 
 
 
-Parameter_Server::Parameter_Server(bool enable_hugetlbfs) {
+Parameter_Server::Parameter_Server(bool enable_hugetlbfs, bool enable_memfd) {
     this->logger = init_logger("info", "Parameter_Server");
     this->enable_hugetlbfs = enable_hugetlbfs;
+    this->enable_memfd_ = enable_memfd;
 };
 // void Parameter_Server::Init(
 //     std::string& weight_shm_name, std::string& tensor_meta_shm_name,

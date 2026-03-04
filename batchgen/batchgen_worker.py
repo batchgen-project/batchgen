@@ -261,6 +261,12 @@ class BatchGenWorkerArgs:
 	adaptive_chunk_max: int = 65536
 	adaptive_chunk_ema_alpha: float = 0.1
 	adaptive_chunk_multiplier: float = 1.5
+	# --fast-init (memfd_create + THP)
+	fast_init: bool = False
+	kv_memfd_pid: int = -1
+	kv_memfd_fd: int = -1
+	weights_memfd_pid: int = -1
+	weights_memfd_fd: int = -1
 
 
 class BatchGenWorker:
@@ -379,25 +385,35 @@ class BatchGenWorker:
 			f"Rank {self.rank}: shm_name: {self.shm_name}, "
 			f"tensor_meta_shm_name: {self.tensor_meta_shm_name}, "
 			f"weight_byte_size: {self.weight_byte_size}, "
-			f"enable_hugetlbfs: {self.enable_hugetlbfs}"
+			f"enable_hugetlbfs: {self.enable_hugetlbfs}, "
+			f"fast_init: {args.fast_init}"
 		)
+		import time as _time
+		_t0 = _time.monotonic()
 		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
 		self.weights_storage.Init(
-			self.shm_name, 
-			self.weight_byte_size, 
+			self.shm_name,
+			self.weight_byte_size,
 			self.tensor_meta_shm_name,
-			self.enable_hugetlbfs
+			self.enable_hugetlbfs,
+			args.fast_init,
+			args.weights_memfd_pid,
+			args.weights_memfd_fd,
 		)
-		logging.info(f"Rank {self.rank}: Shared memory segments initialized.")
+		logging.info(f"Rank {self.rank}: [startup] Weights storage init: {_time.monotonic() - _t0:.2f}s")
 
 		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)
 		self.host_kv_cache_size = args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
-		
+
 		worker_kv_config = build_host_kv_config(
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
 		)
+		if args.fast_init:
+			worker_kv_config.enable_memfd = True
+			worker_kv_config.memfd_creator_pid = args.kv_memfd_pid
+			worker_kv_config.memfd_fd = args.kv_memfd_fd
 
 		# Select worker view based on model's KV cache configuration
 		# MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
@@ -407,9 +423,10 @@ class BatchGenWorker:
 			self.host_paged_kv_worker_view = core_engine.DefaultHostPagedKVWorkerView(worker_kv_config)
 
 		# Initialize Host KV view (parallel cudaHostRegister for all local ranks)
-		logging.info(f"Rank {self.rank}: Initializing Host KV view with parallel cudaHostRegister (local_rank={self.local_rank})")
+		_t0 = _time.monotonic()
+		logging.info(f"Rank {self.rank}: Initializing Host KV view with cudaHostRegister (local_rank={self.local_rank}, fast_init={args.fast_init})")
 		self.host_paged_kv_worker_view.initialize(device_index=self.local_rank, create_region=False)
-		logging.info(f"Rank {self.rank}: Host KV cudaHostRegister completed (local_rank={self.local_rank})")
+		logging.info(f"Rank {self.rank}: [startup] Host KV init (cudaHostRegister): {_time.monotonic() - _t0:.2f}s")
 
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components

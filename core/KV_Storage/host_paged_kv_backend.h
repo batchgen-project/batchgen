@@ -34,6 +34,9 @@ struct HostPagedKVConfig {
     std::size_t v_element_size_bytes = 0;
     std::size_t sequence_table_capacity = 0;
     std::size_t alignment_bytes = 64;
+    bool enable_memfd = false;
+    int memfd_creator_pid = -1;
+    int memfd_fd = -1;
 };
 
 inline std::uint64_t HashCombine(std::uint64_t seed, std::uint64_t value) {
@@ -149,6 +152,7 @@ inline std::uint64_t HashHostKVConfig(const HostPagedKVConfig& config) {
     seed = HashCombine(seed, sanitized.v_element_size_bytes);
     seed = HashCombine(seed, sanitized.sequence_table_capacity);
     seed = HashCombine(seed, sanitized.alignment_bytes);
+    seed = HashCombine(seed, static_cast<std::uint64_t>(sanitized.enable_memfd));
     return seed;
 }
 
@@ -185,6 +189,7 @@ class HostPagedKVBackend {
 
     const HostPagedKVConfig& config() const { return config_; }
     bool has_v_cache() const { return has_v_cache_; }
+    int memfd_fd() const;
 
    private:
     struct SharedState;
