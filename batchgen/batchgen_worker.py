@@ -694,8 +694,11 @@ class BatchGenWorker:
 		self._watchdog = watchdog
 
 	def set_decode_watchdog(self, watchdog) -> None:
-		"""Set a per-decode-step watchdog. Fed at the start of each decode iteration."""
+		"""Set a per-decode-step watchdog. Starts disabled; enabled only during decode."""
 		self._decode_watchdog = watchdog
+		# Start disabled — only enable around actual decode iterations
+		if hasattr(watchdog, '_active'):
+			watchdog._active = False
 
 	def feed_watchdog(self) -> None:
 		"""Feed the watchdog to prevent timeout during long operations."""
@@ -706,6 +709,17 @@ class BatchGenWorker:
 		"""Feed the decode watchdog at the start of each decode step."""
 		if self._decode_watchdog is not None:
 			self._decode_watchdog.feed()
+
+	def enable_decode_watchdog(self) -> None:
+		"""Enable decode watchdog monitoring (call before decode loop)."""
+		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
+			self._decode_watchdog._active = True
+			self._decode_watchdog.feed()  # Reset timer
+
+	def disable_decode_watchdog(self) -> None:
+		"""Disable decode watchdog monitoring (call after decode loop)."""
+		if self._decode_watchdog is not None and hasattr(self._decode_watchdog, '_active'):
+			self._decode_watchdog._active = False
 
 	@contextmanager
 	def disable_watchdog(self):
@@ -6705,7 +6719,8 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 		
-		# Main decode loop
+		# Main decode loop — enable decode watchdog for monitoring
+		self.enable_decode_watchdog()
 		while decode_uuids:
 			local_iteration += 1
 			self._cumulative_decode_iterations += 1
@@ -7124,6 +7139,7 @@ class BatchGenWorker:
 				f"{'='*50}"
 			)
 
+		self.disable_decode_watchdog()
 		return decode_uuids, batch
 
 	def _wait_pending_kv_append_tasks(self) -> int:
