@@ -65,7 +65,8 @@ auto weights_map = deserialize_from_shared_memory(tensor_meta_shm_name);
 */
 void Weights_Storage::Init(
     std::string& shm_name, int64_t byte_size,
-    std::string& tensor_meta_shm_name, bool enable_hugetlbfs) 
+    std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
+    bool enable_memfd, int memfd_creator_pid, int memfd_fd_arg)
 {
     this->logger->info(
         "Setting CUDA device to {} for Weights_Storage initialization.",
@@ -84,7 +85,8 @@ void Weights_Storage::Init(
 
     // Worker process: register with CUDA for DMA access (pin_for_cuda=true)
     void* weight_ptr =
-        allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs, true);
+        allocate_shared_pinned_memory(shm_name, byte_size, false, enable_hugetlbfs, true,
+                                      enable_memfd, memfd_creator_pid, memfd_fd_arg);
         
     // Check if weight_ptr is null
     if (weight_ptr == nullptr) {

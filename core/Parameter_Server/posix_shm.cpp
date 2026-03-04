@@ -275,7 +275,11 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
                                     int64_t size,
                                     bool create,
                                     bool enable_hugetlbfs,
-                                    bool pin_for_cuda) {
+                                    bool pin_for_cuda,
+                                    bool enable_memfd,
+                                    int memfd_creator_pid,
+                                    int memfd_fd_arg,
+                                    int* out_memfd_fd) {
     if (size <= 0) {
         throw std::runtime_error("Invalid allocation size: " + std::to_string(size));
     }
@@ -291,9 +295,9 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
     bool using_huge_pages = false;
     int64_t allocated_size = 0;
     // std::string hugepage_path = "/dev/hugepages/" + shm_name;
-    std::string hugepage_path = "/dev/hugepages/" + 
+    std::string hugepage_path = "/dev/hugepages/" +
         (shm_name[0] == '/' ? shm_name.substr(1) : shm_name);
-        
+
     // STAGE 1: Attempt allocation using hugetlbfs if enabled
     if (enable_hugetlbfs) {
         logger->info("Attempting hugepage allocation...");
@@ -362,6 +366,82 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             }
         } else {
             logger->warn("Could not open hugetlbfs path '{}': {}. Check permissions and mount.", hugepage_path, strerror(errno));
+        }
+    }
+
+    // STAGE 1.5: memfd_create + THP (--fast-init)
+    if (!ptr && enable_memfd) {
+        size_t alignment = std::max(huge_page_size, page_size);
+        int64_t aligned_size = ((size + huge_page_size - 1) / huge_page_size) * huge_page_size;
+
+        if (create) {
+            int fd = static_cast<int>(syscall(SYS_memfd_create, "batchgen_weights", 0));
+            if (fd < 0) {
+                throw std::runtime_error(
+                    "--fast-init: memfd_create for weights failed: " +
+                    std::string(strerror(errno)));
+            }
+            if (ftruncate64(fd, aligned_size) != 0) {
+                int err = errno;
+                close(fd);
+                throw std::runtime_error(
+                    "--fast-init: ftruncate on weights memfd failed: " +
+                    std::string(strerror(err)));
+            }
+            ptr = mmap_aligned(aligned_size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, fd, 0, alignment);
+            if (ptr == MAP_FAILED) {
+                int err = errno;
+                close(fd);
+                ptr = nullptr;
+                throw std::runtime_error(
+                    "--fast-init: mmap on weights memfd failed: " +
+                    std::string(strerror(err)));
+            }
+            allocated_size = aligned_size;
+            madvise(ptr, allocated_size, MADV_HUGEPAGE);
+            // Skip touch_pages — weight loading writes every byte of the region,
+            // which faults pages in naturally with THP via madvise above.
+            logger->info("--fast-init: Skipping page touching for weights memfd (pages fault in during weight copy)");
+            if (out_memfd_fd) {
+                *out_memfd_fd = fd;
+            }
+            logger->info("--fast-init: Weights allocated via memfd_create ({:.1f} GB, THP)",
+                         allocated_size / (1024.0 * 1024.0 * 1024.0));
+        } else {
+            // Worker: open via /proc/<pid>/fd/<N>
+            if (memfd_creator_pid <= 0 || memfd_fd_arg < 0) {
+                throw std::runtime_error(
+                    "--fast-init worker: invalid weights memfd_creator_pid or memfd_fd");
+            }
+            std::string proc_path = "/proc/" + std::to_string(memfd_creator_pid) +
+                                    "/fd/" + std::to_string(memfd_fd_arg);
+            int fd = open(proc_path.c_str(), O_RDWR);
+            if (fd < 0) {
+                throw std::runtime_error(
+                    "--fast-init worker: cannot open " + proc_path + ": " +
+                    strerror(errno));
+            }
+            struct stat sb;
+            if (fstat(fd, &sb) == -1 || sb.st_size < aligned_size) {
+                close(fd);
+                throw std::runtime_error(
+                    "--fast-init worker: weights memfd too small or fstat failed");
+            }
+            ptr = mmap_aligned(sb.st_size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, fd, 0, alignment);
+            if (ptr == MAP_FAILED) {
+                int err = errno;
+                close(fd);
+                ptr = nullptr;
+                throw std::runtime_error(
+                    "--fast-init worker: mmap on weights memfd failed: " +
+                    std::string(strerror(err)));
+            }
+            allocated_size = sb.st_size;
+            close(fd);
+            logger->info("--fast-init worker: Weights attached via memfd ({:.1f} GB)",
+                         allocated_size / (1024.0 * 1024.0 * 1024.0));
         }
     }
 

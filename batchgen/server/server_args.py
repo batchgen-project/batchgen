@@ -58,6 +58,7 @@ class ServerArgs:
     cache_dir: Optional[Path] = None
     converted_ckpt_dir: Optional[Path] = None
     enable_hugetlbfs: bool = False
+    fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
     kv_dtype: str = "bfloat16"
     host_kv_cache_size: Optional[int] = None
@@ -154,6 +155,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--enable-hugetlbfs",
         action="store_true",
         help="Enable hugeTLBFS for shared memory (requires system support)",
+    )
+    parser.add_argument(
+        "--fast-init",
+        action="store_true",
+        help="Use memfd_create + THP for fast memory registration. "
+             "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
+             "(2) root access (for pre-allocation memory compaction). "
+             "Automatically runs drop_caches + compact_memory before allocation "
+             "to defragment physical memory for stable 2MB THP pages.",
     )
     parser.add_argument(
         "--dist-init-addr",
@@ -480,6 +490,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         cache_dir=parsed.cache_dir,
         converted_ckpt_dir=parsed.converted_ckpt_dir,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
+        fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
         kv_dtype=parsed.kv_dtype,
         host_kv_cache_size=parsed.host_kv_cache_size,
