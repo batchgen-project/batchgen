@@ -15,9 +15,11 @@ from pydantic import BaseModel, Field, root_validator, validator
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
     name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -42,6 +44,14 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default=None,
         description="Reasoning effort level for GPT-OSS models (low, medium, high)",
+    )
+    tools: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="List of tools the model may call (OpenAI function-calling format)",
+    )
+    thinking: Optional[bool] = Field(
+        default=None,
+        description="Enable/disable thinking mode (None = model default)",
     )
 
     @validator("stream")
@@ -197,9 +207,22 @@ class Usage(BaseModel):
     total_tokens: int
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
 class ChatCompletionChoiceMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
-    content: str
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class ChatCompletionChoice(BaseModel):

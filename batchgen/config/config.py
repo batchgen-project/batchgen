@@ -85,7 +85,7 @@ class BasicConfig:
 class ModuleBatchingConfig:
     global_batch_size: Optional[int] = 0
     # Token-based prefill config (for prepack mode, always recommended)
-    prefill_micro_batch_token_cap: int = 120_000  # Max tokens per prefill micro-batch
+    prefill_micro_batch_token_cap: int = 131_072  # Max tokens per prefill micro-batch (= max_position_embeddings)
     prepack_row_capacity: Optional[int] = None  # Token budget per packed row (None = no limit)
     # Sequence-count based prefill config (for non-prepack mode)
     attn_prefill_micro_batch_size: Optional[int] = 0

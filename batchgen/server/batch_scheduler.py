@@ -27,6 +27,8 @@ from batchgen.server.io_struct import (
     FileObject,
     FilePurpose,
     FileStatus,
+    ToolCall,
+    ToolCallFunction,
     Usage,
 )
 from batchgen.server.server_args import ServerArgs
@@ -193,6 +195,26 @@ class BatchScheduler:
         prompts, per_request_max_tokens = self._convert_requests_to_worker_inputs(requests)
         # Use batch-level max_decoding_length if specified, otherwise use per-request value
         max_tokens = batch.max_decoding_length or per_request_max_tokens
+
+        # Build incremental writer metadata
+        incremental_output_dir = (
+            self.server_args.incremental_output_dir
+            if not self.server_args.no_incremental_save
+            else None
+        )
+        incremental_kwargs = {}
+        if incremental_output_dir:
+            incremental_kwargs = dict(
+                custom_id_map={idx: req.custom_id for idx, req in enumerate(requests)},
+                request_url_map={idx: req.url.value for idx, req in enumerate(requests)},
+                prompt_text_map={idx: prompts[idx] for idx in range(len(prompts))},
+                batch_id=batch_id,
+                model_name=requests[0].body.model if requests else "unknown",
+                incremental_output_dir=incremental_output_dir,
+                parse_thinking=self.server_args.parse_thinking,
+                parse_tool_call=self.server_args.parse_tool_call,
+            )
+
         try:
             results = await asyncio.to_thread(
                 self.worker.infer,
@@ -202,6 +224,7 @@ class BatchScheduler:
                 False,  # ignore_eos
                 batch.temperature,  # None = greedy decoding
                 batch.top_p,  # None = disabled
+                **incremental_kwargs,
             )
         except Exception as exc:
             self.storage.update_batch_status(
@@ -211,10 +234,30 @@ class BatchScheduler:
             return
 
         output_file_id = f"file-{uuid.uuid4().hex}"
-        output_items = self._build_output_items(requests, results, prompts)
-        output_path = self.storage.write_output_file(
-            output_file_id, output_items
-        )
+
+        # If incremental save was active, use the incremental JSONL as the output
+        incremental_path = None
+        if incremental_output_dir:
+            from pathlib import Path
+            import shutil
+            incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
+
+        if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
+            # Copy incremental file to storage for API access
+            api_path = self.storage.files_dir / output_file_id
+            shutil.copy2(incremental_path, api_path)
+            output_path = self.storage.output_dir / f"{output_file_id}.jsonl"
+            shutil.copy2(incremental_path, output_path)
+            logger.info(
+                f"Batch {batch_id}: using incremental output "
+                f"({incremental_path} -> {output_path})"
+            )
+        else:
+            # Fallback: build output the original way
+            output_items = self._build_output_items(requests, results, prompts)
+            output_path = self.storage.write_output_file(
+                output_file_id, output_items
+            )
 
         output_meta = FileObject(
             id=output_file_id,
@@ -251,7 +294,15 @@ class BatchScheduler:
                     body.model,
                     body.reasoning_effort,
                 )
-                prompt = self._format_chat_messages(messages, body.model)
+                # Forward extra kwargs (thinking, tools) to chat template
+                template_kwargs = {}
+                if body.thinking is not None:
+                    template_kwargs["thinking"] = body.thinking
+                if body.tools is not None:
+                    template_kwargs["tools"] = body.tools
+                prompt = self._format_chat_messages(
+                    messages, body.model, **template_kwargs
+                )
                 current_max_tokens = body.max_tokens or 128
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
@@ -308,14 +359,14 @@ class BatchScheduler:
 
         return modified
 
-    def _format_chat_messages(self, messages: List[dict], model: str) -> str:
+    def _format_chat_messages(self, messages: List[dict], model: str, **kwargs) -> str:
         tokenizer = self._get_tokenizer(model)
         if not hasattr(tokenizer, "apply_chat_template"):
             raise RuntimeError(
                 f"Tokenizer for {model} does not support apply_chat_template"
             )
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
 
     def _build_output_items(
@@ -390,6 +441,50 @@ class BatchScheduler:
             body=body,
         )
 
+    def _parse_output(
+        self,
+        model: str,
+        decoded_text: str,
+    ) -> tuple[str, Optional[str], Optional[List[ToolCall]]]:
+        """Apply thinking/tool-call parsing if flags are enabled.
+
+        Returns:
+            (content, reasoning_content, tool_calls)
+        """
+        content = decoded_text
+        reasoning_content = None
+        tool_calls = None
+
+        tokenizer = self._get_tokenizer(model)
+        if tokenizer is None:
+            return content, reasoning_content, tool_calls
+
+        if self.server_args.parse_thinking:
+            try:
+                reasoning_content, content = tokenizer.parse_thinking(content)
+            except NotImplementedError:
+                pass
+
+        if self.server_args.parse_tool_call:
+            try:
+                raw_calls, content = tokenizer.parse_tool_calls(content)
+                if raw_calls:
+                    tool_calls = [
+                        ToolCall(
+                            id=c["id"],
+                            type=c["type"],
+                            function=ToolCallFunction(
+                                name=c["function"]["name"],
+                                arguments=c["function"]["arguments"],
+                            ),
+                        )
+                        for c in raw_calls
+                    ]
+            except NotImplementedError:
+                pass
+
+        return content, reasoning_content, tool_calls
+
     def _build_response_body(
         self,
         request: BatchRequestItem,
@@ -400,6 +495,9 @@ class BatchScheduler:
         created_at = int(time.time())
         decoded_text = self._decode_tokens(model, token_ids)
         usage = self._build_usage(model, prompt_text, token_ids)
+        content, reasoning_content, tool_calls = self._parse_output(
+            model, decoded_text
+        )
 
         if request.url == BatchEndpoint.CHAT_COMPLETIONS:
             body: BatchResponseBody = ChatCompletionResponse(
@@ -410,7 +508,9 @@ class BatchScheduler:
                     ChatCompletionChoice(
                         index=0,
                         message=ChatCompletionChoiceMessage(
-                            content=decoded_text
+                            content=content,
+                            reasoning_content=reasoning_content,
+                            tool_calls=tool_calls,
                         ),
                         logprobs=None,
                         finish_reason=None,
@@ -445,6 +545,9 @@ class BatchScheduler:
         model = request.body.model
         created_at = int(time.time())
         usage = self._build_usage_from_text(model, prompt_text, decoded_text)
+        content, reasoning_content, tool_calls = self._parse_output(
+            model, decoded_text
+        )
 
         if request.url == BatchEndpoint.CHAT_COMPLETIONS:
             body: BatchResponseBody = ChatCompletionResponse(
@@ -455,7 +558,9 @@ class BatchScheduler:
                     ChatCompletionChoice(
                         index=0,
                         message=ChatCompletionChoiceMessage(
-                            content=decoded_text
+                            content=content,
+                            reasoning_content=reasoning_content,
+                            tool_calls=tool_calls,
                         ),
                         logprobs=None,
                         finish_reason=None,

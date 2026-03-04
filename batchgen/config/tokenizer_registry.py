@@ -64,7 +64,10 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
     "Kimi-K2.5": "kimi_k25",
+    "GLM-5-FP8": "glm_moe_dsa",
+    "GLM-5": "glm_moe_dsa",
     "MiniMax-M2.5": "minimax_m25",
+    "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
 }
 
 
@@ -158,6 +161,11 @@ def _import_tokenizers():
 
     try:
         from batchgen.models.moonshotai.kimi_k25 import tokenizer as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.glm.glm5 import tokenizer as _  # noqa: F401
     except ImportError:
         pass
 

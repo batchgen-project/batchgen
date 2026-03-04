@@ -222,6 +222,18 @@ def _server_worker_main_impl(
 		ready_event.set()
 		logging.info(f"Rank {args.global_rank}: Signaled ready event to WorkerManager")
 
+	# 2.6. Initialize decode watchdog AFTER barrier — only monitors decode steps,
+	# not worker init, CUDA graph capture, or NCCL warmup.
+	decode_step_timeout = getattr(args, 'decode_step_timeout', None)
+	decode_watchdog = Watchdog.create(
+		debug_name=f"decode-{args.global_rank}",
+		watchdog_timeout=decode_step_timeout,
+		soft=False,  # Hard mode: kill parent process on timeout
+	)
+	if decode_step_timeout:
+		logging.info(f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s")
+	worker.set_decode_watchdog(decode_watchdog)
+
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
 	world_size = args.world_size
@@ -311,6 +323,21 @@ def _server_worker_main_impl(
 			if global_rank == 0:
 				logging.info(f"[PAYLOAD] Extracted from task_data: temperature={temperature}, top_p={top_p}")
 
+			# Stage incremental writer config on rank 0 (writer created after tokenizer init)
+			incr_output_dir = task_data.get("incremental_output_dir")
+			incr_custom_ids = task_data.get("custom_id_map")
+			if global_rank == 0 and incr_output_dir and incr_custom_ids:
+				worker._incremental_writer_config = {
+					"output_dir": incr_output_dir,
+					"batch_id": task_data.get("batch_id", "unknown"),
+					"model_name": task_data.get("model_name", "unknown"),
+					"custom_id_map": incr_custom_ids,
+					"request_urls": task_data.get("request_url_map", {}),
+					"prompt_texts": task_data.get("prompt_text_map", {}),
+					"parse_thinking": task_data.get("parse_thinking", False),
+					"parse_tool_call": task_data.get("parse_tool_call", False),
+				}
+
 			# Clear previous state if supported
 			if hasattr(worker, 'reset_runtime_state'):
 				worker.reset_runtime_state()
@@ -335,6 +362,14 @@ def _server_worker_main_impl(
 			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
 			inference_error = str(e)
 			local_results = []
+		finally:
+			# Close incremental writer regardless of success/failure
+			if getattr(worker, '_incremental_writer', None) is not None:
+				worker._incremental_writer.close()
+				worker._incremental_writer = None
+			# Clean up staged config
+			if hasattr(worker, '_incremental_writer_config'):
+				del worker._incremental_writer_config
 
 		# --- STEP 5: Synchronize and check for errors ---
 		# Sync CUDA to catch any async errors

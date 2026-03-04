@@ -25,6 +25,7 @@ The Kimi K2.5 tokenizer uses TikToken format with 163,840 tokens.
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -39,7 +40,8 @@ TOKENIZER_DIR = Path(__file__).parent / "assets"
 
 # Kimi K2.5 special token IDs (from tokenizer_config.json)
 KIMI_K25_BOS_TOKEN_ID = 163584  # "[BOS]"
-KIMI_K25_EOS_TOKEN_ID = 163585  # "[EOS]"
+KIMI_K25_EOS_TOKEN_ID = 163586  # "<|im_end|>" (chat end-of-turn)
+KIMI_K25_EOS_TOKEN_IDS = {163585, 163586}  # Both "[EOS]" and "<|im_end|>"
 KIMI_K25_PAD_TOKEN_ID = 163839  # "[PAD]"
 KIMI_K25_VOCAB_SIZE = 163840
 
@@ -88,9 +90,15 @@ class KimiK25Tokenizer(BaseTokenizer):
             added_tokens_decoder=added_tokens_decoder
         )
 
+        # Load chat template from jinja file
+        jinja_file = TOKENIZER_DIR / "chat_template.jinja"
+        if jinja_file.exists():
+            self._tokenizer.chat_template = jinja_file.read_text()
+
         # Set special token IDs
         self.bos_token_id = KIMI_K25_BOS_TOKEN_ID
         self.eos_token_id = KIMI_K25_EOS_TOKEN_ID
+        self.eos_token_ids = KIMI_K25_EOS_TOKEN_IDS
         self.pad_token_id = KIMI_K25_PAD_TOKEN_ID
         self.vocab_size = KIMI_K25_VOCAB_SIZE
         self.padding_side = "right"
@@ -214,3 +222,56 @@ class KimiK25Tokenizer(BaseTokenizer):
                 result["attention_mask"] = attention_mask
 
         return result
+
+    # ---- Output parsing ----
+
+    # Match both <think>...</think> and bare ...{reasoning}</think> (when <think> was in the prompt)
+    _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    _THINK_CLOSE_RE = re.compile(r"^(.*?)</think>", re.DOTALL)
+    _TOOL_CALLS_RE = re.compile(
+        r"<\|tool_calls_section_begin\|>(.*?)<\|tool_calls_section_end\|>",
+        re.DOTALL,
+    )
+    # K2.5 tool call format: <|tool_call_begin|>functions.func_name:idx<|tool_call_argument_begin|>{json}<|tool_call_end|>
+    _TOOL_CALL_RE = re.compile(
+        r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*"
+        r"<\|tool_call_argument_begin\|>\s*(?P<arguments>.*?)\s*<\|tool_call_end\|>",
+        re.DOTALL,
+    )
+
+    def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        # Case 1: Full <think>...</think> tags present
+        m = self._THINK_RE.search(text)
+        if m:
+            reasoning = m.group(1).strip()
+            visible = self._THINK_RE.sub("", text, count=1).strip()
+            return reasoning, visible
+        # Case 2: Only closing </think> — opening <think> was in the prompt
+        m = self._THINK_CLOSE_RE.search(text)
+        if m:
+            reasoning = m.group(1).strip()
+            visible = text[m.end():].strip()
+            return reasoning if reasoning else None, visible
+        return None, text
+
+    def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        section_match = self._TOOL_CALLS_RE.search(text)
+        if not section_match:
+            return None, text
+        section = section_match.group(1)
+        calls = []
+        for m in self._TOOL_CALL_RE.finditer(section):
+            tool_call_id = m.group("tool_call_id")
+            args_str = m.group("arguments").strip()
+            # Extract function name from "functions.func_name:idx" format
+            func_name = tool_call_id.split(".")[1].split(":")[0] if "." in tool_call_id else tool_call_id
+            calls.append({
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": args_str,
+                },
+            })
+        visible = self._TOOL_CALLS_RE.sub("", text, count=1).strip()
+        return calls if calls else None, visible

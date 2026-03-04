@@ -269,6 +269,15 @@ class WorkerManager:
         ignore_eos: bool = False,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        # Incremental writer metadata
+        custom_id_map: Optional[Dict[int, str]] = None,
+        request_url_map: Optional[Dict[int, str]] = None,
+        prompt_text_map: Optional[Dict[int, str]] = None,
+        batch_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        incremental_output_dir: Optional[str] = None,
+        parse_thinking: bool = False,
+        parse_tool_call: bool = False,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -280,6 +289,16 @@ class WorkerManager:
             "temperature": temperature,
             "top_p": top_p,
         }
+        # Incremental writer metadata (only included when active)
+        if incremental_output_dir and custom_id_map:
+            payload["incremental_output_dir"] = incremental_output_dir
+            payload["custom_id_map"] = custom_id_map
+            payload["request_url_map"] = request_url_map or {}
+            payload["prompt_text_map"] = prompt_text_map or {}
+            payload["batch_id"] = batch_id
+            payload["model_name"] = model_name
+            payload["parse_thinking"] = parse_thinking
+            payload["parse_tool_call"] = parse_tool_call
         with self._lock:
             self.request_queue.put(payload)
             result = self.response_queue.get()
@@ -404,6 +423,7 @@ class WorkerManager:
             watchdog_timeout=self.args.watchdog_timeout,
             watchdog_test_stuck_time=self.args.watchdog_test_stuck_time,
             watchdog_heartbeat_interval=self.args.watchdog_heartbeat_interval,
+            decode_step_timeout=self.args.decode_step_timeout,
             enable_prepack=self.args.enable_prepack,
             host_kv_watermark=self.args.host_kv_watermark,
             enable_decode_preemption=self.args.enable_decode_preemption,
@@ -417,6 +437,14 @@ class WorkerManager:
             disable_cuda_graphs=self.args.disable_cuda_graphs,
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
+            host_kv_chunk_size=self.args.host_kv_chunk_size,
+            enable_host_kv_eviction=self.args.enable_host_kv_eviction,
+            host_kv_eviction_watermark=self.args.host_kv_eviction_watermark,
+            adaptive_chunk=self.args.adaptive_chunk,
+            adaptive_chunk_min=self.args.adaptive_chunk_min,
+            adaptive_chunk_max=self.args.adaptive_chunk_max,
+            adaptive_chunk_ema_alpha=self.args.adaptive_chunk_ema_alpha,
+            adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
         )
         self.worker_process = mp.spawn(
             server_worker_main,

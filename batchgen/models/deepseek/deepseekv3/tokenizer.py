@@ -31,8 +31,12 @@ The tokenizer.json file is bundled with BatchGen in this directory.
 It is NOT loaded from user's cache directory.
 """
 
+import json
 import logging
+import re
+import uuid
 from pathlib import Path
+from typing import Optional
 
 from batchgen.config.fast_tokenizer import FastTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
@@ -103,3 +107,35 @@ class DeepSeekV3Tokenizer(FastTokenizer):
             f"DeepSeek-V3 tokenizer initialized: vocab_size={self.vocab_size}, "
             f"bos={self.bos_token_id}, eos={self.eos_token_id}"
         )
+
+    # ---- Output parsing ----
+
+    _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    _TOOL_CALL_RE = re.compile(
+        r"<｜tool▁call▁begin｜>(.*?)<｜tool▁call▁end｜>", re.DOTALL
+    )
+
+    def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        m = self._THINK_RE.search(text)
+        if not m:
+            return None, text
+        reasoning = m.group(1).strip()
+        visible = self._THINK_RE.sub("", text, count=1).strip()
+        return reasoning, visible
+
+    def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        matches = self._TOOL_CALL_RE.findall(text)
+        if not matches:
+            return None, text
+        tool_calls = []
+        for raw in matches:
+            lines = raw.strip().split("\n", 1)
+            name = lines[0].strip()
+            arguments = lines[1].strip() if len(lines) > 1 else "{}"
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            })
+        visible = self._TOOL_CALL_RE.sub("", text).strip()
+        return tool_calls, visible

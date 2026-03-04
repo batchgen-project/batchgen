@@ -28,7 +28,7 @@ Key differences from DeepSeek-V3 PSM:
 - Loads INT4 packed/scale tensors for persistent experts
 """
 
-from .model import KimiK25ForCausalLM
+from .model import KimiK25ForCausalLM, KimiK25MoE, KimiK25MoEBufferManager
 from .wrappers import KimiK25ExpertWrapper, KimiK25AttnWrapper
 import logging
 import types
@@ -79,7 +79,7 @@ class KimiK25ParallelStrategyManager:
 
         # Step 1: Set phase (pure DP - no EP in prefill)
         self.loaded_model_config.phase = "prefill"
-        # Don't set ep_size - prefill uses pure DP (all experts on each rank)
+        self.loaded_model_config.ep_size = 1  # Pure DP: all 384 experts on each rank
 
         # Step 2: Initialize model
         # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides
@@ -131,12 +131,12 @@ class KimiK25ParallelStrategyManager:
 
                 # Routed experts — module keys only (INT4 tensors handled by wrappers)
                 # Prefill uses pure DP: all 384 experts on each rank
+                # In EP mode, non-local experts are None — skip them
                 for expert_idx in range(NUM_TOTAL_EXPERTS):
-                    for name, _ in (
-                        self.model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
-                        .named_parameters()
-                    ):
+                    expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+                    if expert is None:
+                        continue
+                    for name, _ in expert.named_parameters():
                         tensor_full_name = (
                             "model.layers."
                             + str(layer_idx)
@@ -398,7 +398,7 @@ class KimiK25ParallelStrategyManager:
         def _log_hbm(step_name):
             a = torch.cuda.memory_allocated(device) / (1024**3)
             r = torch.cuda.memory_reserved(device) / (1024**3)
-            logging.info(f"Rank {self.rank}: HBM after {step_name}: allocated={a:.2f} GiB, reserved={r:.2f} GiB")
+            logging.debug(f"Rank {self.rank}: HBM after {step_name}: allocated={a:.2f} GiB, reserved={r:.2f} GiB")
 
         torch.cuda.empty_cache()
         _log_hbm("empty_cache")
@@ -473,6 +473,19 @@ class KimiK25ParallelStrategyManager:
         self._init_mode_decoding()
         effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
         self._init_decoding_padding_bsz(effective_padding_bsz)
+
+        # Allocate shared MoE buffer manager (one instance for all 60 MoE layers)
+        max_global_bsz = self.world_size * effective_padding_bsz
+        KimiK25MoE._buf = KimiK25MoEBufferManager(
+            E_local=NUM_LOCAL_EXPERT_PER_LAYER,
+            max_global_bsz=max_global_bsz,
+            H=self.loaded_model_config.hidden_size,
+            N_inter=self.loaded_model_config.moe_intermediate_size,
+            topk=self.loaded_model_config.num_experts_per_tok,
+            num_tokens_per_rank=effective_padding_bsz,
+            device=device,
+        )
+        _log_hbm("MoEBufferManager")
 
         # Initialize All-to-All comms if enabled
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":

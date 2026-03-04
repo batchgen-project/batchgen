@@ -131,7 +131,7 @@ def _get_unpad_data(attention_mask):
 # 		return F.rms_norm(hidden_states, (self.dim,), self.weight, self.variance_epsilon)
 
 # from batchgen.other_kernels.fused_rmsnorm import fused_rmsnorm_func
-from mgn_kernel import fused_rmsnorm
+from batchgen_kernels.common.mgn import fused_rmsnorm
 
 class DeepseekV3RMSNorm(nn.Module):
 	def __init__(self, hidden_size, eps=1e-6):
@@ -712,7 +712,7 @@ def compiled_moe_gate_forward(hidden_states, weight, e_score_correction_bias,
 #     extra_cuda_cflags=["-O3", "--use_fast_math"],
 #     verbose=True
 # )
-from mgn_kernel import moe_fused_gate
+from batchgen_kernels.common.mgn import moe_fused_gate
 class MoEGate(nn.Module):
 	def __init__(self, config):
 		super().__init__()
@@ -1298,7 +1298,7 @@ class DeepseekV3MoE_Decoding(nn.Module):
 
 from batchgen.moe.token_permutation.token_permutation_launcher import FusedMoETokenPermutation
 # from batchgen.moe.expert_bincount.expert_bincount_launcher import FusedExpertBincount
-from mgn_kernel import expert_bincount, fused_moe_token_dispatch, compact_expert_data
+from batchgen_kernels.common.mgn import expert_bincount, fused_moe_token_dispatch, compact_expert_data
 from batchgen.moe.moe_weighted_sum import moe_weighted_sum_triton_v2, moe_weighted_sum_v3
 @triton.jit
 def scatter_weight_reduce_optimized_kernel(

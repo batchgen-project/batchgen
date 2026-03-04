@@ -26,217 +26,29 @@ import torch.nn as nn
 import warnings
 from typing import Optional
 
-# Global variable to cache the compiled extension
 _cuda_extension = None
 _compilation_attempted = False
 
-def _get_simple_cuda_kernel():
-    """Returns a simplified CUDA kernel that compiles quickly"""
-    return '''
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-
-// Simple warp reduction
-__device__ __forceinline__ float warpReduceSum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
-
-// Simple RMSNorm kernel - optimized for fast compilation
-template <typename T>
-__global__ void simple_rmsnorm_kernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    T* __restrict__ output,
-    int batch_size,
-    int hidden_size,
-    float eps) {
-    
-    int batch_idx = blockIdx.x;
-    if (batch_idx >= batch_size) return;
-    
-    const T* input_row = input + batch_idx * hidden_size;
-    T* output_row = output + batch_idx * hidden_size;
-    
-    // Compute sum of squares
-    float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float val = static_cast<float>(input_row[i]);
-        sum_sq += val * val;
-    }
-    
-    // Reduce across threads in block
-    __shared__ float shared_sum[1024];
-    shared_sum[threadIdx.x] = sum_sq;
-    __syncthreads();
-    
-    // Simple reduction in shared memory
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    
-    // Compute normalization factor
-    __shared__ float inv_rms;
-    if (threadIdx.x == 0) {
-        inv_rms = rsqrtf(shared_sum[0] / hidden_size + eps);
-    }
-    __syncthreads();
-    
-    // Apply normalization
-    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float val = static_cast<float>(input_row[i]);
-        float w = static_cast<float>(weight[i]);
-        output_row[i] = static_cast<T>(val * inv_rms * w);
-    }
-}
-
-// Host function
-torch::Tensor simple_rmsnorm_forward(
-    torch::Tensor input,
-    torch::Tensor weight,
-    float eps) {
-    
-    TORCH_CHECK(input.is_cuda(), "Input must be on CUDA");
-    TORCH_CHECK(weight.is_cuda(), "Weight must be on CUDA");
-    
-    // Make tensors contiguous if they aren't already
-    input = input.contiguous();
-    weight = weight.contiguous();
-    
-    auto input_shape = input.sizes();
-    int hidden_size = input_shape[input_shape.size() - 1];
-    int batch_size = input.numel() / hidden_size;
-    
-    auto output = torch::empty_like(input);
-    
-    // Simple kernel launch - use 256 threads per block
-    const int threads = min(256, hidden_size);
-    const int blocks = batch_size;
-    
-    // Dispatch based on type - now includes BF16 support
-    if (input.scalar_type() == torch::kFloat32) {
-        simple_rmsnorm_kernel<float><<<blocks, threads>>>(
-            input.data_ptr<float>(),
-            weight.data_ptr<float>(),
-            output.data_ptr<float>(),
-            batch_size, hidden_size, eps
-        );
-    } else if (input.scalar_type() == torch::kFloat16) {
-        simple_rmsnorm_kernel<at::Half><<<blocks, threads>>>(
-            input.data_ptr<at::Half>(),
-            weight.data_ptr<at::Half>(),
-            output.data_ptr<at::Half>(),
-            batch_size, hidden_size, eps
-        );
-    } else if (input.scalar_type() == torch::kBFloat16) {
-        simple_rmsnorm_kernel<at::BFloat16><<<blocks, threads>>>(
-            input.data_ptr<at::BFloat16>(),
-            weight.data_ptr<at::BFloat16>(),
-            output.data_ptr<at::BFloat16>(),
-            batch_size, hidden_size, eps
-        );
-    } else {
-        TORCH_CHECK(false, "Unsupported dtype. Only float32, float16, and bfloat16 are supported.");
-    }
-    
-    // Check for errors
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        TORCH_CHECK(false, "CUDA kernel error occurred");
-    }
-    
-    return output;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &simple_rmsnorm_forward, "Simple RMSNorm forward");
-}
-'''
 
 def _compile_simple_extension():
-    """Compile the simplified CUDA extension quickly"""
+    """Load the pre-compiled RMSNorm CUDA extension."""
     global _cuda_extension, _compilation_attempted
-    
+
     if _compilation_attempted:
         return _cuda_extension
-    
+
     _compilation_attempted = True
-    
+
     if not torch.cuda.is_available():
-        print("❌ CUDA not available")
         return None
-    
+
     try:
-        from torch.utils.cpp_extension import load_inline
-        import os
-        
-        # Get current GPU architecture only
-        capability = torch.cuda.get_device_capability()
-        current_arch = f"{capability[0]}{capability[1]}"
-        
-        print(f"🔧 Compiling for current GPU (compute {capability[0]}.{capability[1]})...")
-        
-        # Minimal compilation flags for speed - added BF16 support
-        cuda_flags = [
-            '-O2',  # Reduced optimization for faster compilation
-            '--use_fast_math',
-            f'--gpu-architecture=sm_{current_arch}',  # Only current GPU
-            '-U__CUDA_NO_HALF_OPERATORS__',
-            '-U__CUDA_NO_HALF_CONVERSIONS__', 
-            '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
-            '--expt-relaxed-constexpr',
-        ]
-        
-        _cuda_extension = load_inline(
-            name="simple_rmsnorm_cuda",
-            cpp_sources=[""],
-            cuda_sources=[_get_simple_cuda_kernel()],
-            extra_cflags=['-O2'],
-            extra_cuda_cflags=cuda_flags,
-            verbose=False  # Reduce output
-        )
-        
-        print("✅ Compilation successful!")
-        
-        # # Test the extension with different dtypes
-        # try:
-        #     device = torch.device('cuda')
-            
-        #     # Test BF16
-        #     test_input_bf16 = torch.randn(1, 4, device=device, dtype=torch.bfloat16)
-        #     test_weight_bf16 = torch.ones(4, device=device, dtype=torch.bfloat16)
-        #     output_bf16 = _cuda_extension.forward(test_input_bf16, test_weight_bf16, 1e-6)
-        #     print("✅ BF16 kernel test passed!")
-            
-        #     # Test FP16
-        #     test_input_fp16 = torch.randn(1, 4, device=device, dtype=torch.float16)
-        #     test_weight_fp16 = torch.ones(4, device=device, dtype=torch.float16)
-        #     output_fp16 = _cuda_extension.forward(test_input_fp16, test_weight_fp16, 1e-6)
-        #     print("✅ FP16 kernel test passed!")
-            
-        #     # Test FP32
-        #     test_input_fp32 = torch.randn(1, 4, device=device, dtype=torch.float32)
-        #     test_weight_fp32 = torch.ones(4, device=device, dtype=torch.float32)
-        #     output_fp32 = _cuda_extension.forward(test_input_fp32, test_weight_fp32, 1e-6)
-        #     print("✅ FP32 kernel test passed!")
-            
-        # except Exception as test_error:
-        #     print(f"❌ Kernel test failed: {test_error}")
-        #     print("   Falling back to PyTorch implementation")
-        #     _cuda_extension = None
-        
+        import batchgen_kernels
+        _cuda_extension = batchgen_kernels.load_extension("batchgen_kernels.common._C_rmsnorm")
         return _cuda_extension
-        
     except Exception as e:
-        print(f"❌ Compilation failed: {e}")
+        import logging
+        logging.warning(f"Failed to load RMSNorm CUDA extension: {e}")
         return None
 
 def _pytorch_rmsnorm(input, weight, eps=1e-6):

@@ -150,6 +150,43 @@ At page boundaries during decode, `extension_gpu_page_buffer` pages are added. T
 
 **Constraint:** `extension_gpu_page_buffer >= decision_frequency_pages` (to prevent overflow)
 
+### Host KV Scheduling
+
+Controls how host KV cache pages are allocated and reclaimed during inference. By default, each sequence reserves its full KV token budget at prefill time. With dynamic reservation, sequences start with a small chunk and grow incrementally, enabling host KV oversubscription.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host-kv-chunk-size` | `8192` | Initial chunk size in tokens. Each sequence reserves `max(prompt_length, chunk_size)` tokens at prefill instead of the full decode budget. Smaller values increase oversubscription but may trigger more evictions. |
+| `--enable-host-kv-eviction` | `false` | Enable eviction of host KV pages when free pages are exhausted. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
+| `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
+| `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
+| `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
+| `--adaptive-chunk-min` | `1024` | Minimum adaptive chunk size in tokens. |
+| `--adaptive-chunk-max` | `65536` | Maximum adaptive chunk size in tokens. |
+| `--adaptive-chunk-ema-alpha` | `0.1` | EMA smoothing factor (0-1]. Lower values make adaptation slower but more stable. |
+| `--adaptive-chunk-multiplier` | `1.5` | Safety multiplier applied to the EMA estimate. Values > 1.0 reduce eviction frequency at the cost of higher memory usage. |
+
+**How chunk-based reservation works:**
+
+1. At prefill, each sequence allocates `max(prompt_length, chunk_size)` tokens of host KV pages
+2. During decode, sequences that approach their allocated capacity trigger chunk growth (capped at their KV token budget)
+3. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA)
+4. If host pages are exhausted and eviction is enabled, shortest-decoded sequences are evicted first to free pages
+
+**Example: High oversubscription with eviction**
+
+```bash
+python -m batchgen.launch_http_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --host-kv-cache-size 256 \
+    --host-kv-chunk-size 512 \
+    --enable-host-kv-eviction \
+    --host-kv-eviction-watermark 10 \
+    --adaptive-chunk
+```
+
+This allows serving more concurrent sequences than the host KV cache can hold at full decode length. Sequences that exhaust their chunk grow incrementally, and if memory runs out, the least-progressed sequences are evicted and recomputed later.
+
 ### Prefill Optimization
 
 | Flag | Default | Description |
@@ -211,6 +248,15 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 
 ---
 
+## Output Parsing
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--parse-thinking` | `false` | Extract thinking/reasoning blocks into `reasoning_content` field |
+| `--parse-tool-call` | `false` | Extract tool call blocks into `tool_calls` array |
+
+---
+
 ## Storage Configuration
 
 | Flag | Default | Description |
@@ -221,25 +267,55 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 The storage directory structure:
 ```
 storage/
-├── uploads/      # Uploaded batch input files
-├── batches/      # Batch job metadata
-└── outputs/      # Inference results (when --save-result is enabled)
+├── uploads/       # Uploaded batch input files
+├── batches/       # Batch job metadata
+├── outputs/       # Inference results (when --save-result is enabled)
+└── incremental/   # Incremental JSONL results (crash-resilient, enabled by default)
 ```
+
+### Incremental Result Saving
+
+Completed sequences are written incrementally to a JSONL file on disk as they finish, with `fsync` after each write. This enables recovery from spot instance preemption or crashes — partial results are preserved on disk even if the server is killed mid-batch.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--incremental-output-dir` | `{storage_path}/incremental/` | Directory for incremental JSONL output files. Each batch produces one file named `{batch_id}.jsonl`. |
+| `--no-incremental-save` | `false` | Disable incremental saving entirely |
+
+**Enabled by default.** No extra flags are needed. To customize the output directory:
+
+```bash
+python -m batchgen.launch_http_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --incremental-output-dir /data/incremental_results
+```
+
+To disable:
+
+```bash
+python -m batchgen.launch_http_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    --no-incremental-save
+```
+
+Each line in the JSONL file is a complete `BatchResultItem` with `custom_id`, `response` (containing `status_code`, `body` with `choices` and `usage`). Lines are written in completion order (not input order).
 
 ---
 
 ## Watchdog Configuration
 
-The watchdog monitors worker processes and restarts them if they become unresponsive. It is fed after each prefill micro-batch and each decode step.
+The watchdog monitors worker processes and reports health via the `/health` endpoint. See [Watchdog & Health Monitoring](watchdog.md) for full documentation.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--watchdog-timeout` | Disabled | Timeout in seconds per micro-batch/decode step. Recommended: 300 for production. |
+| `--watchdog-timeout` | Disabled | General per-step/micro-batch timeout in seconds. Recommended: 600 for production. |
+| `--decode-step-timeout` | Disabled | Max seconds for a single decode iteration. Recommended: 300 for production. |
+| `--startup-timeout` | Disabled | Max seconds from process launch to server ready. Recommended: 1800 for large models. |
 | `--no-watchdog` | - | Disable watchdog (default behavior, kept for compatibility) |
 
 **When to enable watchdog:**
-- For production deployments: use `--watchdog-timeout 300` (5 minutes)
-- Increase timeout for very long sequences or slow hardware
+- For production deployments: use `--watchdog-timeout 600 --decode-step-timeout 300 --startup-timeout 1800`
+- Increase timeouts for very long sequences or slow hardware
 
 ---
 
