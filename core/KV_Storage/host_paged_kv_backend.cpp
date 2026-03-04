@@ -295,7 +295,12 @@ void HostPagedKVBackend::SharedState::MapPointers() {
 }
 
 void HostPagedKVBackend::SharedState::ConstructSharedState() {
-    std::memset(mapping, 0, total_bytes);
+    if (using_memfd) {
+        // memfd pages are kernel-zeroed on first fault, only zero metadata
+        std::memset(mapping, 0, data_offset);
+    } else {
+        std::memset(mapping, 0, total_bytes);
+    }
     MapPointers();
     header->magic = kSharedMemoryMagic;
     header->layout_fingerprint = layout_fingerprint;
