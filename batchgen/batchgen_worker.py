@@ -3144,10 +3144,33 @@ class BatchGenWorker:
 			f"(prompt lengths: min={min(prompt_lengths)}, max={max(prompt_lengths)})"
 		)
 
-		# Phase 3: Create per-sequence tensors sized to their actual prompt length
-		# MEMORY OPTIMIZATION: Create tensors one at a time directly from gathered lists,
-		# avoiding intermediate tensor storage. Each sequence only needs space for its
-		# own prompt + decoding, critical for long-tailed distributions.
+		# Phase 3: Bulk-allocate contiguous buffers, then assign views per sequence.
+		# This replaces N×3 individual torch.zeros() calls with 3 bulk allocations,
+		# avoiding CPU allocator thrashing (was 29 min for 12K×128K sequences).
+		num_sequences = len(self.global_batch)
+		max_seq_extended_size = min(
+			max(prompt_lengths) + self.max_decoding_length,
+			self.model_context_length
+		)
+
+		import time as _time
+		buf_start = _time.perf_counter()
+		input_ids_buf = torch.zeros((num_sequences, max_seq_extended_size), dtype=torch.long)
+		attention_mask_buf = torch.zeros((num_sequences, max_seq_extended_size), dtype=torch.int64)
+		decoded_tokens_buf = torch.zeros((num_sequences, self.max_decoding_length), dtype=torch.int64)
+		buf_time = _time.perf_counter() - buf_start
+		if self.rank == 0:
+			total_gb = (input_ids_buf.nbytes + attention_mask_buf.nbytes + decoded_tokens_buf.nbytes) / (1024**3)
+			logging.info(
+				f"[TOKENIZE] Bulk buffer allocation: {num_sequences} seqs × {max_seq_extended_size} cols, "
+				f"{total_gb:.1f} GB in {buf_time:.2f}s"
+			)
+
+		# Keep references to prevent GC of backing buffers
+		self._input_ids_buf = input_ids_buf
+		self._attention_mask_buf = attention_mask_buf
+		self._decoded_tokens_buf = decoded_tokens_buf
+
 		for seq in self.global_batch:
 			# CRITICAL: Use seq.global_idx to lookup, NOT enumeration index
 			# tokenized_by_idx is keyed by global_idx from parallel tokenization
@@ -3163,32 +3186,27 @@ class BatchGenWorker:
 				)
 				actual_prompt_len = len(input_ids_list)  # Use actual list length
 
-			# Each sequence gets its own sized tensor: actual_prompt_len + max_decoding_length
-			# Capped by model context length to avoid wasting memory on impossible decoding
 			seq_extended_size = min(
 				actual_prompt_len + self.max_decoding_length,
 				self.model_context_length
 			)
 
-			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
-			attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
+			idx = seq.global_idx  # Row index in contiguous buffer
 
-			# Copy the actual tokens directly from list (left-aligned, no truncation)
-			input_ids_extended[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
-			# CRITICAL: Set attention mask to exactly match input_ids length
-			# This ensures attention_mask.sum() == prompt_length == current_context_length
-			attention_mask_extended[0, :actual_prompt_len] = 1
+			# Views into contiguous buffers (no allocation, just pointer arithmetic)
+			seq.input_ids = input_ids_buf[idx:idx+1, :seq_extended_size]
+			seq.attention_mask = attention_mask_buf[idx:idx+1, :seq_extended_size]
+			seq.decoded_tokens = decoded_tokens_buf[idx:idx+1]
 
-			seq.input_ids = input_ids_extended
-			seq.attention_mask = attention_mask_extended
-			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
+			# Populate prompt tokens
+			seq.input_ids[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+			seq.attention_mask[0, :actual_prompt_len] = 1
 
 			# Free the tokenized data for this sequence immediately
 			del tokenized_by_idx[seq.global_idx]
 
 			seq.prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
-			# kv_token_budget matches the tensor size
 			seq.kv_token_budget = seq_extended_size
 
 		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
