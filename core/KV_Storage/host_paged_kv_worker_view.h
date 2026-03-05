@@ -910,10 +910,10 @@ class HostPagedKVWorkerView {
         if (sequence_ids.empty()) {
             return;
         }
-        std::for_each(sequence_ids.begin(), sequence_ids.end(),
-                      [this](std::int64_t sequence_id) {
-                          UnregisterSequence(sequence_id);
-                      });
+        for (std::int64_t sequence_id : sequence_ids) {
+            page_table_.Remove(sequence_id);
+        }
+        RemovePrefixStates(sequence_ids);
     }
 
     void ReleaseSequencePages(const std::vector<std::int64_t>& sequence_ids) {
