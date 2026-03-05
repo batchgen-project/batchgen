@@ -360,10 +360,10 @@ class WorkerManager:
         try:
             subprocess.run(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True)
             subprocess.run(["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"], check=True)
-            logger.info("[fast-init] Memory compaction completed in %.2fs (drop_caches + compact_memory)",
-                        _time.monotonic() - t0)
+            logging.info("[fast-init] Memory compaction completed in %.2fs (drop_caches + compact_memory)",
+                         _time.monotonic() - t0)
         except (subprocess.CalledProcessError, PermissionError) as e:
-            logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
+            logging.warning("[fast-init] Memory compaction failed (requires root): %s", e)
 
     def _config_hugepages(self, byte_size: int = None) -> None:
         """Configure hugepages for shared memory.
