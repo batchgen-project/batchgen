@@ -356,14 +356,24 @@ class WorkerManager:
         """Drop page cache and compact memory for stable THP allocation."""
         import subprocess
         import time as _time
+        logging.info("[fast-init] Starting memory compaction (drop_caches + compact_memory)...")
         t0 = _time.monotonic()
         try:
-            subprocess.run(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True)
-            subprocess.run(["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"], check=True)
+            r1 = subprocess.run(
+                ["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
+                check=True, capture_output=True, text=True
+            )
+            logging.info("[fast-init] drop_caches done (%.2fs)", _time.monotonic() - t0)
+            r2 = subprocess.run(
+                ["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"],
+                check=True, capture_output=True, text=True
+            )
             logging.info("[fast-init] Memory compaction completed in %.2fs (drop_caches + compact_memory)",
                          _time.monotonic() - t0)
         except (subprocess.CalledProcessError, PermissionError) as e:
             logging.warning("[fast-init] Memory compaction failed (requires root): %s", e)
+        except Exception as e:
+            logging.warning("[fast-init] Memory compaction unexpected error: %s", e)
 
     def _config_hugepages(self, byte_size: int = None) -> None:
         """Configure hugepages for shared memory.
