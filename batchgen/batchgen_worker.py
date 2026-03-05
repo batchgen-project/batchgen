@@ -3945,7 +3945,7 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
 					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu())
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens.clone().cpu())
 					)
 
 		# All ranks participate in gather (NCCL collective requirement)
