@@ -4646,16 +4646,42 @@ class BatchGenWorker:
 		# CRITICAL: Deep free decode model memory BEFORE configuring prefill (Bug Fix 7)
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
+		hbm_before = torch.cuda.memory_allocated(self.torch_device) / (1024**3)
+		hbm_reserved_before = torch.cuda.memory_reserved(self.torch_device) / (1024**3)
+		logging.info(
+			f"Rank {self.rank}: HBM BEFORE prefill config: "
+			f"allocated={hbm_before:.2f} GiB, reserved={hbm_reserved_before:.2f} GiB"
+		)
+
 		logging.info("Deep freeing model memory before prefill config...")
 		self.deep_free_model_memory()
+
+		hbm_after_free = torch.cuda.memory_allocated(self.torch_device) / (1024**3)
+		logging.info(
+			f"Rank {self.rank}: HBM AFTER deep_free_model_memory: "
+			f"allocated={hbm_after_free:.2f} GiB"
+		)
 
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
 		self._destroy_gpu_paged_kv_cache()
 
+		hbm_after_kv = torch.cuda.memory_allocated(self.torch_device) / (1024**3)
+		hbm_reserved_after_kv = torch.cuda.memory_reserved(self.torch_device) / (1024**3)
+		logging.info(
+			f"Rank {self.rank}: HBM AFTER destroy_gpu_kv + empty_cache: "
+			f"allocated={hbm_after_kv:.2f} GiB, reserved={hbm_reserved_after_kv:.2f} GiB"
+		)
+
 		# STEP 1: Configure model for prefill
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+
+		hbm_after_prefill = torch.cuda.memory_allocated(self.torch_device) / (1024**3)
+		logging.info(
+			f"Rank {self.rank}: HBM AFTER configure_prefill: "
+			f"allocated={hbm_after_prefill:.2f} GiB"
+		)
 		self.set_phase("prefill")
 
 		self.core_engine.stop_h2d_worker()
