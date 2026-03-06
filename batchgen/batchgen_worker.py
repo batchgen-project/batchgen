@@ -1845,12 +1845,31 @@ class BatchGenWorker:
 		# Use actual host_pages_allocated for dynamic reservation (if set),
 		# otherwise fall back to full kv_token_budget for backwards compatibility
 		used_pages = 0
+		n_with_alloc = 0
+		pages_from_alloc = 0
+		n_fallback = 0
+		pages_from_fallback = 0
+		fallback_budget_sum = 0
 		for uuid in valid_sequences:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq.host_pages_allocated > 0:
 				used_pages += seq.host_pages_allocated
+				n_with_alloc += 1
+				pages_from_alloc += seq.host_pages_allocated
 			else:
-				used_pages += math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
+				pages = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
+				used_pages += pages
+				n_fallback += 1
+				pages_from_fallback += pages
+				fallback_budget_sum += seq.kv_token_budget
+
+		if n_fallback > 0 and self.local_rank == 0:
+			logging.info(
+				f"[HOST_KV_UTIL] {n_with_alloc} seqs used host_pages_allocated ({pages_from_alloc} pages), "
+				f"{n_fallback} seqs used fallback ({pages_from_fallback} pages), "
+				f"fallback avg kv_budget={fallback_budget_sum/n_fallback:.0f}, "
+				f"total_used={used_pages}/{stats.num_total_pages}"
+			)
 
 		# Free pages = total - used by valid sequences
 		free_pages = stats.num_total_pages - used_pages
@@ -2736,13 +2755,21 @@ class BatchGenWorker:
 				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
 					pending = self._pending_migrated_query_book.pop(uuid)
 					budget = pending['kv_token_budget']
-					new_slot = self._buffer_pool.allocate_slot()
-					seq.input_ids = None  # Will be replaced by buffer view
-					seq._buffer_slot = new_slot
-					self._buffer_pool.input_ids_buffer[new_slot, :budget] = pending['input_ids'][0, :budget]
-					self._buffer_pool.decoded_tokens_buffer[new_slot, :] = pending['decoded_tokens'][0, :]
-					input_ids_view = self._buffer_pool.get_input_ids_view(new_slot, budget)
-					decoded_view = self._buffer_pool.get_decoded_tokens_view(new_slot)
+					# Reuse existing buffer slot — Phase 3 already allocated a slot for every
+					# sequence in global_batch, so seq._buffer_slot is valid
+					existing_slot = seq._buffer_slot
+					logging.info(
+						f"Rank {self.rank}: Migration receive {uuid[:8]}: "
+						f"reusing existing_slot={existing_slot}, budget={budget}"
+					)
+					if existing_slot < 0:
+						logging.error(f"Rank {self.rank}: Migration receive {uuid[:8]} has no buffer slot, allocating new")
+						existing_slot = self._buffer_pool.allocate_slot()
+						seq._buffer_slot = existing_slot
+					self._buffer_pool.input_ids_buffer[existing_slot, :budget] = pending['input_ids'][0, :budget]
+					self._buffer_pool.decoded_tokens_buffer[existing_slot, :] = pending['decoded_tokens'][0, :]
+					input_ids_view = self._buffer_pool.get_input_ids_view(existing_slot, budget)
+					decoded_view = self._buffer_pool.get_decoded_tokens_view(existing_slot)
 					seq.input_ids = input_ids_view
 					seq.decoded_tokens = decoded_view
 					self.query_book[new_local_idx] = query(
