@@ -196,6 +196,7 @@ class WorkerManager:
             try:
                 self.host_kv_manager = self.allocate_host_kv_cache(
                     self.args.host_kv_cache_size, self.args.model,
+                    enable_prefix_cache=self.args.enable_prefix_cache,
                     enable_memfd=self.args.fast_init,
                 )
             except Exception as exc:
@@ -499,6 +500,7 @@ class WorkerManager:
             disable_cuda_graphs=self.args.disable_cuda_graphs,
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
+            enable_prefix_cache=self.args.enable_prefix_cache,
             host_kv_chunk_size=self.args.host_kv_chunk_size,
             enable_host_kv_eviction=self.args.enable_host_kv_eviction,
             host_kv_eviction_watermark=self.args.host_kv_eviction_watermark,
@@ -841,11 +843,13 @@ class WorkerManager:
     @staticmethod
     def allocate_host_kv_cache(
         host_kv_cache_size_gb: int, model_name: str,
+        enable_prefix_cache: bool = True,
         enable_memfd: bool = False,
     ) -> Any:
         config = build_host_kv_config(
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
+            enable_prefix_reuse=enable_prefix_cache,
         )
         if enable_memfd:
             config.enable_memfd = True

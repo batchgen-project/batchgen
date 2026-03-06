@@ -252,6 +252,7 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+	enable_prefix_cache: bool = True  # Enable host KV prefix cache reuse
 	# Dynamic host KV reservation
 	host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens
 	host_kv_eviction_watermark: int = 10  # Trigger eviction when free < this %
@@ -308,6 +309,7 @@ class BatchGenWorker:
 		if args.global_rank == 0:
 			logging.info(
 				f"Dynamic Host KV Config: chunk_size={args.host_kv_chunk_size}, "
+				f"prefix_cache={args.enable_prefix_cache}, "
 				f"eviction_watermark={args.host_kv_eviction_watermark}%, "
 				f"eviction_enabled={args.enable_host_kv_eviction}, "
 				f"adaptive_chunk={args.adaptive_chunk}"
@@ -409,6 +411,7 @@ class BatchGenWorker:
 		worker_kv_config = build_host_kv_config(
 			model_name=args.model_name,
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
+			enable_prefix_reuse=args.enable_prefix_cache,
 		)
 		if args.fast_init:
 			worker_kv_config.enable_memfd = True
