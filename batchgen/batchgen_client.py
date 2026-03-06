@@ -386,6 +386,7 @@ class BatchGenHttpClient:
         poll_interval: float = 5.0,
         timeout: Optional[float] = None,
         max_decoding_length: Optional[int] = None,
+        max_context_length: int = 131072,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -404,6 +405,7 @@ class BatchGenHttpClient:
             poll_interval: Seconds between status checks
             timeout: Maximum seconds to wait
             max_decoding_length: Override max decoding length for all requests (None = use per-request)
+            max_context_length: Max total context (prompt + decode). Default 128K.
             temperature: Sampling temperature (None = greedy decoding)
             top_p: Nucleus sampling threshold (None = disabled)
 
@@ -422,6 +424,7 @@ class BatchGenHttpClient:
             file_id,
             endpoint=endpoint,
             max_decoding_length=max_decoding_length,
+            max_context_length=max_context_length,
             temperature=temperature,
             top_p=top_p,
         )
