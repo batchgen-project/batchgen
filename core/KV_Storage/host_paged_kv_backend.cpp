@@ -213,8 +213,6 @@ void TouchPagesMultiThreaded(void* ptr, std::size_t size, std::size_t stride) {
     }
 }
 
-}  // namespace
-
 struct HostPagedKVBackend::SharedState {
     explicit SharedState(const HostPagedKVConfig& cfg, std::size_t data_bytes,
                          std::uint64_t fingerprint, bool has_v)
