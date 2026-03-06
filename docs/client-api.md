@@ -55,6 +55,7 @@ result = client.submit_batch(
 | `max_decoding_length` | int | None | Override max decoding length for all requests (None = use per-request values) |
 | `temperature` | float | None | Sampling temperature (None = greedy decoding) |
 | `top_p` | float | None | Nucleus sampling threshold (None = disabled) |
+| `top_k` | int | None | Top-k filtering threshold (None = disabled) |
 
 ### Step-by-Step Batch API
 
@@ -103,6 +104,7 @@ Create a batch job.
 | `max_decoding_length` | int | None | Override max decoding length for all requests |
 | `temperature` | float | None | Sampling temperature |
 | `top_p` | float | None | Nucleus sampling threshold |
+| `top_k` | int | None | Top-k filtering threshold |
 
 ### wait_for_batch()
 
@@ -210,6 +212,9 @@ Batch input files use OpenAI-compatible JSONL format. Each line is a separate re
 | `max_tokens` | int | Maximum tokens to generate |
 | `temperature` | float | Sampling temperature (0.0 = greedy) |
 | `top_p` | float | Nucleus sampling threshold |
+| `top_k` | int | Top-k filtering threshold |
+
+**Note:** Per-request sampling parameters override batch-level defaults. See [Input Format](input-format.md) for the full override logic.
 
 ---
 
@@ -252,6 +257,7 @@ python test/r1_mmlu_pro_test/r1_mmlu_pro_batch_test.py \
     --server_port 10900 \
     --temperature 0.7 \
     --top_p 0.9 \
+    --top_k 50 \
     --max_prompts 100
 ```
 
@@ -266,6 +272,8 @@ python test/r1_mmlu_pro_test/r1_mmlu_pro_batch_test.py \
 | `--base_url` | string | No | Full server URL (alternative to host/port, e.g., `http://localhost:10900`) |
 | `--temperature` | float | No | Sampling temperature (default: None = greedy decoding) |
 | `--top_p` | float | No | Nucleus sampling threshold (default: None = disabled) |
+| `--top_k` | int | No | Top-k filtering threshold (default: None = disabled) |
+| `--random_sampling_params` | flag | No | Generate random per-request sampling params for each request |
 | `--poll_interval` | float | No | Seconds between batch status checks (default: `5.0`) |
 | `--timeout` | float | No | Maximum seconds to wait for batch completion (default: None = unlimited) |
 | `--max_prompts` | int | No | Limit number of prompts to process (default: None = all) |
@@ -280,6 +288,7 @@ The CLI arguments map to client API parameters as follows:
 | `--server_host` + `--server_port` | `base_url` | - |
 | `--temperature` | `temperature` | `body.temperature` |
 | `--top_p` | `top_p` | `body.top_p` |
+| `--top_k` | `top_k` | `body.top_k` |
 
 ### Custom Test Scripts
 
