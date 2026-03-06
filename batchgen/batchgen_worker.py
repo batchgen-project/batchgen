@@ -1841,40 +1841,18 @@ class BatchGenWorker:
 		for seqs in status_counts.values():
 			valid_sequences.extend(seqs)
 
-		# Calculate pages used by valid sequences
-		# Use actual host_pages_allocated for dynamic reservation (if set),
-		# otherwise estimate based on prompt_length + chunk_size (the actual
-		# initial host KV allocation size), NOT full kv_token_budget which
-		# massively overestimates when max_decoding_length > chunk_size.
-		chunk_size = self._get_effective_chunk_size()
-		used_pages = 0
-		n_with_alloc = 0
-		pages_from_alloc = 0
-		n_fallback = 0
-		pages_from_fallback = 0
-		for uuid in valid_sequences:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq.host_pages_allocated > 0:
-				used_pages += seq.host_pages_allocated
-				n_with_alloc += 1
-				pages_from_alloc += seq.host_pages_allocated
-			else:
-				estimated_tokens = min(seq.prompt_length + chunk_size, seq.kv_token_budget)
-				pages = math.ceil(estimated_tokens / self.PAGE_SIZE)
-				used_pages += pages
-				n_fallback += 1
-				pages_from_fallback += pages
-
-		if n_fallback > 0 and self.local_rank == 0:
-			logging.info(
-				f"[HOST_KV_UTIL] {n_with_alloc} seqs with host_pages_allocated ({pages_from_alloc} pages), "
-				f"{n_fallback} seqs estimated ({pages_from_fallback} pages), "
-				f"total_used={used_pages}/{stats.num_total_pages}"
-			)
-
-		# Free pages = total - used by valid sequences
-		free_pages = stats.num_total_pages - used_pages
+		# Use C++ ground truth for page counts — shared memory atomic counters
+		# are accurate per-node, unlike per-sequence host_pages_allocated which
+		# is stale on non-owner ranks between metadata syncs.
+		used_pages = stats.num_used_pages
+		free_pages = stats.num_free_pages
 		free_percent = int((free_pages / stats.num_total_pages) * 100) if stats.num_total_pages > 0 else 100
+
+		if self.local_rank == 0:
+			logging.info(
+				f"[HOST_KV_UTIL] C++ stats: used={used_pages}, free={free_pages}, "
+				f"total={stats.num_total_pages}, {len(valid_sequences)} valid seqs"
+			)
 
 		return {
 			'rank': self.rank,
@@ -2758,6 +2736,7 @@ class BatchGenWorker:
 					budget = pending['kv_token_budget']
 					# Reuse existing buffer slot — Phase 3 already allocated a slot for every
 					# sequence in global_batch, so seq._buffer_slot is valid
+					seq = self.global_batch.get_sequence(uuid)
 					existing_slot = seq._buffer_slot
 					logging.info(
 						f"Rank {self.rank}: Migration receive {uuid[:8]}: "
@@ -4433,6 +4412,16 @@ class BatchGenWorker:
 			if self.rank == 0:
 				logging.info(f"--- Iteration {iteration} ---")
 
+			# HBM diagnostic: track memory across iterations to detect leaks
+			if torch.cuda.is_available():
+				free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
+				allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
+				reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
+				logging.info(
+					f"[HBM] Rank {self.rank} iter {iteration} START: "
+					f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
+				)
+
 			# NOTE: Watchdog is fed within prefill and decode loops, not here.
 			# This ensures we only monitor the actual inference phases.
 
@@ -4483,6 +4472,13 @@ class BatchGenWorker:
 
 					# B. Execute Prefill
 					if local_prefill_indices:
+						if torch.cuda.is_available():
+							free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
+							allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
+							logging.info(
+								f"[HBM] Rank {self.rank} BEFORE prefill ({len(local_prefill_indices)} seqs): "
+								f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
+							)
 						prefill_start = time.perf_counter()
 						with torch.inference_mode():
 							if self.enable_prepack:
@@ -4522,6 +4518,14 @@ class BatchGenWorker:
 				max_num_seq_estimate = max(max_num_seq_estimate, 16)
 
 				self._load_decode_model(max_num_seq_estimate, self.comm)
+
+				if torch.cuda.is_available():
+					free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
+					allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
+					logging.info(
+						f"[HBM] Rank {self.rank} AFTER decode model: "
+						f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
+					)
 
 				# ============ STEP B: Init GPU KV with ACTUAL size ============
 				# Only initializes if not already done; subsequent iterations skip
@@ -4771,9 +4775,27 @@ class BatchGenWorker:
 		# Previously this was called AFTER configure_prefill() which caused OOM
 		self._destroy_gpu_paged_kv_cache()
 
+		if torch.cuda.is_available():
+			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
+			allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
+			reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
+			logging.info(
+				f"[HBM] Rank {self.rank} BEFORE configure_prefill: "
+				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB rsv={reserved:.2f}GB"
+			)
+
 		# STEP 1: Configure model for prefill
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
+
+		if torch.cuda.is_available():
+			torch.cuda.synchronize(self.torch_device)
+			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
+			allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
+			logging.info(
+				f"[HBM] Rank {self.rank} AFTER configure_prefill: "
+				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
+			)
 
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_weight_copy_queue()
