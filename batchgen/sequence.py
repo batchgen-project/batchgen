@@ -67,7 +67,7 @@ class SequenceEntry:
     __slots__ = (
         'uuid', 'global_idx', 'prompt_length', 'max_decode_length',
         'status', 'decoded_length', 'current_context_length',
-        'input_ids', 'attention_mask', 'decoded_tokens',
+        'input_ids', 'decoded_tokens',
         'kv_token_budget', 'assigned_rank', 'text', 'eos_reached',
         # Two-page buffer tracking
         'gpu_pages_allocated',
@@ -112,7 +112,6 @@ class SequenceEntry:
         self.decoded_length = 0
         self.current_context_length = prompt_length
         self.input_ids: Optional[torch.Tensor] = None
-        self.attention_mask: Optional[torch.Tensor] = None
         self.decoded_tokens: Optional[torch.Tensor] = None
         self.kv_token_budget: int = prompt_length + max_decode_length
         self.assigned_rank: Optional[int] = None
