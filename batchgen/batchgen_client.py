@@ -259,6 +259,7 @@ class BatchGenHttpClient:
         completion_window: str = "24h",
         metadata: Optional[Dict[str, Any]] = None,
         max_decoding_length: Optional[int] = None,
+        max_context_length: int = 131072,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -270,6 +271,7 @@ class BatchGenHttpClient:
             completion_window: Time window for completion ('24h')
             metadata: Optional metadata dictionary
             max_decoding_length: Override max decoding length for all requests (None = use per-request)
+            max_context_length: Max total context (prompt + decode). Default 128K.
             temperature: Sampling temperature (None = greedy decoding)
             top_p: Nucleus sampling threshold (None = disabled)
 
@@ -280,6 +282,7 @@ class BatchGenHttpClient:
             "input_file_id": input_file_id,
             "endpoint": endpoint,
             "completion_window": completion_window,
+            "max_context_length": max_context_length,
         }
         if metadata:
             payload["metadata"] = metadata

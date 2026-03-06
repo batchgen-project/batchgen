@@ -151,6 +151,7 @@ class CreateBatchRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (override per-request values)
     max_decoding_length: Optional[int] = Field(default=None, ge=1)
+    max_context_length: int = Field(default=131072, ge=1)  # Max total context (prompt + decode). Default 128K.
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
 
@@ -173,6 +174,7 @@ class BatchObject(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (set at batch creation, None = use defaults)
     max_decoding_length: Optional[int] = None
+    max_context_length: int = 131072  # Default 128K
     temperature: Optional[float] = None
     top_p: Optional[float] = None
 

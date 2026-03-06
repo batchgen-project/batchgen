@@ -317,6 +317,7 @@ def _server_worker_main_impl(
 			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
 			current_max_output = task_data.get("max_output_len", 128)
+			max_context_length = task_data.get("max_context_length", 131072)
 			ignore_eos = task_data.get("ignore_eos", False)
 			# Sampling parameters (None = greedy decoding)
 			temperature = task_data.get("temperature", None)
@@ -346,7 +347,8 @@ def _server_worker_main_impl(
 			if len(global_prompts) > 0:
 				# Initialize worker with global batch info
 				# max_input_length can be None - will be determined by longest prompt
-				worker.Init(current_max_input, current_max_output, len(global_prompts))
+				worker.Init(current_max_input, current_max_output, len(global_prompts),
+					max_context_length=max_context_length)
 
 				# Set ignore_eos flag on worker
 				worker.set_ignore_eos(ignore_eos)

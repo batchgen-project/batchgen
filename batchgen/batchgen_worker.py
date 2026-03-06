@@ -453,6 +453,7 @@ class BatchGenWorker:
 		self.eos_token_id: Optional[int] = None
 		self.max_input_length = 0
 		self.max_decoding_length = 0
+		self.max_context_length = 131072  # Default 128K, set per-batch from client
 		self.model_context_length = 131072  # Default 128K, updated from model config
 		self.num_global_queries = 0
 		self.num_local_queries = 0
@@ -485,23 +486,24 @@ class BatchGenWorker:
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
-	def Init(self, max_input_length, max_decoding_length, num_queries):
+	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=131072):
 		"""
 		Initialize/reconfigure for a new batch.
 		- First call: performs full initialization of core_engine, parallel_manager, etc.
 		- Subsequent calls: only updates batch parameters and resets state.
-		
+
 		Args:
 			max_input_length: Maximum input length hint. If None, will be determined dynamically
 			                  during tokenization as the longest prompt in the batch.
 			                  For first initialization, a default of 8192 is used if None.
 			max_decoding_length: Maximum number of tokens to decode.
 			num_queries: Number of queries in the global batch.
+			max_context_length: Maximum total context length (prompt + decode). Default 128K.
 		"""
 		# Check if we need to reset state from previous batch
 		if self._core_initialized and self.global_batch is not None:
 			self._reset_for_new_batch()
-		
+
 		# Update batch-specific parameters
 		# max_input_length can be None - will be set during tokenization
 		# For first initialization, use a reasonable default if None (needed for scheduler)
@@ -511,6 +513,7 @@ class BatchGenWorker:
 		else:
 			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
+		self.max_context_length = max_context_length
 
 		# Cap adaptive chunk sizer's max_chunk by max_decoding_length
 		if self.adaptive_chunk_sizer is not None and max_decoding_length > 0:
@@ -764,7 +767,7 @@ class BatchGenWorker:
 	def _is_sequence_completed(self, seq) -> bool:
 		"""
 		Unified completion check that respects ignore_eos.
-		
+
 		A sequence is completed if:
 		1. It reached max_decoding_length (always checked), OR
 		2. It hit EOS AND ignore_eos is False, OR
@@ -773,16 +776,24 @@ class BatchGenWorker:
 		# Always complete at max decoding length
 		if seq.decoded_length >= self.max_decoding_length:
 			return True
-		
+
 		# Complete if context length limit reached (prompt + decoded >= model max)
 		if seq.current_context_length >= self.model_context_length:
 			return True
-		
+
 		# Only complete at EOS if not ignoring EOS
 		if seq.eos_reached and not self._ignore_eos:
 			return True
-		
+
 		return False
+
+	def _get_finish_reason(self, seq) -> str:
+		"""Return OpenAI-compatible finish_reason for a completed sequence."""
+		# EOS takes priority (natural completion)
+		if seq.eos_reached and not self._ignore_eos:
+			return "stop"
+		# Otherwise it's a length limit (decode cap or context cap)
+		return "length"
 
 	def _compute_two_page_buffer_allocation(
 		self, 
@@ -1175,8 +1186,12 @@ class BatchGenWorker:
 		
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
-		self.model_context_length = getattr(self.model_config, 'max_position_embeddings', 131072)  # Default 128K
-		logging.info(f"Rank {self.rank}: Model context length set to {self.model_context_length}")
+		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
+		self.model_context_length = min(model_max, getattr(self, 'max_context_length', 131072))
+		logging.info(
+			f"Rank {self.rank}: Model context length set to {self.model_context_length} "
+			f"(model_config={model_max}, max_context_length={getattr(self, 'max_context_length', 'N/A')})"
+		)
 		
 		# Load tokenizer using BatchGen's tokenizer abstraction
 		# This removes the dependency on transformers.AutoTokenizer
@@ -3129,11 +3144,12 @@ class BatchGenWorker:
 		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
 		max_prompt_length = max(prompt_lengths)
 
-		# Warn if any prompt exceeds model context length
-		if max_prompt_length >= self.model_context_length:
+		# Warn about prompts that exceed context length limit
+		over_limit = sum(1 for pl in prompt_lengths if pl >= self.model_context_length)
+		if over_limit > 0:
 			logging.warning(
-				f"Rank {self.rank}: Longest prompt ({max_prompt_length} tokens) exceeds or equals "
-				f"model context length ({self.model_context_length}). Some sequences may not decode."
+				f"Rank {self.rank}: {over_limit}/{num_sequences} prompts exceed max context length "
+				f"({self.model_context_length}). These will complete with minimal/no decode tokens."
 			)
 
 		# Update self.max_input_length to the actual longest prompt
@@ -3919,15 +3935,16 @@ class BatchGenWorker:
 		if has_writer.item() == 0:
 			return
 
-		# Each rank collects tokens for its locally-owned completed sequences
+		# Each rank collects tokens + finish_reason for its locally-owned completed sequences
 		my_completed_tokens = []
 		for uuid in completed_uuids:
 			if uuid in self._uuid_to_local_map:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
+					finish_reason = self._get_finish_reason(seq)
 					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu())
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu(), finish_reason)
 					)
 
 		# All ranks participate in gather (NCCL collective requirement)
@@ -3939,8 +3956,8 @@ class BatchGenWorker:
 		if writer is not None:
 			for rank_tokens in all_completed_tokens:
 				if rank_tokens:
-					for global_idx, tokens in rank_tokens:
-						writer.submit(global_idx, tokens)
+					for global_idx, tokens, finish_reason in rank_tokens:
+						writer.submit(global_idx, tokens, finish_reason=finish_reason)
 
 	def _try_load_new_sequences(
 		self, 

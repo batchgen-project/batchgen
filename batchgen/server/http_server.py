@@ -287,6 +287,7 @@ def create_app(
             metadata=body.metadata,
             # Inference parameters (override per-request values)
             max_decoding_length=body.max_decoding_length,
+            max_context_length=body.max_context_length,
             temperature=body.temperature,
             top_p=body.top_p,
         )
