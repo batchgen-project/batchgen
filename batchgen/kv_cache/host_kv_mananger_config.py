@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Dict, Sequence
 
 import torch
@@ -203,6 +204,14 @@ def _apply_capacity_defaults(config: Any) -> None:
 		)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+	"""Parse a boolean feature flag from the environment."""
+	value = os.environ.get(name)
+	if value is None:
+		return default
+	return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 	"""Builds a core HostPagedKVConfig for the given model and host budget."""
 
@@ -247,7 +256,7 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
-	config.enable_prefix_reuse = False
+	config.enable_prefix_reuse = _env_flag("BATCHGEN_ENABLE_PREFIX_REUSE", False)
 	config.prefix_min_reuse_pages = 1
 	config.prefix_min_store_pages = 2
 	_apply_capacity_defaults(config)
@@ -366,7 +375,7 @@ def build_host_kv_config_aux(model_name: str, host_kv_cache_size: int) -> Any | 
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
-	config.enable_prefix_reuse = False
+	config.enable_prefix_reuse = _env_flag("BATCHGEN_ENABLE_PREFIX_REUSE", False)
 	config.prefix_min_reuse_pages = 1
 	config.prefix_min_store_pages = 2
 	_apply_capacity_defaults(config)
