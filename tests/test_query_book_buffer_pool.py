@@ -275,7 +275,7 @@ class TestPerformance:
     @pytest.mark.parametrize("num_seqs,ctx_len", [
         (100, 131072),    # small batch, full context
         (1000, 131072),   # medium batch
-        (12000, 4096),    # large batch, short context (fits in memory)
+        (12000, 4096),    # large batch, short context
     ])
     def test_allocation_speedup(self, num_seqs, ctx_len):
         max_decode = 8192
@@ -312,6 +312,127 @@ class TestPerformance:
 
         speedup = baseline_ms / pool_ms if pool_ms > 0 else float('inf')
         print(f"\n  N={num_seqs}, ctx={ctx_len}: baseline={baseline_ms:.1f}ms, pool={pool_ms:.1f}ms, speedup={speedup:.1f}x")
+
+    def test_realistic_production_workload(self):
+        """Reproduce the actual production scenario: 12K seqs, 131072 ctx, ~2000 token prompts.
+        This matches what we see in server logs: 12032 sequences, max_prompt=2657, max_decode=8192."""
+        import gc
+
+        num_seqs = 12000
+        ctx_len = 131072
+        max_decode = 8192
+        # Realistic prompt lengths: uniform 878-2657 (matching server logs)
+        prompt_lengths = [878 + (i * 1779) % 1780 for i in range(num_seqs)]
+
+        print(f"\n  Production scenario: N={num_seqs}, ctx={ctx_len}, "
+              f"prompts={min(prompt_lengths)}-{max(prompt_lengths)}, max_decode={max_decode}")
+
+        # ---- Baseline: per-sequence allocation (matches current Phase 3) ----
+        gc.collect()
+        t_total = time.perf_counter()
+        t_zeros_input = 0.0
+        t_zeros_decoded = 0.0
+        t_list_to_tensor = 0.0
+        t_copy = 0.0
+
+        tensors = []
+        for i in range(num_seqs):
+            prompt_len = prompt_lengths[i]
+            seq_ext = min(prompt_len + max_decode, ctx_len)
+            # Simulated token list (like tokenizer output)
+            token_list = list(range(prompt_len))
+
+            t0 = time.perf_counter()
+            inp = torch.zeros((1, seq_ext), dtype=torch.long)
+            t1 = time.perf_counter()
+            t_zeros_input += t1 - t0
+
+            t0 = time.perf_counter()
+            token_tensor = torch.tensor(token_list, dtype=torch.long)
+            t1 = time.perf_counter()
+            t_list_to_tensor += t1 - t0
+
+            t0 = time.perf_counter()
+            inp[0, :prompt_len] = token_tensor
+            t1 = time.perf_counter()
+            t_copy += t1 - t0
+
+            t0 = time.perf_counter()
+            dec = torch.zeros((1, max_decode), dtype=torch.int64)
+            t1 = time.perf_counter()
+            t_zeros_decoded += t1 - t0
+
+            tensors.append((inp, dec))
+
+            if (i + 1) % 3000 == 0:
+                elapsed = time.perf_counter() - t_total
+                print(f"    Baseline progress: {i+1}/{num_seqs} ({elapsed:.1f}s)")
+
+        baseline_ms = (time.perf_counter() - t_total) * 1000
+        total_input_gb = sum(min(prompt_lengths[i] + max_decode, ctx_len) for i in range(num_seqs)) * 8 / (1024**3)
+        total_decoded_gb = num_seqs * max_decode * 8 / (1024**3)
+        print(f"  Baseline: {baseline_ms:.0f}ms total ({total_input_gb:.2f}GB input + {total_decoded_gb:.2f}GB decoded)")
+        print(f"    torch.zeros input:  {t_zeros_input*1000:.0f}ms")
+        print(f"    torch.zeros decoded:{t_zeros_decoded*1000:.0f}ms")
+        print(f"    list→tensor:        {t_list_to_tensor*1000:.0f}ms")
+        print(f"    copy:               {t_copy*1000:.0f}ms")
+        del tensors
+        gc.collect()
+
+        # ---- Buffer pool ----
+        t_total = time.perf_counter()
+        t_alloc = time.perf_counter()
+        pool = QueryBookBufferPool(
+            num_sequences=num_seqs,
+            model_context_length=ctx_len,
+            max_decoding_length=max_decode,
+        )
+        t_alloc_ms = (time.perf_counter() - t_alloc) * 1000
+
+        t_list_to_tensor_pool = 0.0
+        t_copy_pool = 0.0
+        t_view_pool = 0.0
+
+        views = []
+        for i in range(num_seqs):
+            prompt_len = prompt_lengths[i]
+            seq_ext = min(prompt_len + max_decode, ctx_len)
+            token_list = list(range(prompt_len))
+
+            t0 = time.perf_counter()
+            slot = pool.allocate_slot()
+            v = pool.get_input_ids_view(slot, seq_ext)
+            d = pool.get_decoded_tokens_view(slot)
+            t1 = time.perf_counter()
+            t_view_pool += t1 - t0
+
+            t0 = time.perf_counter()
+            token_tensor = torch.tensor(token_list, dtype=torch.long)
+            t1 = time.perf_counter()
+            t_list_to_tensor_pool += t1 - t0
+
+            t0 = time.perf_counter()
+            v[0, :prompt_len] = token_tensor
+            t1 = time.perf_counter()
+            t_copy_pool += t1 - t0
+
+            views.append((v, d))
+
+            if (i + 1) % 3000 == 0:
+                elapsed = time.perf_counter() - t_total
+                print(f"    Pool progress: {i+1}/{num_seqs} ({elapsed:.1f}s)")
+
+        pool_ms = (time.perf_counter() - t_total) * 1000
+        print(f"  Buffer pool: {pool_ms:.0f}ms total")
+        print(f"    buffer alloc:       {t_alloc_ms:.0f}ms")
+        print(f"    view creation:      {t_view_pool*1000:.0f}ms")
+        print(f"    list→tensor:        {t_list_to_tensor_pool*1000:.0f}ms")
+        print(f"    copy:               {t_copy_pool*1000:.0f}ms")
+
+        speedup = baseline_ms / pool_ms if pool_ms > 0 else float('inf')
+        print(f"  SPEEDUP: {speedup:.1f}x")
+        del views, pool
+        gc.collect()
 
     def test_migration_overhead(self):
         """Measure clone + copy overhead for simulated migration."""
