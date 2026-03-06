@@ -1409,11 +1409,12 @@ class BatchGenWorker:
 			raise KeyError(f"Missing query entry for sequence {sequence_id}")
 		if query_entry.kv_token_budget is not None:
 			return query_entry.kv_token_budget
-		attention_mask = query_entry.encoded.get("attention_mask")
-		if attention_mask is None:
-			raise KeyError(f"No attention_mask available for sequence {sequence_id}")
-		mask_row = attention_mask[0] if attention_mask.dim() > 1 else attention_mask
-		input_tokens = int(mask_row[: self.max_input_length].sum().item())
+		# Fallback: compute from sequence metadata (attention_mask removed)
+		uuid = self._local_to_uuid_map.get(sequence_id, "")
+		seq = self.global_batch.get_sequence(uuid) if uuid else None
+		if seq is None:
+			raise KeyError(f"No sequence metadata available for sequence {sequence_id}")
+		input_tokens = min(seq.prompt_length, self.max_input_length)
 		total_tokens = input_tokens + self.max_decoding_length
 		query_entry.kv_token_budget = total_tokens
 		return total_tokens
@@ -2372,13 +2373,12 @@ class BatchGenWorker:
 			manager.free_pages_for_sequences([global_idx])
 			# Free host KV pages
 			worker_view.release_sequence_pages([global_idx])
-			# Also send query_book data (input_ids, attention_mask, decoded_tokens)
+			# Also send query_book data (input_ids, decoded_tokens)
 			local_idx = self._uuid_to_local_map.get(uuid)
 			if local_idx is not None and local_idx in self.query_book:
 				qb = self.query_book[local_idx]
 				# Send tensors via Gloo
 				dist.send(tensor=qb.encoded["input_ids"].cpu().contiguous(), dst=to_rank, group=gloo_group)
-				dist.send(tensor=qb.encoded["attention_mask"].cpu().contiguous(), dst=to_rank, group=gloo_group)
 				dist.send(tensor=qb.decoded_tokens.cpu().contiguous(), dst=to_rank, group=gloo_group)
 				if BATCHGEN_CB_DEBUG:
 					logging.debug(f"MIGRATION: Rank {self.rank}: Sent query_book for {uuid[:8]}...")
@@ -2530,35 +2530,16 @@ class BatchGenWorker:
 			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
 			# It will be freed automatically when it goes out of scope
 
-			# Receive query_book data (input_ids, attention_mask, decoded_tokens)
+			# Receive query_book data (input_ids, decoded_tokens)
 			# Get tensor shapes from the Sequence object (all ranks have seq metadata)
 			input_ids_shape = seq.input_ids.shape
-			attention_mask_shape = seq.attention_mask.shape
 			decoded_tokens_shape = seq.decoded_tokens.shape
 
 			input_ids_recv = torch.empty(input_ids_shape, dtype=seq.input_ids.dtype, device="cpu")
-			attention_mask_recv = torch.empty(attention_mask_shape, dtype=seq.attention_mask.dtype, device="cpu")
 			decoded_tokens_recv = torch.empty(decoded_tokens_shape, dtype=seq.decoded_tokens.dtype, device="cpu")
 
 			dist.recv(tensor=input_ids_recv, src=from_rank, group=gloo_group)
-			dist.recv(tensor=attention_mask_recv, src=from_rank, group=gloo_group)
 			dist.recv(tensor=decoded_tokens_recv, src=from_rank, group=gloo_group)
-			
-			# Verify received attention_mask has correct number of 1s
-			recv_attn_ones = attention_mask_recv.sum().item()
-			expected_ones = seq.current_context_length
-			if recv_attn_ones != expected_ones:
-				logging.error(
-					f"MIGRATION RECV: Rank {self.rank}: ATTENTION MASK MISMATCH for {uuid[:8]}! "
-					f"received_ones={int(recv_attn_ones)}, expected={expected_ones} (ctx_len), "
-					f"prompt_len={seq.prompt_length}, decoded_len={seq.decoded_length}"
-				)
-			else:
-				if BATCHGEN_CB_DEBUG:
-					logging.info(
-						f"MIGRATION: Rank {self.rank}: Attention mask OK for {uuid[:8]}: "
-						f"ones={int(recv_attn_ones)} == ctx_len={expected_ones}"
-					)
 
 			# Store in pending dict for later query_book creation
 			if not hasattr(self, '_pending_migrated_query_book'):
@@ -2570,7 +2551,6 @@ class BatchGenWorker:
 			self._pending_migrated_query_book[uuid] = {
 				'text': seq.text,
 				'input_ids': input_ids_recv,
-				'attention_mask': attention_mask_recv,
 				'decoded_tokens': decoded_tokens_recv,
 				'kv_token_budget': seq.kv_token_budget,
 			}
@@ -2717,7 +2697,6 @@ class BatchGenWorker:
 						text=pending['text'],
 						encoded={
 							"input_ids": pending['input_ids'],
-							"attention_mask": pending['attention_mask'],
 						},
 						decoded_tokens=pending['decoded_tokens'],
 						kv_token_budget=pending['kv_token_budget'],
@@ -3249,16 +3228,11 @@ class BatchGenWorker:
 			)
 
 			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
-			attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
 
 			# Copy the actual tokens directly from list (left-aligned, no truncation)
 			input_ids_extended[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
-			# CRITICAL: Set attention mask to exactly match input_ids length
-			# This ensures attention_mask.sum() == prompt_length == current_context_length
-			attention_mask_extended[0, :actual_prompt_len] = 1
 
 			seq.input_ids = input_ids_extended
-			seq.attention_mask = attention_mask_extended
 			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
 
 			# Free the tokenized data for this sequence immediately
@@ -3341,7 +3315,6 @@ class BatchGenWorker:
 				text=seq.text,
 				encoded={
 					"input_ids": seq.input_ids,
-					"attention_mask": seq.attention_mask,
 				},
 				decoded_tokens=seq.decoded_tokens,
 				kv_token_budget=seq.kv_token_budget,
@@ -3494,29 +3467,6 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(
 				f"[WATERMARK] Putting {len(uuids)} sequences ON_HOLD"
-			)
-
-		# DIAGNOSTIC: Verify attention_mask consistency BEFORE going ON_HOLD
-		# This helps identify if the mask-context mismatch is introduced before or after ON_HOLD
-		onhold_mask_diag = []
-		for uuid in uuids:
-			if uuid in self._uuid_to_local_map:
-				local_idx = self._uuid_to_local_map[uuid]
-				seq = self.global_batch.get_sequence(uuid)
-				ctx_len = seq.current_context_length
-				full_mask = self.query_book[local_idx].encoded["attention_mask"]
-				mask_ones = full_mask[:, :ctx_len].sum().item()
-				if mask_ones != ctx_len:
-					onhold_mask_diag.append({
-						'uuid': uuid[:8],
-						'ctx_len': ctx_len,
-						'mask_ones': int(mask_ones),
-						'decoded_len': seq.decoded_length,
-						'diff': int(mask_ones - ctx_len),
-					})
-		if onhold_mask_diag:
-			logging.error(
-				f"Rank {self.rank}: {len(onhold_mask_diag)} sequences have attention_mask mismatch BEFORE going ON_HOLD. First 5: {onhold_mask_diag[:5]}"
 			)
 
 		# CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
@@ -4129,13 +4079,11 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq.decoded_length > 0:
 				qb = self.query_book.get(local_idx)
-				attn_mask_sum = qb.encoded["attention_mask"].sum().item() if qb else "N/A"
 				resuming_diag.append({
 					'uuid': uuid[:8],
 					'decoded_len': seq.decoded_length,
 					'ctx_len': seq.current_context_length,
 					'prompt_len': seq.prompt_length,
-					'attn_mask_sum': attn_mask_sum,
 				})
 		if resuming_diag and BATCHGEN_CB_DEBUG:
 			logging.debug(
@@ -4742,16 +4690,13 @@ class BatchGenWorker:
 			new_prompt_len = len(evicted_ids)
 			prev_decoded = seq.total_decoded_before_eviction
 
-			# Rebuild input_ids and attention_mask with new prompt
+			# Rebuild input_ids with new prompt
 			# kv_token_budget stays unchanged (Q5 answer)
 			seq_extended_size = seq.kv_token_budget
 			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
-			attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
 			input_ids_extended[0, :new_prompt_len] = evicted_ids
-			attention_mask_extended[0, :new_prompt_len] = 1
 
 			seq.input_ids = input_ids_extended
-			seq.attention_mask = attention_mask_extended
 			seq.prompt_length = new_prompt_len
 			seq.current_context_length = new_prompt_len
 			# original_prompt_length stays unchanged (set at init)
@@ -4783,7 +4728,6 @@ class BatchGenWorker:
 					text=seq.text,
 					encoded={
 						"input_ids": seq.input_ids,
-						"attention_mask": seq.attention_mask,
 					},
 					decoded_tokens=seq.decoded_tokens,
 					kv_token_budget=seq.kv_token_budget,
@@ -5258,13 +5202,19 @@ class BatchGenWorker:
 		]
 		batch_max_len = max(batch_seq_lengths)
 
-		# Pad each sequence to batch_max_len
+		# Pad each sequence to batch_max_len and construct attention masks on-the-fly
 		padded_input_ids = []
 		padded_attention_masks = []
 		for query_idx in batch:
 			seq_input_ids = self.query_book[query_idx].encoded["input_ids"]
-			seq_attention_mask = self.query_book[query_idx].encoded["attention_mask"]
+			uuid = self._local_to_uuid_map[query_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			prompt_len = seq.prompt_length
 			seq_len = seq_input_ids.shape[1]
+
+			# Construct attention mask from prompt_length (1s for valid tokens, 0s for padding)
+			seq_attention_mask = torch.zeros((1, seq_len), dtype=torch.int64)
+			seq_attention_mask[0, :prompt_len] = 1
 
 			if seq_len < batch_max_len:
 				# Pad with zeros (left-aligned tokens, right-padded)
@@ -5343,12 +5293,6 @@ class BatchGenWorker:
 			seq.decoded_length = token_pos + 1
 			seq.current_context_length = seq.prompt_length + seq.decoded_length
 
-			# Update attention mask for the first decoded token produced by prefill
-			attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
-			mask_pos = seq.current_context_length - 1  # position of the new token
-			if mask_pos < attn_mask.shape[0]:
-				attn_mask[mask_pos] = 1
-
 			# MODIFIED: Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 				seq.eos_reached = True
@@ -5375,11 +5319,14 @@ class BatchGenWorker:
 
 		for query_idx in batch:
 			input_ids = self.query_book[query_idx].encoded["input_ids"][:, :self.max_input_length]
-			attention_mask = self.query_book[query_idx].encoded["attention_mask"][:, :self.max_input_length]
-
-			# Get actual sequence length
-			actual_len = int(attention_mask.sum().item())
+			uuid = self._local_to_uuid_map[query_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			actual_len = min(seq.prompt_length, self.max_input_length)
 			seq_lengths.append(actual_len)
+
+			# Construct attention mask on-the-fly from prompt_length
+			attention_mask = torch.zeros_like(input_ids, dtype=torch.int64)
+			attention_mask[0, :actual_len] = 1
 
 			input_ids_list.append(input_ids)
 			attention_mask_list.append(attention_mask)
@@ -5614,12 +5561,6 @@ class BatchGenWorker:
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
 			seq.current_context_length = seq.prompt_length + seq.decoded_length
-
-			# Update attention mask for the first decoded token produced by prefill
-			attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
-			mask_pos = seq.current_context_length - 1  # position of the new token
-			if mask_pos < attn_mask.shape[0]:
-				attn_mask[mask_pos] = 1
 
 			# Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -7040,22 +6981,16 @@ class BatchGenWorker:
 						cache_seqlens.append(ctx_len)
 
 					max_ctx = max(cache_seqlens)
-					# Build attention metadata directly on GPU (avoids CPU→GPU copy of list)
-					positions = torch.arange(max_ctx, device=self.torch_device)
+					# Build attention metadata directly on GPU
 					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
-					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)
 
-					Attn_Wrapper.attention_mask = attention_mask
-					# Optimization: Compute position_ids from cache_seqlens directly (O(batch))
-					# instead of attention_mask.sum(-1) which is O(batch × max_ctx)
+					Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
 					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
 					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
 					Attn_Wrapper.max_seqlen = max_ctx
 
 					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-					# Without this, GPT-OSS attention uses stale cache_seqlens (always None),
-					# causing same KV positions to be read/written every decode step.
-					AttnWrapperBase.attention_mask = attention_mask
+					AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
 					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
@@ -7070,14 +7005,14 @@ class BatchGenWorker:
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
 				else:
-					Attn_Wrapper.attention_mask = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+					Attn_Wrapper.attention_mask = None
 					Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
 					Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
 					Attn_Wrapper.max_seqlen = 0
 					Attn_Wrapper.cur_batch = []
 					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
 					# Also bind empty state to AttnWrapperBase for GPT-OSS
-					AttnWrapperBase.attention_mask = Attn_Wrapper.attention_mask
+					AttnWrapperBase.attention_mask = None
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
 					AttnWrapperBase.max_seqlen = 0
@@ -7231,11 +7166,6 @@ class BatchGenWorker:
 
 				decode_pos = seq.decoded_length
 				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
-
-				attn_mask = self.query_book[local_idx].encoded["attention_mask"][0]
-				next_pos = seq.current_context_length
-				if next_pos < attn_mask.shape[0]:
-					attn_mask[next_pos] = 1
 
 				seq.decoded_length += 1
 				seq.current_context_length += 1
@@ -8053,19 +7983,18 @@ class BatchGenWorker:
 				"""CPU ATTN MODE - NO ATTN MICRO BATCH"""
 				with torch.inference_mode():
 					Attn_Wrapper.cur_batch = [batch]
-					attention_mask = torch.cat(
-						[
-							self.query_book[query_idx].encoded["attention_mask"][
-								:, : self.max_input_length + new_token_idx
-							]
-							for query_idx in batch
-						],
-						dim=0,
-					)
+					# Build attention mask on-the-fly from sequence metadata
+					max_len = self.max_input_length + new_token_idx
+					cache_seqlens = []
+					for query_idx in batch:
+						uuid = self._local_to_uuid_map[query_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						cache_seqlens.append(seq.current_context_length)
+					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64)
+					positions = torch.arange(max_len)
+					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)
 					if "deepseek" not in self.model_config.model_type:
-						position_ids = create_position_ids_from_attention_mask(
-							attention_mask
-						)[:, -1].unsqueeze(-1)
+						position_ids = (seqlens_tensor - 1).unsqueeze(-1)
 					else:
 						position_ids = create_position_ids_from_attention_mask(attention_mask)
 
@@ -8131,19 +8060,20 @@ class BatchGenWorker:
 								)
 
 				with torch.inference_mode():
-					attention_mask = torch.cat(
-						[
-							self.query_book[query_idx].encoded["attention_mask"][
-								:, : self.max_input_length + new_token_idx
-							]
-							for query_idx in batch
-						],
-						dim=0,
-					).to(self.torch_device)
+					# Build attention mask on-the-fly from sequence metadata
+					max_len = self.max_input_length + new_token_idx
+					cache_seqlens = []
+					for query_idx in batch:
+						uuid = self._local_to_uuid_map[query_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						cache_seqlens.append(seq.current_context_length)
+					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
+					positions = torch.arange(max_len, device=self.torch_device)
+					attention_mask = (positions.unsqueeze(0) < seqlens_tensor.unsqueeze(1)).to(torch.int64)
 					if "deepseek" in self.model_config.model_type:
 						position_ids = create_position_ids_from_attention_mask(attention_mask)
 					else:
-						position_ids = create_position_ids_from_attention_mask(attention_mask)[:, -1].unsqueeze(-1)
+						position_ids = (seqlens_tensor - 1).unsqueeze(-1)
 
 					Attn_Wrapper.attention_mask = attention_mask
 					Attn_Wrapper.position_ids = position_ids
@@ -8193,14 +8123,6 @@ class BatchGenWorker:
 		new_tokens = new_tokens.to("cpu")
 		for idx, q_idx in enumerate(query_idx):
 			self.query_book[q_idx].decoded_tokens[:, new_token_idx] = new_tokens[idx]
-			
-			attention_mask = self.query_book[q_idx].encoded["attention_mask"][0]
-			zeros_positions = (attention_mask == 0).nonzero(as_tuple=True)[0]
-			if len(zeros_positions) > 0:
-				first_zero_pos = zeros_positions[0].item()
-				self.query_book[q_idx].encoded["attention_mask"][0, first_zero_pos] = torch.tensor(1, dtype=attention_mask.dtype)
-			else:
-				raise ValueError("No 0 found in the attention mask.")
 
 	def init_nvshmem(self):
 		"""Initialize NVSHMEM only once per batch, not per decode iteration."""
