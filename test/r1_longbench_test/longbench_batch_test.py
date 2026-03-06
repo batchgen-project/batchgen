@@ -31,6 +31,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -114,6 +115,10 @@ def create_batch_input_file(
     model_name: str,
     max_tokens: int,
     output_path: Path,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    random_sampling_params: bool = False,
 ) -> None:
     """Create JSONL file in OpenAI batch format.
 
@@ -121,25 +126,42 @@ def create_batch_input_file(
     - custom_id: Unique identifier for the request
     - method: HTTP method (POST)
     - url: API endpoint (/v1/chat/completions)
-    - body: Request body with model, messages, max_tokens
+    - body: Request body with model, messages, max_tokens, sampling params
     """
     with output_path.open("w", encoding="utf-8") as f:
         for idx, query in enumerate(queries):
+            body = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": query},
+                ],
+                "max_tokens": max_tokens,
+            }
+            # Per-request sampling params
+            if random_sampling_params:
+                body["temperature"] = random.choice([0.0, 0.3, 0.5, 0.7, 1.0])
+                body["top_p"] = random.choice([0.5, 0.8, 0.9, 0.95, 1.0])
+                body["top_k"] = random.choice([0, 10, 20, 40, 50])
+            else:
+                if temperature is not None:
+                    body["temperature"] = temperature
+                if top_p is not None:
+                    body["top_p"] = top_p
+                if top_k is not None:
+                    body["top_k"] = top_k
+
             request = {
                 "custom_id": f"longbench-{idx}",
                 "method": "POST",
                 "url": "/v1/chat/completions",
-                "body": {
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": query},
-                    ],
-                    "max_tokens": max_tokens,
-                },
+                "body": body,
             }
             f.write(json.dumps(request, ensure_ascii=False) + "\n")
-    logger.info(f"Created batch input file with {len(queries)} requests: {output_path}")
+    if random_sampling_params:
+        logger.info(f"Created batch input file with {len(queries)} requests (random per-request sampling params): {output_path}")
+    else:
+        logger.info(f"Created batch input file with {len(queries)} requests: {output_path}")
 
 
 def parse_batch_results(content: bytes) -> List[Dict[str, Any]]:
@@ -273,6 +295,17 @@ if __name__ == "__main__":
         default=None,
         help="Nucleus sampling threshold (default: None = disabled)",
     )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=None,
+        help="Top-k filtering (default: None = disabled)",
+    )
+    parser.add_argument(
+        "--random_sampling_params",
+        action="store_true",
+        help="Generate random per-request sampling params (temperature, top_p, top_k) for each request",
+    )
     args = parser.parse_args()
 
     # Construct base URL
@@ -309,18 +342,26 @@ if __name__ == "__main__":
     temp_dir = Path(tempfile.gettempdir())
     input_file = temp_dir / "longbench_batch_input.jsonl"
 
-    # Create batch input file
+    # Create batch input file (with per-request sampling params in JSONL body)
     create_batch_input_file(
         queries=queries,
         model_name=hugging_face_checkpoint,
         max_tokens=args.max_decoding_length,
         output_path=input_file,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        random_sampling_params=args.random_sampling_params,
     )
 
     # Run batch workflow
+    # Sampling params are now per-request in the JSONL body.
+    # Batch-level params serve as defaults only when per-request values are None.
     logger.info(f"Connecting to server at {base_url}")
-    if args.temperature is not None or args.top_p is not None:
-        logger.info(f"Sampling params: temperature={args.temperature}, top_p={args.top_p}")
+    if args.random_sampling_params:
+        logger.info("Using random per-request sampling params (set in JSONL body)")
+    elif args.temperature is not None or args.top_p is not None or args.top_k is not None:
+        logger.info(f"Sampling params: temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}")
     results = run_batch_workflow(
         input_file_path=str(input_file),
         output_file_path=None,  # Results downloaded from server
