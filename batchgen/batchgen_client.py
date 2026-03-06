@@ -262,6 +262,7 @@ class BatchGenHttpClient:
         max_context_length: int = 131072,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Create a batch job.
 
@@ -272,8 +273,9 @@ class BatchGenHttpClient:
             metadata: Optional metadata dictionary
             max_decoding_length: Override max decoding length for all requests (None = use per-request)
             max_context_length: Max total context (prompt + decode). Default 128K.
-            temperature: Sampling temperature (None = greedy decoding)
-            top_p: Nucleus sampling threshold (None = disabled)
+            temperature: Default sampling temperature (None = greedy). Per-request values override.
+            top_p: Default nucleus sampling threshold (None = disabled). Per-request values override.
+            top_k: Default top-k filtering (None or 0 = disabled). Per-request values override.
 
         Returns:
             Batch object with id, status, etc.
@@ -292,6 +294,8 @@ class BatchGenHttpClient:
             payload["temperature"] = temperature
         if top_p is not None:
             payload["top_p"] = top_p
+        if top_k is not None:
+            payload["top_k"] = top_k
         return self.post_json("/v1/batches", payload)
 
     def get_batch(self, batch_id: str) -> Dict[str, Any]:
@@ -389,6 +393,7 @@ class BatchGenHttpClient:
         max_context_length: int = 131072,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Submit a batch job and wait for completion.
 
@@ -406,8 +411,9 @@ class BatchGenHttpClient:
             timeout: Maximum seconds to wait
             max_decoding_length: Override max decoding length for all requests (None = use per-request)
             max_context_length: Max total context (prompt + decode). Default 128K.
-            temperature: Sampling temperature (None = greedy decoding)
-            top_p: Nucleus sampling threshold (None = disabled)
+            temperature: Default sampling temperature (None = greedy). Per-request values override.
+            top_p: Default nucleus sampling threshold (None = disabled). Per-request values override.
+            top_k: Default top-k filtering (None or 0 = disabled). Per-request values override.
 
         Returns:
             Final batch object with output_file_id
@@ -427,6 +433,7 @@ class BatchGenHttpClient:
             max_context_length=max_context_length,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
         )
         batch_id = batch["id"]
         logger.info(f"Created batch: {batch_id}")

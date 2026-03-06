@@ -50,8 +50,11 @@ class SequenceEntry:
         'output_tokens',      # Generated tokens (List[int])
         'current_length',     # prompt_length + len(output_tokens)
         'rank_owner',         # Global rank currently responsible for this sequence
-        'host_page_ids'       # List of physical page IDs on the Host KV Cache server
-        # Add any other necessary metadata (e.g., sampling params, logprobs)
+        'host_page_ids',      # List of physical page IDs on the Host KV Cache server
+        # Per-request sampling parameters (set once at creation, immutable)
+        'temperature',        # None = use default (greedy). Float > 0 = sampling.
+        'top_p',              # None = disabled. Float in (0, 1] = nucleus sampling.
+        'top_k',              # None or 0 = disabled. Int > 0 = top-k filtering.
     )
 
     # Define valid state transitions (optional but good practice)
@@ -70,7 +73,10 @@ class SequenceEntry:
                  uuid: str,
                  input_ids: List[int],
                  max_output_length: int,
-                 rank_owner: int = 0): # Default owner to rank 0 initially
+                 rank_owner: int = 0,
+                 temperature: Optional[float] = None,
+                 top_p: Optional[float] = None,
+                 top_k: Optional[int] = None):
 
         if not isinstance(uuid, str) or not uuid:
             raise ValueError("SequenceEntry requires a non-empty string UUID.")
@@ -87,6 +93,10 @@ class SequenceEntry:
         self.current_length = self.prompt_length
         self.rank_owner = rank_owner
         self.host_page_ids = []
+        # Per-request sampling parameters (immutable after creation)
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
 
     def update_status(self, new_status: SequenceStatus):
         """ Safely transition the sequence to a new status. """
@@ -252,7 +262,8 @@ class ActiveBatch:
     Contains high-performance, vectorized methods for generating kernel inputs.
     """
     __slots__ = ('global_registry', 'active_uuids', 'device', 'pad_token_id',
-                 'active_seqs', 'batch_size')
+                 'active_seqs', 'batch_size',
+                 '_sampling_temps', '_sampling_top_ps', '_sampling_top_ks')
 
     def __init__(self,
                  global_registry: GlobalSequenceRegistry,
@@ -283,6 +294,39 @@ class ActiveBatch:
              raise KeyError(f"Critical error: The following UUIDs were not found in the GlobalRegistry: {missing_uuids}")
 
         self.batch_size = len(self.active_seqs)
+
+        # Build and cache per-sequence sampling param tensors
+        self._sampling_temps = None
+        self._sampling_top_ps = None
+        self._sampling_top_ks = None
+        if self.active_seqs:
+            self._build_sampling_param_tensors()
+
+    def _build_sampling_param_tensors(self):
+        """Build [B] tensors for per-sequence sampling parameters. Cached until rebuild."""
+        # Temperature: None or <=0 means greedy. Use 0.0 as sentinel for greedy.
+        temps = [seq.temperature if seq.temperature is not None else 0.0
+                 for seq in self.active_seqs]
+        top_ps = [seq.top_p if seq.top_p is not None else 1.0
+                  for seq in self.active_seqs]
+        top_ks = [seq.top_k if seq.top_k is not None else 0
+                  for seq in self.active_seqs]
+
+        self._sampling_temps = torch.tensor(temps, dtype=torch.float32, device=self.device)
+        self._sampling_top_ps = torch.tensor(top_ps, dtype=torch.float32, device=self.device)
+        self._sampling_top_ks = torch.tensor(top_ks, dtype=torch.int64, device=self.device)
+
+    @property
+    def sampling_temps(self) -> Optional[torch.Tensor]:
+        return self._sampling_temps
+
+    @property
+    def sampling_top_ps(self) -> Optional[torch.Tensor]:
+        return self._sampling_top_ps
+
+    @property
+    def sampling_top_ks(self) -> Optional[torch.Tensor]:
+        return self._sampling_top_ks
 
     def build_prefill_inputs(self) -> Any: # Use ModelForwardInput type hint
         """
