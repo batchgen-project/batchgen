@@ -270,15 +270,8 @@ class Prefill():
 			],
 			dim=0,
 		)
-		attention_masks = torch.cat(
-			[
-				self.query_book[query_idx].encoded["attention_mask"][
-					:, : self.max_input_length
-				]
-				for query_idx in batch
-			],
-			dim=0,
-		)
+		# Construct attention masks on-the-fly from input_ids (1 where non-zero)
+		attention_masks = (input_ids != 0).to(torch.int64)
 
 		num_prefill_micro_batches = math.ceil(
 			len(batch)
