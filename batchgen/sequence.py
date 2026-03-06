@@ -81,6 +81,7 @@ class SequenceEntry:
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
         'original_max_decode_length',  # Original max_decode_length before eviction
         'total_decoded_before_eviction',  # Tokens decoded before this eviction cycle
+        '_buffer_slot',  # Index into QueryBookBufferPool buffers
     )
 
     VALID_TRANSITIONS = {
@@ -135,6 +136,7 @@ class SequenceEntry:
         self.original_prompt_length: int = prompt_length
         self.original_max_decode_length: int = max_decode_length
         self.total_decoded_before_eviction: int = 0
+        self._buffer_slot: int = -1
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:

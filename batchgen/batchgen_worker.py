@@ -124,6 +124,42 @@ class query:
 		self.kv_token_budget = kv_token_budget
 
 
+class QueryBookBufferPool:
+	"""Pre-allocated contiguous buffers for query book tensors.
+
+	Eliminates per-sequence tensor allocation in Phase 3 of _tokenize_global_batch().
+	With 16 ranks each creating 12K tensors, allocator contention causes ~19 min init.
+	This replaces 24K allocations per rank with 2 large allocations + views.
+	"""
+
+	def __init__(self, num_sequences: int, model_context_length: int, max_decoding_length: int):
+		self.input_ids_buffer = torch.zeros((num_sequences, model_context_length), dtype=torch.long)
+		self.decoded_tokens_buffer = torch.zeros((num_sequences, max_decoding_length), dtype=torch.int64)
+		self.num_sequences = num_sequences
+		self.model_context_length = model_context_length
+		self.max_decoding_length = max_decoding_length
+		self._free_slots: set = set()
+		self._next_slot: int = 0
+
+	def allocate_slot(self) -> int:
+		if self._free_slots:
+			return self._free_slots.pop()
+		slot = self._next_slot
+		if slot >= self.num_sequences:
+			raise RuntimeError(f"QueryBookBufferPool exhausted: {self.num_sequences} slots used")
+		self._next_slot += 1
+		return slot
+
+	def free_slot(self, slot: int):
+		self._free_slots.add(slot)
+
+	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
+		return self.input_ids_buffer[slot:slot+1, :seq_extended_size]
+
+	def get_decoded_tokens_view(self, slot: int) -> torch.Tensor:
+		return self.decoded_tokens_buffer[slot:slot+1, :]
+
+
 @dataclass
 class InputArguments:
 	"""Input arguments as a dataclass with type hints"""
@@ -2377,9 +2413,15 @@ class BatchGenWorker:
 			local_idx = self._uuid_to_local_map.get(uuid)
 			if local_idx is not None and local_idx in self.query_book:
 				qb = self.query_book[local_idx]
-				# Send tensors via Gloo
-				dist.send(tensor=qb.encoded["input_ids"].cpu().contiguous(), dst=to_rank, group=gloo_group)
-				dist.send(tensor=qb.decoded_tokens.cpu().contiguous(), dst=to_rank, group=gloo_group)
+				# Send tensors via Gloo — must use .clone() because buffer pool views
+				# are already contiguous (.contiguous() returns same tensor, not a copy)
+				dist.send(tensor=qb.encoded["input_ids"].clone(), dst=to_rank, group=gloo_group)
+				dist.send(tensor=qb.decoded_tokens.clone(), dst=to_rank, group=gloo_group)
+				# Free buffer slot after send completes
+				seq_for_slot = self.global_batch.get_sequence(uuid)
+				if hasattr(seq_for_slot, '_buffer_slot') and seq_for_slot._buffer_slot >= 0:
+					self._buffer_pool.free_slot(seq_for_slot._buffer_slot)
+					seq_for_slot._buffer_slot = -1
 				if BATCHGEN_CB_DEBUG:
 					logging.debug(f"MIGRATION: Rank {self.rank}: Sent query_book for {uuid[:8]}...")
 			else:
@@ -2690,16 +2732,24 @@ class BatchGenWorker:
 				self._local_to_uuid_map[new_local_idx] = uuid
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
-				# Create query_book entry from pending migrated data
+				# Create query_book entry from pending migrated data, copying into buffer pool
 				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
 					pending = self._pending_migrated_query_book.pop(uuid)
+					budget = pending['kv_token_budget']
+					new_slot = self._buffer_pool.allocate_slot()
+					seq.input_ids = None  # Will be replaced by buffer view
+					seq._buffer_slot = new_slot
+					self._buffer_pool.input_ids_buffer[new_slot, :budget] = pending['input_ids'][0, :budget]
+					self._buffer_pool.decoded_tokens_buffer[new_slot, :] = pending['decoded_tokens'][0, :]
+					input_ids_view = self._buffer_pool.get_input_ids_view(new_slot, budget)
+					decoded_view = self._buffer_pool.get_decoded_tokens_view(new_slot)
+					seq.input_ids = input_ids_view
+					seq.decoded_tokens = decoded_view
 					self.query_book[new_local_idx] = query(
 						text=pending['text'],
-						encoded={
-							"input_ids": pending['input_ids'],
-						},
-						decoded_tokens=pending['decoded_tokens'],
-						kv_token_budget=pending['kv_token_budget'],
+						encoded={"input_ids": input_ids_view},
+						decoded_tokens=decoded_view,
+						kv_token_budget=budget,
 					)
 					logging.debug(f"Rank {self.rank}: Created query_book[{new_local_idx}] for migrated {uuid[:8]}...")
 				else:
@@ -3211,79 +3261,56 @@ class BatchGenWorker:
 			f"(prompt lengths: min={min(prompt_lengths)}, max={max(prompt_lengths)})"
 		)
 
-		# Phase 3: Create per-sequence tensors sized to their actual prompt length
-		# MEMORY OPTIMIZATION: Create tensors one at a time directly from gathered lists,
-		# avoiding intermediate tensor storage. Each sequence only needs space for its
-		# own prompt + decoding, critical for long-tailed distributions.
+		# Phase 3: Create per-sequence tensor views from pre-allocated buffer pool.
+		# Pre-allocating 2 large contiguous buffers eliminates allocator contention
+		# when 16 ranks run Phase 3 simultaneously (was 192K allocations → now 32).
 		phase3_start = time.perf_counter()
-		t_zeros_input = 0.0
-		t_zeros_decoded = 0.0
-		t_list_to_tensor = 0.0
-		t_copy = 0.0
-		t_metadata = 0.0
 		num_seqs = len(self.global_batch)
-		total_input_elements = 0
-		total_decoded_elements = 0
+
+		self._buffer_pool = QueryBookBufferPool(
+			num_sequences=num_seqs,
+			model_context_length=self.model_context_length,
+			max_decoding_length=self.max_decoding_length,
+		)
+		t_alloc = time.perf_counter() - phase3_start
+		logging.info(
+			f"Rank {self.rank}: Phase 3 buffer pool allocated in {t_alloc:.2f}s "
+			f"(input_ids: [{num_seqs}, {self.model_context_length}], "
+			f"decoded_tokens: [{num_seqs}, {self.max_decoding_length}])"
+		)
 
 		for seq_i, seq in enumerate(self.global_batch):
-			# CRITICAL: Use seq.global_idx to lookup, NOT enumeration index
-			# tokenized_by_idx is keyed by global_idx from parallel tokenization
 			item = tokenized_by_idx[seq.global_idx]
 			input_ids_list = item["input_ids"]
 			actual_prompt_len = item["length"]
 
-			# Validation: ensure token list length matches stored length
 			if len(input_ids_list) != actual_prompt_len:
 				logging.error(
 					f"Rank {self.rank}: Token length mismatch for seq {seq.global_idx}: "
 					f"list_len={len(input_ids_list)}, stored_len={actual_prompt_len}"
 				)
-				actual_prompt_len = len(input_ids_list)  # Use actual list length
+				actual_prompt_len = len(input_ids_list)
 
-			# Each sequence gets its own sized tensor: actual_prompt_len + max_decoding_length
-			# Capped by model context length to avoid wasting memory on impossible decoding
 			seq_extended_size = min(
 				actual_prompt_len + self.max_decoding_length,
 				self.model_context_length
 			)
 
-			t0 = time.perf_counter()
-			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
-			t1 = time.perf_counter()
-			t_zeros_input += t1 - t0
-			total_input_elements += seq_extended_size
+			slot = self._buffer_pool.allocate_slot()
+			seq._buffer_slot = slot
 
-			# Copy the actual tokens directly from list (left-aligned, no truncation)
-			t0 = time.perf_counter()
-			token_tensor = torch.tensor(input_ids_list, dtype=torch.long)
-			t1 = time.perf_counter()
-			t_list_to_tensor += t1 - t0
+			input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
+			input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+			seq.input_ids = input_ids_view
+			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 
-			t0 = time.perf_counter()
-			input_ids_extended[0, :actual_prompt_len] = token_tensor
-			t1 = time.perf_counter()
-			t_copy += t1 - t0
-
-			t0 = time.perf_counter()
-			seq.input_ids = input_ids_extended
-			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
-			t1 = time.perf_counter()
-			t_zeros_decoded += t1 - t0
-			total_decoded_elements += self.max_decoding_length
-
-			# Free the tokenized data for this sequence immediately
 			del tokenized_by_idx[seq.global_idx]
 
-			t0 = time.perf_counter()
 			seq.prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
-			# kv_token_budget matches the tensor size
 			seq.kv_token_budget = seq_extended_size
-			t1 = time.perf_counter()
-			t_metadata += t1 - t0
 
-			# Progress log every 1000 sequences
-			if (seq_i + 1) % 1000 == 0:
+			if (seq_i + 1) % 3000 == 0:
 				elapsed = time.perf_counter() - phase3_start
 				logging.info(
 					f"Rank {self.rank}: Phase 3 progress: {seq_i+1}/{num_seqs} sequences "
@@ -3291,15 +3318,9 @@ class BatchGenWorker:
 				)
 
 		phase3_total = time.perf_counter() - phase3_start
-		total_input_gb = total_input_elements * 8 / (1024**3)
-		total_decoded_gb = total_decoded_elements * 8 / (1024**3)
 		logging.info(
-			f"Rank {self.rank}: Phase 3 timing breakdown ({num_seqs} sequences, {phase3_total:.2f}s total):\n"
-			f"  torch.zeros input_ids:  {t_zeros_input:.3f}s ({total_input_gb:.2f} GB)\n"
-			f"  torch.zeros decoded:    {t_zeros_decoded:.3f}s ({total_decoded_gb:.2f} GB)\n"
-			f"  list→tensor conversion: {t_list_to_tensor:.3f}s\n"
-			f"  tensor copy (fill):     {t_copy:.3f}s\n"
-			f"  metadata assignment:    {t_metadata:.3f}s"
+			f"Rank {self.rank}: Phase 3 complete: {num_seqs} sequences in {phase3_total:.2f}s "
+			f"(buffer alloc: {t_alloc:.2f}s, fill: {phase3_total-t_alloc:.2f}s)"
 		)
 
 		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
@@ -4749,20 +4770,22 @@ class BatchGenWorker:
 			new_prompt_len = len(evicted_ids)
 			prev_decoded = seq.total_decoded_before_eviction
 
-			# Rebuild input_ids with new prompt
+			# Rebuild input_ids with new prompt — reuse buffer pool slot
 			# kv_token_budget stays unchanged (Q5 answer)
 			seq_extended_size = seq.kv_token_budget
-			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
-			input_ids_extended[0, :new_prompt_len] = evicted_ids
+			slot = seq._buffer_slot
+			self._buffer_pool.input_ids_buffer[slot, :] = 0
+			self._buffer_pool.input_ids_buffer[slot, :new_prompt_len] = evicted_ids
+			seq.input_ids = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
 
-			seq.input_ids = input_ids_extended
 			seq.prompt_length = new_prompt_len
 			seq.current_context_length = new_prompt_len
 			# original_prompt_length stays unchanged (set at init)
 
 			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
 			# So the final decoded_tokens contains the COMPLETE response
-			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
+			self._buffer_pool.decoded_tokens_buffer[slot, :] = 0
+			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			if prev_decoded > 0:
 				# Extract old decoded tokens from evicted_token_ids
 				old_decoded = evicted_ids[seq.original_prompt_length:]
