@@ -42,6 +42,10 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+run_pip() {
+    python -m pip "$@"
+}
+
 check_prerequisites() {
     print_step "Checking prerequisites..."
 
@@ -52,7 +56,11 @@ check_prerequisites() {
     fi
 
     PYTHON_VERSION=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    if [[ $(echo "$PYTHON_VERSION < 3.11" | bc -l) -eq 1 ]]; then
+    if ! python - <<'PY'
+import sys
+sys.exit(0 if sys.version_info >= (3, 11) else 1)
+PY
+    then
         print_error "Python 3.11+ required. Found: $PYTHON_VERSION"
         exit 1
     fi
@@ -77,7 +85,7 @@ check_prerequisites() {
     # Check ninja (for fast builds)
     if ! command -v ninja &> /dev/null; then
         print_step "Installing ninja for faster builds..."
-        pip install ninja
+        run_pip install ninja
     fi
     print_success "ninja found"
 }
@@ -128,7 +136,7 @@ install_torch() {
         fi
     else
         print_step "Installing PyTorch with CUDA 12.8 support..."
-        pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+        run_pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
         print_success "PyTorch installed"
     fi
 }
@@ -159,7 +167,7 @@ install_flash_attention() {
 
     print_step "Building flash-attention 3 (this may take 10-20 minutes)..."
     cd hopper
-    FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
+    FLASH_ATTENTION_FORCE_BUILD=TRUE run_pip install . --no-build-isolation
 
     print_success "flash-attention 3 installed"
 }
@@ -174,7 +182,7 @@ install_flashmla() {
     fi
 
     print_step "Installing FlashMLA from git (this may take 5-10 minutes)..."
-    FLASH_MLA_DISABLE_SM100=1 pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
+    FLASH_MLA_DISABLE_SM100=1 run_pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
 
     print_success "FlashMLA installed"
 }
@@ -206,7 +214,7 @@ install_deepgemm() {
     fi
 
     print_step "Building DeepGEMM (this may take 5-10 minutes)..."
-    pip install . --no-build-isolation
+    run_pip install . --no-build-isolation
 
     print_success "DeepGEMM installed"
 }
@@ -219,7 +227,7 @@ install_batchgen_kernels() {
 
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
         cd "$BATCHGEN_DIR/batchgen_kernels"
-        pip install . --no-build-isolation
+        run_pip install . --no-build-isolation
         print_success "batchgen_kernels installed"
     else
         print_warning "batchgen_kernels/setup.py not found, skipping kernel compilation"
@@ -235,7 +243,7 @@ install_batchgen() {
 
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install .
+        run_pip install .
         print_success "BatchGen installed"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
@@ -368,9 +376,9 @@ main() {
         if [[ $IS_HOPPER -eq 1 ]]; then
             if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
                 print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
-                pip install --find-links "$WHEEL_DIR" --no-index \
+                run_pip install --find-links "$WHEEL_DIR" --no-index \
                     flash-attn-hopper flash-mla deep-gemm 2>/dev/null || \
-                    pip install "$WHEEL_DIR"/*.whl
+                    run_pip install "$WHEEL_DIR"/*.whl
                 print_success "Hopper dependencies installed from wheels"
             else
                 install_flash_attention
@@ -378,7 +386,7 @@ main() {
                 install_deepgemm
                 # Reinstall PyTorch — building deps from source may downgrade torch or triton
                 print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
-                pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+                run_pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
                 print_success "PyTorch reinstalled"
             fi
         else
