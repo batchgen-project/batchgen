@@ -290,6 +290,7 @@ void BindHostPagedManager(py::module& m, const char* name) {
         .def("build_page_table", &Manager::BuildPageTable,
              py::arg("sequence_ids"))
         .def("get_stats", &Manager::GetStats)
+        .def("memfd_fd", &Manager::memfd_fd)
        .def("__repr__",
            [](const Manager& self) { return self.DebugString(); })
         .def("get_sequence_layer_page_pointers",
@@ -557,9 +558,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // Updated Constructor Binding
         .def(py::init<int>(), py::arg("device_id"))
         .def("Init", &Weights_Storage::Init,
-             py::arg("shm_name"), py::arg("byte_size"),
-             py::arg("module_weights_shm"),
-             py::arg("enable_hugetlbfs") = false)
+            py::arg("shm_name"),
+            py::arg("byte_size"),
+            py::arg("module_weights_shm"),
+            py::arg("enable_hugetlbfs") = false,
+            py::arg("enable_memfd") = false,
+            py::arg("memfd_creator_pid") = -1,
+            py::arg("memfd_fd") = -1)
         .def("get_tensor", &Weights_Storage::get_tensor,
              py::arg("module_key"));
 
@@ -600,6 +605,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPagedKVConfig::prefix_page_ref_capacity)
         .def_readwrite("prefix_page_budget",
                        &kv::HostPagedKVConfig::prefix_page_budget)
+        .def_readwrite("enable_memfd", &kv::HostPagedKVConfig::enable_memfd)
+        .def_readwrite("memfd_creator_pid",
+                       &kv::HostPagedKVConfig::memfd_creator_pid)
+        .def_readwrite("memfd_fd", &kv::HostPagedKVConfig::memfd_fd)
         .def("__repr__",
              [](const kv::HostPagedKVConfig& self) {
                  return kv::ToString(self);
@@ -694,12 +703,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "MLAHostPagedKVWorkerView");
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
-        .def(py::init<bool>())
+        .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),
+             py::arg("enable_memfd") = false)
         .def("Init", &Parameter_Server::Init)
         .def("get_skeleton_state_dict",
              &Parameter_Server::get_skeleton_state_dict)
         .def("byte_size", &Parameter_Server::byte_size)
-        .def("module_weights_shm", &Parameter_Server::module_weights_shm);
+        .def("module_weights_shm", &Parameter_Server::module_weights_shm)
+        .def("weights_memfd_fd", &Parameter_Server::weights_memfd_fd);
 
     m.def(
         "set_data",

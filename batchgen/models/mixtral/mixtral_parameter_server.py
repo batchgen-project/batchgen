@@ -41,12 +41,14 @@ except ImportError:
 
 
 class Mixtral_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs=False, enable_memfd=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
+        self.enable_hugetlbfs = enable_hugetlbfs
+        self.enable_memfd = enable_memfd
         # Use BatchGen's unified config system instead of HuggingFace AutoConfig
         self.model_config = load_config(huggingface_ckpt_name)
 
@@ -57,7 +59,7 @@ class Mixtral_Parameter_Server:
     def Init(self):
         self._save_safetensors_to_pt()
         self._parse_state_dict()
-        self.parameter_server = Parameter_Server()
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
         if "8x7B" in self.huggingface_ckpt_name:
             byte_size = 48 * 1024 * 1024 * 1024 * 2
         elif "8x22B" in self.huggingface_ckpt_name:

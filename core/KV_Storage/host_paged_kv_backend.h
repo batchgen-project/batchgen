@@ -50,6 +50,9 @@ struct HostPagedKVConfig {
     std::size_t prefix_entry_capacity = 0;
     std::size_t prefix_page_ref_capacity = 0;
     std::size_t prefix_page_budget = 0;
+    bool enable_memfd = false;
+    int memfd_creator_pid = -1;
+    int memfd_fd = -1;
 };
 
 struct PrefixAllocationBatchResult {
@@ -182,7 +185,10 @@ inline std::string ToString(const HostPagedKVConfig& config) {
         << ", radix_edge_capacity=" << config.radix_edge_capacity
         << ", prefix_entry_capacity=" << config.prefix_entry_capacity
         << ", prefix_page_ref_capacity=" << config.prefix_page_ref_capacity
-        << ", prefix_page_budget=" << config.prefix_page_budget << ")";
+        << ", prefix_page_budget=" << config.prefix_page_budget
+        << ", enable_memfd=" << config.enable_memfd
+        << ", memfd_creator_pid=" << config.memfd_creator_pid
+        << ", memfd_fd=" << config.memfd_fd << ")";
     return oss.str();
 }
 
@@ -226,6 +232,7 @@ inline std::uint64_t HashHostKVConfig(const HostPagedKVConfig& config) {
     seed = HashCombine(seed, sanitized.prefix_entry_capacity);
     seed = HashCombine(seed, sanitized.prefix_page_ref_capacity);
     seed = HashCombine(seed, sanitized.prefix_page_budget);
+    seed = HashCombine(seed, static_cast<std::uint64_t>(sanitized.enable_memfd));
     return seed;
 }
 
@@ -272,6 +279,7 @@ class HostPagedKVBackend {
 
     const HostPagedKVConfig& config() const { return config_; }
     bool has_v_cache() const { return has_v_cache_; }
+    int memfd_fd() const;
 
    private:
     struct SharedState;

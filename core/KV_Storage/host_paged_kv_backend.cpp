@@ -2,9 +2,11 @@
 #include "host_paged_kv_prefix_cache.h"
 
 #include <fcntl.h>
+#include <linux/memfd.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -182,6 +184,37 @@ struct SharedHeader {
     pthread_mutex_t metadata_mutex{};
 };
 
+std::size_t SafeHardwareConcurrency() {
+    const unsigned int hint = std::thread::hardware_concurrency() / 4;
+    return hint == 0 ? 1 : static_cast<std::size_t>(hint);
+}
+
+int memfd_create_wrapper(const char* name, unsigned int flags) {
+    return static_cast<int>(syscall(SYS_memfd_create, name, flags));
+}
+
+void TouchPagesMultiThreaded(void* ptr, std::size_t size, std::size_t stride) {
+    const int num_threads = std::min(16, static_cast<int>(std::thread::hardware_concurrency()));
+    const std::size_t chunk_size = size / num_threads;
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([=]() {
+            std::size_t start = i * chunk_size;
+            std::size_t end = (i == num_threads - 1) ? size : start + chunk_size;
+            volatile char* p = static_cast<volatile char*>(ptr);
+            for (std::size_t off = start; off < end; off += stride) {
+                p[off] = 0;
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
+}  // namespace
+
 struct HostPagedKVBackend::SharedState {
     explicit SharedState(const HostPagedKVConfig& cfg, std::size_t data_bytes,
                          std::uint64_t fingerprint, bool has_v)
@@ -248,6 +281,8 @@ struct HostPagedKVBackend::SharedState {
     std::byte* data_base = nullptr;
 
     bool created_region = false;
+    bool using_memfd = false;
+    int memfd_fd_value = -1;
 
     std::size_t header_offset = 0;
     std::size_t free_stack_offset = 0;
@@ -436,7 +471,12 @@ void HostPagedKVBackend::SharedState::BindPrefixCache() {
 }
 
 void HostPagedKVBackend::SharedState::ConstructSharedState() {
-    std::memset(mapping, 0, total_bytes);
+    if (using_memfd) {
+        // memfd pages are kernel-zeroed on first fault, only zero metadata
+        std::memset(mapping, 0, data_offset);
+    } else {
+        std::memset(mapping, 0, total_bytes);
+    }
     MapPointers();
 
     header->magic = kSharedMemoryMagic;
@@ -790,7 +830,106 @@ void HostPagedKVBackend::SharedState::DecrementPageRefLocked(
 void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
     const std::size_t page_size = GetSystemPageSize();
     total_bytes = AlignUp(total_bytes_unaligned, page_size);
+    constexpr std::size_t kHugePageSize = 2 * 1024 * 1024;
+    const std::size_t alignment = std::max(kHugePageSize, page_size);
 
+    if (config.enable_memfd) {
+        // ---- memfd_create fast path (--fast-init) ----
+        if (create_region) {
+            int fd = memfd_create_wrapper("batchgen_kv", 0);
+            if (fd < 0) {
+                throw std::runtime_error(
+                    "--fast-init: memfd_create failed: " +
+                    std::string(strerror(errno)));
+            }
+            if (ftruncate(fd, static_cast<off_t>(total_bytes)) == -1) {
+                const int err = errno;
+                close(fd);
+                throw std::system_error(err, std::generic_category(),
+                                        "--fast-init: ftruncate on memfd failed");
+            }
+
+            void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, fd, 0, alignment);
+            if (mapped == MAP_FAILED) {
+                const int err = errno;
+                close(fd);
+                throw std::system_error(err, std::generic_category(),
+                                        "--fast-init: mmap on memfd failed");
+            }
+
+            madvise(mapped, total_bytes, MADV_HUGEPAGE);
+
+            auto touch_start = std::chrono::high_resolution_clock::now();
+            TouchPagesMultiThreaded(mapped, total_bytes, kHugePageSize);
+            auto touch_dur = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - touch_start);
+
+            // Log is not available here (no spdlog), use fprintf
+            fprintf(stderr,
+                    "[fast-init] Host KV memfd: page touching completed in %.2fs "
+                    "(%.1f GB, 2MB stride)\n",
+                    touch_dur.count() / 1000.0,
+                    total_bytes / (1024.0 * 1024.0 * 1024.0));
+
+            shm_fd = fd;
+            memfd_fd_value = fd;
+            using_memfd = true;
+            created_region = true;
+            mapping = static_cast<std::byte*>(mapped);
+            MapPointers();
+            header->init_state.store(
+                static_cast<std::uint32_t>(InitState::kInitializing),
+                std::memory_order_relaxed);
+            ConstructSharedState();
+        } else {
+            // Worker: open memfd via /proc/<pid>/fd/<N>
+            if (config.memfd_creator_pid <= 0 || config.memfd_fd < 0) {
+                throw std::runtime_error(
+                    "--fast-init worker: invalid memfd_creator_pid or memfd_fd");
+            }
+            std::string proc_path = "/proc/" +
+                                    std::to_string(config.memfd_creator_pid) +
+                                    "/fd/" + std::to_string(config.memfd_fd);
+            int fd = open(proc_path.c_str(), O_RDWR);
+            if (fd < 0) {
+                throw std::runtime_error(
+                    "--fast-init worker: cannot open " + proc_path + ": " +
+                    strerror(errno));
+            }
+            struct stat stat_buffer {};
+            if (fstat(fd, &stat_buffer) == -1) {
+                const int err = errno;
+                close(fd);
+                throw std::system_error(err, std::generic_category(),
+                                        "--fast-init worker: fstat failed");
+            }
+            if (static_cast<std::size_t>(stat_buffer.st_size) < total_bytes) {
+                close(fd);
+                throw std::runtime_error(
+                    "--fast-init worker: memfd too small");
+            }
+
+            void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, fd, 0, alignment);
+            if (mapped == MAP_FAILED) {
+                const int err = errno;
+                close(fd);
+                throw std::system_error(err, std::generic_category(),
+                                        "--fast-init worker: mmap failed");
+            }
+
+            shm_fd = fd;
+            using_memfd = true;
+            mapping = static_cast<std::byte*>(mapped);
+            MapPointers();
+            WaitForInitialization();
+            ValidateSharedState();
+        }
+        return;
+    }
+
+    // ---- Original shm_open path (unchanged) ----
     auto resize_region = [&](std::size_t bytes) {
         if (ftruncate(shm_fd, static_cast<off_t>(bytes)) == -1) {
             const int err = errno;
@@ -857,9 +996,6 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
                 "Existing shared memory segment is too small");
         }
     }
-
-    constexpr std::size_t kHugePageSize = 2 * 1024 * 1024;
-    const std::size_t alignment = std::max(kHugePageSize, page_size);
 
     void* mapped = mmap_aligned(total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
                                 shm_fd, 0, alignment);
@@ -1295,6 +1431,10 @@ std::byte* HostPagedKVBackend::DataBase() { return state_->DataBase(); }
 
 const std::byte* HostPagedKVBackend::DataBase() const {
     return state_->DataBase();
+}
+
+int HostPagedKVBackend::memfd_fd() const {
+    return state_->memfd_fd_value;
 }
 
 }  // namespace batchgen::kv

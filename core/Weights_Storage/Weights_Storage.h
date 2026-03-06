@@ -63,7 +63,9 @@ class Weights_Storage {
     ~Weights_Storage();
     
     void Init(std::string& shm_name, int64_t byte_size,
-                std::string& tensor_meta_shm_name, bool enable_hugetlbfs);
+                std::string& tensor_meta_shm_name, bool enable_hugetlbfs,
+                bool enable_memfd = false, int memfd_creator_pid = -1,
+                int memfd_fd = -1);
                   
     std::unordered_map<std::string, tensor_buffer> get_module_weights_storage(
         std::string module_key);

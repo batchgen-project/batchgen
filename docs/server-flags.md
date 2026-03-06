@@ -35,9 +35,11 @@ python -m batchgen.launch_http_server \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--cache-dir` | None | Path to downloaded model weights. Use this for pre-downloaded checkpoints. |
+| `--converted-ckpt-dir` | None | Path to pre-converted checkpoint directory (skips conversion step on startup). |
 
 **Usage Notes:**
 - Use `--cache-dir` when you've downloaded the model to a specific location
+- Use `--converted-ckpt-dir` to point to a checkpoint already converted to BatchGen format, skipping the conversion step
 
 ---
 
@@ -123,8 +125,23 @@ gpu_kv_cache = GPU_memory × gpu_memory_frac - model_instance_size
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable-hugetlbfs` | `false` | Enable hugeTLBFS for shared memory. Requires root privileges (sudo). |
+| `--fast-init` | `false` | Use `memfd_create` + Transparent Huge Pages (THP) for fast memory registration. |
 
 **Note:** When `--enable-hugetlbfs` is enabled, BatchGen will automatically configure huge pages. This requires running the server with root privileges (sudo).
+
+**`--fast-init` details:**
+
+Replaces `shm_open` with `memfd_create` for both KV cache and weights allocation, enabling THP (2MB pages instead of 4KB). This reduces `cudaHostRegister` time by ~9x (e.g., 27s → 3s for 100GB). Before allocation, automatically runs Linux memory compaction (`drop_caches` + `compact_memory`) to defragment physical memory for stable THP allocation.
+
+**Requirements:**
+```bash
+# Enable THP for shared memory (required, set once per boot)
+echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled
+
+# Root access (for memory compaction; runs inside docker as root)
+```
+
+**Priority:** When both `--enable-hugetlbfs` and `--fast-init` are set, hugetlbfs takes priority for weights (explicit 2MB pages > THP). For KV cache, `--fast-init` memfd is always used (hugetlbfs was never supported for KV).
 
 ---
 

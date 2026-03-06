@@ -32,6 +32,7 @@ class MigrationOp:
     from_rank: int
     to_rank: int
     pages: int
+    host_pages: int = 0  # Actual host pages allocated (may differ from pages during chunked growth)
 
 
 @dataclass
