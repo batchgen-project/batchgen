@@ -1843,13 +1843,15 @@ class BatchGenWorker:
 
 		# Calculate pages used by valid sequences
 		# Use actual host_pages_allocated for dynamic reservation (if set),
-		# otherwise fall back to full kv_token_budget for backwards compatibility
+		# otherwise estimate based on prompt_length + chunk_size (the actual
+		# initial host KV allocation size), NOT full kv_token_budget which
+		# massively overestimates when max_decoding_length > chunk_size.
+		chunk_size = self._get_effective_chunk_size()
 		used_pages = 0
 		n_with_alloc = 0
 		pages_from_alloc = 0
 		n_fallback = 0
 		pages_from_fallback = 0
-		fallback_budget_sum = 0
 		for uuid in valid_sequences:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq.host_pages_allocated > 0:
@@ -1857,17 +1859,16 @@ class BatchGenWorker:
 				n_with_alloc += 1
 				pages_from_alloc += seq.host_pages_allocated
 			else:
-				pages = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
+				estimated_tokens = min(seq.prompt_length + chunk_size, seq.kv_token_budget)
+				pages = math.ceil(estimated_tokens / self.PAGE_SIZE)
 				used_pages += pages
 				n_fallback += 1
 				pages_from_fallback += pages
-				fallback_budget_sum += seq.kv_token_budget
 
 		if n_fallback > 0 and self.local_rank == 0:
 			logging.info(
-				f"[HOST_KV_UTIL] {n_with_alloc} seqs used host_pages_allocated ({pages_from_alloc} pages), "
-				f"{n_fallback} seqs used fallback ({pages_from_fallback} pages), "
-				f"fallback avg kv_budget={fallback_budget_sum/n_fallback:.0f}, "
+				f"[HOST_KV_UTIL] {n_with_alloc} seqs with host_pages_allocated ({pages_from_alloc} pages), "
+				f"{n_fallback} seqs estimated ({pages_from_fallback} pages), "
 				f"total_used={used_pages}/{stats.num_total_pages}"
 			)
 
