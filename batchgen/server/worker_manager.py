@@ -27,12 +27,19 @@ from batchgen.server.process_utils import (
     get_model_byte_size,
 )
 from batchgen.server.server_args import ServerArgs
-from batchgen.server_worker_main_loop import server_worker_main
 from batchgen.utils import config_torch_module_initializer
 
 logger = logging.getLogger(__name__)
 
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
+
+
+def _load_server_worker_main():
+    # Delay this import to avoid a package-init cycle when worker subprocesses
+    # import `batchgen.server.process_utils` via `batchgen.server_worker_main_loop`.
+    from batchgen.server_worker_main_loop import server_worker_main
+
+    return server_worker_main
 
 
 def _validate_shmem_enabled() -> None:
@@ -516,7 +523,7 @@ class WorkerManager:
             weights_memfd_fd=self._get_weights_memfd_fd(),
         )
         self.worker_process = mp.spawn(
-            server_worker_main,
+            _load_server_worker_main(),
             args=(
                 self.request_queue,
                 self.response_queue,
