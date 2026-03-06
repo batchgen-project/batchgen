@@ -4036,7 +4036,7 @@ class BatchGenWorker:
 				if seq is not None and local_idx in self.query_book:
 					finish_reason = self._get_finish_reason(seq)
 					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu(), finish_reason)
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens.clone(), finish_reason)
 					)
 
 		# All ranks participate in gather (NCCL collective requirement)
@@ -4629,7 +4629,7 @@ class BatchGenWorker:
 			if local_idx not in self.query_book:
 				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
 				continue
-			decoded_tokens = self.query_book[local_idx].decoded_tokens
+			decoded_tokens = self.query_book[local_idx].decoded_tokens.clone()
 			res_with_idx.append((global_idx, decoded_tokens))
 
 		all_results = [None] * self.world_size
