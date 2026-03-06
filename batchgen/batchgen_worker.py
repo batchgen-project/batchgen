@@ -2800,19 +2800,29 @@ class BatchGenWorker:
 		with self.disable_watchdog():
 			# Step 2: Tokenize all sequences (all ranks do this identically)
 			# This determines the actual max_input_length dynamically
+			t_step = time.perf_counter()
 			self._tokenize_global_batch()
+			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2 _tokenize_global_batch: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 2.1: Create incremental writer now that tokenizer/eos_token_ids are available
+			t_step = time.perf_counter()
 			self._init_incremental_writer()
+			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2.1 _init_incremental_writer: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 2.5: Update engine config with actual max_input_length after tokenization
+			t_step = time.perf_counter()
 			self._update_config_after_tokenization()
+			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2.5 _update_config_after_tokenization: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 3: Assign sequences to ranks (round-robin)
+			t_step = time.perf_counter()
 			self._assign_sequences_to_ranks()
+			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 3 _assign_sequences_to_ranks: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 4: Build query_book for backward compatibility
+			t_step = time.perf_counter()
 			self._build_local_query_book()
+			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 4 _build_local_query_book: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 5: Set counts for compatibility
 			self.num_global_queries = len(global_prompts)
@@ -3205,7 +3215,17 @@ class BatchGenWorker:
 		# MEMORY OPTIMIZATION: Create tensors one at a time directly from gathered lists,
 		# avoiding intermediate tensor storage. Each sequence only needs space for its
 		# own prompt + decoding, critical for long-tailed distributions.
-		for seq in self.global_batch:
+		phase3_start = time.perf_counter()
+		t_zeros_input = 0.0
+		t_zeros_decoded = 0.0
+		t_list_to_tensor = 0.0
+		t_copy = 0.0
+		t_metadata = 0.0
+		num_seqs = len(self.global_batch)
+		total_input_elements = 0
+		total_decoded_elements = 0
+
+		for seq_i, seq in enumerate(self.global_batch):
 			# CRITICAL: Use seq.global_idx to lookup, NOT enumeration index
 			# tokenized_by_idx is keyed by global_idx from parallel tokenization
 			item = tokenized_by_idx[seq.global_idx]
@@ -3227,21 +3247,60 @@ class BatchGenWorker:
 				self.model_context_length
 			)
 
+			t0 = time.perf_counter()
 			input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
+			t1 = time.perf_counter()
+			t_zeros_input += t1 - t0
+			total_input_elements += seq_extended_size
 
 			# Copy the actual tokens directly from list (left-aligned, no truncation)
-			input_ids_extended[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+			t0 = time.perf_counter()
+			token_tensor = torch.tensor(input_ids_list, dtype=torch.long)
+			t1 = time.perf_counter()
+			t_list_to_tensor += t1 - t0
 
+			t0 = time.perf_counter()
+			input_ids_extended[0, :actual_prompt_len] = token_tensor
+			t1 = time.perf_counter()
+			t_copy += t1 - t0
+
+			t0 = time.perf_counter()
 			seq.input_ids = input_ids_extended
 			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
+			t1 = time.perf_counter()
+			t_zeros_decoded += t1 - t0
+			total_decoded_elements += self.max_decoding_length
 
 			# Free the tokenized data for this sequence immediately
 			del tokenized_by_idx[seq.global_idx]
 
+			t0 = time.perf_counter()
 			seq.prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
 			# kv_token_budget matches the tensor size
 			seq.kv_token_budget = seq_extended_size
+			t1 = time.perf_counter()
+			t_metadata += t1 - t0
+
+			# Progress log every 1000 sequences
+			if (seq_i + 1) % 1000 == 0:
+				elapsed = time.perf_counter() - phase3_start
+				logging.info(
+					f"Rank {self.rank}: Phase 3 progress: {seq_i+1}/{num_seqs} sequences "
+					f"({elapsed:.1f}s elapsed)"
+				)
+
+		phase3_total = time.perf_counter() - phase3_start
+		total_input_gb = total_input_elements * 8 / (1024**3)
+		total_decoded_gb = total_decoded_elements * 8 / (1024**3)
+		logging.info(
+			f"Rank {self.rank}: Phase 3 timing breakdown ({num_seqs} sequences, {phase3_total:.2f}s total):\n"
+			f"  torch.zeros input_ids:  {t_zeros_input:.3f}s ({total_input_gb:.2f} GB)\n"
+			f"  torch.zeros decoded:    {t_zeros_decoded:.3f}s ({total_decoded_gb:.2f} GB)\n"
+			f"  list→tensor conversion: {t_list_to_tensor:.3f}s\n"
+			f"  tensor copy (fill):     {t_copy:.3f}s\n"
+			f"  metadata assignment:    {t_metadata:.3f}s"
+		)
 
 		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
 
