@@ -7,7 +7,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from batchgen.server.io_struct import (
     BatchEndpoint,
@@ -192,9 +192,19 @@ class BatchScheduler:
             )
             return
 
-        prompts, per_request_max_tokens = self._convert_requests_to_worker_inputs(requests)
+        prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
+            requests, batch
+        )
         # Use batch-level max_decoding_length if specified, otherwise use per-request value
         max_tokens = batch.max_decoding_length or per_request_max_tokens
+
+        # Log batch-level sampling param defaults
+        if batch.temperature is not None or batch.top_p is not None or batch.top_k is not None:
+            logger.warning(
+                f"Batch {batch_id}: batch-level sampling params "
+                f"(temperature={batch.temperature}, top_p={batch.top_p}, top_k={batch.top_k}) "
+                f"serve as defaults only; per-request values take priority"
+            )
 
         # Build incremental writer metadata
         incremental_output_dir = (
@@ -222,9 +232,10 @@ class BatchScheduler:
                 None,  # max_input_len: dynamically determined from prompts
                 max_tokens,
                 False,  # ignore_eos
-                batch.temperature,  # None = greedy decoding
-                batch.top_p,  # None = disabled
+                None,  # temperature: handled via per-request sampling_params
+                None,  # top_p: handled via per-request sampling_params
                 max_context_length=batch.max_context_length,
+                sampling_params=sampling_params,
                 **incremental_kwargs,
             )
         except Exception as exc:
@@ -281,10 +292,23 @@ class BatchScheduler:
         )
 
     def _convert_requests_to_worker_inputs(
-        self, requests: List[BatchRequestItem]
-    ) -> Tuple[List[str], int]:
+        self, requests: List[BatchRequestItem], batch=None,
+    ) -> Tuple[List[str], int, List[Dict[str, Any]]]:
+        """Convert batch requests to worker inputs with per-request sampling params.
+
+        Returns:
+            (prompts, max_tokens, sampling_params) where sampling_params is a list
+            of dicts with keys: temperature, top_p, top_k. Per-request values take
+            priority; batch-level values serve as defaults.
+        """
         prompts: List[str] = []
         max_tokens: Optional[int] = None
+        sampling_params: List[Dict[str, Any]] = []
+
+        # Batch-level defaults (fallback when per-request is None)
+        batch_temp = batch.temperature if batch else None
+        batch_top_p = batch.top_p if batch else None
+        batch_top_k = batch.top_k if batch else None
 
         for request in requests:
             body = request.body
@@ -315,9 +339,28 @@ class BatchScheduler:
             if max_tokens is None:
                 max_tokens = current_max_tokens
 
+            # Extract per-request sampling params with batch-level fallback
+            # Per-request default is 1.0 for temperature/top_p in OpenAI spec,
+            # so we treat 1.0 as "not explicitly set" and fall through to batch default
+            req_temp = getattr(body, 'temperature', None)
+            req_top_p = getattr(body, 'top_p', None)
+            req_top_k = getattr(body, 'top_k', None)
+
+            # Apply fallback: per-request → batch-level → None
+            # OpenAI defaults (1.0) are treated as "use batch default if set"
+            effective_temp = req_temp if req_temp is not None else batch_temp
+            effective_top_p = req_top_p if req_top_p is not None else batch_top_p
+            effective_top_k = req_top_k if req_top_k is not None else batch_top_k
+
+            sampling_params.append({
+                'temperature': effective_temp,
+                'top_p': effective_top_p,
+                'top_k': effective_top_k,
+            })
+
         if max_tokens is None:
             max_tokens = 128  # Default max output tokens
-        return prompts, max_tokens
+        return prompts, max_tokens, sampling_params
 
     def _inject_reasoning_effort(
         self,

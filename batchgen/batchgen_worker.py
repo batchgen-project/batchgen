@@ -462,6 +462,8 @@ class BatchGenWorker:
 		self._top_p: Optional[float] = None  # Nucleus sampling threshold (None = disabled)
 		self._logged_greedy: bool = False  # Track if we've logged greedy mode this batch
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
+		# Per-request sampling parameters (list of dicts, one per prompt in batch order)
+		self._per_sequence_sampling_params: Optional[list] = None
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -638,7 +640,7 @@ class BatchGenWorker:
 
 	def set_sampling_params(self, temperature: Optional[float] = None, top_p: Optional[float] = None) -> None:
 		"""
-		Set sampling parameters for token generation.
+		Set global sampling parameters for token generation (legacy /v1/inference path).
 
 		Args:
 			temperature: Sampling temperature. None or 0 = greedy decoding (deterministic).
@@ -648,6 +650,7 @@ class BatchGenWorker:
 		"""
 		self._temperature = temperature
 		self._top_p = top_p
+		self._per_sequence_sampling_params = None  # Clear per-sequence params
 		# Always log on rank 0 - use WARNING to ensure visibility
 		if self.rank == 0:
 			if temperature is not None or top_p is not None:
@@ -655,9 +658,57 @@ class BatchGenWorker:
 			else:
 				logging.info(f"[SAMPLING] temperature=None, top_p=None - will use greedy decoding")
 
+	def set_per_sequence_sampling_params(self, params: list) -> None:
+		"""
+		Set per-request sampling parameters from batch API.
+
+		Args:
+			params: List of dicts, one per prompt. Each dict has keys:
+			        temperature (float|None), top_p (float|None), top_k (int|None).
+		"""
+		self._per_sequence_sampling_params = params
+		self._temperature = None  # Clear global params
+		self._top_p = None
+		if self.rank == 0:
+			# Summarize the params
+			n_greedy = sum(1 for p in params if p.get('temperature') is None or p.get('temperature', 1.0) <= 0)
+			n_sampling = len(params) - n_greedy
+			logging.warning(
+				f"[SAMPLING] Per-request params for {len(params)} prompts: "
+				f"{n_greedy} greedy, {n_sampling} sampling"
+			)
+
+	def _build_sampling_tensors(self, batch_size: int) -> tuple:
+		"""Build [B] sampling param tensors from per-sequence params for current batch.
+
+		Returns:
+			(temps, top_ps, top_ks) tensors on the model's device, or (None, None, None)
+			if using global scalar params.
+		"""
+		if self._per_sequence_sampling_params is None:
+			return None, None, None
+
+		device = next(self.model.parameters()).device
+		params = self._per_sequence_sampling_params[:batch_size]
+
+		temps = torch.tensor(
+			[p.get('temperature', 0.0) or 0.0 for p in params],
+			dtype=torch.float32, device=device
+		)
+		top_ps = torch.tensor(
+			[p.get('top_p', 1.0) or 1.0 for p in params],
+			dtype=torch.float32, device=device
+		)
+		top_ks = torch.tensor(
+			[p.get('top_k', 0) or 0 for p in params],
+			dtype=torch.int64, device=device
+		)
+		return temps, top_ps, top_ks
+
 	def _select_tokens(self, logits: torch.Tensor) -> torch.Tensor:
 		"""
 		Select next tokens from logits using greedy or sampling strategy.
+		Supports both global params and per-sequence params.
 
 		Args:
 			logits: [batch_size, vocab_size] logits from model
@@ -665,6 +716,18 @@ class BatchGenWorker:
 		Returns:
 			[batch_size, 1] selected token indices
 		"""
+		from batchgen.sampling import sample_tokens
+
+		# Per-sequence sampling path
+		if self._per_sequence_sampling_params is not None:
+			batch_size = logits.shape[0]
+			temps, top_ps, top_ks = self._build_sampling_tensors(batch_size)
+			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
+				logging.info(f"Using PER-SEQUENCE sampling for {batch_size} sequences")
+				self._logged_sampling = True
+			return sample_tokens(logits, temperature=temps, top_p=top_ps, top_k=top_ks)
+
+		# Global sampling path (legacy)
 		# Fast path: greedy decoding (default)
 		if self._temperature is None or self._temperature <= 0:
 			# Log once per batch (only rank 0, first decode step)
@@ -678,7 +741,6 @@ class BatchGenWorker:
 		if not getattr(self, '_logged_sampling', False) and self.rank == 0:
 			logging.info(f"Using SAMPLING: temperature={self._temperature}, top_p={self._top_p}")
 			self._logged_sampling = True
-		from batchgen.sampling import sample_tokens
 		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
 
 	def _log_prefill_timing(self):
