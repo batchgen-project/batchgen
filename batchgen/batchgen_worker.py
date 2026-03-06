@@ -453,6 +453,7 @@ class BatchGenWorker:
 		self.eos_token_id: Optional[int] = None
 		self.max_input_length = 0
 		self.max_decoding_length = 0
+		self.max_context_length = 131072  # Default 128K, set per-batch from client
 		self.model_context_length = 131072  # Default 128K, updated from model config
 		self.num_global_queries = 0
 		self.num_local_queries = 0
@@ -485,23 +486,24 @@ class BatchGenWorker:
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
-	def Init(self, max_input_length, max_decoding_length, num_queries):
+	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=131072):
 		"""
 		Initialize/reconfigure for a new batch.
 		- First call: performs full initialization of core_engine, parallel_manager, etc.
 		- Subsequent calls: only updates batch parameters and resets state.
-		
+
 		Args:
 			max_input_length: Maximum input length hint. If None, will be determined dynamically
 			                  during tokenization as the longest prompt in the batch.
 			                  For first initialization, a default of 8192 is used if None.
 			max_decoding_length: Maximum number of tokens to decode.
 			num_queries: Number of queries in the global batch.
+			max_context_length: Maximum total context length (prompt + decode). Default 128K.
 		"""
 		# Check if we need to reset state from previous batch
 		if self._core_initialized and self.global_batch is not None:
 			self._reset_for_new_batch()
-		
+
 		# Update batch-specific parameters
 		# max_input_length can be None - will be set during tokenization
 		# For first initialization, use a reasonable default if None (needed for scheduler)
@@ -511,6 +513,7 @@ class BatchGenWorker:
 		else:
 			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
+		self.max_context_length = max_context_length
 
 		# Cap adaptive chunk sizer's max_chunk by max_decoding_length
 		if self.adaptive_chunk_sizer is not None and max_decoding_length > 0:
@@ -764,7 +767,7 @@ class BatchGenWorker:
 	def _is_sequence_completed(self, seq) -> bool:
 		"""
 		Unified completion check that respects ignore_eos.
-		
+
 		A sequence is completed if:
 		1. It reached max_decoding_length (always checked), OR
 		2. It hit EOS AND ignore_eos is False, OR
@@ -773,16 +776,24 @@ class BatchGenWorker:
 		# Always complete at max decoding length
 		if seq.decoded_length >= self.max_decoding_length:
 			return True
-		
+
 		# Complete if context length limit reached (prompt + decoded >= model max)
 		if seq.current_context_length >= self.model_context_length:
 			return True
-		
+
 		# Only complete at EOS if not ignoring EOS
 		if seq.eos_reached and not self._ignore_eos:
 			return True
-		
+
 		return False
+
+	def _get_finish_reason(self, seq) -> str:
+		"""Return OpenAI-compatible finish_reason for a completed sequence."""
+		# EOS takes priority (natural completion)
+		if seq.eos_reached and not self._ignore_eos:
+			return "stop"
+		# Otherwise it's a length limit (decode cap or context cap)
+		return "length"
 
 	def _compute_two_page_buffer_allocation(
 		self, 
@@ -1175,8 +1186,12 @@ class BatchGenWorker:
 		
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
-		self.model_context_length = getattr(self.model_config, 'max_position_embeddings', 131072)  # Default 128K
-		logging.info(f"Rank {self.rank}: Model context length set to {self.model_context_length}")
+		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
+		self.model_context_length = min(model_max, getattr(self, 'max_context_length', 131072))
+		logging.info(
+			f"Rank {self.rank}: Model context length set to {self.model_context_length} "
+			f"(model_config={model_max}, max_context_length={getattr(self, 'max_context_length', 'N/A')})"
+		)
 		
 		# Load tokenizer using BatchGen's tokenizer abstraction
 		# This removes the dependency on transformers.AutoTokenizer
@@ -1928,18 +1943,43 @@ class BatchGenWorker:
 					self.global_batch.get_sequence(u).global_idx  # Tie-breaker
 				))
 				seq = self.global_batch.get_sequence(uuid)
-				pages_needed = math.ceil(seq.kv_token_budget / self.PAGE_SIZE)
+				# CRITICAL FIX: Use actual host pages allocated, not full kv_token_budget.
+				# Host KV uses chunked growth, so host_pages_allocated < ceil(kv_token_budget/PAGE_SIZE).
+				# Using kv_token_budget causes IndexError when loading more pages than host has.
+				pages_needed = seq.host_pages_allocated
+				if pages_needed <= 0:
+					if self.rank == 0:
+						logging.warning(
+							f"MIGRATION: Skipping seq {uuid[:8]}... - no host pages allocated"
+						)
+					migrated_uuids.add(uuid)  # Don't retry
+					continue
 
 				if self.rank == 0:
 					if BATCHGEN_CB_DEBUG:
 						logging.debug(
 							f"MIGRATION: Selected seq {uuid[:8]}... from {len(candidate_sequences)} candidates "
-							f"(global_idx={seq.global_idx}, from_rank={seq.assigned_rank}, pages={pages_needed})"
+							f"(global_idx={seq.global_idx}, from_rank={seq.assigned_rank}, "
+							f"host_pages={pages_needed}, budget_pages={math.ceil(seq.kv_token_budget / self.PAGE_SIZE)})"
 						)
 
 				# Find dest node with most free space (lowest used pages)
 				# Use node_id as tie-breaker for determinism
 				dest_node_id = min(underutilized, key=lambda x: (used_by_node[x[0]], x[0]))[0]
+
+				# Check dest node has enough free pages for this migration
+				dest_total = node_stats[dest_node_id]['num_total_pages']
+				dest_free = dest_total - used_by_node[dest_node_id]
+				if pages_needed > dest_free:
+					if self.rank == 0:
+						logging.info(
+							f"MIGRATION: Dest node {dest_node_id} has insufficient free pages "
+							f"({dest_free} free, need {pages_needed}), removing from candidates"
+						)
+					underutilized = [(nid, s) for nid, s in underutilized if nid != dest_node_id]
+					if not underutilized:
+						break
+					continue
 
 				# Distribute across ranks on dest node for load balancing
 				# Use round-robin based on migration count to this node
@@ -1958,7 +1998,8 @@ class BatchGenWorker:
 					uuid=uuid,
 					from_rank=seq.assigned_rank,
 					to_rank=dest_rank,
-					pages=pages_needed
+					pages=pages_needed,
+					host_pages=pages_needed,
 				))
 
 				# Mark as migrated to avoid selecting again
@@ -2129,7 +2170,13 @@ class BatchGenWorker:
 		page_size = gpu_kv_config.page_size_tokens  # Should be 64
 
 		global_idx = seq.global_idx
-		pages_needed = math.ceil(seq.kv_token_budget / page_size)
+		# CRITICAL FIX: Use actual host pages allocated, not full kv_token_budget.
+		# Host KV uses chunked growth, so host_pages_allocated < ceil(kv_token_budget/page_size).
+		# Using kv_token_budget causes IndexError when loading more pages than host has.
+		pages_needed = seq.host_pages_allocated
+		if pages_needed <= 0:
+			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - no host pages allocated")
+			return
 
 		# Tensor shape matches GPU KV manager: [num_layers, pages, page_size, num_k_heads, k_head_dim]
 		k_shape = (num_layers, pages_needed, page_size, num_k_heads, k_head_dim)
@@ -2543,6 +2590,13 @@ class BatchGenWorker:
 			# IMPORTANT: Don't change sequence status - it remains PREFILLED or ON_HOLD
 			# The sequence is still valid, just owned by a different rank now
 
+			# Update host KV tracking to match actual allocation on dest.
+			# All ranks execute this (migration list is deterministic), keeping fields consistent.
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				seq.host_pages_allocated = mig.host_pages
+				seq.host_token_capacity = mig.host_pages * self.PAGE_SIZE
+
 		# Barrier to ensure all ranks have updated global_batch
 		dist.barrier()
 
@@ -2826,6 +2880,8 @@ class BatchGenWorker:
 					'gpu_pages_allocated': seq.gpu_pages_allocated,
 					'eos_reached': seq.eos_reached,
 					'prompt_length': seq.prompt_length,  # Include for validation
+					'host_pages_allocated': seq.host_pages_allocated,
+					'host_token_capacity': seq.host_token_capacity,
 				}
 		
 		# Step 2: All-gather state from all ranks
@@ -2844,6 +2900,11 @@ class BatchGenWorker:
 							seq.current_context_length = state['current_context_length']
 							seq.gpu_pages_allocated = state['gpu_pages_allocated']
 							seq.eos_reached = state['eos_reached']
+							# Sync host KV fields for consistent migration planning
+							if 'host_pages_allocated' in state:
+								seq.host_pages_allocated = state['host_pages_allocated']
+							if 'host_token_capacity' in state:
+								seq.host_token_capacity = state['host_token_capacity']
 							
 							# VALIDATION: Ensure received ctx_len is consistent
 							expected_ctx = seq.prompt_length + seq.decoded_length
@@ -3083,11 +3144,12 @@ class BatchGenWorker:
 		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
 		max_prompt_length = max(prompt_lengths)
 
-		# Warn if any prompt exceeds model context length
-		if max_prompt_length >= self.model_context_length:
+		# Warn about prompts that exceed context length limit
+		over_limit = sum(1 for pl in prompt_lengths if pl >= self.model_context_length)
+		if over_limit > 0:
 			logging.warning(
-				f"Rank {self.rank}: Longest prompt ({max_prompt_length} tokens) exceeds or equals "
-				f"model context length ({self.model_context_length}). Some sequences may not decode."
+				f"Rank {self.rank}: {over_limit}/{num_sequences} prompts exceed max context length "
+				f"({self.model_context_length}). These will complete with minimal/no decode tokens."
 			)
 
 		# Update self.max_input_length to the actual longest prompt
@@ -3420,9 +3482,12 @@ class BatchGenWorker:
 						self._sequences_with_gpu_kv.discard(uuid)
 
 		# Update sequence status and reset GPU allocation
+		# NOTE: Only reset gpu_pages_allocated, NOT had_initial_gpu_reservation.
+		# ON_HOLD sequences are continuing decode when reloaded, so they should
+		# get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			seq.reset_gpu_allocation()  # Reset gpu_pages_allocated = 0
+			seq.gpu_pages_allocated = 0
 			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
 		# Synchronize state across all ranks
@@ -3870,15 +3935,16 @@ class BatchGenWorker:
 		if has_writer.item() == 0:
 			return
 
-		# Each rank collects tokens for its locally-owned completed sequences
+		# Each rank collects tokens + finish_reason for its locally-owned completed sequences
 		my_completed_tokens = []
 		for uuid in completed_uuids:
 			if uuid in self._uuid_to_local_map:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
+					finish_reason = self._get_finish_reason(seq)
 					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu())
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens.cpu(), finish_reason)
 					)
 
 		# All ranks participate in gather (NCCL collective requirement)
@@ -3890,8 +3956,8 @@ class BatchGenWorker:
 		if writer is not None:
 			for rank_tokens in all_completed_tokens:
 				if rank_tokens:
-					for global_idx, tokens in rank_tokens:
-						writer.submit(global_idx, tokens)
+					for global_idx, tokens, finish_reason in rank_tokens:
+						writer.submit(global_idx, tokens, finish_reason=finish_reason)
 
 	def _try_load_new_sequences(
 		self, 
@@ -5915,6 +5981,9 @@ class BatchGenWorker:
 					seq.current_context_length = state['current_context_length']
 					seq.gpu_pages_allocated = state['gpu_pages_allocated']
 					seq.eos_reached = state['eos_reached']
+					# Sync host KV fields to keep all ranks consistent for migration planning
+					seq.host_pages_allocated = state['host_pages_allocated']
+					seq.host_token_capacity = state['host_token_capacity']
 
 		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
@@ -5978,11 +6047,15 @@ class BatchGenWorker:
 		if decisions.growth_feasible and decisions.host_growth_uuids:
 			host_grow_requests = []
 			for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
+				# Update metadata on ALL ranks (decisions are broadcast from rank 0).
+				# This keeps host_pages_allocated consistent across ranks, which is
+				# critical for deterministic migration planning in _plan_kv_migration().
+				seq = self.global_batch.get_sequence(uuid)
+				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
+				seq.host_pages_allocated += growth_pages
+				# Only do actual host page allocation on owner rank
 				if uuid in self._uuid_to_local_map:
-					seq = self.global_batch.get_sequence(uuid)
 					host_grow_requests.append((seq.global_idx, growth_pages))
-					seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
-					seq.host_pages_allocated += growth_pages
 
 			if host_grow_requests and worker_view is not None:
 				worker_view.grow_pages_for_sequences(host_grow_requests)

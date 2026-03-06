@@ -224,6 +224,7 @@ class BatchScheduler:
                 False,  # ignore_eos
                 batch.temperature,  # None = greedy decoding
                 batch.top_p,  # None = disabled
+                max_context_length=batch.max_context_length,
                 **incremental_kwargs,
             )
         except Exception as exc:

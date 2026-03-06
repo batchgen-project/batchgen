@@ -87,13 +87,13 @@ class IncrementalWriter:
             f"output={self._output_path}, sequences={len(custom_id_map)}"
         )
 
-    def submit(self, global_idx: int, decoded_tokens: torch.Tensor) -> None:
+    def submit(self, global_idx: int, decoded_tokens: torch.Tensor, finish_reason: str = "stop") -> None:
         """Enqueue a completed sequence for async writing. Thread-safe."""
         if self._closed:
             logger.warning("IncrementalWriter.submit() called after close()")
             return
         tokens_cpu = decoded_tokens.cpu() if decoded_tokens.is_cuda else decoded_tokens.clone()
-        self._queue.put((global_idx, tokens_cpu))
+        self._queue.put((global_idx, tokens_cpu, finish_reason))
 
     def close(self) -> None:
         """Flush remaining items and join the background thread."""
@@ -129,9 +129,9 @@ class IncrementalWriter:
                         os.fsync(fh.fileno())
                         break
 
-                    global_idx, tokens = item
+                    global_idx, tokens, finish_reason = item
                     try:
-                        line = self._build_result_line(global_idx, tokens)
+                        line = self._build_result_line(global_idx, tokens, finish_reason=finish_reason)
                         fh.write(line)
                         fh.write("\n")
                         fh.flush()
@@ -146,7 +146,7 @@ class IncrementalWriter:
 
     # -------------------- Result building --------------------
 
-    def _build_result_line(self, global_idx: int, tokens: torch.Tensor) -> str:
+    def _build_result_line(self, global_idx: int, tokens: torch.Tensor, finish_reason: str = "stop") -> str:
         """Build a BatchResultItem-compatible JSON line."""
         custom_id = self._custom_id_map.get(global_idx, f"unknown_{global_idx}")
         endpoint_url = self._request_urls.get(global_idx, BatchEndpoint.CHAT_COMPLETIONS.value)
@@ -184,7 +184,7 @@ class IncrementalWriter:
                             tool_calls=tool_calls,
                         ),
                         logprobs=None,
-                        finish_reason="stop",
+                        finish_reason=finish_reason,
                     )
                 ],
                 usage=usage,
@@ -199,7 +199,7 @@ class IncrementalWriter:
                         index=0,
                         text=decoded_text,
                         logprobs=None,
-                        finish_reason="stop",
+                        finish_reason=finish_reason,
                     )
                 ],
                 usage=usage,

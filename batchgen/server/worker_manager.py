@@ -325,6 +325,7 @@ class WorkerManager:
         incremental_output_dir: Optional[str] = None,
         parse_thinking: bool = False,
         parse_tool_call: bool = False,
+        max_context_length: int = 131072,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -335,6 +336,7 @@ class WorkerManager:
             "ignore_eos": ignore_eos,
             "temperature": temperature,
             "top_p": top_p,
+            "max_context_length": max_context_length,
         }
         # Incremental writer metadata (only included when active)
         if incremental_output_dir and custom_id_map:
