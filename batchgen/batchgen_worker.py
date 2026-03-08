@@ -132,9 +132,10 @@ class QueryBookBufferPool:
 	This replaces 24K allocations per rank with 2 large allocations + views.
 	"""
 
-	def __init__(self, num_sequences: int, model_context_length: int, max_decoding_length: int):
+	def __init__(self, num_sequences: int, model_context_length: int, max_decoding_length: int, pad_token_id: int = 0):
 		self.input_ids_buffer = torch.zeros((num_sequences, model_context_length), dtype=torch.long)
-		self.decoded_tokens_buffer = torch.zeros((num_sequences, max_decoding_length), dtype=torch.int64)
+		self.decoded_tokens_buffer = torch.full((num_sequences, max_decoding_length), pad_token_id, dtype=torch.int64)
+		self.pad_token_id = pad_token_id
 		self.num_sequences = num_sequences
 		self.model_context_length = model_context_length
 		self.max_decoding_length = max_decoding_length
@@ -1299,7 +1300,8 @@ class BatchGenWorker:
 		# Set EOS token IDs from tokenizer (support multiple stop tokens)
 		self.eos_token_id = self.tokenizer.eos_token_id
 		self.eos_token_ids = getattr(self.tokenizer, 'eos_token_ids', {self.eos_token_id})
-		logging.info(f"Rank {self.rank}: EOS token IDs set to {self.eos_token_ids}")
+		self.pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+		logging.info(f"Rank {self.rank}: EOS token IDs set to {self.eos_token_ids}, pad_token_id={self.pad_token_id}")
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
 		# Note: EngineConfig is created by the model-specific initializer which uses a Planner
@@ -2814,6 +2816,7 @@ class BatchGenWorker:
 			prompt_texts=cfg["prompt_texts"],
 			tokenizer=self.tokenizer,
 			eos_token_ids=self.eos_token_ids,
+			pad_token_id=self.pad_token_id,
 			parse_thinking=cfg.get("parse_thinking", False),
 			parse_tool_call=cfg.get("parse_tool_call", False),
 		)
@@ -3278,6 +3281,7 @@ class BatchGenWorker:
 			num_sequences=num_seqs,
 			model_context_length=self.model_context_length,
 			max_decoding_length=self.max_decoding_length,
+			pad_token_id=self.pad_token_id,
 		)
 		t_alloc = time.perf_counter() - phase3_start
 		logging.info(
@@ -3311,6 +3315,7 @@ class BatchGenWorker:
 			seq.input_ids = input_ids_view
 			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 
+			# Free the tokenized data for this sequence immediately
 			del tokenized_by_idx[seq.global_idx]
 
 			seq.prompt_length = actual_prompt_len
@@ -4713,10 +4718,9 @@ class BatchGenWorker:
 		if eos_positions:
 			end_pos = eos_positions[0]
 		else:
-			# No EOS found, use all non-zero tokens
-			# Find last non-zero token
-			non_zero = [i for i, t in enumerate(tokens_list) if t != 0]
-			end_pos = non_zero[-1] + 1 if non_zero else len(tokens_list)
+			# No EOS found, use all non-padding tokens
+			non_pad = [i for i, t in enumerate(tokens_list) if t != self.pad_token_id]
+			end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
 
 		# Decode tokens up to end position
 		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
@@ -4834,7 +4838,7 @@ class BatchGenWorker:
 
 			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
 			# So the final decoded_tokens contains the COMPLETE response
-			self._buffer_pool.decoded_tokens_buffer[slot, :] = 0
+			self._buffer_pool.decoded_tokens_buffer[slot, :] = self._buffer_pool.pad_token_id
 			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			if prev_decoded > 0:
 				# Extract old decoded tokens from evicted_token_ids
