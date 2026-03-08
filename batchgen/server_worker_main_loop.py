@@ -324,6 +324,8 @@ def _server_worker_main_impl(
 			top_p = task_data.get("top_p", None)
 			# Per-request sampling params (list of dicts, one per prompt)
 			sampling_params = task_data.get("sampling_params", None)
+			# Per-sequence max output token limits
+			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
 			if global_rank == 0:
 				if sampling_params:
 					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
@@ -367,7 +369,10 @@ def _server_worker_main_impl(
 					worker.set_sampling_params(temperature=temperature, top_p=top_p)
 
 				# Process the global batch - worker internally handles distribution
-				local_results = worker.process_new_batch(global_prompts)
+				local_results = worker.process_new_batch(
+					global_prompts,
+					per_sequence_max_tokens=per_sequence_max_tokens,
+				)
 			else:
 				local_results = []
 
