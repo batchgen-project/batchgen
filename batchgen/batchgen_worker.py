@@ -1853,7 +1853,7 @@ class BatchGenWorker:
 		free_percent = int((free_pages / stats.num_total_pages) * 100) if stats.num_total_pages > 0 else 100
 
 		if self.local_rank == 0:
-			logging.info(
+			logging.debug(
 				f"[HOST_KV_UTIL] C++ stats: used={used_pages}, free={free_pages}, "
 				f"total={stats.num_total_pages}, {len(valid_sequences)} valid seqs"
 			)
