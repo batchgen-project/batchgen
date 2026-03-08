@@ -339,7 +339,6 @@ class BatchGenWorker:
 				max_chunk=args.adaptive_chunk_max,
 				ema_alpha=args.adaptive_chunk_ema_alpha,
 				multiplier=args.adaptive_chunk_multiplier,
-				rank=args.global_rank,
 			)
 		else:
 			self.adaptive_chunk_sizer = None
