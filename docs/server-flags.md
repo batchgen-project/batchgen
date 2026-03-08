@@ -174,7 +174,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host-kv-chunk-size` | `8192` | Initial chunk size in tokens. Each sequence reserves `max(prompt_length, chunk_size)` tokens at prefill instead of the full decode budget. Smaller values increase oversubscription but may trigger more evictions. |
-| `--enable-host-kv-eviction` | `false` | Enable eviction of host KV pages when free pages are exhausted. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
+| `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is now always enabled when chunked reservation is active. This flag is ignored. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
 | `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
 | `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
@@ -188,7 +188,7 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 1. At prefill, each sequence allocates `max(prompt_length, chunk_size)` tokens of host KV pages
 2. During decode, sequences that approach their allocated capacity trigger chunk growth (capped at their KV token budget)
 3. If adaptive chunk is enabled, the chunk size is adjusted based on observed decode lengths (EMA)
-4. If host pages are exhausted and eviction is enabled, shortest-decoded sequences are evicted first to free pages
+4. If host pages are exhausted, shortest-decoded sequences are evicted first to free pages
 
 **Example: High oversubscription with eviction**
 
@@ -197,12 +197,11 @@ python -m batchgen.launch_http_server \
     --model deepseek-ai/DeepSeek-R1 \
     --host-kv-cache-size 256 \
     --host-kv-chunk-size 512 \
-    --enable-host-kv-eviction \
     --host-kv-eviction-watermark 10 \
     --adaptive-chunk
 ```
 
-This allows serving more concurrent sequences than the host KV cache can hold at full decode length. Sequences that exhaust their chunk grow incrementally, and if memory runs out, the least-progressed sequences are evicted and recomputed later.
+This allows serving more concurrent sequences than the host KV cache can hold at full decode length. Sequences that exhaust their chunk grow incrementally, and if memory runs out, the least-progressed sequences are automatically evicted and recomputed later. Eviction is always enabled — no flag needed.
 
 ### Prefill Optimization
 

@@ -70,7 +70,8 @@ class CompletionRequest(BaseModel):
     prompt: Union[str, List[str]] = Field(
         ..., description="Prompt(s) for completion"
     )
-    max_tokens: Optional[int] = Field(default=16, ge=1)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
@@ -154,7 +155,7 @@ class CreateBatchRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = Field(default=None, ge=1)
-    max_context_length: int = Field(default=131072, ge=1)  # Max total context (prompt + decode). Default 128K.
+    max_context_length: Optional[int] = Field(default=None, ge=1)  # Max total context (prompt + decode). None = use model max.
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0)
@@ -178,7 +179,7 @@ class BatchObject(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = None
-    max_context_length: int = 131072  # Default 128K
+    max_context_length: Optional[int] = None  # None = use model max
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None

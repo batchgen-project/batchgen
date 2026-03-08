@@ -505,8 +505,8 @@ class KVMigrationHelper:
         local_idx = self.worker._uuid_to_local_map.get(mig.uuid)
         if local_idx is not None and local_idx in self.worker.query_book:
             qb = self.worker.query_book[local_idx]
-            dist.send(tensor=qb.encoded["input_ids"].cpu().contiguous(), dst=mig.to_rank, group=gloo_group)
-            dist.send(tensor=qb.decoded_tokens.cpu().contiguous(), dst=mig.to_rank, group=gloo_group)
+            dist.send(tensor=qb.encoded["input_ids"].clone(), dst=mig.to_rank, group=gloo_group)
+            dist.send(tensor=qb.decoded_tokens.clone(), dst=mig.to_rank, group=gloo_group)
 
         if self.debug:
             logger.debug(f"MIGRATION: Rank {self.rank}: Sent {mig.uuid[:8]}... in {(time.perf_counter()-t0)*1000:.1f}ms")

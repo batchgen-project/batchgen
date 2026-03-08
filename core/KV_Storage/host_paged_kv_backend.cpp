@@ -519,13 +519,6 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
             auto touch_dur = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::high_resolution_clock::now() - touch_start);
 
-            // Log is not available here (no spdlog), use fprintf
-            fprintf(stderr,
-                    "[fast-init] Host KV memfd: page touching completed in %.2fs "
-                    "(%.1f GB, 2MB stride)\n",
-                    touch_dur.count() / 1000.0,
-                    total_bytes / (1024.0 * 1024.0 * 1024.0));
-
             shm_fd = fd;
             memfd_fd_value = fd;
             using_memfd = true;

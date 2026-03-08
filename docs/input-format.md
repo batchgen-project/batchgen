@@ -76,9 +76,10 @@ Output length can be set at three levels. Per-request values always take priorit
 |----------|--------|-------|
 | 1 (highest) | Per-request `max_completion_tokens` in JSONL body | `body.max_completion_tokens` |
 | 2 | Per-request `max_tokens` in JSONL body (legacy) | `body.max_tokens` |
-| 3 (lowest) | Batch-level `max_decoding_length` (fallback default) | `create_batch(max_decoding_length=...)` |
+| 3 | Batch-level `max_decoding_length` (fallback default) | `create_batch(max_decoding_length=...)` |
+| 4 (lowest) | Hardcoded fallback (with warning) | `128` tokens — a warning is logged when this is used |
 
-When both `max_completion_tokens` and `max_tokens` are set on the same request, `max_completion_tokens` wins. When neither is set, the batch-level `max_decoding_length` is used as the default. Each sequence is checked independently — different sequences in the same batch can have different output limits.
+When both `max_completion_tokens` and `max_tokens` are set on the same request, `max_completion_tokens` wins. When neither is set, the batch-level `max_decoding_length` is used as the default. If that is also unset, a fallback of 128 tokens is applied and a warning is logged. Each sequence is checked independently — different sequences in the same batch can have different output limits.
 
 ### Sampling Override Priority
 
@@ -139,8 +140,11 @@ Different sampling strategies per request:
 
 ### Text Completions
 
+Both `max_completion_tokens` and `max_tokens` are supported for `/v1/completions` requests, with the same priority rules as chat completions.
+
 ```jsonl
-{"custom_id": "tc-1", "method": "POST", "url": "/v1/completions", "body": {"model": "m", "prompt": "The meaning of life is", "max_tokens": 100, "temperature": 0.7}}
+{"custom_id": "tc-1", "method": "POST", "url": "/v1/completions", "body": {"model": "m", "prompt": "The meaning of life is", "max_completion_tokens": 100, "temperature": 0.7}}
+{"custom_id": "tc-2", "method": "POST", "url": "/v1/completions", "body": {"model": "m", "prompt": "Once upon a time", "max_tokens": 200}}
 ```
 
 ---

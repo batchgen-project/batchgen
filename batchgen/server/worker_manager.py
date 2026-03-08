@@ -325,7 +325,7 @@ class WorkerManager:
         incremental_output_dir: Optional[str] = None,
         parse_thinking: bool = False,
         parse_tool_call: bool = False,
-        max_context_length: int = 131072,
+        max_context_length: Optional[int] = None,
         sampling_params: Optional[List[Dict[str, Any]]] = None,
         per_sequence_max_tokens: Optional[List[int]] = None,
     ) -> List[Any]:

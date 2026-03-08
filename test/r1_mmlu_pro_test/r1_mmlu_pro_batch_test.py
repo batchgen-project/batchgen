@@ -421,7 +421,7 @@ if __name__ == "__main__":
 
     # Verify per-sequence max_completion_tokens compliance
     if per_seq_limits is not None:
-        tokenizer = AutoTokenizer.from_pretrained(hugging_face_checkpoint)
+        tokenizer = AutoTokenizer.from_pretrained(hugging_face_checkpoint, trust_remote_code=True)
         print("\n--- Per-Sequence max_completion_tokens Verification ---")
         violations = 0
         for idx, result in enumerate(results):

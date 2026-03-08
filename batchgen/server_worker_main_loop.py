@@ -317,7 +317,7 @@ def _server_worker_main_impl(
 			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
 			current_max_output = task_data.get("max_output_len", 128)
-			max_context_length = task_data.get("max_context_length", 131072)
+			max_context_length = task_data.get("max_context_length", None)
 			ignore_eos = task_data.get("ignore_eos", False)
 			# Sampling parameters (None = greedy decoding)
 			temperature = task_data.get("temperature", None)
