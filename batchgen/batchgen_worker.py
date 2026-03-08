@@ -1263,7 +1263,8 @@ class BatchGenWorker:
 		# Set EOS token IDs from tokenizer (support multiple stop tokens)
 		self.eos_token_id = self.tokenizer.eos_token_id
 		self.eos_token_ids = getattr(self.tokenizer, 'eos_token_ids', {self.eos_token_id})
-		logging.info(f"Rank {self.rank}: EOS token IDs set to {self.eos_token_ids}")
+		self.pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+		logging.info(f"Rank {self.rank}: EOS token IDs set to {self.eos_token_ids}, pad_token_id={self.pad_token_id}")
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
 		# Note: EngineConfig is created by the model-specific initializer which uses a Planner
@@ -2757,6 +2758,7 @@ class BatchGenWorker:
 			prompt_texts=cfg["prompt_texts"],
 			tokenizer=self.tokenizer,
 			eos_token_ids=self.eos_token_ids,
+			pad_token_id=self.pad_token_id,
 			parse_thinking=cfg.get("parse_thinking", False),
 			parse_tool_call=cfg.get("parse_tool_call", False),
 		)
@@ -3245,7 +3247,7 @@ class BatchGenWorker:
 			input_ids_extended[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
 
 			seq.input_ids = input_ids_extended
-			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
+			seq.decoded_tokens = torch.full((1, self.max_decoding_length), self.pad_token_id, dtype=torch.int64)
 
 			# Free the tokenized data for this sequence immediately
 			del tokenized_by_idx[seq.global_idx]
@@ -4637,10 +4639,9 @@ class BatchGenWorker:
 		if eos_positions:
 			end_pos = eos_positions[0]
 		else:
-			# No EOS found, use all non-zero tokens
-			# Find last non-zero token
-			non_zero = [i for i, t in enumerate(tokens_list) if t != 0]
-			end_pos = non_zero[-1] + 1 if non_zero else len(tokens_list)
+			# No EOS found, use all non-padding tokens
+			non_pad = [i for i, t in enumerate(tokens_list) if t != self.pad_token_id]
+			end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
 
 		# Decode tokens up to end position
 		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
@@ -4739,7 +4740,7 @@ class BatchGenWorker:
 
 			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
 			# So the final decoded_tokens contains the COMPLETE response
-			seq.decoded_tokens = torch.zeros(1, self.max_decoding_length, dtype=torch.int64)
+			seq.decoded_tokens = torch.full((1, self.max_decoding_length), self.pad_token_id, dtype=torch.int64)
 			if prev_decoded > 0:
 				# Extract old decoded tokens from evicted_token_ids
 				old_decoded = evicted_ids[seq.original_prompt_length:]
