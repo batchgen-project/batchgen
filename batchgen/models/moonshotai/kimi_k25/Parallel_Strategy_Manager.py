@@ -86,7 +86,7 @@ class KimiK25ParallelStrategyManager:
         alloc_before = torch.cuda.memory_allocated(device)
 
         # 1. Delete old model (frees nn.Parameters on GPU)
-        if self.model is not None:
+        if getattr(self, 'model', None) is not None:
             del self.model
             self.model = None
 
