@@ -124,9 +124,11 @@ class AdaptiveChunkSizer:
         max_chunk: int = 65536,
         ema_alpha: float = 0.1,
         multiplier: float = 1.5,
+        rank: int = 0,
     ):
         self.current_chunk = initial_chunk
         self.min_chunk = min_chunk
+        self.rank = rank
         self.max_chunk = max_chunk
         self.ema_alpha = ema_alpha
         self.multiplier = multiplier
@@ -152,8 +154,8 @@ class AdaptiveChunkSizer:
             )
             # Round up to page boundary (64 tokens per page)
             self.current_chunk = math.ceil(self.current_chunk / 64) * 64
-            if self.current_chunk != old_chunk and BATCHGEN_CB_DEBUG:
-                logger.debug(
+            if self.current_chunk != old_chunk and self.rank == 0:
+                logger.info(
                     f"[ADAPTIVE_CHUNK] {old_chunk} -> {self.current_chunk} "
                     f"ema={self.ema_decode_length:.0f} completed={self.completed_count}"
                 )
