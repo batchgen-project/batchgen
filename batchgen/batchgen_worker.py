@@ -8676,6 +8676,14 @@ class BatchGenWorker:
 		self._cuda_graph_manager = None
 		self._whole_model_graph = False
 
+		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
+		# (INT4 contiguous weight buffers, MoE class-level buffers)
+		if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+			pm = self.parallel_manager
+			for attr in ('_int4_packed_gpu_buf', '_int4_scale_gpu_buf'):
+				if hasattr(pm, attr):
+					delattr(pm, attr)
+
 		# Release memory
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
