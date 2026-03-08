@@ -872,8 +872,8 @@ class BatchGenWorker:
 		2. It hit EOS AND ignore_eos is False, OR
 		3. current_context_length >= model_context_length (context limit reached)
 		"""
-		# Always complete at max decoding length
-		if seq.decoded_length >= self.max_decoding_length:
+		# Always complete at per-sequence max decoding length
+		if seq.decoded_length >= seq.max_decode_length:
 			return True
 
 		# Complete if context length limit reached (prompt + decoded >= model max)
@@ -2821,23 +2821,35 @@ class BatchGenWorker:
 			parse_tool_call=cfg.get("parse_tool_call", False),
 		)
 
-	def process_new_batch(self, global_prompts: List[str]) -> List[torch.Tensor]:
+	def process_new_batch(
+		self,
+		global_prompts: List[str],
+		per_sequence_max_tokens: Optional[List[int]] = None,
+	) -> List[torch.Tensor]:
 		"""
 		Process a global batch of prompts.
 		All ranks receive the same global_prompts and maintain consistent state.
+
+		Args:
+			global_prompts: List of prompt strings.
+			per_sequence_max_tokens: Optional per-sequence max output token limits.
+				Falls back to self.max_decoding_length if None or if individual entry is None.
 		"""
 		logging.info(
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
-		
+
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
 		for idx, text in enumerate(global_prompts):
+			max_dec = self.max_decoding_length
+			if per_sequence_max_tokens is not None and idx < len(per_sequence_max_tokens):
+				max_dec = per_sequence_max_tokens[idx] if per_sequence_max_tokens[idx] is not None else self.max_decoding_length
 			seq = SequenceEntry(
 				uuid=f"seq_{idx}",
 				global_idx=idx,
 				prompt_length=0,
-				max_decode_length=self.max_decoding_length,
+				max_decode_length=max_dec,
 				text=text,
 			)
 			self.global_batch.add_sequence(seq)
@@ -3993,16 +4005,40 @@ class BatchGenWorker:
 		Check for completed sequences at page boundaries.
 		FIXED: Respects ignore_eos flag.
 		"""
+		n = len(decode_uuids)
+		if n == 0:
+			return [], [], []
+
+		# Vectorized completion check: build tensors once, compare in batch
+		decoded_lens = torch.empty(n, dtype=torch.int64)
+		max_lens = torch.empty(n, dtype=torch.int64)
+		ctx_lens = torch.empty(n, dtype=torch.int64)
+		eos_flags = torch.empty(n, dtype=torch.bool)
+		ignore_eos = self._ignore_eos
+
+		seqs = []
+		for i, uuid in enumerate(decode_uuids):
+			seq = self.global_batch.get_sequence(uuid)
+			seqs.append(seq)
+			decoded_lens[i] = seq.decoded_length
+			max_lens[i] = seq.max_decode_length
+			ctx_lens[i] = seq.current_context_length
+			eos_flags[i] = seq.eos_reached and not ignore_eos
+
+		completed_mask = (
+			(decoded_lens >= max_lens)
+			| (ctx_lens >= self.model_context_length)
+			| eos_flags
+		)
+
 		completed_uuids = []
 		active_uuids = []
 		active_local_indices = []
-		
-		for uuid in decode_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			
-			# FIXED: Use unified completion check
-			if self._is_sequence_completed(seq):
+		for i in range(n):
+			uuid = decode_uuids[i]
+			if completed_mask[i]:
 				completed_uuids.append(uuid)
+				seq = seqs[i]
 				logging.info(
 					f"Rank {self.rank}: Sequence {uuid} completed at token {new_token_idx} "
 					f"(decoded_length={seq.decoded_length}, eos_reached={seq.eos_reached}, "
@@ -4012,7 +4048,7 @@ class BatchGenWorker:
 				active_uuids.append(uuid)
 				if uuid in self._uuid_to_local_map:
 					active_local_indices.append(self._uuid_to_local_map[uuid])
-		
+
 		return active_uuids, active_local_indices, completed_uuids
 
 	def _submit_completed_to_incremental_writer(
@@ -7310,9 +7346,9 @@ class BatchGenWorker:
 				if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 					seq.eos_reached = True
 
-				if seq.decoded_length >= self.max_decoding_length:
+				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
-			
+
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
 		# Cleanup
@@ -8156,7 +8192,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 						
 						# Always check max length
-						if seq.decoded_length >= self.max_decoding_length:
+						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
 
 				new_token_idx += 1
@@ -8233,7 +8269,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 						
 						# Always check max length
-						if seq.decoded_length >= self.max_decoding_length:
+						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
 
 				new_token_idx += 1
