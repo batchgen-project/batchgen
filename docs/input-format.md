@@ -36,7 +36,8 @@ Reference for the JSONL input file format used by BatchGen's `/v1/batches` API. 
 | `model` | string | Yes | Model identifier (for OpenAI compatibility — BatchGen uses the server's loaded model) |
 | `messages` | array | Yes* | Chat messages with `role` and `content` (for `/v1/chat/completions`) |
 | `prompt` | string | Yes* | Text prompt (for `/v1/completions`) |
-| `max_tokens` | int | No | Maximum tokens to generate per request |
+| `max_completion_tokens` | int | No | Maximum output tokens to generate per request (preferred, OpenAI-compatible) |
+| `max_tokens` | int | No | Maximum output tokens to generate per request (legacy alias for `max_completion_tokens`) |
 | `temperature` | float | No | Sampling temperature (see [Sampling Parameters](#sampling-parameters)) |
 | `top_p` | float | No | Nucleus sampling threshold (see [Sampling Parameters](#sampling-parameters)) |
 | `top_k` | int | No | Top-k filtering threshold (see [Sampling Parameters](#sampling-parameters)) |
@@ -67,7 +68,19 @@ When a sampling parameter is not specified in the request body:
 | `top_p` absent | No nucleus filtering (equivalent to top_p=1.0) |
 | `top_k` absent | No top-k filtering (equivalent to top_k=0) |
 
-### Override Priority
+### Output Length Priority
+
+Output length can be set at three levels. Per-request values always take priority:
+
+| Priority | Source | Field |
+|----------|--------|-------|
+| 1 (highest) | Per-request `max_completion_tokens` in JSONL body | `body.max_completion_tokens` |
+| 2 | Per-request `max_tokens` in JSONL body (legacy) | `body.max_tokens` |
+| 3 (lowest) | Batch-level `max_decoding_length` (fallback default) | `create_batch(max_decoding_length=...)` |
+
+When both `max_completion_tokens` and `max_tokens` are set on the same request, `max_completion_tokens` wins. When neither is set, the batch-level `max_decoding_length` is used as the default. Each sequence is checked independently — different sequences in the same batch can have different output limits.
+
+### Sampling Override Priority
 
 Sampling parameters can be set at two levels. Per-request values always take priority:
 
@@ -101,7 +114,17 @@ All sampling operations are vectorized on GPU — no Python loops over sequences
 No sampling parameters specified — all requests use argmax:
 
 ```jsonl
-{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "2+2=?"}], "max_tokens": 10}}
+{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "2+2=?"}], "max_completion_tokens": 10}}
+```
+
+### Per-Sequence Output Limits
+
+Different output lengths per request — each sequence is checked independently:
+
+```jsonl
+{"custom_id": "short", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "What is 2+2?"}], "max_completion_tokens": 10}}
+{"custom_id": "long", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "Write a detailed essay"}], "max_completion_tokens": 4096}}
+{"custom_id": "legacy", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "Summarize this"}], "max_tokens": 100}}
 ```
 
 ### Mixed Sampling in One Batch
@@ -109,9 +132,9 @@ No sampling parameters specified — all requests use argmax:
 Different sampling strategies per request:
 
 ```jsonl
-{"custom_id": "greedy", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "What is 2+2?"}], "max_tokens": 10, "temperature": 0.0}}
-{"custom_id": "creative", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "Write a poem"}], "max_tokens": 200, "temperature": 1.0, "top_p": 0.9}}
-{"custom_id": "focused", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "Summarize this"}], "max_tokens": 100, "temperature": 0.3, "top_k": 10}}
+{"custom_id": "greedy", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "What is 2+2?"}], "max_completion_tokens": 10, "temperature": 0.0}}
+{"custom_id": "creative", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "Write a poem"}], "max_completion_tokens": 200, "temperature": 1.0, "top_p": 0.9}}
+{"custom_id": "focused", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "m", "messages": [{"role": "user", "content": "Summarize this"}], "max_completion_tokens": 100, "temperature": 0.3, "top_k": 10}}
 ```
 
 ### Text Completions
