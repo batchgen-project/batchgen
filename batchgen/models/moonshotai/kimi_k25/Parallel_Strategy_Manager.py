@@ -71,6 +71,57 @@ class KimiK25ParallelStrategyManager:
         self.world_size = world_size
         self.rank = global_rank
 
+    def _cleanup_decode_gpu_state(self):
+        """Free all phase-specific GPU allocations (model, buffers, class state).
+
+        Called before both configure_prefill() and configure_decoding() to ensure
+        no GPU memory leaks across phase transitions. Cleans up:
+        - Model instance and its nn.Parameters
+        - INT4 contiguous GPU weight buffers (PSM attributes)
+        - KimiK25MoE._buf class-level activation buffer manager
+        - KimiK25MoE._shared_expert_stream class-level CUDA stream
+        - AllToAll communication buffers (if enabled)
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        alloc_before = torch.cuda.memory_allocated(device)
+
+        # 1. Delete old model (frees nn.Parameters on GPU)
+        if getattr(self, 'model', None) is not None:
+            del self.model
+            self.model = None
+
+        # 2. INT4 contiguous GPU buffers (stored on PSM, not on model)
+        if hasattr(self, '_int4_packed_gpu_buf'):
+            del self._int4_packed_gpu_buf
+        if hasattr(self, '_int4_scale_gpu_buf'):
+            del self._int4_scale_gpu_buf
+
+        # 3. MoE buffer manager (class variable — survives model deletion)
+        if hasattr(KimiK25MoE, '_buf') and KimiK25MoE._buf is not None:
+            KimiK25MoE._buf = None
+
+        # 4. MoE shared CUDA stream (class variable)
+        if hasattr(KimiK25MoE, '_shared_expert_stream'):
+            KimiK25MoE._shared_expert_stream = None
+
+        # 5. AllToAll communication buffers (if ATA was enabled)
+        for attr in ('expert_x', 'expert_y', 'y', 'dp_x', 'ata',
+                     'expert_num_tokens', 'indices', 'weights'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+
+        alloc_after = torch.cuda.memory_allocated(device)
+        logging.info(
+            f"Rank {self.rank}: [HBM] phase cleanup freed "
+            f"{(alloc_before - alloc_after) / (1024**3):.2f} GiB "
+            f"(allocated: {alloc_before / (1024**3):.2f} → {alloc_after / (1024**3):.2f} GiB)"
+        )
+
     def configure_prefill(self):
         """Configure model skeleton for prefill (pure DP) and weight copy task."""
         import time
@@ -80,6 +131,9 @@ class KimiK25ParallelStrategyManager:
         # Step 1: Set phase (pure DP - no EP in prefill)
         self.loaded_model_config.phase = "prefill"
         self.loaded_model_config.ep_size = 1  # Pure DP: all 384 experts on each rank
+
+        # Step 1.5: Free decode-phase GPU allocations before creating prefill model
+        self._cleanup_decode_gpu_state()
 
         # Step 2: Initialize model
         # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides
@@ -237,19 +291,8 @@ class KimiK25ParallelStrategyManager:
             f"reserved={reserved_before / (1024**3):.2f} GiB"
         )
 
-        # Deep free prefill model before loading decode model
-        if self.model is not None:
-            del self.model
-            self.model = None
-        # Free INT4 contiguous GPU buffers (PSM attributes, not on model)
-        if hasattr(self, '_int4_packed_gpu_buf'):
-            del self._int4_packed_gpu_buf
-        if hasattr(self, '_int4_scale_gpu_buf'):
-            del self._int4_scale_gpu_buf
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Deep free prefill model and all phase-specific GPU allocations
+        self._cleanup_decode_gpu_state()
 
         # Log GPU memory after deep free
         alloc_after = torch.cuda.memory_allocated(device)
