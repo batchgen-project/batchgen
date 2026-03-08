@@ -1014,11 +1014,17 @@ class KimiK25ParallelStrategyManager:
                 layer.mlp.shared_experts.up_weight_bf16 = layer.mlp.shared_experts.module.up_proj.weight.data
                 layer.mlp.shared_experts.down_weight_bf16 = layer.mlp.shared_experts.module.down_proj.weight.data
 
-            # Debug: Log weight_copy_task size (only first MoE layer)
-            if layer_idx == self.loaded_model_config.first_k_dense_replace:
-                logging.info(f"Rank {self.rank} Layer {layer_idx}: weight_copy_task['routed_expert'] has {len(self.weight_copy_task['routed_expert'])} entries")
-                logging.info(f"Rank {self.rank} Layer {layer_idx}: layer.mlp.experts has {len(layer.mlp.experts)} total slots")
-                logging.info(f"Rank {self.rank} Layer {layer_idx}: Phase={self.loaded_model_config.phase}")
+            # Offloading summary (rank 0 only, first MoE layer only)
+            if layer_idx == self.loaded_model_config.first_k_dense_replace and self.rank == 0:
+                n_offloaded = len(self.weight_copy_task['routed_expert'])
+                n_total = len(layer.mlp.experts)
+                attn_offloaded = len(self.weight_copy_task.get('attn', [])) > 0
+                shared_offloaded = len(self.weight_copy_task.get('shared_expert', [])) > 0
+                logging.info(
+                    f"Offloading summary: attention={'offloaded' if attn_offloaded else 'persistent'}, "
+                    f"shared_experts={'offloaded' if shared_offloaded else 'persistent'}, "
+                    f"routed_experts={n_offloaded}/{n_total} offloaded ({100*n_offloaded/n_total:.0f}%)"
+                )
 
             # Loop through all expert slots (384 total)
             # In prefill: all slots are instantiated
@@ -1039,9 +1045,6 @@ class KimiK25ParallelStrategyManager:
                     persistent = False
                 else:
                     persistent = True
-                    # Debug: Log first few persistent experts
-                    if layer_idx == self.loaded_model_config.first_k_dense_replace and global_expert_idx < 3:
-                        logging.info(f"Rank {self.rank} Layer {layer_idx}: Expert {module_key} is PERSISTENT (not in weight_copy_task)")
 
                 # K2.5: No FP8 weight_dequant_scales
                 layer.mlp.experts[expert_idx] = KimiK25ExpertWrapper(

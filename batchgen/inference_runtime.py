@@ -69,7 +69,8 @@ class InferenceRuntime:
 		self.core_engine.clear_kv_storage()
 		self.core_engine.start_h2d_worker()
 		self.current_phase = phase
-		logging.info(f"{self.global_rank} End Config Prefill")
+		if self.global_rank == 0:
+			logging.info("End Config Prefill")
 
 	def prefill(self, input_batch: ModelForwardInput) -> ModelForwardOutput:
 		"""
@@ -119,7 +120,8 @@ class InferenceRuntime:
 			self.core_engine.start_h2d_worker()
 
 		self.current_phase = phase
-		logging.info(f"{self.rank} End Config Decoding")
+		if self.rank == 0:
+			logging.info("End Config Decoding")
 
 	def decode(self, decode_batch):
 		"""

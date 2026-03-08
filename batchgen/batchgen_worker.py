@@ -525,7 +525,7 @@ class BatchGenWorker:
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
-	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=131072):
+	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):
 		"""
 		Initialize/reconfigure for a new batch.
 		- First call: performs full initialization of core_engine, parallel_manager, etc.
@@ -537,7 +537,7 @@ class BatchGenWorker:
 			                  For first initialization, a default of 8192 is used if None.
 			max_decoding_length: Maximum number of tokens to decode.
 			num_queries: Number of queries in the global batch.
-			max_context_length: Maximum total context length (prompt + decode). Default 128K.
+			max_context_length: Maximum total context length (prompt + decode). None = use model max.
 		"""
 		# Check if we need to reset state from previous batch
 		if self._core_initialized and self.global_batch is not None:
@@ -1286,11 +1286,13 @@ class BatchGenWorker:
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
 		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
-		self.model_context_length = min(model_max, getattr(self, 'max_context_length', 131072))
-		logging.info(
-			f"Rank {self.rank}: Model context length set to {self.model_context_length} "
-			f"(model_config={model_max}, max_context_length={getattr(self, 'max_context_length', 'N/A')})"
-		)
+		client_max = getattr(self, 'max_context_length', None)
+		self.model_context_length = model_max if client_max is None else min(model_max, client_max)
+		if self.rank == 0:
+			logging.info(
+				f"Model context length set to {self.model_context_length} "
+				f"(model_config={model_max}, client_max_context_length={client_max})"
+			)
 		
 		# Load tokenizer using BatchGen's tokenizer abstraction
 		# This removes the dependency on transformers.AutoTokenizer
@@ -2128,7 +2130,8 @@ class BatchGenWorker:
 					seen.add(mig.uuid)
 					unique_migrations.append(mig)
 			migrations = unique_migrations
-			logging.warning(f"MIGRATION: Removed duplicates, {len(migrations)} unique migrations remain")
+			if self.rank == 0:
+				logging.warning(f"MIGRATION: Removed duplicates, {len(migrations)} unique migrations remain")
 
 		if self.rank == 0:
 			if migrations:
@@ -4689,10 +4692,10 @@ class BatchGenWorker:
 			self._log_batch_statistics()
 
 		# ============ Gather Results in Original Order ============
-		# NOTE: After migrations, sequences may have moved between ranks.
-		# Iterate over actual entries in _local_to_uuid_map (not sequential range)
-		# to handle cases where local indices were freed or added during migration.
-		res_with_idx = []
+		# Detokenize locally on each rank to avoid gathering large token tensors.
+		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
+		# Gathering strings (~KB each) instead reduces memory by ~100x.
+		local_results = []
 		for local_idx, uuid in self._local_to_uuid_map.items():
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
@@ -4702,26 +4705,19 @@ class BatchGenWorker:
 			if local_idx not in self.query_book:
 				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
 				continue
-			decoded_tokens = self.query_book[local_idx].decoded_tokens.clone()
-			res_with_idx.append((global_idx, decoded_tokens))
+			decoded_tokens = self.query_book[local_idx].decoded_tokens
+			decoded_str = self._decode_tokens_to_string(decoded_tokens)
+			local_results.append((global_idx, decoded_str))
 
 		all_results = [None] * self.world_size
-		dist.all_gather_object(all_results, res_with_idx)
-
+		dist.all_gather_object(all_results, local_results)
 		all_results = [item for sublist in all_results for item in sublist]
 		all_results.sort(key=lambda x: x[0])
 
-		# Decode tokens to strings (only on rank 0 since only rank 0 returns results)
-		decoded_strings = []
-		if self.rank == 0:
-			decode_start = time.perf_counter()
-			for global_idx, tokens in all_results:
-				decoded_str = self._decode_tokens_to_string(tokens)
-				decoded_strings.append(decoded_str)
-			decode_time = time.perf_counter() - decode_start
-			logging.info(f"Detokenization complete: {len(decoded_strings)} sequences in {decode_time:.2f}s")
+		decoded_strings = [s for _, s in all_results]
 
-			# Log decode timing stats (GPT-OSS specific)
+		if self.rank == 0:
+			logging.info(f"Detokenization complete: {len(decoded_strings)} sequences (distributed across {self.world_size} ranks)")
 			self._log_decode_timing()
 
 		dist.barrier()
