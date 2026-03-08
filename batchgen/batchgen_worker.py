@@ -2786,7 +2786,7 @@ class BatchGenWorker:
 		for idx, text in enumerate(global_prompts):
 			max_dec = self.max_decoding_length
 			if per_sequence_max_tokens is not None and idx < len(per_sequence_max_tokens):
-				max_dec = per_sequence_max_tokens[idx] or self.max_decoding_length
+				max_dec = per_sequence_max_tokens[idx] if per_sequence_max_tokens[idx] is not None else self.max_decoding_length
 			seq = SequenceEntry(
 				uuid=f"seq_{idx}",
 				global_idx=idx,
@@ -7211,9 +7211,9 @@ class BatchGenWorker:
 				if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 					seq.eos_reached = True
 
-				if seq.decoded_length >= self.max_decoding_length:
+				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
-			
+
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
 		# Cleanup
@@ -8057,7 +8057,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 						
 						# Always check max length
-						if seq.decoded_length >= self.max_decoding_length:
+						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
 
 				new_token_idx += 1
@@ -8134,7 +8134,7 @@ class BatchGenWorker:
 							seq.eos_reached = True
 						
 						# Always check max length
-						if seq.decoded_length >= self.max_decoding_length:
+						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
 
 				new_token_idx += 1

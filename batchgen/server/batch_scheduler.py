@@ -67,11 +67,8 @@ def parse_batch_file(
 
         if isinstance(request.body, ChatCompletionRequest):
             current_model = request.body.model
-            has_max = (request.body.max_completion_tokens is not None
-                       or request.body.max_tokens is not None)
         elif isinstance(request.body, CompletionRequest):
             current_model = request.body.model
-            has_max = request.body.max_tokens is not None
         else:
             return False, f"Line {idx}: Unsupported request body", []
 
@@ -328,7 +325,7 @@ class BatchScheduler:
                     messages, body.model, **template_kwargs
                 )
                 # Priority: max_completion_tokens > max_tokens > None
-                current_max_tokens = body.max_completion_tokens or body.max_tokens
+                current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
                 current_max_tokens = body.max_tokens

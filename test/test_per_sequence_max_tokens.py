@@ -199,16 +199,16 @@ class TestRequestFieldPriority:
         assert req.max_tokens == 50
         assert req.max_completion_tokens == 100
 
-    def test_priority_in_or_expression(self):
-        """max_completion_tokens should win over max_tokens in `or` priority."""
+    def test_priority_max_completion_tokens_wins(self):
+        """max_completion_tokens should win over max_tokens."""
         req = ChatCompletionRequest(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=50,
             max_completion_tokens=100,
         )
-        # This mirrors the logic in _convert_requests_to_worker_inputs
-        result = req.max_completion_tokens or req.max_tokens
+        # Mirrors the fixed logic in _convert_requests_to_worker_inputs
+        result = req.max_completion_tokens if req.max_completion_tokens is not None else req.max_tokens
         assert result == 100
 
     def test_fallback_to_max_tokens(self):
@@ -218,7 +218,7 @@ class TestRequestFieldPriority:
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=50,
         )
-        result = req.max_completion_tokens or req.max_tokens
+        result = req.max_completion_tokens if req.max_completion_tokens is not None else req.max_tokens
         assert result == 50
 
     def test_neither_set_returns_none(self):
@@ -227,7 +227,7 @@ class TestRequestFieldPriority:
             model="test",
             messages=[{"role": "user", "content": "hi"}],
         )
-        result = req.max_completion_tokens or req.max_tokens
+        result = req.max_completion_tokens if req.max_completion_tokens is not None else req.max_tokens
         assert result is None
 
 
@@ -468,6 +468,55 @@ class TestFallbackLogic:
         per_request = [50, 100, 200, 75]
         budget = max(per_request)
         assert budget == 200
+
+
+# ===========================================================================
+# 7. Falsy-zero edge cases (regression tests for `or` vs `is not None`)
+# ===========================================================================
+class TestFalsyZeroEdgeCases:
+    """Ensure zero values are not treated as None/falsy."""
+
+    def test_process_new_batch_zero_max_tokens(self):
+        """per_sequence_max_tokens=[0] should set max_decode_length=0, not fallback."""
+        # Simulates the fixed logic in process_new_batch
+        per_sequence_max_tokens = [0, 100, None]
+        worker_default = 512
+        results = []
+        for idx in range(3):
+            max_dec = worker_default
+            if per_sequence_max_tokens is not None and idx < len(per_sequence_max_tokens):
+                val = per_sequence_max_tokens[idx]
+                max_dec = val if val is not None else worker_default
+            results.append(max_dec)
+        assert results == [0, 100, 512]
+
+    def test_convert_requests_zero_max_completion_tokens(self):
+        """max_completion_tokens=0 should NOT fall through to max_tokens."""
+        # Note: pydantic ge=1 would reject 0, but test the logic in isolation
+        max_completion_tokens = 0
+        max_tokens = 50
+        result = max_completion_tokens if max_completion_tokens is not None else max_tokens
+        assert result == 0
+
+    def test_convert_requests_none_falls_through(self):
+        """max_completion_tokens=None should fall through to max_tokens."""
+        max_completion_tokens = None
+        max_tokens = 50
+        result = max_completion_tokens if max_completion_tokens is not None else max_tokens
+        assert result == 50
+
+    def test_per_seq_completion_not_worker_wide(self):
+        """Completion check uses seq.max_decode_length, not a shared worker value."""
+        worker_max = 1000
+        seq = SequenceEntry(
+            uuid="test", global_idx=0, prompt_length=10,
+            max_decode_length=50, text="test"
+        )
+        seq.decoded_length = 60
+        # Per-seq check: completed (60 >= 50)
+        assert seq.decoded_length >= seq.max_decode_length
+        # Worker-wide check would say NOT completed (60 < 1000)
+        assert seq.decoded_length < worker_max
 
 
 if __name__ == "__main__":
