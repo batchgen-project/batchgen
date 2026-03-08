@@ -1016,7 +1016,8 @@ class KimiK25ParallelStrategyManager:
 
             # Offloading summary (rank 0 only, first MoE layer only)
             if layer_idx == self.loaded_model_config.first_k_dense_replace and self.rank == 0:
-                n_offloaded = len(self.weight_copy_task['routed_expert'])
+                layer_prefix = f"routed_expert_{layer_idx}_"
+                n_offloaded = sum(1 for e in self.weight_copy_task['routed_expert'] if e.startswith(layer_prefix))
                 n_total = len(layer.mlp.experts)
                 attn_offloaded = len(self.weight_copy_task.get('attn', [])) > 0
                 shared_offloaded = len(self.weight_copy_task.get('shared_expert', [])) > 0
