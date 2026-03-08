@@ -330,7 +330,8 @@ class BatchGenWorker:
 		# Dynamic host KV reservation
 		self.host_kv_chunk_size = args.host_kv_chunk_size
 		self.host_kv_eviction_watermark = args.host_kv_eviction_watermark
-		self.enable_host_kv_eviction = args.enable_host_kv_eviction
+		# Eviction is always enabled — it's a correctness requirement for chunked host KV
+		self.enable_host_kv_eviction = True
 		if args.adaptive_chunk:
 			self.adaptive_chunk_sizer = AdaptiveChunkSizer(
 				initial_chunk=args.host_kv_chunk_size,
@@ -5786,7 +5787,7 @@ class BatchGenWorker:
 				logging.warning(
 					f"[HOST_KV_GROWTH] Skipped: need {total_growth_needed} pages "
 					f"but only {host_stats.num_free_pages} free "
-					f"({safety_margin} reserved). Will rely on eviction."
+					f"({safety_margin} reserved). Will rely on eviction or sequence completions to free pages."
 				)
 
 		# Host KV eviction decisions
