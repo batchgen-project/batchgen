@@ -185,7 +185,16 @@ class BatchScheduler:
             requests, batch
         )
         # Apply batch-level max_decoding_length as fallback for requests without explicit value
-        default_max = batch.max_decoding_length or 128
+        default_max = batch.max_decoding_length
+        if default_max is None:
+            default_max = 128
+            n_missing = sum(1 for mt in per_request_max_tokens if mt is None)
+            if n_missing > 0:
+                logger.warning(
+                    f"Batch {batch_id}: {n_missing}/{len(per_request_max_tokens)} requests have no "
+                    f"max_completion_tokens/max_tokens; using fallback={default_max}. "
+                    f"Set batch-level max_decoding_length or per-request max_completion_tokens."
+                )
         per_request_max_tokens = [
             mt if mt is not None else default_max
             for mt in per_request_max_tokens
@@ -328,7 +337,7 @@ class BatchScheduler:
                 current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
-                current_max_tokens = body.max_tokens
+                current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
             else:
                 raise ValueError("Unsupported request body type")
 

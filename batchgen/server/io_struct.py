@@ -70,7 +70,8 @@ class CompletionRequest(BaseModel):
     prompt: Union[str, List[str]] = Field(
         ..., description="Prompt(s) for completion"
     )
-    max_tokens: Optional[int] = Field(default=16, ge=1)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
