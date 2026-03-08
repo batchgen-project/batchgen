@@ -55,7 +55,7 @@ conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
 # 2. Install all wheels from the latest release
-RELEASE_URL="https://github.com/EfficientMoE/BatchGen/releases/download/v1.0.3"
+RELEASE_URL="https://github.com/EfficientMoE/BatchGen/releases/download/v1.0.4"
 pip install \
   "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
   "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
@@ -78,8 +78,8 @@ bash scripts/build_wheels.sh --output-dir /path/to/wheels
 Then upload to a GitHub Release:
 
 ```bash
-gh release create v1.0.3 --title "BatchGen v1.0.3"
-gh release upload v1.0.3 /path/to/wheels/*.whl
+gh release create v1.0.4 --title "BatchGen v1.0.4"
+gh release upload v1.0.4 /path/to/wheels/*.whl
 ```
 
 ## Important: Do Not Run from the Source Directory
