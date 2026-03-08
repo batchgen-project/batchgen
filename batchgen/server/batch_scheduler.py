@@ -187,14 +187,23 @@ class BatchScheduler:
         # Apply batch-level max_decoding_length as fallback for requests without explicit value
         default_max = batch.max_decoding_length
         if default_max is None:
-            default_max = 128
-            n_missing = sum(1 for mt in per_request_max_tokens if mt is None)
-            if n_missing > 0:
-                logger.warning(
-                    f"Batch {batch_id}: {n_missing}/{len(per_request_max_tokens)} requests have no "
-                    f"max_completion_tokens/max_tokens; using fallback={default_max}. "
-                    f"Set batch-level max_decoding_length or per-request max_completion_tokens."
+            missing_ids = [
+                requests[i].get("custom_id", f"request-{i}")
+                for i, mt in enumerate(per_request_max_tokens)
+                if mt is None
+            ]
+            if missing_ids:
+                error_message = (
+                    f"Batch {batch_id}: {len(missing_ids)}/{len(per_request_max_tokens)} requests "
+                    f"have no max_completion_tokens or max_tokens, and no batch-level "
+                    f"max_decoding_length is set. Set one of these to proceed. "
+                    f"First missing: {missing_ids[:5]}"
                 )
+                logger.error(error_message)
+                self._update_batch_status(
+                    batch_id, BatchStatus.FAILED, error=error_message
+                )
+                return
         per_request_max_tokens = [
             mt if mt is not None else default_max
             for mt in per_request_max_tokens

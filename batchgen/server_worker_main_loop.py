@@ -316,7 +316,7 @@ def _server_worker_main_impl(
 			# max_input_len: If None or not provided, will be determined dynamically
 			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
-			current_max_output = task_data.get("max_output_len", 128)
+			current_max_output = task_data.get("max_output_len")
 			max_context_length = task_data.get("max_context_length", None)
 			ignore_eos = task_data.get("ignore_eos", False)
 			# Sampling parameters (None = greedy decoding)
