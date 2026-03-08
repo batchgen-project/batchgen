@@ -45,6 +45,7 @@ def mla_prefill_flashattention3(
 	offload_kv = torch.cat(
 		[normed_kv, k_pe], dim=-1
 	)
+	del compressed_kv
 
 	kv = self.kv_b_proj(normed_kv)
 	kv = kv.view(bsz, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -62,7 +63,8 @@ def mla_prefill_flashattention3(
 	)
 	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
 	key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-	key_states[:, :, :, self.qk_nope_head_dim :] = k_pe	
+	key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
 	query_states = query_states.contiguous()
 	key_states = key_states.contiguous()
@@ -91,7 +93,8 @@ def mla_prefill_flashattention3(
 		max_seqlen_k=max_seqlen_in_batch_k,
 		softmax_scale=self.softmax_scale,
 		causal=True
-	)		
+	)
+	del query_states, key_states, value_states
 
 	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
 		bsz, seq_len, self.num_heads * self.v_head_dim
@@ -1011,6 +1014,7 @@ def mla_prefill_flashattention3_prepacked(
 
 	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
+	del compressed_kv, k_pe_flat
 
 	# Expand KV
 	kv = self.kv_b_proj(normed_kv)
@@ -1028,6 +1032,7 @@ def mla_prefill_flashattention3_prepacked(
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 	key_states[:, :, :self.qk_nope_head_dim] = k_nope
 	key_states[:, :, self.qk_nope_head_dim:] = k_pe
+	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
 	query_states = query_states.contiguous()
 	key_states = key_states.contiguous()
@@ -1045,6 +1050,7 @@ def mla_prefill_flashattention3_prepacked(
 		softmax_scale=self.softmax_scale,
 		causal=True
 	)
+	del query_states, key_states, value_states
 
 	# Handle tuple return from flash_attn
 	if isinstance(attn_output, tuple):
@@ -1121,6 +1127,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 
 	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
+	del compressed_kv, k_pe_flat
 
 	# Expand KV with W8A16
 	kv = w8a16_gemm(
@@ -1142,6 +1149,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 	key_states[:, :, :self.qk_nope_head_dim] = k_nope
 	key_states[:, :, self.qk_nope_head_dim:] = k_pe
+	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
 	query_states = query_states.contiguous()
 	key_states = key_states.contiguous()
@@ -1159,6 +1167,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		softmax_scale=self.softmax_scale,
 		causal=True
 	)
+	del query_states, key_states, value_states
 
 	if isinstance(attn_output, tuple):
 		attn_output = attn_output[0]

@@ -59,7 +59,7 @@ class KimiK25Config(BaseModelConfig):
     architectures: List[str] = field(default_factory=lambda: ["KimiK25ForCausalLM"])
 
     # ==================== Core Architecture ====================
-    vocab_size: int = 129280
+    vocab_size: int = 163840
     hidden_size: int = 7168
     intermediate_size: int = 18432
     num_hidden_layers: int = 61
@@ -96,7 +96,7 @@ class KimiK25Config(BaseModelConfig):
     topk_method: str = "noaux_tc"
     n_group: int = 1                   # vs 8 in DeepSeek-V3 (no grouping)
     topk_group: int = 1               # vs 4 in DeepSeek-V3
-    routed_scaling_factor: float = 2.5
+    routed_scaling_factor: float = 2.827
     norm_topk_prob: bool = True
     scoring_func: str = "sigmoid"
 
@@ -104,20 +104,20 @@ class KimiK25Config(BaseModelConfig):
     aux_loss_alpha: float = 0.001
 
     # ==================== Position Encoding ====================
-    max_position_embeddings: int = 163840
+    max_position_embeddings: int = 262144
     rope_theta: float = 50000.0        # vs 10000 in DeepSeek-V3
     rope_scaling: Dict[str, Any] = field(default_factory=lambda: {
         "type": "yarn",
-        "factor": 40,
+        "factor": 64.0,
         "original_max_position_embeddings": 4096,
-        "beta_fast": 32,
-        "beta_slow": 1,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
         "mscale": 1.0,
         "mscale_all_dim": 1.0,
     })
 
     # ==================== Normalization & Activation ====================
-    rms_norm_eps: float = 1e-6
+    rms_norm_eps: float = 1e-5
     hidden_act: str = "silu"
 
     # ==================== Quantization: INT4 W4A16 (weight-only) ====================
@@ -135,13 +135,13 @@ class KimiK25Config(BaseModelConfig):
     })
 
     # ==================== Tokenizer ====================
-    bos_token_id: int = 0
-    eos_token_id: int = 1
-    pad_token_id: Optional[int] = None
+    bos_token_id: int = 163584
+    eos_token_id: int = 163585
+    pad_token_id: Optional[int] = 163839
     tie_word_embeddings: bool = False
 
     # ==================== K2.5-specific ====================
-    num_nextn_predict_layers: int = 1
+    num_nextn_predict_layers: int = 0
     ep_size: int = 1
     seq_aux: bool = True
 
