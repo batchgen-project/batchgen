@@ -259,7 +259,7 @@ class BatchGenHttpClient:
         completion_window: str = "24h",
         metadata: Optional[Dict[str, Any]] = None,
         max_decoding_length: Optional[int] = None,
-        max_context_length: int = 131072,
+        max_context_length: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -271,8 +271,8 @@ class BatchGenHttpClient:
             endpoint: Target endpoint ('/v1/chat/completions' or '/v1/completions')
             completion_window: Time window for completion ('24h')
             metadata: Optional metadata dictionary
-            max_decoding_length: Override max decoding length for all requests (None = use per-request)
-            max_context_length: Max total context (prompt + decode). Default 128K.
+            max_decoding_length: Batch-level fallback max output tokens (None = require per-request)
+            max_context_length: Max total context (prompt + decode). None = use model maximum.
             temperature: Default sampling temperature (None = greedy). Per-request values override.
             top_p: Default nucleus sampling threshold (None = disabled). Per-request values override.
             top_k: Default top-k filtering (None or 0 = disabled). Per-request values override.
@@ -284,8 +284,9 @@ class BatchGenHttpClient:
             "input_file_id": input_file_id,
             "endpoint": endpoint,
             "completion_window": completion_window,
-            "max_context_length": max_context_length,
         }
+        if max_context_length is not None:
+            payload["max_context_length"] = max_context_length
         if metadata:
             payload["metadata"] = metadata
         if max_decoding_length is not None:
@@ -390,7 +391,7 @@ class BatchGenHttpClient:
         poll_interval: float = 5.0,
         timeout: Optional[float] = None,
         max_decoding_length: Optional[int] = None,
-        max_context_length: int = 131072,
+        max_context_length: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -409,8 +410,8 @@ class BatchGenHttpClient:
             endpoint: Target endpoint
             poll_interval: Seconds between status checks
             timeout: Maximum seconds to wait
-            max_decoding_length: Override max decoding length for all requests (None = use per-request)
-            max_context_length: Max total context (prompt + decode). Default 128K.
+            max_decoding_length: Batch-level fallback max output tokens (None = require per-request)
+            max_context_length: Max total context (prompt + decode). None = use model maximum.
             temperature: Default sampling temperature (None = greedy). Per-request values override.
             top_p: Default nucleus sampling threshold (None = disabled). Per-request values override.
             top_k: Default top-k filtering (None or 0 = disabled). Per-request values override.

@@ -491,8 +491,8 @@ class BatchGenWorker:
 		self.eos_token_id: Optional[int] = None
 		self.max_input_length = 0
 		self.max_decoding_length = 0
-		self.max_context_length = 131072  # Default 128K, set per-batch from client
-		self.model_context_length = 131072  # Default 128K, updated from model config
+		self.max_context_length = None  # Set per-batch from client; None = use model max
+		self.model_context_length = None  # Updated from model config during init
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._ignore_eos: bool = False
