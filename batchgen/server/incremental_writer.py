@@ -218,7 +218,7 @@ class IncrementalWriter:
             error=None,
         )
 
-        return json.dumps(result_item.dict(), default=str)
+        return json.dumps(result_item.dict(), default=str, ensure_ascii=False)
 
     # -------------------- Helpers --------------------
 
