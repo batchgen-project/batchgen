@@ -1,3 +1,0 @@
-[submodule "mgn-kernel/csrc/cutlass"]
-	path = mgn-kernel/csrc/cutlass
-	url = git@github.com:NVIDIA/cutlass.git
