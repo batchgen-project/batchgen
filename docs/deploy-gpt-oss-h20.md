@@ -134,8 +134,8 @@ For other GPU configurations, adjust `CUDA_VISIBLE_DEVICES` and `--world-size`:
 GPT-OSS-120B supports the `reasoning_effort` parameter for extended thinking:
 
 ```jsonl
-{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "Solve: What is the integral of x^2 * e^x?"}], "max_tokens": 4096, "reasoning_effort": "high"}}
-{"custom_id": "req-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "What is AI?"}], "max_tokens": 512}}
+{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "Solve: What is the integral of x^2 * e^x?"}], "max_completion_tokens": 4096, "reasoning_effort": "high"}}
+{"custom_id": "req-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-oss-120b", "messages": [{"role": "user", "content": "What is AI?"}], "max_completion_tokens": 512}}
 ```
 
 | Parameter | Values | Description |
@@ -155,7 +155,7 @@ result = client.submit_batch(
     input_file_path="requests.jsonl",
     output_file_path="results.jsonl",
     endpoint="/v1/chat/completions",
-    max_decoding_length=4096,
+    max_decoding_length=4096,  # Fallback for requests without per-request max_completion_tokens
     temperature=0.7,
 )
 

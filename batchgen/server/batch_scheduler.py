@@ -7,7 +7,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from batchgen.server.io_struct import (
     BatchEndpoint,
@@ -55,7 +55,6 @@ def parse_batch_file(
 
     requests: List[BatchRequestItem] = []
     model_name: Optional[str] = None
-    max_tokens_value: Optional[int] = None
 
     for idx, line in enumerate(lines, start=1):
         if not line.strip():
@@ -68,25 +67,15 @@ def parse_batch_file(
 
         if isinstance(request.body, ChatCompletionRequest):
             current_model = request.body.model
-            current_max_tokens = request.body.max_tokens
         elif isinstance(request.body, CompletionRequest):
             current_model = request.body.model
-            current_max_tokens = request.body.max_tokens
         else:
             return False, f"Line {idx}: Unsupported request body", []
-
-        if not current_max_tokens:
-            return False, f"Line {idx}: max_tokens is required", []
 
         if model_name is None:
             model_name = current_model
         elif model_name != current_model:
             return False, f"Line {idx}: Inconsistent model value", []
-
-        if max_tokens_value is None:
-            max_tokens_value = current_max_tokens
-        elif max_tokens_value != current_max_tokens:
-            return False, f"Line {idx}: Inconsistent max_tokens value", []
 
         requests.append(request)
 
@@ -192,9 +181,42 @@ class BatchScheduler:
             )
             return
 
-        prompts, per_request_max_tokens = self._convert_requests_to_worker_inputs(requests)
-        # Use batch-level max_decoding_length if specified, otherwise use per-request value
-        max_tokens = batch.max_decoding_length or per_request_max_tokens
+        prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
+            requests, batch
+        )
+        # Apply batch-level max_decoding_length as fallback for requests without explicit value
+        default_max = batch.max_decoding_length
+        if default_max is None:
+            missing_ids = [
+                requests[i].get("custom_id", f"request-{i}")
+                for i, mt in enumerate(per_request_max_tokens)
+                if mt is None
+            ]
+            if missing_ids:
+                error_message = (
+                    f"Batch {batch_id}: {len(missing_ids)}/{len(per_request_max_tokens)} requests "
+                    f"have no max_completion_tokens or max_tokens, and no batch-level "
+                    f"max_decoding_length is set. Set one of these to proceed. "
+                    f"First missing: {missing_ids[:5]}"
+                )
+                logger.error(error_message)
+                self._update_batch_status(
+                    batch_id, BatchStatus.FAILED, error=error_message
+                )
+                return
+        per_request_max_tokens = [
+            mt if mt is not None else default_max
+            for mt in per_request_max_tokens
+        ]
+        max_tokens = max(per_request_max_tokens)
+
+        # Log batch-level sampling param defaults
+        if batch.temperature is not None or batch.top_p is not None or batch.top_k is not None:
+            logger.warning(
+                f"Batch {batch_id}: batch-level sampling params "
+                f"(temperature={batch.temperature}, top_p={batch.top_p}, top_k={batch.top_k}) "
+                f"serve as defaults only; per-request values take priority"
+            )
 
         # Build incremental writer metadata
         incremental_output_dir = (
@@ -222,9 +244,11 @@ class BatchScheduler:
                 None,  # max_input_len: dynamically determined from prompts
                 max_tokens,
                 False,  # ignore_eos
-                batch.temperature,  # None = greedy decoding
-                batch.top_p,  # None = disabled
+                None,  # temperature: handled via per-request sampling_params
+                None,  # top_p: handled via per-request sampling_params
                 max_context_length=batch.max_context_length,
+                sampling_params=sampling_params,
+                per_sequence_max_tokens=per_request_max_tokens,
                 **incremental_kwargs,
             )
         except Exception as exc:
@@ -281,10 +305,24 @@ class BatchScheduler:
         )
 
     def _convert_requests_to_worker_inputs(
-        self, requests: List[BatchRequestItem]
-    ) -> Tuple[List[str], int]:
+        self, requests: List[BatchRequestItem], batch=None,
+    ) -> Tuple[List[str], List[int], List[Dict[str, Any]]]:
+        """Convert batch requests to worker inputs with per-request sampling params.
+
+        Returns:
+            (prompts, per_request_max_tokens, sampling_params) where
+            per_request_max_tokens is a per-sequence list of max output token limits,
+            and sampling_params is a list of dicts with keys: temperature, top_p, top_k.
+            Per-request values take priority; batch-level values serve as defaults.
+        """
         prompts: List[str] = []
-        max_tokens: Optional[int] = None
+        per_request_max_tokens: List[int] = []
+        sampling_params: List[Dict[str, Any]] = []
+
+        # Batch-level defaults (fallback when per-request is None)
+        batch_temp = batch.temperature if batch else None
+        batch_top_p = batch.top_p if batch else None
+        batch_top_k = batch.top_k if batch else None
 
         for request in requests:
             body = request.body
@@ -304,20 +342,34 @@ class BatchScheduler:
                 prompt = self._format_chat_messages(
                     messages, body.model, **template_kwargs
                 )
-                current_max_tokens = body.max_tokens or 128
+                # Priority: max_completion_tokens > max_tokens > None
+                current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
             elif isinstance(body, CompletionRequest):
                 prompt = completion_prompt_to_text(body.prompt)
-                current_max_tokens = body.max_tokens or 128
+                current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
             else:
                 raise ValueError("Unsupported request body type")
 
             prompts.append(prompt)
-            if max_tokens is None:
-                max_tokens = current_max_tokens
+            per_request_max_tokens.append(current_max_tokens)
 
-        if max_tokens is None:
-            max_tokens = 128  # Default max output tokens
-        return prompts, max_tokens
+            # Extract per-request sampling params with batch-level fallback
+            req_temp = getattr(body, 'temperature', None)
+            req_top_p = getattr(body, 'top_p', None)
+            req_top_k = getattr(body, 'top_k', None)
+
+            # Apply fallback: per-request → batch-level → None
+            effective_temp = req_temp if req_temp is not None else batch_temp
+            effective_top_p = req_top_p if req_top_p is not None else batch_top_p
+            effective_top_k = req_top_k if req_top_k is not None else batch_top_k
+
+            sampling_params.append({
+                'temperature': effective_temp,
+                'top_p': effective_top_p,
+                'top_k': effective_top_k,
+            })
+
+        return prompts, per_request_max_tokens, sampling_params
 
     def _inject_reasoning_effort(
         self,

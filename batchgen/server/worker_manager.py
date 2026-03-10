@@ -333,7 +333,9 @@ class WorkerManager:
         incremental_output_dir: Optional[str] = None,
         parse_thinking: bool = False,
         parse_tool_call: bool = False,
-        max_context_length: int = 131072,
+        max_context_length: Optional[int] = None,
+        sampling_params: Optional[List[Dict[str, Any]]] = None,
+        per_sequence_max_tokens: Optional[List[int]] = None,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -346,6 +348,12 @@ class WorkerManager:
             "top_p": top_p,
             "max_context_length": max_context_length,
         }
+        # Per-request sampling parameters (list of dicts with temperature/top_p/top_k)
+        if sampling_params is not None:
+            payload["sampling_params"] = sampling_params
+        # Per-sequence max output token limits
+        if per_sequence_max_tokens is not None:
+            payload["per_sequence_max_tokens"] = per_sequence_max_tokens
         # Incremental writer metadata (only included when active)
         if incremental_output_dir and custom_id_map:
             payload["incremental_output_dir"] = incremental_output_dir

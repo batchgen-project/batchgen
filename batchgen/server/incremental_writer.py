@@ -54,6 +54,7 @@ class IncrementalWriter:
         prompt_texts: Dict[int, str],
         tokenizer: Any,
         eos_token_ids: Set[int],
+        pad_token_id: int = 0,
         parse_thinking: bool = False,
         parse_tool_call: bool = False,
     ):
@@ -66,6 +67,7 @@ class IncrementalWriter:
         self._prompt_texts = prompt_texts
         self._tokenizer = tokenizer
         self._eos_token_ids = set(eos_token_ids)
+        self._pad_token_id = pad_token_id
         self._parse_thinking = parse_thinking
         self._parse_tool_call = parse_tool_call
 
@@ -216,7 +218,7 @@ class IncrementalWriter:
             error=None,
         )
 
-        return json.dumps(result_item.dict(), default=str)
+        return json.dumps(result_item.dict(), default=str, ensure_ascii=False)
 
     # -------------------- Helpers --------------------
 
@@ -238,9 +240,9 @@ class IncrementalWriter:
         if eos_positions:
             end_pos = eos_positions[0]
         else:
-            # No EOS: use all non-zero tokens
-            non_zero = [i for i, t in enumerate(tokens_list) if t != 0]
-            end_pos = non_zero[-1] + 1 if non_zero else len(tokens_list)
+            # No EOS: use all non-padding tokens
+            non_pad = [i for i, t in enumerate(tokens_list) if t != self._pad_token_id]
+            end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
 
         return self._tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
 
@@ -252,7 +254,7 @@ class IncrementalWriter:
         for i, t in enumerate(tokens_list):
             if t in self._eos_token_ids and i >= 1:
                 return i
-            if t == 0:
+            if t == self._pad_token_id:
                 return i
         return len(tokens_list)
 

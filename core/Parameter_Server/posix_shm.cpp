@@ -400,9 +400,21 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             }
             allocated_size = aligned_size;
             madvise(ptr, allocated_size, MADV_HUGEPAGE);
-            // Skip touch_pages — weight loading writes every byte of the region,
-            // which faults pages in naturally with THP via madvise above.
-            logger->info("--fast-init: Skipping page touching for weights memfd (pages fault in during weight copy)");
+            // Pre-fault THP pages before weight loading to avoid
+            // non-deterministic compaction stalls during direct I/O.
+            {
+                auto touch_start = std::chrono::high_resolution_clock::now();
+                bool ok = touch_pages(ptr, allocated_size, huge_page_size, /*multi_threaded=*/true);
+                auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::high_resolution_clock::now() - touch_start).count();
+                if (ok) {
+                    logger->info("--fast-init: Weights page touching completed in {:.2f}s ({:.1f} GB)",
+                                 touch_ms / 1000.0, allocated_size / (1024.0 * 1024.0 * 1024.0));
+                } else {
+                    logger->warn("--fast-init: Weights page touching failed after {:.2f}s, proceeding anyway",
+                                 touch_ms / 1000.0);
+                }
+            }
             if (out_memfd_fd) {
                 *out_memfd_fd = fd;
             }

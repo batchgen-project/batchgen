@@ -67,7 +67,7 @@ class SequenceEntry:
     __slots__ = (
         'uuid', 'global_idx', 'prompt_length', 'max_decode_length',
         'status', 'decoded_length', 'current_context_length',
-        'input_ids', 'attention_mask', 'decoded_tokens',
+        'input_ids', 'decoded_tokens',
         'kv_token_budget', 'assigned_rank', 'text', 'eos_reached',
         # Two-page buffer tracking
         'gpu_pages_allocated',
@@ -81,6 +81,7 @@ class SequenceEntry:
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
         'original_max_decode_length',  # Original max_decode_length before eviction
         'total_decoded_before_eviction',  # Tokens decoded before this eviction cycle
+        '_buffer_slot',  # Index into QueryBookBufferPool buffers
     )
 
     VALID_TRANSITIONS = {
@@ -112,7 +113,6 @@ class SequenceEntry:
         self.decoded_length = 0
         self.current_context_length = prompt_length
         self.input_ids: Optional[torch.Tensor] = None
-        self.attention_mask: Optional[torch.Tensor] = None
         self.decoded_tokens: Optional[torch.Tensor] = None
         self.kv_token_budget: int = prompt_length + max_decode_length
         self.assigned_rank: Optional[int] = None
@@ -136,6 +136,7 @@ class SequenceEntry:
         self.original_prompt_length: int = prompt_length
         self.original_max_decode_length: int = max_decode_length
         self.total_decoded_before_eviction: int = 0
+        self._buffer_slot: int = -1
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:

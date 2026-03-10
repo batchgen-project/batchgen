@@ -31,11 +31,13 @@ class ChatCompletionRequest(BaseModel):
     )
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
+    top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)
     stream: Optional[bool] = Field(
         default=False, description="Must be false for batch requests"
     )
     max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     logit_bias: Optional[Dict[str, float]] = None
@@ -68,9 +70,11 @@ class CompletionRequest(BaseModel):
     prompt: Union[str, List[str]] = Field(
         ..., description="Prompt(s) for completion"
     )
-    max_tokens: Optional[int] = Field(default=16, ge=1)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
+    top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)
     stream: Optional[bool] = Field(default=False)
     logprobs: Optional[int] = Field(default=None, ge=0, le=5)
@@ -149,11 +153,12 @@ class CreateBatchRequest(BaseModel):
     endpoint: BatchEndpoint = BatchEndpoint.CHAT_COMPLETIONS
     completion_window: CompletionWindow = CompletionWindow.ONE_DAY
     metadata: Optional[Dict[str, Any]] = None
-    # Inference parameters (override per-request values)
+    # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = Field(default=None, ge=1)
-    max_context_length: int = Field(default=131072, ge=1)  # Max total context (prompt + decode). Default 128K.
+    max_context_length: Optional[int] = Field(default=None, ge=1)  # Max total context (prompt + decode). None = use model max.
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
+    top_k: Optional[int] = Field(default=None, ge=0)
 
 
 class BatchObject(BaseModel):
@@ -172,11 +177,12 @@ class BatchObject(BaseModel):
     cancelling_at: Optional[int] = None
     error: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    # Inference parameters (set at batch creation, None = use defaults)
+    # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = None
-    max_context_length: int = 131072  # Default 128K
+    max_context_length: Optional[int] = None  # None = use model max
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    top_k: Optional[int] = None
 
     @root_validator(pre=True)
     def default_timestamps(cls, values: Dict[str, Any]) -> Dict[str, Any]:

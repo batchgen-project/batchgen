@@ -52,9 +52,10 @@ result = client.submit_batch(
 | `endpoint` | string | `/v1/chat/completions` | Target endpoint (`/v1/chat/completions` or `/v1/completions`) |
 | `poll_interval` | float | 5.0 | Seconds between status checks |
 | `timeout` | float | None | Maximum seconds to wait (None = unlimited) |
-| `max_decoding_length` | int | None | Override max decoding length for all requests (None = use per-request values) |
+| `max_decoding_length` | int | None | Batch-level fallback for requests without explicit `max_completion_tokens` or `max_tokens` (None = required per-request) |
 | `temperature` | float | None | Sampling temperature (None = greedy decoding) |
 | `top_p` | float | None | Nucleus sampling threshold (None = disabled) |
+| `top_k` | int | None | Top-k filtering threshold (None = disabled) |
 
 ### Step-by-Step Batch API
 
@@ -100,9 +101,10 @@ Create a batch job.
 | `endpoint` | string | `/v1/chat/completions` | Target endpoint |
 | `completion_window` | string | `24h` | Time window for completion |
 | `metadata` | dict | None | Optional metadata dictionary |
-| `max_decoding_length` | int | None | Override max decoding length for all requests |
+| `max_decoding_length` | int | None | Batch-level fallback for requests without explicit `max_completion_tokens` or `max_tokens` |
 | `temperature` | float | None | Sampling temperature |
 | `top_p` | float | None | Nucleus sampling threshold |
+| `top_k` | int | None | Top-k filtering threshold |
 
 ### wait_for_batch()
 
@@ -189,8 +191,8 @@ Batch input files use OpenAI-compatible JSONL format. Each line is a separate re
 ### Chat Completions
 
 ```jsonl
-{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "deepseek-r1", "messages": [{"role": "user", "content": "What is AI?"}], "max_tokens": 100}}
-{"custom_id": "req-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "deepseek-r1", "messages": [{"role": "user", "content": "Explain ML."}], "max_tokens": 200}}
+{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "deepseek-r1", "messages": [{"role": "user", "content": "What is AI?"}], "max_completion_tokens": 100}}
+{"custom_id": "req-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "deepseek-r1", "messages": [{"role": "user", "content": "Explain ML."}], "max_completion_tokens": 200}}
 ```
 
 ### Text Completions
@@ -207,9 +209,13 @@ Batch input files use OpenAI-compatible JSONL format. Each line is a separate re
 | `model` | string | Model identifier (for compatibility, not used by BatchGen) |
 | `messages` | array | Chat messages with `role` and `content` |
 | `prompt` | string | Text prompt (for text completions) |
-| `max_tokens` | int | Maximum tokens to generate |
+| `max_completion_tokens` | int | Maximum output tokens to generate (preferred, OpenAI-compatible) |
+| `max_tokens` | int | Maximum output tokens to generate (legacy alias for `max_completion_tokens`) |
 | `temperature` | float | Sampling temperature (0.0 = greedy) |
 | `top_p` | float | Nucleus sampling threshold |
+| `top_k` | int | Top-k filtering threshold |
+
+**Note:** Per-request sampling parameters override batch-level defaults. See [Input Format](input-format.md) for the full override logic.
 
 ---
 
@@ -252,6 +258,7 @@ python test/r1_mmlu_pro_test/r1_mmlu_pro_batch_test.py \
     --server_port 10900 \
     --temperature 0.7 \
     --top_p 0.9 \
+    --top_k 50 \
     --max_prompts 100
 ```
 
@@ -260,12 +267,17 @@ python test/r1_mmlu_pro_test/r1_mmlu_pro_batch_test.py \
 | Argument | Type | Required | Description |
 |----------|------|----------|-------------|
 | `--hugging_face_checkpoint` | string | Yes | Path to model checkpoint (used for tokenizer) |
-| `--max_decoding_length` | int | Yes | Maximum tokens to generate (becomes `max_tokens` in request body) |
+| `--max_decoding_length` | int | Conditional | Batch-level fallback max output tokens (required unless `--random_max_completion_tokens` is set) |
+| `--random_max_completion_tokens` | flag | No | Generate random per-request `max_completion_tokens` for each request |
+| `--min_completion_tokens` | int | No | Lower bound for random `max_completion_tokens` (default: 16) |
+| `--max_completion_tokens` | int | No | Upper bound for random `max_completion_tokens` (default: `--max_decoding_length`) |
 | `--server_host` | string | No | Server hostname (default: `localhost`) |
 | `--server_port` | int | No | Server port (default: `10900`) |
 | `--base_url` | string | No | Full server URL (alternative to host/port, e.g., `http://localhost:10900`) |
 | `--temperature` | float | No | Sampling temperature (default: None = greedy decoding) |
 | `--top_p` | float | No | Nucleus sampling threshold (default: None = disabled) |
+| `--top_k` | int | No | Top-k filtering threshold (default: None = disabled) |
+| `--random_sampling_params` | flag | No | Generate random per-request sampling params for each request |
 | `--poll_interval` | float | No | Seconds between batch status checks (default: `5.0`) |
 | `--timeout` | float | No | Maximum seconds to wait for batch completion (default: None = unlimited) |
 | `--max_prompts` | int | No | Limit number of prompts to process (default: None = all) |
@@ -276,10 +288,12 @@ The CLI arguments map to client API parameters as follows:
 
 | CLI Argument | Client API Parameter | Request Body Field |
 |--------------|---------------------|-------------------|
-| `--max_decoding_length` | `max_decoding_length` | `body.max_tokens` |
+| `--max_decoding_length` | `max_decoding_length` | Batch-level fallback (not written to body) |
+| `--random_max_completion_tokens` | - | `body.max_completion_tokens` (random per-request) |
 | `--server_host` + `--server_port` | `base_url` | - |
 | `--temperature` | `temperature` | `body.temperature` |
 | `--top_p` | `top_p` | `body.top_p` |
+| `--top_k` | `top_k` | `body.top_k` |
 
 ### Custom Test Scripts
 

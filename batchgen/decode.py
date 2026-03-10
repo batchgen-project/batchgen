@@ -176,7 +176,8 @@ class Decode():
 		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
 
 	def config_decode(self, num_seq, comm=None):
-		logging.info(f"Start Config Decoding")
+		if self.rank == 0:
+			logging.info("Start Config Decoding")
 		self.deep_free_model_memory()
 
 		# self.gpu_paged_kv_manager.initialize()
@@ -204,7 +205,8 @@ class Decode():
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 
-		logging.info(f"{self.rank} End Config Decoding")
+		if self.rank == 0:
+			logging.info("End Config Decoding")
 
 	def cleanup_decode(self):
 		pass

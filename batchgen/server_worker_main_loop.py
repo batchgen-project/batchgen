@@ -316,14 +316,21 @@ def _server_worker_main_impl(
 			# max_input_len: If None or not provided, will be determined dynamically
 			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
-			current_max_output = task_data.get("max_output_len", 128)
-			max_context_length = task_data.get("max_context_length", 131072)
+			current_max_output = task_data.get("max_output_len")
+			max_context_length = task_data.get("max_context_length", None)
 			ignore_eos = task_data.get("ignore_eos", False)
 			# Sampling parameters (None = greedy decoding)
 			temperature = task_data.get("temperature", None)
 			top_p = task_data.get("top_p", None)
+			# Per-request sampling params (list of dicts, one per prompt)
+			sampling_params = task_data.get("sampling_params", None)
+			# Per-sequence max output token limits
+			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
 			if global_rank == 0:
-				logging.info(f"[PAYLOAD] Extracted from task_data: temperature={temperature}, top_p={top_p}")
+				if sampling_params:
+					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
+				else:
+					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
 
 			# Stage incremental writer config on rank 0 (writer created after tokenizer init)
 			incr_output_dir = task_data.get("incremental_output_dir")
@@ -353,11 +360,19 @@ def _server_worker_main_impl(
 				# Set ignore_eos flag on worker
 				worker.set_ignore_eos(ignore_eos)
 
-				# Set sampling parameters (None = greedy decoding)
-				worker.set_sampling_params(temperature=temperature, top_p=top_p)
+				# Set sampling parameters
+				if sampling_params:
+					# Per-request sampling params from batch API
+					worker.set_per_sequence_sampling_params(sampling_params)
+				else:
+					# Global sampling params (legacy /v1/inference path)
+					worker.set_sampling_params(temperature=temperature, top_p=top_p)
 
 				# Process the global batch - worker internally handles distribution
-				local_results = worker.process_new_batch(global_prompts)
+				local_results = worker.process_new_batch(
+					global_prompts,
+					per_sequence_max_tokens=per_sequence_max_tokens,
+				)
 			else:
 				local_results = []
 

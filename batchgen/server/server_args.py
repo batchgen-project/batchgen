@@ -96,7 +96,7 @@ class ServerArgs:
     # Dynamic host KV reservation settings
     host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
     host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
-    enable_host_kv_eviction: bool = False  # Enable host KV eviction + prefill recompute
+    enable_host_kv_eviction: bool = False  # Deprecated: eviction is always enabled when chunked host KV is active
     adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
     adaptive_chunk_min: int = 1024  # Minimum adaptive chunk size in tokens
     adaptive_chunk_max: int = 65536  # Maximum adaptive chunk size in tokens
@@ -359,7 +359,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--enable-host-kv-eviction",
         action="store_true",
         default=False,
-        help="Enable host KV eviction with prefill recompute for evicted sequences (default: disabled)",
+        help="[Deprecated] Host KV eviction is now always enabled. This flag is ignored.",
     )
     parser.add_argument(
         "--adaptive-chunk",

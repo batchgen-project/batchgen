@@ -201,10 +201,10 @@ class BatchTokenizer:
         if eos_positions:
             end_pos = eos_positions[0]
         else:
-            # No EOS found, use all non-zero tokens
-            # Find last non-zero token
-            non_zero = [i for i, t in enumerate(tokens_list) if t != 0]
-            end_pos = non_zero[-1] + 1 if non_zero else len(tokens_list)
+            # No EOS found, use all non-padding tokens
+            pad_id = getattr(self.tokenizer, 'pad_token_id', 0)
+            non_pad = [i for i, t in enumerate(tokens_list) if t != pad_id]
+            end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
 
         # Decode tokens up to end position
         return self.tokenizer.decode(
