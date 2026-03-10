@@ -233,7 +233,7 @@ class WorkerManager:
 
         # Stop the monitor thread
         if self._monitor_thread is not None:
-            self._monitor_thread.join(timeout=5)
+            self._monitor_thread.join(timeout=1)
 
         # Collect worker PIDs before sending shutdown signal
         worker_pids = self._get_worker_pids()
