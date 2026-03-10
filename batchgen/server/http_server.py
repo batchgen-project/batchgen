@@ -110,6 +110,10 @@ def create_app(
         )
         print(f"[startup] End-to-end server ready in {e2e_elapsed:.2f}s", flush=True)
 
+        # Install signal handlers HERE — after uvicorn has set up its own.
+        # This ensures our handlers override uvicorn's default graceful shutdown.
+        app.state._install_shutdown_handlers()
+
         try:
             yield
         finally:
@@ -499,6 +503,42 @@ def launch_server(server_args: ServerArgs) -> None:
             )
             t.start()
 
+    def _fast_shutdown():
+        """Fast shutdown: kill workers, clean resources, exit."""
+        logger.info("Fast shutdown: stopping workers...")
+        try:
+            # Get worker manager from app state
+            worker = getattr(app.state, "worker", None)
+            if worker is not None:
+                worker.stop()
+        except Exception:
+            logger.warning("Worker stop failed, continuing shutdown.", exc_info=True)
+
+        logger.info("Fast shutdown: cleaning resources...")
+        try:
+            cleanup_resources(shm_prefix=None, clean_hugepages=False, kill_workers=True)
+        except Exception:
+            pass
+
+        # Background hugepage cleanup — don't block exit
+        from batchgen.server.process_utils import (
+            cleanup_hugepages_files, unmount_hugetlbfs, reset_hugepages_allocation
+        )
+        def _hp_cleanup():
+            try:
+                cleanup_hugepages_files()
+                unmount_hugetlbfs()
+                reset_hugepages_allocation()
+            except Exception:
+                pass
+
+        hp_thread = threading.Thread(target=_hp_cleanup, daemon=True)
+        hp_thread.start()
+        hp_thread.join(timeout=3.0)
+
+        logger.info("Fast shutdown complete.")
+        os._exit(0)
+
     def shutdown_handler(signum, frame):
         sig_name = signal.Signals(signum).name
 
@@ -508,15 +548,22 @@ def launch_server(server_args: ServerArgs) -> None:
             os._exit(1)
 
         _shutdown_state["requested"] = True
-        logger.info("Received %s, initiating shutdown...", sig_name)
+        logger.info("Received %s, initiating fast shutdown...", sig_name)
         _do_peer_kill()
-        raise KeyboardInterrupt()
 
-    # Install signal handlers for shutdown
-    # SIGQUIT is sent by watchdog when worker timeout occurs
-    original_sigint = signal.signal(signal.SIGINT, shutdown_handler)
-    original_sigterm = signal.signal(signal.SIGTERM, shutdown_handler)
-    original_sigquit = signal.signal(signal.SIGQUIT, shutdown_handler)
+        # Run fast shutdown in a thread so signal handler returns quickly.
+        # This bypasses uvicorn's slow graceful shutdown.
+        t = threading.Thread(target=_fast_shutdown, daemon=True, name="fast-shutdown")
+        t.start()
+
+    def _install_shutdown_handlers():
+        """Install signal handlers. Called from lifespan AFTER uvicorn sets its own."""
+        signal.signal(signal.SIGINT, shutdown_handler)
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        signal.signal(signal.SIGQUIT, shutdown_handler)
+        logger.info("Fast shutdown signal handlers installed.")
+
+    app.state._install_shutdown_handlers = _install_shutdown_handlers
 
     try:
         logger.info("Starting BatchGen HTTP server.")
@@ -533,38 +580,10 @@ def launch_server(server_args: ServerArgs) -> None:
         if _shutdown_state["requested"]:
             logger.info("Shutdown initiated by signal.")
     finally:
-        # Restore original signal handlers so a second signal triggers os._exit
-        signal.signal(signal.SIGINT, original_sigint)
-        signal.signal(signal.SIGTERM, original_sigterm)
-        signal.signal(signal.SIGQUIT, original_sigquit)
-
-        logger.info("HTTP server stopped.")
-
-        # Kill workers + clean SHM (required for next launch).
-        # Hugepage cleanup is done in background (non-blocking).
-        cleanup_resources(
-            shm_prefix=None,
-            clean_hugepages=False,
-            kill_workers=True,
-        )
-
-        # Background hugepage cleanup with 3s timeout
-        from batchgen.server.process_utils import (
-            cleanup_hugepages_files, unmount_hugetlbfs, reset_hugepages_allocation
-        )
-        def _background_hugepage_cleanup():
-            try:
-                cleanup_hugepages_files()
-                unmount_hugetlbfs()
-                reset_hugepages_allocation()
-            except Exception as e:
-                logger.warning("Hugepage cleanup error: %s", e)
-
-        hp_thread = threading.Thread(target=_background_hugepage_cleanup, daemon=True)
-        hp_thread.start()
-        hp_thread.join(timeout=3.0)
-        if hp_thread.is_alive():
-            logger.warning("Hugepage cleanup still running after 3s, exiting anyway.")
+        if not _shutdown_state["requested"]:
+            # Normal exit (not via signal) — still clean up
+            logger.info("HTTP server stopped.")
+            cleanup_resources(shm_prefix=None, clean_hugepages=False, kill_workers=True)
 
         if worker_exit_state.is_failed():
             reason = worker_exit_state.reason or "Worker process exited."
