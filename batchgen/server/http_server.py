@@ -112,7 +112,11 @@ def create_app(
 
         # Install signal handlers HERE — after uvicorn has set up its own.
         # This ensures our handlers override uvicorn's default graceful shutdown.
-        app.state._install_shutdown_handlers()
+        # Use loop.add_signal_handler for compatibility with uvloop.
+        try:
+            app.state._install_shutdown_handlers()
+        except Exception as e:
+            logger.warning("Failed to install shutdown handlers: %s", e)
 
         try:
             yield
@@ -558,10 +562,25 @@ def launch_server(server_args: ServerArgs) -> None:
 
     def _install_shutdown_handlers():
         """Install signal handlers. Called from lifespan AFTER uvicorn sets its own."""
-        signal.signal(signal.SIGINT, shutdown_handler)
-        signal.signal(signal.SIGTERM, shutdown_handler)
-        signal.signal(signal.SIGQUIT, shutdown_handler)
-        logger.info("Fast shutdown signal handlers installed.")
+        import asyncio as _asyncio
+
+        def _signal_callback(signum):
+            shutdown_handler(signum, None)
+
+        try:
+            loop = _asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
+                loop.add_signal_handler(sig, _signal_callback, sig)
+            logger.info("Fast shutdown signal handlers installed (via event loop).")
+        except Exception as e1:
+            # Fallback to signal.signal if loop method fails
+            try:
+                signal.signal(signal.SIGINT, shutdown_handler)
+                signal.signal(signal.SIGTERM, shutdown_handler)
+                signal.signal(signal.SIGQUIT, shutdown_handler)
+                logger.info("Fast shutdown signal handlers installed (via signal.signal).")
+            except Exception as e2:
+                logger.error("Failed to install shutdown handlers: loop=%s, signal=%s", e1, e2)
 
     app.state._install_shutdown_handlers = _install_shutdown_handlers
 
