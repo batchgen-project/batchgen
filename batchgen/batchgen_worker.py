@@ -1396,6 +1396,14 @@ class BatchGenWorker:
 		)
 
 		self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
+		host_kv_runtime_cfg = getattr(self.engine_config, "Host_Paged_KV_Config", None)
+		if host_kv_runtime_cfg is not None:
+			host_kv_runtime_cfg.enable_prefix_reuse = bool(
+				getattr(worker_kv_config, "enable_prefix_reuse", False)
+			)
+			host_kv_runtime_cfg.page_size = int(
+				getattr(worker_kv_config, "page_size_tokens", host_kv_runtime_cfg.page_size)
+			)
 		self.engine_config.Basic_Config.num_queries = num_queries
 
 		# Set CUDA graph config from command-line args
@@ -5096,10 +5104,14 @@ class BatchGenWorker:
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
 			host_cfg = getattr(self.engine_config, "Host_Paged_KV_Config", None)
-			enable_prefix_reuse = (
-				host_cfg is not None
-				and getattr(host_cfg, "enable_prefix_reuse", False)
-			)
+			enable_prefix_reuse = bool(getattr(self.args, "enable_prefix_cache", False))
+			page_size = seq.PAGE_SIZE
+			if host_cfg is not None:
+				enable_prefix_reuse = (
+					enable_prefix_reuse
+					or bool(getattr(host_cfg, "enable_prefix_reuse", False))
+				)
+				page_size = max(1, int(getattr(host_cfg, "page_size", page_size)))
 			if enable_prefix_reuse:
 				_, reused_prefix_tokens = self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences_with_prefix(
 					list(zip(global_sequence_ids, sequence_tokens)),
@@ -5108,7 +5120,6 @@ class BatchGenWorker:
 				)
 				reused_sequences = sum(1 for tokens in reused_prefix_tokens if tokens > 0)
 				reused_tokens_total = sum(int(tokens) for tokens in reused_prefix_tokens)
-				page_size = max(1, int(getattr(host_cfg, "page_size_tokens", 1)))
 				if reused_sequences > 0:
 					logging.info(
 						f"Rank {self.rank}: PrefixCache allocation summary "
