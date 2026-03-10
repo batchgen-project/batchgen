@@ -108,7 +108,7 @@ def create_app(
         logger.info(
             "[startup] End-to-end server ready in %.2fs", e2e_elapsed,
         )
-        print(f"[startup] End-to-end server ready in {e2e_elapsed:.2f}s", flush=True)
+        print(f"[startup] End-to-end server ready in {e2e_elapsed:.2f}s")
 
         # Install signal handlers HERE — after uvicorn has set up its own.
         # This ensures our handlers override uvicorn's default graceful shutdown.
@@ -509,7 +509,8 @@ def launch_server(server_args: ServerArgs) -> None:
 
     def _fast_shutdown():
         """Fast shutdown: kill workers, clean resources, exit."""
-        print("[FastKill] Fast shutdown: stopping workers...", flush=True)
+        _ts = time.strftime("%H:%M:%S")
+        print(f"[{_ts}] [FastKill] Stopping workers...", flush=True)
         try:
             # Get worker manager from app state
             worker = getattr(app.state, "worker", None)
@@ -540,7 +541,8 @@ def launch_server(server_args: ServerArgs) -> None:
         hp_thread.start()
         hp_thread.join(timeout=3.0)
 
-        print("[FastKill] Fast shutdown complete, exiting.", flush=True)
+        _ts = time.strftime("%H:%M:%S")
+        print(f"[{_ts}] [FastKill] Shutdown complete.", flush=True)
         os._exit(0)
 
     def shutdown_handler(signum, frame):
@@ -552,7 +554,8 @@ def launch_server(server_args: ServerArgs) -> None:
             os._exit(1)
 
         _shutdown_state["requested"] = True
-        print(f"[FastKill] Received {sig_name}, initiating fast shutdown...", flush=True)
+        _ts = time.strftime("%H:%M:%S")
+        print(f"[{_ts}] [FastKill] Received {sig_name}, shutting down...", flush=True)
         _do_peer_kill()
 
         # Run fast shutdown in a thread so signal handler returns quickly.
@@ -571,14 +574,14 @@ def launch_server(server_args: ServerArgs) -> None:
             loop = _asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
                 loop.add_signal_handler(sig, _signal_callback, sig)
-            print("[FastKill] Signal handlers installed (via event loop).", flush=True)
+            print("[FastKill] Signal handlers installed.", flush=True)
         except Exception as e1:
             # Fallback to signal.signal if loop method fails
             try:
                 signal.signal(signal.SIGINT, shutdown_handler)
                 signal.signal(signal.SIGTERM, shutdown_handler)
                 signal.signal(signal.SIGQUIT, shutdown_handler)
-                print("[FastKill] Signal handlers installed (via signal.signal).", flush=True)
+                print("[FastKill] Signal handlers installed (fallback).", flush=True)
             except Exception as e2:
                 print(f"[FastKill] FAILED to install handlers: loop={e1}, signal={e2}", flush=True)
 
