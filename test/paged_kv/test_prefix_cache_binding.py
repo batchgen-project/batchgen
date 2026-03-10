@@ -135,3 +135,42 @@ def test_prefix_cache_harness_duplicate_commit_avoids_spurious_evict() -> None:
     assert stats_after.prefix_evict_count == 0
     assert cache.page_refcount(0) == 1
     assert cache.page_refcount(1) == 1
+
+
+def test_prefix_cache_harness_lookup_refreshes_lru_recency() -> None:
+    cache = _make_prefix_cache(num_pages=12, prefix_page_budget=4)
+    tokens_a = [6000 + i for i in range(128)]
+    tokens_b = [7000 + i for i in range(128)]
+    tokens_c = [8000 + i for i in range(128)]
+
+    assert cache.commit(tokens_a, [0, 1]) is True
+    assert cache.commit(tokens_b, [2, 3]) is True
+
+    pages, reused = cache.lookup(tokens_a, 2)
+    assert pages == [0, 1]
+    assert reused == 2
+
+    assert cache.commit(tokens_c, [4, 5]) is True
+    stats = cache.get_stats()
+    assert stats.prefix_evict_count >= 1
+    assert stats.prefix_entry_count == 2
+    assert stats.prefix_used_pages == 4
+
+    pages, reused = cache.lookup(tokens_a, 2)
+    assert pages == [0, 1]
+    assert reused == 2
+
+    pages, reused = cache.lookup(tokens_b, 2)
+    assert pages == []
+    assert reused == 0
+
+    pages, reused = cache.lookup(tokens_c, 2)
+    assert pages == [4, 5]
+    assert reused == 2
+
+    assert cache.page_refcount(0) == 1
+    assert cache.page_refcount(1) == 1
+    assert cache.page_refcount(2) == 0
+    assert cache.page_refcount(3) == 0
+    assert cache.page_refcount(4) == 1
+    assert cache.page_refcount(5) == 1

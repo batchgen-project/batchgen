@@ -218,6 +218,155 @@ def test_prefix_reuse_includes_decode_tokens() -> None:
         _shm_unlink(shm_name)
 
 
+def test_prefix_reuse_waits_for_full_decode_page_before_commit() -> None:
+    if not torch.cuda.is_available():
+        raise SkipTest("CUDA is not available")
+
+    shm_name = _random_shm_name()
+    cfg = _make_mla_config(
+        shm_name, enable_prefix_reuse=True, page_size_tokens=8
+    )
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+
+    try:
+        worker.initialize(device_index=0, create_region=True)
+
+        prompt_tokens = [500 + i for i in range(cfg.page_size_tokens)]
+        decode_tokens = [600 + i for i in range(cfg.page_size_tokens - 1)]
+        full_tokens = prompt_tokens + decode_tokens
+
+        worker.register_sequences([351])
+        pages_1, reused_1 = worker.allocate_pages_for_sequences_with_prefix(
+            [(351, len(full_tokens))], prompt_tokens, [0, len(prompt_tokens)]
+        )
+        assert reused_1 == [0]
+        assert len(pages_1[0]) == 2
+
+        prefill_k = torch.full(
+            (1, len(prompt_tokens), cfg.num_k_heads, cfg.k_head_dim),
+            fill_value=1.0,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        worker.async_offload_layer_kv_to_host(
+            layer_idx=0,
+            sequence_ids=[351],
+            k_tensor=prefill_k,
+            v_tensor=None,
+            sequence_lengths=[len(prompt_tokens)],
+        ).wait()
+
+        for step, token_id in enumerate(decode_tokens):
+            decode_k = torch.full(
+                (1, 1, cfg.num_k_heads, cfg.k_head_dim),
+                fill_value=2.0 + step,
+                dtype=torch.bfloat16,
+                device="cuda:0",
+            )
+            worker.async_append_decode_kv_to_host(
+                layer_idx=0,
+                sequence_ids=[351],
+                k_tensor=decode_k,
+                v_tensor=None,
+                sequence_lengths=[len(prompt_tokens) + step],
+                decode_token_ids=[token_id],
+            ).wait()
+
+        worker.release_sequence_pages([351])
+
+        worker.register_sequences([352])
+        pages_2, reused_2 = worker.allocate_pages_for_sequences_with_prefix(
+            [(352, len(full_tokens))], full_tokens, [0, len(full_tokens)]
+        )
+
+        assert len(pages_2[0]) == 2
+        assert reused_2 == [len(prompt_tokens)]
+
+        stats = worker.get_stats()
+        assert stats.num_prefix_hits >= 1
+        assert stats.num_shared_pages >= 1
+
+        worker.release_sequence_pages([352])
+    finally:
+        worker.shutdown()
+        del worker
+        _shm_unlink(shm_name)
+
+
+def test_prefix_reuse_skips_decode_extension_when_token_ids_missing() -> None:
+    if not torch.cuda.is_available():
+        raise SkipTest("CUDA is not available")
+
+    shm_name = _random_shm_name()
+    cfg = _make_mla_config(
+        shm_name, enable_prefix_reuse=True, page_size_tokens=8
+    )
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+
+    try:
+        worker.initialize(device_index=0, create_region=True)
+
+        prompt_tokens = [700 + i for i in range(cfg.page_size_tokens)]
+        decode_tokens = [800 + i for i in range(cfg.page_size_tokens)]
+        full_tokens = prompt_tokens + decode_tokens
+
+        worker.register_sequences([361])
+        pages_1, reused_1 = worker.allocate_pages_for_sequences_with_prefix(
+            [(361, len(full_tokens))], prompt_tokens, [0, len(prompt_tokens)]
+        )
+        assert reused_1 == [0]
+        assert len(pages_1[0]) == 2
+
+        prefill_k = torch.full(
+            (1, len(prompt_tokens), cfg.num_k_heads, cfg.k_head_dim),
+            fill_value=1.0,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        worker.async_offload_layer_kv_to_host(
+            layer_idx=0,
+            sequence_ids=[361],
+            k_tensor=prefill_k,
+            v_tensor=None,
+            sequence_lengths=[len(prompt_tokens)],
+        ).wait()
+
+        for step in range(len(decode_tokens)):
+            decode_k = torch.full(
+                (1, 1, cfg.num_k_heads, cfg.k_head_dim),
+                fill_value=3.0 + step,
+                dtype=torch.bfloat16,
+                device="cuda:0",
+            )
+            worker.async_append_decode_kv_to_host(
+                layer_idx=0,
+                sequence_ids=[361],
+                k_tensor=decode_k,
+                v_tensor=None,
+                sequence_lengths=[len(prompt_tokens) + step],
+            ).wait()
+
+        worker.release_sequence_pages([361])
+
+        worker.register_sequences([362])
+        pages_2, reused_2 = worker.allocate_pages_for_sequences_with_prefix(
+            [(362, len(full_tokens))], full_tokens, [0, len(full_tokens)]
+        )
+
+        assert len(pages_2[0]) == 2
+        assert reused_2 == [len(prompt_tokens)]
+
+        stats = worker.get_stats()
+        assert stats.num_prefix_hits >= 1
+        assert stats.num_shared_pages >= 1
+
+        worker.release_sequence_pages([362])
+    finally:
+        worker.shutdown()
+        del worker
+        _shm_unlink(shm_name)
+
+
 def test_prefix_batch_allocation_failure_rolls_back() -> None:
     if not torch.cuda.is_available():
         raise SkipTest("CUDA is not available")
