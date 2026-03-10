@@ -1,7 +1,10 @@
 import ctypes
 import errno
+import multiprocessing as mp
+import queue
 import random
 import string
+import traceback
 from unittest import SkipTest
 
 import torch
@@ -53,6 +56,289 @@ def _make_mla_config(
     cfg.prefix_page_ref_capacity = 1024
     cfg.prefix_page_budget = 128
     return cfg
+
+
+def _put_mp_success(result_queue, role: str, **payload) -> None:
+    result_queue.put({"role": role, "ok": True, **payload})
+
+
+def _put_mp_error(result_queue, role: str) -> None:
+    result_queue.put({"role": role, "ok": False, "error": traceback.format_exc()})
+
+
+def _prefix_prompt_creator_proc(
+    shm_name: str,
+    prompt_tokens: list[int],
+    result_queue,
+    ready_event,
+    done_event,
+) -> None:
+    worker = None
+    try:
+        torch.cuda.set_device(0)
+        cfg = _make_mla_config(shm_name, enable_prefix_reuse=True)
+        worker = bg.MLAHostPagedKVWorkerView(cfg)
+        worker.initialize(device_index=0, create_region=True)
+
+        worker.register_sequences([501])
+        pages, reused = worker.allocate_pages_for_sequences_with_prefix(
+            [(501, len(prompt_tokens))], prompt_tokens, [0, len(prompt_tokens)]
+        )
+        assert reused == [0]
+        assert len(pages[0]) == 1
+
+        prefill_k = torch.full(
+            (1, len(prompt_tokens), cfg.num_k_heads, cfg.k_head_dim),
+            fill_value=1.0,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        worker.async_offload_layer_kv_to_host(
+            layer_idx=0,
+            sequence_ids=[501],
+            k_tensor=prefill_k,
+            v_tensor=None,
+            sequence_lengths=[len(prompt_tokens)],
+        ).wait()
+        worker.release_sequence_pages([501])
+
+        stats = worker.get_stats()
+        _put_mp_success(
+            result_queue,
+            "creator",
+            prefix_entries=stats.num_prefix_entries,
+            shared_pages=stats.num_shared_pages,
+        )
+        ready_event.set()
+
+        if not done_event.wait(timeout=30):
+            raise TimeoutError("Timed out waiting for attacher process")
+    except Exception:
+        ready_event.set()
+        _put_mp_error(result_queue, "creator")
+        raise
+    finally:
+        if worker is not None:
+            worker.shutdown()
+            del worker
+
+
+def _prefix_prompt_attacher_proc(
+    shm_name: str,
+    prompt_tokens: list[int],
+    result_queue,
+    ready_event,
+    done_event,
+) -> None:
+    worker = None
+    try:
+        if not ready_event.wait(timeout=30):
+            raise TimeoutError("Timed out waiting for creator process")
+
+        torch.cuda.set_device(0)
+        cfg = _make_mla_config(shm_name, enable_prefix_reuse=True)
+        worker = bg.MLAHostPagedKVWorkerView(cfg)
+        worker.initialize(device_index=0, create_region=False)
+
+        worker.register_sequences([502])
+        pages, reused = worker.allocate_pages_for_sequences_with_prefix(
+            [(502, len(prompt_tokens))], prompt_tokens, [0, len(prompt_tokens)]
+        )
+        stats = worker.get_stats()
+        worker.release_sequence_pages([502])
+
+        _put_mp_success(
+            result_queue,
+            "attacher",
+            reused_tokens=reused,
+            allocated_pages=len(pages[0]),
+            prefix_hits=stats.num_prefix_hits,
+            shared_pages=stats.num_shared_pages,
+        )
+        done_event.set()
+    except Exception:
+        done_event.set()
+        _put_mp_error(result_queue, "attacher")
+        raise
+    finally:
+        if worker is not None:
+            worker.shutdown()
+            del worker
+
+
+def _prefix_decode_creator_proc(
+    shm_name: str,
+    page_size_tokens: int,
+    prompt_tokens: list[int],
+    decode_tokens: list[int],
+    result_queue,
+    ready_event,
+    done_event,
+) -> None:
+    worker = None
+    try:
+        if len(prompt_tokens) != page_size_tokens or len(decode_tokens) != page_size_tokens:
+            raise AssertionError("decode multiprocess helper expects exact full-page prompt/decode")
+
+        torch.cuda.set_device(0)
+        cfg = _make_mla_config(
+            shm_name, enable_prefix_reuse=True, page_size_tokens=page_size_tokens
+        )
+        worker = bg.MLAHostPagedKVWorkerView(cfg)
+        worker.initialize(device_index=0, create_region=True)
+
+        full_tokens = prompt_tokens + decode_tokens
+        worker.register_sequences([601])
+        pages, reused = worker.allocate_pages_for_sequences_with_prefix(
+            [(601, len(full_tokens))], prompt_tokens, [0, len(prompt_tokens)]
+        )
+        assert reused == [0]
+        assert len(pages[0]) == 2
+
+        prefill_k = torch.full(
+            (1, len(prompt_tokens), cfg.num_k_heads, cfg.k_head_dim),
+            fill_value=1.0,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        )
+        worker.async_offload_layer_kv_to_host(
+            layer_idx=0,
+            sequence_ids=[601],
+            k_tensor=prefill_k,
+            v_tensor=None,
+            sequence_lengths=[len(prompt_tokens)],
+        ).wait()
+
+        for step, token_id in enumerate(decode_tokens):
+            decode_k = torch.full(
+                (1, 1, cfg.num_k_heads, cfg.k_head_dim),
+                fill_value=2.0 + step,
+                dtype=torch.bfloat16,
+                device="cuda:0",
+            )
+            worker.async_append_decode_kv_to_host(
+                layer_idx=0,
+                sequence_ids=[601],
+                k_tensor=decode_k,
+                v_tensor=None,
+                sequence_lengths=[len(prompt_tokens) + step],
+                decode_token_ids=[token_id],
+            ).wait()
+
+        worker.release_sequence_pages([601])
+        stats = worker.get_stats()
+        _put_mp_success(
+            result_queue,
+            "creator",
+            prefix_entries=stats.num_prefix_entries,
+            shared_pages=stats.num_shared_pages,
+        )
+        ready_event.set()
+
+        if not done_event.wait(timeout=30):
+            raise TimeoutError("Timed out waiting for attacher process")
+    except Exception:
+        ready_event.set()
+        _put_mp_error(result_queue, "creator")
+        raise
+    finally:
+        if worker is not None:
+            worker.shutdown()
+            del worker
+
+
+def _prefix_decode_attacher_proc(
+    shm_name: str,
+    page_size_tokens: int,
+    full_tokens: list[int],
+    result_queue,
+    ready_event,
+    done_event,
+) -> None:
+    worker = None
+    try:
+        if not ready_event.wait(timeout=30):
+            raise TimeoutError("Timed out waiting for creator process")
+
+        torch.cuda.set_device(0)
+        cfg = _make_mla_config(
+            shm_name, enable_prefix_reuse=True, page_size_tokens=page_size_tokens
+        )
+        worker = bg.MLAHostPagedKVWorkerView(cfg)
+        worker.initialize(device_index=0, create_region=False)
+
+        worker.register_sequences([602])
+        pages, reused = worker.allocate_pages_for_sequences_with_prefix(
+            [(602, len(full_tokens))], full_tokens, [0, len(full_tokens)]
+        )
+        stats = worker.get_stats()
+        worker.release_sequence_pages([602])
+
+        _put_mp_success(
+            result_queue,
+            "attacher",
+            reused_tokens=reused,
+            allocated_pages=len(pages[0]),
+            prefix_hits=stats.num_prefix_hits,
+            shared_pages=stats.num_shared_pages,
+        )
+        done_event.set()
+    except Exception:
+        done_event.set()
+        _put_mp_error(result_queue, "attacher")
+        raise
+    finally:
+        if worker is not None:
+            worker.shutdown()
+            del worker
+
+
+def _run_mp_pair(creator_target, creator_args, attacher_target, attacher_args):
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    ready_event = ctx.Event()
+    done_event = ctx.Event()
+
+    creator = ctx.Process(
+        target=creator_target,
+        args=(*creator_args, result_queue, ready_event, done_event),
+    )
+    attacher = ctx.Process(
+        target=attacher_target,
+        args=(*attacher_args, result_queue, ready_event, done_event),
+    )
+
+    creator.start()
+    attacher.start()
+
+    creator.join(timeout=60)
+    attacher.join(timeout=60)
+
+    if creator.is_alive():
+        creator.terminate()
+        creator.join(timeout=5)
+        raise AssertionError("creator process timed out")
+    if attacher.is_alive():
+        attacher.terminate()
+        attacher.join(timeout=5)
+        raise AssertionError("attacher process timed out")
+
+    results = {}
+    for _ in range(2):
+        try:
+            item = result_queue.get(timeout=5)
+        except queue.Empty:
+            break
+        results[item["role"]] = item
+
+    if creator.exitcode != 0:
+        raise AssertionError(results.get("creator", {}).get("error", "creator process failed"))
+    if attacher.exitcode != 0:
+        raise AssertionError(results.get("attacher", {}).get("error", "attacher process failed"))
+
+    assert results["creator"]["ok"] is True
+    assert results["attacher"]["ok"] is True
+    return results
 
 
 def test_prefix_reuse_disabled_regression() -> None:
@@ -364,6 +650,59 @@ def test_prefix_reuse_skips_decode_extension_when_token_ids_missing() -> None:
     finally:
         worker.shutdown()
         del worker
+        _shm_unlink(shm_name)
+
+
+def test_prefix_reuse_across_process_attach() -> None:
+    if not torch.cuda.is_available():
+        raise SkipTest("CUDA is not available")
+
+    shm_name = _random_shm_name()
+    prompt_tokens = [900 + i for i in range(64)]
+
+    try:
+        results = _run_mp_pair(
+            _prefix_prompt_creator_proc,
+            (shm_name, prompt_tokens),
+            _prefix_prompt_attacher_proc,
+            (shm_name, prompt_tokens),
+        )
+
+        assert results["creator"]["prefix_entries"] >= 1
+        assert results["creator"]["shared_pages"] >= 1
+        assert results["attacher"]["reused_tokens"] == [64]
+        assert results["attacher"]["allocated_pages"] == 1
+        assert results["attacher"]["prefix_hits"] >= 1
+        assert results["attacher"]["shared_pages"] >= 1
+    finally:
+        _shm_unlink(shm_name)
+
+
+def test_prefix_reuse_decode_extension_across_process_attach() -> None:
+    if not torch.cuda.is_available():
+        raise SkipTest("CUDA is not available")
+
+    shm_name = _random_shm_name()
+    page_size_tokens = 8
+    prompt_tokens = [1000 + i for i in range(page_size_tokens)]
+    decode_tokens = [1100 + i for i in range(page_size_tokens)]
+    full_tokens = prompt_tokens + decode_tokens
+
+    try:
+        results = _run_mp_pair(
+            _prefix_decode_creator_proc,
+            (shm_name, page_size_tokens, prompt_tokens, decode_tokens),
+            _prefix_decode_attacher_proc,
+            (shm_name, page_size_tokens, full_tokens),
+        )
+
+        assert results["creator"]["prefix_entries"] >= 1
+        assert results["creator"]["shared_pages"] >= 1
+        assert results["attacher"]["reused_tokens"] == [len(full_tokens)]
+        assert results["attacher"]["allocated_pages"] == 2
+        assert results["attacher"]["prefix_hits"] >= 1
+        assert results["attacher"]["shared_pages"] >= 1
+    finally:
         _shm_unlink(shm_name)
 
 
