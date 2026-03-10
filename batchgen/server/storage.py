@@ -120,7 +120,7 @@ class StorageManager:
         api_path = self.files_dir / file_id
         with api_path.open("w", encoding="utf-8") as handle:
             for item in items:
-                handle.write(json.dumps(item.dict(), default=str))
+                handle.write(json.dumps(item.dict(), default=str, ensure_ascii=False))
                 handle.write("\n")
 
         # Also write to output_dir with .jsonl extension for direct access
