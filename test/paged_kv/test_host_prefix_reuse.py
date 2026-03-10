@@ -107,6 +107,7 @@ def _prefix_prompt_creator_proc(
             result_queue,
             "creator",
             prefix_entries=stats.num_prefix_entries,
+            cache_entry_pages=stats.num_cache_entry_pages,
             shared_pages=stats.num_shared_pages,
         )
         ready_event.set()
@@ -231,6 +232,7 @@ def _prefix_decode_creator_proc(
             result_queue,
             "creator",
             prefix_entries=stats.num_prefix_entries,
+            cache_entry_pages=stats.num_cache_entry_pages,
             shared_pages=stats.num_shared_pages,
         )
         ready_event.set()
@@ -669,7 +671,7 @@ def test_prefix_reuse_across_process_attach() -> None:
         )
 
         assert results["creator"]["prefix_entries"] >= 1
-        assert results["creator"]["shared_pages"] >= 1
+        assert results["creator"]["cache_entry_pages"] >= 1
         assert results["attacher"]["reused_tokens"] == [64]
         assert results["attacher"]["allocated_pages"] == 1
         assert results["attacher"]["prefix_hits"] >= 1
@@ -697,7 +699,7 @@ def test_prefix_reuse_decode_extension_across_process_attach() -> None:
         )
 
         assert results["creator"]["prefix_entries"] >= 1
-        assert results["creator"]["shared_pages"] >= 1
+        assert results["creator"]["cache_entry_pages"] >= 2
         assert results["attacher"]["reused_tokens"] == [len(full_tokens)]
         assert results["attacher"]["allocated_pages"] == 2
         assert results["attacher"]["prefix_hits"] >= 1
