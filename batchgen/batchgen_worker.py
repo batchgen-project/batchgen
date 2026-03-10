@@ -94,6 +94,11 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
+# KV offload ablation: measure per-component overhead of _append_decode_kv_to_host_async
+BATCHGEN_KV_ABLATION = os.environ.get('BATCHGEN_KV_ABLATION', '0') == '1'
+# Skip host offload entirely (measurement only — breaks host KV resume!)
+BATCHGEN_KV_SKIP_HOST_OFFLOAD = os.environ.get('BATCHGEN_KV_SKIP_HOST_OFFLOAD', '0') == '1'
+
 # Decode preemption configuration (DEPRECATED: use CLI args instead)
 # --host-kv-watermark: Default 70% (when free slots exceed this threshold, prefill is prioritized)
 # --enable-decode-preemption / --no-decode-preemption: Default enabled
@@ -1174,18 +1179,25 @@ class BatchGenWorker:
 		"""
 		if not batch:
 			return
-		
+
+		# Skip-offload mode: measure upper bound of savings (breaks host KV!)
+		if BATCHGEN_KV_SKIP_HOST_OFFLOAD:
+			return
+
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
 			return
-		
+
+		if BATCHGEN_KV_ABLATION:
+			_abl_t0 = time.perf_counter()
+
 		# Build sequence info
 		sequence_ids = []
 		sequence_lengths = []
-		
+
 		# DIAGNOSTIC: Track host KV append positions for debugging
 		append_diag = []
-		
+
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -1193,7 +1205,7 @@ class BatchGenWorker:
 			# Write position is current position (0-indexed)
 			write_pos = seq.current_context_length - 1
 			sequence_lengths.append(write_pos)
-			
+
 			# Track for debugging (only first few sequences)
 			if len(append_diag) < 3 and seq.decoded_length > 1:
 				append_diag.append({
@@ -1202,7 +1214,7 @@ class BatchGenWorker:
 					'decoded_len': seq.decoded_length,
 					'write_pos': write_pos,
 				})
-		
+
 		# Log append positions for resumed sequences (layer 0 only to reduce spam)
 		if layer_idx == 0 and append_diag and BATCHGEN_CB_DEBUG:
 			logging.debug(
@@ -1236,6 +1248,9 @@ class BatchGenWorker:
 				f"Rank {self.rank}: NaN detected in k_tensor BEFORE host append (layer={layer_idx}) - affected_seqs={nan_seq_info}"
 			)
 		
+		if BATCHGEN_KV_ABLATION:
+			_abl_t1 = time.perf_counter()
+
 		# Ensure compute stream finishes writing k_tensor before D2H copy reads it.
 		# Record event on compute stream, then event.synchronize() waits only for
 		# work up to this point (not all GPU work). Lighter than full device sync.
@@ -1243,7 +1258,10 @@ class BatchGenWorker:
 			self._kv_offload_event = torch.cuda.Event()
 		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
 		self._kv_offload_event.synchronize()
-		
+
+		if BATCHGEN_KV_ABLATION:
+			_abl_t2 = time.perf_counter()
+
 		# Launch async append
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
@@ -1260,10 +1278,20 @@ class BatchGenWorker:
 		self._pending_kv_append_tensors.append(k_tensor)
 		if v_tensor is not None:
 			self._pending_kv_append_tensors.append(v_tensor)
-		
+
 		# Add to pending list - will be waited at page boundary
 		if task is not None:
 			self._pending_kv_append_tasks.append(task)
+
+		if BATCHGEN_KV_ABLATION:
+			_abl_t3 = time.perf_counter()
+			if not hasattr(self, '_kv_ablation_stats'):
+				self._kv_ablation_stats = {'batch_loop': 0.0, 'event_sync': 0.0, 'cpp_launch': 0.0, 'count': 0}
+			s = self._kv_ablation_stats
+			s['batch_loop'] += (_abl_t1 - _abl_t0)
+			s['event_sync'] += (_abl_t2 - _abl_t1)
+			s['cpp_launch'] += (_abl_t3 - _abl_t2)
+			s['count'] += 1
 
 		# THROTTLING FIX: Prevent "Resource temporarily unavailable" (EAGAIN) error
 		# std::async creates a new thread for each task. With 61 layers and 64 tokens
@@ -7095,7 +7123,21 @@ class BatchGenWorker:
 							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
 							f"{page_info}"
 						)
-				
+
+				# KV ablation: log per-boundary callback overhead breakdown
+				if BATCHGEN_KV_ABLATION and hasattr(self, '_kv_ablation_stats'):
+					s = self._kv_ablation_stats
+					n = s['count'] or 1
+					logging.info(
+						f"[KV-ABLATION] boundary={self._cumulative_decode_boundaries}, callbacks={n}, "
+						f"batch_loop={s['batch_loop']*1000:.2f}ms, "
+						f"event_sync={s['event_sync']*1000:.2f}ms, "
+						f"cpp_launch={s['cpp_launch']*1000:.2f}ms, "
+						f"total={(s['batch_loop']+s['event_sync']+s['cpp_launch'])*1000:.2f}ms, "
+						f"avg_sync={s['event_sync']*1000/n:.3f}ms/call"
+					)
+					self._kv_ablation_stats = {'batch_loop': 0.0, 'event_sync': 0.0, 'cpp_launch': 0.0, 'count': 0}
+
 				if not decode_uuids:
 					# Check for pending loads
 					if pending_load_uuids:
@@ -7462,20 +7504,27 @@ class BatchGenWorker:
 		"""
 		if not batch:
 			return
-		
+
+		# Skip-offload mode: measure upper bound of savings (breaks host KV!)
+		if BATCHGEN_KV_SKIP_HOST_OFFLOAD:
+			return
+
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
 			return
-		
+
+		if BATCHGEN_KV_ABLATION:
+			_abl_t0 = time.perf_counter()
+
 		sequence_ids = []
 		sequence_lengths = []
-		
+
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			sequence_ids.append(seq.global_idx)
 			sequence_lengths.append(seq.current_context_length - 1)
-		
+
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
 		if v_tensor is not None and v_tensor.dim() == 3:
@@ -7504,7 +7553,10 @@ class BatchGenWorker:
 				f"layer={layer_idx}, k_tensor_shape={list(k_tensor.shape)}, "
 				f"affected_seqs={nan_seq_info}"
 			)
-		
+
+		if BATCHGEN_KV_ABLATION:
+			_abl_t1 = time.perf_counter()
+
 		# Ensure compute stream finishes writing k_tensor before D2H copy reads it.
 		# Record event on compute stream, then event.synchronize() waits only for
 		# work up to this point (not all GPU work). Lighter than full device sync.
@@ -7512,7 +7564,10 @@ class BatchGenWorker:
 			self._kv_offload_event = torch.cuda.Event()
 		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
 		self._kv_offload_event.synchronize()
-		
+
+		if BATCHGEN_KV_ABLATION:
+			_abl_t2 = time.perf_counter()
+
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
@@ -7530,9 +7585,19 @@ class BatchGenWorker:
 		self._pending_kv_append_tensors.append(k_tensor)
 		if v_tensor is not None:
 			self._pending_kv_append_tensors.append(v_tensor)
-		
+
 		# Add to pending list - will be waited at page boundary
 		self._pending_kv_append_tasks.append(task)
+
+		if BATCHGEN_KV_ABLATION:
+			_abl_t3 = time.perf_counter()
+			if not hasattr(self, '_kv_ablation_stats'):
+				self._kv_ablation_stats = {'batch_loop': 0.0, 'event_sync': 0.0, 'cpp_launch': 0.0, 'count': 0}
+			s = self._kv_ablation_stats
+			s['batch_loop'] += (_abl_t1 - _abl_t0)
+			s['event_sync'] += (_abl_t2 - _abl_t1)
+			s['cpp_launch'] += (_abl_t3 - _abl_t2)
+			s['count'] += 1
 
 		# THROTTLING FIX: Prevent "Resource temporarily unavailable" (EAGAIN) error
 		# std::async creates a new thread for each task. With 61 layers and 64 tokens
