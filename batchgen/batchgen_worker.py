@@ -510,6 +510,7 @@ class BatchGenWorker:
 		self._core_initialized = False
 		self._batch_completed = False
 		self._nvshmem_initialized_this_run = False
+		self._prefix_cache_stats_at_batch_start = None
 		
 		# 10. Distributed Communication Info
 		self.dist_init_addr = args.dist_init_addr
@@ -1819,6 +1820,93 @@ class BatchGenWorker:
 		stats = self.host_paged_kv_worker_view.get_stats()
 		return stats.num_free_pages
 
+	def _snapshot_prefix_cache_stats(self) -> Optional[Dict[str, float]]:
+		"""Capture shared PrefixCache counters for batch-level reporting."""
+		worker_view = getattr(self, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			return None
+
+		try:
+			stats = worker_view.get_stats()
+		except Exception as exc:
+			logging.warning(
+				f"Rank {self.rank}: Failed to read PrefixCache stats: {exc}"
+			)
+			return None
+
+		hits = int(stats.num_prefix_hits)
+		misses = int(stats.num_prefix_misses)
+		lookups = hits + misses
+		return {
+			"num_total_pages": int(stats.num_total_pages),
+			"num_free_pages": int(stats.num_free_pages),
+			"num_used_pages": int(stats.num_used_pages),
+			"num_prefix_entries": int(stats.num_prefix_entries),
+			"num_prefix_hits": hits,
+			"num_prefix_misses": misses,
+			"num_prefix_evictions": int(stats.num_prefix_evictions),
+			"num_cache_entry_pages": int(stats.num_cache_entry_pages),
+			"num_shared_pages": int(stats.num_shared_pages),
+			"hit_rate": (hits / lookups) if lookups > 0 else 0.0,
+		}
+
+	def _log_prefix_cache_batch_report(self) -> None:
+		"""Log PrefixCache cumulative and per-batch deltas after batch completion."""
+		if self.rank != 0:
+			return
+
+		after = self._snapshot_prefix_cache_stats()
+		before = self._prefix_cache_stats_at_batch_start
+		if after is None:
+			logging.info("[PrefixCache] Stats unavailable after batch completion")
+			return
+
+		if before is None:
+			logging.info(
+				"[PrefixCache] cumulative: entries=%d hits=%d misses=%d "
+				"hit_rate=%.2f%% evictions=%d cache_entry_pages=%d shared_pages=%d "
+				"host_used_pages=%d/%d",
+				after["num_prefix_entries"],
+				after["num_prefix_hits"],
+				after["num_prefix_misses"],
+				after["hit_rate"] * 100.0,
+				after["num_prefix_evictions"],
+				after["num_cache_entry_pages"],
+				after["num_shared_pages"],
+				after["num_used_pages"],
+				after["num_total_pages"],
+			)
+			return
+
+		batch_hits = after["num_prefix_hits"] - before["num_prefix_hits"]
+		batch_misses = after["num_prefix_misses"] - before["num_prefix_misses"]
+		batch_evictions = after["num_prefix_evictions"] - before["num_prefix_evictions"]
+		batch_lookup_total = batch_hits + batch_misses
+		batch_hit_rate = (batch_hits / batch_lookup_total) if batch_lookup_total > 0 else 0.0
+
+		logging.info(
+			"[PrefixCache] batch: hits=%d misses=%d hit_rate=%.2f%% "
+			"entries_delta=%d cache_pages_delta=%d shared_pages_delta=%d evictions_delta=%d; "
+			"cumulative: entries=%d hits=%d misses=%d hit_rate=%.2f%% "
+			"evictions=%d cache_entry_pages=%d shared_pages=%d host_used_pages=%d/%d",
+			batch_hits,
+			batch_misses,
+			batch_hit_rate * 100.0,
+			after["num_prefix_entries"] - before["num_prefix_entries"],
+			after["num_cache_entry_pages"] - before["num_cache_entry_pages"],
+			after["num_shared_pages"] - before["num_shared_pages"],
+			batch_evictions,
+			after["num_prefix_entries"],
+			after["num_prefix_hits"],
+			after["num_prefix_misses"],
+			after["hit_rate"] * 100.0,
+			after["num_prefix_evictions"],
+			after["num_cache_entry_pages"],
+			after["num_shared_pages"],
+			after["num_used_pages"],
+			after["num_total_pages"],
+		)
+
 	def _get_or_create_gloo_group(self):
 		"""Get or create a Gloo process group for CPU tensor migrations.
 
@@ -2876,6 +2964,7 @@ class BatchGenWorker:
 			per_sequence_max_tokens: Optional per-sequence max output token limits.
 				Falls back to self.max_decoding_length if None or if individual entry is None.
 		"""
+		self._prefix_cache_stats_at_batch_start = self._snapshot_prefix_cache_stats()
 		logging.info(
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
@@ -4728,6 +4817,7 @@ class BatchGenWorker:
 
 			# Compute and log batch statistics
 			self._log_batch_statistics()
+			self._log_prefix_cache_batch_report()
 
 		# ============ Gather Results in Original Order ============
 		# Detokenize locally on each rank to avoid gathering large token tensors.
@@ -5257,6 +5347,11 @@ class BatchGenWorker:
 				# Mark initial reservation done
 				seq.mark_initial_gpu_reservation_done()
 				self._sequences_with_gpu_kv.add(uuid)
+		else:
+			# Idle ranks still participate in CUDA graph warmup/capture. Keep an
+			# explicit empty page table so graph segments can access KV caches
+			# without tripping over an uninitialized gpu_table.
+			self.gpu_paged_kv_cache_manager.clear_page_table()
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
