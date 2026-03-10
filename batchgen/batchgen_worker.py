@@ -451,6 +451,7 @@ class BatchGenWorker:
 			host_kv_cache_size=args.global_host_kv_cache_size_gb * (1024**3),
 			enable_prefix_reuse=args.enable_prefix_cache,
 		)
+		self._worker_host_kv_config = worker_kv_config
 		if args.fast_init:
 			worker_kv_config.enable_memfd = True
 			worker_kv_config.memfd_creator_pid = args.kv_memfd_pid
@@ -1397,6 +1398,7 @@ class BatchGenWorker:
 
 		self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
 		host_kv_runtime_cfg = getattr(self.engine_config, "Host_Paged_KV_Config", None)
+		worker_kv_config = getattr(self, "_worker_host_kv_config", None)
 		if host_kv_runtime_cfg is not None:
 			host_kv_runtime_cfg.enable_prefix_reuse = bool(
 				getattr(worker_kv_config, "enable_prefix_reuse", False)
