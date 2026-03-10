@@ -509,7 +509,7 @@ def launch_server(server_args: ServerArgs) -> None:
 
     def _fast_shutdown():
         """Fast shutdown: kill workers, clean resources, exit."""
-        logger.info("Fast shutdown: stopping workers...")
+        print("[FastKill] Fast shutdown: stopping workers...", flush=True)
         try:
             # Get worker manager from app state
             worker = getattr(app.state, "worker", None)
@@ -540,7 +540,7 @@ def launch_server(server_args: ServerArgs) -> None:
         hp_thread.start()
         hp_thread.join(timeout=3.0)
 
-        logger.info("Fast shutdown complete.")
+        print("[FastKill] Fast shutdown complete, exiting.", flush=True)
         os._exit(0)
 
     def shutdown_handler(signum, frame):
@@ -552,7 +552,7 @@ def launch_server(server_args: ServerArgs) -> None:
             os._exit(1)
 
         _shutdown_state["requested"] = True
-        logger.info("Received %s, initiating fast shutdown...", sig_name)
+        print(f"[FastKill] Received {sig_name}, initiating fast shutdown...", flush=True)
         _do_peer_kill()
 
         # Run fast shutdown in a thread so signal handler returns quickly.
@@ -571,16 +571,16 @@ def launch_server(server_args: ServerArgs) -> None:
             loop = _asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
                 loop.add_signal_handler(sig, _signal_callback, sig)
-            logger.info("Fast shutdown signal handlers installed (via event loop).")
+            print("[FastKill] Signal handlers installed (via event loop).", flush=True)
         except Exception as e1:
             # Fallback to signal.signal if loop method fails
             try:
                 signal.signal(signal.SIGINT, shutdown_handler)
                 signal.signal(signal.SIGTERM, shutdown_handler)
                 signal.signal(signal.SIGQUIT, shutdown_handler)
-                logger.info("Fast shutdown signal handlers installed (via signal.signal).")
+                print("[FastKill] Signal handlers installed (via signal.signal).", flush=True)
             except Exception as e2:
-                logger.error("Failed to install shutdown handlers: loop=%s, signal=%s", e1, e2)
+                print(f"[FastKill] FAILED to install handlers: loop={e1}, signal={e2}", flush=True)
 
     app.state._install_shutdown_handlers = _install_shutdown_handlers
 
