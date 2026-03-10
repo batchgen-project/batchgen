@@ -108,6 +108,10 @@ class ServerArgs:
     decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
     # Startup timeout
     startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
+    # Peer nodes for distributed kill propagation (SSH host:docker_container pairs)
+    # Format: "ssh_host:container_name,ssh_host2:container_name2"
+    # On shutdown, each peer receives SIGTERM+SIGKILL to all BatchGen processes
+    peer_nodes: Optional[str] = None
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -397,6 +401,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Disable incremental saving of completed sequences to disk",
     )
+    parser.add_argument(
+        "--peer-nodes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of SSH_HOST:CONTAINER pairs for distributed kill propagation. "
+            "Example: 'wechat_96:batchgen,wechat_87:tairan-batchgen'. "
+            "On shutdown, SIGTERM+SIGKILL is sent to all BatchGen processes on each peer."
+        ),
+    )
     return parser
 
 
@@ -530,6 +544,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         no_incremental_save=parsed.no_incremental_save,
         decode_step_timeout=parsed.decode_step_timeout,
         startup_timeout=parsed.startup_timeout,
+        peer_nodes=parsed.peer_nodes,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

@@ -293,7 +293,7 @@ def unmount_hugetlbfs() -> bool:
             return True
 
         # Unmount all hugetlbfs mounts
-        max_attempts = 10
+        max_attempts = 2
         for attempt in range(max_attempts):
             result = subprocess.run(
                 ["mount"],
@@ -318,7 +318,7 @@ def unmount_hugetlbfs() -> bool:
                     logger.debug(
                         f"Unmount attempt {attempt + 1} failed, retrying..."
                     )
-                    time.sleep(0.5)
+                    time.sleep(0.1)
                 else:
                     logger.warning(
                         f"Failed to unmount hugetlbfs: {umount_result.stderr}"
@@ -425,6 +425,58 @@ def cleanup_resources(
         reset_hugepages_allocation()
 
     logger.info("Resource cleanup completed")
+
+
+def kill_peer_nodes(peer_nodes: str) -> None:
+    """Send SIGTERM+SIGKILL to all BatchGen processes on peer nodes via SSH.
+
+    Propagates shutdown to other nodes in a distributed setup so workers
+    blocked in NCCL collectives are killed, rather than hanging for the
+    NCCL socket timeout.
+
+    Args:
+        peer_nodes: Comma-separated "ssh_host:container" pairs.
+                    Example: "wechat_96:batchgen,wechat_87:tairan-batchgen"
+                    Use "ssh_host:-" to kill directly on the host (no docker).
+    """
+    if not peer_nodes:
+        return
+
+    pairs = [p.strip() for p in peer_nodes.split(",") if p.strip()]
+    for pair in pairs:
+        if ":" not in pair:
+            logger.warning("Skipping malformed peer_nodes entry (no colon): %r", pair)
+            continue
+
+        ssh_host, container = pair.rsplit(":", 1)
+        ssh_host = ssh_host.strip()
+        container = container.strip()
+
+        # Kill ALL BatchGen processes (server + workers), then SIGKILL survivors after 2s
+        kill_cmd = (
+            "pkill -TERM -f 'launch_http_server|server_worker_main|batchgen' 2>/dev/null || true; "
+            "sleep 2; "
+            "pkill -9 -f 'launch_http_server|server_worker_main|batchgen' 2>/dev/null || true"
+        )
+
+        if container and container != "-":
+            remote_cmd = f"docker exec {container} bash -c '{kill_cmd}'"
+        else:
+            remote_cmd = kill_cmd
+
+        try:
+            logger.info("Propagating shutdown to peer %s (container=%s)...",
+                        ssh_host, container if container != "-" else "host")
+            subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                 ssh_host, remote_cmd],
+                capture_output=True, text=True, timeout=10,
+            )
+            logger.info("Shutdown propagated to %s", ssh_host)
+        except subprocess.TimeoutExpired:
+            logger.warning("SSH to %s timed out during peer kill", ssh_host)
+        except Exception as exc:
+            logger.warning("Failed to kill peer %s: %s", ssh_host, exc)
 
 
 def install_worker_signal_handlers(

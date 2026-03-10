@@ -456,12 +456,12 @@ def launch_server(server_args: ServerArgs) -> None:
     import signal
     import threading
 
-    from batchgen.server.process_utils import cleanup_resources
+    from batchgen.server.process_utils import cleanup_resources, kill_peer_nodes
 
     worker_exit_state = WorkerExitState()
     health_state = ServerHealthState()
     app = create_app(server_args, worker_exit_state, health_state)
-    shutdown_requested = False
+    _shutdown_state = {"requested": False}
 
     # Startup timeout: if the server doesn't become ready in time, log error
     # and force-exit the process with exit code 1. The caller (shell, systemd,
@@ -488,15 +488,31 @@ def launch_server(server_args: ServerArgs) -> None:
         t = threading.Thread(target=_startup_watchdog, daemon=True)
         t.start()
 
+    def _do_peer_kill():
+        """Propagate SIGTERM+SIGKILL to peer nodes in background."""
+        if server_args.peer_nodes:
+            t = threading.Thread(
+                target=kill_peer_nodes,
+                args=(server_args.peer_nodes,),
+                daemon=True,
+                name="peer-kill",
+            )
+            t.start()
+
     def shutdown_handler(signum, frame):
-        nonlocal shutdown_requested
         sig_name = signal.Signals(signum).name
-        logger.info(f"Received {sig_name}, initiating graceful shutdown...")
-        shutdown_requested = True
-        # Re-raise to let uvicorn handle shutdown
+
+        if _shutdown_state["requested"]:
+            # Second signal while already shutting down — hard exit immediately.
+            logger.warning("Received second %s during shutdown — forcing os._exit(1).", sig_name)
+            os._exit(1)
+
+        _shutdown_state["requested"] = True
+        logger.info("Received %s, initiating shutdown...", sig_name)
+        _do_peer_kill()
         raise KeyboardInterrupt()
 
-    # Install signal handlers for graceful shutdown
+    # Install signal handlers for shutdown
     # SIGQUIT is sent by watchdog when worker timeout occurs
     original_sigint = signal.signal(signal.SIGINT, shutdown_handler)
     original_sigterm = signal.signal(signal.SIGTERM, shutdown_handler)
@@ -514,24 +530,41 @@ def launch_server(server_args: ServerArgs) -> None:
             loop="uvloop",
         )
     except KeyboardInterrupt:
-        if shutdown_requested:
-            logger.info("Graceful shutdown initiated by signal.")
+        if _shutdown_state["requested"]:
+            logger.info("Shutdown initiated by signal.")
     finally:
-        # Restore original signal handlers
+        # Restore original signal handlers so a second signal triggers os._exit
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
         signal.signal(signal.SIGQUIT, original_sigquit)
 
         logger.info("HTTP server stopped.")
 
-        # Final cleanup in case lifespan cleanup was incomplete
-        # (e.g., if server was killed before lifespan could run, or watchdog triggered)
-        # Always clean hugepages on shutdown for complete resource release
+        # Kill workers + clean SHM (required for next launch).
+        # Hugepage cleanup is done in background (non-blocking).
         cleanup_resources(
-            shm_prefix=None,  # Clean all shared memory files
-            clean_hugepages=True,  # Always clean hugepages on shutdown
-            kill_workers=True,  # Force kill any remaining workers
+            shm_prefix=None,
+            clean_hugepages=False,
+            kill_workers=True,
         )
+
+        # Background hugepage cleanup with 3s timeout
+        from batchgen.server.process_utils import (
+            cleanup_hugepages_files, unmount_hugetlbfs, reset_hugepages_allocation
+        )
+        def _background_hugepage_cleanup():
+            try:
+                cleanup_hugepages_files()
+                unmount_hugetlbfs()
+                reset_hugepages_allocation()
+            except Exception as e:
+                logger.warning("Hugepage cleanup error: %s", e)
+
+        hp_thread = threading.Thread(target=_background_hugepage_cleanup, daemon=True)
+        hp_thread.start()
+        hp_thread.join(timeout=3.0)
+        if hp_thread.is_alive():
+            logger.warning("Hugepage cleanup still running after 3s, exiting anyway.")
 
         if worker_exit_state.is_failed():
             reason = worker_exit_state.reason or "Worker process exited."

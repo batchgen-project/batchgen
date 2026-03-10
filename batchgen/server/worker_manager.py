@@ -255,40 +255,28 @@ class WorkerManager:
         except Exception:
             logger.warning("Failed to signal worker shutdown", exc_info=True)
 
-        # Wait for workers to exit (reduced timeout for interactive use)
+        # Wait for workers to exit (2s timeout — workers use os._exit on SIGTERM)
         workers_joined = False
         if self.worker_process is not None:
             try:
                 with self._join_lock:
-                    self.worker_process.join(timeout=5)  # Reduced from 30s
+                    self.worker_process.join(timeout=2)
                 workers_joined = True
             except Exception:
                 logger.warning("Failed to join worker process", exc_info=True)
 
         # Force-kill workers that didn't exit after SIGTERM
         if not workers_joined and worker_pids:
-            logger.warning(
-                "Workers did not exit gracefully, force-killing..."
-            )
+            logger.warning("Workers did not exit after 2s, force-killing (SIGKILL)...")
             for pid in worker_pids:
                 try:
                     proc = psutil.Process(pid)
                     proc.kill()
-                    logger.info(f"Force-killed worker process {pid}")
+                    logger.info("Force-killed worker process %d", pid)
                 except Exception:
                     pass
 
-        # Get shm_name for cleanup if available
-        shm_name = self.model_info.get("shm_name")
-        shm_prefix = shm_name if shm_name else "batchgen"
-
-        # Cleanup resources (shared memory, hugepages, etc.)
-        cleanup_resources(
-            shm_prefix=shm_prefix,
-            clean_hugepages=self._hugepages_enabled,
-            kill_workers=False,  # Already handled above
-        )
-
+        # Resource cleanup (SHM, hugepages) is centralized in launch_server() finally block.
         self.started = False
         logger.info("WorkerManager stopped")
 

@@ -35,7 +35,7 @@ def _setup_nccl_env():
 	# Increase connection timeout and retry attempts
 	# NCCL_SOCKET_TIMEOUT: timeout in milliseconds for socket operations (default: varies)
 	if "NCCL_SOCKET_TIMEOUT" not in os.environ:
-		os.environ["NCCL_SOCKET_TIMEOUT"] = "300000"  # 5 minutes in ms
+		os.environ["NCCL_SOCKET_TIMEOUT"] = "30000"  # 30 seconds in ms
 
 	# NCCL_NET_RETRY_COUNT: number of retries for network operations
 	if "NCCL_NET_RETRY_COUNT" not in os.environ:
@@ -70,11 +70,16 @@ def server_worker_main(
 		logging.error(f"[FATAL] Unhandled exception in worker "
 					  f"rank_idx={rank_idx}, global_rank={global_rank}: {e}")
 		traceback.print_exc()
-		try:
-			if dist.is_available() and dist.is_initialized():
-				dist.destroy_process_group()
-		except Exception:
-			pass
+		import threading as _threading
+		def _try_destroy():
+			try:
+				if dist.is_available() and dist.is_initialized():
+					dist.destroy_process_group()
+			except Exception:
+				pass
+		t = _threading.Thread(target=_try_destroy, daemon=True)
+		t.start()
+		t.join(timeout=2.0)
 		os._exit(1)
 
 
@@ -111,12 +116,17 @@ def _server_worker_main_impl(
 	# This is critical for multi-node setups where node 1 workers might be
 	# blocked in NCCL operations when node 0 is killed.
 	def _worker_shutdown_callback():
-		"""Cleanup callback when worker receives termination signal."""
-		try:
-			if dist.is_available() and dist.is_initialized():
-				dist.destroy_process_group()
-		except Exception:
-			pass
+		"""Try graceful NCCL cleanup with timeout, then let os._exit proceed."""
+		import threading as _threading
+		def _try_destroy():
+			try:
+				if dist.is_available() and dist.is_initialized():
+					dist.destroy_process_group()
+			except Exception:
+				pass
+		t = _threading.Thread(target=_try_destroy, daemon=True)
+		t.start()
+		t.join(timeout=2.0)  # Give NCCL 2s to clean up; if stuck in collective, give up
 
 	install_worker_signal_handlers(_worker_shutdown_callback)
 
