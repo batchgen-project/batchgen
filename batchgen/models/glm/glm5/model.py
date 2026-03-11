@@ -638,7 +638,7 @@ class Glm5MoEGate(nn.Module):
         bsz_seq = hidden_states.shape[0]
 
         # Sigmoid scoring (n_group=1: score all experts directly)
-        logits = F.linear(hidden_states, self.weight)  # [bsz_seq, num_experts]
+        logits = F.linear(hidden_states, self.weight.to(hidden_states.dtype))  # [bsz_seq, num_experts]
         scores = torch.sigmoid(logits)
 
         # Apply score correction bias
@@ -985,7 +985,7 @@ class Glm5MoE(MoEBase):
 
         output = torch.zeros_like(hidden_flat, dtype=torch.float32)
         for i, expert in enumerate(self.experts):
-            if expert is None:
+            if isinstance(expert, _Glm5ExpertPlaceholder):
                 continue
             expert_mask = (topk_indices == i).any(dim=-1)
             if not expert_mask.any():
