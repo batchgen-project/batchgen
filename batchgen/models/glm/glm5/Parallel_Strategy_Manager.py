@@ -560,12 +560,26 @@ class GLM5ParallelStrategyManager:
                 f"offloading={self.enable_ep_offloading})"
             )
 
+    # MoEBase has an abstract method gate(), so the nn.Module attribute
+    # is named gate_module to avoid shadowing. Map back to HF checkpoint names.
+    _SKELETON_KEY_REMAP = {
+        ".mlp.gate_module.": ".mlp.gate.",
+    }
+
     def _load_model_skeleton(self):
         """Load skeleton weights as-is (no CPU dequant). FP8 dequant happens on-the-fly."""
         for key, param in self.model.named_parameters():
             if key in self.state_dict_name_map:
                 continue
-            if key in self.skeleton_state_dict:
+            # Try direct match first, then remapped key
+            ckpt_key = key
+            for src, dst in self._SKELETON_KEY_REMAP.items():
+                if src in key:
+                    ckpt_key = key.replace(src, dst)
+                    break
+            if ckpt_key in self.skeleton_state_dict:
+                param.data = self.skeleton_state_dict[ckpt_key]
+            elif key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
 
         skeleton_size = sum(
