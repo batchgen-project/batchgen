@@ -170,8 +170,17 @@ class DualHostKVCoordinator:
 
 		primary_mgr = bg_lib.MLAHostPagedKVManager(primary_config)
 		primary_mgr.initialize(True)
-		aux_mgr = bg_lib.MLAHostPagedKVManager(aux_config)
-		aux_mgr.initialize(True)
+		try:
+			aux_mgr = bg_lib.MLAHostPagedKVManager(aux_config)
+			aux_mgr.initialize(True)
+		except RuntimeError as e:
+			if "logger" in str(e) and "already exists" in str(e):
+				logger.warning(
+					"Cannot create auxiliary KV manager (duplicate C++ logger). "
+					"Falling back to primary-only mode. Error: %s", e
+				)
+				return None
+			raise
 
 		logger.info(
 			"DualHostKVCoordinator managers created: %d pages, "
