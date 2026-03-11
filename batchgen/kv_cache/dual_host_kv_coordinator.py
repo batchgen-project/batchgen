@@ -127,10 +127,18 @@ class DualHostKVCoordinator:
 			if "logger" in str(e) and "already exists" in str(e):
 				logger.warning(
 					"Cannot create auxiliary KV view (duplicate C++ logger). "
-					"Falling back to primary-only mode. DSA indexer KV will "
+					"Using primary-only mode. DSA indexer KV will "
 					"be unavailable. Error: %s", e
 				)
-				return None  # Fall through to generic path in batchgen_worker
+				# Return coordinator with auxiliary=None; primary already created
+				# so we can't fall back to generic path (would hit same collision).
+				coordinator = cls(primary_view, None)
+				logger.info(
+					"DualHostKVCoordinator created (primary-only): %d pages, "
+					"primary k_dim=%d",
+					num_pages, primary_profile.k_head_dim,
+				)
+				return coordinator
 			raise
 
 		coordinator = cls(primary_view, aux_view)
@@ -177,9 +185,9 @@ class DualHostKVCoordinator:
 			if "logger" in str(e) and "already exists" in str(e):
 				logger.warning(
 					"Cannot create auxiliary KV manager (duplicate C++ logger). "
-					"Falling back to primary-only mode. Error: %s", e
+					"Using primary-only mode. Error: %s", e
 				)
-				return None
+				return primary_mgr, None
 			raise
 
 		logger.info(
@@ -193,21 +201,25 @@ class DualHostKVCoordinator:
 
 	def initialize(self, **kwargs) -> None:
 		self.primary.initialize(**kwargs)
-		self.auxiliary.initialize(**kwargs)
+		if self.auxiliary is not None:
+			self.auxiliary.initialize(**kwargs)
 
 	# -- Sequence management (mirrored) --
 
 	def register_sequences(self, sequence_ids) -> None:
 		self.primary.register_sequences(sequence_ids)
-		self.auxiliary.register_sequences(sequence_ids)
+		if self.auxiliary is not None:
+			self.auxiliary.register_sequences(sequence_ids)
 
 	def allocate_pages_for_sequences(self, seq_token_pairs) -> None:
 		self.primary.allocate_pages_for_sequences(seq_token_pairs)
-		self.auxiliary.allocate_pages_for_sequences(seq_token_pairs)
+		if self.auxiliary is not None:
+			self.auxiliary.allocate_pages_for_sequences(seq_token_pairs)
 
 	def release_sequence_pages(self, sequence_ids) -> None:
 		self.primary.release_sequence_pages(sequence_ids)
-		self.auxiliary.release_sequence_pages(sequence_ids)
+		if self.auxiliary is not None:
+			self.auxiliary.release_sequence_pages(sequence_ids)
 
 	# -- Query (primary only) --
 
