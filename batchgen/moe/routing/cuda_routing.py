@@ -1,8 +1,7 @@
 """
 CUDA routing kernels for GPT-OSS-120B MoE.
 
-JIT-compiled CUDA extension providing gate, dispatch, and reduce kernels.
-Compiled eagerly at import time so the first kernel call has no compilation stall.
+Pre-compiled via pip install -e batchgen_kernels/. Loaded lazily on first use.
 
 Usage:
     from batchgen.moe.routing import (
@@ -13,34 +12,20 @@ Usage:
 """
 
 import torch
-from pathlib import Path
-from torch.utils.cpp_extension import load
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Compile at import time
+# Pre-compiled at pip install time, loaded lazily on first kernel call
 # ──────────────────────────────────────────────────────────────────────────────
 
-_csrc_dir = Path(__file__).parent / "csrc"
+_cuda_ext = None
 
-_cuda_ext = load(
-    name="routing_cuda",
-    sources=[
-        str(_csrc_dir / "routing_extension.cc"),
-        str(_csrc_dir / "gate_topk_softmax.cu"),
-        str(_csrc_dir / "dispatch_count_gather.cu"),
-        str(_csrc_dir / "reduce_weighted_scatter.cu"),
-        str(_csrc_dir / "router_epilogue.cu"),
-        str(_csrc_dir / "gate_sigmoid_topk.cu"),
-        str(_csrc_dir / "fused_gate.cu"),
-    ],
-    extra_cuda_cflags=[
-        "-O3",
-        "--use_fast_math",
-        "-std=c++17",
-        "-gencode", "arch=compute_90a,code=sm_90a",   # H100 (WGMMA required)
-    ],
-    verbose=False,
-)
+
+def _get_ext():
+    global _cuda_ext
+    if _cuda_ext is None:
+        import batchgen_kernels
+        _cuda_ext = batchgen_kernels.load_extension("batchgen_kernels.moe._C_routing")
+    return _cuda_ext
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,7 +48,7 @@ def gate_topk_softmax_cuda(router_logits, topk_indices=None, topk_weights=None, 
         topk_indices: [N, K] int32
         topk_weights: [N, K] FP32
     """
-    ext = _cuda_ext
+    ext = _get_ext()
     N = router_logits.shape[0]
     device = router_logits.device
 
@@ -108,7 +93,7 @@ def gate_sigmoid_topk_cuda(
         topk_indices: [N, K] int32
         topk_weights: [N, K] FP32
     """
-    ext = _cuda_ext
+    ext = _get_ext()
     N = router_logits.shape[0]
     device = router_logits.device
 
@@ -137,7 +122,7 @@ def router_bias_cast_cuda(logits, bias, output):
         bias: [E] BF16 (router bias, or empty tensor if no bias)
         output: [N, E] FP32 (pre-allocated output for gate kernel)
     """
-    _cuda_ext.router_bias_cast(logits, bias, output)
+    _get_ext().router_bias_cast(logits, bias, output)
 
 
 def dispatch_count_gather_cuda(
@@ -164,7 +149,7 @@ def dispatch_count_gather_cuda(
         expert_offsets: [E_local+1] int32
         topk_pos: [N*K] int32
     """
-    ext = _cuda_ext
+    ext = _get_ext()
 
     # Kernel requires int32 indices
     if topk_indices.dtype != torch.int32:
@@ -235,7 +220,7 @@ class FusedGateContext:
             router_bias: [E] BF16 (or empty tensor if no bias)
             topk: number of top experts (2, 4, or 8)
         """
-        ext = _cuda_ext
+        ext = _get_ext()
         bias = router_bias if router_bias is not None else torch.empty(
             0, dtype=torch.bfloat16, device=router_weight.device)
         self._ctx = ext.create_fused_gate_context(router_weight, bias, topk)
@@ -305,7 +290,7 @@ def reduce_weighted_scatter_cuda(
     Returns:
         output: [N, H] BF16
     """
-    ext = _cuda_ext
+    ext = _get_ext()
 
     # Kernel requires FP32 weights for accumulation precision
     if topk_weights.dtype != torch.float32:

@@ -278,13 +278,16 @@ def mla_decoding_flashmla_(
 	position_ids: torch.Tensor,
 	scale
 ):
-	# Create a block table for the key states
+	from batchgen.models.wrappers.attention import AttnWrapperBase
+	# Use cache_seqlens directly instead of attention_mask.sum()
+	if AttnWrapperBase.cache_seqlens is not None:
+		cache_seqlens = AttnWrapperBase.cache_seqlens
+	else:
+		cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+
 	block_size = 64
-	cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
-	
 	max_seqlen = cache_seqlens.max().item()
 	max_seqlen_pad = ((max_seqlen + block_size - 1) // block_size) * block_size
-	# compressed_kv = dequant_per_token_triton(past_key_states, scale)
 	if max_seqlen_pad >= past_key_states.size(1):
 		compressed_kv = dequant_per_token_return_with_max_seqlen_pad(
 			past_key_states, scale, max_seqlen_pad
@@ -294,11 +297,9 @@ def mla_decoding_flashmla_(
 		scale = scale[:, :max_seqlen_pad, :].contiguous()
 		compressed_kv = dequant_per_token_triton(compressed_kv, scale)
 
-	
-	assert attention_mask.dim() == 2
 	bsz, q_len, _ = hidden_states.size()
-	q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
-	kv_len = attention_mask.size(-1)
+	q_position_id = (cache_seqlens.to(torch.int64) - 1).unsqueeze(-1)
+	kv_len = max_seqlen_pad
 
 	
 	# Log norm weight dtype
@@ -486,10 +487,9 @@ def mla_decoding_flashmla_attn_mode_3_(
 			
 	"""
 	hidden_states = hidden_states.squeeze_(1)
-	assert attention_mask.dim() == 2
 	# Create a block table for the key states
-	block_size = 64	
-	bsz, seq_len = attention_mask.size()
+	block_size = 64
+	bsz = hidden_states.size(0)
 	compressed_kv = dequant_compressed_kv_per_token(past_key_states, scale, max_seqlen)
 	max_seqlen_pad = compressed_kv.size(1)
 
@@ -1440,14 +1440,6 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
 
-	# Validate RoPE cache size
-	max_pos_id = q_position_ids.max().item()
-	cos_seq_len = cos.size(0)
-	if max_pos_id >= cos_seq_len:
-		raise ValueError(
-			f"q_position_ids (max={max_pos_id}) exceed RoPE cache size ({cos_seq_len})"
-		)
-
 	# ============ KV CACHE UPDATE ============
 	offload_kv = fused_rmsnorm_rope_with_q(
 		new_compressed_kv,
@@ -2057,21 +2049,21 @@ def mla_decoding_flashmla_attn_mode_3_dequant_fusion(
 			- max_seq_len is reserved for scale. 
 			
 	"""
-	assert attention_mask.dim() == 2
-	# Create a block table for the key states
+	from batchgen.models.wrappers.attention import AttnWrapperBase
+	# Use cache_seqlens directly instead of attention_mask.sum()
 	block_size = 64
-	cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
-	
-	bsz, seq_len = attention_mask.size()
+	if AttnWrapperBase.cache_seqlens is not None:
+		cache_seqlens = AttnWrapperBase.cache_seqlens
+	else:
+		cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+
+	bsz = hidden_states.size(0)
 	max_seqlen = cache_seqlens.max().item()
-	
-	# _,max_seq_len, _ = past_key_states.size()
+
 	compressed_kv = dequant_compressed_kv_per_token_with_length(past_key_states, scale, max_seqlen)
 	max_seqlen_pad = compressed_kv.size(1)
 
-	# q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
-	# kv_len = attention_mask.size(-1)
-	q_position_ids = (attention_mask.sum(-1) - 1).unsqueeze(-1)
+	q_position_ids = (cache_seqlens.to(torch.int64) - 1).unsqueeze(-1)
 	
 	q = fused_fp8_bf16_gemm(
 		hidden_states, self.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"]
@@ -2187,15 +2179,22 @@ def mla_decoding_flashmla(
 	past_value_states: torch.Tensor,
 	attention_mask: torch.Tensor,
 	position_ids: torch.Tensor,
-	scale
+	scale,
+	cache_seqlens_override: torch.Tensor = None,
+	max_seqlen_override: int = None,
 ):
-	# Create a block table for the key states
+	from batchgen.models.wrappers.attention import AttnWrapperBase
+	# Use cache_seqlens directly instead of attention_mask.sum()
+	if cache_seqlens_override is not None:
+		cache_seqlens = cache_seqlens_override
+	elif AttnWrapperBase.cache_seqlens is not None:
+		cache_seqlens = AttnWrapperBase.cache_seqlens
+	else:
+		cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+
 	block_size = 64
-	cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
-	
-	max_seqlen = cache_seqlens.max().item()
+	max_seqlen = max_seqlen_override if max_seqlen_override is not None else cache_seqlens.max().item()
 	max_seqlen_pad = ((max_seqlen + block_size - 1) // block_size) * block_size
-	# compressed_kv = dequant_per_token_triton(past_key_states, scale)
 	if max_seqlen_pad >= past_key_states.size(1):
 		compressed_kv = dequant_per_token_return_with_max_seqlen_pad(
 			past_key_states, scale, max_seqlen_pad
@@ -2205,11 +2204,9 @@ def mla_decoding_flashmla(
 		scale = scale[:, :max_seqlen_pad, :].contiguous()
 		compressed_kv = dequant_per_token_triton(compressed_kv, scale)
 
-	
-	assert attention_mask.dim() == 2
 	bsz, q_len, _ = hidden_states.size()
-	q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
-	kv_len = attention_mask.size(-1)
+	q_position_id = (cache_seqlens.to(torch.int64) - 1).unsqueeze(-1)
+	kv_len = max_seqlen_pad
 	
 	q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
@@ -2531,13 +2528,16 @@ def mla_decoding_flashmla_v2(
 		- The max_seqlen_pad is the max_context_length (a multiple of block_size).
 
 	"""
-	# Create a block table for the key states
+	from batchgen.models.wrappers.attention import AttnWrapperBase
+	# Use cache_seqlens directly instead of attention_mask.sum()
 	block_size = 64
-	cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
-	
+	if AttnWrapperBase.cache_seqlens is not None:
+		cache_seqlens = AttnWrapperBase.cache_seqlens
+	else:
+		cache_seqlens = attention_mask.sum(dim=1).to(torch.int32)
+
 	max_seqlen = cache_seqlens.max().item()
 	max_seqlen_pad = ((max_seqlen + block_size - 1) // block_size) * block_size
-	# compressed_kv = dequant_per_token_triton(past_key_states, scale)
 	if max_seqlen_pad >= past_key_states.size(1):
 		compressed_kv = dequant_per_token_return_with_max_seqlen_pad(
 			past_key_states, scale, max_seqlen_pad
@@ -2547,11 +2547,9 @@ def mla_decoding_flashmla_v2(
 		scale = scale[:, :max_seqlen_pad, :].contiguous()
 		compressed_kv = dequant_per_token_triton(compressed_kv, scale)
 
-	
-	assert attention_mask.dim() == 2
 	bsz, q_len, _ = hidden_states.size()
-	q_position_id = (attention_mask.sum(-1) - 1).unsqueeze(-1)
-	kv_len = attention_mask.size(-1)
+	q_position_id = (cache_seqlens.to(torch.int64) - 1).unsqueeze(-1)
+	kv_len = max_seqlen_pad
 	
 	# q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 	# q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)

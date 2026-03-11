@@ -13,7 +13,10 @@ GLM-5 tokenizer specifications:
 - Uses HuggingFace tokenizer.json format (bundled in this directory)
 """
 
+import json
 import logging
+import re
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -102,3 +105,54 @@ class GLM5Tokenizer(FastTokenizer):
         if tokenize:
             return self.encode(rendered, add_special_tokens=False)
         return rendered
+
+    # ---- Output parsing ----
+
+    _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    _ARG_RE = re.compile(
+        r"<arg_key>(.*?)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL
+    )
+
+    def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        m = self._THINK_RE.search(text)
+        if not m:
+            return None, text
+        reasoning = m.group(1).strip()
+        visible = self._THINK_RE.sub("", text, count=1).strip()
+        return reasoning, visible
+
+    def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        matches = self._TOOL_CALL_RE.findall(text)
+        if not matches:
+            return None, text
+        tool_calls = []
+        for raw in matches:
+            raw = raw.strip()
+            # Function name is the text before the first <arg_key>
+            arg_start = raw.find("<arg_key>")
+            if arg_start == -1:
+                name = raw
+                arguments = {}
+            else:
+                name = raw[:arg_start].strip()
+                arguments = {}
+                for am in self._ARG_RE.finditer(raw):
+                    key = am.group(1).strip()
+                    val = am.group(2).strip()
+                    # Try to parse JSON values (numbers, booleans, objects)
+                    try:
+                        arguments[key] = json.loads(val)
+                    except (ValueError, json.JSONDecodeError):
+                        arguments[key] = val
+
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments),
+                },
+            })
+        visible = self._TOOL_CALL_RE.sub("", text).strip()
+        return tool_calls, visible

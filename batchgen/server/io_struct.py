@@ -15,9 +15,11 @@ from pydantic import BaseModel, Field, root_validator, validator
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
     name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -29,11 +31,13 @@ class ChatCompletionRequest(BaseModel):
     )
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
+    top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)
     stream: Optional[bool] = Field(
         default=False, description="Must be false for batch requests"
     )
     max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     logit_bias: Optional[Dict[str, float]] = None
@@ -43,12 +47,13 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Reasoning effort level for GPT-OSS models (low, medium, high)",
     )
-    # Thinking/reasoning mode for GLM-5 and similar models
-    enable_thinking: Optional[bool] = Field(
+    tools: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="Enable thinking/reasoning mode for supported models (GLM-5). "
-                    "When true, model generates <think>...</think> reasoning before the answer. "
-                    "Overrides server-level --enable-thinking flag if set.",
+        description="List of tools the model may call (OpenAI function-calling format)",
+    )
+    thinking: Optional[bool] = Field(
+        default=None,
+        description="Enable/disable thinking mode (None = model default)",
     )
 
     @validator("stream")
@@ -65,9 +70,11 @@ class CompletionRequest(BaseModel):
     prompt: Union[str, List[str]] = Field(
         ..., description="Prompt(s) for completion"
     )
-    max_tokens: Optional[int] = Field(default=16, ge=1)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
+    top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)
     stream: Optional[bool] = Field(default=False)
     logprobs: Optional[int] = Field(default=None, ge=0, le=5)
@@ -146,10 +153,12 @@ class CreateBatchRequest(BaseModel):
     endpoint: BatchEndpoint = BatchEndpoint.CHAT_COMPLETIONS
     completion_window: CompletionWindow = CompletionWindow.ONE_DAY
     metadata: Optional[Dict[str, Any]] = None
-    # Inference parameters (override per-request values)
+    # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = Field(default=None, ge=1)
+    max_context_length: Optional[int] = Field(default=None, ge=1)  # Max total context (prompt + decode). None = use model max.
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
+    top_k: Optional[int] = Field(default=None, ge=0)
 
 
 class BatchObject(BaseModel):
@@ -168,10 +177,12 @@ class BatchObject(BaseModel):
     cancelling_at: Optional[int] = None
     error: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    # Inference parameters (set at batch creation, None = use defaults)
+    # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = None
+    max_context_length: Optional[int] = None  # None = use model max
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    top_k: Optional[int] = None
 
     @root_validator(pre=True)
     def default_timestamps(cls, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -204,9 +215,22 @@ class Usage(BaseModel):
     total_tokens: int
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
 class ChatCompletionChoiceMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
-    content: str
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class ChatCompletionChoice(BaseModel):

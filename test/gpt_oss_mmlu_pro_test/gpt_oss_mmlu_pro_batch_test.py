@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import tempfile
 from pathlib import Path
@@ -145,15 +146,31 @@ def create_batch_input_file(
     max_tokens: int,
     output_path: Path,
     reasoning_effort: Optional[str] = None,
-) -> None:
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    random_sampling_params: bool = False,
+    random_max_completion_tokens: bool = False,
+    min_completion_tokens: Optional[int] = None,
+    max_completion_tokens: Optional[int] = None,
+) -> Optional[List[int]]:
     """Create JSONL file in OpenAI batch format.
 
     Each line is a JSON object with:
     - custom_id: Unique identifier for the request
     - method: HTTP method (POST)
     - url: API endpoint (/v1/chat/completions)
-    - body: Request body with model, messages, max_tokens, reasoning_effort
+    - body: Request body with model, messages, max_tokens/max_completion_tokens, reasoning_effort, sampling params
+
+    Returns:
+        List of per-request max_completion_tokens if random mode is enabled, None otherwise.
     """
+    per_seq_limits: Optional[List[int]] = None
+    if random_max_completion_tokens:
+        lo = min_completion_tokens or 16
+        hi = max_completion_tokens or max_tokens or 128
+        per_seq_limits = [random.randint(lo, hi) for _ in range(len(queries))]
+
     with output_path.open("w", encoding="utf-8") as f:
         for idx, query in enumerate(queries):
             body = {
@@ -165,11 +182,29 @@ def create_batch_input_file(
                     },
                     {"role": "user", "content": query},
                 ],
-                "max_tokens": max_tokens,
             }
+            # Per-request max_completion_tokens or uniform max_tokens
+            if per_seq_limits is not None:
+                body["max_completion_tokens"] = per_seq_limits[idx]
+            else:
+                body["max_tokens"] = max_tokens
+
             # Add reasoning_effort for GPT-OSS models
             if reasoning_effort is not None:
                 body["reasoning_effort"] = reasoning_effort
+            # Per-request sampling params
+            if random_sampling_params:
+                body["temperature"] = random.choice([0.0, 0.3, 0.5, 0.7, 1.0])
+                body["top_p"] = random.choice([0.5, 0.8, 0.9, 0.95, 1.0])
+                body["top_k"] = random.choice([0, 10, 20, 40, 50])
+            else:
+                if temperature is not None:
+                    body["temperature"] = temperature
+                if top_p is not None:
+                    body["top_p"] = top_p
+                if top_k is not None:
+                    body["top_k"] = top_k
+
             request = {
                 "custom_id": f"mmlu-{idx}",
                 "method": "POST",
@@ -177,9 +212,18 @@ def create_batch_input_file(
                 "body": body,
             }
             f.write(json.dumps(request, ensure_ascii=False) + "\n")
-    logger.info(f"Created batch input file with {len(queries)} requests: {output_path}")
+
+    info_parts = [f"{len(queries)} requests"]
+    if random_sampling_params:
+        info_parts.append("random per-request sampling params")
+    if per_seq_limits is not None:
+        lo = min(per_seq_limits)
+        hi = max(per_seq_limits)
+        info_parts.append(f"random max_completion_tokens [{lo}, {hi}]")
+    logger.info(f"Created batch input file with {', '.join(info_parts)}: {output_path}")
     if reasoning_effort:
         logger.info(f"Reasoning effort: {reasoning_effort}")
+    return per_seq_limits
 
 
 def parse_batch_results(content: bytes) -> List[Dict[str, Any]]:
@@ -205,6 +249,7 @@ def run_batch_workflow(
     base_url: str,
     poll_interval: float = 5.0,
     timeout: Optional[float] = None,
+    max_context_length: int = 131072,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
@@ -216,6 +261,7 @@ def run_batch_workflow(
         base_url: Server base URL
         poll_interval: Seconds between status checks
         timeout: Maximum seconds to wait
+        max_context_length: Max total context (prompt + decode). Default 128K.
         temperature: Sampling temperature (None = greedy decoding)
         top_p: Nucleus sampling threshold (None = disabled)
 
@@ -236,6 +282,7 @@ def run_batch_workflow(
         endpoint="/v1/chat/completions",
         poll_interval=poll_interval,
         timeout=timeout,
+        max_context_length=max_context_length,
         temperature=temperature,
         top_p=top_p,
     )
@@ -264,7 +311,8 @@ if __name__ == "__main__":
         help="Max number of prompts to process. If not set, run the whole dataset.",
     )
     parser.add_argument(
-        "--max_decoding_length", type=int, required=True, help="Max tokens to decode"
+        "--max_decoding_length", type=int, default=None,
+        help="Max tokens to decode (required unless --random_max_completion_tokens is set)",
     )
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
@@ -288,6 +336,12 @@ if __name__ == "__main__":
         "--timeout", type=float, default=None, help="Maximum seconds to wait for batch"
     )
     parser.add_argument(
+        "--max_context_length",
+        type=int,
+        default=131072,
+        help="Max total context length (prompt + decode). Default 128K.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=None,
@@ -298,6 +352,34 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="Nucleus sampling threshold (default: None = disabled)",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=None,
+        help="Top-k filtering (default: None = disabled)",
+    )
+    parser.add_argument(
+        "--random_sampling_params",
+        action="store_true",
+        help="Generate random per-request sampling params (temperature, top_p, top_k) for each request",
+    )
+    parser.add_argument(
+        "--random_max_completion_tokens",
+        action="store_true",
+        help="Generate random per-request max_completion_tokens for each request",
+    )
+    parser.add_argument(
+        "--min_completion_tokens",
+        type=int,
+        default=None,
+        help="Lower bound for random max_completion_tokens (default: 16)",
+    )
+    parser.add_argument(
+        "--max_completion_tokens",
+        type=int,
+        default=None,
+        help="Upper bound for random max_completion_tokens (default: --max_decoding_length)",
     )
     parser.add_argument(
         "--reasoning_effort",
@@ -312,6 +394,10 @@ if __name__ == "__main__":
         help="Print detailed output for every sample (query, raw answer, parsed choice, ground truth)",
     )
     args = parser.parse_args()
+
+    # Validate: max_decoding_length required unless random_max_completion_tokens is set
+    if not args.random_max_completion_tokens and args.max_decoding_length is None:
+        parser.error("--max_decoding_length is required unless --random_max_completion_tokens is set")
 
     # Construct base URL
     if args.base_url:
@@ -385,25 +471,39 @@ if __name__ == "__main__":
     temp_dir = Path(tempfile.gettempdir())
     input_file = temp_dir / "gpt_oss_mmlu_pro_batch_input.jsonl"
 
-    # Create batch input file
-    create_batch_input_file(
+    # Create batch input file (with per-request sampling params in JSONL body)
+    per_seq_limits = create_batch_input_file(
         queries=queries,
         model_name=hugging_face_checkpoint,
-        max_tokens=args.max_decoding_length,
+        max_tokens=args.max_decoding_length or 128,
         output_path=input_file,
         reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        random_sampling_params=args.random_sampling_params,
+        random_max_completion_tokens=args.random_max_completion_tokens,
+        min_completion_tokens=args.min_completion_tokens,
+        max_completion_tokens=args.max_completion_tokens,
     )
 
     # Run batch workflow
+    # Sampling params are now per-request in the JSONL body.
+    # Batch-level params serve as defaults only when per-request values are None.
     logger.info(f"Connecting to server at {base_url}")
-    if args.temperature is not None or args.top_p is not None:
-        logger.info(f"Sampling params: temperature={args.temperature}, top_p={args.top_p}")
+    if args.random_max_completion_tokens:
+        logger.info("Using random per-request max_completion_tokens (set in JSONL body)")
+    if args.random_sampling_params:
+        logger.info("Using random per-request sampling params (set in JSONL body)")
+    elif args.temperature is not None or args.top_p is not None or args.top_k is not None:
+        logger.info(f"Sampling params: temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}")
     results = run_batch_workflow(
         input_file_path=str(input_file),
         output_file_path=None,  # Results downloaded from server
         base_url=base_url,
         poll_interval=args.poll_interval,
         timeout=args.timeout,
+        max_context_length=args.max_context_length,
         temperature=args.temperature,
         top_p=args.top_p,
     )
@@ -423,6 +523,39 @@ if __name__ == "__main__":
             answer_set.append(content)
         else:
             answer_set.append("")
+
+    # Verify per-sequence max_completion_tokens compliance
+    if per_seq_limits is not None:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(hugging_face_checkpoint)
+        print("\n--- Per-Sequence max_completion_tokens Verification ---")
+        violations = 0
+        for idx, result in enumerate(results):
+            response = result.get("response", {})
+            body = response.get("body", {})
+            usage = body.get("usage", {})
+            server_completion_tokens = usage.get("completion_tokens", -1)
+
+            choices = body.get("choices", [])
+            content = choices[0].get("message", {}).get("content", "") if choices else ""
+            retokenized_count = len(tokenizer.encode(content, add_special_tokens=False)) if content else 0
+
+            limit = per_seq_limits[idx]
+            server_ok = server_completion_tokens <= limit if server_completion_tokens >= 0 else True
+            retok_ok = retokenized_count <= limit
+
+            if not server_ok or not retok_ok:
+                violations += 1
+                print(
+                    f"  VIOLATION seq {idx}: limit={limit}, "
+                    f"server={server_completion_tokens}, retokenized={retokenized_count}"
+                )
+
+        if violations == 0:
+            print(f"  ALL {len(results)} sequences respect their max_completion_tokens limits")
+        else:
+            print(f"  {violations}/{len(results)} sequences VIOLATED their limits")
+        print("-" * 50)
 
     # Print results with Harmony format parsing info
     ground_truths = dataset["answer"].tolist()

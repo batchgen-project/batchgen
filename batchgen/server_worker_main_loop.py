@@ -135,6 +135,9 @@ def _server_worker_main_impl(
 	# 2. Initialize Process Group
 	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
 
+	# Set CUDA device before init_process_group so NCCL uses the correct device context
+	torch.cuda.set_device(args.local_rank)
+
 	try:
 		dist.init_process_group(
 			backend="nccl",
@@ -147,8 +150,6 @@ def _server_worker_main_impl(
 	except Exception as e:
 		logging.error(f"Failed to initialize process group: {e}")
 		sys.exit(1)
-
-	torch.cuda.set_device(args.local_rank)
 	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
 
 	# CRITICAL: Warmup NCCL connections before entering server loop
@@ -221,6 +222,18 @@ def _server_worker_main_impl(
 	if ready_event is not None and args.global_rank == 0:
 		ready_event.set()
 		logging.info(f"Rank {args.global_rank}: Signaled ready event to WorkerManager")
+
+	# 2.6. Initialize decode watchdog AFTER barrier — only monitors decode steps,
+	# not worker init, CUDA graph capture, or NCCL warmup.
+	decode_step_timeout = getattr(args, 'decode_step_timeout', None)
+	decode_watchdog = Watchdog.create(
+		debug_name=f"decode-{args.global_rank}",
+		watchdog_timeout=decode_step_timeout,
+		soft=False,  # Hard mode: kill parent process on timeout
+	)
+	if decode_step_timeout:
+		logging.info(f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s")
+	worker.set_decode_watchdog(decode_watchdog)
 
 	# 3. Long-lived server loop
 	global_rank = args.global_rank
@@ -303,13 +316,36 @@ def _server_worker_main_impl(
 			# max_input_len: If None or not provided, will be determined dynamically
 			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
-			current_max_output = task_data.get("max_output_len", 128)
+			current_max_output = task_data.get("max_output_len")
+			max_context_length = task_data.get("max_context_length", None)
 			ignore_eos = task_data.get("ignore_eos", False)
 			# Sampling parameters (None = greedy decoding)
 			temperature = task_data.get("temperature", None)
 			top_p = task_data.get("top_p", None)
+			# Per-request sampling params (list of dicts, one per prompt)
+			sampling_params = task_data.get("sampling_params", None)
+			# Per-sequence max output token limits
+			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
 			if global_rank == 0:
-				logging.info(f"[PAYLOAD] Extracted from task_data: temperature={temperature}, top_p={top_p}")
+				if sampling_params:
+					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
+				else:
+					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
+
+			# Stage incremental writer config on rank 0 (writer created after tokenizer init)
+			incr_output_dir = task_data.get("incremental_output_dir")
+			incr_custom_ids = task_data.get("custom_id_map")
+			if global_rank == 0 and incr_output_dir and incr_custom_ids:
+				worker._incremental_writer_config = {
+					"output_dir": incr_output_dir,
+					"batch_id": task_data.get("batch_id", "unknown"),
+					"model_name": task_data.get("model_name", "unknown"),
+					"custom_id_map": incr_custom_ids,
+					"request_urls": task_data.get("request_url_map", {}),
+					"prompt_texts": task_data.get("prompt_text_map", {}),
+					"parse_thinking": task_data.get("parse_thinking", False),
+					"parse_tool_call": task_data.get("parse_tool_call", False),
+				}
 
 			# Clear previous state if supported
 			if hasattr(worker, 'reset_runtime_state'):
@@ -318,16 +354,25 @@ def _server_worker_main_impl(
 			if len(global_prompts) > 0:
 				# Initialize worker with global batch info
 				# max_input_length can be None - will be determined by longest prompt
-				worker.Init(current_max_input, current_max_output, len(global_prompts))
+				worker.Init(current_max_input, current_max_output, len(global_prompts),
+					max_context_length=max_context_length)
 
 				# Set ignore_eos flag on worker
 				worker.set_ignore_eos(ignore_eos)
 
-				# Set sampling parameters (None = greedy decoding)
-				worker.set_sampling_params(temperature=temperature, top_p=top_p)
+				# Set sampling parameters
+				if sampling_params:
+					# Per-request sampling params from batch API
+					worker.set_per_sequence_sampling_params(sampling_params)
+				else:
+					# Global sampling params (legacy /v1/inference path)
+					worker.set_sampling_params(temperature=temperature, top_p=top_p)
 
 				# Process the global batch - worker internally handles distribution
-				local_results = worker.process_new_batch(global_prompts)
+				local_results = worker.process_new_batch(
+					global_prompts,
+					per_sequence_max_tokens=per_sequence_max_tokens,
+				)
 			else:
 				local_results = []
 
@@ -335,6 +380,14 @@ def _server_worker_main_impl(
 			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
 			inference_error = str(e)
 			local_results = []
+		finally:
+			# Close incremental writer regardless of success/failure
+			if getattr(worker, '_incremental_writer', None) is not None:
+				worker._incremental_writer.close()
+				worker._incremental_writer = None
+			# Clean up staged config
+			if hasattr(worker, '_incremental_writer_config'):
+				del worker._incremental_writer_config
 
 		# --- STEP 5: Synchronize and check for errors ---
 		# Sync CUDA to catch any async errors

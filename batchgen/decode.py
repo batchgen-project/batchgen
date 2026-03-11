@@ -176,7 +176,8 @@ class Decode():
 		return sample_tokens(logits, temperature=self._temperature, top_p=self._top_p)
 
 	def config_decode(self, num_seq, comm=None):
-		logging.info(f"Start Config Decoding")
+		if self.rank == 0:
+			logging.info("Start Config Decoding")
 		self.deep_free_model_memory()
 
 		# self.gpu_paged_kv_manager.initialize()
@@ -204,7 +205,8 @@ class Decode():
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 
-		logging.info(f"{self.rank} End Config Decoding")
+		if self.rank == 0:
+			logging.info("End Config Decoding")
 
 	def cleanup_decode(self):
 		pass
@@ -705,19 +707,24 @@ class DecodeBatchState:
 
 def check_eos_batch(
     new_tokens: torch.Tensor,
-    eos_token_id: int,
+    eos_token_id,
     sequence_uuids: List[str],
 ) -> Tuple[List[str], List[str]]:
     """Check for EOS tokens in a batch of new tokens.
 
     Args:
         new_tokens: [batch_size, 1] tensor of new token IDs
-        eos_token_id: The EOS token ID to check for
+        eos_token_id: EOS token ID (int) or set/list of EOS token IDs
         sequence_uuids: List of sequence UUIDs corresponding to tokens
 
     Returns:
         (continuing_uuids, completed_uuids)
     """
+    # Normalize to set for O(1) lookup
+    if isinstance(eos_token_id, int):
+        eos_token_id = {eos_token_id}
+    eos_set = set(eos_token_id)
+
     # Flatten tokens for comparison
     tokens_flat = new_tokens.view(-1).cpu().tolist()
 
@@ -725,7 +732,7 @@ def check_eos_batch(
     completed = []
 
     for uuid, token in zip(sequence_uuids, tokens_flat):
-        if token == eos_token_id:
+        if token in eos_set:
             completed.append(uuid)
         else:
             continuing.append(uuid)

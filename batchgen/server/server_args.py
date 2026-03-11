@@ -58,6 +58,7 @@ class ServerArgs:
     cache_dir: Optional[Path] = None
     converted_ckpt_dir: Optional[Path] = None
     enable_hugetlbfs: bool = False
+    fast_init: bool = False
     dist_init_addr: str = "localhost:12355"
     kv_dtype: str = "bfloat16"
     host_kv_cache_size: Optional[int] = None
@@ -86,15 +87,35 @@ class ServerArgs:
     enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+    parse_thinking: bool = False  # Extract reasoning_content from model output
+    parse_tool_call: bool = False  # Extract tool_calls from model output
     disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
     detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
-    enable_thinking: bool = False  # Enable thinking/reasoning mode by default for supported models
+    # Dynamic host KV reservation settings
+    host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
+    host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
+    enable_host_kv_eviction: bool = False  # Deprecated: eviction is always enabled when chunked host KV is active
+    adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
+    adaptive_chunk_min: int = 1024  # Minimum adaptive chunk size in tokens
+    adaptive_chunk_max: int = 65536  # Maximum adaptive chunk size in tokens
+    adaptive_chunk_ema_alpha: float = 0.1  # EMA smoothing factor
+    adaptive_chunk_multiplier: float = 1.5  # Headroom multiplier on EMA
+    # Incremental result saving (crash-resilient output)
+    incremental_output_dir: Optional[str] = None  # Directory for incremental JSONL; None = auto
+    no_incremental_save: bool = False  # Opt-out flag to disable incremental saving
+    # Decode step watchdog
+    decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
+    # Startup timeout
+    startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
 
     def __post_init__(self):
         if self.storage_path is None:
             self.storage_path = _default_storage_path()
+        # Default incremental output dir: {storage_path}/incremental/
+        if self.incremental_output_dir is None and not self.no_incremental_save:
+            self.incremental_output_dir = str(self.storage_path / "incremental")
 
     def resolve_paths(self) -> None:
         """Normalize any path-like args."""
@@ -126,9 +147,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to pre-downloaded model weights",
     )
     parser.add_argument(
+        "--converted-ckpt-dir",
+        type=Path,
+        default=None,
+        help="Path to pre-converted checkpoint directory (skips conversion step)",
+    )
+    parser.add_argument(
         "--enable-hugetlbfs",
         action="store_true",
         help="Enable hugeTLBFS for shared memory (requires system support)",
+    )
+    parser.add_argument(
+        "--fast-init",
+        action="store_true",
+        help="Use memfd_create + THP for fast memory registration. "
+             "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
+             "(2) root access (for pre-allocation memory compaction). "
+             "Automatically runs drop_caches + compact_memory before allocation "
+             "to defragment physical memory for stable 2MB THP pages.",
     )
     parser.add_argument(
         "--dist-init-addr",
@@ -192,6 +228,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Idle heartbeat interval in seconds when watchdog is enabled",
     )
     parser.add_argument(
+        "--decode-step-timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds for a single decode step. If exceeded, server is marked unhealthy and killed. Default: disabled. Recommended: 300.",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds from process launch to server ready (/health returns 200). If exceeded, server exits. Default: disabled. Recommended: 1800.",
+    )
+    parser.add_argument(
         "--enable-prepack",
         action="store_true",
         default=True,
@@ -252,6 +300,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected.",
     )
     parser.add_argument(
+        "--parse-thinking",
+        action="store_true",
+        default=False,
+        help="Extract thinking/reasoning blocks from model output into reasoning_content field",
+    )
+    parser.add_argument(
+        "--parse-tool-call",
+        action="store_true",
+        default=False,
+        help="Extract tool call blocks from model output into tool_calls array",
+    )
+    parser.add_argument(
         "--disable-cuda-graphs",
         action="store_true",
         default=False,
@@ -275,12 +335,74 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Include special tokens in detokenized output (default: off, special tokens stripped).",
     )
+    # Dynamic host KV reservation
     parser.add_argument(
-        "--enable-thinking",
+        "--host-kv-chunk-size",
+        type=int,
+        default=8192,
+        help="Host KV chunk size in tokens for dynamic reservation (default: 8192). Each sequence initially reserves prompt_length + chunk_size tokens instead of full max_decode_length.",
+    )
+    parser.add_argument(
+        "--host-kv-eviction-watermark",
+        type=int,
+        default=10,
+        help="Trigger host KV eviction when free pages drop below this percentage (default: 10)",
+    )
+    parser.add_argument(
+        "--enable-host-kv-eviction",
         action="store_true",
         default=False,
-        help="Enable thinking/reasoning mode by default for supported models (GLM-5, etc.). "
-             "Can be overridden per-request via the enable_thinking field in the API body.",
+        help="[Deprecated] Host KV eviction is now always enabled. This flag is ignored.",
+    )
+    parser.add_argument(
+        "--adaptive-chunk",
+        action="store_true",
+        default=True,
+        help="Enable EMA-based adaptive chunk sizing (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-adaptive-chunk",
+        action="store_true",
+        default=False,
+        help="Disable EMA-based adaptive chunk sizing (use static --host-kv-chunk-size)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-min",
+        type=int,
+        default=1024,
+        help="Minimum adaptive chunk size in tokens (default: 1024)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-max",
+        type=int,
+        default=65536,
+        help="Maximum adaptive chunk size in tokens (default: 65536)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-ema-alpha",
+        type=float,
+        default=0.1,
+        help="EMA smoothing factor for adaptive chunk sizing (default: 0.1)",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-multiplier",
+        type=float,
+        default=1.5,
+        help="Headroom multiplier on EMA for adaptive chunk sizing (default: 1.5)",
+    )
+    # Incremental result saving (crash-resilient)
+    parser.add_argument(
+        "--incremental-output-dir",
+        type=str,
+        default=None,
+        help="Directory for incremental JSONL results (crash-resilient). "
+             "Default: {storage_path}/incremental/",
+    )
+    parser.add_argument(
+        "--no-incremental-save",
+        action="store_true",
+        default=False,
+        help="Disable incremental saving of completed sequences to disk",
     )
     return parser
 
@@ -318,6 +440,10 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("watchdog_test_stuck_time must be non-negative")
     if args.watchdog_test_stuck_time > 0 and args.watchdog_timeout is None:
         raise ValueError("watchdog_test_stuck_time requires watchdog_timeout")
+    if args.decode_step_timeout is not None and args.decode_step_timeout <= 0:
+        raise ValueError("decode_step_timeout must be positive")
+    if args.startup_timeout is not None and args.startup_timeout <= 0:
+        raise ValueError("startup_timeout must be positive")
     if args.host_kv_watermark < 0 or args.host_kv_watermark > 100:
         raise ValueError("host_kv_watermark must be between 0 and 100")
     if args.gpu_memory_frac <= 0 or args.gpu_memory_frac > 1.0:
@@ -339,6 +465,18 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError(
             "ep_offloading_ratio > 0 requires --enable-ep-with-offloading"
         )
+    if args.host_kv_chunk_size <= 0:
+        raise ValueError("host_kv_chunk_size must be positive")
+    if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
+        raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
+    if args.adaptive_chunk_min <= 0:
+        raise ValueError("adaptive_chunk_min must be positive")
+    if args.adaptive_chunk_max < args.adaptive_chunk_min:
+        raise ValueError("adaptive_chunk_max must be >= adaptive_chunk_min")
+    if args.adaptive_chunk_ema_alpha <= 0 or args.adaptive_chunk_ema_alpha > 1.0:
+        raise ValueError("adaptive_chunk_ema_alpha must be in (0, 1]")
+    if args.adaptive_chunk_multiplier <= 0:
+        raise ValueError("adaptive_chunk_multiplier must be positive")
     args.storage_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -357,7 +495,9 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         listen_ip=parsed.listen_ip,
         listen_port=parsed.listen_port,
         cache_dir=parsed.cache_dir,
+        converted_ckpt_dir=parsed.converted_ckpt_dir,
         enable_hugetlbfs=parsed.enable_hugetlbfs,
+        fast_init=parsed.fast_init,
         dist_init_addr=parsed.dist_init_addr,
         kv_dtype=parsed.kv_dtype,
         host_kv_cache_size=parsed.host_kv_cache_size,
@@ -379,12 +519,25 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         decision_frequency_pages=parsed.decision_frequency_pages,
         enable_ep_with_offloading=parsed.enable_ep_with_offloading,
         ep_offloading_ratio=parsed.ep_offloading_ratio,
+        parse_thinking=parsed.parse_thinking,
+        parse_tool_call=parsed.parse_tool_call,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
         detokenization_include_special_tokens=parsed.detokenization_include_special_tokens,
-        enable_thinking=parsed.enable_thinking,
+        host_kv_chunk_size=parsed.host_kv_chunk_size,
+        host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
+        enable_host_kv_eviction=parsed.enable_host_kv_eviction,
+        adaptive_chunk=not getattr(parsed, 'no_adaptive_chunk', False),
+        adaptive_chunk_min=parsed.adaptive_chunk_min,
+        adaptive_chunk_max=parsed.adaptive_chunk_max,
+        adaptive_chunk_ema_alpha=parsed.adaptive_chunk_ema_alpha,
+        adaptive_chunk_multiplier=parsed.adaptive_chunk_multiplier,
+        incremental_output_dir=parsed.incremental_output_dir,
+        no_incremental_save=parsed.no_incremental_save,
+        decode_step_timeout=parsed.decode_step_timeout,
+        startup_timeout=parsed.startup_timeout,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

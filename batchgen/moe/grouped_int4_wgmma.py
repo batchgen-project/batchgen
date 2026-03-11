@@ -23,52 +23,20 @@ Architecture:
 
 import logging
 import torch
-from torch.utils.cpp_extension import load_inline
 from typing import Tuple, List, Optional
 
-# Lazy-loaded CUDA module
 _wgmma_module = None
-
-# The CUDA source is loaded from the kernel development file on first use.
-# This avoids embedding 800+ lines of CUDA in Python source while keeping
-# the module self-contained (only reads from within BatchGen repo).
-_CUDA_SOURCE_PATH = None
-
-
-def _load_cuda_source() -> str:
-    """Load CUDA source from the co-located .cu file."""
-    import os
-    cu_path = os.path.join(os.path.dirname(__file__), "grouped_int4_wgmma.cu")
-    if not os.path.isfile(cu_path):
-        raise FileNotFoundError(
-            f"CUDA source not found at {cu_path}. "
-            f"Copy from batchgen_kernels/moe_gemm/grouped_gemm_bf16_int4_bf16_bf16/"
-        )
-    with open(cu_path, "r") as f:
-        return f.read()
 
 
 def _get_wgmma_module():
-    """Build and cache the grouped INT4 WGMMA CUDA module."""
+    """Load the pre-compiled grouped INT4 WGMMA CUDA module."""
     global _wgmma_module
     if _wgmma_module is not None:
         return _wgmma_module
 
-    cuda_source = _load_cuda_source()
-
-    device = torch.cuda.current_device()
-    cc = torch.cuda.get_device_capability(device)
-    arch = f"-arch=sm_{cc[0]}{cc[1]}a"
-    cuda_flags = ["-std=c++17", arch, "-O3", "--ptxas-options=-v", "-lineinfo"]
-
-    _wgmma_module = load_inline(
-        name="grouped_int4_moe_wgmma_v1",
-        cpp_sources=[""],
-        cuda_sources=[cuda_source],
-        extra_cuda_cflags=cuda_flags,
-        verbose=False,
-    )
-    logging.info("[WGMMA] Built grouped INT4 WGMMA module")
+    import batchgen_kernels
+    _wgmma_module = batchgen_kernels.load_extension("batchgen_kernels.moe._C_grouped_int4_wgmma")
+    logging.info("[WGMMA] Loaded pre-compiled grouped INT4 WGMMA module")
     return _wgmma_module
 
 

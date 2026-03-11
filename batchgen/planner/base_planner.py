@@ -74,7 +74,7 @@ class BasePlanner(ABC):
     def _set_default_configs(self):
         """Set common default configs. Subclasses can override."""
         # Token-based prefill (for prepack mode, always recommended)
-        self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 120_000
+        self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 131_072
         self.config.Module_Batching_Config.prepack_row_capacity = None
 
         # Sequence-based prefill (for non-prepack mode)

@@ -20,8 +20,8 @@ NC='\033[0m' # No Color
 
 # Configuration - pinned versions for reproducibility
 FLASH_ATTN_VERSION="v2.8.2"
-FLASHMLA_COMMIT="9edee0c022cd0938148a18e334203b0aab43aa19"
-DEEPGEMM_COMMIT="d374456"
+FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
+DEEPGEMM_VERSION="v2.1.1.post3"
 
 # Installation directory (defaults to temp, can be overridden)
 INSTALL_DIR="${BATCHGEN_INSTALL_DIR:-/tmp/batchgen_deps}"
@@ -128,7 +128,7 @@ install_torch() {
         fi
     else
         print_step "Installing PyTorch with CUDA 12.8 support..."
-        pip install torch==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+        pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
         print_success "PyTorch installed"
     fi
 }
@@ -159,7 +159,7 @@ install_flash_attention() {
 
     print_step "Building flash-attention 3 (this may take 10-20 minutes)..."
     cd hopper
-    pip install . --no-build-isolation
+    FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
 
     print_success "flash-attention 3 installed"
 }
@@ -174,7 +174,7 @@ install_flashmla() {
     fi
 
     print_step "Installing FlashMLA from git (this may take 5-10 minutes)..."
-    pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
+    FLASH_MLA_DISABLE_SM100=1 pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
 
     print_success "FlashMLA installed"
 }
@@ -195,13 +195,13 @@ install_deepgemm() {
         print_step "Updating existing DeepGEMM repository..."
         cd DeepGEMM
         git fetch origin
-        git checkout "$DEEPGEMM_COMMIT"
+        git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     else
         print_step "Cloning DeepGEMM repository..."
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
         cd DeepGEMM
-        git checkout "$DEEPGEMM_COMMIT"
+        git checkout "$DEEPGEMM_VERSION"
         git submodule update --init --recursive
     fi
 
@@ -209,6 +209,21 @@ install_deepgemm() {
     pip install . --no-build-isolation
 
     print_success "DeepGEMM installed"
+}
+
+install_batchgen_kernels() {
+    print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
+
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BATCHGEN_DIR="$(dirname "$SCRIPT_DIR")"
+
+    if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
+        cd "$BATCHGEN_DIR/batchgen_kernels"
+        pip install . --no-build-isolation
+        print_success "batchgen_kernels installed"
+    else
+        print_warning "batchgen_kernels/setup.py not found, skipping kernel compilation"
+    fi
 }
 
 install_batchgen() {
@@ -220,8 +235,8 @@ install_batchgen() {
 
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install -e .
-        print_success "BatchGen installed in editable mode"
+        pip install .
+        print_success "BatchGen installed"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
         print_error "Please run this script from the BatchGen/scripts directory"
@@ -250,6 +265,7 @@ show_help() {
     echo "  --flashmla        Install FlashMLA only"
     echo "  --deepgemm        Install DeepGEMM only"
     echo "  --batchgen        Install BatchGen only"
+    echo "  --wheel-dir DIR   Use pre-built wheels for flash-attn/FlashMLA/DeepGEMM"
     echo "  --skip-gpu-check  Skip GPU architecture detection"
     echo "  --keep-build      Keep build directory after installation"
     echo "  --help            Show this help message"
@@ -259,9 +275,10 @@ show_help() {
     echo "  KEEP_BUILD_DIR        Set to 1 to keep build directory"
     echo ""
     echo "Examples:"
-    echo "  $0                    # Install everything (auto-detect GPU)"
-    echo "  $0 --flash-attn       # Install only flash-attention 3"
-    echo "  $0 --skip-gpu-check   # Install all deps without GPU check"
+    echo "  $0                                  # Install everything (auto-detect GPU)"
+    echo "  $0 --flash-attn                     # Install only flash-attention 3"
+    echo "  $0 --wheel-dir /path/to/wheels      # Install deps from pre-built wheels"
+    echo "  $0 --skip-gpu-check                 # Install all deps without GPU check"
 }
 
 main() {
@@ -277,6 +294,7 @@ main() {
     INSTALL_DEEPGEMM=0
     INSTALL_BATCHGEN=0
     SKIP_GPU_CHECK=0
+    WHEEL_DIR=""
 
     if [[ $# -eq 0 ]]; then
         INSTALL_ALL=1
@@ -307,6 +325,10 @@ main() {
             --skip-gpu-check)
                 SKIP_GPU_CHECK=1
                 shift
+                ;;
+            --wheel-dir)
+                WHEEL_DIR="$2"
+                shift 2
                 ;;
             --keep-build)
                 export KEEP_BUILD_DIR=1
@@ -344,13 +366,26 @@ main() {
     # Install dependencies based on options
     if [[ $INSTALL_ALL -eq 1 ]]; then
         if [[ $IS_HOPPER -eq 1 ]]; then
-            install_flash_attention
-            install_flashmla
-            install_deepgemm
+            if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
+                print_step "Installing Hopper dependencies from pre-built wheels: $WHEEL_DIR"
+                pip install --find-links "$WHEEL_DIR" --no-index \
+                    flash-attn-hopper flash-mla deep-gemm 2>/dev/null || \
+                    pip install "$WHEEL_DIR"/*.whl
+                print_success "Hopper dependencies installed from wheels"
+            else
+                install_flash_attention
+                install_flashmla
+                install_deepgemm
+                # Reinstall PyTorch — building deps from source may downgrade torch or triton
+                print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
+                pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+                print_success "PyTorch reinstalled"
+            fi
         else
             print_warning "Skipping Hopper-specific dependencies (non-Hopper GPU detected)"
             print_warning "Use --skip-gpu-check to force installation"
         fi
+        install_batchgen_kernels
         install_batchgen
     else
         if [[ $INSTALL_FLASH_ATTN -eq 1 ]]; then
@@ -363,6 +398,7 @@ main() {
             install_deepgemm
         fi
         if [[ $INSTALL_BATCHGEN -eq 1 ]]; then
+            install_batchgen_kernels
             install_batchgen
         fi
     fi

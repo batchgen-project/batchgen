@@ -33,6 +33,8 @@ GPT-OSS tokenizer specifications:
 
 import json
 import logging
+import re
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -296,3 +298,55 @@ class GPTOssTokenizer(BaseTokenizer):
         if tokenize:
             return self.encode(rendered, add_special_tokens=False)
         return rendered
+
+    # ---- Output parsing ----
+
+    _CHANNEL_RE = re.compile(
+        r"<\|channel\|>(.*?)<\|message\|>(.*?)(?=<\|channel\|>|<\|return\|>|$)",
+        re.DOTALL,
+    )
+
+    def parse_thinking(self, text: str) -> tuple[Optional[str], str]:
+        channels = {}
+        for m in self._CHANNEL_RE.finditer(text):
+            channel_name = m.group(1).strip()
+            channel_content = m.group(2).strip()
+            channels[channel_name] = channel_content
+
+        if not channels:
+            return None, text
+
+        reasoning = channels.get("analysis")
+        visible = channels.get("final", text)
+        return reasoning, visible
+
+    def parse_tool_calls(self, text: str) -> tuple[Optional[list], str]:
+        if "<|call|>" not in text:
+            return None, text
+
+        parts = text.split("<|call|>")
+        visible = parts[0].strip()
+        tool_calls = []
+        for raw_call in parts[1:]:
+            raw_call = raw_call.strip()
+            # Strip trailing special tokens
+            for tok in ("<|return|>", "<|end|>"):
+                if raw_call.endswith(tok):
+                    raw_call = raw_call[: -len(tok)].strip()
+            try:
+                payload = json.loads(raw_call)
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": payload.get("name", ""),
+                        "arguments": json.dumps(
+                            payload.get("parameters", payload.get("arguments", {}))
+                        ),
+                    },
+                })
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Failed to parse GPT-OSS tool call: %s", raw_call[:200]
+                )
+        return tool_calls or None, visible

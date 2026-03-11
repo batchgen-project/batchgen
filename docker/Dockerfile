@@ -38,9 +38,9 @@ RUN uv pip install torch==2.9.0+cu128 --extra-index-url https://download.pytorch
 # Install Flash Attention
 RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && cd flash-attention \
-    && git checkout v2.8.3 \
+    && git checkout v2.8.2 \
     && cd hopper \
-    && uv pip install . --no-build-isolation \
+    && FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install . --no-build-isolation \
     && uv cache clean
 
 # Install FlashMLA
@@ -62,7 +62,13 @@ RUN git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git \
 # Install from moe gen source
 COPY . /root/moegen
 
-RUN uv pip install -r requirements.txt && uv pip install -e . -v \
+# Install batchgen_kernels (AOT-compiled CUDA extensions)
+RUN cd /root/moegen/batchgen_kernels \
+    && uv pip install . --no-build-isolation \
+    && uv cache clean
+
+# Install BatchGen
+RUN uv pip install -r requirements.txt && uv pip install . -v \
     && uv cache clean
 
 ENV NCCL_BUFFSIZE=16777216

@@ -24,7 +24,11 @@
 #include <unordered_map>
 void* allocate_shared_pinned_memory(const std::string& shm_name, int64_t size,
                                     bool create, bool enable_hugetlbfs,
-                                    bool pin_for_cuda = true);
+                                    bool pin_for_cuda = true,
+                                    bool enable_memfd = false,
+                                    int memfd_creator_pid = -1,
+                                    int memfd_fd = -1,
+                                    int* out_memfd_fd = nullptr);
 void free_shared_pinned_memory(std::string& shm_name, void* ptr, int64_t size,
                                bool create);
 void serialize_to_shared_memory(

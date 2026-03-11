@@ -64,6 +64,9 @@ class KimiK25Planner(BasePlanner):
         # EP offloading is disabled for K2.5 (all experts resident on GPU)
         self.config.EP_Config.enable_offloading = False
 
+        # K2.5 context window: max_position_embeddings=262144 (YaRN: 4096 * factor=64)
+        self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 262_144
+
     def get_module_shapes(self) -> dict:
         """Return Kimi K2.5 specific tensor shapes."""
         return {

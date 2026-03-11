@@ -32,6 +32,7 @@ class MigrationOp:
     from_rank: int
     to_rank: int
     pages: int
+    host_pages: int = 0  # Actual host pages allocated (may differ from pages during chunked growth)
 
 
 @dataclass
@@ -504,9 +505,8 @@ class KVMigrationHelper:
         local_idx = self.worker._uuid_to_local_map.get(mig.uuid)
         if local_idx is not None and local_idx in self.worker.query_book:
             qb = self.worker.query_book[local_idx]
-            dist.send(tensor=qb.encoded["input_ids"].cpu().contiguous(), dst=mig.to_rank, group=gloo_group)
-            dist.send(tensor=qb.encoded["attention_mask"].cpu().contiguous(), dst=mig.to_rank, group=gloo_group)
-            dist.send(tensor=qb.decoded_tokens.cpu().contiguous(), dst=mig.to_rank, group=gloo_group)
+            dist.send(tensor=qb.encoded["input_ids"].clone(), dst=mig.to_rank, group=gloo_group)
+            dist.send(tensor=qb.decoded_tokens.clone(), dst=mig.to_rank, group=gloo_group)
 
         if self.debug:
             logger.debug(f"MIGRATION: Rank {self.rank}: Sent {mig.uuid[:8]}... in {(time.perf_counter()-t0)*1000:.1f}ms")
@@ -555,18 +555,15 @@ class KVMigrationHelper:
 
         # Receive query_book data
         input_ids_recv = torch.empty(seq.input_ids.shape, dtype=seq.input_ids.dtype, device="cpu")
-        attention_mask_recv = torch.empty(seq.attention_mask.shape, dtype=seq.attention_mask.dtype, device="cpu")
         decoded_tokens_recv = torch.empty(seq.decoded_tokens.shape, dtype=seq.decoded_tokens.dtype, device="cpu")
 
         dist.recv(tensor=input_ids_recv, src=mig.from_rank, group=gloo_group)
-        dist.recv(tensor=attention_mask_recv, src=mig.from_rank, group=gloo_group)
         dist.recv(tensor=decoded_tokens_recv, src=mig.from_rank, group=gloo_group)
 
         # Store pending data
         self._pending_migrated_query_book[mig.uuid] = {
             'text': seq.text,
             'input_ids': input_ids_recv,
-            'attention_mask': attention_mask_recv,
             'decoded_tokens': decoded_tokens_recv,
             'kv_token_budget': seq.kv_token_budget,
         }

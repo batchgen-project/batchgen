@@ -159,8 +159,18 @@ setup(
             # Data files (tokenizers, configs, etc.)
             "**/*.json",
             "**/*.parquet",
+            "**/*.jinja",
+            "**/*.model",
             # Compiled binaries
             "**/*.so",
+        ],
+    },
+    exclude_package_data={
+        "batchgen": [
+            "storage/batches/*",
+            "storage/files/*",
+            "storage/files_meta/*",
+            "storage/outputs/*",
         ],
     },
     include_package_data=True,

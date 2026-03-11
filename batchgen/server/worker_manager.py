@@ -34,6 +34,27 @@ logger = logging.getLogger(__name__)
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 
 
+def _validate_shmem_enabled() -> None:
+    """Check that THP shmem is enabled for --fast-init. Raises RuntimeError if not."""
+    import re
+    sysfs_path = "/sys/kernel/mm/transparent_hugepage/shmem_enabled"
+    try:
+        with open(sysfs_path) as f:
+            line = f.read().strip()
+        match = re.search(r'\[(\w+)\]', line)
+        active = match.group(1) if match else "unknown"
+        if active not in ("always", "within_size"):
+            raise RuntimeError(
+                f"--fast-init requires shmem_enabled='always' or 'within_size', "
+                f"got '{active}'. Fix: echo always > {sysfs_path}"
+            )
+        logger.info("THP shmem_enabled=%s (OK for --fast-init)", active)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"--fast-init requires THP support. {sysfs_path} not found."
+        )
+
+
 def detect_gpu_arch() -> str:
     """Auto-detect GPU architecture based on CUDA compute capability.
 
@@ -148,12 +169,21 @@ class WorkerManager:
 
     # ---------------------- Public API ----------------------
     def start(self) -> None:
+        import time as _time
+
         if self.started:
             return
+
+        startup_start = _time.monotonic()
 
         self._stopping = False
         self._monitor_stop_event.clear()
         self._ready_event.clear()
+
+        if self.args.fast_init:
+            _validate_shmem_enabled()
+            self._compact_memory()
+
         if self.args.enable_hugetlbfs:
             byte_size = get_model_byte_size(self.args.model)
             self._config_hugepages(byte_size)
@@ -161,19 +191,36 @@ class WorkerManager:
 
         config_torch_module_initializer()
         if self.args.host_kv_cache_size:
+            kv_start = _time.monotonic()
             try:
-                self.allocate_host_kv_cache(
-                    self.args.host_kv_cache_size, self.args.model
+                self.host_kv_manager = self.allocate_host_kv_cache(
+                    self.args.host_kv_cache_size, self.args.model,
+                    enable_memfd=self.args.fast_init,
                 )
             except Exception as exc:
                 logger.warning("Host KV cache allocation failed: %s", exc)
+                self.host_kv_manager = None
+            logger.info("[startup] Host KV cache allocated in %.2fs",
+                        _time.monotonic() - kv_start)
+
+        model_start = _time.monotonic()
         self._load_model_resources()
+        logger.info("[startup] Model resources loaded in %.2fs",
+                    _time.monotonic() - model_start)
+
+        spawn_start = _time.monotonic()
         self._spawn_workers()
         self._start_worker_monitor()
         self._wait_for_workers_ready()
+        logger.info("[startup] Workers ready in %.2fs",
+                    _time.monotonic() - spawn_start)
+
         self.started = True
         logger.info(
-            "WorkerManager started with %s GPUs", torch.cuda.device_count()
+            "[startup] Total server startup: %.2fs (fast_init=%s, GPUs=%s)",
+            _time.monotonic() - startup_start,
+            self.args.fast_init,
+            torch.cuda.device_count(),
         )
 
     def stop(self) -> None:
@@ -268,6 +315,18 @@ class WorkerManager:
         ignore_eos: bool = False,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        # Incremental writer metadata
+        custom_id_map: Optional[Dict[int, str]] = None,
+        request_url_map: Optional[Dict[int, str]] = None,
+        prompt_text_map: Optional[Dict[int, str]] = None,
+        batch_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        incremental_output_dir: Optional[str] = None,
+        parse_thinking: bool = False,
+        parse_tool_call: bool = False,
+        max_context_length: Optional[int] = None,
+        sampling_params: Optional[List[Dict[str, Any]]] = None,
+        per_sequence_max_tokens: Optional[List[int]] = None,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -278,13 +337,43 @@ class WorkerManager:
             "ignore_eos": ignore_eos,
             "temperature": temperature,
             "top_p": top_p,
+            "max_context_length": max_context_length,
         }
+        # Per-request sampling parameters (list of dicts with temperature/top_p/top_k)
+        if sampling_params is not None:
+            payload["sampling_params"] = sampling_params
+        # Per-sequence max output token limits
+        if per_sequence_max_tokens is not None:
+            payload["per_sequence_max_tokens"] = per_sequence_max_tokens
+        # Incremental writer metadata (only included when active)
+        if incremental_output_dir and custom_id_map:
+            payload["incremental_output_dir"] = incremental_output_dir
+            payload["custom_id_map"] = custom_id_map
+            payload["request_url_map"] = request_url_map or {}
+            payload["prompt_text_map"] = prompt_text_map or {}
+            payload["batch_id"] = batch_id
+            payload["model_name"] = model_name
+            payload["parse_thinking"] = parse_thinking
+            payload["parse_tool_call"] = parse_tool_call
         with self._lock:
             self.request_queue.put(payload)
             result = self.response_queue.get()
         return result
 
     # ---------------------- Startup helpers ----------------------
+    def _compact_memory(self) -> None:
+        """Drop page cache and compact memory for stable THP allocation."""
+        import subprocess
+        import time as _time
+        t0 = _time.monotonic()
+        try:
+            subprocess.run(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True)
+            subprocess.run(["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"], check=True)
+            logger.info("[fast-init] Memory compaction completed in %.2fs (drop_caches + compact_memory)",
+                        _time.monotonic() - t0)
+        except (subprocess.CalledProcessError, PermissionError) as e:
+            logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
+
     def _config_hugepages(self, byte_size: int = None) -> None:
         """Configure hugepages for shared memory.
 
@@ -403,6 +492,7 @@ class WorkerManager:
             watchdog_timeout=self.args.watchdog_timeout,
             watchdog_test_stuck_time=self.args.watchdog_test_stuck_time,
             watchdog_heartbeat_interval=self.args.watchdog_heartbeat_interval,
+            decode_step_timeout=self.args.decode_step_timeout,
             enable_prepack=self.args.enable_prepack,
             host_kv_watermark=self.args.host_kv_watermark,
             enable_decode_preemption=self.args.enable_decode_preemption,
@@ -417,6 +507,19 @@ class WorkerManager:
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
             detokenization_include_special_tokens=self.args.detokenization_include_special_tokens,
+            host_kv_chunk_size=self.args.host_kv_chunk_size,
+            enable_host_kv_eviction=self.args.enable_host_kv_eviction,
+            host_kv_eviction_watermark=self.args.host_kv_eviction_watermark,
+            adaptive_chunk=self.args.adaptive_chunk,
+            adaptive_chunk_min=self.args.adaptive_chunk_min,
+            adaptive_chunk_max=self.args.adaptive_chunk_max,
+            adaptive_chunk_ema_alpha=self.args.adaptive_chunk_ema_alpha,
+            adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
+            fast_init=self.args.fast_init,
+            kv_memfd_pid=self._get_kv_memfd_pid(),
+            kv_memfd_fd=self._get_kv_memfd_fd(),
+            weights_memfd_pid=self._get_weights_memfd_pid(),
+            weights_memfd_fd=self._get_weights_memfd_fd(),
         )
         from batchgen.server_worker_main_loop import server_worker_main
         self.worker_process = mp.spawn(
@@ -431,6 +534,30 @@ class WorkerManager:
             join=False,
             daemon=True,
         )
+
+    def _get_kv_memfd_pid(self) -> int:
+        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+            return os.getpid()
+        return -1
+
+    def _get_kv_memfd_fd(self) -> int:
+        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+            return self.host_kv_manager.memfd_fd()
+        return -1
+
+    def _get_weights_memfd_pid(self) -> int:
+        ps = getattr(self, 'parameter_server_instance', None)
+        if self.args.fast_init and ps is not None:
+            fd = ps.parameter_server.weights_memfd_fd()
+            if fd >= 0:
+                return os.getpid()
+        return -1
+
+    def _get_weights_memfd_fd(self) -> int:
+        ps = getattr(self, 'parameter_server_instance', None)
+        if self.args.fast_init and ps is not None:
+            return ps.parameter_server.weights_memfd_fd()
+        return -1
 
     def _wait_for_workers_ready(self) -> None:
         if self.worker_process is None:
@@ -538,6 +665,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
             )
         elif "mixtral" in self.args.model.lower():
             from batchgen.models.mixtral.mixtral_parameter_server import (
@@ -545,7 +673,8 @@ class WorkerManager:
             )
 
             parameter_server = Mixtral_Parameter_Server(
-                self.args.model, self.args.cache_dir, converted_ckpt_dir
+                self.args.model, self.args.cache_dir, converted_ckpt_dir,
+                enable_memfd=self.args.fast_init,
             )
         elif "gpt-oss-120b" in self.args.model.lower():
             from batchgen.models.openai.gpt_oss_120b.gpt_oss_parameter_server import (
@@ -557,6 +686,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
             )
         elif "moonshotai" in self.args.model.lower() or "kimi" in self.args.model.lower():
             from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
@@ -568,6 +698,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
             )
         elif "minimax" in self.args.model.lower():
             from batchgen.models.minimax.minimax_m25.minimax_m25_parameter_server import (
@@ -579,6 +710,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
             )
         elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
             from batchgen.models.glm.glm5.glm5_parameter_server import (
@@ -728,7 +860,8 @@ class WorkerManager:
 
     @staticmethod
     def allocate_host_kv_cache(
-        host_kv_cache_size_gb: int, model_name: str
+        host_kv_cache_size_gb: int, model_name: str,
+        enable_memfd: bool = False,
     ) -> Any:
         from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
 
@@ -748,6 +881,8 @@ class WorkerManager:
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
         )
+        if enable_memfd:
+            config.enable_memfd = True
         # Select manager based on model's KV cache configuration
         # MLA models (num_v_heads=0) don't have V cache, GQA/MHA models (num_v_heads>0) do
         if config.num_v_heads == 0:

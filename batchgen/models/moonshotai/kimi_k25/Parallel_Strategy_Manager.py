@@ -28,7 +28,7 @@ Key differences from DeepSeek-V3 PSM:
 - Loads INT4 packed/scale tensors for persistent experts
 """
 
-from .model import KimiK25ForCausalLM
+from .model import KimiK25ForCausalLM, KimiK25MoE, KimiK25MoEBufferManager
 from .wrappers import KimiK25ExpertWrapper, KimiK25AttnWrapper
 import logging
 import types
@@ -71,6 +71,57 @@ class KimiK25ParallelStrategyManager:
         self.world_size = world_size
         self.rank = global_rank
 
+    def _cleanup_decode_gpu_state(self):
+        """Free all phase-specific GPU allocations (model, buffers, class state).
+
+        Called before both configure_prefill() and configure_decoding() to ensure
+        no GPU memory leaks across phase transitions. Cleans up:
+        - Model instance and its nn.Parameters
+        - INT4 contiguous GPU weight buffers (PSM attributes)
+        - KimiK25MoE._buf class-level activation buffer manager
+        - KimiK25MoE._shared_expert_stream class-level CUDA stream
+        - AllToAll communication buffers (if enabled)
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        alloc_before = torch.cuda.memory_allocated(device)
+
+        # 1. Delete old model (frees nn.Parameters on GPU)
+        if getattr(self, 'model', None) is not None:
+            del self.model
+            self.model = None
+
+        # 2. INT4 contiguous GPU buffers (stored on PSM, not on model)
+        if hasattr(self, '_int4_packed_gpu_buf'):
+            del self._int4_packed_gpu_buf
+        if hasattr(self, '_int4_scale_gpu_buf'):
+            del self._int4_scale_gpu_buf
+
+        # 3. MoE buffer manager (class variable — survives model deletion)
+        if hasattr(KimiK25MoE, '_buf') and KimiK25MoE._buf is not None:
+            KimiK25MoE._buf = None
+
+        # 4. MoE shared CUDA stream (class variable)
+        if hasattr(KimiK25MoE, '_shared_expert_stream'):
+            KimiK25MoE._shared_expert_stream = None
+
+        # 5. AllToAll communication buffers (if ATA was enabled)
+        for attr in ('expert_x', 'expert_y', 'y', 'dp_x', 'ata',
+                     'expert_num_tokens', 'indices', 'weights'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+
+        alloc_after = torch.cuda.memory_allocated(device)
+        logging.info(
+            f"Rank {self.rank}: [HBM] phase cleanup freed "
+            f"{(alloc_before - alloc_after) / (1024**3):.2f} GiB "
+            f"(allocated: {alloc_before / (1024**3):.2f} → {alloc_after / (1024**3):.2f} GiB)"
+        )
+
     def configure_prefill(self):
         """Configure model skeleton for prefill (pure DP) and weight copy task."""
         import time
@@ -79,7 +130,10 @@ class KimiK25ParallelStrategyManager:
 
         # Step 1: Set phase (pure DP - no EP in prefill)
         self.loaded_model_config.phase = "prefill"
-        # Don't set ep_size - prefill uses pure DP (all experts on each rank)
+        self.loaded_model_config.ep_size = 1  # Pure DP: all 384 experts on each rank
+
+        # Step 1.5: Free decode-phase GPU allocations before creating prefill model
+        self._cleanup_decode_gpu_state()
 
         # Step 2: Initialize model
         # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides
@@ -131,12 +185,12 @@ class KimiK25ParallelStrategyManager:
 
                 # Routed experts — module keys only (INT4 tensors handled by wrappers)
                 # Prefill uses pure DP: all 384 experts on each rank
+                # In EP mode, non-local experts are None — skip them
                 for expert_idx in range(NUM_TOTAL_EXPERTS):
-                    for name, _ in (
-                        self.model.model.layers[layer_idx]
-                        .mlp.experts[expert_idx]
-                        .named_parameters()
-                    ):
+                    expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+                    if expert is None:
+                        continue
+                    for name, _ in expert.named_parameters():
                         tensor_full_name = (
                             "model.layers."
                             + str(layer_idx)
@@ -237,19 +291,8 @@ class KimiK25ParallelStrategyManager:
             f"reserved={reserved_before / (1024**3):.2f} GiB"
         )
 
-        # Deep free prefill model before loading decode model
-        if self.model is not None:
-            del self.model
-            self.model = None
-        # Free INT4 contiguous GPU buffers (PSM attributes, not on model)
-        if hasattr(self, '_int4_packed_gpu_buf'):
-            del self._int4_packed_gpu_buf
-        if hasattr(self, '_int4_scale_gpu_buf'):
-            del self._int4_scale_gpu_buf
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Deep free prefill model and all phase-specific GPU allocations
+        self._cleanup_decode_gpu_state()
 
         # Log GPU memory after deep free
         alloc_after = torch.cuda.memory_allocated(device)
@@ -398,7 +441,7 @@ class KimiK25ParallelStrategyManager:
         def _log_hbm(step_name):
             a = torch.cuda.memory_allocated(device) / (1024**3)
             r = torch.cuda.memory_reserved(device) / (1024**3)
-            logging.info(f"Rank {self.rank}: HBM after {step_name}: allocated={a:.2f} GiB, reserved={r:.2f} GiB")
+            logging.debug(f"Rank {self.rank}: HBM after {step_name}: allocated={a:.2f} GiB, reserved={r:.2f} GiB")
 
         torch.cuda.empty_cache()
         _log_hbm("empty_cache")
@@ -473,6 +516,19 @@ class KimiK25ParallelStrategyManager:
         self._init_mode_decoding()
         effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
         self._init_decoding_padding_bsz(effective_padding_bsz)
+
+        # Allocate shared MoE buffer manager (one instance for all 60 MoE layers)
+        max_global_bsz = self.world_size * effective_padding_bsz
+        KimiK25MoE._buf = KimiK25MoEBufferManager(
+            E_local=NUM_LOCAL_EXPERT_PER_LAYER,
+            max_global_bsz=max_global_bsz,
+            H=self.loaded_model_config.hidden_size,
+            N_inter=self.loaded_model_config.moe_intermediate_size,
+            topk=self.loaded_model_config.num_experts_per_tok,
+            num_tokens_per_rank=effective_padding_bsz,
+            device=device,
+        )
+        _log_hbm("MoEBufferManager")
 
         # Initialize All-to-All comms if enabled
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
@@ -958,11 +1014,18 @@ class KimiK25ParallelStrategyManager:
                 layer.mlp.shared_experts.up_weight_bf16 = layer.mlp.shared_experts.module.up_proj.weight.data
                 layer.mlp.shared_experts.down_weight_bf16 = layer.mlp.shared_experts.module.down_proj.weight.data
 
-            # Debug: Log weight_copy_task size (only first MoE layer)
-            if layer_idx == self.loaded_model_config.first_k_dense_replace:
-                logging.info(f"Rank {self.rank} Layer {layer_idx}: weight_copy_task['routed_expert'] has {len(self.weight_copy_task['routed_expert'])} entries")
-                logging.info(f"Rank {self.rank} Layer {layer_idx}: layer.mlp.experts has {len(layer.mlp.experts)} total slots")
-                logging.info(f"Rank {self.rank} Layer {layer_idx}: Phase={self.loaded_model_config.phase}")
+            # Offloading summary (rank 0 only, first MoE layer only)
+            if layer_idx == self.loaded_model_config.first_k_dense_replace and self.rank == 0:
+                layer_prefix = f"routed_expert_{layer_idx}_"
+                n_offloaded = sum(1 for e in self.weight_copy_task['routed_expert'] if e.startswith(layer_prefix))
+                n_total = len(layer.mlp.experts)
+                attn_offloaded = len(self.weight_copy_task.get('attn', [])) > 0
+                shared_offloaded = len(self.weight_copy_task.get('shared_expert', [])) > 0
+                logging.info(
+                    f"Offloading summary: attention={'offloaded' if attn_offloaded else 'persistent'}, "
+                    f"shared_experts={'offloaded' if shared_offloaded else 'persistent'}, "
+                    f"routed_experts={n_offloaded}/{n_total} offloaded ({100*n_offloaded/n_total:.0f}%)"
+                )
 
             # Loop through all expert slots (384 total)
             # In prefill: all slots are instantiated
@@ -983,9 +1046,6 @@ class KimiK25ParallelStrategyManager:
                     persistent = False
                 else:
                     persistent = True
-                    # Debug: Log first few persistent experts
-                    if layer_idx == self.loaded_model_config.first_k_dense_replace and global_expert_idx < 3:
-                        logging.info(f"Rank {self.rank} Layer {layer_idx}: Expert {module_key} is PERSISTENT (not in weight_copy_task)")
 
                 # K2.5: No FP8 weight_dequant_scales
                 layer.mlp.experts[expert_idx] = KimiK25ExpertWrapper(

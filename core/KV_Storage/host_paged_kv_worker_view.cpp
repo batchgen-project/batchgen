@@ -64,9 +64,6 @@ void RegisterPinnedRange(void* base, std::size_t bytes, int device_index,
             logger->error("{} (device_index={})", message, device_index);
         });
     
-    logger->info("Attempting cudaHostRegister (ptr={}, bytes={}, device={})", 
-                 base, bytes, device_index);
-    
     // Use cudaHostRegisterDefault to match Weights_Storage behavior
     InvokeCudaChecked(
         "cudaHostRegister", logger,
@@ -74,8 +71,6 @@ void RegisterPinnedRange(void* base, std::size_t bytes, int device_index,
         [&](const std::string& message) {
             logger->error("{} (ptr={}, bytes={})", message, base, bytes);
         });
-    logger->info("Successfully registered pinned KV range (ptr={}, bytes={}, device={})", 
-                 base, bytes, device_index);
 }
 
 void UnregisterPinnedRange(void* base, int device_index,
@@ -98,7 +93,6 @@ void UnregisterPinnedRange(void* base, int device_index,
         [&](const std::string& message) {
             logger->error("{} (ptr={})", message, base);
         });
-    logger->info("Unregistered pinned KV range (ptr={})", base);
 }
 
 }  // namespace batchgen::kv::worker_detail
