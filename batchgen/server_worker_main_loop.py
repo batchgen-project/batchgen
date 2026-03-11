@@ -421,13 +421,21 @@ def _server_worker_main_impl(
 		# Results are already on rank 0 (local_results), no gather needed
 		# Other ranks have empty results by design
 		if global_rank == 0:
-			final_results = local_results if local_results else []
+			final_results = local_results if local_results else {}
 
 			# Safeguard: if results are empty but no errors, something went wrong
 			if not final_results and len(task_data.get("prompts", [])) > 0:
-				logging.error(f"Results are unexpectedly empty!")
-				response_queue.put({"error": "Results unexpectedly empty after inference"})
-				continue
+				# Check if all sequences were rejected (context length exceeded)
+				rejected = getattr(worker, '_rejected_sequences', None)
+				if rejected:
+					logging.info(
+						f"All {len(rejected)} sequences rejected "
+						f"(context length exceeded). Returning empty results."
+					)
+				else:
+					logging.error(f"Results are unexpectedly empty!")
+					response_queue.put({"error": "Results unexpectedly empty after inference"})
+					continue
 
 			response_queue.put(final_results)
 
