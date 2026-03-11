@@ -2801,6 +2801,38 @@ class BatchGenWorker:
 
 	# ============ Main Entry Point ============
 
+	def _reject_overlimit_sequences(self) -> List[Tuple[int, int]]:
+		"""Remove sequences whose prompt_length >= model_context_length.
+
+		Called after _tokenize_global_batch() on ALL ranks identically.
+		Rejected sequences are removed from global_batch and their buffer
+		slots freed. Results are stored in self._rejected_sequences for
+		later error reporting via IncrementalWriter.
+
+		Returns:
+			List of (global_idx, prompt_length) for rejected sequences.
+		"""
+		rejected = []
+		uuids_to_remove = []
+		for seq in self.global_batch:
+			if seq.prompt_length >= self.model_context_length:
+				rejected.append((seq.global_idx, seq.prompt_length))
+				uuids_to_remove.append(seq.uuid)
+
+		for uuid in uuids_to_remove:
+			seq = self.global_batch.remove_sequence(uuid)
+			if seq and hasattr(seq, '_buffer_slot'):
+				self._buffer_pool.free_slot(seq._buffer_slot)
+
+		if rejected:
+			logging.info(
+				f"Rank {self.rank}: Rejected {len(rejected)}/{len(rejected) + len(self.global_batch)} "
+				f"sequences exceeding context length {self.model_context_length}"
+			)
+
+		self._rejected_sequences = rejected
+		return rejected
+
 	def _init_incremental_writer(self) -> None:
 		"""Create IncrementalWriter from staged config (rank 0 only).
 
@@ -2880,10 +2912,40 @@ class BatchGenWorker:
 			self._tokenize_global_batch()
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2 _tokenize_global_batch: {time.perf_counter()-t_step:.2f}s")
 
+			# Step 2.05: Reject sequences exceeding context length
+			t_step = time.perf_counter()
+			self._reject_overlimit_sequences()
+			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2.05 _reject_overlimit: {time.perf_counter()-t_step:.2f}s")
+
+			# If all sequences rejected, skip inference entirely
+			if len(self.global_batch) == 0:
+				logging.info(f"Rank {self.rank}: All sequences rejected. Skipping inference.")
+				self._init_incremental_writer()
+				if self.rank == 0 and self._incremental_writer:
+					for global_idx, prompt_length in self._rejected_sequences:
+						self._incremental_writer.submit_error(
+							global_idx, "context_length_exceeded",
+							f"This model's maximum context length is {self.model_context_length} tokens. "
+							f"However, your messages resulted in {prompt_length} tokens. "
+							f"Please reduce the length of the messages.",
+						)
+				return {}
+
 			# Step 2.1: Create incremental writer now that tokenizer/eos_token_ids are available
 			t_step = time.perf_counter()
 			self._init_incremental_writer()
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2.1 _init_incremental_writer: {time.perf_counter()-t_step:.2f}s")
+
+			# Step 2.15: Write rejection errors via incremental writer
+			if self.rank == 0 and self._incremental_writer and self._rejected_sequences:
+				for global_idx, prompt_length in self._rejected_sequences:
+					self._incremental_writer.submit_error(
+						global_idx, "context_length_exceeded",
+						f"This model's maximum context length is {self.model_context_length} tokens. "
+						f"However, your messages resulted in {prompt_length} tokens. "
+						f"Please reduce the length of the messages.",
+					)
+				logging.info(f"Rank 0: Wrote {len(self._rejected_sequences)} rejection errors to incremental output")
 
 			# Step 2.5: Update engine config with actual max_input_length after tokenization
 			t_step = time.perf_counter()
@@ -4713,21 +4775,19 @@ class BatchGenWorker:
 		all_results = [None] * self.world_size
 		dist.all_gather_object(all_results, local_results)
 		all_results = [item for sublist in all_results for item in sublist]
-		all_results.sort(key=lambda x: x[0])
-
-		decoded_strings = [s for _, s in all_results]
+		result_dict = {global_idx: decoded_str for global_idx, decoded_str in all_results}
 
 		if self.rank == 0:
-			logging.info(f"Detokenization complete: {len(decoded_strings)} sequences (distributed across {self.world_size} ranks)")
+			logging.info(f"Detokenization complete: {len(result_dict)} sequences (distributed across {self.world_size} ranks)")
 			self._log_decode_timing()
 
 		dist.barrier()
 		self._batch_completed = True
 
 		if self.rank == 0:
-			return decoded_strings
+			return result_dict
 		else:
-			return []
+			return {}
 
 	def _decode_tokens_to_string(self, tokens: torch.Tensor, min_tokens: int = 1) -> str:
 		"""Decode token IDs to string, stopping at first EOS token.
