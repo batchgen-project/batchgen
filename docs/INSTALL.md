@@ -61,7 +61,7 @@ pip install \
   "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/deep_gemm-2.1.1+c9f8b34-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/batchgen_kernels-0.1.0-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen-0.1-py3-none-any.whl"
+  "${RELEASE_URL}/batchgen-1.0.4-py3-none-any.whl"
 ```
 
 No source compilation needed — pip auto-installs all remaining Python dependencies
