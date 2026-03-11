@@ -663,48 +663,6 @@ class Glm5MoEGate(nn.Module):
 # MoE Layer (Prefill)
 # ============================================================================
 
-class Glm5MoE(nn.Module):
-    """MoE layer for prefill: per-expert sequential processing."""
-
-    def __init__(self, config: Glm5Config):
-        super().__init__()
-        self.num_experts = config.n_routed_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.hidden_size = config.hidden_size
-
-        self.gate = Glm5MoEGate(config)
-        self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.num_experts)]
-
-        # Shared expert
-        self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_flat = hidden_states.view(-1, hidden_dim)
-
-        topk_weights, topk_indices = self.gate(hidden_flat)
-
-        # Shared expert
-        shared_output = self.shared_experts(hidden_flat)
-
-        # Routed experts
-        output = torch.zeros_like(hidden_flat)
-        for i, expert in enumerate(self.experts):
-            expert_mask = (topk_indices == i).any(dim=-1)
-            if not expert_mask.any():
-                continue
-            expert_input = hidden_flat[expert_mask]
-            expert_output = expert(expert_input)
-            expert_weight = torch.where(
-                topk_indices[expert_mask] == i,
-                topk_weights[expert_mask],
-                torch.zeros_like(topk_weights[expert_mask])
-            ).sum(dim=-1)
-            output[expert_mask] += expert_output * expert_weight.unsqueeze(-1)
-
-        output = output + shared_output
-        return output.view(batch_size, seq_len, hidden_dim)
-
 
 # ============================================================================
 # Scatter + Weighted Reduce (Triton kernel, copied from DeepSeek V3)
@@ -780,13 +738,13 @@ def scatter_weight_reduce_optimized(res, global_indices, token_topk_pos,
 
 from batchgen.moe.moe_base import MoEBase
 
-class Glm5FP8MoE(MoEBase):
-    """GLM-5 FP8 MoE decode layer.
+class Glm5MoE(MoEBase):
+    """GLM-5 MoE layer (unified prefill + EP decode).
 
-    Inherits the universal decode template from MoEBase:
-        AllGather → Gate → Expert Compute → AllReduce → Extract + Shared
+    Inherits the universal template from MoEBase:
+        forward() dispatches to _forward_prefill() or _forward_decode() by config.phase.
 
-    Implements:
+    Decode path implements:
         gate()                       — sigmoid + bias + topk (CUDA kernel with fallback)
         expert_compute_persistent()  — WGMMA FP8 pipeline (zero CPU-GPU sync)
         expert_compute_mixed()       — WGMMA persistent + loop non-persistent (one .tolist())
@@ -803,7 +761,7 @@ class Glm5FP8MoE(MoEBase):
         self.use_wgmma_fp8 = os.environ.get("BATCHGEN_USE_WGMMA_FP8", "0") == "1"
 
         self.gate_module = Glm5MoEGate(config)
-        self.experts = [None] * self.total_experts
+        self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
 
     # ── Token count management (called by PSM) ──
@@ -870,11 +828,11 @@ class Glm5FP8MoE(MoEBase):
 
         # WGMMA: build shared modules (once across all layers)
         if self.use_wgmma_fp8:
-            if Glm5FP8MoE._wgmma_modules is None:
+            if Glm5MoE._wgmma_modules is None:
                 from batchgen.moe.fp8_wgmma_pipeline import build_all_modules
-                Glm5FP8MoE._wgmma_modules = build_all_modules()
-            self._wgmma_layer_id = Glm5FP8MoE._wgmma_next_layer_id
-            Glm5FP8MoE._wgmma_next_layer_id += 1
+                Glm5MoE._wgmma_modules = build_all_modules()
+            self._wgmma_layer_id = Glm5MoE._wgmma_next_layer_id
+            Glm5MoE._wgmma_next_layer_id += 1
 
     def cleanup(self):
         for attr in ('gate_list', 'up_list', 'down_list',
@@ -890,7 +848,7 @@ class Glm5FP8MoE(MoEBase):
         if self.use_wgmma_fp8:
             try:
                 from batchgen.moe.routing import gate_sigmoid_topk_cuda
-                bufs = Glm5FP8MoE._wgmma_shared_bufs
+                bufs = Glm5MoE._wgmma_shared_bufs
                 if bufs is not None:
                     G = x.shape[0]
                     rl_bf16 = bufs.router_logits_bf16[:G]
@@ -922,7 +880,7 @@ class Glm5FP8MoE(MoEBase):
         """All-persistent expert compute. Zero CPU-GPU sync on WGMMA path."""
         if self.use_wgmma_fp8:
             # WGMMA path: dispatch_scatter_3d → WGMMA pipeline → reduce (zero sync)
-            bufs = Glm5FP8MoE._wgmma_shared_bufs
+            bufs = Glm5MoE._wgmma_shared_bufs
             if bufs is None:
                 bufs = self._lazy_init_wgmma_bufs()
 
@@ -1050,7 +1008,7 @@ class Glm5FP8MoE(MoEBase):
     def _lazy_init_wgmma_bufs(self):
         """Lazy-init WGMMAMoEBuffers on first forward."""
         from batchgen.moe.fp8_wgmma_pipeline import WGMMAMoEBuffers, DEFAULT_MTP
-        wgmma_mod, fast_mod, dr_mod = Glm5FP8MoE._wgmma_modules
+        wgmma_mod, fast_mod, dr_mod = Glm5MoE._wgmma_modules
         num_global_tokens = self.num_tokens_per_rank * self.world_size
         bufs = WGMMAMoEBuffers(
             wgmma_mod, fast_mod, dr_mod,
@@ -1064,7 +1022,7 @@ class Glm5FP8MoE(MoEBase):
             num_global_tokens,
             num_tokens_per_rank=self.num_tokens_per_rank,
             device=self.device)
-        Glm5FP8MoE._wgmma_shared_bufs = bufs
+        Glm5MoE._wgmma_shared_bufs = bufs
         return bufs
 
     def _grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets,

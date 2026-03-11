@@ -26,7 +26,7 @@ import types
 import torch
 import torch.distributed as dist
 
-from .model import Glm5ForCausalLM, Glm5FP8MoE
+from .model import Glm5ForCausalLM, Glm5MoE
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
@@ -241,7 +241,7 @@ class GLM5ParallelStrategyManager:
         self._load_shared_expert_module()
         self._config_attn_module()
         self._config_expert_module()
-        self._setup_decode_moe(comm)
+        self._configure_decode_moe(comm)
         self._config_lm_head_hook()
 
         self.model.eval()
@@ -280,7 +280,7 @@ class GLM5ParallelStrategyManager:
 
         # Initialize shared buffer manager (pre-allocated comm buffers for all MoE layers)
         device = self.engine_config.Basic_Config.device_torch
-        Glm5FP8MoE.init_buffer_manager(
+        Glm5MoE.init_buffer_manager(
             max_rank_bsz, self.world_size, self.HIDDEN_SIZE, device,
         )
 
@@ -535,44 +535,27 @@ class GLM5ParallelStrategyManager:
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Expert module config time: {elapsed:.2f}s")
 
-    def _setup_decode_moe(self, comm):
-        """Replace Glm5MoE with Glm5FP8MoE for EP decode path.
+    def _configure_decode_moe(self, comm):
+        """Configure existing Glm5MoE instances for EP decode.
 
-        Creates Glm5FP8MoE per MoE layer, transfers gate, shared_experts,
-        and all expert wrappers from the old Glm5MoE. Pointer arrays for
-        grouped FP8 GEMM are built later in _init_mode_decoding() via init().
+        No class swap — same Glm5MoE(MoEBase) is used for both prefill and
+        decode. Just inject comm and set EP attributes.
         """
-        device = self.engine_config.Basic_Config.device_torch
         NUM_EXPERT_PER_RANK = self.NUM_TOTAL_EXPERTS // self.world_size
 
         for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
-            old_moe = self.model.model.layers[layer_idx].mlp
-
-            decode_moe = Glm5FP8MoE(self.loaded_model_config, comm=comm)
-
-            # Transfer gate and shared experts
-            decode_moe.gate_module = old_moe.gate
-            decode_moe.shared_experts = old_moe.shared_experts
-
-            # Set EP range
-            decode_moe.routed_expert_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
-            decode_moe.routed_expert_end_idx = (self.global_rank + 1) * NUM_EXPERT_PER_RANK
-            decode_moe.experts_per_rank = NUM_EXPERT_PER_RANK
-            decode_moe.num_persistent_local_experts = self.num_local_expert_per_layer
-
-            # Transfer all expert wrappers (persistent + non-persistent)
-            for expert_idx in range(self.NUM_TOTAL_EXPERTS):
-                decode_moe.experts[expert_idx] = old_moe.experts[expert_idx]
-
-            # Propagate offloading flag
-            decode_moe.enable_ep_offloading = self.enable_ep_offloading
-
-            decode_moe.to(device)
-            self.model.model.layers[layer_idx].mlp = decode_moe
+            moe = self.model.model.layers[layer_idx].mlp
+            moe.comm = comm
+            moe.device = self.engine_config.Basic_Config.device_torch
+            moe.routed_expert_start_idx = self.global_rank * NUM_EXPERT_PER_RANK
+            moe.routed_expert_end_idx = (self.global_rank + 1) * NUM_EXPERT_PER_RANK
+            moe.experts_per_rank = NUM_EXPERT_PER_RANK
+            moe.num_persistent_local_experts = self.num_local_expert_per_layer
+            moe.enable_ep_offloading = self.enable_ep_offloading
 
         if self.rank == 0:
             logging.info(
-                f"[DECODE] Set up Glm5FP8MoE for {self.model_config.num_hidden_layers - self.FIRST_K_DENSE} "
+                f"[DECODE] Configured Glm5MoE for {self.model_config.num_hidden_layers - self.FIRST_K_DENSE} "
                 f"MoE layers (experts_per_rank={NUM_EXPERT_PER_RANK}, "
                 f"offloading={self.enable_ep_offloading})"
             )

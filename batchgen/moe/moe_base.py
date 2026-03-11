@@ -11,7 +11,7 @@ Zero CPU-GPU sync on the all-persistent WGMMA path (default for GLM-5).
 Class hierarchy:
     MoEBufferManager          (one per model, shared across all MoE layers)
     MoEBase(nn.Module)        (abstract base, template method pattern)
-      +-- Glm5FP8MoE          (FP8 grouped WGMMA, sigmoid gate)
+      +-- Glm5MoE          (FP8 grouped WGMMA, sigmoid gate)
       +-- KimiK25MoE          (INT4 grouped WGMMA, sigmoid gate)  [future]
 
 Reference:
