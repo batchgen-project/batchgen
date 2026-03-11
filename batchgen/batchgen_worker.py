@@ -94,10 +94,6 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
-# KV offload ablation: measure per-component overhead of deferred KV host offload
-BATCHGEN_KV_ABLATION = os.environ.get('BATCHGEN_KV_ABLATION', '0') == '1'
-# Skip host offload entirely (measurement only — breaks host KV resume!)
-BATCHGEN_KV_SKIP_HOST_OFFLOAD = os.environ.get('BATCHGEN_KV_SKIP_HOST_OFFLOAD', '0') == '1'
 
 # Decode preemption configuration (DEPRECATED: use CLI args instead)
 # --host-kv-watermark: Default 70% (when free slots exceed this threshold, prefill is prioritized)
@@ -6975,21 +6971,6 @@ class BatchGenWorker:
 							f"{page_info}"
 						)
 
-				# KV ablation: log per-boundary callback overhead breakdown
-				if BATCHGEN_KV_ABLATION and hasattr(self, '_kv_ablation_stats'):
-					s = self._kv_ablation_stats
-					n = s['count'] or 1
-					nf = s.get('flushes', 0) or 1
-					logging.info(
-						f"[KV-ABLATION] boundary={self._cumulative_decode_boundaries}, callbacks={n}, flushes={s.get('flushes', 0)}, "
-						f"batch_loop={s['batch_loop']*1000:.2f}ms, "
-						f"event_sync={s['event_sync']*1000:.2f}ms, "
-						f"cpp_launch={s['cpp_launch']*1000:.2f}ms, "
-						f"total={(s['batch_loop']+s['event_sync']+s['cpp_launch'])*1000:.2f}ms, "
-						f"avg_sync_per_flush={s['event_sync']*1000/nf:.3f}ms"
-					)
-					self._kv_ablation_stats = {'batch_loop': 0.0, 'event_sync': 0.0, 'cpp_launch': 0.0, 'count': 0, 'flushes': 0}
-
 				if not decode_uuids:
 					# Check for pending loads
 					if pending_load_uuids:
@@ -7119,7 +7100,7 @@ class BatchGenWorker:
 				current_batch = list(batch)
 				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 
-				if _kv_worker_view is not None and not BATCHGEN_KV_SKIP_HOST_OFFLOAD:
+				if _kv_worker_view is not None:
 					# Pre-compute sequence info once per step (not once per layer)
 					_kv_seq_ids = []
 					_kv_seq_lengths = []
@@ -7133,8 +7114,6 @@ class BatchGenWorker:
 					self._deferred_kv_worker_view = _kv_worker_view
 
 				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-					if BATCHGEN_KV_SKIP_HOST_OFFLOAD:
-						return
 					self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
 
 				Attn_Wrapper.kv_append_callback = kv_append_callback
@@ -7380,17 +7359,11 @@ class BatchGenWorker:
 
 		sequence_ids, sequence_lengths = batch_info
 
-		if BATCHGEN_KV_ABLATION:
-			_abl_t0 = time.perf_counter()
-
 		# ONE sync for ALL layers — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
 			self._kv_offload_event = torch.cuda.Event()
 		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
 		self._kv_offload_event.synchronize()
-
-		if BATCHGEN_KV_ABLATION:
-			_abl_t1 = time.perf_counter()
 
 		# Fire all D2H copies
 		if not hasattr(self, '_pending_kv_append_tensors'):
@@ -7415,17 +7388,6 @@ class BatchGenWorker:
 				self._pending_kv_append_tensors.append(v_tensor)
 			if task is not None:
 				self._pending_kv_append_tasks.append(task)
-
-		if BATCHGEN_KV_ABLATION:
-			_abl_t2 = time.perf_counter()
-			n = len(entries)
-			if not hasattr(self, '_kv_ablation_stats'):
-				self._kv_ablation_stats = {'batch_loop': 0.0, 'event_sync': 0.0, 'cpp_launch': 0.0, 'count': 0, 'flushes': 0}
-			s = self._kv_ablation_stats
-			s['event_sync'] += (_abl_t1 - _abl_t0)
-			s['cpp_launch'] += (_abl_t2 - _abl_t1)
-			s['count'] += n
-			s['flushes'] = s.get('flushes', 0) + 1
 
 		self._deferred_kv_entries = []
 
