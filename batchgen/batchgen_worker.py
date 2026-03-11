@@ -461,7 +461,6 @@ class BatchGenWorker:
 			worker_kv_config = build_host_kv_config(
 				model_name=args.model_name,
 				host_kv_cache_size=host_budget_bytes,
-				core_engine_module=core_engine,
 			)
 			if args.fast_init:
 				worker_kv_config.enable_memfd = True
