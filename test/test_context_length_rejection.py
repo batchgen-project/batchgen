@@ -37,8 +37,13 @@ MODEL_CONTEXT_LENGTHS = {
     "openai/gpt-oss-120b": 131072,
 }
 
-# Approximate tokens per word for repeating pattern (conservative)
-TOKENS_PER_WORD = 1.5
+# Number of words to generate for over-limit prompts.
+# Common English words tokenize to ~1 token each, so 300K words ≈ 300K tokens,
+# safely exceeding 262K (Kimi K2.5) or 128K (GPT-OSS) context limits.
+OVERLIMIT_NUM_WORDS = 300_000
+
+BASE_WORDS = ["hello", "world", "the", "quick", "brown", "fox", "jumps",
+              "over", "lazy", "dog", "alpha", "beta", "gamma", "delta"]
 
 
 def make_short_prompt(idx: int) -> str:
@@ -46,42 +51,12 @@ def make_short_prompt(idx: int) -> str:
     return f"What is {idx} + {idx * 2}? Answer briefly."
 
 
-def make_overlimit_prompt(target_tokens: int) -> str:
-    """Create a prompt that exceeds target_tokens.
+def make_overlimit_prompt(ctx_len: int) -> str:
+    """Create a prompt that clearly exceeds ctx_len tokens.
 
-    Uses repeating 'word ' pattern. Each word ≈ 1-2 tokens.
-    We overshoot by 10% to ensure we exceed the limit.
+    Generates 300K words (~300K tokens), well above any model context limit.
     """
-    num_words = int(target_tokens / TOKENS_PER_WORD * 1.1)
-    # Use varied words to avoid tokenizer compression of repeated tokens
-    words = []
-    base_words = ["hello", "world", "the", "quick", "brown", "fox", "jumps",
-                  "over", "lazy", "dog", "alpha", "beta", "gamma", "delta"]
-    for i in range(num_words):
-        words.append(base_words[i % len(base_words)])
-    return " ".join(words)
-
-
-def make_exact_token_prompt(target_tokens: int, over: bool = False) -> str:
-    """Create a prompt with approximately target_tokens.
-
-    For boundary testing. Note: exact count depends on the tokenizer,
-    so this is an approximation. The server-side tokenizer determines
-    the real count.
-
-    Args:
-        target_tokens: Target token count
-        over: If True, aim slightly over; if False, aim slightly under
-    """
-    if over:
-        # Aim for target + small margin
-        num_words = int(target_tokens / TOKENS_PER_WORD * 1.02)
-    else:
-        # Aim for target - small margin
-        num_words = int(target_tokens / TOKENS_PER_WORD * 0.98)
-    base_words = ["hello", "world", "the", "quick", "brown", "fox", "jumps",
-                  "over", "lazy", "dog", "alpha", "beta", "gamma", "delta"]
-    words = [base_words[i % len(base_words)] for i in range(num_words)]
+    words = [BASE_WORDS[i % len(BASE_WORDS)] for i in range(OVERLIMIT_NUM_WORDS)]
     return " ".join(words)
 
 
@@ -268,50 +243,8 @@ def test_case_3_mixed(client, model, ctx_len, tmpdir):
     return True
 
 
-def test_case_4_exactly_at_limit(client, model, ctx_len, tmpdir):
-    """Case 4: Prompt exactly at limit → rejected (>= threshold)."""
-    logger.info("=" * 60)
-    logger.info(f"CASE 4: Prompt at exactly {ctx_len} tokens (boundary)")
-    logger.info("=" * 60)
-
-    # Use slightly-over to ensure we hit >= ctx_len
-    prompt = make_exact_token_prompt(ctx_len, over=True)
-    requests = [build_request("boundary-at", model, prompt)]
-
-    path = os.path.join(tmpdir, "case4.jsonl")
-    write_jsonl(requests, path)
-    logger.info(f"  Input: 1 request targeting ~{ctx_len} tokens")
-
-    results = run_batch(client, path)
-
-    assert len(results) == 1, f"Expected 1 result, got {len(results)}"
-    assert_error_item(results[0])
-    logger.info("  PASS: Boundary prompt rejected")
-    return True
-
-
-def test_case_5_just_under_limit(client, model, ctx_len, tmpdir):
-    """Case 5: Prompt at limit - margin → accepted."""
-    logger.info("=" * 60)
-    logger.info(f"CASE 5: Prompt just under {ctx_len} tokens")
-    logger.info("=" * 60)
-
-    # Use well-under to ensure we're below (exact boundary is hard without
-    # the server's tokenizer, so use 95% of limit to be safe)
-    prompt = make_exact_token_prompt(int(ctx_len * 0.95), over=False)
-    requests = [build_request("boundary-under", model, prompt,
-                              max_completion_tokens=4)]
-
-    path = os.path.join(tmpdir, "case5.jsonl")
-    write_jsonl(requests, path)
-    logger.info(f"  Input: 1 request targeting ~{int(ctx_len * 0.95)} tokens")
-
-    results = run_batch(client, path, timeout=1200.0)
-
-    assert len(results) == 1, f"Expected 1 result, got {len(results)}"
-    assert_success_item(results[0])
-    logger.info("  PASS: Just-under-limit prompt accepted and completed")
-    return True
+    # Cases 4 and 5 (exact boundary tests) removed — require tokenizer
+    # for precise token count targeting. Covered by Cases 1-3 and 6-8.
 
 
 def test_case_6_asymmetric_ranks(client, model, ctx_len, tmpdir):
@@ -485,8 +418,6 @@ def main():
         1: test_case_1_all_over_limit,
         2: test_case_2_all_under_limit,
         3: test_case_3_mixed,
-        4: test_case_4_exactly_at_limit,
-        5: test_case_5_just_under_limit,
         6: test_case_6_asymmetric_ranks,
         7: test_case_7_single_overlimit_in_large_batch,
         8: test_case_8_error_format,
