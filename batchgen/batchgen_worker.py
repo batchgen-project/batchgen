@@ -3336,10 +3336,12 @@ class BatchGenWorker:
 		# Update self.max_input_length to the actual longest prompt
 		# This is used for attention mask shape: [bsz, max_prompt_length + max_decoding_length]
 		self.max_input_length = max_prompt_length
-		logging.info(
-			f"Rank {self.rank}: Dynamic max_prompt_length set to {max_prompt_length} "
-			f"(prompt lengths: min={min(prompt_lengths)}, max={max(prompt_lengths)})"
-		)
+		if num_sequences > 0:
+			logging.info(
+				f"Rank {self.rank}: Dynamic max_prompt_length set to {max_prompt_length} "
+				f"(prompt lengths: min={min(remaining_lengths)}, max={max(remaining_lengths)}, "
+				f"count={num_sequences})"
+			)
 
 		# Phase 3: Create per-sequence tensor views from pre-allocated buffer pool.
 		# Pre-allocating 2 large contiguous buffers eliminates allocator contention
