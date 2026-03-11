@@ -22,6 +22,18 @@ from batchgen.models.engine_loader import core_engine as bg_lib
 logger = logging.getLogger(__name__)
 
 
+def _try_set_logger_name(config, name: str) -> bool:
+	"""Try to set a custom logger name on a C++ HostPagedKVConfig.
+
+	Returns True if the field exists and was set, False otherwise.
+	"""
+	try:
+		config.logger_name = name
+		return True
+	except AttributeError:
+		return False
+
+
 def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> Any:
 	"""Build a bg_lib.HostPagedKVConfig from a _HostKVModelProfile."""
 	from batchgen.kv_cache.host_kv_mananger_config import _dtype_size_bytes
@@ -117,10 +129,11 @@ class DualHostKVCoordinator:
 			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
 		)
 
+		# Set distinct logger names to avoid C++ logger name collision
+		_try_set_logger_name(primary_config, "HostPagedKVWorkerView")
+		_try_set_logger_name(aux_config, "HostPagedKVWorkerView_aux")
+
 		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
-		# The C++ MLAHostPagedKVWorkerView registers a logger named
-		# 'HostPagedKVWorkerView'. Creating a second instance in the same
-		# process causes RuntimeError("logger with name ... already exists").
 		try:
 			aux_view = core_engine_module.MLAHostPagedKVWorkerView(aux_config)
 		except RuntimeError as e:
@@ -130,8 +143,6 @@ class DualHostKVCoordinator:
 					"Using primary-only mode. DSA indexer KV will "
 					"be unavailable. Error: %s", e
 				)
-				# Return coordinator with auxiliary=None; primary already created
-				# so we can't fall back to generic path (would hit same collision).
 				coordinator = cls(primary_view, None)
 				logger.info(
 					"DualHostKVCoordinator created (primary-only): %d pages, "
@@ -175,6 +186,10 @@ class DualHostKVCoordinator:
 		aux_config = _build_host_config_from_profile(
 			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
 		)
+
+		# Set distinct logger names to avoid C++ logger name collision
+		_try_set_logger_name(primary_config, "HostPagedKVManager")
+		_try_set_logger_name(aux_config, "HostPagedKVManager_aux")
 
 		primary_mgr = bg_lib.MLAHostPagedKVManager(primary_config)
 		primary_mgr.initialize(True)

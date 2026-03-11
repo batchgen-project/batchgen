@@ -144,9 +144,30 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             self.cached_down, self.weight_dequant_scale.get('down_proj.weight_scale_inv'), intermediate
         )
 
+    def _forward_bf16(self, hidden_states: torch.Tensor, weights: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """BF16 matmul path for non-persistent prefill experts.
+
+        Dequantizes FP8 weights to BF16, then uses F.linear (safe for prefill).
+        """
+        dequant_weights = self.dequantize_weights(weights)
+        gate = F.linear(hidden_states, dequant_weights["gate_proj.weight"])
+        up = F.linear(hidden_states, dequant_weights["up_proj.weight"])
+        intermediate = F.silu(gate) * up
+        return F.linear(intermediate, dequant_weights["down_proj.weight"])
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.persistent:
             weights = self.load_weights(self.module_key)
+            # Non-persistent prefill: use BF16 dequant + F.linear
+            # (FP8 w8a16_gemm path is for persistent decode experts only)
+            if self.phase == "prefill":
+                result = self._forward_bf16(hidden_states, weights)
+                torch.cuda.current_stream(
+                    self.engine_config.Basic_Config.device_torch
+                ).synchronize()
+                self.free_weights(self.module_key)
+                return result
+            # Non-persistent decode: FP8 path
             self.cached_gate = weights["gate_proj.weight"]
             self.cached_up = weights["up_proj.weight"]
             self.cached_down = weights["down_proj.weight"]
