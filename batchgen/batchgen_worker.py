@@ -94,12 +94,10 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
-# KV offload ablation: measure per-component overhead of _append_decode_kv_to_host_async
+# KV offload ablation: measure per-component overhead of deferred KV host offload
 BATCHGEN_KV_ABLATION = os.environ.get('BATCHGEN_KV_ABLATION', '0') == '1'
 # Skip host offload entirely (measurement only — breaks host KV resume!)
 BATCHGEN_KV_SKIP_HOST_OFFLOAD = os.environ.get('BATCHGEN_KV_SKIP_HOST_OFFLOAD', '0') == '1'
-# Deferred KV offload: accumulate during forward, single sync + batch D2H after forward
-BATCHGEN_KV_DEFERRED = os.environ.get('BATCHGEN_KV_DEFERRED', '1') == '1'
 
 # Decode preemption configuration (DEPRECATED: use CLI args instead)
 # --host-kv-watermark: Default 70% (when free slots exceed this threshold, prefill is prioritized)
@@ -7121,7 +7119,7 @@ class BatchGenWorker:
 				current_batch = list(batch)
 				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 
-				if BATCHGEN_KV_DEFERRED and _kv_worker_view is not None and not BATCHGEN_KV_SKIP_HOST_OFFLOAD:
+				if _kv_worker_view is not None and not BATCHGEN_KV_SKIP_HOST_OFFLOAD:
 					# Pre-compute sequence info once per step (not once per layer)
 					_kv_seq_ids = []
 					_kv_seq_lengths = []
@@ -7134,14 +7132,10 @@ class BatchGenWorker:
 					self._deferred_kv_entries = []
 					self._deferred_kv_worker_view = _kv_worker_view
 
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						if BATCHGEN_KV_SKIP_HOST_OFFLOAD:
-							return
-						self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
-				else:
-					# Fallback: per-layer sync (original behavior, or no host KV)
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor, v_tensor)
+				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+					if BATCHGEN_KV_SKIP_HOST_OFFLOAD:
+						return
+					self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
 
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
@@ -7220,8 +7214,7 @@ class BatchGenWorker:
 			new_tokens = new_tokens_out
 
 			# Flush deferred KV host offload (ONE sync + batch D2H)
-			if BATCHGEN_KV_DEFERRED:
-				self._flush_deferred_kv_to_host()
+			self._flush_deferred_kv_to_host()
 
 			# DEBUG: Print sampled tokens and logits comparison
 			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
@@ -7437,125 +7430,6 @@ class BatchGenWorker:
 		self._deferred_kv_entries = []
 
 		# Throttle: all N layers launched at once, check threshold
-		MAX_PENDING_KV_TASKS = 256
-		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
-
-	def _append_decode_kv_to_host_async(
-		self,
-		layer_idx: int,
-		batch: List[int],
-		k_tensor: torch.Tensor,
-		v_tensor: torch.Tensor = None,
-	) -> None:  # Returns None, not the task
-		"""
-		Async append - adds task to pending list, does NOT wait.
-
-		CRITICAL: Must keep tensor references alive until async operation completes!
-		GPT-OSS uses GQA with separate K and V caches, so v_tensor must be passed.
-		"""
-		if not batch:
-			return
-
-		# Skip-offload mode: measure upper bound of savings (breaks host KV!)
-		if BATCHGEN_KV_SKIP_HOST_OFFLOAD:
-			return
-
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			return
-
-		if BATCHGEN_KV_ABLATION:
-			_abl_t0 = time.perf_counter()
-
-		sequence_ids = []
-		sequence_lengths = []
-
-		for local_idx in batch:
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			sequence_ids.append(seq.global_idx)
-			sequence_lengths.append(seq.current_context_length - 1)
-
-		if k_tensor.dim() == 3:
-			k_tensor = k_tensor.unsqueeze(2)
-		if v_tensor is not None and v_tensor.dim() == 3:
-			v_tensor = v_tensor.unsqueeze(2)
-
-		# NaN DETECTION: Check for NaN in KV tensor BEFORE appending to host
-		# This catches attention computation issues that would propagate to host KV
-		if layer_idx == 0 and torch.isnan(k_tensor).any():
-			nan_mask = torch.isnan(k_tensor).any(dim=-1).any(dim=-1).any(dim=-1)  # [batch]
-			nan_indices = torch.where(nan_mask)[0].tolist()
-			nan_seq_info = []
-			for idx in nan_indices:
-				if idx < len(batch):
-					local_idx = batch[idx]
-					uuid = self._local_to_uuid_map.get(local_idx, "unknown")
-					seq = self.global_batch.get_sequence(uuid) if uuid != "unknown" else None
-					nan_seq_info.append({
-						'batch_idx': idx,
-						'local_idx': local_idx,
-						'uuid': uuid[:8] if uuid != "unknown" else "unknown",
-						'global_idx': seq.global_idx if seq else -1,
-						'ctx_len': seq.current_context_length if seq else -1,
-					})
-			logging.error(
-				f"[KV-NaN-DETECT] Rank {self.rank}: NaN detected in k_tensor BEFORE host append! "
-				f"layer={layer_idx}, k_tensor_shape={list(k_tensor.shape)}, "
-				f"affected_seqs={nan_seq_info}"
-			)
-
-		if BATCHGEN_KV_ABLATION:
-			_abl_t1 = time.perf_counter()
-
-		# Ensure compute stream finishes writing k_tensor before D2H copy reads it.
-		# Record event on compute stream, then event.synchronize() waits only for
-		# work up to this point (not all GPU work). Lighter than full device sync.
-		if not hasattr(self, '_kv_offload_event'):
-			self._kv_offload_event = torch.cuda.Event()
-		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
-		self._kv_offload_event.synchronize()
-
-		if BATCHGEN_KV_ABLATION:
-			_abl_t2 = time.perf_counter()
-
-		task = worker_view.async_append_decode_kv_to_host(
-			layer_idx=layer_idx,
-			sequence_ids=sequence_ids,
-			k_tensor=k_tensor,
-			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
-			sequence_lengths=sequence_lengths,
-		)
-
-		# CRITICAL FIX: Store tensor references alongside task to prevent GC
-		# PyTorch's CUDA caching allocator can reuse memory if tensor is dereferenced
-		# while async operation is still reading from it!
-		# Must store BOTH k and v tensors for GQA models
-		if not hasattr(self, '_pending_kv_append_tensors'):
-			self._pending_kv_append_tensors = []
-		self._pending_kv_append_tensors.append(k_tensor)
-		if v_tensor is not None:
-			self._pending_kv_append_tensors.append(v_tensor)
-
-		# Add to pending list - will be waited at page boundary
-		self._pending_kv_append_tasks.append(task)
-
-		if BATCHGEN_KV_ABLATION:
-			_abl_t3 = time.perf_counter()
-			if not hasattr(self, '_kv_ablation_stats'):
-				self._kv_ablation_stats = {'batch_loop': 0.0, 'event_sync': 0.0, 'cpp_launch': 0.0, 'count': 0}
-			s = self._kv_ablation_stats
-			s['batch_loop'] += (_abl_t1 - _abl_t0)
-			s['event_sync'] += (_abl_t2 - _abl_t1)
-			s['cpp_launch'] += (_abl_t3 - _abl_t2)
-			s['count'] += 1
-
-		# THROTTLING FIX: Prevent "Resource temporarily unavailable" (EAGAIN) error
-		# std::async creates a new thread for each task. With 61 layers and 64 tokens
-		# per boundary, we can hit ~3900 concurrent threads per boundary interval.
-		# Wait and clear when threshold is reached to avoid exhausting system thread limits.
-		# Threshold: 256 tasks (conservative to leave room for other threads)
 		MAX_PENDING_KV_TASKS = 256
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
 			self._wait_pending_kv_append_tasks()
