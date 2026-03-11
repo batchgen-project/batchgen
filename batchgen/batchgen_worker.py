@@ -2801,37 +2801,8 @@ class BatchGenWorker:
 
 	# ============ Main Entry Point ============
 
-	def _reject_overlimit_sequences(self) -> List[Tuple[int, int]]:
-		"""Remove sequences whose prompt_length >= model_context_length.
-
-		Called after _tokenize_global_batch() on ALL ranks identically.
-		Rejected sequences are removed from global_batch and their buffer
-		slots freed. Results are stored in self._rejected_sequences for
-		later error reporting via IncrementalWriter.
-
-		Returns:
-			List of (global_idx, prompt_length) for rejected sequences.
-		"""
-		rejected = []
-		uuids_to_remove = []
-		for seq in self.global_batch:
-			if seq.prompt_length >= self.model_context_length:
-				rejected.append((seq.global_idx, seq.prompt_length))
-				uuids_to_remove.append(seq.uuid)
-
-		for uuid in uuids_to_remove:
-			seq = self.global_batch.remove_sequence(uuid)
-			if seq and hasattr(seq, '_buffer_slot'):
-				self._buffer_pool.free_slot(seq._buffer_slot)
-
-		if rejected:
-			logging.info(
-				f"Rank {self.rank}: Rejected {len(rejected)}/{len(rejected) + len(self.global_batch)} "
-				f"sequences exceeding context length {self.model_context_length}"
-			)
-
-		self._rejected_sequences = rejected
-		return rejected
+	# _reject_overlimit_sequences logic is now inside _tokenize_global_batch()
+	# between Phase 2 (prompt length computation) and Phase 3 (buffer allocation).
 
 	def _init_incremental_writer(self) -> None:
 		"""Create IncrementalWriter from staged config (rank 0 only).
@@ -2912,10 +2883,8 @@ class BatchGenWorker:
 			self._tokenize_global_batch()
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2 _tokenize_global_batch: {time.perf_counter()-t_step:.2f}s")
 
-			# Step 2.05: Reject sequences exceeding context length
-			t_step = time.perf_counter()
-			self._reject_overlimit_sequences()
-			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2.05 _reject_overlimit: {time.perf_counter()-t_step:.2f}s")
+			# Rejection of over-limit sequences now happens inside _tokenize_global_batch()
+			# (between Phase 2 and Phase 3). self._rejected_sequences is set there.
 
 			# If all sequences rejected, skip inference entirely
 			if len(self.global_batch) == 0:
@@ -3333,13 +3302,36 @@ class BatchGenWorker:
 		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
 		max_prompt_length = max(prompt_lengths)
 
-		# Warn about prompts that exceed context length limit
-		over_limit = sum(1 for pl in prompt_lengths if pl >= self.model_context_length)
-		if over_limit > 0:
-			logging.warning(
-				f"Rank {self.rank}: {over_limit}/{num_sequences} prompts exceed max context length "
-				f"({self.model_context_length}). These will complete with minimal/no decode tokens."
+		# Phase 2.5: Reject sequences exceeding context length BEFORE buffer allocation.
+		# Must happen here because Phase 3 would crash trying to copy oversized tokens
+		# into model_context_length-sized buffers.
+		self._rejected_sequences = []
+		uuids_to_remove = []
+		for seq in self.global_batch:
+			pl = tokenized_by_idx[seq.global_idx]["length"]
+			if pl >= self.model_context_length:
+				self._rejected_sequences.append((seq.global_idx, pl))
+				uuids_to_remove.append(seq.uuid)
+				# Free tokenized data for rejected sequence
+				del tokenized_by_idx[seq.global_idx]
+
+		for uuid in uuids_to_remove:
+			self.global_batch.remove_sequence(uuid)
+
+		if self._rejected_sequences:
+			logging.info(
+				f"Rank {self.rank}: Rejected {len(self._rejected_sequences)}/"
+				f"{len(self._rejected_sequences) + len(self.global_batch)} "
+				f"sequences exceeding context length {self.model_context_length}"
 			)
+
+		# Recalculate max_prompt_length after rejection (remaining sequences only)
+		num_sequences = len(self.global_batch)
+		if num_sequences > 0:
+			remaining_lengths = [tokenized_by_idx[seq.global_idx]["length"] for seq in self.global_batch]
+			max_prompt_length = max(remaining_lengths)
+		else:
+			max_prompt_length = 0
 
 		# Update self.max_input_length to the actual longest prompt
 		# This is used for attention mask shape: [bsz, max_prompt_length + max_decoding_length]
@@ -3352,6 +3344,11 @@ class BatchGenWorker:
 		# Phase 3: Create per-sequence tensor views from pre-allocated buffer pool.
 		# Pre-allocating 2 large contiguous buffers eliminates allocator contention
 		# when 16 ranks run Phase 3 simultaneously (was 192K allocations → now 32).
+		# Skip if all sequences were rejected in Phase 2.5.
+		if num_sequences == 0:
+			logging.info(f"Rank {self.rank}: All sequences rejected, skipping Phase 3 buffer allocation")
+			return
+
 		phase3_start = time.perf_counter()
 		num_seqs = len(self.global_batch)
 
