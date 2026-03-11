@@ -568,8 +568,10 @@ class GLM5ParallelStrategyManager:
 
     def _load_model_skeleton(self):
         """Load skeleton weights as-is (no CPU dequant). FP8 dequant happens on-the-fly."""
+        loaded, skipped, remapped = 0, 0, 0
         for key, param in self.model.named_parameters():
             if key in self.state_dict_name_map:
+                skipped += 1
                 continue
             # Try direct match first, then remapped key
             ckpt_key = key
@@ -579,8 +581,18 @@ class GLM5ParallelStrategyManager:
                     break
             if ckpt_key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[ckpt_key]
+                loaded += 1
+                if ckpt_key != key:
+                    remapped += 1
             elif key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
+                loaded += 1
+            else:
+                if self.rank == 0 and "gate" in key:
+                    logging.warning(f"[SKELETON] Missing key: {key} (tried ckpt_key={ckpt_key})")
+
+        if self.rank == 0:
+            logging.info(f"[SKELETON] loaded={loaded}, skipped={skipped}, remapped={remapped}")
 
         skeleton_size = sum(
             p.numel() * p.element_size() for p in self.model.parameters()
