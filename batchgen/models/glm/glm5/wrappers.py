@@ -193,6 +193,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
+        # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step)
+        self._cached_q_absorb = None
+        self._cached_out_absorb = None
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -208,6 +211,25 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
+
+    def initialize_decode_absorb(self):
+        """Pre-compute absorbed projections from FP8 kv_b_proj weight.
+
+        Dequantizes the static FP8 weight once and caches the BF16
+        q_absorb and out_absorb matrices. Eliminates 78× per-step
+        dequantization in _forward_decode_dsa().
+        """
+        from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
+        attn = self.module
+        weight_scale = self.weight_dequant_scale
+        if weight_scale is None or "kv_b_proj.weight_scale_inv" not in weight_scale:
+            return
+        kv_b_proj = deepseek_v3_dequantization(
+            attn.kv_b_proj.weight.data,
+            weight_scale["kv_b_proj.weight_scale_inv"],
+        ).view(attn.num_heads, -1, attn.kv_lora_rank)
+        self._cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
+        self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
@@ -431,11 +453,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 attn.kv_lora_rank, attn.qk_rope_head_dim,
             )
 
+        # Pre-compute seq_lengths_i32 once (shared by kv_write and indexer_k)
+        new_token_pos = position_ids.squeeze(-1)  # [batch]
+        manager_device = gpu_paged_kv_manager.device
+        seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
+
         # --- Step 1: Write new MLA KV to primary cache ---
         with (dt.timed("kv_write", li) if dt else _nullctx()):
-            manager_device = gpu_paged_kv_manager.device
-            k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
-            seq_lengths_i32 = position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
+            k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
+            if k_tensor.device != manager_device:
+                k_tensor = k_tensor.to(manager_device)
             gpu_paged_kv_manager.update_layer_decode_new_token(
                 k_tensor=k_tensor,
                 v_tensor=None,
@@ -447,12 +474,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 2: Write indexer K to auxiliary cache ---
         with (dt.timed("indexer_k", li) if dt else _nullctx()):
-            # position_ids = cache_seqlens - 1 = 0-based position of the new token
-            # Must match primary cache write position (Step 1 uses position_ids)
-            new_token_pos = position_ids.squeeze(-1)  # [batch]
             indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=new_token_pos, max_seqlen=max_seqlen)
             indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
-            seq_lengths_i32_aux = new_token_pos.to(dtype=torch.int32, device=gpu_paged_kv_manager_aux.device)
+            aux_device = gpu_paged_kv_manager_aux.device
+            seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
             gpu_paged_kv_manager_aux.update_layer_decode_new_token(
                 k_tensor=indexer_k_tensor,
                 v_tensor=None,
@@ -500,12 +525,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 5: Absorbed Q → sparse FlashMLA ---
         with (dt.timed("q_absorb", li) if dt else _nullctx()):
-            kv_b_proj = deepseek_v3_dequantization(
-                attn.kv_b_proj.weight.data,
-                weight_scale["kv_b_proj.weight_scale_inv"],
-            ).view(attn.num_heads, -1, attn.kv_lora_rank)
-            q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
-            out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
+            if self._cached_q_absorb is not None:
+                q_absorb = self._cached_q_absorb
+                out_absorb = self._cached_out_absorb
+            else:
+                kv_b_proj = deepseek_v3_dequantization(
+                    attn.kv_b_proj.weight.data,
+                    weight_scale["kv_b_proj.weight_scale_inv"],
+                ).view(attn.num_heads, -1, attn.kv_lora_rank)
+                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
+                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
 
             qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
             query_states = torch.empty(
@@ -533,8 +562,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
-            attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
-            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
