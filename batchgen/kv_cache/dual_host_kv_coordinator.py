@@ -118,7 +118,20 @@ class DualHostKVCoordinator:
 		)
 
 		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
-		aux_view = core_engine_module.MLAHostPagedKVWorkerView(aux_config)
+		# The C++ MLAHostPagedKVWorkerView registers a logger named
+		# 'HostPagedKVWorkerView'. Creating a second instance in the same
+		# process causes RuntimeError("logger with name ... already exists").
+		try:
+			aux_view = core_engine_module.MLAHostPagedKVWorkerView(aux_config)
+		except RuntimeError as e:
+			if "logger" in str(e) and "already exists" in str(e):
+				logger.warning(
+					"Cannot create auxiliary KV view (duplicate C++ logger). "
+					"Falling back to primary-only mode. DSA indexer KV will "
+					"be unavailable. Error: %s", e
+				)
+				return None  # Fall through to generic path in batchgen_worker
+			raise
 
 		coordinator = cls(primary_view, aux_view)
 		logger.info(
