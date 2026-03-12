@@ -158,35 +158,6 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.persistent:
             weights = self.load_weights(self.module_key)
-            # DEBUG T33: log first expert weight details (once)
-            if not hasattr(GLM5ExpertWrapper, '_debug_weight_logged') and self.phase == "prefill":
-                import torch.distributed as _dist
-                if _dist.get_rank() == 0:
-                    import logging as _log
-                    GLM5ExpertWrapper._debug_weight_logged = True
-                    for k, v in weights.items():
-                        _log.info(
-                            f"[DEBUG-EXPERT-WEIGHTS] key={k} dtype={v.dtype} "
-                            f"shape={v.shape} mean={v.float().mean().item():.6f} "
-                            f"std={v.float().std().item():.6f}"
-                        )
-                    dq = self.dequantize_weights(weights)
-                    for k, v in dq.items():
-                        _log.info(
-                            f"[DEBUG-EXPERT-DEQUANT] key={k} dtype={v.dtype} "
-                            f"shape={v.shape} mean={v.float().mean().item():.6f} "
-                            f"std={v.float().std().item():.6f}"
-                        )
-            # Non-persistent prefill: use BF16 dequant + F.linear
-            # (FP8 w8a16_gemm path is for persistent decode experts only)
-            if self.phase == "prefill":
-                result = self._forward_bf16(hidden_states, weights)
-                torch.cuda.current_stream(
-                    self.engine_config.Basic_Config.device_torch
-                ).synchronize()
-                self.free_weights(self.module_key)
-                return result
-            # Non-persistent decode: FP8 path
             self.cached_gate = weights["gate_proj.weight"]
             self.cached_up = weights["up_proj.weight"]
             self.cached_down = weights["down_proj.weight"]
