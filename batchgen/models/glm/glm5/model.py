@@ -977,19 +977,35 @@ class Glm5MoE(MoEBase):
 
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Prefill: per-expert loop (no EP)."""
+        import logging as _log
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_flat
 
         topk_weights, topk_indices = self.gate_module(hidden_flat)
 
+        # DEBUG T33: log gate output
+        if torch.distributed.get_rank() == 0 and not hasattr(Glm5MoE, '_prefill_debug_logged'):
+            Glm5MoE._prefill_debug_logged = True
+            _log.info(
+                f"[DEBUG-MOE-PREFILL] hidden_flat shape={hidden_flat.shape} dtype={hidden_flat.dtype} "
+                f"mean={hidden_flat.mean().item():.6f} std={hidden_flat.std().item():.6f}"
+            )
+            _log.info(
+                f"[DEBUG-MOE-PREFILL] gate topk_weights shape={topk_weights.shape} "
+                f"mean={topk_weights.mean().item():.6f} "
+                f"topk_indices[:3]={topk_indices[:3].tolist()}"
+            )
+
         output = torch.zeros_like(hidden_flat, dtype=torch.float32)
+        n_active = 0
         for i, expert in enumerate(self.experts):
             if isinstance(expert, _Glm5ExpertPlaceholder):
                 continue
             expert_mask = (topk_indices == i).any(dim=-1)
             if not expert_mask.any():
                 continue
+            n_active += 1
             expert_input = hidden_flat[expert_mask]
             expert_output = expert(expert_input)
             expert_weight = torch.where(
@@ -998,6 +1014,19 @@ class Glm5MoE(MoEBase):
                 torch.zeros_like(topk_weights[expert_mask])
             ).sum(dim=-1)
             output[expert_mask] += expert_output.float() * expert_weight.unsqueeze(-1)
+
+        # DEBUG T33: log expert output
+        if torch.distributed.get_rank() == 0 and not hasattr(Glm5MoE, '_prefill_debug_logged2'):
+            Glm5MoE._prefill_debug_logged2 = True
+            shared_out = self.shared_experts(identity)
+            _log.info(
+                f"[DEBUG-MOE-PREFILL] n_active_experts={n_active} "
+                f"routed_out mean={output.mean().item():.6f} std={output.std().item():.6f} "
+                f"shared_out mean={shared_out.mean().item():.6f} std={shared_out.std().item():.6f}"
+            )
+            output = output.to(hidden_flat.dtype)
+            output = output + shared_out
+            return output.view(*orig_shape)
 
         output = output.to(hidden_flat.dtype)
         output = output + self.shared_experts(identity)
