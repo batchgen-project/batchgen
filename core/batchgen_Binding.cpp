@@ -338,6 +338,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("memfd_creator_pid",
                        &kv::HostPagedKVConfig::memfd_creator_pid)
         .def_readwrite("memfd_fd", &kv::HostPagedKVConfig::memfd_fd)
+        .def_readwrite("logger_name", &kv::HostPagedKVConfig::logger_name)
         .def("__repr__",
              [](const kv::HostPagedKVConfig& self) {
                  return kv::ToString(self);

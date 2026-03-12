@@ -192,7 +192,8 @@ class HostPagedKVWorkerView {
           layout_(config_),
           backend_(config_, layout_.DataSectionBytes(), layout_.Fingerprint(),
                    Layout::kHasVCache),
-          logger_(init_logger("info", "HostPagedKVWorkerView")) {}
+          logger_(init_logger("info",
+              config_.logger_name.empty() ? "HostPagedKVWorkerView" : config_.logger_name)) {}
 
     HostPagedKVWorkerView(const HostPagedKVWorkerView&) = delete;
     HostPagedKVWorkerView& operator=(const HostPagedKVWorkerView&) = delete;

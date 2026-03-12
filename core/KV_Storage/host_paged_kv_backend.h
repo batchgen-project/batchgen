@@ -37,6 +37,7 @@ struct HostPagedKVConfig {
     bool enable_memfd = false;
     int memfd_creator_pid = -1;
     int memfd_fd = -1;
+    std::string logger_name;  // Custom logger name (empty = use default)
 };
 
 inline std::uint64_t HashCombine(std::uint64_t seed, std::uint64_t value) {
