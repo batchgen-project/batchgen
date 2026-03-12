@@ -151,7 +151,7 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             self.cached_up = weights["up_proj.weight"]
             self.cached_down = weights["down_proj.weight"]
 
-        result = self.micro_batch_forward(hidden_states, "expert")
+        result = self._forward_impl(hidden_states)
 
         if not self.persistent:
             torch.cuda.current_stream(
