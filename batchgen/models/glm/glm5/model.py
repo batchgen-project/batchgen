@@ -780,7 +780,7 @@ class Glm5MoE(nn.Module):
 
         self.use_wgmma_fp8 = os.environ.get("BATCHGEN_USE_WGMMA_FP8", "0") == "1"
 
-        self.gate_module = Glm5MoEGate(config)
+        self.gate = Glm5MoEGate(config)
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
 
@@ -930,7 +930,7 @@ class Glm5MoE(nn.Module):
         # 2) Gate
         with (dt.timed("routing", 0) if dt else _nullctx()):
             global_x = all_tokens
-            topk_idx, topk_weight = self.gate(global_x)
+            topk_idx, topk_weight = self._gate_decode(global_x)
 
         # 3+4) Expert compute
         all_persistent = (self.num_persistent_local_experts == self.experts_per_rank)
@@ -959,7 +959,7 @@ class Glm5MoE(nn.Module):
 
     # ── Gate + Expert Compute ──
 
-    def gate(self, x: torch.Tensor):
+    def _gate_decode(self, x: torch.Tensor):
         """Sigmoid gating with e_score_correction. CUDA kernel with Python fallback."""
         if self.use_wgmma_fp8:
             try:
@@ -969,27 +969,27 @@ class Glm5MoE(nn.Module):
                     G = x.shape[0]
                     rl_bf16 = bufs.router_logits_bf16[:G]
                     rl_fp32 = bufs.router_logits[:G]
-                    torch.mm(x, self.gate_module.weight.t(), out=rl_bf16)
+                    torch.mm(x, self.gate.weight.t(), out=rl_bf16)
                     rl_fp32.copy_(rl_bf16)
                     return gate_sigmoid_topk_cuda(
                         rl_fp32,
-                        self.gate_module.e_score_correction_bias.float(),
+                        self.gate.e_score_correction_bias.float(),
                         k=self.num_experts_per_tok,
-                        routed_scaling_factor=self.gate_module.routed_scaling_factor,
+                        routed_scaling_factor=self.gate.routed_scaling_factor,
                     )
                 else:
-                    router_logits = F.linear(x, self.gate_module.weight).float()
+                    router_logits = F.linear(x, self.gate.weight).float()
                     return gate_sigmoid_topk_cuda(
                         router_logits,
-                        self.gate_module.e_score_correction_bias.float(),
+                        self.gate.e_score_correction_bias.float(),
                         k=self.num_experts_per_tok,
-                        routed_scaling_factor=self.gate_module.routed_scaling_factor,
+                        routed_scaling_factor=self.gate.routed_scaling_factor,
                     )
             except ImportError:
                 logging.warning("gate_sigmoid_topk_cuda unavailable, using Python fallback")
 
         # Python fallback
-        topk_weight, topk_idx = self.gate_module(x)
+        topk_weight, topk_idx = self.gate(x)
         return topk_idx.to(torch.int32), topk_weight.to(torch.float32)
 
     def expert_compute_persistent(self, global_x, topk_idx, topk_weight):
@@ -1097,7 +1097,7 @@ class Glm5MoE(nn.Module):
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_flat
 
-        topk_weights, topk_indices = self.gate_module(hidden_flat)
+        topk_weights, topk_indices = self.gate(hidden_flat)
 
         output = torch.zeros_like(hidden_flat, dtype=torch.float32)
         n_active = 0
