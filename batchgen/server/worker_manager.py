@@ -193,13 +193,19 @@ class WorkerManager:
         if self.args.host_kv_cache_size:
             kv_start = _time.monotonic()
             try:
-                self.host_kv_manager = self.allocate_host_kv_cache(
+                result = self.allocate_host_kv_cache(
                     self.args.host_kv_cache_size, self.args.model,
                     enable_memfd=self.args.fast_init,
                 )
+                if isinstance(result, tuple):
+                    self.host_kv_manager, self.host_kv_aux_manager = result
+                else:
+                    self.host_kv_manager = result
+                    self.host_kv_aux_manager = None
             except Exception as exc:
                 logger.warning("Host KV cache allocation failed: %s", exc)
                 self.host_kv_manager = None
+                self.host_kv_aux_manager = None
             logger.info("[startup] Host KV cache allocated in %.2fs",
                         _time.monotonic() - kv_start)
 
@@ -518,6 +524,7 @@ class WorkerManager:
             fast_init=self.args.fast_init,
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
+            kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
             weights_memfd_pid=self._get_weights_memfd_pid(),
             weights_memfd_fd=self._get_weights_memfd_fd(),
         )
@@ -543,6 +550,11 @@ class WorkerManager:
     def _get_kv_memfd_fd(self) -> int:
         if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
             return self.host_kv_manager.memfd_fd()
+        return -1
+
+    def _get_kv_aux_memfd_fd(self) -> int:
+        if self.args.fast_init and getattr(self, 'host_kv_aux_manager', None) is not None:
+            return self.host_kv_aux_manager.memfd_fd()
         return -1
 
     def _get_weights_memfd_pid(self) -> int:
@@ -877,7 +889,7 @@ class WorkerManager:
             logger.info(
                 "Allocated dual host KV cache: primary + auxiliary (DSA indexer)"
             )
-            return primary_mgr
+            return primary_mgr, aux_mgr
 
         config = build_host_kv_config(
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),

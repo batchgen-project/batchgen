@@ -110,6 +110,7 @@ class DualHostKVCoordinator:
 		enable_memfd: bool = False,
 		memfd_creator_pid: int = -1,
 		memfd_fd: int = -1,
+		aux_memfd_fd: int = -1,
 	) -> Optional["DualHostKVCoordinator"]:
 		"""Factory: split budget proportionally, create both worker views.
 
@@ -142,7 +143,7 @@ class DualHostKVCoordinator:
 			primary_config.memfd_fd = memfd_fd
 			aux_config.enable_memfd = True
 			aux_config.memfd_creator_pid = memfd_creator_pid
-			aux_config.memfd_fd = memfd_fd
+			aux_config.memfd_fd = aux_memfd_fd
 
 		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
 		try:

@@ -302,6 +302,7 @@ class BatchGenWorkerArgs:
 	fast_init: bool = False
 	kv_memfd_pid: int = -1
 	kv_memfd_fd: int = -1
+	kv_aux_memfd_fd: int = -1  # Separate memfd fd for auxiliary (indexer) KV cache
 	weights_memfd_pid: int = -1
 	weights_memfd_fd: int = -1
 
@@ -454,6 +455,7 @@ class BatchGenWorker:
 			enable_memfd=args.fast_init,
 			memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
 			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
+			aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
 		)
 		if dual_host is not None:
 			self.host_paged_kv_worker_view = dual_host
