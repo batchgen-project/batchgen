@@ -722,6 +722,7 @@ class WorkerManager:
                 self.args.cache_dir,
                 converted_ckpt_dir,
                 self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
             )
         else:
             raise NotImplementedError(

@@ -39,13 +39,14 @@ except ImportError:
 
 
 class GLM5_Parameter_Server:
-    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs):
+    def __init__(self, huggingface_ckpt_name, cache_dir, converted_ckpt_dir, enable_hugetlbfs, enable_memfd=False):
         self.cache_dir = cache_dir
         self.huggingface_ckpt_name = huggingface_ckpt_name
         self.converted_ckpt_dir = converted_ckpt_dir
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
+        self.enable_memfd = enable_memfd
         self.model_config = load_config(huggingface_ckpt_name)
         self.hf_config = Glm5Config()
         self.hf_config._name_or_path = huggingface_ckpt_name
@@ -65,7 +66,7 @@ class GLM5_Parameter_Server:
 
         self._parse_state_dict()
 
-        self.parameter_server = Parameter_Server(self.enable_hugetlbfs)
+        self.parameter_server = Parameter_Server(self.enable_hugetlbfs, self.enable_memfd)
 
         # GLM-5-FP8: FP8 experts (~675 GB) + FP8 attn + rest ≈ 700 GB
         # GLM-5: BF16 experts (~1350 GB) + FP8 attn + rest ≈ 1380 GB
