@@ -538,7 +538,7 @@ class GLM5ParallelStrategyManager:
     def _configure_decode_moe(self, comm):
         """Configure existing Glm5MoE instances for EP decode.
 
-        No class swap — same Glm5MoE(MoEBase) is used for both prefill and
+        No class swap — same Glm5MoE is used for both prefill and
         decode. Just inject comm and set EP attributes.
         """
         NUM_EXPERT_PER_RANK = self.NUM_TOTAL_EXPERTS // self.world_size

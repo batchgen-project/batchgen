@@ -733,18 +733,16 @@ def scatter_weight_reduce_optimized(res, global_indices, token_topk_pos,
 
 
 # ============================================================================
-# MoE Layer (Decode with EP) — inherits from MoEBase
+# MoE Layer (Decode with EP) — standalone nn.Module (K2.5 pattern)
 # ============================================================================
 
-from batchgen.moe.moe_base import MoEBase
-
-class Glm5MoE(MoEBase):
+class Glm5MoE(nn.Module):
     """GLM-5 MoE layer (unified prefill + EP decode).
 
-    Inherits the universal template from MoEBase:
+    Standalone module (no MoEBase inheritance). Follows K2.5 pattern:
         forward() dispatches to _forward_prefill() or _forward_decode() by config.phase.
 
-    Decode path implements:
+    Decode path:
         gate()                       — sigmoid + bias + topk (CUDA kernel with fallback)
         expert_compute_persistent()  — WGMMA FP8 pipeline (zero CPU-GPU sync)
         expert_compute_mixed()       — WGMMA persistent + loop non-persistent (one .tolist())
@@ -753,11 +751,33 @@ class Glm5MoE(MoEBase):
 
     # Shared across all instances (all 75 MoE layers)
     _wgmma_modules = None       # (wgmma_mod, fast_mod, dr_mod)
-    _wgmma_shared_bufs = None   # WGMMAMoEBuffers instance
+    _buf = None                 # WGMMAMoEBuffers instance (unified: GEMM + comm buffers)
     _wgmma_next_layer_id = 0    # Counter for layer registration
 
     def __init__(self, config: Glm5Config, comm=None):
-        super().__init__(config, comm)
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.comm = comm
+
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            self.rank, self.world_size = 0, 1
+        else:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+
+        self.experts_per_rank = config.n_routed_experts // self.world_size
+        self.total_experts = self.world_size * self.experts_per_rank
+        self.routed_expert_start_idx = self.rank * self.experts_per_rank
+        self.routed_expert_end_idx = (self.rank + 1) * self.experts_per_rank
+
+        self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
+        self.num_tokens_per_rank = None
+        self.enable_ep_offloading = False
+        self.num_persistent_local_experts = self.experts_per_rank
+
         self.use_wgmma_fp8 = os.environ.get("BATCHGEN_USE_WGMMA_FP8", "0") == "1"
 
         self.gate_module = Glm5MoEGate(config)
@@ -766,8 +786,22 @@ class Glm5MoE(MoEBase):
 
     # ── Token count management (called by PSM) ──
 
+    @classmethod
+    def init_buffer_manager(cls, num_tokens_per_rank: int, world_size: int,
+                            hidden_size: int, device: torch.device):
+        """Initialize shared WGMMAMoEBuffers. Called once by PSM.
+
+        WGMMAMoEBuffers is the unified buffer manager — it contains both
+        GEMM buffers (act_buf, gate_out, etc.) and comm buffers (all_tokens,
+        padded_hidden_states) that MoEBufferManager used to provide separately.
+        Actual buffer creation is deferred to _lazy_init_wgmma_bufs() since it
+        needs weight pointers from the first layer's init().
+        """
+        # Store params for deferred creation in _lazy_init_wgmma_bufs
+        cls._deferred_buf_params = (num_tokens_per_rank, world_size, hidden_size, device)
+
     def init_num_tokens(self, num_tokens_per_rank: int):
-        super().init_num_tokens(num_tokens_per_rank)
+        self.num_tokens_per_rank = num_tokens_per_rank
         self.max_num_tokens_per_rank = num_tokens_per_rank
         global_num_tokens = num_tokens_per_rank * self.world_size
         K = self.num_experts_per_tok
@@ -781,7 +815,7 @@ class Glm5MoE(MoEBase):
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         if num_tokens_per_rank == self.num_tokens_per_rank:
             return
-        super().set_num_tokens_per_rank(num_tokens_per_rank)
+        self.num_tokens_per_rank = num_tokens_per_rank
         if hasattr(self, 'max_num_tokens_per_rank') and num_tokens_per_rank > self.max_num_tokens_per_rank:
             self.max_num_tokens_per_rank = num_tokens_per_rank
         global_num_tokens = num_tokens_per_rank * self.world_size
@@ -841,14 +875,96 @@ class Glm5MoE(MoEBase):
                       'gate_scale_ptrs_ptr', 'up_scale_ptrs_ptr', 'down_scale_ptrs_ptr'):
             setattr(self, attr, None)
 
-    # ── MoEBase abstract method implementations ──
+    # ── Forward ──
+
+    @torch.inference_mode()
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if getattr(self.config, 'phase', 'decode') == 'decode':
+            return self._forward_decode(hidden_states)
+        return self._forward_prefill(hidden_states)
+
+    @torch.inference_mode()
+    def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """EP decode: AllGather → Gate → Expert Compute → AllReduce → Extract + Shared."""
+        import torch.distributed as dist
+        from contextlib import nullcontext as _nullctx
+        from batchgen.timing import get_decode_timer
+
+        dt = get_decode_timer()
+
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_states
+        num_tokens, hidden_size = hidden_states.shape
+
+        if num_tokens > self.num_tokens_per_rank:
+            raise RuntimeError(
+                f"MoE buffer overflow: num_tokens={num_tokens} > "
+                f"num_tokens_per_rank={self.num_tokens_per_rank}"
+            )
+
+        buf = self._buf
+        ntp = self.num_tokens_per_rank
+
+        # 1) AllGather
+        with (dt.timed("allgather", 0) if dt else _nullctx()):
+            G = self.world_size * ntp
+            all_tokens = buf.all_tokens[:G] if buf is not None else torch.zeros(
+                G, hidden_size, device=self.device, dtype=torch.bfloat16)
+
+            if buf is not None:
+                all_tokens.zero_()
+                padded = buf.padded_hidden_states[:ntp]
+                padded.zero_()
+                padded[:num_tokens] = hidden_states
+            else:
+                padded = torch.zeros(ntp, hidden_size, device=self.device, dtype=hidden_states.dtype)
+                padded[:num_tokens] = hidden_states
+
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    all_tokens, padded,
+                    stream=torch.cuda.default_stream(self.device),
+                )
+
+        # 2) Gate
+        with (dt.timed("routing", 0) if dt else _nullctx()):
+            global_x = all_tokens
+            topk_idx, topk_weight = self.gate(global_x)
+
+        # 3+4) Expert compute
+        all_persistent = (self.num_persistent_local_experts == self.experts_per_rank)
+        if all_persistent and not self.enable_ep_offloading:
+            with (dt.timed("wgmma_pipeline", 0) if dt else _nullctx()):
+                global_results = self.expert_compute_persistent(
+                    global_x, topk_idx, topk_weight)
+        else:
+            with (dt.timed("mixed_compute", 0) if dt else _nullctx()):
+                global_results = self.expert_compute_mixed(
+                    global_x, topk_idx, topk_weight)
+
+        # 5) AllReduce
+        with (dt.timed("allreduce", 0) if dt else _nullctx()):
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    global_results, op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.default_stream(self.device),
+                )
+
+        # 6) Extract local slice + shared expert
+        start = self.rank * ntp
+        out = global_results[start:start + num_tokens].to(hidden_states.dtype)
+        out = out + self.shared_expert_forward(identity)
+        return out.view(*orig_shape)
+
+    # ── Gate + Expert Compute ──
 
     def gate(self, x: torch.Tensor):
         """Sigmoid gating with e_score_correction. CUDA kernel with Python fallback."""
         if self.use_wgmma_fp8:
             try:
                 from batchgen.moe.routing import gate_sigmoid_topk_cuda
-                bufs = Glm5MoE._wgmma_shared_bufs
+                bufs = Glm5MoE._buf
                 if bufs is not None:
                     G = x.shape[0]
                     rl_bf16 = bufs.router_logits_bf16[:G]
@@ -880,7 +996,7 @@ class Glm5MoE(MoEBase):
         """All-persistent expert compute. Zero CPU-GPU sync on WGMMA path."""
         if self.use_wgmma_fp8:
             # WGMMA path: dispatch_scatter_3d → WGMMA pipeline → reduce (zero sync)
-            bufs = Glm5MoE._wgmma_shared_bufs
+            bufs = Glm5MoE._buf
             if bufs is None:
                 bufs = self._lazy_init_wgmma_bufs()
 
@@ -1024,7 +1140,7 @@ class Glm5MoE(MoEBase):
             num_global_tokens,
             num_tokens_per_rank=self.num_tokens_per_rank,
             device=self.device)
-        Glm5MoE._wgmma_shared_bufs = bufs
+        Glm5MoE._buf = bufs
         return bufs
 
     def _grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets,
