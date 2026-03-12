@@ -1251,5 +1251,18 @@ class Glm5ForCausalLM(nn.Module):
         )
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        # DEBUG T33: log first token prediction to verify prefill correctness
+        if torch.distributed.get_rank() == 0:
+            import logging as _log
+            last_logits = logits[:, -1, :]  # [B, vocab]
+            top5 = torch.topk(last_logits[0], 5)
+            _log.info(
+                f"[DEBUG-PREFILL] phase={getattr(self.config, 'phase', '?')} "
+                f"logits_shape={logits.shape} "
+                f"top5_ids={top5.indices.tolist()} "
+                f"top5_vals={[f'{v:.2f}' for v in top5.values.tolist()]} "
+                f"logits_mean={last_logits.mean().item():.4f} "
+                f"logits_std={last_logits.std().item():.4f}"
+            )
         from types import SimpleNamespace
         return SimpleNamespace(logits=logits)
