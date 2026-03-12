@@ -144,17 +144,6 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
             self.cached_down, self.weight_dequant_scale.get('down_proj.weight_scale_inv'), intermediate
         )
 
-    def _forward_bf16(self, hidden_states: torch.Tensor, weights: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """BF16 matmul path for non-persistent prefill experts.
-
-        Dequantizes FP8 weights to BF16, then uses F.linear (safe for prefill).
-        """
-        dequant_weights = self.dequantize_weights(weights)
-        gate = F.linear(hidden_states, dequant_weights["gate_proj.weight"])
-        up = F.linear(hidden_states, dequant_weights["up_proj.weight"])
-        intermediate = F.silu(gate) * up
-        return F.linear(intermediate, dequant_weights["down_proj.weight"])
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.persistent:
             weights = self.load_weights(self.module_key)
