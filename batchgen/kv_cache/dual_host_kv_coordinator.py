@@ -107,6 +107,9 @@ class DualHostKVCoordinator:
 		model_name: str,
 		host_kv_cache_size: int,
 		core_engine_module,
+		enable_memfd: bool = False,
+		memfd_creator_pid: int = -1,
+		memfd_fd: int = -1,
 	) -> Optional["DualHostKVCoordinator"]:
 		"""Factory: split budget proportionally, create both worker views.
 
@@ -132,6 +135,14 @@ class DualHostKVCoordinator:
 		# Set distinct logger names to avoid C++ logger name collision
 		_try_set_logger_name(primary_config, "HostPagedKVWorkerView")
 		_try_set_logger_name(aux_config, "HostPagedKVWorkerView_aux")
+
+		if enable_memfd:
+			primary_config.enable_memfd = True
+			primary_config.memfd_creator_pid = memfd_creator_pid
+			primary_config.memfd_fd = memfd_fd
+			aux_config.enable_memfd = True
+			aux_config.memfd_creator_pid = memfd_creator_pid
+			aux_config.memfd_fd = memfd_fd
 
 		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
 		try:
@@ -165,6 +176,7 @@ class DualHostKVCoordinator:
 		cls,
 		model_name: str,
 		host_kv_cache_size: int,
+		enable_memfd: bool = False,
 	) -> Optional[Tuple[Any, Any]]:
 		"""Server-side factory: create and initialize both host KV managers.
 
@@ -190,6 +202,10 @@ class DualHostKVCoordinator:
 		# Set distinct logger names to avoid C++ logger name collision
 		_try_set_logger_name(primary_config, "HostPagedKVManager")
 		_try_set_logger_name(aux_config, "HostPagedKVManager_aux")
+
+		if enable_memfd:
+			primary_config.enable_memfd = True
+			aux_config.enable_memfd = True
 
 		primary_mgr = bg_lib.MLAHostPagedKVManager(primary_config)
 		primary_mgr.initialize(True)

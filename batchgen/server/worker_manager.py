@@ -869,6 +869,7 @@ class WorkerManager:
         dual = DualHostKVCoordinator.create_managers(
             model_name=model_name,
             host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+            enable_memfd=enable_memfd,
         )
         if dual is not None:
             primary_mgr, aux_mgr = dual

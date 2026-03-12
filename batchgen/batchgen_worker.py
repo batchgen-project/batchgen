@@ -451,6 +451,9 @@ class BatchGenWorker:
 			model_name=args.model_name,
 			host_kv_cache_size=host_budget_bytes,
 			core_engine_module=core_engine,
+			enable_memfd=args.fast_init,
+			memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
+			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
 		)
 		if dual_host is not None:
 			self.host_paged_kv_worker_view = dual_host
