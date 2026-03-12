@@ -1239,6 +1239,21 @@ class Glm5Model(nn.Module):
             hidden_states, _, _ = layer(
                 hidden_states, attention_mask, position_ids, past_kv, use_cache,
             )
+            # DEBUG T33: trace hidden state stats per layer (first call only)
+            if (not hasattr(Glm5Model, '_layer_debug_done')
+                    and torch.distributed.get_rank() == 0
+                    and idx in (0, 2, 3, 39, 78)):
+                import logging as _log
+                _log.info(
+                    f"[DEBUG-LAYER] layer={idx} "
+                    f"mean={hidden_states.mean().item():.6f} "
+                    f"std={hidden_states.std().item():.6f} "
+                    f"absmax={hidden_states.abs().max().item():.4f} "
+                    f"has_nan={hidden_states.isnan().any().item()} "
+                    f"has_inf={hidden_states.isinf().any().item()}"
+                )
+                if idx == 78:
+                    Glm5Model._layer_debug_done = True
 
         hidden_states = self.norm(hidden_states)
         return (hidden_states,)
