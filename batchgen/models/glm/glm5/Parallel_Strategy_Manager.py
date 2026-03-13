@@ -620,10 +620,19 @@ class GLM5ParallelStrategyManager:
 
     def _init_fused_kernels(self):
         """Initialize TMA-based CUDA kernels after FP8 scales are attached."""
+        count = 0
         for layer_idx in range(len(self.model.model.layers)):
             wrapper = self.model.model.layers[layer_idx].self_attn
-            if hasattr(wrapper, 'initialize_fused_kernels'):
+            has_method = hasattr(wrapper, 'initialize_fused_kernels')
+            if layer_idx == 0:
+                logging.warning(
+                    f"[_init_fused_kernels] layer 0: type={type(wrapper).__name__}, "
+                    f"has_method={has_method}"
+                )
+            if has_method:
                 wrapper.initialize_fused_kernels()
+                count += 1
+        logging.warning(f"[_init_fused_kernels] called {count}/{len(self.model.model.layers)} layers")
 
     def _lm_head_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)
