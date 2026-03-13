@@ -295,8 +295,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
         Must be called AFTER torch.cuda.set_device(local_rank) — TMA descriptors
         contain physical GPU addresses and are not portable across devices.
         """
+        import sys
         attn = self.module
         indexer = attn.indexer
+
+        if self.layer_idx == 0:
+            print(f"[DEBUG] initialize_fused_kernels layer 0: "
+                  f"_HAS_FUSED_INDEXER_KV={_HAS_FUSED_INDEXER_KV}, "
+                  f"_HAS_FUSED_SCORE={_HAS_FUSED_SCORE}, "
+                  f"_HAS_FP8_ABSORB={_HAS_FP8_ABSORB}, "
+                  f"has_wk_scale={hasattr(indexer, 'wk_scale')}, "
+                  f"has_wq_b_scale={hasattr(indexer, 'wq_b_scale')}",
+                  flush=True, file=sys.stderr)
 
         # WP2: Fused indexer KV proj (GEMM-only path, LayerNorm stays in PyTorch)
         if _HAS_FUSED_INDEXER_KV and hasattr(indexer, 'wk_scale'):
