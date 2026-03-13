@@ -20,6 +20,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+	from batchgen_kernels.attention.dsa import fused_indexer_gather as _fused_indexer_gather
+except (ImportError, Exception):
+	_fused_indexer_gather = None
+
 
 @dataclass
 class IndexerConfig:
@@ -153,6 +158,12 @@ def _gather_all_from_paged_cache(
 	num_k_heads = blocked_k.shape[2]
 	k_head_dim = blocked_k.shape[3]
 	device = blocked_k.device
+
+	# Use fused Triton kernel if available
+	if _fused_indexer_gather is not None:
+		return _fused_indexer_gather(
+			blocked_k, block_table, cache_seqlens, page_size, max_seqlen,
+		)
 
 	# Pre-allocate output
 	gathered = torch.zeros(

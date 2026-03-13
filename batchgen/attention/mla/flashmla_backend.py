@@ -23,6 +23,12 @@ from ...quantization.fp8e4m3 import (
 from typing import Optional, Tuple
 import math
 
+try:
+	from batchgen_kernels.attention.dsa import FP8AbsorbWeights, fp8_q_absorb, fp8_out_absorb
+	_HAS_FP8_ABSORB = True
+except (ImportError, Exception):
+	_HAS_FP8_ABSORB = False
+
 def quant_per_token(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 	"""
 	Quantize a [bsz, seq, 576] BF16 tensor to FP8 per 128-element block.
@@ -688,30 +694,51 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	past_key_states[batch_indices, q_position_ids[:, 0], :] = new_compressed_kv_fp8[:, 0, :]
 	scale[batch_indices, q_position_ids[:, 0], :] = new_scale[:, 0, :]
 	
-	# Prepare KV projection weights with dequantization
-	kv_b_proj = deepseek_v3_dequantization(
-		self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
-	).view(self.num_heads, -1, self.kv_lora_rank)
-	
-	q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
-	out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+	# Prepare absorb weights (cached after first call)
+	if _HAS_FP8_ABSORB and not hasattr(self, '_fp8_absorb_weights'):
+		kv_b_proj_bf16 = deepseek_v3_dequantization(
+			self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+		).view(self.num_heads, -1, self.kv_lora_rank)
+		q_absorb_w = kv_b_proj_bf16[:, : self.qk_nope_head_dim, :]
+		out_absorb_w = kv_b_proj_bf16[:, self.qk_nope_head_dim :, :]
+		self._fp8_absorb_weights = FP8AbsorbWeights(q_absorb_w, out_absorb_w)
 
-	qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-	query_states = torch.empty(
-		bsz, self.num_heads, 1, qk_head_dim,
-		dtype=compressed_kv_ref.dtype,
-		device=compressed_kv_ref.device,
-	)
+	if _HAS_FP8_ABSORB:
+		# FP8 WGMMA q_absorb: [B, H, 192] → [B, H, 512]
+		q_nope_3d = q_nope.view(bsz, self.num_heads, self.qk_nope_head_dim)
+		q_absorbed = fp8_q_absorb(q_nope_3d, self._fp8_absorb_weights)
 
-	query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
-	query_states[:, :, :, self.kv_lora_rank :] = q_pe
+		qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+		query_states = torch.empty(
+			bsz, self.num_heads, 1, qk_head_dim,
+			dtype=compressed_kv_ref.dtype,
+			device=compressed_kv_ref.device,
+		)
+		query_states[:, :, 0, : self.kv_lora_rank] = q_absorbed
+		query_states[:, :, :, self.kv_lora_rank :] = q_pe
+	else:
+		kv_b_proj = deepseek_v3_dequantization(
+			self.kv_b_proj.weight.data, weight_scale["kv_b_proj.weight_scale_inv"]
+		).view(self.num_heads, -1, self.kv_lora_rank)
+		q_absorb = kv_b_proj[:, : self.qk_nope_head_dim, :]
+		out_absorb = kv_b_proj[:, self.qk_nope_head_dim :, :]
+
+		qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+		query_states = torch.empty(
+			bsz, self.num_heads, 1, qk_head_dim,
+			dtype=compressed_kv_ref.dtype,
+			device=compressed_kv_ref.device,
+		)
+		query_states[:, :, :, : self.kv_lora_rank] = torch.einsum('hdc,bhid->bhic', q_absorb, q_nope)
+		query_states[:, :, :, self.kv_lora_rank :] = q_pe
+
 	query_states = query_states.view(
 		bsz, 1, self.num_heads, qk_head_dim
 	)
 
 	assert qk_head_dim == 576, f"qk_head_dim should be 576, but got {qk_head_dim}"
-	
-	block_size = 64	
+
+	block_size = 64
 	block_table = torch.arange(
 		bsz * max_seqlen_pad // block_size, dtype=torch.int32, device=compressed_kv_ref.device
 	).view(bsz, max_seqlen_pad // block_size)
@@ -738,7 +765,13 @@ def mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn_(
 	except Exception as e:
 		logging.error(f"Error in flash_mla_with_kvcache: {e}")
 		raise
-	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+
+	if _HAS_FP8_ABSORB:
+		# FP8 WGMMA out_absorb: [B, 1, H, 512] → [B, 1, H, 256] → transpose to [B, H, 1, 256]
+		attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
+		attn_output = attn_output.transpose(1, 2)
+	else:
+		attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
 	
 	if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
 		raise ValueError(

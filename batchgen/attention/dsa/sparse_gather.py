@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import torch
 
+try:
+	from batchgen_kernels.attention.dsa import fused_paged_gather as _fused_paged_gather
+except (ImportError, Exception):
+	_fused_paged_gather = None
+
 
 def sparse_gather_from_paged_kv(
 	blocked_k: torch.Tensor,
@@ -37,6 +42,10 @@ def sparse_gather_from_paged_kv(
 	batch_size, topk = token_indices.shape
 	num_k_heads = blocked_k.shape[2]
 	k_head_dim = blocked_k.shape[3]
+
+	# Use fused Triton kernel if available
+	if _fused_paged_gather is not None:
+		return _fused_paged_gather(blocked_k, block_table, token_indices, page_size)
 
 	# Convert absolute token positions to page index and offset
 	logical_page_idx = token_indices // page_size  # [batch, topk]
