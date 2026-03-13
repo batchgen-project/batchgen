@@ -61,6 +61,7 @@ class GLM5Tokenizer(FastTokenizer):
         self.eos_token_id = GLM5_EOS_TOKEN_ID
         self.pad_token_id = GLM5_PAD_TOKEN_ID
         self.stop_token_ids = GLM5_STOP_TOKEN_IDS
+        self.eos_token_ids = set(self.stop_token_ids)
         self.vocab_size = GLM5_VOCAB_SIZE
 
         # Find pad token string for padding setup
