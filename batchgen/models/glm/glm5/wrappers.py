@@ -332,8 +332,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_module = None
                 self._indexer_cuda_weights = None
 
-        # WP4: Fused scoring pipeline (wraps WP2 module for wq_b projection)
-        if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
+        # WP4: DISABLED for debugging — isolating WP2 accuracy
+        if False and _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
             try:
                 wq_b_bf16 = glm5_fp8_dequantization(
                     indexer.wq_b.weight.data, indexer.wq_b_scale,
