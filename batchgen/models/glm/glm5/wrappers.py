@@ -278,7 +278,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     self._cached_q_absorb,   # [H, 192, 512]
                     self._cached_out_absorb,  # [H, 256, 512]
                 )
-                logging.getLogger("glm5").info(
+                logging.getLogger("glm5").warning(
                     f"[layer {self.layer_idx}] FP8 absorb weights initialized"
                 )
             except Exception as e:
@@ -309,7 +309,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_weights = FP8IndexerWeightsCUDA(
                     wk_bf16, self._indexer_cuda_module,
                 )
-                logging.getLogger("glm5").info(
+                logging.getLogger("glm5").warning(
                     f"[layer {self.layer_idx}] WP2 fused indexer KV proj initialized"
                 )
             except Exception as e:
@@ -332,7 +332,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 indexer._fused_score_weights = self._fused_wqb_weights
                 indexer._fused_score_module = self._indexer_cuda_module
                 indexer._warned_fused_score_fallback = False
-                logging.getLogger("glm5").info(
+                logging.getLogger("glm5").warning(
                     f"[layer {self.layer_idx}] WP4 fused scoring pipeline initialized"
                 )
             except Exception as e:

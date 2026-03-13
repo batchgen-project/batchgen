@@ -143,6 +143,7 @@ class GLM5ParallelStrategyManager:
         step_start = time.perf_counter()
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
+        self._init_fused_kernels()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time
@@ -247,6 +248,7 @@ class GLM5ParallelStrategyManager:
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
+        self._init_fused_kernels()
 
         if self.rank == 0:
             used = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
@@ -478,7 +480,6 @@ class GLM5ParallelStrategyManager:
             if persistent:
                 wrapper._register_fp8_weights()
                 wrapper.initialize_decode_absorb()
-                wrapper.initialize_fused_kernels()
 
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Attn module config time: {elapsed:.2f}s")
@@ -616,6 +617,13 @@ class GLM5ParallelStrategyManager:
                 if key in self.dequant_scale:
                     setattr(mlp, f"{proj.split('_')[0]}_scale",
                             self.dequant_scale[key].to(device))
+
+    def _init_fused_kernels(self):
+        """Initialize TMA-based CUDA kernels after FP8 scales are attached."""
+        for layer_idx in range(len(self.model.model.layers)):
+            wrapper = self.model.model.layers[layer_idx].self_attn
+            if hasattr(wrapper, 'initialize_fused_kernels'):
+                wrapper.initialize_fused_kernels()
 
     def _lm_head_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)
