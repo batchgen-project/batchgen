@@ -278,11 +278,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     self._cached_q_absorb,   # [H, 192, 512]
                     self._cached_out_absorb,  # [H, 256, 512]
                 )
-                logging.getLogger("glm5").warning(
+                logging.warning(
                     f"[layer {self.layer_idx}] FP8 absorb weights initialized"
                 )
             except Exception as e:
-                logging.getLogger("glm5").warning(
+                logging.warning(
                     f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
                 )
                 self._fp8_absorb_weights = None
@@ -309,11 +309,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_weights = FP8IndexerWeightsCUDA(
                     wk_bf16, self._indexer_cuda_module,
                 )
-                logging.getLogger("glm5").warning(
+                logging.warning(
                     f"[layer {self.layer_idx}] WP2 fused indexer KV proj initialized"
                 )
             except Exception as e:
-                logging.getLogger("glm5").warning(
+                logging.warning(
                     f"[layer {self.layer_idx}] WP2 init failed: {e}"
                 )
                 self._indexer_cuda_module = None
@@ -332,11 +332,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 indexer._fused_score_weights = self._fused_wqb_weights
                 indexer._fused_score_module = self._indexer_cuda_module
                 indexer._warned_fused_score_fallback = False
-                logging.getLogger("glm5").warning(
+                logging.warning(
                     f"[layer {self.layer_idx}] WP4 fused scoring pipeline initialized"
                 )
             except Exception as e:
-                logging.getLogger("glm5").warning(
+                logging.warning(
                     f"[layer {self.layer_idx}] WP4 init failed: {e}"
                 )
                 self._fused_wqb_weights = None
@@ -603,7 +603,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             else:
                 if not self._warned_indexer_kv_fallback:
                     self._warned_indexer_kv_fallback = True
-                    logging.getLogger("glm5").warning(
+                    logging.warning(
                         f"[layer {self.layer_idx}] WP2 fused indexer KV proj unavailable, "
                         "falling back to PyTorch w8a16_gemm — check batchgen_kernels import"
                     )
@@ -687,7 +687,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             else:
                 if not self._warned_fp8_absorb_fallback:
                     self._warned_fp8_absorb_fallback = True
-                    logging.getLogger("glm5").warning(
+                    logging.warning(
                         f"[layer {self.layer_idx}] WP5 FP8 absorb unavailable, "
                         "falling back to torch.einsum — check batchgen_kernels import"
                     )

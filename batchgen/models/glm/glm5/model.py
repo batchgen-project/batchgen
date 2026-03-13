@@ -453,7 +453,7 @@ class Glm5Indexer(nn.Module):
         else:
             if hasattr(self, '_warned_fused_score_fallback') and not self._warned_fused_score_fallback:
                 self._warned_fused_score_fallback = True
-                logging.getLogger("glm5").warning(
+                logging.warning(
                     f"[layer {self.layer_idx}] WP4 fused scoring unavailable, "
                     "falling back to PyTorch score_and_select"
                 )
