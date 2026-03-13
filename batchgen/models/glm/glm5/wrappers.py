@@ -33,8 +33,9 @@ try:
         FP8AbsorbWeights, fp8_q_absorb, fp8_out_absorb,
     )
     _HAS_FP8_ABSORB = True
-except ImportError:
+except Exception as _e:
     _HAS_FP8_ABSORB = False
+    logging.warning(f"[WP5] FP8 absorb import failed: {_e}")
 
 # Try importing fused indexer KV proj (WP2)
 try:
@@ -43,8 +44,9 @@ try:
         FP8IndexerWeightsCUDA,
     )
     _HAS_FUSED_INDEXER_KV = True
-except ImportError:
+except Exception as _e:
     _HAS_FUSED_INDEXER_KV = False
+    logging.warning(f"[WP2] Fused indexer KV proj import failed: {_e}")
 
 # Try importing fused scoring pipeline (WP4)
 try:
@@ -53,8 +55,9 @@ try:
         fused_score_pipeline,
     )
     _HAS_FUSED_SCORE = True
-except ImportError:
+except Exception as _e:
     _HAS_FUSED_SCORE = False
+    logging.warning(f"[WP4] Fused scoring import failed: {_e}")
 
 # Initialize GLM-5 decode timer (activated by BATCHGEN_DECODE_TIMING=1)
 _GLM5_ATTN_CATEGORIES = [
