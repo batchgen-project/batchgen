@@ -423,10 +423,44 @@ class Glm5Indexer(nn.Module):
         gathered = blocked_flat[flat_idx].view(self._gather_cache_shape)
 
         gathered_k = gathered.squeeze(2)
-        return self.score_and_select(
-            q_a, hidden_states, gathered_k, cache_seqlens,
-            positions=positions, max_seqlen=max_seqlen,
-        )
+
+        # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
+        if hasattr(self, '_fused_score_weights') and self._fused_score_weights is not None:
+            from batchgen_kernels.attention.dsa.fused_indexer_score import fused_score_pipeline
+            # Get RoPE cos/sin tables
+            seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
+            cos, sin = self.rotary_emb(
+                gathered_k[:1, :1, :self.rope_head_dim],  # dummy for dtype/device
+                seq_len,
+            )
+            top_k_indices, _ = fused_score_pipeline(
+                q_a=q_a.squeeze(1),                      # [B, q_lora_rank]
+                hidden_states=hidden_states.squeeze(1),   # [B, hidden_size]
+                cached_k=gathered_k,                      # [B, max_seqlen, 128]
+                cache_seqlens=cache_seqlens.int(),
+                wq_b_weights=self._fused_score_weights,
+                weights_proj_weight=self.weights_proj.weight.data,  # [32, 6144]
+                cos_table=cos.to(torch.bfloat16),
+                sin_table=sin.to(torch.bfloat16),
+                positions=positions,
+                module=self._fused_score_module,
+                n_heads=self.index_n_heads,
+                head_dim=self.index_head_dim,
+                rope_dim=self.rope_head_dim,
+                topk=min(self.index_topk, max_seqlen),
+            )
+            return top_k_indices
+        else:
+            if hasattr(self, '_warned_fused_score_fallback') and not self._warned_fused_score_fallback:
+                self._warned_fused_score_fallback = True
+                logging.getLogger("glm5").warning(
+                    f"[layer {self.layer_idx}] WP4 fused scoring unavailable, "
+                    "falling back to PyTorch score_and_select"
+                )
+            return self.score_and_select(
+                q_a, hidden_states, gathered_k, cache_seqlens,
+                positions=positions, max_seqlen=max_seqlen,
+            )
 
 
 # ============================================================================

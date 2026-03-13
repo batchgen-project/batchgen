@@ -27,6 +27,35 @@ import torch.nn.functional as F
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
 
+# Try importing FP8 absorb kernels (WP5)
+try:
+    from batchgen_kernels.attention.dsa.fp8_absorb import (
+        FP8AbsorbWeights, fp8_q_absorb, fp8_out_absorb,
+    )
+    _HAS_FP8_ABSORB = True
+except ImportError:
+    _HAS_FP8_ABSORB = False
+
+# Try importing fused indexer KV proj (WP2)
+try:
+    from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
+        build_module as _build_indexer_module,
+        FP8IndexerWeightsCUDA,
+    )
+    _HAS_FUSED_INDEXER_KV = True
+except ImportError:
+    _HAS_FUSED_INDEXER_KV = False
+
+# Try importing fused scoring pipeline (WP4)
+try:
+    from batchgen_kernels.attention.dsa.fused_indexer_score import (
+        FP8WqbWeightsCUDA,
+        fused_score_pipeline,
+    )
+    _HAS_FUSED_SCORE = True
+except ImportError:
+    _HAS_FUSED_SCORE = False
+
 # Initialize GLM-5 decode timer (activated by BATCHGEN_DECODE_TIMING=1)
 _GLM5_ATTN_CATEGORIES = [
     "act_quant", "q_proj", "kv_proj", "kv_write",
@@ -196,6 +225,17 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step)
         self._cached_q_absorb = None
         self._cached_out_absorb = None
+        # WP5: FP8 absorb weights (pre-quantized once at init)
+        self._fp8_absorb_weights = None
+        # WP2: Fused indexer KV proj (CUDA WGMMA)
+        self._indexer_cuda_module = None
+        self._indexer_cuda_weights = None
+        # WP4: Fused scoring pipeline
+        self._fused_wqb_weights = None
+        self._fused_score_module = None
+        # Fallback warning guards
+        self._warned_fp8_absorb_fallback = False
+        self._warned_indexer_kv_fallback = False
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -230,6 +270,76 @@ class GLM5AttnWrapper(AttnWrapperBase):
         ).view(attn.num_heads, -1, attn.kv_lora_rank)
         self._cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
         self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
+
+        # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
+        if _HAS_FP8_ABSORB:
+            try:
+                self._fp8_absorb_weights = FP8AbsorbWeights(
+                    self._cached_q_absorb,   # [H, 192, 512]
+                    self._cached_out_absorb,  # [H, 256, 512]
+                )
+                logging.getLogger("glm5").info(
+                    f"[layer {self.layer_idx}] FP8 absorb weights initialized"
+                )
+            except Exception as e:
+                logging.getLogger("glm5").warning(
+                    f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
+                )
+                self._fp8_absorb_weights = None
+
+        # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
+
+    def initialize_fused_kernels(self):
+        """Initialize TMA-based CUDA kernels (WP2/WP4).
+
+        Must be called AFTER torch.cuda.set_device(local_rank) — TMA descriptors
+        contain physical GPU addresses and are not portable across devices.
+        """
+        attn = self.module
+        indexer = attn.indexer
+
+        # WP2: Fused indexer KV proj (GEMM-only path, LayerNorm stays in PyTorch)
+        if _HAS_FUSED_INDEXER_KV and hasattr(indexer, 'wk_scale'):
+            try:
+                self._indexer_cuda_module = _build_indexer_module()
+                # Dequantize FP8 wk weight to BF16 (kernel re-quantizes internally for TMA)
+                wk_bf16 = glm5_fp8_dequantization(
+                    indexer.wk.weight.data, indexer.wk_scale,
+                )
+                self._indexer_cuda_weights = FP8IndexerWeightsCUDA(
+                    wk_bf16, self._indexer_cuda_module,
+                )
+                logging.getLogger("glm5").info(
+                    f"[layer {self.layer_idx}] WP2 fused indexer KV proj initialized"
+                )
+            except Exception as e:
+                logging.getLogger("glm5").warning(
+                    f"[layer {self.layer_idx}] WP2 init failed: {e}"
+                )
+                self._indexer_cuda_module = None
+                self._indexer_cuda_weights = None
+
+        # WP4: Fused scoring pipeline (wraps WP2 module for wq_b projection)
+        if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
+            try:
+                wq_b_bf16 = glm5_fp8_dequantization(
+                    indexer.wq_b.weight.data, indexer.wq_b_scale,
+                )
+                self._fused_wqb_weights = FP8WqbWeightsCUDA(
+                    wq_b_bf16, self._indexer_cuda_module,
+                )
+                # Attach to indexer so score_and_select_paged can use it
+                indexer._fused_score_weights = self._fused_wqb_weights
+                indexer._fused_score_module = self._indexer_cuda_module
+                indexer._warned_fused_score_fallback = False
+                logging.getLogger("glm5").info(
+                    f"[layer {self.layer_idx}] WP4 fused scoring pipeline initialized"
+                )
+            except Exception as e:
+                logging.getLogger("glm5").warning(
+                    f"[layer {self.layer_idx}] WP4 init failed: {e}"
+                )
+                self._fused_wqb_weights = None
 
     def dequantize_weights(
         self, weights_dict: Dict[str, torch.Tensor]
@@ -474,7 +584,32 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 2: Write indexer K to auxiliary cache ---
         with (dt.timed("indexer_k", li) if dt else _nullctx()):
-            indexer_kv = indexer.compute_indexer_kv(hidden_states, positions=new_token_pos, max_seqlen=max_seqlen)
+            # WP2: Fused CUDA WGMMA wk_proj (GEMM only) + PyTorch LayerNorm + RoPE + Hadamard
+            if self._indexer_cuda_weights is not None:
+                from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import cuda_wk_proj_gemm_only
+                # CUDA kernel: hidden_states → FP8 act_quant → WGMMA wk_proj
+                k_raw = cuda_wk_proj_gemm_only(
+                    hidden_flat,  # [B, hidden_size] — already squeezed above
+                    self._indexer_cuda_weights,
+                    self._indexer_cuda_module,
+                )  # [B, index_head_dim=128]
+                # LayerNorm (model uses nn.LayerNorm with bias, not RMSNorm)
+                k_normed = indexer.k_norm(k_raw)
+                # Apply RoPE + Hadamard (reuse indexer's fused op)
+                k_normed_3d = k_normed.unsqueeze(1)  # [B, 1, 128]
+                indexer_kv = indexer._fused_rope_hadamard_or_fallback(
+                    k_normed_3d, new_token_pos, max_seqlen=max_seqlen,
+                ).unsqueeze(2)  # [B, 1, 1, 128]
+            else:
+                if not self._warned_indexer_kv_fallback:
+                    self._warned_indexer_kv_fallback = True
+                    logging.getLogger("glm5").warning(
+                        f"[layer {self.layer_idx}] WP2 fused indexer KV proj unavailable, "
+                        "falling back to PyTorch w8a16_gemm — check batchgen_kernels import"
+                    )
+                indexer_kv = indexer.compute_indexer_kv(
+                    hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
+                )
             indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
             aux_device = gpu_paged_kv_manager_aux.device
             seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
@@ -541,10 +676,25 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 bsz, attn.num_heads, 1, qk_head_dim,
                 dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
             )
-            q_nope_squeezed = q_nope.squeeze(2)
-            query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
-                "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
-            ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+            q_nope_squeezed = q_nope.squeeze(2)  # [B, H, qk_nope_head_dim]
+
+            # WP5: FP8 absorb kernel or fallback to torch.einsum
+            if self._fp8_absorb_weights is not None:
+                absorbed_q = fp8_q_absorb(q_nope_squeezed, self._fp8_absorb_weights)
+                query_states[:, :, :, :attn.kv_lora_rank] = absorbed_q.view(
+                    bsz, attn.num_heads, 1, attn.kv_lora_rank
+                )
+            else:
+                if not self._warned_fp8_absorb_fallback:
+                    self._warned_fp8_absorb_fallback = True
+                    logging.getLogger("glm5").warning(
+                        f"[layer {self.layer_idx}] WP5 FP8 absorb unavailable, "
+                        "falling back to torch.einsum — check batchgen_kernels import"
+                    )
+                query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
+                    "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
+                ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+
             query_states[:, :, :, attn.kv_lora_rank:] = q_pe
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
@@ -562,7 +712,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
-            attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
+            # WP5: FP8 out_absorb kernel or fallback to torch.einsum
+            if self._fp8_absorb_weights is not None:
+                attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
+            else:
+                attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(

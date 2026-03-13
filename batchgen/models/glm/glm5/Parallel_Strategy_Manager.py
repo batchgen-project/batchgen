@@ -478,6 +478,7 @@ class GLM5ParallelStrategyManager:
             if persistent:
                 wrapper._register_fp8_weights()
                 wrapper.initialize_decode_absorb()
+                wrapper.initialize_fused_kernels()
 
         elapsed = time.perf_counter() - start_time
         logging.debug(f"Attn module config time: {elapsed:.2f}s")
