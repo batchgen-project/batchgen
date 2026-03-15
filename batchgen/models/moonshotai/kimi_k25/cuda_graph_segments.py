@@ -82,6 +82,8 @@ class K25WholeModelSegment:
 
         # Per-layer KV buffers for host offloading (allocated in setup)
         self._kv_buffers = None
+        # K2.5 MLA has no separate V cache (compressed KV only)
+        self._no_v_cache = True
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         """Allocate KV offload buffers and set capture mode flags."""

@@ -7369,10 +7369,13 @@ class BatchGenWorker:
 					if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
 						for layer_idx in range(wm_seg.num_layers):
 							kv_buf = wm_seg._kv_buffers[layer_idx]
+							# K2.5 MLA has no separate V cache — pass None for v_tensor
+							v_buf = kv_buf.get("value")
+							v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
 							kv_cb(
 								layer_idx,
 								kv_buf["key"][:batch_size].clone(),
-								kv_buf["value"][:batch_size].clone(),
+								v_clone,
 							)
 				else:
 					# Per-layer graph or eager forward
