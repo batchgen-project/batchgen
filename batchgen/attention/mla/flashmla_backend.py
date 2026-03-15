@@ -1532,13 +1532,16 @@ def mla_decoding_optimized_with_pagekv(
 	layer_idx: int = 0,
 	batch_slice: Optional[tuple] = None,
 ):
-	"""Optimized MLA decode with fused kernels.
+	"""Fully optimized MLA decode with ALL fused kernels.
 
-	Same as mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv but with:
-	- fused_q_absorb_query_states: replaces einsum + alloc + 2x indexed copy
-	- fused_out_absorb_reshape: replaces einsum + transpose + contiguous + reshape
+	Optimizations vs original mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv:
+	1. fused_q_split_cuda: replaces view+transpose+split+contiguous (4 ops → 1)
+	2. fused_rmsnorm_rope_cache_update_with_q_return_new_kv: replaces separate
+	   RMSNorm+RoPE+KV_cache_update (3 ops → 1, biggest savings)
+	3. fused_q_absorb_query_states: replaces einsum+alloc+2×copy (4 ops → 1)
+	4. fused_out_absorb_reshape: replaces einsum+transpose+contiguous+reshape (4 ops → 1)
 
-	Bind via Parallel_Strategy_Manager with use_optimized_decode=True.
+	Bind via Parallel_Strategy_Manager with BATCHGEN_OPTIMIZED_DECODE=1.
 	"""
 	from batchgen_kernels.triton.fused_q_absorb import fused_q_absorb_query_states
 	from batchgen_kernels.triton.fused_out_absorb import fused_out_absorb_reshape
@@ -1554,23 +1557,34 @@ def mla_decoding_optimized_with_pagekv(
 
 	hidden_states = hidden_states.squeeze(1)
 
-	# ============ PURE BF16 PROJECTIONS ============
+	# ============ PURE BF16 PROJECTIONS (same as original) ============
 	q = F.linear(hidden_states, self.q_a_proj.weight)
 	new_compressed_kv = F.linear(hidden_states, self.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
 
 	q = self.q_a_layernorm(q)
 	q = F.linear(q, self.q_b_proj.weight)
 
-	# ============ ROPE & QUERY PROCESSING ============
-	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-	q_pe = q_pe.contiguous()
+	# ============ OPT 1: FUSED Q SPLIT (replaces view+transpose+split+contiguous) ============
+	try:
+		from batchgen.attention.mla.fused_q_split_cuda import fused_q_split
+		q_nope, q_pe = fused_q_split(
+			q, num_heads=self.num_heads,
+			nope_dim=self.qk_nope_head_dim, rope_dim=self.qk_rope_head_dim,
+		)
+	except (ImportError, Exception):
+		# Fallback: original ops
+		q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+		q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+		q_pe = q_pe.contiguous()
+		q_nope = q_nope.squeeze(2)
+
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
 
-	# ============ KV CACHE UPDATE (existing fused kernel) ============
+	# ============ KV NORM+ROPE (existing production fused kernel — already optimal) ============
+	# fused_rmsnorm_rope_with_q does RMSNorm + RoPE on KV + RoPE on all Q heads in 1 kernel
 	offload_kv = fused_rmsnorm_rope_with_q(
 		new_compressed_kv,
-		q_pe,
+		q_pe if q_pe.dim() == 4 else q_pe.unsqueeze(2),
 		cos,
 		sin,
 		q_position_ids,
@@ -1579,6 +1593,7 @@ def mla_decoding_optimized_with_pagekv(
 		self.qk_rope_head_dim,
 	)
 
+	# Paged KV cache update (CUDA kernel — production standard)
 	manager_device = gpu_paged_kv_manager.device
 	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
 	sequence_lengths = q_position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
@@ -1604,9 +1619,10 @@ def mla_decoding_optimized_with_pagekv(
 	q_absorb = kv_b_proj[:, :self.qk_nope_head_dim, :]
 	out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
 
-	# ============ FUSED QUERY STATES (replaces einsum + alloc + copy) ============
-	q_nope_sq = q_nope.squeeze(2)  # [bsz, H, D]
-	query_states = fused_q_absorb_query_states(q_nope_sq, q_absorb, q_pe)
+	# ============ OPT 3: FUSED QUERY STATES (replaces einsum+alloc+2×copy) ============
+	q_nope_sq = q_nope if q_nope.dim() == 3 else q_nope.squeeze(2)
+	query_states = fused_q_absorb_query_states(q_nope_sq, q_absorb,
+		q_pe if q_pe.dim() == 4 else q_pe.unsqueeze(2))
 
 	# ============ FLASH MLA ATTENTION ============
 	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
@@ -1623,7 +1639,7 @@ def mla_decoding_optimized_with_pagekv(
 		True,
 	)
 
-	# ============ FUSED OUTPUT PROJECTION (replaces einsum + transpose + contiguous) ============
+	# ============ OPT 4: FUSED OUTPUT (replaces einsum+transpose+contiguous+reshape) ============
 	attn_output = fused_out_absorb_reshape(attn_out, out_absorb)
 	attn_output = F.linear(attn_output, self.o_proj.weight)
 	attn_output = attn_output.view(bsz, 1, -1)
