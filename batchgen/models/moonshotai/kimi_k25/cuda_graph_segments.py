@@ -10,6 +10,12 @@ K2.5 specifics vs GPT-OSS:
   - Shared expert runs on same stream during graph capture (no async overlap)
   - fused_rmsnorm_rope_with_q for combined KV norm+RoPE+cache update
 
+MLA forward is INLINED (not delegated to decoding_attn_mode_3_bf16) because:
+  - CUDA graph requires static tensor addresses — the gpu_paged_kv_manager's internal
+    block_table may be reallocated. We use the static page_table input instead.
+  - Same approach as GPT-OSS WholeModelSegment (see cuda_graph_segments.py lines 880-900).
+  - Zero overhead: same kernels, same number of launches, just different page_table pointer.
+
 Dynamic metadata (cache_seqlens, page_table) are static-address input buffers
 whose contents are updated before each replay. KV cache is at fixed GPU addresses.
 NCCL collectives use PyNccl (ctypes) for graph compatibility.
@@ -19,6 +25,7 @@ import logging
 from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from batchgen.models.wrappers.attention import AttnWrapperBase
@@ -33,7 +40,7 @@ class K25WholeModelSegment:
 
     All layers run eagerly within the graph (no per-layer graph replay).
     NCCL collectives (all_gather + all_reduce per MoE layer) are captured.
-    KV cache writes happen at fixed GPU addresses via gpu_paged_kv_manager.
+    KV cache writes use static page_table/slot_indices inputs (not gpu_manager's state).
 
     Inputs:  input_ids [B, 1] int64, cache_seqlens [B] int32,
              page_table [B, max_pages] int32, slot_indices [B] int32
@@ -59,26 +66,25 @@ class K25WholeModelSegment:
         layers = model.model.layers
         self.num_layers = len(layers)
 
-        # KV dimensions for offload buffers
+        # MLA dimensions (from first attention layer)
         attn0 = layers[0].self_attn
-        if hasattr(attn0, 'module'):
-            attn_mod = attn0.module
-        else:
-            attn_mod = attn0
-        self.kv_lora_rank = attn_mod.kv_lora_rank
-        self.qk_rope_head_dim = attn_mod.qk_rope_head_dim
+        attn_mod = attn0.module if hasattr(attn0, 'module') else attn0
+        self.kv_lora_rank = attn_mod.kv_lora_rank        # 512
+        self.qk_rope_head_dim = attn_mod.qk_rope_head_dim  # 64
+        self.qk_nope_head_dim = attn_mod.qk_nope_head_dim  # 128
+        self.v_head_dim = attn_mod.v_head_dim              # 128
+        self.num_heads = attn_mod.num_heads                # 64
+        self.q_head_dim = attn_mod.q_head_dim              # 192
+        self.q_lora_rank = attn_mod.q_lora_rank            # 1536
         self.kv_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 576
         self.max_seq_len = model.model.config.max_position_embeddings
+        self.softmax_scale = attn_mod.softmax_scale
 
         # Per-layer KV buffers for host offloading (allocated in setup)
         self._kv_buffers = None
 
     def setup_static_buffers(self, bucket_size: int) -> None:
-        """Allocate KV offload buffers and set capture mode flags.
-
-        Called once per bucket size during graph capture.
-        """
-        # Allocate KV buffers once at max_bucket_size
+        """Allocate KV offload buffers and set capture mode flags."""
         if self._kv_buffers is None:
             alloc_size = self.max_bucket_size
             self._kv_buffers = []
@@ -89,14 +95,14 @@ class K25WholeModelSegment:
                         dtype=torch.bfloat16, device=self.device,
                     ),
                     # K2.5 MLA has no separate V cache (compressed KV only).
-                    # Empty tensor for compatibility with decode loop KV callback.
+                    # Placeholder for decode loop KV callback compatibility.
                     "value": torch.zeros(
                         alloc_size, 1, 1, self.kv_dim,
                         dtype=torch.bfloat16, device=self.device,
                     ),
                 })
 
-        # Set capture mode flag so layers know graph is being captured
+        # Set capture mode flag
         for layer in self.model.model.layers:
             layer._graph_capture_mode = True
 
@@ -130,55 +136,129 @@ class K25WholeModelSegment:
     ) -> Dict[str, torch.Tensor]:
         """Full decode forward: embed → layers → norm → lm_head.
 
+        MLA attention is INLINED to use static page_table/slot_indices inputs.
         All ops run on the current CUDA stream (graph-captured).
         """
+        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+        from batchgen_kernels.triton.fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
+        from batchgen.kv_cache.gpu_kv_kernels import run_paged_kv_token_update_fused
+
         B = input_ids.shape[0]
         model = self.model.model  # KimiK25Model
+        gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+        page_size_tokens = gpu_kv_manager.config.page_size_tokens
 
         # === Embedding ===
         hidden_states = model.embed_tokens(input_ids)  # [B, 1, H]
 
-        # === Pre-compute position IDs from cache_seqlens ===
-        # position_ids = cache_seqlens - 1 (0-indexed position of the new decode token)
+        # === Position IDs (shared across all layers) ===
         q_position_ids = (cache_seqlens - 1).clamp(min=0).unsqueeze(1).to(torch.int64)  # [B, 1]
-
-        gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
 
         # === Decoder layers ===
         for layer_idx, decoder_layer in enumerate(model.layers):
             attn_wrapper = decoder_layer.self_attn
-            if hasattr(attn_wrapper, 'module'):
-                attn_mod = attn_wrapper.module
-            else:
-                attn_mod = attn_wrapper
+            attn_mod = attn_wrapper.module if hasattr(attn_wrapper, 'module') else attn_wrapper
 
             # =====================================================
-            # MLA Attention (inline for graph compatibility)
+            # MLA Attention (INLINED — uses static page_table)
             # =====================================================
 
             # Pre-attn RMSNorm
             residual = hidden_states
             normed = decoder_layer.input_layernorm(hidden_states)
 
-            # Call the bound decode function (either optimized or original)
-            # This function handles: q projections, KV norm+RoPE, cache update,
-            # FlashMLA attention, absorb einsums, o_proj
-            attn_output, k_tensor = attn_mod.decoding_attn_mode_3_bf16(
-                normed,
+            # Q projections: hidden → q_a → norm → q_b
+            normed_sq = normed.squeeze(1)  # [B, H]
+            q = F.linear(normed_sq, attn_mod.q_a_proj.weight)
+            new_compressed_kv = F.linear(normed_sq, attn_mod.kv_a_proj_with_mqa.weight).view(B, 1, -1)
+            q = attn_mod.q_a_layernorm(q)
+            q = F.linear(q, attn_mod.q_b_proj.weight)
+
+            # Q reshape + split into q_nope [B,H,128] and q_pe [B,H,1,64]
+            q = q.view(B, 1, self.num_heads, self.q_head_dim).transpose(1, 2)
+            q_nope, q_pe = torch.split(
+                q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            q_pe = q_pe.contiguous()
+
+            # RoPE cos/sin
+            cos, sin = attn_mod.rotary_emb(q_pe, seq_len=self.max_seq_len)
+
+            # Fused KV norm + RoPE + Q RoPE (existing production kernel)
+            offload_kv = fused_rmsnorm_rope_with_q(
+                new_compressed_kv,
+                q_pe,
+                cos,
+                sin,
                 q_position_ids,
-                cache_seqlens,
-                self.max_seq_len,  # Fixed max for RoPE cos/sin cache coverage
-                None,  # weight_scale (BF16, not needed)
-                gpu_kv_manager,
-                layer_idx,
-                None,  # batch_slice
+                attn_mod.kv_a_layernorm.weight,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
             )
 
-            # Copy KV to static offload buffer (baked into graph for host offloading)
-            if self._kv_buffers is not None and k_tensor is not None:
+            # KV tensor for host offloading callback
+            k_tensor = offload_kv.view(B, 1, 1, offload_kv.size(-1))
+
+            # Copy KV to static offload buffer (baked into graph)
+            if self._kv_buffers is not None:
                 self._kv_buffers[layer_idx]["key"][:B].copy_(k_tensor[:B])
 
-            # Post-attn: residual add + RMSNorm (fused when available)
+            # KV write to GPU paged cache — use STATIC page_table + slot_indices
+            # (NOT gpu_kv_manager.update_layer_decode_new_token which reads manager state)
+            blocked_k, _, _ = gpu_kv_manager.get_layer_kv_with_page_table(layer_idx)
+            run_paged_kv_token_update_fused(
+                k_cache=blocked_k,
+                k_tokens=k_tensor.view(B, -1),
+                page_table=page_table,      # static input
+                slot_indices=slot_indices,   # static input
+                token_indices=q_position_ids.squeeze(-1).to(torch.int32),
+                page_size_tokens=page_size_tokens,
+            )
+
+            # Q absorb: q_nope × kv_b_proj → query_states
+            kv_b_proj = attn_mod.kv_b_proj.weight.data.view(
+                self.num_heads, -1, self.kv_lora_rank
+            )
+            q_absorb = kv_b_proj[:, :self.qk_nope_head_dim, :]
+            out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
+
+            qk_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            query_states = torch.empty(
+                B, self.num_heads, 1, qk_head_dim,
+                dtype=blocked_k.dtype, device=self.device,
+            )
+            q_nope_sq = q_nope.squeeze(2)
+            query_states[:, :, :, :self.kv_lora_rank] = torch.einsum(
+                "bhd,hdc->bhc", q_nope_sq, q_absorb
+            ).view(B, self.num_heads, 1, self.kv_lora_rank)
+            query_states[:, :, :, self.kv_lora_rank:] = q_pe
+            query_states = query_states.view(B, 1, self.num_heads, qk_head_dim)
+
+            # FlashMLA attention — use STATIC page_table as block_table
+            tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+
+            attn_out, _ = flash_mla_with_kvcache(
+                query_states,
+                blocked_k,
+                page_table,             # static input (NOT manager's block_table)
+                cache_seqlens,
+                self.kv_lora_rank,      # 512 = head_dim_v
+                tile_scheduler_metadata,
+                num_splits,
+                self.softmax_scale,
+                True,                   # causal
+            )
+
+            # Output absorb + o_proj
+            attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(B, self.num_heads * self.v_head_dim)
+            attn_output = F.linear(attn_output, attn_mod.o_proj.weight)
+            attn_output = attn_output.view(B, 1, -1)
+
+            # =====================================================
+            # Post-attn: residual add + RMSNorm
+            # =====================================================
             fused_add_norm = decoder_layer._get_fused_add_rmsnorm_fn()
             if fused_add_norm is not None:
                 normed, residual = fused_add_norm(
@@ -195,11 +275,8 @@ class K25WholeModelSegment:
             # MoE / Dense MLP
             # =====================================================
             moe = decoder_layer.mlp
-            if hasattr(moe, '_forward_decode_graph'):
-                # Graph-compatible MoE forward (no separate stream for shared expert)
-                mlp_out = moe._forward_decode_graph(normed)
-            elif hasattr(moe, '_forward_decode') and hasattr(moe, 'comm') and moe.comm is not None:
-                # MoE layer — use graph-compatible path
+            if hasattr(moe, 'comm') and moe.comm is not None:
+                # MoE layer — graph-compatible path (no separate stream)
                 mlp_out = self._moe_forward_graph(moe, normed)
             else:
                 # Dense MLP (layer 0) or fallback
@@ -274,7 +351,6 @@ class K25WholeModelSegment:
         # 5) Expert compute: grouped INT4 WGMMA inplace
         if getattr(moe, '_use_grouped_wgmma', False) \
                 and buf.tma_dispatched is not None:
-            from batchgen.moe.fused_int4_wgmma_grouped import _load_int4_grouped_module
             mod = moe._wgmma_mod
             w = moe._moe_weights
             mtp = buf.max_tokens_padded
