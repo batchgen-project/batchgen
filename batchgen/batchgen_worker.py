@@ -6845,7 +6845,7 @@ class BatchGenWorker:
 			# Discard per-layer segments, register one WholeModelSegment instead.
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-			vocab_size = self.model.vocab_size
+			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
 			hidden_size = self.model.config.hidden_size
 
 			if _is_k25:
