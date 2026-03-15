@@ -1571,8 +1571,11 @@ def mla_decoding_optimized_with_pagekv(
 			q, num_heads=self.num_heads,
 			nope_dim=self.qk_nope_head_dim, rope_dim=self.qk_rope_head_dim,
 		)
-	except (ImportError, Exception):
+	except (ImportError, Exception) as _e:
 		# Fallback: original ops
+		if not getattr(mla_decoding_optimized_with_pagekv, '_warned_q_split', False):
+			logging.warning(f"[MLA OPT] fused_q_split_cuda unavailable, using fallback: {_e}")
+			mla_decoding_optimized_with_pagekv._warned_q_split = True
 		q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 		q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 		q_pe = q_pe.contiguous()

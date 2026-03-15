@@ -6657,7 +6657,7 @@ class BatchGenWorker:
 			return
 
 		# Model guard: only capture for supported models
-		SUPPORTED_MODELS = {"gpt-oss-120b"}
+		SUPPORTED_MODELS = {"gpt-oss-120b", "kimi-k2.5", "kimi_k2.5", "kimi-k25", "kimi_k25"}
 		model_name = getattr(self, 'model_name', '') or ''
 		if not any(s in model_name.lower() for s in SUPPORTED_MODELS):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
@@ -6742,6 +6742,9 @@ class BatchGenWorker:
 		)
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
+		# Detect K2.5 model for specialized graph segment
+		_is_k25 = any(s in (self.model_name or '').lower() for s in ('kimi-k2.5', 'kimi_k2.5', 'kimi-k25', 'kimi_k25'))
+
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
 		# Generate exactly num_buckets geometrically-spaced bucket sizes.
@@ -6757,67 +6760,79 @@ class BatchGenWorker:
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
 
-		# Pre-warm: initialize sinks and RoPE cache before capture
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			wrapper = decoder_layer.self_attn
-			# Initialize sinks for persistent mode
-			if wrapper.sinks is None and wrapper.persistent and hasattr(wrapper.module, 'sinks'):
-				wrapper.sinks = wrapper.module.sinks.data.to(self.torch_device)
-			elif wrapper.sinks is not None:
-				wrapper.sinks = wrapper.sinks.to(self.torch_device)
-			# Pre-warm RoPE cos/sin cache to max position embeddings
-			dummy = torch.zeros(1, 1, wrapper.num_kv_heads, wrapper.head_dim, device=self.torch_device)
-			wrapper.module.rotary_emb(dummy, seq_len=max_rope_len)
-
-		# Register full attention segments
-		# Use max possible pages based on max sequence length, not current state.
-		# The page_table static buffer column width is baked into the graph —
-		# if sequences grow beyond this during decode, FlashAttention reads
-		# past the buffer causing illegal memory access.
-		page_size_tokens = gpu_manager.config.page_size_tokens
-		max_seq_len = self.model.config.max_position_embeddings
-		max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			attn_wrapper = decoder_layer.self_attn
-			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_rope_len,
-								  max_pages, page_size_tokens)
-			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
-
-		# Register MoE segments with shared buffer pool (EP mode)
+		# GPT-OSS-specific pre-warm and per-layer segment registration
+		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
 		has_moe_graph = False
 		moe_pool = None
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			moe_decode = decoder_layer.mlp
-			if (hasattr(moe_decode, 'persistent_expert_indices')
-					and len(moe_decode.persistent_expert_indices) > 0
-					and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
-				# Create shared pool once from first MoE layer's params
-				if moe_pool is None:
-					moe_pool = SharedMoEBufferPool(
-						world_size=self.world_size,
-						hidden_size=moe_decode.hidden_size,
-						total_experts=moe_decode.total_experts,
-						num_experts_per_tok=moe_decode.num_experts_per_tok,
-						num_local_experts=len(moe_decode.persistent_expert_indices),
-						N_intermediate=moe_decode.gate_weight_ref.shape[0],
-						device=self.torch_device,
-					)
-					moe_pool.setup(bucketing.bucket_sizes)
-				moe_seg = MoESegment(
-					moe_decode, moe_pool, moe_decode.comm,
-					self.world_size, self.rank, self.torch_device,
-				)
-				decoder_layer._moe_segment = moe_seg
-				decoder_layer._moe_bucketing = bucketing
-				# Register compute segment for graph capture.
-				# All_gather is graph-captured; all_reduce remains eager.
-				if not os.environ.get("BATCHGEN_MOE_EAGER"):
-					moe_compute_seg = MoEComputeSegment(
+		if not _is_k25:
+			# Pre-warm: initialize sinks and RoPE cache before capture
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				wrapper = decoder_layer.self_attn
+				# Initialize sinks for persistent mode
+				if wrapper.sinks is None and wrapper.persistent and hasattr(wrapper.module, 'sinks'):
+					wrapper.sinks = wrapper.module.sinks.data.to(self.torch_device)
+				elif wrapper.sinks is not None:
+					wrapper.sinks = wrapper.sinks.to(self.torch_device)
+				# Pre-warm RoPE cos/sin cache to max position embeddings
+				dummy = torch.zeros(1, 1, wrapper.num_kv_heads, wrapper.head_dim, device=self.torch_device)
+				wrapper.module.rotary_emb(dummy, seq_len=max_rope_len)
+
+			# Register full attention segments
+			# Use max possible pages based on max sequence length, not current state.
+			# The page_table static buffer column width is baked into the graph —
+			# if sequences grow beyond this during decode, FlashAttention reads
+			# past the buffer causing illegal memory access.
+			page_size_tokens = gpu_manager.config.page_size_tokens
+			max_seq_len = self.model.config.max_position_embeddings
+			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				attn_wrapper = decoder_layer.self_attn
+				seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_rope_len,
+									  max_pages, page_size_tokens)
+				manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
+
+			# Register MoE segments with shared buffer pool (EP mode)
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				moe_decode = decoder_layer.mlp
+				if (hasattr(moe_decode, 'persistent_expert_indices')
+						and len(moe_decode.persistent_expert_indices) > 0
+						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+					# Create shared pool once from first MoE layer's params
+					if moe_pool is None:
+						moe_pool = SharedMoEBufferPool(
+							world_size=self.world_size,
+							hidden_size=moe_decode.hidden_size,
+							total_experts=moe_decode.total_experts,
+							num_experts_per_tok=moe_decode.num_experts_per_tok,
+							num_local_experts=len(moe_decode.persistent_expert_indices),
+							N_intermediate=moe_decode.gate_weight_ref.shape[0],
+							device=self.torch_device,
+						)
+						moe_pool.setup(bucketing.bucket_sizes)
+					moe_seg = MoESegment(
 						moe_decode, moe_pool, moe_decode.comm,
 						self.world_size, self.rank, self.torch_device,
 					)
-					manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
-					has_moe_graph = True
+					decoder_layer._moe_segment = moe_seg
+					decoder_layer._moe_bucketing = bucketing
+					# Register compute segment for graph capture.
+					# All_gather is graph-captured; all_reduce remains eager.
+					if not os.environ.get("BATCHGEN_MOE_EAGER"):
+						moe_compute_seg = MoEComputeSegment(
+							moe_decode, moe_pool, moe_decode.comm,
+							self.world_size, self.rank, self.torch_device,
+						)
+						manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
+						has_moe_graph = True
+		else:
+			# K2.5: Pre-warm RoPE cache (shared instance)
+			rotary_emb = self.model.model._shared_rotary_emb
+			dummy = torch.zeros(1, 1, 1, rotary_emb.dim, device=self.torch_device)
+			rotary_emb(dummy, seq_len=max_rope_len)
+			# Compute max_pages for K2.5
+			page_size_tokens = gpu_manager.config.page_size_tokens
+			max_seq_len = self.model.config.max_position_embeddings
+			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
 
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
@@ -6830,33 +6845,47 @@ class BatchGenWorker:
 			# Discard per-layer segments, register one WholeModelSegment instead.
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-			# Build MoE segments dict (layer_idx → MoESegment) for WholeModelSegment.
-			# Use MoESegment (not MoEComputeSegment) because it includes all_reduce
-			# inside the graph — required for single-graph whole-model capture.
-			moe_segments = {}
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				moe_decode = decoder_layer.mlp
-				if (hasattr(moe_decode, 'persistent_expert_indices')
-						and len(moe_decode.persistent_expert_indices) > 0
-						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
-					moe_segments[layer_idx] = MoESegment(
-						moe_decode, moe_pool, moe_decode.comm,
-						self.world_size, self.rank, self.torch_device,
-					)
-
 			vocab_size = self.model.vocab_size
 			hidden_size = self.model.config.hidden_size
 
-			whole_seg = WholeModelSegment(
-				model=self.model,
-				moe_pool=moe_pool,
-				moe_segments=moe_segments,
-				device=self.torch_device,
-				max_pages_per_seq=max_pages,
-				vocab_size=vocab_size,
-				hidden_size=hidden_size,
-				max_bucket_size=bucketing._max_bucket,
-			)
+			if _is_k25:
+				# K2.5 uses MLA attention + 3D strided MoE — different segment class
+				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import K25WholeModelSegment
+				whole_seg = K25WholeModelSegment(
+					model=self.model,
+					device=self.torch_device,
+					max_pages_per_seq=max_pages,
+					vocab_size=vocab_size,
+					hidden_size=hidden_size,
+					max_bucket_size=bucketing._max_bucket,
+				)
+			else:
+				# GPT-OSS: GQA attention + SharedMoEBufferPool
+				# Build MoE segments dict (layer_idx → MoESegment) for WholeModelSegment.
+				# Use MoESegment (not MoEComputeSegment) because it includes all_reduce
+				# inside the graph — required for single-graph whole-model capture.
+				moe_segments = {}
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					moe_decode = decoder_layer.mlp
+					if (hasattr(moe_decode, 'persistent_expert_indices')
+							and len(moe_decode.persistent_expert_indices) > 0
+							and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+						moe_segments[layer_idx] = MoESegment(
+							moe_decode, moe_pool, moe_decode.comm,
+							self.world_size, self.rank, self.torch_device,
+						)
+
+				whole_seg = WholeModelSegment(
+					model=self.model,
+					moe_pool=moe_pool,
+					moe_segments=moe_segments,
+					device=self.torch_device,
+					max_pages_per_seq=max_pages,
+					vocab_size=vocab_size,
+					hidden_size=hidden_size,
+					max_bucket_size=bucketing._max_bucket,
+				)
+
 			manager.register_segment("whole_model", whole_seg)
 
 			if self.rank == 0:
