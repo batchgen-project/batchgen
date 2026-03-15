@@ -1520,6 +1520,117 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 	return attn_output, k_tensor
 
 
+@torch.inference_mode()
+def mla_decoding_optimized_with_pagekv(
+	self,
+	hidden_states: torch.Tensor,
+	q_position_ids: torch.Tensor,
+	cache_seqlens: torch.Tensor,
+	max_seqlen: int,
+	weight_scale: Optional[dict] = None,
+	gpu_paged_kv_manager: Optional['GPUPagedKVCacheManager'] = None,
+	layer_idx: int = 0,
+	batch_slice: Optional[tuple] = None,
+):
+	"""Optimized MLA decode with fused kernels.
+
+	Same as mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv but with:
+	- fused_q_absorb_query_states: replaces einsum + alloc + 2x indexed copy
+	- fused_out_absorb_reshape: replaces einsum + transpose + contiguous + reshape
+
+	Bind via Parallel_Strategy_Manager with use_optimized_decode=True.
+	"""
+	from batchgen_kernels.triton.fused_q_absorb import fused_q_absorb_query_states
+	from batchgen_kernels.triton.fused_out_absorb import fused_out_absorb_reshape
+
+	if gpu_paged_kv_manager is None:
+		raise ValueError("gpu_paged_kv_manager is required for optimized decode path")
+
+	bsz = hidden_states.shape[0]
+	q_len = 1
+
+	if bsz == 0:
+		return hidden_states, None
+
+	hidden_states = hidden_states.squeeze(1)
+
+	# ============ PURE BF16 PROJECTIONS ============
+	q = F.linear(hidden_states, self.q_a_proj.weight)
+	new_compressed_kv = F.linear(hidden_states, self.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
+
+	q = self.q_a_layernorm(q)
+	q = F.linear(q, self.q_b_proj.weight)
+
+	# ============ ROPE & QUERY PROCESSING ============
+	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+	q_pe = q_pe.contiguous()
+	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
+
+	# ============ KV CACHE UPDATE (existing fused kernel) ============
+	offload_kv = fused_rmsnorm_rope_with_q(
+		new_compressed_kv,
+		q_pe,
+		cos,
+		sin,
+		q_position_ids,
+		self.kv_a_layernorm.weight,
+		self.kv_lora_rank,
+		self.qk_rope_head_dim,
+	)
+
+	manager_device = gpu_paged_kv_manager.device
+	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
+	sequence_lengths = q_position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
+
+	gpu_paged_kv_manager.update_layer_decode_new_token(
+		k_tensor=k_tensor,
+		v_tensor=None,
+		sequence_lengths=sequence_lengths,
+		layer_idx=layer_idx,
+		batch_slice=batch_slice,
+	)
+
+	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
+		layer_idx=layer_idx
+	)
+
+	if batch_slice is not None:
+		start_idx, end_idx = batch_slice
+		block_table = block_table[start_idx:end_idx]
+
+	# ============ KV_B_PROJ ============
+	kv_b_proj = self.kv_b_proj.weight.data.view(self.num_heads, -1, self.kv_lora_rank)
+	q_absorb = kv_b_proj[:, :self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
+
+	# ============ FUSED QUERY STATES (replaces einsum + alloc + copy) ============
+	q_nope_sq = q_nope.squeeze(2)  # [bsz, H, D]
+	query_states = fused_q_absorb_query_states(q_nope_sq, q_absorb, q_pe)
+
+	# ============ FLASH MLA ATTENTION ============
+	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+
+	attn_out, _ = flash_mla_with_kvcache(
+		query_states,
+		blocked_k,
+		block_table,
+		cache_seqlens,
+		512,
+		tile_scheduler_metadata,
+		num_splits,
+		self.softmax_scale,
+		True,
+	)
+
+	# ============ FUSED OUTPUT PROJECTION (replaces einsum + transpose + contiguous) ============
+	attn_output = fused_out_absorb_reshape(attn_out, out_absorb)
+	attn_output = F.linear(attn_output, self.o_proj.weight)
+	attn_output = attn_output.view(bsz, 1, -1)
+
+	return attn_output, k_tensor
+
+
 # @torch.inference_mode()
 # def mla_decoding_flashmla_attn_mode_3_bf16_without_inplace_cache_update(
 # 	self,

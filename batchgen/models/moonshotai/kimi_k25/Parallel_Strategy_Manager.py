@@ -768,12 +768,24 @@ class KimiK25ParallelStrategyManager:
                     attn_module, "decoding_attn",
                     types.MethodType(mla_decoding_flashmla, attn_module),
                 )
-                setattr(
-                    attn_module, "decoding_attn_mode_3_bf16",
-                    types.MethodType(
-                        mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv, attn_module
-                    ),
-                )
+                # Use optimized decode path if enabled via env var
+                import os as _os
+                if _os.environ.get("BATCHGEN_OPTIMIZED_DECODE", "0") == "1":
+                    from batchgen.attention.mla.flashmla_backend import mla_decoding_optimized_with_pagekv
+                    setattr(
+                        attn_module, "decoding_attn_mode_3_bf16",
+                        types.MethodType(
+                            mla_decoding_optimized_with_pagekv, attn_module
+                        ),
+                    )
+                    logging.info("[K2.5] Using OPTIMIZED decode path (fused kernels)")
+                else:
+                    setattr(
+                        attn_module, "decoding_attn_mode_3_bf16",
+                        types.MethodType(
+                            mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv, attn_module
+                        ),
+                    )
                 setattr(
                     attn_module, "decoding_attn_bf16",
                     types.MethodType(mla_decoding_flashmla, attn_module),
