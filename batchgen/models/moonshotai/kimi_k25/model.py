@@ -795,6 +795,15 @@ class KimiK25DecoderLayer(nn.Module):
         except Exception:
             return None
 
+    def enable_cuda_graph(self, manager, attn_name: str):
+        """Enable per-layer CUDA graph for MLA attention.
+
+        MoE stays eager (preserves async shared expert overlap).
+        Each rank uses local batch_size for bucket selection (DP-attention, no NCCL).
+        """
+        self.cuda_graph_manager = manager
+        self._attn_segment_name = attn_name
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -805,27 +814,68 @@ class KimiK25DecoderLayer(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ):
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+
+        batch_size = hidden_states.shape[0]
         fused_add_norm = self._get_fused_add_rmsnorm_fn()
 
-        # Pre-norm attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_out = self.self_attn(hidden_states=hidden_states)
-        hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+        # ---- MLA Attention: CUDA graph or eager ----
+        use_graph = (hasattr(self, 'cuda_graph_manager')
+                     and self.cuda_graph_manager is not None
+                     and getattr(self, '_attn_segment_name', None) is not None
+                     and batch_size > 0)
+        attn_done = False
 
-        # Fused: residual += attn_out, then post_attention_layernorm
-        if fused_add_norm is not None:
-            hidden_states, residual = fused_add_norm(
-                residual, hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
-        else:
-            hidden_states = residual + hidden_states
+        if use_graph:
+            try:
+                gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+                _, _, page_table = gpu_kv_manager.get_layer_kv_with_page_table(self.layer_idx)
+                slot_indices = gpu_kv_manager._gpu_page_table_manager._slot_index_tensor
+                cache_seqlens = AttnWrapperBase.cache_seqlens
+
+                out = self.cuda_graph_manager.replay(
+                    self._attn_segment_name,
+                    batch_size,
+                    hidden_states=hidden_states,
+                    cache_seqlens=cache_seqlens[:batch_size],
+                    page_table=page_table[:batch_size],
+                    slot_indices=slot_indices[:batch_size],
+                )
+
+                # Graph already computed: normed (MoE input), residual, k_tensor
+                hidden_states = out["normed"]
+                residual = out["residual"]
+
+                # KV host offload callback
+                kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+                if kv_cb is not None:
+                    kv_cb(self.layer_idx, out["k_tensor"][:batch_size].clone(), None)
+
+                attn_done = True
+            except (ValueError, RuntimeError) as e:
+                logging.warning(f"Layer {self.layer_idx} graph replay failed: {e}, falling back to eager")
+                attn_done = False
+
+        if not attn_done:
+            # Original eager path
             residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
+            attn_out = self.self_attn(hidden_states=hidden_states)
+            hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
 
-        # MoE/FFN
+            # Fused: residual += attn_out, then post_attention_layernorm
+            if fused_add_norm is not None:
+                hidden_states, residual = fused_add_norm(
+                    residual, hidden_states,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = residual + hidden_states
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # ---- MoE/FFN: always eager (preserves async shared expert overlap) ----
         hidden_states = self.mlp(hidden_states)
 
         # residual += mlp_out

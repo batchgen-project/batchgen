@@ -6837,8 +6837,13 @@ class BatchGenWorker:
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
-		# Whole-model graph is the default. Set BATCHGEN_SEGMENTED_GRAPH=1 to use per-layer graphs instead.
-		use_whole_model = os.environ.get("BATCHGEN_SEGMENTED_GRAPH", "0") != "1"
+		# Whole-model graph is the default for GPT-OSS.
+		# K2.5 ALWAYS uses per-layer (segmented) mode because whole-model graph
+		# serializes the shared expert, losing async overlap (~18ms/step regression).
+		if _is_k25:
+			use_whole_model = False
+		else:
+			use_whole_model = os.environ.get("BATCHGEN_SEGMENTED_GRAPH", "0") != "1"
 
 		if use_whole_model:
 			# Whole-model mode: single graph for entire decode pass.
@@ -6914,32 +6919,65 @@ class BatchGenWorker:
 					f"CUDA graphs ready (whole-model): {stats['total_capture_time_ms']:.0f}ms"
 				)
 		else:
-			# Per-layer mode (existing behavior)
+			# Per-layer mode: capture attention graph per layer, MoE stays eager.
 			self._whole_model_graph = False
 
-			if self.rank == 0:
-				num_segs = "attn+moe" if has_moe_graph else "attn"
-				logging.info(
-					f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
-					f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
-				)
+			if _is_k25:
+				# K2.5: Register K25AttnSegment per layer (MLA attention only, no MoE graph).
+				# MoE stays eager to preserve async shared expert overlap.
+				# Each rank uses local batch_size for bucket selection (DP-attention, no NCCL).
+				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import K25AttnSegment
 
-			# Sync all ranks before warmup — MoE segments use NCCL collectives
-			# which require all ranks to participate simultaneously.
-			if has_moe_graph:
-				torch.cuda.synchronize(self.torch_device)
-				dist.barrier()
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					attn_wrapper = decoder_layer.self_attn
+					seg = K25AttnSegment(
+						decoder_layer, attn_wrapper, layer_idx,
+						max_seq_len=max_rope_len,
+						max_pages_per_seq=max_pages,
+						page_size_tokens=page_size_tokens,
+					)
+					seg_name = f"layer_{layer_idx}_attn"
+					manager.register_segment(seg_name, seg)
 
-			manager.warmup_and_capture_all()
+				if self.rank == 0:
+					logging.info(
+						f"CUDA graph capture (K2.5 MLA): {len(self.model.model.layers)} layers (attn only) × "
+						f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+					)
 
-			# Enable graph mode on each decoder layer
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
-				decoder_layer.enable_cuda_graph(
-					manager,
-					full_attn_name=f"layer_{layer_idx}_full_attn",
-					moe_name=moe_name,
-				)
+				manager.warmup_and_capture_all()
+
+				# Enable graph mode on each decoder layer
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					decoder_layer.enable_cuda_graph(
+						manager,
+						attn_name=f"layer_{layer_idx}_attn",
+					)
+			else:
+				# GPT-OSS: per-layer mode (existing behavior)
+				if self.rank == 0:
+					num_segs = "attn+moe" if has_moe_graph else "attn"
+					logging.info(
+						f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
+						f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+					)
+
+				# Sync all ranks before warmup — MoE segments use NCCL collectives
+				# which require all ranks to participate simultaneously.
+				if has_moe_graph:
+					torch.cuda.synchronize(self.torch_device)
+					dist.barrier()
+
+				manager.warmup_and_capture_all()
+
+				# Enable graph mode on each decoder layer
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
+					decoder_layer.enable_cuda_graph(
+						manager,
+						full_attn_name=f"layer_{layer_idx}_full_attn",
+						moe_name=moe_name,
+					)
 
 			self._cuda_graph_manager = manager
 			if self.rank == 0:
