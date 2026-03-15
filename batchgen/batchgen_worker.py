@@ -6952,6 +6952,7 @@ class BatchGenWorker:
 					decoder_layer.enable_cuda_graph(
 						manager,
 						attn_name=f"layer_{layer_idx}_attn",
+						max_pages_per_seq=max_pages,
 					)
 			else:
 				# GPT-OSS: per-layer mode (existing behavior)

@@ -795,7 +795,7 @@ class KimiK25DecoderLayer(nn.Module):
         except Exception:
             return None
 
-    def enable_cuda_graph(self, manager, attn_name: str):
+    def enable_cuda_graph(self, manager, attn_name: str, max_pages_per_seq: int = 0):
         """Enable per-layer CUDA graph for MLA attention.
 
         MoE stays eager (preserves async shared expert overlap).
@@ -803,6 +803,7 @@ class KimiK25DecoderLayer(nn.Module):
         """
         self.cuda_graph_manager = manager
         self._attn_segment_name = attn_name
+        self._graph_max_pages = max_pages_per_seq
 
     def forward(
         self,
@@ -833,12 +834,23 @@ class KimiK25DecoderLayer(nn.Module):
                 slot_indices = gpu_kv_manager._gpu_page_table_manager._slot_index_tensor
                 cache_seqlens = AttnWrapperBase.cache_seqlens
 
+                # Pad page_table to match captured graph's static buffer width.
+                # gpu_table columns = current_max_pages (dynamic, grows with seq len).
+                # Graph was captured with max_pages_per_seq columns.
+                pt = page_table[:batch_size]
+                if self._graph_max_pages > 0 and pt.shape[1] < self._graph_max_pages:
+                    pt = torch.nn.functional.pad(
+                        pt, (0, self._graph_max_pages - pt.shape[1]), value=0
+                    )
+                elif self._graph_max_pages > 0 and pt.shape[1] > self._graph_max_pages:
+                    pt = pt[:, :self._graph_max_pages]
+
                 out = self.cuda_graph_manager.replay(
                     self._attn_segment_name,
                     batch_size,
                     hidden_states=hidden_states,
                     cache_seqlens=cache_seqlens[:batch_size],
-                    page_table=page_table[:batch_size],
+                    page_table=pt,
                     slot_indices=slot_indices[:batch_size],
                 )
 
