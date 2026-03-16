@@ -1542,18 +1542,20 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 	attn_output = attn_output.view(bsz, 1, -1)
 	if _do_timing: _mark("out_absorb_oproj")
 
-	# ============ PRINT TIMING (every 64 steps, layer 0 only) ============
+	# ============ ACCUMULATE TIMING (print at step 128, layer 0 only) ============
 	if _do_timing:
-		# Store events for deferred processing (no sync here)
 		if '_pending_events' not in _accum:
 			_accum['_pending_events'] = []
 		_accum['_pending_events'].append(_events)
 
-		if _step > 0 and _step % 64 == 0:
-			# Sync once and process all 64 steps' events
+		# Print at step 128 (after enough data, skip first 8 warmup steps)
+		if _step == 128:
 			torch.cuda.synchronize()
 			pending = _accum.pop('_pending_events', [])
-			for evts in pending:
+			# Skip first 8 steps (warmup, Triton JIT, etc.)
+			skip = min(8, len(pending) // 2)
+			measure = pending[skip:]
+			for evts in measure:
 				for i in range(1, len(evts)):
 					name = evts[i][0]
 					dt = evts[i-1][1].elapsed_time(evts[i][1])
@@ -1561,17 +1563,15 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 			# Print averages
 			parts = []
 			total = 0
+			n = len(measure)
 			for name in [k for k in _accum if not k.startswith('_')]:
-				avg_us = _accum[name] / len(pending) * 1000
+				avg_us = _accum[name] / n * 1000
 				parts.append(f"{name}={avg_us:.0f}us")
 				total += avg_us
 			parts.append(f"TOTAL={total:.0f}us")
 			import logging as _logging
-			_logging.info(f"[MLA TIMING L0] bsz={bsz} step={_step} (avg over {len(pending)}): {', '.join(parts)}")
-			# Reset
-			for k in list(_accum.keys()):
-				if not k.startswith('_'):
-					del _accum[k]
+			_logging.info(f"[MLA TIMING L0] bsz={bsz} (avg over {n} steps, skip {skip}): {', '.join(parts)}")
+			_accum.clear()
 			_accum['_pending_events'] = []
 
 	return attn_output, k_tensor
