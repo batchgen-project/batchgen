@@ -425,19 +425,26 @@ class BatchScheduler:
     def _build_output_items(
         self,
         requests: List[BatchRequestItem],
-        results: List[Any],
+        results: Any,
         prompts: List[str],
     ) -> List[BatchResultItem]:
         output: List[BatchResultItem] = []
-        normalized_results = self._normalize_worker_results(
-            results, len(requests)
-        )
-        for idx, request in enumerate(requests):
-            result = (
-                normalized_results[idx]
-                if idx < len(normalized_results)
-                else None
+        # Support both dict (new: {global_idx: str}) and list (legacy) results
+        if isinstance(results, dict):
+            normalized_results = results
+        else:
+            normalized_results = self._normalize_worker_results(
+                results, len(requests)
             )
+        for idx, request in enumerate(requests):
+            if isinstance(normalized_results, dict):
+                result = normalized_results.get(idx)
+            else:
+                result = (
+                    normalized_results[idx]
+                    if idx < len(normalized_results)
+                    else None
+                )
             response = None
             error = None
             if result is None:

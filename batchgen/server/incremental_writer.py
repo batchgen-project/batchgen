@@ -21,6 +21,7 @@ import torch
 
 from batchgen.server.io_struct import (
     BatchEndpoint,
+    BatchError,
     BatchResponse,
     BatchResultItem,
     ChatCompletionChoice,
@@ -97,6 +98,13 @@ class IncrementalWriter:
         tokens_cpu = decoded_tokens.cpu() if decoded_tokens.is_cuda else decoded_tokens.clone()
         self._queue.put((global_idx, tokens_cpu, finish_reason))
 
+    def submit_error(self, global_idx: int, error_code: str, error_message: str) -> None:
+        """Enqueue an error result for a rejected sequence. Thread-safe."""
+        if self._closed:
+            logger.warning("IncrementalWriter.submit_error() called after close()")
+            return
+        self._queue.put(("error", global_idx, error_code, error_message))
+
     def close(self) -> None:
         """Flush remaining items and join the background thread."""
         if self._closed:
@@ -131,9 +139,15 @@ class IncrementalWriter:
                         os.fsync(fh.fileno())
                         break
 
-                    global_idx, tokens, finish_reason = item
                     try:
-                        line = self._build_result_line(global_idx, tokens, finish_reason=finish_reason)
+                        # Error items: ("error", global_idx, error_code, error_message)
+                        if isinstance(item, tuple) and len(item) == 4 and item[0] == "error":
+                            _, global_idx, error_code, error_message = item
+                            line = self._build_error_line(global_idx, error_code, error_message)
+                        else:
+                            # Normal items: (global_idx, tokens, finish_reason)
+                            global_idx, tokens, finish_reason = item
+                            line = self._build_result_line(global_idx, tokens, finish_reason=finish_reason)
                         fh.write(line)
                         fh.write("\n")
                         fh.flush()
@@ -141,7 +155,7 @@ class IncrementalWriter:
                         self._count += 1
                     except Exception:
                         logger.exception(
-                            f"IncrementalWriter: failed to write global_idx={global_idx}"
+                            f"IncrementalWriter: failed to write item"
                         )
         except Exception:
             logger.exception("IncrementalWriter background thread crashed")
@@ -218,6 +232,17 @@ class IncrementalWriter:
             error=None,
         )
 
+        return json.dumps(result_item.dict(), default=str, ensure_ascii=False)
+
+    def _build_error_line(self, global_idx: int, error_code: str, error_message: str) -> str:
+        """Build a BatchResultItem-compatible JSON line for a rejected sequence."""
+        custom_id = self._custom_id_map.get(global_idx, f"unknown_{global_idx}")
+        result_item = BatchResultItem(
+            id=f"batch_req_{uuid_lib.uuid4().hex[:24]}",
+            custom_id=custom_id,
+            response=None,
+            error=BatchError(code=error_code, message=error_message),
+        )
         return json.dumps(result_item.dict(), default=str, ensure_ascii=False)
 
     # -------------------- Helpers --------------------

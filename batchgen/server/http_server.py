@@ -379,6 +379,9 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc))
 
         latency_ms = int((time.perf_counter() - start) * 1000)
+        # Worker returns dict {global_idx: str} — convert to ordered list
+        if isinstance(results, dict):
+            results = [results[k] for k in sorted(results.keys())]
         normalized_results = normalize_inference_results(results)
 
         response_data = {

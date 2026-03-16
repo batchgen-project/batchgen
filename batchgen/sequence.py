@@ -383,6 +383,15 @@ class SequenceBatch:
                 self._rank_index[sequence.assigned_rank] = set()
             self._rank_index[sequence.assigned_rank].add(sequence.uuid)
 
+    def remove_sequence(self, uuid: str) -> Optional[SequenceEntry]:
+        """Remove a sequence from the batch and all indices."""
+        seq = self.sequences.pop(uuid, None)
+        if seq:
+            self._status_index[seq.status].discard(uuid)
+            if seq.assigned_rank is not None and seq.assigned_rank in self._rank_index:
+                self._rank_index[seq.assigned_rank].discard(uuid)
+        return seq
+
     def get_sequence(self, uuid: str) -> Optional[SequenceEntry]:
         return self.sequences.get(uuid, None)
 
