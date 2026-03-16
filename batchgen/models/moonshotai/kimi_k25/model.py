@@ -34,6 +34,7 @@ Design:
 
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -59,6 +60,158 @@ from batchgen.moe.dispatch_scatter_3d import (
 class _CausalLMOutput:
     """Minimal output container with .logits attribute for worker compatibility."""
     logits: torch.Tensor
+
+
+# ============================================================================
+# Per-Layer Sub-Op Timer (BATCHGEN_K25_TIMING=1 to enable)
+# ============================================================================
+
+_K25_TIMING_ENABLED = os.environ.get("BATCHGEN_K25_TIMING", "0") == "1"
+_K25_TIMING_LOG_INTERVAL = int(os.environ.get("BATCHGEN_K25_TIMING_INTERVAL", "10"))
+
+# MoE sub-op names (order matters for table output)
+_MOE_OPS = [
+    "allgather", "gate", "dispatch", "wgmma_s1", "wgmma_s2",
+    "reduce", "allreduce", "shared_expert", "extract_combine",
+]
+# Layer-level op names
+_LAYER_OPS = ["input_ln", "mla", "post_ln_res", "mlp", "res_add"]
+
+
+class K25DecodeTimer:
+    """CUDA event-based per-layer sub-op timer for K2.5 decode.
+
+    Enabled by BATCHGEN_K25_TIMING=1. Accumulates timings across steps,
+    logs averages every BATCHGEN_K25_TIMING_INTERVAL steps (default 10).
+
+    Events are recorded without sync during forward. A single sync happens
+    at step_done() to read all event pairs at once (avoids per-layer sync).
+    """
+
+    def __init__(self, num_layers: int = 61, device: str = "cuda"):
+        self.num_layers = num_layers
+        self.device = device
+        self.step_count = 0
+
+        # Per-layer, per-op accumulators (us)
+        self.layer_accum = {
+            op: [0.0] * num_layers for op in _LAYER_OPS
+        }
+        self.moe_accum = {
+            op: [0.0] * num_layers for op in _MOE_OPS
+        }
+        self.samples = 0
+
+        # Deferred event pairs: list of (layer_idx, events, op_names, "layer"|"moe")
+        self._pending_events = []
+
+    def make_events(self, n: int):
+        """Create n+1 CUDA events (n intervals between n+1 markers)."""
+        return [torch.cuda.Event(enable_timing=True) for _ in range(n + 1)]
+
+    def defer_layer_times(self, layer_idx: int, events, op_names):
+        """Store events for deferred processing (no sync needed)."""
+        self._pending_events.append((layer_idx, events, op_names, "layer"))
+
+    def defer_moe_times(self, layer_idx: int, events, op_names):
+        """Store events for deferred processing (no sync needed)."""
+        self._pending_events.append((layer_idx, events, op_names, "moe"))
+
+    def step_done(self):
+        """Called after one full forward pass (all 61 layers).
+        Single sync, then read all deferred events."""
+        torch.cuda.synchronize()
+
+        # Process all deferred events
+        for layer_idx, events, op_names, kind in self._pending_events:
+            accum = self.layer_accum if kind == "layer" else self.moe_accum
+            for i, op in enumerate(op_names):
+                us = events[i].elapsed_time(events[i + 1]) * 1000.0
+                accum[op][layer_idx] += us
+        self._pending_events.clear()
+
+        self.samples += 1
+        self.step_count += 1
+        if self.samples >= _K25_TIMING_LOG_INTERVAL:
+            self._log_and_reset()
+
+    def _log_and_reset(self):
+        n = self.samples
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            self.samples = 0
+            for op in _LAYER_OPS:
+                self.layer_accum[op] = [0.0] * self.num_layers
+            for op in _MOE_OPS:
+                self.moe_accum[op] = [0.0] * self.num_layers
+            return
+
+        header_layer = "layer | " + " | ".join(f"{op:>10}" for op in _LAYER_OPS) + " | total_us"
+        header_moe = "layer | " + " | ".join(f"{op:>14}" for op in _MOE_OPS) + " | moe_total"
+        sep_layer = "-" * len(header_layer)
+        sep_moe = "-" * len(header_moe)
+
+        lines = [
+            f"\n[K25 Timing] avg over {n} steps (step {self.step_count - n + 1}-{self.step_count}):",
+            "",
+            "=== Layer-level breakdown (us) ===",
+            header_layer,
+            sep_layer,
+        ]
+        for l in range(self.num_layers):
+            vals = [self.layer_accum[op][l] / n for op in _LAYER_OPS]
+            total = sum(vals)
+            row = f"  {l:3d} | " + " | ".join(f"{v:10.1f}" for v in vals) + f" | {total:8.1f}"
+            lines.append(row)
+
+        # Averages for layer 0 vs 1-60
+        lines.append(sep_layer)
+        avg0 = {op: self.layer_accum[op][0] / n for op in _LAYER_OPS}
+        avg_rest = {op: sum(self.layer_accum[op][1:]) / (n * 60) for op in _LAYER_OPS}
+        row0 = "  L0  | " + " | ".join(f"{avg0[op]:10.1f}" for op in _LAYER_OPS) + f" | {sum(avg0.values()):8.1f}"
+        row_r = " L1-60| " + " | ".join(f"{avg_rest[op]:10.1f}" for op in _LAYER_OPS) + f" | {sum(avg_rest.values()):8.1f}"
+        lines.extend([row0, row_r])
+
+        lines.extend([
+            "",
+            "=== MoE sub-op breakdown (us, layers 1-60 only) ===",
+            header_moe,
+            sep_moe,
+        ])
+        for l in range(1, self.num_layers):
+            vals = [self.moe_accum[op][l] / n for op in _MOE_OPS]
+            total = sum(vals)
+            row = f"  {l:3d} | " + " | ".join(f"{v:14.1f}" for v in vals) + f" | {total:9.1f}"
+            lines.append(row)
+
+        # MoE averages
+        lines.append(sep_moe)
+        avg_moe = {op: sum(self.moe_accum[op][1:]) / (n * 60) for op in _MOE_OPS}
+        row_m = " avg  | " + " | ".join(f"{avg_moe[op]:14.1f}" for op in _MOE_OPS) + f" | {sum(avg_moe.values()):9.1f}"
+        lines.append(row_m)
+
+        logging.info("\n".join(lines))
+
+        # Reset
+        self.samples = 0
+        for op in _LAYER_OPS:
+            self.layer_accum[op] = [0.0] * self.num_layers
+        for op in _MOE_OPS:
+            self.moe_accum[op] = [0.0] * self.num_layers
+
+
+# Global timer instance (lazy init)
+_k25_timer: Optional[K25DecodeTimer] = None
+
+
+def _get_k25_timer(num_layers: int = 61) -> Optional[K25DecodeTimer]:
+    global _k25_timer
+    if not _K25_TIMING_ENABLED:
+        return None
+    if _k25_timer is None:
+        _k25_timer = K25DecodeTimer(num_layers=num_layers)
+        logging.info(f"[K25 Timing] Enabled: {num_layers} layers, log every {_K25_TIMING_LOG_INTERVAL} steps")
+    return _k25_timer
 
 
 # ============================================================================
@@ -593,31 +746,7 @@ class KimiK25MoE(nn.Module):
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """EP decode: AllGather → CUDA gate → 3D dispatch → inplace WGMMA → reduce → AllReduce."""
-        import os as _os
-        # Only time on rank 0, first MoE layer (use instance id to identify)
-        if not hasattr(self, '_is_timing_layer'):
-            self._is_timing_layer = False
-            if _os.environ.get("BATCHGEN_MOE_TIMING", "0") == "1" and self.rank == 0:
-                if not hasattr(self.__class__, '_timing_layer_assigned'):
-                    self.__class__._timing_layer_assigned = True
-                    self._is_timing_layer = True
-        _do_moe_timing = self._is_timing_layer
-        if _do_moe_timing:
-            if not hasattr(self, '_moe_timing_step'):
-                self._moe_timing_step = 0
-                self._moe_timing_accum = {}
-            _step = self._moe_timing_step
-            self._moe_timing_step = _step + 1
-            _accum = self._moe_timing_accum
-            if '_pending' not in _accum:
-                _accum['_pending'] = []
-            _events = []
-            def _mark(name):
-                e = torch.cuda.Event(enable_timing=True)
-                e.record()
-                _events.append((name, e))
-            _mark("start")
-
+        timer = _get_k25_timer()
         buf = self.__class__._buf
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -656,17 +785,26 @@ class KimiK25MoE(nn.Module):
         with torch.cuda.stream(shared_stream):
             shared_out = self.shared_experts(identity)
 
+        # --- MoE sub-op timing (9 ops, 10 events on compute stream) ---
+        if timer is not None:
+            ev = timer.make_events(len(_MOE_OPS))
+            ev[0].record()  # before allgather
+
         # AllGather on compute stream (normal path)
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
                 all_tokens, padded,
                 stream=torch.cuda.default_stream(device),
             )
-        if _do_moe_timing: _mark("allgather")
+
+        if timer is not None:
+            ev[1].record()  # after allgather, before gate
 
         # 2) CUDA gate: sigmoid + top-k + normalize + scale
         topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
-        if _do_moe_timing: _mark("gate")
+
+        if timer is not None:
+            ev[2].record()  # after gate, before dispatch
 
         # 3) 3D dispatch scatter into strided buffer
         if buf is not None:
@@ -692,7 +830,8 @@ class KimiK25MoE(nn.Module):
                 expert_counts, expert_counters, topk_pos,
             )
 
-        if _do_moe_timing: _mark("dispatch")
+        if timer is not None:
+            ev[3].record()  # after dispatch, before wgmma_s1
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
         if getattr(self, '_use_grouped_wgmma', False) \
@@ -715,6 +854,11 @@ class KimiK25MoE(nn.Module):
                 N, K // 2, K // 32, max_m_tiles, mtp,
             )
 
+        if timer is not None:
+            ev[4].record()  # after wgmma_s1, before wgmma_s2
+
+        if getattr(self, '_use_grouped_wgmma', False) \
+                and buf is not None and buf.tma_dispatched is not None:
             # Stage 2 inplace: intermediate → expert_out
             mod.grouped_int4_moe_stage2_inplace(
                 buf.intermediate, buf.expert_out, buf.tma_intermediate,
@@ -724,7 +868,8 @@ class KimiK25MoE(nn.Module):
                 K, N // 2, N // 32, max_m_tiles, mtp,
             )
 
-        if _do_moe_timing: _mark("wgmma")
+        if timer is not None:
+            ev[5].record()  # after wgmma_s2, before reduce
 
         # 5) Reduce: weighted scatter from 3D strided buffer to flat [G, H]
         if buf is not None:
@@ -739,7 +884,8 @@ class KimiK25MoE(nn.Module):
                 num_global, H, topk,
             )
 
-        if _do_moe_timing: _mark("reduce_scatter")
+        if timer is not None:
+            ev[6].record()  # after reduce, before allreduce
 
         # 6) AllReduce
         with self.comm.change_state(enable=True):
@@ -747,40 +893,23 @@ class KimiK25MoE(nn.Module):
                 global_results, op=dist.ReduceOp.SUM,
                 stream=torch.cuda.default_stream(device),
             )
-        if _do_moe_timing: _mark("allreduce")
+
+        if timer is not None:
+            ev[7].record()  # after allreduce, before shared_expert sync
 
         # 7) Sync shared expert stream and combine
         compute_stream.wait_stream(shared_stream)
-        if _do_moe_timing: _mark("shared_expert_sync")
+
+        if timer is not None:
+            ev[8].record()  # after shared_expert sync, before extract_combine
 
         start = self.rank * self.num_tokens_per_rank
         end = start + num_tokens
         out = global_results[start:end] + shared_out
 
-        # Print MoE timing at step 128 (layer with lowest idx is chosen)
-        if _do_moe_timing:
-            _accum['_pending'].append(_events)
-            if _step == 128:
-                torch.cuda.synchronize()
-                pending = _accum['_pending']
-                skip = min(8, len(pending) // 2)
-                measure = pending[skip:]
-                for evts in measure:
-                    for i in range(1, len(evts)):
-                        name = evts[i][0]
-                        dt = evts[i-1][1].elapsed_time(evts[i][1])
-                        _accum[name] = _accum.get(name, 0.0) + dt
-                parts = []
-                total = 0
-                n = len(measure)
-                for name in [k for k in _accum if not k.startswith('_')]:
-                    avg_us = _accum[name] / n * 1000
-                    parts.append(f"{name}={avg_us:.0f}us")
-                    total += avg_us
-                parts.append(f"TOTAL={total:.0f}us")
-                logging.info(f"[MOE TIMING R0] bsz={num_tokens} global={num_global} (avg over {n} steps): {', '.join(parts)}")
-                _accum.clear()
-                _accum['_pending'] = []
+        if timer is not None:
+            ev[9].record()  # after extract_combine
+            timer.defer_moe_times(self._layer_idx, ev, _MOE_OPS)
 
         return out.view(*orig_shape)
 
@@ -845,6 +974,7 @@ class KimiK25DecoderLayer(nn.Module):
             self.mlp = DenseMLP(config)
         else:
             self.mlp = KimiK25MoE(config)
+            self.mlp._layer_idx = layer_idx
 
     @staticmethod
     def _get_fused_add_rmsnorm_fn():
@@ -879,8 +1009,14 @@ class KimiK25DecoderLayer(nn.Module):
     ):
         from batchgen.models.wrappers.attention import AttnWrapperBase
 
+        timer = _get_k25_timer()
+        layer_idx = kwargs.get("layer_idx", self.layer_idx)
         batch_size = hidden_states.shape[0]
         fused_add_norm = self._get_fused_add_rmsnorm_fn()
+
+        if timer is not None:
+            ev = timer.make_events(len(_LAYER_OPS))
+            ev[0].record()
 
         # ---- MLA Attention: CUDA graph or eager ----
         use_graph = (hasattr(self, 'cuda_graph_manager')
@@ -896,9 +1032,6 @@ class KimiK25DecoderLayer(nn.Module):
                 slot_indices = gpu_kv_manager._gpu_page_table_manager._slot_index_tensor
                 cache_seqlens = AttnWrapperBase.cache_seqlens
 
-                # Pad page_table to match captured graph's static buffer width.
-                # gpu_table columns = current_max_pages (dynamic, grows with seq len).
-                # Graph was captured with max_pages_per_seq columns.
                 pt = page_table[:batch_size]
                 if self._graph_max_pages > 0 and pt.shape[1] < self._graph_max_pages:
                     pt = torch.nn.functional.pad(
@@ -916,11 +1049,9 @@ class KimiK25DecoderLayer(nn.Module):
                     slot_indices=slot_indices[:batch_size],
                 )
 
-                # Graph already computed: normed (MoE input), residual, k_tensor
                 hidden_states = out["normed"]
                 residual = out["residual"]
 
-                # KV host offload callback
                 kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
                 if kv_cb is not None:
                     kv_cb(self.layer_idx, out["k_tensor"][:batch_size].clone(), None)
@@ -930,14 +1061,18 @@ class KimiK25DecoderLayer(nn.Module):
                 logging.warning(f"Layer {self.layer_idx} graph replay failed: {e}, falling back to eager")
                 attn_done = False
 
+        if timer is not None:
+            ev[1].record()  # input_ln (includes graph setup overhead if graph path)
+
         if not attn_done:
-            # Original eager path
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+            if timer is not None:
+                ev[1].record()  # re-record after actual input_ln
+
             attn_out = self.self_attn(hidden_states=hidden_states)
             hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
 
-            # Fused: residual += attn_out, then post_attention_layernorm
             if fused_add_norm is not None:
                 hidden_states, residual = fused_add_norm(
                     residual, hidden_states,
@@ -949,11 +1084,24 @@ class KimiK25DecoderLayer(nn.Module):
                 residual = hidden_states
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
+        if timer is not None:
+            ev[2].record()  # after mla
+
+        if timer is not None:
+            ev[3].record()  # post_ln_res (fused with mla in eager, part of graph in graph path)
+
         # ---- MoE/FFN: always eager (preserves async shared expert overlap) ----
         hidden_states = self.mlp(hidden_states)
 
+        if timer is not None:
+            ev[4].record()  # after mlp
+
         # residual += mlp_out
         hidden_states = residual + hidden_states
+
+        if timer is not None:
+            ev[5].record()  # after res_add
+            timer.defer_layer_times(layer_idx, ev, _LAYER_OPS)
 
         return (hidden_states, None, None)
 
@@ -1022,15 +1170,22 @@ class KimiK25Model(nn.Module):
 
         hidden_states = inputs_embeds
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             layer_output = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                layer_idx=layer_idx,
             )
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
         hidden_states = self.norm(hidden_states)
+
+        # Signal step done to timer
+        timer = _get_k25_timer()
+        if timer is not None:
+            timer.step_done()
+
         return hidden_states
 
 
