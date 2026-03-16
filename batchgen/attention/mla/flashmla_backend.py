@@ -1426,18 +1426,37 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 
 	hidden_states = hidden_states.squeeze(1)  # [bsz, hidden_dim]
 
+	# ============ PER-OP TIMING (BATCHGEN_MLA_TIMING=1) ============
+	import os as _os
+	_do_timing = _os.environ.get("BATCHGEN_MLA_TIMING", "0") == "1" and layer_idx == 0
+	if _do_timing:
+		if not hasattr(mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv, '_timing_step'):
+			mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_step = 0
+			mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_accum = {}
+		_step = mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_step
+		mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_step = _step + 1
+		_accum = mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_accum
+		_events = []
+		def _mark(name):
+			e = torch.cuda.Event(enable_timing=True)
+			e.record()
+			_events.append((name, e))
+		_mark("start")
+
 	# ============ PURE BF16 PROJECTIONS (no quantization) ============
 	q = F.linear(hidden_states, self.q_a_proj.weight)
 	new_compressed_kv = F.linear(hidden_states, self.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
 
 	q = self.q_a_layernorm(q)
 	q = F.linear(q, self.q_b_proj.weight)
+	if _do_timing: _mark("projections")
 
 	# ============ ROPE & QUERY PROCESSING ============
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
+	if _do_timing: _mark("q_reshape_rope")
 
 	# ============ KV CACHE UPDATE ============
 	offload_kv = fused_rmsnorm_rope_with_q(
@@ -1450,6 +1469,7 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 		self.kv_lora_rank,
 		self.qk_rope_head_dim,
 	)
+	if _do_timing: _mark("fused_kv_norm_rope")
 
 	manager_device = gpu_paged_kv_manager.device
 	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
@@ -1462,10 +1482,12 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 		layer_idx=layer_idx,
 		batch_slice=batch_slice,
 	)
+	if _do_timing: _mark("kv_cache_update")
 
 	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
 		layer_idx=layer_idx
 	)
+	if _do_timing: _mark("get_kv_page_table")
 
 	# Apply batch slice for micro-batching
 	if batch_slice is not None:
@@ -1494,6 +1516,7 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 	).view(bsz, self.num_heads, 1, self.kv_lora_rank)
 	query_states[:, :, :, self.kv_lora_rank:] = q_pe
 	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
+	if _do_timing: _mark("q_absorb")
 
 	# ============ FLASH MLA ATTENTION ============
 	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
@@ -1509,6 +1532,7 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 		self.softmax_scale,
 		True,
 	)
+	if _do_timing: _mark("flash_mla")
 
 	# ============ OUTPUT PROJECTION (Pure BF16) ============
 	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
@@ -1516,6 +1540,39 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
 	attn_output = F.linear(attn_output, self.o_proj.weight)
 	attn_output = attn_output.view(bsz, 1, -1)
+	if _do_timing: _mark("out_absorb_oproj")
+
+	# ============ PRINT TIMING (every 64 steps, layer 0 only) ============
+	if _do_timing:
+		# Store events for deferred processing (no sync here)
+		if '_pending_events' not in _accum:
+			_accum['_pending_events'] = []
+		_accum['_pending_events'].append(_events)
+
+		if _step > 0 and _step % 64 == 0:
+			# Sync once and process all 64 steps' events
+			torch.cuda.synchronize()
+			pending = _accum.pop('_pending_events', [])
+			for evts in pending:
+				for i in range(1, len(evts)):
+					name = evts[i][0]
+					dt = evts[i-1][1].elapsed_time(evts[i][1])
+					_accum[name] = _accum.get(name, 0.0) + dt
+			# Print averages
+			parts = []
+			total = 0
+			for name in [k for k in _accum if not k.startswith('_')]:
+				avg_us = _accum[name] / len(pending) * 1000
+				parts.append(f"{name}={avg_us:.0f}us")
+				total += avg_us
+			parts.append(f"TOTAL={total:.0f}us")
+			import logging as _logging
+			_logging.info(f"[MLA TIMING L0] bsz={bsz} step={_step} (avg over {len(pending)}): {', '.join(parts)}")
+			# Reset
+			for k in list(_accum.keys()):
+				if not k.startswith('_'):
+					del _accum[k]
+			_accum['_pending_events'] = []
 
 	return attn_output, k_tensor
 
