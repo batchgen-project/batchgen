@@ -1147,60 +1147,6 @@ class BatchGenWorker:
 				remaining_global = self._local_indices_to_global_seq_ids(remaining_local)
 				manager.rebuild_page_table(remaining_global)
 
-	def _flush_deferred_kv_to_host(self) -> None:
-		"""Flush all deferred KV host offload entries accumulated during forward.
-
-		ONE event.synchronize() covers all layers, then batch-launch D2H copies.
-		This replaces N per-layer syncs with a single post-forward sync.
-		"""
-		entries = getattr(self, '_deferred_kv_entries', [])
-		if not entries:
-			return
-
-		worker_view = getattr(self, '_deferred_kv_worker_view', None)
-		batch_info = getattr(self, '_deferred_kv_batch', None)
-		if worker_view is None or batch_info is None:
-			self._deferred_kv_entries = []
-			return
-
-		sequence_ids, sequence_lengths = batch_info
-
-		# ONE sync for ALL layers — the key optimization
-		if not hasattr(self, '_kv_offload_event'):
-			self._kv_offload_event = torch.cuda.Event()
-		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
-		self._kv_offload_event.synchronize()
-
-		# Fire all D2H copies
-		if not hasattr(self, '_pending_kv_append_tensors'):
-			self._pending_kv_append_tensors = []
-
-		for layer_idx, k_tensor, v_tensor in entries:
-			if k_tensor.dim() == 3:
-				k_tensor = k_tensor.unsqueeze(2)
-			if v_tensor is not None and v_tensor.dim() == 3:
-				v_tensor = v_tensor.unsqueeze(2)
-
-			task = worker_view.async_append_decode_kv_to_host(
-				layer_idx=layer_idx,
-				sequence_ids=sequence_ids,
-				k_tensor=k_tensor,
-				v_tensor=v_tensor,
-				sequence_lengths=sequence_lengths,
-			)
-
-			self._pending_kv_append_tensors.append(k_tensor)
-			if v_tensor is not None:
-				self._pending_kv_append_tensors.append(v_tensor)
-			if task is not None:
-				self._pending_kv_append_tasks.append(task)
-
-		# Throttle: prevent thread exhaustion from std::async
-		if len(self._pending_kv_append_tasks) >= 256:
-			self._wait_pending_kv_append_tasks()
-
-		self._deferred_kv_entries = []
-
 	def _append_decode_kv_to_host_async(
 		self,
 		layer_idx: int,
@@ -7406,25 +7352,12 @@ class BatchGenWorker:
 					# Per-layer graph or eager: no NCCL in graph, use local batch size
 					_max_bs = max(len(batch), 1)
 
-				# KV append callback — deferred: accumulate during forward, single sync after
+				# KV append callback
+				# NOTE: v_tensor is optional for backward compatibility with MLA models (DeepSeek)
+				# GPT-OSS uses GQA with separate K and V, so it passes both tensors
 				current_batch = list(batch)
-				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-
-				if _kv_worker_view is not None:
-					_kv_seq_ids = []
-					_kv_seq_lengths = []
-					for local_idx in current_batch:
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
-						_kv_seq_ids.append(seq.global_idx)
-						_kv_seq_lengths.append(seq.current_context_length - 1)
-					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
-					self._deferred_kv_entries = []
-					self._deferred_kv_worker_view = _kv_worker_view
-
 				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-					self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
-
+					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor, v_tensor)
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 				AttnWrapperBase.kv_append_callback = kv_append_callback
@@ -7503,9 +7436,6 @@ class BatchGenWorker:
 					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
-
-			# Flush deferred KV entries — single sync for all layers
-			self._flush_deferred_kv_to_host()
 
 			# DEBUG: Print sampled tokens and logits comparison
 			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
