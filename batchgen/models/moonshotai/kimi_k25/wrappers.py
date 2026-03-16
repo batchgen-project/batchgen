@@ -424,7 +424,9 @@ class KimiK25AttnWrapper(AttnWrapperBase):
                 None,
             )
 
-            if AttnWrapperBase.kv_append_callback is not None:
+            import os as _os
+            _skip_cb = _os.environ.get("BATCHGEN_SKIP_KV_CALLBACK", "0") == "1"
+            if not _skip_cb and AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
 
             return (attn_output, None, None)

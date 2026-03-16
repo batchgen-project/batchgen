@@ -68,6 +68,7 @@ class _CausalLMOutput:
 
 _K25_TIMING_ENABLED = os.environ.get("BATCHGEN_K25_TIMING", "0") == "1"
 _K25_TIMING_LOG_INTERVAL = int(os.environ.get("BATCHGEN_K25_TIMING_INTERVAL", "10"))
+_K25_TIMING_SYNC_EVERY = int(os.environ.get("BATCHGEN_K25_TIMING_SYNC_EVERY", "50"))
 
 # MoE sub-op names (order matters for table output)
 _MOE_OPS = [
@@ -119,10 +120,19 @@ class K25DecodeTimer:
 
     def step_done(self):
         """Called after one full forward pass (all 61 layers).
-        Single sync, then read all deferred events."""
-        torch.cuda.synchronize()
 
-        # Process all deferred events
+        Only sync every _K25_TIMING_SYNC_EVERY steps to avoid serializing
+        the GPU pipeline. On non-sync steps, discard pending events.
+        """
+        self.step_count += 1
+
+        if self.step_count % _K25_TIMING_SYNC_EVERY != 0:
+            # Non-sync step: discard events to avoid memory buildup
+            self._pending_events.clear()
+            return
+
+        # Sync step: read all deferred events
+        torch.cuda.synchronize()
         for layer_idx, events, op_names, kind in self._pending_events:
             accum = self.layer_accum if kind == "layer" else self.moe_accum
             for i, op in enumerate(op_names):
@@ -131,7 +141,6 @@ class K25DecodeTimer:
         self._pending_events.clear()
 
         self.samples += 1
-        self.step_count += 1
         if self.samples >= _K25_TIMING_LOG_INTERVAL:
             self._log_and_reset()
 
