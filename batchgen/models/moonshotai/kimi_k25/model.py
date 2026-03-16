@@ -593,6 +593,31 @@ class KimiK25MoE(nn.Module):
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """EP decode: AllGather → CUDA gate → 3D dispatch → inplace WGMMA → reduce → AllReduce."""
+        import os as _os
+        # Only time on rank 0, first MoE layer (use instance id to identify)
+        if not hasattr(self, '_is_timing_layer'):
+            self._is_timing_layer = False
+            if _os.environ.get("BATCHGEN_MOE_TIMING", "0") == "1" and self.rank == 0:
+                if not hasattr(self.__class__, '_timing_layer_assigned'):
+                    self.__class__._timing_layer_assigned = True
+                    self._is_timing_layer = True
+        _do_moe_timing = self._is_timing_layer
+        if _do_moe_timing:
+            if not hasattr(self, '_moe_timing_step'):
+                self._moe_timing_step = 0
+                self._moe_timing_accum = {}
+            _step = self._moe_timing_step
+            self._moe_timing_step = _step + 1
+            _accum = self._moe_timing_accum
+            if '_pending' not in _accum:
+                _accum['_pending'] = []
+            _events = []
+            def _mark(name):
+                e = torch.cuda.Event(enable_timing=True)
+                e.record()
+                _events.append((name, e))
+            _mark("start")
+
         buf = self.__class__._buf
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -637,9 +662,11 @@ class KimiK25MoE(nn.Module):
                 all_tokens, padded,
                 stream=torch.cuda.default_stream(device),
             )
+        if _do_moe_timing: _mark("allgather")
 
         # 2) CUDA gate: sigmoid + top-k + normalize + scale
         topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
+        if _do_moe_timing: _mark("gate")
 
         # 3) 3D dispatch scatter into strided buffer
         if buf is not None:
@@ -664,6 +691,8 @@ class KimiK25MoE(nn.Module):
                 self.routed_expert_start_idx, E, mtp,
                 expert_counts, expert_counters, topk_pos,
             )
+
+        if _do_moe_timing: _mark("dispatch")
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
         if getattr(self, '_use_grouped_wgmma', False) \
@@ -695,6 +724,8 @@ class KimiK25MoE(nn.Module):
                 K, N // 2, N // 32, max_m_tiles, mtp,
             )
 
+        if _do_moe_timing: _mark("wgmma")
+
         # 5) Reduce: weighted scatter from 3D strided buffer to flat [G, H]
         if buf is not None:
             result_buf = buf.result_buffer[:num_global]
@@ -708,18 +739,49 @@ class KimiK25MoE(nn.Module):
                 num_global, H, topk,
             )
 
+        if _do_moe_timing: _mark("reduce_scatter")
+
         # 6) AllReduce
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 global_results, op=dist.ReduceOp.SUM,
                 stream=torch.cuda.default_stream(device),
             )
+        if _do_moe_timing: _mark("allreduce")
 
         # 7) Sync shared expert stream and combine
         compute_stream.wait_stream(shared_stream)
+        if _do_moe_timing: _mark("shared_expert_sync")
+
         start = self.rank * self.num_tokens_per_rank
         end = start + num_tokens
         out = global_results[start:end] + shared_out
+
+        # Print MoE timing at step 128 (layer with lowest idx is chosen)
+        if _do_moe_timing:
+            _accum['_pending'].append(_events)
+            if _step == 128:
+                torch.cuda.synchronize()
+                pending = _accum['_pending']
+                skip = min(8, len(pending) // 2)
+                measure = pending[skip:]
+                for evts in measure:
+                    for i in range(1, len(evts)):
+                        name = evts[i][0]
+                        dt = evts[i-1][1].elapsed_time(evts[i][1])
+                        _accum[name] = _accum.get(name, 0.0) + dt
+                parts = []
+                total = 0
+                n = len(measure)
+                for name in [k for k in _accum if not k.startswith('_')]:
+                    avg_us = _accum[name] / n * 1000
+                    parts.append(f"{name}={avg_us:.0f}us")
+                    total += avg_us
+                parts.append(f"TOTAL={total:.0f}us")
+                logging.info(f"[MOE TIMING R0] bsz={num_tokens} global={num_global} (avg over {n} steps): {', '.join(parts)}")
+                _accum.clear()
+                _accum['_pending'] = []
+
         return out.view(*orig_shape)
 
     @torch.inference_mode()
