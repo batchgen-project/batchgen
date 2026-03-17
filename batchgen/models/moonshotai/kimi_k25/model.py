@@ -872,6 +872,11 @@ class KimiK25MoE(nn.Module):
             ev[3].record()  # after dispatch, before wgmma_s1
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
+        # Set mod/w/mtp unconditionally — S2 always uses WGMMA
+        mod = self._wgmma_mod if getattr(self, '_use_grouped_wgmma', False) else None
+        w = self._moe_weights if getattr(self, '_use_grouped_wgmma', False) else None
+        mtp = buf.max_tokens_padded if buf is not None else 0
+
         _used_marlin_s1 = False
         if getattr(self, '_use_marlin_decode', False) \
                 and buf is not None \
@@ -888,18 +893,16 @@ class KimiK25MoE(nn.Module):
             )
             _used_marlin_s1 = True
 
-        if not _used_marlin_s1 \
-                and getattr(self, '_use_grouped_wgmma', False) \
-                and buf is not None and buf.tma_dispatched is not None:
-            # Fallback: INT4 WGMMA S1 (prefill or M>8)
-            mod = self._wgmma_mod
-            w = self._moe_weights
-            mtp = buf.max_tokens_padded
-            # Heuristic grid: assume worst-case ~2x uniform distribution
+        # Compute max_m_tiles for WGMMA (used by both S1 fallback and S2)
+        if buf is not None:
             avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
+        if not _used_marlin_s1 \
+                and getattr(self, '_use_grouped_wgmma', False) \
+                and buf is not None and buf.tma_dispatched is not None:
+            # Fallback: INT4 WGMMA S1 (prefill or M>8)
             # Stage 1 inplace: dispatched_x → intermediate
             mod.grouped_int4_moe_stage1_inplace(
                 buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
