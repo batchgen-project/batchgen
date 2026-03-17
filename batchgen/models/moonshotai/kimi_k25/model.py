@@ -958,6 +958,9 @@ class KimiK25MoE(nn.Module):
                 self._marlin_diag_count = 0
             if self._marlin_diag_count < 5 and self.rank == 0 \
                     and mod is not None and buf.tma_dispatched is not None:
+                print(f"[DIAG] ENTERING diagnostic path diag_count={self._marlin_diag_count} "
+                      f"rank={self.rank} mod={mod is not None} tma={buf.tma_dispatched is not None}",
+                      flush=True)
                 # Save WGMMA S1 result
                 wgmma_intermediate = buf.intermediate.clone()
                 mod.grouped_int4_moe_stage1_inplace(
@@ -991,9 +994,10 @@ class KimiK25MoE(nn.Module):
                         ml_slice.flatten().unsqueeze(0)).item()
                     wg_norm = wg_slice.norm().item()
                     ml_norm = ml_slice.norm().item()
-                    logging.info(
+                    print(
                         f"[DIAG] step={self._marlin_diag_count} expert={e_idx} cnt={cnt} "
-                        f"cos_sim={cos:.6f} wgmma_norm={wg_norm:.4f} marlin_norm={ml_norm:.4f}")
+                        f"cos_sim={cos:.6f} wgmma_norm={wg_norm:.4f} marlin_norm={ml_norm:.4f}",
+                        flush=True)
                 self._marlin_diag_count += 1
                 _used_marlin_s1 = True
             else:
