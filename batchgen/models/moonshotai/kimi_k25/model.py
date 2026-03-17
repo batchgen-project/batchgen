@@ -749,15 +749,14 @@ class KimiK25MoE(nn.Module):
             self._wgmma_mod = _load_int4_grouped_module()
             self._use_grouped_wgmma = True
 
-            # Marlin W4A16 decode S1: pre-compute ALL pointer arrays and buffers
+            # Marlin W4A16 decode S1: weight pointers only (mtp-dependent buffers deferred)
             self._use_marlin_decode = False
+            self._marlin_mtp = 0  # track current mtp for lazy re-init
             if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
                 try:
                     N = self.moe_intermediate_size
-                    buf = self.__class__._buf
-                    mtp = buf.max_tokens_padded if buf is not None else 64
 
-                    # Weight + scale pointer arrays (interleaved gate+up)
+                    # Weight + scale pointer arrays (interleaved gate+up) — init-time only
                     gate_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
                     gate_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
                     up_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
@@ -774,44 +773,60 @@ class KimiK25MoE(nn.Module):
                     mw = {}
                     mw['B_ptrs'] = torch.cat([gate_w_ptrs, up_w_ptrs])      # [2E]
                     mw['scales_ptrs'] = torch.cat([gate_s_ptrs, up_s_ptrs])  # [2E]
-
-                    # Stride-based expert_starts: e * mtp (pre-computed, never changes)
-                    mw['expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * mtp)
-
-                    # Pre-allocate gate/up output buffers (same shape as intermediate)
-                    buf_rows = E * mtp
-                    mw['gate_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
-                    mw['up_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
-
-                    # C_ptrs: stride-based into gate_buf and up_buf
-                    bytes_per_row = N * 2  # BF16
-                    C_gate_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                    C_up_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                    gate_base = mw['gate_buf'].data_ptr()
-                    up_base = mw['up_buf'].data_ptr()
-                    for local_e in range(E):
-                        row_off = local_e * mtp
-                        C_gate_ptrs[local_e] = gate_base + row_off * bytes_per_row
-                        C_up_ptrs[local_e] = up_base + row_off * bytes_per_row
-                    mw['C_ptrs'] = torch.cat([C_gate_ptrs, C_up_ptrs])  # [2E]
-
-                    # Workspace (locks)
-                    n_tiles = N // 256
-                    mw['workspace'] = torch.zeros(
-                        2 * E * (n_tiles + 17), dtype=torch.int32, device=device)
                     mw['N'] = N
                     mw['K'] = self.config.hidden_size
 
                     self._marlin_weights = mw
                     self._use_marlin_decode = True
                     if self.rank == 0:
-                        logging.info(f"[MoE] Marlin W4A16 decode S1 initialized (E={E}, mtp={mtp})")
+                        logging.info(f"[MoE] Marlin W4A16 decode S1: weight ptrs ready (E={E}), buffers deferred to first forward")
                 except AttributeError as e:
                     logging.warning(f"[MoE] Marlin weights not found: {e}")
                     self._use_marlin_decode = False
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
+
+    def _init_marlin_buffers(self, mtp: int):
+        """Lazy init for Marlin mtp-dependent buffers (expert_starts, gate/up bufs, C_ptrs, workspace).
+
+        Called on first forward when buf is available, or when mtp changes (buffer resize).
+        Weight pointers (B_ptrs, scales_ptrs) are already set from init_grouped_wgmma.
+        """
+        mw = self._marlin_weights
+        E = self.num_persistent_local_experts
+        N = mw['N']
+        device = self.device
+
+        # Stride-based expert_starts: row offset per expert in 3D strided layout
+        mw['expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * mtp)
+
+        # Pre-allocate gate/up output buffers matching 3D stride
+        buf_rows = E * mtp
+        mw['gate_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
+        mw['up_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
+
+        # C_ptrs: stride-based into gate_buf and up_buf
+        bytes_per_row = N * 2  # BF16
+        C_gate_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+        C_up_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+        gate_base = mw['gate_buf'].data_ptr()
+        up_base = mw['up_buf'].data_ptr()
+        for local_e in range(E):
+            row_off = local_e * mtp
+            C_gate_ptrs[local_e] = gate_base + row_off * bytes_per_row
+            C_up_ptrs[local_e] = up_base + row_off * bytes_per_row
+        mw['C_ptrs'] = torch.cat([C_gate_ptrs, C_up_ptrs])  # [2E]
+
+        # Workspace (locks)
+        n_tiles = N // 256
+        mw['workspace'] = torch.zeros(
+            2 * E * (n_tiles + 17), dtype=torch.int32, device=device)
+
+        self._marlin_mtp = mtp
+        if self.rank == 0:
+            logging.info(f"[MoE] Marlin buffers initialized (E={E}, mtp={mtp}, "
+                         f"gate_buf={buf_rows}×{N}, {buf_rows * N * 2 * 2 / 1e6:.1f} MB)")
 
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -913,6 +928,9 @@ class KimiK25MoE(nn.Module):
         if getattr(self, '_use_marlin_decode', False) \
                 and buf is not None \
                 and expert_counts.max().item() <= 8:
+            # Lazy init: create mtp-dependent buffers on first call or after resize
+            if self._marlin_mtp != mtp:
+                self._init_marlin_buffers(mtp)
             # Marlin W4A16 for S1 (gate+up+SiLU) — zero-overhead path
             from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_3d_inplace
             mw = self._marlin_weights
