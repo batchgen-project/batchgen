@@ -787,36 +787,45 @@ class KimiK25MoE(nn.Module):
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
 
+    _MARLIN_COMPACT_STRIDE = 16  # max M per expert for Marlin decode (compact output)
+
     def _init_marlin_buffers(self, mtp: int):
         """Lazy init for Marlin mtp-dependent buffers (expert_starts, gate/up bufs, C_ptrs, workspace).
 
         Called on first forward when buf is available, or when mtp changes (buffer resize).
         Weight pointers (B_ptrs, scales_ptrs) are already set from init_grouped_wgmma.
+
+        Memory strategy: gate/up output buffers use compact stride (16 rows/expert)
+        instead of mtp (4096) to avoid OOM. SiLU scatters from compact → mtp-strided intermediate.
         """
         mw = self._marlin_weights
         E = self.num_persistent_local_experts
         N = mw['N']
         device = self.device
+        cs = self._MARLIN_COMPACT_STRIDE
 
-        # Stride-based expert_starts: row offset per expert in 3D strided layout
+        # expert_starts for A input: mtp stride (reads from dispatched_x)
         mw['expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * mtp)
 
-        # Pre-allocate gate/up output buffers matching 3D stride
-        buf_rows = E * mtp
-        mw['gate_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
-        mw['up_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
+        # Compact gate/up output buffers: cs rows per expert (not mtp)
+        compact_rows = E * cs
+        mw['gate_buf'] = torch.zeros(compact_rows, N, dtype=torch.bfloat16, device=device)
+        mw['up_buf'] = torch.zeros(compact_rows, N, dtype=torch.bfloat16, device=device)
 
-        # C_ptrs: stride-based into gate_buf and up_buf
+        # C_ptrs: compact stride into gate_buf and up_buf
         bytes_per_row = N * 2  # BF16
         C_gate_ptrs = torch.empty(E, dtype=torch.int64, device=device)
         C_up_ptrs = torch.empty(E, dtype=torch.int64, device=device)
         gate_base = mw['gate_buf'].data_ptr()
         up_base = mw['up_buf'].data_ptr()
         for local_e in range(E):
-            row_off = local_e * mtp
+            row_off = local_e * cs
             C_gate_ptrs[local_e] = gate_base + row_off * bytes_per_row
             C_up_ptrs[local_e] = up_base + row_off * bytes_per_row
         mw['C_ptrs'] = torch.cat([C_gate_ptrs, C_up_ptrs])  # [2E]
+
+        # C_expert_starts for kernel output: compact stride
+        mw['C_expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * cs)
 
         # Workspace (locks)
         n_tiles = N // 256
@@ -824,9 +833,11 @@ class KimiK25MoE(nn.Module):
             2 * E * (n_tiles + 17), dtype=torch.int32, device=device)
 
         self._marlin_mtp = mtp
+        compact_mb = compact_rows * N * 2 * 2 / 1e6
         if self.rank == 0:
             logging.info(f"[MoE] Marlin buffers initialized (E={E}, mtp={mtp}, "
-                         f"gate_buf={buf_rows}×{N}, {buf_rows * N * 2 * 2 / 1e6:.1f} MB)")
+                         f"compact_stride={cs}, gate_buf={compact_rows}×{N}, "
+                         f"{compact_mb:.1f} MB)")
 
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -939,6 +950,7 @@ class KimiK25MoE(nn.Module):
                 mw['expert_starts'], mw['B_ptrs'], mw['scales_ptrs'],
                 mw['C_ptrs'], mw['gate_buf'], mw['up_buf'],
                 mw['N'], mw['K'], mw['workspace'],
+                compact_stride=self._MARLIN_COMPACT_STRIDE,
             )
             _used_marlin_s1 = True
 

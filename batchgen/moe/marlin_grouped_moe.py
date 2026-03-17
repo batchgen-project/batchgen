@@ -34,6 +34,11 @@ void grouped_marlin_gemm(
     torch::Tensor workspace, int num_matrices, int n_tiles);
 
 void silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
+
+void silu_mul_scatter(
+    torch::Tensor gate, torch::Tensor up, torch::Tensor out,
+    torch::Tensor expert_counts,
+    int num_experts, int compact_stride, int output_stride, int N);
 """
 
     from torch.utils.cpp_extension import load_inline
@@ -42,7 +47,7 @@ void silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
         name="marlin_grouped_gemm",
         cpp_sources=[launcher_code],
         cuda_sources=[cuda_src],
-        functions=["grouped_marlin_gemm", "silu_mul"],
+        functions=["grouped_marlin_gemm", "silu_mul", "silu_mul_scatter"],
         extra_cuda_cflags=[
             "-O3",
             "-std=c++17",
@@ -78,21 +83,23 @@ def marlin_grouped_stage1_3d_inplace(
     N: int,
     K: int,
     workspace: torch.Tensor,
+    compact_stride: int = 16,
 ) -> None:
     """Zero-overhead Marlin S1: 2 kernel launches, zero Python loops/allocations.
 
     Args:
-        dispatched_x_3d: [E*mtp, K] BF16 — input (read via expert_starts stride)
-        intermediate_3d: [E*mtp, N] BF16 — output (SiLU result written here)
+        dispatched_x_3d: [E*mtp, K] BF16 — input (read via expert_starts with mtp stride)
+        intermediate_3d: [E*mtp, N] BF16 — output (SiLU result scattered here)
         expert_counts: [E] int32 GPU — actual tokens per expert (from dispatch, per-step)
-        expert_starts: [E] int32 GPU — row offsets (pre-computed: arange(E)*mtp, init-time)
+        expert_starts: [E] int32 GPU — A input row offsets (arange(E)*mtp, init-time)
         B_ptrs: [2E] int64 — gate+up weight pointers (init-time)
         scales_ptrs: [2E] int64 — gate+up scale pointers (init-time)
-        C_ptrs: [2E] int64 — output pointers: [gate_buf rows..., up_buf rows...] (init-time)
-        gate_buf: [E*mtp, N] BF16 — pre-allocated gate output buffer (init-time)
-        up_buf: [E*mtp, N] BF16 — pre-allocated up output buffer (init-time)
+        C_ptrs: [2E] int64 — output pointers into compact gate_buf/up_buf (init-time)
+        gate_buf: [E*compact_stride, N] BF16 — compact gate output buffer
+        up_buf: [E*compact_stride, N] BF16 — compact up output buffer
         N, K: dimensions
         workspace: [locks] int32 (init-time)
+        compact_stride: rows per expert in gate/up output (default 16)
     """
     global _warned
     if not _warned:
@@ -102,6 +109,7 @@ def marlin_grouped_stage1_3d_inplace(
     mod = _load_module()
     E = expert_counts.shape[0]
     n_tiles = N // 256
+    mtp = intermediate_3d.shape[0] // E  # output stride
 
     # Launch 1: Grouped GEMM — all 2E matrices in one kernel
     mod.grouped_marlin_gemm(
@@ -110,5 +118,8 @@ def marlin_grouped_stage1_3d_inplace(
         E, N, K, workspace, 2 * E, n_tiles,
     )
 
-    # Launch 2: SiLU element-wise on entire buffer (padding is harmless)
-    mod.silu_mul(gate_buf, up_buf, intermediate_3d)
+    # Launch 2: SiLU with scatter — compact gate/up → mtp-strided intermediate
+    mod.silu_mul_scatter(
+        gate_buf, up_buf, intermediate_3d, expert_counts,
+        E, compact_stride, mtp, N,
+    )

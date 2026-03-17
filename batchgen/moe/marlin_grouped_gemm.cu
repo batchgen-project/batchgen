@@ -504,6 +504,35 @@ __global__ void silu_mul_kernel(
   }
 }
 
+// Stride-aware SiLU: reads from compact gate/up (compact_stride per expert),
+// writes to mtp-strided output (output_stride per expert).
+__global__ void silu_mul_scatter_kernel(
+    const scalar_t* __restrict__ gate, const scalar_t* __restrict__ up,
+    scalar_t* __restrict__ out,
+    const int* __restrict__ expert_counts,
+    int num_experts, int compact_stride, int output_stride, int N)
+{
+  // Each thread handles one element: (expert, row, col)
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_compact = num_experts * compact_stride * N;
+  if (tid >= total_compact) return;
+
+  int col = tid % N;
+  int row_global = tid / N;
+  int expert = row_global / compact_stride;
+  int row_local = row_global % compact_stride;
+
+  if (expert >= num_experts) return;
+  if (row_local >= expert_counts[expert]) return;
+
+  int src_idx = expert * compact_stride * N + row_local * N + col;
+  int dst_idx = expert * output_stride * N + row_local * N + col;
+
+  float g = num2float(gate[src_idx]);
+  float u = num2float(up[src_idx]);
+  out[dst_idx] = float2num(g / (1.0f + __expf(-g)) * u);
+}
+
 // ============================================================================
 // Launchers
 // ============================================================================
@@ -543,4 +572,19 @@ void silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out)
         reinterpret_cast<const scalar_t*>(gate.data_ptr()),
         reinterpret_cast<const scalar_t*>(up.data_ptr()),
         reinterpret_cast<scalar_t*>(out.data_ptr()), n);
+}
+
+void silu_mul_scatter(
+    torch::Tensor gate, torch::Tensor up, torch::Tensor out,
+    torch::Tensor expert_counts,
+    int num_experts, int compact_stride, int output_stride, int N)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int total = num_experts * compact_stride * N;
+    silu_mul_scatter_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<const scalar_t*>(gate.data_ptr()),
+        reinterpret_cast<const scalar_t*>(up.data_ptr()),
+        reinterpret_cast<scalar_t*>(out.data_ptr()),
+        expert_counts.data_ptr<int>(),
+        num_experts, compact_stride, output_stride, N);
 }
