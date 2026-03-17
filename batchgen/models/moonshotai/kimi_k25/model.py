@@ -936,6 +936,13 @@ class KimiK25MoE(nn.Module):
         mtp = buf.max_tokens_padded if buf is not None else 0
 
         _used_marlin_s1 = False
+
+        # Compute max_m_tiles for WGMMA (used by both S1 fallback and S2)
+        if buf is not None:
+            avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
+            max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
+            max_m_tiles = max(max_m_tiles, 1)
+
         if getattr(self, '_use_marlin_decode', False) \
                 and buf is not None \
                 and expert_counts.max().item() <= 8:
@@ -945,20 +952,60 @@ class KimiK25MoE(nn.Module):
             # Marlin W4A16 for S1 (gate+up+SiLU) — zero-overhead path
             from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_3d_inplace
             mw = self._marlin_weights
-            marlin_grouped_stage1_3d_inplace(
-                buf.dispatched_x, buf.intermediate, expert_counts,
-                mw['expert_starts'], mw['B_ptrs'], mw['scales_ptrs'],
-                mw['C_ptrs'], mw['gate_buf'], mw['up_buf'],
-                mw['N'], mw['K'], mw['workspace'],
-                compact_stride=self._MARLIN_COMPACT_STRIDE,
-            )
-            _used_marlin_s1 = True
 
-        # Compute max_m_tiles for WGMMA (used by both S1 fallback and S2)
-        if buf is not None:
-            avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
-            max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
-            max_m_tiles = max(max_m_tiles, 1)
+            # --- DIAGNOSTIC: compare Marlin vs WGMMA S1 for first 5 steps on rank 0 ---
+            if not hasattr(self, '_marlin_diag_count'):
+                self._marlin_diag_count = 0
+            if self._marlin_diag_count < 5 and self.rank == 0 \
+                    and mod is not None and buf.tma_dispatched is not None:
+                # Save WGMMA S1 result
+                wgmma_intermediate = buf.intermediate.clone()
+                mod.grouped_int4_moe_stage1_inplace(
+                    buf.dispatched_x, wgmma_intermediate, buf.tma_dispatched,
+                    expert_counts,
+                    w["_ptr_gate"], w["_ptr_gate_scale"],
+                    w["_ptr_up"], w["_ptr_up_scale"],
+                    buf.empty_bias, buf.empty_bias,
+                    N, K // 2, K // 32, max_m_tiles, mtp,
+                )
+                # Run Marlin S1
+                marlin_grouped_stage1_3d_inplace(
+                    buf.dispatched_x, buf.intermediate, expert_counts,
+                    mw['expert_starts'], mw['B_ptrs'], mw['scales_ptrs'],
+                    mw['C_ptrs'], mw['gate_buf'], mw['up_buf'],
+                    mw['N'], mw['K'], mw['workspace'],
+                    compact_stride=self._MARLIN_COMPACT_STRIDE,
+                )
+                # Compare per-expert
+                torch.cuda.synchronize()
+                ec = expert_counts.cpu().tolist()
+                for e_idx in range(min(4, len(ec))):
+                    cnt = ec[e_idx]
+                    if cnt <= 0:
+                        continue
+                    s = e_idx * mtp
+                    wg_slice = wgmma_intermediate[s:s+cnt].float()
+                    ml_slice = buf.intermediate[s:s+cnt].float()
+                    cos = torch.nn.functional.cosine_similarity(
+                        wg_slice.flatten().unsqueeze(0),
+                        ml_slice.flatten().unsqueeze(0)).item()
+                    wg_norm = wg_slice.norm().item()
+                    ml_norm = ml_slice.norm().item()
+                    logging.info(
+                        f"[DIAG] step={self._marlin_diag_count} expert={e_idx} cnt={cnt} "
+                        f"cos_sim={cos:.6f} wgmma_norm={wg_norm:.4f} marlin_norm={ml_norm:.4f}")
+                self._marlin_diag_count += 1
+                _used_marlin_s1 = True
+            else:
+                # Normal Marlin path (no diagnostic)
+                marlin_grouped_stage1_3d_inplace(
+                    buf.dispatched_x, buf.intermediate, expert_counts,
+                    mw['expert_starts'], mw['B_ptrs'], mw['scales_ptrs'],
+                    mw['C_ptrs'], mw['gate_buf'], mw['up_buf'],
+                    mw['N'], mw['K'], mw['workspace'],
+                    compact_stride=self._MARLIN_COMPACT_STRIDE,
+                )
+                _used_marlin_s1 = True
 
         if not _used_marlin_s1 \
                 and getattr(self, '_use_grouped_wgmma', False) \
