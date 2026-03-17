@@ -202,7 +202,8 @@ __global__ void MarlinSimple(
     const int4* const* __restrict__ B_ptrs,
     int4* const* __restrict__ C_ptrs,
     const int4* const* __restrict__ scales_ptrs,
-    const int* __restrict__ expert_offsets,
+    const int* __restrict__ expert_starts,     // [E] row offset per expert (stride-based)
+    const int* __restrict__ expert_counts,     // [E] actual token count per expert
     int num_experts,
     int prob_n, int prob_k, int lda,
     int n_tiles_per_expert)
@@ -212,9 +213,9 @@ __global__ void MarlinSimple(
   int tile_idx = blockIdx.x % n_tiles_per_expert;
   int expert_idx = matrix_idx % num_experts;
 
-  int token_start = expert_offsets[expert_idx];
-  int prob_m = expert_offsets[expert_idx + 1] - token_start;
+  int prob_m = expert_counts[expert_idx];
   if (prob_m <= 0) return;
+  int token_start = expert_starts[expert_idx];
 
   const int4* A_ptr = A + token_start * (lda / 8);
   const int4* B = B_ptrs[matrix_idx];
@@ -512,18 +513,14 @@ __global__ void silu_mul_kernel(
 
 void grouped_marlin_gemm(
     torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
-    torch::Tensor scales_ptrs, torch::Tensor expert_offsets,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
     int num_experts, int prob_n, int prob_k,
-    torch::Tensor workspace, int num_matrices, int n_tiles,
-    bool use_atomic_add, bool use_fp32_reduce)
+    torch::Tensor workspace, int num_matrices, int n_tiles)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Exact SMEM calculation: max(sh_red_size, sh_b_size) + sh_s_size + STAGES*a_sh_stage
-    // = max(528, 4096) + 128 + 4*128 = 4096 + 128 + 512 = 4736 int4 elements
-    // = 4736 * 16 bytes = 75776 bytes
-    // Round up to next 1KB boundary for alignment
-    constexpr int smem_bytes = ((4736 * 16) + 1023) / 1024 * 1024;  // 76800 bytes = 75KB
+    constexpr int smem_bytes = ((4736 * 16) + 1023) / 1024 * 1024;  // 76800 bytes
     cudaFuncSetAttribute((void*)MarlinSimple, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
     int total_ctas = n_tiles * num_matrices;
@@ -532,7 +529,8 @@ void grouped_marlin_gemm(
         reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
         reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
         reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
-        expert_offsets.data_ptr<int>(),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
         num_experts, prob_n, prob_k, prob_k,
         n_tiles);
 }

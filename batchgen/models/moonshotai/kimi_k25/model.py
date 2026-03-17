@@ -749,33 +749,65 @@ class KimiK25MoE(nn.Module):
             self._wgmma_mod = _load_int4_grouped_module()
             self._use_grouped_wgmma = True
 
-            # Marlin W4A16 decode S1: build pointer arrays if weights available
+            # Marlin W4A16 decode S1: pre-compute ALL pointer arrays and buffers
             self._use_marlin_decode = False
             if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
                 try:
-                    marlin_weights = {}
-                    for prefix in ('gate', 'up'):  # S1 only, S2 stays WGMMA
-                        mw_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                        ms_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                        for local_e in range(E):
-                            global_e = self.routed_expert_start_idx + local_e
-                            wrapper = self.experts[global_e]
-                            module = wrapper.module if hasattr(wrapper, 'module') else wrapper
-                            mw_ptrs[local_e] = getattr(module, f'marlin_{prefix}_qw').data_ptr()
-                            ms_ptrs[local_e] = getattr(module, f'marlin_{prefix}_scale').data_ptr()
-                        marlin_weights[f'_ptr_marlin_{prefix}'] = mw_ptrs
-                        marlin_weights[f'_ptr_marlin_{prefix}_scale'] = ms_ptrs
-
                     N = self.moe_intermediate_size
+                    buf = self.__class__._buf
+                    mtp = buf.max_tokens_padded if buf is not None else 64
+
+                    # Weight + scale pointer arrays (interleaved gate+up)
+                    gate_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    gate_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    up_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    up_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    for local_e in range(E):
+                        global_e = self.routed_expert_start_idx + local_e
+                        wrapper = self.experts[global_e]
+                        module = wrapper.module if hasattr(wrapper, 'module') else wrapper
+                        gate_w_ptrs[local_e] = module.marlin_gate_qw.data_ptr()
+                        gate_s_ptrs[local_e] = module.marlin_gate_scale.data_ptr()
+                        up_w_ptrs[local_e] = module.marlin_up_qw.data_ptr()
+                        up_s_ptrs[local_e] = module.marlin_up_scale.data_ptr()
+
+                    mw = {}
+                    mw['B_ptrs'] = torch.cat([gate_w_ptrs, up_w_ptrs])      # [2E]
+                    mw['scales_ptrs'] = torch.cat([gate_s_ptrs, up_s_ptrs])  # [2E]
+
+                    # Stride-based expert_starts: e * mtp (pre-computed, never changes)
+                    mw['expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * mtp)
+
+                    # Pre-allocate gate/up output buffers (same shape as intermediate)
+                    buf_rows = E * mtp
+                    mw['gate_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
+                    mw['up_buf'] = torch.zeros(buf_rows, N, dtype=torch.bfloat16, device=device)
+
+                    # C_ptrs: stride-based into gate_buf and up_buf
+                    bytes_per_row = N * 2  # BF16
+                    C_gate_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    C_up_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    gate_base = mw['gate_buf'].data_ptr()
+                    up_base = mw['up_buf'].data_ptr()
+                    for local_e in range(E):
+                        row_off = local_e * mtp
+                        C_gate_ptrs[local_e] = gate_base + row_off * bytes_per_row
+                        C_up_ptrs[local_e] = up_base + row_off * bytes_per_row
+                    mw['C_ptrs'] = torch.cat([C_gate_ptrs, C_up_ptrs])  # [2E]
+
+                    # Workspace (locks)
                     n_tiles = N // 256
-                    marlin_weights['_marlin_workspace'] = torch.zeros(
+                    mw['workspace'] = torch.zeros(
                         2 * E * (n_tiles + 17), dtype=torch.int32, device=device)
-                    self._marlin_weights = marlin_weights
+                    mw['N'] = N
+                    mw['K'] = self.config.hidden_size
+
+                    self._marlin_weights = mw
                     self._use_marlin_decode = True
                     if self.rank == 0:
-                        logging.info("[MoE] Marlin W4A16 decode S1 initialized")
-                except AttributeError:
-                    logging.warning("[MoE] Marlin weights not found on experts, disabling Marlin decode")
+                        logging.info(f"[MoE] Marlin W4A16 decode S1 initialized (E={E}, mtp={mtp})")
+                except AttributeError as e:
+                    logging.warning(f"[MoE] Marlin weights not found: {e}")
                     self._use_marlin_decode = False
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
@@ -881,15 +913,14 @@ class KimiK25MoE(nn.Module):
         if getattr(self, '_use_marlin_decode', False) \
                 and buf is not None \
                 and expert_counts.max().item() <= 8:
-            # Marlin W4A16 for S1 (gate+up+SiLU) — decode M<=8
-            from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_from_3d
+            # Marlin W4A16 for S1 (gate+up+SiLU) — zero-overhead path
+            from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_3d_inplace
             mw = self._marlin_weights
-            marlin_grouped_stage1_from_3d(
-                buf.dispatched_x, expert_counts, buf.max_tokens_padded,
-                mw["_ptr_marlin_gate"], mw["_ptr_marlin_gate_scale"],
-                mw["_ptr_marlin_up"], mw["_ptr_marlin_up_scale"],
-                N, K, mw["_marlin_workspace"],
-                intermediate_3d=buf.intermediate,
+            marlin_grouped_stage1_3d_inplace(
+                buf.dispatched_x, buf.intermediate, expert_counts,
+                mw['expert_starts'], mw['B_ptrs'], mw['scales_ptrs'],
+                mw['C_ptrs'], mw['gate_buf'], mw['up_buf'],
+                mw['N'], mw['K'], mw['workspace'],
             )
             _used_marlin_s1 = True
 
