@@ -502,6 +502,10 @@ class KimiK25ParallelStrategyManager:
         self._move_int4_to_gpu_contiguous()
         _log_hbm("_move_int4_to_gpu_contiguous")
 
+        # Optional: convert INT4 → Marlin format for decode S1 (BATCHGEN_MARLIN_DECODE=1)
+        self._register_marlin_weights()
+        _log_hbm("_register_marlin_weights")
+
         # Initialize grouped WGMMA for persistent experts (after INT4 weights on GPU)
         for layer_idx in range(
             self.loaded_model_config.first_k_dense_replace,
@@ -953,6 +957,42 @@ class KimiK25ParallelStrategyManager:
         self._int4_scale_gpu_buf = scale_gpu_buf
 
         logging.debug(f"INT4 weights moved to GPU contiguously for {len(self.local_routed_experts)} experts")
+
+    def _register_marlin_weights(self):
+        """Convert GPU INT4 weights → Marlin format for decode S1.
+
+        Called after _move_int4_to_gpu_contiguous() so INT4 data is on GPU.
+        Only converts gate + up (S1). Down projection stays INT4 WGMMA.
+        """
+        import os
+        if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") != "1":
+            return
+
+        from batchgen.moe.marlin_weight_prep import convert_int4_to_marlin
+        device = self.engine_config.Basic_Config.device_torch
+
+        count = 0
+        for routed_expert_idx in self.local_routed_experts:
+            layer_idx = int(routed_expert_idx.split("_")[2])
+            global_expert_idx = int(routed_expert_idx.split("_")[3])
+            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
+            module = expert.module if hasattr(expert, 'module') else expert
+
+            K = module.int4_gate_packed.shape[1] * 8  # K//8 → K
+            N = module.int4_gate_packed.shape[0]
+
+            for proj in ('gate', 'up'):  # S1 only
+                packed = getattr(module, f'int4_{proj}_packed')
+                scale = getattr(module, f'int4_{proj}_scale')
+                marlin_qw, marlin_s = convert_int4_to_marlin(
+                    packed, scale, K, N, marlin_group_size=128)
+                setattr(module, f'marlin_{proj}_qw', marlin_qw)
+                setattr(module, f'marlin_{proj}_scale', marlin_s)
+            count += 1
+
+        if self.rank == 0:
+            logging.info(
+                f"[MODEL] Marlin weights registered for {count} experts (gate+up S1, gs=128)")
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, router) to model.

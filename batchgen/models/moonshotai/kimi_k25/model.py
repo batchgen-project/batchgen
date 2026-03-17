@@ -748,6 +748,35 @@ class KimiK25MoE(nn.Module):
             self._moe_weights = weights
             self._wgmma_mod = _load_int4_grouped_module()
             self._use_grouped_wgmma = True
+
+            # Marlin W4A16 decode S1: build pointer arrays if weights available
+            self._use_marlin_decode = False
+            if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
+                try:
+                    marlin_weights = {}
+                    for prefix in ('gate', 'up'):  # S1 only, S2 stays WGMMA
+                        mw_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                        ms_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                        for local_e in range(E):
+                            global_e = self.routed_expert_start_idx + local_e
+                            wrapper = self.experts[global_e]
+                            module = wrapper.module if hasattr(wrapper, 'module') else wrapper
+                            mw_ptrs[local_e] = getattr(module, f'marlin_{prefix}_qw').data_ptr()
+                            ms_ptrs[local_e] = getattr(module, f'marlin_{prefix}_scale').data_ptr()
+                        marlin_weights[f'_ptr_marlin_{prefix}'] = mw_ptrs
+                        marlin_weights[f'_ptr_marlin_{prefix}_scale'] = ms_ptrs
+
+                    N = self.moe_intermediate_size
+                    n_tiles = N // 256
+                    marlin_weights['_marlin_workspace'] = torch.zeros(
+                        2 * E * (n_tiles + 17), dtype=torch.int32, device=device)
+                    self._marlin_weights = marlin_weights
+                    self._use_marlin_decode = True
+                    if self.rank == 0:
+                        logging.info("[MoE] Marlin W4A16 decode S1 initialized")
+                except AttributeError:
+                    logging.warning("[MoE] Marlin weights not found on experts, disabling Marlin decode")
+                    self._use_marlin_decode = False
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
@@ -843,8 +872,26 @@ class KimiK25MoE(nn.Module):
             ev[3].record()  # after dispatch, before wgmma_s1
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
-        if getattr(self, '_use_grouped_wgmma', False) \
+        _used_marlin_s1 = False
+        if getattr(self, '_use_marlin_decode', False) \
+                and buf is not None \
+                and expert_counts.max().item() <= 8:
+            # Marlin W4A16 for S1 (gate+up+SiLU) — decode M<=8
+            from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_from_3d
+            mw = self._marlin_weights
+            marlin_grouped_stage1_from_3d(
+                buf.dispatched_x, expert_counts, buf.max_tokens_padded,
+                mw["_ptr_marlin_gate"], mw["_ptr_marlin_gate_scale"],
+                mw["_ptr_marlin_up"], mw["_ptr_marlin_up_scale"],
+                N, K, mw["_marlin_workspace"],
+                intermediate_3d=buf.intermediate,
+            )
+            _used_marlin_s1 = True
+
+        if not _used_marlin_s1 \
+                and getattr(self, '_use_grouped_wgmma', False) \
                 and buf is not None and buf.tma_dispatched is not None:
+            # Fallback: INT4 WGMMA S1 (prefill or M>8)
             mod = self._wgmma_mod
             w = self._moe_weights
             mtp = buf.max_tokens_padded

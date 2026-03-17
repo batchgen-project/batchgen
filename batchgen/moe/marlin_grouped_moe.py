@@ -86,13 +86,13 @@ def marlin_grouped_stage1(
 ) -> torch.Tensor:
     """Marlin grouped Stage 1: gate + up + SiLU for M<=8 decode.
 
+    Accepts flat contiguous sorted activations with cumulative expert_offsets.
+
     Args:
-        sorted_hidden: [total_dispatched, K] BF16 sorted activations
+        sorted_hidden: [total_dispatched, K] BF16 sorted activations (contiguous)
         expert_offsets: [num_experts+1] int32 cumulative token offsets
-        gate_marlin_ptrs: [E] int64 device pointers to Marlin gate weights
-        gate_scale_ptrs: [E] int64 device pointers to Marlin gate scales
-        up_marlin_ptrs: [E] int64 device pointers to Marlin up weights
-        up_scale_ptrs: [E] int64 device pointers to Marlin up scales
+        gate/up_marlin_ptrs: [E] int64 device pointers to Marlin weights
+        gate/up_scale_ptrs: [E] int64 device pointers to Marlin scales
         N: intermediate_size (output width per expert)
         K: hidden_size (input width)
         workspace: pre-allocated int32 lock buffer
@@ -142,3 +142,78 @@ def marlin_grouped_stage1(
     mod.silu_mul(C_gate, C_up, silu_out)
 
     return silu_out
+
+
+def marlin_grouped_stage1_from_3d(
+    dispatched_x_3d: torch.Tensor,
+    expert_counts: torch.Tensor,
+    mtp: int,
+    gate_marlin_ptrs: torch.Tensor,
+    gate_scale_ptrs: torch.Tensor,
+    up_marlin_ptrs: torch.Tensor,
+    up_scale_ptrs: torch.Tensor,
+    N: int,
+    K: int,
+    workspace: torch.Tensor,
+    intermediate_3d: torch.Tensor = None,
+) -> torch.Tensor:
+    """Marlin grouped Stage 1 from 3D strided buffer layout.
+
+    Handles the 3D strided → flat contiguous conversion for compatibility
+    with the production WGMMA dispatch path. Copy overhead ~1us for decode.
+
+    Args:
+        dispatched_x_3d: [E*mtp, K] BF16 3D strided buffer
+        expert_counts: [E] int32 tokens per expert
+        mtp: max_tokens_padded (stride between expert slabs)
+        intermediate_3d: [E*mtp, N] BF16 output buffer to write into (optional)
+            If provided, writes Marlin output back into 3D strided format for S2.
+        (other args same as marlin_grouped_stage1)
+
+    Returns:
+        If intermediate_3d is provided: intermediate_3d (modified in-place)
+        Otherwise: [total_dispatched, N] flat BF16 intermediate
+    """
+    E = expert_counts.shape[0]
+    device = dispatched_x_3d.device
+    dtype = dispatched_x_3d.dtype
+
+    # Build cumulative offsets and copy valid tokens to flat buffer
+    total_tokens = expert_counts.sum().item()
+    if total_tokens == 0:
+        if intermediate_3d is not None:
+            return intermediate_3d
+        return torch.empty(0, N, dtype=dtype, device=device)
+
+    flat_hidden = torch.empty(total_tokens, K, dtype=dtype, device=device)
+    expert_offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+
+    offset = 0
+    for e in range(E):
+        cnt = expert_counts[e].item()
+        if cnt > 0:
+            src_start = e * mtp
+            flat_hidden[offset:offset + cnt] = dispatched_x_3d[src_start:src_start + cnt]
+        expert_offsets[e + 1] = offset + cnt
+        offset += cnt
+
+    # Run Marlin on flat data
+    flat_intermediate = marlin_grouped_stage1(
+        flat_hidden, expert_offsets,
+        gate_marlin_ptrs, gate_scale_ptrs,
+        up_marlin_ptrs, up_scale_ptrs,
+        N, K, workspace,
+    )
+
+    # Copy results back to 3D strided format if needed
+    if intermediate_3d is not None:
+        offset = 0
+        for e in range(E):
+            cnt = expert_counts[e].item()
+            if cnt > 0:
+                dst_start = e * mtp
+                intermediate_3d[dst_start:dst_start + cnt] = flat_intermediate[offset:offset + cnt]
+            offset += cnt
+        return intermediate_3d
+
+    return flat_intermediate
