@@ -669,6 +669,202 @@ def test_m16_s1_fused():
     print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
 
 
+def test_s3_down_projection():
+    """Test S3: down projection via MarlinGrouped_M16 with swapped dims.
+
+    S3: prob_k=2048 (input/reduction), prob_n=7168 (output).
+    K=2048 must be multiple of 128 (TK*16): 2048/128=16 ✓
+    N=7168 must be multiple of 256 (TN*16): 7168/256=28 ✓
+    """
+    E = 4
+    K_in = 2048   # input dimension (N from model perspective)
+    N_out = 7168  # output dimension (K from model perspective)
+    device = "cuda"
+    M_values = [1, 4, 8, 16, 32, 64, 128]
+
+    print(f"\n=== Test S3 Down Projection: E={E} K_in={K_in} N_out={N_out} ===\n")
+
+    from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+    from batchgen.moe.marlin_grouped_moe import _load_module
+
+    mod = _load_module()
+    n_tiles = N_out // 256  # 28
+
+    # Create down projection weights: [N_out, K_in] = [7168, 2048]
+    print("Creating + repacking down weights...", end=" ", flush=True)
+    down_qw, down_s, down_refs = [], [], []
+    for e in range(E):
+        packed, scales, w_ref = create_k25_int4_weights(K_in, N_out, device=device)
+        qw, ms = repack_int4_to_marlin_gs32(packed, scales, K_in, N_out)
+        down_qw.append(qw)
+        down_s.append(ms)
+        down_refs.append(w_ref)  # [K_in, N_out] BF16
+    print("done")
+
+    B_ptrs = torch.tensor([w.data_ptr() for w in down_qw], dtype=torch.int64, device=device)
+    scales_ptrs = torch.tensor([s.data_ptr() for s in down_s], dtype=torch.int64, device=device)
+
+    workspace = torch.zeros(E * (n_tiles + 17), dtype=torch.int32, device=device)
+    all_pass = True
+
+    for M in M_values:
+        mtp = M
+        max_m_tiles = (M + 15) // 16
+
+        # Input: [E*mtp, K_in] (intermediate from S2 SiLU)
+        A = torch.randn((E * mtp, K_in), dtype=torch.bfloat16, device=device) * 0.1
+        expert_starts = torch.arange(E, dtype=torch.int32, device=device) * mtp
+        expert_counts = torch.full((E,), M, dtype=torch.int32, device=device)
+
+        # Output: [E*mtp, N_out]
+        expert_out = torch.zeros(E * mtp, N_out, dtype=torch.bfloat16, device=device)
+
+        bytes_per_row = N_out * 2
+        C_ptrs = torch.tensor(
+            [expert_out.data_ptr() + e * mtp * bytes_per_row for e in range(E)],
+            dtype=torch.int64, device=device)
+
+        # Run S3
+        mod.grouped_marlin_gemm_m16(
+            A, B_ptrs, C_ptrs, scales_ptrs,
+            expert_starts, expert_counts,
+            E, N_out, K_in, workspace, E, n_tiles, max_m_tiles)
+        torch.cuda.synchronize()
+
+        # Validate
+        max_cd = 0
+        for e in range(E):
+            a_e = A[e * mtp: e * mtp + M]
+            ref = torch.mm(a_e, down_refs[e])  # [M, N_out]
+            out_e = expert_out[e * mtp: e * mtp + M]
+            cd = calc_diff(out_e, ref)
+            max_cd = max(max_cd, cd)
+
+        status = "PASS" if max_cd < 1e-3 else "FAIL"
+        if max_cd >= 1e-3:
+            all_pass = False
+        print(f"  M={M:4d} max_m_tiles={max_m_tiles:3d} max_calc_diff={max_cd:.2e} [{status}]")
+
+    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+
+
+def test_3stage_e2e():
+    """Test full 3-stage pipeline: GEMM(gate+up) → SiLU → GEMM(down)."""
+    E, K, N = 4, 7168, 2048
+    M = 4
+    mtp = M
+    max_m_tiles = (M + 15) // 16
+    device = "cuda"
+
+    print(f"\n=== Test 3-Stage E2E: E={E} M={M} K={K} N={N} ===\n")
+
+    from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+    from batchgen.moe.marlin_grouped_moe import _load_module
+
+    mod = _load_module()
+
+    # Create gate, up, down weights
+    print("Creating + repacking all weights...", end=" ", flush=True)
+    gate_qw, gate_s, gate_refs = [], [], []
+    up_qw, up_s, up_refs = [], [], []
+    down_qw, down_s, down_refs = [], [], []
+
+    for e in range(E):
+        # Gate: [K, N] = [7168, 2048]
+        gp, gs, gr = create_k25_int4_weights(K, N, device=device)
+        gqw, gms = repack_int4_to_marlin_gs32(gp, gs, K, N)
+        gate_qw.append(gqw); gate_s.append(gms); gate_refs.append(gr)
+
+        # Up: [K, N] = [7168, 2048]
+        up_, us_, ur_ = create_k25_int4_weights(K, N, device=device)
+        uqw, ums = repack_int4_to_marlin_gs32(up_, us_, K, N)
+        up_qw.append(uqw); up_s.append(ums); up_refs.append(ur_)
+
+        # Down: [N, K] = [2048, 7168] (input=N, output=K)
+        dp, ds, dr = create_k25_int4_weights(N, K, device=device)
+        dqw, dms = repack_int4_to_marlin_gs32(dp, ds, N, K)
+        down_qw.append(dqw); down_s.append(dms); down_refs.append(dr)
+    print("done")
+
+    # S1 pointer arrays [2E]
+    s1_B_ptrs = torch.tensor(
+        [w.data_ptr() for w in gate_qw] + [w.data_ptr() for w in up_qw],
+        dtype=torch.int64, device=device)
+    s1_scales_ptrs = torch.tensor(
+        [s.data_ptr() for s in gate_s] + [s.data_ptr() for s in up_s],
+        dtype=torch.int64, device=device)
+
+    # S3 pointer arrays [E]
+    s3_B_ptrs = torch.tensor([w.data_ptr() for w in down_qw], dtype=torch.int64, device=device)
+    s3_scales_ptrs = torch.tensor([s.data_ptr() for s in down_s], dtype=torch.int64, device=device)
+
+    # Buffers
+    A = torch.randn((E * mtp, K), dtype=torch.bfloat16, device=device) * 0.1
+    expert_starts = torch.arange(E, dtype=torch.int32, device=device) * mtp
+    expert_counts = torch.full((E,), M, dtype=torch.int32, device=device)
+
+    gate_buf = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+    up_buf = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+    intermediate = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+    expert_out = torch.zeros(E * mtp, K, dtype=torch.bfloat16, device=device)
+
+    bytes_per_row_N = N * 2
+    bytes_per_row_K = K * 2
+    s1_C_ptrs = torch.tensor(
+        [gate_buf.data_ptr() + e * mtp * bytes_per_row_N for e in range(E)]
+        + [up_buf.data_ptr() + e * mtp * bytes_per_row_N for e in range(E)],
+        dtype=torch.int64, device=device)
+    s3_C_ptrs = torch.tensor(
+        [expert_out.data_ptr() + e * mtp * bytes_per_row_K for e in range(E)],
+        dtype=torch.int64, device=device)
+
+    n_tiles_s1 = N // 256
+    n_tiles_s3 = K // 256
+    s1_workspace = torch.zeros(2 * E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
+    s3_workspace = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
+
+    # Run 3-stage pipeline
+    print("Running 3-stage pipeline...", end=" ", flush=True)
+
+    # Stage 1: gate+up GEMM
+    mod.grouped_marlin_gemm_m16(
+        A, s1_B_ptrs, s1_C_ptrs, s1_scales_ptrs,
+        expert_starts, expert_counts,
+        E, N, K, s1_workspace, 2 * E, n_tiles_s1, max_m_tiles)
+
+    # Stage 2: SiLU
+    mod.silu_mul(gate_buf, up_buf, intermediate)
+
+    # Stage 3: down GEMM
+    mod.grouped_marlin_gemm_m16(
+        intermediate, s3_B_ptrs, s3_C_ptrs, s3_scales_ptrs,
+        expert_starts, expert_counts,
+        E, K, N, s3_workspace, E, n_tiles_s3, max_m_tiles)
+
+    torch.cuda.synchronize()
+    print("done")
+
+    # Validate
+    print("\nValidation per-expert:")
+    all_pass = True
+    for e in range(E):
+        a_e = A[e * mtp: e * mtp + M]
+        ref_gate = torch.mm(a_e, gate_refs[e])
+        ref_up = torch.mm(a_e, up_refs[e])
+        ref_silu = torch.nn.functional.silu(ref_gate.float()) * ref_up.float()
+        ref_intermediate = ref_silu.bfloat16()
+        ref_out = torch.mm(ref_intermediate, down_refs[e])
+
+        out_e = expert_out[e * mtp: e * mtp + M]
+        cd = calc_diff(out_e, ref_out)
+        status = "PASS" if cd < 1e-3 else "FAIL"
+        if cd >= 1e-3:
+            all_pass = False
+        print(f"  E{e} calc_diff={cd:.2e} [{status}]")
+
+    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+
+
 def main():
     import sys
     test_name = sys.argv[1] if len(sys.argv) > 1 else "all"
@@ -680,6 +876,8 @@ def main():
         "m16_variable": test_m16_variable_experts,
         "m16_edge": test_m16_edge_cases,
         "s1_fused": test_m16_s1_fused,
+        "s3_down": test_s3_down_projection,
+        "e2e_3stage": test_3stage_e2e,
     }
 
     if test_name == "all":
