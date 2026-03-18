@@ -752,6 +752,8 @@ class KimiK25MoE(nn.Module):
             # Marlin W4A16 decode S1: weight pointers only (mtp-dependent buffers deferred)
             self._use_marlin_decode = False
             self._marlin_mtp = 0  # track current mtp for lazy re-init
+            self._marlin_compact_stride = 0
+            self._marlin_intermediate_ptr = 0
             if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
                 try:
                     N = self.moe_intermediate_size
@@ -787,45 +789,39 @@ class KimiK25MoE(nn.Module):
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
 
-    _MARLIN_COMPACT_STRIDE = 16  # max M per expert for Marlin decode (compact output)
+    _MARLIN_M16_CUTOFF = 32  # use M16 Marlin for avg_per_expert <= 32, WGMMA above
 
-    def _init_marlin_buffers(self, mtp: int):
-        """Lazy init for Marlin mtp-dependent buffers (expert_starts, gate/up bufs, C_ptrs, workspace).
+    def _init_marlin_buffers(self, mtp: int, compact_stride: int, intermediate: torch.Tensor):
+        """Lazy init for Marlin M16 unified path buffers.
 
-        Called on first forward when buf is available, or when mtp changes (buffer resize).
-        Weight pointers (B_ptrs, scales_ptrs) are already set from init_grouped_wgmma.
+        Called on first forward, when mtp changes, compact_stride grows,
+        or intermediate buffer pointer changes.
 
-        Memory strategy: gate/up output buffers use compact stride (16 rows/expert)
-        instead of mtp (4096) to avoid OOM. SiLU scatters from compact → mtp-strided intermediate.
+        Memory strategy:
+        - Gate output writes directly to intermediate (mtp stride, zero extra alloc)
+        - Up output writes to compact up_buf (compact_stride, dynamic size)
+        - Dual-stride SiLU fuses: intermediate = SiLU(gate) * up
         """
         mw = self._marlin_weights
         E = self.num_persistent_local_experts
         N = mw['N']
         device = self.device
-        cs = self._MARLIN_COMPACT_STRIDE
 
         # expert_starts for A input: mtp stride (reads from dispatched_x)
         mw['expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * mtp)
 
-        # Compact gate/up output buffers: cs rows per expert (not mtp)
-        compact_rows = E * cs
-        mw['gate_buf'] = torch.zeros(compact_rows, N, dtype=torch.bfloat16, device=device)
-        mw['up_buf'] = torch.zeros(compact_rows, N, dtype=torch.bfloat16, device=device)
+        # Up buffer: compact stride (dynamic, grows with batch size)
+        mw['up_buf'] = torch.zeros(E * compact_stride, N, dtype=torch.bfloat16, device=device)
 
-        # C_ptrs: compact stride into gate_buf and up_buf
+        # C_ptrs: gate → intermediate (mtp stride), up → up_buf (compact stride)
         bytes_per_row = N * 2  # BF16
-        C_gate_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-        C_up_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-        gate_base = mw['gate_buf'].data_ptr()
-        up_base = mw['up_buf'].data_ptr()
-        for local_e in range(E):
-            row_off = local_e * cs
-            C_gate_ptrs[local_e] = gate_base + row_off * bytes_per_row
-            C_up_ptrs[local_e] = up_base + row_off * bytes_per_row
-        mw['C_ptrs'] = torch.cat([C_gate_ptrs, C_up_ptrs])  # [2E]
-
-        # C_expert_starts for kernel output: compact stride
-        mw['C_expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * cs)
+        gate_C_ptrs = torch.tensor(
+            [intermediate.data_ptr() + e * mtp * bytes_per_row for e in range(E)],
+            dtype=torch.int64, device=device)
+        up_C_ptrs = torch.tensor(
+            [mw['up_buf'].data_ptr() + e * compact_stride * bytes_per_row for e in range(E)],
+            dtype=torch.int64, device=device)
+        mw['C_ptrs'] = torch.cat([gate_C_ptrs, up_C_ptrs])  # [2E]
 
         # Workspace (locks)
         n_tiles = N // 256
@@ -833,11 +829,12 @@ class KimiK25MoE(nn.Module):
             2 * E * (n_tiles + 17), dtype=torch.int32, device=device)
 
         self._marlin_mtp = mtp
-        compact_mb = compact_rows * N * 2 * 2 / 1e6
+        self._marlin_compact_stride = compact_stride
+        self._marlin_intermediate_ptr = intermediate.data_ptr()
+        up_mb = E * compact_stride * N * 2 / 1e6
         if self.rank == 0:
-            logging.info(f"[MoE] Marlin buffers initialized (E={E}, mtp={mtp}, "
-                         f"compact_stride={cs}, gate_buf={compact_rows}×{N}, "
-                         f"{compact_mb:.1f} MB)")
+            logging.info(f"[MoE] Marlin M16 buffers initialized (E={E}, mtp={mtp}, "
+                         f"compact_stride={compact_stride}, up_buf={up_mb:.1f} MB)")
 
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -943,30 +940,37 @@ class KimiK25MoE(nn.Module):
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
-        if getattr(self, '_use_marlin_decode', False) \
-                and buf is not None \
-                and expert_counts.max().item() <= 8:
-            # Lazy init: create mtp-dependent buffers on first call or after resize
-            if self._marlin_mtp != mtp:
-                self._init_marlin_buffers(mtp)
-            # Marlin W4A16 for S1 (gate+up+SiLU) — zero-overhead path
-            buf.intermediate.zero_()  # prevent stale padding for S2 WGMMA
-            from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_3d_inplace
-            mw = self._marlin_weights
-            marlin_grouped_stage1_3d_inplace(
-                buf.dispatched_x, buf.intermediate, expert_counts,
-                mw['expert_starts'], mw['B_ptrs'], mw['scales_ptrs'],
-                mw['C_ptrs'], mw['gate_buf'], mw['up_buf'],
-                mw['N'], mw['K'], mw['workspace'],
-                compact_stride=self._MARLIN_COMPACT_STRIDE,
-            )
-            _used_marlin_s1 = True
+        if getattr(self, '_use_marlin_decode', False) and buf is not None:
+            # CPU-side dispatch: no GPU sync needed
+            # Pigeonhole bound: max tokens any single expert can receive
+            max_possible_m = min(num_global * topk, mtp)
+            max_marlin_m_tiles = (max_possible_m + 15) // 16
+            compact_stride = max_marlin_m_tiles * 16
+
+            if avg_per_expert <= self._MARLIN_M16_CUTOFF:
+                # M16 Marlin path: 2.7× faster than WGMMA at decode M
+                # Reinit if mtp changed, compact_stride grew, or intermediate ptr changed
+                if (self._marlin_mtp != mtp
+                        or self._marlin_compact_stride < compact_stride
+                        or self._marlin_intermediate_ptr != buf.intermediate.data_ptr()):
+                    self._init_marlin_buffers(mtp, compact_stride, buf.intermediate)
+
+                from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_unified
+                mw = self._marlin_weights
+                marlin_grouped_stage1_unified(
+                    buf.dispatched_x, buf.intermediate, mw['up_buf'],
+                    expert_counts, mw['expert_starts'],
+                    mw['B_ptrs'], mw['scales_ptrs'], mw['C_ptrs'],
+                    mw['N'], mw['K'], mw['workspace'],
+                    max_marlin_m_tiles, self._marlin_compact_stride,
+                    mtp, buf.E_local,
+                )
+                _used_marlin_s1 = True
 
         if not _used_marlin_s1 \
                 and getattr(self, '_use_grouped_wgmma', False) \
                 and buf is not None and buf.tma_dispatched is not None:
-            # Fallback: INT4 WGMMA S1 (prefill or M>8)
-            # Stage 1 inplace: dispatched_x → intermediate
+            # WGMMA S1 fallback: used when avg_per_expert > CUTOFF or Marlin disabled
             mod.grouped_int4_moe_stage1_inplace(
                 buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
                 expert_counts,
