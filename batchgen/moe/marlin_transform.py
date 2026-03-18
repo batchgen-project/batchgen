@@ -147,10 +147,10 @@ def marlin_to_wgmma_fused_gpu(
     device = marlin_qw.device
     mod = _load_transform_module()
 
-    # Weight transform
-    perm = get_weight_perm(4).to(device=device, dtype=torch.int32)
+    # Weight transform — need INVERSE perm (maps raw position → marlin position)
+    inv_perm = _get_inverse_weight_perm(4).to(device=device, dtype=torch.int32)
     raw_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
-    mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, perm, K, N)
+    mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, inv_perm, K, N)
 
     # Scale transform
     K_groups = K // INT4_GROUP_SIZE
@@ -425,7 +425,7 @@ def bench_fused_gpu_transform():
         marlin_qw, marlin_s = repack_int4_to_marlin_gs32(raw_packed, raw_scales, K, N)
 
         # Pre-allocate output
-        perm_t = get_weight_perm(4).to(device=device, dtype=torch.int32)
+        perm_t = _get_inverse_weight_perm(4).to(device=device, dtype=torch.int32)
         out_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
         K_groups = K // 32
         out_scales = torch.empty(N, K_groups, dtype=torch.bfloat16, device=device)
