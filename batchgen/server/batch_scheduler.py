@@ -112,6 +112,9 @@ class BatchScheduler:
         self._pool_initialized = False  # First batch triggers worker init
         self._completion_listener_task: Optional[asyncio.Task] = None
         self._drain_task: Optional[asyncio.Task] = None
+        # Per-request metadata for building output JSONL in pool mode
+        # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
+        self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     async def start(self) -> None:
         if self._task:
@@ -862,6 +865,23 @@ class BatchScheduler:
         if not hasattr(self, '_pool_max_context_length'):
             self._pool_max_context_length = batch.max_context_length
 
+        # Store per-request metadata for output JSONL building
+        self._pool_request_meta[batch_id] = {}
+        for idx, req in enumerate(requests):
+            rid = req.custom_id or f"{batch_id}_req_{idx}"
+            self._pool_request_meta[batch_id][rid] = {
+                "custom_id": rid,
+                "url": req.url.value,
+                "model": req.body.model,
+                "prompt_text": prompts[idx],
+            }
+
+        # Ensure incremental output directory exists
+        incr_dir = self.server_args.incremental_output_dir
+        if incr_dir:
+            from pathlib import Path
+            Path(incr_dir).mkdir(parents=True, exist_ok=True)
+
         logger.info(
             f"[POOL] Batch {batch_id}: {len(entries)} requests pushed to IntakePool "
             f"(total in pool: {self._intake_pool.size()})"
@@ -966,11 +986,13 @@ class BatchScheduler:
                     request_id = result.get("request_id")
                     batch_id = result.get("batch_id")
                     if request_id:
-                        # Free scheduling pool slot
                         try:
                             self._scheduling_pool.free_slot(request_id)
                         except KeyError:
-                            pass  # Slot may already be freed
+                            pass
+                    # Write output JSONL line
+                    if batch_id and request_id:
+                        self._write_pool_completion(batch_id, request_id, result)
                     if batch_id:
                         batch_done = self._scheduling_pool.mark_request_completed(
                             request_id, batch_id
@@ -988,6 +1010,93 @@ class BatchScheduler:
                     logger.warning(f"[POOL] Unexpected result: {type(result)}")
 
         logger.info("[POOL] Completion listener stopped")
+
+    def _write_pool_completion(
+        self, batch_id: str, request_id: str, result: dict
+    ) -> None:
+        """Write a single completion to the batch output JSONL file.
+
+        Builds an OpenAI-compatible BatchResultItem and appends it to
+        {incremental_output_dir}/{batch_id}.jsonl.
+        """
+        incr_dir = self.server_args.incremental_output_dir
+        if not incr_dir:
+            return
+
+        meta = self._pool_request_meta.get(batch_id, {}).get(request_id)
+        if not meta:
+            logger.warning(f"[POOL] No metadata for {request_id} in batch {batch_id}")
+            return
+
+        decoded_text = result.get("text", "")
+        prompt_length = result.get("prompt_length", 0)
+        decoded_length = result.get("decoded_length", 0)
+        model = meta["model"]
+        custom_id = meta["custom_id"]
+        url = meta["url"]
+        created_at = int(time.time())
+
+        # Build response body based on endpoint type
+        if url == "/v1/chat/completions":
+            body = {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": created_at,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": decoded_text,
+                    },
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_length,
+                    "completion_tokens": decoded_length,
+                    "total_tokens": prompt_length + decoded_length,
+                },
+            }
+        else:
+            body = {
+                "id": f"cmpl-{uuid.uuid4().hex}",
+                "object": "text_completion",
+                "created": created_at,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "text": decoded_text,
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_length,
+                    "completion_tokens": decoded_length,
+                    "total_tokens": prompt_length + decoded_length,
+                },
+            }
+
+        result_item = {
+            "id": f"batch_req_{uuid.uuid4().hex[:24]}",
+            "custom_id": custom_id,
+            "response": {
+                "status_code": 200,
+                "request_id": f"req_{uuid.uuid4().hex}",
+                "body": body,
+            },
+            "error": None,
+        }
+
+        # Append to JSONL file
+        from pathlib import Path
+        output_path = Path(incr_dir) / f"{batch_id}.jsonl"
+        try:
+            with open(output_path, "a") as f:
+                f.write(json.dumps(result_item, ensure_ascii=False) + "\n")
+                f.flush()
+        except Exception as e:
+            logger.error(f"[POOL] Failed to write completion for {request_id}: {e}")
 
     def _finalize_batch_output(
         self,
@@ -1049,6 +1158,7 @@ class BatchScheduler:
             output_file_id=output_file_id,
         )
 
-        # Clean up batch tracker
+        # Clean up batch tracker and request metadata
         self._scheduling_pool.remove_batch_tracker(batch_id)
+        self._pool_request_meta.pop(batch_id, None)
         logger.info(f"[POOL] Batch {batch_id} finalized")
