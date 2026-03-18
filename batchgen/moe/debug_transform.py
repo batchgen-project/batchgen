@@ -2,7 +2,7 @@
 import torch
 from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32, get_weight_perm, GPTQ_MARLIN_TILE
 
-K, N = 64, 32  # small for debugging
+K, N = 7168, 2048  # production shapes
 device = "cuda"
 
 # Create simple sequential nibbles
