@@ -940,6 +940,8 @@ class BatchGenWorker:
 
 	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
 		"""Build local query book entries for newly admitted sequences on this rank."""
+		if self.query_book is None:
+			self.query_book = {}
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None or seq.assigned_rank != self.rank:
@@ -952,6 +954,13 @@ class BatchGenWorker:
 				self._next_local_idx += 1
 			self._local_to_uuid_map[local_idx] = uuid
 			self._uuid_to_local_map[uuid] = local_idx
+			# Build query book entry (needed by prefill_prepacked)
+			self.query_book[local_idx] = query(
+				text=seq.text,
+				encoded={"input_ids": seq.input_ids},
+				decoded_tokens=seq.decoded_tokens,
+				kv_token_budget=seq.kv_token_budget,
+			)
 
 	def _report_completion(self, uuid: str) -> None:
 		"""Report a single sequence completion to the response queue.
