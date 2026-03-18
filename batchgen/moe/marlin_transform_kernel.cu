@@ -117,6 +117,7 @@ __constant__ int c_scale_perm[64] = {
 __global__ void marlin_to_wgmma_transform_kernel(
     const int* __restrict__ marlin_qw,  // [K//16, N*2] int32
     int* __restrict__ raw_qw,           // [N, K//8] int32
+    const int* __restrict__ perm,       // [1024] permutation LUT (passed from Python)
     int K, int N)
 {
     // Each thread produces one output int32 = 8 nibbles at output[n, k_group]
@@ -145,7 +146,7 @@ __global__ void marlin_to_wgmma_transform_kernel(
         // Apply forward Marlin permutation to find where this nibble is stored
         int chunk = raw_col >> 10;       // raw_col / 1024
         int pos = raw_col & 1023;        // raw_col % 1024
-        int marlin_col = chunk * 1024 + c_perm[pos];
+        int marlin_col = chunk * 1024 + perm[pos];
 
         // Read from Marlin packed format
         int marlin_int32 = marlin_col >> 3;           // / 8
@@ -194,6 +195,7 @@ __global__ void marlin_to_wgmma_scale_transform_kernel(
 
 void marlin_to_wgmma_transform(
     torch::Tensor marlin_qw, torch::Tensor raw_qw,
+    torch::Tensor perm,
     int K, int N)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -201,6 +203,7 @@ void marlin_to_wgmma_transform(
     marlin_to_wgmma_transform_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
         marlin_qw.data_ptr<int>(),
         raw_qw.data_ptr<int>(),
+        perm.data_ptr<int>(),
         K, N);
 }
 

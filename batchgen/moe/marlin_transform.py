@@ -116,7 +116,7 @@ def _load_transform_module():
     launcher_code = r"""
 #include <torch/extension.h>
 void marlin_to_wgmma_transform(
-    torch::Tensor marlin_qw, torch::Tensor raw_qw, int K, int N);
+    torch::Tensor marlin_qw, torch::Tensor raw_qw, torch::Tensor perm, int K, int N);
 void marlin_to_wgmma_scale_transform(
     torch::Tensor marlin_s, torch::Tensor raw_s, int K_groups, int N);
 """
@@ -148,8 +148,9 @@ def marlin_to_wgmma_fused_gpu(
     mod = _load_transform_module()
 
     # Weight transform
+    perm = get_weight_perm(4).to(device=device, dtype=torch.int32)
     raw_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
-    mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, K, N)
+    mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, perm, K, N)
 
     # Scale transform
     K_groups = K // INT4_GROUP_SIZE
@@ -424,6 +425,7 @@ def bench_fused_gpu_transform():
         marlin_qw, marlin_s = repack_int4_to_marlin_gs32(raw_packed, raw_scales, K, N)
 
         # Pre-allocate output
+        perm_t = get_weight_perm(4).to(device=device, dtype=torch.int32)
         out_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
         K_groups = K // 32
         out_scales = torch.empty(N, K_groups, dtype=torch.bfloat16, device=device)
@@ -431,7 +433,7 @@ def bench_fused_gpu_transform():
 
         # Warmup
         for _ in range(10):
-            mod.marlin_to_wgmma_transform(marlin_qw, out_packed, K, N)
+            mod.marlin_to_wgmma_transform(marlin_qw, out_packed, perm_t, K, N)
             mod.marlin_to_wgmma_scale_transform(marlin_s, out_scales, K_groups, N)
 
         # Benchmark weights only
@@ -439,7 +441,7 @@ def bench_fused_gpu_transform():
         e = torch.cuda.Event(enable_timing=True)
         s.record()
         for _ in range(iters):
-            mod.marlin_to_wgmma_transform(marlin_qw, out_packed, K, N)
+            mod.marlin_to_wgmma_transform(marlin_qw, out_packed, perm_t, K, N)
         e.record()
         torch.cuda.synchronize()
         w_us = s.elapsed_time(e) / iters * 1000
