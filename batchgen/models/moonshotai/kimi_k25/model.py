@@ -798,11 +798,16 @@ class KimiK25MoE(nn.Module):
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
 
-    def _init_marlin_buffers(self, mtp: int):
-        """Lazy init for Marlin 3-stage decode buffers.
+    # Class-level shared Marlin buffers (like _buf, allocated once for all layers)
+    _marlin_gate_buf = None
+    _marlin_up_buf = None
 
-        Called on first decode forward or when mtp changes.
-        Allocates gate_buf, up_buf for S1, C_ptrs for S1+S3, workspaces.
+    def _init_marlin_buffers(self, mtp: int):
+        """Init Marlin 3-stage decode buffers.
+
+        gate_buf and up_buf are class-level (shared across all 60 MoE layers).
+        Called once during model init, before KV cache sizing.
+        Per-instance: expert_starts, C_ptrs, workspaces.
         """
         mw = self._marlin_weights
         E = self.num_persistent_local_experts
@@ -813,9 +818,15 @@ class KimiK25MoE(nn.Module):
         # Expert starts: mtp stride for 3D buffer access
         mw['expert_starts'] = torch.arange(E, dtype=torch.int32, device=device) * mtp
 
-        # S1 output buffers: gate_buf + up_buf at [E*mtp, N] (mtp stride)
-        mw['gate_buf'] = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
-        mw['up_buf'] = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+        # S1 output buffers: shared across all layers (allocated once)
+        if self.__class__._marlin_gate_buf is None or self.__class__._marlin_gate_buf.shape[0] != E * mtp:
+            self.__class__._marlin_gate_buf = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+            self.__class__._marlin_up_buf = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+            if self.rank == 0:
+                buf_mb = 2 * E * mtp * N * 2 / 1e6
+                logging.info(f"[MoE] Marlin shared buffers allocated: gate+up={buf_mb:.1f} MB")
+        mw['gate_buf'] = self.__class__._marlin_gate_buf
+        mw['up_buf'] = self.__class__._marlin_up_buf
 
         # S1 C_ptrs [2E]: gate into gate_buf, up into up_buf (mtp stride)
         bpr_N = N * 2  # bytes per row (BF16)

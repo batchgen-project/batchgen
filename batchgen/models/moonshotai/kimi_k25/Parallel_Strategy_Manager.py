@@ -534,6 +534,20 @@ class KimiK25ParallelStrategyManager:
         )
         _log_hbm("MoEBufferManager")
 
+        # Pre-allocate Marlin decode buffers (gate_buf + up_buf) BEFORE KV cache sizing.
+        # This ensures the memory planner accounts for them when sizing KV cache.
+        if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
+            mtp = KimiK25MoE._buf.max_tokens_padded
+            for layer_idx in range(
+                self.loaded_model_config.first_k_dense_replace,
+                self.model_config.num_hidden_layers,
+            ):
+                moe = self.model.model.layers[layer_idx].mlp
+                if hasattr(moe, '_use_marlin_decode') and moe._use_marlin_decode:
+                    moe._init_marlin_buffers(mtp)
+                    break  # All layers share the same class-level _buf, init once
+            _log_hbm("Marlin decode buffers (gate_buf + up_buf)")
+
         # Initialize All-to-All comms if enabled
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
             self._init_ata_comms(effective_padding_bsz)
