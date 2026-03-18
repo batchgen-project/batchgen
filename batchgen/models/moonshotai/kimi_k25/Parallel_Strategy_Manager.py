@@ -886,6 +886,14 @@ class KimiK25ParallelStrategyManager:
             expert.int4_down_packed = tensors["down_proj.weight_packed"]
             expert.int4_down_scale = tensors["down_proj.weight_scale"]
 
+            # Load pre-converted Marlin weights if present in checkpoint
+            for proj in ('gate', 'up', 'down'):
+                marlin_packed_key = f"{proj}_proj.weight_marlin_packed"
+                marlin_scale_key = f"{proj}_proj.weight_marlin_scale"
+                if marlin_packed_key in tensors and marlin_scale_key in tensors:
+                    setattr(expert, f'marlin_{proj}_qw', tensors[marlin_packed_key])
+                    setattr(expert, f'marlin_{proj}_scale', tensors[marlin_scale_key])
+
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
 
     def _move_int4_to_gpu_contiguous(self):
@@ -981,9 +989,16 @@ class KimiK25ParallelStrategyManager:
             expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
             module = expert.module if hasattr(expert, 'module') else expert
 
-            # Check if pre-converted Marlin weights already exist
+            # Check if pre-converted Marlin weights already exist (from offline converter)
             if (hasattr(module, 'marlin_gate_qw') and hasattr(module, 'marlin_up_qw')
                     and hasattr(module, 'marlin_down_qw')):
+                # Move pre-converted weights to GPU if they're on CPU
+                for proj in ('gate', 'up', 'down'):
+                    qw = getattr(module, f'marlin_{proj}_qw')
+                    sc = getattr(module, f'marlin_{proj}_scale')
+                    if not qw.is_cuda:
+                        setattr(module, f'marlin_{proj}_qw', qw.to(device))
+                        setattr(module, f'marlin_{proj}_scale', sc.to(device))
                 skipped += 1
                 continue
 

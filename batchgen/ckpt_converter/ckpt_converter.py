@@ -49,7 +49,67 @@ class ckpt_converter:
 		else:
 			raise ValueError(f"Unsupported dtype: {dtype}")
 		
-	def convert(self, ckpt_path, output_dir):
+	def _apply_marlin_repack(self, ckpt):
+		"""Repack INT4 expert weights to Marlin tile layout in-place.
+
+		Finds paired weight_packed + weight_scale tensors for routed expert
+		projections (gate/up/down) and converts them to Marlin format.
+		Total bytes unchanged (same nibble count, different layout).
+
+		Returns: modified ckpt dict with Marlin-repacked tensors +
+		         new 'weight_marlin_packed' / 'weight_marlin_scale' keys.
+		"""
+		from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+		import re
+
+		# Pattern: *.mlp.experts.*.{gate,up,down}_proj.weight_packed
+		packed_pattern = re.compile(
+			r'(.+\.mlp\.experts\.\d+\.(gate|up|down)_proj)\.weight_packed$')
+
+		count = 0
+		new_tensors = {}
+		for name in list(ckpt.keys()):
+			m = packed_pattern.match(name)
+			if not m:
+				continue
+			prefix = m.group(1)  # e.g., "...experts.0.gate_proj"
+			proj = m.group(2)    # gate, up, or down
+			scale_name = f"{prefix}.weight_scale"
+			if scale_name not in ckpt:
+				continue
+
+			packed = ckpt[name]       # [N, K//8] int32 or uint8
+			scale = ckpt[scale_name]  # [N, K//32] bf16
+
+			# Convert uint8 [N, K//2] → int32 [N, K//8] if needed
+			if packed.dtype == torch.uint8:
+				packed = packed.view(torch.int32) if packed.shape[-1] % 4 == 0 else \
+				         packed.contiguous().view(packed.shape[0], -1, 4).view(torch.int32).squeeze(-1)
+				# Actually uint8 [N, K//2] needs proper conversion to int32 [N, K//8]
+				N_dim = packed.shape[0] if len(packed.shape) == 2 else scale.shape[0]
+				K_dim = scale.shape[1] * 32  # K//32 * 32 = K
+				# Re-interpret: 2 nibbles per byte, 8 nibbles per int32
+				packed_i32 = packed.view(N_dim, K_dim // 8, 4).contiguous()
+				packed_i32 = packed_i32.view(torch.int32).squeeze(-1)
+				packed = packed_i32
+
+			N = packed.shape[0]
+			K = packed.shape[1] * 8
+
+			marlin_qw, marlin_s = repack_int4_to_marlin_gs32(
+				packed, scale.to(torch.bfloat16), K, N)
+
+			# Store Marlin tensors with new names
+			new_tensors[f"{prefix}.weight_marlin_packed"] = marlin_qw
+			new_tensors[f"{prefix}.weight_marlin_scale"] = marlin_s
+			count += 1
+
+		ckpt.update(new_tensors)
+		if count > 0:
+			logging.info(f"[ckpt_converter] Marlin repack: {count} projections converted")
+		return ckpt
+
+	def convert(self, ckpt_path, output_dir, marlin=False):
 		# Check if the file dir exists
 		if not os.path.exists(ckpt_path):
 			raise FileNotFoundError(f"Checkpoint file path {ckpt_path} does not exist.")
@@ -69,7 +129,11 @@ class ckpt_converter:
 			ckpt = load_file(ckpt_path)
 		else:
 			ckpt = torch.load(ckpt_path, weights_only=True)
-		
+
+		# Optional: repack INT4 expert weights to Marlin tile layout
+		if marlin:
+			ckpt = self._apply_marlin_repack(ckpt)
+
 		out_file_name = os.path.join(output_dir, os.path.basename(ckpt_path).replace(".safetensors", ".bin")).replace(".pt", ".bin")
 		out_metadata_name = os.path.join(output_dir, os.path.basename(ckpt_path).replace(".safetensors", ".json").replace(".pt", ".json"))	
 	
@@ -190,7 +254,7 @@ class ckpt_converter:
 
 		return True, None
 
-	def convert_model_directory(self, input_dir, output_dir=None, force=False):
+	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False):
 		"""
 		Convert all checkpoint files in a directory to BatchGen format.
 
@@ -257,9 +321,10 @@ class ckpt_converter:
 
 		for file_path in file_iterator:
 			logging.debug(f"Converting {file_path} to {output_dir}")
-			self.convert(file_path, output_dir)
+			self.convert(file_path, output_dir, marlin=marlin)
 
-		logging.info(f"Conversion complete. Output directory: {output_dir}")
+		logging.info(f"Conversion complete. Output directory: {output_dir}"
+		             f"{' (with Marlin repack)' if marlin else ''}")
 		return output_dir
 
 	
