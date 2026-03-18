@@ -144,6 +144,52 @@ def _dequantize_k25_int4(packed_int32, scales_bf16, K, N):
     return result.t().to(torch.float16).contiguous()
 
 
+def repack_int4_to_marlin_gs32(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    K: int, N: int,
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> tuple:
+    """Repack K2.5 INT4 gs=32 → Marlin tile layout WITHOUT requantization.
+
+    Direct nibble rearrangement: K2.5 [N, K//8] → Marlin [K, N//8].
+    Zero quantization error — only layout transformation.
+
+    Args:
+        weight_packed: [N, K//8] int32 (K2.5 checkpoint, 8 nibbles per int32)
+        weight_scale: [N, K//32] BF16 (K2.5 group_size=32 scales)
+        K: hidden dimension (in_features)
+        N: intermediate dimension (out_features)
+        compute_dtype: output scale dtype
+
+    Returns:
+        marlin_qw: [K, N//8] int32 Marlin-packed weight (same nibble values, different layout)
+        marlin_s: [K//32, N] permuted scales in compute_dtype
+    """
+    assert weight_packed.shape == (N, K // 8), f"Expected [{N}, {K // 8}], got {weight_packed.shape}"
+    device = weight_packed.device
+
+    # Step 1: Unpack all nibbles to [N, K] uint4 values (0-15, NOT offset decoded)
+    unpacked = torch.empty(N, K // 8, 8, dtype=torch.int32, device=device)
+    for i in range(8):
+        unpacked[:, :, i] = (weight_packed >> (i * 4)) & 0xF
+    q_w_nk = unpacked.view(N, K)  # [N, K] nibble values 0-15
+
+    # Step 2: Transpose to [K, N] for Marlin layout
+    q_w = q_w_nk.t().contiguous()  # [K, N]
+
+    # Step 3: Marlin tile permutation + packing (no quantization change)
+    perm = get_weight_perm(4)
+    marlin_qw = _marlin_pack_weights(q_w, K, N, perm)
+
+    # Step 4: Transpose scales [N, K//32] → [K//32, N] and permute for Marlin
+    marlin_s = weight_scale.t().contiguous().to(torch.float16)  # [K//32, N]
+    marlin_s = _marlin_permute_scales(marlin_s, K, N, INT4_GROUP_SIZE)
+    marlin_s = marlin_s.to(compute_dtype)
+
+    return marlin_qw, marlin_s
+
+
 def convert_int4_to_marlin(
     weight_packed: torch.Tensor,
     weight_scale: torch.Tensor,

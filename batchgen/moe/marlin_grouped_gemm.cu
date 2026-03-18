@@ -166,7 +166,7 @@ static constexpr int TM = 1;    // thread_m_blocks
 static constexpr int TN = 16;   // thread_n_blocks (256 output cols)
 static constexpr int TK = 8;    // thread_k_blocks (128 K per stage)
 static constexpr int STAGES = 4;
-static constexpr int GROUP_BLOCKS = 8;  // group_size=128, block=16
+static constexpr int GROUP_BLOCKS = 2;  // group_size=32, block=16 (K2.5 native gs)
 static constexpr int PACK = 8;          // 32/4
 static constexpr int MBLOCK = 8;        // m_block_size_8 = true
 
@@ -186,11 +186,14 @@ static constexpr int b_sh_stage = b_sh_stride * TK;  // 1024
 static constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;  // 4
 
 static constexpr int s_sh_stride = 16 * TN / 8;  // 32
-static constexpr int s_sh_stage = s_sh_stride;    // 32 (group_blocks >= TK)
+static constexpr int s_tb_groups = TK / GROUP_BLOCKS;  // 4 (scale groups per pipeline stage)
+static constexpr int s_sh_stage = s_tb_groups * s_sh_stride;  // 128
+
+static constexpr int k_iter_size = TK * 16 / b_sh_wr_iters;  // 32 (K elements per k-iteration)
 
 static constexpr int sh_red_size = (2 * TN + 1) * 16 * TM;  // 528
 static constexpr int sh_b_size = STAGES * b_sh_stage;        // 4096
-static constexpr int sh_s_size = STAGES * s_sh_stage;        // 128
+static constexpr int sh_s_size = STAGES * s_sh_stage;        // 512
 
 
 // ============================================================================
@@ -311,11 +314,14 @@ __global__ void MarlinSimple(
         B_ptr[i] += b_gl_rd_delta_o;
       }
 
-      // Scales (group_blocks >= TK: load every stage)
+      // Scales (GROUP_BLOCKS=2: load s_tb_groups=4 scale rows per stage)
       int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-      if (s_sh_wr_pred)
-        cp_async4(&sh_s_stage[threadIdx.x], &scales_ptr[s_gl_rd]);
-      s_gl_rd += s_gl_stride;
+#pragma unroll
+      for (int i = 0; i < s_tb_groups; i++) {
+        if (s_sh_wr_pred)
+          cp_async4(&sh_s_stage[i * s_sh_stride + threadIdx.x], &scales_ptr[s_gl_rd]);
+        s_gl_rd += s_gl_stride;
+      }
     }
     cp_async_fence();
   };
@@ -339,14 +345,15 @@ __global__ void MarlinSimple(
         &sh_b_stage[b_sh_wr_delta * (k % b_sh_wr_iters) + threadIdx.x]);
   };
 
-  auto load_scales = [&](int k, int full_pipe) {
-    int pipe = full_pipe % STAGES;
-    if (k % b_sh_wr_iters == 0) {
-      int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-      reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
-    } else {
-      reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
-    }
+  auto load_scales = [&](int k, int pipe) {
+    // GROUP_BLOCKS=2: compute which scale group this k-iteration belongs to
+    int cur_k = k_iter_size * (k % b_sh_wr_iters);
+    int k_blocks = cur_k / 16;
+    int cur_group_id = k_blocks / GROUP_BLOCKS;
+
+    int4* sh_s_stage = sh_s + s_sh_stage * (pipe % STAGES);
+    reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
+        sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
   };
 
   auto matmul = [&](int k) {
@@ -549,7 +556,8 @@ void grouped_marlin_gemm(
 {
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    constexpr int smem_bytes = ((4736 * 16) + 1023) / 1024 * 1024;  // 76800 bytes
+    // SMEM: max(sh_red=528, sh_b=4096) + sh_s=512 + 4*a_sh_stage=512 = 5120 int4 = 81920 bytes
+    constexpr int smem_bytes = ((5120 * 16) + 1023) / 1024 * 1024;  // 82944 bytes
     cudaFuncSetAttribute((void*)MarlinSimple, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
     int total_ctas = n_tiles * num_matrices;

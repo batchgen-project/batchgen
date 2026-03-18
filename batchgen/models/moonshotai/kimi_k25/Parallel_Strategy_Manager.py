@@ -968,7 +968,7 @@ class KimiK25ParallelStrategyManager:
         if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") != "1":
             return
 
-        from batchgen.moe.marlin_weight_prep import convert_int4_to_marlin
+        from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
         device = self.engine_config.Basic_Config.device_torch
 
         count = 0
@@ -984,15 +984,15 @@ class KimiK25ParallelStrategyManager:
             for proj in ('gate', 'up'):  # S1 only
                 packed = getattr(module, f'int4_{proj}_packed')
                 scale = getattr(module, f'int4_{proj}_scale')
-                marlin_qw, marlin_s = convert_int4_to_marlin(
-                    packed, scale, K, N, marlin_group_size=128)
+                marlin_qw, marlin_s = repack_int4_to_marlin_gs32(
+                    packed, scale, K, N)
                 setattr(module, f'marlin_{proj}_qw', marlin_qw)
                 setattr(module, f'marlin_{proj}_scale', marlin_s)
             count += 1
 
         if self.rank == 0:
             logging.info(
-                f"[MODEL] Marlin weights registered for {count} experts (gate+up S1, gs=128)")
+                f"[MODEL] Marlin weights registered for {count} experts (gate+up S1, gs=32 direct repack)")
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, router) to model.
