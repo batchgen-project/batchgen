@@ -749,20 +749,23 @@ class KimiK25MoE(nn.Module):
             self._wgmma_mod = _load_int4_grouped_module()
             self._use_grouped_wgmma = True
 
-            # Marlin W4A16 decode S1: weight pointers only (mtp-dependent buffers deferred)
+            # Marlin W4A16 3-stage decode: weight pointers only (mtp-dependent buffers deferred)
             self._use_marlin_decode = False
-            self._marlin_mtp = 0  # track current mtp for lazy re-init
-            self._marlin_compact_stride = 0
-            self._marlin_intermediate_ptr = 0
+            self._marlin_mtp = 0
+            self._MARLIN_DECODE_CUTOFF = 32  # use Marlin for max_possible_m <= 32
             if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
                 try:
                     N = self.moe_intermediate_size
+                    K = self.config.hidden_size
 
-                    # Weight + scale pointer arrays (interleaved gate+up) — init-time only
+                    # Collect weight pointers for all 3 projections
                     gate_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
                     gate_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
                     up_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
                     up_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    down_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                    down_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+
                     for local_e in range(E):
                         global_e = self.routed_expert_start_idx + local_e
                         wrapper = self.experts[global_e]
@@ -771,17 +774,24 @@ class KimiK25MoE(nn.Module):
                         gate_s_ptrs[local_e] = module.marlin_gate_scale.data_ptr()
                         up_w_ptrs[local_e] = module.marlin_up_qw.data_ptr()
                         up_s_ptrs[local_e] = module.marlin_up_scale.data_ptr()
+                        down_w_ptrs[local_e] = module.marlin_down_qw.data_ptr()
+                        down_s_ptrs[local_e] = module.marlin_down_scale.data_ptr()
 
                     mw = {}
-                    mw['B_ptrs'] = torch.cat([gate_w_ptrs, up_w_ptrs])      # [2E]
-                    mw['scales_ptrs'] = torch.cat([gate_s_ptrs, up_s_ptrs])  # [2E]
+                    # S1: gate+up interleaved [2E]
+                    mw['s1_B_ptrs'] = torch.cat([gate_w_ptrs, up_w_ptrs])
+                    mw['s1_scales_ptrs'] = torch.cat([gate_s_ptrs, up_s_ptrs])
+                    # S3: down [E]
+                    mw['s3_B_ptrs'] = down_w_ptrs
+                    mw['s3_scales_ptrs'] = down_s_ptrs
                     mw['N'] = N
-                    mw['K'] = self.config.hidden_size
+                    mw['K'] = K
 
                     self._marlin_weights = mw
                     self._use_marlin_decode = True
                     if self.rank == 0:
-                        logging.info(f"[MoE] Marlin W4A16 decode S1: weight ptrs ready (E={E}), buffers deferred to first forward")
+                        logging.info(f"[MoE] Marlin W4A16 3-stage: weight ptrs ready "
+                                     f"(E={E}, gate+up+down), buffers deferred")
                 except AttributeError as e:
                     logging.warning(f"[MoE] Marlin weights not found: {e}")
                     self._use_marlin_decode = False
@@ -789,52 +799,50 @@ class KimiK25MoE(nn.Module):
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
 
-    _MARLIN_M16_CUTOFF = 32  # use M16 Marlin for avg_per_expert <= 32, WGMMA above
+    def _init_marlin_buffers(self, mtp: int):
+        """Lazy init for Marlin 3-stage decode buffers.
 
-    def _init_marlin_buffers(self, mtp: int, compact_stride: int, intermediate: torch.Tensor):
-        """Lazy init for Marlin M16 unified path buffers.
-
-        Called on first forward, when mtp changes, compact_stride grows,
-        or intermediate buffer pointer changes.
-
-        Memory strategy:
-        - Gate output writes directly to intermediate (mtp stride, zero extra alloc)
-        - Up output writes to compact up_buf (compact_stride, dynamic size)
-        - Dual-stride SiLU fuses: intermediate = SiLU(gate) * up
+        Called on first decode forward or when mtp changes.
+        Allocates gate_buf, up_buf for S1, C_ptrs for S1+S3, workspaces.
         """
         mw = self._marlin_weights
         E = self.num_persistent_local_experts
-        N = mw['N']
+        N = mw['N']  # 2048
+        K = mw['K']  # 7168
         device = self.device
 
-        # expert_starts for A input: mtp stride (reads from dispatched_x)
-        mw['expert_starts'] = (torch.arange(E, dtype=torch.int32, device=device) * mtp)
+        # Expert starts: mtp stride for 3D buffer access
+        mw['expert_starts'] = torch.arange(E, dtype=torch.int32, device=device) * mtp
 
-        # Up buffer: compact stride (dynamic, grows with batch size)
-        mw['up_buf'] = torch.zeros(E * compact_stride, N, dtype=torch.bfloat16, device=device)
+        # S1 output buffers: gate_buf + up_buf at [E*mtp, N] (mtp stride)
+        mw['gate_buf'] = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+        mw['up_buf'] = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
 
-        # C_ptrs: gate → intermediate (mtp stride), up → up_buf (compact stride)
-        bytes_per_row = N * 2  # BF16
-        gate_C_ptrs = torch.tensor(
-            [intermediate.data_ptr() + e * mtp * bytes_per_row for e in range(E)],
+        # S1 C_ptrs [2E]: gate into gate_buf, up into up_buf (mtp stride)
+        bpr_N = N * 2  # bytes per row (BF16)
+        gate_C = torch.tensor(
+            [mw['gate_buf'].data_ptr() + e * mtp * bpr_N for e in range(E)],
             dtype=torch.int64, device=device)
-        up_C_ptrs = torch.tensor(
-            [mw['up_buf'].data_ptr() + e * compact_stride * bytes_per_row for e in range(E)],
+        up_C = torch.tensor(
+            [mw['up_buf'].data_ptr() + e * mtp * bpr_N for e in range(E)],
             dtype=torch.int64, device=device)
-        mw['C_ptrs'] = torch.cat([gate_C_ptrs, up_C_ptrs])  # [2E]
+        mw['s1_C_ptrs'] = torch.cat([gate_C, up_C])  # [2E]
 
-        # Workspace (locks)
-        n_tiles = N // 256
-        mw['workspace'] = torch.zeros(
-            2 * E * (n_tiles + 17), dtype=torch.int32, device=device)
+        # S1 workspace
+        n_tiles_s1 = N // 256  # 8
+        mw['s1_workspace'] = torch.zeros(
+            2 * E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
+
+        # S3 workspace (C_ptrs for S3 built per-call since expert_out may change)
+        n_tiles_s3 = K // 256  # 28
+        mw['s3_workspace'] = torch.zeros(
+            E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
 
         self._marlin_mtp = mtp
-        self._marlin_compact_stride = compact_stride
-        self._marlin_intermediate_ptr = intermediate.data_ptr()
-        up_mb = E * compact_stride * N * 2 / 1e6
+        buf_mb = 2 * E * mtp * N * 2 / 1e6
         if self.rank == 0:
-            logging.info(f"[MoE] Marlin M16 buffers initialized (E={E}, mtp={mtp}, "
-                         f"compact_stride={compact_stride}, up_buf={up_mb:.1f} MB)")
+            logging.info(f"[MoE] Marlin 3-stage buffers initialized "
+                         f"(E={E}, mtp={mtp}, gate+up={buf_mb:.1f} MB)")
 
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -927,50 +935,65 @@ class KimiK25MoE(nn.Module):
             ev[3].record()  # after dispatch, before wgmma_s1
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
-        # Set mod/w/mtp unconditionally — S2 always uses WGMMA
         mod = self._wgmma_mod if getattr(self, '_use_grouped_wgmma', False) else None
         w = self._moe_weights if getattr(self, '_use_grouped_wgmma', False) else None
         mtp = buf.max_tokens_padded if buf is not None else 0
 
-        _used_marlin_s1 = False
+        _used_marlin = False
 
-        # Compute max_m_tiles for WGMMA (used by both S1 fallback and S2)
+        # Compute max_m_tiles for WGMMA (needed for WGMMA fallback path)
         if buf is not None:
             avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
         if getattr(self, '_use_marlin_decode', False) and buf is not None:
-            # CPU-side dispatch: no GPU sync needed
-            # Pigeonhole bound: max tokens any single expert can receive
-            max_possible_m = min(num_global * topk, mtp)
-            max_marlin_m_tiles = (max_possible_m + 15) // 16
-            compact_stride = max_marlin_m_tiles * 16
+            # Pigeonhole bound: max tokens any expert can receive (provable, not heuristic)
+            max_possible_m = min(num_global, mtp)
 
-            if avg_per_expert <= self._MARLIN_M16_CUTOFF:
-                # M16 Marlin path: 2.7× faster than WGMMA at decode M
-                # Reinit if mtp changed, compact_stride grew, or intermediate ptr changed
-                if (self._marlin_mtp != mtp
-                        or self._marlin_compact_stride < compact_stride
-                        or self._marlin_intermediate_ptr != buf.intermediate.data_ptr()):
-                    self._init_marlin_buffers(mtp, compact_stride, buf.intermediate)
+            if max_possible_m <= self._MARLIN_DECODE_CUTOFF:
+                # === DECODE: Marlin 3-Stage (2.6× faster than WGMMA) ===
+                if self._marlin_mtp != mtp:
+                    self._init_marlin_buffers(mtp)
 
-                from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_unified
+                max_marlin_m_tiles = (max_possible_m + 15) // 16
+                from batchgen.moe.marlin_grouped_moe import _load_module as _load_marlin
+                mod_m = _load_marlin()
                 mw = self._marlin_weights
-                marlin_grouped_stage1_unified(
-                    buf.dispatched_x, buf.intermediate, mw['up_buf'],
-                    expert_counts, mw['expert_starts'],
-                    mw['B_ptrs'], mw['scales_ptrs'], mw['C_ptrs'],
-                    mw['N'], mw['K'], mw['workspace'],
-                    max_marlin_m_tiles, self._marlin_compact_stride,
-                    mtp, buf.E_local,
-                )
-                _used_marlin_s1 = True
+                E_local = buf.E_local
 
-        if not _used_marlin_s1 \
+                # Build S3 C_ptrs into expert_out (may change if expert_out reallocated)
+                bpr_K = mw['K'] * 2
+                s3_C_ptrs = torch.tensor(
+                    [buf.expert_out.data_ptr() + e * mtp * bpr_K for e in range(E_local)],
+                    dtype=torch.int64, device=device)
+
+                # Stage 1: gate+up GEMM (2E matrices)
+                n_tiles_s1 = N // 256
+                mod_m.grouped_marlin_gemm_m16(
+                    buf.dispatched_x, mw['s1_B_ptrs'], mw['s1_C_ptrs'],
+                    mw['s1_scales_ptrs'], mw['expert_starts'], expert_counts,
+                    E_local, N, K, mw['s1_workspace'],
+                    2 * E_local, n_tiles_s1, max_marlin_m_tiles)
+
+                # Stage 2: SiLU(gate) * up → intermediate
+                mod_m.silu_mul(mw['gate_buf'], mw['up_buf'], buf.intermediate)
+
+                # Stage 3: down GEMM (E matrices)
+                n_tiles_s3 = K // 256
+                mod_m.grouped_marlin_gemm_m16(
+                    buf.intermediate, mw['s3_B_ptrs'], s3_C_ptrs,
+                    mw['s3_scales_ptrs'], mw['expert_starts'], expert_counts,
+                    E_local, K, N, mw['s3_workspace'],
+                    E_local, n_tiles_s3, max_marlin_m_tiles)
+
+                _used_marlin = True
+
+        if not _used_marlin \
                 and getattr(self, '_use_grouped_wgmma', False) \
                 and buf is not None and buf.tma_dispatched is not None:
-            # WGMMA S1 fallback: used when avg_per_expert > CUTOFF or Marlin disabled
+            # === PREFILL / FALLBACK: WGMMA 2-Stage ===
+            # S1: fused gate+up+SiLU
             mod.grouped_int4_moe_stage1_inplace(
                 buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
                 expert_counts,
@@ -979,13 +1002,7 @@ class KimiK25MoE(nn.Module):
                 buf.empty_bias, buf.empty_bias,
                 N, K // 2, K // 32, max_m_tiles, mtp,
             )
-
-        if timer is not None:
-            ev[4].record()  # after wgmma_s1, before wgmma_s2
-
-        if getattr(self, '_use_grouped_wgmma', False) \
-                and buf is not None and buf.tma_dispatched is not None:
-            # Stage 2 inplace: intermediate → expert_out
+            # S2: down
             mod.grouped_int4_moe_stage2_inplace(
                 buf.intermediate, buf.expert_out, buf.tma_intermediate,
                 expert_counts,
