@@ -161,11 +161,13 @@ def raw_to_marlin_fused_gpu(
     mod.raw_to_marlin_transform(raw_packed, marlin_qw, perm, K, N)
 
     # Scale transform: raw [N, K//32] → Marlin permuted [K//32, N]
+    # Use PyTorch GPU ops (same approach as _marlin_permute_scales, validated by CPU round-trip)
     scale_perm, _ = _get_scale_perms()
-    scale_perm_t = torch.tensor(scale_perm, device=device, dtype=torch.int32)
+    scale_perm_t = torch.tensor(scale_perm, device=device, dtype=torch.long)
     K_groups = K // INT4_GROUP_SIZE
-    marlin_s = torch.empty(K_groups, N, dtype=raw_scales.dtype, device=device)
-    mod.raw_to_marlin_scale_transform(raw_scales, marlin_s, scale_perm_t, K_groups, N)
+    s_transposed = raw_scales.to(torch.float16).t().contiguous()  # [K//32, N]
+    marlin_s = s_transposed.reshape(-1, len(scale_perm))[:, scale_perm_t]
+    marlin_s = marlin_s.reshape(-1, N).contiguous().to(raw_scales.dtype)
 
     return marlin_qw, marlin_s
 
