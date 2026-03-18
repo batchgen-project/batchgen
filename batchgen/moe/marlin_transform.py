@@ -119,6 +119,10 @@ void marlin_to_wgmma_transform(
     torch::Tensor marlin_qw, torch::Tensor raw_qw, torch::Tensor perm, int K, int N);
 void marlin_to_wgmma_scale_transform(
     torch::Tensor marlin_s, torch::Tensor raw_s, torch::Tensor scale_perm, int K_groups, int N);
+void raw_to_marlin_transform(
+    torch::Tensor raw_qw, torch::Tensor marlin_qw, torch::Tensor perm, int K, int N);
+void raw_to_marlin_scale_transform(
+    torch::Tensor raw_s, torch::Tensor marlin_s, torch::Tensor scale_perm, int K_groups, int N);
 """
 
     from torch.utils.cpp_extension import load_inline
@@ -126,11 +130,44 @@ void marlin_to_wgmma_scale_transform(
         name="marlin_transform",
         cpp_sources=[launcher_code],
         cuda_sources=[cuda_src],
-        functions=["marlin_to_wgmma_transform", "marlin_to_wgmma_scale_transform"],
+        functions=[
+            "marlin_to_wgmma_transform", "marlin_to_wgmma_scale_transform",
+            "raw_to_marlin_transform", "raw_to_marlin_scale_transform",
+        ],
         extra_cuda_cflags=["-O3", "-std=c++17", "-arch=sm_90a", "--use_fast_math"],
         verbose=False,
     )
     return _transform_module
+
+
+def raw_to_marlin_fused_gpu(
+    raw_packed: torch.Tensor,
+    raw_scales: torch.Tensor,
+    K: int, N: int,
+) -> tuple:
+    """GPU forward transform: raw INT4 [N, K//8] → Marlin [K//16, N*2].
+
+    Returns:
+        marlin_qw: [K//16, N*2] int32
+        marlin_s: [K//32, N] BF16 (permuted)
+    """
+    device = raw_packed.device
+    mod = _load_transform_module()
+
+    # Weight transform: raw → Marlin
+    # perm maps marlin_pos → raw_pos (forward perm from _marlin_permute_weights)
+    perm = get_weight_perm(4).to(device=device, dtype=torch.int32)
+    marlin_qw = torch.empty(K // 16, N * 2, dtype=torch.int32, device=device)
+    mod.raw_to_marlin_transform(raw_packed, marlin_qw, perm, K, N)
+
+    # Scale transform: raw [N, K//32] → Marlin permuted [K//32, N]
+    scale_perm, _ = _get_scale_perms()
+    scale_perm_t = torch.tensor(scale_perm, device=device, dtype=torch.int32)
+    K_groups = K // INT4_GROUP_SIZE
+    marlin_s = torch.empty(K_groups, N, dtype=raw_scales.dtype, device=device)
+    mod.raw_to_marlin_scale_transform(raw_scales, marlin_s, scale_perm_t, K_groups, N)
+
+    return marlin_qw, marlin_s
 
 
 def marlin_to_wgmma_fused_gpu(
@@ -362,6 +399,118 @@ def bench_gpu_transform():
     print(f"  vs WGMMA compute per layer: ~1200 us → transform overhead shown above")
 
 
+def test_forward_gpu():
+    """Verify GPU forward transform (raw→Marlin) matches CPU reference."""
+    from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+
+    for K, N in [(7168, 2048), (2048, 7168)]:
+        print(f"\nForward GPU test K={K} N={N}:")
+        device = "cuda"
+
+        # Create raw weights
+        w = torch.randn((N, K), dtype=torch.float16, device=device) * 0.1
+        n_groups = K // 32
+        w_grouped = w.view(N, n_groups, 32)
+        max_val = w_grouped.max(dim=-1, keepdim=True).values
+        min_val = w_grouped.min(dim=-1, keepdim=True).values
+        scales = torch.max(max_val.abs() / 7.0, min_val.abs() / 8.0).clamp(min=1e-10)
+        q = torch.round(w_grouped / scales).int() + 8
+        q = torch.clamp(q, 0, 15)
+        q_flat = q.view(N, K).int()
+        raw_packed = torch.zeros(N, K // 8, dtype=torch.int32, device=device)
+        for i in range(8):
+            raw_packed |= (q_flat[:, i::8] & 0xF) << (i * 4)
+        raw_scales = scales.squeeze(-1).to(torch.bfloat16)
+
+        # CPU reference: raw → Marlin
+        cpu_marlin_qw, cpu_marlin_s = repack_int4_to_marlin_gs32(raw_packed, raw_scales, K, N)
+
+        # GPU forward: raw → Marlin
+        gpu_marlin_qw, gpu_marlin_s = raw_to_marlin_fused_gpu(raw_packed, raw_scales, K, N)
+        torch.cuda.synchronize()
+
+        w_match = torch.equal(cpu_marlin_qw, gpu_marlin_qw)
+        s_match = torch.equal(cpu_marlin_s, gpu_marlin_s)
+
+        print(f"  Weights match CPU: {'MATCH' if w_match else 'MISMATCH'}")
+        print(f"  Scales match CPU:  {'MATCH' if s_match else 'MISMATCH'}")
+        if not w_match:
+            diff = (cpu_marlin_qw != gpu_marlin_qw).sum().item()
+            print(f"  Weight mismatches: {diff} / {cpu_marlin_qw.numel()}")
+
+        # Also verify round-trip: raw→Marlin(GPU)→raw(GPU)
+        rt_packed, rt_scales = marlin_to_wgmma_fused_gpu(gpu_marlin_qw, gpu_marlin_s, K, N)
+        torch.cuda.synchronize()
+        rt_w = torch.equal(raw_packed, rt_packed)
+        rt_s = torch.equal(raw_scales, rt_scales)
+        print(f"  Round-trip weights: {'MATCH' if rt_w else 'MISMATCH'}")
+        print(f"  Round-trip scales:  {'MATCH' if rt_s else 'MISMATCH'}")
+
+        status = "PASS" if (w_match and s_match and rt_w and rt_s) else "FAIL"
+        print(f"  [{status}]")
+
+
+def bench_forward_gpu():
+    """Benchmark GPU forward transform (raw→Marlin)."""
+    from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+
+    device = "cuda"
+    iters = 1000
+
+    print(f"\nForward GPU Transform Benchmark (iters={iters}):")
+    print(f"Device: {torch.cuda.get_device_name()}")
+
+    for K, N, label in [(7168, 2048, "gate/up"), (2048, 7168, "down")]:
+        w = torch.randn((N, K), dtype=torch.float16, device=device) * 0.1
+        n_groups = K // 32
+        w_grouped = w.view(N, n_groups, 32)
+        max_val = w_grouped.max(dim=-1, keepdim=True).values
+        min_val = w_grouped.min(dim=-1, keepdim=True).values
+        scales = torch.max(max_val.abs() / 7.0, min_val.abs() / 8.0).clamp(min=1e-10)
+        q = torch.round(w_grouped / scales).int() + 8
+        q = torch.clamp(q, 0, 15)
+        q_flat = q.view(N, K).int()
+        raw_packed = torch.zeros(N, K // 8, dtype=torch.int32, device=device)
+        for i in range(8):
+            raw_packed |= (q_flat[:, i::8] & 0xF) << (i * 4)
+        raw_scales = scales.squeeze(-1).to(torch.bfloat16)
+
+        # Pre-allocate
+        perm = get_weight_perm(4).to(device=device, dtype=torch.int32)
+        marlin_qw = torch.empty(K // 16, N * 2, dtype=torch.int32, device=device)
+        scale_perm_list, _ = _get_scale_perms()
+        scale_perm_t = torch.tensor(scale_perm_list, device=device, dtype=torch.int32)
+        K_groups = K // 32
+        marlin_s = torch.empty(K_groups, N, dtype=torch.bfloat16, device=device)
+        mod = _load_transform_module()
+
+        # Warmup
+        for _ in range(10):
+            mod.raw_to_marlin_transform(raw_packed, marlin_qw, perm, K, N)
+
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(iters):
+            mod.raw_to_marlin_transform(raw_packed, marlin_qw, perm, K, N)
+        e.record()
+        torch.cuda.synchronize()
+        w_us = s.elapsed_time(e) / iters * 1000
+
+        s.record()
+        for _ in range(iters):
+            mod.raw_to_marlin_scale_transform(raw_scales, marlin_s, scale_perm_t, K_groups, N)
+        e.record()
+        torch.cuda.synchronize()
+        s_us = s.elapsed_time(e) / iters * 1000
+
+        data_mb = K * N / 2 / 1e6
+        print(f"  {label:8s} K={K:5d} N={N:5d}: weights={w_us:7.1f} us, scales={s_us:5.1f} us | {data_mb:.1f} MB")
+
+    print(f"\n  Per expert (3 projections): ~{3 * w_us:.0f} us")
+    print(f"  64 shards × 6 experts × 3 projs: ~{64 * 6 * 3 * w_us / 1000:.1f} ms total GPU compute")
+
+
 def test_fused_gpu():
     """Verify fused CUDA transform matches CPU reference (bit-identical)."""
     from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
@@ -475,7 +624,9 @@ if __name__ == "__main__":
         test_roundtrip()
         test_gpu_vs_cpu()
         test_fused_gpu()
+        test_forward_gpu()
         bench_fused_gpu_transform()
+        bench_forward_gpu()
     elif test_name == "roundtrip":
         test_roundtrip()
     elif test_name == "gpu":
@@ -483,7 +634,11 @@ if __name__ == "__main__":
     elif test_name == "fused":
         test_fused_gpu()
         bench_fused_gpu_transform()
+    elif test_name == "forward":
+        test_forward_gpu()
+        bench_forward_gpu()
     elif test_name == "bench":
         bench_fused_gpu_transform()
+        bench_forward_gpu()
     else:
-        print(f"Unknown: {test_name}. Use: all, roundtrip, gpu, fused, bench")
+        print(f"Unknown: {test_name}. Use: all, roundtrip, gpu, fused, forward, bench")

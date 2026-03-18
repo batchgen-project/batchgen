@@ -187,6 +187,94 @@ __global__ void marlin_to_wgmma_scale_transform_kernel(
 }
 
 
+/*
+ * Forward transform: raw INT4 [N, K//8] int32 → Marlin [K//16, N*2] int32.
+ *
+ * Gather pattern: each thread produces one output Marlin int32 (8 nibbles).
+ * For output nibble at Marlin position (k_tile, marlin_col):
+ *   chunk = marlin_col / 1024;  pos = marlin_col % 1024
+ *   raw_col = chunk * 1024 + perm[pos]   (perm maps marlin→raw within tile)
+ *   n_tile = raw_col / 256;  remainder = raw_col % 256
+ *   k_in_tile = remainder / 16;  n_in_tile = remainder % 16
+ *   k = k_tile * 16 + k_in_tile;  n = n_tile * 16 + n_in_tile
+ *   Read nibble from raw_qw[n, k//8] at shift (k%8)*4
+ */
+__global__ void raw_to_marlin_transform_kernel(
+    const int* __restrict__ raw_qw,      // [N, K//8] int32 (K2.5/WGMMA format)
+    int* __restrict__ marlin_qw,          // [K//16, N*2] int32 (Marlin format)
+    const int* __restrict__ perm,         // [1024] forward perm (marlin→raw within tile)
+    int K, int N)
+{
+    // Each thread produces one output Marlin int32 at [k_tile, col_idx]
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int output_stride = N * 2;  // Marlin row width in int32
+    int total_out = (K / 16) * output_stride;
+    if (tid >= total_out) return;
+
+    int k_tile = tid / output_stride;
+    int col_idx = tid % output_stride;
+
+    // This int32 holds 8 consecutive nibbles at Marlin positions [col_idx*8 .. col_idx*8+7]
+    int raw_stride = K / 8;  // raw row width in int32
+
+    int result = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int marlin_col = col_idx * 8 + i;
+
+        // Apply perm to find which raw nibble goes here
+        int chunk = marlin_col >> 10;
+        int pos = marlin_col & 1023;
+        int raw_col = chunk * 1024 + perm[pos];
+
+        // Decode raw_col to (n, k_in_tile) within the tiled layout
+        int n_tile = raw_col / 256;
+        int remainder = raw_col % 256;
+        int k_in_tile = remainder / 16;
+        int n_in_tile = remainder % 16;
+
+        int k = k_tile * 16 + k_in_tile;
+        int n = n_tile * 16 + n_in_tile;
+
+        // Read from raw [N, K//8] format
+        int raw_int32 = raw_qw[n * raw_stride + (k >> 3)];
+        int raw_shift = (k & 7) << 2;
+        int val = (raw_int32 >> raw_shift) & 0xF;
+
+        result |= (val << (i * 4));
+    }
+
+    marlin_qw[tid] = result;
+}
+
+/*
+ * Forward scale transform: raw [N, K//gs] → Marlin permuted [K//gs, N].
+ * Transpose + apply scale_perm.
+ */
+__global__ void raw_to_marlin_scale_transform_kernel(
+    const uint16_t* __restrict__ raw_s,     // [N, K//gs] raw
+    uint16_t* __restrict__ marlin_s,         // [K//gs, N] permuted
+    const int* __restrict__ scale_perm,      // [64] scale permutation
+    int K_groups, int N)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = K_groups * N;
+    if (tid >= total) return;
+
+    // Output is [K_groups, N], row-major
+    int n = tid % N;
+    int marlin_kg = tid / N;
+
+    // Inverse scale_perm: output[marlin_kg, n] = input[n, raw_kg]
+    // scale_perm maps marlin position → raw position
+    int chunk = marlin_kg / 64;
+    int pos = marlin_kg % 64;
+    int raw_kg = chunk * 64 + scale_perm[pos];
+
+    marlin_s[tid] = raw_s[n * K_groups + raw_kg];
+}
+
+
 // ============================================================================
 // Launcher
 // ============================================================================
@@ -218,6 +306,34 @@ void marlin_to_wgmma_scale_transform(
     marlin_to_wgmma_scale_transform_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
         reinterpret_cast<const uint16_t*>(marlin_s.data_ptr()),
         reinterpret_cast<uint16_t*>(raw_s.data_ptr()),
+        scale_perm.data_ptr<int>(),
+        K_groups, N);
+}
+
+void raw_to_marlin_transform(
+    torch::Tensor raw_qw, torch::Tensor marlin_qw,
+    torch::Tensor perm,
+    int K, int N)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int total = (K / 16) * (N * 2);
+    raw_to_marlin_transform_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        raw_qw.data_ptr<int>(),
+        marlin_qw.data_ptr<int>(),
+        perm.data_ptr<int>(),
+        K, N);
+}
+
+void raw_to_marlin_scale_transform(
+    torch::Tensor raw_s, torch::Tensor marlin_s,
+    torch::Tensor scale_perm,
+    int K_groups, int N)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int total = K_groups * N;
+    raw_to_marlin_scale_transform_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<const uint16_t*>(raw_s.data_ptr()),
+        reinterpret_cast<uint16_t*>(marlin_s.data_ptr()),
         scale_perm.data_ptr<int>(),
         K_groups, N);
 }
