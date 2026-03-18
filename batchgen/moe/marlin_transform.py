@@ -100,6 +100,61 @@ def marlin_to_wgmma_cpu(
     return raw_packed, raw_scales
 
 
+def marlin_to_wgmma_gpu(
+    marlin_qw: torch.Tensor,
+    marlin_s: torch.Tensor,
+    K: int, N: int,
+) -> tuple:
+    """GPU transform: Marlin [K//16, N*2] int32 → K2.5 raw [N, K//8] int32.
+
+    Uses native PyTorch GPU ops (no custom CUDA kernel).
+    Pure memory shuffle — all ops are index permutation / reshape / transpose.
+
+    Returns:
+        raw_packed: [N, K//8] int32 (K2.5/WGMMA format)
+        raw_scales: [N, K//32] BF16
+    """
+    device = marlin_qw.device
+    assert marlin_qw.is_cuda, "marlin_to_wgmma_gpu requires CUDA tensors"
+
+    TILE = GPTQ_MARLIN_TILE  # 16
+
+    # Step 1: Unpack int32 → nibbles [K//16, N*16]
+    # Each int32 contains 8 nibbles. Shape [K//16, N*2] → flatten → unpack → reshape
+    flat = marlin_qw.reshape(-1)
+    # Vectorized unpack: shift each int32 by 0,4,8,...,28 bits, mask to 4 bits
+    shifts = torch.arange(8, device=device, dtype=torch.int32) * 4  # [8]
+    nibbles = ((flat.unsqueeze(1) >> shifts) & 0xF)  # [n_int32, 8]
+    q_marlin = nibbles.reshape(K // TILE, N * TILE)  # [K//16, N*16]
+
+    # Step 2: Inverse nibble permutation within tiles
+    inv_perm = _get_inverse_weight_perm(4).to(device)
+    q_tiled = q_marlin.reshape(-1, inv_perm.numel())  # [n_tile_rows, 1024]
+    q_tiled = q_tiled[:, inv_perm]  # apply inverse permutation
+    q_tiled = q_tiled.reshape(K // TILE, N * TILE)
+
+    # Step 3: Undo tile transpose [K//16, N//16, 16, 16] → [K//16, 16, N//16, 16] → [K, N]
+    q_tiled = q_tiled.reshape(K // TILE, N // TILE, TILE, TILE)
+    q_raw_kn = q_tiled.permute(0, 2, 1, 3).reshape(K, N)
+
+    # Step 4: Transpose [K, N] → [N, K]
+    q_raw_nk = q_raw_kn.t().contiguous()
+
+    # Step 5: Pack nibbles → int32 [N, K//8] (vectorized)
+    q_groups = q_raw_nk.reshape(N, K // 8, 8)  # [N, K//8, 8]
+    shifts_pack = torch.arange(8, device=device, dtype=torch.int32) * 4
+    raw_packed = (q_groups << shifts_pack).sum(dim=-1).to(torch.int32)
+
+    # Step 6: Inverse scale permutation
+    inv_scale_perm = _get_inverse_scale_perm()
+    inv_scale_perm_t = torch.tensor(inv_scale_perm, device=device, dtype=torch.long)
+    s_inv = marlin_s.to(torch.float16).reshape(-1, len(inv_scale_perm))
+    s_inv = s_inv[:, inv_scale_perm_t]
+    raw_scales = s_inv.reshape(-1, N).t().contiguous().to(marlin_s.dtype)
+
+    return raw_packed, raw_scales
+
+
 def test_roundtrip():
     """Verify: K2.5 raw → Marlin → WGMMA raw is bit-identical."""
     from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
@@ -148,5 +203,113 @@ def test_roundtrip():
         print(f"  [{status}]")
 
 
+def test_gpu_vs_cpu():
+    """Verify GPU transform matches CPU reference (bit-identical)."""
+    from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+
+    for K, N in [(7168, 2048), (2048, 7168)]:
+        print(f"\nGPU vs CPU test K={K} N={N}:")
+        device = "cuda"
+
+        # Create K2.5 raw weights
+        w = torch.randn((N, K), dtype=torch.float16, device=device) * 0.1
+        n_groups = K // 32
+        w_grouped = w.view(N, n_groups, 32)
+        max_val = w_grouped.max(dim=-1, keepdim=True).values
+        min_val = w_grouped.min(dim=-1, keepdim=True).values
+        scales = torch.max(max_val.abs() / 7.0, min_val.abs() / 8.0).clamp(min=1e-10)
+        q = torch.round(w_grouped / scales).int() + 8
+        q = torch.clamp(q, 0, 15)
+        q_flat = q.view(N, K).int()
+        raw_packed = torch.zeros(N, K // 8, dtype=torch.int32, device=device)
+        for i in range(8):
+            raw_packed |= (q_flat[:, i::8] & 0xF) << (i * 4)
+        raw_scales = scales.squeeze(-1).to(torch.bfloat16)
+
+        # Forward: K2.5 → Marlin
+        marlin_qw, marlin_s = repack_int4_to_marlin_gs32(raw_packed, raw_scales, K, N)
+
+        # CPU transform
+        cpu_packed, cpu_scales = marlin_to_wgmma_cpu(marlin_qw, marlin_s, K, N)
+
+        # GPU transform
+        gpu_packed, gpu_scales = marlin_to_wgmma_gpu(marlin_qw, marlin_s, K, N)
+
+        w_match = torch.equal(cpu_packed, gpu_packed)
+        s_match = torch.equal(cpu_scales, gpu_scales)
+        rt_match = torch.equal(raw_packed, gpu_packed)
+
+        print(f"  GPU vs CPU weights: {'MATCH' if w_match else 'MISMATCH'}")
+        print(f"  GPU vs CPU scales:  {'MATCH' if s_match else 'MISMATCH'}")
+        print(f"  GPU round-trip:     {'MATCH' if rt_match else 'MISMATCH'}")
+        status = "PASS" if (w_match and s_match and rt_match) else "FAIL"
+        print(f"  [{status}]")
+
+
+def bench_gpu_transform():
+    """Benchmark GPU transform kernel timing."""
+    from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+
+    device = "cuda"
+    iters = 100
+
+    print(f"\nGPU Transform Benchmark (iters={iters}):")
+    print(f"Device: {torch.cuda.get_device_name()}")
+
+    for K, N, label in [(7168, 2048, "gate/up"), (2048, 7168, "down")]:
+        # Create Marlin weights
+        w = torch.randn((N, K), dtype=torch.float16, device=device) * 0.1
+        n_groups = K // 32
+        w_grouped = w.view(N, n_groups, 32)
+        max_val = w_grouped.max(dim=-1, keepdim=True).values
+        min_val = w_grouped.min(dim=-1, keepdim=True).values
+        scales = torch.max(max_val.abs() / 7.0, min_val.abs() / 8.0).clamp(min=1e-10)
+        q = torch.round(w_grouped / scales).int() + 8
+        q = torch.clamp(q, 0, 15)
+        q_flat = q.view(N, K).int()
+        raw_packed = torch.zeros(N, K // 8, dtype=torch.int32, device=device)
+        for i in range(8):
+            raw_packed |= (q_flat[:, i::8] & 0xF) << (i * 4)
+        raw_scales = scales.squeeze(-1).to(torch.bfloat16)
+        marlin_qw, marlin_s = repack_int4_to_marlin_gs32(raw_packed, raw_scales, K, N)
+
+        # Warmup
+        for _ in range(10):
+            marlin_to_wgmma_gpu(marlin_qw, marlin_s, K, N)
+
+        # Benchmark
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(iters):
+            marlin_to_wgmma_gpu(marlin_qw, marlin_s, K, N)
+        e.record()
+        torch.cuda.synchronize()
+        us_per = s.elapsed_time(e) / iters * 1000
+
+        data_mb = K * N / 2 / 1e6  # INT4 packed size
+        bw_tb = data_mb * 2 / (us_per * 1e-6) / 1e6  # read + write
+
+        print(f"  {label:8s} K={K:5d} N={N:5d}: {us_per:8.1f} us | {data_mb:.1f} MB | {bw_tb:.2f} TB/s")
+
+    # Per-expert total (3 projections)
+    print(f"\n  Per-expert (3 projections): ~{3 * us_per:.0f} us")
+    print(f"  Per-layer (24 experts):     ~{24 * 3 * us_per / 1000:.1f} ms")
+    print(f"  vs WGMMA compute per layer: ~1200 us → transform overhead shown above")
+
+
 if __name__ == "__main__":
-    test_roundtrip()
+    import sys
+    test_name = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if test_name == "all":
+        test_roundtrip()
+        test_gpu_vs_cpu()
+        bench_gpu_transform()
+    elif test_name == "roundtrip":
+        test_roundtrip()
+    elif test_name == "gpu":
+        test_gpu_vs_cpu()
+    elif test_name == "bench":
+        bench_gpu_transform()
+    else:
+        print(f"Unknown: {test_name}. Use: all, roundtrip, gpu, bench")
