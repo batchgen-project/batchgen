@@ -58,23 +58,27 @@ def marlin_to_wgmma_cpu(
     """
     device = marlin_qw.device
 
-    # Step 1: Unpack Marlin int32 → nibbles [K, N]
-    # Marlin packs 8 nibbles per int32 at positions 0,4,8,...,28 bits
-    unpacked = torch.empty(K, N // 8, 8, dtype=torch.int32, device=device)
+    # marlin_qw shape: [K//16, N*2] int32 (from _marlin_pack_weights)
+    # Each row = one K-tile (16 K values), packed: N*16 nibbles → N*2 int32s (8 nibbles each)
+    assert marlin_qw.shape == (K // GPTQ_MARLIN_TILE, N * 2), \
+        f"Expected [{K // GPTQ_MARLIN_TILE}, {N * 2}], got {marlin_qw.shape}"
+
+    # Step 1: Unpack int32 → nibbles [K//16, N*16]
+    flat = marlin_qw.reshape(-1)  # flatten
+    n_int32 = flat.numel()
+    unpacked = torch.empty(n_int32, 8, dtype=torch.int32, device=device)
     for i in range(8):
-        unpacked[:, :, i] = (marlin_qw >> (i * 4)) & 0xF
-    q_marlin = unpacked.view(K, N)  # [K, N] nibbles in Marlin-permuted order
+        unpacked[:, i] = (flat >> (i * 4)) & 0xF
+    q_marlin = unpacked.view(K // GPTQ_MARLIN_TILE, N * GPTQ_MARLIN_TILE)
+    # Now [K//16, N*16] — nibbles in Marlin-permuted tile order
 
-    # Step 2: Inverse Marlin tile permutation
-    # _marlin_permute_weights: reshape [K//16, 16, N//16, 16] → permute(0,2,1,3) → perm
-    # Inverse: inv_perm → permute(0,2,1,3) → reshape [K, N]
+    # Step 2: Inverse nibble-level permutation within tiles
     inv_perm = _get_inverse_weight_perm(4).to(device)
+    q_tiled = q_marlin.reshape((-1, inv_perm.numel()))[:, inv_perm].reshape(q_marlin.shape)
 
-    # Undo nibble-level permutation within tiles
-    q_tiled = q_marlin.reshape((K // GPTQ_MARLIN_TILE, N * GPTQ_MARLIN_TILE))
-    q_tiled = q_tiled.reshape((-1, inv_perm.numel()))[:, inv_perm].reshape(q_tiled.shape)
-
-    # Undo tile transpose: [K//16, N//16, 16, 16] → permute(0,2,1,3) → [K//16, 16, N//16, 16]
+    # Step 3: Undo tile transpose
+    # Forward was: [K//16, 16, N//16, 16] → permute(0,2,1,3) → [K//16, N//16, 16, 16]
+    # Inverse: [K//16, N//16, 16, 16] → permute(0,2,1,3) → [K//16, 16, N//16, 16]
     q_tiled = q_tiled.reshape((K // GPTQ_MARLIN_TILE, N // GPTQ_MARLIN_TILE,
                                 GPTQ_MARLIN_TILE, GPTQ_MARLIN_TILE))
     q_raw_kn = q_tiled.permute((0, 2, 1, 3)).reshape(K, N)  # [K, N] raw nibble order
