@@ -943,7 +943,8 @@ class KimiK25MoE(nn.Module):
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
-        if getattr(self, '_use_marlin_decode', False) and buf is not None:
+        if getattr(self, '_use_marlin_decode', False) and buf is not None \
+                and num_global <= 128:
             # Lazy init: create mtp-dependent buffers on first call or after resize
             if self._marlin_mtp != mtp:
                 self._init_marlin_buffers(mtp)
