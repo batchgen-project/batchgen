@@ -108,6 +108,9 @@ class ServerArgs:
     decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
     # Startup timeout
     startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
+    # Request pool: max QueryBook capacity. Default 10240 enables pool mode.
+    # Set to 0 to force legacy batch-FIFO mode.
+    max_pool_size: int = 10240
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -237,6 +240,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Maximum seconds from process launch to server ready (/health returns 200). If exceeded, server exits. Default: disabled. Recommended: 1800.",
+    )
+    parser.add_argument(
+        "--max-pool-size",
+        type=int,
+        default=10240,
+        help="Max QueryBook pool capacity for persistent request scheduling. "
+             "Default: 10240 (pool mode enabled). Set to 0 for legacy batch-FIFO mode.",
     )
     parser.add_argument(
         "--enable-prepack",
@@ -530,6 +540,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         no_incremental_save=parsed.no_incremental_save,
         decode_step_timeout=parsed.decode_step_timeout,
         startup_timeout=parsed.startup_timeout,
+        max_pool_size=parsed.max_pool_size,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

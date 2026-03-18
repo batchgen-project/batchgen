@@ -31,6 +31,8 @@ from batchgen.server.io_struct import (
     ToolCallFunction,
     Usage,
 )
+from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
+from batchgen.server.scheduling_pool import SchedulingPool
 from batchgen.server.server_args import ServerArgs
 from batchgen.server.storage import StorageManager
 from batchgen.server.worker_manager import WorkerManager
@@ -101,12 +103,29 @@ class BatchScheduler:
         self._stopped = asyncio.Event()
         self._tokenizer = None
         self._tokenizer_model: Optional[str] = None
+        # Request pool state
+        self._pool_mode = server_args.max_pool_size > 0
+        self._intake_pool = IntakePool()
+        self._scheduling_pool = SchedulingPool(
+            capacity=server_args.max_pool_size if self._pool_mode else 1024
+        )
+        self._pool_initialized = False  # First batch triggers worker init
+        self._completion_listener_task: Optional[asyncio.Task] = None
+        self._drain_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         if self._task:
             return
         self._stopped.clear()
         self._task = asyncio.create_task(self._run())
+        # Start pool mode background tasks
+        if self._pool_mode:
+            self._completion_listener_task = asyncio.create_task(
+                self._pool_completion_listener()
+            )
+            self._drain_task = asyncio.create_task(
+                self._drain_intake_to_worker()
+            )
 
     async def stop(self) -> None:
         if not self._task:
@@ -237,6 +256,15 @@ class BatchScheduler:
                 parse_tool_call=self.server_args.parse_tool_call,
             )
 
+        # --- Pool mode: send admission messages instead of blocking infer() ---
+        if self._pool_mode:
+            await self._process_batch_pool_mode(
+                batch_id, batch, requests, prompts,
+                per_request_max_tokens, sampling_params, incremental_kwargs,
+            )
+            return
+
+        # --- Legacy mode: blocking infer() ---
         try:
             results = await asyncio.to_thread(
                 self.worker.infer,
@@ -782,3 +810,245 @@ class BatchScheduler:
                 for key, val in value.items()
             }
         return value
+
+    # ============ Pool Mode ============
+
+    async def _process_batch_pool_mode(
+        self,
+        batch_id: str,
+        batch: Any,
+        requests: List[BatchRequestItem],
+        prompts: List[str],
+        per_request_max_tokens: List[int],
+        sampling_params: List[Dict[str, Any]],
+        incremental_kwargs: Dict[str, Any],
+    ) -> None:
+        """Process a batch in pool mode: push to IntakePool for async processing.
+
+        All batches (including the first) go through IntakePool → drain task → worker.
+        The drain task sends an "init" message on first drain, then admission messages.
+        """
+        max_tokens = max(per_request_max_tokens)
+
+        # Register batch for completion tracking
+        self._scheduling_pool.register_batch(
+            batch_id=batch_id,
+            total_requests=len(requests),
+            output_path=str(
+                self.storage.output_dir / f"{batch_id}_output.jsonl"
+            ) if hasattr(self.storage, 'output_dir') else None,
+        )
+
+        # Build IntakeEntry objects and push to IntakePool
+        entries = []
+        for idx, req in enumerate(requests):
+            entries.append(IntakeEntry(
+                request_id=req.custom_id or f"{batch_id}_req_{idx}",
+                batch_id=batch_id,
+                raw_request={
+                    "text": prompts[idx],
+                    "max_tokens": per_request_max_tokens[idx],
+                    "priority": 0,  # TODO: support per-batch priority from API
+                    "sampling_params": sampling_params[idx] if sampling_params else {},
+                },
+                priority=Priority.NORMAL,
+            ))
+        self._intake_pool.submit_batch(batch_id, entries, Priority.NORMAL)
+        # Store max_tokens for init message
+        if not hasattr(self, '_pool_max_output_len'):
+            self._pool_max_output_len = max_tokens
+        else:
+            self._pool_max_output_len = max(self._pool_max_output_len, max_tokens)
+        if not hasattr(self, '_pool_max_context_length'):
+            self._pool_max_context_length = batch.max_context_length
+
+        logger.info(
+            f"[POOL] Batch {batch_id}: {len(entries)} requests pushed to IntakePool "
+            f"(total in pool: {self._intake_pool.size()})"
+        )
+
+        # Wait for this batch to complete
+        while True:
+            tracker = self._scheduling_pool.get_batch_tracker(batch_id)
+            if tracker and tracker.is_complete:
+                break
+            await asyncio.sleep(0.5)
+
+        # Finalize batch output
+        self._finalize_batch_output(batch_id, requests, prompts)
+
+    async def _drain_intake_to_worker(self) -> None:
+        """Background task: drain IntakePool → send admission messages to worker.
+
+        On first drain, sends an "init" message to trigger worker initialization.
+        Subsequent drains send "admit" messages with sequences.
+        """
+        logger.info("[POOL] Intake drain task started")
+        while not self._stopped.is_set():
+            if self._intake_pool.is_empty():
+                await asyncio.sleep(0.1)
+                continue
+
+            # First drain: send init message to worker
+            if not self._pool_initialized:
+                init_msg = {
+                    "type": "init",
+                    "max_output_len": getattr(self, '_pool_max_output_len', 4096),
+                    "max_context_length": getattr(self, '_pool_max_context_length', None),
+                }
+                self.worker.request_queue.put(init_msg)
+                self._pool_initialized = True
+                logger.info("[POOL] Init message sent to worker")
+                # Brief wait for worker to initialize before sending sequences
+                await asyncio.sleep(1.0)
+
+            # Drain from IntakePool (up to scheduling pool free slots)
+            free_slots = self._scheduling_pool.num_free_slots()
+            if free_slots <= 0:
+                await asyncio.sleep(0.2)
+                continue
+
+            drained = self._scheduling_pool.select_from_intake(
+                self._intake_pool, max_n=free_slots
+            )
+            if not drained:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Build admission message from drained entries
+            admit_entries = []
+            for entry in drained:
+                slot = self._scheduling_pool.allocate_slot(entry.request_id)
+                admit_entries.append({
+                    "request_id": entry.request_id,
+                    "text": entry.raw_request.get("text", ""),
+                    "max_tokens": entry.raw_request.get("max_tokens", 4096),
+                    "batch_id": entry.batch_id,
+                    "priority": entry.priority.value,
+                    "sampling_params": entry.raw_request.get("sampling_params", {}),
+                })
+
+            admission_msg = {
+                "type": "admit",
+                "entries": admit_entries,
+            }
+            self.worker.request_queue.put(admission_msg)
+            logger.info(
+                f"[POOL] Drained {len(admit_entries)} entries to worker "
+                f"(intake remaining: {self._intake_pool.size()}, "
+                f"scheduling active: {self._scheduling_pool.num_active_slots()})"
+            )
+
+        logger.info("[POOL] Intake drain task stopped")
+
+    async def _pool_completion_listener(self) -> None:
+        """Background task: read per-request completions from worker response queue.
+
+        Routes each completion to the correct batch tracker and writes
+        incremental output.
+        """
+        logger.info("[POOL] Completion listener started")
+        while not self._stopped.is_set():
+            try:
+                result = await asyncio.to_thread(
+                    self.worker.response_queue.get,
+                    timeout=1.0,
+                )
+            except Exception:
+                continue
+
+            if result is None:
+                break
+
+            if isinstance(result, dict):
+                msg_type = result.get("type")
+                if msg_type == "completion":
+                    request_id = result.get("request_id")
+                    batch_id = result.get("batch_id")
+                    if request_id:
+                        # Free scheduling pool slot
+                        try:
+                            self._scheduling_pool.free_slot(request_id)
+                        except KeyError:
+                            pass  # Slot may already be freed
+                    if batch_id:
+                        batch_done = self._scheduling_pool.mark_request_completed(
+                            request_id, batch_id
+                        )
+                        if batch_done:
+                            logger.info(f"[POOL] Batch {batch_id} completed")
+                elif msg_type == "pool_shutdown":
+                    logger.info("[POOL] Worker shutdown signal received")
+                    break
+                elif "error" in result:
+                    logger.error(f"[POOL] Worker error: {result}")
+                    break
+                else:
+                    # Legacy result dict — should not happen in pool mode
+                    logger.warning(f"[POOL] Unexpected result: {type(result)}")
+
+        logger.info("[POOL] Completion listener stopped")
+
+    def _finalize_batch_output(
+        self,
+        batch_id: str,
+        requests: List[BatchRequestItem],
+        prompts: List[str],
+    ) -> None:
+        """Finalize batch output after all requests complete.
+
+        In pool mode, the incremental writer handles per-request output.
+        This method writes the batch status and output file metadata.
+        """
+        output_file_id = f"file-{uuid.uuid4().hex}"
+
+        # Check for incremental output
+        incremental_path = None
+        incremental_output_dir = (
+            self.server_args.incremental_output_dir
+            if not self.server_args.no_incremental_save
+            else None
+        )
+        if incremental_output_dir:
+            from pathlib import Path
+            import shutil
+            incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
+
+        if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
+            import shutil
+            api_path = self.storage.files_dir / output_file_id
+            shutil.copy2(incremental_path, api_path)
+            output_path = self.storage.output_dir / f"{output_file_id}.jsonl"
+            shutil.copy2(incremental_path, output_path)
+        else:
+            # No incremental output available — write empty placeholder
+            output_path = self.storage.output_dir / f"{output_file_id}.jsonl"
+            output_path.write_text("")
+            logger.warning(
+                f"[POOL] Batch {batch_id}: no incremental output found, "
+                f"writing empty output"
+            )
+
+        output_meta = FileObject(
+            id=output_file_id,
+            bytes=output_path.stat().st_size,
+            created_at=int(time.time()),
+            filename=output_path.name,
+            purpose=FilePurpose.BATCH_OUTPUT.value,
+            status=FileStatus.PROCESSED.value,
+            status_details=None,
+            checksum=None,
+        )
+        self.storage.save_metadata(output_file_id, output_meta.dict())
+
+        completed_at = int(time.time())
+        self.storage.update_batch_status(
+            batch_id,
+            BatchStatus.COMPLETED,
+            completed_at=completed_at,
+            output_file_id=output_file_id,
+        )
+
+        # Clean up batch tracker
+        self._scheduling_pool.remove_batch_tracker(batch_id)
+        logger.info(f"[POOL] Batch {batch_id} finalized")

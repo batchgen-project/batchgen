@@ -304,6 +304,8 @@ class BatchGenWorkerArgs:
 	kv_memfd_fd: int = -1
 	weights_memfd_pid: int = -1
 	weights_memfd_fd: int = -1
+	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
+	max_pool_size: int = 10240  # Default enables pool mode. 0 = legacy batch-FIFO.
 
 
 class BatchGenWorker:
@@ -524,6 +526,12 @@ class BatchGenWorker:
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
 
+		# Request pool: admission queue and response queue for persistent loop
+		self._admission_queue = None  # mp.Queue, set via set_admission_queue()
+		self._response_queue = None   # mp.Queue, set via set_response_queue()
+		self._shutdown_requested = False
+		self._max_pool_size = args.max_pool_size  # 0 = legacy mode
+
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
 	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):
@@ -715,6 +723,278 @@ class BatchGenWorker:
 				f"[SAMPLING] Per-request params for {len(params)} prompts: "
 				f"{n_greedy} greedy, {n_sampling} sampling"
 			)
+
+	# ============ Request Pool: Admission Queue ============
+
+	def set_admission_queue(self, queue) -> None:
+		"""Set the mp.Queue used to receive new admission messages during generate()."""
+		self._admission_queue = queue
+
+	def set_response_queue(self, queue) -> None:
+		"""Set the mp.Queue used to send per-request completion results."""
+		self._response_queue = queue
+
+	def _poll_admissions(self) -> bool:
+		"""Poll for new admission messages. Called at top of generate() outer loop.
+
+		Only rank 0 polls the queue; result is broadcast to all ranks.
+		New sequences are tokenized, assigned ranks, and added to global_batch as QUEUEING.
+
+		Returns:
+			True if new sequences were admitted.
+		"""
+		import queue as queue_mod
+
+		has_new = False
+		msg_data = None
+
+		if self.rank == 0 and self._admission_queue is not None:
+			try:
+				msg = self._admission_queue.get_nowait()
+				if msg is None:
+					self._shutdown_requested = True
+				elif isinstance(msg, dict) and msg.get("type") == "admit":
+					msg_data = msg
+					has_new = True
+			except queue_mod.Empty:
+				pass
+
+		# Broadcast status to all ranks
+		status = torch.tensor(
+			[1 if has_new else 0, 1 if self._shutdown_requested else 0],
+			dtype=torch.int32, device=self.torch_device,
+		)
+		dist.broadcast(status, src=0)
+		has_new = status[0].item() == 1
+		self._shutdown_requested = status[1].item() == 1
+
+		if has_new:
+			container = [msg_data]
+			dist.broadcast_object_list(container, src=0)
+			msg_data = container[0]
+			self._admit_sequences_from_message(msg_data)
+
+		return has_new
+
+	def _admit_sequences_from_message(self, msg: dict) -> None:
+		"""Admit new sequences from an admission message into the live global_batch.
+
+		This is a lightweight version of process_new_batch steps 1-4, designed
+		to add sequences to an already-running generate() loop without resetting state.
+
+		Args:
+			msg: Dict with keys:
+				- "entries": List of dicts, each with "request_id", "text", "max_tokens",
+				  "batch_id", "priority", and optionally "sampling_params"
+		"""
+		entries = msg.get("entries", [])
+		if not entries:
+			return
+
+		# Determine starting global_idx (continue from existing batch)
+		existing_max_idx = max(
+			(seq.global_idx for seq in self.global_batch), default=-1
+		)
+		start_idx = existing_max_idx + 1
+
+		# Step 1: Create SequenceEntry objects
+		new_uuids = []
+		for i, entry in enumerate(entries):
+			global_idx = start_idx + i
+			max_dec = entry.get("max_tokens", self.max_decoding_length)
+			seq = SequenceEntry(
+				uuid=entry["request_id"],
+				global_idx=global_idx,
+				prompt_length=0,  # Set during tokenization
+				max_decode_length=max_dec,
+				text=entry.get("text", ""),
+			)
+			seq.batch_id = entry.get("batch_id")
+			seq.priority = entry.get("priority", 0)
+			self.global_batch.add_sequence(seq)
+			new_uuids.append(seq.uuid)
+
+		# Step 2: Tokenize new sequences (all ranks, parallel)
+		self._tokenize_admitted_sequences(new_uuids)
+
+		# Step 3: Assign ranks (round-robin, continuing from existing)
+		self._assign_admitted_sequences_to_ranks(new_uuids)
+
+		# Step 4: Build local query book entries for new sequences
+		self._build_local_query_book_for_admitted(new_uuids)
+
+		if self.rank == 0:
+			logging.info(
+				f"[ADMIT] Admitted {len(entries)} sequences "
+				f"(global_idx {start_idx}-{start_idx + len(entries) - 1}), "
+				f"global_batch now has {len(self.global_batch)} sequences"
+			)
+
+	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
+		"""Tokenize newly admitted sequences and assign buffer pool slots.
+
+		Uses parallel tokenization across ranks (same pattern as _tokenize_global_batch
+		but only for the new sequences).
+		"""
+		sequences = [self.global_batch.get_sequence(u) for u in uuids]
+		all_texts = [seq.text for seq in sequences]
+		num_new = len(all_texts)
+
+		# Parallel tokenization across ranks
+		my_indices = list(range(self.rank, num_new, self.world_size))
+		my_texts = [all_texts[i] for i in my_indices]
+
+		if my_texts:
+			my_batch_tokenized = self.tokenizer(
+				my_texts,
+				return_tensors="pt",
+				truncation=False,
+				padding=True,
+				return_attention_mask=True,
+			)
+			my_tokenized = []
+			for i in range(len(my_texts)):
+				actual_len = int(my_batch_tokenized["attention_mask"][i].sum().item())
+				my_tokenized.append({
+					"idx": my_indices[i],
+					"input_ids": my_batch_tokenized["input_ids"][i, :actual_len].tolist(),
+					"length": actual_len,
+				})
+		else:
+			my_tokenized = []
+
+		# Gather across ranks
+		all_tokenized_lists = [None] * self.world_size
+		dist.all_gather_object(all_tokenized_lists, my_tokenized)
+
+		tokenized_by_idx = {}
+		for rank_results in all_tokenized_lists:
+			if rank_results:
+				for item in rank_results:
+					tokenized_by_idx[item["idx"]] = item
+		del all_tokenized_lists
+
+		# Reject sequences exceeding context length
+		rejected_uuids = []
+		for i, seq in enumerate(sequences):
+			item = tokenized_by_idx.get(i)
+			if item is None:
+				rejected_uuids.append(seq.uuid)
+				continue
+			if item["length"] >= self.model_context_length:
+				rejected_uuids.append(seq.uuid)
+				if self.rank == 0:
+					logging.warning(
+						f"[ADMIT] Rejecting {seq.uuid}: prompt length {item['length']} >= "
+						f"model context {self.model_context_length}"
+					)
+
+		for uuid in rejected_uuids:
+			self.global_batch.remove_sequence(uuid)
+			# TODO: Report rejection to response_queue
+
+		# Assign buffer slots and fill token data
+		for i, seq in enumerate(sequences):
+			if seq.uuid in rejected_uuids:
+				continue
+			item = tokenized_by_idx[i]
+			input_ids_list = item["input_ids"]
+			actual_prompt_len = item["length"]
+
+			seq_extended_size = min(
+				actual_prompt_len + seq.max_decode_length,
+				self.model_context_length,
+			)
+
+			slot = self._buffer_pool.allocate_slot()
+			seq._buffer_slot = slot
+
+			input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
+			input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+			seq.input_ids = input_ids_view
+			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
+
+			seq.prompt_length = actual_prompt_len
+			seq.current_context_length = actual_prompt_len
+			seq.kv_token_budget = seq_extended_size
+
+	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
+		"""Assign newly admitted sequences to ranks using round-robin.
+
+		Continues the round-robin from the current state (balancing across ranks).
+		"""
+		# Count current assignments per rank
+		rank_counts = [0] * self.world_size
+		for seq in self.global_batch:
+			if seq.uuid not in uuids and seq.assigned_rank is not None:
+				rank_counts[seq.assigned_rank] += 1
+
+		# Assign new sequences to least-loaded rank
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			min_rank = rank_counts.index(min(rank_counts))
+			self.global_batch.assign_rank(uuid, min_rank)
+			rank_counts[min_rank] += 1
+
+	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
+		"""Build local query book entries for newly admitted sequences on this rank."""
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or seq.assigned_rank != self.rank:
+				continue
+			# Allocate local index
+			if self._free_local_indices:
+				local_idx = self._free_local_indices.pop()
+			else:
+				local_idx = self._next_local_idx
+				self._next_local_idx += 1
+			self._local_to_uuid_map[local_idx] = uuid
+			self._uuid_to_local_map[uuid] = local_idx
+
+	def _report_completion(self, uuid: str) -> None:
+		"""Report a single sequence completion to the response queue.
+
+		Also frees the QueryBook buffer slot so it can be reused by new admissions.
+		"""
+		seq = self.global_batch.get_sequence(uuid)
+		if seq is None:
+			return
+
+		# Free buffer slot (all ranks do this to keep state consistent)
+		if hasattr(self, '_buffer_pool') and self._buffer_pool is not None:
+			if seq._buffer_slot >= 0:
+				self._buffer_pool.free_slot(seq._buffer_slot)
+
+		# Free local index mapping
+		local_idx = self._uuid_to_local_map.pop(uuid, None)
+		if local_idx is not None:
+			del self._local_to_uuid_map[local_idx]
+			self._free_local_indices.add(local_idx)
+
+		# Only rank 0 sends to response queue
+		if self.rank != 0 or self._response_queue is None:
+			return
+		# Gather decoded text
+		text = ""
+		if seq.decoded_tokens is not None and seq.decoded_length > 0:
+			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
+			try:
+				text = self.tokenizer.decode(token_ids)
+			except Exception:
+				text = ""
+		self._response_queue.put({
+			"type": "completion",
+			"request_id": uuid,
+			"batch_id": getattr(seq, "batch_id", None),
+			"global_idx": seq.global_idx,
+			"text": text,
+			"prompt_length": seq.prompt_length,
+			"decoded_length": seq.decoded_length,
+		})
+
+	# ============ End Request Pool Methods ============
 
 	def _build_sampling_tensors(self, batch_size: int) -> tuple:
 		"""Build [B] sampling param tensors from per-sequence params for current batch.
@@ -3354,8 +3634,10 @@ class BatchGenWorker:
 		phase3_start = time.perf_counter()
 		num_seqs = len(self.global_batch)
 
+		# Use max_pool_size for pre-allocation if in pool mode (allows future admissions)
+		pool_capacity = max(num_seqs, self._max_pool_size) if self._max_pool_size > 0 else num_seqs
 		self._buffer_pool = QueryBookBufferPool(
-			num_sequences=num_seqs,
+			num_sequences=pool_capacity,
 			model_context_length=self.model_context_length,
 			max_decoding_length=self.max_decoding_length,
 			pad_token_id=self.pad_token_id,
@@ -4398,6 +4680,49 @@ class BatchGenWorker:
 
 	# ============ Main Generation Loop ============
 
+	def generate_persistent(self):
+		"""Pool mode entry point: init core, empty batch, persistent generate() loop.
+
+		Called from server_worker_main_loop when pool mode is active.
+		Uses Init() to set up model/tokenizer/KV, then enters generate()
+		with an empty global_batch that accepts sequences via admission messages.
+		"""
+		logging.info(f"Rank {self.rank}: Entering persistent generate() mode")
+
+		# Use Init() to set up core components (model, tokenizer, KV config)
+		# num_queries=0 means no sequences yet — they'll come via admission
+		if not self._core_initialized:
+			self.Init(None, self.max_decoding_length, 0,
+				max_context_length=self.max_context_length)
+
+		# Initialize empty global batch (Init may have created one via _reset)
+		self.global_batch = SequenceBatch()
+
+		# Pre-allocate buffer pool for max_pool_size
+		self._buffer_pool = QueryBookBufferPool(
+			num_sequences=self._max_pool_size,
+			model_context_length=self.model_context_length,
+			max_decoding_length=self.max_decoding_length,
+			pad_token_id=self.pad_token_id,
+		)
+		logging.info(
+			f"Rank {self.rank}: Buffer pool pre-allocated for {self._max_pool_size} sequences "
+			f"(context_length={self.model_context_length}, "
+			f"max_decoding={self.max_decoding_length})"
+		)
+
+		# Initialize index maps
+		self._local_to_uuid_map = {}
+		self._uuid_to_local_map = {}
+		self._free_local_indices = set()
+		self._next_local_idx = 0
+		self.num_global_queries = 0
+		self.num_local_queries = 0
+		self._rejected_sequences = []
+
+		# Enter the persistent generate loop
+		return self.generate()
+
 	def generate(self):
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
@@ -4512,8 +4837,60 @@ class BatchGenWorker:
 
 		iteration = 0
 
-		# Continues until ALL sequences in the global batch are COMPLETED
-		while not self.global_batch.all_completed():
+		# Persistent loop: continues until all completed AND no more admissions expected
+		while True:
+			# --- ADMISSION CHECK: Poll for new sequences from IntakePool ---
+			if self._admission_queue is not None:
+				admitted = self._poll_admissions()
+				if admitted and self.rank == 0:
+					logging.info(f"[POOL] Admitted new sequences, total in batch: {len(self.global_batch)}")
+
+			# --- TERMINATION CHECK ---
+			if self.global_batch.all_completed():
+				if self._admission_queue is None:
+					break  # Legacy mode: no pool, just finish
+				if self._shutdown_requested:
+					break  # Pool mode: shutdown requested and all done
+				# Pool mode: wait briefly for more work before exiting
+				import queue as queue_mod
+				if self.rank == 0:
+					try:
+						msg = self._admission_queue.get(timeout=1.0)
+						if msg is None:
+							self._shutdown_requested = True
+						elif isinstance(msg, dict) and msg.get("type") == "admit":
+							# Broadcast that we got new work
+							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
+							dist.broadcast(status, src=0)
+							container = [msg]
+							dist.broadcast_object_list(container, src=0)
+							self._admit_sequences_from_message(msg)
+							# Continue loop — new sequences will be picked up
+						else:
+							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
+							dist.broadcast(status, src=0)
+					except queue_mod.Empty:
+						# No work arrived, broadcast no-work to other ranks
+						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
+						dist.broadcast(status, src=0)
+						continue  # Try again
+				else:
+					# Non-rank-0: wait for rank 0's broadcast
+					status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
+					dist.broadcast(status, src=0)
+					has_new = status[0].item() == 1
+					if has_new:
+						container = [None]
+						dist.broadcast_object_list(container, src=0)
+						self._admit_sequences_from_message(container[0])
+					elif status[1].item() == 1:
+						self._shutdown_requested = True
+					# Continue loop regardless
+				if self.global_batch.all_completed() and self._shutdown_requested:
+					break
+				if self.global_batch.all_completed():
+					continue  # Keep waiting
+
 			iteration += 1
 			if self.rank == 0:
 				logging.info(f"--- Iteration {iteration} ---")
@@ -4665,6 +5042,9 @@ class BatchGenWorker:
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
 					self._submit_completed_to_incremental_writer(list(global_completed))
+					# Report completions to response queue (pool mode)
+					for uuid in global_completed:
+						self._report_completion(uuid)
 
 				if not decode_uuids:
 					break
@@ -5864,10 +6244,12 @@ class BatchGenWorker:
 				for uuid in active_uuids:
 					state = global_seq_state.get(uuid)
 					if state and uuid not in completed_set:
+						seq = self.global_batch.get_sequence(uuid)
 						eviction_candidates.append((uuid, {
 							'decoded_length': state['decoded_length'],
 							'host_pages_allocated': state.get('host_pages_allocated', 0),
-							'global_idx': self.global_batch.get_sequence(uuid).global_idx,
+							'global_idx': seq.global_idx,
+							'priority': getattr(seq, 'priority', 0),
 						}))
 
 				target_free = int(total_pages * self.host_kv_eviction_watermark / 100)
@@ -5912,8 +6294,10 @@ class BatchGenWorker:
 						for uuid in decode_after_eviction
 						if uuid in global_seq_state and global_seq_state[uuid]['assigned_rank'] == r
 					]
+					# Priority-aware: NORMAL (0) evicted before HIGH (1)
 					rank_seqs.sort(
-						key=lambda x: (x[1]['decoded_length'],
+						key=lambda x: (getattr(self.global_batch.get_sequence(x[0]), 'priority', 0),
+									x[1]['decoded_length'],
 									self.global_batch.get_sequence(x[0]).global_idx)
 					)
 					pages_to_free = total_additional_by_rank[r] - per_rank_free[r]
@@ -6246,6 +6630,9 @@ class BatchGenWorker:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			# Incremental write: gather completed tokens to rank 0
 			self._submit_completed_to_incremental_writer(completed_uuids)
+			# Report completions to response queue (pool mode)
+			for uuid in completed_uuids:
+				self._report_completion(uuid)
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
@@ -8190,6 +8577,9 @@ class BatchGenWorker:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 					# Incremental write: gather completed tokens to rank 0
 					self._submit_completed_to_incremental_writer(completed_uuids)
+					# Report completions to response queue (pool mode)
+					for uuid in completed_uuids:
+						self._report_completion(uuid)
 					# FIX: Must release GPU KV pages BEFORE releasing host KV pages
 					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 					if my_completed:

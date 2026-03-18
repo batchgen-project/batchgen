@@ -516,6 +516,7 @@ class WorkerManager:
             adaptive_chunk_ema_alpha=self.args.adaptive_chunk_ema_alpha,
             adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
             fast_init=self.args.fast_init,
+            max_pool_size=self.args.max_pool_size,
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             weights_memfd_pid=self._get_weights_memfd_pid(),

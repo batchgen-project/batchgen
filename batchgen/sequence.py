@@ -82,6 +82,10 @@ class SequenceEntry:
         'original_max_decode_length',  # Original max_decode_length before eviction
         'total_decoded_before_eviction',  # Tokens decoded before this eviction cycle
         '_buffer_slot',  # Index into QueryBookBufferPool buffers
+        # Request pool fields
+        'batch_id',              # Which batch this sequence belongs to (for result routing)
+        'pool_slot_index',       # Index in SchedulingPool's pre-allocated QueryBook
+        'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
     )
 
     VALID_TRANSITIONS = {
@@ -137,6 +141,11 @@ class SequenceEntry:
         self.original_max_decode_length: int = max_decode_length
         self.total_decoded_before_eviction: int = 0
         self._buffer_slot: int = -1
+
+        # Request pool fields (set externally when using pool-based scheduling)
+        self.batch_id: Optional[str] = None
+        self.pool_slot_index: int = -1
+        self.priority: int = 0  # 0=NORMAL, 1=HIGH
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:

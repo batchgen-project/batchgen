@@ -292,8 +292,6 @@ def _server_worker_main_impl(
 			logging.info(f"Rank {global_rank}: Received reload command, hot-reloading worker module...")
 			try:
 				new_module = _reload_worker_module()
-				# Rebind key methods to the existing worker instance
-				# This allows code changes to take effect without recreating the worker
 				worker._page_boundary_fast = new_module.BatchGenWorker._page_boundary_fast.__get__(worker, type(worker))
 				worker.decoding_continuous = new_module.BatchGenWorker.decoding_continuous.__get__(worker, type(worker))
 				worker.generate = new_module.BatchGenWorker.generate.__get__(worker, type(worker))
@@ -305,26 +303,55 @@ def _server_worker_main_impl(
 				logging.error(f"Rank {global_rank}: Hot reload failed: {e}", exc_info=True)
 				if global_rank == 0:
 					response_queue.put({"status": "reload_failed", "error": str(e)})
-			continue  # Skip to next iteration
+			continue
 
-		# --- STEP 4: Inference with full global batch ---
+		# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
+		if isinstance(task_data, dict) and task_data.get("type") == "init":
+			logging.info(f"Rank {global_rank}: Pool mode init received")
+			try:
+				current_max_output = task_data.get("max_output_len", 4096)
+				max_context_length = task_data.get("max_context_length", None)
+
+				# Initialize worker with pool capacity (no sequences yet)
+				worker.Init(None, current_max_output, 0,
+					max_context_length=max_context_length)
+
+				# Set admission and response queues for persistent generate()
+				worker.set_admission_queue(request_queue)
+				worker.set_response_queue(response_queue)
+
+				if global_rank == 0:
+					logging.info(
+						f"[POOL] Worker initialized (max_pool_size={args.max_pool_size}). "
+						f"Entering persistent generate() loop."
+					)
+
+				# Enter persistent generate() — blocks until shutdown
+				# generate() starts with empty global_batch, polls for admissions
+				worker.generate_persistent()
+
+			except Exception as e:
+				logging.error(f"Error in pool mode on rank {global_rank}: {e}", exc_info=True)
+				if global_rank == 0:
+					response_queue.put({"type": "pool_shutdown", "error": str(e)})
+
+			# Pool mode exits here — send shutdown sentinel and break
+			if global_rank == 0:
+				response_queue.put({"type": "pool_shutdown"})
+			break
+
+		# --- STEP 4: Legacy inference with full global batch ---
 		local_results = []
 		inference_error = None
 		try:
-			# Unpack payload - all ranks now have the full global batch
 			global_prompts = task_data.get("prompts", [])
-			# max_input_len: If None or not provided, will be determined dynamically
-			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
 			current_max_output = task_data.get("max_output_len")
 			max_context_length = task_data.get("max_context_length", None)
 			ignore_eos = task_data.get("ignore_eos", False)
-			# Sampling parameters (None = greedy decoding)
 			temperature = task_data.get("temperature", None)
 			top_p = task_data.get("top_p", None)
-			# Per-request sampling params (list of dicts, one per prompt)
 			sampling_params = task_data.get("sampling_params", None)
-			# Per-sequence max output token limits
 			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
 			if global_rank == 0:
 				if sampling_params:
@@ -332,7 +359,6 @@ def _server_worker_main_impl(
 				else:
 					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
 
-			# Stage incremental writer config on rank 0 (writer created after tokenizer init)
 			incr_output_dir = task_data.get("incremental_output_dir")
 			incr_custom_ids = task_data.get("custom_id_map")
 			if global_rank == 0 and incr_output_dir and incr_custom_ids:
@@ -347,28 +373,17 @@ def _server_worker_main_impl(
 					"parse_tool_call": task_data.get("parse_tool_call", False),
 				}
 
-			# Clear previous state if supported
 			if hasattr(worker, 'reset_runtime_state'):
 				worker.reset_runtime_state()
 
 			if len(global_prompts) > 0:
-				# Initialize worker with global batch info
-				# max_input_length can be None - will be determined by longest prompt
 				worker.Init(current_max_input, current_max_output, len(global_prompts),
 					max_context_length=max_context_length)
-
-				# Set ignore_eos flag on worker
 				worker.set_ignore_eos(ignore_eos)
-
-				# Set sampling parameters
 				if sampling_params:
-					# Per-request sampling params from batch API
 					worker.set_per_sequence_sampling_params(sampling_params)
 				else:
-					# Global sampling params (legacy /v1/inference path)
 					worker.set_sampling_params(temperature=temperature, top_p=top_p)
-
-				# Process the global batch - worker internally handles distribution
 				local_results = worker.process_new_batch(
 					global_prompts,
 					per_sequence_max_tokens=per_sequence_max_tokens,
@@ -381,66 +396,46 @@ def _server_worker_main_impl(
 			inference_error = str(e)
 			local_results = []
 		finally:
-			# Close incremental writer regardless of success/failure
 			if getattr(worker, '_incremental_writer', None) is not None:
 				worker._incremental_writer.close()
 				worker._incremental_writer = None
-			# Clean up staged config
 			if hasattr(worker, '_incremental_writer_config'):
 				del worker._incremental_writer_config
 
 		# --- STEP 5: Synchronize and check for errors ---
-		# Sync CUDA to catch any async errors
 		try:
 			torch.cuda.synchronize()
 		except RuntimeError as e:
 			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank}: {e}")
 			inference_error = str(e)
 
-		# Barrier to ensure all ranks complete inference
 		dist.barrier()
 
-		# Check for errors across all ranks using all_reduce
-		# Each rank contributes 1 if it has an error, 0 otherwise
 		error_flag = torch.tensor([1 if inference_error else 0], dtype=torch.int32, device='cuda')
 		dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
 		has_any_error = error_flag.item() > 0
 
 		if has_any_error:
-			# Gather error messages from all ranks
 			error_list = [None for _ in range(world_size)] if global_rank == 0 else None
 			dist.gather_object(inference_error, error_list, dst=0)
-
 			if global_rank == 0:
 				errors = [e for e in error_list if e is not None]
 				logging.error(f"Inference failed with errors from ranks: {errors}")
 				response_queue.put({"error": errors[0], "all_errors": errors})
 			continue
 
-		# --- STEP 6: Response (Rank 0 Only) ---
-		# Results are already on rank 0 (local_results), no gather needed
-		# Other ranks have empty results by design
+		# --- STEP 6: Legacy Response (Rank 0 Only) ---
 		if global_rank == 0:
 			final_results = local_results if local_results else {}
-
-			# Safeguard: if results are empty but no errors, something went wrong
 			if not final_results and len(task_data.get("prompts", [])) > 0:
-				# Check if all sequences were rejected (context length exceeded)
 				rejected = getattr(worker, '_rejected_sequences', None)
 				if rejected:
-					logging.info(
-						f"All {len(rejected)} sequences rejected "
-						f"(context length exceeded). Returning empty results."
-					)
+					logging.info(f"All {len(rejected)} sequences rejected (context length exceeded).")
 				else:
 					logging.error(f"Results are unexpectedly empty!")
 					response_queue.put({"error": "Results unexpectedly empty after inference"})
 					continue
-
 			response_queue.put(final_results)
-
-		# NOTE: Watchdog is fed within prefill/decode phases in the worker,
-		# not here. This ensures we only monitor actual inference operations.
 
 	# Cleanup
 	dist.destroy_process_group()
