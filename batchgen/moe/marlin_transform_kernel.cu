@@ -166,6 +166,7 @@ __global__ void marlin_to_wgmma_transform_kernel(
 __global__ void marlin_to_wgmma_scale_transform_kernel(
     const uint16_t* __restrict__ marlin_s,  // [K//gs, N] permuted BF16/FP16
     uint16_t* __restrict__ raw_s,           // [N, K//gs] raw
+    const int* __restrict__ scale_perm,     // [64] scale permutation
     int K_groups, int N)                    // K_groups = K / group_size
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -178,7 +179,7 @@ __global__ void marlin_to_wgmma_scale_transform_kernel(
     // Inverse scale permutation: marlin stores in permuted order within 64-element chunks
     int chunk = kg / 64;
     int pos_in_chunk = kg % 64;
-    int marlin_pos = c_scale_perm[pos_in_chunk];  // forward perm maps raw→marlin
+    int marlin_pos = scale_perm[pos_in_chunk];
     int marlin_kg = chunk * 64 + marlin_pos;
 
     // Read from Marlin [K_groups, N] and write to raw [N, K_groups] (transpose)
@@ -209,6 +210,7 @@ void marlin_to_wgmma_transform(
 
 void marlin_to_wgmma_scale_transform(
     torch::Tensor marlin_s, torch::Tensor raw_s,
+    torch::Tensor scale_perm,
     int K_groups, int N)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -216,5 +218,6 @@ void marlin_to_wgmma_scale_transform(
     marlin_to_wgmma_scale_transform_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
         reinterpret_cast<const uint16_t*>(marlin_s.data_ptr()),
         reinterpret_cast<uint16_t*>(raw_s.data_ptr()),
+        scale_perm.data_ptr<int>(),
         K_groups, N);
 }

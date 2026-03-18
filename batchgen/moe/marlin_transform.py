@@ -118,7 +118,7 @@ def _load_transform_module():
 void marlin_to_wgmma_transform(
     torch::Tensor marlin_qw, torch::Tensor raw_qw, torch::Tensor perm, int K, int N);
 void marlin_to_wgmma_scale_transform(
-    torch::Tensor marlin_s, torch::Tensor raw_s, int K_groups, int N);
+    torch::Tensor marlin_s, torch::Tensor raw_s, torch::Tensor scale_perm, int K_groups, int N);
 """
 
     from torch.utils.cpp_extension import load_inline
@@ -152,10 +152,11 @@ def marlin_to_wgmma_fused_gpu(
     raw_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
     mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, inv_perm, K, N)
 
-    # Scale transform
+    # Scale transform — use inverse scale perm (maps raw output pos → marlin input pos)
+    inv_scale_perm = torch.tensor(_get_inverse_scale_perm(), device=device, dtype=torch.int32)
     K_groups = K // INT4_GROUP_SIZE
     raw_scales = torch.empty(N, K_groups, dtype=marlin_s.dtype, device=device)
-    mod.marlin_to_wgmma_scale_transform(marlin_s, raw_scales, K_groups, N)
+    mod.marlin_to_wgmma_scale_transform(marlin_s, raw_scales, inv_scale_perm, K_groups, N)
 
     return raw_packed, raw_scales
 
@@ -431,10 +432,12 @@ def bench_fused_gpu_transform():
         out_scales = torch.empty(N, K_groups, dtype=torch.bfloat16, device=device)
         mod = _load_transform_module()
 
+        inv_sp = torch.tensor(_get_inverse_scale_perm(), device=device, dtype=torch.int32)
+
         # Warmup
         for _ in range(10):
             mod.marlin_to_wgmma_transform(marlin_qw, out_packed, perm_t, K, N)
-            mod.marlin_to_wgmma_scale_transform(marlin_s, out_scales, K_groups, N)
+            mod.marlin_to_wgmma_scale_transform(marlin_s, out_scales, inv_sp, K_groups, N)
 
         # Benchmark weights only
         s = torch.cuda.Event(enable_timing=True)
@@ -449,7 +452,7 @@ def bench_fused_gpu_transform():
         # Benchmark scales only
         s.record()
         for _ in range(iters):
-            mod.marlin_to_wgmma_scale_transform(marlin_s, out_scales, K_groups, N)
+            mod.marlin_to_wgmma_scale_transform(marlin_s, out_scales, inv_sp, K_groups, N)
         e.record()
         torch.cuda.synchronize()
         s_us = s.elapsed_time(e) / iters * 1000
