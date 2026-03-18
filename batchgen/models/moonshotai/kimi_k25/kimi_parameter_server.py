@@ -93,16 +93,6 @@ _INT4_EXPERT_TENSOR_NAMES = [
     "down_proj.weight_scale",
 ]
 
-# Marlin-repacked expert tensor names (produced by ckpt_converter --marlin)
-_MARLIN_EXPERT_TENSOR_NAMES = [
-    "gate_proj.weight_marlin_packed",
-    "gate_proj.weight_marlin_scale",
-    "up_proj.weight_marlin_packed",
-    "up_proj.weight_marlin_scale",
-    "down_proj.weight_marlin_packed",
-    "down_proj.weight_marlin_scale",
-]
-
 
 class KimiK25_Parameter_Server:
     """Parameter server for Kimi K2.5 with INT4 W4A16 weight handling.
@@ -229,16 +219,6 @@ class KimiK25_Parameter_Server:
                 for expert_idx in range(self.num_experts):
                     # INT4 raw weights (always present)
                     for name in _INT4_EXPERT_TENSOR_NAMES:
-                        tensor_full_name = (
-                            f"language_model.model.layers.{layer_idx}.mlp.experts."
-                            f"{expert_idx}.{name}"
-                        )
-                        self.state_dict_name_map[tensor_full_name] = {
-                            "module_key": f"routed_expert_{layer_idx}_{expert_idx}",
-                            "tensor_key": name,
-                        }
-                    # Marlin-repacked weights (optional, from --marlin converter)
-                    for name in _MARLIN_EXPERT_TENSOR_NAMES:
                         tensor_full_name = (
                             f"language_model.model.layers.{layer_idx}.mlp.experts."
                             f"{expert_idx}.{name}"

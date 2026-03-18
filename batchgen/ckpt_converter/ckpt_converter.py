@@ -50,15 +50,14 @@ class ckpt_converter:
 			raise ValueError(f"Unsupported dtype: {dtype}")
 		
 	def _apply_marlin_repack(self, ckpt):
-		"""Repack INT4 expert weights to Marlin tile layout using GPU kernel.
+		"""Replace INT4 expert weights with Marlin tile layout IN-PLACE using GPU kernel.
 
 		Finds paired weight_packed + weight_scale tensors for routed expert
-		projections (gate/up/down) and converts them to Marlin format.
-		Uses fused CUDA kernel (~52 us/projection) instead of CPU numpy (~seconds).
-		Total bytes unchanged (same nibble count, different layout).
+		projections (gate/up/down) and REPLACES them with Marlin format.
+		Same tensor names, different data layout. Same total bytes.
+		Uses fused CUDA kernel (~52 us/projection).
 
-		Returns: modified ckpt dict with Marlin-repacked tensors +
-		         new 'weight_marlin_packed' / 'weight_marlin_scale' keys.
+		Returns: modified ckpt dict with weight_packed/weight_scale replaced by Marlin layout.
 		"""
 		from batchgen.moe.marlin_transform import raw_to_marlin_fused_gpu
 		import re
@@ -73,7 +72,6 @@ class ckpt_converter:
 			return ckpt
 
 		count = 0
-		new_tensors = {}
 		for name in list(ckpt.keys()):
 			m = packed_pattern.match(name)
 			if not m:
@@ -104,13 +102,13 @@ class ckpt_converter:
 			marlin_qw, marlin_s = raw_to_marlin_fused_gpu(packed_gpu, scale_gpu, K, N)
 			torch.cuda.synchronize()
 
-			new_tensors[f"{prefix}.weight_marlin_packed"] = marlin_qw.cpu()
-			new_tensors[f"{prefix}.weight_marlin_scale"] = marlin_s.cpu()
+			# REPLACE in-place: same tensor names, Marlin layout
+			ckpt[name] = marlin_qw.cpu()
+			ckpt[scale_name] = marlin_s.cpu()
 			count += 1
 
-		ckpt.update(new_tensors)
 		if count > 0:
-			logging.info(f"[ckpt_converter] Marlin GPU repack: {count} projections converted")
+			logging.info(f"[ckpt_converter] Marlin GPU repack: {count} projections replaced in-place")
 		return ckpt
 
 	def convert(self, ckpt_path, output_dir, marlin=False):

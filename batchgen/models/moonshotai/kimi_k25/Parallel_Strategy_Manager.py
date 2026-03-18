@@ -886,13 +886,6 @@ class KimiK25ParallelStrategyManager:
             expert.int4_down_packed = tensors["down_proj.weight_packed"]
             expert.int4_down_scale = tensors["down_proj.weight_scale"]
 
-            # Load pre-converted Marlin weights if present in checkpoint
-            for proj in ('gate', 'up', 'down'):
-                marlin_packed_key = f"{proj}_proj.weight_marlin_packed"
-                marlin_scale_key = f"{proj}_proj.weight_marlin_scale"
-                if marlin_packed_key in tensors and marlin_scale_key in tensors:
-                    setattr(expert, f'marlin_{proj}_qw', tensors[marlin_packed_key])
-                    setattr(expert, f'marlin_{proj}_scale', tensors[marlin_scale_key])
 
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
 
@@ -967,74 +960,71 @@ class KimiK25ParallelStrategyManager:
         logging.debug(f"INT4 weights moved to GPU contiguously for {len(self.local_routed_experts)} experts")
 
     def _register_marlin_weights(self):
-        """Convert GPU INT4 weights → Marlin format for all 3 projections (gate+up+down).
+        """Register Marlin weights for 3-stage decode (gate+up+down).
 
-        Called after _move_int4_to_gpu_contiguous() so INT4 data is on GPU.
-        Converts gate+up (S1) and down (S3) for Marlin 3-stage decode pipeline.
+        If checkpoint was converted with --marlin, int4_*_packed already contains
+        Marlin layout → assign directly as marlin_*_qw (no repack needed).
+        If old checkpoint (raw INT4), repack at runtime via CPU.
 
-        If pre-converted Marlin weights exist (from offline converter), skip repack.
+        Detection: Marlin layout is [K//16, N*2], raw is [N, K//8].
+        For gate/up: N=2048, K=7168. Marlin=[448, 4096], raw=[2048, 896].
         """
         import os
         if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") != "1":
             return
 
-        from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
         device = self.engine_config.Basic_Config.device_torch
 
-        count = 0
-        skipped = 0
+        count_marlin = 0
+        count_repack = 0
         for routed_expert_idx in self.local_routed_experts:
             layer_idx = int(routed_expert_idx.split("_")[2])
             global_expert_idx = int(routed_expert_idx.split("_")[3])
             expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
             module = expert.module if hasattr(expert, 'module') else expert
 
-            # Check if pre-converted Marlin weights already exist (from offline converter)
-            if (hasattr(module, 'marlin_gate_qw') and hasattr(module, 'marlin_up_qw')
-                    and hasattr(module, 'marlin_down_qw')):
-                # Move pre-converted weights to GPU if they're on CPU
+            gate_packed = module.int4_gate_packed
+            # Detect format: Marlin [K//16, N*2] has shape[0] < shape[1] for K>N
+            # Raw [N, K//8] has shape[0] > shape[1] for N<K
+            # For gate/up: raw=[2048, 896], marlin=[448, 4096]
+            is_marlin = gate_packed.shape[0] < gate_packed.shape[1]
+
+            if is_marlin:
+                # Already Marlin layout from --marlin converter
                 for proj in ('gate', 'up', 'down'):
-                    qw = getattr(module, f'marlin_{proj}_qw')
-                    sc = getattr(module, f'marlin_{proj}_scale')
-                    if not qw.is_cuda:
-                        setattr(module, f'marlin_{proj}_qw', qw.to(device))
-                        setattr(module, f'marlin_{proj}_scale', sc.to(device))
-                skipped += 1
-                continue
+                    setattr(module, f'marlin_{proj}_qw', getattr(module, f'int4_{proj}_packed'))
+                    setattr(module, f'marlin_{proj}_scale', getattr(module, f'int4_{proj}_scale'))
+                count_marlin += 1
+            else:
+                # Old checkpoint, runtime repack
+                from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+                K = gate_packed.shape[1] * 8
+                N = gate_packed.shape[0]
 
-            K = module.int4_gate_packed.shape[1] * 8  # K//8 → K (hidden_size=7168)
-            N = module.int4_gate_packed.shape[0]       # intermediate_size=2048
+                for proj in ('gate', 'up'):
+                    packed = getattr(module, f'int4_{proj}_packed')
+                    scale = getattr(module, f'int4_{proj}_scale')
+                    marlin_qw, marlin_s = repack_int4_to_marlin_gs32(packed, scale, K, N)
+                    setattr(module, f'marlin_{proj}_qw', marlin_qw)
+                    setattr(module, f'marlin_{proj}_scale', marlin_s)
 
-            # S1: gate + up (input K, output N)
-            for proj in ('gate', 'up'):
-                packed = getattr(module, f'int4_{proj}_packed')
-                scale = getattr(module, f'int4_{proj}_scale')
-                marlin_qw, marlin_s = repack_int4_to_marlin_gs32(
-                    packed, scale, K, N)
-                setattr(module, f'marlin_{proj}_qw', marlin_qw)
-                setattr(module, f'marlin_{proj}_scale', marlin_s)
-
-            # S3: down (input N, output K — swapped dimensions)
-            down_packed = module.int4_down_packed
-            down_scale = module.int4_down_scale
-            down_K_in = down_packed.shape[1] * 8   # N = 2048
-            down_N_out = down_packed.shape[0]       # K = 7168
-            marlin_dqw, marlin_ds = repack_int4_to_marlin_gs32(
-                down_packed, down_scale, down_K_in, down_N_out)
-            module.marlin_down_qw = marlin_dqw
-            module.marlin_down_scale = marlin_ds
-
-            count += 1
+                down_packed = module.int4_down_packed
+                down_scale = module.int4_down_scale
+                down_K_in = down_packed.shape[1] * 8
+                down_N_out = down_packed.shape[0]
+                marlin_dqw, marlin_ds = repack_int4_to_marlin_gs32(
+                    down_packed, down_scale, down_K_in, down_N_out)
+                module.marlin_down_qw = marlin_dqw
+                module.marlin_down_scale = marlin_ds
+                count_repack += 1
 
         if self.rank == 0:
-            if skipped > 0:
-                logging.info(
-                    f"[MODEL] Marlin weights: {skipped} pre-converted (skipped), "
-                    f"{count} repacked at runtime")
-            else:
-                logging.info(
-                    f"[MODEL] Marlin weights registered for {count} experts "
-                    f"(gate+up+down, 3-stage, gs=32 direct repack)")
+            if count_marlin > 0:
+                logging.info(f"[MODEL] Marlin weights: {count_marlin} experts "
+                             f"(pre-converted, direct assign)")
+            if count_repack > 0:
+                logging.info(f"[MODEL] Marlin weights: {count_repack} experts "
+                             f"(runtime repack from raw INT4)")
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, router) to model.
