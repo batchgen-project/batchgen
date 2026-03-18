@@ -943,16 +943,12 @@ class KimiK25MoE(nn.Module):
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
-        if getattr(self, '_use_marlin_decode', False) \
-                and buf is not None \
-                and expert_counts.max().item() <= 8:
+        if getattr(self, '_use_marlin_decode', False) and buf is not None:
             # Lazy init: create mtp-dependent buffers on first call or after resize
             if self._marlin_mtp != mtp:
                 self._init_marlin_buffers(mtp)
             # Marlin W4A16 for S1 (gate+up+SiLU) — zero-overhead path
-            # Zero intermediate: Marlin+scatter SiLU only writes expert_counts[e] rows,
-            # but S2 WGMMA reads max_m_tiles*BLOCK_M rows. Stale padding rows cause wrong S2 output.
-            buf.intermediate.zero_()
+            buf.intermediate.zero_()  # prevent stale padding for S2 WGMMA
             from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_3d_inplace
             mw = self._marlin_weights
             marlin_grouped_stage1_3d_inplace(
