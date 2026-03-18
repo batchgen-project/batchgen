@@ -926,6 +926,15 @@ class KimiK25ParallelStrategyManager:
         total_packed_numel = sum(t.numel() for _, _, t in packed_entries)
         total_scale_numel = sum(t.numel() for _, _, t in scale_entries)
 
+        if self.rank == 0:
+            # Debug: log first few tensor shapes to verify
+            for i, (_, attr, t) in enumerate(packed_entries[:6]):
+                logging.info(f"[DEBUG] packed[{i}] {attr}: shape={list(t.shape)}, "
+                             f"numel={t.numel()}, dtype={t.dtype}")
+            logging.info(f"[DEBUG] total_packed_numel={total_packed_numel}, "
+                         f"n_entries={len(packed_entries)}, "
+                         f"total_GiB={total_packed_numel * 4 / (1024**3):.2f}")
+
         packed_gpu_buf = torch.empty(total_packed_numel, dtype=torch.int32, device=device)
         scale_gpu_buf = torch.empty(total_scale_numel, dtype=torch.bfloat16, device=device)
 
