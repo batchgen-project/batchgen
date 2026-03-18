@@ -950,6 +950,9 @@ class KimiK25MoE(nn.Module):
             if self._marlin_mtp != mtp:
                 self._init_marlin_buffers(mtp)
             # Marlin W4A16 for S1 (gate+up+SiLU) — zero-overhead path
+            # Zero intermediate: Marlin+scatter SiLU only writes expert_counts[e] rows,
+            # but S2 WGMMA reads max_m_tiles*BLOCK_M rows. Stale padding rows cause wrong S2 output.
+            buf.intermediate.zero_()
             from batchgen.moe.marlin_grouped_moe import marlin_grouped_stage1_3d_inplace
             mw = self._marlin_weights
             marlin_grouped_stage1_3d_inplace(
