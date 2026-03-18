@@ -752,7 +752,6 @@ class KimiK25MoE(nn.Module):
             # Marlin W4A16 3-stage decode: weight pointers only (mtp-dependent buffers deferred)
             self._use_marlin_decode = False
             self._marlin_mtp = 0
-            self._MARLIN_DECODE_CUTOFF = 32  # use Marlin for max_possible_m <= 32
             if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
                 try:
                     N = self.moe_intermediate_size
@@ -935,65 +934,57 @@ class KimiK25MoE(nn.Module):
             ev[3].record()  # after dispatch, before wgmma_s1
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
-        mod = self._wgmma_mod if getattr(self, '_use_grouped_wgmma', False) else None
-        w = self._moe_weights if getattr(self, '_use_grouped_wgmma', False) else None
         mtp = buf.max_tokens_padded if buf is not None else 0
 
-        _used_marlin = False
+        if getattr(self, '_use_marlin_decode', False) and buf is not None:
+            # === DECODE: Marlin 3-Stage (weight-format-driven, no runtime dispatch) ===
+            # Marlin weights are loaded at init time. Kernel selection follows weight format.
+            if self._marlin_mtp != mtp:
+                self._init_marlin_buffers(mtp)
 
-        # Compute max_m_tiles for WGMMA (needed for WGMMA fallback path)
-        if buf is not None:
+            # Pigeonhole bound for CTA M-tiling grid size
+            max_possible_m = min(num_global, mtp)
+            max_marlin_m_tiles = (max_possible_m + 15) // 16
+
+            from batchgen.moe.marlin_grouped_moe import _load_module as _load_marlin
+            mod_m = _load_marlin()
+            mw = self._marlin_weights
+            E_local = buf.E_local
+
+            # Build S3 C_ptrs into expert_out (may change if expert_out reallocated)
+            bpr_K = mw['K'] * 2
+            s3_C_ptrs = torch.tensor(
+                [buf.expert_out.data_ptr() + e * mtp * bpr_K for e in range(E_local)],
+                dtype=torch.int64, device=device)
+
+            # Stage 1: gate+up GEMM (2E matrices)
+            n_tiles_s1 = N // 256
+            mod_m.grouped_marlin_gemm_m16(
+                buf.dispatched_x, mw['s1_B_ptrs'], mw['s1_C_ptrs'],
+                mw['s1_scales_ptrs'], mw['expert_starts'], expert_counts,
+                E_local, N, K, mw['s1_workspace'],
+                2 * E_local, n_tiles_s1, max_marlin_m_tiles)
+
+            # Stage 2: SiLU(gate) * up → intermediate
+            mod_m.silu_mul(mw['gate_buf'], mw['up_buf'], buf.intermediate)
+
+            # Stage 3: down GEMM (E matrices)
+            n_tiles_s3 = K // 256
+            mod_m.grouped_marlin_gemm_m16(
+                buf.intermediate, mw['s3_B_ptrs'], s3_C_ptrs,
+                mw['s3_scales_ptrs'], mw['expert_starts'], expert_counts,
+                E_local, K, N, mw['s3_workspace'],
+                E_local, n_tiles_s3, max_marlin_m_tiles)
+
+        elif getattr(self, '_use_grouped_wgmma', False) \
+                and buf is not None and buf.tma_dispatched is not None:
+            # === WGMMA 2-Stage (used when Marlin disabled or prefill mode) ===
+            mod = self._wgmma_mod
+            w = self._moe_weights
             avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
-        if getattr(self, '_use_marlin_decode', False) and buf is not None:
-            # Pigeonhole bound: max tokens any expert can receive (provable, not heuristic)
-            max_possible_m = min(num_global, mtp)
-
-            if max_possible_m <= self._MARLIN_DECODE_CUTOFF:
-                # === DECODE: Marlin 3-Stage (2.6× faster than WGMMA) ===
-                if self._marlin_mtp != mtp:
-                    self._init_marlin_buffers(mtp)
-
-                max_marlin_m_tiles = (max_possible_m + 15) // 16
-                from batchgen.moe.marlin_grouped_moe import _load_module as _load_marlin
-                mod_m = _load_marlin()
-                mw = self._marlin_weights
-                E_local = buf.E_local
-
-                # Build S3 C_ptrs into expert_out (may change if expert_out reallocated)
-                bpr_K = mw['K'] * 2
-                s3_C_ptrs = torch.tensor(
-                    [buf.expert_out.data_ptr() + e * mtp * bpr_K for e in range(E_local)],
-                    dtype=torch.int64, device=device)
-
-                # Stage 1: gate+up GEMM (2E matrices)
-                n_tiles_s1 = N // 256
-                mod_m.grouped_marlin_gemm_m16(
-                    buf.dispatched_x, mw['s1_B_ptrs'], mw['s1_C_ptrs'],
-                    mw['s1_scales_ptrs'], mw['expert_starts'], expert_counts,
-                    E_local, N, K, mw['s1_workspace'],
-                    2 * E_local, n_tiles_s1, max_marlin_m_tiles)
-
-                # Stage 2: SiLU(gate) * up → intermediate
-                mod_m.silu_mul(mw['gate_buf'], mw['up_buf'], buf.intermediate)
-
-                # Stage 3: down GEMM (E matrices)
-                n_tiles_s3 = K // 256
-                mod_m.grouped_marlin_gemm_m16(
-                    buf.intermediate, mw['s3_B_ptrs'], s3_C_ptrs,
-                    mw['s3_scales_ptrs'], mw['expert_starts'], expert_counts,
-                    E_local, K, N, mw['s3_workspace'],
-                    E_local, n_tiles_s3, max_marlin_m_tiles)
-
-                _used_marlin = True
-
-        if not _used_marlin \
-                and getattr(self, '_use_grouped_wgmma', False) \
-                and buf is not None and buf.tma_dispatched is not None:
-            # === PREFILL / FALLBACK: WGMMA 2-Stage ===
-            # S1: fused gate+up+SiLU
             mod.grouped_int4_moe_stage1_inplace(
                 buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
                 expert_counts,
@@ -1002,7 +993,6 @@ class KimiK25MoE(nn.Module):
                 buf.empty_bias, buf.empty_bias,
                 N, K // 2, K // 32, max_m_tiles, mtp,
             )
-            # S2: down
             mod.grouped_int4_moe_stage2_inplace(
                 buf.intermediate, buf.expert_out, buf.tma_intermediate,
                 expert_counts,
