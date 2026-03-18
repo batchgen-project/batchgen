@@ -47,6 +47,15 @@ void grouped_marlin_gemm_m16(
     torch::Tensor workspace, int num_matrices, int n_tiles,
     int max_m_tiles);
 
+void grouped_marlin_gemm_m16_s1(
+    torch::Tensor A,
+    torch::Tensor gate_B_ptrs, torch::Tensor up_B_ptrs,
+    torch::Tensor C_ptrs,
+    torch::Tensor gate_scales_ptrs, torch::Tensor up_scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int n_tiles, int max_m_tiles);
+
 void silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
 
 void silu_mul_scatter(
@@ -69,6 +78,7 @@ void silu_mul_dual_stride(
         functions=[
             "grouped_marlin_gemm",
             "grouped_marlin_gemm_m16",
+            "grouped_marlin_gemm_m16_s1",
             "silu_mul",
             "silu_mul_scatter",
             "silu_mul_dual_stride",
@@ -135,6 +145,62 @@ def marlin_grouped_stage1_3d_inplace(
     mod.silu_mul_scatter(
         gate_buf, up_buf, intermediate_3d, expert_counts,
         E, compact_stride, mtp, N,
+    )
+
+
+def marlin_grouped_stage1_fused(
+    dispatched_x_3d: torch.Tensor,
+    intermediate_3d: torch.Tensor,
+    expert_counts: torch.Tensor,
+    expert_starts: torch.Tensor,
+    gate_B_ptrs: torch.Tensor,
+    gate_scales_ptrs: torch.Tensor,
+    up_B_ptrs: torch.Tensor,
+    up_scales_ptrs: torch.Tensor,
+    C_ptrs: torch.Tensor,
+    N: int,
+    K: int,
+    workspace: torch.Tensor,
+    max_m_tiles: int,
+    mtp: int,
+    num_experts: int,
+) -> None:
+    """Fused S1: gate+up+SiLU in single kernel. No temp buffer.
+
+    Each CTA does two sequential K-reductions (gate then up) for the same
+    (expert, m_tile, n_tile). Gate result stored in SMEM, fused with SiLU
+    in the write-back.
+
+    Args:
+        dispatched_x_3d: [E*mtp, K] BF16 input
+        intermediate_3d: [E*mtp, N] BF16 output (SiLU(gate) * up written here)
+        expert_counts: [E] int32 GPU
+        expert_starts: [E] int32 GPU (= arange(E) * mtp)
+        gate_B_ptrs: [E] int64 gate weight pointers
+        gate_scales_ptrs: [E] int64 gate scale pointers
+        up_B_ptrs: [E] int64 up weight pointers
+        up_scales_ptrs: [E] int64 up scale pointers
+        C_ptrs: [E] int64 output pointers (into intermediate at mtp stride)
+        N, K: dimensions
+        workspace: [locks] int32
+        max_m_tiles: ceil(min(num_global, mtp) / 16)
+        mtp: max tokens padded per expert
+        num_experts: E
+    """
+    global _warned_m16
+    if not _warned_m16:
+        logging.info("[Marlin] Using fused M16 Marlin S1 (gate+up+SiLU, single kernel)")
+        _warned_m16 = True
+
+    mod = _load_module()
+    n_tiles = N // 256
+
+    mod.grouped_marlin_gemm_m16_s1(
+        dispatched_x_3d,
+        gate_B_ptrs, up_B_ptrs, C_ptrs,
+        gate_scales_ptrs, up_scales_ptrs,
+        expert_starts, expert_counts,
+        num_experts, N, K, workspace, n_tiles, max_m_tiles,
     )
 
 

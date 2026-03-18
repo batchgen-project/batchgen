@@ -537,7 +537,400 @@ static constexpr int M16_MBLOCK = 16;
 static constexpr int m16_a_sh_stage = a_sh_stride * M16_MBLOCK;         // 256
 static constexpr int m16_a_sh_wr_iters = div_ceil(m16_a_sh_stage, a_sh_wr_delta);  // 1
 static constexpr int m16_sh_a_size = STAGES * m16_a_sh_stage;           // 1024
-// Total SMEM: max(528, 4096) + 512 + 1024 = 5632 int4 = 90112 bytes
+// Total SMEM M16: max(528, 4096) + 512 + 1024 = 5632 int4 = 90112 bytes
+// Total SMEM M16_S1 (fused): + 528 for gate result = 6160 int4 = 98560 bytes
+static constexpr int sh_gate_size = sh_red_size;  // 528 int4 — stores gate BF16 result
+
+// ============================================================================
+// Fused S1 kernel: gate+up+SiLU in single kernel, no temp buffer
+// ============================================================================
+
+__global__ void MarlinGrouped_M16_S1(
+    const int4* __restrict__ A,
+    const int4* const* __restrict__ gate_B_ptrs,     // [E] gate weight ptrs
+    const int4* const* __restrict__ up_B_ptrs,       // [E] up weight ptrs
+    int4* const* __restrict__ C_ptrs,                // [E] output ptrs (into intermediate)
+    const int4* const* __restrict__ gate_scales_ptrs, // [E] gate scale ptrs
+    const int4* const* __restrict__ up_scales_ptrs,   // [E] up scale ptrs
+    const int* __restrict__ expert_starts,
+    const int* __restrict__ expert_counts,
+    int num_experts,
+    int prob_n, int prob_k, int lda,
+    int n_tiles_per_expert,
+    int max_m_tiles)
+{
+  // CTA dispatch: grid = E × max_m_tiles × n_tiles
+  int linear_idx = blockIdx.x;
+  int expert_idx = linear_idx / (max_m_tiles * n_tiles_per_expert);
+  int remainder = linear_idx % (max_m_tiles * n_tiles_per_expert);
+  int m_tile_idx = remainder / n_tiles_per_expert;
+  int tile_idx = remainder % n_tiles_per_expert;
+
+  int expert_m = expert_counts[expert_idx];
+  int m_start = m_tile_idx * M16_MBLOCK;
+  if (m_start >= expert_m) return;
+
+  int prob_m = min(M16_MBLOCK, expert_m - m_start);
+  int token_start = expert_starts[expert_idx] + m_start;
+
+  const int4* A_ptr = A + token_start * (lda / 8);
+  int c_gl_stride_out = prob_n / 8;
+  int4* C = C_ptrs[expert_idx] + m_start * c_gl_stride_out;
+
+  int k_tiles = prob_k / 16 / TK;
+
+  // A indices (constant across gate/up passes — A is the same)
+  int a_gl_stride = lda / 8;
+  int a_gl_rd_delta_i = a_gl_stride * (THREADS / a_gl_rd_delta_o);
+  int a_gl_rd_base = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+
+  int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+  int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % 16) + (threadIdx.x % 32) / 16;
+  a_sh_rd += 2 * ((threadIdx.x / 32) / (TN / 4));
+
+  // B indices (N-tile offset, reused for both passes)
+  int b_gl_stride = 16 * prob_n / (PACK * 4);
+  int b_gl_rd_delta_o = b_gl_stride * TK;
+  int b_gl_rd_delta_i = b_gl_stride * (THREADS / b_sh_stride_threads);
+  int b_gl_rd_base = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads);
+  b_gl_rd_base += b_sh_stride * tile_idx;
+
+  // Scale indices
+  int s_gl_stride = prob_n / 8;
+  int s_gl_rd_base = s_sh_stride * tile_idx + threadIdx.x;
+  bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
+  int s_sh_rd = 8 * ((threadIdx.x / 32) % (TN / 4)) + (threadIdx.x % 32) / 4;
+
+  // A predicates
+  bool a_sh_wr_pred[m16_a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < m16_a_sh_wr_iters; i++)
+    a_sh_wr_pred[i] = a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
+
+  // XOR transform for A
+  auto transform_a = [&](int i) {
+    int row = i / a_gl_rd_delta_o;
+    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
+  };
+
+  int a_sh_wr_trans[m16_a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < m16_a_sh_wr_iters; i++)
+    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
+
+  int a_sh_rd_trans[b_sh_wr_iters][TM];
+#pragma unroll
+  for (int i = 0; i < b_sh_wr_iters; i++)
+    for (int j = 0; j < TM; j++)
+      a_sh_rd_trans[i][j] = transform_a(a_sh_rd_delta_o * i + a_sh_rd_delta_i * j + a_sh_rd);
+
+  // Shared memory layout (with gate result area)
+  extern __shared__ int4 sh[];
+  int4* sh_b = sh;
+  int4* sh_red = sh;
+  int4* sh_s = sh + (sh_red_size > sh_b_size ? sh_red_size : sh_b_size);
+  int4* sh_a = sh_s + sh_s_size;
+  int4* sh_gate = sh_a + m16_sh_a_size;  // gate BF16 result (528 int4 = 8.4 KB)
+
+  // Registers
+  FragA frag_a[2][TM];
+  I4 frag_b_quant[2][1];
+  FragC frag_c[TM][4][2];
+  FragS frag_s[2][4];
+
+  // ---- Lambdas for pipeline ops (capture mutable state via references) ----
+  // These reference B_ptr, scales_ptr, s_gl_rd, a_gl_rd which are reset between passes
+  const int4* B_ptr_arr[b_sh_wr_iters];
+  const int4* cur_scales_ptr;
+  int s_gl_rd;
+  int a_gl_rd;
+
+  auto fetch_to_shared = [&](int pipe, int k_off, bool pred) {
+    if (pred) {
+      int4* sh_a_stage = sh_a + m16_a_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < m16_a_sh_wr_iters; i++)
+        cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]],
+                       &A_ptr[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * k_off],
+                       a_sh_wr_pred[i]);
+      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < b_sh_wr_iters; i++) {
+        cp_async4(&sh_b_stage[b_sh_wr_delta * i + threadIdx.x], B_ptr_arr[i]);
+        B_ptr_arr[i] += b_gl_rd_delta_o;
+      }
+      int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < s_tb_groups; i++) {
+        if (s_sh_wr_pred)
+          cp_async4(&sh_s_stage[i * s_sh_stride + threadIdx.x], &cur_scales_ptr[s_gl_rd]);
+        s_gl_rd += s_gl_stride;
+      }
+    }
+    cp_async_fence();
+  };
+
+  auto load_regs = [&](int k, int pipe) {
+    int4* sh_a_stage = sh_a + m16_a_sh_stage * pipe;
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+      ldsm4(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+    int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+    frag_b_quant[k % 2][0] = *reinterpret_cast<I4*>(
+        &sh_b_stage[b_sh_wr_delta * (k % b_sh_wr_iters) + threadIdx.x]);
+  };
+
+  auto load_scales = [&](int k, int pipe) {
+    int cur_k = k_iter_size * (k % b_sh_wr_iters);
+    int k_blocks = cur_k / 16;
+    int cur_group_id = k_blocks / GROUP_BLOCKS;
+    int4* sh_s_stage = sh_s + s_sh_stage * (pipe % STAGES);
+    reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
+        sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+  };
+
+  auto matmul = [&](int k) {
+    int k2 = k % 2;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      FragB frag_b0, frag_b1;
+      int b_quant_0 = frag_b_quant[k2][0][j];
+      int b_quant_1 = b_quant_0 >> 8;
+      dequant_u4b8(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
+      dequant_u4b8(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
+      scale_op(frag_b0, frag_s[k2][j], 0);
+      scale_op(frag_b1, frag_s[k2][j], 1);
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+        mma_op(frag_a[k2][i], frag_b0, frag_c[i][j][0]);
+        mma_op(frag_a[k2][i], frag_b1, frag_c[i][j][1]);
+      }
+    }
+  };
+
+  auto run_reduction = [&]() {
+    constexpr int red_off = THREADS / b_sh_stride_threads / 2;
+    if constexpr (red_off >= 1) {
+      auto red_idx = threadIdx.x / b_sh_stride_threads;
+      constexpr int red_sh_stride = b_sh_stride_threads * 4 * 2;
+      constexpr int red_sh_delta = b_sh_stride_threads;
+      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
+                      (threadIdx.x % b_sh_stride_threads);
+#pragma unroll
+      for (int m = 0; m < TM; m++) {
+#pragma unroll
+        for (int i = red_off; i > 0; i /= 2) {
+          if (i <= red_idx && red_idx < 2 * i) {
+#pragma unroll
+            for (int j = 0; j < 4 * 2; j++) {
+              int red_sh_wr = red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
+              if (i < red_off) {
+                float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * j + red_sh_rd]);
+                float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
+#pragma unroll
+                for (int kk = 0; kk < 4; kk++)
+                  reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + j][kk] += c_rd[kk] + c_wr[kk];
+              }
+              sh_red[red_sh_wr] = reinterpret_cast<int4*>(&frag_c)[4 * 2 * m + j];
+            }
+          }
+          __syncthreads();
+        }
+        if (red_idx == 0) {
+#pragma unroll
+          for (int i = 0; i < 4 * 2; i++) {
+            float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+              reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + i][j] += c_rd[j];
+          }
+        }
+        __syncthreads();
+      }
+    }
+  };
+
+  auto write_result_to_smem = [&](int4* dst) {
+    // Write reduced result from frag_c → sh_red, then copy to dst
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
+    c_sh_wr += 32 * (threadIdx.x / 32);
+
+    if (threadIdx.x / 32 < TN / 4) {
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int wr = c_sh_wr + 8 * j;
+          scalar_t2 r0 = nums2num2(float2num(frag_c[i][j][0][0]), float2num(frag_c[i][j][0][1]));
+          scalar_t2 r1 = nums2num2(float2num(frag_c[i][j][0][2]), float2num(frag_c[i][j][0][3]));
+          scalar_t2 r2 = nums2num2(float2num(frag_c[i][j][1][0]), float2num(frag_c[i][j][1][1]));
+          scalar_t2 r3 = nums2num2(float2num(frag_c[i][j][1][2]), float2num(frag_c[i][j][1][3]));
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 0] = r0;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 0] = r1;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 4] = r2;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 4] = r3;
+        }
+        c_sh_wr += 16 * (4 * c_sh_stride);
+      }
+    }
+    __syncthreads();
+
+    // Copy sh_red → dst (gate result area)
+#pragma unroll
+    for (int i = threadIdx.x; i < sh_red_size; i += THREADS)
+      dst[i] = sh_red[i];
+    __syncthreads();
+  };
+
+  auto run_pipeline = [&]() {
+    // Fill pipeline
+#pragma unroll
+    for (int i = 0; i < STAGES - 1; i++)
+      fetch_to_shared(i, i, i < k_tiles);
+    cp_async_wait<STAGES - 2>();
+    __syncthreads();
+
+    // Load first registers
+    load_regs(0, 0);
+    load_scales(0, 0);
+    a_gl_rd += a_gl_rd_delta_o * (STAGES - 1);
+
+    // Main loop
+    int slice_iters = k_tiles;
+    while (slice_iters) {
+#pragma unroll
+      for (int pipe = 0; pipe < STAGES;) {
+#pragma unroll
+        for (int k = 0; k < b_sh_wr_iters; k++) {
+          load_regs(k + 1, pipe % STAGES);
+          load_scales(k + 1, pipe);
+          if (k == b_sh_wr_iters - 2) {
+            fetch_to_shared((pipe + STAGES - 1) % STAGES, pipe, slice_iters >= STAGES);
+            pipe++;
+            cp_async_wait<STAGES - 2>();
+            __syncthreads();
+          }
+          matmul(k);
+        }
+        slice_iters--;
+        if (slice_iters == 0) break;
+      }
+      a_gl_rd += a_gl_rd_delta_o * STAGES;
+    }
+    cp_async_wait<0>();
+  };
+
+  // ================================================================
+  // PASS 1: Gate K-reduction
+  // ================================================================
+  {
+    const int4* B = gate_B_ptrs[expert_idx];
+    cur_scales_ptr = gate_scales_ptrs[expert_idx];
+    s_gl_rd = s_gl_rd_base;
+    a_gl_rd = a_gl_rd_base;
+#pragma unroll
+    for (int i = 0; i < b_sh_wr_iters; i++)
+      B_ptr_arr[i] = B + b_gl_rd_delta_i * i + b_gl_rd_base;
+
+    // Zero accumulators
+#pragma unroll
+    for (int i = 0; i < TM * 4 * 2 * 4; i++)
+      reinterpret_cast<float*>(frag_c)[i] = 0;
+
+    run_pipeline();
+    run_reduction();
+    write_result_to_smem(sh_gate);  // gate BF16 → sh_gate
+  }
+
+  // ================================================================
+  // PASS 2: Up K-reduction
+  // ================================================================
+  {
+    const int4* B = up_B_ptrs[expert_idx];
+    cur_scales_ptr = up_scales_ptrs[expert_idx];
+    s_gl_rd = s_gl_rd_base;
+    a_gl_rd = a_gl_rd_base;
+#pragma unroll
+    for (int i = 0; i < b_sh_wr_iters; i++)
+      B_ptr_arr[i] = B + b_gl_rd_delta_i * i + b_gl_rd_base;
+
+    // Zero accumulators
+#pragma unroll
+    for (int i = 0; i < TM * 4 * 2 * 4; i++)
+      reinterpret_cast<float*>(frag_c)[i] = 0;
+
+    run_pipeline();
+    run_reduction();
+
+    // Write up result to sh_red (standard write-back pattern)
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
+    c_sh_wr += 32 * (threadIdx.x / 32);
+
+    if (threadIdx.x / 32 < TN / 4) {
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int wr = c_sh_wr + 8 * j;
+          scalar_t2 r0 = nums2num2(float2num(frag_c[i][j][0][0]), float2num(frag_c[i][j][0][1]));
+          scalar_t2 r1 = nums2num2(float2num(frag_c[i][j][0][2]), float2num(frag_c[i][j][0][3]));
+          scalar_t2 r2 = nums2num2(float2num(frag_c[i][j][1][0]), float2num(frag_c[i][j][1][1]));
+          scalar_t2 r3 = nums2num2(float2num(frag_c[i][j][1][2]), float2num(frag_c[i][j][1][3]));
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 0] = r0;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 0] = r1;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 4] = r2;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 4] = r3;
+        }
+        c_sh_wr += 16 * (4 * c_sh_stride);
+      }
+    }
+    __syncthreads();
+  }
+
+  // ================================================================
+  // FUSED WRITE-BACK: SiLU(gate) * up → output C
+  // ================================================================
+  {
+    int c_gl_stride = prob_n / 8;
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_gl_wr_delta = c_gl_stride * (THREADS / (2 * TN));
+    constexpr int c_sh_rd_delta = c_sh_stride * (THREADS / (2 * TN));
+
+    int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    c_gl_wr += (2 * TN) * tile_idx;
+    int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    int c_gl_wr_end = c_gl_stride * prob_m;
+
+    // Read gate from sh_gate, up from sh_red (same layout), fuse SiLU
+#pragma unroll
+    for (int i = 0; i < div_ceil(16 * TM, THREADS / (2 * TN)); i++) {
+      if (c_gl_wr < c_gl_wr_end) {
+        // Read 8 BF16 elements each from gate and up
+        int4 gate_chunk = sh_gate[c_sh_rd];
+        int4 up_chunk = sh_red[c_sh_rd];
+        scalar_t* g_ptr = reinterpret_cast<scalar_t*>(&gate_chunk);
+        scalar_t* u_ptr = reinterpret_cast<scalar_t*>(&up_chunk);
+        int4 result;
+        scalar_t* r_ptr = reinterpret_cast<scalar_t*>(&result);
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+          float g = num2float(g_ptr[k]);
+          float u = num2float(u_ptr[k]);
+          r_ptr[k] = float2num(g / (1.0f + __expf(-g)) * u);
+        }
+        C[c_gl_wr] = result;
+        c_gl_wr += c_gl_wr_delta;
+        c_sh_rd += c_sh_rd_delta;
+      }
+    }
+  }
+}
+
+// ============================================================================
+// M16 kernel (for S2 and standalone use)
+// ============================================================================
 
 __global__ void MarlinGrouped_M16(
     const int4* __restrict__ A,
@@ -972,6 +1365,36 @@ void silu_mul_scatter(
         reinterpret_cast<scalar_t*>(out.data_ptr()),
         expert_counts.data_ptr<int>(),
         num_experts, compact_stride, output_stride, N);
+}
+
+void grouped_marlin_gemm_m16_s1(
+    torch::Tensor A,
+    torch::Tensor gate_B_ptrs, torch::Tensor up_B_ptrs,
+    torch::Tensor C_ptrs,
+    torch::Tensor gate_scales_ptrs, torch::Tensor up_scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int n_tiles, int max_m_tiles)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // SMEM: M16 base (90112) + gate result (528 * 16 = 8448) = 98560 bytes
+    constexpr int smem_bytes = 98560;
+    cudaFuncSetAttribute((void*)MarlinGrouped_M16_S1,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int total_ctas = n_tiles * max_m_tiles * num_experts;
+    MarlinGrouped_M16_S1<<<total_ctas, 256, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_scales_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k, prob_k,
+        n_tiles, max_m_tiles);
 }
 
 void grouped_marlin_gemm_m16(

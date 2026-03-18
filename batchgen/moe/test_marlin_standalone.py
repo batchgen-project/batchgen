@@ -569,6 +569,106 @@ def test_m16_edge_cases():
     print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
 
 
+def test_m16_s1_fused():
+    """Test fused S1 kernel: gate+up+SiLU in single kernel."""
+    E, K, N = 24, 7168, 2048
+    device = "cuda"
+
+    # Variable tokens per expert
+    expert_counts_list = [1, 3, 8, 15, 32, 64, 2, 7, 16, 48, 4, 1,
+                          128, 5, 12, 3, 24, 96, 1, 6, 33, 2, 10, 55]
+    max_m = max(expert_counts_list)
+    max_m_tiles = (max_m + 15) // 16
+    mtp = max_m_tiles * 16
+
+    expert_counts = torch.tensor(expert_counts_list[:E], dtype=torch.int32, device=device)
+
+    print(f"\n=== Test Fused S1: E={E} K={K} N={N} ===")
+    print(f"    max_m={max_m} max_m_tiles={max_m_tiles} mtp={mtp}")
+    print(f"    expert_counts={expert_counts.tolist()}\n")
+
+    from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+    from batchgen.moe.marlin_grouped_moe import _load_module
+
+    mod = _load_module()
+
+    # Weights
+    gate_qw, gate_s, gate_refs = [], [], []
+    up_qw, up_s, up_refs = [], [], []
+    print("Creating + repacking weights...", end=" ", flush=True)
+    for e in range(E):
+        gp, gs, gr = create_k25_int4_weights(K, N, device=device)
+        gqw, gms = repack_int4_to_marlin_gs32(gp, gs, K, N)
+        gate_qw.append(gqw); gate_s.append(gms); gate_refs.append(gr)
+
+        up_, us_, ur_ = create_k25_int4_weights(K, N, device=device)
+        uqw, ums = repack_int4_to_marlin_gs32(up_, us_, K, N)
+        up_qw.append(uqw); up_s.append(ums); up_refs.append(ur_)
+    print("done")
+
+    # Separate gate and up pointer arrays [E] each (NOT interleaved 2E)
+    gate_B_ptrs = torch.tensor(
+        [w.data_ptr() for w in gate_qw], dtype=torch.int64, device=device)
+    up_B_ptrs = torch.tensor(
+        [w.data_ptr() for w in up_qw], dtype=torch.int64, device=device)
+    gate_scales_ptrs = torch.tensor(
+        [s.data_ptr() for s in gate_s], dtype=torch.int64, device=device)
+    up_scales_ptrs = torch.tensor(
+        [s.data_ptr() for s in up_s], dtype=torch.int64, device=device)
+
+    # Input
+    dispatched_x = torch.zeros(E * mtp, K, dtype=torch.bfloat16, device=device)
+    for e in range(E):
+        cnt = expert_counts[e].item()
+        dispatched_x[e * mtp: e * mtp + cnt] = torch.randn(cnt, K, dtype=torch.bfloat16, device=device) * 0.1
+
+    expert_starts = torch.arange(E, dtype=torch.int32, device=device) * mtp
+    intermediate = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
+
+    # C_ptrs: [E] into intermediate at mtp stride
+    bytes_per_row = N * 2
+    C_ptrs = torch.tensor(
+        [intermediate.data_ptr() + e * mtp * bytes_per_row for e in range(E)],
+        dtype=torch.int64, device=device)
+
+    n_tiles = N // 256
+    workspace = torch.zeros(E * (n_tiles + 17), dtype=torch.int32, device=device)
+
+    # Run fused S1
+    print("Running fused S1 (gate+up+SiLU)...", end=" ", flush=True)
+    mod.grouped_marlin_gemm_m16_s1(
+        dispatched_x,
+        gate_B_ptrs, up_B_ptrs, C_ptrs,
+        gate_scales_ptrs, up_scales_ptrs,
+        expert_starts, expert_counts,
+        E, N, K, workspace, n_tiles, max_m_tiles)
+    torch.cuda.synchronize()
+    print("done")
+
+    # Validate
+    print("\nValidation per-expert:")
+    all_pass = True
+    for e in range(E):
+        cnt = expert_counts[e].item()
+        if cnt == 0:
+            print(f"  E{e:2d} cnt=0 [SKIP]")
+            continue
+        a_e = dispatched_x[e * mtp: e * mtp + cnt]
+        ref_gate = torch.mm(a_e, gate_refs[e])
+        ref_up = torch.mm(a_e, up_refs[e])
+        ref_silu = torch.nn.functional.silu(ref_gate.float()) * ref_up.float()
+        ref_out = ref_silu.bfloat16()
+        out_e = intermediate[e * mtp: e * mtp + cnt]
+
+        cd = calc_diff(out_e, ref_out)
+        status = "PASS" if cd < 1e-3 else "FAIL"
+        if cd >= 1e-3:
+            all_pass = False
+        print(f"  E{e:2d} cnt={cnt:3d} calc_diff={cd:.2e} [{status}]")
+
+    print(f"\nOverall: {'PASS' if all_pass else 'FAIL'}")
+
+
 def main():
     import sys
     test_name = sys.argv[1] if len(sys.argv) > 1 else "all"
@@ -579,6 +679,7 @@ def main():
         "m16_sweep": test_m16_sweep,
         "m16_variable": test_m16_variable_experts,
         "m16_edge": test_m16_edge_cases,
+        "s1_fused": test_m16_s1_fused,
     }
 
     if test_name == "all":
