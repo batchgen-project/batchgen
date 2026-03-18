@@ -60,5 +60,10 @@ for k in range(8):
     marlin_int32 = marlin_col // 8
     marlin_shift = (marlin_col % 8) * 4
     val = (marlin_qw[k_tile, marlin_int32].item() >> marlin_shift) & 0xF
+    actual_val = (marlin_qw[k_tile, marlin_int32].item() >> marlin_shift) & 0xF
+    # Also check with flat indexing (how CUDA kernel accesses it)
+    flat_idx = k_tile * (N * 2) + marlin_int32
+    flat_val = (marlin_qw.reshape(-1)[flat_idx].item() >> marlin_shift) & 0xF
     print(f"  k={k}: raw_col={raw_col}, perm[{pos}]={perm[pos]}, marlin_col={marlin_col}, "
-          f"int32_idx={marlin_int32}, shift={marlin_shift}, val={val}")
+          f"int32=[{k_tile},{marlin_int32}], shift={marlin_shift}, "
+          f"2d_val={actual_val}, flat_val={flat_val}, expected={k}")
