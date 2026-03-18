@@ -152,14 +152,14 @@ def marlin_to_wgmma_fused_gpu(
     raw_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
     mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, inv_perm, K, N)
 
-    # Scale transform — _marlin_permute_scales does s[:, scale_perm], so
-    # scale_perm[out_pos] = in_pos. For reverse: we need scale_perm directly
-    # (it maps output pos → input pos in the marlin array)
-    scale_perm, _ = _get_scale_perms()
-    scale_perm_t = torch.tensor(scale_perm, device=device, dtype=torch.int32)
-    K_groups = K // INT4_GROUP_SIZE
-    raw_scales = torch.empty(N, K_groups, dtype=marlin_s.dtype, device=device)
-    mod.marlin_to_wgmma_scale_transform(marlin_s, raw_scales, scale_perm_t, K_groups, N)
+    # Scale transform — use CPU reference (scales are tiny, ~1 MB, negligible overhead)
+    # The scale permutation has complex reshape interactions with group_size < K.
+    # CPU version is validated via round-trip test.
+    inv_scale_perm = _get_inverse_scale_perm()
+    inv_scale_perm_t = torch.tensor(inv_scale_perm, device=device, dtype=torch.long)
+    s_inv = marlin_s.to(torch.float16).reshape(-1, len(inv_scale_perm))
+    s_inv = s_inv[:, inv_scale_perm_t]
+    raw_scales = s_inv.reshape(-1, N).t().contiguous().to(marlin_s.dtype)
 
     return raw_packed, raw_scales
 
