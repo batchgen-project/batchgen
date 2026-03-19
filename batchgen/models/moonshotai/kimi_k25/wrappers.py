@@ -150,22 +150,29 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
     def _transform_marlin_to_raw(self, weights: dict):
         """Transform Marlin-layout weights to raw INT4 on-the-fly for WGMMA prefill.
 
-        Called for non-persistent experts loaded from Marlin-only checkpoint.
+        Called for both persistent and non-persistent experts from Marlin checkpoint.
         ~180 us per expert (3 projections × 58 us), negligible vs compute.
+        Handles both key formats (core engine keys may differ from stored keys).
         """
         from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
-        for proj in ('gate', 'up', 'down'):
-            packed_key = f"{proj}_proj.weight_packed"
-            scale_key = f"{proj}_proj.weight_scale"
-            packed = weights[packed_key]
-            # Detect Marlin layout: shape[0] < shape[1] (e.g., [448, 4096])
-            # Raw layout: shape[0] > shape[1] (e.g., [2048, 896])
+        # Find all packed weight keys and transform Marlin→raw
+        for key in list(weights.keys()):
+            if not key.endswith("_packed") and not key.endswith("packed"):
+                continue
+            packed = weights[key]
+            if not isinstance(packed, torch.Tensor) or packed.dim() != 2:
+                continue
+            # Detect Marlin layout: shape[0] < shape[1]
             if packed.shape[0] < packed.shape[1]:
+                # Find corresponding scale key
+                scale_key = key.replace("_packed", "_scale").replace("packed", "scale")
+                if scale_key not in weights:
+                    continue
                 K_proj = packed.shape[0] * 16
                 N_proj = packed.shape[1] // 2
                 raw_packed, raw_scale = marlin_to_wgmma_fused_gpu(
                     packed, weights[scale_key], K_proj, N_proj)
-                weights[packed_key] = raw_packed
+                weights[key] = raw_packed
                 weights[scale_key] = raw_scale
 
     def _forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:
