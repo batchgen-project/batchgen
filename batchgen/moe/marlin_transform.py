@@ -104,11 +104,19 @@ _transform_module = None
 
 
 def _load_transform_module():
-    """Compile the fused Marlin→WGMMA transform CUDA kernel."""
+    """Load Marlin transform kernel (pre-compiled or JIT fallback)."""
     global _transform_module
     if _transform_module is not None:
         return _transform_module
 
+    # Try pre-compiled extension first
+    try:
+        import batchgen_kernels.moe._C_marlin_transform as _transform_module
+        return _transform_module
+    except ImportError:
+        pass
+
+    # Fallback: JIT compile
     from pathlib import Path
     cu_path = Path(__file__).parent / "marlin_transform_kernel.cu"
     cuda_src = cu_path.read_text()

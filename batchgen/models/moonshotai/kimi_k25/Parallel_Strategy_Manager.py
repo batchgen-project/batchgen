@@ -480,12 +480,13 @@ class KimiK25ParallelStrategyManager:
             layer.mlp.nonpersistent_expert_ids = list(range(routed_expert_gpu_end, routed_expert_host_end))
             layer.mlp.num_persistent_local_experts = self.num_local_expert_per_layer
 
-        logging.info(
-            f"Rank {self.rank}: K2.5 MoE expert split — "
-            f"persistent: {self.num_local_expert_per_layer}, "
-            f"non-persistent: {routed_expert_host_end - routed_expert_gpu_end}, "
-            f"for layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1}"
-        )
+        if self.rank == 0:
+            logging.info(
+                f"K2.5 MoE expert split — "
+                f"persistent: {self.num_local_expert_per_layer}, "
+                f"non-persistent: {routed_expert_host_end - routed_expert_gpu_end}, "
+                f"for layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1}"
+            )
 
         self.model.eval()
 
@@ -939,15 +940,6 @@ class KimiK25ParallelStrategyManager:
         # Pre-allocate contiguous GPU buffers
         total_packed_numel = sum(t.numel() for _, _, t in packed_entries)
         total_scale_numel = sum(t.numel() for _, _, t in scale_entries)
-
-        if self.rank == 0:
-            # Debug: log first few tensor shapes to verify
-            for i, (_, attr, t) in enumerate(packed_entries[:6]):
-                logging.info(f"[DEBUG] packed[{i}] {attr}: shape={list(t.shape)}, "
-                             f"numel={t.numel()}, dtype={t.dtype}")
-            logging.info(f"[DEBUG] total_packed_numel={total_packed_numel}, "
-                         f"n_entries={len(packed_entries)}, "
-                         f"total_GiB={total_packed_numel * 4 / (1024**3):.2f}")
 
         packed_gpu_buf = torch.empty(total_packed_numel, dtype=torch.int32, device=device)
         scale_gpu_buf = torch.empty(total_scale_numel, dtype=torch.bfloat16, device=device)

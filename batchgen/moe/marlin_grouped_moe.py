@@ -21,11 +21,21 @@ _warned_m16 = False
 
 
 def _load_module():
-    """Compile Marlin grouped GEMM kernel via load_inline."""
+    """Load Marlin grouped GEMM kernel (pre-compiled or JIT fallback)."""
     global _module
     if _module is not None:
         return _module
 
+    # Try pre-compiled extension first
+    try:
+        import batchgen_kernels.moe._C_marlin_grouped_gemm as _module
+        logging.info("[Marlin] Loaded pre-compiled marlin_grouped_gemm")
+        return _module
+    except ImportError:
+        pass
+
+    # Fallback: JIT compile
+    logging.info("[Marlin] Pre-compiled not found, using JIT compile")
     cu_path = Path(__file__).parent / "marlin_grouped_gemm.cu"
     cuda_src = cu_path.read_text()
 

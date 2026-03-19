@@ -790,9 +790,6 @@ class KimiK25MoE(nn.Module):
 
                     self._marlin_weights = mw
                     self._use_marlin_decode = True
-                    if self.rank == 0:
-                        logging.info(f"[MoE] Marlin W4A16 3-stage: weight ptrs ready "
-                                     f"(E={E}, gate+up+down), buffers deferred")
                 except AttributeError as e:
                     logging.warning(f"[MoE] Marlin weights not found: {e}")
                     self._use_marlin_decode = False
