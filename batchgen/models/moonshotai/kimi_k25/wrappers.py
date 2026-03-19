@@ -30,6 +30,7 @@ Key differences from DeepSeek-V3:
 """
 
 import logging
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -139,6 +140,27 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             "down_proj.weight_scale": self.module.int4_down_scale,
         }
 
+    def _transform_marlin_to_raw(self, weights: dict):
+        """Transform Marlin-layout weights to raw INT4 on-the-fly for WGMMA prefill.
+
+        Called for non-persistent experts loaded from Marlin-only checkpoint.
+        ~180 us per expert (3 projections × 58 us), negligible vs compute.
+        """
+        from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
+        for proj in ('gate', 'up', 'down'):
+            packed_key = f"{proj}_proj.weight_packed"
+            scale_key = f"{proj}_proj.weight_scale"
+            packed = weights[packed_key]
+            # Detect Marlin layout: shape[0] < shape[1] (e.g., [448, 4096])
+            # Raw layout: shape[0] > shape[1] (e.g., [2048, 896])
+            if packed.shape[0] < packed.shape[1]:
+                K_proj = packed.shape[0] * 16
+                N_proj = packed.shape[1] // 2
+                raw_packed, raw_scale = marlin_to_wgmma_fused_gpu(
+                    packed, weights[scale_key], K_proj, N_proj)
+                weights[packed_key] = raw_packed
+                weights[scale_key] = raw_scale
+
     def _forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Direct BF16 GEMM path for pre-dequantized weights.
 
@@ -203,6 +225,10 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             weights = self._get_stored_int4_weights()
         else:
             weights = self.load_weights(self.module_key)
+            # Transform Marlin→WGMMA on-the-fly for prefill (58 us/proj)
+            # Non-persistent experts loaded from Marlin checkpoint need conversion
+            if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
+                self._transform_marlin_to_raw(weights)
 
         # Ensure BF16 activations
         if hidden_states.dtype != torch.bfloat16:

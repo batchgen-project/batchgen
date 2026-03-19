@@ -1013,10 +1013,24 @@ class KimiK25ParallelStrategyManager:
             is_marlin = gate_packed.shape[0] < gate_packed.shape[1]
 
             if is_marlin:
-                # Already Marlin layout from --marlin converter
+                # Marlin checkpoint: int4_* attrs are Marlin layout.
+                # 1. Clone as marlin_* (for Marlin decode kernel)
+                # 2. Transform int4_* BACK to raw INT4 (for WGMMA prefill)
+                from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
                 for proj in ('gate', 'up', 'down'):
-                    setattr(module, f'marlin_{proj}_qw', getattr(module, f'int4_{proj}_packed'))
-                    setattr(module, f'marlin_{proj}_scale', getattr(module, f'int4_{proj}_scale'))
+                    marlin_packed = getattr(module, f'int4_{proj}_packed')
+                    marlin_scale = getattr(module, f'int4_{proj}_scale')
+                    # Save Marlin copies for decode
+                    setattr(module, f'marlin_{proj}_qw', marlin_packed.clone())
+                    setattr(module, f'marlin_{proj}_scale', marlin_scale.clone())
+                    # Transform back to raw INT4 for WGMMA prefill
+                    K_proj = marlin_packed.shape[0] * 16
+                    N_proj = marlin_packed.shape[1] // 2
+                    raw_packed, raw_scale = marlin_to_wgmma_fused_gpu(
+                        marlin_packed, marlin_scale, K_proj, N_proj)
+                    setattr(module, f'int4_{proj}_packed', raw_packed)
+                    setattr(module, f'int4_{proj}_scale', raw_scale)
+                torch.cuda.synchronize()
                 count_marlin += 1
             else:
                 # Old checkpoint, runtime repack
