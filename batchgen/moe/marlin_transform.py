@@ -114,9 +114,8 @@ def _load_transform_module():
         import batchgen_kernels.moe._C_marlin_transform as _transform_module
         return _transform_module
     except ImportError:
-        pass
-
-    # Fallback: JIT compile
+        import logging
+        logging.warning("[Marlin] batchgen_kernels.moe._C_marlin_transform not found, falling back to JIT compile")
     from pathlib import Path
     cu_path = Path(__file__).parent / "marlin_transform_kernel.cu"
     cuda_src = cu_path.read_text()

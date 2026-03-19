@@ -32,10 +32,7 @@ def _load_module():
         logging.info("[Marlin] Loaded pre-compiled marlin_grouped_gemm")
         return _module
     except ImportError:
-        pass
-
-    # Fallback: JIT compile
-    logging.info("[Marlin] Pre-compiled not found, using JIT compile")
+        logging.warning("[Marlin] batchgen_kernels.moe._C_marlin_grouped_gemm not found, falling back to JIT compile")
     cu_path = Path(__file__).parent / "marlin_grouped_gemm.cu"
     cuda_src = cu_path.read_text()
 
