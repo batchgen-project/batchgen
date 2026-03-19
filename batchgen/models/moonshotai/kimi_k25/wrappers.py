@@ -147,6 +147,8 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             self._transform_marlin_to_raw(weights)
         return weights
 
+    _transform_logged = False
+
     def _transform_marlin_to_raw(self, weights: dict):
         """Transform Marlin-layout weights to raw INT4 on-the-fly for WGMMA prefill.
 
@@ -155,6 +157,7 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         Handles both key formats (core engine keys may differ from stored keys).
         """
         from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
+        transformed = 0
         # Find all packed weight keys and transform Marlin→raw
         for key in list(weights.keys()):
             if not key.endswith("_packed") and not key.endswith("packed"):
@@ -174,6 +177,11 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
                     packed, weights[scale_key], K_proj, N_proj)
                 weights[key] = raw_packed
                 weights[scale_key] = raw_scale
+                transformed += 1
+        if not self.__class__._transform_logged and transformed > 0:
+            logging.info(f"[Marlin] Transformed {transformed} projections Marlin→raw "
+                         f"(keys: {[k for k in weights if 'packed' in k]})")
+            self.__class__._transform_logged = True
 
     def _forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Direct BF16 GEMM path for pre-dequantized weights.
