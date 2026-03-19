@@ -27,17 +27,10 @@ def build_long_prompt(target_tokens: int) -> str:
     # K2.5 uses a BPE tokenizer. A simple repeating sentence averages
     # ~1.3 tokens per word. Use a fixed sentence and repeat.
     # "The quick brown fox jumps over the lazy dog." = ~10 tokens
+    # K2.5 BPE: ~0.89 tokens per word. Overshoot then trim with tokenizer.
     sentence = "The quick brown fox jumps over the lazy dog. "
-    tokens_per_sentence = 11  # approximate
-    num_repeats = (target_tokens // tokens_per_sentence) + 100  # overshoot
-
+    num_repeats = int(target_tokens * 0.15) + 1000  # generous overshoot
     long_text = sentence * num_repeats
-
-    # Trim to approximate target (we'll measure exact with tokenizer if available)
-    # Each char ≈ 0.25 tokens for English, so target_tokens * 4 chars
-    char_estimate = target_tokens * 4
-    long_text = long_text[:char_estimate]
-
     return long_text
 
 
@@ -109,12 +102,13 @@ def main():
     client = BatchGenHttpClient(base_url=args.base_url)
 
     logger.info("Uploading batch...")
-    file_id = client.upload_file(jsonl_path)
+    file_resp = client.upload_file(jsonl_path)
+    file_id = file_resp["id"]
     logger.info(f"File ID: {file_id}")
 
     logger.info("Creating batch...")
     batch = client.create_batch(
-        file_id=file_id,
+        input_file_id=file_id,
         endpoint="/v1/chat/completions",
         max_decoding_length=args.max_tokens,
     )
