@@ -777,9 +777,11 @@ class KimiK25MoE(nn.Module):
                         down_s_ptrs[local_e] = module.marlin_down_scale.data_ptr()
 
                     mw = {}
-                    # S1: gate+up interleaved [2E]
-                    mw['s1_B_ptrs'] = torch.cat([gate_w_ptrs, up_w_ptrs])
-                    mw['s1_scales_ptrs'] = torch.cat([gate_s_ptrs, up_s_ptrs])
+                    # S1 fused: separate gate/up [E] each
+                    mw['gate_B_ptrs'] = gate_w_ptrs
+                    mw['gate_scales_ptrs'] = gate_s_ptrs
+                    mw['up_B_ptrs'] = up_w_ptrs
+                    mw['up_scales_ptrs'] = up_s_ptrs
                     # S3: down [E]
                     mw['s3_B_ptrs'] = down_w_ptrs
                     mw['s3_scales_ptrs'] = down_s_ptrs
@@ -818,30 +820,17 @@ class KimiK25MoE(nn.Module):
         # Expert starts: mtp stride for 3D buffer access
         mw['expert_starts'] = torch.arange(E, dtype=torch.int32, device=device) * mtp
 
-        # S1 output buffers: shared across all layers (allocated once)
-        if self.__class__._marlin_gate_buf is None or self.__class__._marlin_gate_buf.shape[0] != E * mtp:
-            self.__class__._marlin_gate_buf = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
-            self.__class__._marlin_up_buf = torch.zeros(E * mtp, N, dtype=torch.bfloat16, device=device)
-            if self.rank == 0:
-                buf_mb = 2 * E * mtp * N * 2 / 1e6
-                logging.info(f"[MoE] Marlin shared buffers allocated: gate+up={buf_mb:.1f} MB")
-        mw['gate_buf'] = self.__class__._marlin_gate_buf
-        mw['up_buf'] = self.__class__._marlin_up_buf
-
-        # S1 C_ptrs [2E]: gate into gate_buf, up into up_buf (mtp stride)
+        # S1 fused C_ptrs [E]: output into buf.intermediate at mtp stride
+        buf = self.__class__._buf
         bpr_N = N * 2  # bytes per row (BF16)
-        gate_C = torch.tensor(
-            [mw['gate_buf'].data_ptr() + e * mtp * bpr_N for e in range(E)],
+        mw['s1_fused_C_ptrs'] = torch.tensor(
+            [buf.intermediate.data_ptr() + e * mtp * bpr_N for e in range(E)],
             dtype=torch.int64, device=device)
-        up_C = torch.tensor(
-            [mw['up_buf'].data_ptr() + e * mtp * bpr_N for e in range(E)],
-            dtype=torch.int64, device=device)
-        mw['s1_C_ptrs'] = torch.cat([gate_C, up_C])  # [2E]
 
-        # S1 workspace
+        # S1 workspace (E matrices for fused kernel)
         n_tiles_s1 = N // 256  # 8
         mw['s1_workspace'] = torch.zeros(
-            2 * E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
+            E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
 
         # S3 workspace
         n_tiles_s3 = K // 256  # 28
@@ -857,10 +846,9 @@ class KimiK25MoE(nn.Module):
         self._marlin_mod = _load_module()
 
         self._marlin_mtp = mtp
-        buf_mb = 2 * E * mtp * N * 2 / 1e6
         if self.rank == 0:
-            logging.info(f"[MoE] Marlin 3-stage buffers initialized "
-                         f"(E={E}, mtp={mtp}, gate+up={buf_mb:.1f} MB)")
+            logging.info(f"[MoE] Marlin 3-stage fused buffers initialized "
+                         f"(E={E}, mtp={mtp})")
 
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -977,21 +965,17 @@ class KimiK25MoE(nn.Module):
                     dtype=torch.int64, device=device)
                 mw['_s3_expert_out_ptr'] = buf.expert_out.data_ptr()
 
-            # Stage 1: gate+up GEMM (2E matrices)
+            # Stage 1: fused gate+up+SiLU (single kernel, E matrices)
             n_tiles_s1 = N // 256
-            mod_m.grouped_marlin_gemm_m16(
-                buf.dispatched_x, mw['s1_B_ptrs'], mw['s1_C_ptrs'],
-                mw['s1_scales_ptrs'], mw['expert_starts'], expert_counts,
-                E_local, N, K, mw['s1_workspace'],
-                2 * E_local, n_tiles_s1, max_marlin_m_tiles)
-
-            # Stage 2: SiLU(gate) * up → intermediate (skip inactive rows)
-            mod_m.silu_mul_scatter(
-                mw['gate_buf'], mw['up_buf'], buf.intermediate,
-                expert_counts, E_local, mtp, mtp, N)
+            mod_m.grouped_marlin_gemm_m16_s1(
+                buf.dispatched_x,
+                mw['gate_B_ptrs'], mw['up_B_ptrs'], mw['s1_fused_C_ptrs'],
+                mw['gate_scales_ptrs'], mw['up_scales_ptrs'],
+                mw['expert_starts'], expert_counts,
+                E_local, N, K, mw['s1_workspace'], n_tiles_s1, max_marlin_m_tiles)
 
             if timer is not None:
-                ev[4].record()  # after S1+SiLU, before S3
+                ev[4].record()  # after fused S1, before S3
 
             # Stage 3: down GEMM (E matrices)
             n_tiles_s3 = K // 256
