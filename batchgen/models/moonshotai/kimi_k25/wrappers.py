@@ -135,8 +135,11 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
 
         Accesses weights through self.module to always get the current device
         tensors (GPU views after _move_int4_to_gpu_contiguous).
+
+        If weights are in Marlin layout (from Marlin checkpoint), transforms
+        to raw INT4 on-the-fly for WGMMA prefill. ~180 us per expert.
         """
-        return {
+        weights = {
             "gate_proj.weight_packed": self.module.int4_gate_packed,
             "gate_proj.weight_scale": self.module.int4_gate_scale,
             "up_proj.weight_packed": self.module.int4_up_packed,
@@ -144,6 +147,10 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             "down_proj.weight_packed": self.module.int4_down_packed,
             "down_proj.weight_scale": self.module.int4_down_scale,
         }
+        # Transform Marlin→raw INT4 on-the-fly for WGMMA prefill
+        if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
+            self._transform_marlin_to_raw(weights)
+        return weights
 
     def _transform_marlin_to_raw(self, weights: dict):
         """Transform Marlin-layout weights to raw INT4 on-the-fly for WGMMA prefill.
