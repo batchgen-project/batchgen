@@ -843,10 +843,18 @@ class KimiK25MoE(nn.Module):
         mw['s1_workspace'] = torch.zeros(
             2 * E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
 
-        # S3 workspace (C_ptrs for S3 built per-call since expert_out may change)
+        # S3 workspace
         n_tiles_s3 = K // 256  # 28
         mw['s3_workspace'] = torch.zeros(
             E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
+
+        # S3 C_ptrs: pre-computed, recomputed only if expert_out moves
+        mw['_s3_expert_out_ptr'] = None
+        mw['s3_C_ptrs'] = None
+
+        # Cache Marlin module to avoid per-step import + function call
+        from batchgen.moe.marlin_grouped_moe import _load_module
+        self._marlin_mod = _load_module()
 
         self._marlin_mtp = mtp
         buf_mb = 2 * E * mtp * N * 2 / 1e6
@@ -957,16 +965,17 @@ class KimiK25MoE(nn.Module):
             max_possible_m = min(num_global, mtp)
             max_marlin_m_tiles = (max_possible_m + 15) // 16
 
-            from batchgen.moe.marlin_grouped_moe import _load_module as _load_marlin
-            mod_m = _load_marlin()
+            mod_m = self._marlin_mod
             mw = self._marlin_weights
             E_local = buf.E_local
 
-            # Build S3 C_ptrs into expert_out (may change if expert_out reallocated)
-            bpr_K = mw['K'] * 2
-            s3_C_ptrs = torch.tensor(
-                [buf.expert_out.data_ptr() + e * mtp * bpr_K for e in range(E_local)],
-                dtype=torch.int64, device=device)
+            # S3 C_ptrs: recompute only if expert_out buffer moved
+            if mw['_s3_expert_out_ptr'] != buf.expert_out.data_ptr():
+                bpr_K = mw['K'] * 2
+                mw['s3_C_ptrs'] = torch.tensor(
+                    [buf.expert_out.data_ptr() + e * mtp * bpr_K for e in range(E_local)],
+                    dtype=torch.int64, device=device)
+                mw['_s3_expert_out_ptr'] = buf.expert_out.data_ptr()
 
             # Stage 1: gate+up GEMM (2E matrices)
             n_tiles_s1 = N // 256
@@ -976,13 +985,15 @@ class KimiK25MoE(nn.Module):
                 E_local, N, K, mw['s1_workspace'],
                 2 * E_local, n_tiles_s1, max_marlin_m_tiles)
 
-            # Stage 2: SiLU(gate) * up → intermediate
-            mod_m.silu_mul(mw['gate_buf'], mw['up_buf'], buf.intermediate)
+            # Stage 2: SiLU(gate) * up → intermediate (skip inactive rows)
+            mod_m.silu_mul_scatter(
+                mw['gate_buf'], mw['up_buf'], buf.intermediate,
+                expert_counts, E_local, mtp, mtp, N)
 
             # Stage 3: down GEMM (E matrices)
             n_tiles_s3 = K // 256
             mod_m.grouped_marlin_gemm_m16(
-                buf.intermediate, mw['s3_B_ptrs'], s3_C_ptrs,
+                buf.intermediate, mw['s3_B_ptrs'], mw['s3_C_ptrs'],
                 mw['s3_scales_ptrs'], mw['expert_starts'], expert_counts,
                 E_local, K, N, mw['s3_workspace'],
                 E_local, n_tiles_s3, max_marlin_m_tiles)
