@@ -1013,23 +1013,13 @@ class KimiK25ParallelStrategyManager:
             is_marlin = gate_packed.shape[0] < gate_packed.shape[1]
 
             if is_marlin:
-                # Marlin checkpoint: int4_* attrs are views into _int4_packed_gpu_buf.
-                # 1. Assign as marlin_* directly (NO clone — views keep buffer alive)
-                # 2. Transform to raw INT4 for WGMMA prefill (new tensors)
-                from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
+                # Marlin checkpoint: int4_* attrs are already Marlin layout.
+                # Just assign as marlin_* for decode. No transform needed here.
+                # Prefill transform (Marlin→raw) happens on-the-fly in
+                # wrappers.py dequantize_weights() when WGMMA needs raw INT4.
                 for proj in ('gate', 'up', 'down'):
-                    marlin_packed = getattr(module, f'int4_{proj}_packed')
-                    marlin_scale = getattr(module, f'int4_{proj}_scale')
-                    # Marlin decode: use original views (no clone, no extra memory)
-                    setattr(module, f'marlin_{proj}_qw', marlin_packed)
-                    setattr(module, f'marlin_{proj}_scale', marlin_scale)
-                    # WGMMA prefill: transform to raw INT4 (new tensors)
-                    K_proj = marlin_packed.shape[0] * 16
-                    N_proj = marlin_packed.shape[1] // 2
-                    raw_packed, raw_scale = marlin_to_wgmma_fused_gpu(
-                        marlin_packed, marlin_scale, K_proj, N_proj)
-                    setattr(module, f'int4_{proj}_packed', raw_packed)
-                    setattr(module, f'int4_{proj}_scale', raw_scale)
+                    setattr(module, f'marlin_{proj}_qw', getattr(module, f'int4_{proj}_packed'))
+                    setattr(module, f'marlin_{proj}_scale', getattr(module, f'int4_{proj}_scale'))
                 count_marlin += 1
             else:
                 # Old checkpoint, runtime repack
@@ -1053,15 +1043,6 @@ class KimiK25ParallelStrategyManager:
                 module.marlin_down_qw = marlin_dqw
                 module.marlin_down_scale = marlin_ds
                 count_repack += 1
-
-        # Free the old contiguous buffer — marlin_* attrs now hold direct references
-        # to the buffer's views, keeping it alive. The int4_* attrs point to new
-        # raw INT4 tensors from the transform. No more need for the PSM reference.
-        if count_marlin > 0 and hasattr(self, '_int4_packed_gpu_buf'):
-            del self._int4_packed_gpu_buf
-            del self._int4_scale_gpu_buf
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
 
         if self.rank == 0:
             if count_marlin > 0:
