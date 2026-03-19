@@ -990,6 +990,9 @@ class KimiK25MoE(nn.Module):
                 mw['gate_buf'], mw['up_buf'], buf.intermediate,
                 expert_counts, E_local, mtp, mtp, N)
 
+            if timer is not None:
+                ev[4].record()  # after S1+SiLU, before S3
+
             # Stage 3: down GEMM (E matrices)
             n_tiles_s3 = K // 256
             mod_m.grouped_marlin_gemm_m16(
@@ -1015,6 +1018,8 @@ class KimiK25MoE(nn.Module):
                 buf.empty_bias, buf.empty_bias,
                 N, K // 2, K // 32, max_m_tiles, mtp,
             )
+            if timer is not None:
+                ev[4].record()  # after stage1, before stage2
             mod.grouped_int4_moe_stage2_inplace(
                 buf.intermediate, buf.expert_out, buf.tma_intermediate,
                 expert_counts,
