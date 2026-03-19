@@ -161,13 +161,13 @@ def raw_to_marlin_fused_gpu(
     mod.raw_to_marlin_transform(raw_packed, marlin_qw, perm, K, N)
 
     # Scale transform: raw [N, K//32] → Marlin permuted [K//32, N]
-    # Use PyTorch GPU ops (same approach as _marlin_permute_scales, validated by CPU round-trip)
+    # Work in native dtype (no fp16 cast — bf16 values may overflow fp16 range)
     scale_perm, _ = _get_scale_perms()
     scale_perm_t = torch.tensor(scale_perm, device=device, dtype=torch.long)
     K_groups = K // INT4_GROUP_SIZE
-    s_transposed = raw_scales.to(torch.float16).t().contiguous()  # [K//32, N]
+    s_transposed = raw_scales.t().contiguous()  # [K//32, N]
     marlin_s = s_transposed.reshape(-1, len(scale_perm))[:, scale_perm_t]
-    marlin_s = marlin_s.reshape(-1, N).contiguous().to(raw_scales.dtype)
+    marlin_s = marlin_s.reshape(-1, N).contiguous()
 
     return marlin_qw, marlin_s
 
@@ -191,14 +191,12 @@ def marlin_to_wgmma_fused_gpu(
     raw_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
     mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, inv_perm, K, N)
 
-    # Scale transform — use CPU reference (scales are tiny, ~1 MB, negligible overhead)
-    # The scale permutation has complex reshape interactions with group_size < K.
-    # CPU version is validated via round-trip test.
+    # Scale transform: inverse permute + transpose. Work in native dtype (no fp16 cast).
     inv_scale_perm = _get_inverse_scale_perm()
     inv_scale_perm_t = torch.tensor(inv_scale_perm, device=device, dtype=torch.long)
-    s_inv = marlin_s.to(torch.float16).reshape(-1, len(inv_scale_perm))
+    s_inv = marlin_s.reshape(-1, len(inv_scale_perm))
     s_inv = s_inv[:, inv_scale_perm_t]
-    raw_scales = s_inv.reshape(-1, N).t().contiguous().to(marlin_s.dtype)
+    raw_scales = s_inv.reshape(-1, N).t().contiguous()
 
     return raw_packed, raw_scales
 
