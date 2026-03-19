@@ -87,11 +87,12 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
     ) -> Dict[str, torch.Tensor]:
         """Dequantize INT4 packed weights to BF16.
 
+        If weights are in Marlin layout (from Marlin-only checkpoint),
+        transform to raw INT4 first, then dequantize as usual.
+
         Expected weight format:
-        - "gate_proj.weight_packed": uint8 [N, K//2]
-        - "gate_proj.weight_scale": bf16 [N, K//32]
-        - "up_proj.weight_packed", "up_proj.weight_scale"
-        - "down_proj.weight_packed", "down_proj.weight_scale"
+        - "gate_proj.weight_packed": uint8 [N, K//2] or int32 [K//16, N*2] (Marlin)
+        - "gate_proj.weight_scale": bf16 [N, K//32] or bf16 [K//32, N] (Marlin)
 
         Args:
             weights_dict: Dict with packed weights and scales
@@ -99,6 +100,10 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         Returns:
             Dict with dequantized BF16 weights (standard .weight keys)
         """
+        # Transform Marlin→raw INT4 on-the-fly if needed (non-persistent experts)
+        if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
+            self._transform_marlin_to_raw(weights_dict)
+
         result = {}
 
         for name, tensor in weights_dict.items():
@@ -225,10 +230,6 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             weights = self._get_stored_int4_weights()
         else:
             weights = self.load_weights(self.module_key)
-            # Transform Marlin→WGMMA on-the-fly for prefill (58 us/proj)
-            # Non-persistent experts loaded from Marlin checkpoint need conversion
-            if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
-                self._transform_marlin_to_raw(weights)
 
         # Ensure BF16 activations
         if hidden_states.dtype != torch.bfloat16:
