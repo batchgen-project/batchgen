@@ -326,6 +326,8 @@ def _server_worker_main_impl(
 			sampling_params = task_data.get("sampling_params", None)
 			# Per-sequence max output token limits
 			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
+			# Batch-level termination tokens (safety/regulation feature)
+			batch_termination_tokens = task_data.get("batch_termination_tokens", None)
 			if global_rank == 0:
 				if sampling_params:
 					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
@@ -359,6 +361,9 @@ def _server_worker_main_impl(
 
 				# Set ignore_eos flag on worker
 				worker.set_ignore_eos(ignore_eos)
+
+				# Set or clear batch termination tokens
+				worker.set_batch_termination_tokens(batch_termination_tokens)
 
 				# Set sampling parameters
 				if sampling_params:
@@ -428,6 +433,14 @@ def _server_worker_main_impl(
 				logging.error(f"Results are unexpectedly empty!")
 				response_queue.put({"error": "Results unexpectedly empty after inference"})
 				continue
+
+			# Wrap results with batch termination metadata if triggered
+			if getattr(worker, '_batch_terminated', False):
+				final_results = {
+					"status": "batch_terminated",
+					"results": final_results,
+					"termination_info": worker._batch_termination_info,
+				}
 
 			response_queue.put(final_results)
 

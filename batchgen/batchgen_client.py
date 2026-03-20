@@ -4,7 +4,7 @@ import pickle
 import time
 import logging
 import argparse
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 
 try:
     import requests
@@ -85,6 +85,7 @@ class BatchGenClient:
         ignore_eos: bool = False,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        batch_termination_tokens: Optional[Set[int]] = None,
     ) -> Optional[Dict]:
         """
         Submit inference request with generation parameters.
@@ -98,6 +99,11 @@ class BatchGenClient:
                        (useful for benchmarking)
             temperature: Sampling temperature (None = greedy decoding)
             top_p: Nucleus sampling threshold (None = disabled)
+            batch_termination_tokens: Optional set of token IDs that trigger
+                          immediate termination of the entire batch. If any
+                          sequence generates a token in this set, all sequences
+                          stop and partial results are returned with termination
+                          metadata. Used for safety/regulation scenarios.
 
         Returns:
             Server response dictionary
@@ -113,6 +119,8 @@ class BatchGenClient:
             payload["temperature"] = temperature
         if top_p is not None:
             payload["top_p"] = top_p
+        if batch_termination_tokens is not None:
+            payload["batch_termination_tokens"] = batch_termination_tokens
         return self.send_request(payload)
 
     def ping(self) -> Optional[Dict]:

@@ -60,6 +60,8 @@ ARCH_PATTERNS: Dict[str, str] = {
     "Mixtral": "mixtral",
     "GptOss": "gpt_oss",
     "Qwen2Moe": "qwen2_moe",
+    "Qwen3": "qwen3",
+    "Qwen3ForCausalLM": "qwen3",
     "MiniMaxM2": "minimax_m25",
 }
 
@@ -76,6 +78,9 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x22B": "mixtral",
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
+    "Qwen/Qwen3": "qwen3",
+    "Qwen3Guard": "qwen3",
+    "qwen3guard": "qwen3",
 }
 
 
@@ -237,6 +242,11 @@ def _import_model_configs():
 
     try:
         from batchgen.models.minimax.minimax_m25 import config as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.qwen.qwen3 import config as _  # noqa: F401
     except ImportError:
         pass
 

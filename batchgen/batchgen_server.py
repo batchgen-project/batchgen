@@ -338,6 +338,7 @@ class BatchGenServer:
 		max_input_len = 1024
 		max_output_len = 128
 		ignore_eos = False  # NEW: Default to respecting EOS
+		batch_termination_tokens = None
 
 		if isinstance(request, list):
 			# Backwards compatibility for raw lists
@@ -350,6 +351,7 @@ class BatchGenServer:
 			max_input_len = request.get('max_input_len', 1024)
 			max_output_len = request.get('max_output_len', 128)
 			ignore_eos = request.get('ignore_eos', False)  # NEW: Extract ignore_eos
+			batch_termination_tokens = request.get('batch_termination_tokens', None)
 		else:
 			return {'status': 'error', 'message': 'Invalid input type.'}
 		
@@ -382,6 +384,7 @@ class BatchGenServer:
 					"max_input_len": max_input_len,
 					"max_output_len": max_output_len,
 					"ignore_eos": ignore_eos,  # NEW: Pass to worker
+				"batch_termination_tokens": batch_termination_tokens,
 				}
 				
 				self.request_queue.put(worker_payload)

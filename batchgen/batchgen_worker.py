@@ -496,6 +496,9 @@ class BatchGenWorker:
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._ignore_eos: bool = False
+		self._batch_termination_tokens: Optional[Set[int]] = None
+		self._batch_terminated: bool = False
+		self._batch_termination_info: Optional[Dict] = None
 		self._temperature: Optional[float] = None  # Sampling temperature (None = greedy)
 		self._top_p: Optional[float] = None  # Nucleus sampling threshold (None = disabled)
 		self._logged_greedy: bool = False  # Track if we've logged greedy mode this batch
@@ -675,6 +678,22 @@ class BatchGenWorker:
 		"""
 		self._ignore_eos = ignore_eos
 		logging.info(f"Rank {self.rank}: ignore_eos set to {ignore_eos}")
+
+	def set_batch_termination_tokens(self, tokens: Optional[Set[int]] = None) -> None:
+		"""
+		Set or clear token IDs that trigger immediate termination of the entire batch.
+
+		When any sequence generates a token in this set, all sequences are
+		marked complete and partial results are returned with termination metadata.
+
+		Args:
+			tokens: Set of token IDs that trigger batch termination, or None to disable
+		"""
+		self._batch_termination_tokens = set(tokens) if tokens else None
+		self._batch_terminated = False
+		self._batch_termination_info = None
+		if self.rank == 0 and self._batch_termination_tokens:
+			logging.info(f"Batch termination tokens set: {self._batch_termination_tokens}")
 
 	def set_sampling_params(self, temperature: Optional[float] = None, top_p: Optional[float] = None) -> None:
 		"""
@@ -7345,6 +7364,29 @@ class BatchGenWorker:
 
 				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
+
+			# Batch termination check: if any sequence generated a termination token,
+			# mark ALL sequences as completed to stop the entire batch
+			if self._batch_termination_tokens and not self._batch_terminated:
+				for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
+					token_id = new_tokens_cpu[i].item()
+					if token_id in self._batch_termination_tokens:
+						self._batch_terminated = True
+						self._batch_termination_info = {
+							"trigger_seq_uuid": seq.uuid,
+							"trigger_seq_global_idx": seq.global_idx,
+							"trigger_token_id": token_id,
+						}
+						logging.info(
+							f"Rank {self.rank}: Batch termination triggered by "
+							f"seq {seq.global_idx} (token_id={token_id})"
+						)
+						# Mark all active sequences as completed
+						for uuid in decode_uuids:
+							s = self.global_batch.get_sequence(uuid)
+							if s and not self._is_sequence_completed(s):
+								s.eos_reached = True
+						break
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
