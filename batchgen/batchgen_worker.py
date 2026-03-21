@@ -5305,9 +5305,29 @@ class BatchGenWorker:
 			"Ensure _init_gpu_kv_with_actual_size() was called first."
 		)
 
-		# Allocate GPU KV for sequences
+		# Allocate GPU KV for sequences — ONLY for sequences that DON'T already have GPU KV
+		# Carried-over sequences (IN_DECODE with valid GPU KV from previous decode group)
+		# must NOT be reloaded from host, as their GPU KV is already up-to-date and
+		# host reload can corrupt the KV state at decode group boundaries.
 		if local_decode_indices:
-			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
+			new_indices = []
+			carried_over_count = 0
+			for local_idx in local_decode_indices:
+				uuid = self._local_to_uuid_map[local_idx]
+				if uuid in self._sequences_with_gpu_kv:
+					carried_over_count += 1
+				else:
+					new_indices.append(local_idx)
+
+			if carried_over_count > 0 and self.rank == 0:
+				logging.info(
+					f"[DECODE] Skipping GPU KV reload for {carried_over_count} carried-over sequences "
+					f"(already have valid GPU KV)"
+				)
+
+			if new_indices:
+				self._allocate_gpu_kv_two_page_buffer(new_indices, load_from_host=True)
+
 			for local_idx in local_decode_indices:
 				uuid = self._local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
