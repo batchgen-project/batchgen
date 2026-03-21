@@ -1172,6 +1172,23 @@ class BatchGenWorker:
 
 		sequence_ids, sequence_lengths = batch_info
 
+		# DIAG-134: Log KV flush positions for sequences near DECISION_INTERVAL boundary
+		if BATCHGEN_DIAG_134 and entries:
+			# Only log layer 0 to avoid spam
+			for i, seq_id in enumerate(sequence_ids):
+				seq_len = sequence_lengths[i] if i < len(sequence_lengths) else -1
+				# Find this sequence to get decoded_length
+				for uuid, local_idx in self._uuid_to_local_map.items():
+					seq = self.global_batch.get_sequence(uuid)
+					if seq and seq.global_idx == seq_id and 120 <= seq.decoded_length <= 140:
+						logging.warning(
+							f"[DIAG-134] KV_FLUSH rank={self.rank} gidx={seq_id} "
+							f"append_pos={seq_len} decoded_len={seq.decoded_length} "
+							f"ctx={seq.current_context_length} prompt={seq.prompt_length} "
+							f"host_pages={seq.host_pages_allocated}"
+						)
+						break
+
 		# ONE sync for ALL layers — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
 			self._kv_offload_event = torch.cuda.Event()
@@ -1704,6 +1721,38 @@ class BatchGenWorker:
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
+
+		# DIAG-134: Verify GPU KV after host→GPU load for sequences near boundary
+		if BATCHGEN_DIAG_134:
+			page_counts_list = active_sequence_page_counts.tolist()
+			for idx, global_idx in enumerate(global_sequence_ids):
+				for uuid, local_idx in self._uuid_to_local_map.items():
+					seq = self.global_batch.get_sequence(uuid)
+					if seq and seq.global_idx == global_idx and 120 <= seq.decoded_length <= 145:
+						gpu_pages = page_counts_list[idx] if idx < len(page_counts_list) else -1
+						# Read layer-0 KV at last decoded position to verify
+						k_cache_l0 = manager._k_cache[0] if manager._k_cache is not None else None
+						kv_checksum = "N/A"
+						if k_cache_l0 is not None and manager._gpu_page_table_manager.gpu_table is not None:
+							pt = manager._gpu_page_table_manager.gpu_table
+							slot_map = manager._gpu_page_table_manager.seq_id_to_slot
+							slot = slot_map.get(global_idx, -1)
+							if slot >= 0 and slot < pt.shape[0]:
+								last_kv_pos = seq.current_context_length - 2  # -2: last completed KV position
+								page_idx = last_kv_pos // manager.config.page_size_tokens
+								offset = last_kv_pos % manager.config.page_size_tokens
+								if page_idx < pt.shape[1]:
+									phys_page = pt[slot, page_idx].item()
+									if phys_page >= 0 and phys_page < k_cache_l0.shape[0]:
+										kv_val = k_cache_l0[phys_page, offset, :4].tolist()
+										kv_checksum = f"L0_kv[{last_kv_pos}]={[f'{v:.4f}' for v in kv_val]}"
+						logging.warning(
+							f"[DIAG-134] KV_LOAD_VERIFY rank={self.rank} gidx={global_idx} "
+							f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
+							f"gpu_pages_loaded={gpu_pages} host_pages={seq.host_pages_allocated} "
+							f"{kv_checksum}"
+						)
+						break
 
 		# DEBUG: Verify KV content is different across sequences after host→GPU load
 		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1" and len(global_sequence_ids) >= 2:
@@ -5203,7 +5252,27 @@ class BatchGenWorker:
 		3. GPU KV page allocation
 		"""
 		start_time = time.perf_counter()
-		
+
+		# DIAG-134: State dump for resuming sequences near DECISION_INTERVAL boundary
+		if BATCHGEN_DIAG_134:
+			import math as _math
+			for uuid in decode_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq and 120 <= seq.decoded_length <= 145:
+					expected_ctx = seq.prompt_length + seq.decoded_length
+					ctx_ok = seq.current_context_length == expected_ctx
+					host_pages_needed = _math.ceil(expected_ctx / self.PAGE_SIZE) if expected_ctx > 0 else 0
+					host_ok = seq.host_pages_allocated >= host_pages_needed
+					logging.warning(
+						f"[DIAG-134] CONFIG_ENTRY rank={self.rank} gidx={seq.global_idx} "
+						f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
+						f"expected_ctx={expected_ctx} ctx_ok={ctx_ok} "
+						f"prompt={seq.prompt_length} "
+						f"host_pages={seq.host_pages_allocated} host_needed={host_pages_needed} host_ok={host_ok} "
+						f"gpu_pages={seq.gpu_pages_allocated} had_initial={seq.had_initial_gpu_reservation} "
+						f"status={seq.status.name}"
+					)
+
 		# ============ CRITICAL FIX: Repair current_context_length for ALL sequences FIRST ============
 		# This must happen BEFORE any validation or diagnostics that read current_context_length.
 		# The root cause of ctx_len=0 bug is that current_context_length can become stale during
@@ -5305,29 +5374,9 @@ class BatchGenWorker:
 			"Ensure _init_gpu_kv_with_actual_size() was called first."
 		)
 
-		# Allocate GPU KV for sequences — ONLY for sequences that DON'T already have GPU KV
-		# Carried-over sequences (IN_DECODE with valid GPU KV from previous decode group)
-		# must NOT be reloaded from host, as their GPU KV is already up-to-date and
-		# host reload can corrupt the KV state at decode group boundaries.
+		# Allocate GPU KV for sequences
 		if local_decode_indices:
-			new_indices = []
-			carried_over_count = 0
-			for local_idx in local_decode_indices:
-				uuid = self._local_to_uuid_map[local_idx]
-				if uuid in self._sequences_with_gpu_kv:
-					carried_over_count += 1
-				else:
-					new_indices.append(local_idx)
-
-			if carried_over_count > 0 and self.rank == 0:
-				logging.info(
-					f"[DECODE] Skipping GPU KV reload for {carried_over_count} carried-over sequences "
-					f"(already have valid GPU KV)"
-				)
-
-			if new_indices:
-				self._allocate_gpu_kv_two_page_buffer(new_indices, load_from_host=True)
-
+			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
 			for local_idx in local_decode_indices:
 				uuid = self._local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
@@ -7233,7 +7282,45 @@ class BatchGenWorker:
 		# OPTIMIZATION: Track if page table was verified since last batch change
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
-		
+
+		# DIAG-134: At decode group entry, verify GPU KV for sequences near boundary
+		if BATCHGEN_DIAG_134 and gpu_manager and gpu_manager._k_cache is not None:
+			k_cache_l0 = gpu_manager._k_cache[0]
+			pt_mgr = gpu_manager._gpu_page_table_manager
+			if pt_mgr and pt_mgr.gpu_table is not None:
+				for local_idx in batch:
+					uuid = self._local_to_uuid_map.get(local_idx)
+					if not uuid:
+						continue
+					seq = self.global_batch.get_sequence(uuid)
+					if seq and 120 <= seq.decoded_length <= 145:
+						slot = pt_mgr.seq_id_to_slot.get(seq.global_idx, -1)
+						if slot >= 0:
+							# Read GPU KV at 3 positions: decoded_len-3, -2, -1
+							kv_samples = []
+							for offset in [-3, -2, -1]:
+								pos = seq.current_context_length + offset - 1
+								if pos < 0:
+									continue
+								page_idx = pos // gpu_manager.config.page_size_tokens
+								page_off = pos % gpu_manager.config.page_size_tokens
+								if page_idx < pt_mgr.gpu_table.shape[1]:
+									phys = pt_mgr.gpu_table[slot, page_idx].item()
+									if 0 <= phys < k_cache_l0.shape[0]:
+										val = k_cache_l0[phys, page_off, 0].item()
+										kv_samples.append(f"pos{pos}={val:.4f}")
+									else:
+										kv_samples.append(f"pos{pos}=BAD_PAGE({phys})")
+								else:
+									kv_samples.append(f"pos{pos}=NO_PAGE(pidx={page_idx})")
+							# Also read decoded token at last position
+							last_tok = self.query_book[local_idx].decoded_tokens[0, seq.decoded_length - 1].item()
+							logging.warning(
+								f"[DIAG-134] DECODE_ENTRY_KV rank={self.rank} gidx={seq.global_idx} "
+								f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
+								f"slot={slot} last_tok={last_tok} kv=[{', '.join(kv_samples)}]"
+							)
+
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
