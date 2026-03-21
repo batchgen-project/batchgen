@@ -7585,6 +7585,14 @@ class BatchGenWorker:
 			# Update sequences (reuse batch_sequences from forward pass setup)
 			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
 				if self._is_sequence_completed(seq):
+					# DIAG-134: Log WHY a short sequence is skipped as completed
+					if BATCHGEN_DIAG_134 and self.rank == 0 and seq.decoded_length <= 200:
+						logging.warning(
+							f"[DIAG-134] SKIP_COMPLETED gidx={seq.global_idx} "
+							f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
+							f"ctx={seq.current_context_length} max_dec={seq.max_decode_length} "
+							f"model_ctx={self.model_context_length} iter={local_iteration}"
+						)
 					continue
 
 				decode_pos = seq.decoded_length
