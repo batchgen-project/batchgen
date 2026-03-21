@@ -3729,6 +3729,13 @@ class BatchGenWorker:
 		# get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
+			# DIAG-134: Log ON_HOLD with decoded_length for short sequences
+			if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
+				logging.warning(
+					f"[DIAG-134] ON_HOLD rank={self.rank} gidx={seq.global_idx} "
+					f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
+					f"ctx={seq.current_context_length}"
+				)
 			seq.gpu_pages_allocated = 0
 			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
@@ -6173,11 +6180,14 @@ class BatchGenWorker:
 				is_completed = self._is_sequence_completed(seq)
 				# DIAG-134: Log on ANY rank when a short sequence is marked completed at boundary
 				if BATCHGEN_DIAG_134 and is_completed and seq.decoded_length <= 200:
+					local_idx = self._uuid_to_local_map[uuid]
+					raw_toks = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
 					logging.warning(
 						f"[DIAG-134] STATE_GATHER_COMPLETED rank={self.rank} gidx={seq.global_idx} "
 						f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
 						f"ctx={seq.current_context_length} max_dec={seq.max_decode_length} "
-						f"model_ctx={self.model_context_length}"
+						f"model_ctx={self.model_context_length} "
+						f"last_30_toks={raw_toks[-30:]} first_5_toks={raw_toks[:5]}"
 					)
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
@@ -6706,6 +6716,13 @@ class BatchGenWorker:
 		for local_idx in pending_local_indices:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
+			# DIAG-134: Log RESUME with decoded_length for short sequences
+			if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
+				logging.warning(
+					f"[DIAG-134] RESUME rank={self.rank} gidx={seq.global_idx} "
+					f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
+					f"ctx={seq.current_context_length} status={seq.status.name}"
+				)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
@@ -7594,10 +7611,10 @@ class BatchGenWorker:
 			# Update sequences (reuse batch_sequences from forward pass setup)
 			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
 				if self._is_sequence_completed(seq):
-					# DIAG-134: Log WHY a short sequence is skipped as completed
-					if BATCHGEN_DIAG_134 and self.rank == 0 and seq.decoded_length <= 200:
+					# DIAG-134: Log WHY a short sequence is skipped as completed (ALL ranks)
+					if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
 						logging.warning(
-							f"[DIAG-134] SKIP_COMPLETED gidx={seq.global_idx} "
+							f"[DIAG-134] SKIP_COMPLETED rank={self.rank} gidx={seq.global_idx} "
 							f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
 							f"ctx={seq.current_context_length} max_dec={seq.max_decode_length} "
 							f"model_ctx={self.model_context_length} iter={local_iteration}"
@@ -7616,11 +7633,11 @@ class BatchGenWorker:
 						)
 				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
 
-				# DIAG-134: Log token writes around boundary (positions 125-140) for all sequences
-				if BATCHGEN_DIAG_134 and self.rank == 0 and 125 <= decode_pos <= 140:
+				# DIAG-134: Log token writes around boundary (positions 125-140) on ALL ranks
+				if BATCHGEN_DIAG_134 and 125 <= decode_pos <= 140:
 					tok_id = new_tokens_cpu[i].item()
 					logging.info(
-						f"[DIAG-134] TOKEN_WRITE gidx={seq.global_idx} pos={decode_pos} "
+						f"[DIAG-134] TOKEN_WRITE rank={self.rank} gidx={seq.global_idx} pos={decode_pos} "
 						f"tok={tok_id} ctx={seq.current_context_length} iter={local_iteration}"
 					)
 
@@ -7630,14 +7647,14 @@ class BatchGenWorker:
 				# Use CPU tensor to avoid GPU sync
 				if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 					seq.eos_reached = True
-					# DIAG-134: Dump raw token buffer for short sequences on EOS
-					if BATCHGEN_DIAG_134 and self.rank == 0 and seq.decoded_length <= 200:
+					# DIAG-134: Dump raw token buffer for short sequences on EOS (ALL ranks)
+					if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
 						raw_toks = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
 						logging.warning(
-							f"[DIAG-134] SHORT_EOS gidx={seq.global_idx} decoded_len={seq.decoded_length} "
+							f"[DIAG-134] SHORT_EOS rank={self.rank} gidx={seq.global_idx} decoded_len={seq.decoded_length} "
 							f"iter={local_iteration} eos_tok={new_tokens_cpu[i].item()} "
-							f"last_20_toks={raw_toks[-20:]} "
-							f"has_163607={'163607' if 163607 in raw_toks else 'NO </think>'}"
+							f"last_30_toks={raw_toks[-30:]} "
+							f"has_163607={'YES' if 163607 in raw_toks else 'NO'}"
 						)
 
 				if seq.decoded_length >= seq.max_decode_length:
