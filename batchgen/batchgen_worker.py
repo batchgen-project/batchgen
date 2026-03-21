@@ -1744,8 +1744,8 @@ class BatchGenWorker:
 								if page_idx < pt.shape[1]:
 									phys_page = pt[slot, page_idx].item()
 									if phys_page >= 0 and phys_page < k_cache_l0.shape[0]:
-										kv_val = k_cache_l0[phys_page, offset, :4].tolist()
-										kv_checksum = f"L0_kv[{last_kv_pos}]={[f'{v:.4f}' for v in kv_val]}"
+										kv_slice = k_cache_l0[phys_page, offset, :4].float().flatten()
+										kv_checksum = f"L0_kv[{last_kv_pos}]=[{', '.join(f'{kv_slice[j].item():.4f}' for j in range(min(4, kv_slice.numel())))}]"
 						logging.warning(
 							f"[DIAG-134] KV_LOAD_VERIFY rank={self.rank} gidx={global_idx} "
 							f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
