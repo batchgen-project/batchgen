@@ -144,7 +144,11 @@ class QueryBookBufferPool:
 
 	def allocate_slot(self) -> int:
 		if self._free_slots:
-			return self._free_slots.pop()
+			slot = self._free_slots.pop()
+			# Clear stale data from previous occupant to prevent EOS/token contamination
+			self.decoded_tokens_buffer[slot, :] = self.pad_token_id
+			self.input_ids_buffer[slot, :] = 0
+			return slot
 		slot = self._next_slot
 		if slot >= self.num_sequences:
 			raise RuntimeError(f"QueryBookBufferPool exhausted: {self.num_sequences} slots used")
@@ -4203,7 +4207,7 @@ class BatchGenWorker:
 				if seq is not None and local_idx in self.query_book:
 					finish_reason = self._get_finish_reason(seq)
 					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens.clone(), finish_reason)
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length].clone(), finish_reason)
 					)
 
 		# All ranks participate in gather (NCCL collective requirement)
@@ -4821,7 +4825,7 @@ class BatchGenWorker:
 			if local_idx not in self.query_book:
 				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
 				continue
-			decoded_tokens = self.query_book[local_idx].decoded_tokens
+			decoded_tokens = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
 			decoded_str = self._decode_tokens_to_string(decoded_tokens)
 			local_results.append((global_idx, decoded_str))
 
@@ -6675,7 +6679,7 @@ class BatchGenWorker:
 			)
 		
 		self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
-		
+
 		for local_idx in pending_local_indices:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -6683,7 +6687,15 @@ class BatchGenWorker:
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
-		
+			# Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
+			if local_idx in self.query_book:
+				self.query_book[local_idx] = query(
+					text=seq.text,
+					encoded={"input_ids": seq.input_ids},
+					decoded_tokens=seq.decoded_tokens,
+					kv_token_budget=seq.kv_token_budget,
+				)
+
 		updated_uuids = current_decode_uuids + valid_pending_uuids
 		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 		
@@ -7540,6 +7552,15 @@ class BatchGenWorker:
 					continue
 
 				decode_pos = seq.decoded_length
+				if BATCHGEN_CB_DEBUG:
+					qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
+					seq_ptr = seq.decoded_tokens.data_ptr()
+					if qb_ptr != seq_ptr:
+						logging.error(
+							f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
+							f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
+							f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
+						)
 				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
 
 				seq.decoded_length += 1
