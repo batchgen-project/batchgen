@@ -6170,12 +6170,21 @@ class BatchGenWorker:
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
+				is_completed = self._is_sequence_completed(seq)
+				# DIAG-134: Log on ANY rank when a short sequence is marked completed at boundary
+				if BATCHGEN_DIAG_134 and is_completed and seq.decoded_length <= 200:
+					logging.warning(
+						f"[DIAG-134] STATE_GATHER_COMPLETED rank={self.rank} gidx={seq.global_idx} "
+						f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
+						f"ctx={seq.current_context_length} max_dec={seq.max_decode_length} "
+						f"model_ctx={self.model_context_length}"
+					)
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
 					'gpu_pages_allocated': seq.gpu_pages_allocated,
 					'eos_reached': seq.eos_reached,
-					'completed': self._is_sequence_completed(seq),
+					'completed': is_completed,
 					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
 					# Host KV growth fields
