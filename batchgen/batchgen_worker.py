@@ -6303,6 +6303,17 @@ class BatchGenWorker:
 
 		# A. Release completed sequences
 		completed_uuids = decisions.completed_uuids
+		if completed_uuids and BATCHGEN_DIAG_134 and self.rank == 0:
+			for uuid in completed_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				state = global_seq_state.get(uuid, {})
+				if seq and state.get('decoded_length', 9999) <= 200:
+					logging.warning(
+						f"[DIAG-134] BOUNDARY_COMPLETE gidx={seq.global_idx} "
+						f"decoded={state.get('decoded_length')} eos={state.get('eos_reached')} "
+						f"ctx={state.get('current_context_length')} "
+						f"rank={state.get('owning_rank')}"
+					)
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			# Incremental write: gather completed tokens to rank 0
