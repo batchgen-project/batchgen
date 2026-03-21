@@ -84,6 +84,9 @@ else:
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
+# Diagnostic logging for 134-token truncation investigation
+BATCHGEN_DIAG_134 = os.environ.get("BATCHGEN_DIAG_134", "0") == "1"
+
 # Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
 # Default: enabled (recommended always on). Use --no-prepack to disable.
 BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "1") == "1"
@@ -7186,6 +7189,15 @@ class BatchGenWorker:
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
+				# DIAG-134: Log batch state BEFORE boundary
+				if BATCHGEN_DIAG_134 and self.rank == 0 and local_iteration <= 256:
+					batch_gids = self._local_indices_to_global_seq_ids(batch) if batch else []
+					pt_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager and gpu_manager._gpu_page_table_manager and gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+					logging.info(
+						f"[DIAG-134] PRE-BOUNDARY iter={local_iteration} "
+						f"batch_size={len(batch)} batch_gids[:10]={batch_gids[:10]} "
+						f"pt_slots[:10]={pt_order[:10]} match={batch_gids == pt_order}"
+					)
 				last_boundary = local_iteration
 
 				(decode_uuids, batch,
@@ -7210,6 +7222,13 @@ class BatchGenWorker:
 
 					if post_boundary_slot_order != post_boundary_batch_global_ids:
 						# Fix: Rebuild page table to match batch
+						if BATCHGEN_DIAG_134 and self.rank == 0:
+							logging.warning(
+								f"[DIAG-134] POST-BOUNDARY PAGE TABLE REBUILD at iter={local_iteration}: "
+								f"old_slots[:5]={post_boundary_slot_order[:5]}, "
+								f"new_batch[:5]={post_boundary_batch_global_ids[:5]}, "
+								f"len_old={len(post_boundary_slot_order)}, len_new={len(post_boundary_batch_global_ids)}"
+							)
 						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
 
 				# Page table is now verified for this batch
@@ -7395,6 +7414,12 @@ class BatchGenWorker:
 							batch_global_order = Attn_Wrapper.cur_batch
 							if slot_order != batch_global_order:
 								# Fix: Rebuild page table to match batch order
+								if BATCHGEN_DIAG_134 and self.rank == 0:
+									logging.warning(
+										f"[DIAG-134] PAGE TABLE MISMATCH at iter={local_iteration}: "
+										f"slot_order[:5]={slot_order[:5]}, batch[:5]={batch_global_order[:5]}, "
+										f"len_slot={len(slot_order)}, len_batch={len(batch_global_order)}"
+									)
 								gpu_manager.rebuild_page_table(batch_global_order)
 						_page_table_verified_this_batch = True
 				
@@ -7563,12 +7588,29 @@ class BatchGenWorker:
 						)
 				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
 
+				# DIAG-134: Log token writes around boundary (positions 125-140) for all sequences
+				if BATCHGEN_DIAG_134 and self.rank == 0 and 125 <= decode_pos <= 140:
+					tok_id = new_tokens_cpu[i].item()
+					logging.info(
+						f"[DIAG-134] TOKEN_WRITE gidx={seq.global_idx} pos={decode_pos} "
+						f"tok={tok_id} ctx={seq.current_context_length} iter={local_iteration}"
+					)
+
 				seq.decoded_length += 1
 				seq.current_context_length += 1
 
 				# Use CPU tensor to avoid GPU sync
 				if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 					seq.eos_reached = True
+					# DIAG-134: Dump raw token buffer for short sequences on EOS
+					if BATCHGEN_DIAG_134 and self.rank == 0 and seq.decoded_length <= 200:
+						raw_toks = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
+						logging.warning(
+							f"[DIAG-134] SHORT_EOS gidx={seq.global_idx} decoded_len={seq.decoded_length} "
+							f"iter={local_iteration} eos_tok={new_tokens_cpu[i].item()} "
+							f"last_20_toks={raw_toks[-20:]} "
+							f"has_163607={'163607' if 163607 in raw_toks else 'NO </think>'}"
+						)
 
 				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
