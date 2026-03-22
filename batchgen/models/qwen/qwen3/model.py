@@ -205,7 +205,8 @@ class Qwen3Model(nn.Module):
     def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, **kwargs)
+            layer_out = layer(hidden_states, **kwargs)
+            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
