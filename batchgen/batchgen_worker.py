@@ -5294,6 +5294,18 @@ class BatchGenWorker:
 			remaining_decode = max(0, seq.original_max_decode_length - prev_decoded)
 			seq.max_decode_length = remaining_decode
 
+			# DIAG: Log reconstructed state before clearing eviction
+			if BATCHGEN_KV_SANITY and prev_decoded > 0:
+				_n = n_old if prev_decoded > 0 else 0
+				logging.warning(
+					f"[REPREFILL_DIAG] rank={self.rank} gidx={seq.global_idx} "
+					f"new_prompt_len={new_prompt_len} prev_decoded={prev_decoded} "
+					f"n_old={_n} decoded_len={seq.decoded_length} "
+					f"prompt={seq.prompt_length} orig_prompt={seq.original_prompt_length} "
+					f"first_5_decoded={seq.decoded_tokens[0, :min(5,seq.decoded_length)].tolist() if seq.decoded_length > 0 else []} "
+					f"last_5_decoded={seq.decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist() if seq.decoded_length > 0 else []}"
+				)
+
 			# Clear eviction state
 			seq.evicted_token_ids = None
 
@@ -5889,6 +5901,16 @@ class BatchGenWorker:
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
 			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
+
+			# DIAG: Log post-prefill state for re-entered sequences
+			if BATCHGEN_KV_SANITY and seq.total_decoded_before_eviction > 0:
+				logging.warning(
+					f"[PREFILL_DONE_DIAG] rank={self.rank} gidx={seq.global_idx} "
+					f"decoded_len={seq.decoded_length} prompt={seq.prompt_length} "
+					f"orig_prompt={seq.original_prompt_length} ctx={seq.current_context_length} "
+					f"new_token={new_tokens_cpu[i].item()} token_pos={token_pos} "
+					f"last_5_decoded={self.query_book[local_idx].decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist()}"
+				)
 
 			# MODIFIED: Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -6717,6 +6739,15 @@ class BatchGenWorker:
 					else:
 						seq.evicted_token_ids = prompt_tokens.clone()
 					seq.total_decoded_before_eviction = seq.decoded_length
+					if BATCHGEN_KV_SANITY and seq.decoded_length > 0:
+						logging.warning(
+							f"[EVICT_DIAG] rank={self.rank} gidx={seq.global_idx} "
+							f"decoded_len={seq.decoded_length} prompt={seq.prompt_length} "
+							f"orig_prompt={seq.original_prompt_length} "
+							f"evicted_ids_len={len(seq.evicted_token_ids)} "
+							f"first_5_decoded={seq.decoded_tokens[0, :min(5,seq.decoded_length)].tolist()} "
+							f"last_5_decoded={seq.decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist()}"
+						)
 					if BATCHGEN_CB_DEBUG:
 						logging.debug(
 							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
@@ -8008,6 +8039,14 @@ class BatchGenWorker:
 							f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
 						)
 				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
+				# DIAG: Log first 10 token writes for re-entered sequences
+				if BATCHGEN_KV_SANITY and seq.total_decoded_before_eviction > 0 and local_iteration <= 10:
+					logging.warning(
+						f"[DECODE_WRITE_DIAG] rank={self.rank} gidx={seq.global_idx} "
+						f"iter={local_iteration} decode_pos={decode_pos} "
+						f"token={new_tokens_cpu[i].item()} "
+						f"decoded_len_before={seq.decoded_length} ctx={seq.current_context_length}"
+					)
 
 				# DIAG-134: Log token writes around boundary (positions 125-140) on ALL ranks
 				if BATCHGEN_DIAG_134 and 125 <= decode_pos <= 140:
@@ -8751,7 +8790,15 @@ class BatchGenWorker:
 				continue
 			token = query_entry.decoded_tokens[:, pos:pos+1]
 			tokens.append(token)
-		
+			# DIAG: Log decode input for re-entered sequences
+			if BATCHGEN_KV_SANITY and seq.total_decoded_before_eviction > 0:
+				logging.warning(
+					f"[DECODE_INPUT_DIAG] rank={self.rank} gidx={seq.global_idx} "
+					f"decoded_len={seq.decoded_length} pos={pos} "
+					f"input_token={token[0,0].item()} "
+					f"last_5_decoded={query_entry.decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist()}"
+				)
+
 		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		
 		if result.shape[0] != len(batch):
