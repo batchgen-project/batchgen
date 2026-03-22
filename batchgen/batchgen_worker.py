@@ -3146,7 +3146,7 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				# CRITICAL: Ensure current_context_length is consistent before sending
 				# The invariant is: current_context_length = prompt_length + decoded_length
-				expected_ctx = seq.prompt_length + seq.decoded_length
+				expected_ctx = seq.original_prompt_length + seq.decoded_length
 				if seq.current_context_length != expected_ctx:
 					logging.warning(
 						f"Rank {self.rank}: Correcting ctx_len for {uuid[:8]} before sync: "
@@ -3180,6 +3180,13 @@ class BatchGenWorker:
 							seq.current_context_length = state['current_context_length']
 							seq.gpu_pages_allocated = state['gpu_pages_allocated']
 							seq.eos_reached = state['eos_reached']
+							# DIAG-134: Log received metadata for sequences near truncation boundary
+							if BATCHGEN_DIAG_134 and 120 <= state['decoded_length'] <= 145:
+								logging.warning(
+									f"[DIAG-134] SYNC_RECV rank={self.rank} gidx={seq.global_idx} "
+									f"recv_decoded={state['decoded_length']} recv_ctx={state['current_context_length']} "
+									f"recv_eos={state['eos_reached']}"
+								)
 							# Sync host KV fields for consistent migration planning
 							if 'host_pages_allocated' in state:
 								seq.host_pages_allocated = state['host_pages_allocated']
@@ -3187,7 +3194,7 @@ class BatchGenWorker:
 								seq.host_token_capacity = state['host_token_capacity']
 							
 							# VALIDATION: Ensure received ctx_len is consistent
-							expected_ctx = seq.prompt_length + seq.decoded_length
+							expected_ctx = seq.original_prompt_length + seq.decoded_length
 							if seq.current_context_length != expected_ctx:
 								logging.error(
 									f"Rank {self.rank}: [SYNC-VALIDATE] Received inconsistent ctx_len for {uuid[:8]}: "
@@ -5307,7 +5314,7 @@ class BatchGenWorker:
 			for uuid in decode_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq and 120 <= seq.decoded_length <= 145:
-					expected_ctx = seq.prompt_length + seq.decoded_length
+					expected_ctx = seq.original_prompt_length + seq.decoded_length
 					ctx_ok = seq.current_context_length == expected_ctx
 					host_pages_needed = _math.ceil(expected_ctx / self.PAGE_SIZE) if expected_ctx > 0 else 0
 					host_ok = seq.host_pages_allocated >= host_pages_needed
@@ -5336,7 +5343,7 @@ class BatchGenWorker:
 			# Compute the correct context length
 			# For sequences with decoded tokens: ctx_len = prompt_length + decoded_length
 			# For freshly prefilled sequences: ctx_len should equal prompt_length (decoded_length=0)
-			expected_ctx = seq.prompt_length + seq.decoded_length
+			expected_ctx = seq.original_prompt_length + seq.decoded_length
 			
 			# Repair if mismatched
 			if seq.current_context_length != expected_ctx:
@@ -5704,7 +5711,7 @@ class BatchGenWorker:
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.prompt_length + seq.decoded_length
+			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 			# MODIFIED: Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -5973,7 +5980,7 @@ class BatchGenWorker:
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.prompt_length + seq.decoded_length
+			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 			# Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -7550,10 +7557,24 @@ class BatchGenWorker:
 					for seq in batch_sequences:
 						ctx_len = seq.current_context_length
 						if ctx_len == 0:  # Rare edge case - trust prompt_length + decoded_length
-							ctx_len = seq.prompt_length + seq.decoded_length
+							ctx_len = seq.original_prompt_length + seq.decoded_length
 							if ctx_len > 0:
 								seq.current_context_length = ctx_len
 						cache_seqlens.append(ctx_len)
+
+					# DIAG-134: Verify cache_seqlens at first forward pass
+					if BATCHGEN_DIAG_134 and local_iteration == 1:
+						for fi, fseq in enumerate(batch_sequences):
+							if 120 <= fseq.decoded_length <= 200:
+								expected = fseq.original_prompt_length + fseq.decoded_length
+								logging.warning(
+									f"[DIAG-134] FIRST_FWD rank={self.rank} gidx={fseq.global_idx} "
+									f"cache_seqlens={cache_seqlens[fi]} expected={expected} "
+									f"match={cache_seqlens[fi]==expected} "
+									f"decoded_len={fseq.decoded_length} prompt={fseq.prompt_length} "
+									f"orig_prompt={fseq.original_prompt_length} "
+									f"ctx={fseq.current_context_length}"
+								)
 
 					max_ctx = max(cache_seqlens)
 					# Build attention metadata directly on GPU
@@ -7831,6 +7852,8 @@ class BatchGenWorker:
 						logging.warning(
 							f"[DIAG-134] SHORT_EOS rank={self.rank} gidx={seq.global_idx} decoded_len={seq.decoded_length} "
 							f"iter={local_iteration} eos_tok={new_tokens_cpu[i].item()} "
+							f"was_evicted={seq.total_decoded_before_eviction > 0} "
+							f"orig_prompt={seq.original_prompt_length} prompt={seq.prompt_length} "
 							f"last_30_toks={raw_toks[-30:]} "
 							f"has_163607={'YES' if 163607 in raw_toks else 'NO'}"
 						)
