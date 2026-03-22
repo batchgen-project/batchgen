@@ -150,12 +150,29 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ):
         # Attention with residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Pass hidden_states as keyword arg for AttnWrapperBase compatibility
-        attn_out = self.self_attn(hidden_states=hidden_states, **kwargs)
+        attn_out = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            **kwargs,
+        )
         # Handle tuple return from wrapper (output, attn_weights, kv_cache)
         if isinstance(attn_out, tuple):
             hidden_states = attn_out[0]
@@ -169,7 +186,8 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        # Return tuple for BatchGen worker compatibility (expects layer_outputs[0])
+        return (hidden_states,)
 
 
 class Qwen3Model(nn.Module):
