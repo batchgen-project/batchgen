@@ -102,6 +102,9 @@ class Qwen3Initializer:
         engine_config.Basic_Config.num_threads = 0
         engine_config.Basic_Config.gpu_arch = getattr(args, 'gpu_arch', 'ampere')
 
+        # Use GPU paged KV cache (attn_mode=3) — required for continuous batching
+        engine_config.Basic_Config.attn_mode = 3
+
         return engine_config
 
     def _default_engine_config(self):
