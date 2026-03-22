@@ -68,6 +68,9 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "GLM-5": "glm_moe_dsa",
     "MiniMax-M2.5": "minimax_m25",
     "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
+    "Qwen3": "qwen3",
+    "Qwen3Guard": "qwen3",
+    "qwen3guard": "qwen3",
 }
 
 
@@ -171,6 +174,11 @@ def _import_tokenizers():
 
     try:
         from batchgen.models.minimax.minimax_m25 import tokenizer as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.qwen.qwen3 import tokenizer as _  # noqa: F401
     except ImportError:
         pass
 
