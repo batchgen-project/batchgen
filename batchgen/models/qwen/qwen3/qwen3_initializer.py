@@ -153,6 +153,14 @@ class Qwen3Initializer:
         num_kv_heads = self.model_config.num_key_value_heads  # 8
         head_dim = self.model_config.head_dim               # 128
 
+        # Module buffer counts for C++ core engine (must be Dict[str, int])
+        self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer = {
+            "attn": 1,
+        }
+        self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
+            "attn": 0,  # Persistent during decode
+        }
+
         # Only attn uses dynamic weight loading via core engine
         # MLP weights are persistent in model skeleton (fits in GPU memory)
         self.engine_config.GPU_Buffer_Config.module_shapes = {
