@@ -247,9 +247,9 @@ class Qwen3AttnWrapper(AttnWrapperBase):
             page_table = page_table[start_idx:end_idx]
 
         # GQA decode attention with paged KV
-        query_t = query.transpose(1, 2)  # [B, H, 1, D]
+        # batchgen_gqa_decode_bf16 expects q=[B, 1, H, D], not [B, H, 1, D]
         attn_output, _ = batchgen_gqa_decode_bf16(
-            q=query_t,
+            q=query,  # [batch, 1, num_heads, head_dim]
             k_cache=k_cache_layer,
             v_cache=v_cache_layer,
             cache_seqlens=micro_cache_seqlens,
