@@ -90,6 +90,9 @@ BATCHGEN_DIAG_134 = os.environ.get("BATCHGEN_DIAG_134", "0") == "1"
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
 
+# KV cache reload sanity check: compare fingerprints before destroy vs after reload
+BATCHGEN_KV_SANITY = os.environ.get("BATCHGEN_KV_SANITY", "0") == "1"
+
 # Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
 # Default: enabled (recommended always on). Use --no-prepack to disable.
 BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "1") == "1"
@@ -1719,6 +1722,10 @@ class BatchGenWorker:
 		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
 		torch.cuda.synchronize(self.torch_device)
 
+		# KV sanity check: verify fingerprints AFTER host→GPU reload
+		if BATCHGEN_KV_SANITY:
+			self._verify_kv_fingerprints("POST_RELOAD", global_sequence_ids)
+
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
@@ -1813,7 +1820,122 @@ class BatchGenWorker:
 			else:
 				print(f"[KV LOAD DEBUG] OK: K values differ across sequences (expected for different prompts)")
 
-	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:	
+	def _capture_kv_fingerprints(self, label: str) -> None:
+		"""Capture KV checksums at key positions for sequences near truncation range."""
+		manager = self.gpu_paged_kv_cache_manager
+		if not manager or not hasattr(manager, '_k_cache') or manager._k_cache is None:
+			return
+		pt_mgr = manager._gpu_page_table_manager
+		if not pt_mgr or pt_mgr.gpu_table is None:
+			return
+
+		k_cache_l0 = manager._k_cache[0]  # layer 0
+		pt = pt_mgr.gpu_table
+		slot_map = pt_mgr.seq_id_to_slot
+		page_size = self.PAGE_SIZE
+
+		self._kv_fingerprints = {}
+		for uuid in list(self._sequences_with_gpu_kv):
+			seq = self.global_batch.get_sequence(uuid)
+			if not seq or seq.decoded_length < 120:
+				continue
+
+			gidx = seq.global_idx
+			slot = slot_map.get(gidx, -1)
+			if slot < 0:
+				continue
+
+			fingerprint = {}
+			positions = [0, seq.original_prompt_length, seq.original_prompt_length + 64, seq.current_context_length - 1]
+			for pos in positions:
+				if pos < 0 or pos >= seq.current_context_length:
+					continue
+				pidx = pos // page_size
+				poff = pos % page_size
+				if pidx < pt.shape[1] and slot < pt.shape[0]:
+					phys = pt[slot, pidx].item()
+					if 0 <= phys < k_cache_l0.shape[0]:
+						kv_vec = k_cache_l0[phys, poff].flatten().float()
+						fingerprint[pos] = kv_vec.abs().sum().item()
+
+			self._kv_fingerprints[gidx] = {
+				'decoded_length': seq.decoded_length,
+				'ctx': seq.current_context_length,
+				'prompt': seq.original_prompt_length,
+				'slot': slot,
+				'checksums': fingerprint,
+			}
+
+		logging.warning(
+			f"[KV_SANITY] {label} rank={self.rank}: Captured fingerprints for "
+			f"{len(self._kv_fingerprints)} sequences"
+		)
+
+	def _verify_kv_fingerprints(self, label: str, global_sequence_ids: List[int]) -> None:
+		"""Compare current KV with stored fingerprints after reload."""
+		if not hasattr(self, '_kv_fingerprints') or not self._kv_fingerprints:
+			return
+
+		manager = self.gpu_paged_kv_cache_manager
+		if not manager or not hasattr(manager, '_k_cache') or manager._k_cache is None:
+			return
+		pt_mgr = manager._gpu_page_table_manager
+		if not pt_mgr or pt_mgr.gpu_table is None:
+			return
+
+		k_cache_l0 = manager._k_cache[0]
+		pt = pt_mgr.gpu_table
+		slot_map = pt_mgr.seq_id_to_slot
+		page_size = self.PAGE_SIZE
+
+		matched = 0
+		mismatched = 0
+		for global_idx in global_sequence_ids:
+			if global_idx not in self._kv_fingerprints:
+				continue
+
+			fp = self._kv_fingerprints[global_idx]
+			slot = slot_map.get(global_idx, -1)
+			if slot < 0:
+				logging.error(
+					f"[KV_SANITY] {label} rank={self.rank} gidx={global_idx} "
+					f"NO SLOT after reload (was slot={fp['slot']})"
+				)
+				mismatched += 1
+				continue
+
+			mismatches = []
+			for pos, expected_cksum in fp['checksums'].items():
+				pidx = pos // page_size
+				poff = pos % page_size
+				if pidx < pt.shape[1] and slot < pt.shape[0]:
+					phys = pt[slot, pidx].item()
+					if 0 <= phys < k_cache_l0.shape[0]:
+						kv_vec = k_cache_l0[phys, poff].flatten().float()
+						actual_cksum = kv_vec.abs().sum().item()
+						if abs(actual_cksum - expected_cksum) > 1e-3:
+							mismatches.append(
+								f"pos={pos}: expected={expected_cksum:.4f}, got={actual_cksum:.4f}"
+							)
+
+			if mismatches:
+				logging.error(
+					f"[KV_SANITY] {label} rank={self.rank} gidx={global_idx} "
+					f"MISMATCH! decoded={fp['decoded_length']} ctx={fp['ctx']} "
+					f"old_slot={fp['slot']} new_slot={slot} "
+					f"mismatches={mismatches}"
+				)
+				mismatched += 1
+			else:
+				matched += 1
+
+		if matched + mismatched > 0:
+			logging.warning(
+				f"[KV_SANITY] {label} rank={self.rank}: "
+				f"{matched} OK, {mismatched} MISMATCH out of {matched + mismatched} checked"
+			)
+
+	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not local_sequence_ids:
@@ -7869,7 +7991,11 @@ class BatchGenWorker:
 		if pending_async_task is not None:
 			pending_async_task.wait()
 			torch.cuda.synchronize(self.torch_device)
-		
+
+		# KV sanity check: capture fingerprints BEFORE GPU KV is destroyed
+		if BATCHGEN_KV_SANITY:
+			self._capture_kv_fingerprints("PRE_DESTROY")
+
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
 		Attn_Wrapper.past_key_states = None
