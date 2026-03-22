@@ -483,6 +483,13 @@ class BatchGenServer:
 			ps = MiniMaxM25_Parameter_Server(
 				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
 			)
+		elif "qwen3" in self.args.model.lower() or "qwen3guard" in self.args.model.lower():
+			from batchgen.models.qwen.qwen3.qwen3_parameter_server import (
+				Qwen3ParameterServer,
+			)
+			ps = Qwen3ParameterServer(
+				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
+			)
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")
 
