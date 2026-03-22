@@ -7306,9 +7306,11 @@ class BatchGenWorker:
 								page_off = pos % gpu_manager.config.page_size_tokens
 								if page_idx < pt_mgr.gpu_table.shape[1]:
 									phys = pt_mgr.gpu_table[slot, page_idx].item()
-									if 0 <= phys < k_cache_l0.shape[0]:
-										val = k_cache_l0[phys, page_off, 0].item()
-										kv_samples.append(f"pos{pos}={val:.4f}")
+									if 0 <= phys < k_cache_l0.shape[1]:
+										kv_flat = k_cache_l0[phys, page_off].flatten().float()
+										val = kv_flat[0].item() if kv_flat.numel() > 0 else 0.0
+										is_zero = (kv_flat.abs().sum().item() < 1e-6)
+										kv_samples.append(f"pos{pos}={'ZERO' if is_zero else f'{val:.4f}'}")
 									else:
 										kv_samples.append(f"pos{pos}=BAD_PAGE({phys})")
 								else:
