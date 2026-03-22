@@ -215,15 +215,16 @@ class Qwen3AttnWrapper(AttnWrapperBase):
         # QK-norm
         query, key = self._apply_qk_norm(query, key)
 
-        # RoPE
+        # RoPE — cos/sin need shape [B, 1, 1, D] for [B, S, H, D] tensors
         max_seqlen = AttnWrapperBase.max_seqlen or 1
         cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
         if current_token_position is not None:
-            cos = cos[current_token_position].unsqueeze(1)
-            sin = sin[current_token_position].unsqueeze(1)
+            # cos[positions] → [B, D], unsqueeze twice for seq and head dims
+            cos = cos[current_token_position].unsqueeze(1).unsqueeze(1)  # [B, 1, 1, D]
+            sin = sin[current_token_position].unsqueeze(1).unsqueeze(1)
         else:
-            cos = cos[:1]
-            sin = sin[:1]
+            cos = cos[:1].unsqueeze(0)  # [1, 1, 1, D]
+            sin = sin[:1].unsqueeze(0)
 
         query, key = self._apply_rotary(query, key, cos, sin)
 
