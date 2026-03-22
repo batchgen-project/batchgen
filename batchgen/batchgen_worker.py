@@ -4796,6 +4796,19 @@ class BatchGenWorker:
 					break
 				
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
+
+				# ============ CRITICAL: Sync metadata before decode config ============
+				# After decode→prefill→decode transitions, sequence metadata
+				# (decoded_length, current_context_length, host_pages_allocated) may be
+				# stale on non-owning ranks. The last sync was at the previous decode
+				# group's final boundary. Sequences decoded additional tokens after that
+				# boundary without cross-rank sync. Without this sync,
+				# _allocate_gpu_kv_two_page_buffer may allocate too few GPU pages
+				# (capped by stale host_pages_allocated), causing KV corruption at the
+				# DECISION_INTERVAL boundary (~134-token truncation bug).
+				if decode_uuids:
+					self._sync_sequence_metadata(decode_uuids)
+
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 
 				# B. Config Decode
