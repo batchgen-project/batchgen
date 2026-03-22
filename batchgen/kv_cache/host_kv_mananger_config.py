@@ -393,6 +393,11 @@ def build_gpu_kv_config_fixed_size(
 		kv_dim = 8 * 128 * 2  # K + V
 		num_layers = 62
 		dtype_bytes = 2  # bfloat16
+	elif "qwen3" in model_name.lower():
+		# Qwen3 GQA: 8 KV heads * 128 head_dim = 1024 for K, same for V
+		kv_dim = 8 * 128 * 2  # K + V
+		num_layers = 36
+		dtype_bytes = 2  # bfloat16
 	else:
 		raise NotImplementedError(f"Model {model_name} not supported")
 	
